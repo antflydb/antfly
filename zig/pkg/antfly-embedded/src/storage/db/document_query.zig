@@ -39,13 +39,13 @@ pub fn lookupJson(
 pub fn lookupJsonWithOutput(alloc: Allocator, output: Allocator, raw: []const u8, opts: types.LookupOptions) !types.LookupResult {
     if (opts.fields.len == 0 and opts.include_all_fields) return .{ .json = try output.dupe(u8, raw) };
     if (spanProjectionSupported(opts.fields)) {
-        try validateUniqueJson(alloc, raw);
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const a = arena.allocator();
         var view = @import("query/json_view.zig").View.init(a, raw);
         // Plain JSON lookup historically parses numbers before serialization.
         view.parse_numbers = true;
+        try validateUniqueJson(a, raw, &view, try view.projectionPaths(opts.fields));
         var projected: std.json.ObjectMap = .empty;
         var path: std.ArrayListUnmanaged([]const u8) = .empty;
         var excluded: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -103,13 +103,85 @@ fn spanProjectionSupported(fields: []const []const u8) bool {
 /// Validate skipped subtrees too, including duplicate object keys. Reuse one
 /// key arena per nesting level rather than allocating a DOM for every value.
 /// Scalar values are scanned without decoding or retaining their strings.
-fn validateUniqueJson(alloc: Allocator, raw: []const u8) !void {
+fn validateUniqueJson(alloc: Allocator, raw: []const u8, view: *@import("query/json_view.zig").View, paths: []const @import("query/json_view.zig").View.ProjectionPath) !void {
+    const View = @import("query/json_view.zig").View;
+    const Path = View.ProjectionPath;
+    const Paths = std.ArrayListUnmanaged(Path);
     const scratch = @import("antfly_platform").allocator.reclaimingScratch(alloc);
     const Frame = struct {
         object: bool = false,
         key: bool = true,
         arena: std.heap.ArenaAllocator,
         names: std.StringHashMapUnmanaged(void) = .empty,
+        node: ?*View.Node = null,
+        children: std.ArrayListUnmanaged(View.Child) = .empty,
+        object_paths: std.StringHashMapUnmanaged(Paths) = .empty,
+        index_paths: std.AutoHashMapUnmanaged(usize, Paths) = .empty,
+        fanout: Paths = .empty,
+        name: []const u8 = "",
+        ordinal: usize = 0,
+        start: usize = 0,
+        pending_node: ?*View.Node = null,
+        pending_paths: []const Path = &.{},
+
+        fn plan(self: *@This(), a: Allocator, selected: []const Path) !void {
+            if (self.node == null) return;
+            for (selected) |path| {
+                if (self.object) {
+                    if (path.parts.len <= 1) continue;
+                    const entry = try self.object_paths.getOrPut(a, path.parts[0]);
+                    if (!entry.found_existing) entry.value_ptr.* = .empty;
+                    try entry.value_ptr.append(a, .{ .parts = path.parts[1..] });
+                } else if (View.projectionIndex(path.parts[0])) |i| {
+                    const entry = try self.index_paths.getOrPut(a, i);
+                    if (!entry.found_existing) entry.value_ptr.* = .empty;
+                    if (path.parts.len > 1) try entry.value_ptr.append(a, .{ .parts = path.parts[1..] });
+                } else try self.fanout.append(a, path);
+            }
+        }
+        fn beginValue(self: *@This(), a: Allocator, start: usize, object_value: bool) !void {
+            self.start = start;
+            self.pending_node = null;
+            self.pending_paths = &.{};
+            if (self.node == null) return;
+            if (self.object) {
+                if (self.object_paths.get(self.name)) |selected| self.pending_paths = selected.items;
+                // Scalar/whole-subtree fields need only one raw span, no node allocation.
+                if (self.pending_paths.len != 0) self.pending_node = try a.create(View.Node);
+            } else {
+                const numeric = self.index_paths.get(self.ordinal);
+                if (numeric == null and self.fanout.items.len == 0) return;
+                self.pending_node = try a.create(View.Node);
+                if (object_value) {
+                    if (numeric) |selected| self.pending_paths = selected.items;
+                    if (self.fanout.items.len != 0) {
+                        var combined: Paths = .empty;
+                        try combined.appendSlice(a, self.pending_paths);
+                        try combined.appendSlice(a, self.fanout.items);
+                        self.pending_paths = combined.items;
+                    }
+                }
+            }
+            if (self.pending_node) |node| node.* = .{ .raw = &.{} };
+        }
+        fn finishValue(self: *@This(), a: Allocator, source: []const u8, end: usize) !void {
+            if (self.node) |parent| {
+                const span = source[self.start..end];
+                if (self.pending_node) |node| node.raw = span;
+                if (self.object) {
+                    try parent.object_index.put(a, self.name, self.children.items.len);
+                    try self.children.append(a, .{ .node = if (self.pending_node) |node| node.* else .{ .raw = span } });
+                } else if (self.pending_node) |node| {
+                    if (self.fanout.items.len != 0) try self.children.append(a, .{ .node = node.* }) else try parent.array_index.put(a, self.ordinal, node);
+                }
+            }
+            self.ordinal += 1;
+        }
+        fn finishContainer(self: *@This(), a: Allocator) !void {
+            if (self.node) |node| {
+                if (self.object or self.fanout.items.len != 0) node.children = try self.children.toOwnedSlice(a) else try node.array_index.put(a, std.math.maxInt(usize), node);
+            }
+        }
     };
     var frames: std.ArrayListUnmanaged(Frame) = .empty;
     defer {
@@ -124,40 +196,42 @@ fn validateUniqueJson(alloc: Allocator, raw: []const u8) !void {
         const token = try scanner.peekNextTokenType();
         if (depth != 0) {
             const frame = &frames.items[depth - 1];
+            if ((frame.object and frame.key and token == .object_end) or (!frame.object and token == .array_end)) {
+                _ = try scanner.next();
+                try frame.finishContainer(alloc);
+                depth -= 1;
+                if (depth != 0) try frames.items[depth - 1].finishValue(alloc, raw, scanner.cursor);
+                continue;
+            }
             if (frame.object and frame.key) {
-                if (token == .object_end) {
-                    _ = try scanner.next();
-                    depth -= 1;
-                    continue;
-                }
                 const name = switch (try scanner.nextAllocMax(frame.arena.allocator(), .alloc_if_needed, raw.len)) {
-                    .string, .allocated_string => |key| key,
+                    .string, .allocated_string => |key_name| key_name,
                     else => return error.SyntaxError,
                 };
                 if ((try frame.names.getOrPut(frame.arena.allocator(), name)).found_existing) return error.DuplicateField;
+                frame.name = if (frame.node != null) try alloc.dupe(u8, name) else name;
                 frame.key = false;
                 continue;
             }
-            if (!frame.object and token == .array_end) {
-                _ = try scanner.next();
-                depth -= 1;
-                continue;
-            }
             frame.key = true;
+            try frame.beginValue(alloc, scanner.cursor, token == .object_begin);
         }
         root_seen = true;
         if (token == .object_begin or token == .array_begin) {
+            const selected_node: ?*View.Node = if (depth == 0) (if (token == .object_begin) &view.root else null) else if (frames.items[depth - 1].pending_paths.len != 0) frames.items[depth - 1].pending_node else null;
+            const selected_paths = if (depth == 0) paths else frames.items[depth - 1].pending_paths;
             _ = try scanner.next();
             if (depth == frames.items.len) try frames.append(scratch, .{ .arena = .init(scratch) });
             const frame = &frames.items[depth];
-            _ = frame.arena.reset(.{ .retain_with_limit = 16 * 1024 });
-            frame.names = .empty;
-            frame.object = token == .object_begin;
-            frame.key = true;
+            var key_arena = frame.arena;
+            _ = key_arena.reset(.{ .retain_with_limit = 16 * 1024 });
+            frame.* = .{ .arena = key_arena, .object = token == .object_begin, .node = selected_node };
+            try frame.plan(alloc, selected_paths);
             depth += 1;
         } else {
             if (token == .object_end or token == .array_end or token == .end_of_document) return error.SyntaxError;
             try scanner.skipValue();
+            if (depth != 0) try frames.items[depth - 1].finishValue(alloc, raw, scanner.cursor);
         }
     }
     if (try scanner.next() != .end_of_document) return error.SyntaxError;
@@ -755,12 +829,14 @@ test "public graph metric borrowed wire span projection preserves document selec
                 "{\"a\":{\"x\":null},\"b\":[]}",
                 "42",
                 "{\"\\u0061\":{\"\\u0078\":\"escaped key\"}}",
+                "{\"a\":{\"x\":[{\"y\":1},{\"y\":2}]},\"b\":[{\"x\":1},{\"x\":2},3,{\"x\":4}]}",
             };
             const selections = [_][]const []const u8{
-                &.{"a.x"},          &.{ "b.x", "b.y" }, &.{"b.01.x"},      &.{"b.0"},
-                &.{ "a", "a.x" },   &.{ "a.x", "a" },   &.{ "c", "a.y" },  &.{ "missing.x", "a.missing" },
-                &.{ "", ".a..x." }, &.{"*"},            &.{ "a", "-a.y" }, &.{"-b"},
-                &.{},
+                &.{"a.x"},                       &.{ "b.x", "b.y" },                              &.{"b.01.x"},                 &.{"b.0"},
+                &.{ "a", "a.x" },                &.{ "a.x", "a" },                                &.{ "c", "a.y" },             &.{ "missing.x", "a.missing" },
+                &.{ "", ".a..x." },              &.{"*"},                                         &.{ "a", "-a.y" },            &.{"-b"},
+                &.{ "b.x", "b.3.x", "b.0.x" },   &.{ "b.0.x", "b.x" },                            &.{ "b.3", "b.0", "b.01" },   &.{ "a.x.0.y", "a.x.1.y" },
+                &.{ "a", "a.x.1.y", "a.x.0.y" }, &.{"b.999999999999999999999999999999999999999"}, &.{"b.18446744073709551615"}, &.{},
             };
             for (inputs) |raw| for (selections) |fields| {
                 const opts: types.LookupOptions = .{ .fields = fields, .include_all_fields = false };
@@ -784,7 +860,7 @@ test "public graph metric borrowed wire span projection preserves document selec
     }
     const Fail = struct {
         fn run(a: Allocator) !void {
-            var result = try lookupJsonWithOutput(a, a, "{\"keep\":[{\"n\":1}],\"omit\":[{\"n\":2},{\"n\":3}]}", .{ .fields = &.{"keep.n"}, .include_all_fields = false });
+            var result = try lookupJsonWithOutput(a, a, "{\"keep\":[{\"n\":1}],\"omit\":[{\"n\":2},{\"n\":3}]}", .{ .fields = &.{ "keep.n", "keep.0.n" }, .include_all_fields = false });
             defer result.deinit(a);
             try std.testing.expectEqualStrings("{\"keep\":[{\"n\":1}]}", result.json);
         }
@@ -815,4 +891,34 @@ test "public graph metric borrowed wire span projection bounds omitted document 
     }
     try std.testing.expect(peaks[1] < peaks[0] / 10 and peaks[2] < peaks[0] / 10);
     std.debug.print("SPAN_PROJECTION omitted_objects=16384 dom_peak={d} span_peak={d} exclusion_peak={d}\n", .{ peaks[0], peaks[1], peaks[2] });
+}
+
+test "public graph metric borrowed wire span projection fuses validation and sparse array indices" {
+    const a = std.testing.allocator;
+    const Counter = @import("../lite/test_allocator.zig").BudgetAllocator;
+    var input = std.Io.Writer.Allocating.init(a);
+    defer input.deinit();
+    try input.writer.writeAll("{\"arr\":[");
+    for (0..20000) |i| {
+        if (i != 0) try input.writer.writeByte(',');
+        try input.writer.print("{d}", .{i});
+    }
+    try input.writer.writeAll("]}");
+    const fields = [_][]const u8{ "arr.19999", "arr.19990", "arr.19998", "arr.19997", "arr.19996", "arr.19995", "arr.19994", "arr.19993", "arr.19992", "arr.19991", "arr.19989", "arr.19988", "arr.19987", "arr.19986", "arr.19985", "arr.19984" };
+    var budget: Counter = .{ .backing = a, .limit = 64 * 1024 };
+    var result = try lookupJsonWithOutput(budget.allocator(), a, input.written(), .{ .fields = &fields, .include_all_fields = false });
+    defer result.deinit(a);
+    try std.testing.expectEqualStrings("{\"arr\":[19984]}", result.json);
+    try std.testing.expectEqual(@as(usize, 0), budget.live);
+    std.debug.print("FUSED_ARRAY_PROJECTION rows=20000 selectors=16 scratch_peak={d}\n", .{budget.peak});
+    // Inspect the navigation directly: unselected elements never become nodes.
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const View = @import("query/json_view.zig").View;
+    var view = View.init(arena.allocator(), input.written());
+    try validateUniqueJson(arena.allocator(), input.written(), &view, try view.projectionPaths(&fields));
+    const arr = &view.root.children.?[0].node;
+    try std.testing.expect(arr.children == null);
+    try std.testing.expect(arr.array_index.contains(std.math.maxInt(usize)));
+    try std.testing.expectEqual(@as(u32, 17), arr.array_index.count());
 }

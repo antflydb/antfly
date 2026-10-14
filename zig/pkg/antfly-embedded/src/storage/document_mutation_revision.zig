@@ -49,6 +49,11 @@ pub fn loadContent(txn: anytype, physical: []const u8) !?Content {
 /// Decode a bounded proof window from one sorted, deduplicated metadata read.
 /// Values are reduced to owned scalars before any primary read can retire them.
 pub fn loadWindow(txn: anytype, a: std.mem.Allocator, physical: []const []const u8, ids: []const []const u8, contents: []?Content, timestamps: []u64) !void {
+    return loadWindowWithRevisions(txn, a, physical, ids, contents, timestamps, null);
+}
+
+pub fn loadWindowWithRevisions(txn: anytype, a: std.mem.Allocator, physical: []const []const u8, ids: []const []const u8, contents: []?Content, timestamps: []u64, mutation_revisions: ?[]u64) !void {
+    if (mutation_revisions) |out| if (out.len != physical.len) return error.InvalidArgument;
     if (physical.len != ids.len or contents.len != ids.len or timestamps.len != ids.len or ids.len > 64) return error.InvalidArgument;
     const Entry = struct {
         key: []const u8,
@@ -98,6 +103,7 @@ pub fn loadWindow(txn: anytype, a: std.mem.Allocator, physical: []const []const 
             timestamps[entry.row] = std.mem.readInt(u64, raw[0..8], .little);
         },
     };
+    if (mutation_revisions) |out| @memcpy(out, revisions[0..out.len]);
     for (contents, physical, 0..) |*content, row, i| if (content.*) |cached| {
         if (!keys.isStoredDocumentRowKey(row) or cached.kind != row[row.len - 1] or cached.revision != revisions[i]) content.* = null;
     };
@@ -138,6 +144,85 @@ pub fn load(txn: anytype, key: Key) !u64 {
     };
     if (raw.len != 8) return error.InvalidDocumentMutationRevision;
     return std.mem.readInt(u64, raw[0..8], .little);
+}
+
+/// Foreground reads already hash a missing proof. Keep a bounded, disposable
+/// repair queue rather than restarting a physical migration for each miss.
+/// Drain ownership before publication under the ordinary leader/apply gates.
+pub const RepairQueue = struct {
+    const Entry = struct { physical: []u8, content: Content };
+    pub const max_entries = 64;
+    pub const max_key_bytes = 256 * 1024;
+    mutex: std.atomic.Mutex = .unlocked,
+    pending: std.atomic.Value(bool) = .init(false),
+    entries: [max_entries]Entry = undefined,
+    count: usize = 0,
+    key_bytes: usize = 0,
+
+    /// False requests the durable sweep on contention/overflow. Allocation
+    /// failure is also a fallback, never a failure of the foreground query.
+    pub fn enqueue(self: *@This(), a: std.mem.Allocator, physical: []const u8, content: Content) bool {
+        if (!self.mutex.tryLock()) return false;
+        defer self.mutex.unlock();
+        for (self.entries[0..self.count]) |*entry| if (std.mem.eql(u8, entry.physical, physical)) {
+            if (content.revision >= entry.content.revision) entry.content = content;
+            return true;
+        };
+        if (self.count == max_entries or physical.len > max_key_bytes -| self.key_bytes) return false;
+        const owned = a.dupe(u8, physical) catch return false;
+        self.entries[self.count] = .{ .physical = owned, .content = content };
+        self.count += 1;
+        self.key_bytes += physical.len;
+        self.pending.store(true, .release);
+        return true;
+    }
+    pub const Page = struct {
+        entries: [max_entries]Entry = undefined,
+        count: usize = 0,
+        pub fn stage(self: *const @This(), txn: anytype) !usize {
+            var installed: usize = 0;
+            for (self.entries[0..self.count]) |entry| installed += @intFromBool(try stageContent(txn, entry.physical, entry.content));
+            return installed;
+        }
+        pub fn deinit(self: *@This(), a: std.mem.Allocator) void {
+            for (self.entries[0..self.count]) |entry| a.free(entry.physical);
+            self.count = 0;
+        }
+        pub fn retry(self: *@This(), queue: *RepairQueue, a: std.mem.Allocator) bool {
+            var complete = true;
+            for (self.entries[0..self.count]) |entry| complete = queue.enqueue(a, entry.physical, entry.content) and complete;
+            return complete;
+        }
+    };
+    /// Transfer owned keys under a short lock; no storage reads or gate waits
+    /// hold the queue mutex. Foreground readers can enqueue the next page.
+    pub fn take(self: *@This()) ?Page {
+        if (!self.mutex.tryLock()) return null;
+        defer self.mutex.unlock();
+        var page: Page = .{ .count = self.count };
+        @memcpy(page.entries[0..page.count], self.entries[0..self.count]);
+        self.count = 0;
+        self.key_bytes = 0;
+        self.pending.store(false, .release);
+        return page;
+    }
+    pub fn clear(self: *@This(), a: std.mem.Allocator) void {
+        for (self.entries[0..self.count]) |entry| a.free(entry.physical);
+        self.count = 0;
+        self.key_bytes = 0;
+        self.pending.store(false, .release);
+    }
+    pub fn deinit(self: *@This(), a: std.mem.Allocator) void {
+        self.clear(a);
+    }
+};
+
+fn stageContent(txn: anytype, physical: []const u8, content: Content) !bool {
+    const key = keyForPhysical(physical) orelse return error.InvalidArgument;
+    if (try load(txn, key) != content.revision or !try txn.contains(physical)) return false;
+    if (try loadContent(txn, physical) != null) return false;
+    try txn.put(&contentKey(key), &encodeContent(content));
+    return true;
 }
 
 const backfill_key = "\x00\x00__metadata__:document_content_backfill_v1";
@@ -228,11 +313,7 @@ pub const BackfillPage = struct {
         if ((current == null) != (self.before == null) or (current != null and !std.mem.eql(u8, current.?, self.before.?))) return error.DocumentAuthorityCursorChanged;
         var installed: usize = 0;
         for (self.entries) |entry| {
-            const key = keyForPhysical(entry.physical).?;
-            if (try load(txn, key) != entry.content.revision or !try txn.contains(entry.physical)) continue;
-            if (try loadContent(txn, entry.physical) != null) continue;
-            try txn.put(&contentKey(key), &encodeContent(entry.content));
-            installed += 1;
+            installed += @intFromBool(try stageContent(txn, entry.physical, entry.content));
         }
         try txn.put(backfill_key, self.after);
         return installed;
@@ -522,4 +603,77 @@ test "public graph metric borrowed wire backfill skips cached bodies and publish
     try write.put(key, "new");
     try std.testing.expect(try write.contains(key));
     try std.testing.expect(!try write.contains("missing"));
+}
+
+test "public graph metric borrowed wire targeted proof repair bounds deduplicates and fences publication" {
+    const a = std.testing.allocator;
+    var queue: RepairQueue = .{};
+    defer queue.deinit(a);
+    const physical = "\x01doc:repair\x00\x00\x10";
+    const content: Content = .{ .revision = 9, .bytes = 1024, .kind = 0x10, .digest = @splat(7) };
+    try std.testing.expect(queue.enqueue(a, physical, content));
+    var older = content;
+    older.revision = 8;
+    try std.testing.expect(queue.enqueue(a, physical, older));
+    try std.testing.expectEqual(@as(usize, 1), queue.count);
+    try std.testing.expectEqual(@as(u64, 9), queue.entries[0].content.revision);
+    const Fake = struct {
+        revision: [8]u8 = .{ 9, 0, 0, 0, 0, 0, 0, 0 },
+        present: bool = true,
+        fail: bool = false,
+        writes: usize = 0,
+        pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+            if (self.fail) return error.TestPublicationFailure;
+            if (std.mem.startsWith(u8, key, content_prefix)) return error.NotFound;
+            return &self.revision;
+        }
+        pub fn contains(self: *@This(), _: []const u8) !bool {
+            return self.present;
+        }
+        pub fn put(self: *@This(), _: []const u8, raw: []const u8) !void {
+            try std.testing.expectEqual(@as(u64, 9), (try decodeContent(raw)).revision);
+            self.writes += 1;
+        }
+    };
+    var page = queue.take().?;
+    defer page.deinit(a);
+    try std.testing.expect(!queue.pending.load(.acquire));
+    var txn: Fake = .{};
+    txn.fail = true;
+    try std.testing.expectError(error.TestPublicationFailure, page.stage(&txn));
+    try std.testing.expect(page.retry(&queue, a));
+    try std.testing.expect(queue.pending.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), queue.count);
+    txn.fail = false;
+    txn.revision[0] = 10;
+    try std.testing.expectEqual(@as(usize, 0), try page.stage(&txn));
+    txn.revision[0] = 9;
+    txn.present = false;
+    try std.testing.expectEqual(@as(usize, 0), try page.stage(&txn));
+    txn.present = true;
+    try std.testing.expectEqual(@as(usize, 1), try page.stage(&txn));
+    try std.testing.expectEqual(@as(usize, 1), txn.writes);
+    for (1..RepairQueue.max_entries) |i| {
+        const key = try std.fmt.allocPrint(a, "key-{d}", .{i});
+        defer a.free(key);
+        try std.testing.expect(queue.enqueue(a, key, content));
+    }
+    try std.testing.expect(!queue.enqueue(a, "overflow", content));
+    try std.testing.expect(queue.mutex.tryLock());
+    try std.testing.expect(!queue.enqueue(a, "contended", content));
+    queue.mutex.unlock();
+    queue.clear(a);
+    const huge = try a.alloc(u8, RepairQueue.max_key_bytes + 1);
+    defer a.free(huge);
+    try std.testing.expect(!queue.enqueue(a, huge, content));
+    try std.testing.expect(!queue.pending.load(.acquire));
+    const Fail = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var q: RepairQueue = .{};
+            defer q.deinit(allocator);
+            if (!q.enqueue(allocator, physical, content)) return error.OutOfMemory;
+            try std.testing.expect(q.pending.load(.acquire));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Fail.run, .{});
 }

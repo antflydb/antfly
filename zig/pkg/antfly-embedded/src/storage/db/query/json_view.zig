@@ -39,7 +39,7 @@ pub const View = struct {
             return if (raw.len == 0) 0 else raw[0];
         }
     };
-    const Child = struct { node: Node };
+    pub const Child = struct { node: Node };
 
     pub fn init(alloc: Allocator, raw: []const u8) View {
         return .{ .alloc = alloc, .root = .{ .raw = raw } };
@@ -92,7 +92,11 @@ pub const View = struct {
 
     fn element(self: *View, node: *Node, index: usize) !?*Node {
         if (node.children) |entries| return if (index < entries.len) &entries[index].node else null;
+        // No JSON array can contain maxInt(usize) elements; reserve that
+        // index as an exhaustion marker without enlarging every native node.
+        if (index == std.math.maxInt(usize)) return null;
         if (node.array_index.get(index)) |cached| return cached;
+        if (node.array_index.contains(std.math.maxInt(usize))) return null;
         var scanner = std.json.Scanner.initCompleteInput(self.alloc, node.raw);
         defer scanner.deinit();
         _ = try scanner.next();
@@ -112,6 +116,23 @@ pub const View = struct {
             }
         }
         return null;
+    }
+
+    pub const ProjectionPath = struct { parts: []const []const u8 };
+    pub fn projectionPaths(self: *View, fields: []const []const u8) ![]const ProjectionPath {
+        var paths: std.ArrayListUnmanaged(ProjectionPath) = .empty;
+        for (fields) |field_name| {
+            if (field_name.len == 0 or field_name[0] == '-' or std.mem.eql(u8, field_name, "*")) continue;
+            var parts: std.ArrayListUnmanaged([]const u8) = .empty;
+            var tokens = std.mem.tokenizeScalar(u8, field_name, '.');
+            while (tokens.next()) |part| try parts.append(self.alloc, part);
+            if (parts.items.len != 0) try paths.append(self.alloc, .{ .parts = parts.items });
+        }
+        return paths.items;
+    }
+    pub fn projectionIndex(part: []const u8) ?usize {
+        if (part.len == 0 or std.mem.indexOfNone(u8, part, "0123456789") != null) return null;
+        return std.fmt.parseInt(usize, part, 10) catch null;
     }
 
     pub fn materialize(self: *View, node: *Node) !Value {
@@ -213,9 +234,7 @@ pub const View = struct {
             },
             '[' => {
                 var result = std.json.Array.init(alloc);
-                const numeric = std.fmt.parseInt(usize, path[0], 10) catch null;
-                // document projection accepts only digit-only indices.
-                const index = if (path[0].len != 0 and std.mem.indexOfNone(u8, path[0], "0123456789") == null) numeric else null;
+                const index = projectionIndex(path[0]);
                 if (index) |i| {
                     const item = (try self.element(node, i)) orelse return;
                     if (path.len == 1) {

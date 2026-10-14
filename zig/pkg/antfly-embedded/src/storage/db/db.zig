@@ -3132,6 +3132,8 @@ pub const DB = struct {
     document_authority_backfill_requested: std.atomic.Value(bool) = .init(false),
     document_authority_backfill_mutex: std.atomic.Mutex = .unlocked,
     document_authority_backfill_restart: bool = false,
+    document_authority_repairs: @import("../document_mutation_revision.zig").RepairQueue = .{},
+    document_authority_repairs_yield_sweep: bool = false,
     relational_columns_building: std.atomic.Value(bool) = .init(false),
     relational_columns_rebuild_requested: std.atomic.Value(bool) = .init(false),
     relational_column_maintenance: relational_columns.Maintenance = .{},
@@ -5916,6 +5918,7 @@ pub const DB = struct {
         self.setQueryVisibilityHook(null);
         self.async_context.background_closing.store(true, .release);
         stopNativeProjectionMaintenance(self.async_context);
+        self.document_authority_repairs.deinit(self.alloc);
         self.async_context.enrichment_desired_running.store(false, .release);
         if (self.algebraic_hll_owner_id != 0) {
             self.backend_runtime.durable_jobs.closeOwner(self.algebraic_hll_owner_id);
@@ -30780,7 +30783,7 @@ pub const DB = struct {
         const self: *DB = @ptrCast(@alignCast(ptr));
         const source = self.local_execution.source_vectors.load(.acquire);
         return .{
-            .artifacts = (replicationWriteGateAllowsBackgroundWork(self.local_execution.replication_write_gate) and (self.document_authority_backfill_active.load(.acquire) or self.document_authority_backfill_requested.load(.acquire))) or self.hasPendingGraphReplacements() or self.artifact_repair_metadata_pending or self.artifact_footprint_pending.load(.acquire) or self.artifact_producer_baseline_pending.load(.acquire) or (if (source) |value| value.collectionPending() else false),
+            .artifacts = (replicationWriteGateAllowsBackgroundWork(self.local_execution.replication_write_gate) and (self.document_authority_backfill_active.load(.acquire) or self.document_authority_backfill_requested.load(.acquire) or self.document_authority_repairs.pending.load(.acquire))) or self.hasPendingGraphReplacements() or self.artifact_repair_metadata_pending or self.artifact_footprint_pending.load(.acquire) or self.artifact_producer_baseline_pending.load(.acquire) or (if (source) |value| value.collectionPending() else false),
             .producers = self.artifact_producer_scheduler.active(self.independentMaintenanceNowNs()),
             .indexes = self.local_execution.relational_index_maintenance_sweep.isPending() and platform_time.monotonicNs() >= self.local_execution.relational_index_retry_after_ns.load(.acquire),
             .columns = self.relational_column_maintenance.pending.load(.acquire) and !self.relational_column_maintenance.backing_off.load(.acquire),
@@ -30797,8 +30800,28 @@ pub const DB = struct {
         if (!replicationWriteGateAllowsBackgroundWork(self.local_execution.replication_write_gate)) return false;
         if (!self.document_authority_backfill_mutex.tryLock()) return false;
         defer self.document_authority_backfill_mutex.unlock();
+        if (self.document_authority_repairs.pending.load(.acquire) and !self.document_authority_repairs_yield_sweep) {
+            var page = self.document_authority_repairs.take() orelse return false;
+            defer page.deinit(self.alloc);
+            errdefer if (!page.retry(&self.document_authority_repairs, self.alloc)) self.document_authority_backfill_requested.store(true, .release);
+            var repair_ctx = self.batchContext();
+            var repair_mutation = acquireReplicationMutationSharedContext(&repair_ctx);
+            defer if (repair_mutation) |*lease| lease.release();
+            try enforceReplicationWriteGateOptional(repair_ctx.replication_write_gate);
+            var repair_replay = try acquireSnapshotReplayContext(&repair_ctx);
+            defer if (repair_replay) |*lease| lease.release();
+            try lockApplyForPortableRuntimeContext(&repair_ctx);
+            defer repair_ctx.apply_mutex.unlockExclusive();
+            var writer = try self.core.store.beginWriteTxn();
+            errdefer writer.abort();
+            _ = try page.stage(&writer);
+            try writer.commit();
+            self.document_authority_repairs_yield_sweep = self.document_authority_backfill_active.load(.acquire) or self.document_authority_backfill_requested.load(.acquire);
+            return !self.document_authority_repairs_yield_sweep and !self.document_authority_repairs.pending.load(.acquire);
+        }
+        self.document_authority_repairs_yield_sweep = false;
         const restart = if (!self.document_authority_backfill_active.load(.acquire)) self.document_authority_backfill_requested.swap(false, .acq_rel) else false;
-        if (!self.document_authority_backfill_active.load(.acquire) and !restart) return true;
+        if (!self.document_authority_backfill_active.load(.acquire) and !restart) return !self.document_authority_repairs.pending.load(.acquire);
         self.document_authority_backfill_active.store(true, .release);
         self.document_authority_backfill_restart = self.document_authority_backfill_restart or restart;
         var ctx = self.batchContext();
@@ -30818,7 +30841,7 @@ pub const DB = struct {
             return err;
         }) orelse {
             self.document_authority_backfill_active.store(false, .release);
-            return true;
+            return !self.document_authority_repairs.pending.load(.acquire);
         };
         defer prepared.deinit();
         try lockApplyForPortableRuntimeContext(&ctx);
@@ -30829,7 +30852,7 @@ pub const DB = struct {
         try writer.commit();
         self.document_authority_backfill_restart = false;
         self.document_authority_backfill_active.store(!prepared.complete, .release);
-        return prepared.complete;
+        return prepared.complete and !self.document_authority_repairs.pending.load(.acquire);
     }
 
     /// One bounded physical-key page, never under the DB apply lock. Both
@@ -39424,6 +39447,7 @@ pub const DB = struct {
         var ids: [64][]const u8 = undefined;
         var contents: [64]?@import("../document_mutation_revision.zig").Content = undefined;
         var versions: [64]u64 = undefined;
+        var mutation_revisions: [64]u64 = undefined;
         const body_allocator = req.document_output_allocator orelse alloc;
         if (req.document_output_allocator != null) result.stored_data_allocator = body_allocator;
         var eager_bytes: usize = 0;
@@ -39450,7 +39474,7 @@ pub const DB = struct {
                 }
                 var scope = try read.?.openReadScope(@import("antfly_platform").allocator.reclaimingScratch(alloc));
                 defer scope.close();
-                try @import("../document_mutation_revision.zig").loadWindow(&scope, m, physical[0..count], ids[0..count], contents[0..count], versions[0..count]);
+                try @import("../document_mutation_revision.zig").loadWindowWithRevisions(&scope, m, physical[0..count], ids[0..count], contents[0..count], versions[0..count], mutation_revisions[0..count]);
             }
             if (req.cancellation) |token| try token.check();
             if (req.execution_deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.Timeout;
@@ -39467,10 +39491,12 @@ pub const DB = struct {
                 digest = content.digest;
                 break :cached content.bytes;
             } else legacy: {
-                self.document_authority_backfill_requested.store(true, .release);
                 const raw = primary_window.get(&read.?, store_key, null) catch |err| return if (err == error.NotFound) error.StorageReadTemporarilyUnavailable else err;
                 raw_primary = raw;
                 std.crypto.hash.sha2.Sha256.hash(raw, &digest, .{});
+                const revision = mutation_revisions[index % 64];
+                if (!self.document_authority_repairs.enqueue(self.alloc, store_key, .{ .revision = revision, .bytes = raw.len, .kind = store_key[store_key.len - 1], .digest = digest }))
+                    self.document_authority_backfill_requested.store(true, .release);
                 break :legacy raw.len;
             };
             const version = versions[index % 64];
@@ -136872,7 +136898,9 @@ test "public graph metric borrowed wire content migration fences edits abort del
     var schema_view = db.core.acquireSchemaView();
     defer if (schema_view) |*view| view.release();
     try db.attachDistributedDocumentAuthorityAtSnapshot(a, .{ .include_stored = false, .document_authority_mode = .candidates, .document_authority_group = 11 }, &result, null, schema_view);
-    try std.testing.expect(db.document_authority_backfill_requested.load(.acquire));
+    try std.testing.expect(db.document_authority_repairs.pending.load(.acquire));
+    try std.testing.expect(!db.document_authority_backfill_requested.load(.acquire));
+    try std.testing.expect((try revision.BackfillPage.prepare(a, db.core.store, false)) == null);
     const sequence = db.core.nextDerivedSequence();
     for (0..16) |_| {
         if (try db.advanceDocumentAuthorityBackfillPage()) break;
@@ -136887,6 +136915,9 @@ test "public graph metric borrowed wire content migration fences edits abort del
         try std.testing.expectEqualSlices(u8, &digest, &cached.digest);
         try std.testing.expectEqual(sequence, db.core.nextDerivedSequence());
     }
+    try std.testing.expect(!db.document_authority_repairs.pending.load(.acquire));
+    try std.testing.expect(!db.document_authority_backfill_active.load(.acquire));
+    try std.testing.expect((try revision.BackfillPage.prepare(a, db.core.store, false)) == null);
     std.debug.print("CONTENT_MIGRATION stale_and_deleted_skipped=2 aborted_publish_visible=0 logical_rewrites=0\n", .{});
 }
 
