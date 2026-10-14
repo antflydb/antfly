@@ -85,13 +85,28 @@ pub const SignedClaimDelivery = struct {
         self.proof.verify(try self.outcome.deliveryDigest()) catch return error.InvalidPrivateIndexClaimReceipt;
     }
 
-    pub fn verifyPartition(self: SignedClaimDelivery, plan: *const local.storage_db_relational_index_owner_job.private_claims.delivery.Plan, cohort: *const local.storage_db_relational_index_owner_job.private_claims.delivery.Cohort, group_index: usize) !void {
+    pub fn verifyPartition(self: SignedClaimDelivery, plan: *const local.storage_db_relational_index_owner_job.private_claims.delivery.Plan, cohort: anytype, group_index: usize) !void {
         try plan.requireTarget(cohort, group_index, self.outcome.binding);
         try self.verifyFor(.{ .binding = self.outcome.binding, .claims = try plan.groupClaims(group_index) });
     }
 
     pub fn commitment(self: SignedClaimDelivery) !Digest {
         return self.proof.commitment(try self.outcome.deliveryDigest());
+    }
+
+    /// Use only within a source-root-signed complete delivery statement, which
+    /// authenticates the relation between this exact set and actual source rows.
+    pub fn verifyRecorded(self: SignedClaimDelivery, logical_rows: usize) !void {
+        try self.validateRecordedShape(logical_rows);
+        self.proof.verify(try self.outcome.deliveryDigest()) catch return error.InvalidPrivateIndexClaimReceipt;
+    }
+
+    pub fn validateRecordedShape(self: SignedClaimDelivery, logical_rows: usize) !void {
+        if (logical_rows == 0 or logical_rows > local.storage_db_relational_index_owner_job.private_claims.max_claims or
+            self.outcome.claims_added > logical_rows or self.outcome.duplicate != (self.outcome.claims_added == 0) or self.proof.authority != .native)
+            return error.InvalidPrivateIndexClaimReceipt;
+        (NativeSigningView{ .identity = self.proof.identity, .reporter_incarnation = self.proof.reporter_incarnation, .binding_digest = self.proof.authority.native }).validate(self.proof.identity.metadata_incarnation) catch return error.InvalidPrivateIndexClaimReceipt;
+        _ = try self.outcome.deliveryDigest();
     }
 };
 
@@ -279,11 +294,69 @@ pub const OwnerRequest = struct {
     id: Id,
     operation: OwnerOperation,
     projection: enum { permission, admission } = .permission,
+    /// At most the destinations touched by one bounded source batch. The
+    /// metadata service derives their routes; callers never supply descriptors.
+    claim_groups: ?ClaimGroups = null,
 
     pub fn validate(self: OwnerRequest) !void {
         if (self.table_id == 0 or self.group_id == 0 or std.mem.allEqual(u8, &self.id, 0) or
             (self.projection == .admission and self.operation != .fence and self.operation != .cancel))
             return error.InvalidGenerationPublication;
+        if (self.claim_groups) |groups| {
+            if (self.operation != .build or self.projection != .permission) return error.InvalidGenerationPublication;
+            try groups.validate();
+        }
+    }
+};
+
+pub const ClaimGroups = struct {
+    items: []const u64,
+    pub fn validate(self: ClaimGroups) !void {
+        if (self.items.len > local.storage_db_relational_index_owner_job.private_claims.max_claims) return error.InvalidGenerationPublication;
+        var previous: u64 = 0;
+        for (self.items) |group| {
+            if (group <= previous) return error.InvalidGenerationPublication;
+            previous = group;
+        }
+    }
+    pub fn jsonStringify(self: ClaimGroups, jw: anytype) !void {
+        try jw.write(self.items);
+    }
+    pub fn jsonParse(alloc: Allocator, source: anytype, options: std.json.ParseOptions) !ClaimGroups {
+        if (try source.next() != .array_begin) return error.UnexpectedToken;
+        var items: std.ArrayList(u64) = .empty;
+        var previous: u64 = 0;
+        while (try source.peekNextTokenType() != .array_end) {
+            if (items.items.len >= local.storage_db_relational_index_owner_job.private_claims.max_claims) return error.LengthMismatch;
+            const group = try std.json.innerParse(u64, alloc, source, options);
+            if (group <= previous) return error.UnexpectedToken;
+            previous = group;
+            try items.append(alloc, group);
+        }
+        _ = try source.next();
+        return .{ .items = try items.toOwnedSlice(alloc) };
+    }
+};
+
+pub const ClaimRoutes = struct {
+    items: []const local.storage_db_relational_index_owner_job.private_claims.delivery.Target,
+    pub fn jsonStringify(self: ClaimRoutes, jw: anytype) !void {
+        try jw.write(self.items);
+    }
+    pub fn jsonParse(alloc: Allocator, source: anytype, options: std.json.ParseOptions) !ClaimRoutes {
+        if (try source.next() != .array_begin) return error.UnexpectedToken;
+        const TargetRoute = local.storage_db_relational_index_owner_job.private_claims.delivery.Target;
+        var items: std.ArrayList(TargetRoute) = .empty;
+        var limited = options;
+        limited.max_value_len = @min(options.max_value_len orelse std.math.maxInt(usize), 33);
+        while (try source.peekNextTokenType() != .array_end) {
+            if (items.items.len >= local.storage_db_relational_index_owner_job.private_claims.max_claims) return error.LengthMismatch;
+            const target = try std.json.innerParse(TargetRoute, alloc, source, limited);
+            if (target.start.len > 33 or target.end.len > 33) return error.LengthMismatch;
+            try items.append(alloc, target);
+        }
+        _ = try source.next();
+        return .{ .items = try items.toOwnedSlice(alloc) };
     }
 };
 /// Fixed-size authority observed in the permission transaction. This is not
@@ -321,6 +394,7 @@ pub const OwnerDecision = struct {
     dispatch: ?Dispatch = null,
     inputs: ?Inputs = null,
     native_signing: ?NativeSigningView = null,
+    claim_routes: ?ClaimRoutes = null,
     /// Read-only recovery of an already accepted latest stage. This is never
     /// execution permission, schema input, or an index allocation request.
     attestation: ?Attestation = null,
@@ -331,6 +405,19 @@ pub const OwnerDecision = struct {
         if (self.head.table_id != request.table_id or self.owner.owner.group_id != request.group_id or
             !std.mem.eql(u8, &self.head.plan_id, &request.id)) return error.GenerationPublicationChanged;
         if (try ownerPermission(self.head, self.owner, request.operation) != self.disposition) return error.InvalidCatalogRecord;
+        if (request.claim_groups) |groups| {
+            if (self.disposition == .execute) {
+                const routes = self.claim_routes orelse return error.InvalidCatalogRecord;
+                if (routes.items.len != groups.items.len) return error.InvalidCatalogRecord;
+                for (routes.items, groups.items) |target, group| {
+                    try target.owner.validate();
+                    const peer = target.owner;
+                    if (peer.group_id != group or peer.ordinal >= self.head.owner_count or peer.namespace.table_id != request.table_id or
+                        !std.mem.eql(u8, &peer.plan_id, &self.head.plan_id) or !std.mem.eql(u8, &peer.plan_digest, &self.head.plan_digest) or
+                        target.start.len > 33 or target.end.len > 33 or (target.end.len != 0 and std.mem.order(u8, target.start, target.end) != .lt)) return error.InvalidCatalogRecord;
+                }
+            } else if (self.claim_routes != null) return error.InvalidCatalogRecord;
+        } else if (self.claim_routes != null) return error.InvalidCatalogRecord;
         if (self.native_signing) |view| {
             if (self.disposition != .execute or self.owner.owner.authority != .native) return error.InvalidCatalogRecord;
             try view.validate(self.metadata_incarnation);

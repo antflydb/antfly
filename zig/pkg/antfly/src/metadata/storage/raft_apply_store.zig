@@ -4310,6 +4310,12 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
         receipt.action = .reserved;
         receipt.position.native.sequence += 1;
         const reserved = try index_progress.acknowledge(fenced.head, fenced.owner, fenced.head.revision, receipt);
+        const complete = @import("../relational_index_source_delivery.zig");
+        var subset = try local.storage_db_relational_index_owner_job.private_claims.delivery.Subset.init(store.alloc, owner.owner, head.owner_count, &.{.{ .owner = owner.owner }});
+        defer subset.deinit();
+        var closed = try complete.prepare(store.alloc, &source_read, &subset, .{ .ordinal = 1, .batch_digest = source_read.batch.?.header.digest(), .targets = .{ .items = &.{.{ .index = 0, .signed = signed }} } }, .{});
+        defer closed.deinit();
+        const closed_signed: complete.Signed = .{ .data = closed.data, .proof = try proof.sign(root, try closed.data.digest()) };
         const Fault = enum { none, signature, claims, binding, candidate, canceled, active_job, lifecycle, range, reporter, root_identity, root_generation, reader_role, reader_unknown, source_mode, source_namespace, source_cut, source_unknown, native_binding };
         inline for (std.meta.tags(Fault)) |fault| {
             var txn = try store.store.beginWriteTxn();
@@ -4375,6 +4381,27 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
                 .signature, .claims, .binding, .candidate => {}, // Target-only command mutations above.
                 .canceled, .active_job, .lifecycle, .range => try std.testing.expectError(error.GenerationPublicationChanged, store.verifyRelationalIndexSourceBatchTxn(&txn, group, signed_source, &source_read)),
                 else => try std.testing.expectError(error.IndexOwnerReceiptChanged, store.verifyRelationalIndexSourceBatchTxn(&txn, group, signed_source, &source_read)),
+            }
+            switch (fault) {
+                .none => {
+                    try std.testing.expectEqual(try closed_signed.proof.commitment(try closed.data.digest()), try store.verifyRelationalIndexSourceDeliveryTxn(&txn, group, closed_signed));
+                    var route_arena = std.heap.ArenaAllocator.init(store.alloc);
+                    defer route_arena.deinit();
+                    const routes = try store.readIndexClaimRoutesTxn(route_arena.allocator(), &txn, group, reserved.head, .{ .items = &.{owner.owner.group_id} });
+                    try std.testing.expectEqual(@as(usize, 1), routes.items.len);
+                    try std.testing.expectEqualDeep(owner.owner, routes.items[0].owner);
+                    // Source signatures never replace independent target proof
+                    // verification in the accepting metadata transaction.
+                    const parts = @constCast(closed.data.parts.items);
+                    parts[0].target.proof.signature[0] ^= 1;
+                    var forged = closed_signed;
+                    forged.proof = try proof.sign(root, try closed.data.digest());
+                    try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, store.verifyRelationalIndexSourceDeliveryTxn(&txn, group, forged));
+                    parts[0].target.proof.signature[0] ^= 1;
+                },
+                .signature, .claims, .binding, .candidate => {},
+                .canceled, .active_job, .lifecycle, .range => try std.testing.expectError(error.GenerationPublicationChanged, store.verifyRelationalIndexSourceDeliveryTxn(&txn, group, closed_signed)),
+                else => try std.testing.expectError(error.IndexOwnerReceiptChanged, store.verifyRelationalIndexSourceDeliveryTxn(&txn, group, closed_signed)),
             }
         }
     }
@@ -16455,6 +16482,53 @@ pub const RaftApplyStore = struct {
 
     const CurrentIndexBuildOwner = struct { head: index_progress.Head, owner: index_progress.Owner };
 
+    fn readIndexClaimRoutesTxn(self: *RaftApplyStore, alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, head: index_progress.Head, groups: index_publication.ClaimGroups) !index_publication.ClaimRoutes {
+        try groups.validate();
+        try head.validate();
+        try index_publication.requireActivePointer(txn, group_id, head);
+        const lock = (try @import("../table_lifecycle_lock.zig").read(txn, group_id, head.table_id)) orelse return error.GenerationPublicationChanged;
+        if (lock.kind != .index_build or !std.mem.eql(u8, &lock.id, &head.plan_id)) return error.GenerationPublicationChanged;
+        const routing = @import("antfly_local_sources").storage_db_relational_index_owner_job.private_claims.delivery;
+        const routes = try alloc.alloc(routing.Target, groups.items.len);
+        var buf: [192]u8 = undefined;
+        for (groups.items, routes) |peer_group, *target| {
+            const ordinal = index_publication.ownerOrdinal(txn, group_id, head.table_id, peer_group) catch |err| switch (err) {
+                error.NotFound => return error.GenerationPublicationChanged,
+                else => return err,
+            };
+            const owner = try index_progress.OwnerState.decode(try txn.get(try index_publication.ownerKey(&buf, group_id, head.table_id, ordinal)));
+            if (try index_publication.ownerPermission(head, owner, .build) != .execute) return error.GenerationPublicationChanged;
+            var dispatch = try index_publication.readDispatch(self.alloc, txn, group_id, owner.owner);
+            defer dispatch.deinit();
+            const range = try decodeRangeRecord(self.alloc, try txn.get(try rangeKeyForGroup(&buf, group_id, peer_group)));
+            defer metadata_table_manager.freeRange(self.alloc, range);
+            if (!metadata_table_manager.rangeRecordsEqual(range, dispatch.value.owner.range)) return error.GenerationPublicationChanged;
+            target.* = .{ .owner = owner.owner, .start = try alloc.dupe(u8, routing.routingBound(range.start_key)), .end = try alloc.dupe(u8, routing.routingBound(range.end_key orelse "")) };
+        }
+        return .{ .items = routes };
+    }
+
+    /// Compact all-partition preflight, without row bodies or schema-sized
+    /// projections. This is not a durable decision or consumption permission.
+    pub fn verifyRelationalIndexSourceDeliveryTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, signed: @import("../relational_index_source_delivery.zig").Signed) ![32]u8 {
+        try signed.verify();
+        const data = signed.data;
+        const source = try self.currentIndexBuildOwnerTxn(txn, group_id, data.source, null);
+        var dispatch = try index_publication.readDispatch(self.alloc, txn, group_id, source.owner);
+        defer dispatch.deinit();
+        const Source = @import("antfly_local_sources").storage_db_relational_index_owner_job.private_claims.SourceStream;
+        const raw = &data.header.bytes;
+        const scope: Source.Scope = .{ .table_name = dispatch.value.table_name, .generation = raw[72..88].*, .schema_version = std.mem.readInt(u32, raw[88..92], .little), .tuple_fingerprint = raw[192..224].*, .nulls_not_distinct = raw[185] != 0 };
+        if (scope.table_name.len != std.mem.readInt(u32, raw[92..96], .little) or !std.mem.eql(u8, &try scope.digest(), raw[40..72])) return error.PrivateIndexOwnerJobChanged;
+        try self.requireIndexOwnerRootProofTxn(txn, group_id, source.owner, .{ .native = try data.header.position() }, signed.proof, source.head.reader_requirements, false);
+        for (data.parts.items) |part| {
+            try part.target.verifyRecorded(part.rows);
+            const target = try self.currentIndexBuildOwnerTxn(txn, group_id, part.target.outcome.binding, null);
+            try self.requireIndexOwnerRootProofTxn(txn, group_id, target.owner, .{ .native = part.target.outcome.position }, part.target.proof, target.head.reader_requirements, false);
+        }
+        return signed.proof.commitment(try data.digest());
+    }
+
     /// Shared fixed-directory/catalog/range checks, not a caller-supplied
     /// verification flag or schema-sized candidate recompilation.
     fn currentIndexBuildOwnerTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, binding: @import("antfly_local_sources").storage_db_relational_index_owner_job.Binding, table_name: ?[]const u8) !CurrentIndexBuildOwner {
@@ -16611,12 +16685,18 @@ pub const RaftApplyStore = struct {
         }
         decision.dispatch = d;
         if (owner.owner.authority == .native) decision.native_signing = try self.nativeIndexSigningViewTxn(&txn, group_id, incarnation);
+        var route_arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer route_arena.deinit();
+        if (request.claim_groups) |groups| {
+            decision.claim_routes = try self.readIndexClaimRoutesTxn(route_arena.allocator(), &txn, group_id, head, groups);
+        }
         var inputs: ?std.json.Parsed(index_publication.Inputs) = null;
         defer if (inputs) |*value| value.deinit();
         if (request.projection == .admission) {
             inputs = try index_publication.readInputs(self.alloc, &txn, group_id, head);
             decision.inputs = inputs.?.value;
         }
+        try decision.requireRequest(request);
         return std.json.Stringify.valueAlloc(alloc, decision, .{});
     }
 

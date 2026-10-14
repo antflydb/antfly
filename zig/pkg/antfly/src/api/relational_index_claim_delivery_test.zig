@@ -189,3 +189,45 @@ test "relational index publication claim delivery maximum cohort bounds routing 
     }
     try std.testing.expect(comparisons <= progress.max_owners * 13);
 }
+
+fn subsetAllocation(alloc: Allocator) !void {
+    const source_owner = testOwner(3999, 1000);
+    var subset = try delivery.Subset.init(alloc, source_owner, 4096, &.{
+        .{ .owner = testOwner(4095, 12), .start = "\x80" },
+        .{ .owner = testOwner(17, 11), .end = "\x80" },
+    });
+    defer subset.deinit();
+    try subset.requireBinding(testBinding(source_owner));
+    try subset.requireBinding(testBinding(testOwner(17, 11)));
+    var comparisons: usize = 0;
+    try std.testing.expectEqual(@as(u16, 0), try subset.route(@splat(0), &comparisons));
+    try std.testing.expectEqual(@as(u16, 1), try subset.route(@splat(255), &comparisons));
+    try std.testing.expect(comparisons <= 4);
+}
+
+test "relational index publication touched destinations preserve sparse ordinals and reject missing coverage" {
+    try subsetAllocation(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, subsetAllocation, .{});
+    const source_owner = testOwner(3999, 1000);
+    var subset = try delivery.Subset.init(std.testing.allocator, source_owner, 4096, &.{.{ .owner = testOwner(17, 11), .end = "\x80" }});
+    defer subset.deinit();
+    var comparisons: usize = 0;
+    try std.testing.expectError(error.InvalidIndexPublicationCandidate, subset.route(@splat(255), &comparisons));
+    try std.testing.expectError(error.PrivateIndexOwnerJobChanged, subset.requireBinding(testBinding(testOwner(18, 12))));
+    try std.testing.expectError(error.InvalidIndexPublicationCandidate, delivery.Subset.init(std.testing.allocator, source_owner, 4096, &.{
+        .{ .owner = testOwner(17, 11), .end = "\x90" }, .{ .owner = testOwner(4095, 12), .start = "\x80" },
+    }));
+    try std.testing.expectError(error.InvalidIndexPublicationCandidate, delivery.Subset.init(std.testing.allocator, source_owner, 4096, &.{.{ .owner = testOwner(17, 1000) }}));
+}
+
+test "relational index publication routing bounds preserve all fixed-key prefix comparisons" {
+    var bound: [256]u8 = @splat(127);
+    for (0..256) |last| {
+        var key: Digest = @splat(127);
+        key[31] = @intCast(last);
+        for (0..bound.len + 1) |len| {
+            try std.testing.expectEqual(std.mem.order(u8, &key, bound[0..len]), std.mem.order(u8, &key, delivery.routingBound(bound[0..len])));
+            try std.testing.expect(delivery.routingBound(bound[0..len]).len <= 33);
+        }
+    }
+}

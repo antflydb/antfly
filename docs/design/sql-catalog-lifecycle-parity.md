@@ -6414,3 +6414,63 @@ durable all-partition source ACKs, source/target EOF inventory seals, provenance
 backed missing-root repair, real data-Raft execution, terminal native publication
 evidence and atomic schema/catalog activation. Source consumption and public
 activation guards remain closed. No push or full release pass is claimed.
+
+### Compact complete-delivery statements and touched-owner routing
+
+The existing private claims route can now prepare a source-root-signed complete
+delivery statement. Its input contains the expected source ordinal/header digest
+and at most 128 signed target deliveries, not caller-provided source rows,
+allocations, ranges or success flags. The receiver obtains fresh build permission
+and destination routes from one metadata snapshot, reads the actual first pending
+batch from one pinned compiled owner, reconstructs the exact canonical partitions
+and verifies every target signature/set against those actual logical rows.
+It rejects omitted/duplicated/unknown partitions, unused destinations, wrong
+source batches, pending mirrors and inconsistent target authority. The signed
+statement binds all row masks, logical member counts/contributions, exact target
+root commitments, the source header and the applying source root generation.
+
+Metadata looks up only the distinct destinations touched by the batch rather
+than scanning all admitted owners or returning schema-sized plan inputs. Sparse
+global ordinals remain intact. Fixed 32-byte hash keys compare identically against
+a range bound and its first 33 bytes, even when the key equals the bound's first
+32 bytes; compact routes therefore need no potentially large primary-key bounds.
+The owned subset validates disjoint spans and routes in logarithmic time. Unlike
+an admitted full cohort it permits gaps, but every actual source row must resolve
+to exactly one supplied destination. Empty source batches require no destinations
+and still do not imply complete-stream EOF inventory validation.
+
+Source/target logical member hashing is shared with the existing exact claim-set
+commitment and remains independent of physical claim-value encoding. The XOR
+contribution is diagnostic accounting, not authority or a substitute for exact
+delivery proofs, native journal provenance or EOF seals. Bodyless metadata
+preflight verifies the source signature, complete masks and independently signed
+target deliveries, then repeats current job/catalog/range, enrolled-root,
+capability, native-binding and observed-cut checks in the same transaction.
+Even a correctly source-signed statement containing an invalid target signature
+is rejected. No row bodies enter this compact metadata verification interface.
+
+Requests and responses use bounded parsers and source-specific transport caps.
+The result owns its fixed-data target proof copies after releasing the source
+batch/route arena; signing retains the original pinned generation and expected
+digest. The private route remains standalone-native only, with no fabricated
+data-Raft cut or new public index endpoint.
+
+Qualification fixed nullable range ends and use of a private equality helper.
+`/private/tmp/antfly-source-complete-delivery-debug.log` passed 94/94 Debug steps,
+including 37 publication/router tests, three actual leased-owner/adapter tests
+and the decoder barrier. The broader native run
+`/private/tmp/antfly-source-complete-delivery-native-debug.log` passed 87/87 steps,
+including eight native page tests, six C-ABI tests, 14 candidate prerequisites and
+46 runtime contracts. Counts overlap and are not original SQL cases. Coverage
+includes allocation failures, sparse 4,096-owner ordinals, missing destinations,
+all tested fixed-key prefix comparisons, JSON round trips, source/delivery
+substitution, pinned-generation changes, independent target-signature rejection
+and metadata authority faults. No throughput improvement is claimed.
+
+This completes compact provenance production/preflight, not durable acceptance.
+The metadata acceptance journal, atomic native consumption/outbox replay,
+source/target EOF inventory seals, provenance-backed repair, data-Raft execution
+and terminal schema/catalog activation remain unfinished. Neither the `closed`
+response nor successful preflight permits deleting source batches. Original
+dispositions remain 483 implemented / 862 unresolved; consumption/public
+activation guards stay closed. No release pass or push is claimed.

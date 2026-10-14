@@ -240,19 +240,7 @@ pub const ClaimCommand = struct {
         var items: [private_claims.max_claims]Item = undefined;
         for (self.claims, items[0..self.claims.len]) |claim, *item| {
             item.tuple = integrity.hash(claim.tuple);
-            var state = std.crypto.hash.Blake3.init(.{});
-            state.update("antfly/private-unique-live-claim/v1");
-            state.update(&item.tuple);
-            var version: [4]u8 = undefined;
-            std.mem.writeInt(u32, &version, claim.schema_version, .little);
-            state.update(&version);
-            for ([_][]const u8{ claim.parent_table, claim.parent_key }) |field| {
-                var length: [8]u8 = undefined;
-                std.mem.writeInt(u64, &length, field.len, .little);
-                state.update(&length);
-                state.update(field);
-            }
-            state.final(&item.value);
+            item.value = memberDigest(claim);
         }
         const active = items[0..self.claims.len];
         std.mem.sort(Item, active, {}, struct {
@@ -278,6 +266,26 @@ pub const ClaimCommand = struct {
         var result: integrity.Digest = undefined;
         state.final(&result);
         return .{ .digest = result, .count = count };
+    }
+
+    /// Logical member identity shared by source contributions and eventual
+    /// target inventory seals. Independent of physical claim-value encoding.
+    pub fn memberDigest(claim: integrity.Claim) integrity.Digest {
+        var state = std.crypto.hash.Blake3.init(.{});
+        state.update("antfly/private-unique-live-claim/v1");
+        state.update(&integrity.hash(claim.tuple));
+        var version: [4]u8 = undefined;
+        std.mem.writeInt(u32, &version, claim.schema_version, .little);
+        state.update(&version);
+        for ([_][]const u8{ claim.parent_table, claim.parent_key }) |field| {
+            var length: [8]u8 = undefined;
+            std.mem.writeInt(u64, &length, field.len, .little);
+            state.update(&length);
+            state.update(field);
+        }
+        var result: integrity.Digest = undefined;
+        state.final(&result);
+        return result;
     }
 };
 

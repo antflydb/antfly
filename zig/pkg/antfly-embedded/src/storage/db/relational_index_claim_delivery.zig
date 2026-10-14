@@ -31,6 +31,87 @@ pub const Target = struct {
     end: []const u8 = "",
 };
 
+/// Routing keys have exactly 32 bytes. A longer lexicographic bound is
+/// comparison-equivalent to its first 33 bytes, including the prefix-equal case.
+pub fn routingBound(bound: []const u8) []const u8 {
+    return bound[0..@min(bound.len, 33)];
+}
+
+/// Fresh metadata may grant only the destinations touched by this batch.
+/// Global coverage is an admission invariant; local coverage must still account
+/// for every actual source row. Missing destinations cause route() to fail.
+pub const Subset = struct {
+    arena: std.heap.ArenaAllocator,
+    source_owner: progress.Owner,
+    owner_count: u16,
+    targets: []const Target,
+    by_ordinal: [progress.max_owners]u16 = @splat(std.math.maxInt(u16)),
+    digest: Digest,
+
+    pub fn init(alloc: Allocator, source_owner: progress.Owner, owner_count: u16, input: []const Target) !Subset {
+        try source_owner.validate();
+        if (owner_count == 0 or owner_count > progress.max_owners or source_owner.ordinal >= owner_count or input.len > claims.max_claims or input.len > owner_count) return error.InvalidIndexPublicationCandidate;
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        const targets = try a.dupe(Target, input);
+        var result: Subset = .{ .arena = arena, .source_owner = source_owner, .owner_count = owner_count, .targets = targets, .digest = undefined };
+        var seen: [progress.max_owners]bool = @splat(false);
+        for (targets, 0..) |*target, i| {
+            const owner = target.owner;
+            try owner.validate();
+            if (owner.ordinal >= owner_count or seen[owner.ordinal] or
+                !std.mem.eql(u8, &owner.plan_id, &source_owner.plan_id) or !std.mem.eql(u8, &owner.plan_digest, &source_owner.plan_digest) or
+                owner.namespace.table_id != source_owner.namespace.table_id or
+                ((owner.ordinal == source_owner.ordinal or owner.group_id == source_owner.group_id) and !std.meta.eql(owner, source_owner))) return error.InvalidIndexPublicationCandidate;
+            seen[owner.ordinal] = true;
+            for (targets[0..i]) |prior| if (prior.owner.group_id == owner.group_id) return error.InvalidIndexPublicationCandidate;
+            target.start = try a.dupe(u8, routingBound(target.start));
+            target.end = try a.dupe(u8, routingBound(target.end));
+            if (target.end.len != 0 and std.mem.order(u8, target.start, target.end) != .lt) return error.InvalidIndexPublicationCandidate;
+        }
+        std.mem.sort(Target, targets, {}, struct {
+            fn less(_: void, left: Target, right: Target) bool {
+                return std.mem.order(u8, left.start, right.start) == .lt;
+            }
+        }.less);
+        var state = std.crypto.hash.Blake3.init(.{});
+        state.update("antfly/private-claim-destinations/v1");
+        hashOwner(&state, source_owner);
+        var count: [2]u8 = undefined;
+        std.mem.writeInt(u16, &count, owner_count, .little);
+        state.update(&count);
+        for (targets, 0..) |target, i| {
+            if (i != 0 and (targets[i - 1].end.len == 0 or std.mem.order(u8, targets[i - 1].end, target.start) == .gt)) return error.InvalidIndexPublicationCandidate;
+            result.by_ordinal[target.owner.ordinal] = @intCast(i);
+            hashOwner(&state, target.owner);
+            hashField(&state, target.start);
+            hashField(&state, target.end);
+        }
+        state.final(&result.digest);
+        // Allocation may have moved the arena's state since result was copied.
+        result.arena = arena;
+        return result;
+    }
+
+    pub fn deinit(self: *Subset) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+
+    pub fn requireBinding(self: *const Subset, binding: jobs.Binding) !void {
+        if (binding.ordinal >= self.owner_count) return error.PrivateIndexOwnerJobChanged;
+        if (binding.ordinal == self.source_owner.ordinal) return requireOwnerBinding(binding, self.source_owner);
+        const index = self.by_ordinal[binding.ordinal];
+        if (index >= self.targets.len) return error.PrivateIndexOwnerJobChanged;
+        return requireOwnerBinding(binding, self.targets[index].owner);
+    }
+
+    pub fn route(self: *const Subset, key: Digest, comparisons: *usize) !u16 {
+        return routeTargets(self.targets, key, comparisons);
+    }
+};
+
 /// Owned immutable complete range cut. Build once per admitted cohort, not
 /// once per source page. Ordinals preserve metadata identity after range sort.
 pub const Cohort = struct {
@@ -106,29 +187,13 @@ pub const Cohort = struct {
     }
 
     pub fn route(self: *const Cohort, key: Digest, comparisons: *usize) !u16 {
-        var low: usize = 0;
-        var high: usize = self.targets.len;
-        while (low < high) {
-            const middle = low + (high - low) / 2;
-            comparisons.* +|= 1;
-            if (std.mem.order(u8, self.targets[middle].start, &key) != .gt) low = middle + 1 else high = middle;
-        }
-        if (low == 0) return error.InvalidIndexPublicationCandidate;
-        const index = low - 1;
-        const end = self.targets[index].end;
-        if (end.len != 0 and std.mem.order(u8, &key, end) != .lt) return error.InvalidIndexPublicationCandidate;
-        return @intCast(index);
+        return routeTargets(self.targets, key, comparisons);
     }
 
     pub fn requireBinding(self: *const Cohort, binding: jobs.Binding) !void {
-        _ = try binding.encode();
         if (binding.ordinal >= self.by_ordinal.len) return error.PrivateIndexOwnerJobChanged;
         const owner = self.targets[self.by_ordinal[binding.ordinal]].owner;
-        if (binding.phase != .reserved or binding.authority != owner.authority or
-            !std.mem.eql(u8, &binding.id, &owner.plan_id) or !std.mem.eql(u8, &binding.plan_digest, &owner.plan_digest) or
-            !std.mem.eql(u8, &binding.owner_digest, &owner.fence_digest) or
-            !binding.fence.namespace.eql(owner.namespace) or binding.fence.owner_group_id != owner.group_id)
-            return error.PrivateIndexOwnerJobChanged;
+        return requireOwnerBinding(binding, owner);
     }
 };
 
@@ -202,11 +267,11 @@ pub const Plan = struct {
 
     /// O(rows log owners + rows log rows), bounded scratch and no allocator.
     /// Payload hashing happens here, never in the serialized commit section.
-    pub fn prepare(cohort: *const Cohort, binding: jobs.Binding, view: View) !Plan {
+    pub fn prepare(cohort: anytype, binding: jobs.Binding, view: View) !Plan {
         return prepareControlled(cohort, binding, view, .{});
     }
 
-    pub fn prepareControlled(cohort: *const Cohort, binding: jobs.Binding, view: View, context: Context) !Plan {
+    pub fn prepareControlled(cohort: anytype, binding: jobs.Binding, view: View, context: Context) !Plan {
         try context.ensureActive();
         try cohort.requireBinding(binding);
         try view.validateControlled(binding, context);
@@ -261,15 +326,19 @@ pub const Plan = struct {
     }
 
     pub fn groupClaims(self: *const Plan, group_index: usize) ![]const integrity.Claim {
-        if (group_index >= self.group_count) return error.InvalidPrivateIndexClaimInventory;
+        if (self.group_count > claims.max_claims or self.row_count > claims.max_claims or group_index >= self.group_count) return error.InvalidPrivateIndexClaimInventory;
         const group = self.groups[group_index];
-        return self.claims[group.first .. group.first + group.count];
+        const end = @as(usize, group.first) + group.count;
+        if (group.count == 0 or end > self.row_count) return error.InvalidPrivateIndexClaimInventory;
+        return self.claims[group.first..end];
     }
 
     /// Check structural target identity. Fresh metadata permission, actual
     /// receiving-range enforcement and root authentication remain mandatory.
-    pub fn requireTarget(self: *const Plan, cohort: *const Cohort, group_index: usize, target: jobs.Binding) !void {
-        if (group_index >= self.group_count or !std.mem.eql(u8, &cohort.digest, &self.cohort_digest)) return error.PrivateIndexOwnerJobChanged;
+    pub fn requireTarget(self: *const Plan, cohort: anytype, group_index: usize, target: jobs.Binding) !void {
+        if (self.group_count > claims.max_claims or group_index >= self.group_count or !std.mem.eql(u8, &cohort.digest, &self.cohort_digest)) return error.PrivateIndexOwnerJobChanged;
+        _ = try self.groupClaims(group_index);
+        if (self.groups[group_index].target_index >= cohort.targets.len) return error.PrivateIndexOwnerJobChanged;
         try cohort.requireBinding(target);
         if (cohort.by_ordinal[target.ordinal] != self.groups[group_index].target_index or
             !std.mem.eql(u8, &target.inputs_digest, &self.source.inputs_digest) or
@@ -307,4 +376,39 @@ fn hashField(state: *std.crypto.hash.Blake3, value: []const u8) void {
     std.mem.writeInt(u64, &length, value.len, .little);
     state.update(&length);
     state.update(value);
+}
+
+fn hashOwner(state: *std.crypto.hash.Blake3, owner: progress.Owner) void {
+    state.update(&owner.plan_id);
+    state.update(&owner.plan_digest);
+    state.update(&owner.fence_digest);
+    var numbers: [35]u8 = undefined;
+    std.mem.writeInt(u16, numbers[0..2], owner.ordinal, .little);
+    for ([_]u64{ owner.group_id, owner.namespace.table_id, owner.namespace.shard_id, owner.namespace.range_id }, 0..) |value, i|
+        std.mem.writeInt(u64, numbers[2 + i * 8 ..][0..8], value, .little);
+    numbers[34] = @backingInt(owner.authority);
+    state.update(&numbers);
+}
+
+fn requireOwnerBinding(binding: jobs.Binding, owner: progress.Owner) !void {
+    _ = try binding.encode();
+    if (binding.phase != .reserved or binding.authority != owner.authority or
+        !std.mem.eql(u8, &binding.id, &owner.plan_id) or !std.mem.eql(u8, &binding.plan_digest, &owner.plan_digest) or
+        !std.mem.eql(u8, &binding.owner_digest, &owner.fence_digest) or
+        !binding.fence.namespace.eql(owner.namespace) or binding.fence.owner_group_id != owner.group_id) return error.PrivateIndexOwnerJobChanged;
+}
+
+fn routeTargets(targets: []const Target, key: Digest, comparisons: *usize) !u16 {
+    var low: usize = 0;
+    var high: usize = targets.len;
+    while (low < high) {
+        const middle = low + (high - low) / 2;
+        comparisons.* +|= 1;
+        if (std.mem.order(u8, targets[middle].start, &key) != .gt) low = middle + 1 else high = middle;
+    }
+    if (low == 0) return error.InvalidIndexPublicationCandidate;
+    const index = low - 1;
+    const end = targets[index].end;
+    if (end.len != 0 and std.mem.order(u8, &key, end) != .lt) return error.InvalidIndexPublicationCandidate;
+    return @intCast(index);
 }

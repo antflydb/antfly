@@ -155,6 +155,10 @@ test "native index owner adapter executes fresh permission stages and recovers r
         pub fn systemCatalog(self: *@This(), a: std.mem.Allocator, context: local.api_operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             try std.testing.expect(context.index_publication_authority);
             var value = self.value;
+            if (call.relational_index_owner_decision.claim_groups) |groups| {
+                if (groups.items.len != 0) return error.UnexpectedFixtureDestination;
+                value.claim_routes = .{ .items = &.{} };
+            }
             if (call.relational_index_owner_decision.projection == .permission)
                 value.inputs = null
             else
@@ -327,6 +331,14 @@ test "native index owner adapter executes fresh permission stages and recovers r
         try std.testing.expectEqual(root_generation, source_response.signed_source.?.root_generation);
         try std.testing.expectEqual(@as(usize, 0), source_read.batch.?.rows().len);
         try std.testing.expectEqual(built.building.outcome.value.advanced.position, try source_read.batch.?.header.position());
+        const closure_request: execution.ClaimRequest = .{ .id = plan.id, .table_id = plan.before.table_id, .group_id = group, .closure = .{ .ordinal = 1, .batch_digest = source_read.batch.?.header.digest(), .targets = .{ .items = &.{} } } };
+        var complete_source = try execution.claimStep(alloc, &owners, &metadata, plan.before.name, closure_request, .{});
+        defer complete_source.deinit();
+        try std.testing.expect(complete_source == .closed);
+        try complete_source.signNative(signing_root, 2, 3, 4);
+        try complete_source.response().validate(closure_request);
+        try std.testing.expectEqual(@as(usize, 0), complete_source.closed.owned.data.parts.items.len);
+        try std.testing.expectEqual(root_generation, complete_source.closed.proof.?.root_generation);
         const delivery: execution.ClaimRequest = .{ .id = plan.id, .table_id = plan.before.table_id, .group_id = group, .claims = claim_command.claims };
         var received = try execution.claimStep(alloc, &owners, &metadata, plan.before.name, delivery, .{});
         defer received.deinit();
@@ -407,6 +419,7 @@ test "native index owner adapter executes fresh permission stages and recovers r
         try std.testing.expectEqual(@as(u64, 7), recovered.recovered.root_generation);
         try std.testing.expectEqual(@as(u64, 7), source_result.rootGeneration().?);
         try std.testing.expectEqual(@as(u64, 7), source_response.signed_source.?.root_generation);
+        try std.testing.expectEqual(@as(u64, 7), complete_source.closed.proof.?.root_generation);
     }
 }
 
