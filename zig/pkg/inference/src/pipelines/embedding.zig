@@ -141,6 +141,9 @@ pub const EmbeddingConfig = struct {
     /// CLAP preprocessing, and duplicated backend input tensors. The field
     /// retains its decode-specific name for source compatibility.
     max_audio_decode_working_bytes: usize = audio.default_decode_working_bytes,
+    audio_prepare_ahead: bool = true,
+    audio_prepared_batches: bool = true,
+    gemma4_audio_batching: bool = true,
 };
 
 /// CLAP preprocessing handles clips sequentially, but its peak includes the
@@ -185,21 +188,28 @@ fn ensureClapWorkingSet(retained_pcm_bytes: usize, feature_reserve_bytes: usize,
     if (peak > max_working_bytes) return error.AudioTooLarge;
 }
 
-const ClapBatchPlan = struct {
+pub const ClapBatchPlan = struct {
     channels: usize,
     frames: usize,
     mels: usize,
     feature_elements: usize,
     feature_reserve_bytes: usize,
     fusion_enabled: bool,
+    force_short_singleton: bool,
 };
 
-fn clapBatchPlan(session: backends.Session, batch: usize) !ClapBatchPlan {
-    var channels: usize = 1;
-    const fusion_enabled = if (session_factory.getClapConfig(session)) |clap_cfg| blk: {
-        channels = if (clap_cfg.audio_config.enable_fusion and batch == 1) 4 else 1;
-        break :blk clap_cfg.audio_config.enable_fusion;
-    } else false;
+pub fn clapPreprocessingPolicy(session: backends.Session, logical_batch: usize) @import("audio_preparation.zig").ClapPreprocessingPolicy {
+    const fusion_enabled = if (session_factory.getClapConfig(session)) |cfg| cfg.audio_config.enable_fusion else false;
+    return @import("audio_preparation.zig").ClapPreprocessingPolicy.init(fusion_enabled, logical_batch);
+}
+
+pub fn clapBatchPlan(session: backends.Session, batch: usize) !ClapBatchPlan {
+    return clapBatchPlanWithPolicy(session, batch, clapPreprocessingPolicy(session, batch));
+}
+
+/// Reserve physical-batch storage while preserving the caller's feature policy.
+pub fn clapBatchPlanWithPolicy(session: backends.Session, batch: usize, policy: @import("audio_preparation.zig").ClapPreprocessingPolicy) !ClapBatchPlan {
+    const channels = policy.channels;
     const default_frames = audio.CLAP_CONFIG.chunk_length_s * audio.CLAP_CONFIG.sample_rate / audio.CLAP_CONFIG.hop_length + 1;
     const frames = clapInputFeatureFrames(session, default_frames);
     const mels = audio.CLAP_CONFIG.n_mels;
@@ -211,7 +221,8 @@ fn clapBatchPlan(session: backends.Session, batch: usize) !ClapBatchPlan {
         .mels = mels,
         .feature_elements = working.elements,
         .feature_reserve_bytes = working.reserve_bytes,
-        .fusion_enabled = fusion_enabled,
+        .fusion_enabled = policy.fusion_enabled,
+        .force_short_singleton = policy.force_short_singleton,
     };
 }
 
@@ -279,10 +290,7 @@ pub const AtomicResidentProjectionStats = struct {
     }
 };
 
-pub const EncodedAudioClip = struct {
-    bytes: []const u8,
-    decode_options: audio.DecodeOptions = .{},
-};
+pub const EncodedAudioClip = @import("audio_preparation.zig").Clip;
 
 pub const EmbeddingPipeline = struct {
     batch_observation: ?*@import("batch_execution.zig").Observation = null,
@@ -317,6 +325,7 @@ pub const EmbeddingPipeline = struct {
     /// resident encoder request. This is intentionally request-scoped because
     /// architecture sessions create and own their resident backend per run.
     last_resident_backend_timing: ?ops_mod.BackendDebugTimingSnapshot = null,
+    audio_timings: ?*@import("embedding_gemma2.zig").MediaTimings = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -1080,7 +1089,10 @@ pub const EmbeddingPipeline = struct {
     };
 
     pub fn embedImagesReported(self: *EmbeddingPipeline, images: []const []const u8) anyerror!ImageBatchResult {
-        if (session_factory.getEmbeddingGemma2Config(self.session) != null) return .{ .vectors = try self.embedGemma2Media(images, true, null), .execution = .serial };
+        if (session_factory.getEmbeddingGemma2Config(self.session) != null) {
+            const result = try @import("embedding_gemma2.zig").embedImages(self.allocator, self.session, self.tok, images, .{}, self.execution_lock, self.execution_control, null);
+            return .{ .vectors = result.vectors, .execution = result.execution };
+        }
         if (images.len == 0) return .{ .vectors = try self.allocator.alloc([]f32, 0), .execution = .serial };
         // The batch primitive acquires the execution gate only after bounded
         // preprocessing. Fallback reuses that primitive for each item, so
@@ -1103,7 +1115,10 @@ pub const EmbeddingPipeline = struct {
     /// and never enters the encoder. Healthy rows retain their original order.
     pub fn embedImagesIndexed(self: *EmbeddingPipeline, images: []const []const u8, errors: []?anyerror) !ImageBatchResult {
         if (errors.len != images.len) return error.InvalidInputShape;
-        if (session_factory.getEmbeddingGemma2Config(self.session) != null) return .{ .vectors = try self.embedGemma2Media(images, true, errors), .execution = .serial };
+        if (session_factory.getEmbeddingGemma2Config(self.session) != null) {
+            const result = try @import("embedding_gemma2.zig").embedImages(self.allocator, self.session, self.tok, images, .{}, self.execution_lock, self.execution_control, errors);
+            return .{ .vectors = result.vectors, .execution = result.execution };
+        }
         if (images.len == 0) return .{ .vectors = try self.allocator.alloc([]f32, 0), .execution = .serial };
         const vectors = self.embedImagesBatchIndexed(images, errors) catch |err| {
             if (images.len <= 1 or !shouldFallbackBatchedImageError(err)) return err;
@@ -1518,7 +1533,12 @@ pub const EmbeddingPipeline = struct {
     /// Embed a batch of supported encoded audio clips, returning [batch][embed_dim] embeddings.
     /// Requires an audio_session (CLAP model).
     pub fn embedAudio(self: *EmbeddingPipeline, audio_clips: []const []const u8) ![][]f32 {
-        if (session_factory.getEmbeddingGemma2Config(self.session) != null) return self.embedGemma2Media(audio_clips, false, null);
+        if (session_factory.getEmbeddingGemma2Config(self.session) != null) {
+            const clips = try self.allocator.alloc(EncodedAudioClip, audio_clips.len);
+            defer self.allocator.free(clips);
+            for (clips, audio_clips) |*clip, bytes| clip.* = .{ .bytes = bytes };
+            return self.embedEncodedAudio(clips);
+        }
         if (audio_clips.len > 0) {
             const audio_session = self.audio_session orelse if (sessionHasInput(self.session, "input_features")) self.session else return error.NoAudioSession;
             const feature_plan = try clapBatchPlan(audio_session, audio_clips.len);
@@ -1540,12 +1560,20 @@ pub const EmbeddingPipeline = struct {
         audio_clips: []const EncodedAudioClip,
     ) ![][]f32 {
         if (session_factory.getEmbeddingGemma2Config(self.session) != null) {
+            if (self.config.gemma4_audio_batching) {
+                const grouped = @import("embedding_gemma2.zig");
+                const result = try grouped.embedAudios(self.allocator, self.session, self.tok, audio_clips, .{ .prepare_ahead = self.config.audio_prepare_ahead, .timings = self.audio_timings }, self.execution_lock, self.execution_control, null);
+                self.allocator.free(result.input_tokens);
+                return result.vectors;
+            }
             const bytes = try self.allocator.alloc([]const u8, audio_clips.len);
             defer self.allocator.free(bytes);
             for (bytes, audio_clips) |*dest, clip| dest.* = clip.bytes;
             return self.embedGemma2Media(bytes, false, null);
         }
         if (audio_clips.len == 0) return try self.allocator.alloc([]f32, 0);
+        const prepared_session = self.audio_session orelse if (sessionHasInput(self.session, "input_features")) self.session else return error.NoAudioSession;
+        if (self.config.audio_prepared_batches and (prepared_session.backend() == .metal or prepared_session.backend() == .cuda)) return (try self.embedClapAudioPrepared(audio_clips, null)).vectors;
 
         const audio_session = self.audio_session orelse if (sessionHasInput(self.session, "input_features")) self.session else return error.NoAudioSession;
         const feature_plan = try clapBatchPlan(audio_session, audio_clips.len);
@@ -1592,12 +1620,19 @@ pub const EmbeddingPipeline = struct {
     pub fn embedEncodedAudioIndexed(self: *EmbeddingPipeline, clips: []const EncodedAudioClip, errors: []?anyerror) !ImageBatchResult {
         if (clips.len != errors.len) return error.InvalidInputShape;
         if (session_factory.getEmbeddingGemma2Config(self.session) != null) {
+            if (self.config.gemma4_audio_batching) {
+                const result = try @import("embedding_gemma2.zig").embedAudios(self.allocator, self.session, self.tok, clips, .{ .prepare_ahead = self.config.audio_prepare_ahead, .timings = self.audio_timings }, self.execution_lock, self.execution_control, errors);
+                self.allocator.free(result.input_tokens);
+                return .{ .vectors = result.vectors, .execution = result.execution };
+            }
             const bytes = try self.allocator.alloc([]const u8, clips.len);
             defer self.allocator.free(bytes);
             for (bytes, clips) |*dest, clip| dest.* = clip.bytes;
             return .{ .vectors = try self.embedGemma2Media(bytes, false, errors), .execution = .serial };
         }
         @memset(errors, null);
+        const prepared_session = self.audio_session orelse if (sessionHasInput(self.session, "input_features")) self.session else return error.NoAudioSession;
+        if (self.config.audio_prepared_batches and (prepared_session.backend() == .metal or prepared_session.backend() == .cuda)) return self.embedClapAudioPrepared(clips, errors);
         const alloc = self.allocator;
         const vectors = try alloc.alloc([]f32, clips.len);
         @memset(vectors, &.{});
@@ -1670,6 +1705,124 @@ pub const EmbeddingPipeline = struct {
             for (decoded[0..retained]) |*clip| clip.deinit();
             retained = 0;
         }
+        return .{ .vectors = vectors, .execution = if (fallback) .fallback else observation.execution(observation.native_items + observation.serial_items) };
+    }
+
+    fn embedClapAudioPrepared(self: *EmbeddingPipeline, clips: []const EncodedAudioClip, errors: ?[]?anyerror) anyerror!ImageBatchResult {
+        const prep = @import("audio_preparation.zig");
+        const session = self.audio_session orelse if (sessionHasInput(self.session, "input_features")) self.session else return error.NoAudioSession;
+        const out = self.allocator;
+        const vectors = try out.alloc([]f32, clips.len);
+        @memset(vectors, &.{});
+        errdefer {
+            for (vectors) |vector| out.free(vector);
+            out.free(vectors);
+        }
+        if (errors) |items| {
+            if (items.len != clips.len) return error.InvalidInputShape;
+            @memset(items, null);
+        }
+        if (clips.len == 0) return .{ .vectors = vectors, .execution = .serial };
+        try self.lockExecution();
+        defer self.unlockExecution();
+        var slots: [2]prep.Wave = undefined;
+        var live: [2]bool = @splat(false);
+        defer for (&slots, live) |*slot, exists| if (exists) slot.deinit();
+        const control = self.execution_control orelse InferenceExecutionControl{};
+        const budget = self.config.max_audio_decode_working_bytes;
+        const preprocessing = clapPreprocessingPolicy(session, clips.len);
+        var current: usize = 0;
+        var offset: usize = 0;
+        const first = @min(prep.max_batch, clips.len);
+        slots[0] = prep.Wave.initClap(session, clips[0..first], if (errors) |e| e[0..first] else null, control, budget, preprocessing);
+        live[0] = true;
+        slots[0].run();
+        var observation = @import("batch_execution.zig").Observation{};
+        var fallback = false;
+        while (offset < clips.len) {
+            try control.check();
+            const slot = &slots[current];
+            slot.join();
+            if (slot.failure) |err| return err;
+            if (self.audio_timings) |t| t.preprocess_ns += slot.prepare_ns;
+            const next = 1 - current;
+            const next_offset = offset + slot.consumed;
+            const next_count = @min(prep.max_batch, clips.len - next_offset);
+            if (next_count > 0) {
+                slots[next] = prep.Wave.initClap(session, clips[next_offset..][0..next_count], if (errors) |e| e[next_offset..][0..next_count] else null, control, budget, preprocessing);
+                live[next] = true;
+                if (self.config.audio_prepare_ahead) {
+                    const spawned = slots[next].start();
+                    if (self.audio_timings) |t| t.preparation_jobs += @intFromBool(spawned);
+                }
+            }
+            if (self.audio_timings) |t| t.max_prepared_audio = @max(t.max_prepared_audio, slot.clips.len + if (self.config.audio_prepare_ahead) next_count else 0);
+            if (slot.retained > 0) {
+                var scoped = self.*;
+                scoped.allocator = slot.allocator();
+                scoped.execution_lock = null;
+                scoped.execution_gate_held = true;
+                const plan = try slot.clapPlan(slot.retained);
+                const request = @import("../backends/session.zig").RunRequest{ .batch = slot.retained, .sequence = plan.frames, .input_bytes = slot.mels.len * 4, .pre_admitted_host_bytes = slot.mels.len * 4, .host_preprocess_bytes = plan.feature_reserve_bytes };
+                var permit = session.admit(request) catch |err| blk: {
+                    if (next_count == 0 or !self.config.audio_prepare_ahead or !prep.pressure(err)) return err;
+                    slots[next].deinit();
+                    slots[next].failure = err;
+                    break :blk try session.admit(request);
+                };
+                defer permit.deinit();
+                const begun = platform.time.monotonicNs();
+                const result = scoped.embedClapPreparedFeatures(session, plan, slot.retained, slot.mels, slot.flags[0..slot.retained], &permit) catch |err| blk: {
+                    if (err != error.BatchedAudioOutputCollapsed or slot.retained == 1) return err;
+                    permit.deinit();
+                    // Preserve singleton fusion/layout when an exported graph
+                    // collapses its batch. The feature producer stays bounded.
+                    scoped.config.audio_prepared_batches = false;
+                    const rows = try scoped.allocator.alloc([]f32, slot.retained);
+                    var copied: usize = 0;
+                    errdefer {
+                        for (rows[0..copied]) |row| scoped.allocator.free(row);
+                        scoped.allocator.free(rows);
+                    }
+                    for (slot.indexes[0..slot.retained], rows) |index, *row| {
+                        const clip = slot.clips[index];
+                        const one = if (clip.pcm) |pcm| try scoped.embedAudioPcm(&.{pcm}) else try scoped.embedEncodedAudio(&.{clip});
+                        row.* = one[0];
+                        scoped.allocator.free(one);
+                        copied += 1;
+                    }
+                    fallback = true;
+                    break :blk rows;
+                };
+                defer {
+                    for (result) |row| scoped.allocator.free(row);
+                    scoped.allocator.free(result);
+                }
+                if (result.len != slot.retained) return error.InvalidEmbeddingResultCount;
+                self.last_resident_backend_timing = scoped.last_resident_backend_timing;
+                if (self.audio_timings) |t| {
+                    t.audio_ns += platform.time.monotonicNs() - begun;
+                    t.resident_cohorts += 1;
+                }
+                for (slot.indexes[0..slot.retained], result) |index, row| vectors[offset + index] = try out.dupe(f32, row);
+                observation.record(slot.retained);
+            }
+            slot.deinit();
+            live[current] = false;
+            offset = next_offset;
+            if (next_count > 0) {
+                if (!self.config.audio_prepare_ahead) slots[next].run();
+                slots[next].join();
+                if (slots[next].failure) |err| if (prep.pressure(err)) {
+                    slots[next].deinit();
+                    slots[next] = prep.Wave.initClap(session, clips[next_offset..][0..next_count], if (errors) |e| e[next_offset..][0..next_count] else null, control, budget, preprocessing);
+                    if (self.audio_timings) |t| t.preparation_backpressure_retries += 1;
+                    slots[next].run();
+                };
+                current = next;
+            }
+        }
+        try control.check();
         return .{ .vectors = vectors, .execution = if (fallback) .fallback else observation.execution(observation.native_items + observation.serial_items) };
     }
 
@@ -1759,8 +1912,15 @@ pub const EmbeddingPipeline = struct {
     }
 
     pub fn embedAudioPcmReported(self: *EmbeddingPipeline, audio_clips: []const audio.PcmAudio) anyerror!ImageBatchResult {
-        if (session_factory.getEmbeddingGemma2Config(self.session) != null) return .{ .vectors = try self.embedGemma2Pcm(audio_clips), .execution = .serial };
+        if (session_factory.getEmbeddingGemma2Config(self.session) != null) return self.embedGemma2PcmReported(audio_clips);
         if (audio_clips.len == 0) return .{ .vectors = try self.allocator.alloc([]f32, 0), .execution = .serial };
+        const prepared_session = self.audio_session orelse if (sessionHasInput(self.session, "input_features")) self.session else return error.NoAudioSession;
+        if (self.config.audio_prepared_batches and (prepared_session.backend() == .metal or prepared_session.backend() == .cuda)) {
+            const clips = try self.allocator.alloc(EncodedAudioClip, audio_clips.len);
+            defer self.allocator.free(clips);
+            for (clips, audio_clips) |*dst, pcm| dst.* = .{ .pcm = pcm };
+            return self.embedClapAudioPrepared(clips, null);
+        }
         try self.lockExecution();
         defer self.unlockExecution();
         const vectors = self.embedAudioPcmBatch(audio_clips) catch |err| {
@@ -1773,6 +1933,10 @@ pub const EmbeddingPipeline = struct {
     }
 
     fn embedGemma2Pcm(self: *EmbeddingPipeline, clips: anytype) ![][]f32 {
+        return (try self.embedGemma2PcmReported(clips)).vectors;
+    }
+
+    fn embedGemma2PcmReported(self: *EmbeddingPipeline, clips: anytype) !ImageBatchResult {
         if (clips.len > 128) return error.ResourceLimitExceeded;
         var bytes: usize = 0;
         for (clips) |clip| {
@@ -1783,6 +1947,41 @@ pub const EmbeddingPipeline = struct {
             for (clip.samples) |sample| if (!std.math.isFinite(sample)) return error.UnsupportedAudioFormat;
         }
         if (bytes > 64 * 1024 * 1024) return error.AudioTooLarge;
+        if (self.config.gemma4_audio_batching and (self.session.backend() == .metal or self.session.backend() == .cuda)) {
+            try self.lockExecution();
+            defer self.unlockExecution();
+            var host = try self.session.admitHostPreprocess(bytes);
+            defer host.deinit();
+            const prepared = try self.allocator.alloc(EncodedAudioClip, clips.len);
+            defer self.allocator.free(prepared);
+            var mono = std.ArrayList([]f32).empty;
+            defer {
+                for (mono.items) |samples| self.allocator.free(samples);
+                mono.deinit(self.allocator);
+            }
+            for (prepared, clips) |*dst, clip| {
+                if (self.execution_control) |control| try control.check();
+                const channels = if (@hasField(@TypeOf(clip), "channels")) clip.channels else 1;
+                var samples: []const f32 = clip.samples;
+                if (channels > 1) {
+                    const downmixed = try self.allocator.alloc(f32, samples.len / channels);
+                    mono.append(self.allocator, downmixed) catch |err| {
+                        self.allocator.free(downmixed);
+                        return err;
+                    };
+                    for (downmixed, 0..) |*value, frame| {
+                        var sum: f32 = 0;
+                        for (samples[frame * channels ..][0..channels]) |sample| sum += sample;
+                        value.* = sum / @as(f32, @floatFromInt(channels));
+                    }
+                    samples = downmixed;
+                }
+                dst.* = .{ .pcm = .{ .samples = samples, .sample_rate = clip.sample_rate } };
+            }
+            const result = try @import("embedding_gemma2.zig").embedAudios(self.allocator, self.session, self.tok, prepared, .{ .prepare_ahead = self.config.audio_prepare_ahead, .timings = self.audio_timings }, null, self.execution_control, null);
+            self.allocator.free(result.input_tokens);
+            return .{ .vectors = result.vectors, .execution = result.execution };
+        }
         var permit = try self.session.admit(.{ .batch = 1, .sequence = 1, .host_preprocess_bytes = 64 * 1024 * 1024 });
         defer permit.deinit();
         const output = try self.allocator.alloc([]f32, clips.len);
@@ -1802,7 +2001,7 @@ pub const EmbeddingPipeline = struct {
             vector.* = result.vector;
             initialized += 1;
         }
-        return output;
+        return .{ .vectors = output, .execution = .serial };
     }
 
     fn lockExecution(self: *EmbeddingPipeline) !void {
@@ -1901,6 +2100,11 @@ pub const EmbeddingPipeline = struct {
             }
         }
 
+        return self.embedClapPreparedFeatures(as, feature_plan, batch, all_mels, is_longer, &run_permit);
+    }
+
+    fn embedClapPreparedFeatures(self: *EmbeddingPipeline, as: backends.Session, feature_plan: ClapBatchPlan, batch: usize, all_mels: []const f32, is_longer: []const u8, permit: *@import("../backends/session.zig").RunPermit) ![][]f32 {
+        const alloc = self.allocator;
         // Build input tensor: [batch, channels, n_frames, n_mels]
         const mel_shape = [_]i64{ @intCast(batch), @intCast(feature_plan.channels), @intCast(feature_plan.frames), @intCast(feature_plan.mels) };
         var mel_tensor = try Tensor.initFloat32(alloc, "input_features", &mel_shape, all_mels);
@@ -1923,12 +2127,12 @@ pub const EmbeddingPipeline = struct {
                 batch,
                 "audio.encoder.resident",
                 "audio.projection.resident",
-                &run_permit,
+                permit,
             )) |embeddings| return embeddings;
         }
 
         const encoder_start = embedTimingStart(self.print_timing);
-        var outputs = try run_permit.runWithControl(run_inputs, alloc, self.execution_control);
+        var outputs = try permit.runWithControl(run_inputs, alloc, self.execution_control);
         logEmbedTiming("audio.encoder", batch, encoder_start);
         logEmbedTensorShapes(self.print_timing, "audio.outputs", outputs);
         defer {
@@ -4140,4 +4344,41 @@ fn z17RepeatArray(comptime array: anytype, comptime repetitions: usize) [array.l
     var result: [array.len * repetitions]@TypeOf(array[0]) = undefined;
     for (0..repetitions) |i| @memcpy(result[i * array.len ..][0..array.len], &array);
     return result;
+}
+
+test "CLAP prepared accelerator waves preserve indexed errors and collapsed-batch fallback" {
+    const a = std.testing.allocator;
+    var fake = FakeCollapsingAudioSession{};
+    var vtable = fake.session().vtable.*;
+    const Mock = struct {
+        fn backend(_: *anyopaque) backends.BackendType {
+            return .metal;
+        }
+    };
+    vtable.backend = Mock.backend;
+    const session = backends.Session{ .ptr = &fake, .vtable = &vtable };
+    var pipeline = EmbeddingPipeline{ .allocator = a, .session = session, .audio_session = session, .tok = undefined, .config = .{ .normalize = false } };
+    const samples: [1024]f32 = @splat(0);
+    const wav = try audio.wav.encodeMono(a, &samples, .{ .sample_rate = audio.CLAP_CONFIG.sample_rate, .audio_format = 1, .bits_per_sample = 16 });
+    defer a.free(wav);
+    var clips: [10]EncodedAudioClip = undefined;
+    for (&clips) |*clip| clip.* = .{ .bytes = wav };
+    clips[1].bytes = "invalid audio";
+    var errors: [10]?anyerror = undefined;
+    const result = try pipeline.embedEncodedAudioIndexed(&clips, &errors);
+    defer freeEmbeddingSlices(a, result.vectors);
+    try std.testing.expectEqual(.fallback, result.execution);
+    try std.testing.expect(errors[1] != null);
+    try std.testing.expectEqual(@as(usize, 10), result.vectors.len);
+    for (result.vectors, errors, 0..) |row, failure, index| {
+        if (index == 1) {
+            try std.testing.expectEqual(@as(usize, 0), row.len);
+        } else {
+            try std.testing.expect(failure == null);
+            try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, row);
+        }
+    }
+    try std.testing.expect(fake.collapsed_batch_attempts > 1);
+    // Two attempted batch forwards plus nine valid singleton fallbacks.
+    try std.testing.expectEqual(@as(usize, 11), fake.run_count);
 }

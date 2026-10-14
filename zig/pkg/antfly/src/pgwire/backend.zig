@@ -195,7 +195,12 @@ pub const Result = struct {
     }
 };
 
-pub const Cell = struct { value: std.json.Value, sql_null: bool };
+pub const Cell = struct {
+    value: std.json.Value = .null,
+    sql_null: bool,
+    array: ?*const @import("antfly_local_sources").sql_array_value.Value = null,
+    numeric: ?*const @import("antfly_local_sources").sql_numeric_value.Value = null,
+};
 pub const Cells = struct {
     context: *anyopaque,
     begin: usize = 0,

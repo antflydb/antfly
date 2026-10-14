@@ -2329,10 +2329,11 @@ pub const ComputeBackend = struct {
         packedGegluExact: ?*const fn (ctx: *anyopaque, input: CT, rows: usize, width: usize) anyerror!?CT = null,
         splitQkvRope: ?*const fn (ctx: *anyopaque, input: CT, batch: usize, seq: usize, heads: usize, dim: usize, theta: f32) anyerror!?SplitLastDim3Result = null,
 
-        /// Optional Qwen3-VL vision-attention route. It has the same unmasked,
+        /// Optional model-scoped vision-attention routes. They have the same unmasked,
         /// unbiased semantics as scaledDotProductAttention with an empty mask,
         /// but lets a backend select a model-scoped kernel without changing
         /// unrelated vision encoders that happen to share a tensor shape.
+        scaledDotProductAttentionGemma4Vision: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT = null,
         scaledDotProductAttentionQwen3VlVision: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT = null,
 
         /// Optional bidirectional attention with no mask. This is equivalent
@@ -4174,6 +4175,15 @@ pub const ComputeBackend = struct {
 
     pub fn scaledDotProductAttention(self: *const ComputeBackend, Q: CT, K: CT, V: CT, mask: []const i64, attn_bias: ?CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) !CT {
         return self.vtable.scaledDotProductAttention(self.ptr, Q, K, V, mask, attn_bias, batch, seq_len, num_heads, head_dim);
+    }
+
+    /// Unmasked, token-major Gemma4 vision attention. Providers without the
+    /// qualified model-specific kernel retain portable unmasked attention.
+    pub fn scaledDotProductAttentionGemma4Vision(self: *const ComputeBackend, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) !CT {
+        if (self.vtable.scaledDotProductAttentionGemma4Vision) |f| {
+            return f(self.ptr, Q, K, V, batch, seq_len, num_heads, head_dim);
+        }
+        return self.scaledDotProductAttention(Q, K, V, &.{}, null, batch, seq_len, num_heads, head_dim);
     }
 
     /// Runs Qwen3-VL's unmasked vision attention. Backends that do not expose

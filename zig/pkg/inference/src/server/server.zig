@@ -1234,6 +1234,11 @@ fn rawGenerateChatTemplateKwargsAreValid(
 
 const HardCancellationWatchdog = @import("../hard_cancellation_watchdog.zig").HardCancellationWatchdog;
 
+pub fn httpBodyLimitBytesFromMib(mib: usize) error{InvalidHttpBodyLimit}!usize {
+    if (mib == 0) return error.InvalidHttpBodyLimit;
+    return std.math.mul(usize, mib, 1024 * 1024) catch error.InvalidHttpBodyLimit;
+}
+
 pub const NodeConfig = struct {
     models_dir: []const u8 = "./models",
     ml_dir: []const u8 = "./ml",
@@ -1252,6 +1257,9 @@ pub const NodeConfig = struct {
     /// from connection lifetimes; in particular, HTTP/2 frame pumps remain
     /// available to receive streaming request bodies.
     http_max_request_tasks: u32 = 64,
+    /// Encoded HTTP payload limit, independent of GPU cohort/admission bounds.
+    /// Inline media batches can exceed the transport's 10 MiB default.
+    http_max_body_bytes: usize = 10 * 1024 * 1024,
     pool_size: usize = 2,
     /// Optional hard envelope for all memory charged to this process/container.
     /// This is required when the runtime has no finite cgroup memory.max and
@@ -1372,6 +1380,31 @@ pub const GenerationBatchingConfig = struct {
             // direct path until the multi-wave row scheduler is validated.
             .max_active_requests_for_batching = validated_max_items,
         };
+    }
+    fn gemma4MetalOcrPolicyForRows(self: @This(), requested_rows: usize) runtime.scheduler.native_generate.Policy {
+        var policy = self.schedulerPolicy();
+        const rows = @min(@max(requested_rows, 1), 4);
+        policy.max_step_items = rows;
+        policy.max_active_requests_for_batching = rows;
+        policy.max_decode_wait_us = self.max_decode_wait_us;
+        policy.allow_mixed_sequence_lengths = true;
+        return policy;
+    }
+
+    fn gemma4MetalOcrContinuousPolicyForRows(self: @This(), requested_rows: usize, requested_window: usize) runtime.scheduler.native_generate.Policy {
+        var policy = self.gemma4MetalOcrPolicyForRows(requested_rows);
+        // Admit a bounded resident window larger than a single GPU cohort.
+        // Finished tasks retire their leases immediately, so pending decoders
+        // fill the next step without waiting for the longest page in a wave.
+        policy.max_active_requests_for_batching = @min(@max(requested_window, policy.max_step_items), 16);
+        return policy;
+    }
+
+    fn gemma4MetalOcrPolicy(self: @This()) runtime.scheduler.native_generate.Policy {
+        const rows = platform.env.getenvUsize("ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS") orelse 2;
+        if (platform.env.getenvBoolDefault("ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS", false))
+            return self.gemma4MetalOcrContinuousPolicyForRows(rows, platform.env.getenvUsize("ANTFLY_GEMMA4_METAL_OCR_WINDOW") orelse 8);
+        return self.gemma4MetalOcrPolicyForRows(rows);
     }
 };
 
@@ -3985,7 +4018,7 @@ pub const Node = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator, config: NodeConfig) !Node {
-        if (config.http_max_connections == 0 or config.http_max_request_tasks == 0)
+        if (config.http_max_connections == 0 or config.http_max_request_tasks == 0 or config.http_max_body_bytes == 0)
             return error.InvalidHttpTransportCapacity;
         if (config.kernel_jit.profile_capture_only) {
             return error.KernelJitProfileCaptureUnsupportedInServer;
@@ -6630,6 +6663,33 @@ pub const Node = struct {
     }
 
     fn tryEmbedParsedViaBroker(self: *Node, allocator: std.mem.Allocator, io: std.Io, model: *model_manager_mod.LoadedModel, parsed: *const ParsedDenseEmbedInputs, control: InferenceExecutionControl, task_type: EmbeddingTaskType, instruction: ?[]const u8, audio_working_bytes: usize) !?[][]f32 {
+        if (model.manifest.embedding_style == .embedding_gemma2 and parsed.audio.items.len == parsed.total_count and parsed.total_count > 0 and instruction == null) {
+            const grouped = @import("../pipelines/embedding_gemma2.zig");
+            const parts = try allocator.alloc(grouped.Part, parsed.total_count);
+            defer allocator.free(parts);
+            const groups = try allocator.alloc(grouped.Group, parsed.total_count);
+            defer allocator.free(groups);
+            for (parsed.audio.items, parts, groups, 0..) |input, *part, *group, index| {
+                // Ambiguous codecs retain the MIME-aware pipeline executor.
+                if (@import("../pipelines/audio.zig").detectFormat(input.bytes) == null) return null;
+                part.* = .{ .audio = input.bytes };
+                group.* = .{ .content = parts[index..][0..1] };
+            }
+            const contract = try resolvedInferenceExecutorContract(self, "embed", &model.manifest);
+            const batch = (try self.tryEmbedGemma4MediaGroups(allocator, model, groups, .{ .task_type = @tagName(task_type) }, control, contract)) orelse return null;
+            defer batch.deinit();
+            const vectors = try allocator.alloc([]f32, parsed.total_count);
+            @memset(vectors, &.{});
+            errdefer freeDirectDenseVectors(allocator, vectors);
+            for (batch.items, parsed.audio.items) |*item, input| switch (item.result) {
+                .value => |*value| {
+                    vectors[input.index] = value.vector;
+                    value.vector = &.{};
+                },
+                .item_error => |failure| return failure.cause,
+            };
+            return vectors;
+        }
         if (model.manifest.embedding_style == .embedding_gemma2 and (parsed.images.items.len != 0 or parsed.audio.items.len != 0)) return null;
         const contract = try resolvedInferenceExecutorContract(self, "embed", &model.manifest);
         if (contract.batch.mode != .native or contract.batch.max_items <= 1 or model.manifest.hasCapability("sparse")) return null;
@@ -7085,7 +7145,39 @@ pub const Node = struct {
         task_type: EmbeddingTaskType,
         instruction: ?[]const u8,
     ) !?[][]f32 {
-        if (model.manifest.embedding_style == .embedding_gemma2) return null;
+        if (model.manifest.embedding_style == .embedding_gemma2) {
+            if (instruction != null) return null;
+            const grouped = @import("../pipelines/embedding_gemma2.zig");
+            const n = if (rasters.len != 0) rasters.len else encoded.len;
+            if (n == 0 or (rasters.len != 0 and encoded.len != 0)) return null;
+            const parts = try allocator.alloc(grouped.Part, n);
+            defer allocator.free(parts);
+            const groups = try allocator.alloc(grouped.Group, n);
+            defer allocator.free(groups);
+            for (parts, groups, 0..) |*part, *group, index| {
+                part.* = if (rasters.len != 0) .{ .raster = rasters[index] } else .{ .image = encoded[index].bytes };
+                group.* = .{ .content = parts[index..][0..1] };
+            }
+            const contract = try resolvedInferenceExecutorContract(self, "embed", &model.manifest);
+            const batch = (try self.tryEmbedGemma4MediaGroups(allocator, model, groups, .{ .task_type = @tagName(task_type) }, control, contract)) orelse return null;
+            defer batch.deinit();
+            const vectors = try allocator.alloc([]f32, n);
+            var initialized: usize = 0;
+            errdefer {
+                for (vectors[0..initialized]) |vector| allocator.free(vector);
+                allocator.free(vectors);
+            }
+            for (batch.items, vectors) |*item, *vector| switch (item.result) {
+                .value => |*value| {
+                    vector.* = value.vector;
+                    value.vector = &.{};
+                    initialized += 1;
+                },
+                .item_error => |failure| return failure.cause,
+            };
+            return vectors;
+        }
+
         const contract = try resolvedInferenceExecutorContract(self, "embed", &model.manifest);
         if (contract.batch.mode != .native or contract.batch.max_items <= 1 or !contract.accepts_image or model.manifest.hasCapability("sparse")) return null;
         const raw = rasters.len > 0;
@@ -14134,6 +14226,16 @@ pub const Node = struct {
         out: *BatchGenerateTaskResult,
 
         fn run(self: *@This()) std.Io.Cancelable!void {
+            // Retire completed coordinated pages immediately. A finished
+            // peer must not keep the last live page on the eager row scheduler.
+            defer if (self.pipeline.cb.kind() == .metal and self.pipeline.execution_lock != null) {
+                if (self.pipeline.scheduler) |scheduler| if (self.pipeline.scheduler_lease) |lease| {
+                    if (lease.request_id != 0) {
+                        scheduler.release(lease.*);
+                        lease.request_id = 0;
+                    }
+                };
+            };
             self.runInner() catch |err| {
                 self.out.@"error" = batchGenerationError(err);
             };
@@ -14181,6 +14283,9 @@ pub const Node = struct {
         /// those objects serially avoids racing streams, scratch buffers, and
         /// graph-capture state while still amortizing backend construction.
         shared_serial,
+        /// One backend and an outer model lease; a separate mutex serializes
+        /// projector/prefill and coordinated decode steps inside this batch.
+        coordinated_shared,
     };
 
     fn batchExecutionMode(backend: runtime.kv.pool.BackendKind) BatchExecutionMode {
@@ -14197,12 +14302,14 @@ pub const Node = struct {
     const BatchModelLock = struct {
         mutex: *std.atomic.Mutex,
         owns_outer_lock: bool,
+        coordinated: bool = false,
+        step_mutex: std.atomic.Mutex = .unlocked,
 
         fn initWithControl(mode: BatchExecutionMode, mutex: *std.atomic.Mutex, io: std.Io, control: ?InferenceExecutionControl) !@This() {
-            if (mode == .shared_serial) {
+            if (mode != .isolated_parallel) {
                 if (control) |active| try active.lock(mutex) else platform.sync.lockYieldingIo(mutex, io);
             }
-            return .{ .mutex = mutex, .owns_outer_lock = mode == .shared_serial };
+            return .{ .mutex = mutex, .owns_outer_lock = mode != .isolated_parallel, .coordinated = mode == .coordinated_shared };
         }
 
         fn init(
@@ -14210,17 +14317,18 @@ pub const Node = struct {
             mutex: *std.atomic.Mutex,
             io: std.Io,
         ) @This() {
-            const owns_outer_lock = execution_mode == .shared_serial;
+            const owns_outer_lock = execution_mode != .isolated_parallel;
             if (owns_outer_lock) platform.sync.lockYieldingIo(mutex, io);
-            return .{ .mutex = mutex, .owns_outer_lock = owns_outer_lock };
+            return .{ .mutex = mutex, .owns_outer_lock = owns_outer_lock, .coordinated = execution_mode == .coordinated_shared };
         }
 
-        fn pipelineExecutionLock(self: *const @This()) ?*std.atomic.Mutex {
+        fn pipelineExecutionLock(self: *@This()) ?*std.atomic.Mutex {
             // The request owns the model mutex for the complete lifetime of a
             // shared Metal/CUDA backend, so the pipeline must not lock it
             // again. Besides avoiding self-deadlock, this keeps request-scoped
             // backend state (including CUDA's RunBudget pointer) from being
             // rebound by another request between generation steps.
+            if (self.coordinated) return &self.step_mutex;
             return if (self.owns_outer_lock) null else self.mutex;
         }
 
@@ -14251,6 +14359,16 @@ pub const Node = struct {
             .scratch_bytes = @max(existing.scratch_bytes, next.scratch_bytes),
             .scratch_tier = existing.scratch_tier,
         };
+    }
+
+    fn mergeCoordinatedBatchEstimate(current: ?runtime.tier.memory.Estimate, next: runtime.tier.memory.Estimate) runtime.tier.memory.Estimate {
+        var total = current orelse return next;
+        std.debug.assert(total.kv_tier == next.kv_tier and total.scratch_tier == next.scratch_tier);
+        total.kv_bytes +|= next.kv_bytes;
+        total.scratch_bytes +|= next.scratch_bytes;
+        total.prompt_tokens +|= next.prompt_tokens;
+        total.retained_tokens +|= next.retained_tokens;
+        return total;
     }
 
     fn acquireBatchAdmission(
@@ -14510,7 +14628,11 @@ pub const Node = struct {
             var admitted_group_len = generateBatchWindowPrefixLen(
                 media_shapes,
                 group_indices.items,
-                provisional_contract.batch.max_items,
+                if (platform.env.getenvBoolDefault("ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS", false) and
+                    (selection.native_choice == .metal or selection.native_choice == .auto) and prepared_model.manifest.gguf_projector_path != null)
+                    @min(provisional_contract.batch.max_items, self.config.generation_batching.gemma4MetalOcrPolicy().max_active_requests_for_batching.?)
+                else
+                    provisional_contract.batch.max_items,
                 provisional_contract.batch.max_encoded_media_bytes,
             );
             var group_encoded_bytes: usize = 0;
@@ -14806,7 +14928,12 @@ pub const Node = struct {
                         break;
                     }
                 }
-                const execution_mode = if (group_has_media)
+                const coordinated_metal_ocr = platform.env.getenvBoolDefault("ANTFLY_GEMMA4_METAL_OCR_BATCH", false) and
+                    group_indices.items.len >= 2 and backend_kind == .metal and gpt_config.family == .gemma and gpt_config.gemma4_channel_protocol and gpt_config.hasPle() and model.manifest.gguf_projector_path != null and
+                    group_indices.items.len <= self.config.generation_batching.gemma4MetalOcrPolicy().max_active_requests_for_batching.?;
+                const execution_mode = if (coordinated_metal_ocr)
+                    BatchExecutionMode.coordinated_shared
+                else if (group_has_media)
                     BatchExecutionMode.shared_serial
                 else
                     batchExecutionMode(backend_kind);
@@ -14929,6 +15056,9 @@ pub const Node = struct {
                             continue;
                         };
                     }
+                    // Keep CUDA's homogeneous C2 policy intact. Only this
+                    // qualified Metal cohort admits independent decode positions.
+                    if (execution_mode == .coordinated_shared) coordinator.setPolicy(self.config.generation_batching.gemma4MetalOcrPolicy());
                     for (group_indices.items, 0..) |idx, pos| {
                         if (!pending[idx]) continue;
                         leases[pos].prefill_chunk_size = coordinator.recommendPrefillChunkFor(leases[pos].request_id);
@@ -15068,7 +15198,7 @@ pub const Node = struct {
                         continue;
                     };
                     resource_estimates[pos] = resource_estimate;
-                    if (execution_mode == .shared_serial) {
+                    if (execution_mode != .isolated_parallel) {
                         runnable_count += 1;
                         continue;
                     }
@@ -15097,7 +15227,7 @@ pub const Node = struct {
                 // admission may evict an idle model and destroy its backend.
                 var shared_batch_admission: ?BatchAdmission = null;
                 defer releaseBatchAdmission(&shared_run_budget, &shared_batch_admission);
-                if (execution_mode == .shared_serial) {
+                if (execution_mode != .isolated_parallel) {
                     while (runnable_count > 0 and shared_batch_admission == null) {
                         var combined: ?runtime.tier.memory.Estimate = null;
                         var largest_pos: ?usize = null;
@@ -15105,7 +15235,10 @@ pub const Node = struct {
                         for (group_indices.items, 0..) |idx, pos| {
                             if (!pending[idx]) continue;
                             const estimate = resource_estimates[pos].?;
-                            combined = mergeSerialBatchEstimate(combined, estimate);
+                            combined = if (execution_mode == .coordinated_shared)
+                                mergeCoordinatedBatchEstimate(combined, estimate)
+                            else
+                                mergeSerialBatchEstimate(combined, estimate);
                             const pressure = estimate.kv_bytes +| estimate.scratch_bytes;
                             if (largest_pos == null or pressure > largest_pressure) {
                                 largest_pos = pos;
@@ -15153,7 +15286,7 @@ pub const Node = struct {
                 defer batch_model_lock.deinit();
 
                 var shared_cb: ?ops.ComputeBackend = null;
-                if (execution_mode == .shared_serial) {
+                if (execution_mode != .isolated_parallel) {
                     shared_cb = session_factory.getComputeBackendWithBudget(
                         model.session,
                         ctx.allocator,
@@ -19876,6 +20009,15 @@ pub const Node = struct {
         return self.embedGroupsFromPath(a, io, path, &manifest, contract, input, options, control, admission.byte_cap);
     }
 
+    fn tryEmbedGemma4MediaGroups(self: *Node, out: std.mem.Allocator, model: *model_manager_mod.LoadedModel, groups: []const @import("../pipelines/embedding_gemma2.zig").Group, options: @import("../pipelines/embedding_gemma2.zig").Options, control: InferenceExecutionControl, contract: ResolvedInferenceExecutorContract) !?@import("../pipelines/gemma4_image_broker.zig").Result {
+        const audio_only = groups.len > 0 and groups[0].content.len == 1 and groups[0].content[0] == .audio;
+        if (platform.env.getenvBool(if (audio_only) "ANTFLY_GEMMA4_DISABLE_AUDIO_BROKER" else "ANTFLY_GEMMA4_DISABLE_IMAGE_BROKER")) return null;
+        var owned_io: ?std.Io.Threaded = null;
+        defer if (owned_io) |*value| value.deinit();
+        const io = self.inferenceIo(out, control.io, &owned_io);
+        return @import("../pipelines/gemma4_image_broker.zig").submit(self.executorMicrobatchBroker(), out, io, model.model_dir, @intFromPtr(model), model.session, model.getTokenizer(), model.embeddingExecutionLock(), control, groups, options, self.config.executor_microbatch_max_wait_us, contract.batch.max_encoded_media_bytes, contract.batch.max_decoded_pixels orelse std.math.maxInt(u64), contract.batch.max_items);
+    }
+
     fn embedGroupsFromPath(self: *Node, out: std.mem.Allocator, io: std.Io, path: []const u8, manifest: *const manifest_mod.ModelManifest, contract: ResolvedInferenceExecutorContract, input: std.json.Value, options: @import("../pipelines/embedding_gemma2.zig").Options, control: InferenceExecutionControl, byte_cap: usize) ![][]f32 {
         const grouped = @import("../pipelines/embedding_gemma2.zig");
         if (manifest.embedding_style != .embedding_gemma2) return error.UnsupportedEmbeddingProvider;
@@ -19902,6 +20044,21 @@ pub const Node = struct {
         errdefer {
             for (vectors[0..count]) |vector| out.free(vector);
             out.free(vectors);
+        }
+        if (try self.tryEmbedGemma4MediaGroups(out, loaded, groups, options, control, contract)) |batch| {
+            defer batch.deinit();
+            for (batch.items, vectors) |*item, *vector| {
+                switch (item.result) {
+                    .value => |*value| {
+                        vector.* = value.vector;
+                        value.vector = &.{};
+                        count += 1;
+                    },
+                    .item_error => |failure| return failure.cause,
+                }
+            }
+            try loaded.verifyEmbeddingIdentity();
+            return vectors;
         }
         for (groups, vectors) |group, *vector| {
             const result = try grouped.embed(out, loaded.session, loaded.getTokenizer(), group, options, loaded.embeddingExecutionLock(), control);
@@ -19956,15 +20113,36 @@ pub const Node = struct {
         const loaded = handle.get();
         if (request.model_identity) |expected| if (!std.mem.eql(u8, expected, &loaded.embedding_identity.?)) return error.EmbeddingIdentityMismatch;
         try loaded.verifyEmbeddingIdentity();
-        for (groups, 0..) |maybe_group, index| {
-            const group = maybe_group orelse continue;
-            const result = grouped.embed(a, loaded.session, loaded.getTokenizer(), group, .{ .task_type = @tagName(request.task_type orelse .RETRIEVAL_DOCUMENT), .dimensions = if (request.dimensions) |dim| @intCast(dim) else 768 }, loaded.embeddingExecutionLock(), control) catch |err| {
-                if (request.error_policy == .fail_fast or isDenseEmbedRequestAbort(err)) return err;
-                try errors.append(a, embedItemFailure(index, err, "embedding"));
-                continue;
+        const compact = try a.alloc(grouped.Group, groups.len);
+        var complete = true;
+        for (groups, compact) |maybe, *value| {
+            if (maybe) |group| value.* = group else complete = false;
+        }
+        var coalesced = if (complete) try self.tryEmbedGemma4MediaGroups(a, loaded, compact, .{ .task_type = @tagName(request.task_type orelse .RETRIEVAL_DOCUMENT), .dimensions = if (request.dimensions) |dim| @intCast(dim) else 768 }, control, contract) else null;
+        if (coalesced) |*batch| {
+            defer batch.deinit();
+            for (batch.items, 0..) |*item, index| switch (item.result) {
+                .value => |*value| {
+                    vectors[index] = value.vector;
+                    input_tokens += value.input_tokens;
+                    value.vector = &.{};
+                },
+                .item_error => |failure| {
+                    if (request.error_policy == .fail_fast or isDenseEmbedRequestAbort(failure.cause)) return failure.cause;
+                    try errors.append(a, embedItemFailure(index, failure.cause, "embedding"));
+                },
             };
-            vectors[index] = result.vector;
-            input_tokens += result.input_tokens;
+        } else {
+            for (groups, 0..) |maybe_group, index| {
+                const group = maybe_group orelse continue;
+                const result = grouped.embed(a, loaded.session, loaded.getTokenizer(), group, .{ .task_type = @tagName(request.task_type orelse .RETRIEVAL_DOCUMENT), .dimensions = if (request.dimensions) |dim| @intCast(dim) else 768 }, loaded.embeddingExecutionLock(), control) catch |err| {
+                    if (request.error_policy == .fail_fast or isDenseEmbedRequestAbort(err)) return err;
+                    try errors.append(a, embedItemFailure(index, err, "embedding"));
+                    continue;
+                };
+                vectors[index] = result.vector;
+                input_tokens += result.input_tokens;
+            }
         }
         try loaded.verifyEmbeddingIdentity();
         if (request.error_policy == .per_item) {
@@ -20521,6 +20699,7 @@ pub const Node = struct {
             .port = port,
             .max_connections = self.config.http_max_connections,
             .max_request_tasks = self.config.http_max_request_tasks,
+            .max_body_size = self.config.http_max_body_bytes,
             // Generation can legitimately take longer than the generic 30s HTTP
             // default during cold model startup or first-token GPU execution.
             .header_read_timeout_ms = 300_000,
@@ -25993,6 +26172,31 @@ test "generate batch shared backends own the outer model lock" {
     shared.deinit();
     try std.testing.expect(mutex.tryLock());
     mutex.unlock();
+}
+
+test "coordinated Metal batch retains model ownership with an independent step mutex" {
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    var mutex: std.atomic.Mutex = .unlocked;
+    var shared = Node.BatchModelLock.init(.coordinated_shared, &mutex, io_impl.io());
+    try std.testing.expect(!mutex.tryLock());
+    const step = shared.pipelineExecutionLock().?;
+    try std.testing.expect(step != &mutex);
+    try std.testing.expect(step.tryLock());
+    step.unlock();
+    shared.deinit();
+    try std.testing.expect(mutex.tryLock());
+    mutex.unlock();
+}
+
+test "coordinated batch admission reserves all live KV caches and scratch" {
+    const first = runtime.tier.memory.Estimate{ .prompt_tokens = 100, .retained_tokens = 120, .kv_bytes = 900, .kv_tier = .backend, .scratch_bytes = 200, .scratch_tier = .backend };
+    const second = runtime.tier.memory.Estimate{ .prompt_tokens = 300, .retained_tokens = 320, .kv_bytes = 400, .kv_tier = .backend, .scratch_bytes = 700, .scratch_tier = .backend };
+    const merged = Node.mergeCoordinatedBatchEstimate(first, second);
+    try std.testing.expectEqual(@as(usize, 400), merged.prompt_tokens);
+    try std.testing.expectEqual(@as(usize, 440), merged.retained_tokens);
+    try std.testing.expectEqual(@as(usize, 1300), merged.kv_bytes);
+    try std.testing.expectEqual(@as(usize, 900), merged.scratch_bytes);
 }
 
 test "serial batch admission covers each request without summing them" {
@@ -34536,6 +34740,11 @@ fn generationErrorResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
 }
 
 fn batchGenerationError(err: anyerror) api.GenerateBatchError {
+    switch (err) {
+        error.ImageDecodeFailed, error.ImageTooLarge, error.ImageBatchTooLarge => return Node.generateBatchImageError(err),
+        else => {},
+    }
+
     if (generationRequestFailure(err)) |failure| {
         return .{
             .code = failure.code,
@@ -36029,4 +36238,111 @@ test "embeddinggemma2 linked reduced dimensions match HTTP and preserve ownershi
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "Metal OCR policy enables ragged rows without widening the CUDA policy" {
+    const config = GenerationBatchingConfig{ .mode = .on, .max_step_items = 8 };
+    const base = config.schedulerPolicy();
+    try std.testing.expectEqual(@as(usize, 2), base.max_step_items);
+    try std.testing.expect(!base.allow_mixed_sequence_lengths);
+    const metal = config.gemma4MetalOcrPolicyForRows(4);
+    try std.testing.expectEqual(@as(usize, 4), metal.max_step_items);
+    try std.testing.expectEqual(@as(usize, 4), metal.max_active_requests_for_batching.?);
+    try std.testing.expect(metal.allow_mixed_sequence_lengths);
+    try std.testing.expectEqual(@as(usize, 1), config.gemma4MetalOcrPolicyForRows(0).max_step_items);
+    try std.testing.expectEqual(@as(usize, 4), config.gemma4MetalOcrPolicyForRows(99).max_step_items);
+}
+
+test "Metal OCR coordinator packs four unequal page positions" {
+    const a = std.testing.allocator;
+    var coordinator = runtime.scheduler.native_generate.NativeGenerateCoordinator.init(a);
+    defer coordinator.deinit();
+    const config = GenerationBatchingConfig{};
+    coordinator.setPolicy(config.gemma4MetalOcrPolicyForRows(4));
+    var leases: [4]runtime.scheduler.native_generate.Lease = undefined;
+    var initialized: usize = 0;
+    defer for (leases[0..initialized]) |lease| coordinator.release(lease);
+    var work: [4]u8 = undefined;
+    for (&leases, 0..) |*lease, row| {
+        lease.* = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 64, .max_tokens = 8 });
+        initialized += 1;
+        coordinator.beginDecode(lease, 10 + row);
+        try coordinator.enqueueDecodeWork(lease.*, @ptrCast(&work[row]), 11 + row, 11 + row, 0, .{});
+    }
+    var claimed = std.ArrayListUnmanaged(runtime.scheduler.native_generate.StepItem).empty;
+    defer claimed.deinit(a);
+    try std.testing.expect(try coordinator.claimStep(a, &leases[0], @ptrCast(&work[0]), .decode, coordinator.defaultStepBudget(), &claimed));
+    try std.testing.expectEqual(@as(usize, 4), claimed.items.len);
+    coordinator.completeStep(&leases[0], claimed.items);
+}
+
+test "generation batch corrupt images are permanent while allocation failures remain retryable" {
+    const bad_image = batchGenerationError(error.ImageDecodeFailed);
+    try std.testing.expectEqualStrings("INVALID_IMAGE", bad_image.code);
+    try std.testing.expect(!bad_image.retryable);
+    const allocation = batchGenerationError(error.OutOfMemory);
+    try std.testing.expect(allocation.retryable);
+}
+
+test "Metal OCR continuous window keeps GPU cohorts bounded" {
+    const config = GenerationBatchingConfig{};
+    const policy = config.gemma4MetalOcrContinuousPolicyForRows(4, 8);
+    try std.testing.expectEqual(@as(usize, 4), policy.max_step_items);
+    try std.testing.expectEqual(@as(usize, 8), policy.max_active_requests_for_batching.?);
+    try std.testing.expectEqual(@as(usize, 16), config.gemma4MetalOcrContinuousPolicyForRows(4, 999).max_active_requests_for_batching.?);
+    try std.testing.expectEqual(@as(usize, 4), config.gemma4MetalOcrContinuousPolicyForRows(4, 0).max_active_requests_for_batching.?);
+}
+
+test "Metal OCR continuous coordinator refills four row cohorts from eight unequal pages" {
+    const a = std.testing.allocator;
+    var coordinator = runtime.scheduler.native_generate.NativeGenerateCoordinator.init(a);
+    defer coordinator.deinit();
+    coordinator.setPolicy((GenerationBatchingConfig{}).gemma4MetalOcrContinuousPolicyForRows(4, 8));
+    var leases: [9]runtime.scheduler.native_generate.Lease = undefined;
+    var initialized: usize = 0;
+    defer for (leases[0..initialized]) |lease| if (lease.request_id != 0) {
+        coordinator.release(lease);
+    };
+    var work: [9]u8 = undefined;
+    for (leases[0..8], 0..) |*lease, row| {
+        lease.* = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 64, .max_tokens = 8 });
+        initialized += 1;
+        coordinator.beginDecode(lease, 10 + row * 17);
+        try coordinator.enqueueDecodeWork(lease.*, @ptrCast(&work[row]), 11 + row * 17, 11 + row * 17, 0, .{});
+    }
+    var claimed = std.ArrayListUnmanaged(runtime.scheduler.native_generate.StepItem).empty;
+    defer claimed.deinit(a);
+    try std.testing.expect(coordinator.shouldBatchCurrentRequests());
+    try std.testing.expect(try coordinator.claimStep(a, &leases[0], @ptrCast(&work[0]), .decode, coordinator.defaultStepBudget(), &claimed));
+    try std.testing.expectEqual(@as(usize, 4), claimed.items.len);
+    coordinator.completeStep(&leases[0], claimed.items);
+    coordinator.release(leases[0]);
+    leases[0].request_id = 0;
+    leases[8] = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 64, .max_tokens = 8 });
+    initialized += 1;
+    coordinator.beginDecode(&leases[8], 1000);
+    try coordinator.enqueueDecodeWork(leases[8], @ptrCast(&work[8]), 1001, 1001, 0, .{});
+    claimed.clearRetainingCapacity();
+    try std.testing.expect(try coordinator.claimStep(a, &leases[4], @ptrCast(&work[4]), .decode, coordinator.defaultStepBudget(), &claimed));
+    try std.testing.expectEqual(@as(usize, 4), claimed.items.len);
+    for (claimed.items) |item| try std.testing.expect(item.work_ptr != @as(*anyopaque, @ptrCast(&work[0])));
+    coordinator.completeStep(&leases[4], claimed.items);
+    claimed.clearRetainingCapacity();
+    try std.testing.expect(try coordinator.claimStep(a, &leases[8], @ptrCast(&work[8]), .decode, coordinator.defaultStepBudget(), &claimed));
+    try std.testing.expectEqual(@as(usize, 1), claimed.items.len);
+    coordinator.completeStep(&leases[8], claimed.items);
+}
+
+test "inference HTTP inline media body limit remains bounded and configurable" {
+    try std.testing.expectEqual(@as(usize, 32 * 1024 * 1024), try httpBodyLimitBytesFromMib(32));
+    try std.testing.expectError(error.InvalidHttpBodyLimit, httpBodyLimitBytesFromMib(0));
+    try std.testing.expectError(error.InvalidHttpBodyLimit, httpBodyLimitBytesFromMib(std.math.maxInt(usize)));
+    try std.testing.expectError(error.InvalidHttpTransportCapacity, Node.init(std.testing.allocator, .{ .http_max_body_bytes = 0 }));
+    var node: Node = undefined;
+    node.config = .{};
+    try std.testing.expectEqual(@as(usize, 10 * 1024 * 1024), node.httpServerConfig("127.0.0.1", 8090).max_body_size);
+    node.config.http_max_body_bytes = try httpBodyLimitBytesFromMib(32);
+    const transport = node.httpServerConfig("127.0.0.1", 8090).normalized();
+    try std.testing.expectEqual(node.config.http_max_body_bytes, transport.max_body_size);
+    try std.testing.expectEqual(@as(usize, 64 * 1024 * 1024), transport.request_body_buffer_budget_bytes);
 }

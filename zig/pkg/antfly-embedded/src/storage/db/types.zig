@@ -1817,6 +1817,7 @@ pub const GraphQueryTransport = struct {
     }
 };
 
+pub const document_authority = @import("query/document_authority.zig");
 pub const SearchRequest = struct {
     pub fn hasHitEvaluation(self: @This()) bool {
         return self.evaluation_limit > 0 and !self.evaluation_graph;
@@ -1826,6 +1827,9 @@ pub const SearchRequest = struct {
     /// from public JSON. Independent graph fanout tasks reserve owned children.
     execution_runnable: ?@import("antfly_runtime_abi").runnable_abi.Borrowed = null,
 
+    /// Authenticated internal two-phase hydration, never set by public parsing.
+    document_authority_mode: document_authority.Mode = .none,
+    document_authority_group: u64 = 0,
     evaluation_json: []const u8 = "",
     evaluation_limit: u32 = 0,
     evaluation_matches: bool = false,
@@ -2012,6 +2016,8 @@ const hierarchy_children_validated_fields = [_][]const u8{
 };
 
 const hierarchy_children_supported_internal_fields = [_][]const u8{
+    "document_authority_mode",
+    "document_authority_group",
     "response_table_name",
     "prepared_read_table_id",
     "native_query_cut",
@@ -2522,6 +2528,8 @@ pub const ColumnSource = @import("column_source.zig").Row;
 pub const ColumnSourcePage = @import("column_source.zig").Page;
 
 pub const SearchHit = struct {
+    /// Owned internal selection proof; absent on ordinary/public results.
+    document_authority: ?*const @import("query/document_authority.zig").Authority = null,
     computed_json: ?[]u8 = null,
     id: []u8,
     /// Internal graph-hydration namespace. Null means the query's source
@@ -2557,6 +2565,7 @@ pub const SearchHit = struct {
         var cloned = SearchHit{ .id = try alloc.dupe(u8, self.id) };
         errdefer {
             alloc.free(cloned.id);
+            if (cloned.document_authority) |proof| alloc.destroy(proof);
             if (cloned.computed_json) |data| alloc.free(data);
             if (cloned.source_table) |table| alloc.free(table);
             if (cloned.score_details) |*details| details.deinit(alloc);
@@ -2569,6 +2578,11 @@ pub const SearchHit = struct {
             if (cloned.ancestor_unit_data) |data| alloc.free(data);
             if (cloned.artifact_ref) |*artifact_ref| artifact_ref.deinit(alloc);
             freeHighlights(alloc, cloned.highlights);
+        }
+        if (self.document_authority) |proof| {
+            const owned = try alloc.create(@import("query/document_authority.zig").Authority);
+            owned.* = proof.*;
+            cloned.document_authority = owned;
         }
         cloned.computed_json = if (self.computed_json) |data| try alloc.dupe(u8, data) else null;
         cloned.source_table = if (self.source_table) |table| try alloc.dupe(u8, table) else null;
@@ -2605,6 +2619,7 @@ pub const SearchHit = struct {
 
     pub fn deinit(self: *SearchHit, alloc: Allocator) void {
         alloc.free(self.id);
+        if (self.document_authority) |proof| alloc.destroy(proof);
         if (self.computed_json) |data| alloc.free(data);
         if (self.source_table) |table| alloc.free(table);
         if (self.score_details) |*details| details.deinit(alloc);
@@ -2864,6 +2879,7 @@ pub const ShardIdentityReadGeneration = struct {
 };
 
 pub const SearchResult = struct {
+    document_authority_version: u32 = 0,
     alloc: Allocator,
     hits: []SearchHit,
     total_hits: u32,

@@ -31,7 +31,404 @@ pub fn attach(handle: *h.Handle, db: *h.db_mod.DB) void {
 
 /// Read-only candidate seam also used by ephemeral query resolution.
 pub fn candidateSource(handle: *h.Handle) callbacks.CandidateSource {
-    return .{ .ptr = handle.parent_handle orelse handle, .vtable = &.{ .get = candidateGet, .scan_prefix = candidateScan, .nearest = candidateNearest, .bound_table = boundTable, .embed_mention = embedMention } };
+    return .{ .ptr = handle.parent_handle orelse handle, .vtable = &.{ .get = candidateGet, .scan_prefix = candidateScan, .nearest = candidateNearest, .bound_table = boundTable, .embed_mention = embedMention, .revisions = candidateRevisions, .embedding_cache_prepare = embeddingCachePrepare, .embedding_cache_flush = embeddingCacheFlush, .embedding_cache_get = embeddingCacheGet, .embedding_cache_put = embeddingCachePut, .load_vector = loadVector } };
+}
+
+fn candidateRevisions(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, index: []const u8, embedding: []const u8) anyerror!callbacks.CandidateSource.Revisions {
+    const handle: *h.Handle = @ptrCast(@alignCast(ptr));
+    // Directory handles permit concurrent writes; without a pinned candidate
+    // snapshot they must refetch. Native calls own the database path gate.
+    const database = try tables.get(handle, table);
+    const physical = try boundTable(ptr, table);
+    const index_config = database.core.index_manager.get(index);
+    var schema = database.core.acquireSchemaView();
+    defer if (schema) |*view| view.release();
+    const time_dependent = if (schema) |view| view.visibilityTtlDurationNs() != 0 else false;
+    const hash = @import("antfly_resolver").fingerprint;
+    const embedder = database.resolution_embedder orelse if (database.enrichment_runtime) |runtime| runtime.config.dense_embedder else null;
+    const model_revision: ?[32]u8 = if (embedder) |provider| blk: {
+        if (embedding.len == 0) break :blk null;
+        const revision = provider.cache_revision_fn orelse break :blk null;
+        break :blk try revision(provider.ptr, a, embedding);
+    } else null;
+    var applied = try database.core.loadAppliedSequence(a, index);
+    if (database.executor.appliedSequence(index)) |live| applied = @max(applied, live);
+    return .{
+        .candidates = if (time_dependent or handle.lite_profile != .native) null else try hash(a, .{ physical, database.core.nextDerivedSequence(), database.core.nextEnrichmentSequence(), index_config, applied }),
+        .embedding = if (model_revision) |revision| try hash(a, .{revision}) else null,
+    };
+}
+
+const embedding_cache_prefix = "\x00antfly/cache/mention_embeddings/v2/";
+const embedding_cache_bytes_key = "\x00antfly/cache/mention_embeddings/bytes_v2";
+const embedding_cache_limit: usize = 256 * 1024 * 1024;
+var embedding_cache_limit_for_test: ?usize = null;
+const embedding_cache_pending_limit: usize = 16 * 1024 * 1024;
+const embedding_cache_retention_ns: i64 = 30 * std.time.ns_per_day;
+const embedding_cache_sweep_key = "\x00antfly/cache/mention_embeddings/last_sweep_ns";
+
+fn embeddingCacheKey(a: std.mem.Allocator, digest: [32]u8) ![]u8 {
+    return std.fmt.allocPrint(a, "{s}{s}", .{ embedding_cache_prefix, std.fmt.bytesToHex(digest, .lower) });
+}
+
+fn decodeCachedVector(a: std.mem.Allocator, raw: []const u8) !?[]const f32 {
+    if (raw.len < 48 or !std.mem.eql(u8, raw[0..4], "ECF2")) return null;
+    const now: i64 = @intCast(std.Io.Clock.real.now(h.handleLockIo()).nanoseconds);
+    const created = std.mem.readInt(i64, raw[40..48], .little);
+    if (now >= created and now - created > embedding_cache_retention_ns) return null;
+    const count = std.mem.readInt(u32, raw[4..8], .little);
+    if (count == 0 or raw.len != 48 + @as(usize, count) * 4) return null;
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(raw[48..], &hash, .{});
+    if (!std.mem.eql(u8, &hash, raw[8..40])) return null;
+    const vector = try a.alloc(f32, count);
+    for (vector, 0..) |*value, i| {
+        value.* = @bitCast(std.mem.readInt(u32, raw[48 + i * 4 ..][0..4], .little));
+        if (!std.math.isFinite(value.*)) {
+            a.free(vector);
+            return null;
+        }
+    }
+    return vector;
+}
+
+fn embeddingCacheGet(ptr: *anyopaque, a: std.mem.Allocator, digest: [32]u8) anyerror!?[]const f32 {
+    const root: *h.Handle = @ptrCast(@alignCast(ptr));
+    lockCache(&root.embedding_cache_mutex);
+    if (root.embedding_cache_pending.get(digest)) |raw| {
+        defer root.embedding_cache_mutex.unlock();
+        return decodeCachedVector(a, raw);
+    }
+    root.embedding_cache_mutex.unlock();
+    const key = try embeddingCacheKey(a, digest);
+    defer a.free(key);
+    var read = try root.db.core.store.beginReadTxn();
+    defer read.abort();
+    const raw = read.get(key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    return decodeCachedVector(a, raw);
+}
+
+fn lockCache(mutex: *std.atomic.Mutex) void {
+    while (!mutex.tryLock()) @import("antfly_platform").time.yieldNow();
+}
+
+fn embeddingCachePut(ptr: *anyopaque, digest: [32]u8, vector: []const f32) anyerror!void {
+    const root: *h.Handle = @ptrCast(@alignCast(ptr));
+    if (!h.liteOpenModeCanWrite(root.open_mode) or vector.len == 0 or vector.len > 4 * 1024 * 1024) return;
+    const raw = try root.alloc.alloc(u8, 48 + vector.len * 4);
+    errdefer root.alloc.free(raw);
+    @memcpy(raw[0..4], "ECF2");
+    std.mem.writeInt(u32, raw[4..8], @intCast(vector.len), .little);
+    std.mem.writeInt(i64, raw[40..48], @intCast(std.Io.Clock.real.now(h.handleLockIo()).nanoseconds), .little);
+    for (vector, 0..) |value, i| {
+        if (!std.math.isFinite(value)) {
+            root.alloc.free(raw);
+            return;
+        }
+        std.mem.writeInt(u32, raw[48 + i * 4 ..][0..4], @bitCast(value), .little);
+    }
+    std.crypto.hash.sha2.Sha256.hash(raw[48..], raw[8..40], .{});
+    lockCache(&root.embedding_cache_mutex);
+    defer root.embedding_cache_mutex.unlock();
+    if (root.embedding_cache_pending.contains(digest) or root.embedding_cache_pending_bytes + raw.len > embedding_cache_pending_limit) {
+        root.alloc.free(raw);
+        return;
+    }
+    try root.embedding_cache_pending.put(root.alloc, digest, raw);
+    root.embedding_cache_pending_bytes += raw.len;
+}
+
+const PreparedEmbeddingCache = struct {
+    root: *h.Handle,
+    arena: std.heap.ArenaAllocator,
+    writes: []const callbacks.CandidateSource.CacheBatch.Write,
+    deletes: []const []const u8,
+    keys: []const [32]u8,
+    fn finish(ptr: *anyopaque, committed: bool) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const root = self.root;
+        if (committed) {
+            lockCache(&root.embedding_cache_mutex);
+            for (self.keys) |key| if (root.embedding_cache_pending.fetchRemove(key)) |entry| {
+                root.embedding_cache_pending_bytes -= entry.value.len;
+                root.alloc.free(entry.value);
+            };
+            root.embedding_cache_mutex.unlock();
+        }
+        self.arena.deinit();
+        root.alloc.destroy(self);
+        root.embedding_cache_commit_mutex.unlock();
+    }
+};
+
+fn prepareEmbeddingCache(root: *h.Handle) !callbacks.CandidateSource.CacheBatch {
+    lockCache(&root.embedding_cache_commit_mutex);
+    errdefer root.embedding_cache_commit_mutex.unlock();
+    const state = try root.alloc.create(PreparedEmbeddingCache);
+    errdefer root.alloc.destroy(state);
+    state.* = .{ .root = root, .arena = std.heap.ArenaAllocator.init(root.alloc), .writes = &.{}, .deletes = &.{}, .keys = &.{} };
+    errdefer state.arena.deinit();
+    const a = state.arena.allocator();
+    var writes: std.ArrayList(callbacks.CandidateSource.CacheBatch.Write) = .empty;
+    var deletes: std.ArrayList([]const u8) = .empty;
+    var keys: std.ArrayList([32]u8) = .empty;
+    var read = try root.db.core.store.beginReadTxn();
+    defer read.abort();
+    const old_usage = read.get(embedding_cache_bytes_key) catch "0";
+    var usage = std.fmt.parseInt(usize, old_usage, 10) catch 0;
+    lockCache(&root.embedding_cache_mutex);
+    {
+        defer root.embedding_cache_mutex.unlock();
+        var it = root.embedding_cache_pending.iterator();
+        while (it.next()) |entry| {
+            const key = try embeddingCacheKey(a, entry.key_ptr.*);
+            const old = read.get(key) catch "";
+            usage -|= if (old.len > 0) old.len + key.len else 0;
+            usage +|= entry.value_ptr.*.len + key.len;
+            try writes.append(a, .{ .key = key, .value = try a.dupe(u8, entry.value_ptr.*) });
+            try keys.append(a, entry.key_ptr.*);
+        }
+    }
+    // Bound the complete shared cache, independent of mention/document/table
+    // count. Eviction touches only cache keys; live references may recompute.
+    var cursor = try read.openCursor();
+    defer cursor.close();
+    var row = try cursor.seekAtOrAfter(embedding_cache_prefix);
+    const limit = if (@import("builtin").is_test) embedding_cache_limit_for_test orelse embedding_cache_limit else embedding_cache_limit;
+    while (usage > limit) {
+        const kv = row orelse break;
+        if (!std.mem.startsWith(u8, kv.key, embedding_cache_prefix)) break;
+        var replaced = false;
+        for (writes.items) |write| if (std.mem.eql(u8, write.key, kv.key)) {
+            replaced = true;
+            break;
+        };
+        if (!replaced) {
+            try deletes.append(a, try a.dupe(u8, kv.key));
+            usage -|= kv.key.len + kv.value.len;
+        }
+        row = try cursor.next();
+    }
+    while (usage > limit and writes.items.len > 0) {
+        const dropped = writes.pop().?;
+        usage -|= dropped.key.len + dropped.value.len;
+        if (read.get(dropped.key)) |old| {
+            try deletes.append(a, dropped.key);
+            _ = old;
+        } else |_| {}
+    }
+    try writes.append(a, .{ .key = embedding_cache_bytes_key, .value = try std.fmt.allocPrint(a, "{d}", .{usage}) });
+    state.writes = writes.items;
+    state.deletes = deletes.items;
+    state.keys = keys.items;
+    return .{ .ptr = state, .writes = state.writes, .deletes = state.deletes, .finish = PreparedEmbeddingCache.finish };
+}
+
+fn embeddingCachePrepare(ptr: *anyopaque, _: std.mem.Allocator, store: *anyopaque) anyerror!?callbacks.CandidateSource.CacheBatch {
+    const root: *h.Handle = @ptrCast(@alignCast(ptr));
+    if (store != @as(*anyopaque, @ptrCast(root.db.core.store))) return null;
+    lockCache(&root.embedding_cache_mutex);
+    const pending = root.embedding_cache_pending.count();
+    root.embedding_cache_mutex.unlock();
+    if (pending == 0) return null;
+    return try prepareEmbeddingCache(root);
+}
+
+fn embeddingCacheFlush(ptr: *anyopaque) anyerror!void {
+    const root: *h.Handle = @ptrCast(@alignCast(ptr));
+    lockCache(&root.embedding_cache_mutex);
+    const pending = root.embedding_cache_pending.count();
+    root.embedding_cache_mutex.unlock();
+    if (pending == 0) return;
+    const batch = try prepareEmbeddingCache(root);
+    var committed = false;
+    defer batch.finish(batch.ptr, committed);
+    var txn = try root.db.core.store.beginWriteTxn();
+    errdefer txn.abort();
+    for (batch.deletes) |key| try txn.delete(key);
+    for (batch.writes) |write| try txn.put(write.key, write.value);
+    try txn.commit();
+    committed = true;
+}
+
+fn loadVector(ptr: *anyopaque, a: std.mem.Allocator, ref: @import("antfly_resolver").VectorReference) anyerror!?[]const f32 {
+    const root: *h.Handle = @ptrCast(@alignCast(ptr));
+    const current = (try candidateRevisions(ptr, a, ref.table, ref.index_name, "")).candidates orelse return null;
+    if (!std.mem.eql(u8, &current, &ref.index_revision)) return null;
+    const database = try tables.get(root, ref.table);
+    if (ref.vector_id) |id| {
+        if ((try database.core.index_manager.lookupDenseVectorId(database.core.store, ref.index_name, ref.key)) != id) return null;
+        const dense = database.core.index_manager.denseIndex(ref.index_name) orelse return null;
+        var txn = try dense.index.beginReadTxn();
+        defer txn.abort();
+        const vector = try a.alloc(f32, ref.dimensions);
+        const loaded = dense.index.getVectorInto(&txn, id, vector) catch {
+            a.free(vector);
+            return null;
+        };
+        if (loaded.len != ref.dimensions) {
+            a.free(vector);
+            return null;
+        }
+        return vector;
+    }
+    const raw = try candidateGet(ptr, a, ref.table, ref.key) orelse return null;
+    defer a.free(raw);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const field = parsed.value.object.get(ref.field) orelse return null;
+    if (field != .array or field.array.items.len != ref.dimensions) return null;
+    const vector = try a.alloc(f32, ref.dimensions);
+    for (field.array.items, vector) |value, *out| switch (value) {
+        .float => |n| out.* = @floatCast(n),
+        .integer => |n| out.* = @floatFromInt(n),
+        else => {
+            a.free(vector);
+            return null;
+        },
+    };
+    return vector;
+}
+
+const embedding_cache_cursor_key = "\x00antfly/cache/mention_embeddings/sweep_cursor";
+
+/// Incremental expiration scans cache keys only, never documents/artifacts.
+fn sweepEmbeddingCachePage(root: *h.Handle) !void {
+    const now: i64 = @intCast(std.Io.Clock.real.now(h.handleLockIo()).nanoseconds);
+    lockCache(&root.embedding_cache_commit_mutex);
+    defer root.embedding_cache_commit_mutex.unlock();
+    var read = try root.db.core.store.beginReadTxn();
+    defer read.abort();
+    const resume_key = read.get(embedding_cache_cursor_key) catch "";
+    const stamp = read.get(embedding_cache_sweep_key) catch "0";
+    const previous = std.fmt.parseInt(i64, stamp, 10) catch 0;
+    if (resume_key.len == 0 and now >= previous and now - previous < 15 * std.time.ns_per_min) return;
+    var usage = std.fmt.parseInt(usize, read.get(embedding_cache_bytes_key) catch "0", 10) catch 0;
+    const prefix = "\x00antfly/cache/mention_embeddings/v";
+    var cursor = try read.openCursor();
+    defer cursor.close();
+    var row = try cursor.seekAtOrAfter(if (resume_key.len == 0) prefix else resume_key);
+    if (row != null and resume_key.len != 0 and std.mem.eql(u8, row.?.key, resume_key)) row = try cursor.next();
+    var write = try root.db.core.store.beginWriteTxn();
+    errdefer write.abort();
+    var count: usize = 0;
+    var last: []const u8 = "";
+    defer root.alloc.free(last);
+    while (row) |kv| : (row = try cursor.next()) {
+        if (!std.mem.startsWith(u8, kv.key, prefix)) {
+            row = null;
+            break;
+        }
+        if (count == 256) break;
+        count += 1;
+        const owned_key = try root.alloc.dupe(u8, kv.key);
+        root.alloc.free(last);
+        last = owned_key;
+        const current = std.mem.startsWith(u8, kv.key, embedding_cache_prefix);
+        const expired = !current or kv.value.len < 48 or !std.mem.eql(u8, kv.value[0..4], "ECF2") or
+            now -| std.mem.readInt(i64, kv.value[40..48], .little) > embedding_cache_retention_ns;
+        if (expired) {
+            try write.delete(kv.key);
+            if (current) usage -|= kv.key.len + kv.value.len;
+        }
+    }
+    if (row == null) {
+        try write.delete(embedding_cache_cursor_key);
+        const text = try std.fmt.allocPrint(root.alloc, "{d}", .{now});
+        defer root.alloc.free(text);
+        try write.put(embedding_cache_sweep_key, text);
+    } else try write.put(embedding_cache_cursor_key, last);
+    const bytes = try std.fmt.allocPrint(root.alloc, "{d}", .{usage});
+    defer root.alloc.free(bytes);
+    try write.put(embedding_cache_bytes_key, bytes);
+    try write.commit();
+}
+
+/// Opportunistic periodic mark/sweep. Artifacts own references, never cache
+/// entries; races with an unfinished artifact only cause harmless recomputation.
+pub fn collectEmbeddingCache(root: *h.Handle, force: bool) !void {
+    if (!h.liteOpenModeCanWrite(root.open_mode)) return;
+    if (!force) return sweepEmbeddingCachePage(root);
+    try embeddingCacheFlush(root);
+    lockCache(&root.embedding_cache_commit_mutex);
+    defer root.embedding_cache_commit_mutex.unlock();
+    const now = std.math.cast(i64, std.Io.Clock.real.now(h.handleLockIo()).nanoseconds) orelse return;
+    if (!force) {
+        var read = try root.db.core.store.beginReadTxn();
+        defer read.abort();
+        const last = read.get(embedding_cache_sweep_key) catch |err| switch (err) {
+            error.NotFound => "0",
+            else => return err,
+        };
+        const timestamp = std.fmt.parseInt(i64, last, 10) catch 0;
+        if (now >= timestamp and now - timestamp < 15 * std.time.ns_per_min) return;
+    }
+    var live: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
+    defer live.deinit(root.alloc);
+    const Mark = struct {
+        fn table(a: std.mem.Allocator, database: *h.db_mod.DB, keys: *std.AutoHashMapUnmanaged([32]u8, void)) !void {
+            var read = try database.core.store.beginReadTxn();
+            defer read.abort();
+            var cursor = try read.openCursor();
+            defer cursor.close();
+            var row = try cursor.seekAtOrAfter("");
+            while (row) |kv| : (row = try cursor.next()) {
+                if (!@import("../storage/internal_keys.zig").isResolutionArtifactKey(kv.key)) continue;
+                var arena = std.heap.ArenaAllocator.init(a);
+                defer arena.deinit();
+                const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), kv.value, .{}) catch continue;
+                if (parsed != .object) continue;
+                const work = parsed.object.get("_resolution_work") orelse continue;
+                if (work != .object) continue;
+                const mentions = work.object.get("mentions") orelse continue;
+                if (mentions != .array) continue;
+                for (mentions.array.items) |mention| {
+                    if (mention != .object) continue;
+                    const value = mention.object.get("embedding_key") orelse continue;
+                    const key = std.json.parseFromValueLeaky(?[32]u8, arena.allocator(), value, .{}) catch continue;
+                    if (key) |digest| try keys.put(a, digest, {});
+                }
+            }
+        }
+    };
+    try Mark.table(root.alloc, &root.db, &live);
+    var tables_it = root.embedded_tables.valueIterator();
+    while (tables_it.next()) |table| try Mark.table(root.alloc, &table.*.db, &live);
+    var read = try root.db.core.store.beginReadTxn();
+    defer read.abort();
+    var cursor = try read.openCursor();
+    defer cursor.close();
+    var write = try root.db.core.store.beginWriteTxn();
+    errdefer write.abort();
+    var deleted: usize = 0;
+    var retained_bytes: usize = 0;
+    var row = try cursor.seekAtOrAfter(embedding_cache_prefix);
+    while (row) |kv| : (row = try cursor.next()) {
+        if (!std.mem.startsWith(u8, kv.key, embedding_cache_prefix)) break;
+        var digest: [32]u8 = undefined;
+        const parsed = if (kv.key.len == embedding_cache_prefix.len + 64) std.fmt.hexToBytes(&digest, kv.key[embedding_cache_prefix.len..]) catch null else null;
+        if (parsed != null and live.contains(digest)) {
+            retained_bytes += kv.key.len + kv.value.len;
+            continue;
+        }
+        try write.delete(kv.key);
+        deleted += 1;
+        if (deleted % 1024 == 0) {
+            try write.commit();
+            write = try root.db.core.store.beginWriteTxn();
+        }
+    }
+    const stamp = try std.fmt.allocPrint(root.alloc, "{d}", .{now});
+    defer root.alloc.free(stamp);
+    try write.put(embedding_cache_sweep_key, stamp);
+    const usage = try std.fmt.allocPrint(root.alloc, "{d}", .{retained_bytes});
+    defer root.alloc.free(usage);
+    try write.put(embedding_cache_bytes_key, usage);
+    try write.commit();
 }
 
 fn embedMention(ptr: *anyopaque, allocator: std.mem.Allocator, table: []const u8, embedding_name: []const u8, text: []const u8, dims: u32) anyerror![]f32 {
@@ -87,8 +484,11 @@ fn merge(a: std.mem.Allocator, current: ?[]const u8, incoming: []const u8, key: 
         if (redirect != .string) return error.InvalidEntityPromotionDocument;
         try ops.append(a, .{ .op = .set, .path = "merged_into", .value_json = try std.json.Stringify.valueAlloc(a, redirect, .{}) });
         if (document.object.get("merged_into_table")) |table| {
-            if (table != .string) return error.InvalidEntityPromotionDocument;
-            try ops.append(a, .{ .op = .set, .path = "merged_into_table", .value_json = try std.json.Stringify.valueAlloc(a, table, .{}) });
+            switch (table) {
+                .string => try ops.append(a, .{ .op = .set, .path = "merged_into_table", .value_json = try std.json.Stringify.valueAlloc(a, table, .{}) }),
+                .null => try ops.append(a, .{ .op = .unset, .path = "merged_into_table" }),
+                else => return error.InvalidEntityPromotionDocument,
+            }
         } else try ops.append(a, .{ .op = .unset, .path = "merged_into_table" });
     }
     if (ops.items.len == 0) return error.InvalidEntityPromotionDocument;
@@ -99,6 +499,10 @@ fn upsertBatch(ptr: *anyopaque, allocator: std.mem.Allocator, entries: []const c
     const handle: *h.Handle = @ptrCast(@alignCast(ptr));
     if (!h.liteOpenModeCanWrite(handle.open_mode)) return error.ReadOnly;
     if (entries.len == 0) return;
+    // Source-table workers share one destination coordinator. Serialize only
+    // canonical read/merge/commit, never extraction, embedding or candidate work.
+    handle.promotion_commit_mutex.lockUncancelable(h.handleLockIo());
+    defer handle.promotion_commit_mutex.unlock(h.handleLockIo());
     try @import("sql_commit.zig").recover(handle);
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -142,13 +546,16 @@ fn upsertBatch(ptr: *anyopaque, allocator: std.mem.Allocator, entries: []const c
 pub fn runUntilIdle(handle: *h.Handle) !void {
     const root = handle.parent_handle orelse handle;
     if (root.embedded_path == null) return handle.database().runUntilIdle();
-    try tables.load(root);
+    try tables.loadAvailable(root);
     for (0..1024) |_| {
         const before = replaySequence(root);
         try root.db.runUntilIdle();
         var iterator = root.embedded_tables.valueIterator();
         while (iterator.next()) |table| try table.*.db.runUntilIdle();
-        if (before == replaySequence(root)) return;
+        if (before == replaySequence(root)) {
+            collectEmbeddingCache(root, false) catch {};
+            return;
+        }
     }
     return error.RunUntilIdleDidNotConverge;
 }
@@ -227,7 +634,23 @@ fn candidateNearest(ptr: *anyopaque, a: std.mem.Allocator, name: []const u8, que
         };
         const hydrated = try hydrateCandidate(a, json, query.vector_fields, vector);
         defer if (hydrated) |bytes| a.free(bytes);
-        try consume(ctx, hit.id, hydrated orelse json);
+        const revision = if (query.cache_vectors) (try candidateRevisions(ptr, a, name, query.index_name, "")).candidates else null;
+        if (revision) |epoch| {
+            var parsed = try std.json.parseFromSlice(std.json.Value, a, hydrated orelse json, .{});
+            defer parsed.deinit();
+            const arena = parsed.arena.allocator();
+            const original = try std.json.parseFromSliceLeaky(std.json.Value, arena, json, .{});
+            var refs: std.ArrayList(@import("antfly_resolver").VectorReference) = .empty;
+            for (query.vector_fields) |field| if (parsed.value.object.get(field)) |value| {
+                if (value != .array) continue;
+                try refs.append(arena, .{ .field = field, .table = name, .index_name = query.index_name, .key = hit.id, .vector_id = if (original.object.contains(field)) null else vector_id, .index_revision = epoch, .dimensions = value.array.items.len });
+            };
+            const wire = try std.json.Stringify.valueAlloc(arena, refs.items, .{});
+            try parsed.value.object.put(arena, "_resolution_vector_refs", try std.json.parseFromSliceLeaky(std.json.Value, arena, wire, .{}));
+            const referenced = try std.json.Stringify.valueAlloc(a, parsed.value, .{});
+            defer a.free(referenced);
+            try consume(ctx, hit.id, referenced);
+        } else try consume(ctx, hit.id, hydrated orelse json);
     };
 }
 
@@ -544,10 +967,17 @@ test "capi Lite promotion resolves ANN and explicit aliases through stored entit
     // hand-written canonical row or vector. A deterministic provider makes
     // this production drain path run in ordinary CI without model downloads.
     const Embedder = struct {
+        model_revision: u8 = 1,
         mention_calls: usize = 0,
         entity_calls: usize = 0,
+        forbid_model_load: bool = false,
+        fn revision(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8) !?[32]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return @as([32]u8, @splat(self.model_revision));
+        }
         fn embed(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, _: []const u8, dims: u32) anyerror![]f32 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.forbid_model_load) return error.UnexpectedModelLoad;
             if (std.mem.eql(u8, name, "mention_names")) self.mention_calls += 1 else self.entity_calls += 1;
             if (dims != 3) return error.InvalidArgument;
             return try alloc.dupe(f32, &.{ 1, 0, 0 });
@@ -555,12 +985,12 @@ test "capi Lite promotion resolves ANN and explicit aliases through stored entit
     };
     var embed_context: Embedder = .{};
     try entities.addEnrichment(.{ .name = "entity_names", .kind = .embedding, .field = "canonical_name", .vector_space = "names", .expected_dims = 3 });
-    try entities.reconfigureEnrichmentRuntime(.{ .enable_without_producers = true, .dense_embedder = .{ .ptr = &embed_context, .dense_embed_fn = Embedder.embed } });
+    try entities.reconfigureEnrichmentRuntime(.{ .enable_without_producers = true, .dense_embedder = .{ .ptr = &embed_context, .dense_embed_fn = Embedder.embed, .cache_revision_fn = Embedder.revision } });
     const config =
         \\{"name":"knowledge","type":"graph","source":{"artifact":"kg","format":"extraction_graph","mention_edge_type":"mentions"},"artifact":{"name":"kg","kind":"asset","source":{"type":"field","value":"kg"},"content_type":"application/json"},"edge_types":[{"name":"mentions"}],"resolvers":[{"name":"concepts","table":"entities","source_artifact":"kg","resolution_artifact":"resolved","key_template":"concept/{{ slug _entity.text }}","candidate_search":"ann","candidate_ann_index":"names","candidate_limit":1,"name_embedding":"mention_names","name_embedding_dims":3,"scorer_json":"{\"comparisons\":[{\"name\":\"embedding\",\"left\":\"name_embedding\",\"right\":\"canonical_embedding\",\"levels\":[{\"when\":\"cosine > 0.9\",\"weight\":8.0},{\"else\":true,\"weight\":-6.0}]}],\"combine\":{\"bias\":-3.0},\"decision\":{\"match\":0.9}}","config_generation":1}]}
     ;
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(id, .fromSlice(config)));
-    const fake_embedder: @import("../storage/db/enrichment/embedder.zig").DenseEmbedder = .{ .ptr = &embed_context, .dense_embed_fn = Embedder.embed };
+    const fake_embedder: @import("../storage/db/enrichment/embedder.zig").DenseEmbedder = .{ .ptr = &embed_context, .dense_embed_fn = Embedder.embed, .cache_revision_fn = Embedder.revision };
     try handle.db.reconfigureEnrichmentRuntime(.{ .enable_without_producers = true, .dense_embedder = fake_embedder });
     handle.db.setResolutionEmbedder(fake_embedder);
     try handle.db.batch(.{ .writes = &.{.{ .key = "claim:seed", .value = "{\"kg\":{\"entities\":[{\"id\":\"e0\",\"label\":\"concept\",\"text\":\"Approval reviewer\"}]}}" }} });
@@ -577,6 +1007,63 @@ test "capi Lite promotion resolves ANN and explicit aliases through stored entit
     try std.testing.expectEqual(@as(usize, 1), edges.len);
     try std.testing.expectEqualStrings("concept/approval_reviewer", edges[0].target);
     try std.testing.expect((try entities.lookup(a, "concept/laya_reviewer", .{})) == null);
+    const before_duplicate = embed_context.mention_calls;
+    try handle.db.batch(.{ .writes = &.{.{ .key = "claim:duplicate", .value = "{\"kg\":{\"entities\":[{\"id\":\"e0\",\"label\":\"concept\",\"text\":\"Laya reviewer\"}]}}" }} });
+    try runUntilIdle(handle);
+    try std.testing.expectEqual(before_duplicate, embed_context.mention_calls);
+    try tables.create(handle, "second_source", "{}", false);
+    var second_id: ?*anyopaque = null;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, tables.antfly_db_open_table(id, .fromSlice("second_source"), &second_id));
+    defer api.antfly_db_close(second_id);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(second_id, .fromSlice(config)));
+    const second = try tables.get(handle, "second_source");
+    try second.reconfigureEnrichmentRuntime(.{ .enable_without_producers = true, .dense_embedder = fake_embedder });
+    second.setResolutionEmbedder(fake_embedder);
+    try second.batch(.{ .writes = &.{.{ .key = "claim:other_table", .value = "{\"kg\":{\"entities\":[{\"id\":\"e0\",\"label\":\"concept\",\"text\":\"Laya reviewer\"}]}}" }} });
+    try runUntilIdle(handle);
+    try std.testing.expectEqual(before_duplicate, embed_context.mention_calls);
+    const private_key = try @import("../storage/internal_keys.zig").resolutionArtifactKeyAlloc(a, "claim:duplicate", "resolved");
+    defer a.free(private_key);
+    const private_bytes = try handle.db.core.store.get(a, private_key);
+    defer a.free(private_bytes);
+    var private_arena = std.heap.ArenaAllocator.init(a);
+    defer private_arena.deinit();
+    const private_json = try std.json.parseFromSliceLeaky(std.json.Value, private_arena.allocator(), private_bytes, .{});
+    const work_json = private_json.object.get("_resolution_work").?;
+    const mention = work_json.object.get("mentions").?.array.items[0];
+    try std.testing.expect(mention.object.get("embedding").? == .null);
+    const embedding_key = (try std.json.parseFromValueLeaky(?[32]u8, private_arena.allocator(), mention.object.get("embedding_key").?, .{})).?;
+    try std.testing.expectEqual(@as(usize, 0), handle.embedding_cache_pending.count());
+    const persisted_cache_key = try embeddingCacheKey(a, embedding_key);
+    defer a.free(persisted_cache_key);
+    const persisted_vector = try handle.db.core.store.get(a, persisted_cache_key);
+    defer a.free(persisted_vector);
+    try std.testing.expect(std.mem.startsWith(u8, persisted_vector, "ECF2"));
+    const wire_candidate = work_json.object.get("candidates").?.array.items[0];
+    const refs = try std.json.parseFromValueLeaky([]const @import("antfly_resolver").VectorReference, private_arena.allocator(), wire_candidate.object.get("vector_refs").?, .{});
+    try std.testing.expect(refs.len > 0 and refs[0].vector_id != null);
+    for (wire_candidate.object.get("record").?.object.get("fields").?.array.items) |field| {
+        if (std.mem.eql(u8, field.object.get("name").?.string, "canonical_embedding")) try std.testing.expect(field.object.get("value").?.object.contains("none"));
+    }
+    var current_ref = refs[0];
+    current_ref.index_revision = (try candidateRevisions(handle, a, "entities", "names", "")).candidates.?;
+    const loaded_vector = (try loadVector(handle, a, current_ref)).?;
+    defer a.free(loaded_vector);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 0, 0 }, loaded_vector);
+    var stale_ref = current_ref;
+    stale_ref.index_revision[0] ^= 1;
+    try std.testing.expect((try loadVector(handle, a, stale_ref)) == null);
+    stale_ref = current_ref;
+    stale_ref.vector_id = std.math.maxInt(u64);
+    try std.testing.expect((try loadVector(handle, a, stale_ref)) == null);
+    const orphan: [32]u8 = @splat(255);
+    try embeddingCachePut(handle, orphan, &.{ 1, 0, 0 });
+    try collectEmbeddingCache(handle, true);
+    try std.testing.expect((try embeddingCacheGet(handle, a, orphan)) == null);
+    const retained_embedding = (try embeddingCacheGet(handle, a, embedding_key)).?;
+    defer a.free(retained_embedding);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 0, 0 }, retained_embedding);
+
     // Public query resolution uses the stored ANN index and custom scorer
     // vector field, but must not publish a query document or any derived work.
     const sequence = handle.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().commit_sequence;
@@ -588,6 +1075,7 @@ test "capi Lite promotion resolves ANN and explicit aliases through stored entit
     const query_json = try std.json.parseFromSlice(std.json.Value, a, query_result.ptr.?[0..query_result.len], .{});
     defer query_json.deinit();
     const query_resolution = query_json.value.object.get("resolution").?.object;
+    try std.testing.expect(!query_resolution.contains("_resolution_work"));
     const resolved = query_resolution.get("entities").?.array.items;
     try std.testing.expectEqual(@as(usize, 1), resolved.len);
     try std.testing.expectEqualStrings("concept/approval_reviewer", resolved[0].object.get("doc_ref").?.object.get("key").?.string);
@@ -611,6 +1099,112 @@ test "capi Lite promotion resolves ANN and explicit aliases through stored entit
     defer @import("../graph/graph.zig").GraphIndex.freeEdges(a, alias_edges);
     try std.testing.expectEqual(@as(usize, 1), alias_edges.len);
     try std.testing.expectEqualStrings("concept/approval_reviewer", alias_edges[0].target);
+
+    // Reapply a public inline config with a changed scorer. A real config
+    // replay must reuse mention embeddings, including across canonical writes.
+    const before_replay = embed_context.mention_calls;
+    const before_entity_replay = embed_context.entity_calls;
+    embed_context.forbid_model_load = true;
+    var updated = try std.json.parseFromSlice(std.json.Value, a, config, .{});
+    defer updated.deinit();
+    try updated.value.object.put(a, "name", .{ .string = "knowledge_updated" });
+    const scorer_value = updated.value.object.get("resolvers").?.array.items[0].object.getPtr("scorer_json").?;
+    const scorer = try std.mem.replaceOwned(u8, a, scorer_value.string, "0.9", "0.8");
+    defer a.free(scorer);
+    scorer_value.* = .{ .string = scorer };
+    const new_config = try std.json.Stringify.valueAlloc(a, updated.value, .{});
+    defer a.free(new_config);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(id, .fromSlice(new_config)));
+    try runUntilIdle(handle);
+    try std.testing.expectEqual(before_replay, embed_context.mention_calls);
+    try std.testing.expectEqual(before_entity_replay, embed_context.entity_calls);
+    embed_context.forbid_model_load = false;
+    // A candidate/index revision changes independently of the embedding model.
+    const before_revision = try candidateRevisions(handle, a, "entities", "names", "mention_names");
+    try entities.batch(.{ .writes = &.{.{ .key = "concept/new", .value = "{\"canonical_name\":\"New candidate\"}" }} });
+    const after_revision = try candidateRevisions(handle, a, "entities", "names", "mention_names");
+    try std.testing.expect(!std.mem.eql(u8, &before_revision.candidates.?, &after_revision.candidates.?));
+    try std.testing.expectEqualSlices(u8, &before_revision.embedding.?, &after_revision.embedding.?);
+
+    try entities.batch(.{ .deletes = &.{"concept/new"} });
+    const deleted_revision = try candidateRevisions(handle, a, "entities", "names", "mention_names");
+    try std.testing.expect(!std.mem.eql(u8, &after_revision.candidates.?, &deleted_revision.candidates.?));
+    const compacted = try handle.owned_lite_backend.?.vacuum();
+    _ = compacted;
+    const compacted_revision = try candidateRevisions(handle, a, "entities", "names", "mention_names");
+    // Compaction cannot roll back the deletion fence or resurrect candidates.
+    try std.testing.expectEqualSlices(u8, &deleted_revision.candidates.?, &compacted_revision.candidates.?);
+    const absent = try entities.get(a, "concept/new");
+    try std.testing.expect(absent == null);
+    embed_context.model_revision = 2;
+    const upgraded_revision = try candidateRevisions(handle, a, "entities", "names", "mention_names");
+    try std.testing.expect(!std.mem.eql(u8, &deleted_revision.embedding.?, &upgraded_revision.embedding.?));
+    embed_context.model_revision = 1;
+    // Logical TTL visibility may change before physical cleanup appends a
+    // replay record. Until cleanup, a candidate snapshot cannot be reused.
+    try entities.setSchema(.{ .version = 1, .ttl_duration_ns = std.time.ns_per_s });
+    const expiring_revision = try candidateRevisions(handle, a, "entities", "names", "mention_names");
+    try std.testing.expect(expiring_revision.candidates == null);
+    try std.testing.expect(expiring_revision.embedding != null);
+    try entities.setSchema(.{ .version = 2, .ttl_duration_ns = 0 });
+
+    // The cache shares the artifact's portable lifetime. Exercise export ->
+    // import -> close -> reopen before the next real scorer change.
+    try runUntilIdle(handle);
+    {
+        const runtime = handle.db.resolution_runtime.?;
+        try std.testing.expect(runtime.catch_up_mutex.tryLock());
+        defer runtime.catch_up_mutex.unlock();
+        var deleted: bool = true;
+        try std.testing.expectEqual(h.capi.ErrorCode.busy, api.antfly_db_delete_index(id, .fromSlice("knowledge"), &deleted));
+        try std.testing.expect(!deleted);
+        try std.testing.expect(handle.db.core.index_manager.get("knowledge") != null);
+    }
+    const resolution_key = try @import("../storage/internal_keys.zig").resolutionArtifactKeyAlloc(a, "claim:ann", "resolved");
+    defer a.free(resolution_key);
+    const cached = try handle.db.core.store.get(a, resolution_key);
+    defer a.free(cached);
+    var backup: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free(&backup);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_backup(id, &backup));
+    const destination_path = try std.fmt.allocPrint(a, "{s}.restored.aflite", .{tmp.path()});
+    defer a.free(destination_path);
+    const destination = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, destination_path, .{ .profile = .native, .externally_locked = true }, true, null, null);
+    const destination_id = try api.publishHandle(destination);
+    {
+        defer api.antfly_db_close(destination_id);
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_import_backup(destination_id, .{ .ptr = backup.ptr, .len = backup.len }));
+        const imported = try destination.db.core.store.get(a, resolution_key);
+        defer a.free(imported);
+        try std.testing.expectEqualStrings(cached, imported);
+    }
+    const reopened = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, destination_path, .{ .profile = .native, .externally_locked = true }, false, null, null);
+    const reopened_id = try api.publishHandle(reopened);
+    defer api.antfly_db_close(reopened_id);
+    const reopened_cache = try reopened.db.core.store.get(a, resolution_key);
+    defer a.free(reopened_cache);
+    try std.testing.expectEqualStrings(cached, reopened_cache);
+    const reopened_entities = try tables.get(reopened, "entities");
+    try reopened_entities.reconfigureEnrichmentRuntime(.{ .enable_without_producers = true, .dense_embedder = fake_embedder });
+    try reopened.db.reconfigureEnrichmentRuntime(.{ .enable_without_producers = true, .dense_embedder = fake_embedder });
+    reopened.db.setResolutionEmbedder(fake_embedder);
+    // Explicitly install the same provider on the destination used by mentions.
+    reopened_entities.setResolutionEmbedder(fake_embedder);
+    const before_reopen_replay = embed_context.mention_calls;
+    try updated.value.object.put(a, "name", .{ .string = "knowledge_restored" });
+    const restored_scorer = try std.mem.replaceOwned(u8, a, scorer, "0.8", "0.7");
+    defer a.free(restored_scorer);
+    scorer_value.* = .{ .string = restored_scorer };
+    const restored_config = try std.json.Stringify.valueAlloc(a, updated.value, .{});
+    defer a.free(restored_config);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(reopened_id, .fromSlice(restored_config)));
+    try runUntilIdle(reopened);
+    try std.testing.expect(embed_context.mention_calls > before_reopen_replay);
+    // Once the restored cache is populated, another new document reuses it.
+    const after_restore = embed_context.mention_calls;
+    try reopened.db.batch(.{ .writes = &.{.{ .key = "claim:restored-duplicate", .value = "{\"kg\":{\"entities\":[{\"id\":\"e0\",\"label\":\"concept\",\"text\":\"Laya reviewer\"}]}}" }} });
+    try runUntilIdle(reopened);
+    try std.testing.expectEqual(after_restore, embed_context.mention_calls);
 }
 
 test "capi Lite models_dir loads a real extractor for graph enrichment" {
@@ -869,7 +1463,7 @@ test "capi resolver render and merge rekey existing edges without entity promoti
     const rendered = try std.json.parseFromSlice(std.json.Value, a, out.ptr.?[0..out.len], .{});
     defer rendered.deinit();
     try std.testing.expectEqualStrings("concept/qwen", rendered.value.object.get("key").?.string);
-    try std.testing.expectEqual(@as(i64, 2), rendered.value.object.get("config_generation").?.integer);
+    try std.testing.expectEqual(@as(i64, 5), rendered.value.object.get("config_generation").?.integer);
     // Read-only handles can query aliases without canonical documents and
     // observe the same durable generation after reopening.
     api.antfly_db_close(id);
@@ -884,7 +1478,7 @@ test "capi resolver render and merge rekey existing edges without entity promoti
     const resolution = queried.value.object.get("resolution").?.object;
     try std.testing.expectEqualStrings("concept/qwen", resolution.get("entities").?.array.items[0].object.get("doc_ref").?.object.get("key").?.string);
     try std.testing.expectEqualStrings("match", resolution.get("entities").?.array.items[0].object.get("decision").?.string);
-    try std.testing.expectEqual(@as(i64, 2), resolution.get("config_generation").?.integer);
+    try std.testing.expectEqual(rendered.value.object.get("config_generation").?.integer, resolution.get("config_generation").?.integer);
 }
 
 test "capi resolver config merge config advances revisions and protects key namespaces" {
@@ -966,6 +1560,14 @@ test "capi resolver config merge config advances revisions and protects key name
 }
 
 test "capi native text queries overlap writer commits and retain retired providers" {
+    try testNativeTextQueryConcurrentCommit(false);
+}
+
+test "capi native text queries return busy after a concurrent merge" {
+    try testNativeTextQueryConcurrentCommit(true);
+}
+
+fn testNativeTextQueryConcurrentCommit(change_config: bool) !void {
     const api = @import("db.zig");
     const extracting = @import("antfly_extracting");
     const managed = @import("../inference/managed_embedder.zig");
@@ -1002,11 +1604,15 @@ test "capi native text queries overlap writer commits and retain retired provide
     const Writer = struct {
         id: ?*anyopaque,
         state: *State,
+        change_config: bool,
         code: h.capi.ErrorCode = .internal,
         fn run(self: *@This()) void {
             var result: h.capi.Buffer = .{};
             defer api.antfly_buffer_free(&result);
-            self.code = api.antfly_db_batch_json(self.id, .fromSlice("{\"inserts\":{\"probe\":{\"body\":\"committed\"}}}"), &result);
+            self.code = if (self.change_config)
+                api.antfly_db_merge_resolver_keys_json(self.id, .fromSlice("concepts"), .fromSlice("{\"key\":\"concept/antfly\",\"target\":\"concept/canonical\"}"))
+            else
+                api.antfly_db_batch_json(self.id, .fromSlice("{\"inserts\":{\"probe\":{\"body\":\"committed\"}}}"), &result);
             self.state.committed.set(h.handleLockIo());
         }
     };
@@ -1022,11 +1628,27 @@ test "capi native text queries overlap writer commits and retain retired provide
         \\{"name":"knowledge","type":"graph","source":{"artifact":"kg","format":"extraction_graph","mention_edge_type":"mentions"},"artifact":{"name":"kg","kind":"asset","source":{"type":"field","value":"body"},"content_type":"application/json","producer_json":{"type":"extractor","config":{"provider":"antfly","model":"test-extractor","schema":{"entities":["company"]}}}},"edge_types":[{"name":"mentions"}],"resolvers":[{"name":"concepts","table":"default","promote":false,"source_artifact":"kg","resolution_artifact":"resolved","key_template":"concept/{{ uslug _entity.text }}","config_generation":1}]}
     ;
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(writer, .fromSlice(config)));
+    var sql_output: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free(&sql_output);
+    for ([_][]const u8{
+        \\{"statement":"CREATE TABLE numbers (n BIGINT)"}
+        ,
+        \\{"statement":"INSERT INTO numbers (_id,n) VALUES ('row',7)"}
+        ,
+    }) |request| {
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_sql_json(writer, .fromSlice(request), &sql_output));
+        api.antfly_buffer_free(&sql_output);
+    }
     var readonly = options;
     readonly.open_mode = h.capi.open_mode_readonly;
     var reader: ?*anyopaque = null;
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_open_with_options(path, &readonly, &reader));
     defer api.antfly_db_close(reader);
+    const sql_cursor = @import("sql_cursor.zig");
+    var cursor: u64 = 0;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, sql_cursor.antfly_db_sql_open_cursor_json(reader, .fromSlice("{\"statement\":\"SELECT n FROM numbers\"}"), &cursor, &sql_output));
+    api.antfly_buffer_free(&sql_output);
+    defer _ = sql_cursor.antfly_db_sql_close_cursor(reader, cursor);
     var state: State = .{};
     const setup = api.enterHandle(reader, .read).?;
     const snapshot = setup.handle;
@@ -1043,7 +1665,7 @@ test "capi native text queries overlap writer commits and retain retired provide
     defer second_thread.join();
     defer state.release.set(h.handleLockIo());
     try state.both_entered.waitTimeout(h.handleLockIo(), .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } });
-    var write: Writer = .{ .id = writer, .state = &state };
+    var write: Writer = .{ .id = writer, .state = &state, .change_config = change_config };
     const writer_thread = try std.Thread.spawn(.{ .stack_size = 8 * 1024 * 1024 }, Writer.run, .{&write});
     defer writer_thread.join();
     defer state.release.set(h.handleLockIo());
@@ -1058,9 +1680,230 @@ test "capi native text queries overlap writer commits and retain retired provide
     state.release.set(h.handleLockIo());
     try first.done.waitTimeout(h.handleLockIo(), .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } });
     try second.done.waitTimeout(h.handleLockIo(), .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } });
-    try std.testing.expectEqual(h.capi.ErrorCode.ok, first.code);
-    try std.testing.expectEqual(h.capi.ErrorCode.ok, second.code);
+    try std.testing.expectEqual(if (change_config) h.capi.ErrorCode.busy else h.capi.ErrorCode.ok, first.code);
+    try std.testing.expectEqual(if (change_config) h.capi.ErrorCode.busy else h.capi.ErrorCode.ok, second.code);
+    const pinned = api.enterHandle(reader, .read).?;
+    // resumeQuery collected while this registry was attached to the new root.
+    // The cursor must still pin the original root after both queries finish.
+    try std.testing.expectEqual(@as(usize, 1), pinned.connection.?.owner.retired.items.len);
+    try std.testing.expect(pinned.connection.?.owner.retired.items[0] == snapshot);
+    pinned.leave();
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, sql_cursor.antfly_db_sql_fetch_cursor_json(reader, cursor, 10, &sql_output));
+    try std.testing.expect(std.mem.indexOf(u8, sql_output.ptr.?[0..sql_output.len], "7") != null);
+    api.antfly_buffer_free(&sql_output);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, sql_cursor.antfly_db_sql_close_cursor(reader, cursor));
     const finished = api.enterHandle(reader, .read).?;
     try std.testing.expectEqual(@as(usize, 0), finished.connection.?.owner.retired.items.len);
     finished.leave();
+}
+
+test "capi inline resolver ownership migrates legacy declarations and preserves independent definitions" {
+    const api = @import("db.zig");
+    const a = std.testing.allocator;
+    var tmp = try api.TestDirectory.init("resolver-ownership");
+    defer tmp.cleanup();
+    const config =
+        \\{"name":"knowledge","type":"graph","source":{"artifact":"kg","format":"extraction_graph","mention_edge_type":"mentions"},"artifact":{"name":"kg","kind":"asset","source":{"type":"field","value":"kg"},"content_type":"application/json"},"edge_types":[{"name":"mentions"}],"resolvers":[{"name":"concepts","table":"default","promote":false,"source_artifact":"kg","resolution_artifact":"resolved","key_template":"concept/{{ uslug _entity.text }}","config_generation":1}]}
+    ;
+    const Case = struct { independent: bool, replay: bool };
+    for ([_]Case{ .{ .independent = false, .replay = false }, .{ .independent = false, .replay = true }, .{ .independent = true, .replay = true } }, 0..) |case, ordinal| {
+        const independent = case.independent;
+        const path = try std.fmt.allocPrint(a, "{s}-{d}.aflite", .{ tmp.path(), ordinal });
+        defer a.free(path);
+        const handle = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .native, .externally_locked = true }, true, null, null);
+        const id = try api.publishHandle(handle);
+        defer api.antfly_db_close(id);
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(id, .fromSlice(config)));
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(id));
+        const configs = try handle.db.listResolvers(a);
+        defer {
+            for (configs) |*cfg| cfg.deinit(a);
+            a.free(configs);
+        }
+        if (independent) {
+            try std.testing.expect(try handle.db.removeResolver("concepts"));
+            try handle.db.addResolver(configs[0]);
+        } else {
+            var legacy = configs[0];
+            legacy.inline_managed = null;
+            try handle.db.restoreResolverIdentityWithoutDrain("concepts", legacy);
+        }
+        // Replaying the existing index claims a pre-ownership inline resolver,
+        // while an independently registered definition remains independent.
+        if (case.replay) {
+            try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(id, .fromSlice(config)));
+            try std.testing.expectEqual(!independent, handle.db.core.index_manager.getResolver("concepts").?.inline_managed.?);
+        }
+        var deleted = false;
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_delete_index(id, .fromSlice("knowledge"), &deleted));
+        try std.testing.expect(deleted);
+        var out: h.capi.Buffer = .{};
+        defer api.antfly_buffer_free(&out);
+        try std.testing.expectEqual(if (independent) h.capi.ErrorCode.ok else h.capi.ErrorCode.not_found, api.antfly_db_render_resolver_key_json(id, .fromSlice("concepts"), .fromSlice("{\"text\":\"Antfly\",\"label\":\"concept\"}"), &out));
+    }
+}
+
+test "capi resolver reader version is checked before opening catalog" {
+    const api = @import("db.zig");
+    const a = std.testing.allocator;
+    var tmp = try api.TestDirectory.init("reader-epoch");
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, "{s}.aflite", .{tmp.path()});
+    defer a.free(path);
+    const handle = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .native, .externally_locked = true }, true, null, null);
+    const id = try api.publishHandle(handle);
+    try handle.db.core.store.put(@import("../storage/db/catalog/resolver_catalog.zig").minimum_reader_key, "3");
+    api.antfly_db_close(id);
+    try std.testing.expectError(error.UnsupportedDatabaseReaderVersion, api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .native, .externally_locked = true }, false, null, null));
+}
+
+test "capi resolver sparse model revision uses sparse capability discovery" {
+    try h.managed_embedder.testSparseCacheRevision();
+}
+
+test "capi resolver concurrent source promotions preserve shared destination aliases" {
+    const api = @import("db.zig");
+    const a = std.testing.allocator;
+    var tmp = try api.TestDirectory.init("concurrent-promotion");
+    defer tmp.cleanup();
+    const root = try api.openDefaultDirectoryHandle(std.mem.span(tmp.path().ptr));
+    const id = try api.publishHandle(root);
+    defer api.antfly_db_close(id);
+    try tables.create(root, "entities", "{}", false);
+    var ready = std.atomic.Value(u32).init(0);
+    const State = struct {
+        root: *h.Handle,
+        ready: *std.atomic.Value(u32),
+        json: []const u8,
+        failure: ?anyerror = null,
+        fn run(state: *@This()) void {
+            _ = state.ready.fetchAdd(1, .acq_rel);
+            while (state.ready.load(.acquire) < 2) std.atomic.spinLoopHint();
+            upsert(state.root, std.heap.c_allocator, "entities", "entity/ada", state.json) catch |err| {
+                state.failure = err;
+            };
+        }
+    };
+    var first: State = .{ .root = root, .ready = &ready, .json = "{\"entity_type\":\"person\",\"canonical_name\":\"Ada\",\"aliases\":[\"Ada\"]}" };
+    var second: State = .{ .root = root, .ready = &ready, .json = "{\"entity_type\":\"person\",\"canonical_name\":\"ADA\",\"aliases\":[\"ADA\"]}" };
+    const one = try std.Thread.spawn(.{ .stack_size = 16 * 1024 * 1024 }, State.run, .{&first});
+    const two = try std.Thread.spawn(.{ .stack_size = 16 * 1024 * 1024 }, State.run, .{&second});
+    one.join();
+    two.join();
+    if (first.failure) |err| return err;
+    if (second.failure) |err| return err;
+    const destination = try tables.get(root, "entities");
+    var row = (try destination.lookup(a, "entity/ada", .{})).?;
+    defer row.deinit(a);
+    var json = try std.json.parseFromSlice(std.json.Value, a, row.json, .{});
+    defer json.deinit();
+    try std.testing.expectEqual(@as(usize, 2), json.value.object.get("aliases").?.array.items.len);
+    const canonical = json.value.object.get("canonical_name").?.string;
+    try std.testing.expect(std.mem.eql(u8, canonical, "Ada") or std.mem.eql(u8, canonical, "ADA"));
+}
+
+test "capi resolver embedding cache batches writes bounds size and expires pages" {
+    const api = @import("db.zig");
+    const a = std.testing.allocator;
+    var tmp = try api.TestDirectory.init("mention-cache-pages");
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, "{s}.aflite", .{tmp.path()});
+    defer a.free(path);
+    const handle = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .native, .externally_locked = true }, true, null, null);
+    const id = try api.publishHandle(handle);
+    defer api.antfly_db_close(id);
+    const sequence = handle.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().commit_sequence;
+    for (0..300) |i| {
+        var digest: [32]u8 = @splat(0);
+        std.mem.writeInt(u64, digest[0..8], i, .little);
+        try embeddingCachePut(handle, digest, &.{1});
+    }
+    try std.testing.expectEqual(sequence, handle.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().commit_sequence);
+    try embeddingCacheFlush(handle);
+    try std.testing.expectEqual(sequence + 1, handle.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().commit_sequence);
+    try std.testing.expectEqual(@as(usize, 0), handle.embedding_cache_pending.count());
+    {
+        var read = try handle.db.core.store.beginReadTxn();
+        defer read.abort();
+        var cursor = try read.openCursor();
+        defer cursor.close();
+        var txn = try handle.db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        var row = try cursor.seekAtOrAfter(embedding_cache_prefix);
+        while (row) |kv| : (row = try cursor.next()) {
+            if (!std.mem.startsWith(u8, kv.key, embedding_cache_prefix)) break;
+            const expired = try a.dupe(u8, kv.value);
+            defer a.free(expired);
+            std.mem.writeInt(i64, expired[40..48], 0, .little);
+            try txn.put(kv.key, expired);
+        }
+        try txn.commit();
+    }
+    try collectEmbeddingCache(handle, false);
+    {
+        var read = try handle.db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect((try read.get(embedding_cache_cursor_key)).len > 0);
+        const bytes = try read.get(embedding_cache_bytes_key);
+        try std.testing.expect(try std.fmt.parseInt(usize, bytes, 10) > 0);
+    }
+    try collectEmbeddingCache(handle, false);
+    embedding_cache_limit_for_test = 512;
+    defer embedding_cache_limit_for_test = null;
+    for (0..10) |i| try embeddingCachePut(handle, @splat(@intCast(i)), &.{ 1, 2, 3 });
+    try embeddingCacheFlush(handle);
+    var read = try handle.db.core.store.beginReadTxn();
+    defer read.abort();
+    var cursor = try read.openCursor();
+    defer cursor.close();
+    var row = try cursor.seekAtOrAfter(embedding_cache_prefix);
+    var total: usize = 0;
+    while (row) |kv| : (row = try cursor.next()) {
+        if (!std.mem.startsWith(u8, kv.key, embedding_cache_prefix)) break;
+        total += kv.key.len + kv.value.len;
+    }
+    try std.testing.expect(total <= 512);
+    try std.testing.expectEqual(total, try std.fmt.parseInt(usize, try read.get(embedding_cache_bytes_key), 10));
+}
+
+test "capi resolver failed replacement permits portable backup and cancellation" {
+    const api = @import("db.zig");
+    const a = std.testing.allocator;
+    var tmp = try api.TestDirectory.init("failed-shadow-backup");
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, "{s}.aflite", .{tmp.path()});
+    defer a.free(path);
+    const handle = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .native, .externally_locked = true }, true, null, null);
+    const id = try api.publishHandle(handle);
+    defer api.antfly_db_close(id);
+    const old = "{\"name\":\"old\",\"type\":\"graph\",\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}]}";
+    const replacement = "{\"name\":\"new\",\"type\":\"graph\",\"replaces\":\"old\",\"edge_types\":[{\"name\":\"R\",\"field\":\"next_links\"}]}";
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(id, .fromSlice(old)));
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var rows: std.ArrayList(h.db_mod.types.BatchWrite) = .empty;
+    for (0..300) |i| try rows.append(arena.allocator(), .{ .key = try std.fmt.allocPrint(arena.allocator(), "doc:{d}", .{i}), .value = "{\"links\":[\"old\"],\"next_links\":[\"new\"]}" });
+    try handle.db.batch(.{ .writes = rows.items });
+    try runUntilIdle(handle);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(id, .fromSlice(replacement)));
+    _ = try handle.db.advanceGraphReplacement();
+    const jobs = try handle.db.graphReplacementStatusAlloc(a);
+    defer jobs.deinit();
+    try std.testing.expectEqual(@as(usize, 1), jobs.value.len);
+    var job = jobs.value[0];
+    job.phase = .failed;
+    job.last_error = "InjectedReplacementBuildFailure";
+    try handle.db.core.index_manager.failGraphReplacement(handle.db.core.store, job);
+    try runUntilIdle(handle);
+    try std.testing.expectEqual(@as(u64, 999), try handle.db.core.index_manager.clampReplayForGraphReplacementBuilds(handle.db.core.store, 999));
+    var archive: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free(&archive);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_backup(id, &archive));
+    try @import("database_backup.zig").validate(a, archive.ptr.?[0..archive.len]);
+    var cancelled = false;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_cancel_replacement(id, .fromSlice("new"), &cancelled));
+    try std.testing.expect(cancelled);
+    try runUntilIdle(handle);
+    try std.testing.expect(handle.db.core.index_manager.get("old") != null);
+    try std.testing.expect(handle.db.core.index_manager.get("new") == null);
 }

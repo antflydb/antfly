@@ -47,6 +47,14 @@ pub const Scratch = struct {
         self.strings.deinit(alloc);
     }
 
+    pub fn retain(self: *Scratch, text: []const u8) ![]const u8 {
+        const alloc = self.memory.allocator();
+        const owned = try alloc.dupe(u8, text);
+        errdefer alloc.free(owned);
+        try self.strings.append(alloc, owned);
+        return owned;
+    }
+
     pub fn table(self: *Scratch, raw: []const u8, field: []const u8) !?[]const u8 {
         if (raw.len == 0) return null;
         return self.parse(raw, field) catch |err| switch (err) {

@@ -196,6 +196,9 @@ pub const Limits = struct {
 };
 
 pub const Shape = struct {
+    /// Exact non-batch geometry. Zero preserves legacy grouping. Kept out of
+    /// shard selection so heterogeneous arrays enroll atomically in one shard.
+    geometry_key: u64 = 0,
     bytes: usize = 0,
     pixels: u64 = 0,
     tokens: usize = 0,
@@ -552,6 +555,7 @@ const Ticket = struct {
 
 const Group = struct {
     key: Key,
+    geometry_key: u64 = 0,
     limits: Limits,
     execute_ctx: *anyopaque,
     execute_fn: ExecuteFn,
@@ -835,7 +839,7 @@ pub const Broker = struct {
         var group: *Group = undefined;
         var leader = false;
         for (shard.groups.items) |candidate| {
-            if (candidate.key.eql(key) and candidate.limits.eql(limits) and
+            if (candidate.geometry_key == shape.geometry_key and candidate.key.eql(key) and candidate.limits.eql(limits) and
                 candidate.execute_ctx == execute_ctx and candidate.execute_fn == execute_fn and
                 candidate.fits(shape))
             {
@@ -846,6 +850,7 @@ pub const Broker = struct {
             group = try self.allocator.create(Group);
             group.* = .{
                 .key = key,
+                .geometry_key = shape.geometry_key,
                 .limits = limits,
                 .execute_ctx = execute_ctx,
                 .execute_fn = execute_fn,
@@ -2014,4 +2019,30 @@ test "microbatch post execution fences dispose owned values and preserve healthy
     try std.testing.expect(slots[1].err == null);
     Value.release(std.testing.allocator, outputs[1]);
     try std.testing.expectEqual(@as(usize, 6), releases);
+}
+
+test "microbatch geometry buckets gather interleaved rows and preserve identity" {
+    var broker = Broker.init(std.testing.allocator);
+    defer broker.deinit();
+    var executor = TestExecutor{};
+    const inputs = [_]usize{ 3, 7, 4, 9 };
+    const shapes = [_]Shape{
+        .{ .geometry_key = 11 }, .{ .geometry_key = 22 },
+        .{ .geometry_key = 11 }, .{ .geometry_key = 22 },
+    };
+    const identities = [_]Identity{
+        .{ .item_id = "a1", .page_number = 1 }, .{ .item_id = "b1", .page_number = 1 },
+        .{ .item_id = "a2", .page_number = 2 }, .{ .item_id = "b2", .page_number = 2 },
+    };
+    const results = try broker.submitBatchControlled(usize, usize, std.testing.io, std.testing.allocator, .{ .model = "gemma4", .task = .embed, .resource_class = .gpu }, .{ .mode = .native, .preferred_items = 2, .max_items = 4 }, &shapes, &identities, null, .{}, &inputs, &executor, TestExecutor.run);
+    defer std.testing.allocator.free(results);
+    try std.testing.expectEqual(@as(usize, 2), executor.calls.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 2), executor.largest_batch.load(.monotonic));
+    try std.testing.expectEqual(results[0].execution_id, results[2].execution_id);
+    try std.testing.expectEqual(results[1].execution_id, results[3].execution_id);
+    try std.testing.expect(results[0].execution_id != results[1].execution_id);
+    for (results, inputs, identities) |result, input, identity| {
+        try std.testing.expectEqual(input * 2, result.result.value);
+        try std.testing.expectEqualDeep(identity, result.identity);
+    }
 }

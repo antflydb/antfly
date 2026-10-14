@@ -1280,7 +1280,14 @@ pub const Operations = struct {
     pub fn graphEdges(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_graph.GraphEdgesRequest) Error!distributed_graph.GraphEdgesResponse {
         try request.ensureActive();
         const reads = try self.routedReads(alloc, request, group_id);
-        return (reads.graphEdgesGroupLocal(alloc, group_id, table_name, input, .read_index) catch |err| {
+        const control = request.platformDeadline() catch |err| {
+            if (mapCommonReadError(err)) |mapped| return mapped;
+            return error.Internal;
+        };
+        var controlled = input;
+        controlled.cancellation = request.cancellation;
+        controlled.execution_deadline_ns = control.deadline_ns;
+        return (reads.graphEdgesGroupLocal(alloc, group_id, table_name, controlled, .read_index) catch |err| {
             if (mapCommonReadError(err)) |mapped| return mapped;
             return switch (err) {
                 error.InvalidQueryRequest, error.IndexNotFound => error.InvalidArgument,

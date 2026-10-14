@@ -5068,6 +5068,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     min_applied = @min(min_applied, stats.applied_sequence);
                 }
             }
+            min_applied = try ctx.index_manager.clampReplayForGraphReplacementBuilds(ctx.store, min_applied);
             min_applied = try clampReplayTruncationForRepairPins(ctx.alloc, ctx.index_repair_checkpoint, min_applied);
             if (min_applied == 0 or min_applied == std.math.maxInt(u64)) return;
             try truncateReplayLogs(ctx, min_applied);
