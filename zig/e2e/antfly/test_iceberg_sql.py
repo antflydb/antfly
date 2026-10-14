@@ -1343,6 +1343,7 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
                     "source": "e2e",
                     "epoch": "1",
                     "checkpoint": "2",
+                    "expected_checkpoint": "1",
                     "key_fields": ["id"],
                     "changes": [
                         {
