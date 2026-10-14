@@ -4643,8 +4643,7 @@ test "relational index publication ACK client binds read grants and never retrie
     };
     const request = try publication.testing.fencedAck();
     const pending = publication.testing.pendingAckStatus(request);
-    const update = try @import("antfly_local_sources").storage_db_relational_index_publication_progress.acknowledge(pending.head, pending.owner, 1, request.signed.receipt);
-    const complete = try std.json.Stringify.valueAlloc(alloc, publication.AckStatus{ .head = update.head, .owner = update.owner }, .{});
+    const complete = try std.json.Stringify.valueAlloc(alloc, try publication.testing.completeAckStatus(request), .{});
     defer alloc.free(complete);
     const absent = try std.json.Stringify.valueAlloc(alloc, pending, .{});
     defer alloc.free(absent);

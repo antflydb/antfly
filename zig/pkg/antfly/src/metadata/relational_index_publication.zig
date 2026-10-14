@@ -30,6 +30,7 @@ const lifecycle = @import("table_lifecycle_lock.zig");
 const Allocator = std.mem.Allocator;
 const native_control = local.storage_db_relational_index_owner_control;
 const readers = local.common_schema_readers;
+const root_enrollment = @import("store_root_enrollment.zig");
 
 fn readerRequirements(before: records.TableRecord, after: records.TableRecord) !?readers.ReaderRequirements {
     var joined: readers.ReaderFloor = .{};
@@ -46,16 +47,110 @@ pub const RootProof = @import("relational_index_root_attestation.zig").Proof;
 /// in the SAME transaction as its progress CAS. Never accept a service ACK or
 /// caller-supplied verification boolean in place of those reads.
 pub const SignedReceipt = struct {
+    pub const encoded_len = 512;
     receipt: progress.Receipt,
     proof: RootProof,
 
-    pub fn verifySignature(self: SignedReceipt) !void {
+    pub fn commitment(self: SignedReceipt) !Digest {
+        return self.proof.commitment(try self.receipt.digest());
+    }
+
+    fn validateShape(self: SignedReceipt) !void {
+        self.receipt.owner.validate() catch return error.InvalidIndexOwnerReceipt;
+        self.receipt.position.requireNamespace(self.receipt.owner.namespace) catch return error.InvalidIndexOwnerReceipt;
+        self.proof.identity.validate() catch return error.InvalidIndexOwnerReceipt;
+        if ((self.receipt.owner.authority == .native) != (self.receipt.position == .native) or
+            self.proof.reporter_incarnation == 0 or self.proof.root_generation == 0 or
+            std.mem.allEqual(u8, &self.receipt.candidate_digest, 0) or std.mem.allEqual(u8, &self.receipt.reservation_digest, 0) or
+            std.mem.allEqual(u8, &self.receipt.evidence_digest, 0)) return error.InvalidIndexOwnerReceipt;
         if (self.receipt.owner.authority != switch (self.proof.authority) {
             .raft => progress.Authority.raft,
             .native => progress.Authority.native,
         }) return error.InvalidIndexOwnerReceipt;
+        switch (self.proof.authority) {
+            .raft => |replica| if (replica == 0) return error.InvalidIndexOwnerReceipt,
+            .native => |binding| if (std.mem.allEqual(u8, &binding, 0)) return error.InvalidIndexOwnerReceipt,
+        }
+    }
+
+    pub fn verifySignature(self: SignedReceipt) !void {
+        try self.validateShape();
         const logical_digest = self.receipt.digest() catch return error.InvalidIndexOwnerReceipt;
         self.proof.verify(logical_digest) catch return error.InvalidIndexOwnerReceipt;
+    }
+
+    /// Canonical physical representation, not an ownership grant. Admission
+    /// verifies the signature/current root before staging this fixed record.
+    pub fn encode(self: SignedReceipt) ![encoded_len]u8 {
+        try self.validateShape();
+        var bytes: [encoded_len]u8 = @splat(0);
+        @memcpy(bytes[0..4], "AIPR");
+        bytes[4] = 1;
+        bytes[5] = @backingInt(self.receipt.action);
+        bytes[6] = @backingInt(self.receipt.owner.authority);
+        @memcpy(bytes[8..24], &self.receipt.owner.plan_id);
+        @memcpy(bytes[24..56], &self.receipt.owner.plan_digest);
+        std.mem.writeInt(u16, bytes[56..58], self.receipt.owner.ordinal, .little);
+        for ([_]u64{ self.receipt.owner.group_id, self.receipt.owner.namespace.table_id, self.receipt.owner.namespace.shard_id, self.receipt.owner.namespace.range_id }, 0..) |value, i|
+            std.mem.writeInt(u64, bytes[64 + i * 8 ..][0..8], value, .little);
+        @memcpy(bytes[96..128], &self.receipt.owner.fence_digest);
+        @memcpy(bytes[128..161], &try self.receipt.position.encode());
+        @memcpy(bytes[168..200], &self.receipt.candidate_digest);
+        @memcpy(bytes[200..232], &self.receipt.reservation_digest);
+        @memcpy(bytes[232..264], &self.receipt.evidence_digest);
+        @memcpy(bytes[264..296], &self.proof.identity.metadata_incarnation);
+        std.mem.writeInt(u64, bytes[296..304], self.proof.identity.node_id, .little);
+        std.mem.writeInt(u64, bytes[304..312], self.proof.identity.store_id, .little);
+        std.mem.writeInt(u128, bytes[312..328], self.proof.identity.root_incarnation, .little);
+        @memcpy(bytes[328..360], &self.proof.identity.public_key);
+        std.mem.writeInt(u64, bytes[360..368], self.proof.reporter_incarnation, .little);
+        bytes[368] = @backingInt(self.receipt.owner.authority);
+        switch (self.proof.authority) {
+            .raft => |replica| std.mem.writeInt(u64, bytes[376..384], replica, .little),
+            .native => |binding| @memcpy(bytes[376..408], &binding),
+        }
+        std.mem.writeInt(u64, bytes[408..416], self.proof.root_generation, .little);
+        @memcpy(bytes[416..480], &self.proof.signature);
+        @memcpy(bytes[480..512], &digest(bytes[0..480]));
+        return bytes;
+    }
+
+    pub fn decode(bytes: []const u8) !SignedReceipt {
+        if (bytes.len != encoded_len or !std.mem.eql(u8, bytes[0..4], "AIPR") or bytes[4] != 1 or bytes[7] != 0 or
+            !std.mem.allEqual(u8, bytes[58..64], 0) or !std.mem.allEqual(u8, bytes[161..168], 0) or
+            !std.mem.allEqual(u8, bytes[369..376], 0) or !std.mem.eql(u8, &digest(bytes[0..480]), bytes[480..512])) return error.InvalidCatalogRecord;
+        if (bytes[368] == @backingInt(progress.Authority.raft) and !std.mem.allEqual(u8, bytes[384..408], 0)) return error.InvalidCatalogRecord;
+        const value: SignedReceipt = .{
+            .receipt = .{
+                .owner = .{
+                    .plan_id = bytes[8..24].*,
+                    .plan_digest = bytes[24..56].*,
+                    .ordinal = std.mem.readInt(u16, bytes[56..58], .little),
+                    .group_id = std.mem.readInt(u64, bytes[64..72], .little),
+                    .namespace = .{ .table_id = std.mem.readInt(u64, bytes[72..80], .little), .shard_id = std.mem.readInt(u64, bytes[80..88], .little), .range_id = std.mem.readInt(u64, bytes[88..96], .little) },
+                    .authority = std.enums.fromInt(progress.Authority, bytes[6]) orelse return error.InvalidCatalogRecord,
+                    .fence_digest = bytes[96..128].*,
+                },
+                .action = std.enums.fromInt(progress.Action, bytes[5]) orelse return error.InvalidCatalogRecord,
+                .position = local.storage_db_receipt_position.Position.decode(bytes[128..161]) catch return error.InvalidCatalogRecord,
+                .candidate_digest = bytes[168..200].*,
+                .reservation_digest = bytes[200..232].*,
+                .evidence_digest = bytes[232..264].*,
+            },
+            .proof = .{
+                .identity = .{ .metadata_incarnation = bytes[264..296].*, .node_id = std.mem.readInt(u64, bytes[296..304], .little), .store_id = std.mem.readInt(u64, bytes[304..312], .little), .root_incarnation = std.mem.readInt(u128, bytes[312..328], .little), .public_key = bytes[328..360].* },
+                .reporter_incarnation = std.mem.readInt(u64, bytes[360..368], .little),
+                .authority = switch (bytes[368]) {
+                    1 => .{ .raft = std.mem.readInt(u64, bytes[376..384], .little) },
+                    2 => .{ .native = bytes[376..408].* },
+                    else => return error.InvalidCatalogRecord,
+                },
+                .root_generation = std.mem.readInt(u64, bytes[408..416], .little),
+                .signature = bytes[416..480].*,
+            },
+        };
+        value.verifySignature() catch return error.InvalidCatalogRecord;
+        return value;
     }
 };
 pub const max_bytes = 8 * 1024 * 1024;
@@ -100,6 +195,9 @@ pub const AckStatus = struct {
         try request.validate();
         try self.head.validate();
         try self.owner.validate();
+        for (self.owner.receipts, self.owner.attestations) |logical, physical| {
+            if (!std.mem.allEqual(u8, &logical, 0) and std.mem.allEqual(u8, &physical, 0)) return error.InvalidCatalogRecord;
+        }
         for (self.head.counts, 0..) |count, i| {
             const present = self.owner.flags & (@as(u8, 1) << @as(u3, @intCast(i))) != 0;
             if ((count == 0 and present) or (count == self.head.owner_count and !present)) return error.InvalidCatalogRecord;
@@ -114,7 +212,9 @@ pub const AckStatus = struct {
         const stored = self.owner.receipts[@backingInt(receipt.action)];
         if (std.mem.allEqual(u8, &stored, 0)) return false;
         if (!std.mem.eql(u8, &stored, &try receipt.digest())) return error.GenerationPublicationChanged;
-        return true;
+        const root = self.owner.attestations[@backingInt(receipt.action)];
+        if (std.mem.allEqual(u8, &root, 0)) return error.InvalidCatalogRecord;
+        return std.mem.eql(u8, &root, &try request.signed.commitment());
     }
 };
 
@@ -365,18 +465,22 @@ pub fn groupFromKey(key: []const u8) !?u64 {
     const kind = parts.next() orelse return error.InvalidCatalogRecord;
     if (!std.mem.eql(u8, kind, "plan") and !std.mem.eql(u8, kind, "head") and
         !std.mem.eql(u8, kind, "active") and !std.mem.eql(u8, kind, "owner") and !std.mem.eql(u8, kind, "group") and
-        !std.mem.eql(u8, kind, "inputs") and !std.mem.eql(u8, kind, "dispatch")) return error.InvalidCatalogRecord;
+        !std.mem.eql(u8, kind, "inputs") and !std.mem.eql(u8, kind, "dispatch") and !std.mem.eql(u8, kind, "proof")) return error.InvalidCatalogRecord;
     const number = parts.next() orelse return error.InvalidCatalogRecord;
     const group = std.fmt.parseInt(u64, number, 10) catch return error.InvalidCatalogRecord;
     var buf: [20]u8 = undefined;
     if (group == 0 or !std.mem.eql(u8, number, try std.fmt.bufPrint(&buf, "{d}", .{group}))) return error.InvalidCatalogRecord;
     _ = try tableSuffix(parts.next() orelse return error.InvalidCatalogRecord);
-    if (std.mem.eql(u8, kind, "owner") or std.mem.eql(u8, kind, "dispatch")) {
+    if (std.mem.eql(u8, kind, "owner") or std.mem.eql(u8, kind, "dispatch") or std.mem.eql(u8, kind, "proof")) {
         const ordinal = parts.next() orelse return error.InvalidCatalogRecord;
         if (ordinal.len != 4) return error.InvalidCatalogRecord;
         const value = std.fmt.parseInt(u16, ordinal, 16) catch return error.InvalidCatalogRecord;
         var ordinal_buf: [4]u8 = undefined;
         if (value >= progress.max_owners or !std.mem.eql(u8, ordinal, try std.fmt.bufPrint(&ordinal_buf, "{x:0>4}", .{value}))) return error.InvalidCatalogRecord;
+        if (std.mem.eql(u8, kind, "proof")) {
+            const action = parts.next() orelse return error.InvalidCatalogRecord;
+            if (action.len != 1 or action[0] < '0' or action[0] > '6') return error.InvalidCatalogRecord;
+        }
     } else if (std.mem.eql(u8, kind, "group")) {
         _ = try tableSuffix(parts.next() orelse return error.InvalidCatalogRecord);
     }
@@ -404,6 +508,25 @@ pub fn inputsPrefix(buf: []u8, group: u64) ![]const u8 {
 }
 pub fn dispatchPrefix(buf: []u8, group: u64) ![]const u8 {
     return std.fmt.bufPrint(buf, "{s}dispatch:{d}:", .{ prefix, group });
+}
+pub fn proofsPrefix(buf: []u8, group: u64) ![]const u8 {
+    return std.fmt.bufPrint(buf, "{s}proof:{d}:", .{ prefix, group });
+}
+pub fn proofKey(buf: []u8, group: u64, table: u64, ordinal: u16, action: progress.Action) ![]const u8 {
+    if (ordinal >= progress.max_owners or table == 0) return error.InvalidIndexPublicationCandidate;
+    return std.fmt.bufPrint(buf, "{s}proof:{d}:{x:0>16}:{x:0>4}:{d}", .{ prefix, group, table, ordinal, @backingInt(action) });
+}
+
+/// Retained historical proof, not a fresh ownership grant. All returned fields
+/// are fixed-size values; no parsed allocation or borrowed JSON escapes.
+pub fn storedReceipt(bytes: []const u8, head: progress.Head, owner: progress.OwnerState, action: progress.Action) !SignedReceipt {
+    const signed = try SignedReceipt.decode(bytes);
+    if (signed.receipt.action != action or !std.meta.eql(signed.receipt.owner, owner.owner) or
+        !std.mem.eql(u8, &signed.receipt.candidate_digest, &head.candidate_digest) or
+        !std.mem.eql(u8, &signed.receipt.reservation_digest, &head.reservation_digest) or
+        !std.mem.eql(u8, &try signed.receipt.digest(), &owner.receipts[@backingInt(action)]) or
+        !std.mem.eql(u8, &try signed.commitment(), &owner.attestations[@backingInt(action)])) return error.InvalidCatalogRecord;
+    return signed;
 }
 pub fn inputsKey(buf: []u8, group: u64, table: u64) ![]const u8 {
     return std.fmt.bufPrint(buf, "{s}inputs:{d}:{x:0>16}", .{ prefix, group, table });
@@ -900,6 +1023,8 @@ pub const Prepared = struct {
             if (try txn.hasPrefix(group_prefix)) return error.InvalidCatalogRecord;
             const dispatch_prefix = try std.fmt.bufPrint(&buf, "{s}dispatch:{d}:{x:0>16}:", .{ prefix, group, self.head.table_id });
             if (try txn.hasPrefix(dispatch_prefix)) return error.InvalidCatalogRecord;
+            const proofs_prefix = try std.fmt.bufPrint(&buf, "{s}proof:{d}:{x:0>16}:", .{ prefix, group, self.head.table_id });
+            if (try txn.hasPrefix(proofs_prefix)) return error.InvalidCatalogRecord;
         }
         if (try optionalGet(txn, try activeKey(&buf, group, self.head.table_id)) != null) return error.GenerationPublicationChanged;
         try lifecycle.acquire(txn, group, self.head.table_id, .{ .kind = .index_build, .id = self.head.plan_id });
@@ -908,6 +1033,7 @@ pub const Prepared = struct {
         for (0..old_count) |i| {
             const old = try progress.OwnerState.decode(try txn.get(try ownerKey(&buf, group, self.head.table_id, @intCast(i))));
             if (old.owner.ordinal != i or !std.mem.eql(u8, &old.owner.plan_id, &old_id)) return error.InvalidCatalogRecord;
+            try deleteProofs(txn, group, self.head.table_id, old);
             try txn.delete(try ownerGroupKey(&buf, group, self.head.table_id, old.owner.group_id));
         }
         try txn.put(try planKey(&buf, group, self.head.table_id), self.frame);
@@ -943,6 +1069,13 @@ fn optionalGet(txn: anytype, key: []const u8) !?[]const u8 {
 
 /// DROP removes the one retained terminal attempt, not an unbounded history.
 /// Active jobs must finish their owner cleanup before ordinary table deletion.
+fn deleteProofs(txn: anytype, group: u64, table: u64, owner: progress.OwnerState) !void {
+    var buf: [160]u8 = undefined;
+    for (owner.attestations, 0..) |commitment, action| {
+        if (!std.mem.allEqual(u8, &commitment, 0)) try txn.delete(try proofKey(&buf, group, table, owner.owner.ordinal, @fromBackingInt(@intCast(action))));
+    }
+}
+
 pub fn deleteTerminal(txn: anytype, group: u64, table: u64) !bool {
     var buf: [160]u8 = undefined;
     const bytes = (try optionalGet(txn, try headKey(&buf, group, table))) orelse return false;
@@ -952,6 +1085,7 @@ pub fn deleteTerminal(txn: anytype, group: u64, table: u64) !bool {
     for (0..head.owner_count) |i| {
         const owner = try progress.OwnerState.decode(try txn.get(try ownerKey(&buf, group, table, @intCast(i))));
         if (owner.owner.ordinal != i or !std.mem.eql(u8, &owner.owner.plan_id, &head.plan_id)) return error.InvalidCatalogRecord;
+        try deleteProofs(txn, group, table, owner);
         try txn.delete(try ownerGroupKey(&buf, group, table, owner.owner.group_id));
         try txn.delete(try ownerKey(&buf, group, table, @intCast(i)));
         try txn.delete(try dispatchKey(&buf, group, table, @intCast(i)));
@@ -974,6 +1108,7 @@ pub const Verified = struct {
     plan: std.json.Parsed(Plan),
     prepared: Prepared,
     head: progress.Head,
+    receipt_count: usize,
 
     pub fn deinit(self: *Verified) void {
         self.prepared.deinit();
@@ -1009,11 +1144,38 @@ pub fn verifyOwned(a: Allocator, txn: anytype, group: u64, table: u64) !Verified
         return error.InvalidCatalogRecord;
     if (!std.mem.eql(u8, try txn.get(try inputsKey(&buf, group, table)), prepared.inputs)) return error.InvalidCatalogRecord;
     var counts: [7]u16 = @splat(0);
+    var receipt_count: usize = 0;
+    var cached_enrollment: ?root_enrollment.Identity = null;
     for (prepared.owners, 0..) |expected, i| {
         const owner = progress.OwnerState.decode(try txn.get(try ownerKey(&buf, group, table, @intCast(i)))) catch return error.InvalidCatalogRecord;
         if (!std.meta.eql(owner.owner, expected.owner)) return error.InvalidCatalogRecord;
         if (try ownerOrdinal(txn, group, table, owner.owner.group_id) != i) return error.InvalidCatalogRecord;
         if (!std.mem.eql(u8, try txn.get(try dispatchKey(&buf, group, table, @intCast(i))), prepared.dispatch[i])) return error.InvalidCatalogRecord;
+        for (owner.receipts, 0..) |logical, action_index| {
+            const action: progress.Action = @fromBackingInt(@intCast(action_index));
+            if (std.mem.allEqual(u8, &logical, 0)) {
+                if (!std.mem.allEqual(u8, &owner.attestations[action_index], 0)) return error.InvalidCatalogRecord;
+                continue;
+            }
+            const proof_bytes = try optionalGet(txn, try proofKey(&buf, group, table, @intCast(i), action));
+            const signed = try storedReceipt(proof_bytes orelse return error.InvalidCatalogRecord, head, owner, action);
+            if (!std.mem.eql(u8, &signed.proof.identity.metadata_incarnation, &std.fmt.bytesToHex(parsed.value.table_guard.incarnation, .lower))) return error.InvalidCatalogRecord;
+            // Usually all stages share one grant. Cache only a fixed-size
+            // immutable identity in this pinned view, never a borrowed value.
+            if (cached_enrollment == null or !std.meta.eql(cached_enrollment.?, signed.proof.identity)) {
+                const enrolled_bytes = try optionalGet(txn, try root_enrollment.key(&buf, group, signed.proof.identity.store_id, signed.proof.identity.root_incarnation)) orelse return error.InvalidCatalogRecord;
+                if (enrolled_bytes.len > 1024) return error.InvalidCatalogRecord;
+                var enrolled = std.json.parseFromSlice(root_enrollment.Identity, a, enrolled_bytes, .{}) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => return error.InvalidCatalogRecord,
+                };
+                defer enrolled.deinit();
+                if (!std.meta.eql(enrolled.value, signed.proof.identity)) return error.InvalidCatalogRecord;
+                cached_enrollment = enrolled.value;
+            }
+            if (try owner.latestReceiptAction() == action and !std.meta.eql(signed.receipt.position, owner.position.?)) return error.InvalidCatalogRecord;
+            receipt_count += 1;
+        }
         for (&counts, 0..) |*count, flag| if (owner.flags & (@as(u8, 1) << @as(u3, @intCast(flag))) != 0) {
             count.* += 1;
         };
@@ -1034,12 +1196,12 @@ pub fn verifyOwned(a: Allocator, txn: anytype, group: u64, table: u64) !Verified
         // A terminal attempt may coexist with a newer, unrelated lifecycle job.
         if (held.kind == .index_build) return error.InvalidCatalogRecord;
     }
-    return .{ .plan = parsed, .prepared = prepared, .head = head };
+    return .{ .plan = parsed, .prepared = prepared, .head = head, .receipt_count = receipt_count };
 }
 
 test "relational index publication durable keys are canonical group scoped and exclude owner progress from namespace sources" {
     var buf: [160]u8 = undefined;
-    const Kind = enum { plan, active, head, owner, group, inputs, dispatch };
+    const Kind = enum { plan, active, head, owner, group, inputs, dispatch, proof };
     inline for (std.meta.tags(Kind)) |kind| {
         const key = switch (kind) {
             .plan => try planKey(&buf, 13, 101),
@@ -1049,6 +1211,7 @@ test "relational index publication durable keys are canonical group scoped and e
             .group => try ownerGroupKey(&buf, 13, 101, 301),
             .inputs => try inputsKey(&buf, 13, 101),
             .dispatch => try dispatchKey(&buf, 13, 101, 0),
+            .proof => try proofKey(&buf, 13, 101, 0, .validated),
         };
         try std.testing.expectEqual(@as(?u64, 13), try groupFromKey(key));
         try std.testing.expectEqual(null, try sourceKey(key, 14));
@@ -1115,6 +1278,29 @@ fn testPlan(a: Allocator) !Plan {
 pub const testing = if (@import("builtin").is_test) struct {
     pub const plan = testPlan;
 
+    /// Historical signature fixture only; live ownership admission is tested
+    /// through the real metadata transaction/enrollment adapters separately.
+    pub fn signedHistoricalReceipt(receipt: progress.Receipt, incarnation: [16]u8) !SignedReceipt {
+        const seed: [32]u8 = @splat(9);
+        const pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
+        const root: local.storage_db_root_signing_identity.State = .{ .seed = seed, .root_incarnation = 7, .public_key = pair.public_key.toBytes() };
+        return .{ .receipt = receipt, .proof = try (RootProof{
+            .identity = .{ .metadata_incarnation = std.fmt.bytesToHex(incarnation, .lower), .node_id = 2, .store_id = 3, .root_incarnation = 7, .public_key = root.public_key },
+            .reporter_incarnation = 4,
+            .authority = if (receipt.owner.authority == .native) .{ .native = @splat(7) } else .{ .raft = 5 },
+            .root_generation = 6,
+            .signature = undefined,
+        }).sign(root, try receipt.digest()) };
+    }
+
+    pub fn completeAckStatus(request: Ack) !AckStatus {
+        const pending = pendingAckStatus(request);
+        const update = try progress.acknowledge(pending.head, pending.owner, request.expected_revision, request.signed.receipt);
+        var owner = update.owner;
+        owner.attestations[@backingInt(request.signed.receipt.action)] = try request.signed.commitment();
+        return .{ .head = update.head, .owner = owner };
+    }
+
     pub fn fencedAck() !Ack {
         const seed: [32]u8 = @splat(9);
         const pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
@@ -1150,9 +1336,17 @@ test "relational index publication ACK status binds exact committed digest not r
     const request = try testing.fencedAck();
     const pending = testing.pendingAckStatus(request);
     try std.testing.expect(!try pending.isAcknowledged(request));
-    const update = try progress.acknowledge(pending.head, pending.owner, request.expected_revision, request.signed.receipt);
-    const complete: AckStatus = .{ .head = update.head, .owner = update.owner };
+    const complete = try testing.completeAckStatus(request);
     try std.testing.expect(try complete.isAcknowledged(request));
+    const root: local.storage_db_root_signing_identity.State = .{ .seed = @splat(9), .root_incarnation = request.signed.proof.identity.root_incarnation, .public_key = request.signed.proof.identity.public_key };
+    var other_root = request;
+    other_root.signed.proof.root_generation += 1;
+    other_root.signed.proof = try other_root.signed.proof.sign(root, try other_root.signed.receipt.digest());
+    try other_root.validate();
+    try std.testing.expect(!try complete.isAcknowledged(other_root));
+    var missing_root = complete;
+    missing_root.owner.attestations[0] = @splat(0);
+    try std.testing.expectError(error.InvalidCatalogRecord, missing_root.isAcknowledged(request));
     var bad = complete;
     bad.owner.receipts[0][0] ^= 1;
     try std.testing.expectError(error.GenerationPublicationChanged, bad.isAcknowledged(request));
@@ -1191,6 +1385,26 @@ test "relational index publication signatures bind owner authority position and 
             .signature = undefined,
         }).sign(root, try receipt.digest()) };
         try signed.verifySignature();
+        const encoded = try signed.encode();
+        try std.testing.expectEqual(@as(usize, 512), encoded.len);
+        try std.testing.expectEqualDeep(signed, try SignedReceipt.decode(&encoded));
+        for (0..encoded.len) |offset| {
+            var damaged = encoded;
+            damaged[offset] ^= 1;
+            try std.testing.expectError(error.InvalidCatalogRecord, SignedReceipt.decode(&damaged));
+        }
+        for ([_]usize{ 7, 58, 161, 369, 416 }) |offset| {
+            var damaged = encoded;
+            damaged[offset] ^= 1;
+            @memcpy(damaged[480..512], &digest(damaged[0..480]));
+            try std.testing.expectError(error.InvalidCatalogRecord, SignedReceipt.decode(&damaged));
+        }
+        if (authority == .raft) {
+            var damaged = encoded;
+            damaged[384] = 1;
+            @memcpy(damaged[480..512], &digest(damaged[0..480]));
+            try std.testing.expectError(error.InvalidCatalogRecord, SignedReceipt.decode(&damaged));
+        }
         var altered = signed;
         altered.receipt.owner.namespace.shard_id += 1;
         try std.testing.expectError(error.InvalidIndexOwnerReceipt, altered.verifySignature());

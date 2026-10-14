@@ -65,7 +65,7 @@ pub const Owner = struct {
     authority: Authority,
     fence_digest: Digest,
 
-    fn validate(self: Owner) !void {
+    pub fn validate(self: Owner) !void {
         if (!nonzero(&self.plan_id) or !nonzero(&self.plan_digest) or !nonzero(&self.fence_digest) or
             self.ordinal >= max_owners or self.group_id == 0 or self.namespace.table_id == 0 or
             self.namespace.shard_id == 0 or self.namespace.range_id == 0)
@@ -244,14 +244,27 @@ pub const Head = struct {
 };
 
 pub const OwnerState = struct {
-    pub const encoded_len = 424;
+    pub const encoded_len = 648;
     owner: Owner,
     flags: u8 = 0,
     position: ?positions.Position = null,
     receipts: [7]Digest = @splat(@splat(0)),
+    /// Physical commitments are installed by the authenticated metadata
+    /// adapter. The pure logical progress machine does not invent root proof.
+    attestations: [7]Digest = @splat(@splat(0)),
 
     fn has(self: OwnerState, action: Action) bool {
         return self.flags & bit(action) != 0;
+    }
+
+    pub fn latestReceiptAction(self: OwnerState) !?Action {
+        try self.validate();
+        var index = self.receipts.len;
+        while (index != 0) {
+            index -= 1;
+            if (nonzero(&self.receipts[index])) return @fromBackingInt(@intCast(index));
+        }
+        return null;
     }
     pub fn validate(self: OwnerState) !void {
         try self.owner.validate();
@@ -259,6 +272,7 @@ pub const OwnerState = struct {
         if (self.position) |position| position.requireNamespace(self.owner.namespace) catch return error.InvalidGenerationPublication;
         if (self.position) |position| if (!matchesAuthority(self.owner.authority, position)) return error.InvalidGenerationPublication;
         for (self.receipts, 0..) |digest, i| {
+            if (!nonzero(&digest) and nonzero(&self.attestations[i])) return error.InvalidGenerationPublication;
             const action: Action = @fromBackingInt(@intCast(i));
             // Cancellation synthesizes fenced/reserved progress: the cleanup
             // receipt proves both, even if individual ACKs were never received.
@@ -276,7 +290,7 @@ pub const OwnerState = struct {
         try self.validate();
         var bytes: [encoded_len]u8 = @splat(0);
         @memcpy(bytes[0..4], "AIPO");
-        bytes[4] = 2;
+        bytes[4] = 3;
         bytes[5] = self.flags;
         bytes[6] = @backingInt(self.owner.authority);
         @memcpy(bytes[8..24], &self.owner.plan_id);
@@ -289,15 +303,16 @@ pub const OwnerState = struct {
         @memcpy(bytes[96..128], &self.owner.fence_digest);
         if (self.position) |position| @memcpy(bytes[128..161], &try position.encode());
         for (self.receipts, 0..) |digest, i| @memcpy(bytes[168 + i * 32 ..][0..32], &digest);
-        @memcpy(bytes[392..424], &checksum(bytes[0..392]));
+        for (self.attestations, 0..) |digest, i| @memcpy(bytes[392 + i * 32 ..][0..32], &digest);
+        @memcpy(bytes[616..648], &checksum(bytes[0..616]));
         return bytes;
     }
 
     pub fn decode(bytes: []const u8) !OwnerState {
-        if (bytes.len != encoded_len or !std.mem.eql(u8, bytes[0..4], "AIPO") or bytes[4] != 2 or
+        if (bytes.len != encoded_len or !std.mem.eql(u8, bytes[0..4], "AIPO") or bytes[4] != 3 or
             bytes[7] != 0 or !std.mem.allEqual(u8, bytes[58..64], 0) or
             !std.mem.allEqual(u8, bytes[161..168], 0) or
-            !std.mem.eql(u8, &checksum(bytes[0..392]), bytes[392..424])) return error.InvalidGenerationPublication;
+            !std.mem.eql(u8, &checksum(bytes[0..616]), bytes[616..648])) return error.InvalidGenerationPublication;
         var result: OwnerState = .{
             .owner = .{
                 .plan_id = bytes[8..24].*,
@@ -316,6 +331,7 @@ pub const OwnerState = struct {
             .position = if (std.mem.allEqual(u8, bytes[128..161], 0)) null else positions.Position.decode(bytes[128..161]) catch return error.InvalidGenerationPublication,
         };
         for (&result.receipts, 0..) |*digest, i| digest.* = bytes[168 + i * 32 ..][0..32].*;
+        for (&result.attestations, 0..) |*digest, i| digest.* = bytes[392 + i * 32 ..][0..32].*;
         try result.validate();
         return result;
     }
@@ -606,16 +622,16 @@ test "index owner codec rejects legacy layout and checksummed position padding" 
     const bytes = try owner.encode();
     var malformed = bytes;
     malformed[4] = 1;
-    @memcpy(malformed[392..424], &checksum(malformed[0..392]));
+    @memcpy(malformed[616..648], &checksum(malformed[0..616]));
     try std.testing.expectError(error.InvalidGenerationPublication, OwnerState.decode(&malformed));
     malformed = bytes;
     malformed[161] = 1;
-    @memcpy(malformed[392..424], &checksum(malformed[0..392]));
+    @memcpy(malformed[616..648], &checksum(malformed[0..616]));
     try std.testing.expectError(error.InvalidGenerationPublication, OwnerState.decode(&malformed));
     malformed = bytes;
     const position: positions.Position = .{ .native = .{ .namespace = owner.owner.namespace, .sequence = 1 } };
     @memcpy(malformed[128..161], &try position.encode());
-    @memcpy(malformed[392..424], &checksum(malformed[0..392]));
+    @memcpy(malformed[616..648], &checksum(malformed[0..616]));
     try std.testing.expectError(error.InvalidGenerationPublication, OwnerState.decode(&malformed));
 }
 

@@ -471,9 +471,7 @@ test "relational index publication ACK submission fences capabilities releases m
         }
     };
     const request = try publication.testing.fencedAck();
-    const pending = publication.testing.pendingAckStatus(request);
-    const update = try @import("antfly_local_sources").storage_db_relational_index_publication_progress.acknowledge(pending.head, pending.owner, 1, request.signed.receipt);
-    var svc: Mock = .{ .store = .{ .observed = .{ .head = update.head, .owner = update.owner } } };
+    var svc: Mock = .{ .store = .{ .observed = try publication.testing.completeAckStatus(request) } };
     const context: operation.RequestContext = .{ .index_publication_authority = true };
     try std.testing.expectError(error.Forbidden, acknowledgeRelationalIndexOwner(&svc, std.testing.allocator, .{}, undefined));
     try std.testing.expectError(error.Forbidden, relationalIndexOwnerAckStatusJson(&svc, std.testing.allocator, .{}, undefined));
@@ -492,7 +490,7 @@ test "relational index publication ACK submission fences capabilities releases m
     try std.testing.expectError(error.MetadataMutationOutcomeUnknown, acknowledgeRelationalIndexOwner(&svc, std.testing.allocator, context, request));
     try std.testing.expect(!svc.locked);
     svc.wait_failure = false;
-    svc.store.observed = pending;
+    svc.store.observed = publication.testing.pendingAckStatus(request);
     try std.testing.expectError(error.MetadataMutationOutcomeUnknown, acknowledgeRelationalIndexOwner(&svc, std.testing.allocator, context, request));
     try std.testing.expect(!svc.locked);
     try std.testing.expectEqual(@as(usize, 3), svc.proposals);

@@ -5895,3 +5895,63 @@ Publication must retain/revalidate physical evidence and support owner-root
 replacement/re-attestation instead of treating an old phase counter as proof
 of a newly installed root. That work and the same-transaction joined reader
 floor/catalog decision remain prerequisites for enabling public producers.
+
+### Durable physical evidence and latest-stage re-attestation
+
+AIPO v3 owner records retain a physical commitment beside each logical receipt
+digest. The commitment binds the signer identity, metadata incarnation, current
+reporter, authority, physical root generation, logical receipt and signature.
+Exact ACK observation checks both commitments; a logical receipt from another
+root is not success for the requested physical acknowledgment.
+
+Signed receipts persist separately as canonical AIPR v1 records, exactly 512
+bytes with explicit little-endian fields, reserved-zero validation and a physical
+checksum. They are not JSON storage blobs. Parsing and encoding need no heap;
+the API still uses its typed JSON envelope. Owner progress remains fixed-size
+at 648 bytes, and ACK/status paths do not load schema-sized plans. Recovery keeps
+only one fixed-size enrollment cache, avoiding repeated grant lookup/JSON parsing
+when consecutive proofs share an immutable root identity.
+
+The same transaction stages head, owner and physical record. Failure before or
+after the physical write must abort all three; production and fault-injected
+adapters use the same staging helper. A different currently enrolled root may
+re-attest only the latest completed logical stage. That changes the physical
+commitment and head revision without double-counting progress or advancing the
+namespace source. Historical stage evidence cannot be rewritten this way.
+
+Snapshot/recovery projections include proof records and validate signatures,
+logical/physical commitments, plan/candidate/owner bindings and retained signer
+enrollment. Raw 16-byte catalog incarnations are compared through the canonical
+32-byte hexadecimal root identity, not as equal-width arrays. Reverse directory
+verification rejects orphan proofs. Terminal replacement/drop deletes only the
+proof slots actually retained by its old owner cohort; empty slots add no delete
+traffic, and proof history is bounded by the one retained attempt.
+
+Debug tests cover all-byte corruption, valid-checksum padding and signature
+faults for both authority kinds, atomic abort before/after proof persistence,
+missing/malformed/substituted/unenrolled evidence, orphan records, exact physical
+ACK status, latest-stage-only refresh, persisted refresh through reopen and
+alternating terminal cohorts. The focused gate passed 72/72 steps, including
+16 pure progress tests and linked 32 publication, four HTTP and one decoder
+barrier tests. Earlier focused builds exposed a stale test fixture reference,
+a raw-vs-hex incarnation mismatch and a private validator visibility error;
+those runs are not qualification evidence. The final combined Debug metadata,
+service, reader, catalog, initial-FK, restore, publication, ACK and progress gate
+passed 179/179 steps and 278/278 standard-protocol tests. Linked runners passed
+244 metadata-store, 318 control, 226 runtime, 139 service, 28 replication,
+19 initial-FK, 25 restore and 32 publication tests, plus reader and HTTP checks.
+Two optional live PostgreSQL CDC tests skipped their prerequisites; no failures
+or leaks remained. Counts overlap and are not original-case totals. Formatting,
+inventory integrity, licensing, Apache boundary and control-catalog freshness
+checks passed; cache GC was preview-only. No full SQL release pass or push is
+claimed. Original dispositions remain 483 implemented / 136 rejected /
+105 superseded / 862 unresolved; no throughput improvement or public activation
+is claimed.
+
+The metadata re-attestation operation is available, but native execution adapters
+still return early for acknowledged phases. Next, add read-only latest-receipt
+re-attestation without granting mutation permission, then bounded repair when a
+replacement root lacks durable stage data. Publication must revalidate the
+accepted physical evidence against the current owner cut and commit the joined
+reader floor, catalog and schema decision together. Public producers remain off
+until those boundaries and their distributed recovery faults are qualified.

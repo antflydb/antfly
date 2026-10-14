@@ -79,6 +79,8 @@ const std = @import("std");
 /// This does not itself activate a floor or acknowledge an installed schema.
 /// Version 40 decodes AIPH v2 compact index-publication heads binding separate
 /// semantic/physical reader requirements to the admitted owner cohort.
+/// AIPO v3 retains accepted physical-proof commitments; bounded signed proof
+/// records and latest-stage re-attestation share this unreleased decoder gate.
 /// Admission and planless ACKs require durable activation of this decoder.
 pub const current_version: u16 = 40;
 pub const index_publication_head_version: u16 = 40;

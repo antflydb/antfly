@@ -74,4 +74,16 @@ pub const Proof = struct {
         signing.verify(self.identity.public_key, &(try self.message(logical_digest)), self.signature) catch
             return error.InvalidGenerationPublication;
     }
+
+    /// Commit the physical signer/root as well as the logical receipt. This
+    /// deliberately differs for re-attestation by another current reporter.
+    pub fn commitment(self: Proof, logical_digest: [32]u8) ![32]u8 {
+        var hash = std.crypto.hash.Blake3.init(.{});
+        hash.update("antfly/index-owner-accepted-root/v1");
+        hash.update(&(try self.message(logical_digest)));
+        hash.update(&self.signature);
+        var result: [32]u8 = undefined;
+        hash.final(&result);
+        return result;
+    }
 };
