@@ -19,6 +19,7 @@ const addSnowballModule = @import("../embedded/snowball.zig").addSnowballModule;
 
 pub const AntflyRootImports = struct {
     sql_parser: *std.Build.Module,
+    cypher: *std.Build.Module,
     storage_boundary: @import("../embedded/storage_boundary.zig").Modules,
     cancellation: *std.Build.Module,
     cache_budget: *std.Build.Module,
@@ -420,6 +421,7 @@ pub const AntflyRootImports = struct {
     /// Shared runtime contracts for standalone test and implementation roots.
     /// These imports own no storage, consensus, or inference implementation.
     pub fn configureRuntimeContracts(self: @This(), mod: *std.Build.Module) void {
+        mod.addImport("cypher", self.cypher);
         mod.addImport("antfly_cancellation", self.cancellation);
         mod.addImport("antfly_cache_budget", self.cache_budget);
         mod.addImport("antfly_runtime_abi", self.runtime_abi);

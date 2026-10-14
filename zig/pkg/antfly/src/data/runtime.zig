@@ -11626,15 +11626,22 @@ pub const DataServer = struct {
         // immutable metadata decision itself. The canonical bytes then travel
         // in the data Raft entry: follower apply must never depend on metadata
         // IO, its current availability, or a different metadata read cut.
-        const snapshot = try fetchRowPolicyInstallSnapshot(self, scratch, request);
+        const snapshot = fetchRowPolicyInstallSnapshot(self, scratch, request) catch |err| {
+            std.log.warn("row policy owner snapshot failed table_id={} err={s}", .{ request.table_id, @errorName(err) });
+            return err;
+        };
         var bundle_digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(snapshot, &bundle_digest, .{});
         const read_source = self.read_source.source();
         const Probe = struct {
+            var receipt_mismatch_logs: std.atomic.Value(usize) = .init(0);
             fn run(source: @TypeOf(read_source), a: std.mem.Allocator, group: u64, name: []const u8, req: antfly.public_api.row_policy_install.Request, expected_digest: [32]u8) !?Receipt {
                 var response = (source.lookupGroupLocal(a, group, name, "", .{ .row_policy_receipt = .{ .generation = req.expected_generation, .phase = req.expected_phase } }, .read_index) catch |err| switch (err) {
                     error.RowPolicyReceiptNotFound, error.NotFound => return null,
-                    else => return err,
+                    else => {
+                        std.log.warn("row policy owner receipt probe failed table_id={} err={s}", .{ req.table_id, @errorName(err) });
+                        return err;
+                    },
                 }) orelse return null;
                 defer response.deinit(a);
                 const receipt = try std.json.parseFromSliceLeaky(Receipt, a, response.json, .{});
@@ -11643,7 +11650,11 @@ pub const DataServer = struct {
                     !std.mem.eql(u8, &receipt.descriptor_digest, &req.expected_descriptor_digest) or
                     !std.mem.eql(u8, &receipt.bundle_digest, &expected_digest) or
                     receipt.applied_term == 0 or receipt.applied_index == 0)
+                {
+                    if (receipt_mismatch_logs.fetchAdd(1, .monotonic) < 4)
+                        std.log.warn("row policy owner receipt mismatch table_id={} group={} phase={s} received_phase={s} generation={} received_generation={} bundle_matches={} descriptor_matches={}", .{ req.table_id, group, @tagName(req.expected_phase), @tagName(receipt.phase), req.expected_generation, receipt.generation, std.mem.eql(u8, &receipt.bundle_digest, &expected_digest), std.mem.eql(u8, &receipt.descriptor_digest, &req.expected_descriptor_digest) });
                     return error.RowPolicyCatalogChanged;
+                }
                 return receipt;
             }
         };
@@ -11689,10 +11700,13 @@ pub const DataServer = struct {
                 .disabled => 6,
             };
             const index = try std.math.add(u64, try std.math.mul(u64, request.expected_generation, 8), phase_ordinal);
-            _ = (try self.write_source.source().replicatedBatchGroupLocal(alloc, group_id, table_name, .{
+            _ = (self.write_source.source().replicatedBatchGroupLocal(alloc, group_id, table_name, .{
                 .row_policy_publication = request,
                 .row_policy_install_bundle = snapshot,
-            }, false, .{ .term = 1, .index = index })) orelse return error.RowPolicyUnsupported;
+            }, false, .{ .term = 1, .index = index }) catch |err| {
+                std.log.warn("row policy owner phase apply failed table_id={} err={s}", .{ request.table_id, @errorName(err) });
+                return err;
+            }) orelse return error.RowPolicyUnsupported;
         }
         return (try Await.run(read_source, scratch, group_id, table_name, request, bundle_digest)) orelse error.RowPolicyReceiptNotFound;
     }
@@ -12259,7 +12273,7 @@ pub const DataServer = struct {
         // Source-bound pages carry certified per-row timestamps. Ordered
         // artifact admission is a catalog-only command with no row timestamp.
         // A wall-clock override would change either command's replay contract.
-        if (proposal_req.merge_page != null or proposal_req.online_source != null or proposal_req.artifact_catalog != null or proposal_req.artifact_publication != null or proposal_req.artifact_publication_transport != null) return proposal_req;
+        if (proposal_req.merge_page != null or proposal_req.online_source != null or proposal_req.artifact_catalog != null or proposal_req.artifact_publication != null or proposal_req.artifact_publication_transport != null or proposal_req.row_policy_publication != null) return proposal_req;
         // DB.batch treats zero as "read realtime now". Materialize that value
         // once before any forwarding or Raft encoding so every replica applies
         // identical document versions and TTL deadlines. Preserve zero as the
@@ -41680,6 +41694,34 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(u64, 0), legacy.timestamp_ns);
             const negotiated = DataServer.raftBatchRequestForProtocol(explicit, true, 456);
             try std.testing.expectEqual(@as(u64, 123), negotiated.timestamp_ns);
+
+            // Policy phases are isolated control entries. A timestamp adjunct
+            // makes their strict decoder reject the committed Raft command.
+            for ([_]@import("antfly_local_sources").system_catalog_policies.Publication.Phase{ .pending_install, .serving_install, .active, .pending_disable, .serving_disable, .disabled }) |phase| {
+                const policy_request: antfly.db.types.BatchRequest = .{ .row_policy_publication = .{
+                    .table_id = 7,
+                    .owner_group_id = 11,
+                    .expected_generation = 3,
+                    .expected_catalog_epoch = 19,
+                    .expected_phase = phase,
+                    .expected_descriptor_digest = @splat(9),
+                }, .row_policy_install_bundle = "{\"table_id\":7}" };
+                for ([_]bool{ false, true }) |timestamp_protocol| {
+                    const proposal = DataServer.raftBatchRequestForProtocol(policy_request, timestamp_protocol, 999);
+                    try std.testing.expectEqual(@as(u64, 0), proposal.timestamp_ns);
+                    const policy_encoded = try data_raft_batch.encode(alloc, "docs", proposal);
+                    defer alloc.free(policy_encoded);
+                    var policy_decoded = try data_raft_batch.decode(alloc, policy_encoded);
+                    defer policy_decoded.deinit(alloc);
+                    try std.testing.expectEqualDeep(policy_request.row_policy_publication.?, policy_decoded.batch.req.row_policy_publication.?);
+                    try std.testing.expectEqualStrings(policy_request.row_policy_install_bundle, policy_decoded.batch.req.row_policy_install_bundle);
+                    const forwarded = try data_raft_batch.encode(alloc, "docs", policy_decoded.batch.req);
+                    defer alloc.free(forwarded);
+                    var forwarded_decoded = try data_raft_batch.decode(alloc, forwarded);
+                    defer forwarded_decoded.deinit(alloc);
+                    try std.testing.expectEqualDeep(policy_request.row_policy_publication.?, forwarded_decoded.batch.req.row_policy_publication.?);
+                }
+            }
 
             const pages = @import("antfly_local_sources").storage_db_merge_page_contract;
             var page_request: antfly.db.types.BatchRequest = .{

@@ -338,6 +338,42 @@ pub const ClearDatabaseTablespaceResponse = union(enum) {
     }
 };
 
+/// Success payload selected by HTTP status, never by trial-decoding another status's schema.
+pub const CreateGraphResponse = union(enum) {
+    status_201: types.GraphCatalogEntry,
+    status_202: types.CatalogMutationVisibilityPending,
+    pub fn parseResponse(allocator: std.mem.Allocator, status: u16, body: []const u8) !std.json.Parsed(@This()) {
+        const arena = try allocator.create(std.heap.ArenaAllocator);
+        errdefer allocator.destroy(arena);
+        arena.* = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const value: @This() = switch (status) {
+            201 => .{ .status_201 = try std.json.parseFromSliceLeaky(types.GraphCatalogEntry, arena.allocator(), body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) },
+            202 => .{ .status_202 = try std.json.parseFromSliceLeaky(types.CatalogMutationVisibilityPending, arena.allocator(), body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) },
+            else => return error.InvalidApiResponse,
+        };
+        return .{ .arena = arena, .value = value };
+    }
+};
+
+/// Success payload selected by HTTP status, never by trial-decoding another status's schema.
+pub const UpdateGraphResponse = union(enum) {
+    status_200: types.GraphCatalogEntry,
+    status_202: types.CatalogMutationVisibilityPending,
+    pub fn parseResponse(allocator: std.mem.Allocator, status: u16, body: []const u8) !std.json.Parsed(@This()) {
+        const arena = try allocator.create(std.heap.ArenaAllocator);
+        errdefer allocator.destroy(arena);
+        arena.* = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const value: @This() = switch (status) {
+            200 => .{ .status_200 = try std.json.parseFromSliceLeaky(types.GraphCatalogEntry, arena.allocator(), body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) },
+            202 => .{ .status_202 = try std.json.parseFromSliceLeaky(types.CatalogMutationVisibilityPending, arena.allocator(), body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) },
+            else => return error.InvalidApiResponse,
+        };
+        return .{ .arena = arena, .value = value };
+    }
+};
+
 pub const ListRestoreJobsParams = struct {
     limit: ?[]const u8 = null,
     /// Opaque cursor returned by the preceding page.
@@ -2286,6 +2322,76 @@ pub const Client = struct {
         return ApiResponse(types.EvalResult).fromResponse(self.allocator, &resp);
     }
 
+    /// List graphs
+    /// GET /db/v1/graphs
+    pub fn listGraphs(self: *@This()) !ApiResponse([]const types.GraphCatalogEntry) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/graphs", .{self.base_url});
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse([]const types.GraphCatalogEntry).fromResponse(self.allocator, &resp);
+    }
+
+    /// Get graph
+    /// GET /db/v1/graphs/{graphName}
+    pub fn getGraph(self: *@This(), graph_name: []const u8) !ApiResponse(types.GraphCatalogEntry) {
+        const encoded_graph_name = try httpx.PercentEncoding.encode(self.allocator, graph_name);
+        defer self.allocator.free(encoded_graph_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/graphs/{s}", .{ self.base_url, encoded_graph_name });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.GraphCatalogEntry).fromResponse(self.allocator, &resp);
+    }
+
+    /// Create graph
+    /// POST /db/v1/graphs/{graphName}
+    pub fn createGraph(self: *@This(), graph_name: []const u8, body: types.GraphDefinition) !ApiResponse(CreateGraphResponse) {
+        const encoded_graph_name = try httpx.PercentEncoding.encode(self.allocator, graph_name);
+        defer self.allocator.free(encoded_graph_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/graphs/{s}", .{ self.base_url, encoded_graph_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(CreateGraphResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// Update graph definition
+    /// PUT /db/v1/graphs/{graphName}
+    pub fn updateGraph(self: *@This(), graph_name: []const u8, body: types.GraphDefinitionUpdate) !ApiResponse(UpdateGraphResponse) {
+        const encoded_graph_name = try httpx.PercentEncoding.encode(self.allocator, graph_name);
+        defer self.allocator.free(encoded_graph_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/graphs/{s}", .{ self.base_url, encoded_graph_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.put(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(UpdateGraphResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// Drop graph
+    /// DELETE /db/v1/graphs/{graphName}
+    pub fn dropGraph(self: *@This(), graph_name: []const u8) !ApiResponse(std.json.Value) {
+        const encoded_graph_name = try httpx.PercentEncoding.encode(self.allocator, graph_name);
+        defer self.allocator.free(encoded_graph_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/graphs/{s}", .{ self.base_url, encoded_graph_name });
+        defer self.allocator.free(url);
+        var resp = try self.http.delete(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
+    }
+
+    /// Execute Cypher against a named graph
+    /// POST /db/v1/graphs/{graphName}/query
+    pub fn executeGraphQuery(self: *@This(), graph_name: []const u8, body: types.GraphQueryRequest) !ApiResponse(types.GraphQueryResult) {
+        const encoded_graph_name = try httpx.PercentEncoding.encode(self.allocator, graph_name);
+        defer self.allocator.free(encoded_graph_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/graphs/{s}/query", .{ self.base_url, encoded_graph_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.GraphQueryResult).fromResponse(self.allocator, &resp);
+    }
+
     /// Perform a global query
     /// POST /db/v1/query
     pub fn globalQuery(self: *@This(), body: types.GlobalStatefulQueryRequest) !ApiResponse(types.StatefulQueryResponses) {
@@ -3683,6 +3789,17 @@ pub const Client = struct {
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.TransactionStatusResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// Inspect your transaction receipt
+    /// GET /db/v1/transactions/{transaction_id}/status
+    pub fn getTransactionStatus(self: *@This(), transaction_id: []const u8) !ApiResponse(types.TransactionSessionStatus) {
+        const encoded_transaction_id = try httpx.PercentEncoding.encode(self.allocator, transaction_id);
+        defer self.allocator.free(encoded_transaction_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/transactions/{s}/status", .{ self.base_url, encoded_transaction_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.TransactionSessionStatus).fromResponse(self.allocator, &resp);
     }
 
     /// Stage a transaction write

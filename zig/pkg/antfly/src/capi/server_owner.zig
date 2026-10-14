@@ -2281,6 +2281,88 @@ pub fn metadataApplyStoreProjection(
     };
 }
 
+const MetadataSessionRead = struct {
+    alloc: Allocator,
+    txn: antfly.capi_dependencies.storage_docstore.DocStore.Txn,
+    prefix: []u8,
+};
+pub fn metadataSessionReadOpen(store_ptr: ?*anyopaque, request: *const kernel_owner_abi.MetadataApplyGroupRequest, out_read: *?*anyopaque) callconv(.c) kernel_owner_abi.Status {
+    out_read.* = null;
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const owner = asMetadataApplyStore(store_ptr) orelse return .invalid_argument;
+    const read = owner.alloc.create(MetadataSessionRead) catch return .out_of_memory;
+    var buf: [96]u8 = undefined;
+    const prefix = @import("../metadata/transaction_session_record.zig").prefixForGroup(&buf, request.group_id) catch {
+        owner.alloc.destroy(read);
+        return .invalid_argument;
+    };
+    const owned = owner.alloc.dupe(u8, prefix) catch {
+        owner.alloc.destroy(read);
+        return .out_of_memory;
+    };
+    const txn = owner.store.store.beginReadTxn() catch |err| {
+        owner.alloc.free(owned);
+        owner.alloc.destroy(read);
+        return storageOwnerStatusFromError(err);
+    };
+    read.* = .{ .alloc = owner.alloc, .txn = txn, .prefix = owned };
+    out_read.* = read;
+    return .ok;
+}
+pub fn metadataSessionReadClose(read_ptr: ?*anyopaque) callconv(.c) void {
+    const read: *MetadataSessionRead = @ptrCast(@alignCast(read_ptr orelse return));
+    const alloc = read.alloc;
+    read.txn.abort();
+    alloc.free(read.prefix);
+    alloc.destroy(read);
+}
+pub fn metadataSessionReadInvoke(read_ptr: ?*anyopaque, request: *const kernel_owner_abi.MetadataSessionReadRequest, out_value: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+    out_value.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const read: *MetadataSessionRead = @ptrCast(@alignCast(read_ptr orelse return .invalid_argument));
+    const key = request.key.slice();
+    var upper: [96]u8 = undefined;
+    @memcpy(upper[0..read.prefix.len], read.prefix);
+    upper[read.prefix.len - 1] += 1;
+    const upper_bound = upper[0..read.prefix.len];
+    const bounded = switch (request.operation) {
+        .get, .next, .prev, .seek_at_or_after, .seek_at_or_before => true,
+        else => false,
+    };
+    const upper_seek = request.operation == .seek_at_or_before and std.mem.eql(u8, key, upper_bound);
+    if (bounded and ((!std.mem.startsWith(u8, key, read.prefix) and !upper_seek) or key.len > read.prefix.len + 512)) return .invalid_argument;
+    if (request.operation == .get) {
+        const value = read.txn.get(key) catch |err| return storageOwnerStatusFromError(err);
+        if (value.len > 32 << 20) return .invalid_argument;
+        const copy = read.alloc.dupe(u8, value) catch return .out_of_memory;
+        out_value.* = .{ .ptr = if (copy.len == 0) null else copy.ptr, .len = @intCast(copy.len) };
+        return .ok;
+    }
+    var cursor = read.txn.openCursor() catch |err| return storageOwnerStatusFromError(err);
+    defer cursor.close();
+    var entry = switch (request.operation) {
+        .get => unreachable,
+        .first => cursor.seekAtOrAfter(read.prefix),
+        .last => cursor.seekAtOrBefore(upper_bound),
+        .next, .seek_at_or_after => cursor.seekAtOrAfter(key),
+        .prev, .seek_at_or_before => cursor.seekAtOrBefore(key),
+    } catch |err| return storageOwnerStatusFromError(err);
+    if (entry) |current| {
+        if ((request.operation == .last or upper_seek) and std.mem.eql(u8, current.key, upper_bound)) entry = cursor.prev() catch |err| return storageOwnerStatusFromError(err);
+        if ((request.operation == .next or request.operation == .prev) and std.mem.eql(u8, current.key, key)) entry = (if (request.operation == .next) cursor.next() else cursor.prev()) catch |err| return storageOwnerStatusFromError(err);
+    }
+    const current = entry orelse return .not_found;
+    if (!std.mem.startsWith(u8, current.key, read.prefix)) return .not_found;
+    const size = current.key.len +| current.value.len +| 4;
+    if (size > (32 << 20) + 1024) return .invalid_argument;
+    const output = read.alloc.alloc(u8, size) catch return .out_of_memory;
+    std.mem.writeInt(u32, output[0..4], @intCast(current.key.len), .little);
+    @memcpy(output[4..][0..current.key.len], current.key);
+    @memcpy(output[4 + current.key.len ..], current.value);
+    out_value.* = .{ .ptr = output.ptr, .len = @intCast(output.len) };
+    return .ok;
+}
+
 pub fn metadataReconcileReplicaRoot(
     request: *const kernel_owner_abi.MetadataReplicaRootReconcileRequest,
     out_summary: *kernel_owner_abi.MetadataProvisionSummary,
@@ -4865,8 +4947,10 @@ pub fn replicatedBatchStorageKernelJsonAtRaftEntry(
         // Bound the private ABI payload before crossing into the storage owner;
         // the owner independently checks the canonical bundle limit and shape.
         if (bundle.len == 0 or bundle.len > 4 * 1024 * 1024) return .invalid_argument;
-        const receipt = handle.db.applyReplicatedRowPolicyPublication(bundle, publication, raft_entry) catch |err|
+        const receipt = handle.db.applyReplicatedRowPolicyPublication(bundle, publication, raft_entry) catch |err| {
+            std.log.warn("native row policy phase apply failed table_id={} err={s}", .{ publication.table_id, @errorName(err) });
             return storageOwnerStatusFromError(err);
+        };
         var result = owned.result();
         result.row_policy_receipt = receipt;
         const response = batch_api.encodeBatchResponse(std.heap.c_allocator, result) catch |err|
@@ -5031,6 +5115,14 @@ pub const StorageRelationalRead = struct {
             try validate(ptr);
             return .{ .ptr = pinned, .vtable = &.{ .open = Pinned.open, .release = Pinned.release } };
         }
+        pub fn captureGraph(ptr: *anyopaque, alloc: std.mem.Allocator, input: antfly.capi_dependencies.statement_read_fence.GraphInput) !antfly.capi_dependencies.statement_read_fence.GraphRead {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try validate(ptr);
+            const read = try db_mod.DB.CypherStatementSnapshot.create(alloc, self.db, &self.fence, input, self.cancellation orelse .none);
+            errdefer read.deinit();
+            try validate(ptr);
+            return read;
+        }
     };
 
     pub fn tryFence(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, opts: db_mod.types.ScanOptions) !?Fence {
@@ -5043,7 +5135,7 @@ pub const StorageRelationalRead = struct {
         errdefer alloc.destroy(capture);
         capture.* = .{ .alloc = alloc, .db = &handle.db, .fence = fence, .cancellation = opts.cancellation, .deadline_ns = opts.execution_deadline_ns };
         try Capture.validate(capture);
-        return .{ .ptr = capture, .vtable = &.{ .validate = Capture.validate, .open = Capture.open, .capture_snapshot = Capture.captureSnapshot, .release = Capture.release } };
+        return .{ .ptr = capture, .vtable = &.{ .validate = Capture.validate, .open = Capture.open, .capture_snapshot = Capture.captureSnapshot, .capture_graph = Capture.captureGraph, .release = Capture.release } };
     }
 
     pub fn open(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, from: []const u8, to: []const u8, opts: db_mod.types.ScanOptions) !View {

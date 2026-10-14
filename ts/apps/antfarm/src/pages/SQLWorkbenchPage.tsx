@@ -11,15 +11,18 @@ import { SQLExecutionError, type SQLResponse } from "@antfly/sdk";
 import { useEffect, useRef, useState } from "react";
 import { useApi } from "@/hooks/use-api-config";
 import { sqlCell, sqlParameters } from "./sql-workbench";
+import SQLGraphPreview, { sqlGraphValues } from "@/components/SQLGraphPreview";
 
-export default function SQLWorkbenchPage() {
+export default function SQLWorkbenchPage({ initialStatement }: { initialStatement?: string } = {}) {
   const client = useApi();
-  const [statement, setStatement] = useState("SELECT 1");
+  const [statement, setStatement] = useState(initialStatement ?? "SELECT 1");
   const [parameters, setParameters] = useState("[]");
   const [database, setDatabase] = useState("default");
   const [namespace, setNamespace] = useState("public");
   const [session, setSession] = useState<string>();
   const [result, setResult] = useState<SQLResponse>();
+  const [resultView, setResultView] = useState<"Table" | "Graph" | "JSON">("Table");
+  const graphValues = result ? sqlGraphValues(result) : [];
   const [diagnostic, setDiagnostic] = useState("");
   const [busy, setBusy] = useState(false);
   const [uncertain, setUncertain] = useState(false);
@@ -39,6 +42,7 @@ export default function SQLWorkbenchPage() {
     setBusy(false);
     setSession(undefined);
     setResult(undefined);
+    setResultView("Table");
     setDiagnostic("");
     setUncertain(false);
   }, [client]);
@@ -57,6 +61,7 @@ export default function SQLWorkbenchPage() {
     setBusy(true);
     setDiagnostic("");
     setResult(undefined);
+    setResultView("Table");
     try {
       const response = await client.executeSQL(
         {
@@ -212,33 +217,59 @@ export default function SQLWorkbenchPage() {
           {result.ddl_receipt && (
             <pre className="whitespace-pre-wrap">{JSON.stringify(result.ddl_receipt, null, 2)}</pre>
           )}
-          <div className="overflow-auto">
-            <table className="w-full text-left text-sm">
-              <thead>
-                <tr>
-                  {result.columns.map((column, index) => (
-                    // biome-ignore lint/suspicious/noArrayIndexKey: positional columns may have duplicate names and never reorder within a result.
-                    <th className="border p-2" key={`${index}:${column.name}`}>
-                      {column.name}
-                      <span className="ml-2 text-muted-foreground">{column.type}</span>
-                    </th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {result.rows.map((row, ri) => (
-                  <tr key={JSON.stringify([ri, row])}>
-                    {row.map((_, ci) => (
-                      // biome-ignore lint/suspicious/noArrayIndexKey: immutable SQL cells have positional identity, not unique values.
-                      <td className="border p-2 font-mono whitespace-pre-wrap" key={`${ri}:${ci}`}>
-                        {sqlCell(result, ri, ci)}
-                      </td>
+          <div role="tablist" aria-label="SQL result views" className="flex gap-2">
+            {(["Table", "Graph", "JSON"] as const)
+              .filter((view) => view !== "Graph" || graphValues.length > 0)
+              .map((view) => (
+                <Button
+                  key={view}
+                  role="tab"
+                  aria-selected={resultView === view}
+                  variant={resultView === view ? "default" : "outline"}
+                  onClick={() => setResultView(view)}
+                >
+                  {view}
+                </Button>
+              ))}
+          </div>
+          {resultView === "Graph" && graphValues.length > 0 ? (
+            <SQLGraphPreview values={graphValues} />
+          ) : resultView === "JSON" ? (
+            <pre className="max-h-[32rem] overflow-auto rounded border p-3 text-xs">
+              {JSON.stringify(result, null, 2)}
+            </pre>
+          ) : (
+            <div className="overflow-auto">
+              <table className="w-full text-left text-sm">
+                <thead>
+                  <tr>
+                    {result.columns.map((column, index) => (
+                      // biome-ignore lint/suspicious/noArrayIndexKey: positional columns may have duplicate names and never reorder within a result.
+                      <th className="border p-2" key={`${index}:${column.name}`}>
+                        {column.name}
+                        <span className="ml-2 text-muted-foreground">{column.type}</span>
+                      </th>
                     ))}
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+                </thead>
+                <tbody>
+                  {result.rows.map((row, ri) => (
+                    <tr key={JSON.stringify([ri, row])}>
+                      {row.map((_, ci) => (
+                        // biome-ignore lint/suspicious/noArrayIndexKey: immutable SQL cells have positional identity, not unique values.
+                        <td
+                          className="border p-2 font-mono whitespace-pre-wrap"
+                          key={`${ri}:${ci}`}
+                        >
+                          {sqlCell(result, ri, ci)}
+                        </td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
         </>
       )}
     </DashboardPage>

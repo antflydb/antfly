@@ -24,7 +24,7 @@ pub const default_database_id: u64 = 1;
 pub const default_namespace_id: u64 = 2;
 pub const max_name_bytes = 128;
 pub const max_command_bytes = 3 * 1024 * 1024;
-pub const Kind = enum { database, namespace, tablespace, table, query_source };
+pub const Kind = enum { database, namespace, tablespace, table, query_source, graph };
 
 /// Request-owned query preparation data, excluding topology and unrelated
 /// tables. Read schema and index generations are captured together.
@@ -126,7 +126,82 @@ pub const Resource = struct {
     /// Compatibility metadata only, never a filesystem path override.
     location_json: []const u8 = "null",
     source_json: []const u8 = "null",
+    /// Immutable physical bindings captured atomically when a graph is created.
+    /// Display names in source_json never retarget an existing graph.
+    graph_tables: []const GraphTableBinding = &.{},
+    graph_indexes: []const GraphIndexBinding = &.{},
+    graph_revision: u64 = 1,
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        inline for (@typeInfo(@This()).@"struct".field_names) |name| {
+            const graph_field = comptime std.mem.eql(u8, name, "graph_tables") or std.mem.eql(u8, name, "graph_indexes") or std.mem.eql(u8, name, "graph_revision");
+            if (!graph_field or self.kind == .graph) {
+                try jw.objectField(name);
+                try jw.write(@field(self, name));
+            }
+        }
+        try jw.endObject();
+    }
 };
+
+pub const GraphTableBinding = struct { label_index: u8, table_id: u64, storage_name: []const u8 };
+pub const GraphIndexBinding = struct { mapping_index: u8, identity: @import("cypher").catalog.IndexIdentity };
+
+/// Build the execution definition from authoritative catalog bindings. Older
+/// unbound records require explicit recreation rather than name rebinding.
+pub fn graphForExecution(a: std.mem.Allocator, resource: Resource) !@import("cypher").catalog.Graph {
+    if (resource.kind != .graph) return error.InvalidCatalogRecord;
+    var graph = try @import("cypher").catalog.parseDefinition(a, resource.name, resource.id, resource.graph_revision, resource.source_json);
+    if (resource.graph_tables.len != graph.labels.len) return error.CatalogGenerationChanged;
+    const labels = try a.dupe(@import("cypher").catalog.Label, graph.labels);
+    for (resource.graph_tables, 0..) |binding, i| {
+        if (binding.label_index != i or binding.table_id == 0 or binding.storage_name.len == 0) return error.InvalidCatalogRecord;
+        labels[i].table = try a.dupe(u8, binding.storage_name);
+        labels[i].table_id = binding.table_id;
+    }
+    graph.labels = labels;
+    if (resource.graph_indexes.len != graph.relationships.len) return error.CatalogGenerationChanged;
+    const relationships = try a.dupe(@import("cypher").catalog.Relationship, graph.relationships);
+    for (resource.graph_indexes, 0..) |binding, i| {
+        if (binding.mapping_index != i or binding.identity.incarnation == 0 or binding.identity.config_hash == 0) return error.InvalidCatalogRecord;
+        relationships[i].identity = binding.identity;
+    }
+    graph.relationships = relationships;
+    return graph;
+}
+
+/// Graph mappings follow immutable table IDs through logical table and scope
+/// renames. Unadopted legacy tables still use their original literal target.
+pub fn graphLabelTarget(state: State, binding: GraphTableBinding, fallback: @import("cypher").catalog.Label) !Target {
+    const table = state.byId(.table, binding.table_id) orelse return .{ .database = fallback.database, .namespace = fallback.namespace, .table = fallback.table };
+    if (!std.mem.eql(u8, table.storage_name, binding.storage_name)) return error.CatalogGenerationChanged;
+    const namespace = state.byId(.namespace, table.parent_id) orelse return error.InvalidCatalogRecord;
+    const database = state.byId(.database, namespace.parent_id) orelse return error.InvalidCatalogRecord;
+    const target: Target = .{ .database = database.name, .namespace = namespace.name, .table = table.name };
+    try target.validate();
+    return target;
+}
+
+pub fn appendGraphReadDependencies(a: std.mem.Allocator, out: *std.ArrayListUnmanaged(Resource), reader: anytype, count: usize) !void {
+    for (0..count) |i| {
+        const graph = out.items[i];
+        if (graph.kind != .graph) continue;
+        for (graph.graph_tables) |binding| {
+            const table = (try reader.byId(.table, binding.table_id)) orelse continue;
+            if (!std.mem.eql(u8, table.storage_name, binding.storage_name)) return error.CatalogGenerationChanged;
+            const namespace = (try reader.byId(.namespace, table.parent_id)) orelse return error.InvalidCatalogRecord;
+            const database = (try reader.byId(.database, namespace.parent_id)) orelse return error.InvalidCatalogRecord;
+            for ([_]Resource{ table, namespace, database }) |record| {
+                var found = false;
+                for (out.items) |prior| if (prior.kind == record.kind and prior.id == record.id) {
+                    found = true;
+                    break;
+                };
+                if (!found) try out.append(a, record);
+            }
+        }
+    }
+}
 
 pub const default_database: Resource = .{ .kind = .database, .id = default_database_id, .name = default_database_name };
 pub const default_namespace: Resource = .{ .kind = .namespace, .id = default_namespace_id, .parent_id = default_database_id, .name = default_namespace_name };
@@ -222,7 +297,7 @@ pub const TableScope = struct {
     }
 };
 
-pub const Action = enum { create, drop, rename, set_tablespace };
+pub const Action = enum { create, drop, rename, set_tablespace, set_definition };
 pub const Mutation = struct {
     action: Action,
     kind: Kind,
@@ -234,9 +309,25 @@ pub const Mutation = struct {
     placement_policy: PlacementPolicy = .{},
     location_json: []const u8 = "null",
     source_json: []const u8 = "null",
+    expected_graph_revision: ?u64 = null,
     /// Populated only by native table admission, never accepted from public JSON.
     table_id: u64 = 0,
     storage_name: []const u8 = "",
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        inline for (@typeInfo(@This()).@"struct".field_names) |name| {
+            if (comptime std.mem.eql(u8, name, "expected_graph_revision")) {
+                if (self.expected_graph_revision) |revision| {
+                    try jw.objectField(name);
+                    try jw.write(revision);
+                }
+            } else {
+                try jw.objectField(name);
+                try jw.write(@field(self, name));
+            }
+        }
+        try jw.endObject();
+    }
 };
 
 pub const State = struct {
@@ -613,6 +704,19 @@ fn cloneResource(alloc: std.mem.Allocator, source: Resource) !Resource {
     errdefer alloc.free(r.storage_name);
     r.source_json = try alloc.dupe(u8, source.source_json);
     errdefer alloc.free(r.source_json);
+    const graph_tables = try alloc.dupe(GraphTableBinding, source.graph_tables);
+    var initialized: usize = 0;
+    errdefer {
+        for (graph_tables[0..initialized]) |binding| alloc.free(binding.storage_name);
+        alloc.free(graph_tables);
+    }
+    for (graph_tables) |*binding| {
+        binding.storage_name = try alloc.dupe(u8, binding.storage_name);
+        initialized += 1;
+    }
+    r.graph_tables = graph_tables;
+    r.graph_indexes = try alloc.dupe(GraphIndexBinding, source.graph_indexes);
+    errdefer alloc.free(r.graph_indexes);
     r.location_json = try alloc.dupe(u8, source.location_json);
     errdefer alloc.free(r.location_json);
     if (source.placement_policy.placement_role) |role| r.placement_policy.placement_role = try alloc.dupe(u8, role);
@@ -623,6 +727,9 @@ fn freeResource(alloc: std.mem.Allocator, r: Resource) void {
     alloc.free(r.storage_name);
     alloc.free(r.location_json);
     alloc.free(r.source_json);
+    for (r.graph_tables) |binding| alloc.free(binding.storage_name);
+    alloc.free(r.graph_tables);
+    alloc.free(r.graph_indexes);
     if (r.placement_policy.placement_role) |role| alloc.free(role);
 }
 
@@ -632,10 +739,16 @@ pub const Delta = struct {
     upserts: []Resource,
     removes: []Resource,
     next_id: u64,
+    /// Binding array newly allocated by graph creation; individual fields are
+    /// borrowed from the pinned reader until MutableState clones the resource.
+    owned_graph_tables: []GraphTableBinding = &.{},
+    owned_graph_indexes: []GraphIndexBinding = &.{},
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.upserts);
         alloc.free(self.removes);
+        alloc.free(self.owned_graph_tables);
+        alloc.free(self.owned_graph_indexes);
         self.* = undefined;
     }
 };
@@ -643,7 +756,13 @@ pub const Delta = struct {
 /// Table IDs visible in the same committed snapshot, including legacy tables
 /// whose names are implicitly in default.public. The apply layer supplies these
 /// to prevent deleting a namespace/database that still owns physical tables.
-pub const PhysicalTable = struct { id: u64, name: []const u8 };
+pub const PhysicalTable = struct {
+    id: u64,
+    name: []const u8,
+    /// Test/algorithm reader inventory. Production resolves these lazily from
+    /// the same committed transaction through graphIndexIdentity.
+    graph_indexes: []const struct { name: []const u8, identity: @import("cypher").catalog.IndexIdentity } = &.{},
+};
 
 /// Planning uses a transaction-pinned reader. Point mutations touch only their
 /// dependencies; dropping a database enumerates only that database's children.
@@ -660,7 +779,19 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
     if (request.new_name) |name| try validateResourceName(request.kind, name);
     if (request.tablespace) |name| try validateName(name);
     try request.placement_policy.validate();
-    if (request.kind == .query_source and request.action == .create) try validateQuerySource(alloc, request.source_json) else if (!std.mem.eql(u8, request.source_json, "null")) return error.InvalidCatalogMutation;
+    if (request.kind == .query_source and request.action == .create) {
+        try validateQuerySource(alloc, request.source_json);
+    } else if (request.kind == .graph and (request.action == .create or request.action == .set_definition)) {
+        var region = std.heap.ArenaAllocator.init(alloc);
+        defer region.deinit();
+        _ = @import("cypher").catalog.parseDefinition(region.allocator(), request.name, 1, 1, request.source_json) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidCatalogMutation,
+        };
+    } else if (!std.mem.eql(u8, request.source_json, "null")) return error.InvalidCatalogMutation;
+    if (request.action == .set_definition) {
+        if (request.kind != .graph or request.expected_graph_revision == null or request.expected_graph_revision.? == 0 or request.new_name != null or request.tablespace != null) return error.InvalidCatalogMutation;
+    } else if (request.expected_graph_revision != null) return error.InvalidCatalogMutation;
     if (request.location_json.len > 64 * 1024) return error.InvalidTablespaceLocation;
     var location = std.json.parseFromSlice(std.json.Value, alloc, request.location_json, .{}) catch |err| switch (err) {
         error.OutOfMemory => return err,
@@ -670,7 +801,7 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
     if (request.kind != .tablespace and (!std.mem.eql(u8, request.location_json, "null") or
         request.placement_policy.placement_role != null or request.placement_policy.desired_replica_count != null or request.placement_policy.min_ranges != null)) return error.InvalidCatalogMutation;
     const parent_id: u64 = switch (request.kind) {
-        .database, .tablespace, .query_source => 0,
+        .database, .tablespace, .query_source, .graph => 0,
         .namespace => ((try reader.lookup(.database, 0, request.database)) orelse return error.DatabaseNotFound).id,
         .table => (try reader.namespaceFor(request.database, request.namespace)).id,
     };
@@ -685,13 +816,62 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
     var removes = std.ArrayListUnmanaged(Resource).empty;
     defer removes.deinit(alloc);
     var next_id = next;
+    var graph_tables: []GraphTableBinding = &.{};
+    errdefer alloc.free(graph_tables);
+    var graph_indexes: []GraphIndexBinding = &.{};
+    errdefer alloc.free(graph_indexes);
     switch (request.action) {
-        .create => {
-            if (found != null) return error.CatalogAlreadyExists;
+        .create, .set_definition => {
+            const replacing = request.action == .set_definition;
+            if (!replacing and found != null) return error.CatalogAlreadyExists;
+            if (replacing) {
+                const existing = found orelse return error.CatalogNotFound;
+                if (existing.graph_revision != request.expected_graph_revision.?) return error.CatalogGenerationChanged;
+            }
             if (request.new_name != null) return error.InvalidCatalogMutation;
             const binding = if (request.tablespace) |name| ((try reader.lookup(.tablespace, 0, name)) orelse return error.TablespaceNotFound).id else 0;
             if (request.kind == .tablespace and binding != 0) return error.InvalidCatalogMutation;
-            var resource: Resource = .{ .kind = request.kind, .id = next_id, .parent_id = parent_id, .name = request.name, .tablespace_id = binding, .placement_policy = request.placement_policy, .location_json = request.location_json, .source_json = request.source_json };
+            var resource: Resource = if (replacing) found.? else .{ .kind = request.kind, .id = next_id, .parent_id = parent_id, .name = request.name, .tablespace_id = binding, .placement_policy = request.placement_policy, .location_json = request.location_json, .source_json = request.source_json };
+            if (replacing) {
+                resource.graph_revision = std.math.add(u64, resource.graph_revision, 1) catch return error.CatalogIdExhausted;
+                resource.source_json = request.source_json;
+            }
+            if (request.kind == .graph) {
+                var region = std.heap.ArenaAllocator.init(alloc);
+                defer region.deinit();
+                const graph = try @import("cypher").catalog.parseDefinition(region.allocator(), request.name, resource.id, resource.graph_revision, request.source_json);
+                graph_tables = try alloc.alloc(GraphTableBinding, graph.labels.len);
+                for (graph.labels, graph_tables, 0..) |label, *out, i| {
+                    // Dots never qualify a string; scoped tables use a target object.
+                    try validateTableName(label.table);
+                    try validateName(label.database);
+                    try validateName(label.namespace);
+                    const namespace = try reader.namespaceFor(label.database, label.namespace);
+                    if (try reader.lookup(.table, namespace.id, label.table)) |table| {
+                        out.* = .{ .label_index = @intCast(i), .table_id = table.id, .storage_name = table.storage_name };
+                    } else {
+                        if (namespace.id != default_namespace_id) return error.TableNotFound;
+                        const table = (try reader.physicalByName(label.table)) orelse return error.TableNotFound;
+                        if (try reader.byId(.table, table.id) != null) return error.TableNotFound;
+                        out.* = .{ .label_index = @intCast(i), .table_id = table.id, .storage_name = table.name };
+                    }
+                    const physical = (try reader.physicalById(out.table_id)) orelse return error.TableNotFound;
+                    if (out.table_id == 0 or !std.mem.eql(u8, physical.name, out.storage_name)) return error.CatalogGenerationChanged;
+                }
+                resource.graph_tables = graph_tables;
+                graph_indexes = try alloc.alloc(GraphIndexBinding, graph.relationships.len);
+                for (graph.relationships, graph_indexes, 0..) |mapping, *out, i| {
+                    var source_id: u64 = 0;
+                    for (graph.labels, graph_tables) |label, physical| if (std.mem.eql(u8, label.name, mapping.source_label)) {
+                        source_id = physical.table_id;
+                        break;
+                    };
+                    const identity = (try reader.graphIndexIdentity(source_id, mapping.index)) orelse return error.IndexNotFound;
+                    if (identity.incarnation == 0 or identity.config_hash == 0) return error.CatalogGenerationChanged;
+                    out.* = .{ .mapping_index = @intCast(i), .identity = identity };
+                }
+                resource.graph_indexes = graph_indexes;
+            }
             if (request.kind == .table) {
                 if (request.table_id == 0 or request.storage_name.len == 0) return error.InvalidCatalogMutation;
                 if (try reader.byId(.table, request.table_id) != null or try reader.bindingForStorage(request.storage_name) != null or
@@ -702,7 +882,7 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
                 resource.id = request.table_id;
                 resource.storage_name = request.storage_name;
             }
-            next_id = std.math.add(u64, next_id, 1) catch return error.CatalogIdExhausted;
+            if (!replacing) next_id = std.math.add(u64, next_id, 1) catch return error.CatalogIdExhausted;
             try upserts.append(alloc, resource);
             if (request.kind == .database) {
                 try upserts.append(alloc, .{ .kind = .namespace, .id = next_id, .parent_id = resource.id, .name = default_namespace_name });
@@ -738,7 +918,7 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
                         },
                         .namespace => if ((try reader.children(.table, existing.id, 1)).len != 0) return error.NamespaceNotEmpty,
                         .tablespace => if (try reader.tablespaceInUse(existing.id)) return error.TablespaceInUse,
-                        .query_source => {},
+                        .query_source, .graph => {},
                         .table => {
                             if (!dropping_table) return error.CatalogTableTopologyRequired;
                             if (request.table_id != existing.id or !std.mem.eql(u8, request.storage_name, existing.storage_name)) return error.CatalogGenerationChanged;
@@ -751,7 +931,7 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
     }
     const owned_upserts = try upserts.toOwnedSlice(alloc);
     errdefer alloc.free(owned_upserts);
-    return .{ .upserts = owned_upserts, .removes = try removes.toOwnedSlice(alloc), .next_id = next_id };
+    return .{ .upserts = owned_upserts, .removes = try removes.toOwnedSlice(alloc), .next_id = next_id, .owned_graph_tables = graph_tables, .owned_graph_indexes = graph_indexes };
 }
 
 /// Projection captured during admission and returned only after exact receipt
@@ -798,6 +978,11 @@ pub const MemoryReader = struct {
     }
     pub fn physicalById(self: @This(), id: u64) !?PhysicalTable {
         for (self.tables) |table| if (id == table.id) return table;
+        return null;
+    }
+    pub fn graphIndexIdentity(self: @This(), table_id: u64, index_name: []const u8) !?@import("cypher").catalog.IndexIdentity {
+        const table = (try self.physicalById(table_id)) orelse return null;
+        for (table.graph_indexes) |index| if (std.mem.eql(u8, index.name, index_name)) return index.identity;
         return null;
     }
     pub fn bindingForStorage(self: @This(), name: []const u8) !?Resource {
@@ -1048,6 +1233,7 @@ pub fn projectRead(alloc: std.mem.Allocator, index: *const StateIndex, request: 
         try out.append(alloc, index.byId(.tablespace, id) orelse return error.InvalidCatalogRecord);
     }
     if (request.kind == .namespace) try out.append(alloc, index.byId(.database, parent) orelse return error.InvalidCatalogRecord);
+    if (request.kind == .graph) try appendGraphReadDependencies(alloc, &out, MemoryReader{ .index = index, .tables = &.{} }, count);
     return out.toOwnedSlice(alloc);
 }
 
@@ -1079,7 +1265,7 @@ pub const TableStatusTarget = union(enum) {
 
 pub fn httpStatus(err: anyerror) u16 {
     return switch (err) {
-        error.DatabaseNotFound, error.NamespaceNotFound, error.TablespaceNotFound, error.CatalogNotFound, error.TableNotFound => 404,
+        error.DatabaseNotFound, error.NamespaceNotFound, error.TablespaceNotFound, error.CatalogNotFound, error.TableNotFound, error.IndexNotFound => 404,
         error.CatalogAlreadyExists, error.CatalogGenerationChanged, error.GenerationPublicationChanged, error.GenerationPublicationNotFound, error.ForeignKeyGenerationPublicationRequired, error.RowPolicyCatalogChanged, error.RowPolicyInstallationPending, error.RowPolicyReadersActive, error.TablespaceInUse, error.NamespaceNotEmpty, error.DatabaseNotEmpty, error.ProtectedCatalogResource, error.TableAlreadyExists => 409,
         error.InvalidCatalogName, error.InvalidCatalogMutation, error.InvalidGenerationPublication, error.InvalidInitialFkRetirementPage, error.InvalidRowPolicyPublication, error.InvalidRowPolicyRecord, error.InvalidSettingRecord, error.InvalidSettingValue, error.InvalidTablespaceLocation, error.InvalidTablespacePlacementPolicy, error.InvalidCreateTableRequest => 400,
         error.CatalogCommandTooLarge, error.CreateTableRequestTooLarge, error.RowPolicyLimitExceeded => 413,
@@ -1483,4 +1669,96 @@ test "external lake catalog saved sources reject recursion and retain definition
     try std.testing.expectEqual(identity, renamed.upserts[0].id);
     try std.testing.expectEqualStrings(definition, renamed.upserts[0].source_json);
     try std.testing.expectError(error.InvalidCatalogMutation, validateQuerySource(a, "{\"saved\":\"loop\"}"));
+}
+
+test "graph catalog validates mappings and preserves identity through rename" {
+    const a = std.testing.allocator;
+    const definition =
+        \\{"labels":[{"name":"Document","table":"docs"}],"relationships":[{"name":"CITES","index":"links","source_label":"Document","target_label":"Document","stored_type":"cites"}]}
+    ;
+    const physical = [_]PhysicalTable{.{ .id = 42, .name = "docs", .graph_indexes = &.{.{ .name = "links", .identity = .{ .incarnation = 41, .config_hash = 99 } }} }};
+    var created = try plan(a, .{}, .{ .kind = .graph, .action = .create, .name = "knowledge", .source_json = definition }, &physical);
+    defer created.deinit(a);
+    const state: State = .{ .resources = created.upserts, .next_id = created.next_id };
+    const resource = state.find(.graph, 0, "knowledge").?;
+    try std.testing.expectEqualStrings(definition, resource.source_json);
+    try std.testing.expectEqual(@as(u64, 42), resource.graph_tables[0].table_id);
+    try std.testing.expectEqualStrings("docs", resource.graph_tables[0].storage_name);
+    var renamed = try plan(a, state, .{ .kind = .graph, .action = .rename, .name = "knowledge", .new_name = "research" }, &.{});
+    defer renamed.deinit(a);
+    try std.testing.expectEqual(resource.id, renamed.upserts[0].id);
+    try std.testing.expectEqualStrings(definition, renamed.upserts[0].source_json);
+    try std.testing.expectEqual(@as(u64, 42), renamed.upserts[0].graph_tables[0].table_id);
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    const execution = try graphForExecution(region.allocator(), renamed.upserts[0]);
+    try std.testing.expectEqual(@as(u64, 42), execution.labels[0].table_id);
+    try std.testing.expectEqual(@as(u64, 41), execution.relationships[0].identity.?.incarnation);
+    try std.testing.expectEqual(@as(u64, 99), execution.relationships[0].identity.?.config_hash);
+    var updated = try plan(a, state, .{ .kind = .graph, .action = .set_definition, .name = "knowledge", .source_json = definition, .expected_graph_revision = 1 }, &physical);
+    defer updated.deinit(a);
+    try std.testing.expectEqual(resource.id, updated.upserts[0].id);
+    try std.testing.expectEqual(@as(u64, 2), updated.upserts[0].graph_revision);
+    try std.testing.expectEqual(state.next_id, updated.next_id);
+    try std.testing.expectEqual(@as(u64, 2), (try graphForExecution(region.allocator(), updated.upserts[0])).revision);
+    try std.testing.expectError(error.CatalogGenerationChanged, plan(a, .{ .resources = updated.upserts, .next_id = updated.next_id }, .{ .kind = .graph, .action = .set_definition, .name = "knowledge", .source_json = definition, .expected_graph_revision = 1 }, &physical));
+    try std.testing.expectError(error.InvalidCatalogMutation, plan(a, state, .{ .kind = .graph, .action = .set_definition, .name = "knowledge", .source_json = definition }, &physical));
+    try std.testing.expectError(error.IndexNotFound, plan(a, .{}, .{ .kind = .graph, .action = .create, .name = "missing_index", .source_json = definition }, &.{.{ .id = 42, .name = "docs" }}));
+    try std.testing.expectError(error.TableNotFound, plan(a, .{}, .{ .kind = .graph, .action = .create, .name = "missing", .source_json = definition }, &.{}));
+    try std.testing.expectError(error.InvalidCatalogMutation, plan(a, .{}, .{ .kind = .graph, .action = .create, .name = "bad", .source_json = "{\"labels\":[]}" }, &.{}));
+    try std.testing.expectError(error.InvalidCatalogMutation, plan(a, .{}, .{ .kind = .graph, .action = .create, .name = "bad", .source_json = "{\"labels\":[{\"name\":\"D\",\"table\":\"docs\"}],\"raw_cypher\":\"MATCH (n) RETURN n\"}" }, &.{}));
+}
+
+test "graph catalog binds scoped tables by physical identity and owns bindings" {
+    const a = std.testing.allocator;
+    const resources = [_]Resource{
+        .{ .kind = .database, .id = 5, .name = "research" },
+        .{ .kind = .namespace, .id = 6, .parent_id = 5, .name = "papers" },
+        .{ .kind = .table, .id = 42, .parent_id = 6, .name = "docs", .storage_name = "table:42" },
+    };
+    const initial: State = .{ .resources = &resources, .next_id = 50 };
+    const physical = [_]PhysicalTable{.{ .id = 42, .name = "table:42" }};
+    const definition = "{\"labels\":[{\"name\":\"Document\",\"table\":{\"database\":\"research\",\"namespace\":\"papers\",\"table\":\"docs\"}}]}";
+    var state = try MutableState.clone(a, initial);
+    defer state.deinit();
+    {
+        var delta = try plan(a, initial, .{ .kind = .graph, .action = .create, .name = "knowledge", .source_json = definition }, &physical);
+        defer delta.deinit(a);
+        var change = try state.apply(delta);
+        change.finish(&state, true);
+    }
+    const graph_record = state.value.find(.graph, 0, "knowledge").?;
+    try std.testing.expectEqual(@as(u64, 42), graph_record.graph_tables[0].table_id);
+    var rename = try plan(a, state.value, .{ .kind = .table, .action = .rename, .database = "research", .namespace = "papers", .name = "docs", .new_name = "articles" }, &physical);
+    defer rename.deinit(a);
+    var change = try state.apply(rename);
+    change.finish(&state, true);
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    const graph = try graphForExecution(region.allocator(), graph_record);
+    try std.testing.expectEqualStrings("table:42", graph.labels[0].table);
+    try std.testing.expectEqual(@as(u64, 42), graph.labels[0].table_id);
+    // A renamed mapping cannot be recreated by looking up the old name.
+    try std.testing.expectError(error.TableNotFound, plan(a, state.value, .{ .kind = .graph, .action = .create, .name = "other", .source_json = definition }, &physical));
+}
+
+test "graph catalog reads retain current logical dependency names through scope renames" {
+    const a = std.testing.allocator;
+    const graph: Resource = .{ .kind = .graph, .id = 3, .name = "knowledge", .source_json = "{\"labels\":[{\"name\":\"Document\",\"table\":{\"database\":\"old_db\",\"namespace\":\"old_ns\",\"table\":\"old_table\"}}]}", .graph_tables = &.{.{ .label_index = 0, .table_id = 7, .storage_name = "table:immutable-7" }} };
+    const state: State = .{ .revision = 11, .resources = &.{ graph, .{ .kind = .database, .id = 8, .name = "reports" }, .{ .kind = .namespace, .id = 9, .parent_id = 8, .name = "serving" }, .{ .kind = .table, .id = 7, .parent_id = 9, .name = "renamed", .storage_name = "table:immutable-7" } } };
+    var index = try StateIndex.init(a, state);
+    defer index.deinit(a);
+    const projected = try projectRead(a, &index, .{ .kind = .graph, .name = "knowledge" });
+    defer a.free(projected);
+    try std.testing.expectEqual(@as(usize, 4), projected.len);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const logical = try @import("cypher").catalog.parseDefinition(arena.allocator(), graph.name, graph.id, 1, graph.source_json);
+    const target = try graphLabelTarget(.{ .resources = projected }, graph.graph_tables[0], logical.labels[0]);
+    try std.testing.expectEqualStrings("reports", target.database);
+    try std.testing.expectEqualStrings("serving", target.namespace);
+    try std.testing.expectEqualStrings("renamed", target.table);
+    const physical = try graphForExecution(arena.allocator(), graph);
+    try std.testing.expectEqualStrings("table:immutable-7", physical.labels[0].table);
+    try std.testing.expectError(error.CatalogGenerationChanged, graphLabelTarget(state, .{ .label_index = 0, .table_id = 7, .storage_name = "table:reused" }, logical.labels[0]));
 }

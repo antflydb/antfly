@@ -31,10 +31,29 @@ pub const OpenOptions = struct {
 };
 
 pub const Api = struct {
+    pub const GraphScope = support.single_source_cypher.Scope;
+    pub const GraphDiagnostic = support.cypher.compiler.Diagnostic;
     allocator: Allocator,
     db: embedded_db.DB,
     table_name: []u8,
     semantic_resolver: ?query_contract.SemanticResolver,
+    fn graphHost(self: *Api) support.single_source_cypher.Host(@TypeOf(self.db.inner.*)) {
+        return .{ .root = self.db.inner, .table = self.table_name, .alloc = self.allocator, .writable = self.db.open_mode == .writer };
+    }
+    pub fn graphCatalogJson(self: *Api, alloc: Allocator, body: []const u8) ![]u8 {
+        return self.graphHost().catalogJson(alloc, body);
+    }
+    pub fn cypherJsonWithDiagnostic(self: *Api, alloc: Allocator, graph: []const u8, body: []const u8, diagnostic: *support.cypher.compiler.Diagnostic, scope: *GraphScope) ![]u8 {
+        return self.graphHost().queryJson(alloc, graph, body, diagnostic, scope);
+    }
+    pub fn cypherJson(self: *Api, alloc: Allocator, graph: []const u8, body: []const u8) ![]u8 {
+        var diagnostic: support.cypher.compiler.Diagnostic = .{};
+        var scope: GraphScope = .{};
+        return self.cypherJsonWithDiagnostic(alloc, graph, body, &diagnostic, &scope);
+    }
+    pub fn graphWriteStatusJson(self: *Api, alloc: Allocator, id: []const u8) ![]u8 {
+        return self.graphHost().statusJson(alloc, id);
+    }
 
     pub fn open(allocator: Allocator, path: []const u8, opts: OpenOptions) !Api {
         return .{
@@ -451,6 +470,31 @@ fn namedBoolMutationJson(alloc: Allocator, field_name: []const u8, name: []const
     try appendJsonString(alloc, &out, name);
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
+}
+
+test "embedded api Cypher catalog and writes share portable retained graph values" {
+    const a = std.testing.allocator;
+    var storage = support.lsm_storage.MemoryStorage.init(a);
+    defer storage.deinit();
+    var api = try Api.openHosted(a, "/portable-cypher", .{ .db = .{ .storage = storage.storage(), .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } } } });
+    defer api.close();
+    const index = try api.addIndexJson(a, "{\"name\":\"links\",\"kind\":\"graph\",\"config_json\":\"{}\"}");
+    defer a.free(index);
+    const seeded = try api.batchJson(a, "{\"inserts\":{\"a\":{\"id\":\"a\"},\"b\":{\"id\":\"b\"}},\"sync_level\":\"full_index\"}");
+    defer a.free(seeded);
+    const definition = try api.graphCatalogJson(a, "{\"action\":\"put\",\"name\":\"knowledge\",\"definition\":{\"labels\":[{\"name\":\"Document\",\"table\":\"docs\"}],\"relationships\":[{\"name\":\"KNOWS\",\"index\":\"links\",\"source_label\":\"Document\",\"target_label\":\"Document\",\"stored_type\":\"knows\"}]}}");
+    defer a.free(definition);
+    const write = "{\"query\":\"MATCH (a:Document {id:'a'}),(b:Document {id:'b'}) CREATE (a)-[r:KNOWS {since:2020}]->(b) RETURN r.since\",\"write_request_id\":\"00112233445566778899aabbccddeeff\"}";
+    const result = try api.cypherJson(a, "knowledge", write);
+    defer a.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"status\":\"committed\"") != null);
+    try std.testing.expectError(error.CypherWriteRequestAlreadyUsed, api.cypherJson(a, "knowledge", write));
+    const rows = try api.cypherJson(a, "knowledge", "{\"query\":\"MATCH (a)-[r:KNOWS]->(b) RETURN a.id,r.since,b.id\"}");
+    defer a.free(rows);
+    try std.testing.expect(std.mem.indexOf(u8, rows, "\"value\":\"2020\"") != null);
+    const status = try api.graphWriteStatusJson(a, "00112233445566778899aabbccddeeff");
+    defer a.free(status);
+    try std.testing.expect(std.mem.indexOf(u8, status, "\"disposition\":\"committed\"") != null);
 }
 
 test "embedded api round-trips batch lookup scan and search over memory-backed durable lsm" {

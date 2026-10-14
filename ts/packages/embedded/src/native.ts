@@ -199,6 +199,13 @@ export interface NativeLibrary {
   bufferFree: KoffiFunc<(buffer: object) => void>;
 
   dbSqlJson: KoffiFunc<(handle: unknown, request: object, out: object) => number>;
+  dbGraphCatalogJson?: KoffiFunc<(handle: unknown, request: object, out: object) => number>;
+  dbCypherJson?: KoffiFunc<
+    (handle: unknown, graph: object, request: object, out: object) => number
+  >;
+  dbGraphWriteStatusJson?: KoffiFunc<
+    (handle: unknown, transactionId: object, out: object) => number
+  >;
   dbOpenTable: KoffiFunc<(handle: unknown, name: object, out: unknown[]) => number>;
   dbCreateTableJson: KoffiFunc<(handle: unknown, name: object, schema: object) => number>;
   dbDropTable: KoffiFunc<(handle: unknown, name: object) => number>;
@@ -435,6 +442,31 @@ function buildNative(): NativeLibrary {
   const handle = koffi.load(resolved.path);
 
   const f = handle.func.bind(handle);
+  let dbGraphCatalogJson: NativeLibrary["dbGraphCatalogJson"];
+  let dbCypherJson: NativeLibrary["dbCypherJson"];
+  let dbGraphWriteStatusJson: NativeLibrary["dbGraphWriteStatusJson"];
+  try {
+    dbGraphCatalogJson = f("antfly_db_graph_catalog_json", "uint32_t", [
+      PAntflyDb,
+      AntflySlice,
+      PAntflyBufferOut,
+    ]);
+    dbCypherJson = f("antfly_db_cypher_json", "uint32_t", [
+      PAntflyDb,
+      AntflySlice,
+      AntflySlice,
+      PAntflyBufferOut,
+    ]);
+    dbGraphWriteStatusJson = f("antfly_db_graph_write_status_json", "uint32_t", [
+      PAntflyDb,
+      AntflySlice,
+      PAntflyBufferOut,
+    ]);
+  } catch {
+    dbGraphCatalogJson = undefined;
+    dbCypherJson = undefined;
+    dbGraphWriteStatusJson = undefined;
+  }
 
   return {
     handle,
@@ -464,6 +496,9 @@ function buildNative(): NativeLibrary {
     bufferFree: f("antfly_buffer_free", "void", [koffi.pointer(AntflyBuffer)]),
 
     dbSqlJson: f("antfly_db_sql_json", "uint32_t", [PAntflyDb, AntflySlice, PAntflyBufferOut]),
+    dbGraphCatalogJson,
+    dbCypherJson,
+    dbGraphWriteStatusJson,
     dbOpenTable: f("antfly_db_open_table", "uint32_t", [PAntflyDb, AntflySlice, PAntflyDbOut]),
     dbCreateTableJson: f("antfly_db_create_table_json", "uint32_t", [
       PAntflyDb,

@@ -22,4 +22,5 @@ comptime {
 }
 test {
     _ = capi;
+    _ = @import("capi/cypher.zig");
 }

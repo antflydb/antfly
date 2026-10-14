@@ -259,7 +259,7 @@ pub const Gate = struct {
         if (state.row_policy_phase == .disabled or state.row_policy_phase == .active) {
             if (state.row_policy_phase == .active and
                 (state.row_policy_generation == 0 or state.row_policy_catalog_epoch == 0 or
-                    state.active_schema_version == 0 or state.storage_mode != .relational or
+                    state.storage_mode != .relational or
                     state.row_policy_generation < self.generation.load(.acquire))) return error.RowPolicyCatalogChanged;
             if (state.row_policy_phase == .disabled and
                 (state.row_policy_generation < self.generation.load(.acquire) or
@@ -333,4 +333,12 @@ test "row-policy gate revokes a retained raw read before late output" {
     defer delayed.release();
     try std.testing.expectError(error.RowPolicyCatalogChanged, delayed.checkAt(100));
     try std.testing.expect(!gate.quiesced());
+}
+
+test "row-policy gate publishes initial schema version zero" {
+    var gate = Gate.init(.{ .mode_initialized = true, .storage_mode = .relational, .active_schema_version = 0 });
+    try gate.beginPreparing(.disabled);
+    try gate.publishCommitted(.{ .mode_initialized = true, .storage_mode = .relational, .active_schema_version = 0, .row_policy_phase = .active, .row_policy_generation = 1, .row_policy_catalog_epoch = 9 });
+    try std.testing.expectEqual(@as(u32, 0), gate.schema_version.load(.acquire));
+    try std.testing.expectError(error.RowPolicyAuthenticationRequired, gate.enterRawRead());
 }

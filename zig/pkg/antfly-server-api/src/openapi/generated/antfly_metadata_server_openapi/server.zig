@@ -574,6 +574,46 @@ pub fn parseEvaluateBody(allocator: std.mem.Allocator, body: []const u8) !std.js
     return std.json.parseFromSlice(antfly_eval_openapi.EvalRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Get graph
+pub const GetGraphPathParams = struct {
+    graph_name: []const u8,
+};
+
+/// Create graph
+pub const CreateGraphPathParams = struct {
+    graph_name: []const u8,
+};
+
+/// Parse the JSON request body for createGraph.
+pub fn parseCreateGraphBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.GraphDefinition) {
+    return std.json.parseFromSlice(types.GraphDefinition, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Update graph definition
+pub const UpdateGraphPathParams = struct {
+    graph_name: []const u8,
+};
+
+/// Parse the JSON request body for updateGraph.
+pub fn parseUpdateGraphBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.GraphDefinitionUpdate) {
+    return std.json.parseFromSlice(types.GraphDefinitionUpdate, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Drop graph
+pub const DropGraphPathParams = struct {
+    graph_name: []const u8,
+};
+
+/// Execute Cypher against a named graph
+pub const ExecuteGraphQueryPathParams = struct {
+    graph_name: []const u8,
+};
+
+/// Parse the JSON request body for executeGraphQuery.
+pub fn parseExecuteGraphQueryBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.GraphQueryRequest) {
+    return std.json.parseFromSlice(types.GraphQueryRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Parse the JSON request body for globalQuery.
 pub fn parseGlobalQueryBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.GlobalStatefulQueryRequest) {
     return std.json.parseFromSlice(types.GlobalStatefulQueryRequest, allocator, body, .{ .ignore_unknown_fields = true });
@@ -1345,6 +1385,11 @@ pub fn parseStageTransactionSessionBody(allocator: std.mem.Allocator, body: []co
     return std.json.parseFromSlice(types.TransactionCommitRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Inspect your transaction receipt
+pub const GetTransactionStatusPathParams = struct {
+    transaction_id: []const u8,
+};
+
 /// Stage a transaction write
 pub const StageTransactionWritePathParams = struct {
     transaction_id: []const u8,
@@ -1426,6 +1471,12 @@ pub const routes = [_]Route{
     .{ .method = "PUT", .path = "/databases/{databaseName}/tablespace", .operation_id = "setDatabaseTablespace", .request_body = .buffered, .streaming_response = false },
     .{ .method = "DELETE", .path = "/databases/{databaseName}/tablespace", .operation_id = "clearDatabaseTablespace", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/eval", .operation_id = "evaluate", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/graphs", .operation_id = "listGraphs", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/graphs/{graphName}", .operation_id = "getGraph", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/graphs/{graphName}", .operation_id = "createGraph", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "PUT", .path = "/graphs/{graphName}", .operation_id = "updateGraph", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "DELETE", .path = "/graphs/{graphName}", .operation_id = "dropGraph", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/graphs/{graphName}/query", .operation_id = "executeGraphQuery", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/query", .operation_id = "globalQuery", .request_body = .buffered, .streaming_response = true },
     .{ .method = "POST", .path = "/restore", .operation_id = "restore", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/restore/jobs", .operation_id = "listRestoreJobs", .request_body = .none, .streaming_response = false },
@@ -1519,6 +1570,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/transactions/{transaction_id}/savepoints", .operation_id = "createTransactionSavepoint", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/transactions/{transaction_id}/savepoints/{savepoint_id}/rollback", .operation_id = "rollbackTransactionSavepoint", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/transactions/{transaction_id}/stage", .operation_id = "stageTransactionSession", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/transactions/{transaction_id}/status", .operation_id = "getTransactionStatus", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/transactions/{transaction_id}/write", .operation_id = "stageTransactionWrite", .request_body = .buffered, .streaming_response = false },
 };
 
@@ -1592,6 +1644,12 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "setDatabaseTablespace")) @compileError("ServerRouter: Impl missing required method 'setDatabaseTablespace'");
         if (!@hasDecl(Impl, "clearDatabaseTablespace")) @compileError("ServerRouter: Impl missing required method 'clearDatabaseTablespace'");
         if (!@hasDecl(Impl, "evaluate")) @compileError("ServerRouter: Impl missing required method 'evaluate'");
+        if (!@hasDecl(Impl, "listGraphs")) @compileError("ServerRouter: Impl missing required method 'listGraphs'");
+        if (!@hasDecl(Impl, "getGraph")) @compileError("ServerRouter: Impl missing required method 'getGraph'");
+        if (!@hasDecl(Impl, "createGraph")) @compileError("ServerRouter: Impl missing required method 'createGraph'");
+        if (!@hasDecl(Impl, "updateGraph")) @compileError("ServerRouter: Impl missing required method 'updateGraph'");
+        if (!@hasDecl(Impl, "dropGraph")) @compileError("ServerRouter: Impl missing required method 'dropGraph'");
+        if (!@hasDecl(Impl, "executeGraphQuery")) @compileError("ServerRouter: Impl missing required method 'executeGraphQuery'");
         if (!@hasDecl(Impl, "globalQuery")) @compileError("ServerRouter: Impl missing required method 'globalQuery'");
         if (!@hasDecl(Impl, "restore")) @compileError("ServerRouter: Impl missing required method 'restore'");
         if (!@hasDecl(Impl, "listRestoreJobs")) @compileError("ServerRouter: Impl missing required method 'listRestoreJobs'");
@@ -1685,6 +1743,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "createTransactionSavepoint")) @compileError("ServerRouter: Impl missing required method 'createTransactionSavepoint'");
         if (!@hasDecl(Impl, "rollbackTransactionSavepoint")) @compileError("ServerRouter: Impl missing required method 'rollbackTransactionSavepoint'");
         if (!@hasDecl(Impl, "stageTransactionSession")) @compileError("ServerRouter: Impl missing required method 'stageTransactionSession'");
+        if (!@hasDecl(Impl, "getTransactionStatus")) @compileError("ServerRouter: Impl missing required method 'getTransactionStatus'");
         if (!@hasDecl(Impl, "stageTransactionWrite")) @compileError("ServerRouter: Impl missing required method 'stageTransactionWrite'");
     }
 
@@ -1756,6 +1815,12 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.put("/databases/:databaseName/tablespace", httpx.Handler.bind(self.impl, setDatabaseTablespace));
             try server.delete("/databases/:databaseName/tablespace", httpx.Handler.bind(self.impl, clearDatabaseTablespace));
             try server.post("/eval", httpx.Handler.bind(self.impl, evaluate));
+            try server.get("/graphs", httpx.Handler.bind(self.impl, listGraphs));
+            try server.get("/graphs/:graphName", httpx.Handler.bind(self.impl, getGraph));
+            try server.post("/graphs/:graphName", httpx.Handler.bind(self.impl, createGraph));
+            try server.put("/graphs/:graphName", httpx.Handler.bind(self.impl, updateGraph));
+            try server.delete("/graphs/:graphName", httpx.Handler.bind(self.impl, dropGraph));
+            try server.post("/graphs/:graphName/query", httpx.Handler.bind(self.impl, executeGraphQuery));
             try server.post("/query", httpx.Handler.bind(self.impl, globalQuery));
             try server.post("/restore", httpx.Handler.bind(self.impl, restore));
             try server.get("/restore/jobs", httpx.Handler.bind(self.impl, listRestoreJobs));
@@ -1849,6 +1914,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/transactions/:transaction_id/savepoints", httpx.Handler.bind(self.impl, createTransactionSavepoint));
             try server.post("/transactions/:transaction_id/savepoints/:savepoint_id/rollback", httpx.Handler.bind(self.impl, rollbackTransactionSavepoint));
             try server.post("/transactions/:transaction_id/stage", httpx.Handler.bind(self.impl, stageTransactionSession));
+            try server.get("/transactions/:transaction_id/status", httpx.Handler.bind(self.impl, getTransactionStatus));
             try server.post("/transactions/:transaction_id/write", httpx.Handler.bind(self.impl, stageTransactionWrite));
         }
 
@@ -2338,6 +2404,47 @@ pub fn ServerRouter(comptime Impl: type) type {
         /// POST /eval
         fn evaluate(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.evaluate(ctx);
+        }
+
+        /// List graphs
+        /// GET /graphs
+        fn listGraphs(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.listGraphs(ctx);
+        }
+
+        /// Get graph
+        /// GET /graphs/{graphName}
+        fn getGraph(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const graph_name = ctx.param("graphName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: graphName" });
+            return impl.getGraph(ctx, graph_name);
+        }
+
+        /// Create graph
+        /// POST /graphs/{graphName}
+        fn createGraph(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const graph_name = ctx.param("graphName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: graphName" });
+            return impl.createGraph(ctx, graph_name);
+        }
+
+        /// Update graph definition
+        /// PUT /graphs/{graphName}
+        fn updateGraph(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const graph_name = ctx.param("graphName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: graphName" });
+            return impl.updateGraph(ctx, graph_name);
+        }
+
+        /// Drop graph
+        /// DELETE /graphs/{graphName}
+        fn dropGraph(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const graph_name = ctx.param("graphName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: graphName" });
+            return impl.dropGraph(ctx, graph_name);
+        }
+
+        /// Execute Cypher against a named graph
+        /// POST /graphs/{graphName}/query
+        fn executeGraphQuery(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const graph_name = ctx.param("graphName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: graphName" });
+            return impl.executeGraphQuery(ctx, graph_name);
         }
 
         /// Perform a global query
@@ -3038,6 +3145,13 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.stageTransactionSession(ctx, transaction_id);
         }
 
+        /// Inspect your transaction receipt
+        /// GET /transactions/{transaction_id}/status
+        fn getTransactionStatus(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const transaction_id = ctx.param("transaction_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: transaction_id" });
+            return impl.getTransactionStatus(ctx, transaction_id);
+        }
+
         /// Stage a transaction write
         /// POST /transactions/{transaction_id}/write
         fn stageTransactionWrite(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
@@ -3108,6 +3222,12 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn setDatabaseTablespace(self: *Impl, ctx: *httpx.Context, database_name: []const u8) !httpx.Response
 //   fn clearDatabaseTablespace(self: *Impl, ctx: *httpx.Context, database_name: []const u8) !httpx.Response
 //   fn evaluate(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn listGraphs(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn getGraph(self: *Impl, ctx: *httpx.Context, graph_name: []const u8) !httpx.Response
+//   fn createGraph(self: *Impl, ctx: *httpx.Context, graph_name: []const u8) !httpx.Response
+//   fn updateGraph(self: *Impl, ctx: *httpx.Context, graph_name: []const u8) !httpx.Response
+//   fn dropGraph(self: *Impl, ctx: *httpx.Context, graph_name: []const u8) !httpx.Response
+//   fn executeGraphQuery(self: *Impl, ctx: *httpx.Context, graph_name: []const u8) !httpx.Response
 //   fn globalQuery(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn restore(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn listRestoreJobs(self: *Impl, ctx: *httpx.Context, params: ListRestoreJobsParams) !httpx.Response
@@ -3201,4 +3321,5 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn createTransactionSavepoint(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response
 //   fn rollbackTransactionSavepoint(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8, savepoint_id: []const u8) !httpx.Response
 //   fn stageTransactionSession(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response
+//   fn getTransactionStatus(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response
 //   fn stageTransactionWrite(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response

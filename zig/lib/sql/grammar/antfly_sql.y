@@ -26,7 +26,10 @@
 %reference postgres_scan_l https://github.com/postgres/postgres/blob/4cc02b80774ecdc4cf2a2d5df09c07df36d68ca5/src/backend/parser/scan.l
 %reference cockroach_sql_y https://github.com/cockroachdb/cockroach/blob/master/pkg/sql/parser/sql.y
 
-%expect 10832
+// GRAPH_TABLE adds one existing optional table-function alias IDENT shift/reduce
+// shape. The shift preserves bare aliases; contextual PGQ terminals introduce
+// no pattern conflicts and do not alter PostgreSQL keyword categories.
+%expect 10833
 
 // PostgreSQL keyword categories are derived from kwlist.h at the pinned
 // postgres_commit above. The duplicated reference intentionally makes a
@@ -38,7 +41,7 @@
 
 %start statement
 
-%token IDENT STRING NUMBER PLACEHOLDER
+%token IDENT STRING NUMBER PLACEHOLDER PGQ_GRAPH_TABLE PGQ_COLUMNS
 %token COMMA DOT STAR SEMICOLON LPAREN RPAREN LBRACKET RBRACKET
 %token EQ NEQ LT LTE GT GTE PLUS MINUS SLASH PERCENT PIPE_CONCAT COLON COLON_COLON
 %token AT_CONTAINS RANGE_OVERLAP QUESTION QUESTION_ANY QUESTION_ALL
@@ -1487,10 +1490,25 @@ table_reference_list:
 table_reference:
     table_relation_source system_time_as_of_opt
   | qualified_name LPAREN function_argument_list_opt RPAREN table_function_alias_opt
+  | PGQ_GRAPH_TABLE LPAREN qualified_name MATCH pgq_paths where_clause_opt PGQ_COLUMNS LPAREN select_item_list RPAREN RPAREN table_function_alias_opt
   | LATERAL qualified_name LPAREN function_argument_list_opt RPAREN table_function_alias_opt
   | table_reference qualified_join_operator table_reference join_condition
   | table_reference conditionless_join_operator table_reference
   | LATERAL LPAREN read_statement RPAREN AS identifier_name
+  ;
+
+// Contextual facade terminals keep GRAPH_TABLE and COLUMNS unreserved outside
+// their native relation syntax. Both lower directly into the shared graph AST.
+pgq_paths: pgq_path | pgq_paths COMMA pgq_path ;
+pgq_path: pgq_node pgq_chain | identifier_name EQ pgq_node pgq_chain ;
+pgq_chain: /* empty */ | pgq_chain pgq_relationship pgq_node ;
+pgq_node: LPAREN pgq_alias_opt pgq_label_opt RPAREN ;
+pgq_alias_opt: /* empty */ | identifier_name ;
+pgq_label_opt: /* empty */ | IS identifier_name | COLON identifier_name ;
+pgq_relationship:
+    MINUS LBRACKET pgq_alias_opt pgq_label_opt RBRACKET ARROW_JSON
+  | MINUS LBRACKET pgq_alias_opt pgq_label_opt RBRACKET MINUS
+  | LT MINUS LBRACKET pgq_alias_opt pgq_label_opt RBRACKET MINUS
   ;
 
 table_relation_source:

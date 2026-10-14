@@ -1409,6 +1409,7 @@ pub const ApiHttpClient = struct {
         defer resp.deinit(self.alloc);
         switch (resp.status) {
             200 => {},
+            400 => return remotePreflightError(resp.body),
             408 => return error.Timeout,
             409 => return remoteGroupConflictError(resp.body),
             503 => return remoteStorageReadUnavailableError(resp.body),
@@ -6512,4 +6513,19 @@ fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *con
         break :blk repeated;
     };
     return &result;
+}
+
+test "api http client preserves group query capability errors" {
+    const Executor = struct {
+        body: []const u8 = "UnsupportedQueryRequest",
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .status = 400, .body = try alloc.dupe(u8, self.body) };
+        }
+    };
+    var executor: Executor = .{};
+    var client = ApiHttpClient.init(std.testing.allocator, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
+    try std.testing.expectError(error.UnsupportedQueryRequest, client.fetchGroupQueryWithControl("http://owner", 7, "docs", "{}", null, null));
+    executor.body = "unknown private failure";
+    try std.testing.expectError(error.UnexpectedHttpStatus, client.fetchGroupQueryWithControl("http://owner", 7, "docs", "{}", null, null));
 }

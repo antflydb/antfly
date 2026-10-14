@@ -96,3 +96,44 @@ a separate 64 MiB memory budget; the default transaction intent budget is
 128 MiB. Relational rows are limited to 16 MiB and persisted index keys to
 1 MiB. See [SQL resource limits](src/sql/COMPILER_SUPPORT.md) for accounting
 and native configuration details.
+
+### Cypher graph language
+
+The Zig package exposes `antfly.cypher` for generated parsing, owned graph ASTs,
+catalog mapping validation, typed graph values, parameter decoding, and
+budgeted execution against a host-supplied backend. Compilation is independent
+of storage and can be used for editor diagnostics:
+
+```zig
+var diagnostic: antfly.cypher.compiler.Diagnostic = .{};
+var query = try antfly.cypher.compiler.compile(allocator,
+    "MATCH (n:Document) RETURN n", .{}, &diagnostic);
+defer query.deinit();
+```
+
+Execution requires an authorized backend with a coherent statement read view.
+Native storage provides `DB.queryCypher` over retained immutable query cuts;
+a live DB or an ordinary read-only handle does not satisfy that contract. The
+public C/Lite query APIs expose a durable local graph catalog through
+`antfly_db_graph_catalog_json` and text execution through `antfly_db_cypher_json`.
+Graph definitions retain table and index incarnations and use conditional
+revision updates. Local statements materialize a bounded immutable graph under
+owner capture fences, then release those fences before execution. Writes use
+native intents and the local durable coordinator; query failures roll back
+staged changes, and request IDs prevent duplicate admission.
+`antfly_db_graph_write_status_json` returns a minimal durable receipt without
+staged rows or table names. Protected tables require the hosted authenticated
+authority; local APIs reject uncredentialed protected access.
+
+Go provides `GraphCatalogJSON`, `CypherJSON`, and `GraphWriteStatusJSON`;
+Python provides `graph_catalog_json`, `cypher_json`, and `graph_write_status`;
+Rust provides the corresponding snake-case JSON methods; TypeScript provides
+`graphCatalogJson`, `cypherJson`, and `graphWriteStatus`. Native diagnostics retain
+their code, source span, transaction ID, and write outcome. Unknown outcomes
+require status reconciliation without replaying the query.
+
+The server exposes
+authenticated distributed Cypher through `/graphs/{name}/query` and SQL
+`GRAPH_TABLE` through HTTP and PostgreSQL wire connections, including prepared
+queries and transaction overlays. See [CYPHER.md](../../CYPHER.md) for the
+compatibility matrix and qualification details.

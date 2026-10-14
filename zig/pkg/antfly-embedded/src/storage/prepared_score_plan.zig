@@ -22,7 +22,7 @@ const ScoreSink = @import("backend_types.zig").ScoreSink;
 
 // A rebuild gets a process-unique identity, including after deinit and address
 // reuse. Row/column permutations keep the canonical physical key identity.
-var next_identity = std.atomic.Value(u64).init(1);
+var next_identity = @import("antfly_platform").atomic.Value(u64).init(1);
 pub const PreparedScorePlan = struct {
     pub const max_bytes = 256 * 1024;
     pub const max_keys = 4096;

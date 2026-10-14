@@ -1,0 +1,1043 @@
+{
+  "version": 1,
+  "reference": "Neo4j 5.26",
+  "image": "neo4j@sha256:c7d25c0eeebfe125718d58b72ed5d663c85d0479047733845eb2237c67ce8069",
+  "setup": "CREATE (a:Document {id:'a',title:'Alpha',rank:1}), (b:Document {id:'b',title:'Beta',rank:2}), (c:Document {id:'c',title:'Gamma',rank:3}), (p:Person {id:'a',name:'Ada'}), (a)-[:CITES {weight:1}]->(b), (a)-[:CITES {weight:2}]->(b), (b)-[:CITES]->(a), (b)-[:CITES]->(c), (a)-[:MENTIONS]->(p)",
+  "cases": [
+    {
+      "query": "MATCH (a:Document {id:'a'})-[r:CITES]->(b:Document) RETURN b.title, r.weight ORDER BY r.weight",
+      "rows": [
+        [
+          "Beta",
+          1
+        ],
+        [
+          "Beta",
+          2
+        ]
+      ]
+    },
+    {
+      "query": "MATCH (a:Document {id:'c'}) OPTIONAL MATCH (a)-[:MENTIONS]->(p:Person) RETURN a.title, p.name",
+      "rows": [
+        [
+          "Gamma",
+          null
+        ]
+      ]
+    },
+    {
+      "query": "MATCH (a:Document)-[:MENTIONS]->(p:Person) RETURN a.id=p.id AS same_key, a=p AS same_node",
+      "rows": [
+        [
+          true,
+          false
+        ]
+      ]
+    },
+    {
+      "query": "MATCH p=(a:Document {id:'a'})-[:CITES*2..2]->(b:Document {id:'a'}) RETURN length(p)",
+      "rows": [
+        [
+          2
+        ],
+        [
+          2
+        ]
+      ]
+    },
+    {
+      "query": "MATCH (a:Document {id:'a'})-[r:CITES]->(b)-[r]->(a) RETURN a",
+      "rows": []
+    },
+    {
+      "query": "MATCH (a:Document {id:'a'})-[r:CITES]->(b), (a)-[r]->(b) RETURN a",
+      "rows": []
+    },
+    {
+      "query": "MATCH p=(a:Document {id:'a'})-[:CITES*0..0]->(b:Document) RETURN length(p), a=b",
+      "rows": [
+        [
+          0,
+          true
+        ]
+      ]
+    },
+    {
+      "query": "MATCH (a:Document)-[:CITES]->(b) WITH b.id AS id, count(*) AS n RETURN id,n ORDER BY id",
+      "rows": [
+        [
+          "a",
+          1
+        ],
+        [
+          "b",
+          2
+        ],
+        [
+          "c",
+          1
+        ]
+      ]
+    },
+    {
+      "query": "MATCH (a:Document {id:'missing'}) RETURN count(*) AS n, collect(a) AS nodes",
+      "rows": [
+        [
+          0,
+          []
+        ]
+      ]
+    },
+    {
+      "query": "UNWIND [42, 'hello', null, true, {name:'Alice'}, [1,2,3]] AS x RETURN x ORDER BY x",
+      "rows": [
+        [
+          {
+            "name": "Alice"
+          }
+        ],
+        [
+          [
+            1,
+            2,
+            3
+          ]
+        ],
+        [
+          "hello"
+        ],
+        [
+          true
+        ],
+        [
+          42
+        ],
+        [
+          null
+        ]
+      ]
+    },
+    {
+      "query": "UNWIND [{b:0,a:1},{a:0,b:9},{c:0,a:0},{a:1}] AS x RETURN x ORDER BY x",
+      "rows": [
+        [
+          {
+            "a": 1
+          }
+        ],
+        [
+          {
+            "a": 0,
+            "b": 9
+          }
+        ],
+        [
+          {
+            "b": 0,
+            "a": 1
+          }
+        ],
+        [
+          {
+            "c": 0,
+            "a": 0
+          }
+        ]
+      ]
+    },
+    {
+      "query": "UNWIND [3,1,2,2] AS x RETURN DISTINCT x ORDER BY x SKIP 1 LIMIT 2",
+      "rows": [
+        [
+          2
+        ],
+        [
+          3
+        ]
+      ]
+    },
+    {
+      "query": "RETURN NULL AND false, NULL OR true, NULL IN [], 1 IN [null,1], 2 IN [null,1]",
+      "rows": [
+        [
+          false,
+          true,
+          false,
+          true,
+          null
+        ]
+      ]
+    },
+    {
+      "query": "RETURN [null]=[null], [null,1]=[null,2], {x:null}={x:null}, [null] IN [[null]], {x:null} IN [{y:null}]",
+      "rows": [
+        [
+          null,
+          false,
+          null,
+          null,
+          false
+        ]
+      ]
+    },
+    {
+      "query": "UNWIND [1,2,3] AS x RETURN {total:sum(x), count:count(*)}",
+      "rows": [
+        [
+          {
+            "total": 6,
+            "count": 3
+          }
+        ]
+      ]
+    },
+    {
+      "query": "RETURN 1 AS x UNION RETURN 1 AS x UNION ALL RETURN 2 AS x",
+      "rows": [
+        [
+          1
+        ],
+        [
+          2
+        ]
+      ],
+      "reference_error": "Neo.ClientError.Statement.SyntaxError"
+    },
+    {
+      "query": "RETURN range(3,1,-1), range(1,3,-1), reverse('aé🌱'), substring('aé🌱z',1,2)",
+      "rows": [
+        [
+          [
+            3,
+            2,
+            1
+          ],
+          [],
+          "🌱éa",
+          "é🌱"
+        ]
+      ]
+    },
+    {
+      "query": "RETURN keys({a:1,b:2}), reverse([1,2]), trim(' a '), toString(true), toInteger('3.5'), toFloat('2.5'), toBoolean('FALSE'), toInteger('no')",
+      "rows": [
+        [
+          [
+            "a",
+            "b"
+          ],
+          [
+            2,
+            1
+          ],
+          "a",
+          "true",
+          3,
+          2.5,
+          false,
+          null
+        ]
+      ]
+    },
+    {
+      "query": "MATCH (n:Document) RETURN n.rank AS rank, count(*) + n.rank AS total ORDER BY rank",
+      "rows": [
+        [
+          1,
+          2
+        ],
+        [
+          2,
+          3
+        ],
+        [
+          3,
+          4
+        ]
+      ]
+    },
+    {
+      "query": "WITH 99 AS x RETURN [x IN [1,null,2] WHERE x > 1 | x*2], x",
+      "rows": [
+        [
+          [
+            4
+          ],
+          99
+        ]
+      ]
+    },
+    {
+      "query": "RETURN [x IN [1,2] | x+1], [x IN [1,2]], [x IN null | x]",
+      "rows": [
+        [
+          [
+            2,
+            3
+          ],
+          [
+            1,
+            2
+          ],
+          null
+        ]
+      ]
+    },
+    {
+      "query": "UNWIND [1,2] AS x RETURN [y IN collect(x) | y*2]",
+      "rows": [
+        [
+          [
+            2,
+            4
+          ]
+        ]
+      ]
+    },
+    {
+      "query": "RETURN all(x IN [] WHERE x), any(x IN [] WHERE x), none(x IN [] WHERE x), single(x IN [] WHERE x)",
+      "rows": [
+        [
+          true,
+          false,
+          true,
+          false
+        ]
+      ]
+    },
+    {
+      "query": "RETURN all(x IN [null,false] WHERE x), any(x IN [null,true] WHERE x), none(x IN [null,true] WHERE x), single(x IN [null,true,true] WHERE x)",
+      "rows": [
+        [
+          false,
+          true,
+          false,
+          false
+        ]
+      ]
+    },
+    {
+      "query": "RETURN all(x IN [null,true] WHERE x), any(x IN [null,false] WHERE x), none(x IN [null,false] WHERE x), single(x IN [null,true] WHERE x)",
+      "rows": [
+        [
+          null,
+          null,
+          null,
+          null
+        ]
+      ]
+    },
+    {
+      "query": "RETURN all(x IN null WHERE x), reduce(s=9,x IN null | s+x), reduce(s=9,x IN [] | s+x)",
+      "rows": [
+        [
+          null,
+          null,
+          9
+        ]
+      ]
+    },
+    {
+      "query": "WITH 99 AS x, 7 AS s RETURN reduce(s=0,x IN [1,2,3] | s+x), x, s, any(x IN [1,2] WHERE x=2)",
+      "rows": [
+        [
+          6,
+          99,
+          7,
+          true
+        ]
+      ]
+    },
+    {
+      "query": "UNWIND [1,2,3] AS x RETURN reduce(s=0,y IN collect(x) | s+y), all(y IN collect(x) WHERE y>0)",
+      "rows": [
+        [
+          6,
+          true
+        ]
+      ]
+    },
+    {
+      "query": "RETURN reduce(s=[],x IN [1,2] | s+[x*2]), all(x IN [1,2] WHERE any(y IN [x] WHERE y=x))",
+      "rows": [
+        [
+          [
+            2,
+            4
+          ],
+          true
+        ]
+      ]
+    },
+    {
+      "query": "MATCH p=(a:Document {id:'a'})-[:CITES*1..2]->(b) WHERE all(r IN relationships(p) WHERE coalesce(r.weight,1)>0) RETURN count(*)",
+      "rows": [
+        [
+          6
+        ]
+      ]
+    },
+    {
+      "query": "MATCH (n:Document) WHERE EXISTS { MATCH (n)-[:CITES]->(m) WITH m WHERE m.rank>2 RETURN m } RETURN n.id",
+      "rows": [
+        [
+          "b"
+        ]
+      ]
+    },
+    {
+      "query": "RETURN EXISTS { UNWIND [] AS x RETURN x }, EXISTS { UNWIND [] AS x RETURN count(*) AS total }",
+      "rows": [
+        [
+          false,
+          true
+        ]
+      ]
+    },
+    {
+      "query": "WITH {a:1,b:2} AS m, 4 AS extra RETURN m{.a,.missing,extra,c:extra+1} AS selected, m{a:3, .*} AS first, m{.*,a:3} AS second",
+      "rows": [
+        [
+          {
+            "a": 1,
+            "missing": null,
+            "extra": 4,
+            "c": 5
+          },
+          {
+            "a": 3,
+            "b": 2
+          },
+          {
+            "a": 3,
+            "b": 2
+          }
+        ]
+      ]
+    },
+    {
+      "query": "MATCH (n:Document {id:'a'}) RETURN n{.title,.missing}, n['rank']",
+      "rows": [
+        [
+          {
+            "title": "Alpha",
+            "missing": null
+          },
+          1
+        ]
+      ]
+    },
+    {
+      "query": "MATCH (n:Document {id:'a'})-[r:CITES]->(m) RETURN r{.*}, r['weight'] ORDER BY r['weight']",
+      "rows": [
+        [
+          {
+            "weight": 1
+          },
+          1
+        ],
+        [
+          {
+            "weight": 2
+          },
+          2
+        ]
+      ]
+    },
+    {
+      "query": "WITH null AS n RETURN n{.*,value:1} AS filled, n{} AS empty",
+      "rows": [
+        [
+          null,
+          null
+        ]
+      ]
+    },
+    {
+      "query": "MATCH (n:Document) RETURN collect(n{.title}) AS documents",
+      "rows": [
+        [
+          [
+            {
+              "title": "Alpha"
+            },
+            {
+              "title": "Beta"
+            },
+            {
+              "title": "Gamma"
+            }
+          ]
+        ]
+      ]
+    },
+    {
+      "query": "RETURN 1 < 'a', 1 = 'a', {} < []",
+      "rows": [
+        [
+          null,
+          false,
+          null
+        ]
+      ]
+    },
+    {
+      "query": "RETURN [null] < [1], [null] <= [null], [1,'foo'] < [1,2], [null,2] < [1,1], [1] < [1,null]",
+      "rows": [
+        [
+          null,
+          null,
+          null,
+          null,
+          true
+        ]
+      ]
+    },
+    {
+      "query": "RETURN {a:null} < {a:1}, {a:null,b:2} < {a:1,b:1}, {a:null}<={a:null}, {a:null} < {b:null}, {a:null} < {}",
+      "rows": [
+        [
+          null,
+          null,
+          null,
+          true,
+          false
+        ]
+      ]
+    },
+    {
+      "query": "MATCH p=(a:Document {id:'a'})-[r:CITES]->(b:Document {id:'b'}) RETURN p=[a,r,b], [a,r,b]=p, p<[a,r,b] ORDER BY r.weight",
+      "rows": [
+        [
+          false,
+          false,
+          null
+        ],
+        [
+          false,
+          false,
+          null
+        ]
+      ]
+    },
+    {
+      "query": "RETURN [0,1,2,3][1..3], [0,1,2,3][..2], [0,1,2,3][2..]",
+      "rows": [
+        [
+          [
+            1,
+            2
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            2,
+            3
+          ]
+        ]
+      ]
+    },
+    {
+      "query": "RETURN [0,1,2,3][-3..-1], [0,1,2,3][-100..100], [0,1,2,3][3..1], [0,1][null..1], null[0..1]",
+      "rows": [
+        [
+          [
+            1,
+            2
+          ],
+          [
+            0,
+            1,
+            2,
+            3
+          ],
+          [],
+          null,
+          null
+        ]
+      ]
+    },
+    {
+      "query": "UNWIND [[1,2,3],[1,2,4]] AS xs RETURN xs[..2], count(*) AS n ORDER BY xs[..2]",
+      "rows": [
+        [
+          [
+            1,
+            2
+          ],
+          2
+        ]
+      ]
+    },
+    {
+      "query": "MATCH (n:Document) WITH n ORDER BY n.id RETURN collect(n.id)[1..3] AS ids",
+      "rows": [
+        [
+          [
+            "b",
+            "c"
+          ]
+        ]
+      ]
+    },
+    {
+      "query": "RETURN 1<2<3, 3>2>1, 1=1=1, 1<2>3, 1<null<3",
+      "rows": [
+        [
+          true,
+          true,
+          true,
+          false,
+          null
+        ]
+      ]
+    },
+    {
+      "query": "MATCH (n:Document) WITH n.title AS title WHERE n.rank>1 RETURN title ORDER BY title",
+      "rows": [
+        [
+          "Beta"
+        ],
+        [
+          "Gamma"
+        ]
+      ]
+    },
+    {
+      "query": "WITH 1 AS x WITH 2 AS x WHERE x=2 RETURN x",
+      "rows": [
+        [
+          2
+        ]
+      ]
+    },
+    {
+      "query": "WITH 1 AS x WITH x+1 AS y WHERE x=1 AND y=2 RETURN y",
+      "rows": [
+        [
+          2
+        ]
+      ]
+    },
+    {
+      "query": "MATCH (n:Document) WITH n.title AS title WHERE n.rank IS NULL RETURN title",
+      "rows": []
+    },
+    {
+      "query": "RETURN \"abc\" =~ \"a.*\"",
+      "rows": [
+        [
+          true
+        ]
+      ]
+    },
+    {
+      "query": "RETURN \"abc\" =~ \"b\"",
+      "rows": [
+        [
+          false
+        ]
+      ]
+    },
+    {
+      "query": "RETURN \"AbC\" =~ \"(?i)abc\"",
+      "rows": [
+        [
+          true
+        ]
+      ]
+    },
+    {
+      "query": "RETURN \"β\" =~ \".\"",
+      "rows": [
+        [
+          true
+        ]
+      ]
+    },
+    {
+      "query": "RETURN \"Β\" =~ \"(?i)β\"",
+      "rows": [
+        [
+          false
+        ]
+      ]
+    },
+    {
+      "query": "RETURN \"ab\" =~ \"(?i-m)AB\"",
+      "rows": [
+        [
+          true
+        ]
+      ]
+    },
+    {
+      "query": "RETURN \"123\" =~ \"\\\\d+\"",
+      "rows": [
+        [
+          true
+        ]
+      ]
+    },
+    {
+      "query": "RETURN \"١٢٣\" =~ \"\\\\d+\"",
+      "rows": [
+        [
+          false
+        ]
+      ]
+    },
+    {
+      "query": "RETURN \"a_1\" =~ \"\\\\w+\"",
+      "rows": [
+        [
+          true
+        ]
+      ]
+    },
+    {
+      "query": "RETURN \"abc\" =~ \"\\\\babc\\\\b\"",
+      "rows": [
+        [
+          true
+        ]
+      ]
+    },
+    {
+      "query": "RETURN \"abc\" =~ \"\\\\Babc\"",
+      "rows": [
+        [
+          false
+        ]
+      ]
+    },
+    {
+      "query": "RETURN \"abab\" =~ \"(ab)\\\\1\"",
+      "rows": [
+        [
+          true
+        ]
+      ]
+    },
+    {
+      "query": "RETURN \"a.c[]\" =~ \"\\\\Qa.c[]\\\\E\"",
+      "rows": [
+        [
+          true
+        ]
+      ]
+    },
+    {
+      "query": "RETURN \"AB\" =~ \"\\\\x41B\"",
+      "rows": [
+        [
+          true
+        ]
+      ]
+    },
+    {
+      "query": "RETURN \"a\\nb\" =~ \"(?m)^a$\\\\nb\"",
+      "rows": [
+        [
+          true
+        ]
+      ]
+    },
+    {
+      "query": "RETURN \"a\\r\\nb\" =~ \"(?m)^a$\\\\r\\\\nb\"",
+      "rows": [
+        [
+          true
+        ]
+      ]
+    },
+    {
+      "query": "RETURN \"a\\r\\nb\" =~ \"(?m)a\\\\r$\\\\nb\"",
+      "rows": [
+        [
+          false
+        ]
+      ]
+    },
+    {
+      "query": "RETURN \"a\\nb\" =~ \"(?s)a.b\"",
+      "rows": [
+        [
+          true
+        ]
+      ]
+    },
+    {
+      "query": "RETURN \"a\\n\" =~ \"a$\"",
+      "rows": [
+        [
+          false
+        ]
+      ]
+    },
+    {
+      "query": "RETURN \"a\\n\" =~ \"a\\\\Z\\\\n\"",
+      "rows": [
+        [
+          true
+        ]
+      ]
+    },
+    {
+      "query": "RETURN \"a\\n\" =~ \"a\\\\z\\\\n\"",
+      "rows": [
+        [
+          false
+        ]
+      ]
+    },
+    {
+      "query": "RETURN \"\\n\" =~ \".\"",
+      "rows": [
+        [
+          false
+        ]
+      ]
+    },
+    {
+      "query": "RETURN \"\\n\" =~ \"(?s).\"",
+      "rows": [
+        [
+          true
+        ]
+      ]
+    },
+    {
+      "query": "RETURN \"\\r\" =~ \".\"",
+      "rows": [
+        [
+          false
+        ]
+      ]
+    },
+    {
+      "query": "RETURN \"\\r\" =~ \"(?s).\"",
+      "rows": [
+        [
+          true
+        ]
+      ]
+    },
+    {
+      "query": "RETURN \"\" =~ \".\"",
+      "rows": [
+        [
+          false
+        ]
+      ]
+    },
+    {
+      "query": "RETURN \"\" =~ \"(?s).\"",
+      "rows": [
+        [
+          true
+        ]
+      ]
+    },
+    {
+      "query": "RETURN \" \" =~ \".\"",
+      "rows": [
+        [
+          false
+        ]
+      ]
+    },
+    {
+      "query": "RETURN \" \" =~ \"(?s).\"",
+      "rows": [
+        [
+          true
+        ]
+      ]
+    },
+    {
+      "query": "RETURN \" \" =~ \".\"",
+      "rows": [
+        [
+          false
+        ]
+      ]
+    },
+    {
+      "query": "RETURN \" \" =~ \"(?s).\"",
+      "rows": [
+        [
+          true
+        ]
+      ]
+    },
+    {
+      "query": "MATCH (n:Document) WHERE n.title =~ 'A.*' RETURN n.id",
+      "rows": [
+        [
+          "a"
+        ]
+      ]
+    },
+    {
+      "query": "RETURN 'abc' =~ 'b', 'AbC' =~ '(?i)abc', null =~ '.*'",
+      "rows": [
+        [
+          false,
+          true,
+          null
+        ]
+      ]
+    },
+    {
+      "query": "UNWIND [1,'abc',null] AS x RETURN x =~ 'abc'",
+      "rows": [
+        [
+          null
+        ],
+        [
+          true
+        ],
+        [
+          null
+        ]
+      ]
+    },
+    {
+      "query": "RETURN 1 CONTAINS '1', 'abc' STARTS WITH 1, null ENDS WITH 'a'",
+      "rows": [
+        [
+          null,
+          null,
+          null
+        ]
+      ]
+    },
+    {
+      "query": "WITH null AS a RETURN [(a)-->(b) | b]",
+      "rows": [
+        [
+          []
+        ]
+      ]
+    },
+    {
+      "query": "MATCH (a:Document {id:'a'}) RETURN [(a)-[:CITES]->(b) | b.id]",
+      "rows": [
+        [
+          [
+            "b",
+            "b"
+          ]
+        ]
+      ]
+    },
+    {
+      "query": "MATCH (a:Document {id:'b'}) RETURN [(a)-[:CITES]->(b) WHERE b.rank>2 | b.id]",
+      "rows": [
+        [
+          [
+            "c"
+          ]
+        ]
+      ]
+    },
+    {
+      "query": "MATCH (a:Document {id:'a'}) UNWIND [p=(a)-[:CITES*0..2]->(b) | length(p)] AS size RETURN size ORDER BY size",
+      "rows": [
+        [
+          0
+        ],
+        [
+          1
+        ],
+        [
+          1
+        ],
+        [
+          2
+        ],
+        [
+          2
+        ],
+        [
+          2
+        ],
+        [
+          2
+        ]
+      ]
+    },
+    {
+      "query": "MATCH (a:Document {id:'a'}) RETURN [(a)<-[:CITES]-(b) | b.id]",
+      "rows": [
+        [
+          [
+            "b"
+          ]
+        ]
+      ]
+    },
+    {
+      "query": "MATCH (a:Document {id:'c'}) RETURN [(a)-[:CITES]->(b) | b.id]",
+      "rows": [
+        [
+          []
+        ]
+      ]
+    },
+    {
+      "query": "MATCH (a:Document {id:'a'}) RETURN size([(a)-[:CITES]->(b) | b]),count(*)",
+      "rows": [
+        [
+          2,
+          1
+        ]
+      ]
+    },
+    {
+      "query": "WITH 3 AS a RETURN [(a)-[1,2][0]]",
+      "rows": [
+        [
+          [
+            2
+          ]
+        ]
+      ]
+    },
+    {
+      "query": "WITH 1 AS p MATCH (a:Document {id:'a'}) RETURN [p=(a)-[:CITES]->(b) | length(p)],p",
+      "rows": [
+        [
+          [
+            1,
+            1
+          ],
+          1
+        ]
+      ]
+    },
+    {
+      "query": "MATCH p=(a:Document {id:'a'})-[:CITES]->(b) RETURN [p=(a)-[:CITES]->(c) | length(p)],length(p)",
+      "rows": [
+        [
+          [
+            1,
+            1
+          ],
+          1
+        ],
+        [
+          [
+            1,
+            1
+          ],
+          1
+        ]
+      ]
+    }
+  ]
+}

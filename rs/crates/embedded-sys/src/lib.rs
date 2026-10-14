@@ -710,6 +710,22 @@ unsafe extern "C" {
         request_json: antfly_slice,
         out: *mut antfly_buffer,
     ) -> antfly_error_code;
+    pub fn antfly_db_graph_catalog_json(
+        db: *mut antfly_db,
+        request_json: antfly_slice,
+        out: *mut antfly_buffer,
+    ) -> antfly_error_code;
+    pub fn antfly_db_cypher_json(
+        db: *mut antfly_db,
+        graph_name: antfly_slice,
+        request_json: antfly_slice,
+        out: *mut antfly_buffer,
+    ) -> antfly_error_code;
+    pub fn antfly_db_graph_write_status_json(
+        db: *mut antfly_db,
+        transaction_id: antfly_slice,
+        out: *mut antfly_buffer,
+    ) -> antfly_error_code;
     pub fn antfly_db_search_dense(
         db: *mut antfly_db,
         index_name: antfly_slice,

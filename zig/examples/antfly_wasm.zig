@@ -292,6 +292,47 @@ pub export fn antfly_embedded_close() void {
     setMessage("closed");
 }
 
+fn graphFailure(err: anyerror, diagnostic: Api.GraphDiagnostic, scope: Api.GraphScope) u32 {
+    setMessage(@errorName(err));
+    const bytes = std.json.Stringify.valueAlloc(allocator(), .{ .code = @errorName(err), .message = if (diagnostic.message.len != 0) diagnostic.message else @errorName(err), .span = diagnostic.span, .write_outcome = scope.outcome, .transaction_id = if (scope.transaction_id) |id| @as(?[32]u8, std.fmt.bytesToHex(id, .lower)) else null }, .{}) catch return 1;
+    storeResult(bytes);
+    return 1;
+}
+pub export fn antfly_embedded_graph_catalog_json(ptr: usize, len: usize) u32 {
+    clearLastResult();
+    const api = requireApi() catch |err| return graphFailure(err, .{}, .{});
+    const result = api.graphCatalogJson(allocator(), inputSlice(ptr, len)) catch |err| return graphFailure(err, .{}, .{});
+    storeResult(result);
+    setMessage("ok");
+    return 0;
+}
+pub export fn antfly_embedded_add_index_json(ptr: usize, len: usize) u32 {
+    clearLastResult();
+    const api = requireApi() catch |err| return graphFailure(err, .{}, .{});
+    const result = api.addIndexJson(allocator(), inputSlice(ptr, len)) catch |err| return graphFailure(err, .{}, .{});
+    storeResult(result);
+    setMessage("ok");
+    return 0;
+}
+pub export fn antfly_embedded_cypher_json(graph_ptr: usize, graph_len: usize, ptr: usize, len: usize) u32 {
+    clearLastResult();
+    const api = requireApi() catch |err| return graphFailure(err, .{}, .{});
+    var diagnostic: Api.GraphDiagnostic = .{};
+    var scope: Api.GraphScope = .{};
+    const result = api.cypherJsonWithDiagnostic(allocator(), inputSlice(graph_ptr, graph_len), inputSlice(ptr, len), &diagnostic, &scope) catch |err| return graphFailure(err, diagnostic, scope);
+    storeResult(result);
+    setMessage("ok");
+    return 0;
+}
+pub export fn antfly_embedded_graph_write_status_json(ptr: usize, len: usize) u32 {
+    clearLastResult();
+    const api = requireApi() catch |err| return graphFailure(err, .{}, .{});
+    const result = api.graphWriteStatusJson(allocator(), inputSlice(ptr, len)) catch |err| return graphFailure(err, .{}, .{});
+    storeResult(result);
+    setMessage("ok");
+    return 0;
+}
+
 pub export fn antfly_embedded_alloc(len: usize) usize {
     const bytes = allocator().alloc(u8, len) catch {
         setMessage("OutOfMemory");

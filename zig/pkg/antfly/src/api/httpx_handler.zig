@@ -3302,7 +3302,7 @@ pub const AntflyApiHandler = struct {
             params.group_id,
             params.table_name,
             query_request.req,
-        ) catch |err| return if (err == error.InvalidArgument)
+        ) catch |err| return if (err == error.InvalidArgument or err == error.UnsupportedQueryRequest)
             textResponse(ctx, 400, @errorName(err))
         else
             internalGroupErrorResponse(ctx, err);
@@ -3379,7 +3379,7 @@ pub const AntflyApiHandler = struct {
             params.group_id,
             params.table_name,
             query_request,
-        ) catch |err| return if (err == error.InvalidArgument)
+        ) catch |err| return if (err == error.InvalidArgument or err == error.UnsupportedQueryRequest)
             textResponse(ctx, 400, @errorName(err))
         else
             internalGroupErrorResponse(ctx, err);
@@ -3426,6 +3426,7 @@ pub const AntflyApiHandler = struct {
         }, @errorName(err));
         defer ctx.allocator.free(encoded);
         try ctx.setHeader("content-type", "application/json");
+        try ctx.setHeader(metadata_api.catalog_route_fence_ack_header, metadata_api.catalog_route_fence_ack_value);
         return ctx.response.body(try ctx.allocator.dupe(u8, encoded)).build();
     }
 
@@ -4617,6 +4618,23 @@ pub const AntflyApiHandler = struct {
         defer arena_impl.deinit();
         const response = try transactions_api.buildSessionDetailsResponse(arena_impl.allocator(), details);
         return ctx.openApiJson(response);
+    }
+
+    pub fn getTransactionStatus(self: *AntflyApiHandler, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*value| value.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &identity)) |response| return response;
+        const id = distributed_txn.parseTxnIdHex(transaction_id) catch return textResponse(ctx, 400, "invalid transaction id");
+        if (try self.forwardTransactionSession(ctx, id, "")) |response| return response;
+        // Principal binding remains authoritative after resource revocation.
+        // This read returns no staged rows or catalog identities and must not
+        // require participant permissions or a live execution owner.
+        if ((try self.api_server.txn_sessions.principalAccess(self.api_server.alloc, id, http_server_mod.transactionPrincipal(identity))) != .allowed)
+            return textResponse(ctx, 404, "not found");
+        const status = (try self.api_server.txn_sessions.getStatus(self.api_server.alloc, id)) orelse return textResponse(ctx, 404, "not found");
+        var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+        defer arena.deinit();
+        return ctx.openApiJson(try transactions_api.buildSessionStatusResponse(arena.allocator(), status));
     }
 
     pub fn stageTransactionSession(self: *AntflyApiHandler, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response {
@@ -6611,6 +6629,9 @@ pub const AntflyApiHandler = struct {
         defer target.deinit(ctx.allocator);
         const body = if (ctx.request.method == .DELETE) "" else (try ctx.body()) orelse "";
         if (body.len > system_catalog.max_command_bytes) return textResponse(ctx, 413, "catalog request too large");
+        if (action == .set_definition) {
+            if (!try http_server_mod.resourcePermissionCurrentlyAllowed(identity, .graph, target.name orelse "", .admin)) return jsonErrorResponse(ctx, 403, "graph definition updates require graph administration");
+        }
         // Renaming requires authority over both names; binding requires use of
         // the target policy. Neither operation transfers an unrelated grant.
         if (identity) |value| {
@@ -6623,6 +6644,7 @@ pub const AntflyApiHandler = struct {
                 defer ctx.allocator.free(resource);
                 const kind: usermgr.ResourceType = switch (target.kind) {
                     .query_source => .table,
+                    .graph => .graph,
                     .database => .database,
                     .namespace => .namespace,
                     .table => .table,
@@ -6634,6 +6656,19 @@ pub const AntflyApiHandler = struct {
                 const parsed = std.json.parseFromSlice(struct { tablespace_name: []const u8 }, ctx.allocator, body, .{}) catch return textResponse(ctx, 400, "invalid tablespace binding");
                 defer parsed.deinit();
                 if (!http_server_mod.permissionsAllow(value.permissions, .tablespace, parsed.value.tablespace_name, .read)) return jsonErrorResponse(ctx, 403, "forbidden");
+            }
+        }
+        if ((action == .create or action == .set_definition) and target.kind == .graph) {
+            var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+            defer arena.deinit();
+            const definition = if (action == .set_definition) blk: {
+                const input = std.json.parseFromSliceLeaky(struct { expected_revision: []const u8, definition: @import("cypher").catalog.Definition }, arena.allocator(), body, .{}) catch return jsonErrorResponse(ctx, 400, "invalid graph revision request");
+                break :blk try std.json.Stringify.valueAlloc(arena.allocator(), input.definition, .{ .emit_null_optional_fields = false });
+            } else body;
+            const graph = @import("cypher").catalog.parseDefinition(arena.allocator(), target.name orelse "", 1, 1, definition) catch return jsonErrorResponse(ctx, 400, "invalid graph definition");
+            for (graph.labels) |label| {
+                const logical = try (system_catalog.Target{ .database = label.database, .namespace = label.namespace, .table = label.table }).resourceNameAlloc(arena.allocator());
+                if (!try http_server_mod.tablePermissionCurrentlyAllowed(identity, logical, .read)) return jsonErrorResponse(ctx, 403, "graph mapping requires table read permission");
             }
         }
         var response = try system_catalog_http.execute(self.api_server.source, ctx.allocator, operationContext(ctx, identity), target, action, body);
@@ -6850,6 +6885,67 @@ pub const AntflyApiHandler = struct {
 
     pub fn listQuerySources(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         return self.catalogResource(ctx, null);
+    }
+
+    pub fn listGraphs(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.catalogResource(ctx, null);
+    }
+    pub fn getGraph(self: *AntflyApiHandler, ctx: *httpx.Context, graph_name: []const u8) !httpx.Response {
+        _ = graph_name;
+        return self.catalogResource(ctx, null);
+    }
+    pub fn createGraph(self: *AntflyApiHandler, ctx: *httpx.Context, graph_name: []const u8) !httpx.Response {
+        _ = graph_name;
+        return self.catalogResource(ctx, .create);
+    }
+    pub fn updateGraph(self: *AntflyApiHandler, ctx: *httpx.Context, graph_name: []const u8) !httpx.Response {
+        _ = graph_name;
+        return self.catalogResource(ctx, .set_definition);
+    }
+    pub fn dropGraph(self: *AntflyApiHandler, ctx: *httpx.Context, graph_name: []const u8) !httpx.Response {
+        _ = graph_name;
+        return self.catalogResource(ctx, .drop);
+    }
+    const GraphJob = struct {
+        server: *http_server_mod.ApiHttpServer,
+        identity: *?AuthenticatedIdentity,
+        context: @import("antfly_local_sources").api_operation.RequestContext,
+        name: []const u8,
+        body: []const u8,
+        completion_io: std.Io,
+        done: std.Io.Event = .unset,
+        diagnostic: @import("cypher").compiler.Diagnostic = .{},
+        write_outcome: @import("graph_execution.zig").WriteOutcome = .not_started,
+        result: ?[]u8 = null,
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            defer self.done.set(self.completion_io);
+            self.result = @import("graph_execution.zig").execute(std.heap.page_allocator, self.server, self.identity, self.context, self.name, self.body, &self.diagnostic, &self.write_outcome) catch |err| {
+                self.failure = err;
+                if (err == error.CypherWriteRequestAlreadyUsed) self.write_outcome = .unknown;
+                return;
+            };
+        }
+    };
+    pub fn executeGraphQuery(self: *AntflyApiHandler, ctx: *httpx.Context, graph_name: []const u8) !httpx.Response {
+        _ = graph_name;
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*value| value.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &identity)) |response| return response;
+        const route = (try system_catalog_routes.parseAlloc(ctx.allocator, http_server_mod.stripApiPrefix(ctx.request.uri.path))) orelse return jsonErrorResponse(ctx, 400, "invalid graph target");
+        defer route.deinit(ctx.allocator);
+        const name = route.name orelse return jsonErrorResponse(ctx, 400, "invalid graph target");
+        const body = (try ctx.body()) orelse return jsonErrorResponse(ctx, 400, "missing graph query body");
+        if (body.len > 1 << 20) return jsonErrorResponse(ctx, 413, "graph query request exceeds 1 MiB");
+        const runtime_io = http_server_mod.ApiHttpServer.configuredDurableIo(self.api_server.cfg) orelse return jsonErrorResponse(ctx, 503, "graph execution capacity unavailable");
+        var job: GraphJob = .{ .server = self.api_server, .identity = &identity, .context = tableMutationContext(ctx, &identity), .name = name, .body = body, .completion_io = ctx.io };
+        var future = runtime_io.concurrent(GraphJob.run, .{&job}) catch return jsonErrorResponse(ctx, 503, "graph execution capacity unavailable");
+        job.done.waitUncancelable(ctx.io);
+        @import("protected_future.zig").wait(runtime_io, &future);
+        if (job.failure) |err| return ctx.status(@import("graph_execution.zig").httpStatus(err)).json(.{ .@"error" = @errorName(err), .code = @errorName(err), .message = if (job.diagnostic.message.len != 0) job.diagnostic.message else @import("graph_execution.zig").errorMessage(err, job.write_outcome), .span = job.diagnostic.span, .write_outcome = job.write_outcome });
+        const result = job.result orelse return jsonErrorResponse(ctx, 500, "missing graph result");
+        defer std.heap.page_allocator.free(result);
+        return jsonResponse(ctx, 200, result);
     }
     pub fn getQuerySource(self: *AntflyApiHandler, ctx: *httpx.Context, source_name: []const u8) !httpx.Response {
         _ = source_name;

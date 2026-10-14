@@ -4413,6 +4413,30 @@ pub const ProvisionedKernelOwnerSource = struct {
             return .{ .ptr = retained, .vtable = &.{ .next = RetainedRelationalRead.next, .close = RetainedRelationalRead.close, .normalize = RetainedRelationalRead.normalize, .range_proofs = RetainedRelationalRead.rangeProofs } };
         }
 
+        fn captureGraph(ptr: *anyopaque, alloc: std.mem.Allocator, input: @import("antfly_local_sources").storage_statement_read_fence.GraphInput) !@import("antfly_local_sources").storage_statement_read_fence.GraphRead {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try validate(self);
+            // Standalone owners have no Raft proof provider. Their native
+            // mutation/replay fence still pins the cut. Replicated owners
+            // additionally validate the frozen proof in validate(). Private
+            // remote admission separately requires frozen-proof support.
+            if (input.table_id != self.route.table_id or !std.mem.eql(u8, input.table, self.table)) return error.CatalogGenerationChanged;
+            const native = try self.native.captureGraph(alloc, input);
+            errdefer native.deinit();
+            try validate(self);
+            var owner = self.owner.cloneRead();
+            errdefer owner.deinit();
+            const name = try alloc.dupe(u8, self.table);
+            errdefer alloc.free(name);
+            const retained = try alloc.create(RoutedGraphRead);
+            var route = self.route;
+            route.admission_cancellation = .none;
+            route.admission_deadline_ns = null;
+            route.admission_deadline_io = null;
+            retained.* = .{ .alloc = alloc, .source = self.source, .owner = owner, .native = native, .route = route, .group = self.group, .table = name };
+            return .{ .ptr = retained, .vtable = &.{ .invoke = RoutedGraphRead.invoke, .release = RoutedGraphRead.close, .open_sql = RoutedGraphRead.openSql } };
+        }
+
         fn captureSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator) !@import("antfly_local_sources").storage_statement_read_fence.Snapshot {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const frozen_proof = self.frozen_proof orelse return error.SqlStatementSnapshotRequired;
@@ -4434,6 +4458,44 @@ pub const ProvisionedKernelOwnerSource = struct {
             const snapshot = try alloc.create(RoutedStatementSnapshot);
             snapshot.* = .{ .alloc = alloc, .source = self.source, .owner = owner, .native = native, .route = retained_route, .group = self.group, .table = name, .cancellation = null, .deadline_ns = null, .frozen_proof = frozen_proof };
             return .{ .ptr = snapshot, .vtable = &.{ .open = RoutedStatementSnapshot.openNative, .release = RoutedStatementSnapshot.close } };
+        }
+    };
+
+    const RoutedGraphRead = struct {
+        alloc: std.mem.Allocator,
+        source: *ProvisionedKernelOwnerSource,
+        owner: Lease,
+        native: @import("antfly_local_sources").storage_statement_read_fence.GraphRead,
+        route: metadata_api.CatalogRouteFence,
+        group: u64,
+        table: []u8,
+        fn invoke(ptr: *anyopaque, alloc: std.mem.Allocator, body: []const u8) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try self.source.validateRoutedRead(alloc, self.route, self.group, self.table);
+            const result = try self.native.invoke(alloc, body);
+            errdefer alloc.free(result);
+            try self.source.validateRoutedRead(alloc, self.route, self.group, self.table);
+            return result;
+        }
+        fn openSql(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, from: []const u8, to: []const u8, opts: db_types.ScanOptions) !table_read_source.RelationalReadView {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!std.mem.eql(u8, table, self.table)) return error.Forbidden;
+            try self.source.validateRoutedRead(alloc, self.route, self.group, self.table);
+            var owner = self.owner.cloneRead();
+            errdefer owner.deinit();
+            const view = try self.native.openSql(alloc, table, from, to, opts);
+            errdefer view.deinit();
+            try self.source.validateRoutedRead(alloc, self.route, self.group, self.table);
+            const retained = try alloc.create(RetainedRelationalRead);
+            retained.* = .{ .alloc = alloc, .lease = owner, .view = view };
+            return .{ .ptr = retained, .vtable = &.{ .next = RetainedRelationalRead.next, .close = RetainedRelationalRead.close, .range_proofs = RetainedRelationalRead.rangeProofs } };
+        }
+        fn close(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.native.deinit();
+            self.owner.deinit();
+            self.alloc.free(self.table);
+            self.alloc.destroy(self);
         }
     };
 
@@ -4538,7 +4600,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         if (self.read_safety_barrier.vtable.capture_frozen) |capture_proof|
             retained.frozen_proof = try capture_proof(self.read_safety_barrier.ptr, group);
         try RetainedStatementFence.validateLocal(retained);
-        return .{ .ptr = retained, .vtable = &.{ .validate = RetainedStatementFence.validate, .open = RetainedStatementFence.open, .capture_snapshot = RetainedStatementFence.captureSnapshot, .release = RetainedStatementFence.release } };
+        return .{ .ptr = retained, .vtable = &.{ .validate = RetainedStatementFence.validate, .open = RetainedStatementFence.open, .capture_snapshot = RetainedStatementFence.captureSnapshot, .capture_graph = RetainedStatementFence.captureGraph, .release = RetainedStatementFence.release } };
     }
 
     fn prepareRetainedScanRead(self: *ProvisionedKernelOwnerSource, group: u64, from: []const u8, to: []const u8, opts: db_types.ScanOptions, consistency: read_gate.ReadConsistency) !void {
@@ -5662,9 +5724,15 @@ pub const ProvisionedKernelOwnerSource = struct {
         comptime std.debug.assert(@alignOf(db_types.TransactionWrite) == @alignOf(db_types.BatchWrite));
         const writes: []const db_types.BatchWrite = @ptrCast(req.writes);
         try self.applyTransactionGroupLocal(alloc, group_id, table_name, .{
+            .row_policy_principal_proof = req.row_policy_principal_proof,
+            .row_policy_database = req.row_policy_database,
+            .row_policy_admitted_at_seconds = req.row_policy_admitted_at_seconds,
+            .normalized_graph_rows = req.normalized_graph_rows,
             .writes = writes,
             .deletes = req.deletes,
             .transforms = req.transforms,
+            .graph_writes = req.graph_writes,
+            .graph_deletes = req.graph_deletes,
             .predicates = req.predicates,
             .integrity = req.integrity,
             .integrity_commands = req.integrity_commands,

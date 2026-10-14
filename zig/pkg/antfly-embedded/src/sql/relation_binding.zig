@@ -303,6 +303,7 @@ const Builder = struct {
     alloc: Allocator,
     backend: catalog.Backend,
     parameters: []?ast.ColumnType,
+    graph_parameter_slots: std.ArrayList(usize) = .empty,
     prepared_scope: ?[]const Column = null,
     prepared_demands: std.StringHashMapUnmanaged(void) = .empty,
     scans: std.ArrayList(catalog.StatementScan) = .empty,
@@ -585,7 +586,16 @@ const Builder = struct {
                 else
                     try scalar.inferParameters(self.alloc, constraint.expression, self.shape_columns.items, self.parameters, constraint.expected, .{ .invocation = self.backend.parameter_invocation }) or changed;
             }
-            if (!changed) return;
+            if (!changed) {
+                // Ordinary SQL constraints get first choice. Only a slot used
+                // exclusively as graph data defaults to JSON; its runtime
+                // payload is interpreted using Cypher value semantics.
+                for (self.graph_parameter_slots.items) |slot| if (self.parameters[slot] == null) {
+                    const expression_ = try self.scalarNode(.{ .literal = .{ .parameter = @intCast(slot + 1) } });
+                    _ = try scalar.inferParameters(self.alloc, expression_, self.shape_columns.items, self.parameters, .json, .{ .invocation = self.backend.parameter_invocation });
+                };
+                return;
+            }
         }
         return error.SqlProgramLimitExceeded;
     }
@@ -1382,7 +1392,7 @@ const Builder = struct {
                     }
                     break :blk try self.node(columns, .{ .prepared_rows = names });
                 }
-                if (reference.search == null and !reference.mutation_target and !reference.prepared_rows and reference.name.database == null and reference.name.namespace == null) {
+                if (reference.graph == null and reference.search == null and !reference.mutation_target and !reference.prepared_rows and reference.name.database == null and reference.name.namespace == null) {
                     var i = scope.len;
                     while (i != 0) {
                         i -= 1;
@@ -1413,10 +1423,25 @@ const Builder = struct {
                         }
                     }
                 }
-                const identity = try std.fmt.allocPrint(self.alloc, "{s}\x00{s}\x00{s}", .{ reference.name.database orelse "", reference.name.namespace orelse "", reference.name.table });
+                if (reference.graph != null and (reference.mutation_target or reference.mutation_document or reference.mutation_presence)) return error.ReadOnlyGraphRelation;
+                // Two GRAPH_TABLE references to one graph can have different
+                // patterns and projections. Cache the complete descriptor,
+                // rather than accidentally reusing the first relation shape.
+                const identity = if (reference.graph) |graph|
+                    try std.fmt.allocPrint(self.alloc, "graph:{s}", .{try std.json.Stringify.valueAlloc(self.alloc, graph.*, .{})})
+                else
+                    try std.fmt.allocPrint(self.alloc, "{s}\x00{s}\x00{s}", .{ reference.name.database orelse "", reference.name.namespace orelse "", reference.name.table });
                 const entry = try self.identities.getOrPut(self.alloc, identity);
-                if (!entry.found_existing) entry.value_ptr.* = try self.backend.vtable.resolve(self.backend.ptr, self.alloc, reference.name, .read);
+                if (!entry.found_existing) entry.value_ptr.* = if (reference.graph) |graph|
+                    try (self.backend.vtable.resolve_graph orelse return error.UnsupportedSqlExecution)(self.backend.ptr, self.alloc, graph.*)
+                else
+                    try self.backend.vtable.resolve(self.backend.ptr, self.alloc, reference.name, .read);
                 var table = entry.value_ptr.*;
+                if (reference.graph) |graph| for (graph.parameters) |name| {
+                    const index = std.fmt.parseUnsigned(usize, name, 10) catch return error.InvalidSqlParameters;
+                    if (index == 0 or index > self.parameters.len) return error.InvalidSqlParameters;
+                    try self.graph_parameter_slots.append(self.alloc, index - 1);
+                };
                 if (reference.search) |search| {
                     if (!self.backend.supports_search_relations) return error.UnsupportedSqlExecution;
                     if (reference.mutation_target) return error.UnsupportedSqlShape;
@@ -1474,7 +1499,7 @@ const Builder = struct {
                     request.* = .{ .expression = search.* };
                     break :search_request request;
                 } else null;
-                try self.scans.append(self.alloc, .{ .table = table, .request = .{ .search = search_request, .fields = fields, .limit = 256, .include_primary_digest = reference.mutation_target, .include_document = reference.mutation_document and table.storage_mode == .document } });
+                try self.scans.append(self.alloc, .{ .table = table, .request = .{ .search = search_request, .fields = fields, .graph_parameter_types = if (reference.graph != null) self.parameters else &.{}, .limit = 256, .include_primary_digest = reference.mutation_target, .include_document = reference.mutation_document and table.storage_mode == .document } });
                 break :blk try self.node(columns, .{ .scan = .{ .index = index, .source_columns = source_columns } });
             },
             .derived => |query| blk: {

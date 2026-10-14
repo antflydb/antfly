@@ -173,6 +173,9 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     const wasm_storage_boundary = @import("storage_boundary.zig").create(b, wasm_target, optimize);
     @call(.auto, configureBrowserModule, .{ b, wasm_storage_boundary, embedded_support_wasm_mod } ++ embedded_wasm_deps ++ .{addSnowballModule});
     embedded_support_wasm_mod.addImport("sql_parser", wasm_sql_parser_mod);
+    const wasm_cypher_mod = @import("../../lib/cypher/build_support.zig").createModule(b, b.path("lib/cypher"), wasm_target, optimize);
+    wasm_cypher_mod.addImport("cypher_regex_capture", sql_regex_mod.import_table.get("antfly_capture_regex").?);
+    embedded_support_wasm_mod.addImport("cypher", wasm_cypher_mod);
     const wasm_cancellation_mod = b.createModule(.{
         .root_source_file = b.path("lib/runtime/src/cancellation.zig"),
         .target = wasm_target,
@@ -391,6 +394,8 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         .optimize = optimize,
     });
     inference_wasm_inference_mod.addImport("build_options", inference_wasm_build_options_mod);
+    const wasm_decisions_mod = @import("../../lib/decisions/build.zig").create(b, b.path("lib/decisions/root.zig"));
+    inference_wasm_inference_mod.addImport("antfly_decisions", wasm_decisions_mod);
     inference_wasm_inference_mod.addImport("inference_audio", wasm_inference_audio_mod);
     inference_wasm_inference_mod.addImport("inference_linalg", wasm_inference_linalg_mod);
     inference_wasm_inference_mod.addImport("inference_tokenizer", wasm_inference_tokenizer_mod);

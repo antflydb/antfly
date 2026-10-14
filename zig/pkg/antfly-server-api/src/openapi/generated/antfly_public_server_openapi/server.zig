@@ -817,6 +817,46 @@ pub fn parseEvaluateBody(allocator: std.mem.Allocator, body: []const u8) !std.js
     return std.json.parseFromSlice(antfly_eval_openapi.EvalRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Get graph
+pub const GetGraphPathParams = struct {
+    graph_name: []const u8,
+};
+
+/// Create graph
+pub const CreateGraphPathParams = struct {
+    graph_name: []const u8,
+};
+
+/// Parse the JSON request body for createGraph.
+pub fn parseCreateGraphBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.GraphDefinition) {
+    return std.json.parseFromSlice(types.GraphDefinition, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Update graph definition
+pub const UpdateGraphPathParams = struct {
+    graph_name: []const u8,
+};
+
+/// Parse the JSON request body for updateGraph.
+pub fn parseUpdateGraphBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.GraphDefinitionUpdate) {
+    return std.json.parseFromSlice(types.GraphDefinitionUpdate, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Drop graph
+pub const DropGraphPathParams = struct {
+    graph_name: []const u8,
+};
+
+/// Execute Cypher against a named graph
+pub const ExecuteGraphQueryPathParams = struct {
+    graph_name: []const u8,
+};
+
+/// Parse the JSON request body for executeGraphQuery.
+pub fn parseExecuteGraphQueryBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.GraphQueryRequest) {
+    return std.json.parseFromSlice(types.GraphQueryRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Parse the JSON request body for globalQuery.
 pub fn parseGlobalQueryBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.GlobalStatefulQueryRequest) {
     return std.json.parseFromSlice(types.GlobalStatefulQueryRequest, allocator, body, .{ .ignore_unknown_fields = true });
@@ -1588,6 +1628,11 @@ pub fn parseStageTransactionSessionBody(allocator: std.mem.Allocator, body: []co
     return std.json.parseFromSlice(types.TransactionCommitRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Inspect your transaction receipt
+pub const GetTransactionStatusPathParams = struct {
+    transaction_id: []const u8,
+};
+
 /// Stage a transaction write
 pub const StageTransactionWritePathParams = struct {
     transaction_id: []const u8,
@@ -1693,6 +1738,12 @@ pub const routes = [_]Route{
     .{ .method = "PUT", .path = "/databases/{databaseName}/tablespace", .operation_id = "setDatabaseTablespace", .request_body = .buffered, .streaming_response = false },
     .{ .method = "DELETE", .path = "/databases/{databaseName}/tablespace", .operation_id = "clearDatabaseTablespace", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/eval", .operation_id = "evaluate", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/graphs", .operation_id = "listGraphs", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/graphs/{graphName}", .operation_id = "getGraph", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/graphs/{graphName}", .operation_id = "createGraph", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "PUT", .path = "/graphs/{graphName}", .operation_id = "updateGraph", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "DELETE", .path = "/graphs/{graphName}", .operation_id = "dropGraph", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/graphs/{graphName}/query", .operation_id = "executeGraphQuery", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/query", .operation_id = "globalQuery", .request_body = .buffered, .streaming_response = true },
     .{ .method = "POST", .path = "/restore", .operation_id = "restore", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/restore/jobs", .operation_id = "listRestoreJobs", .request_body = .none, .streaming_response = false },
@@ -1786,6 +1837,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/transactions/{transaction_id}/savepoints", .operation_id = "createTransactionSavepoint", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/transactions/{transaction_id}/savepoints/{savepoint_id}/rollback", .operation_id = "rollbackTransactionSavepoint", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/transactions/{transaction_id}/stage", .operation_id = "stageTransactionSession", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/transactions/{transaction_id}/status", .operation_id = "getTransactionStatus", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/transactions/{transaction_id}/write", .operation_id = "stageTransactionWrite", .request_body = .buffered, .streaming_response = false },
 };
 
@@ -1874,6 +1926,12 @@ pub const routes = [_]Route{
 //   fn setDatabaseTablespace(self: *Impl, ctx: *httpx.Context, database_name: []const u8) !httpx.Response
 //   fn clearDatabaseTablespace(self: *Impl, ctx: *httpx.Context, database_name: []const u8) !httpx.Response
 //   fn evaluate(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn listGraphs(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn getGraph(self: *Impl, ctx: *httpx.Context, graph_name: []const u8) !httpx.Response
+//   fn createGraph(self: *Impl, ctx: *httpx.Context, graph_name: []const u8) !httpx.Response
+//   fn updateGraph(self: *Impl, ctx: *httpx.Context, graph_name: []const u8) !httpx.Response
+//   fn dropGraph(self: *Impl, ctx: *httpx.Context, graph_name: []const u8) !httpx.Response
+//   fn executeGraphQuery(self: *Impl, ctx: *httpx.Context, graph_name: []const u8) !httpx.Response
 //   fn globalQuery(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn restore(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn listRestoreJobs(self: *Impl, ctx: *httpx.Context, params: ListRestoreJobsParams) !httpx.Response
@@ -1967,4 +2025,5 @@ pub const routes = [_]Route{
 //   fn createTransactionSavepoint(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response
 //   fn rollbackTransactionSavepoint(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8, savepoint_id: []const u8) !httpx.Response
 //   fn stageTransactionSession(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response
+//   fn getTransactionStatus(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response
 //   fn stageTransactionWrite(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response

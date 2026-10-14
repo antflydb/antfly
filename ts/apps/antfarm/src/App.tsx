@@ -35,6 +35,7 @@ import RagPlaygroundPage from "./pages/RagPlaygroundPage";
 import ReaderPlaygroundPage from "./pages/ReaderPlaygroundPage";
 import RerankingPlaygroundPage from "./pages/RerankingPlaygroundPage";
 import { SecretsPage } from "./pages/SecretsPage";
+import GraphCatalogPage from "./pages/GraphCatalogPage";
 import SQLWorkbenchPage from "./pages/SQLWorkbenchPage";
 import TableDetailsPage from "./pages/TableDetailsPage";
 import TablesListPage from "./pages/TablesListPage";
@@ -53,6 +54,15 @@ const tableSections = new Set([
   "artifacts",
   "reprocess",
 ]);
+
+function SQLWorkbenchRoute() {
+  const location = useLocation();
+  return (
+    <SQLWorkbenchPage
+      initialStatement={new URLSearchParams(location.search).get("statement") ?? undefined}
+    />
+  );
+}
 
 function TableSectionRedirect({ section, fallback = "/" }: { section: string; fallback?: string }) {
   const { selectedTable, tables, isLoadingTables } = useTable();
@@ -126,7 +136,8 @@ function AppContent() {
                       <>
                         <Route path="/" element={<TablesListPage />} />
                         <Route path="/create" element={<CreateTablePage />} />
-                        <Route path="/sql" element={<SQLWorkbenchPage />} />
+                        <Route path="/sql" element={<SQLWorkbenchRoute />} />
+                        <Route path="/graphs" element={<GraphCatalogPage />} />
                         <Route
                           path="/tables/:tableName"
                           element={<TableDetailsPage currentSection={currentSection} />}

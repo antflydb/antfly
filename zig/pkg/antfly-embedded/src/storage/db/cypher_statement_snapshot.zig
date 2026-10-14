@@ -1,0 +1,314 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+const std = @import("std");
+const cypher = @import("cypher");
+const port = @import("../cypher_read.zig");
+const domain = @import("../../system_catalog/domain.zig");
+pub fn Snapshot(comptime DB: type) type {
+    return struct {
+        const Self = @This();
+        references: std.atomic.Value(usize) = .init(1),
+        a: std.mem.Allocator,
+        arena: std.heap.ArenaAllocator,
+        source: *DB,
+        db: DB,
+        input: port.Input,
+        graph: cypher.catalog.Graph,
+        graphs: []const cypher.catalog.Graph,
+        tables: [1]DB.CypherBackend.Table,
+        adapter: DB.CypherBackend,
+        policy: @import("row_policy_gate.zig").Gate.Lease,
+        pub fn create(a: std.mem.Allocator, db: *DB, fence: *const DB.StatementReadFence, input: port.Input, cancellation: @import("types.zig").CancellationToken) !port.Read {
+            var stage: []const u8 = "catalog";
+            errdefer std.log.warn("Cypher owner snapshot failed table_id={} stage={s}", .{ input.table_id, stage });
+            const self = try a.create(Self);
+            errdefer a.destroy(self);
+            var arena = std.heap.ArenaAllocator.init(a);
+            errdefer arena.deinit();
+            const owned = arena.allocator();
+            const copied = try std.json.parseFromSliceLeaky(port.Input, owned, try std.json.Stringify.valueAlloc(owned, input, .{}), .{ .allocate = .alloc_always });
+            const record = try std.json.parseFromSliceLeaky(domain.Resource, owned, copied.catalog_json, .{ .allocate = .alloc_always });
+            const graph = try domain.graphForExecution(owned, record);
+            const records = if (copied.catalogs_json.len == 0) try owned.dupe(domain.Resource, &.{record}) else try std.json.parseFromSliceLeaky([]const domain.Resource, owned, copied.catalogs_json, .{ .allocate = .alloc_always });
+            if (records.len == 0 or records.len > 64) return error.CypherOwnerBudgetExceeded;
+            const graphs = try owned.alloc(cypher.catalog.Graph, records.len);
+            var primary = false;
+            for (records, graphs, 0..) |entry, *output, index| {
+                for (records[0..index]) |prior| if (prior.id == entry.id) return error.CypherInvalidOwner;
+                output.* = try domain.graphForExecution(owned, entry);
+                if (entry.id == record.id) primary = true;
+            }
+            if (!primary) return error.CatalogGenerationChanged;
+
+            if (copied.table_id != db.core.identity_namespace.table_id) return error.CatalogGenerationChanged;
+            if (copied.ttl_now_ns == 0) return error.CypherSnapshotRequired;
+            var schema = db.core.acquireSchemaView();
+            defer if (schema) |*view| view.release();
+            if (schema) |view| {
+                if (view.version() != copied.schema_version) return error.SchemaVersionChanged;
+            } else if (copied.schema_version != 0) return error.SchemaVersionChanged;
+            stage = "authority";
+            const authority = try db.acquireCypherReadAuthority(a, copied.principal_proof, copied.database);
+            errdefer {
+                var lease = authority;
+                lease.release();
+            }
+            var cut: @import("native_query_cut.zig").Request = .{ .id = &copied.cut_id, .table_id = copied.table_id, .expires_ms = copied.expires_ms, .create = true };
+            stage = "capture";
+            try db.captureQueryCutAtStatementFence(cut, fence, cancellation);
+            cut.create = false;
+            stage = "open";
+            var readonly = try db.openQueryCut(cut, cancellation);
+            errdefer readonly.close();
+            self.* = .{ .a = a, .arena = arena, .source = db, .db = readonly, .input = copied, .graph = graph, .graphs = graphs, .policy = authority, .tables = undefined, .adapter = undefined };
+            self.tables = .{.{ .name = self.input.table, .db = &self.db }};
+            self.adapter = .{ .tables = &self.tables, .ttl_now_ns = copied.ttl_now_ns, .partitioned = true, .authority = .{ .ptr = self, .bind = bind, .checkpoint = checkpoint, .project = project, .project_relationship = projectRelationship, .read_authorization = readAuthorization, .search = search } };
+            const backend = self.adapter.backend();
+            stage = "bind";
+            try backend.vtable.bind(backend.ptr, owned, graph);
+            self.arena = arena;
+            return .{ .ptr = self, .vtable = &.{ .invoke = invoke, .release = release, .open_sql = openSql } };
+        }
+        fn cast(ptr: *anyopaque) *Self {
+            return @ptrCast(@alignCast(ptr));
+        }
+        fn bind(ptr: *anyopaque, graph: cypher.catalog.Graph) !void {
+            const self = cast(ptr);
+            const allowed = for (self.graphs) |entry| {
+                if (graph.incarnation == entry.incarnation and graph.revision == entry.revision) break true;
+            } else false;
+            if (!allowed) return error.CatalogGenerationChanged;
+            try checkpoint(ptr);
+        }
+        fn checkpoint(ptr: *anyopaque) !void {
+            const self = cast(ptr);
+            const time = @import("antfly_platform").time.realtimeNs();
+            if (time / std.time.ns_per_ms >= self.input.expires_ms) return error.DeadlineExceeded;
+            try self.policy.checkAt(@intCast(time / std.time.ns_per_s));
+            var scratch = std.heap.ArenaAllocator.init(self.a);
+            defer scratch.deinit();
+            for (self.graph.relationships) |mapping| {
+                if (!std.mem.eql(u8, self.graph.label(mapping.source_label).?.table, self.input.table)) continue;
+                if (mapping.identity) |expected| {
+                    const actual = (try self.source.cypherGraphIndexIdentity(scratch.allocator(), mapping.index)) orelse return error.CatalogGenerationChanged;
+                    if (actual.incarnation != expected.incarnation or actual.config_hash != expected.config_hash) return error.CatalogGenerationChanged;
+                }
+            }
+        }
+        fn readAuthorization(ptr: *anyopaque, _: std.mem.Allocator, table: []const u8) !DB.CypherBackend.ReadAuthorization {
+            const self = cast(ptr);
+            if (!std.mem.eql(u8, table, self.input.table)) return error.Forbidden;
+            const remaining_ms = self.input.expires_ms -| @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
+            return .{ .proof = self.input.principal_proof, .database = self.input.database, .deadline_ns = @import("antfly_platform").time.monotonicNs() + @as(u64, @min(remaining_ms, 5000)) * std.time.ns_per_ms };
+        }
+        fn project(ptr: *anyopaque, a: std.mem.Allocator, node: *const cypher.value.Node) !?*const cypher.value.Node {
+            const self = cast(ptr);
+            if (self.input.filter_query_json.len != 0) {
+                var match = try self.db.scan(a, node.identity.key, node.identity.key, try self.db.cypherDocumentScanOptions(a, .{ .inclusive_from = true, .limit = 1, .execution_deadline_ns = @import("antfly_platform").time.monotonicNs() + 5 * std.time.ns_per_s, .filter_query_json = self.input.filter_query_json, .row_policy_principal_proof = self.input.principal_proof, .row_policy_database = self.input.database }));
+                defer match.deinit(a);
+                if (match.hashes.len == 0) return null;
+            }
+            return node;
+        }
+        fn search(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, input: cypher.backend.SearchInput) !cypher.backend.SearchPage {
+            const self = cast(ptr);
+            if (!std.mem.eql(u8, table, self.input.table)) return error.Forbidden;
+            if (input.prepared_json.len == 0) return error.CypherSearchPreparationRequired;
+            try checkpoint(ptr);
+            const authorization = try readAuthorization(ptr, a, table);
+            const pinned_indexes = try self.db.listIndexes(a);
+            defer {
+                for (pinned_indexes) |*index| index.deinit(a);
+                a.free(pinned_indexes);
+            }
+            const live_indexes = try self.source.listIndexes(a);
+            defer {
+                for (live_indexes) |*index| index.deinit(a);
+                a.free(live_indexes);
+            }
+            for (pinned_indexes) |pinned| {
+                const live = for (live_indexes) |index| {
+                    if (std.mem.eql(u8, index.name, pinned.name)) break index;
+                } else return error.CatalogGenerationChanged;
+                if (pinned.kind != live.kind or pinned.coverage_generation != live.coverage_generation or pinned.coverage_config_fingerprint != live.coverage_config_fingerprint or !std.mem.eql(u8, pinned.config_json, live.config_json)) return error.CatalogGenerationChanged;
+            }
+            var parsed = try @import("../../api/query_contract.zig").parseQueryRequestWithDeadline(a, null, table, input.prepared_json, authorization.deadline_ns);
+            defer parsed.deinit(a);
+            var request = parsed.req;
+            if (request.limit == 0 or request.limit > 1024 or request.offset != 0) return error.CypherInvalidSearchLimit;
+            if (request.graph_queries.len != 0 or request.graph_metric_queries.len != 0 or request.graph_metric_rerank != null or request.reranker != null) return error.UnsupportedQueryRequest;
+            var allowed: std.ArrayList([]const u8) = .empty;
+            var cursor: ?[]const u8 = null;
+            var examined: usize = 0;
+            const budget = @min(input.max_examined, 65536);
+            while (true) {
+                try checkpoint(ptr);
+                // One extra row detects exhaustion without silently truncating
+                // the authorization domain used by native top-k selection.
+                const demand = @min(256, budget -| examined + 1);
+                var page = try self.db.scan(a, cursor orelse "", "", try self.db.cypherDocumentScanOptions(a, .{ .inclusive_from = cursor == null, .include_documents = true, .limit = @intCast(demand), .execution_deadline_ns = authorization.deadline_ns, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .filter_query_json = self.input.filter_query_json }));
+                defer page.deinit(a);
+                for (page.documents) |document| {
+                    examined += 1;
+                    if (examined > budget) return error.CypherAnchorBudgetExceeded;
+                    const node = (try self.adapter.node(a, table, document.id, document.json)) orelse continue;
+                    if (node.labels.len == 0) continue;
+                    var present = false;
+                    for (request.filter_doc_ids) |id| if (std.mem.eql(u8, id, document.id)) {
+                        present = true;
+                        break;
+                    };
+                    if (request.filter_doc_ids_positive and !present) continue;
+                    if (!request.filter_doc_ids_positive and present) continue;
+                    try allowed.append(a, try a.dupe(u8, document.id));
+                }
+                if (page.documents.len < demand) break;
+                cursor = try a.dupe(u8, page.documents[page.documents.len - 1].id);
+            }
+            request.filter_doc_ids = allowed.items;
+            request.filter_doc_ids_positive = true;
+            request.include_stored = false;
+            var result = try self.db.searchCypherCut(a, request, authorization.proof, authorization.database);
+            defer result.deinit();
+            var seeds: std.ArrayList(cypher.backend.Seed) = .empty;
+            const backend = self.adapter.backend();
+            for (result.hits) |hit| {
+                try checkpoint(ptr);
+                const node = (try backend.vtable.get(backend.ptr, a, .{ .table = table, .key = hit.id })) orelse continue;
+                if (node.labels.len == 0) continue;
+                const score: f64 = hit.score orelse 0;
+                if (!std.math.isFinite(score)) return error.CypherInvalidSearchResult;
+                try seeds.append(a, .{ .node = node, .score = score });
+            }
+            try checkpoint(ptr);
+            return .{ .seeds = try seeds.toOwnedSlice(a), .examined = examined, .approximate = request.dense != null or request.dense_queries.len != 0 or request.query == .dense_knn or result.total_hits_relation != .exact };
+        }
+        fn projectRelationship(ptr: *anyopaque, a: std.mem.Allocator, relationship: *const cypher.value.Relationship) !?*const cypher.value.Relationship {
+            const self = cast(ptr);
+            if (relationship.ownership == .document) {
+                const tuple = try std.json.parseFromSliceLeaky([]const []const u8, a, relationship.identity.key, .{});
+                if (tuple.len != 5 or tuple[4].len == 0 or !std.mem.eql(u8, relationship.identity.table, self.input.table)) return error.CypherInvalidRelationship;
+                // An artifact may override its source key. The producing row
+                // still owns its visibility, independently of both endpoints.
+                var producer = (try self.db.getDocument(a, tuple[4], .{ .row_policy_principal_proof = self.input.principal_proof, .row_policy_database = self.input.database })) orelse return null;
+                defer producer.deinit(a);
+                if (self.input.filter_query_json.len != 0) {
+                    var filter = try @import("../../search/pattern_filter.zig").PreparedPatternFilter.init(a, self.input.filter_query_json);
+                    defer filter.deinit();
+                    if (!try filter.matchesJson(a, tuple[4], try std.json.parseFromSliceLeaky(std.json.Value, a, producer.json, .{ .parse_numbers = false }))) return null;
+                }
+            }
+            return relationship;
+        }
+        fn invoke(ptr: *anyopaque, a: std.mem.Allocator, request: []const u8) ![]u8 {
+            const self = cast(ptr);
+            try checkpoint(ptr);
+            var scratch = std.heap.ArenaAllocator.init(a);
+            defer scratch.deinit();
+            const header = try std.json.parseFromSliceLeaky(struct { graph_incarnation: u64, graph_revision: u64, operation: []const u8 }, scratch.allocator(), request, .{ .ignore_unknown_fields = true });
+            const selected = for (self.graphs) |graph| {
+                if (graph.incarnation == header.graph_incarnation and graph.revision == header.graph_revision) break graph;
+            } else return error.CatalogGenerationChanged;
+            self.graph = selected;
+            const backend = self.adapter.backend();
+            try backend.vtable.bind(backend.ptr, scratch.allocator(), selected);
+            if (std.mem.eql(u8, header.operation, "project")) {
+                const input = try std.json.parseFromSliceLeaky(cypher.rpc.Request, scratch.allocator(), request, .{});
+                const identity = input.identity orelse return error.CypherInvalidDocument;
+                if (!std.mem.eql(u8, identity.table, self.input.table) or !std.mem.eql(u8, input.table, self.input.table)) return error.Forbidden;
+                const document = input.document orelse return error.CypherInvalidDocument;
+                if (!try self.db.permitsCypherDocument(scratch.allocator(), document, input.json_null_fields, self.input.principal_proof, self.input.database))
+                    return std.json.Stringify.valueAlloc(a, .{ .values = @as([]const cypher.wire.Value, &.{}) }, .{});
+                if (self.input.filter_query_json.len != 0) {
+                    var filter = try @import("../../search/pattern_filter.zig").PreparedPatternFilter.init(scratch.allocator(), self.input.filter_query_json);
+                    defer filter.deinit();
+                    if (!try filter.matchesJson(scratch.allocator(), identity.key, document))
+                        return std.json.Stringify.valueAlloc(a, .{ .values = @as([]const cypher.wire.Value, &.{}) }, .{});
+                }
+                const value = try cypher.value.Value.fromJson(scratch.allocator(), document);
+                if (value != .map) return error.CypherInvalidDocument;
+                const node: cypher.value.Node = .{ .identity = identity, .properties = try cypher.value.entityProperties(scratch.allocator(), value.map) };
+                var labels: std.ArrayList([]const u8) = .empty;
+                for (selected.labels) |label| if (selected.admits(&node, label.name)) try labels.append(scratch.allocator(), label.name);
+                var projected = node;
+                projected.labels = labels.items;
+                if (!input.include_relationships) {
+                    try checkpoint(ptr);
+                    return std.json.Stringify.valueAlloc(a, .{ .values = &.{cypher.wire.Value{ .value = .{ .node = &projected } }} }, .{});
+                }
+                const derived = try self.db.cypherDocumentRelationships(scratch.allocator(), selected, &projected);
+                const relationships = try scratch.allocator().alloc(cypher.wire.Value, derived.len);
+                for (derived, relationships) |edge, *out| out.* = .{ .value = .{ .relationship = edge } };
+                try checkpoint(ptr);
+                return std.json.Stringify.valueAlloc(a, .{ .values = &.{cypher.wire.Value{ .value = .{ .node = &projected } }}, .relationships = relationships }, .{});
+            }
+            if (std.mem.eql(u8, header.operation, "normalize")) {
+                const input = try std.json.parseFromSliceLeaky(cypher.rpc.Request, scratch.allocator(), request, .{});
+                const identity = input.identity orelse return error.CypherInvalidDocument;
+                if (!std.mem.eql(u8, identity.table, self.input.table) or !std.mem.eql(u8, input.table, self.input.table)) return error.Forbidden;
+                const document = input.document orelse return error.CypherInvalidDocument;
+                if (document != .object) return error.CypherInvalidDocument;
+                const value = try cypher.value.Value.fromJson(scratch.allocator(), document);
+                const node: cypher.value.Node = .{ .identity = identity, .properties = try cypher.value.entityProperties(scratch.allocator(), value.map) };
+                const normalized = try self.db.normalizeCypherNode(scratch.allocator(), selected, &node, input.apply_defaults);
+                try checkpoint(ptr);
+                return std.json.Stringify.valueAlloc(a, .{ .values = &.{cypher.wire.Value{ .value = .{ .node = normalized } }} }, .{});
+            }
+            if (std.mem.eql(u8, header.operation, "observe") or std.mem.eql(u8, header.operation, "observe_ranges")) {
+                const observations = @import("cypher_write_observation.zig");
+                const observation = if (std.mem.eql(u8, header.operation, "observe_ranges")) try observations.captureRanges(Self, self, scratch.allocator()) else try observations.capture(Self, self, scratch.allocator());
+                return std.json.Stringify.valueAlloc(a, observation, .{});
+            }
+            const result = try (cypher.rpc.Owner{ .backend = backend, .graph = selected, .table = self.input.table }).execute(a, request);
+            errdefer a.free(result);
+            try checkpoint(ptr);
+            return result;
+        }
+        pub fn openWriteObservation(self: *Self, a: std.mem.Allocator) !@import("../relational_read_view.zig").View {
+            return openSql(self, a, self.input.table, "", "", .{ .include_range_proofs = true, .include_content_hashes = true, .sql_document_preimage = true, .relational_query = .{ .fields = &.{} } });
+        }
+        fn openSql(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, from: []const u8, to: []const u8, input: @import("types.zig").ScanOptions) !@import("../relational_read_view.zig").View {
+            const self = cast(ptr);
+            if (!std.mem.eql(u8, table, self.input.table)) return error.Forbidden;
+            try checkpoint(ptr);
+            var scratch = std.heap.ArenaAllocator.init(a);
+            defer scratch.deinit();
+            var opts = input;
+            opts.row_policy_principal_proof = self.input.principal_proof;
+            opts.row_policy_database = self.input.database;
+            if (self.input.filter_query_json.len != 0) {
+                if (opts.filter_query_json.len == 0) opts.filter_query_json = self.input.filter_query_json else opts.filter_query_json = try std.fmt.allocPrint(scratch.allocator(), "{{\"conjuncts\":[{s},{s}]}}", .{ opts.filter_query_json, self.input.filter_query_json });
+            }
+            const view = try @import("cypher_sql_view.zig").open(Self, DB, a, self, &self.db, from, to, opts);
+            _ = self.references.fetchAdd(1, .monotonic);
+            return view;
+        }
+        pub fn sqlCheckpoint(self: *Self) !void {
+            try checkpoint(self);
+        }
+        pub fn releaseSql(self: *Self) void {
+            release(self);
+        }
+        fn release(ptr: *anyopaque) void {
+            const self = cast(ptr);
+            if (self.references.fetchSub(1, .acq_rel) != 1) return;
+            self.db.close();
+            self.policy.release();
+            self.arena.deinit();
+            self.a.destroy(self);
+        }
+    };
+}

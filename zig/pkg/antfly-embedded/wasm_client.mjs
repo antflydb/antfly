@@ -356,6 +356,15 @@ export function bindAntflyEmbeddedApi(exports) {
             freeInput(input);
         }
     }
+    function expectGraphOk(status) {
+        if (Number(status) === 0) return;
+        let diagnostic;
+        try { diagnostic = JSON.parse(lastResult()); } catch { throw new Error(lastMessage()); }
+        const error = new Error(diagnostic.message ?? lastMessage());
+        error.name = "GraphExecutionError";
+        error.diagnostic = diagnostic;
+        throw error;
+    }
 
     return {
         exports,
@@ -370,6 +379,33 @@ export function bindAntflyEmbeddedApi(exports) {
         batchJson(body) {
             return callJson(exports.antfly_embedded_batch_json, toJsonBody(body));
         },
+        graphCatalogJson(body) {
+            const input = writeInput(toJsonBody(body));
+            try { expectGraphOk(exports.antfly_embedded_graph_catalog_json(input.ptr, input.len)); return lastResult(); }
+            finally { freeInput(input); }
+        },
+        graphCatalog(body) { return JSON.parse(this.graphCatalogJson(body)); },
+        addIndexJson(body) {
+            const input = writeInput(toJsonBody(body));
+            try { expectGraphOk(exports.antfly_embedded_add_index_json(input.ptr, input.len)); return lastResult(); }
+            finally { freeInput(input); }
+        },
+        addIndex(body) { return JSON.parse(this.addIndexJson(body)); },
+        cypherJson(graph, body) {
+            const request = typeof body === "string" ? JSON.parse(body) : { ...body };
+            if (request.write_request_id == null && globalThis.crypto?.randomUUID) request.write_request_id = globalThis.crypto.randomUUID().replaceAll("-", "");
+            const name = writeInput(String(graph));
+            const input = writeInput(toJsonBody(request));
+            try { expectGraphOk(exports.antfly_embedded_cypher_json(name.ptr, name.len, input.ptr, input.len)); return lastResult(); }
+            finally { freeInput(input); freeInput(name); }
+        },
+        cypher(graph, body) { return JSON.parse(this.cypherJson(graph, body)); },
+        graphWriteStatusJson(id) {
+            const input = writeInput(String(id));
+            try { expectGraphOk(exports.antfly_embedded_graph_write_status_json(input.ptr, input.len)); return lastResult(); }
+            finally { freeInput(input); }
+        },
+        graphWriteStatus(id) { return JSON.parse(this.graphWriteStatusJson(id)); },
         batch(body) {
             return JSON.parse(this.batchJson(body));
         },

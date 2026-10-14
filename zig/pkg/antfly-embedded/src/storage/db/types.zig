@@ -343,6 +343,7 @@ pub const BatchRequest = struct {
     row_policy_principal_proof: []const u8 = "",
     row_policy_database: []const u8 = "",
     row_policy_admitted_at_seconds: i64 = 0,
+    normalized_graph_rows: bool = false,
     /// Exact metadata read-index snapshot fetched and validated by the owner
     /// leader before proposal. Followers consume these committed bytes locally;
     /// they must never perform metadata IO from deterministic Raft apply.
@@ -1393,6 +1394,9 @@ pub const Query = union(enum) {
 };
 
 pub const LookupOptions = struct {
+    /// Private read-index preparation for a later fenced graph snapshot.
+    /// Public lookup decoders never populate this maintenance-only flag.
+    cypher_prepare: bool = false,
     row_policy_principal_proof: []const u8 = "",
     row_policy_database: []const u8 = "",
     /// Private metadata-coordinator probe. Public HTTP lookup parsing must
@@ -1715,6 +1719,7 @@ pub const TransactionIntentRequest = struct {
     row_policy_principal_proof: []const u8 = "",
     row_policy_database: []const u8 = "",
     row_policy_admitted_at_seconds: i64 = 0,
+    normalized_graph_rows: bool = false,
     range_guards: []const @import("../range_protection.zig").Proof = &.{},
     schema_version: ?u32 = null,
     relational_index_maintenance: ?@import("relational_index_maintenance_contract.zig").Command = null,
@@ -1728,6 +1733,8 @@ pub const TransactionIntentRequest = struct {
     writes: []const TransactionWrite = &.{},
     deletes: []const []const u8 = &.{},
     transforms: []const DocumentTransform = &.{},
+    graph_writes: []const GraphEdgeWrite = &.{},
+    graph_deletes: []const GraphEdgeDelete = &.{},
     predicates: []const TransactionVersionPredicate = &.{},
     integrity: []const TransactionIntegrityOperation = &.{},
     integrity_commands: []const @import("relational_integrity_contract.zig").Command = &.{},

@@ -18,6 +18,7 @@
 //! and schema together. This is not another durable catalog or storage engine.
 const std = @import("std");
 const ast = @import("ast.zig");
+pub const graph_relation = @import("graph_relation.zig");
 
 pub const Column = struct {
     name: []const u8,
@@ -111,6 +112,7 @@ pub const Table = struct {
             return parts.next() == null and std.mem.eql(u8, first, self.database) and std.mem.eql(u8, second, self.namespace) and std.mem.eql(u8, third, self.name);
         }
     };
+    graph: ?*const @import("graph_relation.zig").Binding = null,
     id: u64,
     physical_name: []const u8,
     schema_version: u32,
@@ -173,6 +175,9 @@ pub const Scan = struct {
     };
     pub const Search = struct { expression: ast.Search, request_text: ?[]const u8 = null, limit: ?u32 = null };
     search: ?*const Search = null,
+    /// SQL slots used inside a shared graph fragment retain their bound SQL
+    /// types; graph-only unknown slots use JSON data semantics.
+    graph_parameter_types: []const ?ast.ColumnType = &.{},
     /// A request, never proof. Providers explicitly attest the entire order.
     order: []const Order = &.{},
     /// Advisory SQL OFFSET + LIMIT for costing only. Never a scan stop bound.
@@ -596,6 +601,7 @@ pub const Backend = struct {
         // All returned data belongs to the supplied allocator. Scans receive
         // a short-lived page arena, not the retained statement result arena.
         resolve: *const fn (*anyopaque, std.mem.Allocator, ast.Name, Action) anyerror!Table,
+        resolve_graph: ?*const fn (*anyopaque, std.mem.Allocator, ast.GraphTable) anyerror!Table = null,
         scan: *const fn (*anyopaque, std.mem.Allocator, Table, Scan) anyerror!Page,
         /// null means this provider cannot retain a statement snapshot. Never
         /// substitute a collection of independently refreshed shard pages.

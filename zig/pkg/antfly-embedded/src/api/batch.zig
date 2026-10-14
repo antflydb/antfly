@@ -148,7 +148,26 @@ test "row policy publication Raft codec carries immutable owner-fetched bytes pr
     defer parsed.deinit(alloc);
     try std.testing.expectEqualDeep(request.row_policy_publication.?, parsed.req.row_policy_publication.?);
     try std.testing.expectEqualStrings(request.row_policy_install_bundle, parsed.req.row_policy_install_bundle);
-    try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(alloc, "{\"inserts\":{},\"deletes\":[],\"_row_policy_publication\":{\"table_id\":7,\"expected_generation\":11,\"expected_catalog_epoch\":13,\"expected_phase\":\"pending_install\"},\"sync_level\":\"write\",\"_schema_version\":1}"));
+    const reencoded = try encodeBatchRequest(alloc, parsed.req);
+    defer alloc.free(reencoded);
+    var reparsed = try parseInternalBatchRequest(alloc, reencoded);
+    defer reparsed.deinit(alloc);
+    try std.testing.expectEqualDeep(request.row_policy_publication.?, reparsed.req.row_policy_publication.?);
+    var timestamped = request;
+    timestamped.timestamp_ns = 123;
+    try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(alloc, timestamped));
+    var normalized = request;
+    normalized.normalized_graph_rows = true;
+    try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(alloc, normalized));
+    var fenced = request;
+    fenced.schema_version = 1;
+    try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(alloc, fenced));
+    var adjunct = try std.json.parseFromSlice(std.json.Value, alloc, encoded, .{});
+    defer adjunct.deinit();
+    try adjunct.value.object.put(adjunct.arena.allocator(), "_schema_version", .{ .integer = 1 });
+    const adjunct_bytes = try std.json.Stringify.valueAlloc(alloc, adjunct.value, .{});
+    defer alloc.free(adjunct_bytes);
+    try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(alloc, adjunct_bytes));
 }
 
 test "signed write admission is internal-only and survives the replicated batch codec" {
@@ -747,6 +766,10 @@ fn parseBatchRequestWithOptions(
         break :bundle try alloc.dupe(u8, value.string);
     } else null;
     errdefer if (row_policy_install_bundle) |bundle| alloc.free(bundle);
+    const normalized_graph_rows = if (root.get("_normalized_graph_rows")) |value| blk: {
+        if (!allow_internal or value != .bool) return error.InvalidBatchRequest;
+        break :blk value.bool;
+    } else false;
     const row_policy_proof: []const u8 = if (root.get("_row_policy_principal_proof")) |value| blk: {
         if (!allow_internal or value != .string or value.string.len == 0 or
             value.string.len > @import("../usermgr/row_policy_authority.zig").maximum_token_bytes)
@@ -1481,6 +1504,7 @@ fn parseBatchRequestWithOptions(
             .row_policy_principal_proof = row_policy_proof,
             .row_policy_database = row_policy_database,
             .row_policy_admitted_at_seconds = row_policy_admitted_at_seconds,
+            .normalized_graph_rows = normalized_graph_rows,
             .integrity = integrity,
             .integrity_commands = if (integrity_commands) |commands| commands.value else &.{},
             .range_guards = if (range_guards) |guards| guards.value else &.{},
@@ -1589,6 +1613,20 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
     try @import("../storage/db/artifact_publication.zig").validateRequest(alloc, req);
     try @import("../storage/db/artifact_publication_transport.zig").validateBatchRequest(req);
     if (req.row_policy_publication) |publication| {
+        // A policy command is an isolated Raft control entry. Reject every
+        // adjunct before encoding/proposal, including newly added fields;
+        // otherwise its strict decoder could fail only after durable commit.
+        const defaults: db_mod.types.BatchRequest = .{};
+        inline for (@typeInfo(db_mod.types.BatchRequest).@"struct".field_names) |name| {
+            if (comptime !std.mem.eql(u8, name, "row_policy_publication") and !std.mem.eql(u8, name, "row_policy_install_bundle")) {
+                const field = @field(req, name);
+                if (comptime @typeInfo(@TypeOf(field)) == .pointer and @typeInfo(@TypeOf(field)).pointer.size == .slice) {
+                    // Parsing allocates empty arrays and strings. Their
+                    // addresses have no bearing on a control envelope.
+                    if (field.len != 0) return error.InvalidBatchRequest;
+                } else if (!std.meta.eql(field, @field(defaults, name))) return error.InvalidBatchRequest;
+            }
+        }
         if (publication.table_id == 0 or publication.expected_generation == 0 or publication.expected_catalog_epoch == 0 or publication.owner_group_id == 0 or
             req.row_policy_install_bundle.len == 0 or req.row_policy_install_bundle.len > @import("../system_catalog/policies.zig").max_install_snapshot_bytes or
             req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or
@@ -1793,6 +1831,7 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
         try writer.writeAll(",\"_row_policy_install_bundle\":");
         try writer.print("{f}", .{std.json.fmt(req.row_policy_install_bundle, .{})});
     }
+    if (req.normalized_graph_rows) try writer.writeAll(",\"_normalized_graph_rows\":true");
     if (req.row_policy_principal_proof.len != 0) {
         if (req.row_policy_database.len == 0 or req.row_policy_admitted_at_seconds <= 0)
             return error.InvalidBatchRequest;

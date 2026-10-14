@@ -42,12 +42,14 @@ pub const ResourceType = enum {
     user,
     inference,
     @"*",
+    graph,
 
     pub fn fromSlice(raw: []const u8) !ResourceType {
         if (std.mem.eql(u8, raw, "database")) return .database;
         if (std.mem.eql(u8, raw, "namespace")) return .namespace;
         if (std.mem.eql(u8, raw, "tablespace")) return .tablespace;
         if (std.mem.eql(u8, raw, "table")) return .table;
+        if (std.mem.eql(u8, raw, "graph")) return .graph;
         if (std.mem.eql(u8, raw, "user")) return .user;
         if (std.mem.eql(u8, raw, "inference")) return .inference;
         if (std.mem.eql(u8, raw, "*")) return .@"*";
@@ -60,6 +62,7 @@ pub const ResourceType = enum {
             .namespace => "namespace",
             .tablespace => "tablespace",
             .table => "table",
+            .graph => "graph",
             .user => "user",
             .inference => "inference",
             .@"*" => "*",
@@ -1055,6 +1058,15 @@ pub const UserManager = struct {
         }
 
         return try out.toOwnedSlice(self.alloc);
+    }
+
+    /// Revision of the role authority, captured under the mutation mutex.
+    pub fn rowPolicyRoleRevision(self: *UserManager) u64 {
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        const io = receiver.io();
+        self.mutation_mutex.lockUncancelable(io);
+        defer self.mutation_mutex.unlock(io);
+        return self.role_revision;
     }
 
     /// Recheck the previously admitted credential and table permission under

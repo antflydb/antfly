@@ -16,6 +16,7 @@
 //! Public embedded DB C ABI.
 comptime {
     _ = @import("sql_describe.zig");
+    _ = @import("cypher.zig");
 }
 const handles = @import("handles.zig");
 pub const std = handles.std;
@@ -5271,7 +5272,7 @@ pub fn executeEmbeddedSql(handle: *Handle, table_name: []const u8, request_json:
     try @import("tables.zig").load(handle);
     try @import("sql_commit.zig").recover(handle);
     try @import("sql_ddl.zig").recover(handle);
-    var adapter = sql.Adapter(antfly){ .transaction = session, .handle = handle, .db = handle.database(), .table_name = table_name, .read_only = !liteOpenModeCanWrite(handle.open_mode) or (if (session) |value| value.read_only else false) };
+    var adapter = sql.Adapter(antfly){ .graph_parameters = parsed.value.parameters, .transaction = session, .handle = handle, .db = handle.database(), .table_name = table_name, .read_only = !liteOpenModeCanWrite(handle.open_mode) or (if (session) |value| value.read_only else false) };
     var error_context: antfly.capi_dependencies.sql_errors.Context = .{};
     var result = sql.runtime.execute(handle.alloc, adapter.backend(), &compiled, parsed.value.parameters, .{ .result_rows = parsed.value.limit, .error_context = &error_context }) catch |err| {
         if (err == error.SqlNotNullViolation) out_buf.* = try stringifyJson(.{ .@"error" = error_context.diagnostic(err) });

@@ -82,6 +82,17 @@ pub const Owner = struct {
             self.alloc.destroy(self);
         }
     };
+    const GraphSnapshot = struct {
+        alloc: std.mem.Allocator,
+        cancelled: std.atomic.Value(bool) = .init(false),
+        read: @import("antfly_local_sources").storage_statement_read_fence.GraphRead,
+        fn close(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.read.deinit();
+            self.alloc.destroy(self);
+        }
+    };
+
     const Cursor = struct {
         alloc: std.mem.Allocator,
         cancelled: std.atomic.Value(bool) = .init(false),
@@ -147,6 +158,31 @@ pub const Owner = struct {
         return try self.registry.insert(scope, connection, time.monotonicNs(), deadline_ns, .{ .ptr = owned, .kind = .snapshot, .close = Snapshot.close, .cancellation = &owned.cancelled });
     }
 
+    pub fn captureGraph(self: Owner, scope: registry_mod.Scope, capture_token: registry_mod.Token, connection: u128, input: @import("antfly_local_sources").storage_statement_read_fence.GraphInput, deadline_ns: u64) !registry_mod.Token {
+        if (input.table_id != scope.table_id) return error.RetainedReadScopeChanged;
+        var borrow = try self.registry.borrow(capture_token, scope, .capture, time.monotonicNs());
+        defer borrow.deinit();
+        const captured: *Capture = @ptrCast(@alignCast(borrow.resource.ptr));
+        try captured.fence.validate();
+        const graph = try self.registry.alloc.create(GraphSnapshot);
+        errdefer self.registry.alloc.destroy(graph);
+        graph.* = .{ .alloc = self.registry.alloc, .read = try captured.fence.captureGraph(self.registry.alloc, input) };
+        errdefer graph.read.deinit();
+        try captured.fence.validate();
+        try borrow.validate(time.monotonicNs());
+        return self.registry.insert(scope, connection, time.monotonicNs(), deadline_ns, .{ .ptr = graph, .kind = .graph_snapshot, .close = GraphSnapshot.close, .cancellation = &graph.cancelled });
+    }
+    pub fn invokeGraph(self: Owner, scope: registry_mod.Scope, token: registry_mod.Token, alloc: std.mem.Allocator, body: []const u8) ![]u8 {
+        var borrow = try self.registry.borrow(token, scope, .graph_snapshot, time.monotonicNs());
+        defer borrow.deinit();
+        const graph: *GraphSnapshot = @ptrCast(@alignCast(borrow.resource.ptr));
+        try borrow.validate(time.monotonicNs());
+        const result = try graph.read.invoke(alloc, body);
+        errdefer alloc.free(result);
+        try borrow.validate(time.monotonicNs());
+        return result;
+    }
+
     /// Snapshot gets a separate owned cancellation capsule: releasing the
     /// short mutation capture must not cancel its long-lived paging cursors.
     pub fn open(self: Owner, scope: registry_mod.Scope, capture_token: registry_mod.Token, connection: u128, from: []const u8, to: []const u8, input: types.ScanOptions, deadline_ns: u64) !registry_mod.Token {
@@ -202,6 +238,34 @@ pub const Owner = struct {
         opts.cancellation = CancellationToken.fromAtomic(&owned.cancelled);
         opts.execution_deadline_ns = deadline_ns;
         owned.view = try retained.snapshot.open(alloc, from, to, opts);
+        errdefer owned.view.deinit();
+        try borrow.validate(time.monotonicNs());
+        return try self.registry.insert(scope, connection, time.monotonicNs(), deadline_ns, .{ .ptr = owned, .kind = .cursor, .close = Cursor.close, .cancellation = &owned.cancelled });
+    }
+
+    pub fn openGraph(self: Owner, scope: registry_mod.Scope, snapshot_token: registry_mod.Token, connection: u128, table: []const u8, from: []const u8, to: []const u8, input: types.ScanOptions, deadline_ns: u64) !registry_mod.Token {
+        var borrow = try self.registry.borrow(snapshot_token, scope, .graph_snapshot, time.monotonicNs());
+        defer borrow.deinit();
+        const retained: *GraphSnapshot = @ptrCast(@alignCast(borrow.resource.ptr));
+        const alloc = self.registry.alloc;
+        const owned = try alloc.create(Cursor);
+        errdefer alloc.destroy(owned);
+        owned.* = .{ .alloc = alloc, .view = undefined };
+        var opts = input;
+        var parsed: ?std.json.Parsed(types.RelationalRowQuery) = null;
+        defer if (parsed) |*value| value.deinit();
+        var query = input.relational_query orelse blk: {
+            parsed = try std.json.parseFromSlice(types.RelationalRowQuery, alloc, input.relational_query_json, .{ .allocate = .alloc_always, .parse_numbers = false });
+            break :blk parsed.?.value;
+        };
+        if (query.schema_version) |version| if (version != scope.schema_version) return error.RetainedReadScopeChanged;
+        if (query.index != null or query.auto_index) return error.SqlStatementSnapshotRequired;
+        query.schema_version = scope.schema_version;
+        opts.relational_query = query;
+        opts.columnar_stats = null;
+        opts.cancellation = CancellationToken.fromAtomic(&owned.cancelled);
+        opts.execution_deadline_ns = deadline_ns;
+        owned.view = try retained.read.openSql(alloc, table, from, to, opts);
         errdefer owned.view.deinit();
         try borrow.validate(time.monotonicNs());
         return try self.registry.insert(scope, connection, time.monotonicNs(), deadline_ns, .{ .ptr = owned, .kind = .cursor, .close = Cursor.close, .cancellation = &owned.cancelled });

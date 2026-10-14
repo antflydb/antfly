@@ -3396,6 +3396,13 @@ fn highestSupportedRuntimeStatusVersion(service: anytype, required_version: u16)
 /// decode them. This classifier is shared by single and batched proposals;
 /// ordinary document metadata retains its predecessor admission contract.
 pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
+    if (command == .apply_transaction_sessions) return metadata_topology_protocol.transaction_sessions_version;
+    if (command == .apply_system_catalog) {
+        const Header = struct { mutation: struct { kind: @import("antfly_local_sources").system_catalog_domain.Kind } };
+        var parsed = std.json.parseFromSlice(Header, std.heap.page_allocator, command.apply_system_catalog, .{ .ignore_unknown_fields = true }) catch return metadata_topology_protocol.current_version;
+        defer parsed.deinit();
+        if (parsed.value.mutation.kind == .graph) return metadata_topology_protocol.graph_definition_version;
+    }
     if (command == .compare_and_replace_table and command.compare_and_replace_table.relation_guard != null)
         return metadata_topology_protocol.relation_mutation_version;
     if (command == .apply_relation_reconciliation) {

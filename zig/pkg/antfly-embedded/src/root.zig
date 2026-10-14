@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const embedded = @import("embedded_surface");
+pub const cypher = embedded.cypher;
 pub const db = embedded.db;
 pub const api = embedded.api;
 pub const host_environment = embedded.host_environment;
@@ -151,3 +152,10 @@ test "pkg antfly embedded exposes Lite handle-level snapshot helper" {
 }
 
 pub const lake = embedded.lake;
+
+test "embedded package exposes catalog-free Cypher compilation" {
+    var diagnostic: cypher.compiler.Diagnostic = .{};
+    var compiled = try cypher.compiler.compile(std.testing.allocator, "MATCH (n:Document) RETURN n", .{}, &diagnostic);
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(usize, 2), compiled.query.clauses.len);
+}

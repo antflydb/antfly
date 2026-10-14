@@ -4099,6 +4099,67 @@ pub const ProvisionedTableReadSource = struct {
         return self.groupLocalSourceWithFence(fence).tryStatementReadFenceGroupLocal(alloc, group_id, table_name, opts, consistency);
     }
 
+    fn openCypherStatement(ptr: *anyopaque, alloc: std.mem.Allocator, input: @import("antfly_local_sources").storage_statement_read_fence.GraphStatement) !@import("antfly_local_sources").storage_statement_read_fence.GraphRead {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        var attempt: usize = 0;
+        while (true) : (attempt += 1) {
+            return openCypherStatementAttempt(ptr, alloc, input) catch |err| {
+                if ((err != error.NotLeader and err != error.ReadUnavailable and err != error.Backpressured) or attempt == 3) return err;
+                // A rejected owner has exposed no rows. Release the entire
+                // failed cohort, refresh routes, and acquire fresh capabilities.
+                // Never reuse or replay a cursor or a graph mutation.
+                try input.cancellation.check();
+                if (input.deadline_ns) |deadline| if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.DeadlineExceeded;
+                const io = self.io_impl orelse return err;
+                try io.backend.sleep(.fromMilliseconds(250), .awake);
+                continue;
+            };
+        }
+    }
+
+    fn openCypherStatementAttempt(ptr: *anyopaque, alloc: std.mem.Allocator, input: @import("antfly_local_sources").storage_statement_read_fence.GraphStatement) !@import("antfly_local_sources").storage_statement_read_fence.GraphRead {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        try self.ensureHotStandbyReadAllowed(.read_index);
+        if (input.tables.len == 0 or input.tables.len > 64) return error.CypherOwnerBudgetExceeded;
+        const factory = @import("graph_statement_source.zig");
+        var plans: std.ArrayList(factory.Plan) = .empty;
+        defer plans.deinit(alloc);
+        var routes: std.ArrayList(table_router.GroupRoute) = .empty;
+        defer {
+            for (routes.items) |*route| route.deinit(alloc);
+            routes.deinit(alloc);
+        }
+        const prepared = try alloc.alloc(PreparedSpanRead, input.tables.len);
+        defer alloc.free(prepared);
+        var retained: usize = 0;
+        defer for (prepared[0..retained]) |*value| value.deinit();
+        const opts: db_mod.types.ScanOptions = .{ .execution_deadline_ns = input.deadline_ns, .cancellation = input.cancellation };
+        for (input.tables, prepared) |table, *owned| {
+            try input.cancellation.check();
+            owned.* = try self.prepareRoutedSpanRead(alloc, table.name, "", "", .{ .scan = .{ .from_key = "", .to_key = "", .opts = opts } }, .read_index, .general);
+            retained += 1;
+            if (owned.table_id != table.table_id) return error.CatalogGenerationChanged;
+            try certifyDelayedOwnerCut(owned.group_ids.len);
+            try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table.name, owned.group_ids.len);
+            owned.releaseActivity();
+            for (owned.group_ids, 0..) |group, i| {
+                if (plans.items.len >= 1024) return error.CypherOwnerBudgetExceeded;
+                var route: table_router.GroupRoute = if (self.distributed_router) |router|
+                    (try table_router.resolveGroupRoute(alloc, self.catalog, router.withBudget(.fromRequest(opts)), group, .prefer_leader)) orelse return error.GroupLeaderUnavailable
+                else
+                    table_router.GroupRoute.local;
+                errdefer route.deinit(alloc);
+                const fence = owned.fenceAt(i, input.deadline_ns, input.cancellation);
+                try plans.append(alloc, .{ .table = table, .fence = fence, .route = switch (route) {
+                    .local => .{ .local = self.groupLocalSourceWithFence(fence) },
+                    .remote => |remote| .{ .remote = .{ .executor = self.distributedInternalExecutor(), .base_uri = remote.base_uri } },
+                } });
+                try routes.append(alloc, route);
+            }
+        }
+        return factory.Statement.create(alloc, input, plans.items);
+    }
+
     pub fn source(self: *ProvisionedTableReadSource) TableReadSource {
         return .{
             .ptr = self,
@@ -4108,6 +4169,7 @@ pub const ProvisionedTableReadSource = struct {
             .vtable = &.{
                 .acquire_join_view = JoinReadBinding(ProvisionedTableReadSource).acquire,
                 .open_relational_read = openRelationalRead,
+                .open_cypher_statement = openCypherStatement,
                 .open_relational_statement = openRelationalStatement,
                 .open_relational_statement_snapshot = openRelationalStatementSnapshot,
                 .open_relational_read_group_local_routed = openRelationalReadGroupRouted,
@@ -6875,6 +6937,7 @@ pub const HostedProvisionedTableReadSource = struct {
             .vtable = &.{
                 .acquire_join_view = JoinReadBinding(HostedProvisionedTableReadSource).acquire,
                 .open_relational_read = openRelationalRead,
+                .open_cypher_statement = openCypherStatement,
                 .open_relational_statement = openRelationalStatement,
                 .lookup = lookup,
                 .scan = scan,
@@ -7156,6 +7219,36 @@ pub const HostedProvisionedTableReadSource = struct {
             },
             .planned, .bootstrapping, .replaying, .cutover_ready, .retiring => return false,
         }
+    }
+
+    fn openCypherStatement(ptr: *anyopaque, alloc: std.mem.Allocator, input: @import("antfly_local_sources").storage_statement_read_fence.GraphStatement) !@import("antfly_local_sources").storage_statement_read_fence.GraphRead {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        const Owner = struct {
+            alloc: std.mem.Allocator,
+            coordinator: ProvisionedTableReadSource,
+            read: @import("antfly_local_sources").storage_statement_read_fence.GraphRead,
+            fn invoke(raw: *anyopaque, page_alloc: std.mem.Allocator, body: []const u8) ![]u8 {
+                const owner: *@This() = @ptrCast(@alignCast(raw));
+                return owner.read.invoke(page_alloc, body);
+            }
+            fn openSql(raw: *anyopaque, view_alloc: std.mem.Allocator, table: []const u8, from: []const u8, to: []const u8, opts: db_mod.types.ScanOptions) !table_read_source.RelationalReadView {
+                const owner: *@This() = @ptrCast(@alignCast(raw));
+                return owner.read.openSql(view_alloc, table, from, to, opts);
+            }
+            fn close(raw: *anyopaque) void {
+                const owner: *@This() = @ptrCast(@alignCast(raw));
+                owner.read.deinit();
+                owner.alloc.destroy(owner);
+            }
+        };
+        const owner = try alloc.create(Owner);
+        errdefer alloc.destroy(owner);
+        owner.* = .{ .alloc = alloc, .coordinator = ProvisionedTableReadSource.init(self.replica_root_dir, self.catalog, self.read_safety_barrier), .read = undefined };
+        owner.coordinator.local_read_source = self.local_read_source;
+        owner.coordinator.io_impl = self.io_impl;
+        _ = owner.coordinator.withDistributedRouting(self.router, self.executor, self.internal_service_secret, self.internal_service_issuer);
+        owner.read = try ProvisionedTableReadSource.openCypherStatement(&owner.coordinator, alloc, input);
+        return .{ .ptr = owner, .vtable = &.{ .invoke = Owner.invoke, .release = Owner.close, .open_sql = Owner.openSql } };
     }
 
     fn openRelationalStatement(ptr: *anyopaque, alloc: std.mem.Allocator, scans: []const table_read_source.RelationalStatementScan, consistency: raft_mod.ReadConsistency) !table_read_source.RelationalStatementRead {

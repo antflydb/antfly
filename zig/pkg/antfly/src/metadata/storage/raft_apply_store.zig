@@ -26,6 +26,7 @@ const system_catalog = @import("antfly_local_sources").system_catalog_domain;
 // Accommodate their bounded envelope as well as ordinary 255-byte names.
 const catalog_name_key_buffer_bytes = 2048;
 const system_catalog_storage = @import("../../system_catalog/storage.zig");
+const transaction_session_record = @import("../transaction_session_record.zig");
 const relation_names = @import("antfly_local_sources").system_catalog_relation_names;
 const relation_reconciliation = @import("antfly_local_sources").system_catalog_relation_reconciliation;
 const relation_control = @import("../relation_reconciliation_command.zig");
@@ -5895,6 +5896,7 @@ pub fn onlineMergeAdmissionDigest(alloc: std.mem.Allocator, record: metadata.Mer
 }
 
 pub const TransitionCommand = union(enum) {
+    apply_transaction_sessions: []const u8,
     apply_relation_reconciliation: []const u8,
     apply_restore_staging: []const u8,
     /// Versioned system catalog request, applied atomically with any table topology.
@@ -6061,7 +6063,7 @@ pub const TransitionCommand = union(enum) {
         switch (self.*) {
             .apply_restore_staging, .apply_relation_reconciliation => |bytes| alloc.free(bytes),
             .upsert_schema_progress_batch => |records| alloc.free(records),
-            .publish_secret_collection, .activate_topology_protocol, .apply_system_catalog, .apply_sql_settings, .apply_sql_policies, .apply_sql_policy_publication, .apply_fk_generation_publication, .apply_fk_initial_create, .apply_store_root_enrollment, .ack_initial_fk_retirement, .apply_store_report_update, .apply_store_report_baseline => |bytes| alloc.free(bytes),
+            .publish_secret_collection, .activate_topology_protocol, .apply_system_catalog, .apply_sql_settings, .apply_sql_policies, .apply_sql_policy_publication, .apply_fk_generation_publication, .apply_fk_initial_create, .apply_store_root_enrollment, .ack_initial_fk_retirement, .apply_store_report_update, .apply_store_report_baseline, .apply_transaction_sessions => |bytes| alloc.free(bytes),
             .upsert_node, .register_node => |*record| {
                 metadata_table_manager.freeNode(alloc, record.*);
             },
@@ -10374,9 +10376,11 @@ fn policyHasUnsupportedArtifactIndexes(alloc: std.mem.Allocator, indexes_json: [
         if (config != .object) return error.InvalidCatalogRecord;
         const kind = config.object.get("type") orelse return error.InvalidCatalogRecord;
         if (kind != .string) return error.InvalidCatalogRecord;
-        // Relational secondary indexes recheck primary typed rows before
-        // projection. Search modalities need owner-side candidate filtering.
-        if (!std.mem.eql(u8, kind.string, "relational")) return true;
+        // Graph reads require signed owner authority and recheck both endpoints.
+        // Relational indexes likewise recheck primary typed rows. Cypher
+        // full-text search filters candidates and corpus statistics first.
+        // Public raw graph/search APIs remain gated while a policy is active.
+        if (!std.mem.eql(u8, kind.string, "relational") and !std.mem.eql(u8, kind.string, "graph") and !std.mem.eql(u8, kind.string, "full_text") and !std.mem.eql(u8, kind.string, "embeddings") and !std.mem.eql(u8, kind.string, "dense_vector")) return true;
     }
     return false;
 }
@@ -10470,6 +10474,11 @@ pub const RaftApplyStore = struct {
             .block_cache = block_cache,
             .store = store,
         };
+    }
+    pub fn openSessionRead(self: *RaftApplyStore, alloc: std.mem.Allocator, _: u64) !@import("antfly_local_sources").storage_backend_erased.ReadTxn {
+        var txn = try self.store.beginReadTxn();
+        errdefer txn.abort();
+        return @import("antfly_local_sources").storage_backend_erased.readTxnFrom(alloc, txn);
     }
 
     pub fn deinit(self: *RaftApplyStore) void {
@@ -12629,12 +12638,10 @@ pub const RaftApplyStore = struct {
         defer parsed.deinit(a);
         const native = try @import("antfly_local_sources").schema_mod.deriveRuntimeTableSchema(a, parsed);
         if (native.storage_mode != .relational) return error.RowPolicyCatalogChanged;
-        var has_schema_search = native.index_sort.len != 0;
-        for (native.full_text_documents) |document| {
-            if (document.fields.len != 0 or document.dynamic_rules.len != 0 or
-                document.open_dynamic_paths.len != 0 or document.infer_type_dynamic_paths.len != 0)
-                has_schema_search = true;
-        }
+        // Search-capable scalar schema fields do not open a search API. The
+        // artifact whitelist above and native raw-search gate enforce that.
+        // The policy row evaluator must still understand every typed column.
+        var has_schema_search = false;
         for (native.relational_columns) |column| {
             if (column.column_type == .dense_vector) has_schema_search = true;
         }
@@ -14043,6 +14050,16 @@ pub const RaftApplyStore = struct {
             const value = try decodeTableIdentity(self.view.alloc, bytes);
             if (value.table_id != id) return error.InvalidCatalogRecord;
             return .{ .id = value.table_id, .name = value.name };
+        }
+        pub fn graphIndexIdentity(self: @This(), id: u64, name: []const u8) !?@import("cypher").catalog.IndexIdentity {
+            var buf: [160]u8 = undefined;
+            const bytes = self.view.txn.get(try tableKeyForGroup(&buf, self.view.group_id, id)) catch |err| switch (err) {
+                error.NotFound => return null,
+                else => return err,
+            };
+            const table = try decodeTableRecord(self.view.alloc, bytes);
+            if (table.table_id != id) return error.InvalidCatalogRecord;
+            return @import("../../system_catalog/graph_bindings.zig").indexIdentity(self.view.alloc, table.indexes_json, name);
         }
     };
 
@@ -17570,6 +17587,7 @@ pub const RaftApplyStore = struct {
 
     const MetadataSnapshotKeyFn = *const fn ([]u8, u64) anyerror![]const u8;
     const MetadataSnapshotProjection = enum {
+        transaction_sessions,
         secret_collection,
         system_catalog,
         relation_writer,
@@ -17636,6 +17654,7 @@ pub const RaftApplyStore = struct {
         key: MetadataSnapshotKey,
     };
     const metadata_snapshot_projections = [_]MetadataSnapshotProjectionDescriptor{
+        .{ .projection = .transaction_sessions, .key = .{ .prefix = transaction_session_record.prefixForGroup } },
         .{ .projection = .secret_collection, .key = .{ .prefix = secret_store.prefixForGroup } },
         .{ .projection = .topology_activation, .key = .{ .point = topologyActivationKeyForGroup } },
         .{ .projection = .system_catalog, .key = .{ .prefix = system_catalog_storage.prefixForGroup } },
@@ -17705,6 +17724,7 @@ pub const RaftApplyStore = struct {
     /// without classifying its durable output is therefore a compile error.
     fn transitionCommandProjectionMask(tag: std.meta.Tag(TransitionCommand)) MetadataSnapshotProjectionMask {
         const mask = switch (tag) {
+            .apply_transaction_sessions => metadataSnapshotProjectionBit(.transaction_sessions),
             .apply_relation_reconciliation => metadataSnapshotProjectionBit(.relation_source) | metadataSnapshotProjectionBit(.relation_reconciliation) |
                 metadataSnapshotProjectionBit(.relation_retirements) | metadataSnapshotProjectionBit(.relation_candidates) | metadataSnapshotProjectionBit(.relation_root) | metadataSnapshotProjectionBit(.relation_live) |
                 metadataSnapshotProjectionBit(.relation_writer) | metadataSnapshotProjectionBit(.topology_activation) | metadataSnapshotProjectionBit(.metadata_incarnation),
@@ -20082,6 +20102,9 @@ pub const RaftApplyStore = struct {
             },
             .apply_relation_reconciliation => |bytes| try self.applyRelationControlTxn(txn, group_id, bytes),
             .apply_system_catalog => |bytes| try self.applySystemCatalogTxn(txn, group_id, bytes),
+            .apply_transaction_sessions => |bytes| {
+                _ = try transaction_session_record.apply(txn, self.alloc, group_id, bytes);
+            },
             .apply_sql_settings => |bytes| try self.applySqlSettingsTxn(txn, group_id, bytes),
             .apply_sql_policies => |bytes| try self.applySqlPoliciesTxn(txn, group_id, bytes),
             .apply_sql_policy_publication => |bytes| try self.applySqlPolicyPublicationTxn(txn, group_id, bytes),
@@ -24848,6 +24871,7 @@ fn storeRuntimeStatusRecordVersion(record: metadata.StoreRecord) ?u16 {
 }
 
 const TransitionTag = enum(u8) {
+    apply_transaction_sessions = 78,
     apply_relation_reconciliation = 76,
     mutate_lake_index_lifecycle = 75,
     publish_secret_collection = 60,
@@ -24994,6 +25018,13 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
         .apply_system_catalog => |bytes| {
             if (bytes.len > system_catalog.max_command_bytes) return error.CatalogCommandTooLarge;
             try out.append(alloc, @backingInt(TransitionTag.apply_system_catalog));
+            try appendRequiredString(alloc, &out, bytes);
+        },
+        .apply_transaction_sessions => |bytes| {
+            if (bytes.len > transaction_session_record.max_bytes) return error.TransactionTooLarge;
+            const decoded = try transaction_session_record.decode(alloc, bytes);
+            defer alloc.free(decoded.changes);
+            try out.append(alloc, @backingInt(TransitionTag.apply_transaction_sessions));
             try appendRequiredString(alloc, &out, bytes);
         },
         .apply_sql_settings => |bytes| {
@@ -25425,6 +25456,14 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
         .apply_system_catalog => blk: {
             if (encoded.len > system_catalog.max_command_bytes + 16) return error.CatalogCommandTooLarge;
             break :blk .{ .apply_system_catalog = try readRequiredString(alloc, encoded, &pos) };
+        },
+        .apply_transaction_sessions => blk: {
+            if (encoded.len > transaction_session_record.max_bytes + 16) return error.TransactionTooLarge;
+            const bytes = try readRequiredString(alloc, encoded, &pos);
+            errdefer alloc.free(bytes);
+            const decoded = try transaction_session_record.decode(alloc, bytes);
+            defer alloc.free(decoded.changes);
+            break :blk .{ .apply_transaction_sessions = bytes };
         },
         .apply_sql_settings => blk: {
             if (encoded.len > system_catalog.max_command_bytes + 16) return error.CatalogCommandTooLarge;
@@ -35767,13 +35806,17 @@ test "inert SQL policy definitions survive standalone replay, snapshot, and rest
     }
 }
 
-test "row-policy ENABLE admits relational indexes but rejects search artifact modalities" {
+test "row-policy ENABLE admits authorized graph relational and full-text indexes" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
     try std.testing.expect(!try policyHasUnsupportedArtifactIndexes(alloc, "{}"));
     try std.testing.expect(!try policyHasUnsupportedArtifactIndexes(alloc, "{\"by_account\":{\"type\":\"relational\"}}"));
-    inline for (.{ "full_text", "dense_vector", "graph", "embeddings", "enrichment" }) |kind| {
+    try std.testing.expect(!try policyHasUnsupportedArtifactIndexes(alloc, "{\"links\":{\"type\":\"graph\"}}"));
+    try std.testing.expect(!try policyHasUnsupportedArtifactIndexes(alloc, "{\"text\":{\"type\":\"full_text\"}}"));
+    try std.testing.expect(!try policyHasUnsupportedArtifactIndexes(alloc, "{\"semantic\":{\"type\":\"embeddings\"}}"));
+    try std.testing.expect(!try policyHasUnsupportedArtifactIndexes(alloc, "{\"vectors\":{\"type\":\"dense_vector\"}}"));
+    inline for (.{"enrichment"}) |kind| {
         const json = try std.fmt.allocPrint(alloc, "{{\"idx\":{{\"type\":\"{s}\"}}}}", .{kind});
         try std.testing.expect(try policyHasUnsupportedArtifactIndexes(alloc, json));
     }

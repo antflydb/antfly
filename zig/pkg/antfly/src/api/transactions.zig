@@ -119,6 +119,7 @@ pub const TableCommitRequest = struct {
         try appendBatchWrites(alloc, &self.batch, other.batch.writes);
         try appendBatchDeletes(alloc, &self.batch, other.batch.deletes);
         try appendBatchTransforms(alloc, &self.batch, other.batch.transforms);
+        try @import("transaction_graph_effects.zig").merge(alloc, &self.batch, other.batch.graph_writes, other.batch.graph_deletes);
         try appendPredicates(alloc, &self.predicates, other.predicates.items);
         syncAndClear(self, alloc);
     }
@@ -313,6 +314,8 @@ pub const OwnedTransactionCommitRequest = struct {
                 .writes = table.txn_writes,
                 .deletes = table.batch.deletes,
                 .transforms = table.batch.transforms,
+                .graph_writes = table.batch.graph_writes,
+                .graph_deletes = table.batch.graph_deletes,
                 .predicates = table.predicates.items,
             };
         }
@@ -1831,6 +1834,14 @@ pub const SessionRegistry = struct {
         connection_id: ?[32]u8,
         txn_id: db_mod.types.TxnId,
     ) !SessionInfo {
+        const session_lock = self.sessionLock(txn_id);
+        session_lock.lock();
+        defer session_lock.unlock();
+        if (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) |existing| {
+            var duplicate = existing;
+            duplicate.deinit(alloc);
+            return error.CypherWriteRequestAlreadyUsed;
+        }
         const now = nextTxnTimestamp();
         var session: Session = .{
             .txn_id = txn_id,
@@ -1903,6 +1914,13 @@ pub const SessionRegistry = struct {
         session_lock.lock();
         defer session_lock.unlock();
 
+        if (self.durableMissIsAuthoritative()) {
+            const durable = self.durable.?;
+            var current = (try durable.load(txn_id)) orelse return .missing;
+            defer current.deinit(durable.alloc);
+            return if (principalsEqual(current.principal, principal)) .allowed else .denied;
+        }
+
         self.mutex.lock();
         if (self.sessions.getPtr(txn_id)) |session| {
             const allowed = principalsEqual(session.principal, principal);
@@ -1921,6 +1939,12 @@ pub const SessionRegistry = struct {
         const session_lock = self.sessionLock(txn_id);
         session_lock.lock();
         defer session_lock.unlock();
+        if (self.durableMissIsAuthoritative()) {
+            const durable = self.durable.?;
+            var current = (durable.load(txn_id) catch return null) orelse return null;
+            defer current.deinit(durable.alloc);
+            return current.info();
+        }
         self.mutex.lock();
         if (self.sessions.getPtr(txn_id)) |existing| {
             const info = existing.info();
@@ -2183,7 +2207,7 @@ pub const SessionRegistry = struct {
         if (candidate.sql) |metadata| {
             if (metadata.failed) return error.SqlTransactionAborted;
             if (metadata.mode == .read_only) for (req.tables) |table| {
-                if (table.batch.writes.len != 0 or table.batch.deletes.len != 0 or table.batch.transforms.len != 0) return error.SqlReadOnlyTransaction;
+                if (table.batch.writes.len != 0 or table.batch.deletes.len != 0 or table.batch.transforms.len != 0 or table.batch.graph_writes.len != 0 or table.batch.graph_deletes.len != 0) return error.SqlReadOnlyTransaction;
             };
         }
         if (candidate.commit_body_digest != null) return error.TransactionCommitSealed;
@@ -2320,7 +2344,7 @@ pub const SessionRegistry = struct {
         if (candidate.sql) |metadata| {
             if (metadata.failed) return error.SqlTransactionAborted;
             if (metadata.mode == .read_only and extra_req != null) for (extra_req.?.tables) |table| {
-                if (table.batch.writes.len != 0 or table.batch.deletes.len != 0 or table.batch.transforms.len != 0) return error.SqlReadOnlyTransaction;
+                if (table.batch.writes.len != 0 or table.batch.deletes.len != 0 or table.batch.transforms.len != 0 or table.batch.graph_writes.len != 0 or table.batch.graph_deletes.len != 0) return error.SqlReadOnlyTransaction;
             };
         }
         const body_digest = try commitBodyDigest(alloc, extra_req);
@@ -3029,6 +3053,12 @@ pub const SessionRegistry = struct {
         const session_lock = self.sessionLock(txn_id);
         session_lock.lock();
         defer session_lock.unlock();
+        if (self.durableMissIsAuthoritative()) {
+            const durable = self.durable.?;
+            var current = (try durable.load(txn_id)) orelse return null;
+            defer current.deinit(durable.alloc);
+            return current.owner_node_id;
+        }
         self.mutex.lock();
         if (self.sessions.getPtr(txn_id)) |session| {
             const owner_node_id = session.owner_node_id;
@@ -3327,6 +3357,34 @@ pub const SessionRegistry = struct {
     /// The caller holds the txn stripe. Durable reads happen without the global
     /// registry mutex; publication is a short double-checked map operation.
     fn loadSessionCloneAssumeStripe(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) !?Session {
+        if (self.durableMissIsAuthoritative()) {
+            const durable = self.durable.?;
+            var loaded = (try durable.load(txn_id)) orelse {
+                self.mutex.lock();
+                defer self.mutex.unlock();
+                if (self.sessions.fetchRemove(txn_id)) |old| {
+                    var value = old.value;
+                    value.deinit(alloc);
+                }
+                return null;
+            };
+            defer loaded.deinit(durable.alloc);
+            var cloned = try loaded.clone(alloc);
+            errdefer cloned.deinit(alloc);
+            var cached = try loaded.clone(alloc);
+            var cached_owned = true;
+            defer if (cached_owned) cached.deinit(alloc);
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            try self.sessions.ensureUnusedCapacity(alloc, 1);
+            if (self.sessions.fetchRemove(txn_id)) |old| {
+                var value = old.value;
+                value.deinit(alloc);
+            }
+            self.sessions.putAssumeCapacity(txn_id, cached);
+            cached_owned = false;
+            return cloned;
+        }
         self.mutex.lock();
         if (self.sessions.getPtr(txn_id)) |session| {
             const cloned = session.clone(alloc) catch |err| {
@@ -3859,7 +3917,7 @@ pub fn parseMultiBatchRequest(alloc: std.mem.Allocator, body: []const u8) !Owned
         }
     }
     var operation_count: usize = 0;
-    for (req.tables) |table| operation_count += table.batch.writes.len + table.batch.deletes.len + table.batch.transforms.len;
+    for (req.tables) |table| operation_count += table.batch.writes.len + table.batch.deletes.len + table.batch.transforms.len + table.batch.graph_writes.len + table.batch.graph_deletes.len;
     if (operation_count == 0) return error.InvalidTransactionCommitRequest;
     return req;
 }
@@ -4349,6 +4407,7 @@ fn encodeTableBatchRequest(alloc: std.mem.Allocator, table: TableCommitRequest) 
     }
     if (table.batch.transforms.len > 0) {
         if (!first) try out.append(alloc, ',');
+        first = false;
         try out.appendSlice(alloc, "\"transforms\":[");
         for (table.batch.transforms, 0..) |transform, i| {
             if (i > 0) try out.append(alloc, ',');
@@ -4372,6 +4431,36 @@ fn encodeTableBatchRequest(alloc: std.mem.Allocator, table: TableCommitRequest) 
             try out.append(alloc, '}');
         }
         try out.append(alloc, ']');
+    }
+    inline for (.{ "graph_writes", "graph_deletes" }) |field| {
+        const effects = @field(table.batch, field);
+        if (effects.len != 0) {
+            if (!first) try out.append(alloc, ',');
+            first = false;
+            try appendJsonString(alloc, &out, field);
+            try out.append(alloc, ':');
+            const Wire = struct {
+                items: @TypeOf(effects),
+                pub fn jsonStringify(self: @This(), stream: anytype) !void {
+                    try stream.beginArray();
+                    for (self.items) |edge| {
+                        try stream.beginObject();
+                        inline for (@typeInfo(@TypeOf(edge)).@"struct".field_names) |name| {
+                            const omitted = if (comptime std.mem.eql(u8, name, "edge_id") or std.mem.eql(u8, name, "owner_document") or std.mem.eql(u8, name, "owner")) @field(edge, name).len == 0 else false;
+                            if (!omitted) {
+                                try stream.objectField(name);
+                                try stream.write(@field(edge, name));
+                            }
+                        }
+                        try stream.endObject();
+                    }
+                    try stream.endArray();
+                }
+            };
+            const encoded = try std.json.Stringify.valueAlloc(alloc, Wire{ .items = effects }, .{});
+            defer alloc.free(encoded);
+            try out.appendSlice(alloc, encoded);
+        }
     }
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
@@ -4492,6 +4581,7 @@ fn cloneBatchRequest(alloc: std.mem.Allocator, batch: batch_api.OwnedBatchReques
     try appendBatchWrites(alloc, &out, batch.writes);
     try appendBatchDeletes(alloc, &out, batch.deletes);
     try appendBatchTransforms(alloc, &out, batch.transforms);
+    try @import("transaction_graph_effects.zig").merge(alloc, &out, batch.graph_writes, batch.graph_deletes);
     syncBatchReq(&out);
     return out;
 }
@@ -4501,6 +4591,8 @@ fn syncBatchReq(batch: *batch_api.OwnedBatchRequest) void {
         .writes = batch.writes,
         .deletes = batch.deletes,
         .transforms = batch.transforms,
+        .graph_writes = batch.graph_writes,
+        .graph_deletes = batch.graph_deletes,
     };
 }
 
@@ -7376,4 +7468,41 @@ test "lake SQL session cuts survive savepoint rollback and durable record recove
     var recovered = (try cloneReadSnapshotForKey(a, &restored.lake_cuts, "events", "accepted")).?;
     defer recovered.deinit(a);
     try std.testing.expectEqualStrings(held.document_json.?, recovered.document_json.?);
+}
+
+test "transaction graph effects preserve clone merge and durable encoding" {
+    const a = std.testing.allocator;
+    var original = try parseCommitRequest(a,
+        \\{"read_set":[],"tables":{"docs":{"graph_writes":[{"index_name":"g","source":"a","target":"b","edge_type":"R","edge_id":"edge-1","metadata_json":"{\"value\":9223372036854775807}"}]}}}
+    );
+    defer original.deinit(a);
+    var copy = try original.clone(a);
+    defer copy.deinit(a);
+    const tables = try copy.distributedTables(a);
+    defer a.free(tables);
+    try std.testing.expectEqual(@as(usize, 1), tables[0].graph_writes.len);
+    const encoded = try encodeCommitRequest(a, copy);
+    defer a.free(encoded);
+    var restored = try parseCommitRequest(a, encoded);
+    defer restored.deinit(a);
+    try std.testing.expectEqualStrings("{\"value\":9223372036854775807}", restored.tables[0].batch.graph_writes[0].metadata_json);
+    var deleting = try parseCommitRequest(a,
+        \\{"read_set":[],"tables":{"docs":{"graph_deletes":[{"index_name":"g","source":"a","target":"b","edge_type":"R","edge_id":"edge-1"}]}}}
+    );
+    defer deleting.deinit(a);
+    try restored.mergeFrom(a, &deleting);
+    try std.testing.expectEqual(@as(usize, 0), restored.tables[0].batch.graph_writes.len);
+    try std.testing.expectEqual(@as(usize, 1), restored.tables[0].batch.graph_deletes.len);
+}
+
+test "transaction graph effects client IDs never overwrite an admitted principal" {
+    const a = std.testing.allocator;
+    var registry = SessionRegistry.init(null);
+    defer registry.deinit(a);
+    const id: db_mod.types.TxnId = @splat(7);
+    _ = try registry.beginForPrincipalWithSettingsAndId(a, .{}, 17, "user:a", &.{}, null, id);
+    try std.testing.expectError(error.CypherWriteRequestAlreadyUsed, registry.beginForPrincipalWithSettingsAndId(a, .{}, 42, "user:b", &.{}, null, id));
+    try std.testing.expectEqual(@as(u64, 17), registry.sessions.get(id).?.owner_node_id);
+    try std.testing.expectEqual(SessionRegistry.PrincipalAccess.allowed, try registry.principalAccess(a, id, "user:a"));
+    try std.testing.expectEqual(SessionRegistry.PrincipalAccess.denied, try registry.principalAccess(a, id, "user:b"));
 }

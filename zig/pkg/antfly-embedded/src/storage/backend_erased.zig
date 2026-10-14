@@ -235,6 +235,7 @@ pub const ReadScope = struct {
     allocator: Allocator,
     ptr: *anyopaque,
     vtable: *const VTable,
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
     const VTable = struct {
         get: *const fn (*anyopaque, []const u8) anyerror![]const u8,
         get_many_sorted: ?*const fn (*anyopaque, []const []const u8, []?[]const u8) anyerror!void = null,
@@ -249,6 +250,8 @@ pub const ReadScope = struct {
         get_many_sorted_scores: ?*const fn (*anyopaque, []const []const u8, []?f64) anyerror!void = null,
         get_into: ?*const fn (*anyopaque, []const u8, []u8) anyerror![]const u8 = null,
     };
+    const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
+
     pub fn preparedScorePlan(self: *@This()) ?*@import("prepared_score_plan.zig").PreparedScorePlan {
         return if (self.vtable.prepared_score_plan) |get_plan| get_plan(self.ptr) else null;
     }
@@ -259,14 +262,15 @@ pub const ReadScope = struct {
         return self.vtable.visit_prepared_scores != null;
     }
     pub fn visitPreparedScores(self: *@This(), plan: *@import("prepared_score_plan.zig").PreparedScorePlan, sink: backend_types.CompleteScoreSink) !void {
-        return (self.vtable.visit_prepared_scores orelse return error.Unsupported)(self.ptr, plan, sink);
+        const visit = self.vtable.visit_prepared_scores orelse return error.Unsupported;
+        return BoundaryAbi.call("visit_prepared_scores", self.boundary_dispatch, visit, .{ self.ptr, plan, sink });
     }
     pub fn get(self: *@This(), key: []const u8) ![]const u8 {
-        return self.vtable.get(self.ptr, key);
+        return BoundaryAbi.call("get", self.boundary_dispatch, self.vtable.get, .{ self.ptr, key });
     }
     /// The returned slice belongs to out, independently of scope reset.
     pub fn getInto(self: *@This(), key: []const u8, out: []u8) ![]const u8 {
-        if (self.vtable.get_into) |get_into| return get_into(self.ptr, key, out);
+        if (self.vtable.get_into) |get_into| return BoundaryAbi.call("get_into", self.boundary_dispatch, get_into, .{ self.ptr, key, out });
         const value = try self.get(key);
         if (value.len > out.len) return error.BufferTooSmall;
         @memcpy(out[0..value.len], value);
@@ -281,7 +285,7 @@ pub const ReadScope = struct {
         for (keys, 0..) |key, i| {
             if (i > 0 and std.mem.order(u8, keys[i - 1], key) == .gt) return error.InvalidBatch;
         }
-        if (self.vtable.get_many_sorted) |get_many| return get_many(self.ptr, keys, values);
+        if (self.vtable.get_many_sorted) |get_many| return BoundaryAbi.call("get_many_sorted", self.boundary_dispatch, get_many, .{ self.ptr, keys, values });
         for (keys, values) |key, *value| value.* = self.get(key) catch |err| switch (err) {
             error.NotFound => null,
             else => return err,
@@ -300,7 +304,7 @@ pub const ReadScope = struct {
     }
     pub fn visitManySortedScores(self: *@This(), keys: []const []const u8, sink: backend_types.ScoreSink) !void {
         const visit = self.vtable.visit_many_sorted_scores orelse return error.Unsupported;
-        return visit(self.ptr, keys, sink);
+        return BoundaryAbi.call("visit_many_sorted_scores", self.boundary_dispatch, visit, .{ self.ptr, keys, sink });
     }
     pub fn supportsDirectScores(self: *const @This()) bool {
         return self.vtable.get_many_sorted_scores != null;
@@ -310,7 +314,7 @@ pub const ReadScope = struct {
         @memset(scores, null);
         errdefer @memset(scores, null);
         const read = self.vtable.get_many_sorted_scores orelse return error.Unsupported;
-        return read(self.ptr, keys, scores);
+        return BoundaryAbi.call("get_many_sorted_scores", self.boundary_dispatch, read, .{ self.ptr, keys, scores });
     }
 
     /// Slices belong to caller buffers, independently of reset or close.
@@ -323,7 +327,7 @@ pub const ReadScope = struct {
         for (keys, 0..) |key, i| {
             if (i > 0 and std.mem.order(u8, keys[i - 1], key) == .gt) return error.InvalidBatch;
         }
-        if (self.vtable.get_many_sorted_into) |read| return read(self.ptr, keys, buffers, values);
+        if (self.vtable.get_many_sorted_into) |read| return BoundaryAbi.call("get_many_sorted_into", self.boundary_dispatch, read, .{ self.ptr, keys, buffers, values });
         // Preserve a backend's batched lookup when it lacks direct delivery.
         try self.getManySorted(keys, values);
         for (buffers, values) |buffer, *value| if (value.*) |bytes| {
@@ -336,7 +340,7 @@ pub const ReadScope = struct {
     /// Invalidates scope values and releases pins; keeps bounded reusable scratch.
     pub fn reset(self: *@This()) !void {
         const reset_scope = self.vtable.reset orelse return error.ReadScopeResetUnsupported;
-        try reset_scope(self.ptr);
+        try BoundaryAbi.call("reset", self.boundary_dispatch, reset_scope, .{self.ptr});
     }
 
     pub fn close(self: *@This()) void {
@@ -458,6 +462,7 @@ pub const ReadTxn = struct {
     allocator: Allocator,
     ptr: *anyopaque,
     vtable: *const VTable,
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
 
     pub const VTable = struct {
         abort: *const fn (Allocator, *anyopaque) void,
@@ -468,20 +473,22 @@ pub const ReadTxn = struct {
         open_read_scope: ?*const fn (Allocator, *anyopaque) anyerror!ReadScope = null,
     };
 
+    const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
+
     pub fn abort(self: *ReadTxn) void {
         self.vtable.abort(self.allocator, self.ptr);
         self.* = undefined;
     }
 
     pub fn get(self: *ReadTxn, key: []const u8) ![]const u8 {
-        return try self.vtable.get(self.ptr, key);
+        return try BoundaryAbi.call("get", self.boundary_dispatch, self.vtable.get, .{ self.ptr, key });
     }
 
     pub fn getManySorted(self: *ReadTxn, keys: []const []const u8, values: []?[]const u8) !void {
         if (keys.len != values.len) return error.InvalidBatch;
         @memset(values, null);
         if (self.vtable.get_many_sorted) |get_many_sorted| {
-            return try get_many_sorted(self.ptr, keys, values);
+            return try BoundaryAbi.call("get_many_sorted", self.boundary_dispatch, get_many_sorted, .{ self.ptr, keys, values });
         }
         for (keys, 0..) |key, i| {
             values[i] = self.get(key) catch |err| blk: {
@@ -492,14 +499,14 @@ pub const ReadTxn = struct {
     }
 
     pub fn openCursor(self: *ReadTxn) !Cursor {
-        return try self.vtable.open_cursor(self.allocator, self.ptr);
+        return try BoundaryAbi.call("open_cursor", self.boundary_dispatch, self.vtable.open_cursor, .{ self.allocator, self.ptr });
     }
 
     /// Owns the same immutable snapshot, with independent read/cursor scratch.
     /// The original handle may be aborted before this handle or its cursors.
     pub fn forkRead(self: *ReadTxn) !ReadTxn {
         const fork = self.vtable.fork_read orelse return error.ReadSnapshotForkUnsupported;
-        return fork(self.allocator, self.ptr);
+        return BoundaryAbi.call("fork_read", self.boundary_dispatch, fork, .{ self.allocator, self.ptr });
     }
 
     pub fn forkBorrowedRead(self: *ReadTxn) !ReadTxn {
@@ -507,7 +514,7 @@ pub const ReadTxn = struct {
     }
 
     pub fn openReadScope(self: *ReadTxn, alloc: Allocator) !ReadScope {
-        if (self.vtable.open_read_scope) |open| return open(alloc, self.ptr);
+        if (self.vtable.open_read_scope) |open| return BoundaryAbi.call("open_read_scope", self.boundary_dispatch, open, .{ alloc, self.ptr });
         var cursor = try self.openCursor();
         errdefer cursor.close();
         return cursorReadScope(alloc, cursor);
@@ -518,6 +525,7 @@ pub const ProbeTxn = struct {
     allocator: Allocator,
     ptr: *anyopaque,
     vtable: *const VTable,
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
 
     pub const VTable = struct {
         /// One get_many_sorted call observes a single committed view. Separate
@@ -531,26 +539,29 @@ pub const ProbeTxn = struct {
         get_many_sorted_with_block_cache_admission: ?*const fn (*anyopaque, []const []const u8, []?[]const u8, backend_types.Namespace.BlockCacheAdmission) anyerror!void = null,
     };
 
+    const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
+
     pub fn abort(self: *ProbeTxn) void {
         self.vtable.abort(self.allocator, self.ptr);
         self.* = undefined;
     }
 
     pub fn get(self: *ProbeTxn, key: []const u8) ![]const u8 {
-        return try self.vtable.get(self.ptr, key);
+        return try BoundaryAbi.call("get", self.boundary_dispatch, self.vtable.get, .{ self.ptr, key });
     }
 
     /// May pin an immutable generation until abort. Prefer get for long-lived
     /// probes; use this for a short-lived point projection.
     pub fn getLeased(self: *ProbeTxn, key: []const u8) ![]const u8 {
-        return try (self.vtable.get_leased orelse self.vtable.get)(self.ptr, key);
+        if (self.vtable.get_leased) |leased_get| return BoundaryAbi.call("get_leased", self.boundary_dispatch, leased_get, .{ self.ptr, key });
+        return self.get(key);
     }
 
     pub fn getManySorted(self: *ProbeTxn, keys: []const []const u8, values: []?[]const u8) !void {
         if (keys.len != values.len) return error.InvalidBatch;
         @memset(values, null);
         if (self.vtable.get_many_sorted) |get_many_sorted| {
-            return try get_many_sorted(self.ptr, keys, values);
+            return try BoundaryAbi.call("get_many_sorted", self.boundary_dispatch, get_many_sorted, .{ self.ptr, keys, values });
         }
         for (keys, 0..) |key, i| {
             values[i] = self.get(key) catch |err| blk: {
@@ -569,7 +580,7 @@ pub const ProbeTxn = struct {
         if (keys.len != values.len) return error.InvalidBatch;
         if (self.vtable.get_many_sorted_with_block_cache_admission) |get_many_sorted| {
             @memset(values, null);
-            return try get_many_sorted(self.ptr, keys, values, admission);
+            return try BoundaryAbi.call("get_many_sorted_with_block_cache_admission", self.boundary_dispatch, get_many_sorted, .{ self.ptr, keys, values, admission });
         }
         return try self.getManySorted(keys, values);
     }

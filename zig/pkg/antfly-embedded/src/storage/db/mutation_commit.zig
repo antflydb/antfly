@@ -341,6 +341,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .row_policy_principal_proof = req.row_policy_principal_proof,
                 .row_policy_database = req.row_policy_database,
                 .row_policy_admitted_at_seconds = req.row_policy_admitted_at_seconds,
+                .normalized_graph_rows = req.normalized_graph_rows,
                 .range_guards = req.range_guards,
                 .restore_staging_scope = req.restore_staging_scope,
                 .restore_staging_plan_id = req.restore_staging_plan_id,
@@ -1167,6 +1168,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // instead of scanning every outstanding transaction.
             if (opts.transaction_resolution == null) {
                 try self.core.checkOrdinaryWriteConflicts(effective_ops.writes, effective_ops.deletes);
+                var graph_sources: std.ArrayList(types.BatchWrite) = .empty;
+                defer graph_sources.deinit(self.alloc);
+                for (effective_req.graph_writes) |edge| try graph_sources.append(self.alloc, .{ .key = edge.source, .value = "" });
+                for (effective_req.graph_deletes) |edge| try graph_sources.append(self.alloc, .{ .key = edge.source, .value = "" });
+                try self.core.checkOrdinaryWriteConflicts(graph_sources.items, &.{});
             }
             try self.validateTransformReadSnapshot(transform_snapshot);
             // Catches a concurrent commit to one of this batch's own write keys
@@ -1257,6 +1263,41 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 for (owned_store_values.items) |value| self.alloc.free(value);
                 owned_store_values.deinit(self.alloc);
             }
+            // A graph-only mutation changes the source's adjacency domain.
+            // Touch its primary storage key so existing SQL range observations
+            // detect graph phantoms and prepared graph writers fence outsiders.
+            var touched_graph_sources = std.StringHashMapUnmanaged(void).empty;
+            defer touched_graph_sources.deinit(self.alloc);
+            inline for (.{ effective_req.graph_writes, effective_req.graph_deletes }) |edges| for (edges) |edge| {
+                if (touched_graph_sources.contains(edge.source)) continue;
+                try touched_graph_sources.put(self.alloc, edge.source, {});
+                var primary_written = false;
+                for (effective_ops.writes) |write| if (std.mem.eql(u8, write.key, edge.source)) {
+                    primary_written = true;
+                    break;
+                };
+                for (effective_ops.deletes) |key| if (std.mem.eql(u8, key, edge.source)) {
+                    primary_written = true;
+                    break;
+                };
+                if (primary_written) continue;
+                const key = try encodeStoreLookupKeyAlloc(self, self.alloc, edge.source);
+                defer self.alloc.free(key);
+                const existing = self.core.store.get(self.alloc, key) catch |err| switch (err) {
+                    error.NotFound => continue,
+                    else => return err,
+                };
+                owned_store_values.append(self.alloc, existing) catch |err| {
+                    self.alloc.free(existing);
+                    return err;
+                };
+                const copied_key = try self.alloc.dupe(u8, key);
+                owned_store_keys.append(self.alloc, copied_key) catch |err| {
+                    self.alloc.free(copied_key);
+                    return err;
+                };
+                try store_writes.append(self.alloc, .{ .key = copied_key, .value = existing });
+            };
             const vector_field_names_start_ns = monotonicTimeNs();
             const vector_store_field_names = if (relationalColumns(self) == null)
                 try self.core.index_manager.vectorStoreFieldNamesAlloc(self.alloc)
@@ -3677,17 +3718,19 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     return;
                 }
 
-                const writes = try alloc.alloc(types.BatchWrite, intents.writes.len);
-                defer alloc.free(writes);
-                for (intents.writes, 0..) |write, i| writes[i] = .{ .key = write.key, .value = write.value };
+                var graph_arena = std.heap.ArenaAllocator.init(alloc);
+                defer graph_arena.deinit();
+                const graph_batch = try @import("graph_transaction_effects.zig").materialize(graph_arena.allocator(), intents);
                 var durable_rows = std.StringHashMapUnmanaged([]const u8).empty;
                 defer durable_rows.deinit(alloc);
                 for (intents.prepared_rows, 0..) |maybe_row, i| if (maybe_row) |row| {
                     try durable_rows.put(alloc, intents.writes[i].key, row);
                 };
                 self.batchInternalWithPreparationAllocator(.{
-                    .writes = writes,
-                    .deletes = intents.deletes,
+                    .writes = graph_batch.writes,
+                    .deletes = graph_batch.deletes,
+                    .graph_writes = graph_batch.graph_writes,
+                    .graph_deletes = graph_batch.graph_deletes,
                     .timestamp_ns = commit_version,
                     .sync_level = sync_level,
                     .restore_staging_scope = restore_scope,

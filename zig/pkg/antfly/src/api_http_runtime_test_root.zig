@@ -47,6 +47,8 @@ test {
     _ = @import("api/distributed_candidate_source.zig");
     _ = @import("api/distributed_entity_sink.zig");
     _ = @import("api/http_client.zig");
+    _ = @import("api/internal_group_operations.zig");
+    _ = @import("antfly_local_sources").api_batch;
     _ = @import("api/distributed_join.zig");
     _ = @import("api/distributed_graph.zig");
     _ = @import("antfly_inference_query_embedding_cache");

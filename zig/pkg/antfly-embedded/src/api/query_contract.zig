@@ -9745,9 +9745,7 @@ fn parseLegacyPatternSteps(
                 .edge_filter = edge_filter,
             } else .{ .types = edge_types },
         };
-        if (step.edge != null and (steps[i].edge.min_hops == 0 or
-            steps[i].edge.max_hops == 0 or
-            steps[i].edge.min_hops > steps[i].edge.max_hops or
+        if (step.edge != null and (steps[i].edge.min_hops > steps[i].edge.max_hops or
             steps[i].edge.max_hops > graph_pattern_mod.max_pattern_hops))
             return error.InvalidQueryRequest;
         initialized += 1;
@@ -10130,8 +10128,8 @@ fn parseGraphMatchEdges(alloc: std.mem.Allocator, value: []const indexes_openapi
                 .types = types,
                 .edge_filter = edge_filter,
                 .direction = parseGraphDirection(edge.direction),
-                .min_hops = try parseGraphBoundedU32(edge.min_hops, 1, 1, graph_pattern_mod.max_pattern_hops),
-                .max_hops = try parseGraphBoundedU32(edge.max_hops, 1, 1, graph_pattern_mod.max_pattern_hops),
+                .min_hops = try parseGraphBoundedU32(edge.min_hops, 1, 0, graph_pattern_mod.max_pattern_hops),
+                .max_hops = try parseGraphBoundedU32(edge.max_hops, 1, 0, graph_pattern_mod.max_pattern_hops),
                 .min_weight = weight_bounds.min,
                 .max_weight = weight_bounds.max,
             },

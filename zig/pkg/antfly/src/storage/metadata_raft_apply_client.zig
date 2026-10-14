@@ -85,6 +85,9 @@ pub const RaftApplyStore = struct {
     listeners: std.ArrayListUnmanaged(*ListenerRegistration) = .empty,
     listeners_mutex: std.Io.Mutex = .init,
     hot_standby_adapter: ?*@import("metadata_hot_standby_adapter.zig").Adapter = null,
+    pub fn openSessionRead(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64) !@import("antfly_local_sources").storage_backend_erased.ReadTxn {
+        return @import("metadata_session_read_client.zig").open(alloc, self.handle, group);
+    }
 
     pub const RestoreJobRow = struct {
         key: []u8,

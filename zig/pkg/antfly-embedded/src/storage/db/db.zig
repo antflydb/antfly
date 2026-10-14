@@ -2955,6 +2955,35 @@ test "db optional row policy authority preserves scoped secret denial and outage
     try std.testing.expectError(error.Unavailable, optionalRowPolicyAuthority(std.testing.allocator, &reader, "antfly.trusted_principal.secret"));
 }
 
+test "db corrupt table catalog open releases native reclaimers" {
+    var directory = try TestDirectory.init("corrupt-catalog-open");
+    defer directory.cleanup();
+    const options: OpenOptions = .{ .start_optional_runtimes = false, .start_index_workers = false };
+    var db = try DB.open(std.testing.allocator, directory.path(), options);
+    const invalid: table_catalog_mod.Catalog = .{ .mode_initialized = true, .storage_mode = .document, .row_policy_phase = .active, .row_policy_generation = 1, .row_policy_catalog_epoch = 1 };
+    const encoded = invalid.encode();
+    db.core.table_catalog = invalid;
+    try db.core.store.put(table_catalog_mod.key, &encoded);
+    db.close();
+    try std.testing.expectError(error.InvalidTableCatalog, DB.open(std.testing.allocator, directory.path(), options));
+}
+
+test "db protected transaction BEGIN admits metadata while PREPARE still requires authority" {
+    var directory = try TestDirectory.init("policy-transaction-control");
+    defer directory.cleanup();
+    var db = try DB.open(std.testing.allocator, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    for ([_]table_catalog_mod.RowPolicyPhase{ .preparing, .active }, 0..) |phase, index| {
+        db.local_execution.row_policy_gate.phase.store(@backingInt(phase), .release);
+        defer db.local_execution.row_policy_gate.phase.store(@backingInt(table_catalog_mod.RowPolicyPhase.disabled), .release);
+        const txn_id: types.TxnId = @splat(@as(u8, @intCast(index + 1)));
+        _ = try db.beginTransactionScoped(txn_id, 100, 100, &.{}, true, true, null);
+        try std.testing.expectError(error.RowPolicyAuthenticationRequired, db.writeTransaction(txn_id, .{ .writes = &.{.{ .key = "user", .value = "{}" }} }));
+        try db.abortTransaction(txn_id, 101);
+        try std.testing.expectError(error.NotFound, db.core.store.get(std.testing.allocator, "user"));
+    }
+}
+
 pub const DB = struct {
     retained_query_lease: ?@import("native_query_cut.zig").Guard = null,
     retained_remote_query_lease: ?@import("native_query_cut_repository.zig").StorageLease = null,
@@ -7384,7 +7413,10 @@ pub const DB = struct {
         const bytes = self.core.store.get(self.alloc, key) catch return error.InvalidRowPolicyReceipt;
         defer self.alloc.free(bytes);
         const stored = try row_policy_bundle_mod.Receipt.decode(bytes);
-        if (!std.meta.eql(expected, stored)) return error.InvalidRowPolicyReceipt;
+        var publication = expected;
+        publication.applied_term = stored.applied_term;
+        publication.applied_index = stored.applied_index;
+        if (stored.applied_index < expected.applied_index or !std.meta.eql(publication, stored)) return error.InvalidRowPolicyReceipt;
         return stored;
     }
 
@@ -7395,7 +7427,10 @@ pub const DB = struct {
         };
         if (receipt) |stored| return stored;
         const pending = (try self.pendingRowPolicyReceipt()) orelse return error.InvalidRowPolicyReceipt;
-        if (!std.meta.eql(pending, expected)) return error.RowPolicyCatalogChanged;
+        var publication = expected;
+        publication.applied_term = pending.applied_term;
+        publication.applied_index = pending.applied_index;
+        if (pending.applied_index < expected.applied_index or !std.meta.eql(pending, publication)) return error.RowPolicyCatalogChanged;
         return null;
     }
 
@@ -7478,7 +7513,23 @@ pub const DB = struct {
         );
     }
 
+    const row_policy_native_control_key = "\x00\x00__metadata__:row_policy_native_applied_entry";
+    fn readRowPolicyControlReceipt(alloc: Allocator, store: *docstore_mod.DocStore, native: bool) !?OrderedApplyReceipt {
+        if (!native) return readOrderedApplyReceipt(alloc, store);
+        const raw = store.get(alloc, row_policy_native_control_key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        defer alloc.free(raw);
+        if (raw.len != ordered_apply_receipt_value_len) return error.CorruptOrderedApplyReceipt;
+        const value: OrderedApplyReceipt = .{ .term = std.mem.readInt(u64, raw[0..8], .little), .index = std.mem.readInt(u64, raw[8..16], .little) };
+        if (value.term == 0 or value.index == 0) return error.CorruptOrderedApplyReceipt;
+        return value;
+    }
+
     fn applyRowPolicyPublicationInternal(self: *DB, bundle_bytes: []const u8, request: @import("../../system_catalog/policies.zig").InstallRequest, identity: OrderedApplyReceipt, replication_lsn: ?u64) !?row_policy_bundle_mod.Receipt {
+        var diagnostic_stage: []const u8 = "preflight";
+        errdefer std.log.warn("row policy native failure stage={s} table_id={}", .{ diagnostic_stage, request.table_id });
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         if (identity.term == 0 or identity.index == 0 or (replication_lsn != null and replication_lsn.? == 0)) return error.InvalidRowPolicyPublication;
         if (replication_lsn == null and self.local_execution.replication_async_metadata_mirror == null and
@@ -7518,7 +7569,16 @@ pub const DB = struct {
             self.alloc.free(outbox.key);
             self.alloc.free(outbox.value);
         };
+        // Standalone policy controls have a separate journal. A native owner
+        // may not write a data-Raft marker into its mutation history.
+        const native_control = selected: {
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            const owner = try @import("../source_authority.zig").load(&read);
+            break :selected if (owner) |value| value.kind == .native else false;
+        };
         const schema = self.core.schema orelse return error.RowPolicyCatalogChanged;
+        diagnostic_stage = "bundle_validation";
         var installed = try row_policy_bundle_mod.Installed.init(self.alloc, bundle_bytes, self.core.identity_namespace.table_id, schema);
         defer installed.deinit();
         if (installed.parsed.value.table_id != request.table_id or
@@ -7538,7 +7598,13 @@ pub const DB = struct {
             .bundle_digest = bundle_digest,
             .descriptor_digest = request.expected_descriptor_digest,
         };
-        if (try self.orderedMutationAlreadyApplied(identity)) {
+        diagnostic_stage = "ordered_receipt";
+        const already_applied = checked: {
+            lockApply(self);
+            defer self.core.unlockApply();
+            break :checked (try orderedApplyDisposition(try readRowPolicyControlReceipt(self.alloc, self.core.store, native_control), identity)) == .already_applied;
+        };
+        if (already_applied) {
             lockApply(self);
             const already = self.readRowPolicyApplyResultLocked(expected_receipt) catch |err| {
                 self.core.unlockApply();
@@ -7553,7 +7619,7 @@ pub const DB = struct {
         try self.lockApplyForPortableRuntime();
         var apply_held = true;
         defer if (apply_held) self.core.unlockApply();
-        if (switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), identity)) {
+        if (switch (try orderedApplyDisposition(try readRowPolicyControlReceipt(self.alloc, self.core.store, native_control), identity)) {
             .already_applied => true,
             .apply => false,
         }) {
@@ -7563,11 +7629,59 @@ pub const DB = struct {
             if (replication_lsn) |lsn| try self.recordReplicationApplied(lsn);
             return already;
         }
+        diagnostic_stage = "catalog_fences";
         {
             var read = try self.core.store.beginReadTxn();
             defer read.abort();
             try self.requireOnlineArtifactCatalogMutableLocked(&read);
             try @import("relational_integrity_topology.zig").requireUnfenced(&read);
+        }
+        diagnostic_stage = "gate_preparation";
+        // Multiple owner supervisors can commit the same phase at different
+        // Raft indexes. Retain the exact immutable publication and advance its
+        // receipt without reopening an already-finalized admission barrier.
+        // A changed program, epoch, or descriptor is never an idempotent retry.
+        var phase_key_buf: [128]u8 = undefined;
+        const phase_key = try expected_receipt.key(&phase_key_buf);
+        const prior_phase_bytes = self.core.store.get(self.alloc, phase_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        defer if (prior_phase_bytes) |value| self.alloc.free(value);
+        const prior_pending = try self.pendingRowPolicyReceipt();
+        const prior_phase = if (prior_phase_bytes) |value|
+            try row_policy_bundle_mod.Receipt.decode(value)
+        else if (prior_pending) |value|
+            if (value.phase == expected_receipt.phase and value.generation == expected_receipt.generation) value else null
+        else
+            null;
+        if (prior_phase) |prior| {
+            var comparable = prior;
+            comparable.applied_term = expected_receipt.applied_term;
+            comparable.applied_index = expected_receipt.applied_index;
+            if (!std.meta.eql(comparable, expected_receipt)) return error.RowPolicyCatalogChanged;
+            var marker_buf: [ordered_apply_receipt_value_len]u8 = undefined;
+            var marker = orderedApplyReceiptWrite(identity, &marker_buf);
+            if (native_control) marker.key = row_policy_native_control_key;
+            const encoded = expected_receipt.encode();
+            var txn = try self.core.store.beginWriteTxn();
+            errdefer txn.abort();
+            try txn.put(marker.key, marker.value);
+            try txn.put(if (prior_phase_bytes != null) phase_key else row_policy_bundle_mod.pending_key, &encoded);
+            var lsn_buf: [replication_applied_lsn_value_len]u8 = undefined;
+            if (replication_lsn) |lsn| {
+                const lsn_marker = replicationAppliedSequenceWrite(lsn, &lsn_buf);
+                try txn.put(lsn_marker.key, lsn_marker.value);
+            }
+            if (replication_outbox) |outbox| try txn.put(outbox.key, outbox.value);
+            try txn.commit();
+            if (replication_outbox != null) {
+                self.local_execution.durable_replication_outbox_maybe.store(true, .release);
+                self.local_execution.row_policy_replication_outbox_pending.store(true, .release);
+                schedule_replication_recovery_on_exit = true;
+            }
+            try self.finishRowPolicyReplicationCommitLocked(replication_payload, if (replication_outbox) |outbox| outbox.key else null, &apply_held, &replication_mutation);
+            return if (prior_phase_bytes != null) expected_receipt else null;
         }
         const stage_with_serving = pending_phase and self.local_execution.row_policy_gate.currentPhase() == .active;
         if (!stage_with_serving and pending_phase) {
@@ -7603,6 +7717,7 @@ pub const DB = struct {
                 !std.mem.eql(u8, &prior.descriptor_digest, &request.expected_descriptor_digest) or
                 identity.index <= prior.applied_index) return error.RowPolicyCatalogChanged;
         }
+        diagnostic_stage = "descriptor";
         const previous = self.core.table_catalog;
         const publication = installed.parsed.value;
         const current_range = self.core.byteRange();
@@ -7623,7 +7738,8 @@ pub const DB = struct {
             (publication.policy_generation == previous.row_policy_generation and !stage_with_serving and
                 previous.row_policy_phase != .preparing)) return error.RowPolicyCatalogChanged;
         var receipt_bytes: [ordered_apply_receipt_value_len]u8 = undefined;
-        const receipt = orderedApplyReceiptWrite(identity, &receipt_bytes);
+        var receipt = orderedApplyReceiptWrite(identity, &receipt_bytes);
+        if (native_control) receipt.key = row_policy_native_control_key;
         if (stage_with_serving) {
             if (self.local_execution.row_policy_gate.currentPhase() != .active or previous.row_policy_phase != .active or
                 publication.policy_generation <= previous.row_policy_generation or
@@ -7658,6 +7774,7 @@ pub const DB = struct {
             if (replication_outbox != null) {
                 schedule_replication_recovery_on_exit = true;
             }
+            diagnostic_stage = "durability";
             try self.finishRowPolicyReplicationCommitLocked(replication_payload, if (replication_outbox) |outbox| outbox.key else null, &apply_held, &replication_mutation);
             return expected_receipt;
         }
@@ -7688,6 +7805,7 @@ pub const DB = struct {
         next.generation +|= 1;
         const catalog_bytes = next.encode();
         const encoded_pending = expected_receipt.encode();
+        diagnostic_stage = "decision_write";
         var txn = try self.core.store.beginWriteTxn();
         errdefer txn.abort();
         try txn.put(row_policy_bundle_mod.key, bundle_bytes);
@@ -8113,12 +8231,20 @@ pub const DB = struct {
         defer if (verified_principal) |*principal| principal.deinit();
         var row_policy_lease: ?row_policy_gate_mod.Gate.Lease = null;
         const trusted_replay = opts.ordered_apply_receipt != null or opts.native_initial_child_entry != null or opts.replication_applied_lsn_marker != null;
-        // Strict private-command validation above confines this exemption to
-        // derived inline-edge/job maintenance. It cannot mutate user rows,
-        // and must progress while a policy publication is preparing or active.
-        const graph_cleanup_maintenance = req.graph_endpoint_cleanup;
-        if (!trusted_replay and !graph_cleanup_maintenance) try self.maybeFinalizePendingRowPolicyPublication();
+        // Strict validation confines maintenance to inline-edge cleanup or a
+        // range-tracking capability marker. Neither command changes user rows,
+        // and both must progress during policy preparation and active serving.
+        try @import("../range_protection.zig").validateRequest(req);
+        const graph_cleanup_maintenance = req.graph_endpoint_cleanup or req.activate_range_tracking;
+        if (!graph_cleanup_maintenance or req.row_policy_principal_proof.len != 0)
+            try self.maybeFinalizePendingRowPolicyPublication();
         if (req.row_policy_principal_proof.len != 0) {
+            // Followers do not receive the coordinator's receipt probe. A
+            // committed serving intent must become active before checking the
+            // next signed mutation against its generation. Defer apply while
+            // an older reader still holds the publication barrier.
+            if (trusted_replay and self.local_execution.row_policy_gate.currentPhase() == .preparing)
+                return error.RowPolicyReadersActive;
             if (req.row_policy_admitted_at_seconds <= 0 or req.row_policy_database.len == 0 or
                 req.row_policy_publication != null or req.relational_generation_gc != null or
                 req.online_source != null or req.restore_staging != null)
@@ -8157,7 +8283,6 @@ pub const DB = struct {
                 req.merge_source_transition != null or req.merge_checkpoint != null or
                 req.merge_replication != null or req.merge_page != null or
                 req.merge_artifacts.len != 0)) return error.RowPolicyTopologyUnsupported;
-        try @import("../range_protection.zig").validateRequest(req);
         try @import("merge_page_contract.zig").validateRequest(req);
         try @import("merge_proof_adoption.zig").validateRequest(req);
         try @import("online_source_contract.zig").validateRequest(req);
@@ -18101,6 +18226,23 @@ pub const DB = struct {
         var probe = try self.core.store.beginProbeTxn();
         defer probe.abort();
         for (intents) |intent| {
+            if (@import("graph_transaction_effects.zig").isEffect(intent.key)) {
+                var scratch = std.heap.ArenaAllocator.init(self.alloc);
+                defer scratch.deinit();
+                const effect = try @import("graph_transaction_effects.zig").decode(scratch.allocator(), intent.key, intent.value orelse return error.InvalidTxnRecord);
+                const source = switch (effect) {
+                    .write => |edge| edge.source,
+                    .delete => |edge| edge.source,
+                };
+                // Graph effects inherit the source row's policy. Require its
+                // primary intent, which the remainder of this loop validates
+                // through INSERT/UPDATE/DELETE old and new row predicates.
+                const covered = for (intents) |row| {
+                    if (!isMetadataKey(row.key) and std.mem.eql(u8, row.key, source)) break true;
+                } else false;
+                if (!covered) return error.RowPolicyMutationUnsupported;
+                continue;
+            }
             if (isMetadataKey(intent.key)) return error.RowPolicyMutationUnsupported;
             const store_key = try encodeStoreLookupKeyAlloc(self, self.alloc, intent.key);
             defer self.alloc.free(store_key);
@@ -18126,6 +18268,12 @@ pub const DB = struct {
 
     pub fn lookup(self: *DB, alloc: Allocator, key: []const u8, opts: types.LookupOptions) !?types.LookupResult {
         try checkLookupOptionsActive(opts);
+        if (opts.cypher_prepare) {
+            if (key.len != 0 or opts.fields.len != 0 or self.open_mode == .query_readonly) return error.InvalidArgument;
+            try self.runMaintenanceUntilWithCancellation(self.currentMaintenanceTargetSequence(), .{}, opts.cancellation orelse .none, opts.execution_deadline_ns orelse monotonicTimeNs() + 30 * std.time.ns_per_s);
+            try self.flushAppliedSequencesForIdle();
+            return null;
+        }
         if (std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"generation_handoff_identity\"}") and
             (key.len != 0 or opts.include_primary_digest or opts.relational_integrity_catalog or opts.relational_integrity_action or
                 opts.relational_integrity_jobs_json.len != 0 or opts.relational_index_status_json.len != 0 or
@@ -19339,6 +19487,23 @@ pub const DB = struct {
     pub fn captureQueryCut(self: *DB, request: @import("native_query_cut.zig").Request, cancellation: types.CancellationToken) !void {
         return self.captureQueryCutInternal(request, cancellation, true);
     }
+    /// Capture a graph/search generation under an already-held distributed
+    /// statement cohort. Borrowing the supplied fences avoids reacquiring an
+    /// exclusive admission lock or waiting for replay while replay is frozen.
+    pub fn captureQueryCutAtStatementFence(self: *DB, request: @import("native_query_cut.zig").Request, fence: *const StatementReadFence, cancellation: types.CancellationToken) !void {
+        const cut = @import("native_query_cut.zig");
+        try request.validate(cut.nowMs());
+        if (!request.create or request.table_id != self.core.identity_namespace.table_id) return error.CatalogGenerationChanged;
+        const io = self.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
+        const control: cut.Control = .{ .parent = cancellation, .deadline_ns = monotonicTimeNs() +| (request.expires_ms -| cut.nowMs()) * std.time.ns_per_ms };
+        var guard = try cut.lock(self.alloc, io, self.core.path, control.token());
+        defer guard.deinit();
+        const cache_id = try request.cacheId(self.alloc, self.core.identity_namespace);
+        defer self.alloc.free(cache_id);
+        try cut.admit(self.alloc, io, self.core.path, cache_id, .{}, control.token());
+        _ = try self.snapshotInternalWithStatementFence(cache_id, true, control.token(), control.deadline_ns, null, false, request, fence);
+    }
+
     fn captureQueryCutInternal(self: *DB, request: @import("native_query_cut.zig").Request, cancellation: types.CancellationToken, publish: bool) !void {
         try request.validate(@import("native_query_cut.zig").nowMs());
         _ = try request.namespace(self.core.identity_namespace);
@@ -19430,6 +19595,31 @@ pub const DB = struct {
         return completed;
     }
 
+    fn copyQueryCutRowPolicyAuthority(self: *const DB, readonly: *DB) !void {
+        // Authorization credentials are owner configuration, not corpus data.
+        // An immutable read cut owns copies so closing the source cannot leave
+        // verifier pointers dangling. Policy/role revocation remains the
+        // caller's mandatory authority checkpoint and signed proof expiry.
+        if (self.local_execution.row_policy_authority_secret) |value| {
+            const copy = try readonly.alloc.dupe(u8, value);
+            if (readonly.owned_row_policy_authority_secret) |old| readonly.alloc.free(old);
+            readonly.owned_row_policy_authority_secret = copy;
+            readonly.local_execution.row_policy_authority_secret = copy;
+        }
+        if (self.local_execution.row_policy_authority_issuer) |value| {
+            const copy = try readonly.alloc.dupe(u8, value);
+            if (readonly.owned_row_policy_authority_issuer) |old| readonly.alloc.free(old);
+            readonly.owned_row_policy_authority_issuer = copy;
+            readonly.local_execution.row_policy_authority_issuer = copy;
+        }
+        if (self.local_execution.row_policy_table_name) |value| {
+            const copy = try readonly.alloc.dupe(u8, value);
+            if (readonly.owned_row_policy_table_name) |old| readonly.alloc.free(old);
+            readonly.owned_row_policy_table_name = copy;
+            readonly.local_execution.row_policy_table_name = copy;
+        }
+    }
+
     pub fn openQueryCut(self: *DB, request: @import("native_query_cut.zig").Request, cancellation: types.CancellationToken) !DB {
         const cut = @import("native_query_cut.zig");
         try request.validate(cut.nowMs());
@@ -19462,6 +19652,7 @@ pub const DB = struct {
                     .identity_namespace = origin,
                 });
                 errdefer readonly.close();
+                try self.copyQueryCutRowPolicyAuthority(&readonly);
                 try control.token().check();
                 readonly.retained_remote_query_lease = lease;
                 return readonly;
@@ -19484,6 +19675,7 @@ pub const DB = struct {
             .prefer_existing_identity_namespace = true,
         });
         errdefer readonly.close();
+        try self.copyQueryCutRowPolicyAuthority(&readonly);
         try control.token().check();
         readonly.retained_query_lease = reader;
         transferred = true;
@@ -19542,6 +19734,25 @@ pub const DB = struct {
         backup_seal_only: bool,
         query_cut: ?@import("native_query_cut.zig").Request,
     ) !u64 {
+        return self.snapshotInternalWithStatementFence(id, include_generated, cancellation, maintenance_deadline_ns, expected_topology_fence, backup_seal_only, query_cut, null);
+    }
+
+    fn snapshotInternalWithStatementFence(
+        self: *DB,
+        id: []const u8,
+        include_generated: bool,
+        cancellation: types.CancellationToken,
+        maintenance_deadline_ns: ?u64,
+        expected_topology_fence: ?@import("relational_integrity_topology.zig").Fence,
+        backup_seal_only: bool,
+        query_cut: ?@import("native_query_cut.zig").Request,
+        statement_fence: ?*const StatementReadFence,
+    ) !u64 {
+        if (statement_fence) |fence| {
+            if (query_cut == null or !include_generated or !fence.primary.active or !fence.replay.active or
+                fence.primary.admission != self.core.snapshot_admission or fence.replay.admission != self.core.snapshot_replay_admission)
+                return error.InvalidArgument;
+        }
         const seal_only = backup_seal_only or query_cut != null;
         if (query_cut == null) try self.ensurePrimaryOnlySnapshot();
         // Serialize only snapshot construction/publication. Normal writes can
@@ -19645,11 +19856,11 @@ pub const DB = struct {
         // barrier is writer preferring, so continuous client traffic cannot
         // starve capture. Internal enrichment and resolution callbacks remain
         // admitted while maintenance drains already-committed work.
-        var capture = self.core.snapshot_admission.acquireCaptureIo(io, @as(?types.CancellationToken, cancellation)) catch |err| switch (err) {
+        var capture = if (statement_fence) |fence| fence.primary else self.core.snapshot_admission.acquireCaptureIo(io, @as(?types.CancellationToken, cancellation)) catch |err| switch (err) {
             error.Cancelled => return error.Canceled,
             else => return err,
         };
-        defer capture.release();
+        defer if (statement_fence == null) capture.release();
         // Migration may have won admission after the optimistic entry check.
         // Its structural mutation uses this same snapshot fence.
         if (query_cut == null) try self.ensurePrimaryOnlySnapshot() else try self.requireQueryCutStorage();
@@ -19660,7 +19871,9 @@ pub const DB = struct {
         var structural: ?IndexStructuralMutationGuard = null;
         defer if (structural) |*guard| guard.release();
         var replay_capture: ?snapshot_admission_mod.SnapshotAdmission.CaptureLease = null;
-        defer if (replay_capture) |*lease| lease.release();
+        defer if (statement_fence == null) {
+            if (replay_capture) |*lease| lease.release();
+        };
         var apply_held = false;
         defer if (apply_held) self.core.unlockApply();
         var capture_target_sequence: u64 = undefined;
@@ -19671,17 +19884,29 @@ pub const DB = struct {
         // so an external write stream cannot keep this loop alive forever.
         while (true) {
             const target_sequence = self.currentMaintenanceTargetSequence();
-            self.runMaintenanceUntilWithCancellation(
-                target_sequence,
-                .{},
-                cancellation,
-                maintenance_deadline_ns orelse std.math.maxInt(u64),
-            ) catch |err| switch (err) {
-                error.Cancelled => return error.Canceled,
-                else => return err,
-            };
+            if (statement_fence == null) {
+                self.runMaintenanceUntilWithCancellation(
+                    target_sequence,
+                    .{},
+                    cancellation,
+                    maintenance_deadline_ns orelse std.math.maxInt(u64),
+                ) catch |err| switch (err) {
+                    error.Cancelled => return error.Canceled,
+                    else => return err,
+                };
+                try self.flushAppliedSequencesForIdle();
+            } else {
+                // Never drain a producer while the distributed cohort freezes
+                // replay. Admission must converge before capturing fences.
+                if (self.enrichment_runtime) |runtime| if (runtime.stats().applied_sequence < target_sequence) return error.CypherSnapshotNotReady;
+                const managed = try self.core.managedIndexes(self.alloc);
+                defer {
+                    for (managed) |index| self.alloc.free(@constCast(index.name));
+                    self.alloc.free(managed);
+                }
+                for (managed) |index| if (try self.core.loadAppliedSequence(self.alloc, index.name) < target_sequence) return error.CypherSnapshotNotReady;
+            }
             try ensureSnapshotActive(cancellation);
-            try self.flushAppliedSequencesForIdle();
 
             if (query_cut != null) {
                 try lockAtomicWithCancellation(&self.local_execution.index_structural_mutation_mutex, cancellation);
@@ -19704,7 +19929,7 @@ pub const DB = struct {
                 structural = self.beginDrainedIndexStructuralMutationWithLease("native snapshot", "*", capture.borrowMutation());
                 if (!structural.?.acquireCatalogBarrierUntil(std.math.maxInt(u64))) unreachable;
             }
-            replay_capture = self.core.snapshot_replay_admission.acquireCaptureIo(
+            replay_capture = if (statement_fence) |fence| fence.replay else self.core.snapshot_replay_admission.acquireCaptureIo(
                 io,
                 @as(?types.CancellationToken, cancellation),
             ) catch |err| switch (err) {
@@ -19730,7 +19955,7 @@ pub const DB = struct {
             }
             self.core.unlockApply();
             apply_held = false;
-            replay_capture.?.release();
+            if (statement_fence == null) replay_capture.?.release();
             replay_capture = null;
             structural.?.release();
             structural = null;
@@ -19764,11 +19989,11 @@ pub const DB = struct {
         if (comptime builtin.os.tag == .freestanding) {
             self.core.unlockApply();
             apply_held = false;
-            replay_capture.?.release();
+            if (statement_fence == null) replay_capture.?.release();
             replay_capture = null;
             structural.?.release();
             structural = null;
-            capture.release();
+            if (statement_fence == null) capture.release();
             const total = try primary_snapshot.materialize(
                 self.alloc,
                 io,
@@ -19905,11 +20130,11 @@ pub const DB = struct {
             }
         }
 
-        replay_capture.?.release();
+        if (statement_fence == null) replay_capture.?.release();
         replay_capture = null;
         structural.?.release();
         structural = null;
-        capture.release();
+        if (statement_fence == null) capture.release();
 
         // Both primary and generated artifacts remain pinned. Expensive file
         // copies, primary serialization, hashing, and manifest encoding stay
@@ -23069,8 +23294,11 @@ pub const DB = struct {
     }
 
     pub fn beginTransactionScoped(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, scope: ?[32]u8) !transactions_mod.TxnId {
-        var row_policy_lease = try self.local_execution.row_policy_gate.enterRaw();
-        defer row_policy_lease.release();
+        // BEGIN records participant metadata without reading or changing user
+        // rows. PREPARE retains authenticated policy admission for every row
+        // intent. Restore-scoped BEGIN keeps its stronger raw admission gate.
+        var row_policy_lease: ?row_policy_gate_mod.Gate.Lease = if (scope != null) try self.local_execution.row_policy_gate.enterRaw() else null;
+        defer if (row_policy_lease) |*lease| lease.release();
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
         try self.enforceReplicationWriteGate();
@@ -23184,7 +23412,7 @@ pub const DB = struct {
             if (hasCoordinatedConstraints(view) and !isMetadataKey(intent.key)) return error.ForeignKeyCoordinationRequired;
         }
         for (predicates) |predicate| if (isProtectedIntegrityKey(predicate.key)) return error.InvalidIntegrityOperation;
-        try self.prepareTransactionRows(preparation_alloc, prepared_intents, view);
+        try self.prepareTransactionRows(preparation_alloc, prepared_intents, view, false);
 
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
@@ -23241,7 +23469,11 @@ pub const DB = struct {
         req: types.TransactionIntentRequest,
         ordered_receipt: ?OrderedApplyReceipt,
     ) !void {
-        if (ordered_receipt == null) try self.maybeFinalizePendingRowPolicyPublication();
+        if (ordered_receipt == null or req.row_policy_principal_proof.len != 0)
+            try self.maybeFinalizePendingRowPolicyPublication();
+        if (ordered_receipt != null and req.row_policy_principal_proof.len != 0 and
+            self.local_execution.row_policy_gate.currentPhase() == .preparing)
+            return error.RowPolicyReadersActive;
         var verified_principal: ?std.json.Parsed(row_policy_authority_mod.Payload) = null;
         defer if (verified_principal) |*principal| principal.deinit();
         var row_policy_lease: ?row_policy_gate_mod.Gate.Lease = null;
@@ -23319,15 +23551,22 @@ pub const DB = struct {
             &transform_snapshot,
         );
         defer effective_ops.deinit(preparation_alloc);
-        // Graph projections are maintained as artifact deltas, while the
-        // transaction intent format currently carries only primary key/value
-        // rows. Refuse this combination rather than acknowledging a transform
-        // whose graph half cannot participate in the transaction commit.
-        if (effective_ops.graph_writes.items.len != 0 or effective_ops.graph_deletes.items.len != 0)
-            return error.UnsupportedTransformOperation;
-
+        var graph_effects = std.heap.ArenaAllocator.init(preparation_alloc);
+        defer graph_effects.deinit();
+        const graph_alloc = graph_effects.allocator();
+        const graph_contract = @import("graph_transaction_effects.zig");
         var intents = std.ArrayListUnmanaged(transactions_mod.WriteIntent).empty;
         defer intents.deinit(preparation_alloc);
+        for (req.graph_writes) |edge| {
+            try types.validateGraphEndpointCleanupCommand(.{ .graph_writes = &.{edge} });
+            try graph_contract.append(graph_alloc, preparation_alloc, &intents, .{ .write = edge });
+        }
+        for (req.graph_deletes) |edge| {
+            try types.validateGraphEndpointCleanupCommand(.{ .graph_deletes = &.{edge} });
+            try graph_contract.append(graph_alloc, preparation_alloc, &intents, .{ .delete = edge });
+        }
+        for (effective_ops.graph_writes.items) |edge| try graph_contract.append(graph_alloc, preparation_alloc, &intents, .{ .write = edge });
+        for (effective_ops.graph_deletes.items) |edge| try graph_contract.append(graph_alloc, preparation_alloc, &intents, .{ .delete = edge });
         var predicates = std.ArrayListUnmanaged(transactions_mod.VersionPredicate).empty;
         defer predicates.deinit(preparation_alloc);
 
@@ -23459,7 +23698,7 @@ pub const DB = struct {
             try CaptureMetadata.add(preparation_alloc, &range_metadata_buffers, &predicates, &index_read.?, &control_key);
         }
         defer freePreparedIntentRows(preparation_alloc, intents.items);
-        try self.prepareTransactionRows(preparation_alloc, intents.items, prepared_schema_view);
+        try self.prepareTransactionRows(preparation_alloc, intents.items, prepared_schema_view, req.normalized_graph_rows);
 
         const integrity_catalog_mod = @import("relational_integrity_catalog.zig");
         var integrity_catalog: ?integrity_catalog_mod.Catalog = null;
@@ -23869,6 +24108,7 @@ pub const DB = struct {
         alloc: Allocator,
         intents: []transactions_mod.WriteIntent,
         schema_view: ?schema_registry_mod.SchemaView,
+        preserve_logical_values: bool,
     ) !void {
         const view = schema_view orelse {
             for (intents) |intent| if (intent.json_null_fields.len != 0) return error.InvalidBatchRequest;
@@ -23882,6 +24122,7 @@ pub const DB = struct {
             alloc: Allocator,
             intents: []transactions_mod.WriteIntent,
             view: schema_registry_mod.SchemaView,
+            preserve_logical_values: bool,
             io: std.Io,
             next: std.atomic.Value(usize) = .init(0),
             failed: std.atomic.Value(bool) = .init(false),
@@ -23891,7 +24132,21 @@ pub const DB = struct {
             fn prepare(ctx: *@This(), scratch: Allocator, intent: *transactions_mod.WriteIntent) !void {
                 if (isMetadataKey(intent.key)) return;
                 const value = intent.value orelse return;
-                var row = try mapper.PreparedRelationalWrite.initTyped(ctx.alloc, scratch, scratch, false, intent.key, value, ctx.view.validator(), ctx.view.tableSchema().*, ctx.view.physicalLayout(), intent.json_null_fields, false);
+                const document = if (ctx.preserve_logical_values) blk: {
+                    var parsed = try std.json.parseFromSlice(std.json.Value, scratch, value, .{ .parse_numbers = false });
+                    defer parsed.deinit();
+                    if (parsed.value != .object) return error.InvalidBatchRequest;
+                    // Cypher removal is SQL NULL in a fixed relational schema.
+                    // Explicit cells also preserve nullable generated outputs;
+                    // sparse historical rows have different default semantics.
+                    for (ctx.view.tableSchema().relational_columns) |column| {
+                        if (!parsed.value.object.contains(column.name))
+                            try parsed.value.object.put(parsed.arena.allocator(), column.name, .null);
+                    }
+                    break :blk try std.json.Stringify.valueAlloc(scratch, parsed.value, .{});
+                } else value;
+                defer if (ctx.preserve_logical_values) scratch.free(document);
+                var row = try mapper.PreparedRelationalWrite.initTyped(ctx.alloc, scratch, scratch, false, intent.key, document, ctx.view.validator(), ctx.view.tableSchema().*, ctx.view.physicalLayout(), intent.json_null_fields, ctx.preserve_logical_values);
                 defer row.deinit(ctx.alloc);
                 try row.finalizeMetadata(0);
                 var specials = std.json.ObjectMap.empty;
@@ -23923,7 +24178,7 @@ pub const DB = struct {
             }
         };
         const io = self.backend_runtime.io();
-        var ctx = Context{ .alloc = alloc, .intents = intents, .view = view, .io = io orelse std.Options.debug_io };
+        var ctx = Context{ .alloc = alloc, .intents = intents, .view = view, .preserve_logical_values = preserve_logical_values, .io = io orelse std.Options.debug_io };
         var input_bytes: usize = 0;
         for (intents) |intent| input_bytes +|= if (intent.value) |value| value.len else 0;
         const workers = @min(@as(usize, 8), @min(intents.len, @max(@as(usize, 1), input_bytes / (256 * 1024))));
@@ -26348,6 +26603,179 @@ pub const DB = struct {
         errdefer graph_mod.GraphIndex.freeEdges(alloc, result.edges);
         try row_policy_lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
         return result;
+    }
+
+    /// Graph language reads require a retained immutable query cut. Physical
+    /// paging keeps adjacency memory bounded and preserves parallel edge IDs.
+    pub fn graphEdgesForCypherPageAt(
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+        key: []const u8,
+        edge_types: []const []const u8,
+        direction: graph_mod.EdgeDirection,
+        cursor: ?graph_mod.EdgeScanCursor,
+        limits: graph_mod.EdgePageLimits,
+        ttl_now_ns: u64,
+    ) !graph_mod.EdgePage {
+        return self.graphEdgesForCypherPageAuthorizedAt(alloc, index_name, key, edge_types, direction, cursor, limits, ttl_now_ns, "", "");
+    }
+
+    /// The owner verifies the same signed principal used for document reads.
+    /// Adjacency is internal binding input; endpoint reads enforce row policy
+    /// before any path, entity or property can enter a public result.
+    pub fn graphEdgesForCypherPageAuthorizedAt(
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+        key: []const u8,
+        edge_types: []const []const u8,
+        direction: graph_mod.EdgeDirection,
+        cursor: ?graph_mod.EdgeScanCursor,
+        limits: graph_mod.EdgePageLimits,
+        ttl_now_ns: u64,
+        principal_proof: []const u8,
+        database: []const u8,
+    ) !graph_mod.EdgePage {
+        return self.graphEdgesForCypherPageInternal(alloc, index_name, key, edge_types, direction, cursor, limits, ttl_now_ns, principal_proof, database, null);
+    }
+    pub fn graphEdgesForCypherCapturePageAuthorizedAt(self: *DB, fence: *const StatementReadFence, alloc: Allocator, index_name: []const u8, key: []const u8, edge_types: []const []const u8, direction: graph_mod.EdgeDirection, cursor: ?graph_mod.EdgeScanCursor, limits: graph_mod.EdgePageLimits, ttl_now_ns: u64, principal_proof: []const u8, database: []const u8) !graph_mod.EdgePage {
+        if (fence.source != self) return error.CypherSnapshotRequired;
+        return self.graphEdgesForCypherPageInternal(alloc, index_name, key, edge_types, direction, cursor, limits, ttl_now_ns, principal_proof, database, fence);
+    }
+    fn graphEdgesForCypherPageInternal(self: *DB, alloc: Allocator, index_name: []const u8, key: []const u8, edge_types: []const []const u8, direction: graph_mod.EdgeDirection, cursor: ?graph_mod.EdgeScanCursor, limits: graph_mod.EdgePageLimits, ttl_now_ns: u64, principal_proof: []const u8, database: []const u8, capture_fence: ?*const StatementReadFence) !graph_mod.EdgePage {
+        if (ttl_now_ns == 0 or (!self.hasRetainedQueryCut() and (capture_fence == null or capture_fence.?.source != self))) return error.CypherSnapshotRequired;
+        var verified: ?std.json.Parsed(row_policy_authority_mod.Payload) = null;
+        defer if (verified) |*value| value.deinit();
+        const now_seconds: i64 = @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s));
+        var row_policy_lease = if (principal_proof.len != 0) bound: {
+            verified = try self.verifyRowPolicyPrincipal(alloc, principal_proof, database, .read, now_seconds);
+            break :bound try self.local_execution.row_policy_gate.enterVerifiedPrincipal(&verified.?.value, now_seconds);
+        } else try self.local_execution.row_policy_gate.enterRawRead();
+        defer row_policy_lease.release();
+        try self.lockApplySharedForPortableRuntime();
+        defer self.core.unlockApplyShared();
+        try self.requireGraphEndpointCleanupReady();
+        if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
+        const entry = self.core.graphIndex(index_name) orelse return error.IndexNotFound;
+        var result = try entry.index.getEdgesByTypesPageAt(alloc, key, edge_types, direction, cursor, limits, ttl_now_ns);
+        errdefer result.deinit(alloc);
+        try row_policy_lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+        return result;
+    }
+
+    pub const CypherBackend = @import("cypher").native.Adapter(DB, graph_mod.GraphIndex, graph_mod.EdgeScanCursor);
+    pub const CypherStatementSnapshot = @import("cypher_statement_snapshot.zig").Snapshot(DB);
+    pub fn cypherDocumentKeyAllowed(key: []const u8) bool {
+        return key.len != 0 and !internal_keys.isInternalUserKey(key) and !isMetadataKey(key);
+    }
+
+    pub fn cypherDocumentScanOptions(self: *DB, alloc: Allocator, input: types.ScanOptions) !types.ScanOptions {
+        var opts = input;
+        var schema = self.core.acquireSchemaView() orelse return opts;
+        defer schema.release();
+        // Relational rows must use their typed reader and policy predicate.
+        // A document-style scan intentionally admits only unprotected tables.
+        if (schema.storageMode() == .relational and !opts.isRelational()) {
+            const columns = schema.tableSchema().relational_columns;
+            const fields = try alloc.alloc([]const u8, columns.len);
+            for (columns, fields) |column, *field| field.* = try alloc.dupe(u8, column.name);
+            opts.relational_query = .{ .fields = fields };
+        }
+        return opts;
+    }
+
+    pub const CypherReadLease = row_policy_gate_mod.Gate.Lease;
+    pub const normalizeCypherNode = @import("cypher_postimage.zig").normalize;
+    pub const cypherDocumentRelationships = @import("cypher_postimage.zig").relationships;
+    pub fn acquireCypherReadAuthority(self: *DB, alloc: Allocator, proof: []const u8, database: []const u8) !CypherReadLease {
+        if (proof.len == 0) return self.local_execution.row_policy_gate.enterRawRead();
+        const now_seconds: i64 = @intCast(platform_time.realtimeNs() / std.time.ns_per_s);
+        var principal = try self.verifyRowPolicyPrincipal(alloc, proof, database, .read, now_seconds);
+        defer principal.deinit();
+        return self.local_execution.row_policy_gate.enterVerifiedPrincipal(&principal.value, now_seconds);
+    }
+
+    /// Apply the retained owner policy to a staged SQL postimage. The caller
+    /// cannot use a storage lookup: this row may not exist in the captured cut.
+    pub fn permitsCypherDocument(self: *DB, alloc: Allocator, document: std.json.Value, json_null_fields: []const []const u8, proof: []const u8, database: []const u8) !bool {
+        if (document != .object) return error.InvalidBatchRequest;
+        var authority = try self.acquireCypherReadAuthority(alloc, proof, database);
+        defer authority.release();
+        const now_seconds: i64 = @intCast(platform_time.realtimeNs() / std.time.ns_per_s);
+        try authority.checkAt(now_seconds);
+        if (self.core.table_catalog.row_policy_phase != .active) return true;
+        var principal = try self.verifyRowPolicyPrincipal(alloc, proof, database, .read, now_seconds);
+        defer principal.deinit();
+        var view = self.core.acquireSchemaView() orelse return error.RowPolicyCatalogChanged;
+        defer view.release();
+        const bundle = if (self.local_execution.row_policy_bundle) |*installed| installed else return error.RowPolicyCatalogChanged;
+        var evaluation = try bundle.captureReadEvaluation(alloc, view.tableSchema().*, &principal.value);
+        defer evaluation.deinit();
+        const scalar = @import("../../sql/scalar.zig");
+        const columns = view.tableSchema().relational_columns;
+        const cells = try alloc.alloc(scalar.Datum, columns.len);
+        defer alloc.free(cells);
+        @memset(cells, .{});
+        for (evaluation.evaluator.required_columns) |ordinal| {
+            const column = columns[ordinal];
+            const raw = document.object.get(column.name) orelse .null;
+            const literal_null = for (json_null_fields) |name| {
+                if (column.column_type == .json and std.mem.eql(u8, name, column.name)) break true;
+            } else false;
+            cells[ordinal] = .{ .value = if (raw == .null) raw else try @import("../../sql/describe.zig").coerce(raw, switch (column.column_type) {
+                .string => .string,
+                .integer => .integer,
+                .number => .number,
+                .boolean => .boolean,
+                .datetime => .datetime,
+                .json => .json,
+                else => return error.RowPolicyCatalogChanged,
+            }), .sql_null = raw == .null and !literal_null };
+        }
+        const permitted = try evaluation.evaluator.permits(alloc, cells);
+        try authority.checkAt(@intCast(platform_time.realtimeNs() / std.time.ns_per_s));
+        return permitted;
+    }
+
+    pub fn cypherFieldDerivedEdgeType(self: *const DB, index_name: []const u8, edge_type: []const u8) bool {
+        self.core.lockApplyShared();
+        defer self.core.unlockApplyShared();
+        for (self.core.graphIndexes()) |index| {
+            if (!std.mem.eql(u8, index.config.name, index_name)) continue;
+            for (index.edge_type_configs) |edge| {
+                if (std.mem.eql(u8, edge.name, edge_type) and edge.field_name != null) return true;
+            }
+        }
+        return false;
+    }
+
+    pub fn cypherGraphIndexIdentity(self: *const DB, alloc: Allocator, index_name: []const u8) !?@import("cypher").catalog.IndexIdentity {
+        self.core.lockApplyShared();
+        defer self.core.unlockApplyShared();
+        const cfg = self.core.index_manager.get(index_name) orelse return null;
+        if (cfg.kind != .graph) return null;
+        const identity = self.core.index_manager.coverageIdentityForIndex(index_name) orelse return null;
+        return .{ .incarnation = identity.generation, .config_hash = identity.config_fingerprint orelse try internal_keys.derivedCoverageConfigFingerprint(alloc, cfg.config_json) };
+    }
+
+    /// Execute against caller-retained immutable table cuts and authority
+    /// leases. The returned result owns its values independently of the cuts.
+    pub fn queryCypher(
+        alloc: Allocator,
+        tables: []const CypherBackend.Table,
+        authority: CypherBackend.Authority,
+        ttl_now_ns: u64,
+        graph: @import("cypher").catalog.Graph,
+        request: @import("cypher").request.Request,
+        diagnostic: *@import("cypher").compiler.Diagnostic,
+    ) !@import("cypher").runtime.Result {
+        var adapter: CypherBackend = .{ .tables = tables, .authority = authority, .ttl_now_ns = ttl_now_ns };
+        return request.execute(alloc, adapter.backend(), graph, diagnostic);
+    }
+
+    pub fn hasRetainedQueryCut(self: *const DB) bool {
+        return self.open_mode == .query_readonly and (self.retained_query_lease != null or self.retained_remote_query_lease != null);
     }
 
     pub fn getEdges(
@@ -37502,10 +37930,12 @@ pub const DB = struct {
     }
 
     pub const StatementReadFence = struct {
+        source: ?*DB,
         primary: snapshot_admission_mod.SnapshotAdmission.CaptureLease,
         replay: snapshot_admission_mod.SnapshotAdmission.CaptureLease,
 
         pub fn release(fence: *StatementReadFence) void {
+            fence.source = null;
             fence.replay.release();
             fence.primary.release();
         }
@@ -37545,7 +37975,7 @@ pub const DB = struct {
             primary.release();
             return null;
         }
-        return .{ .primary = primary, .replay = replay };
+        return .{ .source = self, .primary = primary, .replay = replay };
     }
 
     /// Owns a retained schema/store snapshot and its authorization predicate.
@@ -38304,6 +38734,38 @@ pub const DB = struct {
         errdefer self.core.unlockApplyShared();
         try self.enforcePortableRuntimeGate();
         return .{ .db = self, .row_policy_lease = row_policy_lease };
+    }
+
+    /// Only retained, authenticated graph cuts may enter this search path.
+    /// The caller supplies the authorized document whitelist before ranking.
+    pub fn searchCypherCut(self: *DB, alloc: Allocator, req: types.SearchRequest, proof: []const u8, database: []const u8) !types.SearchResult {
+        if (!self.hasRetainedQueryCut() or !req.filter_doc_ids_positive) return error.CypherSnapshotRequired;
+        var lease = try self.acquireCypherReadAuthority(alloc, proof, database);
+        defer lease.release();
+        const access = self.beginDenseSearchAccess(req);
+        defer self.endDenseSearchAccess(access);
+        try self.enforcePortableRuntimeGate();
+        var scoped = try self.searchRequestAtCurrentIdentityGeneration(req);
+        var filter = try self.resolvedDocFilterForIdsAlloc(true, scoped.filter_doc_ids, &.{}, scoped.identity_read_generation);
+        defer filter.deinit(self.alloc);
+        scoped.resolved_doc_filter = &filter;
+        const Control = struct {
+            lease: *row_policy_gate_mod.Gate.Lease,
+            request: types.SearchRequest,
+            fn check(raw: *anyopaque) !void {
+                const control: *@This() = @ptrCast(@alignCast(raw));
+                if (control.request.cancellation) |signal| if (signal.isCancelled()) return error.Canceled;
+                if (control.request.execution_deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.DeadlineExceeded;
+                try control.lease.checkAt(@intCast(platform_time.realtimeNs() / std.time.ns_per_s));
+            }
+        };
+        var control: Control = .{ .lease = &lease, .request = scoped };
+        try Control.check(&control);
+        const corpus_stats = try db_query_search.collectSearchRequestTextStats(alloc, scoped, .{ .ctx = self, .text_index_entry = textIndexEntryCallback, .checkpoint = .{ .ptr = &control, .call = Control.check } });
+        defer @import("../../search/distributed_stats.zig").deinitTextFieldStats(alloc, corpus_stats);
+        scoped.distributed_text_stats = corpus_stats;
+        try Control.check(&control);
+        return self.searchLockedWithExecutionContext(alloc, scoped, .{});
     }
 
     pub fn searchWithExecutionContext(
@@ -131312,14 +131774,18 @@ test "db graph endpoint cleanup pages progress through row policy phases without
                 try db.batch(.{ .graph_writes = &.{edge}, .sync_level = .full_index });
             const job = try internal_keys.graphEndpointCleanupKeyAlloc(alloc, "hub");
             defer alloc.free(job);
-            try db.core.store.put(job, "hub");
             db.local_execution.row_policy_gate.phase.store(@backingInt(phase), .release);
             defer db.local_execution.row_policy_gate.phase.store(@backingInt(table_catalog_mod.RowPolicyPhase.disabled), .release);
             // Maintenance must not acquire a user admission lease, including
             // during preparing. Invalid mixed commands never gain exemption.
             try std.testing.expectError(error.InvalidBatchRequest, db.batch(.{ .graph_endpoint_cleanup = true, .writes = &.{.{ .key = "user", .value = "{}" }} }));
+            try std.testing.expectError(error.InvalidBatchRequest, db.batch(.{ .activate_range_tracking = true, .writes = &.{.{ .key = "user", .value = "{}" }} }));
+            try db.batch(.{ .activate_range_tracking = true, .sync_level = .write });
             try std.testing.expectError(error.RowPolicyAuthenticationRequired, db.batch(.{ .writes = &.{.{ .key = "user", .value = "{}" }} }));
             try std.testing.expectError(error.RowPolicyAuthenticationRequired, graphTestApplyOrdered(&db, .{ .graph_writes = &.{edge} }, .{ .term = 1, .index = 2 }));
+            // Activation may opportunistically run maintenance. Introduce this
+            // cleanup job afterward so each explicit cleanup path is exercised.
+            try db.core.store.put(job, "hub");
             switch (mode) {
                 0 => try std.testing.expect(try db.runStandaloneGraphEndpointCleanupStep()),
                 1 => {
@@ -134058,4 +134524,67 @@ test "issue1015 degraded primary writes reject backlog exhaustion before commit"
         };
     }
     return error.TestUnexpectedResult;
+}
+
+test "db graph endpoint cleanup transaction graph effects commit atomically after reopen" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("cypher-transaction-effects");
+    defer directory.cleanup();
+    var id: types.TxnId = undefined;
+    {
+        var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+        defer db.close();
+        try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+        try db.batch(.{ .writes = &.{ .{ .key = "a", .value = "{}" }, .{ .key = "b", .value = "{}" } } });
+        id = try db.beginTransaction(100);
+        try db.writeTransaction(id, .{ .writes = &.{.{ .key = "new", .value = "{\"title\":\"new\"}" }}, .graph_writes = &.{.{ .edge_id = "cypher-edge", .index_name = "g", .source = "a", .target = "b", .edge_type = "R", .metadata_json = "{\"value\":9223372036854775807}" }} });
+        const edges = try db.getEdges(a, "g", "a", "", .out);
+        defer graph_mod.GraphIndex.freeEdges(a, edges);
+        try std.testing.expectEqual(@as(usize, 0), edges.len);
+    }
+    {
+        var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+        defer db.close();
+        try db.commitTransaction(id, 101);
+        try db.runUntilIdle();
+        const edges = try db.getEdges(a, "g", "a", "", .out);
+        defer graph_mod.GraphIndex.freeEdges(a, edges);
+        try std.testing.expectEqual(@as(usize, 1), edges.len);
+        var node = (try db.getDocument(a, "new", .{})) orelse return error.MissingCommittedDocument;
+        defer node.deinit(a);
+        const deleting = try db.beginTransaction(102);
+        try db.writeTransaction(deleting, .{ .graph_deletes = &.{.{ .edge_id = "cypher-edge", .index_name = "g", .source = "a", .target = "b", .edge_type = "R" }} });
+        try db.abortTransaction(deleting, 103);
+        const retained = try db.getEdges(a, "g", "a", "", .out);
+        defer graph_mod.GraphIndex.freeEdges(a, retained);
+        try std.testing.expectEqual(@as(usize, 1), retained.len);
+    }
+}
+
+test "db graph endpoint cleanup transaction graph effects advance source ranges and respect read guards" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("cypher-graph-source-range");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+    try db.batch(.{ .activate_range_tracking = true });
+    try db.batch(.{ .writes = &.{ .{ .key = "a", .value = "{}" }, .{ .key = "b", .value = "{}" } }, .timestamp_ns = 99 });
+    const tracking = @import("../range_protection.zig");
+    const before = blk: {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        break :blk (try tracking.generation(&read, tracking.bucket("a"))).?;
+    };
+    try db.batch(.{ .graph_writes = &.{.{ .edge_id = "first", .index_name = "g", .source = "a", .target = "b", .edge_type = "R" }} });
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqual(before + 1, (try tracking.generation(&read, tracking.bucket("a"))).?);
+    }
+    const id = try db.beginTransaction(100);
+    try db.writeTransaction(id, .{ .predicates = &.{.{ .key = "a", .expected_version = 99 }} });
+    try std.testing.expectError(error.IntentConflict, db.batch(.{ .graph_writes = &.{.{ .edge_id = "second", .index_name = "g", .source = "a", .target = "b", .edge_type = "R" }} }));
+    try db.abortTransaction(id, 101);
+    try db.batch(.{ .graph_writes = &.{.{ .edge_id = "second", .index_name = "g", .source = "a", .target = "b", .edge_type = "R" }} });
 }

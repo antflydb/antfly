@@ -335,6 +335,9 @@ _FUNCTIONS: list[tuple[str, list[object], object]] = [
     ),
     ("antfly_db_scan_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),
     ("antfly_db_sql_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),
+    ("antfly_db_graph_catalog_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),
+    ("antfly_db_cypher_json", [_VOID_P, AntflySlice, AntflySlice, _BUF_P], _ERR),
+    ("antfly_db_graph_write_status_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),
     ("antfly_db_open_table", [_VOID_P, AntflySlice, ctypes.POINTER(_VOID_P)], _ERR),
     ("antfly_db_create_table_json", [_VOID_P, AntflySlice, AntflySlice], _ERR),
     ("antfly_db_drop_table", [_VOID_P, AntflySlice], _ERR),
@@ -405,6 +408,12 @@ _lib: ctypes.CDLL | None = None
 
 def _configure(lib: ctypes.CDLL) -> None:
     for name, argtypes, restype in _FUNCTIONS:
+        if name in {
+            "antfly_db_graph_catalog_json",
+            "antfly_db_cypher_json",
+            "antfly_db_graph_write_status_json",
+        } and not hasattr(lib, name):
+            continue
         func = getattr(lib, name)
         func.argtypes = argtypes
         func.restype = restype

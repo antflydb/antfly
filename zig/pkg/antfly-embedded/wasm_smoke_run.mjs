@@ -93,4 +93,29 @@ api.close();
 if (api.exports.antfly_embedded_smoke_run() !== 0) {
     throw new Error("hosted text index did not survive close/reopen");
 }
+api.open();
+api.putMany({ a: { id: "a" }, b: { id: "b" } });
+api.addIndex({ name: "links", kind: "graph", config_json: "{}" });
+api.graphCatalog({ action: "put", name: "knowledge", definition: {
+    labels: [{ name: "Document", table: "docs" }],
+    relationships: [{ name: "KNOWS", index: "links", source_label: "Document", target_label: "Document", stored_type: "knows" }],
+} });
+const graphWrite = { query: "MATCH (a:Document {id:'a'}),(b:Document {id:'b'}) CREATE (a)-[r:KNOWS {since:2020}]->(b) RETURN r.since", write_request_id: "00112233445566778899aabbccddeeff" };
+const committed = api.cypher("knowledge", graphWrite);
+if (committed.commit.status !== "committed") throw new Error("WASM graph write did not commit");
+const graphRows = api.cypher("knowledge", { query: "MATCH (a)-[r:KNOWS]->(b) RETURN a.id,r.since,b.id" }).rows;
+if (JSON.stringify(graphRows) !== JSON.stringify([[{type:"string",value:"a"},{type:"integer",value:"2020"},{type:"string",value:"b"}]])) throw new Error("WASM graph values lost identity or integer precision");
+try { api.cypher("knowledge", graphWrite); throw new Error("WASM duplicate graph write was accepted"); }
+catch (error) { if (error.diagnostic?.code !== "CypherWriteRequestAlreadyUsed") throw error; }
+if (api.graphWriteStatus(graphWrite.write_request_id).disposition !== "committed") throw new Error("WASM graph receipt unavailable");
+const exact = api.cypher("knowledge", { query:"RETURN $minimum,$maximum", typed_parameters:{type:"map",value:{minimum:{type:"integer",value:"-9223372036854775808"},maximum:{type:"integer",value:"9223372036854775807"}}} });
+if (exact.rows[0][0].value !== "-9223372036854775808" || exact.rows[0][1].value !== "9223372036854775807") throw new Error("WASM graph parameter precision lost");
+try {
+    api.cypher("knowledge", { query: "CREATE (n:Document {id:'aborted'}) RETURN 1/0", write_request_id: "ffeeddccbbaa99887766554433221100" });
+    throw new Error("WASM failed graph write was accepted");
+} catch (error) {
+    if (error.diagnostic?.code !== "CypherDivisionByZero" || error.diagnostic?.write_outcome !== "not_started") throw error;
+}
+if (api.cypher("knowledge", { query: "MATCH (n:Document {id:'aborted'}) RETURN n" }).rows.length !== 0) throw new Error("WASM failed graph write published a row");
+api.close();
 console.log("antfly embedded shared smoke passed: ok");

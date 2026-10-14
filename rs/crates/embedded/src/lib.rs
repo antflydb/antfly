@@ -76,6 +76,8 @@ pub use status::{
 };
 
 #[cfg(feature = "serde")]
+pub mod cypher;
+#[cfg(feature = "serde")]
 pub mod sql;
 #[cfg(feature = "sqlx")]
 pub mod sqlx;

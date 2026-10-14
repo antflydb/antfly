@@ -19,6 +19,10 @@ const callbacks = @import("../runtime_callback_abi.zig");
 const std = @import("std");
 const types = @import("db/types.zig");
 const View = @import("relational_read_view.zig").View;
+pub const GraphInput = @import("cypher_read.zig").Input;
+pub const GraphRead = @import("cypher_read.zig").Read;
+pub const GraphStatement = @import("cypher_read.zig").Statement;
+pub const GraphTable = @import("cypher_read.zig").Table;
 
 pub const Fence = struct {
     ptr: *anyopaque,
@@ -29,6 +33,7 @@ pub const Fence = struct {
         validate: *const fn (*anyopaque) anyerror!void,
         open: *const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8, types.ScanOptions) anyerror!View,
         capture_snapshot: ?*const fn (*anyopaque, std.mem.Allocator) anyerror!Snapshot = null,
+        capture_graph: ?*const fn (*anyopaque, std.mem.Allocator, @import("cypher_read.zig").Input) anyerror!@import("cypher_read.zig").Read = null,
         release: *const fn (*anyopaque) void,
     };
     const Abi = callbacks.Boundary(VTable);
@@ -48,6 +53,10 @@ pub const Fence = struct {
     pub fn captureSnapshot(self: Fence, alloc: std.mem.Allocator) !Snapshot {
         const capture = self.vtable.capture_snapshot orelse return error.SqlStatementSnapshotRequired;
         return Abi.call("capture_snapshot", self.boundary_dispatch, capture, .{ self.ptr, alloc });
+    }
+    pub fn captureGraph(self: Fence, alloc: std.mem.Allocator, input: @import("cypher_read.zig").Input) !@import("cypher_read.zig").Read {
+        const capture = self.vtable.capture_graph orelse return error.CypherSnapshotRequired;
+        return Abi.call("capture_graph", self.boundary_dispatch, capture, .{ self.ptr, alloc, input });
     }
 
     pub fn deinit(self: Fence) void {

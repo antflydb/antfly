@@ -255,6 +255,7 @@ pub const SearchTextQueryExecutor = struct {
 };
 
 pub const SearchTextStatsExecutor = struct {
+    checkpoint: ?struct { ptr: *anyopaque, call: *const fn (*anyopaque) anyerror!void } = null,
     ctx: ?*anyopaque,
     text_index_entry: *const fn (
         ctx: ?*anyopaque,
@@ -265,6 +266,9 @@ pub const SearchTextStatsExecutor = struct {
         alloc: Allocator,
         keys: []const []const u8,
     ) anyerror![]?[]u8 = null,
+    fn check(self: @This()) !void {
+        if (self.checkpoint) |control| try control.call(control.ptr);
+    }
 };
 
 pub const ExplicitTextStatRequest = control_contract.ExplicitTextStatRequest;
@@ -12661,6 +12665,7 @@ pub fn collectSearchRequestTextStats(
             .index_name = entry.value_ptr.index_name,
             .field = entry.value_ptr.field,
             .terms = terms,
+            .resolved_doc_filter = if (req.resolved_doc_filter) |raw| @ptrCast(@alignCast(raw)) else null,
         };
         request_index += 1;
     }
@@ -12743,10 +12748,12 @@ fn collectFilteredExplicitTextStats(
     defer freeDocIdArrayList(alloc, &selected_doc_keys);
     var doc_offset: u32 = 0;
     for (snapshot.segments) |*seg| {
+        try executor.check();
         {
             seg.shared.lockDeletionShared();
             defer seg.shared.unlockDeletionShared();
             for (0..seg.reader.doc_count) |local_doc_usize| {
+                if (local_doc_usize % 256 == 0) try executor.check();
                 const local_doc: u32 = @intCast(local_doc_usize);
                 if (seg.shared.deleted) |deleted| {
                     if (deleted.contains(local_doc)) continue;
@@ -12800,6 +12807,7 @@ fn collectFilteredExplicitTextStats(
                 seg.shared.lockDeletionShared();
                 defer seg.shared.unlockDeletionShared();
                 for (0..seg.reader.doc_count) |local_doc_usize| {
+                    if (local_doc_usize % 256 == 0) try executor.check();
                     const local_doc: u32 = @intCast(local_doc_usize);
                     if (seg.shared.deleted) |deleted| {
                         if (deleted.contains(local_doc)) continue;
@@ -12813,18 +12821,22 @@ fn collectFilteredExplicitTextStats(
             if (try seg.reader.invertedIndexScoped(alloc, request.field)) |opened| {
                 var inv_reader = opened;
                 defer inv_reader.deinit();
-                var terms = try inv_reader.termIterator();
-                defer terms.deinit();
-                while (try terms.next()) |entry| {
-                    var postings = try entry.result.iterator(alloc);
+                for (0..seg.reader.doc_count) |local_doc_usize| {
+                    if (local_doc_usize % 256 == 0) try executor.check();
+                    const local_doc: u32 = @intCast(local_doc_usize);
+                    if (allowed_local_docs.contains(local_doc)) global_total_field_len +|= try inv_reader.docLength(local_doc);
+                }
+                for (term_doc_freqs) |*item| {
+                    try executor.check();
+                    const found = (try inv_reader.lookup(item.term)) orelse continue;
+                    var postings = try found.iterator(alloc);
                     defer postings.deinit();
                     postings.decode_positions = false;
+                    var visited: usize = 0;
                     while (try postings.next()) |hit| {
-                        if (!allowed_local_docs.contains(hit.doc_id)) continue;
-                        global_total_field_len +|= hit.freq;
-                        for (term_doc_freqs) |*item| {
-                            if (std.mem.eql(u8, item.term, entry.term)) item.doc_freq +|= 1;
-                        }
+                        visited += 1;
+                        if (visited % 256 == 0) try executor.check();
+                        if (allowed_local_docs.contains(hit.doc_id)) item.doc_freq +|= 1;
                     }
                 }
             }

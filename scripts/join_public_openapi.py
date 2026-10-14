@@ -343,6 +343,7 @@ def join_specs() -> dict:
 
 
 def dump_yaml(data: dict, output: Path) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w", encoding="utf-8") as fh:
         yaml.dump(
             data, fh, Dumper=Dumper, sort_keys=False, allow_unicode=True, width=100

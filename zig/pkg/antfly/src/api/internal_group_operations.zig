@@ -76,6 +76,7 @@ pub const Error = operation.ApiError || @import("relational_integrity_errors.zig
     EnrichmentWorkerFailed,
     RepairCanceled,
     InvalidRepairCancelToken,
+    UnsupportedQueryRequest,
 };
 
 /// A rejected primary mutation can be retried after retention catches up.
@@ -1220,7 +1221,8 @@ pub const Operations = struct {
             if (mapCommonReadError(err)) |mapped| return mapped;
             return switch (err) {
                 error.HierarchyCursorStale => error.HierarchyCursorStale,
-                error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.InvalidArgument, error.IndexNotFound => error.InvalidArgument,
+                error.UnsupportedQueryRequest => error.UnsupportedQueryRequest,
+                error.InvalidQueryRequest, error.InvalidArgument, error.IndexNotFound => error.InvalidArgument,
                 error.UnknownGroup, error.TableNotFound => error.NotFound,
                 else => error.Internal,
             };
@@ -2117,91 +2119,6 @@ fn consumerTests() type {
             ));
         }
 
-        test "typed internal query workers preserve identity generation validation" {
-            const FakeReads = struct {
-                fn source() table_reads.TableReadSource {
-                    return .{ .ptr = undefined, .vtable = &.{
-                        .lookup = lookup,
-                        .scan = scan,
-                        .query = publicQuery,
-                        .query_group_local = groupQuery,
-                        .graph_expand_group_local = graphExpand,
-                    } };
-                }
-
-                fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
-                    return null;
-                }
-
-                fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
-                    return null;
-                }
-
-                fn publicQuery(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
-                    return null;
-                }
-
-                fn groupQuery(_: *anyopaque, _: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_mod.types.SearchRequest, consistency: raft_mod.ReadConsistency) !?query_api.QueryResponse {
-                    try std.testing.expectEqual(@as(u64, 17), group_id);
-                    try std.testing.expectEqualStrings("documents", table_name);
-                    try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency);
-                    try std.testing.expectEqual(@as(?u64, 12345), req.identity_read_generation);
-                    if (req.hierarchy_children != null) return error.HierarchyCursorStale;
-                    return error.UnsupportedQueryRequest;
-                }
-
-                fn graphExpand(_: *anyopaque, _: std.mem.Allocator, group_id: u64, table_name: []const u8, req: distributed_graph.GraphExpandRequest, consistency: raft_mod.ReadConsistency) !?distributed_graph.GraphExpandResponse {
-                    try std.testing.expectEqual(@as(u64, 17), group_id);
-                    try std.testing.expectEqualStrings("documents", table_name);
-                    try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency);
-                    try std.testing.expectEqual(@as(?u64, 12345), req.identity_read_generation);
-                    return error.UnsupportedQueryRequest;
-                }
-            };
-
-            const operations = Operations{
-                .reads = FakeReads.source(),
-                .shard_db_adapter = null,
-            };
-
-            try std.testing.expectError(error.InvalidArgument, operations.query(
-                std.testing.allocator,
-                .{},
-                17,
-                "documents",
-                .{ .identity_read_generation = 12345 },
-            ));
-            try std.testing.expectError(error.HierarchyCursorStale, operations.query(
-                std.testing.allocator,
-                .{},
-                17,
-                "documents",
-                .{
-                    .identity_read_generation = 12345,
-                    .hierarchy_children = .{ .parent_id = "doc:a" },
-                },
-            ));
-
-            var frontier: [0]distributed_graph.GraphFrontierItem = .{};
-            var exclude_nodes: [0]distributed_graph.GraphNodeIdentity = .{};
-            var exclude_edges: [0][]u8 = .{};
-            try std.testing.expectError(error.InvalidArgument, operations.graphExpand(
-                std.testing.allocator,
-                .{},
-                17,
-                "documents",
-                .{
-                    .name = @constCast("graph"),
-                    .index_name = @constCast("graph-index"),
-                    .frontier = frontier[0..],
-                    .exclude_nodes = exclude_nodes[0..],
-                    .exclude_edges = exclude_edges[0..],
-                    .params = .{},
-                    .identity_read_generation = 12345,
-                },
-            ));
-        }
-
         test "typed internal group reads preserve retryable resident storage failures" {
             const alloc = std.testing.allocator;
             try std.testing.expectEqual(error.GenerationTransitionActive, Operations.mapCommonReadError(error.GenerationTransitionActive).?);
@@ -2377,4 +2294,89 @@ fn consumerTests() type {
 }
 comptime {
     if (@import("builtin").is_test) _ = consumer_tests;
+}
+
+test "typed internal query workers preserve identity generation validation" {
+    const FakeReads = struct {
+        fn source() table_reads.TableReadSource {
+            return .{ .ptr = undefined, .vtable = &.{
+                .lookup = lookup,
+                .scan = scan,
+                .query = publicQuery,
+                .query_group_local = groupQuery,
+                .graph_expand_group_local = graphExpand,
+            } };
+        }
+
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            return null;
+        }
+
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            return null;
+        }
+
+        fn publicQuery(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return null;
+        }
+
+        fn groupQuery(_: *anyopaque, _: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_mod.types.SearchRequest, consistency: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            try std.testing.expectEqual(@as(u64, 17), group_id);
+            try std.testing.expectEqualStrings("documents", table_name);
+            try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency);
+            try std.testing.expectEqual(@as(?u64, 12345), req.identity_read_generation);
+            if (req.hierarchy_children != null) return error.HierarchyCursorStale;
+            return error.UnsupportedQueryRequest;
+        }
+
+        fn graphExpand(_: *anyopaque, _: std.mem.Allocator, group_id: u64, table_name: []const u8, req: distributed_graph.GraphExpandRequest, consistency: raft_mod.ReadConsistency) !?distributed_graph.GraphExpandResponse {
+            try std.testing.expectEqual(@as(u64, 17), group_id);
+            try std.testing.expectEqualStrings("documents", table_name);
+            try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency);
+            try std.testing.expectEqual(@as(?u64, 12345), req.identity_read_generation);
+            return error.UnsupportedQueryRequest;
+        }
+    };
+
+    const operations = Operations{
+        .reads = FakeReads.source(),
+        .shard_db_adapter = null,
+    };
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, operations.query(
+        std.testing.allocator,
+        .{},
+        17,
+        "documents",
+        .{ .identity_read_generation = 12345 },
+    ));
+    try std.testing.expectError(error.HierarchyCursorStale, operations.query(
+        std.testing.allocator,
+        .{},
+        17,
+        "documents",
+        .{
+            .identity_read_generation = 12345,
+            .hierarchy_children = .{ .parent_id = "doc:a" },
+        },
+    ));
+
+    var frontier: [0]distributed_graph.GraphFrontierItem = .{};
+    var exclude_nodes: [0]distributed_graph.GraphNodeIdentity = .{};
+    var exclude_edges: [0][]u8 = .{};
+    try std.testing.expectError(error.InvalidArgument, operations.graphExpand(
+        std.testing.allocator,
+        .{},
+        17,
+        "documents",
+        .{
+            .name = @constCast("graph"),
+            .index_name = @constCast("graph-index"),
+            .frontier = frontier[0..],
+            .exclude_nodes = exclude_nodes[0..],
+            .exclude_edges = exclude_edges[0..],
+            .params = .{},
+            .identity_read_generation = 12345,
+        },
+    ));
 }

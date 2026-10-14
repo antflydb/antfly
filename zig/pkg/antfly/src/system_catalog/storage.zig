@@ -699,6 +699,7 @@ pub const View = struct {
             try out.append(self.alloc, (try self.byId(.tablespace, id)) orelse return error.InvalidCatalogRecord);
         }
         if (request.kind == .namespace) try out.append(self.alloc, (try self.byId(.database, parent)) orelse return error.InvalidCatalogRecord);
+        if (request.kind == .graph) try domain.appendGraphReadDependencies(self.alloc, &out, self, count);
         return .{ .revision = self.meta.revision, .next_id = self.meta.next_id, .resources = out.items };
     }
 };

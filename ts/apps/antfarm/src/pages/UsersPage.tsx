@@ -67,7 +67,8 @@ export function UsersPage() {
   // Add permission dialog state
   const [addPermDialogOpen, setAddPermDialogOpen] = useState(false);
   const [newPermResource, setNewPermResource] = useState("");
-  const [newPermResourceType, setNewPermResourceType] = useState<"table" | "user" | "*">("table");
+  const [newPermResourceType, setNewPermResourceType] =
+    useState<Permission["resource_type"]>("table");
   const [newPermType, setNewPermType] = useState<"read" | "write" | "admin">("read");
 
   // Delete user dialog state
@@ -483,7 +484,7 @@ export function UsersPage() {
                         <Select
                           value={newPermResourceType}
                           onValueChange={(value) =>
-                            setNewPermResourceType(value as "table" | "user" | "*")
+                            setNewPermResourceType(value as Permission["resource_type"])
                           }
                         >
                           <SelectTrigger id="perm-resource-type">
@@ -491,6 +492,7 @@ export function UsersPage() {
                           </SelectTrigger>
                           <SelectContent>
                             <SelectItem value="table">Table</SelectItem>
+                            <SelectItem value="graph">Graph</SelectItem>
                             <SelectItem value="user">User</SelectItem>
                             <SelectItem value="*">All (*)</SelectItem>
                           </SelectContent>

@@ -252,6 +252,59 @@ class Database:
 
         return SQLSession(self)
 
+    def graph_catalog_json(self, request: JSONInput, *, raw: bool = False) -> Any:
+        """Get/list/put/drop a graph; replacements require expected_revision."""
+        return self._graph_call(None, request, raw=raw)
+
+    def cypher_json(self, graph: str, request: JSONInput, *, raw: bool = False) -> Any:
+        """Execute Cypher with lossless tagged values and typed parameters."""
+        return self._graph_call(graph, request, raw=raw)
+
+    def graph_write_status(self, transaction_id: str, *, raw: bool = False) -> Any:
+        """Reconcile a durable receipt without replaying the graph statement."""
+        handle = self._acquire()
+        try:
+            data, _keep = _ffi.make_slice(encode_text(transaction_id))
+            out = _ffi.AntflyBuffer()
+            native_call = getattr(self._lib, "antfly_db_graph_write_status_json", None)
+            if native_call is None:
+                raise errors.UnsupportedError(message="This native library does not expose graph write receipts")
+            code = native_call(ctypes.c_void_p(handle), data, ctypes.byref(out))
+            body = _ffi.take_buffer(out)
+            if code:
+                diagnostic = decode_json_response(body, False) if body else None
+                if isinstance(diagnostic, dict) and "code" in diagnostic:
+                    raise errors.GraphError(code, diagnostic)
+                errors.raise_for_code(code)
+            return decode_json_response(body, raw)
+        finally:
+            self._release()
+
+    def _graph_call(self, graph: str | None, request: JSONInput, *, raw: bool) -> Any:
+        handle = self._acquire()
+        try:
+            request_slice, _request_keep = _ffi.make_slice(encode_json_input(request))
+            out = _ffi.AntflyBuffer()
+            native_call = getattr(
+                self._lib, "antfly_db_graph_catalog_json" if graph is None else "antfly_db_cypher_json", None
+            )
+            if native_call is None:
+                raise errors.UnsupportedError(message="This native library does not expose Cypher graphs")
+            if graph is None:
+                code = native_call(ctypes.c_void_p(handle), request_slice, ctypes.byref(out))
+            else:
+                graph_slice, _graph_keep = _ffi.make_slice(encode_text(graph))
+                code = native_call(ctypes.c_void_p(handle), graph_slice, request_slice, ctypes.byref(out))
+            data = _ffi.take_buffer(out)
+            if code:
+                diagnostic = decode_json_response(data, False) if data else None
+                if isinstance(diagnostic, dict) and "code" in diagnostic:
+                    raise errors.GraphError(code, diagnostic)
+                errors.raise_for_code(code)
+            return decode_json_response(data, raw)
+        finally:
+            self._release()
+
     def sql_cursor(self, statement: str, parameters: Sequence[Any] = ()):
         from ._sql import SQLCursor
 

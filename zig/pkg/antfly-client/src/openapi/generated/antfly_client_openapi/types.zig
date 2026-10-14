@@ -16774,6 +16774,15 @@ pub const GraphBoundedTraversalConfig = struct {
     law: []const u8,
 };
 
+pub const GraphCatalogEntry = struct {
+    /// Opaque decimal catalog identity
+    graph_id: []const u8,
+    /// Lossless decimal definition revision used for conditional updates
+    revision: []const u8,
+    name: []const u8,
+    definition: GraphDefinition,
+};
+
 /// Exact count(*) or count(alias). The distinct option exists only for alias counts, making distinct count(*) invalid by schema and at runtime. count(*) includes null-extended optional rows; count(alias) counts only bindings where that alias is non-null.
 pub const GraphCountAggregate = union(enum) {
     graph_row_count_aggregate: *GraphRowCountAggregate,
@@ -16830,6 +16839,41 @@ pub const GraphCountAggregate = union(enum) {
             .graph_alias_count_aggregate => |v| try jw.write(v.*),
         }
     }
+};
+
+pub const GraphDefinition = struct {
+    labels: []const GraphLabelMapping,
+    relationships: ?[]const GraphRelationshipMapping = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "labels", "labels", false },
+        .{ "relationships", "relationships", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("labels");
+        try jw.write(self.labels);
+        if (self.relationships) |value| {
+            try jw.objectField("relationships");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const GraphDefinitionUpdate = struct {
+    expected_revision: []const u8,
+    definition: GraphDefinition,
 };
 
 pub const GraphDistinctBudgetExceededError = struct {
@@ -17974,6 +18018,42 @@ pub const GraphKeyNodeSelector = struct {
     keys: []const []const u8,
 };
 
+pub const GraphLabelMapping = struct {
+    name: []const u8,
+    /// A literal default.public table name or an explicitly scoped table target. Bindings retain the physical table incarnation through renames.
+    table: std.json.Value,
+    /// Equality predicates defining this label over stored document properties.
+    where: ?std.json.ArrayHashMap(std.json.Value) = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "name", "name", false },
+        .{ "table", "table", false },
+        .{ "where", "where", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("table");
+        try jw.write(self.table);
+        if (self.where) |value| {
+            try jw.objectField("where");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// `anchor` names the alias enumerated from the query table as the source relation. Every other alias is reached through graph edges and may resolve to a table-qualified target identity. An `ids` filter, or a disjunction made only of `ids` filters, uses the table's primary identity access path and needs no secondary index. Stored-field predicates and row-level authorization filters on the anchor must have native index coverage so Antfly can enumerate the complete relation in `_id` order; otherwise the request fails with `graph_anchor_filter_requires_index`.
 pub const GraphMatch = struct {
     anchor: GraphIdentifier,
@@ -18021,7 +18101,7 @@ pub const GraphMatch = struct {
     }
 };
 
-/// Structural edge expansion from the `from` alias to the `to` alias. Direction defaults to `out`; use `in` to reverse the stored edge or `both` to match an undirected relationship without duplicating stored edges. A fixed single-hop relationship preserves physical self-loops and may bind two distinct aliases to the same node identity. Variable-length expansion uses node-simple paths: a (table, key) identity is visited at most once within one expanded edge path, except when closing onto an already bound target alias for an explicit cycle. Exact distributed and serverless execution rejects planner-required reverse variable expansion when the source tables of unnamed intermediate nodes cannot be proven. Express cross-table multi-hop patterns as explicit single-hop edges with a table-qualified alias at each table boundary.
+/// Structural edge expansion from the `from` alias to the `to` alias. Direction defaults to `out`; use `in` to reverse the stored edge or `both` to match an undirected relationship without duplicating stored edges. A fixed single-hop relationship preserves physical self-loops and may bind two distinct aliases to the same node identity. Variable-length expansion uses Cypher relationship-simple trails: nodes may repeat, but the same physical relationship cannot be reused anywhere within one MATCH group. Each optional group has its own relationship scope. Parallel relationship IDs remain distinct. A zero-hop path binds both endpoints to the same node identity without reading an edge. Exact distributed and serverless execution rejects planner-required reverse variable expansion when the source tables of unnamed intermediate nodes cannot be proven. Express cross-table multi-hop patterns as explicit single-hop edges with a table-qualified alias at each table boundary.
 pub const GraphMatchEdge = struct {
     edge_filter: ?GraphRelationshipFilter = null,
     from: GraphIdentifier,
@@ -19610,6 +19690,62 @@ pub const GraphQuery = union(enum) {
     }
 };
 
+pub const GraphQueryLimits = struct {
+    memory_bytes: ?i64 = null,
+    scanned_anchors: ?i64 = null,
+    explored_edges: ?i64 = null,
+    intermediate_states: ?i64 = null,
+    path_depth: ?i64 = null,
+    recursion_depth: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "memory_bytes", "memory_bytes", true },
+        .{ "scanned_anchors", "scanned_anchors", true },
+        .{ "explored_edges", "explored_edges", true },
+        .{ "intermediate_states", "intermediate_states", true },
+        .{ "path_depth", "path_depth", true },
+        .{ "recursion_depth", "recursion_depth", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.memory_bytes) |value| {
+            try jw.objectField("memory_bytes");
+            try jw.write(value);
+        }
+        if (self.scanned_anchors) |value| {
+            try jw.objectField("scanned_anchors");
+            try jw.write(value);
+        }
+        if (self.explored_edges) |value| {
+            try jw.objectField("explored_edges");
+            try jw.write(value);
+        }
+        if (self.intermediate_states) |value| {
+            try jw.objectField("intermediate_states");
+            try jw.write(value);
+        }
+        if (self.path_depth) |value| {
+            try jw.objectField("path_depth");
+            try jw.write(value);
+        }
+        if (self.recursion_depth) |value| {
+            try jw.objectField("recursion_depth");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// Deprecated graph_searches traversal and path parameters.
 pub const GraphQueryParams = struct {
     edge_filter: ?GraphRelationshipFilter = null,
@@ -19716,8 +19852,192 @@ pub const GraphQueryParams = struct {
     }
 };
 
+pub const GraphQueryRequest = struct {
+    query: []const u8,
+    /// Client-generated native transaction ID for write recovery after cancellation or a lost response. Reusing an admitted ID is rejected; inspect its transaction status instead of replaying the statement.
+    write_request_id: ?[]const u8 = null,
+    /// Ordinary JSON parameters. Mutually exclusive with typed_parameters.
+    parameters: ?std.json.ArrayHashMap(std.json.Value) = null,
+    /// A map GraphWireValue containing lossless data parameters; graph entity parameters are rejected. Mutually exclusive with parameters.
+    typed_parameters: ?GraphWireValue = null,
+    limits: ?GraphQueryLimits = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "query", "query", false },
+        .{ "write_request_id", "write_request_id", true },
+        .{ "parameters", "parameters", true },
+        .{ "typed_parameters", "typed_parameters", true },
+        .{ "limits", "limits", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("query");
+        try jw.write(self.query);
+        if (self.write_request_id) |value| {
+            try jw.objectField("write_request_id");
+            try jw.write(value);
+        }
+        if (self.parameters) |value| {
+            try jw.objectField("parameters");
+            try jw.write(value);
+        }
+        if (self.typed_parameters) |value| {
+            try jw.objectField("typed_parameters");
+            try jw.write(value);
+        }
+        if (self.limits) |value| {
+            try jw.objectField("limits");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const GraphQueryResult = struct {
+    wire_version: i64,
+    columns: []const []const u8,
+    rows: []const []const GraphWireValue,
+    plan: []const std.json.ArrayHashMap(std.json.Value),
+    stats: GraphQueryStats,
+    commit: ?GraphWriteReceipt = null,
+    /// Whether the compiled statement has no mutation clauses; EXPLAIN also reports the underlying statement capability.
+    read_only: ?bool = null,
+    graph_incarnation: []const u8,
+    graph_revision: []const u8,
+    complete: bool,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "wire_version", "wire_version", false },
+        .{ "columns", "columns", false },
+        .{ "rows", "rows", false },
+        .{ "plan", "plan", false },
+        .{ "stats", "stats", false },
+        .{ "commit", "commit", true },
+        .{ "read_only", "read_only", true },
+        .{ "graph_incarnation", "graph_incarnation", false },
+        .{ "graph_revision", "graph_revision", false },
+        .{ "complete", "complete", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("wire_version");
+        try jw.write(self.wire_version);
+        try jw.objectField("columns");
+        try jw.write(self.columns);
+        try jw.objectField("rows");
+        try jw.write(self.rows);
+        try jw.objectField("plan");
+        try jw.write(self.plan);
+        try jw.objectField("stats");
+        try jw.write(self.stats);
+        if (self.commit) |value| {
+            try jw.objectField("commit");
+            try jw.write(value);
+        }
+        if (self.read_only) |value| {
+            try jw.objectField("read_only");
+            try jw.write(value);
+        }
+        try jw.objectField("graph_incarnation");
+        try jw.write(self.graph_incarnation);
+        try jw.objectField("graph_revision");
+        try jw.write(self.graph_revision);
+        try jw.objectField("complete");
+        try jw.write(self.complete);
+        try jw.endObject();
+    }
+};
+
 /// Non-empty canonical graph results keyed exactly by graph_queries operation name. Keys use the versioned GraphIdentifier policy.
 pub const GraphQueryResults = std.json.ArrayHashMap(GraphResult);
+
+pub const GraphQueryStats = struct {
+    scanned_anchors: ?i64 = null,
+    explored_edges: ?i64 = null,
+    intermediate_states: ?i64 = null,
+    mutations: ?i64 = null,
+    memory_bytes: ?i64 = null,
+    search_calls: ?i64 = null,
+    search_candidates: ?i64 = null,
+    search_approximate: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "scanned_anchors", "scanned_anchors", true },
+        .{ "explored_edges", "explored_edges", true },
+        .{ "intermediate_states", "intermediate_states", true },
+        .{ "mutations", "mutations", true },
+        .{ "memory_bytes", "memory_bytes", true },
+        .{ "search_calls", "search_calls", true },
+        .{ "search_candidates", "search_candidates", true },
+        .{ "search_approximate", "search_approximate", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.scanned_anchors) |value| {
+            try jw.objectField("scanned_anchors");
+            try jw.write(value);
+        }
+        if (self.explored_edges) |value| {
+            try jw.objectField("explored_edges");
+            try jw.write(value);
+        }
+        if (self.intermediate_states) |value| {
+            try jw.objectField("intermediate_states");
+            try jw.write(value);
+        }
+        if (self.mutations) |value| {
+            try jw.objectField("mutations");
+            try jw.write(value);
+        }
+        if (self.memory_bytes) |value| {
+            try jw.objectField("memory_bytes");
+            try jw.write(value);
+        }
+        if (self.search_calls) |value| {
+            try jw.objectField("search_calls");
+            try jw.write(value);
+        }
+        if (self.search_candidates) |value| {
+            try jw.objectField("search_candidates");
+            try jw.write(value);
+        }
+        if (self.search_approximate) |value| {
+            try jw.objectField("search_approximate");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
 
 /// Deprecated discriminator used by LegacyGraphQuery.
 pub const GraphQueryType = enum {
@@ -19900,6 +20220,14 @@ pub const GraphRelationshipFilter = struct {
         }
         try jw.endObject();
     }
+};
+
+pub const GraphRelationshipMapping = struct {
+    name: []const u8,
+    index: []const u8,
+    source_label: []const u8,
+    target_label: []const u8,
+    stored_type: []const u8,
 };
 
 pub const GraphRelationshipPropertyPredicate = struct {
@@ -20756,6 +21084,13 @@ pub const GraphWhereNotExists = struct {
     not_exists: GraphNotExistsPattern,
 };
 
+/// Version 1 graph value. INTEGER payloads are signed decimal strings. Map payloads contain typed values, keeping user keys distinct from type tags. Entity identities are opaque table-qualified handles.
+pub const GraphWireValue = struct {
+    type: []const u8,
+    /// Type-specific payload; nested collections and entity properties contain GraphWireValue values.
+    value: std.json.Value,
+};
+
 pub const GraphWorkBudgetExceededError = struct {
     status: i32,
     @"error": []const u8,
@@ -20771,6 +21106,33 @@ pub const GraphWorkBudgetExceededError = struct {
     maximum: u64,
     /// Stable user-facing guidance for reducing graph work.
     remediation: []const u8,
+};
+
+pub const GraphWriteReceipt = struct {
+    /// Native durable transaction identity; never replay a statement after an ambiguous write response.
+    transaction_id: []const u8,
+    status: []const u8,
+    outcome: OpenApiOptionalNullable(std.json.ArrayHashMap(std.json.Value)) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("transaction_id");
+        try jw.write(self.transaction_id);
+        try jw.objectField("status");
+        try jw.write(self.status);
+        switch (self.outcome) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("outcome");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("outcome");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
 };
 
 /// Ground truth data for evaluation
@@ -36971,6 +37333,7 @@ pub const ResourceType = enum {
     database,
     namespace,
     tablespace,
+    graph,
     user,
     inference,
     @"*",
@@ -36981,6 +37344,7 @@ pub const ResourceType = enum {
             .database => "database",
             .namespace => "namespace",
             .tablespace => "tablespace",
+            .graph => "graph",
             .user => "user",
             .inference => "inference",
             .@"*" => "*",
@@ -36998,6 +37362,7 @@ pub const ResourceType = enum {
             .{ "database", .database },
             .{ "namespace", .namespace },
             .{ "tablespace", .tablespace },
+            .{ "graph", .graph },
             .{ "user", .user },
             .{ "inference", .inference },
             .{ "*", .@"*" },

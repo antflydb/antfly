@@ -95,6 +95,13 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     const prior: ?policies.Record = for (state.policies) |record| {
         if (record.table_id == physical.table_id and std.ascii.eqlIgnoreCase(record.name, ddl.name)) break record;
     } else null;
+    // Policy records borrow compiled instruction slices until the synchronous
+    // catalog callback serializes the command. Keep their arenas alive through
+    // that callback, rather than releasing them on leaving the switch arm.
+    var using_program: ?scalar.Program = null;
+    defer if (using_program) |*program| program.deinit();
+    var check_program: ?scalar.Program = null;
+    defer if (check_program) |*program| program.deinit();
     const change: policies.Command = switch (ddl.action) {
         .enable, .disable => unreachable,
         .drop => blk: {
@@ -112,10 +119,8 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
             var loader: SettingLoader = .{ .server = server, .context = context };
             var view = try settings.View.capture(a, .{ .ptr = &loader, .load = SettingLoader.load }, .{ .principal = principal, .database = target.database }, &.{});
             defer view.deinit();
-            var using_program: ?scalar.Program = if (ddl.using) |expression| try bindPredicate(a, expression, table, &view) else null;
-            defer if (using_program) |*program| program.deinit();
-            var check_program: ?scalar.Program = if (ddl.with_check) |expression| try bindPredicate(a, expression, table, &view) else null;
-            defer if (check_program) |*program| program.deinit();
+            using_program = if (ddl.using) |expression| try bindPredicate(a, expression, table, &view) else null;
+            check_program = if (ddl.with_check) |expression| try bindPredicate(a, expression, table, &view) else null;
             const commands = if (prior) |record| record.commands else commandScope(ddl.command);
             if (ddl.action == .alter) {
                 if (ddl.using_specified and !commands.select and !commands.update and !commands.delete) return error.InvalidSqlSyntax;
@@ -174,6 +179,13 @@ test "SQL policy DDL writes a durable draft only and never publishes it" {
                     try std.testing.expectEqual(@as(u64, 17), command.change.put.table_id);
                     try std.testing.expect(command.change.put.commands.select);
                     try std.testing.expect(command.change.put.using != null);
+                    // Exercise the production wire path while all borrowed
+                    // scalar instructions must still be valid.
+                    var encoded: std.Io.Writer.Allocating = .init(alloc);
+                    defer encoded.deinit();
+                    var stream: std.json.Stringify = .{ .writer = &encoded.writer, .options = .{} };
+                    try @import("antfly_local_sources").storage_db_relational_integrity_json.write(command, &stream);
+                    try std.testing.expect(encoded.written().len > 0);
                     self.mutation_calls += 1;
                     break :blk alloc.dupe(u8, "{\"revision\":8}");
                 },

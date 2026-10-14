@@ -3098,6 +3098,43 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
+  /db/v1/transactions/{transaction_id}/status:
+    get:
+      summary: Inspect your transaction receipt
+      description: >
+        Returns outcome and lease metadata for a transaction bound to the
+
+        authenticated principal. This endpoint never returns staged documents,
+
+        table names, keys, read snapshots, or execution plans. The creator can
+
+        inspect the outcome after table permissions are revoked or a table is
+
+        dropped. A missing, expired, or other principal's receipt returns 404;
+
+        absence does not establish that a mutation aborted or permit replay.
+      tags:
+        - data_operations
+      operationId: getTransactionStatus
+      parameters:
+        - $ref: '#/components/parameters/TransactionId'
+      responses:
+        '200':
+          description: Principal-bound transaction status without row data
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionSessionStatus'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
   /db/v1/transactions/{transaction_id}/stage:
     post:
       summary: Stage a transaction commit request
@@ -7487,6 +7524,186 @@ paths:
           description: Source dropped
         '404':
           $ref: '#/components/responses/NotFound'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/graphs:
+    get:
+      summary: List graphs
+      tags:
+        - table_management
+      operationId: listGraphs
+      responses:
+        '200':
+          description: Immutable graph definitions
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/GraphCatalogEntry'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/graphs/{graphName}:
+    parameters:
+      - name: graphName
+        in: path
+        required: true
+        schema:
+          type: string
+          maxLength: 128
+    get:
+      summary: Get graph
+      tags:
+        - table_management
+      operationId: getGraph
+      responses:
+        '200':
+          description: Graph definition and immutable incarnation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GraphCatalogEntry'
+        '404':
+          $ref: '#/components/responses/NotFound'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+    post:
+      summary: Create graph
+      description: Creates a graph mapping over existing tables and graph indexes. Reads require permission
+        on the graph and every input table. Definition updates use conditional revisions; existing cursors
+        retain their captured definition.
+      tags:
+        - table_management
+      operationId: createGraph
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GraphDefinition'
+      responses:
+        '201':
+          description: Graph created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GraphCatalogEntry'
+        '202':
+          description: Committed with visibility pending
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogMutationVisibilityPending'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          description: Graph already exists
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+    put:
+      summary: Update graph definition
+      description: Atomically replaces mappings when expected_revision matches. Requires graph administration
+        and read permission on every new input table. The graph incarnation is preserved and the definition
+        revision advances; stale prepared plans must be prepared again.
+      tags:
+        - table_management
+      operationId: updateGraph
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GraphDefinitionUpdate'
+      responses:
+        '200':
+          description: Graph definition updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GraphCatalogEntry'
+        '202':
+          description: Committed with visibility pending
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogMutationVisibilityPending'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          description: Graph administration or mapped-table read permission denied
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Expected definition revision or dependency incarnation changed
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+    delete:
+      summary: Drop graph
+      tags:
+        - table_management
+      operationId: dropGraph
+      responses:
+        '204':
+          description: Graph dropped
+        '404':
+          $ref: '#/components/responses/NotFound'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/graphs/{graphName}/query:
+    parameters:
+      - name: graphName
+        in: path
+        required: true
+        schema:
+          type: string
+          maxLength: 128
+    post:
+      summary: Execute Cypher against a named graph
+      description: Executes an authenticated statement under the graph definition and each underlying
+        table's permissions and row policies. Resource budgets fail explicitly. EXPLAIN binds without
+        reading rows. Results use the lossless version 1 graph wire format.
+      tags:
+        - query_operations
+      operationId: executeGraphQuery
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GraphQueryRequest'
+      responses:
+        '200':
+          description: Complete graph query result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GraphQueryResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          description: Authentication required
+        '403':
+          description: Graph or underlying table access denied
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Catalog or policy generation changed, or a write conflicted
+        '429':
+          description: Query capacity or resource budget exhausted
+        '503':
+          description: Required owner unavailable
       security:
         - BasicAuth: []
         - ApiKeyAuth: []
@@ -23448,6 +23665,268 @@ components:
           description: Boolean field on change rows; true hides the base row. Changes must retain one
             latest row/tombstone per stable key. Row-policy identities are currently unsupported for keyed
             composition.
+    GraphWireValue:
+      type: object
+      additionalProperties: false
+      required:
+        - type
+        - value
+      description: Version 1 graph value. INTEGER payloads are signed decimal strings. Map payloads contain
+        typed values, keeping user keys distinct from type tags. Entity identities are opaque table-qualified
+        handles.
+      properties:
+        type:
+          type: string
+          enum:
+            - 'null'
+            - boolean
+            - integer
+            - number
+            - string
+            - list
+            - map
+            - node
+            - relationship
+            - path
+        value:
+          description: Type-specific payload; nested collections and entity properties contain GraphWireValue
+            values.
+    GraphQueryLimits:
+      type: object
+      additionalProperties: false
+      properties:
+        memory_bytes:
+          type: integer
+          minimum: 0
+        scanned_anchors:
+          type: integer
+          minimum: 0
+        explored_edges:
+          type: integer
+          minimum: 0
+        intermediate_states:
+          type: integer
+          minimum: 0
+        path_depth:
+          type: integer
+          minimum: 0
+        recursion_depth:
+          type: integer
+          minimum: 0
+    GraphQueryRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - query
+      properties:
+        query:
+          type: string
+          minLength: 1
+          maxLength: 1048576
+        write_request_id:
+          type: string
+          pattern: ^[0-9a-fA-F]{32}$
+          description: Client-generated native transaction ID for write recovery after cancellation or
+            a lost response. Reusing an admitted ID is rejected; inspect its transaction status instead
+            of replaying the statement.
+        parameters:
+          type: object
+          additionalProperties: true
+          description: Ordinary JSON parameters. Mutually exclusive with typed_parameters.
+        typed_parameters:
+          $ref: '#/components/schemas/GraphWireValue'
+          description: A map GraphWireValue containing lossless data parameters; graph entity parameters
+            are rejected. Mutually exclusive with parameters.
+        limits:
+          $ref: '#/components/schemas/GraphQueryLimits'
+    GraphQueryResult:
+      type: object
+      required:
+        - wire_version
+        - columns
+        - rows
+        - plan
+        - stats
+        - graph_incarnation
+        - graph_revision
+        - complete
+      properties:
+        wire_version:
+          type: integer
+          enum:
+            - 1
+        columns:
+          type: array
+          items:
+            type: string
+        rows:
+          type: array
+          items:
+            type: array
+            items:
+              $ref: '#/components/schemas/GraphWireValue'
+        plan:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        stats:
+          $ref: '#/components/schemas/GraphQueryStats'
+        commit:
+          $ref: '#/components/schemas/GraphWriteReceipt'
+        read_only:
+          type: boolean
+          description: Whether the compiled statement has no mutation clauses; EXPLAIN also reports the
+            underlying statement capability.
+        graph_incarnation:
+          type: string
+        graph_revision:
+          type: string
+        complete:
+          type: boolean
+    GraphQueryStats:
+      type: object
+      additionalProperties: false
+      properties:
+        scanned_anchors:
+          type: integer
+          minimum: 0
+        explored_edges:
+          type: integer
+          minimum: 0
+        intermediate_states:
+          type: integer
+          minimum: 0
+        mutations:
+          type: integer
+          minimum: 0
+        memory_bytes:
+          type: integer
+          minimum: 0
+        search_calls:
+          type: integer
+          minimum: 0
+        search_candidates:
+          type: integer
+          minimum: 0
+        search_approximate:
+          type: boolean
+    GraphWriteReceipt:
+      type: object
+      required:
+        - transaction_id
+        - status
+      properties:
+        transaction_id:
+          type: string
+          description: Native durable transaction identity; never replay a statement after an ambiguous
+            write response.
+        status:
+          type: string
+          enum:
+            - committed
+            - committed_pending
+            - committed_repair_required
+            - aborted
+            - unknown
+        outcome:
+          type: object
+          nullable: true
+          additionalProperties: true
+    GraphCatalogEntry:
+      type: object
+      required:
+        - graph_id
+        - name
+        - revision
+        - definition
+      properties:
+        graph_id:
+          type: string
+          description: Opaque decimal catalog identity
+        revision:
+          type: string
+          pattern: ^[1-9][0-9]*$
+          description: Lossless decimal definition revision used for conditional updates
+        name:
+          type: string
+        definition:
+          $ref: '#/components/schemas/GraphDefinition'
+    GraphDefinitionUpdate:
+      type: object
+      additionalProperties: false
+      required:
+        - expected_revision
+        - definition
+      properties:
+        expected_revision:
+          type: string
+          pattern: ^[1-9][0-9]*$
+        definition:
+          $ref: '#/components/schemas/GraphDefinition'
+    GraphDefinition:
+      type: object
+      additionalProperties: false
+      required:
+        - labels
+      properties:
+        labels:
+          type: array
+          minItems: 1
+          maxItems: 64
+          items:
+            $ref: '#/components/schemas/GraphLabelMapping'
+        relationships:
+          type: array
+          maxItems: 64
+          items:
+            $ref: '#/components/schemas/GraphRelationshipMapping'
+    GraphLabelMapping:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - table
+      properties:
+        name:
+          type: string
+          minLength: 1
+        table:
+          description: A literal default.public table name or an explicitly scoped table target. Bindings
+            retain the physical table incarnation through renames.
+          oneOf:
+            - type: string
+              minLength: 1
+            - $ref: '#/components/schemas/CatalogTableTarget'
+        where:
+          type: object
+          additionalProperties: true
+          description: Equality predicates defining this label over stored document properties.
+    GraphRelationshipMapping:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - index
+        - source_label
+        - target_label
+        - stored_type
+      properties:
+        name:
+          type: string
+          minLength: 1
+        index:
+          type: string
+          minLength: 1
+        source_label:
+          type: string
+          minLength: 1
+        target_label:
+          type: string
+          minLength: 1
+        stored_type:
+          type: string
+          minLength: 1
     SavedQuerySource:
       type: object
       required:
@@ -25575,6 +26054,7 @@ components:
         - database
         - namespace
         - tablespace
+        - graph
         - user
         - inference
         - '*'
@@ -34789,12 +35269,13 @@ components:
       description: 'Structural edge expansion from the `from` alias to the `to` alias. Direction defaults
         to `out`; use `in` to reverse the stored edge or `both` to match an undirected relationship without
         duplicating stored edges. A fixed single-hop relationship preserves physical self-loops and may
-        bind two distinct aliases to the same node identity. Variable-length expansion uses node-simple
-        paths: a (table, key) identity is visited at most once within one expanded edge path, except when
-        closing onto an already bound target alias for an explicit cycle. Exact distributed and serverless
-        execution rejects planner-required reverse variable expansion when the source tables of unnamed
-        intermediate nodes cannot be proven. Express cross-table multi-hop patterns as explicit single-hop
-        edges with a table-qualified alias at each table boundary.'
+        bind two distinct aliases to the same node identity. Variable-length expansion uses Cypher relationship-simple
+        trails: nodes may repeat, but the same physical relationship cannot be reused anywhere within
+        one MATCH group. Each optional group has its own relationship scope. Parallel relationship IDs
+        remain distinct. A zero-hop path binds both endpoints to the same node identity without reading
+        an edge. Exact distributed and serverless execution rejects planner-required reverse variable
+        expansion when the source tables of unnamed intermediate nodes cannot be proven. Express cross-table
+        multi-hop patterns as explicit single-hop edges with a table-qualified alias at each table boundary.'
       properties:
         edge_filter:
           $ref: '#/components/schemas/GraphRelationshipFilter'
@@ -34815,12 +35296,12 @@ components:
             at most 64 KiB.
         min_hops:
           type: integer
-          minimum: 1
+          minimum: 0
           maximum: 64
           default: 1
         max_hops:
           type: integer
-          minimum: 1
+          minimum: 0
           maximum: 64
           default: 1
         edge_weight:

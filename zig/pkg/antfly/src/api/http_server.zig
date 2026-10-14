@@ -13088,6 +13088,9 @@ pub const ApiHttpServer = struct {
     }
 
     fn forwardSessionRequest(self: *ApiHttpServer, txn_id: db_mod.types.TxnId, req: http_common.HttpRequest) !?http_common.HttpResponse {
+        // A replicated receipt read has its own linearizable barrier. Its
+        // availability must not depend on the original execution owner's life.
+        if (req.method == .GET and self.txn_sessions.durableMissIsAuthoritative()) return null;
         const owner_node_id = (try self.txn_sessions.getOwnerNodeId(self.alloc, txn_id)) orelse
             if (self.txn_sessions.durableMissIsAuthoritative())
                 return null
@@ -13300,7 +13303,7 @@ pub const ApiHttpServer = struct {
             const resource = resources.get(table.table_name) orelse table.table_name;
             if (resource.len == 0) return false;
             if (table.range_guards != null and !admittedTablePermissionAllowed(authenticated_identity, resource, .read)) return false;
-            if ((table.batch.writes.len != 0 or table.batch.deletes.len != 0 or table.batch.transforms.len != 0) and
+            if ((table.batch.writes.len != 0 or table.batch.deletes.len != 0 or table.batch.transforms.len != 0 or table.batch.graph_writes.len != 0 or table.batch.graph_deletes.len != 0) and
                 !admittedTablePermissionAllowed(authenticated_identity, resource, .write)) return false;
         }
         return true;
@@ -13523,7 +13526,7 @@ pub const ApiHttpServer = struct {
         var indices: std.ArrayList(usize) = .empty;
         var names: std.ArrayList([]const u8) = .empty;
         for (tables, 0..) |table, index| {
-            if (table.writes.len == 0 and table.deletes.len == 0 and table.transforms.len == 0) continue;
+            if (table.writes.len == 0 and table.deletes.len == 0 and table.transforms.len == 0 and table.graph_writes.len == 0 and table.graph_deletes.len == 0 and table.predicates.len == 0 and table.range_guards.len == 0 and table.integrity_commands.len == 0) continue;
             try indices.append(a, index);
             try names.append(a, table.table_name);
         }
@@ -13780,6 +13783,8 @@ pub const ApiHttpServer = struct {
             .writes = txn_writes,
             .deletes = req.deletes,
             .transforms = req.transforms,
+            .graph_writes = req.graph_writes,
+            .graph_deletes = req.graph_deletes,
             .predicates = req.predicates,
             .schema_version = req.schema_version,
             .relational_schema_version = req.relational_schema_version,
@@ -27286,12 +27291,13 @@ pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: http_commo
         if (route.kind == .table and route.name == null and method == .GET) return null;
         const resource_type: usermgr.ResourceType = switch (route.kind) {
             .query_source => .table,
+            .graph => .graph,
             .database => .database,
             .namespace => .namespace,
             .table => .table,
             .tablespace => .tablespace,
         };
-        const permission: usermgr.PermissionType = if (method == .GET or (route.kind == .table and (std.mem.eql(u8, route.suffix, "query") or std.mem.eql(u8, route.suffix, "rows/query")))) .read else if (route.kind == .table and (std.mem.eql(u8, route.suffix, "batch") or std.mem.eql(u8, route.suffix, "rows/mutate"))) .write else .admin;
+        const permission: usermgr.PermissionType = if (method == .GET or (route.kind == .graph and std.mem.eql(u8, route.suffix, "query")) or (route.kind == .table and (std.mem.eql(u8, route.suffix, "query") or std.mem.eql(u8, route.suffix, "rows/query")))) .read else if (route.kind == .table and (std.mem.eql(u8, route.suffix, "batch") or std.mem.eql(u8, route.suffix, "rows/mutate"))) .write else .admin;
         return .{ .resource_type = resource_type, .resource = try system_catalog_routes.resourceNameAlloc(alloc, route), .permission_type = permission, .owns_resource = true };
     }
 
@@ -27791,18 +27797,25 @@ pub fn foreignKeyParentsAllowed(alloc: std.mem.Allocator, identity: ?Authenticat
     return true;
 }
 
-pub fn tablePermissionCurrentlyAllowed(
+pub fn tablePermissionCurrentlyAllowed(identity: ?AuthenticatedIdentity, table_name: []const u8, permission_type: usermgr.PermissionType) !bool {
+    return resourcePermissionCurrentlyAllowed(identity, .table, table_name, permission_type);
+}
+
+pub fn resourcePermissionCurrentlyAllowed(
     authenticated_identity: ?AuthenticatedIdentity,
+    resource_type: usermgr.ResourceType,
     table_name: []const u8,
     permission_type: usermgr.PermissionType,
 ) !bool {
     const identity = authenticated_identity orelse return true;
-    if (!permissionsAllow(identity.permissions, .table, table_name, permission_type))
+    if (!permissionsAllow(identity.permissions, resource_type, table_name, permission_type))
         return false;
     const manager = identity.live_user_manager orelse return true;
     const logical_name = logical: {
-        for (identity.catalog_aliases) |alias| {
-            if (std.mem.eql(u8, alias.physical, table_name)) break :logical alias.logical;
+        if (resource_type == .table) {
+            for (identity.catalog_aliases) |alias| {
+                if (std.mem.eql(u8, alias.physical, table_name)) break :logical alias.logical;
+            }
         }
         break :logical table_name;
     };
@@ -27814,12 +27827,12 @@ pub fn tablePermissionCurrentlyAllowed(
             else => return err,
         };
         defer freePermissions(manager.alloc, current);
-        return permissionsAllow(current, .table, logical_name, permission_type);
+        return permissionsAllow(current, resource_type, logical_name, permission_type);
     }
 
     return try manager.permissionCurrentlyAllowed(
         identity.username,
-        .table,
+        resource_type,
         logical_name,
         permission_type,
     );
@@ -29035,6 +29048,7 @@ fn resourceTypeFromOpenApi(value: usermgr_openapi.ResourceType) usermgr.Resource
         .tablespace => .tablespace,
         .user => .user,
         .inference => .inference,
+        .graph => .graph,
         .@"*" => .@"*",
     };
 }
@@ -29055,6 +29069,7 @@ fn resourceTypeToOpenApi(value: usermgr.ResourceType) usermgr_openapi.ResourceTy
         .tablespace => .tablespace,
         .user => .user,
         .inference => .inference,
+        .graph => .graph,
         .@"*" => .@"*",
     };
 }

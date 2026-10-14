@@ -1233,7 +1233,14 @@ class ThreeByThreeBackupCluster:
         )
 
         def ready(url):
-            return wait_for_server(url, timeout=30.0, processes=processes)
+            return wait_for_server(
+                url,
+                timeout=30.0,
+                processes=processes,
+                allow_unauthorized=bool(
+                    os.environ.get("ANTFLY_TRUSTED_PRINCIPAL_SECRET")
+                ),
+            )
 
         for url, live in zip(
             self.data_api_urls,

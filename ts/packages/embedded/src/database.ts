@@ -16,7 +16,8 @@
 import * as fsp from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { validateAbi } from "./abi.js";
-import { checkCode, InvalidArgumentError } from "./errors.js";
+import { checkCode, InvalidArgumentError, UnsupportedError } from "./errors.js";
+import { GraphError } from "./graph-types.js";
 import {
   callAsync,
   type DecodedBuffer,
@@ -201,6 +202,31 @@ export class Database implements AsyncDisposable {
   }
   sqlJson(request: JsonInput): Promise<unknown> {
     return this.#invokeSql(this.#native.dbSqlJson, jsonSlice(request));
+  }
+  // biome-ignore lint/suspicious/noExplicitAny: native signatures vary
+  #invokeGraph(fn: any, ...args: unknown[]): Promise<unknown> {
+    if (!fn)
+      return Promise.reject(
+        new UnsupportedError("This native library does not expose Cypher graphs")
+      );
+    return this.#run(async (handle) => {
+      const out = newBufferOut();
+      const code = await callAsync(fn, handle, ...args, out);
+      const body = takeBuffer(this.#native, out);
+      const value = body.length ? JSON.parse(body.toString("utf8")) : undefined;
+      if (code && value?.code) throw new GraphError(value, code);
+      checkCode(code);
+      return value;
+    });
+  }
+  graphCatalogJson(request: JsonInput): Promise<unknown> {
+    return this.#invokeGraph(this.#native.dbGraphCatalogJson, jsonSlice(request));
+  }
+  cypherJson(graph: string, request: JsonInput): Promise<unknown> {
+    return this.#invokeGraph(this.#native.dbCypherJson, stringSlice(graph), jsonSlice(request));
+  }
+  graphWriteStatus(transactionId: string): Promise<unknown> {
+    return this.#invokeGraph(this.#native.dbGraphWriteStatusJson, stringSlice(transactionId));
   }
   createTable(name: string, schema: JsonInput): Promise<void> {
     return this.#invokeCode(this.#native.dbCreateTableJson, stringSlice(name), jsonSlice(schema));

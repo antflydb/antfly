@@ -245,6 +245,7 @@ pub const TableReadSource = struct {
     route_fence: ?metadata_api.CatalogRouteFence = null,
 
     pub const VTable = struct {
+        open_cypher_statement: ?*const fn (*anyopaque, std.mem.Allocator, @import("../storage/cypher_read.zig").Statement) anyerror!@import("../storage/cypher_read.zig").Read = null,
         /// Optional owner-local dynamic read set. A distributed router must
         /// not implement this with independently captured shard snapshots.
         open_relational_statement_snapshot: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, u32, read_gate.ReadConsistency, ?CancellationToken, ?u64) anyerror!RelationalStatementSnapshot = null,
@@ -627,6 +628,10 @@ pub const TableReadSource = struct {
         const fence = self.route_fence orelse return error.CatalogRouteFenceRequired;
         const acquire = self.vtable.try_statement_read_fence_group_local_routed orelse return error.SqlStatementSnapshotRequired;
         return BoundaryAbi.call("try_statement_read_fence_group_local_routed", self.boundary_dispatch, acquire, .{ self.ptr, alloc, fence, group, table, opts, consistency });
+    }
+    pub fn openCypherStatement(self: TableReadSource, alloc: std.mem.Allocator, input: @import("../storage/cypher_read.zig").Statement) !@import("../storage/cypher_read.zig").Read {
+        const open = self.vtable.open_cypher_statement orelse return error.CypherSnapshotRequired;
+        return BoundaryAbi.call("open_cypher_statement", self.boundary_dispatch, open, .{ self.ptr, alloc, input });
     }
 
     pub fn bindCatalogRouteFenceJson(

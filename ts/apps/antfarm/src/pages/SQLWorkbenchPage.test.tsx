@@ -37,6 +37,35 @@ describe("SQL workbench mounted lifecycle", () => {
   });
   afterEach(() => cleanup());
 
+  it("visualizes returned SQL graph entities while respecting SQL NULL and preserving integer properties", async () => {
+    const node = {
+      type: "node",
+      value: {
+        identity: { table: "docs", key: "a" },
+        labels: ["Document"],
+        properties: {
+          type: "map",
+          value: { count: { type: "integer", value: "9223372036854775807" } },
+        },
+      },
+    };
+    mocks.client.executeSQL.mockResolvedValue(
+      response({
+        columns: [{ name: "n", type: "json" }],
+        rows: [[node], [node]],
+        sql_nulls: [[false], [true]],
+      })
+    );
+    render(<SQLWorkbenchPage />);
+    fireEvent.click(button("Run statement"));
+    fireEvent.click(await screen.findByRole("tab", { name: "Graph" }));
+    expect(screen.getByRole("img", { name: "SQL result graph" })).toBeTruthy();
+    expect(screen.getByText("1 displayed nodes · 0 displayed relationships")).toBeTruthy();
+    fireEvent.click(button("Inspect SQL node a"));
+    expect(screen.getByLabelText("SQL graph entity").textContent).toContain("9223372036854775807");
+    expect(mocks.client.executeSQL).toHaveBeenCalledTimes(1);
+  });
+
   it("owns BEGIN, statement and COMMIT within the same scope and session", async () => {
     mocks.client.executeSQL
       .mockResolvedValueOnce(

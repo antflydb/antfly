@@ -322,6 +322,13 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     sql_generated_check.dependOn(&yacc_steps.run_generated.step);
     b.step("lib-sql-parser-test", "Run the storage-independent SQL lexer and parser tests").dependOn(&yacc_steps.run_parser_tests.step);
     b.step("lib-sql-parser-bench", "Build and install lib-sql-parser-bench").dependOn(&b.addInstallArtifact(yacc_steps.benchmark, .{}).step);
+    const cypher_mod = @import("../../lib/cypher/build_support.zig").addSteps(b, .{
+        .root = b.path("lib/cypher"),
+        .target = target,
+        .optimize = optimize,
+        .codegen = yacc_build.addCompiler(b, b.path("lib/yacc"), b.graph.host, .safe),
+        .compare_tool = tools_build.addFileCompareTool(b, b.path("tools")),
+    });
     const sql_parser_mod = b.createModule(.{
         .root_source_file = b.path("lib/sql/root.zig"),
         .target = target,
@@ -356,15 +363,29 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     }) });
     const run_relation_name_tests = b.addRunArtifact(relation_name_tests);
     relation_name_tests.root_module.addImport("antfly_platform", platform_mod);
+    relation_name_tests.root_module.addImport("cypher", cypher_mod);
     b.step("system-catalog-relation-test", "Test namespace ownership and atomic catalog publication plans")
         .dependOn(&run_relation_name_tests.step);
     run_sql_tests.step.dependOn(&run_relation_name_tests.step);
+    const graph_catalog_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/graph_catalog_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    graph_catalog_mod.addImport("cypher", cypher_mod);
+    graph_catalog_mod.addImport("antfly_platform", platform_mod);
+    const graph_catalog_tests = b.addTest(.{ .root_module = graph_catalog_mod, .filters = &.{"graph catalog"} });
+    const run_graph_catalog_tests = b.addRunArtifact(graph_catalog_tests);
+    b.step("system-catalog-graph-test", "Test immutable graph catalog table bindings")
+        .dependOn(&run_graph_catalog_tests.step);
+    run_sql_tests.step.dependOn(&run_graph_catalog_tests.step);
     const relation_reconciliation_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/system_catalog/relation_reconciliation.zig"),
         .target = target,
         .optimize = optimize,
     }), .filters = selectTestFilters(b, &.{"relation_reconciliation.test."}) });
     relation_reconciliation_tests.root_module.addImport("antfly_platform", platform_mod);
+    relation_reconciliation_tests.root_module.addImport("cypher", cypher_mod);
     const run_relation_reconciliation_tests = b.addRunArtifact(relation_reconciliation_tests);
     b.step("system-catalog-reconciliation-test", "Test resumable, fenced relation ownership reconciliation")
         .dependOn(&run_relation_reconciliation_tests.step);
@@ -377,6 +398,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     });
     @import("../embedded/source_owner.zig").attach(pgwire_test_mod);
     pgwire_test_mod.addImport("sql_parser", sql_parser_mod);
+    pgwire_test_mod.addImport("cypher", cypher_mod);
     // This intentionally remains a storage-independent test root. Every
     // pgwire-owned test has the pgwire prefix; without a compile filter Zig
     // also discovers transitive storage tests through the SQL binder and
@@ -598,6 +620,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     regex_mod.addImport("antfly_platform", platform_mod);
     const sql_regex_mod = @import("../../lib/sql_regex/build.zig").createModule(b, target, optimize, b.path("lib/sql_regex"));
     regex_mod.addImport("antfly_capture_regex", sql_regex_mod.import_table.get("antfly_capture_regex").?);
+    cypher_mod.addImport("cypher_regex_capture", sql_regex_mod.import_table.get("antfly_capture_regex").?);
     const jsonschema_mod = b.createModule(.{
         .root_source_file = b.path("lib/jsonschema/src/mod.zig"),
         .target = target,
@@ -1151,6 +1174,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     }
     const antfly_imports = AntflyRootImports{
         .sql_parser = sql_parser_mod,
+        .cypher = cypher_mod,
         .storage_boundary = @import("../embedded/storage_boundary.zig").create(b, target, optimize),
         .cancellation = cancellation_mod,
         .cache_budget = cache_budget_mod,
@@ -1273,6 +1297,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     antfly_imports.configureRuntimeContracts(usermgr_mod);
     antfly_imports.storage_boundary.configureSources(sql_test_mod, false, false);
     sql_test_mod.addImport("sql_parser", sql_parser_mod);
+    sql_test_mod.addImport("cypher", cypher_mod);
     sql_test_mod.addImport("antfly_platform", platform_mod);
     sql_test_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
     sql_test_mod.addImport("antfly_regex", regex_mod);
@@ -1287,6 +1312,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     });
     antfly_imports.storage_boundary.configureSources(refinement_bench_mod, false, false);
     refinement_bench_mod.addImport("sql_parser", sql_parser_mod);
+    refinement_bench_mod.addImport("cypher", cypher_mod);
     refinement_bench_mod.addImport("antfly_platform", platform_mod);
     refinement_bench_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
     refinement_bench_mod.addImport("antfly_regex", regex_mod);

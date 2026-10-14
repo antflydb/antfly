@@ -551,6 +551,7 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
     // Check logical scope before any catalog lookup, including IF EXISTS.
     const permission_kind: @import("../usermgr/mod.zig").ResourceType = switch (kind) {
         .query_source => .table,
+        .graph => .graph,
         inline else => |tag| @field(@import("../usermgr/mod.zig").ResourceType, @tagName(tag)),
     };
     if (identity) |authenticated| if (!server_mod.permissionsAllow(authenticated.permissions, permission_kind, resource, .admin)) return error.Forbidden;
@@ -662,13 +663,13 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
             .database => error.SqlDuplicateDatabase,
             .namespace => error.SqlDuplicateNamespace,
             .tablespace => error.SqlDuplicateTablespace,
-            .table, .query_source => err,
+            .table, .query_source, .graph => err,
         };
         if (err == error.CatalogNotFound) return switch (kind) {
             .database => error.DatabaseNotFound,
             .namespace => error.NamespaceNotFound,
             .tablespace => error.TablespaceNotFound,
-            .table, .query_source => err,
+            .table, .query_source, .graph => err,
         };
         return err;
     };

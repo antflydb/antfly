@@ -1977,6 +1977,15 @@ pub const GraphQueryEngine = struct {
             var algebraic_edges = try collectAlgebraicReachabilityEdges(self.alloc, graph_index, start_key, plan.params, self.work_budget);
             defer algebraic_edges.deinit(self.alloc);
             if (algebraic_edges.has_cross_table_edges) return null;
+            // Reachability keeps one depth per node. MATCH permits revisiting
+            // nodes and matches longer trails even when a shorter route exists.
+            // Only a rooted tree proves these contracts equivalent.
+            var targets: std.StringHashMapUnmanaged(void) = .empty;
+            defer targets.deinit(self.alloc);
+            for (algebraic_edges.items) |edge| {
+                if (std.mem.eql(u8, edge.to, start_key)) return null;
+                if ((try targets.getOrPut(self.alloc, edge.to)).found_existing) return null;
+            }
 
             const reached = try algebraic_path_mod.boundedReachabilityWithOptionsAlloc(self.alloc, start_key, algebraic_edges.items, plan.depth, .{
                 .work_budget = self.work_budget,
@@ -2165,9 +2174,7 @@ fn algebraicPatternPlan(gq: GraphQuery) ?AlgebraicPatternPlan {
 }
 
 fn algebraicPatternStepIsOneHop(edge: pattern_mod.PatternEdgeStep) bool {
-    const min_hops = if (edge.min_hops == 0) @as(u32, 1) else edge.min_hops;
-    const max_hops = if (edge.max_hops == 0) @as(u32, 1) else edge.max_hops;
-    return min_hops == 1 and max_hops == 1;
+    return edge.min_hops == 1 and edge.max_hops == 1;
 }
 
 fn algebraicPatternAliasesUnique(pattern: []const pattern_mod.PatternStep) bool {
@@ -5179,4 +5186,28 @@ test "BFS traversal preserves physical edge provenance for distributed paths" {
     try std.testing.expectEqualStrings("B", c_edges[0].target);
     try std.testing.expectEqualStrings("B", c_edges[1].source);
     try std.testing.expectEqualStrings("C", c_edges[1].target);
+}
+
+test "pattern algebraic optimization preserves zero hops, revisits and longer trails" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(!algebraicPatternStepIsOneHop(.{ .direction = .out, .min_hops = 0, .max_hops = 0 }));
+    var sb: [256]u8 = undefined;
+    var rb: [256]u8 = undefined;
+    const ctx = try setupGraph(alloc, "gq-cypher-s", "gq-cypher-r", &sb, &rb);
+    defer {
+        ctx.deinit();
+        alloc.destroy(ctx);
+    }
+    ctx.graph.algebraic_semiring_traversal = true;
+    try ctx.graph.addEdge("A", "B", "e", 1, 0, 0, "");
+    try ctx.graph.addEdge("B", "A", "e", 1, 0, 0, "");
+    try ctx.graph.addEdge("A", "C", "e", 1, 0, 0, "");
+    try ctx.graph.addEdge("B", "C", "e", 1, 0, 0, "");
+    const steps: []const pattern_mod.PatternStep = &.{ .{ .alias = "a", .edge = .{ .direction = .out } }, .{ .alias = "b", .edge = .{ .direction = .out, .types = &.{"e"} } }, .{ .alias = "c", .edge = .{ .direction = .out, .types = &.{"e"} } } };
+    var engine: GraphQueryEngine = .{ .alloc = alloc };
+    const request: GraphQuery = .{ .query_type = .pattern, .index_name = "test", .start_nodes = .{ .keys = &.{"A"} }, .pattern = steps };
+    try std.testing.expect((try engine.executeAlgebraicPattern(&ctx.graph, request, &.{"A"})) == null);
+    var result = try engine.execute(&ctx.graph, request, &.{"A"});
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), result.matches.len);
 }

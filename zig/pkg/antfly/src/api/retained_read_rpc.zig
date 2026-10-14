@@ -28,8 +28,11 @@ pub const max_request_bytes = 4 << 20;
 pub const max_response_bytes = 32 << 20;
 pub const max_lease_ms: u32 = 30_000;
 pub const Request = struct {
-    operation: enum { admit, capture, validate, snapshot, open, open_snapshot, next, normalize, range_proofs, close, cancel },
+    operation: enum { admit, capture, validate, snapshot, open, open_snapshot, next, normalize, range_proofs, close, cancel, graph_snapshot, graph_invoke, admit_graph, graph_open },
     schema_version: u32,
+    graph: ?@import("antfly_local_sources").storage_statement_read_fence.GraphInput = null,
+    graph_body: []const u8 = "",
+    graph_table: []const u8 = "",
     token: ?registry.Token = null,
     connection: u128 = 0,
     lease_ms: u32 = 5000,
@@ -72,10 +75,10 @@ pub fn execute(alloc: std.mem.Allocator, owner: owner_mod.Owner, scope: registry
             owner.registry.disconnectScoped(scope, input.connection);
             return encode(alloc, .{});
         },
-        .admit => {
+        .admit, .admit_graph => {
             // A bounded point probe establishes the owner read-index barrier
             // without retaining any mutation fence or row data.
-            if (try owner.source.lookupGroupLocal(alloc, scope.group_id, table, "", .{}, .read_index)) |value| {
+            if (try owner.source.lookupGroupLocal(alloc, scope.group_id, table, "", .{ .cypher_prepare = input.operation == .admit_graph, .execution_deadline_ns = deadline }, .read_index)) |value| {
                 var found = value;
                 found.deinit(alloc);
             }
@@ -99,6 +102,14 @@ pub fn execute(alloc: std.mem.Allocator, owner: owner_mod.Owner, scope: registry
             errdefer owner.registry.close(token, scope) catch {};
             return encode(alloc, .{ .token = token });
         },
+        .graph_snapshot => {
+            const graph = input.graph orelse return error.InvalidRetainedReadQuery;
+            if (!std.mem.eql(u8, graph.table, table)) return error.RetainedReadScopeChanged;
+            const token = try owner.captureGraph(scope, input.token orelse return error.InvalidRetainedReadToken, input.connection, graph, deadline);
+            errdefer owner.registry.close(token, scope) catch {};
+            return encode(alloc, .{ .token = token });
+        },
+        .graph_invoke => return owner.invokeGraph(scope, input.token orelse return error.InvalidRetainedReadToken, alloc, input.graph_body),
         .open => {
             const token = try owner.open(scope, input.token orelse return error.InvalidRetainedReadToken, input.connection, input.from, input.to, .{
                 .relational_query = input.query orelse return error.InvalidRetainedReadQuery,
@@ -116,6 +127,22 @@ pub fn execute(alloc: std.mem.Allocator, owner: owner_mod.Owner, scope: registry
         },
         .open_snapshot => {
             const token = try owner.openSnapshot(scope, input.token orelse return error.InvalidRetainedReadToken, input.connection, input.from, input.to, .{
+                .relational_query = input.query orelse return error.InvalidRetainedReadQuery,
+                .filter_query_json = input.filter_query_json,
+                .inclusive_from = input.inclusive_from,
+                .exclusive_to = input.exclusive_to,
+                .sql_document_preimage = input.sql_document_preimage,
+                .include_content_hashes = input.include_content_hashes,
+                .include_range_proofs = input.include_range_proofs,
+                .row_policy_principal_proof = input.row_policy_principal_proof,
+                .row_policy_database = input.row_policy_database,
+            }, deadline);
+            errdefer owner.registry.close(token, scope) catch {};
+            return encode(alloc, .{ .token = token });
+        },
+        .graph_open => {
+            if (!std.mem.eql(u8, input.graph_table, table)) return error.Forbidden;
+            const token = try owner.openGraph(scope, input.token orelse return error.InvalidRetainedReadToken, input.connection, table, input.from, input.to, .{
                 .relational_query = input.query orelse return error.InvalidRetainedReadQuery,
                 .filter_query_json = input.filter_query_json,
                 .inclusive_from = input.inclusive_from,

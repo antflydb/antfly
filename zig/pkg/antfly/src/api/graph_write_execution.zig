@@ -1,0 +1,108 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
+//! Compiles a graph overlay into the existing native distributed transaction.
+const std = @import("std");
+const cypher = @import("cypher");
+const local = @import("antfly_local_sources");
+const server_mod = @import("http_server.zig");
+const types = local.storage_db_types;
+const contract = local.api_local_transaction_contract;
+const port = local.storage_statement_read_fence;
+const A = std.mem.Allocator;
+pub const Provider = struct {
+    server: *server_mod.ApiHttpServer,
+    context: local.api_operation.RequestContext,
+    identity: *?server_mod.AuthenticatedIdentity,
+    receipt: ?@import("graph_write_receipt.zig").Result = null,
+    graph: cypher.catalog.Graph,
+    tables: []const port.GraphTable,
+    channel: cypher.rpc.Channel,
+    overlay: ?*cypher.transaction.Overlay = null,
+    transaction_id: ?types.TxnId = null,
+    request_id: ?[]const u8 = null,
+    outcome: ?contract.CommitOutcome = null,
+    pub fn host(self: *Provider) cypher.transaction.Host {
+        return .{ .ptr = self, .new_identity = newIdentity, .commit = commit };
+    }
+    fn cast(ptr: *anyopaque) *Provider {
+        return @ptrCast(@alignCast(ptr));
+    }
+    fn newIdentity(ptr: *anyopaque, a: A, table: []const u8, _: bool) !cypher.value.Identity {
+        const self = cast(ptr);
+        try self.context.ensureActive();
+        var nonce: [16]u8 = undefined;
+        try self.server.embedding_provider_runtime.io.randomSecure(&nonce);
+        return .{ .table = table, .key = try std.fmt.allocPrint(a, "cypher:{s}", .{std.fmt.bytesToHex(nonce, .lower)}) };
+    }
+    const Plan = struct {
+        table: port.GraphTable,
+        writes: std.ArrayList(types.TransactionWrite) = .empty,
+        deletes: std.ArrayList([]const u8) = .empty,
+        predicates: std.ArrayList(types.TransactionVersionPredicate) = .empty,
+        edges: std.ArrayList(types.GraphEdgeWrite) = .empty,
+        removed_edges: std.ArrayList(types.GraphEdgeDelete) = .empty,
+        guards: std.ArrayList(local.api_range_read_guards.OwnerRangeProof) = .empty,
+    };
+    fn plan(plans: []Plan, table: []const u8) !*Plan {
+        for (plans) |*entry| if (std.mem.eql(u8, entry.table.name, table)) return entry;
+        return error.CypherSearchTableOutsideGraph;
+    }
+    const Preimage = struct { plans: []Plan };
+    fn existed(ptr: *anyopaque, table: []const u8, key: []const u8) bool {
+        const preimage: *Preimage = @ptrCast(@alignCast(ptr));
+        const entry = plan(preimage.plans, table) catch return false;
+        for (entry.predicates.items) |predicate| if (std.mem.eql(u8, predicate.key, key)) return true;
+        return false;
+    }
+    fn commit(ptr: *anyopaque, a: A, mutations: []const cypher.backend.Mutation) !void {
+        const self = cast(ptr);
+        try self.context.ensureActive();
+        const overlay = self.overlay orelse return error.CypherTransactionRequired;
+        const plans = try a.alloc(Plan, self.tables.len);
+        for (self.tables, plans) |table, *entry| entry.* = .{ .table = table };
+        const body = try std.json.Stringify.valueAlloc(a, cypher.rpc.Request{ .operation = .observe, .graph_incarnation = self.graph.incarnation, .graph_revision = self.graph.revision }, .{});
+        const bytes = try self.channel.call(self.channel.ptr, a, body);
+        const owners = try std.json.parseFromSliceLeaky([]const local.storage_db_cypher_write_observation.Owner, a, bytes, .{});
+        for (owners) |owner| {
+            const entry = try plan(plans, owner.table);
+            if (entry.table.table_id != owner.fence.table_id) return error.CatalogGenerationChanged;
+            try entry.predicates.appendSlice(a, owner.predicates);
+            try entry.guards.append(a, .{ .fence = owner.fence, .proofs = owner.proofs });
+        }
+        var preimage: Preimage = .{ .plans = plans };
+        const postimages = try cypher.mutations.build(a, self.graph, overlay, mutations, .{ .ptr = &preimage, .existed = existed });
+        for (postimages) |postimage| {
+            const entry = try plan(plans, postimage.table);
+            for (postimage.writes.items) |write| try entry.writes.append(a, .{ .key = write.key, .value = write.value });
+            try entry.deletes.appendSlice(a, postimage.deletes.items);
+            for (postimage.edges.items) |edge| try entry.edges.append(a, .{ .edge_id = edge.edge_id, .index_name = edge.index_name, .source = edge.source, .target = edge.target, .edge_type = edge.edge_type, .metadata_json = edge.metadata_json });
+            for (postimage.removed_edges.items) |edge| try entry.removed_edges.append(a, .{ .edge_id = edge.edge_id, .index_name = edge.index_name, .source = edge.source, .target = edge.target, .edge_type = edge.edge_type });
+        }
+        const requests = try a.alloc(contract.TableCommitRequest, plans.len);
+        for (plans, requests) |entry, *request| {
+            if (entry.guards.items.len == 0) return error.SqlRangeTrackingRequired;
+            const proof = (try self.server.rowPolicyWriteProof(a, self.context, entry.table.table_id, entry.table.name, entry.table.database, if (entry.table.schema_version == 0) null else entry.table.schema_version)) orelse "";
+            request.* = .{ .normalized_graph_rows = true, .table_name = entry.table.name, .schema_version = if (entry.table.schema_version == 0) null else entry.table.schema_version, .writes = entry.writes.items, .deletes = entry.deletes.items, .predicates = entry.predicates.items, .graph_writes = entry.edges.items, .graph_deletes = entry.removed_edges.items, .range_guards = entry.guards.items, .row_policy_principal_proof = proof, .row_policy_database = if (proof.len == 0) "" else entry.table.database, .row_policy_admitted_at_seconds = if (proof.len == 0) 0 else @intCast(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_s) };
+        }
+        var id: types.TxnId = undefined;
+        if (self.request_id) |encoded| id = try @import("distributed_txn.zig").parseTxnIdHex(encoded) else try self.server.embedding_provider_runtime.io.randomSecure(&id);
+        self.transaction_id = id;
+        const receipt = try @import("graph_write_receipt.zig").execute(self.server, self.identity.*, self.context, id, requests, a);
+        self.receipt = receipt;
+        self.outcome = receipt.outcome;
+        if (receipt.status == .aborted) return receipt.failure orelse error.CypherTransactionConflict;
+    }
+};

@@ -3722,6 +3722,50 @@ test "opaque metadata snapshot retries retain later committed prefix across reop
     try std.testing.expectError(error.InvalidMetadataSnapshot, store.snapshotBuilder().installSnapshot(a, group, 12, snapshot));
     try std.testing.expectEqual(@as(u64, 12), (try store.latestCheckpoint(group)).?.commit_index);
 }
+test "opaque metadata session reads retain binary values and survive raft snapshots" {
+    const a = std.testing.allocator;
+    const group: u64 = 41;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(path);
+    const target_path = try std.fmt.allocPrint(a, "{s}/restored", .{path});
+    defer a.free(target_path);
+    var store = try metadata_apply_client.RaftApplyStore.init(a, .{ .root_dir = path, .no_sync = true });
+    defer store.deinit();
+    const records = @import("../metadata/transaction_session_record.zig");
+    const key = try records.keyAlloc(a, group, "receipt");
+    defer a.free(key);
+    const first = try records.encode(a, .{ .changes = &.{.{ .key = "receipt", .expected = null, .value = "\xff\x00" }} });
+    defer a.free(first);
+    try store.applyStandaloneCommand(group, .{ .apply_transaction_sessions = first });
+    var retained = try store.openSessionRead(a, group);
+    defer retained.abort();
+    try std.testing.expectEqualStrings("\xff\x00", try retained.get(key));
+    try std.testing.expectError(error.InvalidArgument, retained.get("outside-session-namespace"));
+    const next = try records.encode(a, .{ .changes = &.{.{ .key = "receipt", .expected = "\xff\x00", .value = "\x80committed" }} });
+    defer a.free(next);
+    try store.applyStandaloneCommand(group, .{ .apply_transaction_sessions = next });
+    try std.testing.expectEqualStrings("\xff\x00", try retained.get(key));
+    var current = try store.openSessionRead(a, group);
+    defer current.abort();
+    try std.testing.expectEqualStrings("\x80committed", try current.get(key));
+    var cursor = try current.openCursor();
+    {
+        defer cursor.close();
+        try std.testing.expectEqualStrings(key, (try cursor.last()).?.key);
+        try std.testing.expectEqualStrings("\x80committed", (try cursor.seekAtOrAfter(key)).?.value);
+        try std.testing.expect((try cursor.next()) == null);
+    }
+    const snapshot = try store.snapshotBuilder().buildSnapshot(a, group);
+    defer a.free(snapshot);
+    var restored = try metadata_apply_client.RaftApplyStore.init(a, .{ .root_dir = target_path, .no_sync = true });
+    defer restored.deinit();
+    try std.testing.expect(try restored.snapshotBuilder().installSnapshot(a, group, 11, snapshot));
+    var recovered = try restored.openSessionRead(a, group);
+    defer recovered.abort();
+    try std.testing.expectEqualStrings("\x80committed", try recovered.get(key));
+}
 
 test "opaque metadata apply owner preserves semantic error identity" {
     const path = "/tmp/antfly-storage-kernel-metadata-errors";

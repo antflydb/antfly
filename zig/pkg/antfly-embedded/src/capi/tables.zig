@@ -44,6 +44,7 @@ fn openTable(handle: *h.Handle, name: []const u8, id: u64) !*Table {
     options.online_source_authority = .native;
     if (handle.owned_lite_backend) |*backend| try backend.configureDbOpenOptionsForNamespace(&options, namespace);
     table.* = .{ .name = owned_name, .id = id, .db = try h.db_mod.DB.open(alloc, path, options) };
+    table.db.local_execution.row_policy_table_name = table.name;
     errdefer table.db.close();
     try api.refreshLiteManagedEmbeddingRuntimeForDatabase(handle, &table.db);
     if (handle.embedded_open_options.start_optional_runtime_workers) table.db.startQuarantineRetryWorkerIfNeeded();

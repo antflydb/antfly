@@ -1658,6 +1658,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-row-semantics-codec-test", "Verify fail-closed row semantics envelopes and allocation failure cleanup")
         .dependOn(&addFilteredTestRunArtifact(b, row_semantics_codec_tests).step);
+    const cypher_transaction_contract_tests = b.addTest(.{
+        .root_module = api_transactions_docid_test_mod,
+        .filters = &.{"transaction graph effects"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("cypher-transaction-contract-test", "Verify graph transaction staging, receipts and principal identity").dependOn(&addFilteredTestRunArtifact(b, cypher_transaction_contract_tests).step);
     const api_transaction_contract_tests = b.addTest(.{
         .root_module = api_transactions_docid_test_mod,
         .filters = &.{ "distributed txn", "hosted participant", "stable distributed transaction retry", "internal batch parser owns binary staged restore controls", "merge page internal codec", "online merge private", "durable SQL session rejects duplicate savepoint ids" },

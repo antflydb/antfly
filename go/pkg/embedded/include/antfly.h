@@ -457,6 +457,20 @@ antfly_error_code antfly_db_search_json(antfly_db *db, antfly_slice request_json
  * Always free a nonempty out buffer, including SQL diagnostics on error. */
 antfly_error_code antfly_db_sql_json(antfly_db *db, antfly_slice request_json, antfly_buffer *out);
 
+/* Local graph catalog. Requests use action=get/list/put/drop, name,
+ * definition (labels/relationships), and decimal-string expected_revision.
+ * Updates and drops require the current revision. Definitions pin table and
+ * graph-index incarnations; dropping/recreating a table does not retarget them.
+ * These local entry points reject managed distributed owner handles and
+ * protected rows without an authenticated hosted authority. */
+antfly_error_code antfly_db_graph_catalog_json(antfly_db *db, antfly_slice request_json, antfly_buffer *out);
+/* Same query/parameters/typed_parameters/limits contract and tagged values as
+ * the hosted graph endpoint. Output buffers use antfly_buffer_free. */
+antfly_error_code antfly_db_cypher_json(antfly_db *db, antfly_slice graph_name, antfly_slice request_json, antfly_buffer *out);
+/* Minimal durable receipt; no staged rows, table names, or execution plans.
+ * An unknown outcome must be reconciled here without replaying the write. */
+antfly_error_code antfly_db_graph_write_status_json(antfly_db *db, antfly_slice transaction_id, antfly_buffer *out);
+
 /* Logical tables have independent schemas, indexes, and document identities.
  * Dropped table IDs are never reused. The root document table is "default". */
 antfly_error_code antfly_db_create_table_json(antfly_db *db, antfly_slice table_name, antfly_slice schema_json);

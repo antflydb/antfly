@@ -728,6 +728,8 @@ pub fn create(b: *std.Build) ?Artifacts {
     const soak_test_step = b.step("soak-test", "Run long-running soak test aggregates");
     const lib_test_step = b.step("lib-test", "Run default standalone library tests");
     dependOnAll(conformance_test_step, &.{ lib_toon_conformance_step, lib_image_conformance_run_step });
+    lib_test_step.dependOn(&b.top_level_steps.get("lib-cypher-test").?.step);
+    lib_test_step.dependOn(&b.top_level_steps.get("cypher-grammar-generated-check").?.step);
     lib_test_step.dependOn(&run_yacc_tests.step);
     lib_test_step.dependOn(&yacc_steps.run_parser_tests.step);
     lib_test_step.dependOn(&run_lib_regex_tests.step);

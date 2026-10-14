@@ -2218,6 +2218,10 @@ const LocalStandaloneMetadata = struct {
             const table = self.owner.manager.tables.get(id) orelse return null;
             return .{ .id = table.table_id, .name = try self.alloc.dupe(u8, table.name) };
         }
+        pub fn graphIndexIdentity(self: @This(), id: u64, name: []const u8) !?@import("cypher").catalog.IndexIdentity {
+            const table = self.owner.manager.tables.get(id) orelse return null;
+            return @import("../system_catalog/graph_bindings.zig").indexIdentity(self.alloc, table.indexes_json, name);
+        }
     };
     fn planCatalogLocked(self: *LocalStandaloneMetadata, alloc: std.mem.Allocator, command: system_catalog.Mutation) !system_catalog.Delta {
         return self.planCatalogTopologyLocked(alloc, command, false);
@@ -4675,6 +4679,15 @@ pub fn runFromIterator(
         secret_store_initialized = true;
     }
 
+    // Standalone owner proofs use the same configured authority as data nodes.
+    const principal_secret = try secret_store.getOwned(alloc, "antfly.trusted_principal.secret");
+    defer if (principal_secret) |value| alloc.free(value);
+    const principal_issuer = try secret_store.getOwned(alloc, "antfly.trusted_principal.issuer");
+    defer if (principal_issuer) |value| alloc.free(value);
+    if ((principal_secret == null) != (principal_issuer == null)) return error.InvalidConfig;
+    if (principal_secret) |value| if (std.mem.trim(u8, value, " \t\r\n").len == 0) return error.InvalidConfig;
+    if (principal_issuer) |value| if (std.mem.trim(u8, value, " \t\r\n").len == 0) return error.InvalidConfig;
+
     var loaded_config: ?antfly.common.config.Config = if (cli.config_path) |config_path|
         try antfly.common.config.loadFromPathWithSecretsForDeploymentWithIo(
             alloc,
@@ -5403,6 +5416,8 @@ pub fn runFromIterator(
             .hot_standby_remote_apply_mutations_enabled = hotStandbyRemoteApplyMutationsEnabled(hot_standby_sync_policy.policy),
             .hot_standby_catalog_create_enabled = hot_standby_role_requested and cli.hot_standby_table_id == 0 and cli.hot_standby_shard_id == 0,
             .auth_enabled = auth_enabled,
+            .trusted_principal_secret = principal_secret,
+            .trusted_principal_issuer = principal_issuer,
             .chatgpt = if (chatgpt) |*manager| manager else null,
             .experimental = cli.experimental,
             .mcp_max_tool_result_bytes = if (loaded_config) |*cfg| cfg.mcp.max_tool_result_bytes else antfly.common.config.default_mcp_max_tool_result_bytes,

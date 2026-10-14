@@ -364,3 +364,25 @@ backups.
 
 See [the native SQL contract](../../../zig/CAPI.md#database-sql) for
 READ COMMITTED, transactional DDL restrictions, and commit outcomes.
+
+## Cypher and SQL graph composition
+
+`graph_catalog_json`, `cypher_json`, and `graph_write_status_json` (with the `serde` feature) expose durable named graphs, Cypher queries and mutations, and
+transaction receipts through libantfly. Catalog requests use `action` (`put`,
+`get`, `list`, `drop`), a graph `name`, and a `definition` for puts. Replacement
+and drop require the current decimal-string `expected_revision`.
+
+Queries use the same request contract as the server: `query`, `parameters` or
+lossless `typed_parameters`, optional limits, and `write_request_id`. Results
+contain tagged graph values; integer values are decimal strings. Native writes
+return a commit receipt. Retain the request ID and resolve an unknown outcome
+through the status method instead of replaying the query. `cypher::GraphError` preserves
+the diagnostic code, span, outcome, and transaction ID when available.
+
+Local SQL supports `GRAPH_TABLE` over these catalogs, including ordinary-table
+joins and staged SQL rows in an explicit transaction. Graph definitions pin
+local table and graph-index identities across reopen. Raw embedded calls reject
+protected tables; authenticated principal queries use the server API.
+
+See [the Cypher contract](../../../zig/CYPHER.md) for grammar, mapping, value,
+mutation, and deployment semantics.

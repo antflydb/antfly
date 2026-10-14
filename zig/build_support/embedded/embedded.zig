@@ -515,6 +515,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi concurrent calls and closes on one handle never touch freed memory",
         "capi text and dense searches succeed while writes commit",
         "capi execute graph queries honors identity read generation",
+        "capi embedded graph catalog and query retain table identities across reopen",
         "capi fact relationships preserve identities and filter before ranking",
         "capi fact path serialization and parsing release partial allocations",
         "capi fact algebraic paths retain provenance and respect frontier limits",
@@ -557,6 +558,13 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         },
     });
     const run_capi_tests = addFilteredTestRunArtifact(b, capi_tests);
+    const cypher_capi_tests = b.addTest(.{
+        .root_module = capi_root_mod,
+        .filters = &.{"capi embedded graph catalog and query"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("capi-cypher-test", "Qualify local graph catalog and retained Cypher queries")
+        .dependOn(&addFilteredTestRunArtifact(b, cypher_capi_tests).step);
     const lake_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/lake_test_root.zig"),
         .target = target,

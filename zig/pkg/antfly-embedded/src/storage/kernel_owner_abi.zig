@@ -1784,6 +1784,17 @@ pub extern fn antfly_metadata_apply_store_projection(
     request: *const MetadataProjectionRequest,
     out_json: *OwnedBytes,
 ) callconv(.c) Status;
+pub const MetadataSessionReadOperation = enum(u32) { get, first, last, next, prev, seek_at_or_after, seek_at_or_before };
+pub const MetadataSessionReadRequest = extern struct {
+    version: u32 = abi_version,
+    operation: MetadataSessionReadOperation,
+    key: BorrowedBytes = .{},
+};
+/// A retained, namespace-scoped metadata read. Concrete transactions remain
+/// kernel-owned; cursor replies are binary key-length/key/value envelopes.
+pub extern fn antfly_metadata_session_read_open(store: ?*anyopaque, request: *const MetadataApplyGroupRequest, out_read: *?*anyopaque) callconv(.c) Status;
+pub extern fn antfly_metadata_session_read_invoke(read: ?*anyopaque, request: *const MetadataSessionReadRequest, out_value: *OwnedBytes) callconv(.c) Status;
+pub extern fn antfly_metadata_session_read_close(read: ?*anyopaque) callconv(.c) void;
 pub extern fn antfly_metadata_apply_store_add_listeners(
     store: ?*anyopaque,
     request: *const MetadataListenerRequest,

@@ -164,6 +164,7 @@ pub const Adapter = struct {
     /// statement. Owner verification still fences every scan against the
     /// exact serving generation, including a publication changed mid-read.
     policy_proofs: ?std.AutoHashMapUnmanaged(u64, ?[]u8) = null,
+    graph_parameters: []const std.json.Value = &.{},
 
     pub fn decisionRuntime(self: *Adapter) !?@import("antfly_local_sources").functions_runtime.Runtime {
         if (self.server.cfg.node_config) |config| {
@@ -184,6 +185,9 @@ pub const Adapter = struct {
     }
 
     pub fn execute(self: *Adapter, alloc: std.mem.Allocator, compiled: *const @import("antfly_local_sources").sql_compiler.Compiled, parameters: []const std.json.Value, limits: @import("antfly_local_sources").sql_runtime.Limits, guarded_backend: ?catalog.Backend) !@import("antfly_local_sources").sql_runtime.Result {
+        const previous_graph_parameters = self.graph_parameters;
+        self.graph_parameters = parameters;
+        defer self.graph_parameters = previous_graph_parameters;
         const previous_receipt_wait_budget = self.receipt_wait_budget;
         self.receipt_wait_budget = .{};
         defer self.receipt_wait_budget = previous_receipt_wait_budget;
@@ -560,7 +564,7 @@ pub const Adapter = struct {
         // Each new backend starts an execution scope; binding, cursor selection
         // and fallback execution within that scope share the receipt budget.
         self.receipt_wait_budget = .{};
-        return .{ .execution_binding_validator = if (self.read_requirements.after_write != null) .{ .ptr = self, .validate = validateReadReceiptBinding } else null, .scalar_control = .{ .ptr = self, .checkpoint = scalarCheckpoint }, .execution_io = self.server.embedding_provider_runtime.io, .ptr = self, .decision_provider = self.decision_provider, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .supports_scan_order = true, .open_scan = openScan, .aggregate_partials = openAggregatePartials, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .ddl = ddl, .checkpoint = checkpoint } };
+        return .{ .execution_binding_validator = if (self.read_requirements.after_write != null) .{ .ptr = self, .validate = validateReadReceiptBinding } else null, .scalar_control = .{ .ptr = self, .checkpoint = scalarCheckpoint }, .execution_io = self.server.embedding_provider_runtime.io, .ptr = self, .decision_provider = self.decision_provider, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .resolve_graph = resolveGraph, .scan = scan, .supports_scan_order = true, .open_scan = openScan, .aggregate_partials = openAggregatePartials, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .ddl = ddl, .checkpoint = checkpoint } };
     }
 
     pub fn settingCapture(self: *Adapter) @FieldType(catalog.Backend, "setting_capture") {
@@ -631,6 +635,61 @@ pub const Adapter = struct {
         try checkpoint(ptr.?);
     }
 
+    fn recordPreparedBinding(self: *Adapter, alloc: std.mem.Allocator, table: catalog.Table) !void {
+        if (self.prepared_bindings) |bindings| try @import("sql_prepared.zig").Binding.verify(bindings, table);
+        if (self.collect_prepared_bindings) |bindings| {
+            const current = try @import("sql_prepared.zig").Binding.from(table);
+            const existing = for (bindings.items) |entry| {
+                if (entry.kind == current.kind and entry.graph_pattern_hash == current.graph_pattern_hash and std.mem.eql(u8, entry.database, current.database) and std.mem.eql(u8, entry.namespace, current.namespace) and std.mem.eql(u8, entry.name, current.name)) {
+                    try @import("sql_prepared.zig").Binding.verify(&.{entry}, table);
+                    break true;
+                }
+            } else false;
+            if (!existing) {
+                if (bindings.items.len >= 64) return error.SqlProgramLimitExceeded;
+                try bindings.append(alloc, current);
+            }
+        }
+    }
+
+    fn resolveGraph(ptr: *anyopaque, alloc: std.mem.Allocator, definition: ast.GraphTable) !catalog.Table {
+        const self: *Adapter = @ptrCast(@alignCast(ptr));
+        try self.context.ensureActive();
+        const database = definition.name.database orelse self.database;
+        const namespace = definition.name.namespace orelse self.namespace;
+        // Graph catalog resources currently belong to default.public. A
+        // qualified name must never silently select that graph in another scope.
+        if (!std.mem.eql(u8, database, system_catalog.default_database_name) or !std.mem.eql(u8, namespace, system_catalog.default_namespace_name)) return error.CatalogNotFound;
+        if (!try http_server.resourcePermissionCurrentlyAllowed(self.identity.*, .graph, definition.name.table, .read)) return error.Forbidden;
+        const bytes = try self.server.source.systemCatalog(alloc, self.context, .{ .read = .{ .kind = .graph, .name = definition.name.table } });
+        const state = try std.json.parseFromSliceLeaky(system_catalog.State, alloc, bytes, .{ .allocate = .alloc_always });
+        const record = state.find(.graph, 0, definition.name.table) orelse return error.CatalogNotFound;
+        const cypher = @import("cypher");
+        const graph = try system_catalog.graphForExecution(alloc, record);
+        const logical = try cypher.catalog.parseDefinition(alloc, record.name, graph.incarnation, graph.revision, record.source_json);
+        var dependencies: std.ArrayList(catalog.Table) = .empty;
+        for (logical.labels, @constCast(graph.labels), 0..) |label, *physical, label_index| {
+            const target = try system_catalog.graphLabelTarget(state, record.graph_tables[label_index], label);
+            physical.logical_table = target.table;
+            physical.database = target.database;
+            physical.namespace = target.namespace;
+            const table = try resolve(self, alloc, .{ .database = target.database, .namespace = target.namespace, .table = target.table }, .read);
+            if (table.id != physical.table_id or !std.mem.eql(u8, table.physical_name, physical.table)) return error.CatalogGenerationChanged;
+            var duplicate = false;
+            for (dependencies.items) |other| if (other.id == table.id) {
+                duplicate = true;
+                break;
+            };
+            if (!duplicate) try dependencies.append(alloc, table);
+        }
+        try cypher.binder.validate(alloc, graph, definition.query);
+        const binding = try alloc.create(catalog.graph_relation.Binding);
+        binding.* = .{ .definition = definition, .graph = graph, .catalog_json = try std.json.Stringify.valueAlloc(alloc, record, .{}), .dependencies = try dependencies.toOwnedSlice(alloc) };
+        const table: catalog.Table = .{ .id = record.id, .physical_name = record.name, .schema_version = 1, .storage_mode = .document, .columns = try catalog.graph_relation.columns(alloc, binding.*), .scope = .{ .database = database, .namespace = namespace, .name = record.name, .revision = state.revision }, .graph = binding };
+        try self.recordPreparedBinding(alloc, table);
+        return table;
+    }
+
     fn resolve(ptr: *anyopaque, alloc: std.mem.Allocator, name: ast.Name, action: catalog.Action) !catalog.Table {
         const self: *Adapter = @ptrCast(@alignCast(ptr));
         const target: system_catalog.Target = .{ .database = name.database orelse self.database, .namespace = name.namespace orelse self.namespace, .table = name.table };
@@ -672,26 +731,24 @@ pub const Adapter = struct {
         binding.scope = .{ .database = try alloc.dupe(u8, target.database), .namespace = try alloc.dupe(u8, target.namespace), .name = try alloc.dupe(u8, target.table), .revision = snapshot.revision };
         self.revision = snapshot.revision;
         self.target = target;
-        if (self.prepared_bindings) |bindings| try @import("sql_prepared.zig").Binding.verify(bindings, binding);
-        if (self.collect_prepared_bindings) |bindings| {
-            const current = try @import("sql_prepared.zig").Binding.from(binding);
-            const existing = for (bindings.items) |entry| {
-                if (std.mem.eql(u8, entry.database, current.database) and std.mem.eql(u8, entry.namespace, current.namespace) and std.mem.eql(u8, entry.name, current.name)) {
-                    try @import("sql_prepared.zig").Binding.verify(&.{entry}, binding);
-                    break true;
-                }
-            } else false;
-            if (!existing) {
-                if (bindings.items.len >= 64) return error.SqlProgramLimitExceeded;
-                try bindings.append(alloc, current);
-            }
-        }
+        try self.recordPreparedBinding(alloc, binding);
         if (self.identity.*) |*identity| try http_server.projectCatalogIdentity(self.server.alloc, identity, logical, table.name);
         return binding;
     }
 
     fn verify(self: *Adapter, alloc: std.mem.Allocator, table: catalog.Table) !void {
         try self.context.ensureActive();
+        if (table.graph) |binding| {
+            if (!try http_server.resourcePermissionCurrentlyAllowed(self.identity.*, .graph, binding.graph.name, .read)) return error.Forbidden;
+            var scratch = std.heap.ArenaAllocator.init(alloc);
+            defer scratch.deinit();
+            const bytes = try self.server.source.systemCatalog(scratch.allocator(), self.context, .{ .read = .{ .kind = .graph, .name = binding.graph.name } });
+            const state = try std.json.parseFromSliceLeaky(system_catalog.State, scratch.allocator(), bytes, .{});
+            const record = state.find(.graph, 0, binding.graph.name) orelse return error.CatalogGenerationChanged;
+            if (record.id != binding.graph.incarnation) return error.CatalogGenerationChanged;
+            for (binding.dependencies) |dependency| try self.verify(alloc, dependency);
+            return;
+        }
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const temporary = arena.allocator();
@@ -745,7 +802,7 @@ pub const Adapter = struct {
         }
     }
 
-    fn rowPolicyProof(self: *Adapter, alloc: std.mem.Allocator, table: catalog.Table) !?[]const u8 {
+    pub fn rowPolicyProof(self: *Adapter, alloc: std.mem.Allocator, table: catalog.Table) !?[]const u8 {
         if (self.policy_proofs) |*proofs| if (proofs.get(table.id)) |cached| return cached;
         const scope = table.scope orelse return error.InvalidSqlBackendResponse;
         const identity: ?*const http_server.AuthenticatedIdentity = if (self.identity.*) |*value| value else null;
@@ -863,6 +920,13 @@ pub const Adapter = struct {
 
     fn openScan(ptr: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !?catalog.Cursor {
         const self: *Adapter = @ptrCast(@alignCast(ptr));
+        if (table.graph != null) {
+            const statement = try self.openGraphStatement(alloc, &.{.{ .table = table, .request = request }});
+            errdefer statement.close(statement.ptr);
+            const wrapper = try alloc.create(SingleStatementCursor);
+            wrapper.* = .{ .alloc = alloc, .statement = statement };
+            return .{ .ptr = wrapper, .next = SingleStatementCursor.next, .close = SingleStatementCursor.close };
+        }
         if (table.external_base_source != null) return try self.openLakeScan(alloc, table, request);
         if (self.range_reads != null) {
             const statement = try openStatement(ptr, alloc, &.{.{ .table = table, .request = request }});
@@ -1527,8 +1591,219 @@ pub const Adapter = struct {
         return .{ .ptr = retained, .cursors = cursors, .close = DynamicStatementRead.close };
     }
 
+    const GraphStatement = struct {
+        a: std.mem.Allocator,
+        arena: std.heap.ArenaAllocator,
+        read: @import("antfly_local_sources").storage_statement_read_fence.GraphRead,
+        cursors: []catalog.Cursor,
+        opened: usize = 0,
+        authority: @import("graph_execution.zig").AuthorityChannel = undefined,
+        fn close(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            for (self.cursors[0..self.opened]) |cursor| cursor.close(cursor.ptr);
+            self.read.deinit();
+            self.arena.deinit();
+            self.a.destroy(self);
+        }
+    };
+    const GraphStatementCursor = struct {
+        a: std.mem.Allocator,
+        adapter: *Adapter,
+        table: catalog.Table,
+        child: catalog.Cursor,
+        owner: *GraphStatement,
+        fn validate(self: *@This(), a: std.mem.Allocator) !void {
+            try self.adapter.verify(a, self.table);
+            if (self.table.graph) |binding| {
+                const authority = &self.owner.authority;
+                authority.name = binding.graph.name;
+                authority.record_id = binding.graph.incarnation;
+                authority.last_authority_check = null;
+                const request = try std.json.Stringify.valueAlloc(a, @import("cypher").rpc.Request{ .operation = .validate, .graph_incarnation = binding.graph.incarnation, .graph_revision = binding.graph.revision }, .{});
+                defer a.free(request);
+                const response = try @import("graph_execution.zig").AuthorityChannel.invoke(authority, a, request);
+                a.free(response);
+            }
+        }
+        fn next(ptr: *anyopaque, a: std.mem.Allocator, limit: u32) !catalog.Page {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try self.validate(a);
+            const page = try self.child.next(self.child.ptr, a, limit);
+            errdefer page.deinit();
+            try self.validate(a);
+            return page;
+        }
+        fn close(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.child.close(self.child.ptr);
+            self.a.destroy(self);
+        }
+    };
+    fn projectGraphSqlRow(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, key: []const u8, document: std.json.Value, json_null_fields: []const []const u8) !bool {
+        const client: *@import("cypher").rpc.Client = @ptrCast(@alignCast(ptr));
+        return (try client.projectDocument(a, .{ .table = table, .key = key }, document, json_null_fields, false)).node != null;
+    }
+    fn openGraphStatement(self: *Adapter, a: std.mem.Allocator, requests: []const catalog.StatementScan) !catalog.StatementRead {
+        const cypher = @import("cypher");
+        const port = @import("antfly_local_sources").storage_statement_read_fence;
+        if (requests.len == 0 or requests.len > 64) return error.SqlProgramLimitExceeded;
+        if (self.dynamic_snapshot != null) return error.UnsupportedSqlExecution;
+        var first: ?*const catalog.graph_relation.Binding = null;
+        for (requests) |request| {
+            if (request.table.external_base_source != null) return error.UnsupportedSqlExecution;
+            if (request.table.graph) |binding| {
+                if (first == null) first = binding;
+            }
+        }
+        const graph = first orelse return error.InvalidSqlGraphTable;
+        const owner = try a.create(GraphStatement);
+        errdefer a.destroy(owner);
+        var arena = std.heap.ArenaAllocator.init(a);
+        errdefer arena.deinit();
+        const owned = arena.allocator();
+        var records: std.ArrayList(system_catalog.Resource) = .empty;
+        for (requests) |request| if (request.table.graph) |binding| {
+            var duplicate = false;
+            for (records.items) |record| if (record.id == binding.graph.incarnation) {
+                duplicate = true;
+                break;
+            };
+            if (!duplicate) try records.append(owned, try std.json.parseFromSliceLeaky(system_catalog.Resource, owned, binding.catalog_json, .{ .allocate = .alloc_always }));
+        };
+        var tables: std.ArrayList(catalog.Table) = .empty;
+        for (requests) |request| {
+            const dependencies = if (request.table.graph) |binding| binding.dependencies else &.{request.table};
+            for (dependencies) |table| {
+                var found = false;
+                for (tables.items) |prior| if (prior.id == table.id) {
+                    if (prior.schema_version != table.schema_version or !std.mem.eql(u8, prior.physical_name, table.physical_name)) return error.CatalogGenerationChanged;
+                    found = true;
+                    break;
+                };
+                if (!found) try tables.append(owned, table);
+            }
+        }
+        if (self.range_reads != null) {
+            const writes = self.server.table_writes orelse return error.SqlRangeTrackingRequired;
+            for (tables.items) |table| {
+                try self.verify(owned, table);
+                try writes.activateRangeTracking(owned, table.physical_name, self.context);
+            }
+        }
+        const role_revision = if (self.identity.*) |principal| if (principal.live_user_manager) |manager| @as(?u64, manager.rowPolicyRoleRevision()) else null else null;
+        const inputs = try owned.alloc(port.GraphTable, tables.items.len);
+        for (tables.items, inputs) |table, *input| input.* = .{ .name = table.physical_name, .table_id = table.id, .schema_version = table.schema_version, .principal_proof = (try self.rowPolicyProof(owned, table)) orelse "", .database = table.scope.?.database, .filter_query_json = (try http_server.resolveEffectiveRowFilterJson(owned, self.identity.*, table.physical_name)) orelse "" };
+        var nonce: [32]u8 = undefined;
+        try self.server.embedding_provider_runtime.io.randomSecure(&nonce);
+        const now = @import("antfly_platform").time.realtimeNs();
+        const context = try self.context.platformDeadline();
+        const read = try (self.server.table_reads orelse return error.TableNotFound).openCypherStatement(a, .{ .catalog_json = graph.catalog_json, .catalogs_json = try std.json.Stringify.valueAlloc(owned, records.items, .{}), .tables = inputs, .cut_id = std.fmt.bytesToHex(nonce, .lower), .expires_ms = now / std.time.ns_per_ms + 30_000, .ttl_now_ns = now, .deadline_ns = context.deadline_ns, .cancellation = context.cancellation });
+        errdefer read.deinit();
+        owner.* = .{ .a = a, .arena = arena, .read = read, .cursors = try owned.alloc(catalog.Cursor, requests.len) };
+        errdefer for (owner.cursors[0..owner.opened]) |cursor| cursor.close(cursor.ptr);
+        owner.authority = .{ .server = self.server, .identity = self.identity, .context = self.context, .name = graph.graph.name, .record_id = graph.graph.incarnation, .tables = inputs, .writes = false, .read = &owner.read, .role_revision = role_revision };
+        const authority = &owner.authority;
+        var client: cypher.rpc.Client = .{ .channel = .{ .ptr = authority, .call = @import("graph_execution.zig").AuthorityChannel.invoke, .checkpoint = @import("graph_execution.zig").AuthorityChannel.checkpoint }, .incarnation = graph.graph.incarnation, .revision = graph.graph.revision };
+        if (self.range_reads) |observed| {
+            const body = try std.json.Stringify.valueAlloc(owned, cypher.rpc.Request{ .operation = .observe_ranges, .graph_incarnation = graph.graph.incarnation, .graph_revision = graph.graph.revision }, .{});
+            const bytes = try client.channel.call(client.channel.ptr, owned, body);
+            const observations = try std.json.parseFromSliceLeaky([]const @import("antfly_local_sources").storage_db_cypher_write_observation.Owner, owned, bytes, .{});
+            for (tables.items) |table| {
+                var proofs: std.ArrayList(@import("antfly_local_sources").api_range_read_guards.OwnerRangeProof) = .empty;
+                for (observations) |observation| {
+                    if (!std.mem.eql(u8, observation.table, table.physical_name)) continue;
+                    if (observation.fence.table_id != table.id) return error.CatalogGenerationChanged;
+                    try proofs.append(owned, .{ .fence = observation.fence, .proofs = observation.proofs });
+                }
+                if (proofs.items.len == 0) return error.SqlRangeTrackingRequired;
+                if (self.staged) |staged| for (staged.tables) |old| {
+                    if (!std.mem.eql(u8, staged.physicalName(old.table_name), table.physical_name)) continue;
+                    if (old.schema_version != null and old.schema_version != table.schema_version) return error.CatalogGenerationChanged;
+                    if (old.range_guards) |guards| {
+                        var checked = try @import("antfly_local_sources").api_range_read_guards.merge(owned, guards.value, proofs.items);
+                        checked.deinit();
+                    }
+                };
+                const scope = table.scope orelse return error.InvalidSqlBackendResponse;
+                const logical = try (system_catalog.Target{ .database = scope.database, .namespace = scope.namespace, .table = scope.name }).resourceNameAlloc(owned);
+                try observed.observeRanges(self.server.alloc, logical, table.physical_name, table.schema_version, proofs.items);
+            }
+        }
+
+        const graph_overlay = @import("sql_graph_overlay.zig");
+        var staged_rows: std.ArrayList(graph_overlay.Row) = .empty;
+        var staged_effects: std.ArrayList(graph_overlay.Effects) = .empty;
+        if (self.staged) |staged| for (staged.tables) |entry| {
+            const physical = staged.physicalName(entry.table_name);
+            if (entry.batch.graph_writes.len != 0 or entry.batch.graph_deletes.len != 0) try staged_effects.append(owned, .{ .table = physical, .writes = entry.batch.graph_writes, .deletes = entry.batch.graph_deletes });
+            for (entry.batch.deletes) |key| try staged_rows.append(owned, .{ .identity = .{ .table = physical, .key = key }, .document_json = null });
+            for (entry.batch.writes) |write| try staged_rows.append(owned, .{ .identity = .{ .table = physical, .key = write.key }, .document_json = write.value, .json_null_fields = write.json_null_fields });
+        };
+        for (requests, owner.cursors) |request, *out| {
+            try self.verify(owned, request.table);
+            const child: catalog.Cursor = if (request.table.graph) |binding| blk: {
+                authority.name = binding.graph.name;
+                authority.record_id = binding.graph.incarnation;
+                authority.last_authority_check = null;
+                client.incarnation = binding.graph.incarnation;
+                client.revision = binding.graph.revision;
+                const parameters = try owned.alloc(cypher.value.Entry, binding.definition.parameters.len);
+                for (binding.definition.parameters, parameters) |name, *parameter| {
+                    const index = std.fmt.parseUnsigned(usize, name, 10) catch return error.InvalidSqlParameters;
+                    if (index == 0 or index > self.graph_parameters.len) return error.InvalidSqlParameters;
+                    var value = self.graph_parameters[index - 1];
+                    if (index <= request.request.graph_parameter_types.len) if (request.request.graph_parameter_types[index - 1]) |kind| {
+                        if (value == .string) value = switch (kind) {
+                            .integer => .{ .integer = std.fmt.parseInt(i64, value.string, 10) catch return error.InvalidSqlParameters },
+                            .number => .{ .float = std.fmt.parseFloat(f64, value.string) catch return error.InvalidSqlParameters },
+                            .boolean => if (std.ascii.eqlIgnoreCase(value.string, "true")) .{ .bool = true } else if (std.ascii.eqlIgnoreCase(value.string, "false")) .{ .bool = false } else return error.InvalidSqlParameters,
+                            else => value,
+                        };
+                    };
+                    parameter.* = .{ .name = name, .value = try cypher.value.Value.fromJson(owned, value) };
+                }
+                var changed = for (staged_rows.items) |row| {
+                    const member = for (binding.graph.labels) |label| {
+                        if (std.mem.eql(u8, label.table, row.identity.table)) break true;
+                    } else false;
+                    if (member) break true;
+                } else false;
+                for (staged_effects.items) |effects| for (binding.graph.labels) |label| {
+                    if (std.mem.eql(u8, label.table, effects.table)) changed = true;
+                };
+                var overlay: graph_overlay.View = .{ .client = &client, .rows = staged_rows.items, .effects = staged_effects.items, .limits = .{} };
+                break :blk try catalog.graph_relation.Cursor.open(a, binding.*, if (changed) overlay.backend() else client.backend(), parameters, request.request, .{});
+            } else blk: {
+                var demanded = request.request;
+                demanded.primary_order = true;
+                const scan_request = try self.prepareScan(owned, request.table, demanded);
+                const view = try owner.read.openSql(a, request.table.physical_name, scan_request.from, scan_request.to, scan_request.opts);
+                errdefer view.deinit();
+                const cursor = try a.create(ReadCursor);
+                errdefer a.destroy(cursor);
+                cursor.* = .{ .alloc = a, .adapter = self, .schema_version = request.table.schema_version, .require_primary_digest = request.request.include_primary_digest, .view = view, .projection = try @import("antfly_local_sources").sql_document_row.Projection.init(a, request.table, request.request.fields) };
+                var base_cursor: catalog.Cursor = .{ .ptr = cursor, .next = ReadCursor.next, .close = ReadCursor.close };
+                if (self.staged) |staged| if (try @import("sql_session_overlay.zig").needsMerge(staged, request.table)) {
+                    const row_filter = try http_server.resolveEffectiveRowFilterJson(owned, self.identity.*, request.table.physical_name);
+                    base_cursor = try @import("sql_session_overlay.zig").openWithProjection(a, base_cursor, staged, request.table, demanded, row_filter, .{ .ptr = &client, .permits = projectGraphSqlRow });
+                };
+                break :blk base_cursor;
+            };
+            errdefer child.close(child.ptr);
+            const wrapper = try a.create(GraphStatementCursor);
+            wrapper.* = .{ .a = a, .adapter = self, .table = request.table, .child = child, .owner = owner };
+            out.* = .{ .ptr = wrapper, .next = GraphStatementCursor.next, .close = GraphStatementCursor.close };
+            owner.opened += 1;
+        }
+        // All allocations through the local arena must finish before its
+        // final state moves into the statement owner.
+        owner.arena = arena;
+        return .{ .ptr = owner, .cursors = owner.cursors, .close = GraphStatement.close };
+    }
+
     fn openStatement(ptr: *anyopaque, alloc: std.mem.Allocator, requests: []const catalog.StatementScan) anyerror!catalog.StatementRead {
         const self: *Adapter = @ptrCast(@alignCast(ptr));
+        for (requests) |request| if (request.table.graph != null) return self.openGraphStatement(alloc, requests);
         for (requests) |request| if (request.table.external_base_source != null) return self.openLakeStatement(alloc, requests);
         if (self.dynamic_snapshot != null) return self.openDynamicStatement(alloc, requests);
         if (requests.len == 0 or requests.len > 64) return error.SqlProgramLimitExceeded;
@@ -3726,4 +4001,78 @@ test "SQL receipt readiness shares one deadline across preflight and scan checks
     try std.testing.expectEqual(start, budget.deadline(start, 0));
     try std.testing.expect(budget.deadline_ns == null);
     try std.testing.expectEqual(std.math.maxInt(u64), budget.deadline(std.math.maxInt(u64) - 1, 10));
+}
+
+test "lake SQL GRAPH_TABLE shared graph joins release every provider allocation" {
+    const cypher = @import("cypher");
+    const port = @import("antfly_local_sources").storage_statement_read_fence;
+    const Fake = struct {
+        const Self = @This();
+        captures: usize = 0,
+        releases: usize = 0,
+        const graph: cypher.catalog.Graph = .{ .name = "knowledge", .incarnation = 1, .revision = 1, .labels = &.{.{ .name = "Document", .table = "docs", .table_id = 7 }}, .relationships = &.{} };
+        const nodes = [_]cypher.value.Node{
+            .{ .identity = .{ .table = "docs", .key = "a" }, .labels = &.{"Document"}, .properties = &.{.{ .name = "id", .value = .{ .string = "a" } }} },
+            .{ .identity = .{ .table = "docs", .key = "b" }, .labels = &.{"Document"}, .properties = &.{.{ .name = "id", .value = .{ .string = "b" } }} },
+        };
+        const record: system_catalog.Resource = .{ .kind = .graph, .id = 1, .name = "knowledge", .source_json = "{\"labels\":[{\"name\":\"Document\",\"table\":\"docs\"}]}", .graph_tables = &.{.{ .label_index = 0, .table_id = 7, .storage_name = "docs" }} };
+        fn status(_: *anyopaque, a: std.mem.Allocator) ![]u8 {
+            return a.dupe(u8, "{}");
+        }
+        fn resolve(_: *anyopaque, a: std.mem.Allocator, _: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            return switch (call) {
+                .read => std.json.Stringify.valueAlloc(a, system_catalog.State{ .revision = 1, .resources = &.{record} }, .{}),
+                .policy_publication_status => a.dupe(u8, "null"),
+                .resolve_many => std.json.Stringify.valueAlloc(a, system_catalog.ResolvedMany{ .revision = 1, .tables = &.{.{ .table_id = 7, .name = "docs", .query_definition = .{ .table_id = 7, .schema_json = "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"Document\",\"document_schemas\":{\"Document\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}}}}}}", .read_schema_json = "", .indexes_json = "{}" } }} }, .{}),
+                else => error.UnexpectedCatalogCall,
+            };
+        }
+        fn bind(_: *anyopaque, _: std.mem.Allocator, _: cypher.catalog.Graph) !void {}
+        fn checkpoint(_: *anyopaque) !void {}
+        fn scan(_: *anyopaque, a: std.mem.Allocator, _: []const u8, after: ?[]const u8, _: usize) !cypher.backend.Page(*const cypher.value.Node) {
+            return .{ .items = if (after == null) try a.dupe(*const cypher.value.Node, &.{ &nodes[0], &nodes[1] }) else &.{} };
+        }
+        fn get(_: *anyopaque, _: std.mem.Allocator, _: cypher.value.Identity) !?*const cypher.value.Node {
+            return null;
+        }
+        fn expand(_: *anyopaque, _: std.mem.Allocator, _: cypher.catalog.Relationship, _: cypher.value.Identity, _: cypher.ast.Direction, _: ?[]const u8, _: usize) !cypher.backend.Page(*const cypher.value.Relationship) {
+            return .{ .items = &.{} };
+        }
+        const Cut = struct {
+            a: std.mem.Allocator,
+            fake: *Self,
+            fn invoke(ptr: *anyopaque, a: std.mem.Allocator, body: []const u8) ![]u8 {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                const backend: cypher.backend.Backend = .{ .ptr = self.fake, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .get = get, .expand = expand } };
+                return (cypher.rpc.Owner{ .backend = backend, .graph = graph, .table = "docs" }).execute(a, body);
+            }
+            fn release(ptr: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.fake.releases += 1;
+                self.a.destroy(self);
+            }
+        };
+        fn open(ptr: *anyopaque, a: std.mem.Allocator, _: port.GraphStatement) !port.GraphRead {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            const cut = try a.create(Cut);
+            cut.* = .{ .a = a, .fake = self };
+            self.captures += 1;
+            return .{ .ptr = cut, .vtable = &.{ .invoke = Cut.invoke, .release = Cut.release } };
+        }
+    };
+    const a = std.testing.allocator;
+    var fake: Fake = .{};
+    var server = http_server.ApiHttpServer.init(a, .{}, .{ .ptr = &fake, .vtable = &.{ .status = undefined, .system_catalog = Fake.resolve, .supports_query_definitions = true } }, .{ .ptr = &fake, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined, .open_cypher_statement = Fake.open } }, null);
+    defer server.deinit();
+    var identity: ?http_server.AuthenticatedIdentity = null;
+    var adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{} };
+    var compiled = try @import("antfly_local_sources").sql_compiler.compile(a, "SELECT g.key,h.key FROM GRAPH_TABLE(knowledge MATCH (n IS Document) WHERE n.id='a' COLUMNS (antfly.documentKey(n) AS key)) g JOIN GRAPH_TABLE(knowledge MATCH (n IS Document) WHERE n.id='b' COLUMNS (antfly.documentKey(n) AS key)) h ON true", .{});
+    defer compiled.deinit();
+    var result = try adapter.execute(a, &compiled, &.{}, .{}, null);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+    try std.testing.expectEqualStrings("a", result.output.rows[0][0].string);
+    try std.testing.expectEqualStrings("b", result.output.rows[0][1].string);
+    try std.testing.expectEqual(@as(usize, 1), fake.captures);
+    try std.testing.expectEqual(fake.captures, fake.releases);
 }

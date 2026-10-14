@@ -85,7 +85,7 @@ pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.Request
         try tables_api.validateObjectCreateDefinition(alloc, create_req);
         object_create = storage_settings.engine == .object;
     }
-    const required_version = if (object_create) protocol.object_table_engine_version else if (request.mutation.kind == .table and request.mutation.action == .drop) protocol.system_catalog_drop_version else protocol.system_catalog_version;
+    const required_version = if (request.mutation.kind == .graph) protocol.graph_definition_version else if (object_create) protocol.object_table_engine_version else if (request.mutation.kind == .table and request.mutation.action == .drop) protocol.system_catalog_drop_version else protocol.system_catalog_version;
     const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, required_version);
     svc.lockCatalogMutation();
     defer svc.unlockCatalogMutation();

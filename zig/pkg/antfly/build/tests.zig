@@ -1020,6 +1020,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = embedded_api_mod,
         .filters = &.{
             "embedded api round-trips batch lookup scan and search over memory-backed durable lsm",
+            "embedded api Cypher catalog and writes share portable retained graph values",
             "embedded api hosted profile drains derived indexing without native runtimes",
             "embedded api hosted profile persists text index across reopen over storage",
             "embedded api createLite provisions default full text index",
@@ -1030,6 +1031,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         },
     });
     const run_embedded_api_tests = addFilteredTestRunArtifact(b, embedded_api_tests);
+    const portable_cypher_tests = b.addTest(.{
+        .root_module = embedded_api_mod,
+        .filters = &.{"embedded api Cypher catalog and writes"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("embedded-cypher-test", "Qualify the portable single-source graph host")
+        .dependOn(&addFilteredTestRunArtifact(b, portable_cypher_tests).step);
     embedded_test_step.dependOn(&run_embedded_api_tests.step);
     // db.zig is also its own module (embedded_db_mod) rather than a file
     // reachable from embedded_mod's root, so its tests need the same
@@ -1562,7 +1570,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "k shortest paths preserve parallel typed edge identities",
         "k shortest paths share one cumulative work budget across spur searches",
         "conjunctive reverse expansion",
-        "conjunctive fixed edges preserve self loops while variable paths remain node simple",
+        "conjunctive fixed and variable edges preserve self loops without reusing relationships",
         "conjunctive match supports branches anti joins inequality and optional nulls",
         "conjunctive validation rejects disconnected and unused aliases",
         "conjunctive validation bounds total recursive pattern shape",
@@ -2002,6 +2010,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-api-catalog-authority-test", "Run configured remote catalog publication authority regression")
         .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, catalog_authority_tests, &.{"unconfigured remote catalog authority skips background work without borrowing internal credentials"}).step);
+    const cypher_transport_filters = &.{ "api http client preserves group query capability errors", "typed internal query workers preserve identity generation validation", "row policy publication Raft codec carries immutable owner-fetched bytes privately" };
+    const cypher_transport_tests = b.addTest(.{
+        .root_module = api_http_runtime_test_mod,
+        .filters = cypher_transport_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-cypher-transport-test", "Verify private graph capability errors survive owner transport")
+        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, cypher_transport_tests, cypher_transport_filters).step);
     root_test_step.dependOn(&run_api_http_runtime_tests.step);
 
     const introducer_tests = b.addTest(.{
@@ -2643,6 +2659,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("lake-integration-test", "Run public lake binding and SQL cursor integration tests").dependOn(&addFilteredTestRunArtifact(b, lake_integration_tests).step);
+    const cypher_capture_tests = b.addTest(.{
+        .root_module = lake_integration_mod,
+        .filters = &.{"external lake Cypher execution reads immutable native document and graph cuts"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("cypher-native-capture-test", "Verify immutable materialization and native capture capabilities")
+        .dependOn(&addFilteredTestRunArtifact(b, cypher_capture_tests).step);
     const filtered_topk_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/lake_filtered_topk_test_root.zig"),
         .target = target,
@@ -2908,6 +2931,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_hot_standby_tests = addFilteredTestRunArtifact(b, hot_standby_tests);
     const hot_standby_test_step = b.step("antfly-storage-hot-standby-test", "Run hot-standby storage tests");
     hot_standby_test_step.dependOn(&run_hot_standby_tests.step);
+
+    const policy_follower_filters = &.{"row-policy Raft apply persists fail-closed intent and finalizes after restart"};
+    const policy_follower_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = policy_follower_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-row-policy-follower-test", "Verify signed follower writes finalize committed policy installation")
+        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, policy_follower_tests, policy_follower_filters).step);
 
     // cmd/standby.zig is owned by the distributed runtime unit. Keep its
     // focused parser root inside pkg/antfly/src so relative imports stay
@@ -6022,6 +6054,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     );
     const graph_runtime_test_step = b.step("graph-runtime-test", "Run graph artifact replay, repair, and traversal integration tests");
     graph_runtime_test_step.dependOn(&run_graph_runtime_tests.step);
+    b.step("cypher-storage-write-test", "Run native graph transaction effect and recovery regressions").dependOn(&run_graph_runtime_tests.step);
+    const cypher_open_failure_filters = [_][]const u8{ "db corrupt table catalog open releases native reclaimers", "db protected transaction BEGIN admits metadata while PREPARE still requires authority" };
+    const cypher_open_failure_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &cypher_open_failure_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("cypher-native-open-failure-test", "Verify retained owner open failures release native resources")
+        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, cypher_open_failure_tests, &cypher_open_failure_filters).step);
     // Ordered dispatch fixtures moved to the server owner in PR 958. Keep the
     // graph gate exercising them through that owner, not through the local DB.
     const graph_ordered_runtime_filters = [_][]const u8{

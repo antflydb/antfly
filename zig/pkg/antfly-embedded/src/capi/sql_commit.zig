@@ -24,6 +24,18 @@ const catalog = dependencies.sql_catalog;
 const key = "\x00antfly/embedded/sql-commit/v1";
 const Record = struct { id: h.db_mod.types.TxnId, timestamp: u64, tables: []const []const u8 };
 
+pub fn hasAdmission(handle: *h.Handle, id: h.db_mod.types.TxnId) !bool {
+    var read = try handle.db.core.store.beginReadTxn();
+    defer read.abort();
+    const bytes = read.get(key) catch |err| switch (err) {
+        error.NotFound => return false,
+        else => return err,
+    };
+    const record = try std.json.parseFromSlice(Record, handle.alloc, bytes, .{});
+    defer record.deinit();
+    return std.mem.eql(u8, &record.value.id, &id);
+}
+
 fn store(handle: *h.Handle, record: ?Record) !void {
     const bytes = if (record) |value| try std.json.Stringify.valueAlloc(handle.alloc, value, .{}) else null;
     defer if (bytes) |value| handle.alloc.free(value);
@@ -76,12 +88,31 @@ pub fn recover(handle: *h.Handle) !void {
 }
 
 pub fn commit(handle: *h.Handle, requests: []const contract.TableCommitRequest, out_id: *?h.db_mod.types.TxnId) !catalog.MutationOutcome {
+    return commitWithGraphGuards(handle, requests, &.{}, null, out_id);
+}
+
+pub const GraphGuard = struct {
+    table_name: []const u8,
+    table_id: u64,
+    schema_version: u32,
+    proofs: []const @typeInfo(@FieldType(h.db_mod.types.TransactionIntentRequest, "range_guards")).pointer.child,
+};
+/// Local capture capabilities are validated against local native owners. They
+/// do not fabricate distributed route fences or data-Raft history.
+pub fn commitWithGraphGuards(handle: *h.Handle, requests: []const contract.TableCommitRequest, guards: []const GraphGuard, requested_id: ?h.db_mod.types.TxnId, out_id: *?h.db_mod.types.TxnId) !catalog.MutationOutcome {
     if (requests.len == 0) return .committed;
     try recover(handle);
     const io = handle.db.backend_runtime.io() orelse return error.UnsupportedSqlExecution;
     const now: u64 = @intCast(@max(0, std.Io.Clock.real.now(io).nanoseconds));
     var id: h.db_mod.types.TxnId = undefined;
-    std.Io.random(io, &id);
+    if (requested_id) |value| {
+        id = value;
+        const existing: ?h.transactions_mod.TxnStatus = handle.db.getTransactionStatus(id) catch |err| switch (err) {
+            error.TxnNotFound => null,
+            else => return err,
+        };
+        if (existing != null) return error.CypherWriteRequestAlreadyUsed;
+    } else try io.randomSecure(&id);
     const names = try handle.alloc.alloc([]const u8, requests.len);
     defer handle.alloc.free(names);
     for (requests, names) |request, *name| name.* = request.table_name;
@@ -95,6 +126,13 @@ pub fn commit(handle: *h.Handle, requests: []const contract.TableCommitRequest, 
     };
     for (requests) |request| {
         const db = try @import("tables.zig").get(handle, request.table_name);
+        const proofs = for (guards) |guard| {
+            if (!std.mem.eql(u8, guard.table_name, request.table_name)) continue;
+            if (guard.table_id != db.core.identity_namespace.table_id or
+                guard.schema_version != (if (db.core.schema) |schema| schema.version else 0) or
+                request.schema_version != (if (guard.schema_version == 0) @as(?u32, null) else guard.schema_version)) return error.CatalogGenerationChanged;
+            break guard.proofs;
+        } else if (guards.len != 0 and (request.normalized_graph_rows or request.graph_writes.len != 0 or request.graph_deletes.len != 0)) return error.CatalogGenerationChanged else &.{};
         if (db != &handle.db) _ = try db.beginTransactionScoped(id, now, now, names, false, true, null);
         try db.writeTransaction(id, .{
             .schema_version = request.schema_version,
@@ -103,6 +141,10 @@ pub fn commit(handle: *h.Handle, requests: []const contract.TableCommitRequest, 
             .relational_repair = request.relational_repair,
             .writes = request.writes,
             .deletes = request.deletes,
+            .normalized_graph_rows = request.normalized_graph_rows,
+            .graph_writes = request.graph_writes,
+            .graph_deletes = request.graph_deletes,
+            .range_guards = proofs,
             .predicates = request.predicates,
             .integrity_commands = request.integrity_commands,
             .relational_activation = request.relational_activation,
