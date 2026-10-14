@@ -446,3 +446,55 @@ test "production HTTP HLS delta merges snapshots and retries missing history wit
     try serving.await(std.testing.io);
     try std.testing.expectEqual(@as(usize, 7), transport.requests);
 }
+
+test "production HTTP HLS date-range v2 combined reload and full fallback preserve authenticated metadata" {
+    const prefix = "#EXTM3U\n#EXT-X-VERSION:9\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:10\n#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,CAN-SKIP-UNTIL=12,CAN-SKIP-DATERANGES=YES\n";
+    const first = prefix ++ "#EXT-X-DATERANGE:ID=\"a\",START-DATE=\"2026-01-01T00:00:00Z\",X-NOTE=\"retained\"\n#EXT-X-PROGRAM-DATE-TIME:2026-01-01T00:00:00Z\n#EXTINF:2,\none.m4s\n";
+    const second = prefix ++ "#EXT-X-SKIP:SKIPPED-SEGMENTS=1,RECENTLY-REMOVED-DATERANGES=\"\"\n#EXT-X-DATERANGE:ID=\"a\",DURATION=2\n#EXTINF:2,\ntwo.m4s\n";
+    const missing = prefix ++ "#EXT-X-SKIP:SKIPPED-SEGMENTS=1\n#EXTINF:2,\ntwo.m4s\n";
+    const full = first ++ "#EXTINF:2,\ntwo.m4s\n#EXT-X-ENDLIST\n";
+    const Request = struct {
+        fn initial(request: http.testing_mod.RequestInfo) !void {
+            try Verify.auth(request);
+            try std.testing.expectEqualStrings("/dates/list.m3u8?token=stable%26key", request.target);
+        }
+        fn delta(request: http.testing_mod.RequestInfo) !void {
+            try Verify.auth(request);
+            try std.testing.expectEqualStrings("/dates/list.m3u8?token=stable%26key&_HLS_skip=v2", request.target);
+        }
+        fn combined(request: http.testing_mod.RequestInfo) !void {
+            try Verify.auth(request);
+            try std.testing.expectEqualStrings("/dates/list.m3u8?token=stable%26key&_HLS_msn=10&_HLS_skip=v2", request.target);
+        }
+        fn now(_: ?*anyopaque) u64 {
+            return std.time.ns_per_s;
+        }
+    };
+    var server = try http.testing_mod.TestServer.start(a, std.testing.io, &.{
+        .{ .path = "/dates/list.m3u8", .assert_request = Request.initial, .max_uses = 1, .respond = .{ .body = first } },
+        .{ .path = "/dates/list.m3u8", .assert_request = Request.delta, .max_uses = 1, .respond = .{ .body = second } },
+        .{ .path = "/dates/list.m3u8", .assert_request = Request.combined, .max_uses = 1, .respond = .{ .body = missing } },
+        .{ .path = "/dates/list.m3u8", .assert_request = Request.initial, .max_uses = 1, .respond = .{ .body = full } },
+    });
+    defer server.deinit();
+    var client = http.Client.initWithConfig(a, std.testing.io, .{ .default_headers = &.{.{ "Authorization", "Bearer fixture-token" }} });
+    defer client.deinit();
+    const url = try std.fmt.allocPrint(a, "{s}/dates/list.m3u8?token=stable%26key", .{server.baseUrl()});
+    defer a.free(url);
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 64 * 1024 * 1024 } };
+    defer std.debug.assert(pool.snapshot().host_bytes == 0);
+    var transport = media.http_stream.Adapter(http){ .allocator = a, .client = &client, .root_url = url, .pool = &pool };
+    var reader = try media.hls_live.Reader(http).init(a, &transport, url, .{ .clock = .{ .now_ns = Request.now } });
+    defer reader.deinit();
+    var serving = try std.testing.io.concurrent(Verify.serve, .{ &server, 4 });
+    defer _ = serving.cancel(std.testing.io) catch {};
+    try reader.reload();
+    try reader.reloadDelta();
+    try std.testing.expectEqualStrings("2", reader.playlist.?.date_ranges[0].duration().?);
+    try reader.reloadBlockingDelta();
+    try std.testing.expectEqualStrings("retained", reader.playlist.?.date_ranges[0].attributes.get("X-NOTE").?.value);
+    try std.testing.expectEqualStrings("2", reader.playlist.?.date_ranges[0].duration().?);
+    try std.testing.expect(reader.playlist.?.ended);
+    try serving.await(std.testing.io);
+    try std.testing.expectEqual(@as(usize, 4), transport.requests);
+}

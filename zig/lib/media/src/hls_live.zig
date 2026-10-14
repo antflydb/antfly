@@ -29,7 +29,7 @@ fn sameInitialization(left: hls.Initialization, right: hls.Initialization) bool 
     return std.mem.eql(u8, left.uri, right.uri) and std.meta.eql(left.range, right.range) and hls.crypto.same(left.encryption, right.encryption);
 }
 fn sameSegment(left: hls.Segment, right: hls.Segment) bool {
-    return std.mem.eql(u8, left.uri, right.uri) and std.meta.eql(left.range, right.range) and sameInitialization(left.initialization, right.initialization) and hls.crypto.same(left.encryption, right.encryption) and left.discontinuity_sequence == right.discontinuity_sequence and left.duration_seconds == right.duration_seconds and std.meta.eql(left.part, right.part) and (if (left.dash) |timing| right.dash != null and dash_cursor.sameTiming(timing, right.dash.?) else right.dash == null);
+    return std.mem.eql(u8, left.uri, right.uri) and std.meta.eql(left.range, right.range) and sameInitialization(left.initialization, right.initialization) and hls.crypto.same(left.encryption, right.encryption) and left.discontinuity_sequence == right.discontinuity_sequence and left.duration_seconds == right.duration_seconds and (if (left.program_date_time) |date| right.program_date_time == null or hls.dateranges.Instant.order(date, right.program_date_time.?) == .eq else true) and std.meta.eql(left.part, right.part) and (if (left.dash) |timing| right.dash != null and dash_cursor.sameTiming(timing, right.dash.?) else right.dash == null);
 }
 
 fn segmentOrder(left: hls.Segment, right: hls.Segment) std.math.Order {
@@ -71,16 +71,28 @@ fn directiveSeparator(url: []const u8) ![]const u8 {
     }
     return if (query == null) "?" else if (std.mem.endsWith(u8, url, "?") or std.mem.endsWith(u8, url, "&")) "" else "&";
 }
-pub fn deltaRequestUrl(a: std.mem.Allocator, url: []const u8, limit: usize) ![]u8 {
+pub const Delivery = struct { sequence: ?u64 = null, part: ?u32 = null, skip: enum { none, segments, dateranges } = .none };
+pub fn deliveryRequestUrl(a: std.mem.Allocator, url: []const u8, delivery: Delivery, limit: usize) ![]u8 {
     const separator = try directiveSeparator(url);
-    if (std.fmt.count("{s}{s}_HLS_skip=YES", .{ url, separator }) > limit) return error.ResourceLimitExceeded;
-    return std.fmt.allocPrint(a, "{s}{s}_HLS_skip=YES", .{ url, separator });
+    if (delivery.part != null and delivery.sequence == null) return error.InvalidHlsDeliveryDirective;
+    var seqbuf: [20]u8 = undefined;
+    var partbuf: [20]u8 = undefined;
+    const seq = if (delivery.sequence) |v| try std.fmt.bufPrint(&seqbuf, "{d}", .{v}) else "";
+    const part = if (delivery.part) |v| try std.fmt.bufPrint(&partbuf, "{d}", .{v}) else "";
+    const skip = switch (delivery.skip) {
+        .none => "",
+        .segments => "YES",
+        .dateranges => "v2",
+    };
+    const arguments = .{ url, if (seq.len != 0 or skip.len != 0) separator else "", if (seq.len != 0) "_HLS_msn=" else "", seq, if (part.len != 0) "&_HLS_part=" else "", part, if (skip.len == 0) "" else if (seq.len != 0) "&_HLS_skip=" else "_HLS_skip=", skip };
+    if (std.fmt.count("{s}{s}{s}{s}{s}{s}{s}{s}", arguments) > limit) return error.ResourceLimitExceeded;
+    return std.fmt.allocPrint(a, "{s}{s}{s}{s}{s}{s}{s}{s}", arguments);
+}
+pub fn deltaRequestUrl(a: std.mem.Allocator, url: []const u8, limit: usize) ![]u8 {
+    return deliveryRequestUrl(a, url, .{ .skip = .segments }, limit);
 }
 pub fn blockingRequestUrl(a: std.mem.Allocator, url: []const u8, sequence: u64, part: ?u32, limit: usize) ![]u8 {
-    const separator = try directiveSeparator(url);
-    const length = if (part) |index| std.fmt.count("{s}{s}_HLS_msn={d}&_HLS_part={d}", .{ url, separator, sequence, index }) else std.fmt.count("{s}{s}_HLS_msn={d}", .{ url, separator, sequence });
-    if (length > limit) return error.ResourceLimitExceeded;
-    return if (part) |index| std.fmt.allocPrint(a, "{s}{s}_HLS_msn={d}&_HLS_part={d}", .{ url, separator, sequence, index }) else std.fmt.allocPrint(a, "{s}{s}_HLS_msn={d}", .{ url, separator, sequence });
+    return deliveryRequestUrl(a, url, .{ .sequence = sequence, .part = part }, limit);
 }
 
 /// Single consumer, borrowing a native HTTP adapter. Initial master discovery
@@ -199,7 +211,7 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
         /// advancing past an unconsumed sequence fails instead of dropping data.
         /// Overlapping sequence descriptors must remain immutable across reloads.
         pub fn reload(self: *Self) !void {
-            return self.reloadRequest(null);
+            return self.reloadRequest(null, false);
         }
         pub fn canSkipReload(self: *const Self) bool {
             if (comptime !@hasDecl(manifest_parser, "parseUpdateControlled")) return false;
@@ -216,9 +228,10 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
         /// Explicit opt-in. Old/missing clock or capability uses an ordinary reload.
         pub fn reloadDelta(self: *Self) !void {
             if (!self.canSkipReload()) return self.reload();
-            const url = try deltaRequestUrl(self.allocator, self.mediaUrl(), self.transport.limits.max_uri_bytes);
+            const v2 = self.playlist.?.server_control.can_skip_dateranges;
+            const url = try deliveryRequestUrl(self.allocator, self.mediaUrl(), .{ .skip = if (v2) .dateranges else .segments }, self.transport.limits.max_uri_bytes);
             defer self.allocator.free(url);
-            return self.reloadRequest(url);
+            return self.reloadRequest(url, v2);
         }
         pub fn canBlockReload(self: *const Self) bool {
             const playlist = self.playlist orelse return false;
@@ -230,9 +243,19 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
             const playlist = self.playlist.?;
             const url = try blockingRequestUrl(self.allocator, self.mediaUrl(), self.next_sequence orelse return error.MediaPlaylistRequired, if (playlist.part_target_seconds != null) self.next_part else null, self.transport.limits.max_uri_bytes);
             defer self.allocator.free(url);
-            return self.reloadRequest(url);
+            return self.reloadRequest(url, false);
         }
-        fn reloadRequest(self: *Self, request_url: ?[]const u8) !void {
+        /// Combine blocking delivery and a fresh delta capability in one request.
+        pub fn reloadBlockingDelta(self: *Self) !void {
+            if (!self.canBlockReload()) return error.UnsupportedHlsBlockingReload;
+            const playlist = self.playlist.?;
+            const skipping = self.canSkipReload();
+            const v2 = skipping and playlist.server_control.can_skip_dateranges;
+            const url = try deliveryRequestUrl(self.allocator, self.mediaUrl(), .{ .sequence = self.next_sequence orelse return error.MediaPlaylistRequired, .part = if (playlist.part_target_seconds != null) self.next_part else null, .skip = if (v2) .dateranges else if (skipping) .segments else .none }, self.transport.limits.max_uri_bytes);
+            defer self.allocator.free(url);
+            return self.reloadRequest(url, v2);
+        }
+        fn reloadRequest(self: *Self, request_url: ?[]const u8, expect_date_delta: bool) !void {
             try self.transport.control.check();
             const requested_ns: ?u64 = if (comptime @hasDecl(manifest_parser, "parseUpdateControlled")) if (self.options.clock) |clock| clock.now_ns(clock.context) else null else null;
             var body = try self.transport.fetch(self.mediaUrl(), request_url orelse self.mediaUrl(), null, self.options.playlist.max_bytes);
@@ -258,13 +281,25 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
             } else if (@hasDecl(manifest_parser, "parseAt"))
                 try manifest_parser.parseAt(self.allocator, body.bytes, self.options.playlist, if (self.options.clock) |clock| clock.now(clock.context) else null)
             else if (@hasDecl(manifest_parser, "parseUpdateControlled")) blk: {
-                const merged = manifest_parser.parseUpdateControlled(self.allocator, body.bytes, self.options.playlist, self.playlist, self.transport.control, self.transport.pool) catch |err| {
+                const merged = parse: {
+                    var candidate = manifest_parser.parseUpdateControlled(self.allocator, body.bytes, self.options.playlist, self.playlist, self.transport.control, self.transport.pool) catch |err| break :parse @as(anyerror!hls.Playlist, err);
+                    if (expect_date_delta and candidate.skipped_segments != null and !candidate.daterange_delta) {
+                        candidate.deinit();
+                        break :parse @as(anyerror!hls.Playlist, error.HlsDeltaHistoryMissing);
+                    }
+                    break :parse @as(anyerror!hls.Playlist, candidate);
+                } catch |err| {
                     if (err != error.HlsDeltaHistoryMissing) return err;
                     // Neither cursor nor committed manifest changes on retry failure.
                     const replacement = try self.transport.fetch(self.mediaUrl(), manifest_url, null, self.options.playlist.max_bytes);
                     body.deinit();
                     body = replacement;
-                    break :blk try manifest_parser.parseUpdateControlled(self.allocator, body.bytes, self.options.playlist, null, self.transport.control, self.transport.pool);
+                    var full = try manifest_parser.parseUpdateControlled(self.allocator, body.bytes, self.options.playlist, self.playlist, self.transport.control, self.transport.pool);
+                    if (full.skipped_segments != null) {
+                        full.deinit();
+                        return error.HlsDeltaHistoryMissing;
+                    }
+                    break :blk full;
                 };
                 break :blk merged;
             } else try manifest_parser.parse(self.allocator, body.bytes, self.options.playlist);
@@ -1339,4 +1374,63 @@ fn deltaReaderAllocationRun(a: std.mem.Allocator) !void {
 }
 test "live HLS delta reader releases planning and transport owners on every allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, deltaReaderAllocationRun, .{});
+}
+
+test "live HLS combined blocking date-range directive preserves authentication and bounds" {
+    const a = std.testing.allocator;
+    const url = try deliveryRequestUrl(a, "https://example.test/list?token=a%26b", .{ .sequence = 18446744073709551615, .part = 2, .skip = .dateranges }, 4096);
+    defer a.free(url);
+    try std.testing.expectEqualStrings("https://example.test/list?token=a%26b&_HLS_msn=18446744073709551615&_HLS_part=2&_HLS_skip=v2", url);
+    try std.testing.expectError(error.InvalidHlsDeliveryDirective, deliveryRequestUrl(a, "https://example.test/list", .{ .part = 0 }, 4096));
+    try std.testing.expectError(error.InvalidHlsDeliveryDirective, deliveryRequestUrl(a, "https://example.test/list?%5FHLS_skip=v2", .{ .sequence = 10, .skip = .dateranges }, 4096));
+    try std.testing.expectError(error.ResourceLimitExceeded, deliveryRequestUrl(a, "https://example.test/list", .{ .sequence = 10, .skip = .dateranges }, 10));
+}
+const date_live_header = "#EXTM3U\n#EXT-X-VERSION:9\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:10\n#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,CAN-SKIP-UNTIL=12,CAN-SKIP-DATERANGES=YES\n";
+const date_live_tags = "#EXT-X-DATERANGE:ID=\"a\",START-DATE=\"2026-01-01T00:00:00Z\",X-NOTE=\"old\"\n#EXT-X-PROGRAM-DATE-TIME:2026-01-01T00:00:00Z\n";
+const date_live_full = date_live_header ++ date_live_tags ++ "#EXTINF:2,\none.mp4\n#EXTINF:2,\ntwo.mp4\n";
+const DateDeltaHttp = struct {
+    pub const Client = struct {
+        responses: []const []const u8,
+        urls: []const []const u8,
+        at: usize = 0,
+        fail_at: ?usize = null,
+        pub fn get(self: *@This(), url: []const u8, _: anytype) !FakeHttp.Response {
+            if (self.at >= self.responses.len) return error.UnexpectedRequest;
+            try std.testing.expectEqualStrings(self.urls[self.at], url);
+            if (self.fail_at == self.at) return error.ConnectionReset;
+            const bytes = self.responses[self.at];
+            self.at += 1;
+            return .{ .body = bytes };
+        }
+    };
+};
+test "live HLS v2 augments metadata combines blocking and falls back atomically on incomplete date history" {
+    const a = std.testing.allocator;
+    const root = "https://example.test/list.m3u8?token=a%26b";
+    inline for (.{ false, true }) |fail| {
+        var clock = DeltaTestClock{};
+        var client = DateDeltaHttp.Client{
+            .responses = &.{ date_live_full, date_live_header ++ "#EXT-X-SKIP:SKIPPED-SEGMENTS=2,RECENTLY-REMOVED-DATERANGES=\"\"\n#EXT-X-DATERANGE:ID=\"a\",X-NEW=1\n" ++ delta_tail, date_live_header ++ "#EXT-X-SKIP:SKIPPED-SEGMENTS=2\n" ++ delta_tail, date_live_full ++ delta_tail },
+            .urls = &.{ root, root ++ "&_HLS_skip=v2", root ++ "&_HLS_msn=10&_HLS_skip=v2", root },
+            .fail_at = if (fail) 3 else null,
+        };
+        var pool = @import("admission.zig").Pool{ .limits = .{ .host_bytes = 32 * 1024 * 1024 } };
+        defer std.debug.assert(pool.snapshot().host_bytes == 0);
+        var transport = network.Adapter(DateDeltaHttp){ .allocator = a, .client = &client, .root_url = root, .pool = &pool };
+        var reader = try Reader(DateDeltaHttp).init(a, &transport, root, .{ .clock = .{ .context = &clock, .now_ns = DeltaTestClock.now } });
+        defer reader.deinit();
+        try reader.reload();
+        try reader.reloadDelta();
+        try std.testing.expectEqual(@as(usize, 1), reader.playlist.?.date_ranges.len);
+        try std.testing.expectEqualStrings("1", reader.playlist.?.date_ranges[0].attributes.get("X-NEW").?.value);
+        if (fail) {
+            try std.testing.expectError(error.ConnectionReset, reader.reloadBlockingDelta());
+            try std.testing.expectEqual(@as(?u64, 10), reader.next_sequence);
+            try std.testing.expectEqualStrings("1", reader.playlist.?.date_ranges[0].attributes.get("X-NEW").?.value);
+            client.fail_at = null;
+            try reader.reload();
+        } else try reader.reloadBlockingDelta();
+        try std.testing.expectEqual(@as(usize, 3), reader.playlist.?.segments.len);
+        try std.testing.expectEqual(@as(usize, 4), client.at);
+    }
 }

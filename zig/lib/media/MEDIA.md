@@ -1738,3 +1738,31 @@ shared-host diagnostics, without a production throughput claim. Broader display,
 codec/fuzz/load/performance and the remaining non-CUDA scope stay active.
 
 See the [qualification receipts](../video/testdata/gbr-model-validation/README.md).
+
+### Owned HLS date ranges and combined v2 reloads
+
+`Playlist.date_ranges` preserves ID/class, exact START/END timestamps, duration,
+SCTE35/CUE and custom attributes. Repeated IDs augment immutable attributes;
+conflicting values fail atomically. END-ON-NEXT resolves the earliest following
+range of the same class and retains that endpoint after v2 metadata removal.
+Explicit segment program dates and arbitrary decimal fractions are owned by
+snapshots. Limits bound range count, attribute/value size and shared planning
+memory; allocation failures and admission denial leave existing owners usable.
+
+`reloadDelta` chooses `v2` only with CAN-SKIP-DATERANGES and a fresh advertised
+skip boundary. `reloadBlockingDelta` combines MSN/part and eligible delta
+requests while preserving authenticated query bytes. Missing history or the
+required v2 removal field triggers one full reload. Full responses validate
+same-ID attributes against history; failed fallback commits neither cursor nor
+metadata. Removal lists are tab-separated, may be empty, and reject duplicate
+IDs and reintroduction in the same update.
+
+ReleaseSafe checks pass 153 portable media and 10 production HTTP tests on
+macOS and actual Linux ARM64; 100,879 bounded coverage-guided date-range fuzz
+runs pass. Generated/local HTTP qualification covers exact directives,
+immutable metadata, full fallback and released admission. Gregorian extended
+timestamps with optional offsets are supported; leap seconds are rejected.
+SCTE35 is preserved without command interpretation. Pretrained parity was not
+rerun for this metadata-only change. Broader live interoperability, separate
+tracks, DRM and the full remaining non-CUDA scope remain active. See
+[qualification receipts](testdata/hls-daterange-validation/README.md).

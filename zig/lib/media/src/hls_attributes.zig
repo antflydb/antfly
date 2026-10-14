@@ -42,6 +42,12 @@ pub const List = struct {
     }
 };
 pub fn parse(bytes: []const u8) !List {
+    return parseImpl(bytes, false);
+}
+pub fn parseSkip(bytes: []const u8) !List {
+    return parseImpl(bytes, true);
+}
+fn parseImpl(bytes: []const u8, skip: bool) !List {
     var result = List{};
     var cursor: usize = 0;
     while (cursor < bytes.len) {
@@ -58,7 +64,7 @@ pub fn parse(bytes: []const u8) !List {
             cursor += 1;
             const end = std.mem.indexOfScalarPos(u8, bytes, cursor, '"') orelse return error.MalformedHls;
             const item = bytes[cursor..end];
-            for (item) |c| if (c < 0x20 or c == 0x7f) return error.MalformedHls;
+            for (item) |c| if ((c < 0x20 and !(skip and c == 9 and std.mem.eql(u8, name, "RECENTLY-REMOVED-DATERANGES"))) or c == 0x7f) return error.MalformedHls;
             cursor = end + 1;
             break :blk item;
         } else blk: {

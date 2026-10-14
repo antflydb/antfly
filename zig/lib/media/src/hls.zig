@@ -17,6 +17,8 @@
 const std = @import("std");
 pub const master = @import("hls_master.zig");
 pub const crypto = @import("hls_crypto.zig");
+pub const dateranges = @import("hls_dateranges.zig");
+pub const DateRange = dateranges.Range;
 pub const Range = struct { offset: u64, length: u64 };
 pub const Initialization = struct { uri: []const u8, range: ?Range, encryption: ?crypto.Key = null };
 /// DASH period identity survives live-window removal and XML reordering.
@@ -71,10 +73,13 @@ pub const Segment = struct {
     encryption: ?crypto.Key = null,
     /// Preserve an explicit identity METHOD=NONE as well as AES across delta updates.
     identity_key_declared: bool = false,
+    program_date_time: ?dateranges.Instant = null,
 };
 pub const Limits = struct {
     max_bytes: usize = 1024 * 1024,
     max_segments: usize = 4096,
+    max_date_ranges: usize = 512,
+    max_date_value_bytes: usize = 4096,
     max_variants: usize = 1024,
     max_renditions: usize = 4096,
     max_uri_bytes: usize = 4096,
@@ -86,6 +91,10 @@ pub const Playlist = struct {
     allocator: std.mem.Allocator,
     segments: []Segment,
     target_duration_seconds: u64,
+    date_ranges: []DateRange = &.{},
+    has_program_date_time: bool = false,
+    skipped_segments: ?u64 = null,
+    daterange_delta: bool = false,
     ended: bool,
     part_target_seconds: ?f64 = null,
     server_control: ServerControl = .{},
@@ -102,6 +111,7 @@ pub const Playlist = struct {
         for (self.owned_uris) |owned| self.allocator.free(owned);
         self.allocator.free(self.owned_uris);
         self.allocator.free(self.segments);
+        self.allocator.free(self.date_ranges);
         self.allocator.free(self.dash_periods);
         self.reservation.deinit();
         self.* = undefined;
@@ -191,11 +201,16 @@ pub fn parseUpdateControlled(a: std.mem.Allocator, bytes: []const u8, limits: Li
     if (bytes.len > limits.max_bytes) return error.ResourceLimitExceeded;
     if (!std.unicode.utf8ValidateSlice(bytes)) return error.MalformedHls;
     if (master.isMaster(bytes)) return error.UnsupportedHls;
-    for (bytes) |c| if ((c < 0x20 and c != '\n' and c != '\r') or c == 0x7f) return error.MalformedHls;
+    for (bytes) |c| if ((c < 0x20 and c != '\n' and c != '\r' and c != '\t') or c == 0x7f) return error.MalformedHls;
     var lines = std.mem.splitScalar(u8, bytes, '\n');
     if (!std.mem.eql(u8, std.mem.trimEnd(u8, lines.next().?, "\r"), "#EXTM3U")) return error.MalformedHls;
     var segments: std.ArrayList(Segment) = .empty;
     errdefer segments.deinit(a);
+    var dates: std.ArrayList(DateRange) = .empty;
+    errdefer dates.deinit(a);
+    var removed_dates: ?[]const u8 = null;
+    var has_program_date_time = false;
+    var pending_program_time: ?dateranges.Instant = null;
     var skipped: ?u64 = null;
     var reservation = @import("admission.zig").Token{};
     errdefer reservation.deinit();
@@ -223,8 +238,25 @@ pub fn parseUpdateControlled(a: std.mem.Allocator, bytes: []const u8, limits: Li
         try control.check();
         const line = std.mem.trimEnd(u8, raw, "\r");
         if (line.len == 0) continue;
+        if (std.mem.indexOfScalar(u8, line, 9) != null and !std.mem.startsWith(u8, line, "#EXT-X-SKIP:")) return error.MalformedHls;
         if (ended or std.mem.eql(u8, line, "#EXTM3U")) return error.MalformedHls;
-        if (std.mem.startsWith(u8, line, "#EXTINF:")) {
+        if (std.mem.startsWith(u8, line, "#EXT-X-DATERANGE:")) {
+            const bytes_bound = std.math.mul(usize, limits.max_date_ranges, @sizeOf(DateRange)) catch return error.ResourceLimitExceeded;
+            if (bytes_bound > limits.max_planning_bytes) return error.ResourceLimitExceeded;
+            if (pool) |shared| if (reservation.pool == null) {
+                reservation = try shared.acquire(.{ .host_bytes = limits.max_planning_bytes });
+            };
+            const fields = try @import("hls_attributes.zig").parse(line[17..]);
+            if (removed_dates) |removed| if (fields.get("ID")) |id| if (removedDate(removed, id.value)) return error.MalformedHls;
+            try dateranges.upsert(a, &dates, fields, if (history) |old| old.date_ranges else &.{}, limits.max_date_ranges, limits.max_date_value_bytes);
+        } else if (std.mem.startsWith(u8, line, "#EXT-X-PROGRAM-DATE-TIME:")) {
+            if (pending_program_time != null) return error.MalformedHls;
+            if (pool) |shared| if (reservation.pool == null) {
+                reservation = try shared.acquire(.{ .host_bytes = limits.max_planning_bytes });
+            };
+            pending_program_time = try dateranges.instant(line[25..]);
+            has_program_date_time = true;
+        } else if (std.mem.startsWith(u8, line, "#EXTINF:")) {
             if (duration != null) return error.MalformedHls;
             const comma = std.mem.indexOfScalar(u8, line, ',') orelse return error.MalformedHls;
             const decimal = line[8..comma];
@@ -280,7 +312,7 @@ pub fn parseUpdateControlled(a: std.mem.Allocator, bytes: []const u8, limits: Li
                 _ = std.math.add(u64, offset, pending.length) catch return error.MalformedHls;
                 range = .{ .offset = offset, .length = pending.length };
             }
-            try segments.append(a, .{ .uri = reference, .range = range, .initialization = initialization orelse .{ .uri = &.{}, .range = null }, .sequence = sequence, .discontinuity_sequence = discontinuity_sequence, .duration_seconds = seconds, .discontinuity = discontinuity and part_index == 0, .encryption = encryption, .identity_key_declared = has_identity_key, .part = .{ .index = part_index, .independent = (try attrs.yesNo("INDEPENDENT")) orelse false, .gap = (try attrs.yesNo("GAP")) orelse false } });
+            try segments.append(a, .{ .uri = reference, .range = range, .initialization = initialization orelse .{ .uri = &.{}, .range = null }, .sequence = sequence, .discontinuity_sequence = discontinuity_sequence, .duration_seconds = seconds, .discontinuity = discontinuity and part_index == 0, .encryption = encryption, .identity_key_declared = has_identity_key, .program_date_time = if (part_index == 0) pending_program_time else null, .part = .{ .index = part_index, .independent = (try attrs.yesNo("INDEPENDENT")) orelse false, .gap = (try attrs.yesNo("GAP")) orelse false } });
             part_index = std.math.add(u32, part_index, 1) catch return error.ResourceLimitExceeded;
         } else if (std.mem.startsWith(u8, line, "#EXT-X-MAP:")) {
             if (part_index != 0) return error.MalformedHls;
@@ -325,13 +357,25 @@ pub fn parseUpdateControlled(a: std.mem.Allocator, bytes: []const u8, limits: Li
             min_version = @max(min_version, declaration.min_version);
         } else if (std.mem.startsWith(u8, line, "#EXT-X-SKIP:")) {
             if (skipped != null or segments.items.len != 0 or duration != null or pending_range != null or discontinuity) return error.MalformedHls;
-            const attrs = try @import("hls_attributes.zig").parse(line[12..]);
+            const attrs = try @import("hls_attributes.zig").parseSkip(line[12..]);
             skipped = (try attrs.integer("SKIPPED-SEGMENTS")) orelse return error.MalformedHls;
-            // This reader requests segment-only YES updates, never v2 date-range deletion.
-            if (attrs.get("RECENTLY-REMOVED-DATERANGES") != null) return error.UnsupportedHls;
+            if (attrs.get("RECENTLY-REMOVED-DATERANGES")) |removed| {
+                if (!removed.quoted or removed.value.len > limits.max_date_value_bytes) return error.MalformedHls;
+                removed_dates = removed.value;
+                try validateRemovedDates(removed.value, limits.max_date_ranges);
+                const old = history orelse return error.HlsDeltaHistoryMissing;
+                for (dates.items) |date| if (removedDate(removed.value, date.id())) return error.MalformedHls;
+                for (old.date_ranges) |date| {
+                    try control.check();
+                    if (removedDate(removed.value, date.id())) continue;
+                    try dateranges.upsert(a, &dates, date.attributes, old.date_ranges, limits.max_date_ranges, limits.max_date_value_bytes);
+                }
+            }
             if (skipped.? > limits.max_segments) return error.ResourceLimitExceeded;
             const end = std.math.add(u64, sequence, skipped.?) catch return error.MalformedHls;
-            if (pool) |shared| reservation = try shared.acquire(.{ .host_bytes = limits.max_planning_bytes });
+            if (pool) |shared| if (reservation.pool == null) {
+                reservation = try shared.acquire(.{ .host_bytes = limits.max_planning_bytes });
+            };
             const array_bytes = std.math.mul(usize, limits.max_segments, @sizeOf(Segment)) catch return error.ResourceLimitExceeded;
             if (array_bytes > limits.max_planning_bytes) return error.ResourceLimitExceeded;
             try segments.ensureTotalCapacityPrecise(a, limits.max_segments);
@@ -381,7 +425,8 @@ pub fn parseUpdateControlled(a: std.mem.Allocator, bytes: []const u8, limits: Li
                 _ = std.math.add(u64, offset, pending.length) catch return error.MalformedHls;
                 range = .{ .offset = offset, .length = pending.length };
             }
-            try segments.append(a, .{ .uri = line, .range = range, .initialization = initialization orelse .{ .uri = &.{}, .range = null }, .sequence = sequence, .discontinuity_sequence = discontinuity_sequence, .duration_seconds = seconds, .discontinuity = discontinuity, .encryption = encryption, .identity_key_declared = has_identity_key });
+            try segments.append(a, .{ .uri = line, .range = range, .initialization = initialization orelse .{ .uri = &.{}, .range = null }, .sequence = sequence, .discontinuity_sequence = discontinuity_sequence, .duration_seconds = seconds, .discontinuity = discontinuity, .encryption = encryption, .identity_key_declared = has_identity_key, .program_date_time = pending_program_time });
+            pending_program_time = null;
             previous_full = segments.items[segments.items.len - 1];
             part_index = 0;
             sequence = std.math.add(u64, sequence, 1) catch return error.MalformedHls;
@@ -391,6 +436,12 @@ pub fn parseUpdateControlled(a: std.mem.Allocator, bytes: []const u8, limits: Li
         }
     }
     if (duration != null or pending_range != null or discontinuity) return error.MalformedHls;
+    if (pending_program_time != null and part_index == 0) return error.MalformedHls;
+    if (skipped != null) if (history) |old| {
+        has_program_date_time = has_program_date_time or old.has_program_date_time;
+    };
+    if (dates.items.len != 0 and !has_program_date_time) return error.MalformedHls;
+    try dateranges.resolve(dates.items, limits.max_date_value_bytes, control);
     const target_seconds = target orelse return error.MalformedHls;
     if (skipped != null and (version orelse 1) < 9) return error.UnsupportedHls;
     if ((version orelse 1) < min_version or (initialization != null and (version orelse 1) < 6)) return error.UnsupportedHls;
@@ -409,16 +460,40 @@ pub fn parseUpdateControlled(a: std.mem.Allocator, bytes: []const u8, limits: Li
         const following = segments.items[index + 1];
         if (following.part) |next| if (following.sequence == segment.sequence and !next.gap) return error.MalformedHls;
     };
-    var result = Playlist{ .allocator = a, .segments = try segments.toOwnedSlice(a), .target_duration_seconds = target_seconds, .ended = ended, .part_target_seconds = part_target, .server_control = server, .preload_hint = preload_hint };
+    const date_slice = try dates.toOwnedSlice(a);
+    const segment_slice = segments.toOwnedSlice(a) catch |err| {
+        a.free(date_slice);
+        return err;
+    };
+    var result = Playlist{ .allocator = a, .date_ranges = date_slice, .has_program_date_time = has_program_date_time, .skipped_segments = skipped, .daterange_delta = removed_dates != null, .segments = segment_slice, .target_duration_seconds = target_seconds, .ended = ended, .part_target_seconds = part_target, .server_control = server, .preload_hint = preload_hint };
     errdefer result.deinit();
-    if (skipped != null) {
+    if (skipped != null or result.date_ranges.len != 0 or result.has_program_date_time) {
         try ownDeltaReferences(&result, limits, control);
-        var bytes_owned: usize = result.segments.len * @sizeOf(Segment) + result.owned_uris.len * @sizeOf([]u8);
+        var bytes_owned: usize = result.segments.len * @sizeOf(Segment) + result.date_ranges.len * @sizeOf(DateRange) + result.owned_uris.len * @sizeOf([]u8);
         for (result.owned_uris) |owned| bytes_owned += owned.len;
+        try dateranges.resolve(result.date_ranges, limits.max_date_value_bytes, control);
         try reservation.resize(.{ .host_bytes = bytes_owned });
         result.reservation = reservation;
     }
     return result;
+}
+
+fn removedDate(text: []const u8, id: []const u8) bool {
+    var fields = std.mem.splitScalar(u8, text, 9);
+    while (fields.next()) |field| if (std.mem.eql(u8, field, id)) return true;
+    return false;
+}
+fn validateRemovedDates(text: []const u8, limit: usize) !void {
+    if (text.len == 0) return;
+    var fields = std.mem.splitScalar(u8, text, 9);
+    var count: usize = 0;
+    while (fields.next()) |field| {
+        if (field.len == 0) return error.MalformedHls;
+        count += 1;
+        if (count > limit) return error.ResourceLimitExceeded;
+        var earlier = std.mem.splitScalar(u8, text[0..@intCast(@intFromPtr(field.ptr) - @intFromPtr(text.ptr))], 9);
+        while (earlier.next()) |old| if (std.mem.eql(u8, old, field)) return error.MalformedHls;
+    }
 }
 
 const fixture = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:41\n#EXT-X-DISCONTINUITY-SEQUENCE:5\n#EXT-X-MAP:URI=\"init,1.mp4\",BYTERANGE=\"100@0\"\n#EXTINF:1.5,first\n#EXT-X-BYTERANGE:200@100\nmedia.mp4\n#EXTINF:2,second\n#EXT-X-BYTERANGE:300\nmedia.mp4\n#EXT-X-DISCONTINUITY\n#EXT-X-MAP:URI=\"init2.mp4\"\n#EXTINF:1,last\nnext.mp4\n#EXT-X-ENDLIST\n";
@@ -598,9 +673,9 @@ fn ownDeltaReferences(playlist: *Playlist, limits: Limits, control: @import("sou
             self.bytes += ref.len;
         }
     };
-    const count = try std.math.add(usize, try std.math.mul(usize, playlist.segments.len, 4), @intFromBool(playlist.preload_hint != null));
+    const count = try std.math.add(usize, try std.math.add(usize, try std.math.mul(usize, playlist.segments.len, 5), try std.math.mul(usize, playlist.date_ranges.len, 129)), @intFromBool(playlist.preload_hint != null));
     const refs = try playlist.allocator.alloc([]u8, count);
-    var owner = Owner{ .a = playlist.allocator, .refs = refs, .bytes = playlist.segments.len * @sizeOf(Segment) + refs.len * @sizeOf([]u8), .limit = limits.max_planning_bytes };
+    var owner = Owner{ .a = playlist.allocator, .refs = refs, .bytes = playlist.segments.len * @sizeOf(Segment) + playlist.date_ranges.len * @sizeOf(DateRange) + refs.len * @sizeOf([]u8), .limit = limits.max_planning_bytes };
     errdefer {
         for (refs[0..owner.used]) |ref| playlist.allocator.free(ref);
         playlist.allocator.free(refs);
@@ -609,9 +684,18 @@ fn ownDeltaReferences(playlist: *Playlist, limits: Limits, control: @import("sou
     for (playlist.segments) |*item| {
         try control.check();
         try owner.copy(&item.uri);
+        if (item.program_date_time) |*date| try owner.copy(&date.fraction);
         try owner.copy(&item.initialization.uri);
         if (item.encryption) |*key| try owner.copy(&key.uri);
         if (item.initialization.encryption) |*key| try owner.copy(&key.uri);
+    }
+    for (playlist.date_ranges) |*date| {
+        try control.check();
+        for (date.attributes.items[0..date.attributes.len]) |*field| {
+            try owner.copy(&field.name);
+            try owner.copy(&field.value);
+        }
+        if (date.resolved_end) |*end| try owner.copy(&end.fraction);
     }
     if (playlist.preload_hint) |*hint| try owner.copy(&hint.uri);
     // Fill unused slots with zero-length owners, keeping exact allocation length.
@@ -683,7 +767,7 @@ test "HLS delta rejects duplicate malformed unsupported and conflicting history"
     defer old.deinit();
     const header = "#EXTM3U\n#EXT-X-VERSION:9\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:10\n#EXT-X-DISCONTINUITY-SEQUENCE:3\n";
     inline for (.{ "#EXT-X-SKIP:SKIPPED-SEGMENTS=\"2\"\n", "#EXT-X-SKIP:SKIPPED-SEGMENTS=2,SKIPPED-SEGMENTS=2\n", "#EXT-X-SKIP:SKIPPED-SEGMENTS=2\n#EXT-X-SKIP:SKIPPED-SEGMENTS=0\n" }) |tail| try std.testing.expectError(error.MalformedHls, parseUpdate(a, header ++ tail, .{}, old));
-    try std.testing.expectError(error.UnsupportedHls, parseUpdate(a, header ++ "#EXT-X-SKIP:SKIPPED-SEGMENTS=2,RECENTLY-REMOVED-DATERANGES=\"id\"\n", .{}, old));
+    try std.testing.expectError(error.HlsDeltaHistoryMissing, parseUpdate(a, header ++ "#EXT-X-SKIP:SKIPPED-SEGMENTS=2,RECENTLY-REMOVED-DATERANGES=\"id\"\n", .{}, null));
     const wrong = "#EXTM3U\n#EXT-X-VERSION:9\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:10\n#EXT-X-SKIP:SKIPPED-SEGMENTS=2\n";
     try std.testing.expectError(error.SourceVersionChanged, parseUpdate(a, wrong, .{}, old));
     var cleared = try parseUpdate(a, header ++ "#EXT-X-SKIP:SKIPPED-SEGMENTS=2\n#EXT-X-KEY:METHOD=NONE\n#EXTINF:2,\nplain\n", .{}, old);
@@ -740,4 +824,108 @@ test "HLS delta inherited identity scope still accepts alternate unsupported key
     var undeclared = try parse(a, header ++ "#EXTINF:2,\nfirst\n", .{});
     defer undeclared.deinit();
     try std.testing.expectError(error.UnsupportedEncryptedMedia, parseUpdate(a, header ++ "#EXT-X-SKIP:SKIPPED-SEGMENTS=1\n" ++ alternative ++ "#EXTINF:2,\nsecond\n", .{}, undeclared));
+}
+
+const dates_base = "#EXTM3U\n#EXT-X-VERSION:9\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:10\n#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES,CAN-SKIP-UNTIL=12,CAN-SKIP-DATERANGES=YES\n#EXT-X-DATERANGE:ID=\"a\",CLASS=\"ad\",START-DATE=\"2026-01-01T01:00:00.1234567890123+01:00\",END-ON-NEXT=YES,X-NOTE=\"comma,value\"\n#EXT-X-DATERANGE:ID=\"b\",CLASS=\"ad\",START-DATE=\"2026-01-01T00:00:02.1234567890123Z\",DURATION=1,SCTE35-OUT=0xFC00,CUE=\"PRE,ONCE\"\n#EXT-X-PROGRAM-DATE-TIME:2026-01-01T00:00:00.1234567890123Z\n#EXTINF:2,\none.mp4\n#EXTINF:2,\ntwo.mp4\n";
+const dates_delta = "#EXTM3U\n#EXT-X-VERSION:9\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:10\n#EXT-X-SKIP:SKIPPED-SEGMENTS=2,RECENTLY-REMOVED-DATERANGES=\"b\tunknown\"\n#EXT-X-DATERANGE:ID=\"a\",X-NEW=1.0\n#EXT-X-DATERANGE:ID=\"c\",CLASS=\"ad\",START-DATE=\"2026-01-01T00:00:04.1234567890123Z\",DURATION=0\n#EXTINF:2,\nthree.mp4\n";
+test "HLS date-range v2 metadata preserves owned attributes resolved endpoints and PDT after history destruction" {
+    const a = std.testing.allocator;
+    const bytes = try a.dupe(u8, dates_base);
+    var old = try parse(a, bytes, .{});
+    var old_live = true;
+    defer if (old_live) old.deinit();
+    defer a.free(bytes);
+    try std.testing.expectEqual(@as(usize, 2), old.date_ranges.len);
+    try std.testing.expect(old.date_ranges[0].resolved_end != null);
+    var pool = @import("admission.zig").Pool{ .limits = .{ .host_bytes = 32 * 1024 * 1024 } };
+    var result = try parseUpdateControlled(a, dates_delta, .{}, old, .{}, &pool);
+    defer result.deinit();
+    old.deinit();
+    old_live = false;
+    @memset(bytes, 0);
+    try std.testing.expect(result.daterange_delta and result.has_program_date_time);
+    try std.testing.expectEqual(@as(usize, 2), result.date_ranges.len);
+    try std.testing.expectEqualStrings("a", result.date_ranges[0].id());
+    try std.testing.expectEqualStrings("comma,value", result.date_ranges[0].attributes.get("X-NOTE").?.value);
+    try std.testing.expectEqualStrings("1.0", result.date_ranges[0].attributes.get("X-NEW").?.value);
+    const end = try dateranges.instant("2026-01-01T00:00:02.1234567890123Z");
+    try std.testing.expectEqual(std.math.Order.eq, dateranges.Instant.order(end, result.date_ranges[0].resolved_end.?));
+    try std.testing.expectEqualStrings("1234567890123", result.segments[0].program_date_time.?.fraction);
+    try std.testing.expect(pool.snapshot().host_bytes > 0);
+}
+test "HLS date-range augmentations validate exact durations and immutable attributes" {
+    const header = "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXT-X-PROGRAM-DATE-TIME:2026-01-01T00:00:00Z\n";
+    const tag = "#EXT-X-DATERANGE:ID=\"a\",START-DATE=\"2026-01-01T00:00:00.9999999999999Z\"\n";
+    const tail = "#EXTINF:2,\na\n";
+    var result = try parse(std.testing.allocator, header ++ tag ++ "#EXT-X-DATERANGE:ID=\"a\",END-DATE=\"2026-01-01T00:00:01.0000000000001Z\",DURATION=0.0000000000002\n" ++ tail, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.date_ranges.len);
+    try std.testing.expectError(error.MalformedHls, parse(std.testing.allocator, header ++ tag ++ "#EXT-X-DATERANGE:ID=\"a\",END-DATE=\"2026-01-01T00:00:01.0000000000001Z\",DURATION=0.0000000000003\n" ++ tail, .{}));
+    try std.testing.expectError(error.SourceVersionChanged, parse(std.testing.allocator, header ++ tag ++ "#EXT-X-DATERANGE:ID=\"a\",START-DATE=\"2026-01-01T00:00:01Z\"\n" ++ tail, .{}));
+    try std.testing.expectError(error.MalformedHls, parse(std.testing.allocator, "#EXTM3U\n#EXT-X-TARGETDURATION:2\n" ++ tag ++ tail, .{}));
+}
+test "HLS date-range v2 requires history and rejects duplicate removals reintroduction and interval mutation" {
+    const a = std.testing.allocator;
+    var old = try parse(a, dates_base, .{});
+    defer old.deinit();
+    const header = "#EXTM3U\n#EXT-X-VERSION:9\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:10\n";
+    try std.testing.expectError(error.HlsDeltaHistoryMissing, parse(a, dates_delta, .{}));
+    try std.testing.expectError(error.MalformedHls, parseUpdate(a, header ++ "#EXT-X-SKIP:SKIPPED-SEGMENTS=2,RECENTLY-REMOVED-DATERANGES=\"b\tb\"\n", .{}, old));
+    try std.testing.expectError(error.MalformedHls, parseUpdate(a, header ++ "#EXT-X-SKIP:SKIPPED-SEGMENTS=2,RECENTLY-REMOVED-DATERANGES=\"b\"\n#EXT-X-DATERANGE:ID=\"b\"\n", .{}, old));
+    try std.testing.expectError(error.SourceVersionChanged, parseUpdate(a, header ++ "#EXT-X-SKIP:SKIPPED-SEGMENTS=2,RECENTLY-REMOVED-DATERANGES=\"\"\n#EXT-X-DATERANGE:ID=\"c\",CLASS=\"ad\",START-DATE=\"2026-01-01T00:00:01Z\"\n", .{}, old));
+    try std.testing.expectError(error.ResourceLimitExceeded, parse(a, dates_base, .{ .max_date_ranges = 1 }));
+}
+fn datesAllocationCampaign(a: std.mem.Allocator) !void {
+    var pool = @import("admission.zig").Pool{ .limits = .{ .host_bytes = 32 * 1024 * 1024 } };
+    var old = try parseUpdateControlled(a, dates_base, .{}, null, .{}, &pool);
+    defer old.deinit();
+    var next = try parseUpdateControlled(a, dates_delta, .{}, old, .{}, &pool);
+    defer next.deinit();
+}
+test "HLS date-range ownership rolls back every allocation and shared admission" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, datesAllocationCampaign, .{});
+}
+
+const dates_fuzz_seeds = .{ partialFuzzSeed(dates_delta), partialFuzzSeed(dates_base) };
+test "HLS date-range fuzz immutable history and admission cleanup" {
+    const Harness = struct {
+        fn fuzz(_: void, smith: *std.testing.Smith) !void {
+            const a = std.testing.allocator;
+            var pool = @import("admission.zig").Pool{ .limits = .{ .host_bytes = 128 * 1024 } };
+            defer std.debug.assert(pool.snapshot().host_bytes == 0);
+            var old = try parse(a, dates_base, .{});
+            defer old.deinit();
+            const endpoint = old.date_ranges[0].resolved_end.?;
+            var bytes: [4096]u8 = undefined;
+            const length = smith.sliceWithHash(&bytes, 0x484c5304);
+            var parsed = parseUpdateControlled(a, bytes[0..length], .{ .max_bytes = bytes.len, .max_segments = 32, .max_date_ranges = 8, .max_date_value_bytes = 256, .max_planning_bytes = 128 * 1024 }, old, .{}, &pool) catch {
+                try std.testing.expectEqual(std.math.Order.eq, dateranges.Instant.order(endpoint, old.date_ranges[0].resolved_end.?));
+                try std.testing.expectEqualStrings("comma,value", old.date_ranges[0].attributes.get("X-NOTE").?.value);
+                return;
+            };
+            defer parsed.deinit();
+            try std.testing.expectEqual(std.math.Order.eq, dateranges.Instant.order(endpoint, old.date_ranges[0].resolved_end.?));
+        }
+    };
+    try std.testing.fuzz({}, Harness.fuzz, .{ .corpus = &dates_fuzz_seeds });
+}
+test "HLS date-range fuzz serialized seeds accept retained and augmented metadata" {
+    var old = try parse(std.testing.allocator, dates_base, .{});
+    defer old.deinit();
+    inline for (dates_fuzz_seeds) |seed| {
+        var smith = std.testing.Smith{ .in = seed };
+        var bytes: [4096]u8 = undefined;
+        const length = smith.sliceWithHash(&bytes, 0x484c5304);
+        var parsed = try parseUpdate(std.testing.allocator, bytes[0..length], .{}, old);
+        defer parsed.deinit();
+        try std.testing.expect(parsed.date_ranges.len == 2);
+    }
+}
+test "HLS date-range admission denial leaves previous metadata usable" {
+    var old = try parse(std.testing.allocator, dates_base, .{});
+    defer old.deinit();
+    var pool = @import("admission.zig").Pool{ .limits = .{ .host_bytes = 1 } };
+    try std.testing.expectError(error.SharedAdmissionExceeded, parseUpdateControlled(std.testing.allocator, dates_delta, .{}, old, .{}, &pool));
+    try std.testing.expectEqual(@as(usize, 0), pool.snapshot().host_bytes);
+    try std.testing.expectEqualStrings("b", old.date_ranges[1].id());
 }

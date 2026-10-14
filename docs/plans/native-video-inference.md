@@ -1957,3 +1957,15 @@ shared-host diagnostics, without a production throughput claim. Broader display,
 codec/fuzz/load/performance and the remaining non-CUDA scope stay active.
 
 See the [qualification receipts](../../zig/lib/video/testdata/gbr-model-validation/README.md).
+
+### HLS date-range v2 follow-up
+
+Delivered owned date-range/program timestamps, immutable augmentation,
+END-ON-NEXT retention, v2 removals and combined blocking/delta delivery with
+capability/freshness checks. Incomplete deltas fall back to full requests;
+failed updates preserve committed cursor, metadata and shared admission.
+Qualification: 153 media plus 10 production HTTP checks on macOS/actual Linux
+ARM64 and 100,879 bounded fuzz runs. [Receipts](../../zig/lib/media/testdata/hls-daterange-validation/README.md)
+bind sources/results and describe supported timestamp/protocol limits.
+The broader non-CUDA plan remains active; this phase adds no model parity or
+production-throughput claim.

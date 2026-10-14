@@ -2565,3 +2565,18 @@ shared-host diagnostics, without a production throughput claim. Broader display,
 codec/fuzz/load/performance and the remaining non-CUDA scope stay active.
 
 See the [qualification receipts](testdata/gbr-model-validation/README.md).
+
+### HLS date-range v2 metadata delivery
+
+Native live ingestion now retains owned exact date-range/program timestamps,
+merges immutable same-ID attributes and handles tab-separated v2 removals.
+Capability/freshness-gated v2 and combined blocking/delta requests preserve
+query authentication. Incomplete responses trigger a full fallback while
+failed attempts preserve committed metadata, media cursor and admission.
+
+153 media and 10 production HTTP checks pass on macOS and actual Linux ARM64;
+100,879 bounded date-range fuzz runs pass. This is metadata/transport
+qualification; model embeddings were not rerun and no arbitrary live-origin,
+production throughput or end-user relevance claim is added. The remaining
+non-CUDA scope stays active. See [receipts](../media/testdata/hls-daterange-validation/README.md)
+and [MEDIA.md](../media/MEDIA.md) for ownership and protocol limits.

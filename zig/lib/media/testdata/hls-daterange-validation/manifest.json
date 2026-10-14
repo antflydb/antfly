@@ -1,0 +1,39 @@
+{
+  "base_commit": "73cbd3152438ffbf5db387ac00615ad57e66b080",
+  "zig": "0.17.0",
+  "optimization": "ReleaseSafe",
+  "linux_image": "sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1",
+  "source_sha256": {
+    "zig/lib/media/src/hls.zig": "cd3a99772f38cfb05835f6f800810e2f61003a1c657e1be7842e770544ceec38",
+    "zig/lib/media/src/hls_attributes.zig": "0d754af7394d4aa1a7a047216e7ce2adeaea2e458743fd616d9d7c3fbdd09dd4",
+    "zig/lib/media/src/hls_dateranges.zig": "35a47bfd54f5b1e176f5bd31c384e16a4ef43a08f5e3985fbdad586e32dd2e2d",
+    "zig/lib/media/src/hls_live.zig": "e1465cf9378323cb77ae25a486a10b6f46614680437c7a39c2cdfde646212a3f",
+    "zig/lib/media/http_live_test_root.zig": "4e5823d5b4ffe6ba686b84b37d0d5a4a1073fd458d6accb386d545c42a0e2991",
+    "zig/lib/media/build.zig": "47f0d1ba6abbc120a0742c468d829165ec7b8fe0590c522676413fbbb56d872f"
+  },
+  "linux_binary_sha256": {
+    "/private/tmp/hls-dates-linux-tests": "cbdfb732b898da562d2c595a5999a5323d6716dd4e2c3bc5763a4aa2f67912be",
+    "/private/tmp/hls-dates-linux-http/bin/media-http-tests": "923c0df02439d6eafbf9584aeeabd8babf35419d2024d6e193c2ddcec19f9ae1"
+  },
+  "logs_sha256": {
+    "macos-media.log": "3efc7aba598ae8695282a92dd767c24c04a513841cd927cfc454ee85978a65dd",
+    "macos-http.log": "8e99ee0829a8a2093da4b366066dd4989a8c35b76fd07dfdb247b5ab55e3bf95",
+    "linux-media.log": "3efc7aba598ae8695282a92dd767c24c04a513841cd927cfc454ee85978a65dd",
+    "linux-http.log": "af7752c7cb2a17765e6a05eca44f6546010dd00dc7426c5ed89546e6738c409a",
+    "fuzz.log": "25c7f2af20fceff77634348b8aa68705cc02bb2545531a6a1a478678b0efc8ef",
+    "linux-http-build.log": "3758567c446d201f32d576844fab739159133b233faaacdd20b1f39e6550b461"
+  },
+  "results": {
+    "macos_media_pass": 153,
+    "linux_arm64_media_pass": 153,
+    "macos_http_pass": 10,
+    "linux_arm64_http_pass": 10,
+    "date_range_fuzz_runs": 100879
+  },
+  "limitations": [
+    "Generated and local HTTP fixtures; no public-origin interoperability claim.",
+    "Metadata changes only; pretrained embeddings were not rerun.",
+    "Linux ARM64 executed; x86_64 runtime remains open.",
+    "Bounded fuzz campaign; no sustained-production coverage claim."
+  ]
+}
