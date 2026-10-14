@@ -27532,8 +27532,9 @@ pub const DB = struct {
     };
 
     /// Register a hidden shadow and return. The maintenance pipeline owns its
-    /// bounded build, replay, durable checkpoints and atomic activation.
-    pub fn replaceGraphIndex(self: *DB, old: []const u8, cfg: types.IndexConfig) !void {
+    /// bounded build, replay, durable checkpoints and atomic activation. Return
+    /// the admitted generation so waits cannot follow a reused target name.
+    pub fn replaceGraphIndex(self: *DB, old: []const u8, cfg: types.IndexConfig) !u64 {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         var owner = self.acquireReplicationMutationShared();
         defer if (owner) |*lease| lease.release();
@@ -27545,6 +27546,7 @@ pub const DB = struct {
         var stored = try self.core.index_manager.prepareGraphReplacementConfig(self.core.store, old, cfg, self.core.nextDerivedSequence());
         defer stored.deinit(self.core.index_manager.alloc);
         self.startArtifactRepairMetadataWorkerIfNeeded();
+        return stored.coverage_generation;
     }
 
     pub fn hasPendingGraphReplacements(self: *DB) bool {
@@ -28040,19 +28042,29 @@ pub const DB = struct {
         return self.hasPendingGraphReplacements();
     }
 
-    fn graphReplacementCommitted(self: *DB, name: []const u8) bool {
+    pub fn indexGeneration(self: *DB, name: []const u8) ?u64 {
         self.core.index_manager.catalog_mutex.lockShared();
         defer self.core.index_manager.catalog_mutex.unlockShared();
-        return self.core.index_manager.get(name) != null;
+        const cfg = self.core.index_manager.get(name) orelse return null;
+        return cfg.coverage_generation;
     }
 
-    pub fn waitGraphReplacement(self: *DB, name: []const u8, timeout_ms: u64) !void {
+    fn graphReplacementGenerationCommitted(self: *DB, name: []const u8, generation: u64) !bool {
+        const actual = self.indexGeneration(name) orelse return false;
+        if (actual != generation) return error.Cancelled;
+        return true;
+    }
+
+    /// Wait for the generation returned by registration, including across
+    /// caller-managed wait quanta. Reusing its name never completes this wait.
+    pub fn waitGraphReplacement(self: *DB, name: []const u8, generation: u64, timeout_ms: u64) !void {
+        if (generation == 0) return error.Cancelled;
         const deadline = monotonicTimeNs() +| timeout_ms *| std.time.ns_per_ms;
         while (true) {
             // Publication appends the new runtime entry before committing the
             // catalog. Its exclusive catalog lease spans commit and retirement;
             // a shared observation cannot acknowledge that provisional entry.
-            if (self.graphReplacementCommitted(name)) return;
+            if (try self.graphReplacementGenerationCommitted(name, generation)) return;
             if (builtin.is_test) if (test_graph_replacement_wait_observation) |hook| try hook(self);
             const jobs = try self.graphReplacementStatusAlloc(self.alloc);
             defer jobs.deinit();
@@ -28061,12 +28073,13 @@ pub const DB = struct {
             } else {
                 // The swap may have removed the marker after the first
                 // catalog observation. Missing work alone is not cancellation.
-                if (self.graphReplacementCommitted(name)) return;
+                if (try self.graphReplacementGenerationCommitted(name, generation)) return;
                 return error.Cancelled;
             };
+            if (pending.generation != generation) return error.Cancelled;
             if (pending.phase == .failed) return error.IndexReplacementFailed;
             if (monotonicTimeNs() >= deadline) {
-                if (self.graphReplacementCommitted(name)) return;
+                if (try self.graphReplacementGenerationCommitted(name, generation)) return;
                 return error.Busy;
             }
             _ = try self.advanceGraphReplacementUntil(deadline);
@@ -135692,7 +135705,7 @@ test "capi resolver replacement builds while replay gates remain available" {
     Check.observed = false;
     DB.test_graph_replacement_before_build = Check.call;
     defer DB.test_graph_replacement_before_build = null;
-    try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = config });
+    _ = try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = config });
     try std.testing.expect(!Check.observed);
     try std.testing.expect(!try db.advanceGraphReplacement());
     try std.testing.expect(db.core.index_manager.get("old") != null);
@@ -135706,7 +135719,7 @@ test "capi resolver replacement builds while replay gates remain available" {
     }
     Check.fail_build = false;
     try db.addIndex(.{ .name = "other_old", .kind = .graph, .config_json = config });
-    try db.replaceGraphIndex("other_old", .{ .name = "z_later", .kind = .graph, .config_json = config });
+    _ = try db.replaceGraphIndex("other_old", .{ .name = "z_later", .kind = .graph, .config_json = config });
     try db.runUntilIdle(); // failed work must not poison unrelated maintenance
     try std.testing.expect(db.core.index_manager.get("z_later") != null);
     try std.testing.expect(db.core.index_manager.get("old") != null);
@@ -135714,7 +135727,7 @@ test "capi resolver replacement builds while replay gates remain available" {
     try std.testing.expect(!try db.cancelReplacement("new"));
     try db.runUntilIdle(); // bounded cleanup frees the reserved artifact name
     Check.fail_build = false;
-    try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = config });
+    _ = try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = config });
     try db.runUntilIdle();
     try std.testing.expect(Check.observed);
     try std.testing.expect(db.core.index_manager.get("old") == null);
@@ -135731,6 +135744,7 @@ test "capi resolver replacement resumes checkpoints while writes continue" {
     defer directory.cleanup();
     const options: OpenOptions = .{ .executor = .{ .backend = .manual }, .start_optional_runtimes = false };
     var scanned: u64 = 0;
+    var generation: u64 = 0;
     const old_cfg: types.IndexConfig = .{ .name = "old", .kind = .graph, .config_json = "{\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}]}" };
     const new_cfg: types.IndexConfig = .{ .name = "new", .kind = .graph, .config_json = "{\"edge_types\":[{\"name\":\"R\",\"field\":\"next_links\"}]}" };
     {
@@ -135743,20 +135757,20 @@ test "capi resolver replacement resumes checkpoints while writes continue" {
         for (0..300) |i| try rows.append(arena.allocator(), .{ .key = try std.fmt.allocPrint(arena.allocator(), "source:{d:0>4}", .{i}), .value = "{\"links\":[\"before\"],\"next_links\":[\"after\"]}" });
         try db.batch(.{ .writes = rows.items });
         try db.runUntilIdle();
-        try db.replaceGraphIndex("old", new_cfg);
+        generation = try db.replaceGraphIndex("old", new_cfg);
         try std.testing.expect(db.core.index_manager.get("new") == null);
         const old_edges = try db.core.index_manager.graphIndex("old").?.index.getEdges(a, "source:0000", "R", .out);
         defer graph_mod.GraphIndex.freeEdges(a, old_edges);
         try std.testing.expectEqual(@as(usize, 1), old_edges.len);
         try std.testing.expectEqualStrings("before", old_edges[0].target);
-        try db.replaceGraphIndex("old", new_cfg); // registration is idempotent
+        try std.testing.expectEqual(generation, try db.replaceGraphIndex("old", new_cfg)); // registration is idempotent
         try std.testing.expect(try db.advanceGraphReplacement());
         const progress = try db.graphReplacementStatusAlloc(a);
         defer progress.deinit();
         scanned = progress.value[0].scanned;
         try std.testing.expect(scanned > 0);
         try std.testing.expect(progress.value[0].resume_key_b64 != null);
-        try std.testing.expectError(error.Busy, db.waitGraphReplacement("new", 0));
+        try std.testing.expectError(error.Busy, db.waitGraphReplacement("new", generation, 0));
     }
     {
         var db = try DB.open(a, directory.path(), options);
@@ -135783,7 +135797,7 @@ test "capi resolver replacement resumes checkpoints while writes continue" {
             try std.testing.expectEqual(@as(usize, 1), retained.len);
             try std.testing.expectEqualStrings("after", retained[0].target);
         }
-        try db.waitGraphReplacement("new", 0);
+        try db.waitGraphReplacement("new", generation, 0);
         try std.testing.expect(!db.hasPendingGraphReplacements());
     }
 }
@@ -135796,7 +135810,7 @@ test "capi resolver replacement fenced tail advances gaps over 1024" {
     defer db.close();
     const config = "{\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}]}";
     try db.addIndex(.{ .name = "old", .kind = .graph, .config_json = config });
-    try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = config });
+    _ = try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = config });
     const jobs = try db.graphReplacementStatusAlloc(a);
     defer jobs.deinit();
     const floor = jobs.value[0].applied_sequence;
@@ -135855,7 +135869,7 @@ test "capi resolver replacement tail resumes inside a large journal batch" {
     defer db.close();
     const config = "{\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}]}";
     try db.addIndex(.{ .name = "old", .kind = .graph, .config_json = config });
-    try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = config });
+    _ = try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = config });
     const jobs = try db.graphReplacementStatusAlloc(a);
     defer jobs.deinit();
     const floor = jobs.value[0].applied_sequence;
@@ -135894,7 +135908,7 @@ test "capi resolver replacement retries transient failures with durable bounded 
     defer db.close();
     const config = "{\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}]}";
     try db.addIndex(.{ .name = "old", .kind = .graph, .config_json = config });
-    try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = config });
+    const generation = try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = config });
     const Failure = struct {
         fn call(_: *DB) anyerror!void {
             return error.NoSpaceLeft;
@@ -135919,12 +135933,12 @@ test "capi resolver replacement retries transient failures with durable bounded 
             try db.core.index_manager.saveGraphReplacementBuild(db.core.store, next);
         } else {
             try std.testing.expectEqual(.failed, job.phase);
-            try std.testing.expectError(error.IndexReplacementFailed, db.waitGraphReplacement("new", 100));
+            try std.testing.expectError(error.IndexReplacementFailed, db.waitGraphReplacement("new", generation, 100));
             try std.testing.expectEqual(@as(u64, 999), try db.core.index_manager.clampReplayForGraphReplacementBuilds(db.core.store, 999));
         }
     }
     try std.testing.expect(try db.cancelReplacement("new"));
-    try std.testing.expectError(error.Cancelled, db.waitGraphReplacement("new", 100));
+    try std.testing.expectError(error.Cancelled, db.waitGraphReplacement("new", generation, 100));
 }
 
 test "capi resolver rejected serving deletion preserves its pending shadow" {
@@ -135935,7 +135949,7 @@ test "capi resolver rejected serving deletion preserves its pending shadow" {
     defer db.close();
     const config = "{\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}]}";
     try db.addIndex(.{ .name = "old", .kind = .graph, .config_json = config });
-    try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = config });
+    _ = try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = config });
     const Failure = struct {
         fn call(_: *DB) anyerror!void {
             return error.InjectedDeleteFailure;
@@ -135966,7 +135980,7 @@ test "capi resolver replacement retry budget resets only after durable progress"
     var rows: std.ArrayList(types.BatchWrite) = .empty;
     for (0..100) |i| try rows.append(arena.allocator(), .{ .key = try std.fmt.allocPrint(arena.allocator(), "source:{d:0>4}", .{i}), .value = "{\"links\":[\"target\"]}" });
     try db.batch(.{ .writes = rows.items });
-    try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = config });
+    _ = try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = config });
     {
         const jobs = try db.graphReplacementStatusAlloc(a);
         defer jobs.deinit();
@@ -136021,13 +136035,14 @@ test "capi resolver replacement wait cannot acknowledge provisional catalog entr
     defer db.close();
     const Check = struct {
         var database: *DB = undefined;
+        var generation: u64 = 0;
         var thread: ?std.Thread = null;
         var done: std.atomic.Value(bool) = .init(false);
         var early: bool = false;
         var failed: bool = false;
         var missing_waiter: bool = false;
         fn wait() void {
-            database.waitGraphReplacement("new", 0) catch {
+            database.waitGraphReplacement("new", generation, 0) catch {
                 failed = true;
             };
             done.store(true, .release);
@@ -136051,7 +136066,7 @@ test "capi resolver replacement wait cannot acknowledge provisional catalog entr
     Check.missing_waiter = false;
     const config = "{\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}]}";
     try db.addIndex(.{ .name = "old", .kind = .graph, .config_json = config });
-    try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = config });
+    Check.generation = try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = config });
     index_manager_mod.test_replacement_swap_boundary = Check.boundary;
     defer index_manager_mod.test_replacement_swap_boundary = null;
     _ = try db.advanceGraphReplacement();
@@ -136115,6 +136130,7 @@ test "capi resolver replacement crash boundaries recover atomic ownership" {
     for ([_][]const u8{ "checkpoint", "activation_tail", "before_commit", "after_commit" }) |stage| {
         var directory = try TestDirectory.init("replacement-crash-boundary");
         defer directory.cleanup();
+        var generation: u64 = 0;
         {
             var db = try DB.open(a, directory.path(), options);
             defer db.close();
@@ -136125,7 +136141,7 @@ test "capi resolver replacement crash boundaries recover atomic ownership" {
             for (0..100) |i| try rows.append(arena.allocator(), .{ .key = try std.fmt.allocPrint(arena.allocator(), "source:{d:0>4}", .{i}), .value = "{\"links\":[\"before\"],\"next_links\":[\"after\"]}" });
             try db.batch(.{ .writes = rows.items });
             try db.runUntilIdle();
-            try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = "{\"edge_types\":[{\"name\":\"R\",\"field\":\"next_links\"}]}" });
+            generation = try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = "{\"edge_types\":[{\"name\":\"R\",\"field\":\"next_links\"}]}" });
         }
         var env = std.process.Environ.Map.init(a);
         defer env.deinit();
@@ -136150,7 +136166,7 @@ test "capi resolver replacement crash boundaries recover atomic ownership" {
             }
         }
         try db.runUntilIdle();
-        try db.waitGraphReplacement("new", 0);
+        try db.waitGraphReplacement("new", generation, 0);
         for ([_][]const u8{ "source:0000", "source:0099" }) |key| {
             const edges = try db.core.index_manager.graphIndex("new").?.index.getEdges(a, key, "R", .out);
             defer graph_mod.GraphIndex.freeEdges(a, edges);
@@ -136169,7 +136185,7 @@ test "capi resolver pending replacement fences old writers without a permanent p
     const resolver_catalog = @import("catalog/resolver_catalog.zig");
     const config = "{\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}]}";
     try db.addIndex(.{ .name = "old", .kind = .graph, .config_json = config });
-    try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = config });
+    _ = try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = config });
     {
         var read = try db.core.store.beginReadTxn();
         defer read.abort();
@@ -136186,7 +136202,7 @@ test "capi resolver pending replacement fences old writers without a permanent p
         try std.testing.expectEqual(@as(u32, 1), try resolver_catalog.readMinimumReaderVersion(&read, 1));
         try std.testing.expectEqual(@as(u32, 1), db.core.index_manager.minimum_reader_version.load(.acquire));
     }
-    try db.replaceGraphIndex("new", .{ .name = "later", .kind = .graph, .config_json = config });
+    _ = try db.replaceGraphIndex("new", .{ .name = "later", .kind = .graph, .config_json = config });
     try std.testing.expect(try db.cancelReplacement("later"));
     {
         var read = try db.core.store.beginReadTxn();
@@ -136205,8 +136221,8 @@ test "capi resolver replacement reader fence survives multiple jobs and resolver
     const config = "{\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}]}";
     try db.addIndex(.{ .name = "old1", .kind = .graph, .config_json = config });
     try db.addIndex(.{ .name = "old2", .kind = .graph, .config_json = config });
-    try db.replaceGraphIndex("old1", .{ .name = "new1", .kind = .graph, .config_json = config });
-    try db.replaceGraphIndex("old2", .{ .name = "new2", .kind = .graph, .config_json = config });
+    _ = try db.replaceGraphIndex("old1", .{ .name = "new1", .kind = .graph, .config_json = config });
+    _ = try db.replaceGraphIndex("old2", .{ .name = "new2", .kind = .graph, .config_json = config });
     try std.testing.expect(try db.cancelReplacement("new1"));
     {
         var read = try db.core.store.beginReadTxn();
@@ -136232,7 +136248,7 @@ test "capi resolver replacement wait rechecks publication when a job disappears"
     defer db.close();
     const config = "{\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}]}";
     try db.addIndex(.{ .name = "old", .kind = .graph, .config_json = config });
-    try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = config });
+    const generation = try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = config });
     const Gap = struct {
         fn swap(database: *DB) anyerror!void {
             DB.test_graph_replacement_wait_observation = null;
@@ -136245,12 +136261,12 @@ test "capi resolver replacement wait rechecks publication when a job disappears"
     };
     DB.test_graph_replacement_wait_observation = Gap.swap;
     defer DB.test_graph_replacement_wait_observation = null;
-    try db.waitGraphReplacement("new", 0);
-    try std.testing.expect(db.graphReplacementCommitted("new"));
-    try db.replaceGraphIndex("new", .{ .name = "later", .kind = .graph, .config_json = config });
+    try db.waitGraphReplacement("new", generation, 0);
+    try std.testing.expect(db.indexGeneration("new") != null);
+    const later_generation = try db.replaceGraphIndex("new", .{ .name = "later", .kind = .graph, .config_json = config });
     DB.test_graph_replacement_wait_observation = Gap.cancel;
-    try std.testing.expectError(error.Cancelled, db.waitGraphReplacement("later", 0));
-    try std.testing.expect(db.graphReplacementCommitted("new"));
+    try std.testing.expectError(error.Cancelled, db.waitGraphReplacement("later", later_generation, 0));
+    try std.testing.expect(db.indexGeneration("new") != null);
 }
 
 test "capi resolver replacement backward wall clock step clamps durable backoff once" {
@@ -136261,7 +136277,7 @@ test "capi resolver replacement backward wall clock step clamps durable backoff 
     defer db.close();
     const config = "{\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}]}";
     try db.addIndex(.{ .name = "old", .kind = .graph, .config_json = config });
-    try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = config });
+    const generation = try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = config });
     DB.test_graph_replacement_retry_now_ns = 50 * std.time.ns_per_s;
     defer DB.test_graph_replacement_retry_now_ns = null;
     {
@@ -136290,7 +136306,7 @@ test "capi resolver replacement backward wall clock step clamps durable backoff 
     }
     DB.test_graph_replacement_retry_now_ns = expected;
     try db.runUntilIdle();
-    try db.waitGraphReplacement("new", 0);
+    try db.waitGraphReplacement("new", generation, 0);
 }
 
 test "capi resolver replacement interrupted ownership preserves accepted work" {
@@ -136301,7 +136317,7 @@ test "capi resolver replacement interrupted ownership preserves accepted work" {
     defer db.close();
     const config = "{\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}]}";
     try db.addIndex(.{ .name = "old", .kind = .graph, .config_json = config });
-    try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = config });
+    const generation = try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = config });
     const Cancel = struct {
         fn wait(_: ?*anyopaque, _: *const u32, _: u32, _: std.Io.Timeout) std.Io.Cancelable!void {
             return error.Canceled;
@@ -136334,7 +136350,7 @@ test "capi resolver replacement interrupted ownership preserves accepted work" {
     }
     DB.test_graph_replacement_before_build = null;
     try db.runUntilIdle();
-    try db.waitGraphReplacement("new", 0);
+    try db.waitGraphReplacement("new", generation, 0);
 }
 
 test "capi resolver escalated deadline bounds tail work and releases queued writers" {
@@ -136350,7 +136366,7 @@ test "capi resolver escalated deadline bounds tail work and releases queued writ
     defer db.close();
     const config = "{\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}]}";
     try db.addIndex(.{ .name = "old", .kind = .graph, .config_json = config });
-    try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = config });
+    _ = try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = config });
     const jobs = try db.graphReplacementStatusAlloc(a);
     defer jobs.deinit();
     var job = jobs.value[0];
@@ -136431,8 +136447,8 @@ test "capi resolver escalated deadline bounds tail work and releases queued writ
     defer progress.deinit();
     try std.testing.expectEqual(@as(usize, 96), progress.value[0].tail_source_cursor);
     try std.testing.expectEqual(job.applied_sequence, progress.value[0].applied_sequence);
-    try std.testing.expect(db.graphReplacementCommitted("old"));
-    try std.testing.expect(!db.graphReplacementCommitted("new"));
+    try std.testing.expect(db.indexGeneration("old") != null);
+    try std.testing.expect(db.indexGeneration("new") == null);
 }
 
 test "capi resolver topology busy leaves pending replacement and resolver config intact" {
@@ -136445,7 +136461,7 @@ test "capi resolver topology busy leaves pending replacement and resolver config
     try db.addIndex(.{ .name = "old", .kind = .graph, .config_json = config });
     var resolver: index_manager_mod.ResolverConfig = .{ .name = "concepts", .table = "default", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "entity/{{ uslug _entity.text }}", .promote = false, .min_confidence = 0.2 };
     try db.addResolver(resolver);
-    try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = config });
+    const generation = try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = config });
     const topology = @import("relational_integrity_topology.zig");
     var digest: [32]u8 = undefined;
     std.crypto.hash.Blake3.hash("", &digest, .{});
@@ -136474,7 +136490,7 @@ test "capi resolver topology busy leaves pending replacement and resolver config
     }
     _ = try db.upsertResolverWithResultOptions(resolver, .{ .drain_backfill = false });
     try db.runUntilIdle();
-    try db.waitGraphReplacement("new", 0);
+    try db.waitGraphReplacement("new", generation, 0);
     try std.testing.expectEqual(@as(f64, 0.4), db.core.index_manager.getResolver("concepts").?.min_confidence);
 }
 
@@ -136487,7 +136503,7 @@ test "capi resolver replacement clock clamp skips denied and ordered writes" {
         defer db.close();
         const config = "{\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}]}";
         try db.addIndex(.{ .name = "old", .kind = .graph, .config_json = config });
-        try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = config });
+        const generation = try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = config });
         DB.test_graph_replacement_retry_now_ns = 50 * std.time.ns_per_s;
         defer DB.test_graph_replacement_retry_now_ns = null;
         const future = db.replacementRetryNow() + 9 * std.time.ns_per_hour;
@@ -136509,10 +136525,71 @@ test "capi resolver replacement clock clamp skips denied and ordered writes" {
             try graphTestApplyOrdered(&db, .{ .writes = &.{.{ .key = "replicated", .value = "{}" }} }, .{ .term = 1, .index = 1 });
         }
         try std.testing.expect(try db.advanceGraphReplacement());
-        try std.testing.expectError(error.Busy, db.waitGraphReplacement("new", 2));
+        try std.testing.expectError(error.Busy, db.waitGraphReplacement("new", generation, 2));
         const jobs = try db.graphReplacementStatusAlloc(a);
         defer jobs.deinit();
         try std.testing.expectEqual(future, jobs.value[0].retry_after_ns);
         try std.testing.expectEqual(@as(u32, 0), jobs.value[0].total_retry_count);
     }
+}
+
+test "capi resolver replacement waits reject reused serving and reserved generations" {
+    const a = std.testing.allocator;
+    for (0..3) |mode| {
+        var directory = try TestDirectory.init("replacement-wait-generation");
+        defer directory.cleanup();
+        var db = try DB.open(a, directory.path(), .{ .executor = .{ .backend = .manual }, .start_optional_runtimes = false });
+        defer db.close();
+        const config = "{\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}]}";
+        const different = "{\"edge_types\":[{\"name\":\"R\",\"field\":\"other_links\"}]}";
+        try db.addIndex(.{ .name = "old", .kind = .graph, .config_json = config });
+        const cfg: types.IndexConfig = .{ .name = "new", .kind = .graph, .config_json = config };
+        const generation = try db.replaceGraphIndex("old", cfg);
+        try std.testing.expectEqual(generation, try db.replaceGraphIndex("old", cfg));
+        try std.testing.expectError(error.Busy, db.waitGraphReplacement("new", generation, 0));
+        try std.testing.expect(try db.cancelReplacement("new"));
+        try db.runUntilIdle();
+        if (mode == 0) {
+            try db.addIndex(.{ .name = "new", .kind = .graph, .config_json = different });
+            try std.testing.expect(db.indexGeneration("new").? != generation);
+            try std.testing.expectError(error.Cancelled, db.waitGraphReplacement("new", generation, 1000));
+            try std.testing.expect(db.indexGeneration("old") != null);
+        } else {
+            const next_generation = try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = if (mode == 1) config else different });
+            try std.testing.expect(next_generation != generation);
+            try std.testing.expectError(error.Cancelled, db.waitGraphReplacement("new", generation, 1000));
+            // An old waiter must neither follow nor advance the new job.
+            const jobs = try db.graphReplacementStatusAlloc(a);
+            defer jobs.deinit();
+            try std.testing.expectEqual(.building, jobs.value[0].phase);
+            try std.testing.expectEqual(next_generation, jobs.value[0].generation);
+            try db.runUntilIdle();
+            try db.waitGraphReplacement("new", next_generation, 0);
+            try std.testing.expectError(error.Cancelled, db.waitGraphReplacement("new", generation, 0));
+        }
+    }
+}
+
+test "capi resolver replacement wait rechecks generation in the publication gap" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("replacement-wait-reused-gap");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .executor = .{ .backend = .manual }, .start_optional_runtimes = false });
+    defer db.close();
+    const config = "{\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}]}";
+    try db.addIndex(.{ .name = "old", .kind = .graph, .config_json = config });
+    const generation = try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = config });
+    const Gap = struct {
+        fn reuse(database: *DB) anyerror!void {
+            DB.test_graph_replacement_wait_observation = null;
+            try std.testing.expect(try database.cancelReplacement("new"));
+            try database.runUntilIdle();
+            try database.addIndex(.{ .name = "new", .kind = .graph, .config_json = "{\"edge_types\":[{\"name\":\"R\",\"field\":\"other_links\"}]}" });
+        }
+    };
+    DB.test_graph_replacement_wait_observation = Gap.reuse;
+    defer DB.test_graph_replacement_wait_observation = null;
+    try std.testing.expectError(error.Cancelled, db.waitGraphReplacement("new", generation, 0));
+    try std.testing.expect(db.indexGeneration("old") != null);
+    try std.testing.expect(db.indexGeneration("new").? != generation);
 }

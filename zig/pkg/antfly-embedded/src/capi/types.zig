@@ -361,7 +361,7 @@ fn classifyError(err: anyerror) ErrorCode {
         error.IndexReplacementConfigurationMismatch => .replacement_configuration_mismatch,
         error.Canceled, error.Cancelled => .cancelled,
         error.VersionConflict => .version_conflict,
-        error.SqlFeatureNotSupported, error.UnsupportedResolverCatalogVersion, error.UnsupportedDatabaseReaderVersion => .unsupported,
+        error.SqlFeatureNotSupported, error.UnsupportedOperation, error.UnsupportedResolverCatalogVersion, error.UnsupportedDatabaseReaderVersion => .unsupported,
         error.IntentConflict, error.DecisionConflict, error.SchemaInUse => .intent_conflict,
         error.TxnNotFound => .txn_not_found,
         error.NotFound, error.IndexNotFound, error.TableNotFound => .not_found,
