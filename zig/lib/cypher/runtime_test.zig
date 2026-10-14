@@ -517,3 +517,57 @@ test "bound result schemas survive empty wildcard projections and align trail ce
         } else try std.testing.expect(cell == .node);
     };
 }
+
+test "UNION deduplicates wildcard and explicit graph columns by name" {
+    const pattern = "MATCH p=(a:Document {id:'a'})-[r:CITES]->(b)-[s:CITES]->(c) ";
+    for ([_][]const u8{
+        pattern ++ "RETURN * UNION " ++ pattern ++ "RETURN a,b,c,r,s,p",
+        pattern ++ "RETURN a,b,c,r,s,p UNION " ++ pattern ++ "RETURN *",
+    }) |query| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 4), result.rows.len);
+        try std.testing.expectEqualStrings("c", result.columns[2]);
+        for (result.rows) |row| {
+            try std.testing.expect(row[2] == .node);
+            try std.testing.expect(row[3] == .relationship);
+        }
+    }
+}
+
+test "boolean and float conversions follow Neo4j scalar input rules" {
+    try check("RETURN toBoolean(0),toBoolean(1),toBoolean(-1),toBoolean(' true '),toBoolean(' false '),toBoolean('bad')", "[[false,true,true,true,false,null]]");
+    try check("RETURN toBoolean('\\u2003TRUE\\u3000'),toBoolean('\\u00a0true\\u00a0')", "[[true,null]]");
+    try check("RETURN toFloat(' 1.5 '),toFloat('1.5d'),toFloat('2F'),toFloat('0x1.8p1'),toFloat(' .5e1 ') = 5.0", "[[1.5,1.5,2,3,true]]");
+    try check("RETURN toFloat('1_0'),toFloat('0x1'),toFloat('1d2'),toFloat('\\u20031.5\\u2003')", "[[null,null,null,null]]");
+}
+
+test "string addition formats scalar operands and preserves list precedence" {
+    try check("RETURN 'row-'+1,1+'-row','v='+true,false+'!', 'v='+1.5,'n='+null", "[[\"row-1\",\"1-row\",\"v=true\",\"false!\",\"v=1.5\",null]]");
+    try check("RETURN 'x'+[1],[1]+'x','v='+1e20", "[[[\"x\",1],[1,\"x\"],\"v=1.0E20\"]]");
+}
+
+test "inline MATCH properties use complete node relationship and path bindings" {
+    try check("MATCH (n:Document {id:n.id}) RETURN n.id ORDER BY n.id", "[[\"a\"],[\"b\"],[\"c\"]]");
+    try check("MATCH (n:Document {id:n.id}) RETURN n.id LIMIT 1", "[[\"a\"]]");
+    try check("MATCH (a:Document {id:b.id}),(b:Document) RETURN a.id,b.id ORDER BY a.id", "[[\"a\",\"a\"],[\"b\",\"b\"],[\"c\",\"c\"]]");
+    try check("MATCH ({rank:b.rank}),(b:Document) RETURN b.id ORDER BY b.id", "[[\"a\"],[\"b\"],[\"c\"]]");
+    try check("MATCH (a:Document {id:'a'})-[r:CITES {weight:r.weight}]->(b {rank:b.rank}) RETURN r.weight ORDER BY r.weight", "[[1],[2]]");
+    try check("MATCH (a:Document {id:'a'})-[r:CITES {weight:b.rank}]->(b) RETURN r.weight", "[[2]]");
+    try check("MATCH p=(a:Document {id:'a'})-[r:CITES*1..2 {weight:length(p)}]->(b) RETURN length(p)", "[[1]]");
+    try check("MATCH (a:Document {id:'a'}) OPTIONAL MATCH (a)-[r:CITES {weight:b.rank+10}]->(b) RETURN a.id,b,r", "[[\"a\",null,null]]");
+}
+
+test "inline nested patterns wait for outer MATCH aliases" {
+    try check("MATCH (a:Document {rank:CASE WHEN EXISTS { MATCH (b) WHERE b.rank=1 } THEN 1 ELSE 2 END}),(b:Document) RETURN a.id,b.id ORDER BY a.id,b.id", "[[\"a\",\"a\"],[\"b\",\"b\"],[\"b\",\"c\"]]");
+    try check("MATCH (a:Document {rank:size([(b)-[:CITES]->(x)|x])}),(b:Document) RETURN a.id,b.id ORDER BY a.id,b.id", "[[\"b\",\"a\"],[\"b\",\"b\"]]");
+    try check("MATCH (n:Document {rank:CASE WHEN EXISTS { MATCH (n) WHERE n.rank=1 } THEN 1 ELSE 0 END}) RETURN n.id LIMIT 1", "[[\"a\"]]");
+}
+
+test "shortest paths evaluate resolved inline nested predicates before selection" {
+    try check("MATCH p=shortestPath((a:Document {id:'a'})-[r:CITES*1..3 {weight:CASE WHEN EXISTS { MATCH (b) WHERE b.rank=2 } THEN 2 ELSE 1 END}]->(b)) RETURN b.id,length(p)", "[[\"b\",1]]");
+}

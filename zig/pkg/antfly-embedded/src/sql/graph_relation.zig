@@ -85,7 +85,8 @@ fn expressionType(binding: Binding, expr: *const cypher.ast.Expr) ast.ColumnType
             else => blk: {
                 const left = expressionType(binding, binary.left);
                 const right = expressionType(binding, binary.right);
-                if (binary.op == .add and left == .string and right == .string) break :blk .string;
+                if (binary.op == .add and ((left == .string and (right == .string or right == .integer or right == .number or right == .boolean)) or
+                    (right == .string and (left == .integer or left == .number or left == .boolean)))) break :blk .string;
                 if (left == .integer and right == .integer and binary.op != .power) break :blk .integer;
                 if ((left == .integer or left == .number) and (right == .integer or right == .number)) break :blk .number;
                 break :blk .json;

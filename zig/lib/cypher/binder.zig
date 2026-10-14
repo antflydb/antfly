@@ -68,7 +68,7 @@ const Binder = struct {
         }
         try scope.append(self.a, .{ .name = alias, .kind = kind });
     }
-    fn pattern(self: *Binder, scope: *Scope, path: ast.Path, create: bool) anyerror!void {
+    fn patternDeclarations(self: *Binder, scope: *Scope, path: ast.Path, create: bool) anyerror!void {
         if (path.selector != .all and (path.edges.len != 1 or create)) return error.CypherInvalidShortestPath;
         for (path.nodes) |node| {
             for (node.labels) |label| if (self.graph.label(label) == null) return error.UnknownGraphLabel;
@@ -91,8 +91,14 @@ const Binder = struct {
             if (find(scope.*, alias) != null) return error.CypherVariableConflict;
         };
         try self.declare(scope, path.alias, .path);
-        for (path.nodes) |node| for (node.properties) |property| try self.expression(scope.*, property.value, false);
-        for (path.edges) |edge| for (edge.properties) |property| try self.expression(scope.*, property.value, false);
+    }
+    fn pattern(self: *Binder, scope: *Scope, path: ast.Path, create: bool) anyerror!void {
+        try self.patternDeclarations(scope, path, create);
+        try self.patternProperties(scope.*, path);
+    }
+    fn patternProperties(self: *Binder, scope: Scope, path: ast.Path) anyerror!void {
+        for (path.nodes) |node| for (node.properties) |property| try self.expression(scope, property.value, false);
+        for (path.edges) |edge| for (edge.properties) |property| try self.expression(scope, property.value, false);
     }
     fn clauses(self: *Binder, input: []const ast.Clause, initial: Scope, nested: bool) anyerror!Scope {
         var scope: Scope = .empty;
@@ -104,7 +110,8 @@ const Binder = struct {
             if (returned) return error.CypherReturnMustBeLast;
             switch (clause.operation) {
                 .match => |m| {
-                    for (m.paths) |path| try self.pattern(&scope, path, false);
+                    for (m.paths) |path| try self.patternDeclarations(&scope, path, false);
+                    for (m.paths) |path| try self.patternProperties(scope, path);
                     if (m.predicate) |predicate| try self.expression(scope, predicate, false);
                 },
                 .project => |p| {

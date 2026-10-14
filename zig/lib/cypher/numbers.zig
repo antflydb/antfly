@@ -16,6 +16,44 @@
 //! Numeric scalar semantics, independent of native libc and host locale.
 const std = @import("std");
 
+/// Java Double.parseDouble's finite numeric syntax. Its boundary trimming is
+/// String.trim (ASCII controls through space), not Character.isWhitespace.
+pub fn floatFromString(input: []const u8) ?f64 {
+    var begin: usize = 0;
+    var end = input.len;
+    while (begin < end and input[begin] <= 0x20) : (begin += 1) {}
+    while (end > begin and input[end - 1] <= 0x20) : (end -= 1) {}
+    var text = input[begin..end];
+    if (text.len == 0) return null;
+    if (std.mem.indexOfScalar(u8, "fFdD", text[text.len - 1]) != null) text = text[0 .. text.len - 1];
+    var i: usize = 0;
+    if (i < text.len and (text[i] == '+' or text[i] == '-')) i += 1;
+    const hex = text.len - i >= 2 and text[i] == '0' and (text[i + 1] == 'x' or text[i + 1] == 'X');
+    if (hex) i += 2;
+    var digits: usize = 0;
+    var point = false;
+    while (i < text.len) : (i += 1) {
+        if (if (hex) std.ascii.isHex(text[i]) else std.ascii.isDigit(text[i])) {
+            digits += 1;
+        } else if (text[i] == '.' and !point) {
+            point = true;
+        } else break;
+    }
+    if (digits == 0) return null;
+    const exponent = i < text.len and (if (hex) text[i] == 'p' or text[i] == 'P' else text[i] == 'e' or text[i] == 'E');
+    if (hex and !exponent) return null;
+    if (exponent) {
+        i += 1;
+        if (i < text.len and (text[i] == '+' or text[i] == '-')) i += 1;
+        const exponent_begin = i;
+        while (i < text.len and std.ascii.isDigit(text[i])) : (i += 1) {}
+        if (i == exponent_begin) return null;
+    }
+    if (i != text.len) return null;
+    const number = std.fmt.parseFloat(f64, text) catch return null;
+    return if (std.math.isFinite(number)) number else null;
+}
+
 /// Parse decimal text without a binary floating-point intermediate. Bounds are
 /// checked before truncation, including fractional values just outside i64.
 /// Invalid syntax returns null; a valid out-of-range decimal is an error.
@@ -200,4 +238,11 @@ test "float text preserves type, notation thresholds and subnormal precision" {
         defer std.testing.allocator.free(text);
         try std.testing.expectEqualStrings(case.text, text);
     }
+}
+
+test "float parsing accepts Java finite syntax without Zig extensions" {
+    for ([_][]const u8{ " 1.5 ", "\x00\t1.5\r", "1.5d", "1.5D", "+1.5f", "0x1.8p0", "0X.6P2F" }) |input|
+        try std.testing.expectEqual(@as(f64, 1.5), floatFromString(input).?);
+    for ([_][]const u8{ "", " ", "+", "f", "1_0", "0x1", ".", "1e", "1e+", "1df", "1d2", "1e9999", "NaN", "Infinity", "\u{2003}1.5", "0x1p", "0x1p1_0" }) |input|
+        try std.testing.expect(floatFromString(input) == null);
 }

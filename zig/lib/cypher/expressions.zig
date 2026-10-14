@@ -15,6 +15,47 @@
 
 const std = @import("std");
 const ast = @import("ast.zig");
+
+/// Nested graph patterns can bind an alias that is absent from a partial row.
+/// Evaluate these only after all of the containing MATCH aliases are bound.
+pub fn containsPattern(expr: *const ast.Expr) bool {
+    return switch (expr.value) {
+        .exists, .pattern_comprehension => true,
+        .literal, .variable, .parameter => false,
+        .property => |p| containsPattern(p.base),
+        .index => |i| containsPattern(i.base) or containsPattern(i.index),
+        .slice => |s| containsPattern(s.base) or optionalPattern(s.start) or optionalPattern(s.end),
+        .unary => |u| containsPattern(u.operand),
+        .binary => |b| containsPattern(b.left) or containsPattern(b.right),
+        .comparison => |c| anyPattern(c.operands),
+        .call => |c| anyPattern(c.args),
+        .list => |items| anyPattern(items),
+        .comprehension => |c| containsPattern(c.input) or optionalPattern(c.predicate) or optionalPattern(c.projection),
+        .list_predicate => |c| containsPattern(c.input) or containsPattern(c.predicate),
+        .reduce => |r| containsPattern(r.initial) or containsPattern(r.input) or containsPattern(r.projection),
+        .map => |entries| blk: {
+            for (entries) |entry| if (containsPattern(entry.value)) break :blk true;
+            break :blk false;
+        },
+        .map_projection => |p| blk: {
+            if (containsPattern(p.base)) break :blk true;
+            for (p.items) |item| if (item == .entry and containsPattern(item.entry.value)) break :blk true;
+            break :blk false;
+        },
+        .case_when => |c| blk: {
+            if (optionalPattern(c.operand) or optionalPattern(c.otherwise)) break :blk true;
+            for (c.branches) |branch| if (containsPattern(branch.condition) or containsPattern(branch.value)) break :blk true;
+            break :blk false;
+        },
+    };
+}
+fn optionalPattern(expr: ?*const ast.Expr) bool {
+    return if (expr) |e| containsPattern(e) else false;
+}
+fn anyPattern(items: []const *const ast.Expr) bool {
+    for (items) |item| if (containsPattern(item)) return true;
+    return false;
+}
 pub fn aggregateName(name: []const u8) bool {
     for ([_][]const u8{ "count", "sum", "avg", "min", "max", "collect" }) |n| if (std.ascii.eqlIgnoreCase(name, n)) return true;
     return false;

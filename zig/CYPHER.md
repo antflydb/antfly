@@ -37,6 +37,15 @@ lossless parameter/value helpers. SDK tests preserve both signed integer
 boundaries, user map keys, and unknown/committed write delivery outcomes.
 The full Go and Rust SDK suites and all 304 Python SDK tests pass.
 
+Cypher scalar compatibility includes integer and whitespace-trimmed boolean
+conversion, Java-compatible finite float text (including suffixes and hexadecimal
+exponents), and string/scalar concatenation with list precedence. Inline MATCH
+properties can refer to node, relationship, and path aliases introduced in the
+same MATCH; predicates wait for their dependencies while retaining early filtering
+where possible. UNION deduplication compares bound column names independently of
+wildcard binding order. Core and native regression cases cover these boundaries,
+including SQL GRAPH_TABLE scalar types and durable mutation postimages.
+
 Native Cypher CREATE defaults, generated-column SET through aliases, and REMOVE
 SQL NULL postimages are qualified against durable SQL rows. Cypher entity properties
 omit SQL NULL and document JSON null fields; `keys(n)` and `properties(n)` do

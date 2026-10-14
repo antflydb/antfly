@@ -289,6 +289,36 @@ def main():
         )
         assert sql["rows"] == [["3"]], sql
         checks += 1
+        for statement, expected in (
+            (
+                "RETURN toBoolean(0),toBoolean(-1),toBoolean(' true '),toBoolean(' false ')",
+                [[False, True, True, False]],
+            ),
+            (
+                "RETURN toFloat(' 1.5 '),toFloat('1.5d'),toFloat('0x1.8p1')",
+                [[1.5, 1.5, 3]],
+            ),
+            ("RETURN 'row-'+1,1+'-row','v='+true", [["row-1", "1-row", "v=true"]]),
+            (
+                "MATCH (n:Document {id:n.id}) RETURN n.id ORDER BY n.id",
+                [["a"], ["b"], ["c"], ["unicode"]],
+            ),
+            (
+                "MATCH (a:Document {id:b.id}),(b:Document) RETURN a.id,b.id ORDER BY a.id",
+                [["a", "a"], ["b", "b"], ["c", "c"], ["unicode", "unicode"]],
+            ),
+        ):
+            actual = strings(query(statement))
+            assert actual == expected, (statement, actual, expected)
+            checks += 1
+        sql = call(
+            "/sql",
+            {
+                "statement": f"SELECT g.x || '!' FROM GRAPH_TABLE({graph} MATCH (n IS Document) WHERE n.id='a' COLUMNS('row-'+n.rank AS x,toBoolean(n.rank) AS ok)) g WHERE g.ok"
+            },
+        )
+        assert sql["rows"] == [["row-1!"]], sql
+        checks += 1
         print(f"{checks} native Cypher/SQL expression checks passed")
     finally:
         if created_graph:

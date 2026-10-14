@@ -555,3 +555,93 @@ def test_graph_table_scalar_types_and_empty_wildcard_schema(require_native, afli
                 f"SELECT g.x + 1 FROM GRAPH_TABLE(g MATCH (n IS D) COLUMNS({function}(n.amount) AS x)) g"
             )
             assert result["rows"] == [[{"sum": "2", "min": "0", "max": "3"}[function]]]
+
+
+def test_union_inline_predicates_and_scalar_conversions_persist(require_native, aflite_path):
+    with af.create_hosted(aflite_path) as database:
+        database.sql("CREATE TABLE docs (name TEXT,amount BIGINT)")
+        with database.open_table("docs") as table:
+            table.add_index({"name": "links", "kind": "graph", "config_json": "{}"})
+        database.graph_catalog_json(
+            {
+                "action": "put",
+                "name": "g",
+                "definition": {
+                    "labels": [{"name": "D", "table": "docs"}],
+                    "relationships": [
+                        {
+                            "name": "LINK",
+                            "index": "links",
+                            "source_label": "D",
+                            "target_label": "D",
+                            "stored_type": "link",
+                        }
+                    ],
+                },
+            }
+        )
+        database.cypher_json(
+            "g",
+            {
+                "query": "CREATE (a:D {name:'a',amount:1})-[:LINK {weight:1}]->(b:D {name:'b',amount:2})-[:LINK]->(c:D {name:'c',amount:3})"
+            },
+        )
+        pattern = "MATCH p=(a:D {name:'a'})-[r:LINK]->(b)-[s:LINK]->(c) "
+        for left, right in (("*", "a,b,c,r,s,p"), ("a,b,c,r,s,p", "*")):
+            for union, count in (("UNION", 1), ("UNION ALL", 2)):
+                result = database.cypher_json("g", {"query": f"{pattern}RETURN {left} {union} {pattern}RETURN {right}"})
+                assert result["columns"] == ["a", "b", "c", "r", "s", "p"]
+                assert len(result["rows"]) == count
+                assert [cell["type"] for cell in result["rows"][0]] == [
+                    "node",
+                    "node",
+                    "node",
+                    "relationship",
+                    "relationship",
+                    "path",
+                ]
+                if count == 2:
+                    assert result["rows"][0] == result["rows"][1]
+        result = database.cypher_json("g", {"query": "MATCH (n:D {name:n.name}) RETURN n.name ORDER BY n.name LIMIT 3"})
+        assert [row[0]["value"] for row in result["rows"]] == ["a", "b", "c"]
+        nested = database.cypher_json(
+            "g",
+            {
+                "query": "MATCH (a:D {amount:CASE WHEN EXISTS { MATCH (b) WHERE b.amount=1 } THEN 1 ELSE 2 END}),(b:D) RETURN a.name,b.name ORDER BY a.name,b.name"
+            },
+        )
+        assert [[cell["value"] for cell in row] for row in nested["rows"]] == [["a", "a"], ["b", "b"], ["b", "c"]]
+        result = database.cypher_json(
+            "g",
+            {
+                "query": "MATCH (a:D {name:'a'})-[r:LINK {weight:b.amount-1}]->(b) SET a.amount=toInteger(toFloat(' 4.0d ')),r.ok=toBoolean(-1) RETURN a.amount,r.ok,'row-'+a.amount"
+            },
+        )
+        assert result["rows"] == [
+            [
+                {"type": "integer", "value": "4"},
+                {"type": "boolean", "value": True},
+                {"type": "string", "value": "row-4"},
+            ]
+        ]
+        for expression in ("'row-'+n.amount", "n.amount+'-row'", "'v='+toBoolean(n.amount)"):
+            result = database.sql(
+                f"SELECT g.x || '!' FROM GRAPH_TABLE(g MATCH (n IS D) COLUMNS ({expression} AS x)) g ORDER BY g.x"
+            )
+            expected = {
+                "'row-'+n.amount": ["row-2!", "row-3!", "row-4!"],
+                "n.amount+'-row'": ["2-row!", "3-row!", "4-row!"],
+                "'v='+toBoolean(n.amount)": ["v=true!"] * 3,
+            }[expression]
+            assert result["rows"] == [[value] for value in expected]
+        database.cypher_json(
+            "g", {"query": "MATCH (n:D {name:'a'}) SET n.name='row-'+toInteger(toFloat(' 7.0F ')) RETURN n.name"}
+        )
+    with af.open_hosted(aflite_path) as database:
+        assert database.sql("SELECT name,amount FROM docs ORDER BY name")["rows"] == [
+            ["b", "2"],
+            ["c", "3"],
+            ["row-7", "4"],
+        ]
+        result = database.cypher_json("g", {"query": "MATCH (a:D {name:'row-7'})-[r:LINK]->(b) RETURN r.ok"})
+        assert result["rows"] == [[{"type": "boolean", "value": True}]]

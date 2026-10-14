@@ -182,6 +182,7 @@ const Engine = struct {
     limits: Limits,
     stats: Stats = .{},
     columns: []const []const u8 = &.{},
+    match_aliases: []const []const u8 = &.{},
     stages: std.ArrayList(Stage) = .empty,
     recursion: usize = 0,
     deleted: std.ArrayList(v.EntityIdentity) = .empty,
@@ -310,7 +311,7 @@ const Engine = struct {
         return rows;
     }
 
-    fn nodeMatches(self: *Engine, raw: *const v.Node, pattern: ast.Node, row: Row) !bool {
+    fn nodeMatches(self: *Engine, raw: *const v.Node, pattern: ast.Node) !bool {
         if (self.isDeleted(.{ .node = raw })) return false;
         const node = if (self.backend.vtable.project_node) |project_node| (try project_node(self.backend.ptr, self.a, raw)) orelse return false else raw;
         const member = for (self.graph.labels) |label| {
@@ -321,14 +322,55 @@ const Engine = struct {
             if (self.graph.label(label) == null) return error.UnknownGraphLabel;
             if (!self.graph.admits(node, label)) return false;
         }
-        for (pattern.properties) |property| {
-            const actual = (v.Value{ .node = node }).property(property.name);
-            const expected = try self.eval(property.value, row, null);
-            if (actual == .null or expected == .null or !(v.Value.equal(actual, expected) orelse false)) return false;
+        return true;
+    }
+    const Constraint = struct { actual: v.Value, expression: *const ast.Expr };
+    const MatchState = struct { row: Row, used: []const *const v.Relationship = &.{}, terminal: ?v.Identity = null, constraints: []const Constraint = &.{} };
+    // Inline properties are predicates over the complete MATCH scope. Filter
+    // immediately when possible; retain forward references until their aliases
+    // are bound, including anonymous entities and each variable-length hop.
+    fn constrain(self: *Engine, input: MatchState, entity: v.Value, properties: []const ast.Entry) !?MatchState {
+        var candidate = input;
+        if (properties.len == 0) return candidate;
+        const visible = try self.readValue(entity);
+        for (properties) |property| {
+            const actual = visible.property(property.name);
+            if (!self.matchScopeReady(candidate.row) and @import("expressions.zig").containsPattern(property.value)) {
+                candidate = try self.deferConstraint(candidate, actual, property.value);
+                continue;
+            }
+            const expected = self.eval(property.value, candidate.row, null) catch |err| {
+                if (err != error.UnboundCypherVariable) return err;
+                candidate = try self.deferConstraint(candidate, actual, property.value);
+                continue;
+            };
+            if (v.Value.equal(actual, expected) != true) return null;
+        }
+        return candidate;
+    }
+    fn deferConstraint(self: *Engine, input: MatchState, actual: v.Value, expression: *const ast.Expr) !MatchState {
+        const pending = try self.a.alloc(Constraint, input.constraints.len + 1);
+        @memcpy(pending[0..input.constraints.len], input.constraints);
+        pending[input.constraints.len] = .{ .actual = actual, .expression = expression };
+        var candidate = input;
+        candidate.constraints = pending;
+        return candidate;
+    }
+    fn constraintsMatch(self: *Engine, constraints: []const Constraint, row: Row, partial: bool) !bool {
+        for (constraints) |constraint| {
+            if (partial and !self.matchScopeReady(row) and @import("expressions.zig").containsPattern(constraint.expression)) continue;
+            const expected = self.eval(constraint.expression, row, null) catch |err| {
+                if (partial and err == error.UnboundCypherVariable) continue;
+                return err;
+            };
+            if (v.Value.equal(constraint.actual, expected) != true) return false;
         }
         return true;
     }
-    const MatchState = struct { row: Row, used: []const *const v.Relationship = &.{}, terminal: ?v.Identity = null };
+    fn matchScopeReady(self: *Engine, row: Row) bool {
+        for (self.match_aliases) |name| if (lookup(row, name) == null) return false;
+        return true;
+    }
     /// A terminal, unordered node projection can demand only SKIP + LIMIT
     /// matches. Aggregation, DISTINCT, ordering, OPTIONAL and traversals retain
     /// exhaustive semantics. Admission still counts every examined native row.
@@ -363,9 +405,11 @@ const Engine = struct {
                     };
                     if (duplicate) continue;
                     try seen.append(self.a, node.identity);
-                    if (!try self.nodeMatches(node, first, rows[0])) continue;
+                    if (!try self.nodeMatches(node, first)) continue;
                     var bound = (try self.bind(rows[0], first.alias, .{ .node = node })) orelse continue;
                     if (path.alias) |alias| bound = (try self.bind(bound, alias, .{ .path = .{ .nodes = try self.a.dupe(*const v.Node, &.{node}), .relationships = &.{} } })) orelse continue;
+                    const candidate = (try self.constrain(.{ .row = bound }, .{ .node = node }, first.properties)) orelse continue;
+                    if (!try self.constraintsMatch(candidate.constraints, bound, false)) continue;
                     if (operation.predicate) |predicate| if ((try (try self.eval(predicate, bound, null)).truth()) != true) continue;
                     try self.state();
                     try output.append(self.a, bound);
@@ -380,6 +424,15 @@ const Engine = struct {
         return try output.toOwnedSlice(self.a);
     }
     fn match(self: *Engine, rows: []const Row, operation: ast.Match) anyerror![]const Row {
+        const prior_aliases = self.match_aliases;
+        defer self.match_aliases = prior_aliases;
+        var aliases: std.ArrayList([]const u8) = .empty;
+        for (operation.paths) |path| {
+            for (path.nodes) |node| if (node.alias) |alias| try aliases.append(self.a, alias);
+            for (path.edges) |edge| if (edge.alias) |alias| try aliases.append(self.a, alias);
+            if (path.alias) |alias| try aliases.append(self.a, alias);
+        }
+        self.match_aliases = aliases.items;
         var output: std.ArrayList(Row) = .empty;
         for (rows) |row| {
             var states: []const MatchState = &.{.{ .row = row }};
@@ -390,6 +443,7 @@ const Engine = struct {
             }
             const initial = output.items.len;
             for (states) |matched| {
+                if (!try self.constraintsMatch(matched.constraints, matched.row, false)) continue;
                 if (operation.predicate) |predicate| if ((try (try self.eval(predicate, matched.row, null)).truth()) != true) continue;
                 try output.append(self.a, matched.row);
             }
@@ -451,8 +505,9 @@ const Engine = struct {
         if (first.alias) |alias| if (lookup(input.row, alias)) |bound| {
             if (bound == .null) return;
             if (bound != .node) return error.CypherTypeMismatch;
-            if (!try self.nodeMatches(bound.node, first, input.row)) return;
-            try self.pathStep(input, path, mode, 0, &.{bound.node}, &.{}, output);
+            if (!try self.nodeMatches(bound.node, first)) return;
+            const candidate = (try self.constrain(input, bound, first.properties)) orelse return;
+            try self.pathStep(candidate, path, mode, 0, &.{bound.node}, &.{}, output);
             return;
         };
         if (self.anchorKey(predicate, first.alias, input.row)) |key| {
@@ -466,9 +521,10 @@ const Engine = struct {
                 if (self.stats.scanned_anchors == self.limits.scanned_anchors) return error.CypherAnchorBudgetExceeded;
                 self.stats.scanned_anchors += 1;
                 const node = (try self.backend.vtable.get(self.backend.ptr, self.a, .{ .table = label.table, .key = key.string })) orelse continue;
-                if (!try self.nodeMatches(node, first, input.row)) continue;
+                if (!try self.nodeMatches(node, first)) continue;
                 const bound = (try self.bind(input.row, first.alias, .{ .node = node })) orelse continue;
-                try self.pathStep(.{ .row = bound, .used = input.used }, path, mode, 0, &.{node}, &.{}, output);
+                const candidate = (try self.constrain(.{ .row = bound, .used = input.used, .constraints = input.constraints }, .{ .node = node }, first.properties)) orelse continue;
+                try self.pathStep(candidate, path, mode, 0, &.{node}, &.{}, output);
             }
             return;
         }
@@ -492,9 +548,10 @@ const Engine = struct {
                     };
                     if (duplicate) continue;
                     try seen.append(self.a, node.identity);
-                    if (!try self.nodeMatches(node, first, input.row)) continue;
+                    if (!try self.nodeMatches(node, first)) continue;
                     const bound = (try self.bind(input.row, first.alias, .{ .node = node })) orelse continue;
-                    try self.pathStep(.{ .row = bound, .used = input.used }, path, mode, 0, &.{node}, &.{}, output);
+                    const candidate = (try self.constrain(.{ .row = bound, .used = input.used, .constraints = input.constraints }, .{ .node = node }, first.properties)) orelse continue;
+                    try self.pathStep(candidate, path, mode, 0, &.{node}, &.{}, output);
                 }
                 if (page.next == null) break;
                 if (cursor) |old| if (std.mem.eql(u8, old, page.next.?)) return error.CypherInvalidBackendCursor;
@@ -506,7 +563,8 @@ const Engine = struct {
         try self.state();
         if (edge_index == path.edges.len) {
             const row = (try self.bind(input.row, path.alias, .{ .path = .{ .nodes = try self.a.dupe(*const v.Node, nodes), .relationships = try self.a.dupe(*const v.Relationship, relationships) } })) orelse return;
-            try output.append(self.a, .{ .row = row, .used = input.used, .terminal = nodes[nodes.len - 1].identity });
+            if (!try self.constraintsMatch(input.constraints, row, true)) return;
+            try output.append(self.a, .{ .row = row, .used = input.used, .terminal = nodes[nodes.len - 1].identity, .constraints = input.constraints });
             return;
         }
         const before = output.items.len;
@@ -538,10 +596,13 @@ const Engine = struct {
     fn expandPath(self: *Engine, input: MatchState, path: ast.Path, mode: ast.PathMode, edge_index: usize, nodes: []const *const v.Node, relationships: []const *const v.Relationship, hops: u32, edge_values: []const v.Value, output: *std.ArrayList(MatchState)) anyerror!void {
         const edge = path.edges[edge_index];
         const current = nodes[nodes.len - 1];
-        if (hops >= edge.min_hops and try self.nodeMatches(current, path.nodes[edge_index + 1], input.row)) {
+        if (hops >= edge.min_hops and try self.nodeMatches(current, path.nodes[edge_index + 1])) {
             if (try self.bind(input.row, path.nodes[edge_index + 1].alias, .{ .node = current })) |node_row| {
                 const edge_value: v.Value = if (edge.variable_length) .{ .list = edge_values } else .{ .relationship = relationships[relationships.len - 1] };
-                if (try self.bind(node_row, edge.alias, edge_value)) |edge_row| try self.pathStep(.{ .row = edge_row, .used = input.used }, path, mode, edge_index + 1, nodes, relationships, output);
+                if (try self.bind(node_row, edge.alias, edge_value)) |edge_row| {
+                    if (try self.constrain(.{ .row = edge_row, .used = input.used, .constraints = input.constraints }, .{ .node = current }, path.nodes[edge_index + 1].properties)) |candidate|
+                        try self.pathStep(candidate, path, mode, edge_index + 1, nodes, relationships, output);
+                }
             }
         }
         if (edge.max_hops) |maximum| if (hops >= maximum) return;
@@ -584,16 +645,7 @@ const Engine = struct {
                         };
                         if (revisited) continue;
                     }
-                    var valid = true;
-                    for (edge.properties) |property| {
-                        const expected = try self.eval(property.value, input.row, null);
-                        const actual = (v.Value{ .relationship = relationship }).property(property.name);
-                        if (expected == .null or actual == .null or !(v.Value.equal(expected, actual) orelse false)) {
-                            valid = false;
-                            break;
-                        }
-                    }
-                    if (!valid) continue;
+                    const candidate = (try self.constrain(input, .{ .relationship = relationship }, edge.properties)) orelse continue;
                     if (relationships.len >= self.limits.path_depth) return error.CypherPathBudgetExceeded;
                     const next_nodes = try self.a.alloc(*const v.Node, nodes.len + 1);
                     @memcpy(next_nodes[0..nodes.len], nodes);
@@ -608,7 +660,7 @@ const Engine = struct {
                     @memcpy(next_values[0..edge_values.len], edge_values);
                     next_values[edge_values.len] = .{ .relationship = relationship };
                     try self.state();
-                    try self.expandPath(.{ .row = input.row, .used = next_used }, path, mode, edge_index, next_nodes, next_relationships, hops + 1, next_values, output);
+                    try self.expandPath(.{ .row = input.row, .used = next_used, .constraints = candidate.constraints }, path, mode, edge_index, next_nodes, next_relationships, hops + 1, next_values, output);
                 }
                 if (page.next == null) break;
                 if (cursor) |old| if (std.mem.eql(u8, old, page.next.?)) return error.CypherInvalidBackendCursor;
@@ -951,7 +1003,7 @@ const Engine = struct {
             defer self.stats.intermediate_states += remaining - work.remaining;
             return .{ .boolean = try self.regex.matches(left.string, right.string, &work) };
         }
-        if (op == .add and left == .string and right == .string) return .{ .string = try std.fmt.allocPrint(self.a, "{s}{s}", .{ left.string, right.string }) };
+        if (op == .add and (left == .string or right == .string) and left != .list and right != .list) return .{ .string = try std.fmt.allocPrint(self.a, "{s}{s}", .{ try self.scalarString(left), try self.scalarString(right) }) };
         if (op == .add and (left == .list or right == .list)) {
             const lhs = if (left == .list) left.list else &.{left};
             const rhs = if (right == .list) right.list else &.{right};
@@ -987,6 +1039,15 @@ const Engine = struct {
         };
         if (!std.math.isFinite(number)) return error.CypherNumericOverflow;
         return .{ .number = number };
+    }
+    fn scalarString(self: *Engine, value: v.Value) ![]const u8 {
+        return switch (value) {
+            .string => value.string,
+            .boolean => if (value.boolean) "true" else "false",
+            .integer => try std.fmt.allocPrint(self.a, "{d}", .{value.integer}),
+            .number => try numbers.floatString(self.a, value.number),
+            else => error.CypherTypeMismatch,
+        };
     }
     fn function(self: *Engine, name: []const u8, args: []const *const ast.Expr, row: Row, group: ?[]const Row) !v.Value {
         if (std.ascii.eqlIgnoreCase(name, "coalesce")) {
@@ -1071,7 +1132,11 @@ const Engine = struct {
         };
         if (std.ascii.eqlIgnoreCase(name, "toBoolean")) return switch (value) {
             .boolean => value,
-            .string => if (std.ascii.eqlIgnoreCase(value.string, "true")) .{ .boolean = true } else if (std.ascii.eqlIgnoreCase(value.string, "false")) .{ .boolean = false } else .null,
+            .integer => .{ .boolean = value.integer != 0 },
+            .string => blk: {
+                const text = try unicode_string.trim(value.string, true, true);
+                break :blk if (std.ascii.eqlIgnoreCase(text, "true")) .{ .boolean = true } else if (std.ascii.eqlIgnoreCase(text, "false")) .{ .boolean = false } else .null;
+            },
             else => error.CypherTypeMismatch,
         };
         if (std.ascii.eqlIgnoreCase(name, "toInteger") or std.ascii.eqlIgnoreCase(name, "toFloat")) {
@@ -1080,7 +1145,7 @@ const Engine = struct {
             if (integer and value == .boolean) return .{ .integer = @intFromBool(value.boolean) };
             if (value != .integer and value != .number and value != .string) return error.CypherTypeMismatch;
             if (integer and value == .string) return if (try numbers.decimalInteger(value.string)) |parsed| .{ .integer = parsed } else .null;
-            const number = if (value == .string) std.fmt.parseFloat(f64, value.string) catch return .null else try value.numeric();
+            const number = if (value == .string) numbers.floatFromString(value.string) orelse return .null else try value.numeric();
             if (!std.math.isFinite(number)) return .null;
             if (!integer) return .{ .number = number };
             if (number >= 9223372036854775808.0 or number < -9223372036854775808.0) return .null;
@@ -1279,7 +1344,9 @@ const Engine = struct {
     }
     fn rowEqual(a: Row, b: Row) bool {
         if (a.len != b.len) return false;
-        for (a, b) |x, y| if (!v.Value.eql(x.value, y.value)) return false;
+        // Wildcards retain binding order internally; UNION arms may project
+        // the same named columns explicitly in a different physical order.
+        for (a) |x| if (!v.Value.eql(x.value, lookup(b, x.name) orelse return false)) return false;
         return true;
     }
     fn distinct(self: *Engine, rows: []const Row) !std.ArrayList(Row) {

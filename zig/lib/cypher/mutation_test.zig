@@ -228,7 +228,7 @@ test "Cypher writes update aliases and paths, remove null properties, and read s
 test "Cypher write errors and commit rejection roll back every staged change" {
     var fixture = Fixture.init();
     defer fixture.arena.deinit();
-    try std.testing.expectError(error.CypherTypeMismatch, fixture.run("CREATE (n:Person {name:'Ada'}) SET n.age=1 RETURN 1 + 'bad'"));
+    try std.testing.expectError(error.CypherTypeMismatch, fixture.run("CREATE (n:Person {name:'Ada'}) SET n.age=1 RETURN 1 + {}"));
     try std.testing.expectEqual(@as(usize, 0), fixture.nodes.len);
     try std.testing.expectEqual(@as(usize, 1), fixture.rollbacks);
     fixture.fail_commit = true;
