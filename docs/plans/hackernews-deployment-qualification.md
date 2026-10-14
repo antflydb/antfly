@@ -856,8 +856,9 @@ This removes filesystem work from a global spin-lock section without changing
 active-reader pins or disk-capacity accounting.
 
 Paged stored highlights group final winner locations by authenticated segment
-identity and document ordinal. Each segment opens once for the page, while one
-hidden document input is reused at a time. Highlight outputs remain attached to
+identity and document ordinal. Each segment opens once per delivered batch, while one
+hidden document input is reused at a time. Streamed response hydration uses
+64-hit batches, so segment reuse is bounded by that batch. Highlight outputs remain attached to
 their original hit positions; ranked order, scores and cursor contents do not
 change. Each document still verifies its native row identity, and a four-document
 lookahead uses the existing bounded prefetch queue. This targets repeated segment

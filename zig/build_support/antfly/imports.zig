@@ -350,7 +350,7 @@ pub const AntflyRootImports = struct {
     const object_runtime_imports = .{
         "inference_api", "inference_config_openapi", "middleware_openapi",
         "s3_openapi",    "scraping_openapi",         "vectorindex",
-        "matcher",
+        "matcher",       "resolver",
     };
 
     /// Public local C API: no server provisioning, quorum observer, or routers.
