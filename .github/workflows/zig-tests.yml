@@ -1888,7 +1888,7 @@ jobs:
         run: >-
           taskset -c ${{ steps.e2e_cpus.outputs.list }} go test
           -tags runtimeintegration ./controllers/inference
-          -run '^TestInferenceRuntimeContract$' -count=1 -v -timeout=20m
+          -run '^Test(InferenceRuntimeContract|RuntimeModelPullRetry)$' -count=1 -v -timeout=20m
 
       - name: Test exhaustive E2E shard partition
         if: matrix.suite == 'antfly-ordinary-0'
