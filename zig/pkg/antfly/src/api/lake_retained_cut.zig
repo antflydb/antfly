@@ -44,6 +44,7 @@ pub const Descriptor = struct {
     published_only: bool,
     recent: []const local.serverless_segment_sidecar_manifest.DeclaredArtifact = &.{},
     recent_cloud: ?catalog.CloudGenerations = null,
+    recent_runs: []const @import("lake_recent_vectors.zig").Run = &.{},
 };
 fn domain(table: u64, store: catalog.Digest) catalog.Digest {
     var hash = std.crypto.hash.Blake3.init(.{});

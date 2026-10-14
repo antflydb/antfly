@@ -1255,7 +1255,7 @@ pub const Adapter = struct {
                     const oa = owner.overlay_arena.?.allocator();
                     const overlay = try oa.create(@import("lake_sql_overlay.zig").Cut);
                     overlay.* = try @import("lake_sql_overlay.zig").Cut.initForTable(oa, cut.pending, request.table);
-                    if (cut.pending.changes.len != 0) try owner.overlays.put(alloc, request.table.id, overlay);
+                    if (cut.pending.count() != 0) try owner.overlays.put(alloc, request.table.id, overlay);
                 } else if (self.lake_visibility == .accepted and schema.external_base_source.?.binding.write_policy == .iceberg_writer) {
                     if (owner.overlay_arena == null) owner.overlay_arena = .init(alloc);
                     const oa = owner.overlay_arena.?.allocator();
@@ -1274,7 +1274,7 @@ pub const Adapter = struct {
                     const pending = try @import("../serverless/lake_ingestion.zig").pending(oa, binding, lake_options, context, cut);
                     if (self.read_requirements.after_write) |receipt| if (receipt.table_id == request.table.id) try self.read_requirements.requireCoverage(request.table.id, lake_options.catalog_generation, pending.lsn, false);
                     const overlay = try oa.create(@import("lake_sql_overlay.zig").Cut);
-                    if (pending.changes.len != 0) try @import("lake_search_overlay.zig").requireNativeAncestry(current_root, source.inventory.snapshot_id);
+                    if (pending.count() != 0) try @import("lake_search_overlay.zig").requireNativeAncestry(current_root, source.inventory.snapshot_id);
                     // Persist the unmodified physical WAL before SQL converts
                     // timestamp values to its logical representation.
                     if (self.active_transaction != null) try self.saveSqlLakeCut(oa, request.table, .{
@@ -1290,7 +1290,7 @@ pub const Adapter = struct {
                         .pending = pending,
                     }, lake_options, context);
                     overlay.* = try @import("lake_sql_overlay.zig").Cut.initForTable(oa, pending, request.table);
-                    if (pending.changes.len != 0) try owner.overlays.put(alloc, request.table.id, overlay);
+                    if (pending.count() != 0) try owner.overlays.put(alloc, request.table.id, overlay);
                 }
                 try owner.sources.put(alloc, request.table.id, source);
             } else try native.append(scratch.allocator(), request);

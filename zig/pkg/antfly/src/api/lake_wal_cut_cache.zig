@@ -24,7 +24,7 @@ const Overlay = @import("lake_search_overlay.zig").Overlay;
 const Set = @import("lake_index_physical_set.zig").Set;
 const Context = local.serverless_query_lake_read_context.Context;
 const A = std.mem.Allocator;
-pub const MaskBuilder = struct { ptr: *anyopaque, build: *const fn (*anyopaque, A) anyerror!Set };
+pub const MaskBuilder = struct { ptr: *anyopaque, build: *const fn (*anyopaque, A) anyerror!Set, build_filter: ?*const fn (*anyopaque, A, []const u8) anyerror!Set = null };
 const Owner = struct {
     references: std.atomic.Value(usize) = .init(1),
     budget: local.sql_memory_budget,
@@ -34,16 +34,14 @@ const Owner = struct {
     mutex: std.atomic.Mutex = .unlocked,
     physical: ?Set = null,
     head: ?wal.Head = null,
-    parent: ?*Owner = null,
-    depth: u8 = 0,
+    image: ?*@import("lake_wal_image.zig").Image = null,
     fn release(self: *Owner) void {
         if (self.references.fetchSub(1, .acq_rel) != 1) return;
         self.masks.deinit();
         self.arena.deinit();
         std.debug.assert(self.budget.live == 0);
-        const parent = self.parent;
+        if (self.image) |image| image.release();
         std.heap.page_allocator.destroy(self);
-        if (parent) |owner| owner.release();
     }
 };
 pub const Pin = struct {
@@ -65,7 +63,7 @@ pub const Pin = struct {
         defer owner.mutex.unlock();
         try context.ensureActive();
         if (owner.physical == null) {
-            owner.physical = builder.build(builder.ptr, owner.masks.allocator()) catch |err| {
+            owner.physical = buildPhysical(owner, builder, context) catch |err| {
                 _ = owner.masks.reset(.free_all);
                 if (err == error.OutOfMemory) return null;
                 return err;
@@ -74,6 +72,25 @@ pub const Pin = struct {
         return &owner.physical.?;
     }
 };
+fn buildPhysical(owner: *Owner, builder: MaskBuilder, context: Context) !Set {
+    const image = owner.image orelse return builder.build(builder.ptr, owner.masks.allocator());
+    const build = builder.build_filter orelse return builder.build(builder.ptr, owner.masks.allocator());
+    var result = Set.init(owner.masks.allocator());
+    for (image.parts) |part| if (part) |held| {
+        const mask = held.mask.?;
+        while (!mask.mutex.tryLock()) {
+            try context.ensureActive();
+            if (context.io) |io| try io.sleep(.fromMilliseconds(1), .awake) else return error.OutOfMemory;
+        }
+        defer mask.mutex.unlock();
+        if (mask.set == null) mask.set = build(builder.ptr, mask.arena.allocator(), held.key_filter) catch |err| {
+            _ = mask.arena.reset(.free_all);
+            return err;
+        };
+        try result.orWith(&mask.set.?);
+    };
+    return result;
+}
 pub const Cache = struct {
     const Entry = struct { identity: [32]u8, authority: [32]u8, owner: ?*Owner = null, used: u64 };
     mutex: std.atomic.Mutex = .unlocked,
@@ -162,7 +179,7 @@ pub const Cache = struct {
             };
             var previous: ?*Owner = null;
             if (head) |tail| for (self.entries) |slot| if (slot) |entry| if (entry.owner) |owner| {
-                if (std.mem.eql(u8, &entry.authority, &authority) and owner.overlay.pending.base_lsn == cut and owner.head != null and owner.depth < 8 and owner.head.?.lsn < tail.lsn and (previous == null or previous.?.head.?.lsn < owner.head.?.lsn)) previous = owner;
+                if (std.mem.eql(u8, &entry.authority, &authority) and owner.overlay.pending.base_lsn == cut and owner.head != null and owner.head.?.lsn < tail.lsn and (previous == null or previous.?.head.?.lsn < owner.head.?.lsn)) previous = owner;
             };
             if (previous) |owner| _ = owner.references.fetchAdd(1, .monotonic);
             defer if (previous) |owner| owner.release();
@@ -202,15 +219,12 @@ pub const Cache = struct {
         const extension = if (previous != null and head != null) try store.rangeAfterHead(a, previous.?.head.?, head.?) else null;
         if (previous != null and extension == null) _ = owner.arena.reset(.free_all);
         const suffix = extension orelse try store.rangePinned(a, cut, head);
-        if (extension != null) {
-            owner.parent = previous;
-            owner.depth = previous.?.depth + 1;
-            _ = previous.?.references.fetchAdd(1, .monotonic);
-        }
         owner.head = if (head) |tail| .{ .lsn = tail.lsn, .key = try a.dupe(u8, tail.key) } else null;
-        var pending = try ingestion.normalizePendingWithBase(a, cut, suffix.lsn, if (extension != null) previous.?.overlay.pending else null, suffix.records);
-        pending.cut_identity = key(@splat(0), cut, head);
-        owner.overlay = try Overlay.init(a, pending);
+        const delta = try ingestion.normalizePending(a, cut, suffix.lsn, suffix.records);
+        const image = try @import("lake_wal_image.zig").Image.update(owner.budget.backing, if (extension != null) previous.?.image else null, delta);
+        owner.image = image;
+        const pending: ingestion.Pending = .{ .base_lsn = cut, .lsn = suffix.lsn, .key_fields = image.key_fields, .changes = &.{}, .change_blocks = &image.blocks, .cut_identity = key(@splat(0), cut, head) };
+        owner.overlay = .{ .pending = pending, .rows = .{ .image = image }, .key_filter = "" };
     }
 };
 
@@ -258,11 +272,11 @@ test "external lake bounded WAL cuts share normalization masks and immutable cha
     defer newer.deinit();
     try std.testing.expect(one.owner != newer.owner);
     try std.testing.expectEqual(@as(usize, 4), provider.gets - before_extend); // floor, tail, one new record/payload
-    try std.testing.expect(newer.owner.parent == one.owner);
+    try std.testing.expect(newer.owner.image != one.owner.image);
     try std.testing.expectEqual(@as(usize, 1), one.overlay().rows.count());
     try std.testing.expectEqual(@as(u64, 2), newer.overlay().pending.lsn);
     try std.testing.expectEqual(@as(usize, 1), newer.overlay().rows.count());
-    try std.testing.expectEqual(@as(usize, 2), newer.overlay().pending.changes.len);
+    try std.testing.expectEqual(@as(usize, 2), newer.overlay().pending.count());
     for (0..8) |i| {
         var authority: [32]u8 = @splat(0);
         authority[0] = @intCast(i + 2);
@@ -280,7 +294,7 @@ test "external lake bounded WAL cuts share normalization masks and immutable cha
     _ = try fork.append(sa, "fork-three", second, 2, 0);
     const restored = try cache.acquire(@splat(1), fork, 0, .{ .io = io });
     defer restored.deinit();
-    try std.testing.expect(restored.owner.parent == null);
+    try std.testing.expect(restored.owner.image.?.rebuilt_rows == restored.owner.image.?.change_count);
     try std.testing.expectEqual(@as(u64, 3), restored.overlay().pending.lsn);
     var pressure: Cache = .{};
     defer pressure.deinit();

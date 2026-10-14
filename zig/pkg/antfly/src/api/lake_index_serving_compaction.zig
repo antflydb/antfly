@@ -40,6 +40,9 @@ const Builder = struct {
     ownership: *corpus.text_directory.Mutations,
     source_routes: *corpus.text_directory.Mutations,
     open_packs: std.ArrayList(Chunk) = .empty,
+    open_tails: std.ArrayList(corpus.Root.Tail) = .empty,
+    candidates: [4]std.ArrayList(corpus.Root.Tail) = @splat(.empty),
+    activated: [4]bool = @splat(false),
     added: std.ArrayList(Chunk) = .empty,
     removed: std.ArrayList(Chunk) = .empty,
     // Four eight-way tiers fill tiny-file packs by bytes. Source spans live in
@@ -79,8 +82,28 @@ const Builder = struct {
         while (level < 3 and input.sources.len >= threshold) : (level += 1) threshold *= 8;
         return self.addAt(level, input);
     }
-    fn addAt(self: *@This(), level: usize, input: Input) !void {
+    fn activate(self: *@This(), level: usize) anyerror!void {
+        if (self.activated[level]) return;
+        self.activated[level] = true;
+        var arena = std.heap.ArenaAllocator.init(self.a);
+        defer arena.deinit();
+        for (self.candidates[level].items) |tail| {
+            try self.check();
+            _ = arena.reset(.free_all);
+            const group = try corpus.loadFileManifest(arena.allocator(), self.store.*, tail.ref, self.pages.domain, self.token, null);
+            if (group.segments.len != 1 or group.sources.len != tail.spans or group.admissions[0].bytes != tail.bytes) return error.InvalidNativeLakeTextCorpus;
+            try self.removed.append(self.out, tail.ref);
+            try self.contribution(group, -1);
+            try self.owner(group, tail.ref, true);
+            self.pack_count = try std.math.sub(u32, self.pack_count, 1);
+            self.serving_bytes = try std.math.sub(u64, self.serving_bytes, tail.bytes);
+            if (self.serving_metadata_bytes) |bytes| self.serving_metadata_bytes = try std.math.sub(u64, bytes, metadataBytes(group, tail.ref));
+            try self.addAt(level, .{ .ref = group.segments[0], .admission = group.admissions[0], .sources = group.sources, .original_docs = group.admissions[0].doc_count, .summary = group.summaries[0] });
+        }
+    }
+    fn addAt(self: *@This(), level: usize, input: Input) anyerror!void {
         try self.check();
+        try self.activate(level);
         var metadata: usize = 0;
         for (input.sources) |span| metadata += span.file.id.len + 512;
         if (self.count[level] != 0 and (self.bytes[level] + input.admission.bytes > 16 * 1024 * 1024 or self.spans[level] + input.sources.len > corpus.source_spans.max_spans or self.metadata_bytes[level] + metadata > 1024 * 1024)) try self.flush(level);
@@ -177,6 +200,7 @@ const Builder = struct {
         for (group.sources) |span| source_metadata += span.file.id.len + 512;
         if (group.sources.len < corpus.source_spans.max_spans and source_metadata < 512 * 1024 and group.admissions[0].bytes < 2 * 1024 * 1024 and self.open_counts[tier] < 7) {
             try self.open_packs.append(self.out, manifest);
+            try self.open_tails.append(self.out, .{ .ref = manifest, .tier = @intCast(tier), .bytes = group.admissions[0].bytes, .spans = @intCast(group.sources.len) });
             self.open_counts[tier] += 1;
         }
         try self.contribution(group, 1);
@@ -310,7 +334,13 @@ pub fn publishDelta(a: A, out: A, store: *stores.ArtifactStore, current: corpus.
                 try affected.put(a, ref.artifact_id, ref);
             }
         }
-        for (old.open_packs) |ref| try affected.put(a, ref.artifact_id, ref);
+        if (old.open_tails.len == old.open_packs.len) {
+            // Only a new or changed input in the same tier activates its tails.
+            // Unrelated tiers keep manifests, source pages and ownership intact.
+            for (old.open_tails) |tail| if (!affected.contains(tail.ref.artifact_id)) {
+                try builder.candidates[tail.tier].append(ca, tail);
+            };
+        } else for (old.open_packs) |ref| try affected.put(a, ref.artifact_id, ref);
         var it = affected.valueIterator();
         while (it.next()) |ref| {
             try builder.check();
@@ -348,6 +378,10 @@ pub fn publishDelta(a: A, out: A, store: *stores.ArtifactStore, current: corpus.
         if (lower != rows) return error.InvalidNativeLakeTextCorpus;
     }
     for (0..4) |level| try builder.flush(level);
+    for (0..4) |level| if (!builder.activated[level]) for (builder.candidates[level].items) |tail| {
+        try builder.open_packs.append(ca, tail.ref);
+        try builder.open_tails.append(ca, tail);
+    };
     var root = current;
     root.serving = null;
     root.directories = try corpus.text_directory.publishManifests(a, store, builder.added.items, builder.removed.items, if (prior) |old| old.directories else .{}, current.domain, token, context.io.?);
@@ -357,6 +391,7 @@ pub fn publishDelta(a: A, out: A, store: *stores.ArtifactStore, current: corpus.
     root.source_routes = try source_routes.finish(if (prior) |old| old.source_routes else null);
     root.pack_ownership = try ownership.finish(if (prior) |old| old.pack_ownership else null);
     root.open_packs = builder.open_packs.items;
+    root.open_tails = builder.open_tails.items;
     root.file_count = builder.pack_count;
     root.segment_count = builder.pack_count;
     root.serving_bytes = builder.serving_bytes;
@@ -518,6 +553,11 @@ test "external lake global frontier cross file packs preserve coordinates ties r
     defer append_plan.deinit();
     // The appended file is already complete in the recovered checkpoint.
     @memset(append_plan.changed, false);
+    const old_scope = store.upload_scope.?;
+    const tail_bytes = try store.getAlloc(first_packs[0].manifest.artifact_id);
+    defer store.allocator.free(tail_bytes);
+    try store.delete(first_packs[0].manifest.artifact_id);
+    store.upload_scope = try stores.UploadScope.forPublication(current.domain, 2, std.testing.io);
     appended.serving = try publish(a, ca, &store, appended, recovered, &append_plan, .{ .io = std.testing.io }, .none);
     // Delta publication must not reopen either canonical file inventory.
     // Make those inventories unavailable while retaining serving ownership.
@@ -527,6 +567,12 @@ test "external lake global frontier cross file packs preserve coordinates ties r
     delta_current.directories.files = null;
     const added: corpus.text_directory.FileRecord = .{ .file = append_plan.files[128], .manifest = refs[128] };
     appended.serving = try publishDelta(a, ca, &store, delta_current, delta_base, .{ .removed = &.{}, .added = &.{added} }, &append_plan, .{ .io = std.testing.io }, .none);
+    const new_scope = store.upload_scope.?;
+    store.upload_scope = old_scope;
+    var restored_tail = try store.put(tail_bytes);
+    defer restored_tail.deinit(store.allocator);
+    try std.testing.expectEqualStrings(first_packs[0].manifest.artifact_id, restored_tail.artifact_id);
+    store.upload_scope = new_scope;
     const appended_root = try corpus.servingRoot(ca, store, appended, .none, null);
     try std.testing.expectEqual(@as(u32, 2), appended_root.segment_count);
     const appended_packs = try corpus.text_directory.fileRecords(ca, appended_root, store, null, .none);

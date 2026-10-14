@@ -26,6 +26,7 @@ pub const Provider = struct {
     until_ms: u64 = 1_000_000,
     stats: usize = 0,
     gets: usize = 0,
+    get_hook: ?struct { ptr: *anyopaque, call: *const fn (*anyopaque) anyerror!void } = null,
     put_hook: ?struct { ptr: *anyopaque, call: *const fn (*anyopaque) anyerror!void } = null,
     retention_hook: ?struct { ptr: *anyopaque, call: *const fn (*anyopaque) anyerror!void } = null,
     pub fn init(a: A) Provider {
@@ -85,6 +86,7 @@ pub const Provider = struct {
     }
     fn get(raw: *anyopaque, a: A, bucket: []const u8, name: []const u8, options: os.GetOptions) !os.GetResult {
         const self = owner(raw);
+        if (self.get_hook) |hook| try hook.call(hook.ptr);
         @import("antfly_platform").sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
         self.gets += 1;

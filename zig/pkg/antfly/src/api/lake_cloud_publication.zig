@@ -49,7 +49,7 @@ pub const Binding = struct {
         errdefer a.destroy(reader);
         const root = try maps.cloneRef(a, cloud.root);
         errdefer maps.freeRef(a, root);
-        reader.* = .{ .client = object.client, .bucket = object.bucket, .prefix = object.prefix, .root = root, .complete = cloud.complete, .shared = maps.sharedNavigation(object.cloud_cache_scope) };
+        reader.* = .{ .client = object.client, .bucket = object.bucket, .prefix = object.prefix, .io = object.cloud_io, .root = root, .complete = cloud.complete, .shared = maps.sharedNavigation(object.cloud_cache_scope) };
         const result: Binding = .{ .a = a, .object = object, .reader = reader, .previous_reader = object.cloud_reader, .previous_roots = object.cloud_certified_roots, .previous_until = object.cloud_certificate_until_ms };
         object.cloud_reader = reader;
         object.cloud_certified_roots = &.{};
@@ -185,12 +185,14 @@ pub const UnionBinding = struct {
         errdefer a.free(readers);
         const pointers = try a.alloc(*maps.Reader, readers.len);
         errdefer a.free(pointers);
+        // Complete fallible allocation before acquiring any shared cache pins.
+        const union_reader = try a.create(maps.Reader);
+        errdefer a.destroy(union_reader);
         for (readers, pointers, selected.items, 0..) |*reader, *pointer, cloud, i| {
-            reader.* = .{ .client = object.client, .bucket = object.bucket, .prefix = object.prefix, .root = cloud.root, .shared = maps.sharedNavigation(object.cloud_cache_scope), .cache_limit = if (i < 4) 2 * 1024 * 1024 else 0 };
+            reader.* = .{ .client = object.client, .bucket = object.bucket, .prefix = object.prefix, .io = object.cloud_io, .root = cloud.root, .shared = maps.sharedNavigation(object.cloud_cache_scope), .cache_limit = if (i < 4) 2 * 1024 * 1024 else 0 };
             pointer.* = reader;
         }
-        const union_reader = try a.create(maps.Reader);
-        union_reader.* = .{ .client = object.client, .bucket = object.bucket, .prefix = object.prefix, .alternatives = pointers };
+        union_reader.* = .{ .client = object.client, .bucket = object.bucket, .prefix = object.prefix, .io = object.cloud_io, .alternatives = pointers };
         const previous = object.cloud_reader;
         object.cloud_reader = union_reader;
         return .{ .a = a, .object = object, .readers = readers, .pointers = pointers, .union_reader = union_reader, .previous = previous };
@@ -230,6 +232,24 @@ test "external lake global frontier cloud certificates bind publications restart
     var publication: catalog.Publication = .{ .reader_protocol = catalog.native_reader_protocol, .namespace = namespace, .generation = 1, .token = @splat(1), .signature = .{ .desired = @splat(1), .source = @splat(2), .credentials = @splat(3), .store = identity }, .published_at_ms = 101, .base_source = .{ .external_parquet = .{ .format = .parquet_prefix, .source_uri = "s3://source/lake", .snapshot_id = "snapshot", .schema_fingerprint = "schema", .file_inventory_artifact = inventory.artifact_id } }, .inventory = .{ .kind = .external_base_source, .artifact_id = inventory.artifact_id, .checksum = inventory.checksum, .byte_len = inventory.byte_len } };
     try finish(a, &writer, &object, &publication, &.{}, table_id, identity, .{ .io = std.testing.io }, .none, false);
     const cloud = publication.cloud_generations.?;
+    {
+        const Failure = struct {
+            fn run(alloc: A, object_: *Object, published: catalog.Publication) !void {
+                const owner = maps.sharedNavigation(object_.cloud_cache_scope).?;
+                defer owner.release();
+                const refs = owner.refs.load(.acquire);
+                var binding_ = UnionBinding.init(alloc, object_, &.{published}, &.{}, published.namespace, published.signature.store) catch |err| {
+                    try std.testing.expectEqual(refs, owner.refs.load(.acquire));
+                    return err;
+                };
+                binding_.deinit();
+                try std.testing.expectEqual(refs, owner.refs.load(.acquire));
+            }
+        };
+        object.cloud_cache_scope = @splat(91);
+        defer object.cloud_cache_scope = @splat(0);
+        try std.testing.checkAllAllocationFailures(a, Failure.run, .{ &object, publication });
+    }
     defer maps.freeRef(a, cloud.root);
     defer a.free(cloud.certificate.?.roots);
     try std.testing.expect(cloud.complete);

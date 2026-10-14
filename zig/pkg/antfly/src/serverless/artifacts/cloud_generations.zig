@@ -103,6 +103,8 @@ const Navigation = struct {
     cache: [128]?Reader.Cached = @splat(null),
     cache_bytes: usize = 0,
     clock: u64 = 0,
+    flights: [32]?[32]u8 = @splat(null),
+    coalesced_waits: std.atomic.Value(u64) = .init(0),
     cache_allocator: A = std.heap.page_allocator,
     cache_limit: usize = 8 * 1024 * 1024,
     fn freeCached(self: *Navigation, value: Reader.Cached) void {
@@ -175,6 +177,7 @@ pub fn sharedNavigation(scope: [32]u8) ?*NavigationOwner {
     return process_navigation.acquire(scope) catch null;
 }
 pub const Reader = struct {
+    io: ?std.Io = null,
     client: objectstore.Client,
     bucket: []const u8,
     prefix: []const u8,
@@ -263,9 +266,22 @@ pub const Reader = struct {
         try ref.validate();
         try token.check();
         if (ref.byte_len > max_page_bytes) return error.InvalidCloudGenerationMap;
-        {
+        var flight: ?usize = null;
+        var flight_hash = std.crypto.hash.Blake3.init(.{});
+        flight_hash.update(ref.artifact_id);
+        flight_hash.update(ref.generation);
+        var identity: [32]u8 = undefined;
+        flight_hash.final(&identity);
+        defer if (flight) |index| {
             lock(&self.navigation().mu);
-            defer self.navigation().mu.unlock();
+            self.navigation().flights[index] = null;
+            self.navigation().mu.unlock();
+        };
+        while (true) {
+            try token.check();
+            lock(&self.navigation().mu);
+            var locked = true;
+            defer if (locked) self.navigation().mu.unlock();
             self.navigation().clock +|= 1;
             for (&self.navigation().cache) |*entry| if (entry.*) |*cached| {
                 if (std.mem.eql(u8, cached.ref.artifact_id, ref.artifact_id) and std.mem.eql(u8, cached.ref.generation, ref.generation)) {
@@ -276,7 +292,28 @@ pub const Reader = struct {
                     return cloneNode(a, cached.node);
                 }
             };
+            if (self.io) |io| {
+                var available: ?usize = null;
+                var waiting = false;
+                for (self.navigation().flights, 0..) |active, index| {
+                    if (active) |held| {
+                        if (std.mem.eql(u8, &held, &identity)) waiting = true;
+                    } else available = index;
+                }
+                if (waiting) {
+                    _ = self.navigation().coalesced_waits.fetchAdd(1, .monotonic);
+                    self.navigation().mu.unlock();
+                    locked = false;
+                    try io.sleep(.fromMilliseconds(1), .awake);
+                    continue;
+                }
+                if (available) |index| {
+                    self.navigation().flights[index] = identity;
+                    flight = index;
+                }
+            }
             try api.chargeReadBudget(&self.remaining_bytes, ref.byte_len);
+            break;
         }
         const path = try key(a, self.prefix, ref.artifact_id);
         defer a.free(path);
@@ -1198,4 +1235,87 @@ test "external lake global frontier shared generation navigation survives reques
         owned.deinit(a);
     }
     try std.testing.expectEqual(before_other + 1, provider.gets);
+}
+
+test "external lake global frontier cold map reads coalesce and canceled leaders release waiters" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var provider = @import("cloud_generations_test_provider.zig").Provider.init(a);
+    defer provider.deinit();
+    var client = provider.client();
+    try client.makeBucket("bucket");
+    const scope: api.UploadScope = .{ .domain = @splat(1), .attempt = @splat(2) };
+    var writer: Writer = .{ .a = a, .reader = .{ .client = client, .bucket = "bucket", .prefix = "native" }, .scope = scope };
+    defer writer.deinit();
+    const id = try scope.artifactId(&(@as([64]u8, @splat('a'))));
+    try writer.capture(&id, 10, "v1", .none);
+    const root = (try writer.finish(.none)).?;
+    defer freeRef(a, root);
+    const Gate = struct {
+        io: std.Io,
+        calls: std.atomic.Value(usize) = .init(0),
+        started: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+        fn get(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.calls.fetchAdd(1, .monotonic) != 0) return;
+            self.started.set(self.io);
+            try self.release.wait(self.io);
+        }
+        fn read(reader: *Reader, alloc: A, key_: []const u8) !?Record {
+            return reader.lookup(alloc, key_, .none);
+        }
+    };
+    for ([_]bool{ false, true }) |cancel| {
+        var gate: Gate = .{ .io = io };
+        provider.get_hook = .{ .ptr = &gate, .call = Gate.get };
+        defer provider.get_hook = null;
+        var pool: NavigationPool = .{};
+        defer pool.deinit();
+        var one: Reader = .{ .io = io, .client = client, .bucket = "bucket", .prefix = "native", .root = root, .shared = try pool.acquire(@splat(9)) };
+        defer one.deinit();
+        var two: Reader = .{ .io = io, .client = client, .bucket = "bucket", .prefix = "native", .root = root, .shared = try pool.acquire(@splat(9)) };
+        defer two.deinit();
+        var leader = try io.concurrent(Gate.read, .{ &one, a, @as([]const u8, &id) });
+        var leader_done = false;
+        defer if (!leader_done) {
+            if (leader.cancel(io)) |record_| {
+                if (record_) |record| {
+                    var owned = record;
+                    owned.deinit(a);
+                }
+            } else |_| {}
+        };
+        try gate.started.wait(io);
+        var waiter = try io.concurrent(Gate.read, .{ &two, a, @as([]const u8, &id) });
+        var waiter_done = false;
+        defer if (!waiter_done) {
+            if (waiter.cancel(io)) |record_| {
+                if (record_) |record| {
+                    var owned = record;
+                    owned.deinit(a);
+                }
+            } else |_| {}
+        };
+        const deadline = @import("antfly_platform").time.monotonicNs() + 2 * std.time.ns_per_s;
+        while (one.navigation().coalesced_waits.load(.monotonic) == 0) {
+            if (@import("antfly_platform").time.monotonicNs() > deadline) return error.TestUnexpectedResult;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        try std.testing.expectEqual(@as(usize, 1), gate.calls.load(.monotonic));
+        if (cancel) {
+            leader_done = true;
+            try std.testing.expectError(error.Canceled, leader.cancel(io));
+        } else {
+            gate.release.set(io);
+            leader_done = true;
+            var record = (try leader.await(io)).?;
+            record.deinit(a);
+        }
+        waiter_done = true;
+        var record = (try waiter.await(io)).?;
+        defer record.deinit(a);
+        try std.testing.expectEqualStrings("v1", record.generation);
+        try std.testing.expectEqual(@as(usize, if (cancel) 2 else 1), gate.calls.load(.monotonic));
+    }
 }

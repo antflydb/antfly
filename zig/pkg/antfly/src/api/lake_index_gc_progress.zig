@@ -294,6 +294,7 @@ pub fn run(collector: *gc.Collector, state: lifecycle.State) !gc.Result {
     collector.progress = &progress;
     defer collector.progress = null;
     const publications = try state.gcPublications(a);
+    if (collector.store.providerStore()) |object| object.cloud_io = collector.context.io;
     var cloud_union: ?@import("lake_cloud_publication.zig").UnionBinding = if (collector.store.providerStore()) |object| try @import("lake_cloud_publication.zig").UnionBinding.init(collector.a, object, publications, collection.retired, collector.namespace, collector.identity) else null;
     defer if (cloud_union) |*binding| binding.deinit();
     if (collection.progress == null) for (state.stores) |binding| {

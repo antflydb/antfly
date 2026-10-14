@@ -1322,6 +1322,72 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
                 for h in hybrid_first["hits"]["hits"]
             )
             hybrid_request["remote_snapshot"] = hybrid_first["remote_snapshot"]
+
+            def retained_runs(token):
+                checksum = token.split(":")[2]
+                paths = list((server.root / "artifacts").rglob(checksum))
+                assert paths, token
+                payload = paths[0].read_bytes()
+                if payload.startswith(b"AFOBJ001"):
+                    payload = payload[84 + struct.unpack_from("<I", payload, 16)[0] :]
+                descriptor = json.loads(payload)
+                return {run["prefix"]: run for run in descriptor["recent_runs"]}
+
+            old_runs = retained_runs(hybrid_first["remote_snapshot"])
+            assert set(old_runs) == {ord("7"), ord("d")}, old_runs
+            newer = call(
+                "POST",
+                "/tables/wal_windows/lake/changes",
+                {
+                    "batch_id": "recent-update",
+                    "source": "e2e",
+                    "epoch": "1",
+                    "checkpoint": "2",
+                    "key_fields": ["id"],
+                    "changes": [
+                        {
+                            "op": "upsert",
+                            "row": {
+                                "id": 1000,
+                                "body": "quasar newer recent",
+                                **vector_image,
+                            },
+                        }
+                    ],
+                },
+            )
+            latest_request = dict(query, embeddings=embeddings)
+            latest_request["lake_read"] = {
+                "visibility": "accepted",
+                "through": newer["read_receipt"],
+            }
+            deadline = time.monotonic() + 120
+            while True:
+                response = requests.post(
+                    server.api_url + "/tables/wal_windows/query",
+                    json=latest_request,
+                    auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                    timeout=120,
+                )
+                if response.ok:
+                    latest = response.json()
+                    latest = latest["responses"][0] if "responses" in latest else latest
+                    break
+                assert response.status_code == 503 and time.monotonic() < deadline, (
+                    response.text + server.debug_logs()
+                )
+                time.sleep(0.1)
+            new_runs = retained_runs(latest["remote_snapshot"])
+            assert old_runs[ord("d")] == new_runs[ord("d")], (old_runs, new_runs)
+            assert old_runs[ord("7")]["digest"] != new_runs[ord("7")]["digest"]
+            assert (
+                next(
+                    hit["_source"]["body"]
+                    for hit in latest["hits"]["hits"]
+                    if hit["_source"]["id"] == 1000
+                )
+                == "quasar newer recent"
+            )
         for restart in (False, True):
             if restart:
                 server.restart()

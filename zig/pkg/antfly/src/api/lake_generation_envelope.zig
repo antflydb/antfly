@@ -28,7 +28,7 @@ pub fn artifactId(prefix: []const u8, token: []const u8) ![]const u8 {
 }
 pub fn encode(a: A, prefix: []const u8, metadata: stores.ArtifactMetadata) ![]u8 {
     const version = metadata.provider_version orelse return std.fmt.allocPrint(a, "{s}{s}:{d}", .{ prefix, metadata.artifact_id, metadata.byte_len });
-    if (version.len == 0 or version.len > 4096 or std.mem.eql(u8, version, "null")) return error.InvalidQueryRequest;
+    if (version.len == 0 or version.len > @import("antfly_local_sources").serverless_manifest_artifact_ref.max_provider_generation_bytes or std.mem.eql(u8, version, "null")) return error.InvalidQueryRequest;
     const base64 = std.base64.url_safe_no_pad;
     const encoded = try a.alloc(u8, base64.Encoder.calcSize(version.len));
     defer a.free(encoded);
@@ -46,7 +46,7 @@ pub fn decode(a: A, prefix: []const u8, token: []const u8, limit: usize) !Envelo
     if (!std.mem.startsWith(u8, suffix, ":g:")) return error.InvalidQueryRequest;
     const decoder = std.base64.url_safe_no_pad.Decoder;
     const size = decoder.calcSizeForSlice(suffix[3..]) catch return error.InvalidQueryRequest;
-    if (size == 0 or size > 4096) return error.InvalidQueryRequest;
+    if (size == 0 or size > @import("antfly_local_sources").serverless_manifest_artifact_ref.max_provider_generation_bytes) return error.InvalidQueryRequest;
     const generation = try a.alloc(u8, size);
     errdefer a.free(generation);
     decoder.decode(generation, suffix[3..]) catch return error.InvalidQueryRequest;

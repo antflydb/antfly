@@ -84,6 +84,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .retained_catalog_metadata = if (retained) |cut| cut.catalog_metadata else null, .node_config = server.cfg.node_config, .secret_store = server.cfg.secret_store, .catalog_table_id = table.table_id, .catalog_generation = table.object_storage_generation };
     var store = try Store.openNative(a, server.cfg.node_config, server.cfg.secret_store, req.remote_snapshot != null, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir);
     defer store.deinit();
+    store.implementation.cloud_io = server.embedding_provider_runtime.io;
     var wal_cut: ?@import("lake_wal_cut_cache.zig").Pin = null;
     defer if (wal_cut) |pin| pin.deinit();
     var overlay_arena = std.heap.ArenaAllocator.init(a);
@@ -104,7 +105,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     if (retained) |cut| {
         if (cut.published_only != published_only) return error.CatalogGenerationChanged;
         retained_pending = cut.pending;
-        if (cut.pending.changes.len != 0) overlay = try overlay_api.Overlay.init(oa, cut.pending);
+        if (cut.pending.count() != 0) overlay = try overlay_api.Overlay.init(oa, cut.pending);
     }
     if (published_only or retained != null) try pinPublishedSource(&source_schema.binding, publication.base_source);
     // The configured queue supports durable standalone filesystem fallback as
@@ -137,7 +138,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
         } else @import("../serverless/lake_ingestion.zig").Pending{ .lsn = cut, .key_fields = &.{}, .changes = &.{} };
         retained_pending = pending;
         if (req.lake_read) |read| if (read.through) |receipt| if (pending.lsn < receipt.wal_lsn) return error.IndexRebuilding;
-        if (pending.changes.len != 0) {
+        if (pending.count() != 0) {
             try overlay_api.requireNativeAncestry(root, base_id);
             overlay = wal_cut.?.overlay();
             // The serving index defines the archive cut; later committed and
@@ -204,17 +205,19 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     } else false;
     owner.cloud_generations = selected.publication().cloud_generations;
     if (has_vectors) if (owner.overlay) |pending_overlay| {
-        const prepared: @import("lake_recent_vectors.zig").Prepared = if (retained) |cut| .{ .declarations = cut.recent, .cloud_generations = cut.recent_cloud } else @import("lake_recent_vectors.zig").prepare(ca, current_table, selected.publication(), pending_overlay, owner.declarations, &store, context, .{ .antfly_provider = server.antfly_provider, .io = server.embedding_provider_runtime.io, .bounded_http_request = true, .deadline_ns = normalized.deadline_ns, .cancellation = retained_cancellation, .secret_store = server.cfg.secret_store, .remote_content = server.cfg.remote_content, .inference_api_url = server.configuredInferenceAPIURL(), .inference_api_key = server.cfg.inference_api_key, .provider_runtime = &server.embedding_provider_runtime, .source_table = table.name }, build_recent, cut_expires_ms) catch |err| {
+        const prepared: @import("lake_recent_vectors.zig").Prepared = if (retained) |cut| .{ .declarations = cut.recent, .cloud_generations = cut.recent_cloud, .runs = cut.recent_runs } else @import("lake_recent_vectors.zig").prepare(ca, current_table, selected.publication(), pending_overlay, owner.declarations, &store, context, .{ .antfly_provider = server.antfly_provider, .io = server.embedding_provider_runtime.io, .bounded_http_request = true, .deadline_ns = normalized.deadline_ns, .cancellation = retained_cancellation, .secret_store = server.cfg.secret_store, .remote_content = server.cfg.remote_content, .inference_api_url = server.configuredInferenceAPIURL(), .inference_api_key = server.cfg.inference_api_key, .provider_runtime = &server.embedding_provider_runtime, .source_table = table.name }, build_recent, cut_expires_ms) catch |err| {
             server.notifyLakeCommit(table.name) catch {};
             return err;
         };
         owner.recent_declarations = prepared.declarations;
+        owner.recent_runs = prepared.runs;
         owner.recent_cloud = prepared.cloud_generations;
         // All declared vector recipes publish as one coherent recent cut.
         var expected: usize = 0;
         for (owner.declarations) |declaration| if (declaration.artifact.kind == .vector_segment or declaration.artifact.kind == .sparse_segment) {
             expected += 1;
         };
+        for (owner.recent_runs) |run| if (run.declarations.len != expected) return error.IndexRebuilding;
         if (owner.recent_declarations.len != expected) return error.IndexRebuilding;
     };
     if (build_recent) return null;
@@ -267,7 +270,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     const serving_token: []const u8 = if (retained != null) req.remote_snapshot.? else if (req.remote_snapshot != null) &snapshot_token else cut: {
         var artifacts = store.artifactStore();
         if (cut_expires_ms <= @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms) return error.DeadlineExceeded;
-        break :cut try retained_api.save(ra, &artifacts, store.identity, server.embedding_provider_runtime.io, .{ .expires_ms = cut_expires_ms, .table_id = table.table_id, .object_generation = table.object_storage_generation, .desired = local.metadata_lake_index_catalog.desiredFingerprint(current_table), .publication = publication, .reader_token = lease.retainedToken(), .pending = retained_pending, .catalog_metadata = retained_metadata, .published_only = published_only, .recent = owner.recent_declarations, .recent_cloud = owner.recent_cloud }, retained_cancellation);
+        break :cut try retained_api.save(ra, &artifacts, store.identity, server.embedding_provider_runtime.io, .{ .expires_ms = cut_expires_ms, .table_id = table.table_id, .object_generation = table.object_storage_generation, .desired = local.metadata_lake_index_catalog.desiredFingerprint(current_table), .publication = publication, .reader_token = lease.retainedToken(), .pending = retained_pending, .catalog_metadata = retained_metadata, .published_only = published_only, .recent = owner.recent_declarations, .recent_cloud = owner.recent_cloud, .recent_runs = owner.recent_runs }, retained_cancellation);
     };
     var meta: local.api_query.QueryResponseMeta = .{ .remote_snapshot = serving_token, .shard_count = 1, .took_ms = @intCast((@import("antfly_platform").time.monotonicNs() -| total_started) / std.time.ns_per_ms) };
     defer meta.deinit(a);
@@ -330,6 +333,8 @@ const Execution = struct {
     active_recent: bool = false,
     cloud_generations: ?local.metadata_lake_index_catalog.CloudGenerations = null,
     recent_cloud: ?local.metadata_lake_index_catalog.CloudGenerations = null,
+    recent_runs: []const @import("lake_recent_vectors.zig").Run = &.{},
+    recent_run: ?@import("lake_recent_vectors.zig").Run = null,
     unit_runtime: ?*@import("lake_index_native_runtime_cache.zig").Entry = null,
     recent_declarations: []const local.serverless_segment_sidecar_manifest.DeclaredArtifact = &.{},
     recent_dense_entries: std.StringHashMapUnmanaged(*local.storage_db_catalog_index_manager.IndexManager.DenseIndex) = .empty,
@@ -624,15 +629,29 @@ const Execution = struct {
     }
     fn buildOverlayPhysical(raw: *anyopaque, a: A) anyerror!@import("lake_index_physical_set.zig").Set {
         const self: *Execution = @ptrCast(@alignCast(raw));
+        if (self.overlay.?.rows.image) |image| {
+            var result = @import("lake_index_physical_set.zig").Set.init(a);
+            errdefer result.deinit();
+            for (image.parts) |part| if (part) |held| {
+                var selected = try buildOverlayPhysicalFilter(raw, a, held.key_filter);
+                defer selected.deinit();
+                try result.orWith(&selected);
+            };
+            return result;
+        }
+        return buildOverlayPhysicalFilter(raw, a, self.overlay.?.key_filter);
+    }
+    fn buildOverlayPhysicalFilter(raw: *anyopaque, a: A, filter: []const u8) anyerror!@import("lake_index_physical_set.zig").Set {
+        const self: *Execution = @ptrCast(@alignCast(raw));
         const resolver: @import("lake_index_text_predicate.zig").PhysicalResolver = .{ .server = self.server, .table = self.table, .source = self.source, .context = self.request, .store = self.store.artifactStore(), .store_identity = self.store.identity, .read_context = self.context, .pinned = .{ .artifacts = self.store.artifactStore(), .store_identity = self.store.identity, .domain = self.domain, .declarations = self.declarations, .read_context = self.context } };
-        const excluded = (try resolver.resolve(a, self.overlay.?.key_filter)) orelse return error.UnsupportedQueryRequest;
+        const excluded = (try resolver.resolve(a, filter)) orelse return error.UnsupportedQueryRequest;
         if (!excluded.exact) return error.UnsupportedQueryRequest;
         return excluded.bitmap;
     }
     fn resolveOverlayPhysical(self: *Execution) !void {
         const overlay = self.overlay orelse return;
         if (overlay.physical != null) return;
-        if (self.wal_cut) |pin| if (try pin.physical(.{ .ptr = self, .build = buildOverlayPhysical }, self.context)) |physical| {
+        if (self.wal_cut) |pin| if (try pin.physical(.{ .ptr = self, .build = buildOverlayPhysical, .build_filter = buildOverlayPhysicalFilter }, self.context)) |physical| {
             overlay.physical = physical.*;
             return;
         };
@@ -1700,7 +1719,7 @@ const Execution = struct {
         const self = from(raw);
         try self.context.ensureActive();
         const native = @import("lake_index_native_dense.zig");
-        const declarations = if (self.active_recent) self.recent_declarations else self.declarations;
+        const declarations = if (self.active_recent) if (self.recent_run) |run| run.declarations else self.recent_declarations else self.declarations;
         const entries = if (self.active_recent) &self.recent_dense_entries else &self.dense_entries;
         var count: usize = 0;
         for (declarations) |declaration| if (declaration.artifact.kind == .vector_segment and declaration.artifact.metadata_version == native.metadata_version) {
@@ -1709,7 +1728,7 @@ const Execution = struct {
         const selected = for (declarations) |declaration| {
             if (declaration.artifact.kind == .vector_segment and declaration.artifact.metadata_version == native.metadata_version and (if (name) |explicit| std.mem.eql(u8, explicit, declaration.name) else count == 1)) break declaration;
         } else return error.IndexNotFound;
-        if (entries.get(selected.name)) |entry| {
+        if (entries.get(if (self.active_recent) selected.artifact.artifact_id else selected.name)) |entry| {
             for (self.runtimes.items) |runtime| if (runtime.dense_entry == entry) {
                 self.unit_runtime = runtime;
                 break;
@@ -1717,10 +1736,10 @@ const Execution = struct {
             return entry;
         }
         try self.runtimes.ensureUnusedCapacity(self.arena, 1);
-        const runtime = try self.server.lake_native_runtimes.acquire(self.server, selected, try @import("lake_recent_vectors.zig").runtimeDomain(selected), self.store.identity, self.context, if (self.active_recent) self.recent_cloud else self.cloud_generations);
+        const runtime = try self.server.lake_native_runtimes.acquire(self.server, selected, try @import("lake_recent_vectors.zig").runtimeDomain(selected), self.store.identity, self.context, if (self.active_recent) if (self.recent_run) |run| run.cloud_generations else self.recent_cloud else self.cloud_generations);
         errdefer runtime.release();
         const entry = runtime.dense_entry.?;
-        try entries.put(self.arena, selected.name, entry);
+        try entries.put(self.arena, if (self.active_recent) selected.artifact.artifact_id else selected.name, entry);
         self.runtimes.appendAssumeCapacity(runtime);
         self.unit_runtime = runtime;
         return entry;
@@ -1747,6 +1766,19 @@ const Execution = struct {
     fn denseSearchProfiled(_: ?*anyopaque, entry: *local.storage_db_catalog_index_manager.IndexManager.DenseIndex, req: local.storage_hbc_adapter.SearchRequest) !local.storage_hbc_adapter.ProfiledSearchResults {
         return entry.index.searchProfiledRequest(req);
     }
+    fn releaseRecentWindow(self: *Execution, first: usize) void {
+        for (self.runtimes.items[first..]) |runtime| runtime.release();
+        self.runtimes.items.len = first;
+        self.recent_dense_entries.clearRetainingCapacity();
+        self.recent_sparse_entries.clearRetainingCapacity();
+    }
+    fn recentRuntime(self: *Execution, runtime: *@import("lake_index_native_runtime_cache.zig").Entry) bool {
+        var dense_entries = self.recent_dense_entries.valueIterator();
+        while (dense_entries.next()) |entry| if (runtime.dense_entry == entry.*) return true;
+        var sparse_entries = self.recent_sparse_entries.valueIterator();
+        while (sparse_entries.next()) |entry| if (runtime.sparse_entry == entry.*) return true;
+        return false;
+    }
     fn searchDense(raw: ?*anyopaque, a: A, req: types.SearchRequest, query: types.DenseKnnQuery) !types.SearchResult {
         const self = from(raw);
         if (self.recent_declarations.len == 0) return searchDensePart(raw, a, req, query);
@@ -1754,13 +1786,27 @@ const Execution = struct {
         leaf.offset = 0;
         leaf.limit = std.math.add(u32, req.offset, req.limit) catch return error.QueryCandidateBudgetExceeded;
         self.active_recent = false;
-        var base = try searchDensePart(raw, a, leaf, query);
-        defer base.deinit();
+        var combined = try searchDensePart(raw, a, leaf, query);
+        defer combined.deinit();
+        const base_runtime = self.unit_runtime;
         self.active_recent = true;
-        defer self.active_recent = false;
-        var recent = try searchDensePart(raw, a, leaf, query);
-        defer recent.deinit();
-        return local.api_query.mergeSearchResults(a, req, &.{ base, recent }, req.offset, req.limit);
+        defer {
+            self.active_recent = false;
+            self.recent_run = null;
+            self.unit_runtime = base_runtime;
+        }
+        const legacy = [_]@import("lake_recent_vectors.zig").Run{.{ .prefix = 0, .digest = @splat(0), .declarations = self.recent_declarations, .cloud_generations = self.recent_cloud }};
+        for (if (self.recent_runs.len != 0) self.recent_runs else &legacy) |run| {
+            self.recent_run = run;
+            const held = self.runtimes.items.len;
+            defer self.releaseRecentWindow(held);
+            var recent = try searchDensePart(raw, a, leaf, query);
+            defer recent.deinit();
+            const merged = try local.api_query.mergeSearchResults(a, leaf, &.{ combined, recent }, 0, leaf.limit);
+            combined.deinit();
+            combined = merged;
+        }
+        return local.api_query.mergeSearchResults(a, req, &.{combined}, req.offset, req.limit);
     }
     fn searchDensePart(raw: ?*anyopaque, a: A, req: types.SearchRequest, dense: types.DenseKnnQuery) !types.SearchResult {
         return search.searchDense(a, from(raw).vectorRequest(req), dense, .{ .ctx = raw, .exact_doc_id_filters = true, .filter_candidate_presence = true, .text_index_entry = noLocal, .dense_index = denseIndex, .lookup_doc_key = lookupDocKey, .resolve_hit_key = densePublicKey, .lookup_vector_id = lookupVectorId, .load_projected_document = requireProjected, .load_projected_documents = loadProjected, .hbc_search = denseSearch, .hbc_search_profiled = denseSearchProfiled, .postprocess = postprocessVector });
@@ -1769,7 +1815,7 @@ const Execution = struct {
         const self = from(raw);
         try self.context.ensureActive();
         const native = @import("lake_index_native_sparse.zig");
-        const declarations = if (self.active_recent) self.recent_declarations else self.declarations;
+        const declarations = if (self.active_recent) if (self.recent_run) |run| run.declarations else self.recent_declarations else self.declarations;
         const entries = if (self.active_recent) &self.recent_sparse_entries else &self.sparse_entries;
         var count: usize = 0;
         for (declarations) |declaration| if (declaration.artifact.kind == .sparse_segment and declaration.artifact.metadata_version == native.metadata_version) {
@@ -1778,7 +1824,7 @@ const Execution = struct {
         const selected = for (declarations) |declaration| {
             if (declaration.artifact.kind == .sparse_segment and declaration.artifact.metadata_version == native.metadata_version and (if (name) |explicit| std.mem.eql(u8, explicit, declaration.name) else count == 1)) break declaration;
         } else return error.IndexNotFound;
-        if (entries.get(selected.name)) |entry| {
+        if (entries.get(if (self.active_recent) selected.artifact.artifact_id else selected.name)) |entry| {
             for (self.runtimes.items) |runtime| if (runtime.sparse_entry == entry) {
                 self.unit_runtime = runtime;
                 break;
@@ -1786,10 +1832,10 @@ const Execution = struct {
             return entry;
         }
         try self.runtimes.ensureUnusedCapacity(self.arena, 1);
-        const runtime = try self.server.lake_native_runtimes.acquire(self.server, selected, try @import("lake_recent_vectors.zig").runtimeDomain(selected), self.store.identity, self.context, if (self.active_recent) self.recent_cloud else self.cloud_generations);
+        const runtime = try self.server.lake_native_runtimes.acquire(self.server, selected, try @import("lake_recent_vectors.zig").runtimeDomain(selected), self.store.identity, self.context, if (self.active_recent) if (self.recent_run) |run| run.cloud_generations else self.recent_cloud else self.cloud_generations);
         errdefer runtime.release();
         const entry = runtime.sparse_entry.?;
-        try entries.put(self.arena, selected.name, entry);
+        try entries.put(self.arena, if (self.active_recent) selected.artifact.artifact_id else selected.name, entry);
         self.runtimes.appendAssumeCapacity(runtime);
         self.unit_runtime = runtime;
         return entry;
@@ -1831,13 +1877,27 @@ const Execution = struct {
         leaf.offset = 0;
         leaf.limit = std.math.add(u32, req.offset, req.limit) catch return error.QueryCandidateBudgetExceeded;
         self.active_recent = false;
-        var base = try searchSparsePart(raw, a, leaf, query);
-        defer base.deinit();
+        var combined = try searchSparsePart(raw, a, leaf, query);
+        defer combined.deinit();
+        const base_runtime = self.unit_runtime;
         self.active_recent = true;
-        defer self.active_recent = false;
-        var recent = try searchSparsePart(raw, a, leaf, query);
-        defer recent.deinit();
-        return local.api_query.mergeSearchResults(a, req, &.{ base, recent }, req.offset, req.limit);
+        defer {
+            self.active_recent = false;
+            self.recent_run = null;
+            self.unit_runtime = base_runtime;
+        }
+        const legacy = [_]@import("lake_recent_vectors.zig").Run{.{ .prefix = 0, .digest = @splat(0), .declarations = self.recent_declarations, .cloud_generations = self.recent_cloud }};
+        for (if (self.recent_runs.len != 0) self.recent_runs else &legacy) |run| {
+            self.recent_run = run;
+            const held = self.runtimes.items.len;
+            defer self.releaseRecentWindow(held);
+            var recent = try searchSparsePart(raw, a, leaf, query);
+            defer recent.deinit();
+            const merged = try local.api_query.mergeSearchResults(a, leaf, &.{ combined, recent }, 0, leaf.limit);
+            combined.deinit();
+            combined = merged;
+        }
+        return local.api_query.mergeSearchResults(a, req, &.{combined}, req.offset, req.limit);
     }
     fn searchSparsePart(raw: ?*anyopaque, a: A, req: types.SearchRequest, sparse: types.SparseKnnQuery) !types.SearchResult {
         return search.searchSparse(a, from(raw).vectorRequest(req), sparse, .{ .score_spill = .{ .io = from(raw).context.io.?, .directory = "/tmp" }, .ctx = raw, .exact_doc_id_filters = true, .project_key = publicKey, .native_key = nativeKey, .filter_candidate_presence = true, .text_index_entry = noLocal, .sparse_index = sparseIndex, .load_projected_document = requireProjected, .load_projected_documents = loadProjected, .postprocess = postprocessVector });
@@ -1861,6 +1921,27 @@ const Execution = struct {
         var artifact_ref = if (unit_key or chunk_key) (try local.storage_db_artifact_ids.decodeArtifactRefAlloc(a, key)) orelse return error.InvalidChunkArtifact else null;
         defer if (artifact_ref) |*ref| ref.deinit(a);
         const public_parent = if (artifact_ref) |ref| ref.document_id else try @import("lake_enrichment_units.zig").parent(key);
+        const old_active = self.active_recent;
+        const old_run = self.recent_run;
+        defer {
+            self.active_recent = old_active;
+            self.recent_run = old_run;
+        }
+        if (self.overlay != null and self.overlay.?.row(public_parent) != null and self.recent_runs.len != 0 and std.mem.startsWith(u8, public_parent, "wal1:")) {
+            self.active_recent = true;
+            self.recent_run = for (self.recent_runs) |run| {
+                if (public_parent.len > 5 and run.prefix == public_parent[5]) break run;
+            } else return error.InvalidChunkArtifact;
+            const name = if (artifact_ref) |ref| named: {
+                const suffix = if (unit_key) "_sources" else "_chunks";
+                if (!std.mem.endsWith(u8, ref.name, suffix)) return error.InvalidChunkArtifact;
+                break :named ref.name[0 .. ref.name.len - suffix.len];
+            } else if (self.unit_runtime) |runtime| if (runtime.dense_entry) |entry| entry.config.name else runtime.sparse_entry.?.config.name else return error.InvalidChunkArtifact;
+            for (self.recent_run.?.declarations) |declaration| if (std.mem.eql(u8, declaration.name, name)) {
+                if (declaration.artifact.kind == .vector_segment) _ = try denseIndex(self, name) else _ = try sparseIndex(self, name);
+                break;
+            };
+        }
         var runtime = self.unit_runtime orelse return error.InvalidChunkArtifact;
         if (artifact_ref) |ref| {
             const suffix = if (unit_key) "_sources" else "_chunks";
@@ -1869,9 +1950,9 @@ const Execution = struct {
             const recent = if (self.overlay) |overlay| overlay.row(public_parent) != null else false;
             runtime = for (self.runtimes.items) |candidate| {
                 if (candidate.dense_entry) |entry| {
-                    if (std.mem.eql(u8, index_name, entry.config.name) and ((self.recent_dense_entries.get(index_name) == entry) == recent)) break candidate;
+                    if (std.mem.eql(u8, index_name, entry.config.name) and (self.recentRuntime(candidate) == recent)) break candidate;
                 } else if (candidate.sparse_entry) |entry| {
-                    if (std.mem.eql(u8, index_name, entry.config.name) and ((self.recent_sparse_entries.get(index_name) == entry) == recent)) break candidate;
+                    if (std.mem.eql(u8, index_name, entry.config.name) and (self.recentRuntime(candidate) == recent)) break candidate;
                 }
             } else return error.InvalidChunkArtifact;
         }

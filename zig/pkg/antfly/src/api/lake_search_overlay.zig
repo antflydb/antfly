@@ -25,7 +25,7 @@ const V = std.json.Value;
 const Bitmap = local.encoding_roaring.RoaringBitmap;
 pub const Overlay = struct {
     pending: ingestion.Pending,
-    rows: std.StringHashMapUnmanaged(V) = .empty,
+    rows: @import("lake_wal_image.zig").Rows = .empty,
     key_filter: []const u8,
     physical: ?@import("lake_index_physical_set.zig").Set = null,
     pub fn valueDigest(value: anytype) [32]u8 {
@@ -50,9 +50,10 @@ pub const Overlay = struct {
         return valueDigest(.{ self.pending, self.rows.count(), combined });
     }
     pub fn init(a: A, pending: ingestion.Pending) !Overlay {
-        var result: Overlay = .{ .pending = pending, .key_filter = "" };
+        const normalized = try pending.materialized(a);
+        var result: Overlay = .{ .pending = normalized, .key_filter = "" };
         var disjunction: std.ArrayList(V) = .empty;
-        for (pending.changes) |change| {
+        for (normalized.changes) |change| {
             var conjunction: std.ArrayList(V) = .empty;
             var identity: std.ArrayList(V) = .empty;
             for (pending.key_fields) |key| {
@@ -152,32 +153,49 @@ pub const Overlay = struct {
         const tail = if (std.mem.startsWith(u8, id, "wal1:")) id[5..] else id;
         return (@as(u16, if (tail.len != 0) tail[0] else 0) << 8) | (if (tail.len > 1) @as(u16, tail[1]) else 0);
     }
+    pub const Partition = struct { prefix: u16, digest: [32]u8, ids: []const []const u8 };
+    pub fn partitions(self: *const Overlay, a: A) ![]const Partition {
+        var result: std.ArrayList(Partition) = .empty;
+        if (self.rows.image) |image| {
+            for (image.parts) |part| if (part) |held| if (held.ids.len != 0) {
+                try result.append(a, .{ .prefix = prefix(held.ids[0]), .digest = held.fingerprint, .ids = held.ids });
+            };
+        } else {
+            const ids = try a.alloc([]const u8, self.rows.count());
+            var it = self.rows.keyIterator();
+            for (ids) |*id| id.* = it.next().?.*;
+            std.mem.sort([]const u8, ids, {}, struct {
+                fn less(_: void, l: []const u8, r: []const u8) bool {
+                    return std.mem.lessThan(u8, l, r);
+                }
+            }.less);
+            var start: usize = 0;
+            while (start < ids.len) {
+                var end = start + 1;
+                while (end < ids.len and prefix(ids[end]) == prefix(ids[start])) : (end += 1) {}
+                var hash = std.crypto.hash.Blake3.init(.{});
+                for (ids[start..end]) |id| hash.update(&valueDigest(.{ id, self.rows.get(id).? }));
+                var fingerprint: [32]u8 = undefined;
+                hash.final(&fingerprint);
+                try result.append(a, .{ .prefix = prefix(ids[start]), .digest = fingerprint, .ids = ids[start..end] });
+                start = end;
+            }
+        }
+        return result.toOwnedSlice(a);
+    }
     fn appendPartitions(self: *const Overlay, a: A, owner: *RecentOwner, writer: *local.index.IndexWriter, previous: ?search.PinnedTextSource, analysis: local.introducer.TextAnalysisConfig, schema: ?local.storage_schema.TableSchema, field: ?[]const u8, context: local.serverless_query_lake_read_context.Context) !void {
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const scratch = arena.allocator();
-        const ids = try scratch.alloc([]const u8, self.rows.count());
-        var it = self.rows.keyIterator();
-        for (ids) |*id| id.* = it.next().?.*;
-        std.mem.sort([]const u8, ids, {}, struct {
-            fn less(_: void, l: []const u8, r: []const u8) bool {
-                return std.mem.lessThan(u8, l, r);
-            }
-        }.less);
         const prior: ?*const RecentMetadata = if (previous) |pin| if (pin.provider_metadata) |raw| @ptrCast(@alignCast(raw)) else null else null;
         var parts: std.ArrayList(RecentPartition) = .empty;
         var sources: std.ArrayList(local.index.IndexWriter.ImmutableSegment) = .empty;
         var retained_bytes: usize = 0;
-        var start: usize = 0;
-        while (start < ids.len) {
+        for (try self.partitions(scratch)) |partition_| {
             try context.ensureActive();
-            var end = start + 1;
-            const p = prefix(ids[start]);
-            while (end < ids.len and prefix(ids[end]) == p) : (end += 1) {}
-            var hash = std.crypto.hash.Blake3.init(.{});
-            for (ids[start..end]) |id| hash.update(&valueDigest(.{ id, self.rows.get(id).? }));
-            var digest: [32]u8 = undefined;
-            hash.final(&digest);
+            const ids = partition_.ids;
+            const p = partition_.prefix;
+            const digest = partition_.digest;
             const matching: ?RecentPartition = if (prior != null) blk: {
                 for (prior.?.partitions) |part| if (part.prefix == p and std.mem.eql(u8, &part.digest, &digest)) break :blk part;
                 break :blk null;
@@ -193,7 +211,7 @@ pub const Overlay = struct {
                 built.locked = .{ .backing = built.budget.allocator() };
                 errdefer built.release();
                 var subset: Overlay = .{ .pending = self.pending, .key_filter = "" };
-                for (ids[start..end]) |id| try subset.rows.put(scratch, id, self.rows.get(id).?);
+                for (ids) |id| try subset.rows.put(scratch, id, self.rows.get(id).?);
                 var build = try local.index.IndexWriter.init(built.locked.allocator());
                 defer build.deinit();
                 subset.appendRecent(built.locked.allocator(), &build, analysis, schema, field, context) catch |err| {
@@ -201,7 +219,7 @@ pub const Overlay = struct {
                     return err;
                 };
                 built.snapshot = build.acquireSnapshot();
-                owner.metadata.rebuilt_rows += end - start;
+                owner.metadata.rebuilt_rows += ids.len;
                 break :fresh built;
             };
             owner.runs.append(a, run) catch |err| {
@@ -213,7 +231,6 @@ pub const Overlay = struct {
             const snapshot = run.snapshot.?;
             for (snapshot.segments, 0..) |_, ordinal| try sources.append(scratch, .{ .snapshot = snapshot, .ordinal = ordinal, .target_id = sources.items.len + 1 });
             try parts.append(scratch, .{ .prefix = p, .digest = digest, .first = first, .count = sources.items.len - first, .run = run });
-            start = end;
         }
         owner.metadata.partitions = try owner.metadata_arena.allocator().dupe(RecentPartition, parts.items);
         try writer.shareImmutableSegments(sources.items);

@@ -3871,3 +3871,58 @@ policies and archive-scale throughput/latency/RSS remain separate qualification.
 Post-qualification cleanup ran `make gc`; its Zig/Rust/Go phases completed before
 its uv cache-prune phase reached the 55-second watchdog. Completed fixture output
 was removed from the worktree; qualification logs remain in `/private/tmp`.
+
+
+## Partition-owned accepted cuts and selective tail maintenance (protocol 43)
+
+Normalized accepted cuts retain independently owned immutable row partitions.
+Only prefixes touched by the authenticated WAL suffix are cloned and normalized;
+unchanged final rows, sorted identities and text digests are shared directly.
+The new cut owns its head and partition references, with no ancestor-cut chain or
+periodic whole-image normalization. Existing 65,536-change and process-cache
+bounds remain. Retained descriptors serialize the same flat `changes` wire view;
+SQL materializes that view only when needed and clones maps before normalization.
+
+Each row partition caches its publication-specific physical replacement mask.
+Body-only updates share that mask through an independent owner; no old row
+partition is retained solely to keep a mask alive. Its key filter is built only
+when that partition changes. A new cut unions the
+compressed masks without repeating unchanged index probes. Optional mask caches
+have a 512 KiB per-partition ceiling; pressure retains the bounded direct path.
+The WAL cache remains process-accounted at 256 MiB, with 128 MiB image admission
+and the existing bounded construction workspace.
+
+Recent dense/sparse indexes use at most sixteen immutable stable-prefix runs.
+Content-and-recipe-keyed durable jobs reuse unchanged runs across accepted cuts;
+changed runs alone invoke enrichment and rebuild native generations. Exact cloud
+selectors and run declarations travel with retained snapshots. A run's expiry
+must cover the requesting cut; renewal retains the existing rebuild/claim fence.
+Queries rank one run at a time, release its runtime, and merge bounded candidate
+windows. Winning chunk delivery can reopen the exact originating run. Empty and
+legacy cuts retain their existing complete-corpus path. The real Iceberg fixture
+checks unchanged run artifacts after another accepted update and then cold restart.
+
+Shared cloud navigation coalesces up to 32 distinct cold page flights per scope.
+Waiters suspend through their operation I/O context, check their own cancellation,
+and retry under their own authority after a failed/canceled leader. No client,
+root, deadline or lease is stored in shared flight state. Saturation and callers
+without asynchronous I/O retain authenticated direct reads. Successful flights
+publish into the existing bounded decoded-page cache before releasing waiters.
+
+Compact tail descriptors identify tiers without opening historical manifests.
+A new or changed input activates only tails in its own tier; promotion activates
+the next tier when required. Other tiers retain their original manifests, source
+pages, term contributions and ownership routes. Legacy roots initialize this
+metadata during their next delta publication. The regression makes an unrelated
+tail manifest unavailable during an append under a fresh upload attempt, proving
+that append maintenance neither reads nor republishes it.
+
+Retained token production and query admission share provider-generation bounds.
+Exact-version tokens support the full 4,096-byte selector limit while malformed
+or oversized envelopes remain rejected. GC union bindings complete fallible
+allocation before acquiring shared navigation references; allocation-failure
+coverage verifies that every acquired reference is released.
+
+Protocol 43 fences the new root/retained-run fields. Live-provider retention
+qualification and archive-scale latency/RSS benchmarking remain separate; these
+changes make no measured archive-speedup claim.

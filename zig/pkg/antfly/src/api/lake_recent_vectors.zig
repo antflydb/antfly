@@ -48,7 +48,9 @@ pub const Job = struct {
     declarations: []const Declared = &.{},
     cloud_generations: ?local.metadata_lake_index_catalog.CloudGenerations = null,
 };
+pub const Run = struct { prefix: u8, digest: [32]u8, declarations: []const Declared, cloud_generations: ?local.metadata_lake_index_catalog.CloudGenerations = null };
 pub const Prepared = struct {
+    runs: []const Run = &.{},
     declarations: []const Declared,
     cloud_generations: ?local.metadata_lake_index_catalog.CloudGenerations = null,
 };
@@ -64,7 +66,7 @@ fn scopeDomain(table: u64, identity: [32]u8) [32]u8 {
     return result;
 }
 fn cutDigest(a: A, table: local.common_topology_records.TableRecord, publication: local.metadata_lake_index_catalog.Publication, overlay: *const overlay_api.Overlay) ![32]u8 {
-    const bytes = try std.json.Stringify.valueAlloc(a, .{ .table = table.table_id, .generation = table.object_storage_generation, .desired = local.metadata_lake_index_catalog.desiredFingerprint(table), .publication = publication.generation, .source = publication.signature.source, .pending = overlay.pending }, .{});
+    const bytes = try std.json.Stringify.valueAlloc(a, .{ .table = table.table_id, .generation = table.object_storage_generation, .desired = local.metadata_lake_index_catalog.desiredFingerprint(table), .publication = publication.generation, .source = publication.signature.source, .format = "partitioned-recent-vectors-v2", .cut = overlay.contentIdentity() }, .{});
     defer a.free(bytes);
     var digest: [32]u8 = undefined;
     std.crypto.hash.Blake3.hash(bytes, &digest, .{});
@@ -77,6 +79,37 @@ fn cancellation(context: Context) Cancellation {
     return if (context.cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn } else .none;
 }
 pub fn prepare(a: A, table: local.common_topology_records.TableRecord, publication: local.metadata_lake_index_catalog.Publication, overlay: *const overlay_api.Overlay, declarations: []const Declared, store: *Store, context: Context, options: local.inference_managed_embedder.InitOptions, build: bool, cut_expires_ms: u64) !Prepared {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const sa = arena.allocator();
+    const parts = try overlay.partitions(sa);
+    if (parts.len == 0) return prepareWhole(a, table, publication, overlay, declarations, store, context, options, build, cut_expires_ms);
+    var runs: std.ArrayList(Run) = .empty;
+    var start: usize = 0;
+    while (start < parts.len) {
+        try context.ensureActive();
+        const prefix: u8 = @intCast(parts[start].prefix >> 8);
+        var end = start + 1;
+        while (end < parts.len and parts[end].prefix >> 8 == prefix) : (end += 1) {}
+        var hash = std.crypto.hash.Blake3.init(.{});
+        var subset: overlay_api.Overlay = .{ .pending = .{ .lsn = 0, .key_fields = overlay.pending.key_fields, .changes = &.{} }, .key_filter = "" };
+        for (parts[start..end]) |part| {
+            var number: [2]u8 = undefined;
+            std.mem.writeInt(u16, &number, part.prefix, .big);
+            hash.update(&number);
+            hash.update(&part.digest);
+            for (part.ids) |id| try subset.rows.put(sa, id, overlay.row(id).?);
+        }
+        var digest: [32]u8 = undefined;
+        hash.final(&digest);
+        subset.pending.cut_identity = digest;
+        const prepared = try prepareWhole(a, table, publication, &subset, declarations, store, context, options, build, cut_expires_ms);
+        try runs.append(a, .{ .prefix = prefix, .digest = digest, .declarations = prepared.declarations, .cloud_generations = prepared.cloud_generations });
+        start = end;
+    }
+    return .{ .declarations = runs.items[0].declarations, .runs = try runs.toOwnedSlice(a) };
+}
+fn prepareWhole(a: A, table: local.common_topology_records.TableRecord, publication: local.metadata_lake_index_catalog.Publication, overlay: *const overlay_api.Overlay, declarations: []const Declared, store: *Store, context: Context, options: local.inference_managed_embedder.InitOptions, build: bool, cut_expires_ms: u64) !Prepared {
     try context.ensureActive();
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -127,16 +160,20 @@ pub fn prepare(a: A, table: local.common_topology_records.TableRecord, publicati
     const maps = @import("../serverless/artifacts/cloud_generations.zig");
     var map_memory: local.sql_memory_budget = .{ .backing = std.heap.page_allocator, .limit = 64 * 1024 * 1024 };
     var map_alloc: local.sql_parallel_scheduler.LockedAllocator = .{ .backing = map_memory.allocator() };
-    var map_writer: ?maps.Writer = if (object) |provider| if (provider.fs_client == null and provider.client.vtable.version_retention != null) .{ .a = map_alloc.allocator(), .io = context.io, .reader = .{ .client = provider.client, .bucket = provider.bucket, .prefix = provider.prefix, .shared = maps.sharedNavigation(provider.cloud_cache_scope) }, .scope = artifacts.upload_scope.?, .complete = true, .cancellation = cancellation(context) } else null else null;
+    var map_writer: ?maps.Writer = if (object) |provider| if (provider.fs_client == null and provider.client.vtable.version_retention != null) .{ .a = map_alloc.allocator(), .io = context.io, .reader = .{ .io = context.io, .client = provider.client, .bucket = provider.bucket, .prefix = provider.prefix, .shared = maps.sharedNavigation(provider.cloud_cache_scope) }, .scope = artifacts.upload_scope.?, .complete = true, .cancellation = cancellation(context) } else null else null;
     const previous_writer = if (object) |provider| provider.cloud_writer else null;
     const previous_reader = if (object) |provider| provider.cloud_reader else null;
+    const previous_complete = if (previous_reader) |reader| reader.complete else false;
     if (map_writer) |*writer| {
         object.?.cloud_writer = writer;
-        object.?.cloud_reader = null;
+        // Reused archive metadata keeps exact selectors; new build artifacts
+        // may still take the authenticated incomplete-map fallback.
+        if (previous_reader) |reader| reader.complete = false;
     }
     defer if (map_writer) |*writer| {
         object.?.cloud_writer = previous_writer;
         object.?.cloud_reader = previous_reader;
+        if (previous_reader) |reader| reader.complete = previous_complete;
         writer.deinit();
     };
     const output: ?[]const Declared = buildSegments(a, scratch, table, overlay, declarations, &artifacts, store, context, options) catch |err| failed: {

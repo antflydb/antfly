@@ -198,7 +198,50 @@ pub fn watermark(a: A, binding: Binding, options: Options, context: Context) !u6
     return store.watermark(a);
 }
 
-pub const Pending = struct { cut_identity: ?[32]u8 = null, base_lsn: u64 = 0, lsn: u64, key_fields: []const []const u8, changes: []const Batch.Change };
+pub const Pending = struct {
+    cut_identity: ?[32]u8 = null,
+    base_lsn: u64 = 0,
+    lsn: u64,
+    key_fields: []const []const u8,
+    changes: []const Batch.Change = &.{},
+    change_blocks: []const []const Batch.Change = &.{},
+    pub fn count(self: @This()) usize {
+        var n = self.changes.len;
+        for (self.change_blocks) |block| n += block.len;
+        return n;
+    }
+    pub fn materialized(self: @This(), a: A) !Pending {
+        if (self.change_blocks.len == 0) return self;
+        var result = self;
+        const changes = try a.alloc(Batch.Change, self.count());
+        @memcpy(changes[0..self.changes.len], self.changes);
+        var n = self.changes.len;
+        for (self.change_blocks) |block| {
+            @memcpy(changes[n..][0..block.len], block);
+            n += block.len;
+        }
+        result.changes = changes;
+        result.change_blocks = &.{};
+        return result;
+    }
+    pub fn jsonStringify(self: @This(), stream: anytype) @TypeOf(stream.*).Error!void {
+        try stream.beginObject();
+        try stream.objectField("cut_identity");
+        try stream.write(self.cut_identity);
+        try stream.objectField("base_lsn");
+        try stream.write(self.base_lsn);
+        try stream.objectField("lsn");
+        try stream.write(self.lsn);
+        try stream.objectField("key_fields");
+        try stream.write(self.key_fields);
+        try stream.objectField("changes");
+        try stream.beginArray();
+        for (self.changes) |change| try stream.write(change);
+        for (self.change_blocks) |block| for (block) |change| try stream.write(change);
+        try stream.endArray();
+        try stream.endObject();
+    }
+};
 /// Caller arena owns the immutable WAL cut and its normalized final images.
 pub fn pending(a: A, binding: Binding, options: Options, context: Context, cut: u64) !Pending {
     var opened = try openQueue(a, binding, options);

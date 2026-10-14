@@ -60,6 +60,7 @@ pub const ObjectStore = struct {
     /// Borrowed, immutable operation-local publication binding. A build writer
     /// owns the separate bounded upload journal and never escapes its lease.
     cloud_retention_qualified: bool = false,
+    cloud_io: ?std.Io = null,
     cloud_cache_scope: [32]u8 = @splat(0),
     cloud_reader: ?*@import("cloud_generations.zig").Reader = null,
     version_operations: std.atomic.Value(u8) = .init(0),

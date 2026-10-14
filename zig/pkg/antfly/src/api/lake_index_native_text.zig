@@ -207,6 +207,8 @@ const CollectionBuilder = struct {
     }
 };
 pub const Root = struct {
+    pub const Tail = struct { ref: artifacts.ChunkRef, tier: u8, bytes: u64, spans: u32 };
+
     version: u16 = metadata_version,
     /// Independent serving packs; this root retains per-file maintenance statistics.
     serving: ?artifacts.ChunkRef = null,
@@ -225,6 +227,7 @@ pub const Root = struct {
     source_routes_version: u8 = 0,
     source_routes: ?statistics.Ref = null,
     open_packs: []const artifacts.ChunkRef = &.{},
+    open_tails: []const Tail = &.{},
     seekable: bool = false,
     /// Stored JSON contains exactly the binding projection, never an implicit
     /// full source document. Older publications require a format refresh.
@@ -295,6 +298,13 @@ pub const Root = struct {
         if (self.source_layout_version > 1) return error.InvalidNativeLakeTextCorpus;
         if (self.source_routes_version > 1 or (self.source_routes != null and self.source_routes_version != 1)) return error.InvalidNativeLakeTextCorpus;
         if (self.source_routes) |ref| try ref.validate();
+        if (self.open_tails.len != 0) {
+            if (self.open_tails.len != self.open_packs.len) return error.InvalidNativeLakeTextCorpus;
+            for (self.open_tails, self.open_packs) |tail, ref| {
+                if (tail.tier > 3 or tail.spans == 0 or tail.spans > source_spans.max_spans or tail.bytes == 0 or !std.mem.eql(u8, tail.ref.artifact_id, ref.artifact_id)) return error.InvalidNativeLakeTextCorpus;
+                try text_directory.validateRef(tail.ref, self.domain);
+            }
+        }
         if (self.open_packs.len > 28) return error.InvalidNativeLakeTextCorpus;
         for (self.open_packs) |ref| try text_directory.validateRef(ref, self.domain);
         if (self.admission_version > 1) return error.InvalidNativeLakeTextCorpus;
