@@ -31,7 +31,7 @@ pub fn main(init: std.process.Init) !void {
     if (!engine.enabled) return error.ProbeRequiresSharedStorage;
     const descriptor = engine.descriptorForValidation();
     engine.validateDescriptor(descriptor) catch |err| {
-        inline for (.{ "table_layout", "db_layout", "core_layout", "handle_layout", "registry_layout", "backend_runtime_layout", "resource_manager_layout", "prepared_owner_layout", "prepared_allocator_layout", "embedding_memo_layout", "async_context_layout", "enrichment_runtime_layout", "relationalReader_layout", "relationalSession_layout", "documentSession_layout", "index_manager_layout", "algebraic_index_layout", "docstore_layout", "rewrite_program_layout", "enrichment_set_layout", "backup_snapshot_layout", "resolution_runtime_layout", "promotion_runtime_layout", "pinned_snapshot_layout", "staged_generation_layout", "generation_manager_layout", "native_manifest_layout" }) |field| {
+        inline for (.{ "table_layout", "db_layout", "core_layout", "handle_layout", "registry_layout", "backend_runtime_layout", "resource_manager_layout", "prepared_owner_layout", "prepared_allocator_layout", "embedding_memo_layout", "async_context_layout", "enrichment_runtime_layout", "relationalReader_layout", "relationalSession_layout", "documentSession_layout", "index_manager_layout", "algebraic_index_layout", "docstore_layout", "rewrite_program_layout", "enrichment_set_layout", "backup_snapshot_layout", "resolution_runtime_layout", "promotion_runtime_layout", "pinned_snapshot_layout", "staged_generation_layout", "generation_manager_layout", "native_manifest_layout", "writer_layout" }) |field| {
             const actual = @field(descriptor, field);
             const expected = @field(engine, field);
             std.debug.print("storage ABI {s}: actual={any} expected={any}\n", .{ field, actual, expected });
@@ -112,6 +112,27 @@ fn exercise(alloc: std.mem.Allocator, root: []const u8, physical: []const u8, io
     defer portable.deinit(alloc);
     try engine.call("portableExport", .{ alloc, db.core.store, &portable });
     if (portable.items.len == 0) return error.SharedStorageReadBackFailed;
+    var streamed: std.Io.Writer.Allocating = .init(alloc);
+    defer streamed.deinit();
+    const ExportOptions = @FieldType(engine.PortableExportOptions, "value");
+    try engine.call("portableExportToWriterWithOptions", .{ alloc, db.core.store, &streamed.writer, ExportOptions{} });
+    if (!std.mem.eql(u8, portable.items, streamed.written())) return error.SharedStorageReadBackFailed;
+    const Failing = struct {
+        fn drain(_: *std.Io.Writer, _: []const []const u8, _: usize) std.Io.Writer.Error!usize {
+            return error.WriteFailed;
+        }
+    };
+    var failing_writer: std.Io.Writer = .{ .buffer = &.{}, .vtable = &.{ .drain = Failing.drain } };
+    if (engine.call("portableExportToWriterWithOptions", .{ alloc, db.core.store, &failing_writer, ExportOptions{} })) |_| {
+        return error.SharedStorageErrorIdentityLost;
+    } else |err| if (err != error.WriteFailed) return error.SharedStorageErrorIdentityLost;
+    const spool_path = try std.fs.path.join(alloc, &.{ root, "native-export-spool" });
+    defer alloc.free(spool_path);
+    const spool = try std.Io.Dir.cwd().createFile(io, spool_path, .{ .read = true });
+    defer spool.close(io);
+    streamed.clearRetainingCapacity();
+    try engine.call("portableExportToWriterWithOptions", .{ alloc, db.core.store, &streamed.writer, ExportOptions{ .spool = .{ .io = io, .file = spool } } });
+    if (!std.mem.eql(u8, portable.items, streamed.written())) return error.SharedStorageReadBackFailed;
     try exerciseForeignPredicate(alloc, db);
     try exerciseForeignHook(db);
     db.batch(.{ .row_policy_install_bundle = "reject-this-private-command" }) catch |err| {

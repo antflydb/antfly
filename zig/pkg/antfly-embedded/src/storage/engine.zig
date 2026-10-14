@@ -34,7 +34,14 @@ pub const Outcome = @import("native_outcome.zig").Outcome;
 pub const ReplayCallbacks = struct { progress: db.ReplayProgressHook };
 pub const ReplayBoundary = @import("named_callback.zig").Boundary(ReplayCallbacks);
 pub const BackupPlan = struct { value: @import("../api/backup_contract.zig").TableBackupPlan, io: ?native.IoBorrow };
+pub const WriterBorrow = @import("native_writer.zig").Borrow;
+pub const PortableExportOptions = struct {
+    value: @import("portable_backup.zig").ExportOptions,
+    spool: ?struct { io: native.IoBorrow, file: std.Io.File },
+};
+
 pub const VTable = struct {
+    portableExportToWriterWithOptions: *const fn (Allocator, *@import("docstore.zig").DocStore, WriterBorrow, PortableExportOptions) Outcome(void),
     openVerifiedRestoreSource: *const fn (staged_generation: *const @import("db/generation_lifecycle.zig").StagedGeneration, alloc: std.mem.Allocator, snapshot_root: []const u8, path: []const u8, opts: db.OpenOptions, expected_namespace: @import("db/doc_identity.zig").Namespace) Outcome(DB),
     restoreSnapshotToDeferredRuntimeRepairWithIoAndCancellation: *const fn (staged_generation: *const @import("db/generation_lifecycle.zig").StagedGeneration, alloc: std.mem.Allocator, io: native.IoBorrow, snapshot_root: []const u8, path: []const u8, opts: db.OpenOptions, identity: db.RestoreIdentity, cancellation: types.CancellationToken) Outcome(void),
     restoreMaterializedNativeGenerationToDeferredRuntimeRepairWithIoAndCancellation: *const fn (staged_generation: *const @import("db/generation_lifecycle.zig").StagedGeneration, alloc: std.mem.Allocator, io: native.IoBorrow, primary_snapshot_root: []const u8, path: []const u8, opts: db.OpenOptions, identity: db.RestoreIdentity, native_generation: *@import("db/native_backup.zig").LoadedManifest, cancellation: types.CancellationToken) Outcome(void),
@@ -243,7 +250,7 @@ pub const VTable = struct {
     drainSnapshotMaintenance: *const fn (self: *DB, deadline_ns: u64) Outcome(void),
     sealBackupCohort: *const fn (self: *DB, id: []const u8, expected: @import("db/relational_integrity_topology.zig").Fence, cancellation: types.CancellationToken) Outcome(@import("db/native_backup_seal.zig").Handle),
     exportBackupCohort: *const fn (self: *DB, handle: @import("db/native_backup_seal.zig").Handle, id: []const u8, cancellation: types.CancellationToken) Outcome(u64),
-    exportBackupCohortPortable: *const fn (self: *DB, handle: @import("db/native_backup_seal.zig").Handle, writer: *std.Io.Writer, options: @import("portable_backup.zig").ExportOptions, cancellation: types.CancellationToken) Outcome(void),
+    exportBackupCohortPortable: *const fn (self: *DB, handle: @import("db/native_backup_seal.zig").Handle, writer: WriterBorrow, options: PortableExportOptions, cancellation: types.CancellationToken) Outcome(void),
     mergeDocumentsPage: *const fn (self: *DB, alloc: std.mem.Allocator, byte_range: types.ByteRange, after_key: ?[]const u8) Outcome([]types.BatchWrite),
     mergeCleanupKeysPage: *const fn (self: *DB, alloc: std.mem.Allocator, byte_range: types.ByteRange, after_key: ?[]const u8) Outcome([]types.BatchWrite),
     repairVerifiedPrimarySnapshot: *const fn (alloc: std.mem.Allocator, staged: *const @import("db/generation_lifecycle.zig").StagedGeneration, namespace: [24]u8, receipt: ?db.OrderedApplyReceipt, root_generation: u64) Outcome(void),
@@ -492,7 +499,7 @@ pub fn fieldsFor(comptime T: type) []const FieldLayout {
     return &Holder.fields;
 }
 pub const Descriptor = extern struct {
-    version: u32 = 19,
+    version: u32 = 20,
     table_layout: native.TypeContract,
     db_layout: native.TypeContract,
     core_layout: native.TypeContract,
@@ -521,6 +528,7 @@ pub const Descriptor = extern struct {
     promotion_runtime_layout: native.TypeContract,
     pinned_snapshot_layout: native.TypeContract,
     native_manifest_layout: native.TypeContract,
+    writer_layout: native.TypeContract,
     generation_manager_layout: native.TypeContract,
     staged_generation_layout: native.TypeContract,
     table_fields: [*]const FieldLayout,
@@ -563,18 +571,18 @@ pub const resource_manager_layout = blk: {
     @setEvalBranchQuota(100_000);
     break :blk native.TypeContract.of(@import("resource_manager.zig").ResourceManager);
 };
-extern fn antfly_storage_engine_get_descriptor_v19() callconv(.c) *const Descriptor;
+extern fn antfly_storage_engine_get_descriptor_v20() callconv(.c) *const Descriptor;
 fn Result(comptime name: []const u8) type {
     const Function = @typeInfo(@FieldType(VTable, name)).pointer.child;
     const Wire = @typeInfo(Function).@"fn".return_type.?;
     return anyerror!@FieldType(Wire, "value");
 }
 pub fn call(comptime name: []const u8, args: anytype) Result(name) {
-    const descriptor = antfly_storage_engine_get_descriptor_v19();
+    const descriptor = antfly_storage_engine_get_descriptor_v20();
     try validateDescriptor(descriptor);
     // Individual hidden accessors let final links discard unused operations.
     // A global table would retain every physical operation in every consumer.
-    const getter = @extern(*const fn () callconv(.c) *const anyopaque, .{ .name = "antfly_storage_engine_" ++ name ++ "_v19" });
+    const getter = @extern(*const fn () callconv(.c) *const anyopaque, .{ .name = "antfly_storage_engine_" ++ name ++ "_v20" });
     const method: @FieldType(VTable, name) = @ptrCast(@alignCast(getter()));
     const Function = @typeInfo(@FieldType(VTable, name)).pointer.child;
     const Args = std.meta.ArgsTuple(Function);
@@ -587,7 +595,14 @@ pub fn call(comptime name: []const u8, args: anytype) Result(name) {
             if (value) |io| native.IoBorrow.init(&io) else null
         else if (comptime T == ?native.IoBorrow and @TypeOf(value) == std.Io)
             native.IoBorrow.init(&value)
-        else if (comptime T == BackupPlan and @TypeOf(value) != BackupPlan) blk: {
+        else if (comptime T == WriterBorrow and @TypeOf(value) == *std.Io.Writer)
+            WriterBorrow.init(value)
+        else if (comptime T == PortableExportOptions and @TypeOf(value) != PortableExportOptions) blk: {
+            var plan = value;
+            const spool: @FieldType(PortableExportOptions, "spool") = if (plan.spool) |entry| .{ .io = native.IoBorrow.init(&entry.io), .file = entry.file } else null;
+            plan.spool = null;
+            break :blk PortableExportOptions{ .value = plan, .spool = spool };
+        } else if (comptime T == BackupPlan and @TypeOf(value) != BackupPlan) blk: {
             var plan = value;
             const io: ?native.IoBorrow = if (plan.io) |borrowed| native.IoBorrow.init(&borrowed) else null;
             plan.io = null;
@@ -600,10 +615,10 @@ pub fn call(comptime name: []const u8, args: anytype) Result(name) {
 }
 
 pub fn descriptorForValidation() *const Descriptor {
-    return antfly_storage_engine_get_descriptor_v19();
+    return antfly_storage_engine_get_descriptor_v20();
 }
 pub fn validateDescriptor(descriptor: *const Descriptor) !void {
-    if (descriptor.version != 19 or !descriptor.table_layout.matches(table_layout) or
+    if (descriptor.version != 20 or !descriptor.table_layout.matches(table_layout) or
         !descriptor.db_layout.matches(db_layout) or !descriptor.core_layout.matches(core_layout) or
         !descriptor.handle_layout.matches(handle_layout) or !descriptor.registry_layout.matches(registry_layout) or
         !descriptor.backend_runtime_layout.matches(backend_runtime_layout) or
@@ -624,7 +639,7 @@ pub fn validateDescriptor(descriptor: *const Descriptor) !void {
         !descriptor.backup_snapshot_layout.matches(backup_snapshot_layout) or
         !descriptor.resolution_runtime_layout.matches(resolution_runtime_layout) or
         !descriptor.promotion_runtime_layout.matches(promotion_runtime_layout) or
-        !descriptor.staged_generation_layout.matches(staged_generation_layout) or !descriptor.generation_manager_layout.matches(generation_manager_layout) or !descriptor.native_manifest_layout.matches(native_manifest_layout) or !descriptor.pinned_snapshot_layout.matches(pinned_snapshot_layout))
+        !descriptor.staged_generation_layout.matches(staged_generation_layout) or !descriptor.generation_manager_layout.matches(generation_manager_layout) or !descriptor.writer_layout.matches(writer_layout) or !descriptor.native_manifest_layout.matches(native_manifest_layout) or !descriptor.pinned_snapshot_layout.matches(pinned_snapshot_layout))
         return error.UnsupportedVersion;
 }
 
@@ -719,3 +734,5 @@ pub const native_manifest_layout = blk: {
     @setEvalBranchQuota(1_000_000);
     break :blk native.TypeContract.of(@import("db/native_backup.zig").LoadedManifest);
 };
+
+pub const writer_layout = native.TypeContract.of(std.Io.Writer);

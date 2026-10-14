@@ -505,6 +505,7 @@ pub fn exportPortableToWriterWithOptions(
     sink_writer: *std.Io.Writer,
     options: ExportOptions,
 ) !void {
+    if (comptime @import("engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("portableExportToWriterWithOptions", .{ alloc, store, sink_writer, options });
     var certificate_builder: ?source_snapshot.Builder = null;
     if (options.source_generation_summary_output) |output| output.output.* = null;
     if (options.source_copy != null and (options.cohort != null or options.source_certificate == null)) return error.InvalidBackupRequest;

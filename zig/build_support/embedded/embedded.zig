@@ -283,6 +283,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         .target = target,
         .optimize = optimize,
         .pic = true,
+        .sanitize_thread = antfly_imports.sanitize_thread,
     });
     antfly_imports.configureEnrichment(b, native_enrichment_mod, link_libc);
     const native_enrichment = @import("shared_library.zig").addProviderArchive(

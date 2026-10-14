@@ -74,7 +74,7 @@ pub fn create(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lan
     return createWithOptions(b, target, optimize, .{});
 }
 
-pub const Options = struct { error_names: ?*std.Build.Module = null };
+pub const Options = struct { sanitize_thread: bool = false, error_names: ?*std.Build.Module = null };
 
 pub fn createWithOptions(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, options: Options) Modules {
     const supported_os = target.result.os.tag == .macos or target.result.os.tag == .linux;
@@ -88,7 +88,7 @@ pub fn createWithOptions(b: *std.Build, target: std.Build.ResolvedTarget, optimi
     const ordinals = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/storage/ordinals/root.zig"), .target = target, .optimize = optimize });
     ordinals.addOptions("storage_ordinal_options", ordinal_options);
     if (native) {
-        const owner = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/storage/ordinals/exports.zig"), .target = target, .optimize = optimize, .pic = true });
+        const owner = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/storage/ordinals/exports.zig"), .target = target, .optimize = optimize, .pic = true, .sanitize_thread = options.sanitize_thread });
         const archive = @import("shared_library.zig").addProviderArchive(b, owner, "antfly-storage-ordinals", 1024 * 1024 * 1024);
         archive.link_function_sections = true;
         archive.link_data_sections = true;

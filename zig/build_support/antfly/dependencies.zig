@@ -1153,7 +1153,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     }
     const antfly_imports = AntflyRootImports{
         .sql_parser = sql_parser_mod,
-        .storage_boundary = @import("../embedded/storage_boundary.zig").createWithOptions(b, target, optimize, .{ .error_names = engine_error_names }),
+        .storage_boundary = @import("../embedded/storage_boundary.zig").createWithOptions(b, target, optimize, .{ .sanitize_thread = sanitize_thread, .error_names = engine_error_names }),
         .cancellation = cancellation_mod,
         .cache_budget = cache_budget_mod,
         .runtime_abi = runtime_abi_mod,

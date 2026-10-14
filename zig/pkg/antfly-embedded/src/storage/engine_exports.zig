@@ -17,6 +17,15 @@ const engine = @import("engine.zig");
 const std = @import("std");
 const native = @import("antfly_runtime_abi").native_abi;
 const Exports = @This();
+fn portableExportToWriterWithOptions(alloc: Allocator, store: *@import("docstore.zig").DocStore, writer: engine.WriterBorrow, options: engine.PortableExportOptions) engine.Outcome(void) {
+    var receiving_writer = writer.receive();
+    var spool_receiver: ?@import("antfly_runtime_abi").io_abi.Receiver = if (options.spool) |spool| spool.io.receive() catch |err| return .{ .failure = .init(@errorName(err)) } else null;
+    var received_options = options.value;
+    if (spool_receiver) |*receiver| received_options.spool = .{ .io = receiver.io(), .file = options.spool.?.file };
+    @import("portable_backup.zig").exportPortableToWriterWithOptions(alloc, store, receiving_writer.writer(), received_options) catch |err| return .{ .failure = .init(@errorName(err)) };
+    receiving_writer.finish() catch |err| return .{ .failure = .init(@errorName(err)) };
+    return .{ .value = {} };
+}
 fn portableExport(alloc: std.mem.Allocator, store: *@import("docstore.zig").DocStore, out: *std.ArrayList(u8)) engine.Outcome(void) {
     return .{ .value = @import("portable_backup.zig").exportPortable(alloc, store, out) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
@@ -900,8 +909,14 @@ fn exportBackupCohort(self: *DB, handle: @import("db/native_backup_seal.zig").Ha
     return .{ .value = self.exportBackupCohort(handle, id, cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
-fn exportBackupCohortPortable(self: *DB, handle: @import("db/native_backup_seal.zig").Handle, writer: *std.Io.Writer, options: @import("portable_backup.zig").ExportOptions, cancellation: types.CancellationToken) engine.Outcome(void) {
-    return .{ .value = self.exportBackupCohortPortable(handle, writer, options, cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
+fn exportBackupCohortPortable(self: *DB, handle: @import("db/native_backup_seal.zig").Handle, writer: engine.WriterBorrow, options: engine.PortableExportOptions, cancellation: types.CancellationToken) engine.Outcome(void) {
+    var receiving_writer = writer.receive();
+    var spool_receiver: ?@import("antfly_runtime_abi").io_abi.Receiver = if (options.spool) |spool| spool.io.receive() catch |err| return .{ .failure = .init(@errorName(err)) } else null;
+    var received_options = options.value;
+    if (spool_receiver) |*receiver| received_options.spool = .{ .io = receiver.io(), .file = options.spool.?.file };
+    self.exportBackupCohortPortable(handle, receiving_writer.writer(), received_options, cancellation) catch |err| return .{ .failure = .init(@errorName(err)) };
+    receiving_writer.finish() catch |err| return .{ .failure = .init(@errorName(err)) };
+    return .{ .value = {} };
 }
 
 fn mergeDocumentsPage(self: *DB, alloc: std.mem.Allocator, byte_range: types.ByteRange, after_key: ?[]const u8) engine.Outcome([]types.BatchWrite) {
@@ -1969,6 +1984,7 @@ const descriptor: engine.Descriptor = .{
     .promotion_runtime_layout = engine.promotion_runtime_layout,
     .pinned_snapshot_layout = engine.pinned_snapshot_layout,
     .native_manifest_layout = engine.native_manifest_layout,
+    .writer_layout = engine.writer_layout,
     .generation_manager_layout = engine.generation_manager_layout,
     .staged_generation_layout = engine.staged_generation_layout,
     .table_fields = engine.table_fields.ptr,
@@ -2004,12 +2020,12 @@ comptime {
                 return @ptrCast(&@field(Exports, name));
             }
         };
-        @export(&Accessor.get, .{ .name = "antfly_storage_engine_" ++ name ++ "_v19", .visibility = .hidden });
+        @export(&Accessor.get, .{ .name = "antfly_storage_engine_" ++ name ++ "_v20", .visibility = .hidden });
     }
     @export(&clearError, .{ .name = "antfly_storage_error_clear_v1", .visibility = .hidden });
     @export(&errorCode, .{ .name = "antfly_storage_error_code_v1", .visibility = .hidden });
     @export(&errorDetail, .{ .name = "antfly_storage_error_detail_v1", .visibility = .hidden });
     @export(&setError, .{ .name = "antfly_storage_error_set_v1", .visibility = .hidden });
     @export(&getAggregationDescriptor, .{ .name = "antfly_storage_engine_get_aggregation_descriptor_v1", .visibility = .hidden });
-    @export(&getDescriptor, .{ .name = "antfly_storage_engine_get_descriptor_v19", .visibility = .hidden });
+    @export(&getDescriptor, .{ .name = "antfly_storage_engine_get_descriptor_v20", .visibility = .hidden });
 }

@@ -225,8 +225,8 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
         }
 
         // Both products consume the same three coarse compute exports. The
-        // Apache owner is already PIC and storage-free. Sanitized server
-        // profiles retain their separately instrumented owner.
+        // Apache owner is already PIC and storage-free, and receives the
+        // same sanitizer setting as the server.
         const compile_max_rss = if (unit == .inference and production_antfly_imports.shared_inference_core) 4 * 1024 * 1024 * 1024 else runtimeCompileMaxRss(unit, .{
             .host = b.graph.host.result,
             .target = target.result,
@@ -237,7 +237,7 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
             .macos_metal_blas_release = production_antfly_imports.darwin_release_memory,
             .macos_shared_storage_sdk27 = production_antfly_imports.darwin_shared_storage_sdk27,
         });
-        const role_artifact = if (unit == .enrichment_compute and !sanitize_thread) blk: {
+        const role_artifact = if (unit == .enrichment_compute) blk: {
             // Reuse the implementation without replacing the runtime's
             // measured profile reservation with the embedded default.
             options.native_enrichment.step.max_rss = compile_max_rss;
