@@ -159,7 +159,9 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
             "api.openapi_contract.test.metadata openapi module generates extractor surface for routed endpoints",
             "api.query.consumerTests.Suite.test.",
             "metadata.storage.raft_apply_store.test.",
+            "storage.db.query.document_authority.test.",
             "storage.db.query.graph_exec.test.",
+            "storage.db.query.search_exec.test.public graph metric borrowed wire",
             "storage.db.types.test.",
         },
     },
@@ -329,9 +331,7 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
         .selection = "issue1015",
         .skip = &.{
             // C ABI regressions borrow the implementation; storage owns its tests.
-            "storage.db.db.test.",
-            "storage.db.derived.catch_up_policy.test.",
-            "storage.db.derived.io_threaded_runtime.test.",
+            "storage.",
         },
     },
     .{

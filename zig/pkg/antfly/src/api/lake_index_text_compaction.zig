@@ -62,6 +62,11 @@ pub fn build(a: A, out: A, store: *stores.ArtifactStore, canonical: corpus.Root,
     };
     var manager: local.sql_spill.Manager = .{ .alloc = a, .io = io, .context = &checkpoint, .checkpoint = Check.call };
     defer manager.deinit();
+    // An optional directory can be absent after a bounded-admission or key
+    // limit fallback. Without a complete base, rebuild current contributions
+    // instead of subtracting old segments or omitting retained ones.
+    const prior_terms: corpus.term_directory.Roots = if (old) |v| (if (v.term_directory.version == 2) v.term_directory else .{}) else .{};
+    const incremental_terms = prior_terms.leaves != null;
     var terms = corpus.term_directory.Builder.init(a, &manager);
     defer terms.deinit();
     terms.enableDurable(pages.store());
@@ -70,7 +75,7 @@ pub fn build(a: A, out: A, store: *stores.ArtifactStore, canonical: corpus.Root,
     defer pending.deinit();
     var scratch = std.heap.ArenaAllocator.init(a);
     defer scratch.deinit();
-    var builder: Builder = .{ .a = a, .out = ca, .store = store, .token = token, .io = io, .context = context, .pages = &pages, .terms = &terms, .previous = previous, .by_file = &by_file, .kept = kept, .pending = &pending };
+    var builder: Builder = .{ .a = a, .out = ca, .store = store, .token = token, .io = io, .context = context, .pages = &pages, .terms = &terms, .incremental_terms = incremental_terms, .previous = previous, .by_file = &by_file, .kept = kept, .pending = &pending };
     var index: usize = 0;
     while (index < files.len) {
         try context.ensureActive();
@@ -123,13 +128,13 @@ pub fn build(a: A, out: A, store: *stores.ArtifactStore, canonical: corpus.Root,
         try removed.append(ca, record.manifest);
         _ = scratch.reset(.free_all);
         const group = try corpus.loadFileManifest(scratch.allocator(), store.*, record.manifest, canonical.domain, token, null);
-        for (group.segments, group.summaries) |segment, summary| try terms.add(pages.store(), summary, corpus.term_directory.identity(segment.artifact_id), -1);
+        if (incremental_terms) for (group.segments, group.summaries) |segment, summary| try terms.add(pages.store(), summary, corpus.term_directory.identity(segment.artifact_id), -1);
     };
     var root = canonical;
     root.compacted = null;
     root.file_count = @intCast(builder.files);
     root.segment_count = builder.segments;
-    root.term_directory = try terms.finish(pages.store(), if (old) |v| v.term_directory else .{});
+    root.term_directory = try terms.finish(pages.store(), prior_terms);
     root.directories = try directory.publishManifests(a, store, builder.changed.items, removed.items, if (old) |v| v.directories else .{}, canonical.domain, token, io);
     try root.validate();
     const bytes = try std.json.Stringify.valueAlloc(ca, root, .{});
@@ -154,6 +159,7 @@ const Builder = struct {
     workspace_bytes: usize = 64 * 1024 * 1024,
     pages: *pages_mod.PageStore,
     terms: *corpus.term_directory.Builder,
+    incremental_terms: bool = false,
     previous: []const directory.FileRecord,
     by_file: *std.StringHashMapUnmanaged(usize),
     kept: []bool,
@@ -170,12 +176,13 @@ const Builder = struct {
         self.files += 1;
         self.segments = try std.math.add(u32, self.segments, @intCast(group.segments.len));
         self.compacted = self.compacted or group.members.len != 0;
-        if (self.by_file.get(group.file.id)) |index| if (std.mem.eql(u8, self.previous[index].manifest.artifact_id, ref.artifact_id)) {
+        const retained = if (self.by_file.get(group.file.id)) |index| blk: {
+            if (!std.mem.eql(u8, self.previous[index].manifest.artifact_id, ref.artifact_id)) break :blk false;
             self.kept[index] = true;
-            return;
-        };
-        try self.changed.append(self.out, .{ .artifact_id = try self.out.dupe(u8, ref.artifact_id), .checksum = try self.out.dupe(u8, ref.checksum), .byte_len = ref.byte_len });
-        for (group.segments, group.summaries) |segment, summary| try self.terms.add(self.pages.store(), summary, corpus.term_directory.identity(segment.artifact_id), 1);
+            break :blk true;
+        } else false;
+        if (!retained) try self.changed.append(self.out, .{ .artifact_id = try self.out.dupe(u8, ref.artifact_id), .checksum = try self.out.dupe(u8, ref.checksum), .byte_len = ref.byte_len });
+        if (!retained or !self.incremental_terms) for (group.segments, group.summaries) |segment, summary| try self.terms.add(self.pages.store(), summary, corpus.term_directory.identity(segment.artifact_id), 1);
     }
     fn add(self: *Builder, group: corpus.FileGroup, ref: Ref) !void {
         self.groups[self.count] = group;
