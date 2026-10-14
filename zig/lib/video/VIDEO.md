@@ -2893,6 +2893,6 @@ availability and authenticated production HTTP short/unchanged/full versions.
 Pretrained CPU and Metal each preserve all six buffered complete-DASH window
 vectors exactly, including token counts and source clocks, through output retry
 and short clean EOF. The authenticated server withholds its tail until model
-output executes. Linux pretrained execution is running and is not yet claimed.
+output executes. Actual Linux ARM64 checkpoint execution also preserves all six windows exactly.
 AES/TS/LL-HLS streaming still uses the buffered path. See
 [partial DASH qualification](../media/testdata/partial-dash/README.md).

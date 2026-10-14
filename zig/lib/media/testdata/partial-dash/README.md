@@ -18,8 +18,10 @@ The pretrained test adds a model-output failure, retains its exact vector for re
 then polls a short clean EOF before fetching the full selected DASH resource. The
 server holds the final response tail until a model output executes. Its six copied
 window vectors, token counts and source clocks are compared with buffered complete
-DASH inference using the same pinned checkpoint and backend. CPU/Metal completion
-is recorded only after each actual checkpoint test terminates.
+DASH inference using the same pinned checkpoint and backend. CPU, Metal and actual Linux ARM64 checkpoint runs each completed with six
+windows, seven callbacks, five requests and zero maximum coordinate difference.
+The receipt binds this Linux test to implementation commit `8abc3421f3`, before
+the subsequent encrypted-streaming work.
 
 This is a generated six-second AVC fixture and bounded qualification. It does not
 establish broad live-origin interoperability, new retrieval quality, CUDA support,

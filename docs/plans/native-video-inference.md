@@ -2258,6 +2258,6 @@ continuous-duration completion and caller-paced prefix-verified growing-body
 polls. HTTP EOF alone does not advance the manifest cursor. Portable Reader and
 authenticated HTTP qualification cover short, unchanged and completed versions;
 pretrained CPU/Metal partial-DASH vectors match buffered complete-DASH exactly
-for all six windows. Linux checkpoint execution is running without a completion
-claim; AES/TS/LL-HLS streaming remains open. See
+for all six windows. Actual Linux ARM64 checkpoint execution also preserves all six windows exactly;
+AES/TS/LL-HLS streaming remains open. See
 `zig/lib/media/testdata/partial-dash/README.md`.
