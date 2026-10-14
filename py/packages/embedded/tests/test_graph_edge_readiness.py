@@ -968,8 +968,9 @@ for path, accepted in [(sys.argv[2], True), (sys.argv[3], False), (sys.argv[4], 
     if handle.value:
         lib.antfly_db_close(handle)
 """
-    subprocess.run([sys.executable, "-c", script, previous, str(plain), str(identity), str(pending)], check=True, timeout=60)
-
+    subprocess.run(
+        [sys.executable, "-c", script, previous, str(plain), str(identity), str(pending)], check=True, timeout=60
+    )
 
     # A previously opened Lite writer must also reject mutation after the
     # registration commit, when its connection refreshes the catalog.
@@ -1009,6 +1010,7 @@ lib.antfly_db_close(handle)
     try:
         import select
 
+        assert writer.stdout is not None
         ready, _, _ = select.select([writer.stdout], [], [], 30)
         assert ready and writer.stdout.readline().strip() == "ready"
         with antfly_embedded.open_hosted(live) as db:
@@ -1204,6 +1206,9 @@ while True:
         text=True,
     ) as child:
         try:
+            assert child.stdin is not None
+            assert child.stdout is not None
+            assert child.stderr is not None
             assert select.select([child.stdout], [], [], 60)[0], "child did not initialize"
             assert child.stdout.readline().strip() == "ready"
             child.stdin.write("build\n")

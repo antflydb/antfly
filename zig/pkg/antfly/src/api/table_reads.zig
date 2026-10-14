@@ -16403,6 +16403,7 @@ const parseRemoteSearchResult = local_query_contract.parseRemoteSearchResult;
 const parseRemoteSearchResultInner = local_query_contract.parseRemoteSearchResultInner;
 
 pub const parseStorageKernelSearchResult = local_query_contract.parseStorageKernelSearchResult;
+pub const restoreDocumentAuthority = local_query_contract.restoreDocumentAuthority;
 pub const parseRemoteGraphMetricRerankScoreDetails = local_query_contract.parseRemoteGraphMetricRerankScoreDetails;
 
 pub const parseRemoteGraphMetricRerankStatus = local_query_contract.parseRemoteGraphMetricRerankStatus;
@@ -27123,6 +27124,55 @@ fn consumerTests() type {
 }
 
 pub const document_hydration_tests = if (builtin.is_test) struct {
+    test "public graph metric borrowed wire compiled owner preserves admitted document authority and sources" {
+        const Fixture = struct {
+            const document = "{\"customer_id\":\"cust:a\",\"title\":\"row\",\"n\":9007199254740993}";
+            fn parse(alloc: std.mem.Allocator, document_bytes: ?[]const u8) !db_mod.types.SearchResult {
+                const envelope = try db_mod.types.document_authority.encode(alloc, .{ .group = 11, .version = 9, .digest = @splat(0x11) }, document_bytes);
+                defer alloc.free(envelope);
+                const wire = try std.fmt.allocPrint(alloc, "{s}{s}{s}{s}{s}", .{
+                    "{\"responses\":[{\"took\":0,\"status\":200,\"hits\":{\"hits\":[{\"_id\":\"a\",\"_score\":1,\"_source\":",
+                    envelope,
+                    "},{\"_id\":\"b\",\"_score\":1,\"_source\":",
+                    envelope,
+                    "}],\"total\":{\"value\":2,\"relation\":\"exact\"}},\"profile\":{\"document_authority_version\":1}}]}",
+                });
+                defer alloc.free(wire);
+                return parseStorageKernelSearchResult(alloc, wire);
+            }
+            fn run(alloc: std.mem.Allocator) !void {
+                for ([_]db_mod.types.document_authority.Mode{ .candidates, .hydrate }) |mode| {
+                    var result = try parse(alloc, document);
+                    defer result.deinit();
+                    try restoreDocumentAuthority(alloc, alloc, 11, mode, &result);
+                    for (result.hits) |hit| {
+                        try std.testing.expectEqualStrings(document, hit.stored_data.?);
+                        try std.testing.expectEqual(@as(u64, 11), hit.document_authority.?.group);
+                        try std.testing.expectEqual(@as(u64, 9), hit.document_authority.?.version);
+                        try std.testing.expectEqual(@as([32]u8, @splat(0x11)), hit.document_authority.?.digest);
+                    }
+                }
+            }
+        };
+        const a = std.testing.allocator;
+        try Fixture.run(a);
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Fixture.run, .{});
+        var ordinary = try Fixture.parse(a, Fixture.document);
+        defer ordinary.deinit();
+        try restoreDocumentAuthority(a, a, 11, .none, &ordinary);
+        try std.testing.expect(ordinary.hits[0].document_authority == null);
+        try std.testing.expect(std.mem.indexOf(u8, ordinary.hits[0].stored_data.?, "__antfly_document_authority_v1") != null);
+        try std.testing.expectError(error.InvalidRemoteResponse, restoreDocumentAuthority(a, a, 12, .candidates, &ordinary));
+        ordinary.document_authority_version = 0;
+        try std.testing.expectError(error.StorageReadTemporarilyUnavailable, restoreDocumentAuthority(a, a, 11, .candidates, &ordinary));
+        var deferred = try Fixture.parse(a, null);
+        defer deferred.deinit();
+        try std.testing.expectError(error.InvalidRemoteResponse, restoreDocumentAuthority(a, a, 11, .hydrate, &deferred));
+        try restoreDocumentAuthority(a, a, 11, .candidates, &deferred);
+        try std.testing.expect(deferred.hits[0].stored_data == null);
+        try std.testing.expect(deferred.hits[0].document_authority != null);
+    }
+
     test "public graph metric borrowed wire document authority captures native primary versions and bounded candidates" {
         const a = std.testing.allocator;
         var directory = try TestDirectory.initFast("document-authority-native");

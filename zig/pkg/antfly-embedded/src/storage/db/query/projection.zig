@@ -262,7 +262,13 @@ test "ordered artifact inventory public projections transfer nested ownership ac
             defer parsed.deinit();
             return try cloneJsonValue(alloc, parsed.value);
         }
-        fn project(alloc: Allocator) !void {
+        fn project(backing: Allocator) !void {
+            // In-place growth depends on OS mapping state. Enumerate every
+            // allocation failure through the deterministic allocate/copy path.
+            var vtable = backing.vtable.*;
+            vtable.resize = Allocator.noResize;
+            vtable.remap = Allocator.noRemap;
+            const alloc: Allocator = .{ .ptr = backing.ptr, .vtable = &vtable };
             const json = try projectLookupStoredBytes(alloc, "doc", "{\"title\":\"retained\"}", .{ .fields = &.{ "_artifacts", "_chunks", "_embeddings", "title", "-secret.nested" }, .include_all_fields = false }, .{
                 .ctx = null,
                 .load_chunks = load,

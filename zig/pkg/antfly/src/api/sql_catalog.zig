@@ -122,6 +122,11 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
         alloc.free(value.table);
         alloc.free(value.table_id);
     };
+    // SQL index DDL has no local shard owner for an external table. Reserve
+    // its publication wakeup before consensus, then activate only after the
+    // exact mutation succeeds; the inventory sweep remains crash recovery.
+    var lake_commit = if (native.external_base_source != null) try server.prepareLakeCommit(table.name) else null;
+    defer if (lake_commit) |*prepared| prepared.deinit(server);
     // Physical identity is immutable and never reused; native schema CAS also
     // fences concurrent schema changes. Never replay an uncertain submission.
     const version = submitSchema(server, context, alloc, table.name, table.table_id, native.version, updated, retirement, validation, if (admission) |captured| captured.guard else null) catch |err| {
@@ -129,6 +134,7 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
         if (err == error.MetadataMutationOutcomeUnknown or err == error.OutOfMemory) return error.SqlMutationOutcomeUnknown;
         return err;
     };
+    if (lake_commit) |*prepared| server.activateLakeCommit(prepared);
     if (receipt) |*value| {
         value.schema_version = version;
         awaitActivation(server, context, alloc, table.name, value) catch {
@@ -899,6 +905,15 @@ test "SQL catalog ALTER submits native schema CAS without client generations" {
         updates: usize = 0,
         path_lookup: bool = false,
         index_exists: bool = false,
+        external_lake: bool = false,
+        uncertain: bool = false,
+        scheduler_server: ?*server_mod.ApiHttpServer = null,
+        fn schema(self: *const @This()) []const u8 {
+            return if (self.external_lake)
+                "{\"version\":7,\"storage_mode\":\"relational\",\"base_source\":{\"kind\":\"external\",\"format\":\"parquet\",\"uri\":\"file:///fixture\",\"table_id\":\"items\",\"schema_fingerprint\":\"auto\"},\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}},\"additionalProperties\":false}}}}"
+            else
+                "{\"version\":7,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}},\"additionalProperties\":false}}}}";
+        }
         fn status(_: *anyopaque) !@import("../metadata/api.zig").MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{} };
         }
@@ -917,7 +932,7 @@ test "SQL catalog ALTER submits native schema CAS without client generations" {
             if (call.resolve_many.relations.len != 0) {
                 try std.testing.expectEqual(@as(usize, if (self.path_lookup) 4 else 2), call.resolve_many.relations.len);
                 try std.testing.expectEqualStrings("items", call.resolve_many.relations[0].name);
-                const table: @import("../metadata/table_manager.zig").TableRecord = .{ .table_id = 17, .name = "table:immutable-17", .schema_json = "{\"version\":7,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}},\"additionalProperties\":false}}}}" };
+                const table: @import("../metadata/table_manager.zig").TableRecord = .{ .table_id = 17, .name = "table:immutable-17", .schema_json = self.schema() };
                 var resolved = domain.ResolvedTable.fromTable(table);
                 resolved.query_definition = domain.QueryDefinition.fromTable(table);
                 var relations: [4]?domain.ResolvedRelation = @splat(null);
@@ -936,10 +951,14 @@ test "SQL catalog ALTER submits native schema CAS without client generations" {
                 }
                 return std.json.Stringify.valueAlloc(alloc, domain.ResolvedMany{ .revision = 9, .tables = &.{}, .relations = relations[0..call.resolve_many.relations.len], .relation_epoch = .{ .revision = 9, .incarnation = @splat(1) } }, .{});
             }
-            return std.json.Stringify.valueAlloc(alloc, .{ .revision = 9, .tables = .{.{ .table_id = 17, .name = "table:immutable-17", .query_definition = .{ .schema_json = "{\"version\":7,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}},\"additionalProperties\":false}}}}", .read_schema_json = "", .indexes_json = "{}" } }} }, .{});
+            return std.json.Stringify.valueAlloc(alloc, .{ .revision = 9, .tables = .{.{ .table_id = 17, .name = "table:immutable-17", .query_definition = .{ .schema_json = self.schema(), .read_schema_json = "", .indexes_json = "{}" } }} }, .{});
         }
         fn mutate(raw: *anyopaque, alloc: std.mem.Allocator, name: []const u8, mode: tables.SchemaMutationMode, body: []const u8, expected: ?u32) !tables.SchemaMutationResult {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.scheduler_server) |scheduler| {
+                try std.testing.expectEqual(@as(usize, 1), scheduler.index_installation_reserved_slots);
+                if (self.uncertain) return error.MetadataMutationOutcomeUnknown;
+            }
             self.updates += 1;
             try std.testing.expectEqualStrings("table:immutable-17", name);
             try std.testing.expectEqual(tables.SchemaMutationMode.replace, mode);
@@ -1001,6 +1020,28 @@ test "SQL catalog ALTER submits native schema CAS without client generations" {
     defer conditional_index.deinit();
     _ = try executeWithPath(&server, null, .{}, "default", "public", alloc, .{ .catalog_ddl = conditional_index.statement.catalog_ddl }, &path);
     try std.testing.expectEqual(@as(usize, 6), source.updates);
+    // Hold worker admission independently of the periodic sweep. Successful
+    // external SQL DDL must still install a keyed publication obligation.
+    var backend = try @import("antfly_local_sources").storage_background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend.deinit();
+    source.external_lake = true;
+    source.path_lookup = false;
+    source.index_exists = false;
+    var lake_server = server_mod.ApiHttpServer.init(alloc, .{ .backend_runtime = backend.ptr() }, server.source, null, null);
+    defer lake_server.deinit();
+    source.scheduler_server = &lake_server;
+    lake_server.lake_index_recovery_after_ns = std.math.maxInt(u64);
+    try backend.ptr().durable_jobs.pauseOwner(lake_server.index_installation_owner_id);
+    _ = try execute(&lake_server, null, .{}, "default", "public", alloc, scoped_input);
+    try std.testing.expectEqual(@as(usize, 0), lake_server.index_installation_reserved_slots);
+    try std.testing.expectEqual(@as(usize, 1), lake_server.index_installation_queue.items.len);
+    try std.testing.expectEqualStrings("table:immutable-17", lake_server.index_installation_queue.items[0].table_name);
+    try std.testing.expectEqualStrings("__lake_publication", lake_server.index_installation_queue.items[0].index_name);
+    const admitted_generation = lake_server.index_installation_queue.items[0].generation;
+    source.uncertain = true;
+    try std.testing.expectError(error.SqlMutationOutcomeUnknown, execute(&lake_server, null, .{}, "default", "public", alloc, scoped_input));
+    try std.testing.expectEqual(@as(usize, 0), lake_server.index_installation_reserved_slots);
+    try std.testing.expectEqual(admitted_generation, lake_server.index_installation_queue.items[0].generation);
 }
 
 test "SQL catalog DDL authorizes before lookup and handles atomic conditional outcomes" {

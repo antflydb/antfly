@@ -918,11 +918,22 @@ def test_fragmented_text_hierarchy_preserves_boolean_scores_and_restart(
                 )
         if layout == "files":
             pages = {}
-            roots = []
+            objects = {}
+            roots = {}
             for path in (server.root / "artifacts").rglob("*"):
                 if not path.is_file():
                     continue
                 payload = path.read_bytes()
+                if not payload.startswith(b"AFOBJ001"):
+                    continue
+                checksum = payload[20:84].decode("ascii")
+                if path.parts[-4] == "graph":
+                    domain, attempt, stored_checksum = path.parts[-3:]
+                    assert stored_checksum == checksum
+                    artifact_id = f"sha256:{checksum}:graph:{domain}:{attempt}"
+                else:
+                    artifact_id = f"sha256:{checksum}"
+                objects[artifact_id] = path
                 begin = payload.find(b"AFGPT003")
                 if begin >= 0:
                     page = payload[begin:]
@@ -934,9 +945,16 @@ def test_fragmented_text_hierarchy_preserves_boolean_scores_and_restart(
                     except (ValueError, UnicodeDecodeError):
                         continue
                     if document.get("inventory_version") == 3:
-                        roots.append(document)
-            assert roots
-            root_document = roots[-1]
+                        roots[artifact_id] = document
+            canonical = [
+                document
+                for document in roots.values()
+                if document["file_count"] == parts and document.get("compacted")
+            ]
+            assert len(canonical) == 1, canonical
+            # Query serving follows the canonical root's compacted reference,
+            # not whichever artifact happens to be last in filesystem order.
+            root_document = roots[canonical[0]["compacted"]["artifact_id"]]
             assert all(
                 root_document.get(key) is None
                 for key in ("serving_inventory", "serving_routes", "segment_files")
@@ -963,23 +981,30 @@ def test_fragmented_text_hierarchy_preserves_boolean_scores_and_restart(
                 else:
                     yield path, records
 
-            # A rare query must never read an unrelated routing leaf. Restart
-            # clears in-memory admission and decoded page caches first.
+            # A rare query must never read unrelated segment payloads or whole
+            # unrelated routing leaves. Small compacted corpora may share one
+            # routing leaf, so inspect descriptors as well as page boundaries.
+            # Restart clears in-memory admission and decoded page caches.
             required = {
                 key[-32:]
                 for _, records in leaves(root_document["term_directory"]["leaves"])
                 for key, _ in records
                 if b"quasar" in key
             }
-            assert len(required) == 3
-            unrelated = [
-                path
-                for path, records in leaves(root_document["directories"]["segments"])
-                if all(key[:32] not in required for key, _ in records)
-            ]
-            assert unrelated, (
-                "Fixture must have a leaf outside the necessary segment set"
-            )
+            assert required and len(required) <= len(expected)
+            unrelated_payloads = set()
+            unrelated_leaves = set()
+            for path, records in leaves(root_document["directories"]["segments"]):
+                if all(key[:32] not in required for key, _ in records):
+                    unrelated_leaves.add(path)
+                for key, value in records:
+                    if key[:32] not in required:
+                        descriptor = json.loads(value)
+                        unrelated_payloads.add(
+                            objects[descriptor["route"]["ref"]["artifact_id"]]
+                        )
+            assert unrelated_payloads, "Fixture must contain unrelated serving segments"
+            unrelated = unrelated_payloads | unrelated_leaves
             server.pause()
             for cache_root in server.root.rglob("lake-ranges"):
                 if cache_root.is_dir():
