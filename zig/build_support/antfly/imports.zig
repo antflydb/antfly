@@ -388,7 +388,10 @@ pub const AntflyRootImports = struct {
         mod.addOptions("build_options", options);
         // Document/media compute has no physical storage handle, including in
         // the independently compiled public embedded enrichment archive.
-        self.storage_boundary.configureProfile(mod, true, false, self.boundary_profile);
+        // This constructor also builds the shared embedded compute archive,
+        // whose caller may carry the default full storage profile. Declare
+        // only compute contracts so storage ABI edits cannot invalidate it.
+        self.storage_boundary.configureProfile(mod, true, false, .enrichment);
         mod.addImport("antfly_platform", self.platform);
         mod.addImport("antfly_cancellation", self.cancellation);
         mod.addImport("antfly_template_content", self.template_content);
