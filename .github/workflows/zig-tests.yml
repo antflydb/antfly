@@ -609,6 +609,7 @@ jobs:
           tools/test_test_runner.py
           tools/test_local_test_partitions.py
           tools/test_sync_generated.py
+          pkg/inference/build/test_prepare_wasm64_zig_lib.py
 
       - name: Test benchmark orchestration and fixture setup
         run: |
