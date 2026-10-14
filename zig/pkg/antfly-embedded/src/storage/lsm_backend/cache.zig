@@ -7226,6 +7226,11 @@ test "cache read admission raw input reserves before allocation and transfers ex
         const control = read_admission.Port.init(&payload);
         // Only these two callbacks are reached by this physical input fixture.
         var vtable: storage_io.Storage.VTable = undefined;
+        // Leave unreachable required callbacks undefined, but initialize every
+        // optional callback so compatibility reads use their intended fallback.
+        inline for (comptime std.meta.fieldNames(storage_io.Storage.VTable)) |name| {
+            if (@typeInfo(@FieldType(storage_io.Storage.VTable, name)) == .optional) @field(vtable, name) = null;
+        }
         vtable.file_size = Fixture.size;
         vtable.read_file_alloc = Fixture.read;
         const storage = storage_io.Storage{ .ptr = &fixture, .vtable = &vtable };
@@ -7561,6 +7566,11 @@ test "cache read admission footer index input decode and publication share prepa
         const payload = adapter.payload();
         const control = read_admission.Port.init(&payload);
         var vtable: storage_io.Storage.VTable = undefined;
+        // Leave unreachable required callbacks undefined, but initialize every
+        // optional callback so compatibility reads use their intended fallback.
+        inline for (comptime std.meta.fieldNames(storage_io.Storage.VTable)) |name| {
+            if (@typeInfo(@FieldType(storage_io.Storage.VTable, name)) == .optional) @field(vtable, name) = null;
+        }
         vtable.file_size = Fixture.size;
         vtable.read_file_range_alloc = Fixture.range;
         vtable.read_file_trailer_alloc = null;
@@ -7630,6 +7640,11 @@ test "cache read admission footer index allocation failures retire input and dec
             const payload = adapter.payload();
             const control = read_admission.Port.init(&payload);
             var vtable: storage_io.Storage.VTable = undefined;
+            // Leave unreachable required callbacks undefined, but initialize every
+            // optional callback so compatibility reads use their intended fallback.
+            inline for (comptime std.meta.fieldNames(storage_io.Storage.VTable)) |name| {
+                if (@typeInfo(@FieldType(storage_io.Storage.VTable, name)) == .optional) @field(vtable, name) = null;
+            }
             vtable.file_size = size;
             vtable.read_file_range_alloc = range;
             vtable.read_file_trailer_alloc = null;
