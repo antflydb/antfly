@@ -2990,6 +2990,38 @@ const DocumentPrimaryReadWindow = struct {
         self.bytes +|= raw.len;
         return raw;
     }
+    fn getMany(self: *@This(), txn: *docstore_mod.DocStore.Txn, physical: []const []const u8, output: []?[]const u8) !void {
+        if (physical.len > 64 or output.len != physical.len) return error.InvalidBatch;
+        self.retire();
+        self.scope = try txn.openReadScope(self.arena.allocator());
+        const Entry = struct {
+            key: []const u8,
+            row: usize,
+            value_index: usize = 0,
+            fn less(_: void, left: @This(), right: @This()) bool {
+                return std.mem.order(u8, left.key, right.key) == .lt;
+            }
+        };
+        var entries: [64]Entry = undefined;
+        for (physical, 0..) |key, i| entries[i] = .{ .key = key, .row = i };
+        std.mem.sort(Entry, entries[0..physical.len], {}, Entry.less);
+        var keys: [64][]const u8 = undefined;
+        var values: [64]?[]const u8 = undefined;
+        var count: usize = 0;
+        for (entries[0..physical.len]) |*entry| {
+            if (count == 0 or !std.mem.eql(u8, keys[count - 1], entry.key)) {
+                keys[count] = entry.key;
+                count += 1;
+            }
+            entry.value_index = count - 1;
+        }
+        try self.scope.?.getManySorted(keys[0..count], values[0..count]);
+        for (values[0..count]) |value| if (value) |raw| {
+            self.bytes +|= raw.len;
+        };
+        for (entries[0..physical.len]) |entry| output[entry.row] = values[entry.value_index];
+    }
+
     fn finishRow(self: *@This(), uncached: bool) void {
         if (uncached or self.bytes >= max_bytes) self.retire();
     }
@@ -39395,6 +39427,8 @@ pub const DB = struct {
         const body_allocator = req.document_output_allocator orelse alloc;
         if (req.document_output_allocator != null) result.stored_data_allocator = body_allocator;
         var eager_bytes: usize = 0;
+        var primary_batch_end: usize = 0;
+        var primary_values: [64]?[]const u8 = undefined;
         for (result.hits, 0..) |*hit, index| {
             if (req.cancellation) |token| try token.check();
             if (req.execution_deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.Timeout;
@@ -39423,7 +39457,11 @@ pub const DB = struct {
             const store_key = physical[index % 64];
             const cached = contents[index % 64];
             var raw_primary: ?[]const u8 = null;
-            defer primary_window.finishRow(cached == null);
+            defer {
+                // Prefetched spans stay live until their last consumer retires.
+                if (index >= primary_batch_end or index + 1 == primary_batch_end)
+                    primary_window.finishRow(cached == null);
+            }
             var digest: [32]u8 = undefined;
             const primary_bytes = if (cached) |content| cached: {
                 digest = content.digest;
@@ -39440,7 +39478,29 @@ pub const DB = struct {
             // Small pages stay in one round trip; large candidates travel
             // as proofs until their global window has been selected.
             const eager = req.document_authority_mode == .candidates and primary_bytes <= 8 * 1024 and primary_bytes <= 64 * 1024 -| eager_bytes;
-            if (raw_primary == null and (req.document_authority_mode == .hydrate or eager)) raw_primary = primary_window.get(&read.?, store_key, primary_bytes) catch |err| return if (err == error.NotFound) error.StorageReadTemporarilyUnavailable else err;
+            if (raw_primary == null and (req.document_authority_mode == .hydrate or eager)) {
+                if (index >= primary_batch_end) {
+                    const offset = index % 64;
+                    const count = @min(@as(usize, 64) - offset, result.hits.len - index);
+                    const byte_limit = if (req.document_authority_mode == .hydrate) DocumentPrimaryReadWindow.max_bytes else 64 * 1024 -| eager_bytes;
+                    var batch_count: usize = 0;
+                    var bytes: usize = 0;
+                    while (batch_count < count) : (batch_count += 1) {
+                        const next = contents[offset + batch_count] orelse break;
+                        if (req.document_authority_mode == .candidates and next.bytes > 8 * 1024) break;
+                        if (next.bytes > byte_limit -| bytes) break;
+                        bytes += @intCast(next.bytes);
+                    }
+                    if (batch_count > 1) {
+                        try primary_window.getMany(&read.?, physical[offset..][0..batch_count], primary_values[offset..][0..batch_count]);
+                        primary_batch_end = index + batch_count;
+                    }
+                }
+                raw_primary = if (index < primary_batch_end)
+                    primary_values[index % 64] orelse return error.StorageReadTemporarilyUnavailable
+                else
+                    primary_window.get(&read.?, store_key, primary_bytes) catch |err| return if (err == error.NotFound) error.StorageReadTemporarilyUnavailable else err;
+            }
             if (!projection_scratch.reset(.{ .retain_with_limit = 64 * 1024 })) _ = projection_scratch.reset(.free_all);
             var projected: ?types.LookupResult = if (req.document_authority_mode == .hydrate or eager)
                 try self.lookupPrimarySnapshotWithSchemaAndOutput(projection_scratch.allocator(), body_allocator, hit.id, .{ .fields = if (req.defer_stored_projection) &.{} else req.fields, .include_all_fields = req.defer_stored_projection or req.include_all_fields }, &read.?, schema_view, raw_primary, version)
@@ -136865,6 +136925,11 @@ test "public graph metric borrowed wire primary byte windows retain original cut
     window.finishRow(true);
     try std.testing.expect(window.scope == null);
     std.debug.print("PRIMARY_BYTE_WINDOW rows=5 bytes_per_row=2097152 retired_windows=2 old_cut_preserved=5\n", .{});
+    var values: [3]?[]const u8 = undefined;
+    try window.getMany(&pinned, &.{ physical[4], physical[2], physical[4] }, &values);
+    for (values) |value| try std.testing.expectEqualSlices(u8, raw, value.?);
+    try std.testing.expectEqual(@as(usize, 4 * 1024 * 1024), window.bytes);
+    std.debug.print("PRIMARY_BATCH requested_rows=3 unique_keys=2 multi_get_calls=1 old_cut_preserved=3\n", .{});
 }
 
 test "capi resolver replacement waits reject reused serving and reserved generations" {

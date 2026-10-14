@@ -38,11 +38,129 @@ pub fn lookupJson(
 /// Strings and number lexemes borrow the parsed source until encoding ends.
 pub fn lookupJsonWithOutput(alloc: Allocator, output: Allocator, raw: []const u8, opts: types.LookupOptions) !types.LookupResult {
     if (opts.fields.len == 0 and opts.include_all_fields) return .{ .json = try output.dupe(u8, raw) };
+    if (spanProjectionSupported(opts.fields)) {
+        try validateUniqueJson(alloc, raw);
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var view = @import("query/json_view.zig").View.init(a, raw);
+        // Plain JSON lookup historically parses numbers before serialization.
+        view.parse_numbers = true;
+        var projected: std.json.ObjectMap = .empty;
+        var path: std.ArrayListUnmanaged([]const u8) = .empty;
+        var excluded: std.ArrayListUnmanaged([]const u8) = .empty;
+        var has_positive = false;
+        var has_negative = false;
+        var include_all = false;
+        for (opts.fields) |field| {
+            if (field.len > 0 and field[0] == '-') {
+                has_negative = true;
+                if (field.len > 1) try excluded.append(a, field[1..]);
+            } else {
+                has_positive = true;
+                include_all = include_all or std.mem.eql(u8, field, "*");
+            }
+        }
+        if (include_all or (!has_positive and has_negative)) {
+            try view.includeRootExcept(a, &projected, excluded.items);
+        } else for (opts.fields) |field| {
+            if (field.len > 0 and field[0] == '-') continue;
+            path.clearRetainingCapacity();
+            var tokens = std.mem.tokenizeScalar(u8, field, '.');
+            while (tokens.next()) |part| try path.append(a, part);
+            if (path.items.len == 0) continue;
+            const omit = for (excluded.items) |name| {
+                if (std.mem.eql(u8, name, "*") or std.mem.eql(u8, name, path.items[0])) break true;
+            } else false;
+            if (!omit) try view.includeRoot(a, &projected, path.items);
+        }
+        return .{ .json = try serializeWithOutput(a, output, .{ .object = projected }) };
+    }
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
     defer parsed.deinit();
     var projected = try projectLookupView(alloc, parsed.value, opts);
     defer deinitProjectionView(alloc, &projected);
     return .{ .json = try serializeWithOutput(alloc, output, projected) };
+}
+
+fn spanProjectionSupported(fields: []const []const u8) bool {
+    var positives: usize = 0;
+    var all = false;
+    for (fields) |field| {
+        const negative = field.len > 0 and field[0] == '-';
+        const name = if (negative) field[1..] else field;
+        if (negative and std.mem.indexOfScalar(u8, name, '.') != null) return false;
+        if (std.mem.indexOfScalar(u8, name, '*') != null and !std.mem.eql(u8, name, "*")) return false;
+        if (!negative) {
+            positives += 1;
+            all = all or std.mem.eql(u8, name, "*");
+        }
+    }
+    // Mixing wildcard inclusion with later array selections is order-sensitive.
+    return !all or positives == 1;
+}
+
+/// Validate skipped subtrees too, including duplicate object keys. Reuse one
+/// key arena per nesting level rather than allocating a DOM for every value.
+/// Scalar values are scanned without decoding or retaining their strings.
+fn validateUniqueJson(alloc: Allocator, raw: []const u8) !void {
+    const scratch = @import("antfly_platform").allocator.reclaimingScratch(alloc);
+    const Frame = struct {
+        object: bool = false,
+        key: bool = true,
+        arena: std.heap.ArenaAllocator,
+        names: std.StringHashMapUnmanaged(void) = .empty,
+    };
+    var frames: std.ArrayListUnmanaged(Frame) = .empty;
+    defer {
+        for (frames.items) |*frame| frame.arena.deinit();
+        frames.deinit(scratch);
+    }
+    var scanner = std.json.Scanner.initCompleteInput(scratch, raw);
+    defer scanner.deinit();
+    var depth: usize = 0;
+    var root_seen = false;
+    while (!root_seen or depth != 0) {
+        const token = try scanner.peekNextTokenType();
+        if (depth != 0) {
+            const frame = &frames.items[depth - 1];
+            if (frame.object and frame.key) {
+                if (token == .object_end) {
+                    _ = try scanner.next();
+                    depth -= 1;
+                    continue;
+                }
+                const name = switch (try scanner.nextAllocMax(frame.arena.allocator(), .alloc_if_needed, raw.len)) {
+                    .string, .allocated_string => |key| key,
+                    else => return error.SyntaxError,
+                };
+                if ((try frame.names.getOrPut(frame.arena.allocator(), name)).found_existing) return error.DuplicateField;
+                frame.key = false;
+                continue;
+            }
+            if (!frame.object and token == .array_end) {
+                _ = try scanner.next();
+                depth -= 1;
+                continue;
+            }
+            frame.key = true;
+        }
+        root_seen = true;
+        if (token == .object_begin or token == .array_begin) {
+            _ = try scanner.next();
+            if (depth == frames.items.len) try frames.append(scratch, .{ .arena = .init(scratch) });
+            const frame = &frames.items[depth];
+            _ = frame.arena.reset(.{ .retain_with_limit = 16 * 1024 });
+            frame.names = .empty;
+            frame.object = token == .object_begin;
+            frame.key = true;
+            depth += 1;
+        } else {
+            if (token == .object_end or token == .array_end or token == .end_of_document) return error.SyntaxError;
+            try scanner.skipValue();
+        }
+    }
+    if (try scanner.next() != .end_of_document) return error.SyntaxError;
 }
 
 /// Encode once in reclaimable scratch, then publish one exact-sized body.
@@ -626,4 +744,75 @@ test "public graph metric borrowed wire bounded native projection scratch respon
         output.deinit();
         try std.testing.expectEqual(@as(usize, 0), counted.live);
     }
+}
+
+test "public graph metric borrowed wire span projection preserves document selectors and errors" {
+    const Case = struct {
+        fn run(a: Allocator) !void {
+            const inputs = [_][]const u8{
+                "{\"a\":{\"x\":1e2,\"y\":true},\"b\":[{\"x\":1,\"y\":2},{\"x\":3},null,[1]],\"c\":null}",
+                "{\"a\":{\"x\":\"hello\\nworld\",\"y\":9007199254740993},\"b\":[1,2]}",
+                "{\"a\":{\"x\":null},\"b\":[]}",
+                "42",
+                "{\"\\u0061\":{\"\\u0078\":\"escaped key\"}}",
+            };
+            const selections = [_][]const []const u8{
+                &.{"a.x"},          &.{ "b.x", "b.y" }, &.{"b.01.x"},      &.{"b.0"},
+                &.{ "a", "a.x" },   &.{ "a.x", "a" },   &.{ "c", "a.y" },  &.{ "missing.x", "a.missing" },
+                &.{ "", ".a..x." }, &.{"*"},            &.{ "a", "-a.y" }, &.{"-b"},
+                &.{},
+            };
+            for (inputs) |raw| for (selections) |fields| {
+                const opts: types.LookupOptions = .{ .fields = fields, .include_all_fields = false };
+                var old = try lookupJson(a, raw, opts);
+                defer old.deinit(a);
+                var fresh = try lookupJsonWithOutput(a, a, raw, opts);
+                defer fresh.deinit(a);
+                try std.testing.expectEqualStrings(old.json, fresh.json);
+            };
+        }
+    };
+    try Case.run(std.testing.allocator);
+    const opts: types.LookupOptions = .{ .fields = &.{"keep"}, .include_all_fields = false };
+    for ([_][]const u8{ "{\"keep\":1,\"omit\":{\"x\":1,\"x\":2}}", "{\"keep\":1,\"omit\":[{\"x\":1,\"x\":2}]}" }) |raw|
+        try std.testing.expectError(error.DuplicateField, lookupJsonWithOutput(std.testing.allocator, std.testing.allocator, raw, opts));
+    for ([_][]const u8{ "{\"keep\":1,\"omit\":[}", "{\"keep\":1}{}", "", "{\"keep\":}", "{\"keep\":1,\"omit\":\"\\uZZZZ\"}" }) |raw| {
+        if (lookupJsonWithOutput(std.testing.allocator, std.testing.allocator, raw, opts)) |result| {
+            std.testing.allocator.free(result.json);
+            return error.TestUnexpectedResult;
+        } else |err| try std.testing.expect(err != error.OutOfMemory);
+    }
+    const Fail = struct {
+        fn run(a: Allocator) !void {
+            var result = try lookupJsonWithOutput(a, a, "{\"keep\":[{\"n\":1}],\"omit\":[{\"n\":2},{\"n\":3}]}", .{ .fields = &.{"keep.n"}, .include_all_fields = false });
+            defer result.deinit(a);
+            try std.testing.expectEqualStrings("{\"keep\":[{\"n\":1}]}", result.json);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fail.run, .{});
+}
+
+test "public graph metric borrowed wire span projection bounds omitted document scratch" {
+    const a = std.testing.allocator;
+    const Counter = @import("../lite/test_allocator.zig").BudgetAllocator;
+    var input = std.Io.Writer.Allocating.init(a);
+    defer input.deinit();
+    try input.writer.writeAll("{\"keep\":7,\"omit\":[");
+    for (0..16384) |i| {
+        if (i != 0) try input.writer.writeByte(',');
+        try input.writer.writeAll("{\"n\":123,\"s\":\"ignored\"}");
+    }
+    try input.writer.writeAll("]}");
+    var peaks: [3]usize = undefined;
+    for (0..3) |mode| {
+        var counted: Counter = .{ .backing = a, .limit = if (mode == 0) 16 * 1024 * 1024 else 64 * 1024 };
+        const opts: types.LookupOptions = .{ .fields = if (mode == 2) &.{"-omit"} else &.{"keep"}, .include_all_fields = false };
+        var result = if (mode == 0) try lookupJson(counted.allocator(), input.written(), opts) else try lookupJsonWithOutput(counted.allocator(), a, input.written(), opts);
+        try std.testing.expectEqualStrings("{\"keep\":7}", result.json);
+        peaks[mode] = counted.peak;
+        result.deinit(if (mode == 0) counted.allocator() else a);
+        try std.testing.expectEqual(@as(usize, 0), counted.live);
+    }
+    try std.testing.expect(peaks[1] < peaks[0] / 10 and peaks[2] < peaks[0] / 10);
+    std.debug.print("SPAN_PROJECTION omitted_objects=16384 dom_peak={d} span_peak={d} exclusion_peak={d}\n", .{ peaks[0], peaks[1], peaks[2] });
 }

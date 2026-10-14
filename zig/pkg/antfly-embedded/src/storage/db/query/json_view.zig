@@ -25,6 +25,7 @@ pub const View = struct {
     alloc: Allocator,
     root: Node,
     materialized_values: usize = 0,
+    parse_numbers: bool = false,
 
     pub const Node = struct {
         raw: []const u8,
@@ -173,11 +174,34 @@ pub const View = struct {
         try self.includeNode(alloc, dst, name, &self.root, path);
     }
 
+    /// Ordinary document projections share the native row path/array rules.
+    pub fn includeRoot(self: *View, alloc: Allocator, dst: *std.json.ObjectMap, path: []const []const u8) !void {
+        if (path.len == 0 or self.root.kind() != '{') return;
+        if (try self.field(&self.root, path[0])) |node|
+            try self.includeNode(alloc, dst, path[0], node, path[1..]);
+    }
+
+    pub fn includeRootExcept(self: *View, alloc: Allocator, dst: *std.json.ObjectMap, excluded: []const []const u8) !void {
+        if (self.root.kind() != '{') return;
+        for (excluded) |name| if (std.mem.eql(u8, name, "*")) return;
+        const children_in_order = try self.children(&self.root);
+        const names = try self.alloc.alloc([]const u8, children_in_order.len);
+        // Preserve source order without adding a name to every array node.
+        var entries = self.root.object_index.iterator();
+        while (entries.next()) |entry| names[entry.value_ptr.*] = entry.key_ptr.*;
+        for (children_in_order, names) |*child, field_name| {
+            const omit = for (excluded) |name| {
+                if (std.mem.eql(u8, name, field_name)) break true;
+            } else false;
+            if (!omit) try self.includeNode(alloc, dst, field_name, &child.node, &.{});
+        }
+    }
+
     fn includeNode(self: *View, alloc: Allocator, dst: *std.json.ObjectMap, name: []const u8, node: *Node, path: []const []const u8) anyerror!void {
         if (path.len == 0) {
             // Projection mutates merged objects. Never lend a cached logical
             // container to it: subsequent paths must still see the original.
-            const value = try std.json.parseFromSliceLeaky(Value, alloc, node.raw, .{ .parse_numbers = false });
+            const value = try std.json.parseFromSliceLeaky(Value, alloc, node.raw, .{ .parse_numbers = self.parse_numbers });
             try dst.put(alloc, name, value);
             return;
         }
@@ -195,7 +219,7 @@ pub const View = struct {
                 if (index) |i| {
                     const item = (try self.element(node, i)) orelse return;
                     if (path.len == 1) {
-                        try result.append(try std.json.parseFromSliceLeaky(Value, alloc, item.raw, .{ .parse_numbers = false }));
+                        try result.append(try std.json.parseFromSliceLeaky(Value, alloc, item.raw, .{ .parse_numbers = self.parse_numbers }));
                     } else if (item.kind() == '{') {
                         var object = std.json.ObjectMap.empty;
                         if (try self.field(item, path[1])) |child| try self.includeNode(alloc, &object, path[1], child, path[2..]);

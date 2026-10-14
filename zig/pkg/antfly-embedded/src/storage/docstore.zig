@@ -639,6 +639,7 @@ pub const DocStore = struct {
         /// Exact key presence in this transaction's view. Physical references
         /// prove presence without resolving external source/artifact payloads.
         pub fn contains(self: *Txn, key: []const u8) !bool {
+            if (self.write) |*write| return write.contains(key);
             if (self.probe) |*probe| return try probe.contains(key);
             _ = self.getPhysical(key) catch |err| switch (err) {
                 error.NotFound => return false,
@@ -844,6 +845,12 @@ pub const DocStore = struct {
             defer cursor.close();
             const row = (try cursor.seekAtOrAfter(prefix)) orelse return false;
             return std.mem.startsWith(u8, row.key, prefix);
+        }
+
+        pub fn openPhysicalKeyCursorAdapter(self: *Txn) !CursorAdapter {
+            var cursor = try self.openPhysicalCursorAdapter();
+            cursor.setKeysOnly();
+            return cursor;
         }
 
         pub fn openPhysicalCursorAdapter(self: *Txn) !CursorAdapter {

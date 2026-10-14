@@ -2975,6 +2975,15 @@ pub const Txn = struct {
 
     /// Caller owns the result. Unlike get(), this does not retain keys or
     /// values in the transaction. Pending mutations still take precedence.
+    /// Pending mutations take precedence; persisted presence validates only
+    /// record headers and keys, never external value pages.
+    pub fn contains(self: *Txn, key: []const u8) !bool {
+        var cursor = try self.openKeyCursor();
+        defer cursor.close();
+        const found = cursor.seekAtOrAfter(key) catch |err| return if (err == error.NotFound) false else err;
+        return std.mem.eql(u8, found, key);
+    }
+
     pub fn getOwned(self: *Txn, allocator: Allocator, key: []const u8) ![]u8 {
         const lookup_key = if (self.prefix.len == 0) key else try std.mem.concat(allocator, u8, &.{ self.prefix, key });
         defer if (self.prefix.len > 0) allocator.free(lookup_key);
@@ -3713,6 +3722,10 @@ pub const Cursor = struct {
     owned_value: ?[]u8 = null,
     disk_candidate: ?native.DocumentIndexEntry = null,
     last_direction: ?Direction = null,
+
+    pub fn setKeysOnly(self: *Cursor) void {
+        self.load_values = false;
+    }
 
     pub fn close(self: *Cursor) void {
         self.records.deinit(self.txn.allocator);

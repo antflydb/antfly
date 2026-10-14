@@ -180,6 +180,7 @@ pub const Cursor = struct {
         seek_at_or_after: *const fn (*anyopaque, []const u8) anyerror!?Entry,
         seek_at_or_before: *const fn (*anyopaque, []const u8) anyerror!?Entry,
         set_upper_bound: ?*const fn (*anyopaque, ?[]const u8) void = null,
+        set_keys_only: ?*const fn (*anyopaque) void = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
@@ -214,6 +215,11 @@ pub const Cursor = struct {
 
     pub fn setUpperBound(self: *Cursor, upper: ?[]const u8) void {
         if (self.vtable.set_upper_bound) |set_upper_bound| set_upper_bound(self.ptr, upper);
+    }
+
+    /// Call before the first move. Unsupported adapters retain normal reads.
+    pub fn setKeysOnly(self: *Cursor) void {
+        if (self.vtable.set_keys_only) |set| set(self.ptr);
     }
 
     pub fn start(self: *Cursor, options: backend_types.CursorOptions) !?Entry {
@@ -738,6 +744,7 @@ pub const WriteTxn = struct {
         delete: *const fn (*anyopaque, []const u8) anyerror!void,
         open_cursor: *const fn (Allocator, *anyopaque) anyerror!Cursor,
         open_read_scope: ?*const fn (Allocator, *anyopaque) anyerror!ReadScope = null,
+        contains: ?*const fn (*anyopaque, []const u8) anyerror!bool = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
@@ -767,6 +774,12 @@ pub const WriteTxn = struct {
 
     pub fn get(self: *WriteTxn, key: []const u8) ![]const u8 {
         return try BoundaryAbi.call("get", self.boundary_dispatch, self.vtable.get, .{ self.ptr, key });
+    }
+
+    pub fn contains(self: *WriteTxn, key: []const u8) !bool {
+        if (self.vtable.contains) |check| return BoundaryAbi.call("contains", self.boundary_dispatch, check, .{ self.ptr, key });
+        _ = self.get(key) catch |err| return if (err == error.NotFound) false else err;
+        return true;
     }
 
     pub fn getManySorted(self: *WriteTxn, keys: []const []const u8, values: []?[]const u8) !void {
@@ -1464,6 +1477,10 @@ fn cursorFromWithParent(allocator: Allocator, handle: anytype, parent: ?ParentRe
             };
         }
 
+        pub fn setKeysOnly(ptr: *anyopaque) void {
+            unbox(ptr).handle.setKeysOnly();
+        }
+
         pub fn setUpperBound(ptr: *anyopaque, upper: ?[]const u8) void {
             unbox(ptr).handle.setUpperBound(upper);
         }
@@ -1481,6 +1498,7 @@ fn cursorFromWithParent(allocator: Allocator, handle: anytype, parent: ?ParentRe
             .seek_at_or_after = vt.seekAtOrAfter,
             .seek_at_or_before = vt.seekAtOrBefore,
             .set_upper_bound = if (@hasDecl(Handle, "setUpperBound")) vt.setUpperBound else null,
+            .set_keys_only = if (@hasDecl(Handle, "setKeysOnly")) vt.setKeysOnly else null,
         },
     };
 }
@@ -1765,6 +1783,10 @@ pub fn writeTxnFrom(allocator: Allocator, handle: anytype) !WriteTxn {
             return try unbox(ptr).handle.get(key);
         }
 
+        fn contains(ptr: *anyopaque, key: []const u8) anyerror!bool {
+            return unbox(ptr).handle.contains(key);
+        }
+
         pub fn getManySorted(ptr: *anyopaque, keys: []const []const u8, values: []?[]const u8) anyerror!void {
             if (keys.len != values.len) return error.InvalidBatch;
             if (@hasDecl(Handle, "getManySorted")) {
@@ -1816,6 +1838,7 @@ pub fn writeTxnFrom(allocator: Allocator, handle: anytype) !WriteTxn {
             .abort = vt.abort,
             .commit = vt.commit,
             .get = vt.get,
+            .contains = if (@hasDecl(Handle, "contains")) vt.contains else null,
             .get_many_sorted = vt.getManySorted,
             .has_prefix = if (@hasDecl(Handle, "hasPrefix")) vt.hasPrefix else null,
             .put = vt.put,

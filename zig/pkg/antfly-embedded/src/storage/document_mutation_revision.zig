@@ -176,7 +176,7 @@ pub const BackfillPage = struct {
         };
         var metadata = try read.openReadScope(a);
         defer metadata.close();
-        var cursor = try read.openPhysicalCursorAdapter();
+        var cursor = try read.openPhysicalKeyCursorAdapter();
         defer cursor.close();
         const previous = if (!restart and before != null) before.?[1..] else &.{keys.user_namespace};
         var item = try cursor.seekAtOrAfter(previous);
@@ -190,7 +190,7 @@ pub const BackfillPage = struct {
         const deadline = @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_ms;
         while (item) |row| {
             if (!keys.isInternalUserKey(row.key)) break;
-            if (rows > 0 and (rows >= 128 or entries.items.len >= 32 or bytes >= 4 * 1024 * 1024 or row.value.len > 4 * 1024 * 1024 -| bytes or @import("antfly_platform").time.monotonicNs() >= deadline)) break;
+            if (rows > 0 and (rows >= 128 or entries.items.len >= 32 or bytes >= 4 * 1024 * 1024 or @import("antfly_platform").time.monotonicNs() >= deadline)) break;
             if (row.key.len > 65536) return error.InvalidDocumentAuthorityCursor;
             last = try a.dupe(u8, row.key);
             // Metadata has a separate scope; its point reads cannot retire
@@ -200,13 +200,18 @@ pub const BackfillPage = struct {
                 // Physical primary rows have no embedding-payload indirection.
                 // Check the cache first; cursor values retain their own lease.
                 if (try loadContent(&metadata, last) == null) {
-                    std.crypto.hash.sha2.Sha256.hash(row.value, &digest, .{});
+                    // Values are fetched only for missing proofs, with an
+                    // independent row lease from the same visibility cut.
+                    var primary = try read.openReadScope(alloc);
+                    defer primary.close();
+                    const raw = try primary.get(last);
+                    std.crypto.hash.sha2.Sha256.hash(raw, &digest, .{});
                     const revision = try load(&metadata, keyForPhysical(last).?);
-                    try entries.append(a, .{ .physical = last, .content = .{ .revision = revision, .bytes = row.value.len, .kind = last[last.len - 1], .digest = digest } });
+                    try entries.append(a, .{ .physical = last, .content = .{ .revision = revision, .bytes = raw.len, .kind = last[last.len - 1], .digest = digest } });
+                    bytes +|= raw.len;
                 }
             }
             rows += 1;
-            bytes +|= row.value.len;
             item = try cursor.next();
         }
         const complete = item == null or !keys.isInternalUserKey(item.?.key);
@@ -460,4 +465,61 @@ test "public graph metric borrowed wire metadata window batches deduplicates and
     try Case.run(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
     std.debug.print("AUTHORITY_WINDOW rows=64 point_calls_before=192 batch_calls_after=1 unique_keys=3\n", .{});
+}
+
+test "public graph metric borrowed wire backfill skips cached bodies and publishes metadata only" {
+    const a = std.testing.allocator;
+    const Lite = @import("lite/docstore.zig");
+    const Store = @import("docstore.zig").DocStore;
+    const Counter = @import("lite/test_allocator.zig").BudgetAllocator;
+    var counted: Counter = .{ .backing = a };
+    const backing = counted.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/authority-key-only.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var lite = try Lite.Store.createWithOptions(backing, path, .{ .io = std.testing.io, .no_sync = true });
+    defer lite.close();
+    var store = try Store.openRuntime(backing, try lite.runtimeStore(backing));
+    defer store.close();
+    const key = try keys.documentKeyAlloc(a, "doc");
+    defer a.free(key);
+    const raw = try a.alloc(u8, 256 * 1024);
+    defer a.free(raw);
+    @memset(raw, 'x');
+    try store.put(key, raw);
+    var anchor = try lite.beginRead();
+    var anchor_live = true;
+    defer if (anchor_live) anchor.abort();
+    const file = try anchor.readFile();
+    file.test_backing_read_bytes.store(0, .monotonic);
+    var warm = (try BackfillPage.prepare(backing, &store, false)).?;
+    defer warm.deinit();
+    try std.testing.expectEqual(@as(usize, 0), warm.entries.len);
+    const warm_bytes = file.test_backing_read_bytes.load(.monotonic);
+    try std.testing.expect(warm_bytes < raw.len / 4);
+    anchor.abort();
+    anchor_live = false;
+    try store.delete(&contentKey(keyForPhysical(key).?));
+    var missing = (try BackfillPage.prepare(backing, &store, false)).?;
+    defer missing.deinit();
+    try std.testing.expectEqual(@as(usize, 1), missing.entries.len);
+    {
+        var write = try store.beginWriteTxn();
+        defer write.abort();
+        const before = counted.live;
+        try std.testing.expectEqual(@as(usize, 1), try missing.stage(&write));
+        const publication_retained = counted.live - before;
+        try std.testing.expect(publication_retained < raw.len / 4);
+        std.debug.print("BACKFILL_KEY_ONLY primary_bytes={d} warm_read_bytes={d} publish_retained={d}\n", .{ raw.len, warm_bytes, publication_retained });
+    }
+    // The same physical presence operation observes pending deletes/reinserts.
+    var write = try store.beginWriteTxn();
+    defer write.abort();
+    try std.testing.expect(try write.contains(key));
+    try write.delete(key);
+    try std.testing.expect(!try write.contains(key));
+    try write.put(key, "new");
+    try std.testing.expect(try write.contains(key));
+    try std.testing.expect(!try write.contains("missing"));
 }
