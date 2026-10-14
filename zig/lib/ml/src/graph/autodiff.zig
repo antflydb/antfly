@@ -1123,6 +1123,32 @@ fn applyVjp(
             try accumulate(b, adjoints, ins[0], grad);
         },
 
+        .fused_geglu => |attrs| {
+            const grad = try b.graph.addNode(.{
+                .op = .{ .fused_geglu_backward = attrs },
+                .output_shape = g.node(ins[0]).output_shape,
+                .inputs = .{ ins[0], adj, null_node, null_node },
+                .num_inputs = 2,
+                .vjp_alternate = null_node,
+            });
+            try accumulate(b, adjoints, ins[0], grad);
+        },
+
+        // A rotation's transpose is its inverse; the tables are inputs, not
+        // trainable values.
+        .fused_rope_table => |attrs| {
+            var inverse = attrs;
+            inverse.inverse = !attrs.inverse;
+            const grad = try b.graph.addNode(.{
+                .op = .{ .fused_rope_table = inverse },
+                .output_shape = g.node(ins[0]).output_shape,
+                .inputs = .{ adj, ins[1], ins[2], null_node },
+                .num_inputs = 3,
+                .vjp_alternate = null_node,
+            });
+            try accumulate(b, adjoints, ins[0], grad);
+        },
+
         // ── Fused RoPE (hand-written VJP; no vjp_alternate) ──────────
         .fused_rope => |attrs| {
             // Forward, for each pair i in [0, rope_dim/2):

@@ -347,6 +347,10 @@ pub const Kind = enum(u32) {
     packed_qkv_rope = 50,
     /// Centered-variance norm(a+b), optionally followed by its residual sum.
     add_norm_centered = 51,
+    /// `fused_rope_table` (ops/rope_table.zig): rows, width, head_dim, inverse.
+    rope_table = 52,
+    /// `fused_geglu_backward` (ops/geglu.zig): rows, width.
+    geglu_backward = 53,
 };
 
 pub const Params = extern struct {
@@ -408,6 +412,18 @@ pub fn layoutFor(kind: Kind, d: [8]u32, scalars: [4]f32) !Layout {
             r.input_elements[0] = r.output_elements;
             r.input_elements[1] = d[0];
             r.integer_inputs = 1 << 1;
+        },
+        .geglu_backward => { // rows, width: x [rows, 2*width], dout [rows, width]
+            r.output_elements = try shape(&.{ d[0], d[1], 2 });
+            r.input_elements[0] = r.output_elements;
+            r.input_elements[1] = try mul(d[0..2]);
+        },
+        .rope_table => { // rows, width, head_dim, inverse
+            if (d[2] == 0 or d[2] % 2 != 0 or d[1] == 0 or d[1] % d[2] != 0 or d[3] > 1) return error.InvalidBoundaryDeviceShape;
+            r.output_elements = try mul(d[0..2]);
+            r.input_elements[0] = r.output_elements;
+            r.input_elements[1] = r.output_elements / 2;
+            r.input_elements[2] = r.output_elements / 2;
         },
         .add_norm_centered => { // rows, hidden, retain_sum
             if (d[2] > 1 or d[1] > 4096 or scalars[0] <= 0) return error.InvalidBoundaryDeviceShape;

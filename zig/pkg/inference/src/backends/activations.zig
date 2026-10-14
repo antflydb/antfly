@@ -223,7 +223,7 @@ inline fn erfApproxVec(x: F32xN) F32xN {
     return sign * (one - poly * expVec(-(ax * ax)));
 }
 
-fn erfApproxF32(x: f32) f32 {
+pub fn erfApproxF32(x: f32) f32 {
     const sign: f32 = if (x < 0) -1.0 else 1.0;
     const ax = @abs(x);
     const t = 1.0 / (1.0 + 0.3275911 * ax);

@@ -1053,6 +1053,35 @@ pub const Builder = struct {
         return fused;
     }
 
+    /// Rotary embedding by runtime tables (see `RopeTableAttrs`). Kept fused
+    /// through lowering; its VJP is the same op with `inverse` flipped.
+    pub fn ropeTable(self: *Builder, input: NodeId, cos: NodeId, sin: NodeId, head_dim: u32) !NodeId {
+        const shape = self.graph.node(input).output_shape;
+        if (shape.rank() != 2 or head_dim == 0 or head_dim % 2 != 0 or @mod(shape.dim(1), head_dim) != 0)
+            return error.InvalidRopeTable;
+        return self.graph.addNode(.{
+            .op = .{ .fused_rope_table = .{ .head_dim = head_dim } },
+            .output_shape = shape,
+            .inputs = .{ input, cos, sin, null_node },
+            .num_inputs = 3,
+            .vjp_alternate = null_node,
+        });
+    }
+
+    /// GeGLU over [rows, 2 * width] (see `GegluAttrs`), kept fused through
+    /// lowering and differentiated by `fused_geglu_backward`.
+    pub fn geglu(self: *Builder, input: NodeId, width: u32) !NodeId {
+        const shape = self.graph.node(input).output_shape;
+        if (shape.rank() != 2 or width == 0 or shape.dim(1) != 2 * @as(i64, width)) return error.InvalidGeglu;
+        return self.graph.addNode(.{
+            .op = .{ .fused_geglu = .{ .width = width } },
+            .output_shape = Shape.init(shape.dtype, &.{ shape.dim(0), width }),
+            .inputs = .{ input, null_node, null_node, null_node },
+            .num_inputs = 1,
+            .vjp_alternate = null_node,
+        });
+    }
+
     /// SwiGLU MLP composition: down(silu(gate(x)) * up(x)).
     /// Takes pre-computed gate/up linear outputs and composes the activation
     /// + elementwise multiply. The caller handles the down-projection after.
