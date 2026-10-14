@@ -1193,7 +1193,11 @@ fn searchRequestAtCurrentIdentityGeneration(self: *DB, req: types.SearchRequest)
     var source = req.native_key_predicate;
     var received = req;
     if (source) |*predicate| received.native_key_predicate = predicate.receiver();
-    return .{ .value = self.searchRequestAtCurrentIdentityGeneration(received) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    var result = self.searchRequestAtCurrentIdentityGeneration(received) catch |err| return .{ .failure = .init(@errorName(err)) };
+    // The receiving proxy borrows this stack frame. Returned requests must
+    // retain the caller's predicate for subsequent searches.
+    result.native_key_predicate = req.native_key_predicate;
+    return .{ .value = result };
 }
 
 fn graphHasIncomingEdgesForInternalReadBoundedAt(self: *DB, alloc: std.mem.Allocator, index_name: []const u8, keys: []const []const u8, expected: @import("db/catalog/index_manager.zig").IndexManager.CoverageIdentity, identity_read_generation: ?u64, ttl_now_ns: u64, max_scanned_rows: usize) engine.Outcome(@import("../graph/graph.zig").GraphIndex.IncomingProbeResult) {

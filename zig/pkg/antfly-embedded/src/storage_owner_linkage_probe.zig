@@ -299,6 +299,15 @@ fn exerciseForeignPredicate(alloc: std.mem.Allocator, db: *db_mod.DB) !void {
         }
     };
     var count: usize = 0;
+    const snapshot = try db.searchRequestAtCurrentIdentityGeneration(.{ .native_key_predicate = .{ .ptr = &count, .allows = Callback.allows } });
+    const predicate = snapshot.native_key_predicate orelse return error.SharedStorageErrorIdentityLost;
+    if (predicate.ptr != @as(*anyopaque, @ptrCast(&count)) or predicate.allows != Callback.allows)
+        return error.SharedStorageErrorIdentityLost;
+    _ = predicate.allows(predicate.ptr, "vector-row") catch |err| {
+        if (err != error.TestWindowFailed or count != 1) return error.SharedStorageErrorIdentityLost;
+    };
+    if (count != 1) return error.SharedStorageErrorIdentityLost;
+    count = 0;
     var result = db.search(alloc, .{ .dense = .{ .vector = &.{ 0, 0 }, .k = 1 }, .native_key_predicate = .{ .ptr = &count, .allows = Callback.allows } }) catch |err| {
         if (err != error.TestWindowFailed or count == 0) return error.SharedStorageErrorIdentityLost;
         _ = db.searchDenseProfiled(alloc, .{ .native_key_predicate = .{ .ptr = &count, .allows = Callback.allows } }, .{ .vector = &.{ 0, 0 }, .k = 1 }) catch |profile_error| {
