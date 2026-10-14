@@ -170,7 +170,11 @@ fn exerciseForeignPredicate(alloc: std.mem.Allocator, db: *db_mod.DB) !void {
     var count: usize = 0;
     var result = db.search(alloc, .{ .dense = .{ .vector = &.{ 0, 0 }, .k = 1 }, .native_key_predicate = .{ .ptr = &count, .allows = Callback.allows } }) catch |err| {
         if (err != error.TestWindowFailed or count == 0) return error.SharedStorageErrorIdentityLost;
-        return;
+        _ = db.searchDenseProfiled(alloc, .{ .native_key_predicate = .{ .ptr = &count, .allows = Callback.allows } }, .{ .vector = &.{ 0, 0 }, .k = 1 }) catch |profile_error| {
+            if (profile_error != error.TestWindowFailed) return error.SharedStorageErrorIdentityLost;
+            return;
+        };
+        return error.SharedStorageInvalidBatchAccepted;
     };
     result.deinit();
     return error.SharedStorageInvalidBatchAccepted;

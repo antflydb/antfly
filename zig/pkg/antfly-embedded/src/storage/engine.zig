@@ -40,6 +40,13 @@ pub fn Outcome(comptime T: type) type {
     return struct { value: T = undefined, failure: Failure = .{} };
 }
 pub const VTable = struct {
+    searchDenseProfiled: *const fn (self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery) Outcome(@import("db/query/search_exec.zig").ProfiledDenseSearchResult),
+    searchDenseProfiledWithCapturedRequest: *const fn (self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery) Outcome(db.ProfiledDenseSearchWithCapturedRequestResult),
+    searchTextKernel: *const fn (self: *DB, alloc: Allocator, index_name: []const u8, text_query: types.TextQuery, options: types.TextKernelSearchOptions) Outcome(types.TextKernelResult),
+    preflightSearchRequestWithExecutionContext: *const fn (self: *DB, alloc: Allocator, req: types.SearchRequest, max_work: u32, exec_ctx: types.ExecutionContext) Outcome(@import("db/query/search_exec.zig").RuntimePreflightSummary),
+    collectPlanningStatsWithExecutionContext: *const fn (self: *DB, alloc: Allocator, req: types.SearchRequest, max_work: u32, exec_ctx: types.ExecutionContext) Outcome(@import("db/planning_stats.zig").PlanningStatsSummary),
+    collectSearchRequestTextStats: *const fn (self: *DB, alloc: Allocator, req: types.SearchRequest) Outcome([]const @import("../search/distributed_stats.zig").TextFieldStats),
+    configureTableStorage: *const fn (self: *DB, settings: @import("../common/table_storage.zig").Settings) Outcome(void),
     batchPrepared: *const fn (*DB.PreparedBatchOwner, types.BatchRequest, ?*BatchProfile, BatchExecutionOptions, *@import("db/execution_resources.zig").GeneratedEmbeddingMemo, *@import("db/execution_resources.zig").PreparedRowAllocator) Outcome(void),
     reconfigureEnrichmentRuntime: *const fn (self: *DB, cfg: @import("db/enrichment/enrichment_runtime.zig").Config) Outcome(void),
     reconfigureEnrichmentRuntimePaused: *const fn (self: *DB, cfg: @import("db/enrichment/enrichment_runtime.zig").Config) Outcome(void),

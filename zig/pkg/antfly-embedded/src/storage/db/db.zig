@@ -4882,6 +4882,7 @@ pub const DB = struct {
     /// Creation/provisioning-only configuration. Existing persisted authority
     /// cannot be changed, and populated roots require an explicit migration.
     pub fn configureTableStorage(self: *DB, settings: table_storage_mod.Settings) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("configureTableStorage", .{ self, settings });
         if (settings.engine != .local) return error.ObjectStorageRequiresHostedTable;
         lockApply(self);
         defer self.core.unlockApply();
@@ -29333,6 +29334,7 @@ pub const DB = struct {
         text_query: types.TextQuery,
         options: types.TextKernelSearchOptions,
     ) !types.TextKernelResult {
+        if (comptime storage_engine.enabled) return storage_engine.call("searchTextKernel", .{ self, alloc, index_name, text_query, options });
         var row_policy_lease = try self.local_execution.row_policy_gate.enterUnsupportedSearch();
         defer row_policy_lease.release();
         try self.lockApplySharedForPortableRuntime();
@@ -40737,6 +40739,7 @@ pub const DB = struct {
     }
 
     pub fn collectSearchRequestTextStats(self: *DB, alloc: Allocator, req: types.SearchRequest) ![]const @import("../../search/distributed_stats.zig").TextFieldStats {
+        if (comptime storage_engine.enabled) return storage_engine.call("collectSearchRequestTextStats", .{ self, alloc, req });
         var row_policy_lease = try self.local_execution.row_policy_gate.enterUnsupportedSearch();
         defer row_policy_lease.release();
         try self.lockApplySharedForPortableRuntime();
@@ -40758,6 +40761,7 @@ pub const DB = struct {
         max_work: u32,
         exec_ctx: types.ExecutionContext,
     ) !db_query_search.RuntimePreflightSummary {
+        if (comptime storage_engine.enabled) return storage_engine.call("preflightSearchRequestWithExecutionContext", .{ self, alloc, req, max_work, exec_ctx });
         return try self.collectPlanningStatsWithExecutionContext(alloc, req, max_work, exec_ctx);
     }
 
@@ -40777,6 +40781,7 @@ pub const DB = struct {
         max_work: u32,
         exec_ctx: types.ExecutionContext,
     ) !planning_stats_mod.PlanningStatsSummary {
+        if (comptime storage_engine.enabled) return storage_engine.call("collectPlanningStatsWithExecutionContext", .{ self, alloc, req, max_work, exec_ctx });
         var row_policy_lease = try self.local_execution.row_policy_gate.enterUnsupportedSearch();
         defer row_policy_lease.release();
         try self.lockApplySharedForPortableRuntime();
@@ -41501,6 +41506,7 @@ pub const DB = struct {
     }
 
     pub fn searchDenseProfiled(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery) !db_query_search.ProfiledDenseSearchResult {
+        if (comptime storage_engine.enabled) return storage_engine.call("searchDenseProfiled", .{ self, alloc, req, dense });
         return (try self.searchDenseProfiledWithCapturedRequest(alloc, req, dense)).profiled;
     }
 
@@ -41512,6 +41518,7 @@ pub const DB = struct {
         req: types.SearchRequest,
         dense: types.DenseKnnQuery,
     ) !ProfiledDenseSearchWithCapturedRequestResult {
+        if (comptime storage_engine.enabled) return storage_engine.call("searchDenseProfiledWithCapturedRequest", .{ self, alloc, req, dense });
         var row_policy_lease = try self.local_execution.row_policy_gate.enterUnsupportedSearch();
         defer row_policy_lease.release();
         if (builtin.os.tag == .freestanding) return error.UnsupportedPlatform;

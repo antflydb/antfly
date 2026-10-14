@@ -243,6 +243,51 @@ fn activateResolverReplayRuntimes(self: *DB) engine.Outcome(void) {
 fn batchPrepared(self: *DB.PreparedBatchOwner, req: types.BatchRequest, profile: ?*BatchProfile, opts: BatchExecutionOptions, memo: *@import("db/execution_resources.zig").GeneratedEmbeddingMemo, allocator: *@import("db/execution_resources.zig").PreparedRowAllocator) engine.Outcome(void) {
     return .{ .value = self.batchInternalPrepared(req, profile, opts, memo, allocator) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
+fn searchDenseProfiled(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery) engine.Outcome(@import("db/query/search_exec.zig").ProfiledDenseSearchResult) {
+    var source = req.native_key_predicate;
+    var received = req;
+    if (source) |*predicate| received.native_key_predicate = predicate.receiver();
+    return .{ .value = self.searchDenseProfiled(alloc, received, dense) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn searchDenseProfiledWithCapturedRequest(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery) engine.Outcome(db.ProfiledDenseSearchWithCapturedRequestResult) {
+    var source = req.native_key_predicate;
+    var received = req;
+    if (source) |*predicate| received.native_key_predicate = predicate.receiver();
+    var value = self.searchDenseProfiledWithCapturedRequest(alloc, received, dense) catch |err| return .{ .failure = .init(@errorName(err)) };
+    value.request.native_key_predicate = req.native_key_predicate;
+    return .{ .value = value };
+}
+
+fn searchTextKernel(self: *DB, alloc: Allocator, index_name: []const u8, text_query: types.TextQuery, options: types.TextKernelSearchOptions) engine.Outcome(types.TextKernelResult) {
+    return .{ .value = self.searchTextKernel(alloc, index_name, text_query, options) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn preflightSearchRequestWithExecutionContext(self: *DB, alloc: Allocator, req: types.SearchRequest, max_work: u32, exec_ctx: types.ExecutionContext) engine.Outcome(@import("db/query/search_exec.zig").RuntimePreflightSummary) {
+    var source = req.native_key_predicate;
+    var received = req;
+    if (source) |*predicate| received.native_key_predicate = predicate.receiver();
+    return .{ .value = self.preflightSearchRequestWithExecutionContext(alloc, received, max_work, exec_ctx) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn collectPlanningStatsWithExecutionContext(self: *DB, alloc: Allocator, req: types.SearchRequest, max_work: u32, exec_ctx: types.ExecutionContext) engine.Outcome(@import("db/planning_stats.zig").PlanningStatsSummary) {
+    var source = req.native_key_predicate;
+    var received = req;
+    if (source) |*predicate| received.native_key_predicate = predicate.receiver();
+    return .{ .value = self.collectPlanningStatsWithExecutionContext(alloc, received, max_work, exec_ctx) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn collectSearchRequestTextStats(self: *DB, alloc: Allocator, req: types.SearchRequest) engine.Outcome([]const @import("../search/distributed_stats.zig").TextFieldStats) {
+    var source = req.native_key_predicate;
+    var received = req;
+    if (source) |*predicate| received.native_key_predicate = predicate.receiver();
+    return .{ .value = self.collectSearchRequestTextStats(alloc, received) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn configureTableStorage(self: *DB, settings: @import("../common/table_storage.zig").Settings) engine.Outcome(void) {
+    return .{ .value = self.configureTableStorage(settings) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
 const descriptor: engine.Descriptor = .{
     .table_layout = engine.table_layout,
     .db_layout = engine.db_layout,

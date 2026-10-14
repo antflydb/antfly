@@ -1208,3 +1208,17 @@ profiles, with read-back verified. Combined replay/SQL/native/C API validation
 passed 103/103 steps, and the final direct-worker/C API run passed 80/80 steps.
 Expanded Debug probe compilation measured 4.47 decimal GB; its 6 GiB reservation
 retains more than 25% margin.
+
+
+The profiled dense/text kernels, preflight, planning/text statistics and table
+storage configuration also forward to the owner. The native query adapter keeps
+borrowed predicate proxies inside the call and restores caller hooks in captured
+results. The first validation of these entries passed 80/80 build steps. The
+expanded owner rounded compiler MaxRSS to 9G; its qualified SDK 27.0 reservation
+is 14 GiB, preserving a whole-GiB rounding allowance plus at least 25% margin.
+
+Six alternating isolated-process runs of the prepared-owner release (1,200 x 64
+rows, 64 warmup batches) measured document medians 3.3520 -> 3.3832 s (+0.93%) and
+SQL insert medians 12.3181 -> 12.2978 s (-0.16%). All counts and read-backs passed.
+These qualify those model-free C API workloads on that snapshot; they do not
+establish equivalence for every server or inference workload.
