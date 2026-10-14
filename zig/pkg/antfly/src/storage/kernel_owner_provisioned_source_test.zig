@@ -1587,7 +1587,18 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
     try std.testing.expectEqual(@as(u64, 7001), lease_capture.last_group_id);
     try std.testing.expect(owner_source.cacheStats().hit_count > initial_cache_stats.hit_count);
 
-    var statuses = (try write_source.source().localRuntimeStatuses(alloc, "articles")).?;
+    // Runtime status is a periodic observation. Bulk/replay publication may
+    // still be sampling the preceding document set after the writes complete.
+    const status_deadline = @import("antfly_platform").time.monotonicNs() + 5 * std.time.ns_per_s;
+    var statuses = ready: while (true) {
+        if (try write_source.source().localRuntimeStatuses(alloc, "articles")) |observed| {
+            var current = observed;
+            if (current.items.len == 1 and current.items[0].stats.doc_count == 4) break :ready current;
+            current.deinit(alloc);
+        }
+        if (@import("antfly_platform").time.monotonicNs() >= status_deadline) return error.RuntimeStatusPublicationTimeout;
+        try std.testing.io.sleep(.fromMilliseconds(5), .awake);
+    };
     defer statuses.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
     try std.testing.expectEqual(@as(u64, 7001), statuses.items[0].group_id);

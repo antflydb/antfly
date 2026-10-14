@@ -922,15 +922,22 @@ def test_fragmented_text_hierarchy_preserves_boolean_scores_and_restart(
             pages = {}
             objects = {}
             documents = {}
-            roots = []
+            roots = {}
             for path in (server.root / "artifacts").rglob("*"):
                 if not path.is_file():
                     continue
                 payload = path.read_bytes()
-                if payload.startswith(b"AFOBJ001"):
-                    payload = payload[84 + struct.unpack_from("<I", payload, 16)[0] :]
-                digest = hashlib.sha256(payload).hexdigest()
-                objects[digest] = path
+                if not payload.startswith(b"AFOBJ001"):
+                    continue
+                checksum = payload[20:84].decode("ascii")
+                if path.parts[-4] == "graph":
+                    domain, attempt, stored_checksum = path.parts[-3:]
+                    assert stored_checksum == checksum
+                    artifact_id = f"sha256:{checksum}:graph:{domain}:{attempt}"
+                else:
+                    artifact_id = f"sha256:{checksum}"
+                payload = payload[84 + struct.unpack_from("<I", payload, 16)[0] :]
+                objects[artifact_id] = path
                 begin = payload.find(b"AFGPT003")
                 if begin >= 0:
                     page = payload[begin:]
@@ -941,14 +948,17 @@ def test_fragmented_text_hierarchy_preserves_boolean_scores_and_restart(
                         document = json.loads(payload[begin:])
                     except (ValueError, UnicodeDecodeError):
                         continue
-                    documents[digest] = document
+                    documents[artifact_id] = document
                     if document.get("inventory_version") == 3:
-                        roots.append(document)
-            assert roots
-            root_document = max(roots, key=lambda item: item.get("file_count", 0))
-            serving = root_document.get("serving") or root_document.get("compacted")
-            if serving:
-                root_document = documents[serving["checksum"]]
+                        roots[artifact_id] = document
+            canonical = [
+                document for document in roots.values()
+                if document["file_count"] == parts
+                and (document.get("serving") or document.get("compacted"))
+            ]
+            assert len(canonical) == 1, canonical
+            serving = canonical[0].get("serving") or canonical[0]["compacted"]
+            root_document = documents[serving["artifact_id"]]
             assert all(
                 root_document.get(key) is None
                 for key in ("serving_inventory", "serving_routes", "segment_files")
@@ -997,7 +1007,7 @@ def test_fragmented_text_hierarchy_preserves_boolean_scores_and_restart(
                 if identity in required:
                     continue
                 record = json.loads(b"".join(value for _, value in sorted(chunks)))
-                unrelated.append(objects[record["route"]["descriptor"]["checksum"]])
+                unrelated.append(objects[record["route"]["descriptor"]["artifact_id"]])
             assert unrelated, "Fixture must have an unrelated serving descriptor"
             server.pause()
             for cache_root in server.root.rglob("lake-ranges"):

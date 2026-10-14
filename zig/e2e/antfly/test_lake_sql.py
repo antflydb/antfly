@@ -4025,6 +4025,10 @@ def test_optional_term_directory_refresh_preserves_unchanged_parquet_matches(tmp
 
     put("a.parquet", "x" * 262120 + " retainedneedle")
     put("b.parquet", "initial")
+    # More than one compaction group ensures refresh also retains an unchanged
+    # group when the formerly disabled optional directory becomes admissible.
+    for name in "cdefghi":
+        put(f"{name}.parquet", "retainedneedle")
     server = StandaloneAntflyServer(
         resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))),
         "127.0.0.1",
@@ -4075,7 +4079,7 @@ def test_optional_term_directory_refresh_preserves_unchanged_parquet_matches(tmp
                     "limit": 10,
                 },
             )
-            assert len(value["hits"]["hits"]) == 1, value
+            assert len(value["hits"]["hits"]) == 8, value
 
         call(
             "POST",
