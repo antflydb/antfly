@@ -183,6 +183,10 @@ pub const Cache = struct {
         idle_prev: ?*Entry = null,
         idle_next: ?*Entry = null,
         idle_linked: bool = false,
+        // Per-path list within the owning shard, so invalidatePath visits only
+        // the entries for that path instead of scanning every LRU list.
+        path_prev: ?*Entry = null,
+        path_next: ?*Entry = null,
 
         fn key(self: *const Entry) Key {
             return .{
@@ -239,6 +243,8 @@ pub const Cache = struct {
     const Shard = struct {
         mutex: std.atomic.Mutex = .unlocked,
         entries: EntryMap = .empty,
+        // Head of each path's entry list. Keys borrow the head entry's path.
+        path_heads: std.StringHashMapUnmanaged(*Entry) = .empty,
         lru_heads: [priority_count]?*Entry = @as([priority_count]?*Entry, @splat(null)),
         lru_tails: [priority_count]?*Entry = @as([priority_count]?*Entry, @splat(null)),
         idle_heads: [priority_count]?*Entry = @as([priority_count]?*Entry, @splat(null)),
@@ -419,6 +425,7 @@ pub const Cache = struct {
                 }
             }
             shard.entries.deinit(self.allocator);
+            shard.path_heads.deinit(self.allocator);
             shard.pending_sync.lock();
             self.finishLoadCleanupForTeardownLocked(shard);
             for (&shard.load_cleanup) |*slot| std.debug.assert(slot.state.load(.acquire) == .free);
@@ -1263,20 +1270,45 @@ pub const Cache = struct {
         for (self.shards) |*shard| {
             const locked = lockAtomic(&shard.mutex);
 
-            for (0..priority_count) |priority| {
-                var current = shard.lru_heads[priority];
-                while (current) |entry| {
-                    const next = entry.lru_next;
-                    if (std.mem.eql(u8, entry.path, path)) {
-                        entry.invalidated = true;
-                        self.bumpInvalidation(entry.kind);
-                        if (entry.ref_count == 0) self.removeEntryLocked(shard, entry);
-                    }
-                    current = next;
-                }
+            var current = shard.path_heads.get(path);
+            while (current) |entry| {
+                const next = entry.path_next;
+                entry.invalidated = true;
+                self.bumpInvalidation(entry.kind);
+                if (entry.ref_count == 0) self.removeEntryLocked(shard, entry);
+                current = next;
             }
             if (locked) shard.mutex.unlock();
         }
+    }
+
+    /// Capacity was reserved by the caller before the entry became visible.
+    fn linkPathLocked(shard: *Shard, entry: *Entry) void {
+        const gop = shard.path_heads.getOrPutAssumeCapacity(entry.path);
+        if (gop.found_existing) {
+            const head = gop.value_ptr.*;
+            head.path_prev = entry;
+            entry.path_next = head;
+        }
+        gop.key_ptr.* = entry.path;
+        gop.value_ptr.* = entry;
+    }
+
+    fn unlinkPathLocked(shard: *Shard, entry: *Entry) void {
+        if (entry.path_next) |next| next.path_prev = entry.path_prev;
+        if (entry.path_prev) |prev| {
+            prev.path_next = entry.path_next;
+        } else if (entry.path_next) |next| {
+            // The map key borrows the head's path; repoint it before the old
+            // head (and its path) is freed.
+            const kv = shard.path_heads.getEntry(entry.path) orelse unreachable;
+            kv.key_ptr.* = next.path;
+            kv.value_ptr.* = next;
+        } else {
+            _ = shard.path_heads.remove(entry.path);
+        }
+        entry.path_prev = null;
+        entry.path_next = null;
     }
 
     pub fn invalidatePrefix(self: *Cache, prefix: []const u8) void {
@@ -1490,6 +1522,7 @@ pub const Cache = struct {
 
         if (control) |budget| try budget.checkpoint();
         entry.last_access = self.nextAccess();
+        try shard.path_heads.ensureUnusedCapacity(self.allocator, 1);
         const gop = try shard.entries.getOrPutContextAdapted(self.allocator, key, KeyContext{}, KeyContext{});
         if (gop.found_existing) {
             const existing = gop.value_ptr.*;
@@ -1511,6 +1544,7 @@ pub const Cache = struct {
         gop.key_ptr.* = entry.key();
         gop.value_ptr.* = entry;
         self.linkEntryLocked(shard, entry);
+        linkPathLocked(shard, entry);
         const used_bytes = self.used_bytes.fetchAdd(byte_cost, .monotonic) + byte_cost;
         updateAtomicMax(&self.peak_used_bytes, used_bytes);
         const kind_index = @backingInt(kind);
@@ -1918,6 +1952,7 @@ pub const Cache = struct {
         _ = shard.entries.fetchRemoveAdapted(entry.key(), KeyContext{}) orelse unreachable;
         std.debug.assert(entry.ref_count == 0);
         self.unlinkEntryLocked(shard, entry);
+        unlinkPathLocked(shard, entry);
         _ = self.used_bytes.fetchSub(entry.byte_cost, .monotonic);
         _ = self.kind_bytes[@backingInt(entry.kind)].fetchSub(entry.byte_cost, .monotonic);
         if (isDataBlockKind(entry.kind)) {
