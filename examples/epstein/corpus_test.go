@@ -556,6 +556,40 @@ func TestCorpusPreparedPageWindowsSurviveRestartAndValidateSource(t *testing.T) 
 	}
 }
 
+func TestCorpusPrepareSkipsPDFRejectedAfterPageCounting(t *testing.T) {
+	dir := t.TempDir()
+	source, state := filepath.Join(dir, "sources"), filepath.Join(dir, "state")
+	broken := bytes.ReplaceAll(createMultiPagePDF(4), []byte("/Type /Page /Parent"), []byte("/Type /Fail /Parent"))
+	badPath := filepath.Join(source, "EFTA00000001.pdf")
+	writeCorpusFixture(t, badPath, broken)
+	writeCorpusFixture(t, filepath.Join(source, "EFTA00000002.pdf"), createMultiPagePDF(2))
+	f, err := os.Open(badPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pages, err := corpusPDFPages(f, int64(len(broken)))
+	f.Close()
+	if err != nil || pages != 4 {
+		t.Fatalf("fixture must pass page counting: %d %v", pages, err)
+	}
+	if err := corpusPrepareCmd([]string{"--state", state, "--source", "test=" + source, "--pages-per-record", "1"}); err != nil {
+		t.Fatal(err)
+	}
+	records := testCorpusRecords(t, state)
+	if len(records) != 2 {
+		t.Fatalf("records=%d", len(records))
+	}
+	for _, record := range records {
+		if strings.Contains(record.ID, "EFTA00000001") {
+			t.Fatal("published a partial unreadable source")
+		}
+	}
+	skipped, err := os.ReadFile(filepath.Join(state, "skipped.ndjson"))
+	if err != nil || !bytes.Contains(skipped, []byte("EFTA00000001")) {
+		t.Fatalf("missing skipped source: %s %v", skipped, err)
+	}
+}
+
 type blockedCorpusResponse struct {
 	*httptest.ResponseRecorder
 	entered chan struct{}

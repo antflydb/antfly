@@ -251,6 +251,7 @@ func corpusPrepareCmd(args []string) error {
 		progress.Seconds = priorSeconds + time.Since(started).Seconds()
 		return atomicCorpusJSON(progressPath, progress)
 	}
+	visited := 0
 	for {
 		if (cfg.LimitFiles > 0 && progress.Files >= cfg.LimitFiles) || (cfg.LimitPages > 0 && progress.Pages >= cfg.LimitPages) {
 			progress.Complete = true
@@ -265,6 +266,7 @@ func corpusPrepareCmd(args []string) error {
 		if e != nil {
 			return e
 		}
+		visited++
 		totalPages := 0
 		if entry.MIME == "application/pdf" {
 			totalPages, e = store.pages(entry.Locator)
@@ -278,6 +280,11 @@ func corpusPrepareCmd(args []string) error {
 					return e
 				}
 				progress.InputOffset += n
+				if visited%100 == 0 {
+					if err = save(); err != nil {
+						return err
+					}
+				}
 				continue
 			}
 		} else if entry.Locator.Size > corpusMaxBytes {
@@ -287,12 +294,37 @@ func corpusPrepareCmd(args []string) error {
 		if cfg.LimitPages > 0 {
 			selectedPages = min(selectedPages, cfg.LimitPages-progress.Pages)
 		}
-		emit := func(loc sourceLocator) error {
-			if loc.First > 0 && (loc.First != 1 || loc.Last != totalPages) {
-				if err := store.preparePageWindow(loc); err != nil {
-					return fmt.Errorf("prepare page window %s %d-%d: %w", entry.ID, loc.First, loc.Last, err)
+		// Prepare every window before publishing any rows for this source.
+		// A corrupt later page must not leave a half-published source manifest.
+		if selectedPages > 0 {
+			for first := 1; first <= selectedPages; first += cfg.PagesPerRecord {
+				loc := entry.Locator
+				loc.First, loc.Last = first, min(first+cfg.PagesPerRecord-1, selectedPages)
+				if loc.First == 1 && loc.Last == totalPages {
+					continue
+				}
+				if e = store.preparePageWindow(loc); e != nil {
+					break
 				}
 			}
+			if e != nil {
+				var invalid *corpusPDFWindowError
+				if !errors.As(e, &invalid) {
+					return fmt.Errorf("prepare page windows %s: %w", entry.ID, e)
+				}
+				if e = recordSkippedSource(filepath.Join(*state, "skipped.ndjson"), entry.ID, e); e != nil {
+					return e
+				}
+				progress.InputOffset += n
+				if visited%100 == 0 {
+					if err = save(); err != nil {
+						return err
+					}
+				}
+				continue
+			}
+		}
+		emit := func(loc sourceLocator) error {
 			versionBytes, _ := json.Marshal(loc)
 			version := sha256.Sum256(versionBytes)
 			original := entry.Locator
@@ -334,7 +366,7 @@ func corpusPrepareCmd(args []string) error {
 		progress.InputOffset += n
 		progress.Files++
 		progress.SourceBytes += entry.Locator.Size
-		if progress.Files%100 == 0 {
+		if visited%100 == 0 {
 			if err = save(); err != nil {
 				return err
 			}
@@ -685,6 +717,11 @@ func warmCorpusPageWindows(store *corpusStore, manifest string) error {
 		total, _ := metadata["original_pages"].(float64)
 		if loc.First > 0 && (loc.First != 1 || loc.Last != int(total)) {
 			if err := store.preparePageWindow(loc); err != nil {
+				var invalid *corpusPDFWindowError
+				if errors.As(err, &invalid) {
+					fmt.Fprintf(os.Stderr, "Skipping unreadable page window %s: %v\n", record.ID, err)
+					continue
+				}
 				return fmt.Errorf("prepare page window %s: %w", record.ID, err)
 			}
 		}

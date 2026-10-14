@@ -9683,7 +9683,7 @@ pub const DB = struct {
         const force_artifacts = [_][]const u8{issue.artifact_name};
         try self.batchInternal(.{
             .writes = &writes,
-            .sync_level = .full_index,
+            .sync_level = if (wait_for_completion) .full_index else .write,
         }, null, .{
             .wait_for_sync_level = wait_for_completion,
             .force_generated_artifact_names = &force_artifacts,
@@ -70204,6 +70204,55 @@ test "db resolved doc filter normalizes doc keys before composing native ids" {
     })) == null);
 }
 
+test "db search structured expansion filters cancel inside dictionary scans" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("db");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtime_workers = false, .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    const writes = try alloc.alloc(types.BatchWrite, 4096);
+    defer alloc.free(writes);
+    var initialized: usize = 0;
+    defer for (writes[0..initialized]) |write| {
+        alloc.free(write.key);
+        alloc.free(write.value);
+    };
+    for (writes, 0..) |*write, index| {
+        const key = try std.fmt.allocPrint(alloc, "doc:{d}", .{index});
+        errdefer alloc.free(key);
+        const value = try std.fmt.allocPrint(alloc, "{{\"body\":\"catalog{d}\"}}", .{index});
+        write.* = .{ .key = key, .value = value };
+        initialized += 1;
+    }
+    try db.batch(.{ .writes = writes, .sync_level = .full_index });
+    const State = struct {
+        checks: usize = 0,
+        fn canceled(ptr: *const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(ptr)));
+            self.checks += 1;
+            return self.checks >= 128;
+        }
+    };
+    for ([_]bool{ false, true }) |exclude| {
+        var state = State{};
+        var request: types.SearchRequest = .{
+            .index_name = "text",
+            .query = .{ .match_all = {} },
+            .include_stored = false,
+            .cancellation = .{ .ptr = &state, .is_cancelled_fn = State.canceled },
+        };
+        const filter = "{\"wildcard\":{\"field\":\"body\",\"pattern\":\"*never-present\"}}";
+        if (exclude) request.exclusion_query_json = filter else request.filter_query_json = filter;
+        var result = db.search(alloc, request) catch |err| {
+            try std.testing.expectEqual(error.Canceled, err);
+            continue;
+        };
+        result.deinit();
+        return error.TestUnexpectedResult;
+    }
+}
+
 test "db vector full text filters project through doc identity ordinals" {
     const alloc = std.testing.allocator;
     var path_tmp = try TestDirectory.init("db");
@@ -80966,12 +81015,15 @@ const plural_source_dense_test_support = if (builtin.is_test) struct {
             const document = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBnYW1tYSBkZWx0YSBlcHNpbG9uIHpldGEgZXRhIHRoZXRhIGlvdGEga2FwcGEgbGFtYmRhIG11IG51IHhpIG9taWNyb24gcGkgcmhvIHNpZ21hIHRhdSB1cHNpbG9uIHBoaSBjaGkgcHNpIG9tZWdh\"}";
             var counting = CountingDenseEmbedder{};
             var db = try DB.open(alloc, std.mem.span(path), .{
+                .start_optional_runtime_workers = false,
+                .start_index_workers = false,
                 .enrichment = .{
                     .owner_id = "worker-a",
                     .dense_embedder = counting.interface(),
                 },
             });
-            defer db.close();
+            var db_open = true;
+            defer if (db_open) db.close();
 
             try db.addEnrichment(.{
                 .name = "document_units_v1",
@@ -81066,6 +81118,28 @@ const plural_source_dense_test_support = if (builtin.is_test) struct {
             try std.testing.expectEqual(@as(u32, 0), range_result.failed);
             try db.runUntilIdle();
             try std.testing.expect(counting.calls > calls_before_range);
+            if (admission == .after_chunks) {
+                const calls_before_deferred = counting.calls;
+                db.enrichment_runtime.?.config.dense_embedder = null;
+                try std.testing.expect(try db.reprocessDocumentArtifact(alloc, "doc:a", "document_chunk_dense_v1"));
+                try std.testing.expectEqual(calls_before_deferred, counting.calls);
+                db.close();
+                db_open = false;
+                db = try DB.open(alloc, std.mem.span(path), .{
+                    .start_optional_runtime_workers = false,
+                    .start_index_workers = false,
+                    .enrichment = .{ .owner_id = "worker-a", .dense_embedder = counting.interface() },
+                });
+                db_open = true;
+                try db.runUntilIdle();
+                try std.testing.expect(counting.calls > calls_before_deferred);
+                const completed_calls = counting.calls;
+                // Once fulfilled, ordinary source replay retains the generation's
+                // cache identities instead of re-embedding again.
+                try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = document }}, .sync_level = .full_index });
+                try db.runUntilIdle();
+                try std.testing.expectEqual(completed_calls, counting.calls);
+            }
         }
     }
 } else struct {};
@@ -81772,13 +81846,13 @@ test "db public artifact reprocess accepts durable work despite unrelated provid
     // Both public endpoints acknowledge the committed request without waiting
     // for the unrelated retry debt. The repair queue still uses full_index.
     try std.testing.expect(try db.reprocessDocumentArtifact(alloc, "doc:repair", "document_units_v1"));
-    // Permit only the requested embedding to succeed. The other document's
-    // provider debt remains retrying, so a table-wide completion wait still fails.
-    gated.allowed_successes.store(gated.successful_requests.load(.acquire) + 1, .release);
+    // Public acceptance commits the request without entering inference. Neither
+    // unrelated retries nor rejection by the requested provider can erase it.
+    const calls_before_acceptance = gated.successful_requests.load(.acquire);
     try std.testing.expect(try db.reprocessDocumentArtifact(alloc, "doc:embedding", "dense_v1"));
-    try std.testing.expectEqual(gated.allowed_successes.load(.acquire), gated.successful_requests.load(.acquire));
-    // A failure in the requested provider itself remains a real request error.
-    try std.testing.expectError(error.EmbedRateLimited, db.reprocessDocumentEmbeddingArtifact(alloc, "doc:embedding", "dense_v1"));
+    try std.testing.expectEqual(calls_before_acceptance, gated.successful_requests.load(.acquire));
+    try std.testing.expect(try db.reprocessDocumentEmbeddingArtifact(alloc, "doc:embedding", "dense_v1"));
+    try std.testing.expectEqual(calls_before_acceptance, gated.successful_requests.load(.acquire));
     try std.testing.expectError(error.NotFound, db.reprocessDocumentArtifact(alloc, "missing", "document_units_v1"));
     try std.testing.expect(!try db.reprocessDocumentArtifact(alloc, "doc:repair", "missing"));
     try std.testing.expect(!try db.reprocessDocumentEmbeddingArtifact(alloc, "missing", "dense_v1"));
@@ -90720,6 +90794,7 @@ test "db deferred generated coverage remains pending until the enrichment worker
     {
         var deterministic = embedder_mod.DeterministicDenseEmbedder{};
         var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_optional_runtime_workers = false,
             .enrichment = .{
                 .owner_id = "worker-a",
                 .dense_embedder = deterministic.interface(),
@@ -90752,6 +90827,7 @@ test "db deferred generated coverage remains pending until the enrichment worker
     {
         var deterministic = embedder_mod.DeterministicDenseEmbedder{};
         var reopened = try DB.open(alloc, std.mem.span(path), .{
+            .start_optional_runtime_workers = false,
             .enrichment = .{
                 .owner_id = "worker-b",
                 .dense_embedder = deterministic.interface(),

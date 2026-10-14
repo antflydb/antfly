@@ -6131,7 +6131,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const max_batch_bytes = generatedEmbedBatchBytes();
                 var batch_source_bytes: usize = 0;
                 for (sources, 0..) |source, i| {
-                    const source_hash = enrichment_artifact_codec.hashEmbeddingSource(source.text, request.producer_json);
+                    const source_hash = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source.text, request.producer_json, request.reprocess_generation);
                     const artifact_key = try embeddingArtifactKeyForBaseAlloc(alloc, source.key, embedding_name);
                     defer alloc.free(artifact_key);
                     if (skip_unchanged_artifacts) {
@@ -6245,7 +6245,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 embedding_name,
                 request.source_field,
                 null,
-                .{ .generated = enrichment_artifact_codec.hashEmbeddingSource(source_text.?, request.producer_json) },
+                .{ .generated = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source_text.?, request.producer_json, request.reprocess_generation) },
                 vector,
             );
             defer alloc.free(artifact_key);
@@ -6414,7 +6414,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 // must publish a failed attempt just like other extraction
                 // failures. Use the mutation allocator for the small manifest
                 // after the extraction allocator has exhausted its budget.
-                if (err == error.OutOfMemory or err == error.ResourceTemporarilyUnavailable or err == error.Canceled or err == error.DeadlineExceeded) return err;
+                if (err == error.OutOfMemory or err == error.ResourceTemporarilyUnavailable or err == error.Canceled or err == error.Cancelled or err == error.DeadlineExceeded or err == error.Timeout or enrichment_runtime_mod.isRetryableEnrichmentError(err)) return err;
                 const exact_error_name = if (err != raw_err) @errorName(err) else boundaryFailureErrorName(&extraction_failure, err);
                 try appendDocumentExtractionFailureManifest(alloc, db, view, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, exact_error_name, "document extraction failed", document_extraction_mod.failureStageFromErrorName(exact_error_name, "document_extraction"), artifact_writes);
                 return;
@@ -6730,11 +6730,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 try pending_chunk_keys.put(alloc, write.key, {});
                 _ = try appendMaterializedChunkSourceToBatch(alloc, &sources, &batch_source_bytes, write.key, write.value, request.source_field);
                 if (sources.items.len >= max_batch_items or batch_source_bytes >= max_batch_bytes) {
-                    try flushGeneratedSparseChunkSourceBatch(alloc, db, runtime, sparse_embedder, embedding_name, request.producer_json, artifact_writes, sparse_embeddings, &sources, consumer_indexes, pending_writes, reuse_unchanged);
+                    try flushGeneratedSparseChunkSourceBatch(alloc, db, runtime, sparse_embedder, embedding_name, request.producer_json, request.reprocess_generation, artifact_writes, sparse_embeddings, &sources, consumer_indexes, pending_writes, reuse_unchanged);
                     batch_source_bytes = 0;
                 }
             }
-            try flushGeneratedSparseChunkSourceBatch(alloc, db, runtime, sparse_embedder, embedding_name, request.producer_json, artifact_writes, sparse_embeddings, &sources, consumer_indexes, pending_writes, reuse_unchanged);
+            try flushGeneratedSparseChunkSourceBatch(alloc, db, runtime, sparse_embedder, embedding_name, request.producer_json, request.reprocess_generation, artifact_writes, sparse_embeddings, &sources, consumer_indexes, pending_writes, reuse_unchanged);
             batch_source_bytes = 0;
 
             const upper = try internal_keys.nextPrefixAlloc(alloc, prefix);
@@ -6744,7 +6744,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer alloc.free(lower);
             while (true) {
                 const next_lower = try scanMaterializedChunkSourceStoreBatch(alloc, db, prefix, upper_bound, lower, request.source_field, &pending_chunk_keys, pending_deletes, &sources, &batch_source_bytes, max_batch_items, max_batch_bytes);
-                try flushGeneratedSparseChunkSourceBatch(alloc, db, runtime, sparse_embedder, embedding_name, request.producer_json, artifact_writes, sparse_embeddings, &sources, consumer_indexes, pending_writes, reuse_unchanged);
+                try flushGeneratedSparseChunkSourceBatch(alloc, db, runtime, sparse_embedder, embedding_name, request.producer_json, request.reprocess_generation, artifact_writes, sparse_embeddings, &sources, consumer_indexes, pending_writes, reuse_unchanged);
                 batch_source_bytes = 0;
                 if (next_lower) |owned_next| {
                     alloc.free(lower);
@@ -6811,7 +6811,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const max_batch_bytes = generatedEmbedBatchBytes();
                 var batch_source_bytes: usize = 0;
                 for (sources, 0..) |source, i| {
-                    const source_hash = enrichment_artifact_codec.hashEmbeddingSource(source.text, request.producer_json);
+                    const source_hash = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source.text, request.producer_json, request.reprocess_generation);
                     const artifact_key = try embeddingArtifactKeyForBaseAlloc(alloc, source.key, embedding_name);
                     defer alloc.free(artifact_key);
                     if (reuse_unchanged) if (try storedOrPendingEmbeddingSourceHash(db, pending_writes, artifact_key)) |existing_hash| {
@@ -6823,18 +6823,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     if (chunk_texts.items.len > 0 and
                         (chunk_texts.items.len >= max_batch_items or batch_source_bytes + source.text.len > max_batch_bytes))
                     {
-                        try flushGeneratedSparseChunkBatch(alloc, runtime, sparse_embedder, embedding_name, request.producer_json, artifact_writes, sparse_embeddings, sources, &source_indexes, &chunk_texts, consumer_indexes);
+                        try flushGeneratedSparseChunkBatch(alloc, runtime, sparse_embedder, embedding_name, request.producer_json, request.reprocess_generation, artifact_writes, sparse_embeddings, sources, &source_indexes, &chunk_texts, consumer_indexes);
                         batch_source_bytes = 0;
                     }
                     try chunk_texts.append(alloc, source.text);
                     try source_indexes.append(alloc, i);
                     batch_source_bytes += source.text.len;
                     if (chunk_texts.items.len >= max_batch_items or batch_source_bytes >= max_batch_bytes) {
-                        try flushGeneratedSparseChunkBatch(alloc, runtime, sparse_embedder, embedding_name, request.producer_json, artifact_writes, sparse_embeddings, sources, &source_indexes, &chunk_texts, consumer_indexes);
+                        try flushGeneratedSparseChunkBatch(alloc, runtime, sparse_embedder, embedding_name, request.producer_json, request.reprocess_generation, artifact_writes, sparse_embeddings, sources, &source_indexes, &chunk_texts, consumer_indexes);
                         batch_source_bytes = 0;
                     }
                 }
-                try flushGeneratedSparseChunkBatch(alloc, runtime, sparse_embedder, embedding_name, request.producer_json, artifact_writes, sparse_embeddings, sources, &source_indexes, &chunk_texts, consumer_indexes);
+                try flushGeneratedSparseChunkBatch(alloc, runtime, sparse_embedder, embedding_name, request.producer_json, request.reprocess_generation, artifact_writes, sparse_embeddings, sources, &source_indexes, &chunk_texts, consumer_indexes);
                 return;
             }
 
@@ -6882,7 +6882,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 artifact_writes,
                 request.doc_key,
                 embedding_name,
-                .{ .generated = enrichment_artifact_codec.hashEmbeddingSource(source_text.?, request.producer_json) },
+                .{ .generated = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source_text.?, request.producer_json, request.reprocess_generation) },
                 sparse.indices,
                 sparse.values,
             );
@@ -8546,6 +8546,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             dense_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite),
         ) !void {
             if (pending.chunk_texts.items.len == 0) return;
+            if (pending.reprocess_generation == null) pending.reprocess_generation = try enrichment_runtime_mod.embeddingReprocessGeneration(runtime, doc_key, pending.embedding_name, pending.producer_json);
             const synthetic_request: enrichment_types.GeneratedEnrichmentRequest = .{
                 .kind = .dense_embedding,
                 .index_name = "",
@@ -8553,6 +8554,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .source_field = pending.source_field,
                 .expected_dims = pending.expected_dims,
                 .producer_json = pending.producer_json,
+                .reprocess_generation = pending.reprocess_generation.?,
             };
             try flushGeneratedDenseChunkBatch(
                 alloc,
@@ -8580,12 +8582,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
         ) !void {
             if (pending.chunk_texts.items.len == 0) return;
+            if (pending.reprocess_generation == null) {
+                const doc_key = (try internal_keys.decodeDocumentComponentAlloc(alloc, pending.sources.items[0].key)) orelse return error.InvalidArtifactPayload;
+                defer alloc.free(doc_key);
+                pending.reprocess_generation = try enrichment_runtime_mod.embeddingReprocessGeneration(runtime, doc_key, pending.embedding_name, pending.producer_json);
+            }
             try flushGeneratedSparseChunkBatch(
                 alloc,
                 runtime,
                 sparse_embedder,
                 pending.embedding_name,
                 pending.producer_json,
+                pending.reprocess_generation.?,
                 artifact_writes,
                 sparse_embeddings,
                 pending.sources.items,

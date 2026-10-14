@@ -567,6 +567,10 @@ indexes need rebuilding with the new analysis configuration; changing query
 text cannot recover terms discarded by an earlier analyzer.
 `corpus graph` retries transient coordinator failures by reconciling the source
 revision again, including any work committed before the failure.
+Preparation completes every page window for a PDF before writing that source's
+manifest rows. PDFs rejected during validation or splitting are recorded in
+`skipped.ndjson`; filesystem failures still stop preparation. Server warmup
+reports unreadable PDF windows and continues preparing other sources.
 The relation extractor defaults to the registered model ID `antflydb/gliner2-base-v1`;
 its installed bundle selects the quantized weights. Use `--artifact-extractor-model`
 on both corpus load commands to select another registered extractor. Inspect

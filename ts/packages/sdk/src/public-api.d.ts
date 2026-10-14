@@ -2401,6 +2401,9 @@ export interface paths {
          *     reader, transcriber, extractor, and document-extraction producers are
          *     all supported, as are dense and sparse embedding producers. Embedding
          *     reprocessing regenerates vectors even when the source chunks are unchanged.
+         *     Embedding requests are committed durably and queued for supervised
+         *     inference. Acceptance does not wait for inference; inspect index coverage
+         *     and repair issues for the eventual outcome.
          */
         post: operations["reprocessDocumentArtifact"];
         delete?: never;

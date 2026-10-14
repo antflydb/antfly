@@ -196,6 +196,9 @@ pub const GeneratedEnrichmentRequest = struct {
     /// Replay sequence of the source document change. This is attached when a
     /// cached request plan is instantiated for a pending journal group.
     sequence: u64 = 0,
+    /// Document-owned reprocess generation, resolved once before execution.
+    /// Zero preserves legacy source-hash identities.
+    reprocess_generation: u64 = 0,
 };
 
 pub const GeneratedEnrichmentRef = struct {
@@ -290,6 +293,7 @@ pub fn cloneGeneratedRequest(alloc: Allocator, request: GeneratedEnrichmentReque
         .upstream_artifact_name = upstream_artifact_name,
         .consumer_indexes = consumer_indexes,
         .sequence = request.sequence,
+        .reprocess_generation = request.reprocess_generation,
     };
 }
 

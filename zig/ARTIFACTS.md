@@ -343,13 +343,27 @@ failed publication, while an active publication remains retryable.
 
 Dense text embedding uses up to two concurrent provider calls within a bounded
 logical batch. `ANTFLY_ENRICHMENT_EMBED_PARALLEL_BATCHES` accepts 1 through 4;
-legacy providers without invocation-local context callbacks stay serial.
+providers without invocation-local context callbacks or an explicit concurrency
+guarantee stay serial. Managed providers opt in; custom providers default to one
+concurrent batch through `DenseEmbedder.dense_batch_concurrency`.
 All calls drain before a retry or replay checkpoint, and their outputs retain
 source order. The existing item and byte budgets bound the complete batch.
 Capacity rejection drains the concurrent wave and retries serially within the
 same deadline, so providers with one available execution slot can still progress.
 Query embedding retries transient inference capacity errors within its original
 deadline and observes cancellation during the wait.
+
+Embedding reprocess requests commit a config-fenced generation with the source
+mutation. Replay resolves it once per producer request, and text, sparse, and PDF
+page cache identities include it. Deferred work therefore survives reopen while
+already completed chunks stay cached during retries. Generation zero preserves
+the identities of existing embedding artifacts. Public embedding reprocess
+acceptance commits this generation and queues supervised inference without
+entering the provider; coverage and repair issues expose its eventual outcome.
+Repair operations that explicitly wait for completion retain full-index sync.
+PDF page image embeddings use
+the page renderer and staged generation path, including for full-index sync;
+the ordinary text precompute path does not embed their source URL.
 
 Embedding producers also accept the document artifact `reprocess` endpoint
 and paged table `reprocess`/`reprocess-jobs` endpoints. These routes accept the

@@ -2386,6 +2386,7 @@ fn collectFullTextResolvedDocSetAlloc(
         text_entry,
         search_query,
         true,
+        .{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns },
     );
 }
 
@@ -8811,6 +8812,7 @@ fn collectStructuredFilterResolvedDocSetAlloc(
         text_entry,
         search_query,
         false,
+        .{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns },
     );
 }
 
@@ -8821,6 +8823,7 @@ fn collectSearchQueryResolvedDocSetAlloc(
     text_entry: *index_manager_mod.IndexManager.TextIndex,
     search_query: search_mod.SearchQuery,
     allow_analyzed_terms: bool,
+    control: query_mod.ExecutionControl,
 ) !?doc_set.ResolvedDocSet {
     var identity_scratch = segment_mod.SegmentReadScratch.init(alloc, 64 * 1024);
     defer identity_scratch.deinit();
@@ -8849,7 +8852,7 @@ fn collectSearchQueryResolvedDocSetAlloc(
     const filter = search_mod.searchQueryToFilterArena(arena_alloc, search_query) catch return null;
     if (bench_profile) filter_compile_ns = platform_time.monotonicNs() - filter_compile_start_ns;
     const execute_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-    const doc_nums = try snapshot.executeFilter(alloc, filter);
+    const doc_nums = try snapshot.executeFilter(alloc, filter.withControl(control));
     if (bench_profile) execute_ns = platform_time.monotonicNs() - execute_start_ns;
     defer alloc.free(doc_nums);
     if (doc_nums.len == 0) {
@@ -8924,7 +8927,7 @@ fn collectStructuredFilterTextDocNumsAlloc(
     ))) return null;
 
     const filter = search_mod.searchQueryToFilterArena(arena_alloc, search_query) catch return null;
-    const doc_nums = try snapshot.executeFilter(alloc, filter);
+    const doc_nums = try snapshot.executeFilter(alloc, filter.withControl(.{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns }));
     if (doc_nums.len == 0) {
         alloc.free(doc_nums);
         return .none;
@@ -9021,6 +9024,7 @@ fn collectStructuredFilterDocIdsAlloc(
     const k: u32 = @intCast(@min(snapshot.liveDocCount(), @as(u64, std.math.maxInt(u32))));
     var result = try search_mod.execute(alloc, snapshot, .{
         .query = search_query,
+        .control = .{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns },
         .k = k,
         .offset = 0,
         .include_stored = false,

@@ -88,6 +88,9 @@ def sync_detailed(
     reader, transcriber, extractor, and document-extraction producers are
     all supported, as are dense and sparse embedding producers. Embedding
     reprocessing regenerates vectors even when the source chunks are unchanged.
+    Embedding requests are committed durably and queued for supervised
+    inference. Acceptance does not wait for inference; inspect index coverage
+    and repair issues for the eventual outcome.
 
     Args:
         table_name (str):
@@ -129,6 +132,9 @@ def sync(
     reader, transcriber, extractor, and document-extraction producers are
     all supported, as are dense and sparse embedding producers. Embedding
     reprocessing regenerates vectors even when the source chunks are unchanged.
+    Embedding requests are committed durably and queued for supervised
+    inference. Acceptance does not wait for inference; inspect index coverage
+    and repair issues for the eventual outcome.
 
     Args:
         table_name (str):
@@ -165,6 +171,9 @@ async def asyncio_detailed(
     reader, transcriber, extractor, and document-extraction producers are
     all supported, as are dense and sparse embedding producers. Embedding
     reprocessing regenerates vectors even when the source chunks are unchanged.
+    Embedding requests are committed durably and queued for supervised
+    inference. Acceptance does not wait for inference; inspect index coverage
+    and repair issues for the eventual outcome.
 
     Args:
         table_name (str):
@@ -204,6 +213,9 @@ async def asyncio(
     reader, transcriber, extractor, and document-extraction producers are
     all supported, as are dense and sparse embedding producers. Embedding
     reprocessing regenerates vectors even when the source chunks are unchanged.
+    Embedding requests are committed durably and queued for supervised
+    inference. Acceptance does not wait for inference; inspect index coverage
+    and repair issues for the eventual outcome.
 
     Args:
         table_name (str):

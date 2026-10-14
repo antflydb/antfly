@@ -1235,6 +1235,7 @@ pub const ManagedEmbedder = struct {
             .dense_embed_raster_items_with_context_fn = embedDenseRasterItemsWithContext,
             .dense_embed_with_context_fn = embedDenseWithContext,
             .dense_embed_batch_with_context_fn = embedDenseBatchWithContext,
+            .dense_batch_concurrency = 4,
             .dense_embed_parts_with_context_fn = embedDensePartsWithContext,
             .media_part_limit_fn = denseMediaPartLimit,
             .capabilities_fn = denseCapabilities,

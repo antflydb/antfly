@@ -354,6 +354,7 @@ type corpusStore struct {
 	pdfMu      sync.Mutex
 	pdfSource  sourceLocator
 	pdfContext *model.Context
+	pdfError   error
 	pdfCleanup func()
 	pageCache  string
 }
@@ -387,6 +388,11 @@ func (r *corpusArchiveReader) Close() error {
 }
 
 func newCorpusStore(cfg corpusConfig) *corpusStore { return &corpusStore{cfg: cfg} }
+
+type corpusPDFWindowError struct{ cause error }
+
+func (e *corpusPDFWindowError) Error() string { return e.cause.Error() }
+func (e *corpusPDFWindowError) Unwrap() error { return e.cause }
 func (s *corpusStore) Close() {
 	s.pdfMu.Lock()
 	if s.pdfCleanup != nil {
@@ -394,6 +400,7 @@ func (s *corpusStore) Close() {
 		s.pdfCleanup = nil
 	}
 	s.pdfContext = nil
+	s.pdfError = nil
 	s.pdfMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -411,12 +418,17 @@ func (s *corpusStore) trimPDF(loc sourceLocator, output io.Writer) error {
 		return err
 	}
 	check.Close()
+	if s.pdfSource == identity && s.pdfError != nil {
+		return s.pdfError
+	}
 	if s.pdfContext == nil || s.pdfSource != identity {
 		if s.pdfCleanup != nil {
 			s.pdfCleanup()
 			s.pdfCleanup = nil
 		}
 		s.pdfContext = nil
+		s.pdfError = nil
+		s.pdfSource = identity
 		source, cleanup, err := s.seekable(identity)
 		if err != nil {
 			return err
@@ -426,11 +438,16 @@ func (s *corpusStore) trimPDF(loc sourceLocator, output io.Writer) error {
 		ctx, err := api.ReadValidateAndOptimize(source, conf)
 		if err != nil {
 			cleanup()
-			return err
+			var ioFailure *os.PathError
+			if errors.As(err, &ioFailure) {
+				return err
+			}
+			s.pdfError = &corpusPDFWindowError{err}
+			return s.pdfError
 		}
 		s.pdfContext, s.pdfSource, s.pdfCleanup = ctx, identity, cleanup
 	}
-	if loc.First < 1 || loc.Last > s.pdfContext.PageCount {
+	if loc.First < 1 || loc.Last < loc.First || loc.Last > s.pdfContext.PageCount {
 		return fmt.Errorf("invalid PDF page range")
 	}
 	pages := make([]int, loc.Last-loc.First+1)
@@ -439,11 +456,11 @@ func (s *corpusStore) trimPDF(loc sourceLocator, output io.Writer) error {
 	}
 	ctx, err := pdfcpu.ExtractPages(s.pdfContext, pages, false)
 	if err != nil {
-		return err
+		return &corpusPDFWindowError{err}
 	}
 	if ctx.Conf.PostProcessValidate {
 		if err := api.ValidateContext(ctx); err != nil {
-			return err
+			return &corpusPDFWindowError{err}
 		}
 	}
 	return api.WriteContext(ctx, output)

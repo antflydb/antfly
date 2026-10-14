@@ -104,6 +104,9 @@ pub const DenseEmbedder = struct {
     dense_embed_part_items_planned_fn: ?*const fn (*anyopaque, Allocator, []const u8, []const template_mod.ContentPart, u32, ?RequestContext, inference_work.CapabilityLease) anyerror![]const []const f32 = null,
     dense_embed_with_context_fn: ?DenseEmbedWithContextFn = null,
     dense_embed_batch_with_context_fn: ?DenseEmbedBatchWithContextFn = null,
+    /// Maximum simultaneous batch calls supported by this provider instance.
+    /// Invocation-local context alone does not guarantee provider reentrancy.
+    dense_batch_concurrency: u8 = 1,
     dense_embed_parts_with_context_fn: ?DenseEmbedPartsWithContextFn = null,
     media_part_limit_fn: ?DenseMediaPartLimitFn = null,
     capabilities_fn: ?DenseCapabilitiesFn = null,

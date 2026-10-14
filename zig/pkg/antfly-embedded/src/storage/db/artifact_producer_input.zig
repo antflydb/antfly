@@ -133,7 +133,7 @@ pub const Token = struct {
 };
 
 /// Compare every provider/planning field, excluding only row identity,
-/// owner-local replay position and the derived consumer list. Those three
+/// owner-local replay position, reprocess generation and the derived consumer list. These
 /// fields cannot authorize a different generator definition. Consumer
 /// projections are independently derived from the certified catalog at apply.
 pub fn sameDefinition(a: requests.GeneratedEnrichmentRequest, b: requests.GeneratedEnrichmentRequest) bool {
@@ -149,7 +149,7 @@ pub fn sameDefinition(a: requests.GeneratedEnrichmentRequest, b: requests.Genera
 }
 
 fn definitionField(comptime name: []const u8) bool {
-    return !std.mem.eql(u8, name, "doc_key") and !std.mem.eql(u8, name, "sequence") and !std.mem.eql(u8, name, "consumer_indexes");
+    return !std.mem.eql(u8, name, "doc_key") and !std.mem.eql(u8, name, "sequence") and !std.mem.eql(u8, name, "reprocess_generation") and !std.mem.eql(u8, name, "consumer_indexes");
 }
 
 /// Stable identity for exactly the fields used by sameDefinition. Framed
@@ -267,7 +267,9 @@ test "ordered artifact inventory producer template binds every inference field" 
     var request = template;
     request.doc_key = "doc";
     request.sequence = 90;
+    request.reprocess_generation = 3;
     try std.testing.expect(sameDefinition(template, request));
+    try std.testing.expectEqualSlices(u8, &definitionDigest(template), &definitionDigest(request));
     request.source_template = "{{other}}";
     try std.testing.expect(!sameDefinition(template, request));
     request = template;
