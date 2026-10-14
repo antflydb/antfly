@@ -40,7 +40,13 @@ pub fn init(source: Source, io: ?std.Io) Self {
 }
 fn run(self: *Self) anyerror!?Window {
     const window = (try self.source.next(self.source.ptr, self.ids[0..self.limit], self.cutoff)) orelse return null;
-    if (self.source.prepare) |prepare| self.prepared = prepare(self.source.ptr, window.identities) catch null;
+    if (self.source.prepare) |prepare| {
+        var pin = (prepare(self.source.ptr, window.identities) catch null) orelse return window;
+        self.prepared = pin.share(std.heap.page_allocator) catch {
+            pin.deinit();
+            return window;
+        };
+    }
     return window;
 }
 pub fn next(self: *Self, limit: usize, cutoff: ?f32) !?Window {
@@ -89,7 +95,7 @@ test "external lake bounded window lookahead joins cancellation and yields under
             var writer = try @import("antfly_local_sources").index.IndexWriter.init(std.testing.allocator);
             defer writer.deinit();
             const pin: Pin = .{ .snapshot = writer.acquireSnapshot(), .name = "prepared", .text_analysis = .{}, .runtime_schema = null, .owner = raw, .release_owner = release };
-            return try pin.share(std.testing.allocator);
+            return pin;
         }
         fn next(raw: *anyopaque, ids: []Id, _: ?f32) !?Window {
             const self: *@This() = @ptrCast(@alignCast(raw));
