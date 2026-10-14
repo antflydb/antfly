@@ -912,9 +912,8 @@ and atomic replacement, preserving the last complete state if canceled. Validate
 request IDs before using a recovered hint to select a cleanup path. Published
 native generations remain subject to their existing independent validation.
 
-[Investigation evidence](../../examples/hackernews/overlay-latency-investigation-20261014.json)
-retains the original failure and twelve additional union-then-overlay sequences
-on the preceding optimized binary. Cold saved overlays return the expected
+The investigation retains the original failure and runs twelve additional
+union-then-overlay sequences on the preceding optimized binary. Cold saved overlays return the expected
 results in 211–652 ms. A 923 ms union triggered stack sampling; no overlay crossed
 the 750 ms sampling threshold. These shared-host runs do not explain the original
 2,366 ms sample or establish a controlled performance improvement. The warming
@@ -931,6 +930,13 @@ bookkeeping remains below 3 ms and time outside composed execution below 2.2 ms.
 The empty progress hint becomes valid and complete automatically, with no warming
 errors across these restarts. This verifies the recovery fix, while preserving the
 historical outlier's unproven attribution.
+
+These local measurements use 142,577 historical rows in 1,024 Parquet files and
+1,000 native current rows, with filesystem storage on a shared macOS ARM64 host.
+OS caches are retained. The `c068b72af7` executable SHA-256 is
+`f0109097be0be122fcc843d4974565cf950c755dd80fc6f16774d3d1b6ecff7e`.
+Raw probe reports are retained locally outside the repository; the measurements,
+failed gates and attribution limits are recorded here.
 
 The complete merged-revision HN matrix passes correctness, including SQL count
 142,577, exact metadata filters, 1,408 unique paginated hits and mutable composed
