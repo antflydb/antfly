@@ -351,6 +351,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .root_source_file = b.path("pkg/antfly/src/pgwire_test_root.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = strip,
         .link_libc = link_libc,
     });
     @import("../embedded/source_owner.zig").attach(pgwire_test_mod);
@@ -364,7 +365,10 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .filters = buildArguments(b) orelse &.{"pgwire"},
     });
     const run_pgwire_tests = b.addRunArtifact(pgwire_tests);
-    pgwire_tests.step.max_rss = 1024 * 1024 * 1024;
+    // Honor stripped CI builds: cold framing/array compiles fit the original
+    // 1 GiB reservation. Debugger builds exceeded it, so reserve their larger
+    // working set separately. The 64 MiB runtime bound is unchanged.
+    pgwire_tests.step.max_rss = (if (strip) @as(usize, 1) else 2) * 1024 * 1024 * 1024;
     run_pgwire_tests.step.max_rss = 64 * 1024 * 1024;
     b.step("pgwire-test", "Run PostgreSQL wire framing, session, and lifecycle tests").dependOn(&run_pgwire_tests.step);
     const openapi_root_check = addOpenApiRootCheckStep(b);
