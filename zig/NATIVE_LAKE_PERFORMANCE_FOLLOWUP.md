@@ -3926,3 +3926,29 @@ coverage verifies that every acquired reference is released.
 Protocol 43 fences the new root/retained-run fields. Live-provider retention
 qualification and archive-scale latency/RSS benchmarking remain separate; these
 changes make no measured archive-speedup claim.
+
+
+Qualification of the protocol-43 refinement at code head `8308732aec`, including
+`origin/main` at `2c8240e703`:
+
+- Merged Debug server: 49/49 build steps succeeded. Full Debug lake qualification:
+  95/95 steps; all 439 integration and 38 focused executions passed, without
+  failures or leaks.
+- ReleaseFast focused suite: 51/51 build steps; all 38 executions passed without
+  failures or leaks.
+- Real Parquet/Iceberg E2Es: eleven archive/index cases passed against the merged
+  server. After correcting the checkpoint and holding catalog publication fixed
+  for the reuse assertion, all four accepted-cut cases passed in 61.75 seconds
+  (seven deselected), giving fifteen distinct selected cases with passing results.
+  The fixture explicitly verifies that both updates use the same publication;
+  background draining may otherwise legitimately move earlier rows into the
+  archive. Pinned replay and restart remain covered.
+- Apache dependency boundary verified 2,037 sources; license headers, formatting
+  of all 73 changed Zig files, Python formatting/name checks and Git whitespace
+  passed. Object-store provider code is unchanged from its separately qualified
+  92-pass/two-live-provider-skip run.
+
+Post-qualification `make gc` preserved active worktree caches and completed its
+Zig/Rust/Go phases; uv cache pruning reached the 55-second watchdog and its own
+process group was stopped. Completed E2E fixture output was removed; logs remain
+in `/private/tmp`.
