@@ -270,7 +270,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = options.data_implementation_module,
         .filters = lib_data_runtime_tests.object.filters,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
-        .max_rss = lib_data_runtime_tests.object.step.max_rss,
+        // The independent physical implementation root peaked at
+        // 16,100,278,272 bytes in the merged native macOS Debug gate.
+        // Do not inherit the consumer's ReleaseFast-derived 13 GiB claim:
+        // 20 GiB retains >=25% headroom without changing Linux/release
+        // admission, test coverage, or the runtime's memory budget.
+        .max_rss = if (target.result.os.tag == .macos and options.data_implementation_module.optimize == .debug)
+            20 * 1024 * 1024 * 1024
+        else
+            lib_data_runtime_tests.object.step.max_rss,
     });
     const run_lib_data_runtime_tests = @import("linked_tests.zig").runPair(b, lib_data_runtime_tests, implementation_tests);
     const lib_data_runtime_test_step = b.step("antfly-data-runtime-test", "Run focused data runtime tests");
