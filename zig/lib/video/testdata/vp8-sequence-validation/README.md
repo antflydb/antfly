@@ -26,10 +26,26 @@ From `zig/`, reproduce with the repository compiler:
 ```sh
 zig build test-video -Doptimize=Debug -Dvideo-test-filter=sequence --summary all
 python3 lib/video/scripts/qualify_sequence_fuzz.py --zig /path/to/zig \
-  --target vp8 --iterations 10000 --output /tmp/vp8-sequence-campaign
+  --target vp8 --iterations 10000 --output .qualification/vp8-sequence-campaign
 ```
 
 The maintained runner now invokes VP8 separately alongside VP9, AV1 and Annex B.
 It hashes all video and image Zig sources, including the maintained VP8 core.
 Bounded real-picture campaigns add qualification, not exhaustive stream/tool
 coverage. The complete non-CUDA objective remains active.
+
+## Completed real-picture sequence campaign
+
+The separate fresh-cache VP8 target completes **11,929 runs**, **185 unique
+inputs** and **1,486/22,157 instrumented edges** in its reported 151-minute
+shared-host run, with exit zero and no crash output. Three positive/setup tests
+also pass. [Final receipt](fuzz-final-vp8.json) and [raw report](fuzz-final-vp8.log)
+retain the zero-origin counters and command. Every recorded code/seed hash matches
+measured commit `ad0679f7602db60b994a8fc00dbf05894b484451`; the existing measured
+harness snapshot also matches exactly. The nonruntime seed README was captured
+from preceding commit `fe0e1cc145cebb17f110da4554f5fc61cb4008ab` before the VP8
+provenance paragraph was added; [its exact snapshot](seed-readme.measured.md) and
+per-path source version are retained. This campaign predates the main merge and
+qualifies that measured source state, not newly added runtime code or current
+whole-file identity. Its 6.71% edge count is not exhaustive codec/tool coverage.
+The longer VP9 campaign and full non-CUDA goal remain active.
