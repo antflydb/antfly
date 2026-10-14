@@ -763,6 +763,12 @@ pub const Detail = enum(c_int) {
     invalid_generated_tool_arguments,
     sql_feature_not_supported,
     catalog_publication_proof_pending,
+    warm_inference_server_unavailable,
+    unsupported_server_generate_option,
+    missing_inference_listener,
+    runtime_failed,
+    runtime_stopping,
+    runtime_already_ready,
     // Reserve a separate range for the unpublished pooling extension so future
     // main-branch additions cannot renumber either set of detail identities.
     runnable_wait_timeout = 0x10000,
@@ -1456,6 +1462,12 @@ pub fn statusFromError(err: anyerror) Status {
         error.VectorMigrationUnsupportedFile => status(.conflict, .vector_migration_unsupported_file),
         error.VectorStoreRequiresOfflineCommand => status(.conflict, .vector_store_requires_offline_command),
         error.StorageKernelFailure => status(.internal, .storage_kernel_failure),
+        error.WarmInferenceServerUnavailable => status(.unavailable, .warm_inference_server_unavailable),
+        error.UnsupportedServerGenerateOption => status(.unsupported, .unsupported_server_generate_option),
+        error.MissingInferenceListener => status(.internal, .missing_inference_listener),
+        error.RuntimeFailed => status(.internal, .runtime_failed),
+        error.RuntimeStopping => status(.cancelled, .runtime_stopping),
+        error.RuntimeAlreadyReady => status(.conflict, .runtime_already_ready),
         else => status(.internal, .none),
     };
 }
@@ -2154,6 +2166,12 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .unsupported_media_token_budget => "UnsupportedMediaTokenBudget",
         .unsupported_local_rate_limit => "UnsupportedLocalRateLimit",
         .storage_kernel_failure => "StorageKernelFailure",
+        .warm_inference_server_unavailable => "WarmInferenceServerUnavailable",
+        .unsupported_server_generate_option => "UnsupportedServerGenerateOption",
+        .missing_inference_listener => "MissingInferenceListener",
+        .runtime_failed => "RuntimeFailed",
+        .runtime_stopping => "RuntimeStopping",
+        .runtime_already_ready => "RuntimeAlreadyReady",
     };
 }
 
@@ -2452,10 +2470,24 @@ test "SQL worker capacity error preserves append-only identity and unavailable b
     try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(.{ .code = @backingInt(Code.internal), .detail = value.detail }));
 }
 
-test "pre-merge pooling detail collisions fail closed" {
+test "legacy pooling detail numbers cannot resolve to reserved pooling errors" {
     const first = @backingInt(Detail.invalid_generated_tool_arguments) + 1;
     const codes = [_]Code{ .timeout, .unavailable, .retryable, .internal, .internal, .unsupported, .unavailable, .unavailable, .invalid_argument, .unavailable };
     for (codes, 0..) |code, index| {
-        try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(.{ .code = @backingInt(code), .detail = first + @as(c_int, @intCast(index)) }));
+        // Main may publish these old experimental numbers. A matching code can
+        // resolve to that published error, but never to a reserved pooling ID.
+        const decoded = errorFromStatus(.{ .code = @backingInt(code), .detail = first + @as(c_int, @intCast(index)) });
+        if (decoded != error.RuntimeBoundaryFailure) {
+            const published = statusFromError(decoded);
+            try std.testing.expect(published.detail < @backingInt(Detail.runnable_wait_timeout));
+            try std.testing.expectEqual(first + @as(c_int, @intCast(index)), published.detail);
+            try std.testing.expectEqual(@backingInt(code), published.code);
+        }
+    }
+}
+
+test "inference command and lifecycle errors retain their identities across engine calls" {
+    inline for (.{ error.WarmInferenceServerUnavailable, error.UnsupportedServerGenerateOption, error.MissingInferenceListener, error.RuntimeFailed, error.RuntimeStopping, error.RuntimeAlreadyReady }) |err| {
+        try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
     }
 }

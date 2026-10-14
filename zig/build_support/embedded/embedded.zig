@@ -250,7 +250,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     const capi_native_object = b.addObject(.{
         .name = "antfly-embedded-capi",
         .root_module = capi_mod,
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
     });
     const capi_native_check = b.step("embedded-capi-check", "Compile the public C API with its independent local source owner");
     capi_native_check.dependOn(&capi_native_object.step);
@@ -266,13 +266,16 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         .optimize = optimize,
         .pic = true,
     });
+    if (antfly_imports.shared_inference_core) native_inference_mod.sanitize_thread = antfly_imports.sanitize_thread;
     antfly_imports.configureInference(b, native_inference_mod, link_libc);
     const native_inference = @import("shared_library.zig").addProviderArchive(
         b,
         native_inference_mod,
-        "antfly-embedded-inference",
-        12 * 1024 * 1024 * 1024,
+        if (antfly_imports.shared_inference_core) "antfly-inference-core" else "antfly-embedded-inference",
+        @as(u64, if (antfly_imports.shared_inference_core and target.result.os.tag == .macos) 20 else if (antfly_imports.darwin_release_memory) 8 else 12) * 1024 * 1024 * 1024,
     );
+    native_inference.link_function_sections = true;
+    native_inference.link_data_sections = true;
     const native_enrichment_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/enrichment_compute_root.zig"),
         .target = target,
@@ -283,8 +286,8 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     const native_enrichment = @import("shared_library.zig").addProviderArchive(
         b,
         native_enrichment_mod,
-        "antfly-embedded-enrichment",
-        8 * 1024 * 1024 * 1024,
+        if (options.server_integration_tests) "antfly-runtime-enrichment_compute" else "antfly-embedded-enrichment",
+        @as(u64, if (antfly_imports.darwin_release_memory) 3 else 8) * 1024 * 1024 * 1024,
     );
     const libantfly_link_mod = capi_mod;
     libantfly_link_mod.strip = strip;

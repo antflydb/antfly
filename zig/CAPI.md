@@ -577,3 +577,9 @@ The current batch and durability checkpoint may overrun that cooperative budget.
 Clock-backoff correction leaves queued jobs unchanged on replicas, write-gated
 handles and databases requiring ordered maintenance; it never chooses a local
 write merely to shorten a retry deadline.
+
+Optional replacement waits capture the admitted generation before releasing
+registration admission and retain it across all wait quanta. Cancelling that
+reservation returns `ANTFLY_CANCELLED`, even if another index or replacement
+subsequently reuses the same name and configuration. Identical requests joining
+an existing reservation wait for that reservation's generation.

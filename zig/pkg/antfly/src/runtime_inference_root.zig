@@ -45,7 +45,7 @@ fn inferenceEntry(context: *const bridge.Context) callconv(.c) c_int {
 }
 
 comptime {
-    _ = @import("antfly_inference_native_exports");
+    if (!@import("antfly_inference_engine").enabled) _ = @import("antfly_inference_native_exports");
     exportInternal(&inferenceEntry, "antfly_runtime_inference");
 }
 

@@ -7275,13 +7275,16 @@ pub export fn antfly_db_set_resolver_namespace_json(handle_ptr: ?*anyopaque, res
     return capi.mapErrorContext(error.NotFound, "resolver does not exist");
 }
 
-/// Registration is atomic; optional waiting releases API/path admission
-/// between maintenance quanta so cancellation and writers remain available.
+var test_index_before_wait_quantum: ?*const fn (?*anyopaque) anyerror!void = null;
+
+/// Registration captures the admitted generation atomically. Optional waiting
+/// retains it while releasing API/path admission between maintenance quanta.
 pub export fn antfly_db_add_index_json(handle_ptr: ?*anyopaque, config_json: capi.Slice) capi.ErrorCode {
     capi.clearLastError();
     var request = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, config_json.bytes(), .{}) catch |err| return capi.mapError(err);
     defer request.deinit();
-    const result = addIndexJsonRegistered(handle_ptr, config_json);
+    var generation: u64 = 0;
+    const result = addIndexJsonRegistered(handle_ptr, config_json, &generation);
     if (result != .ok) return result;
     if (request.value != .object) return .ok;
     const wait = request.value.object.get("wait") orelse return .ok;
@@ -7289,6 +7292,8 @@ pub export fn antfly_db_add_index_json(handle_ptr: ?*anyopaque, config_json: cap
     const name = request.value.object.get("name").?.string;
     const deadline = monotonicNowNs() +| @as(u64, @intCast(timeout)) *| std.time.ns_per_ms;
     while (true) {
+        if (builtin.is_test) if (test_index_before_wait_quantum) |hook|
+            hook(handle_ptr) catch |err| return capi.mapError(err);
         const pending = blk: {
             const guard = enterHandle(handle_ptr, .maintain) orelse return capi.mapError(error.InvalidArgument);
             defer guard.leave();
@@ -7296,7 +7301,7 @@ pub export fn antfly_db_add_index_json(handle_ptr: ?*anyopaque, config_json: cap
             const database = guard.handle.database();
             const now = monotonicNowNs();
             const quantum_ms = @min(@as(u64, 100), (deadline -| now +| (std.time.ns_per_ms - 1)) / std.time.ns_per_ms);
-            database.waitGraphReplacement(name, quantum_ms) catch |err| switch (err) {
+            database.waitGraphReplacement(name, generation, quantum_ms) catch |err| switch (err) {
                 error.Busy => break :blk true,
                 else => return capi.mapError(err),
             };
@@ -7311,6 +7316,7 @@ pub export fn antfly_db_add_index_json(handle_ptr: ?*anyopaque, config_json: cap
 fn addIndexJsonRegistered(
     handle_ptr: ?*anyopaque,
     config_json: capi.Slice,
+    generation: *u64,
 ) capi.ErrorCode {
     capi.clearLastError();
     const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
@@ -7385,6 +7391,7 @@ fn addIndexJsonRegistered(
                 return capi.mapErrorContext(error.IndexReplacementConfigurationMismatch, "index name is reserved by a different pending replacement; cancel_replacement before changing it");
             if (job.phase == .failed)
                 return capi.mapErrorContext(error.IndexReplacementFailed, "replacement failed; inspect pending_work_stats and cancel_replacement before retrying");
+            generation.* = job.generation;
             return .ok;
         }
     }
@@ -7429,6 +7436,7 @@ fn addIndexJsonRegistered(
                 return capi.mapErrorContext(error.InvalidArgument, "index already exists with a different configuration");
             }
             existing_index = true;
+            generation.* = cfg.coverage_generation;
         }
     }
     // Reactivate inline identities before graph construction reads retained
@@ -7444,13 +7452,20 @@ fn addIndexJsonRegistered(
         };
     }
     const index_cfg: db_mod.types.IndexConfig = .{ .name = parsed.value.name, .kind = kind, .config_json = stored_config_json };
-    if (!existing_index) (if (replacement != null and handle.database().core.index_manager.get(replacement.?.string) != null)
-        handle.database().replaceGraphIndex(replacement.?.string, index_cfg)
-    else
-        handle.database().addIndex(index_cfg)) catch |err| {
-        if (rollback) |*undo| undo.restore();
-        return capi.mapError(err);
-    };
+    if (!existing_index) {
+        if (replacement != null and handle.database().core.index_manager.get(replacement.?.string) != null) {
+            generation.* = handle.database().replaceGraphIndex(replacement.?.string, index_cfg) catch |err| {
+                if (rollback) |*undo| undo.restore();
+                return capi.mapError(err);
+            };
+        } else {
+            handle.database().addIndex(index_cfg) catch |err| {
+                if (rollback) |*undo| undo.restore();
+                return capi.mapError(err);
+            };
+            generation.* = handle.database().indexGeneration(index_cfg.name) orelse return capi.mapError(error.Cancelled);
+        }
+    }
     if (existing_index and replacement != null) {
         if (handle.database().core.index_manager.get(replacement.?.string) != null) {
             _ = handle.database().deleteIndex(replacement.?.string) catch |err| {
@@ -8214,5 +8229,70 @@ test "capi SQL contention diagnostics preserve busy and unknown outcomes" {
         const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, output.ptr.?[0..output.len], .{});
         defer parsed.deinit();
         try std.testing.expectEqualStrings(case.state, parsed.value.object.get("error").?.object.get("code").?.string);
+    }
+}
+
+test "capi resolver replacement public waits retain admission generation across quanta" {
+    const a = std.testing.allocator;
+    for (0..4) |mode| {
+        var directory = try TestDirectory.init("replacement-public-wait-generation");
+        defer directory.cleanup();
+        try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+        const path = try std.fmt.allocPrintSentinel(a, "{s}/db.aflite", .{directory.path()}, 0);
+        defer a.free(path);
+        const handle = try openLiteHandleAlloc(path, .{ .no_sync = true, .profile = .hosted }, true);
+        const id = try publishHandle(handle);
+        defer antfly_db_close(id);
+        const old = "{\"name\":\"old\",\"type\":\"graph\",\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}]}";
+        const replacement = "{\"name\":\"new\",\"type\":\"graph\",\"replaces\":\"old\",\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}]}";
+        const wait_replace = "{\"name\":\"new\",\"type\":\"graph\",\"replaces\":\"old\",\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}],\"wait\":{\"timeout_ms\":1000}}";
+        const wait_join = "{\"name\":\"new\",\"type\":\"graph\",\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}],\"wait\":{\"timeout_ms\":1000}}";
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(id, .fromSlice(old)));
+        if (mode != 0) try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(id, .fromSlice(replacement)));
+        const Reuse = struct {
+            var later_quantum = false;
+            var calls: usize = 0;
+            var original_generation: u64 = 0;
+            fn hook(handle_ptr: ?*anyopaque) anyerror!void {
+                calls += 1;
+                {
+                    const guard = enterHandle(handle_ptr, .exclusive) orelse return error.TestUnexpectedResult;
+                    defer guard.leave();
+                    if (guard.entry_error != null) return error.TestUnexpectedResult;
+                    const database = guard.handle.database();
+                    const jobs = try database.graphReplacementStatusAlloc(guard.handle.alloc);
+                    defer jobs.deinit();
+                    try std.testing.expectEqual(@as(usize, 1), jobs.value.len);
+                    original_generation = jobs.value[0].generation;
+                    if (later_quantum and calls == 1) {
+                        // Hold the first quantum in backoff, without relying
+                        // on corpus size, scheduler speed or thread timing.
+                        var job = jobs.value[0];
+                        job.retry_after_ns = @as(u64, @intCast(@max(0, std.Io.Timestamp.now(database.core.index_manager.checkpointIo(), .real).toNanoseconds()))) + 2 * std.time.ns_per_s;
+                        try database.core.index_manager.saveGraphReplacementBuild(database.core.store, job);
+                        return;
+                    }
+                }
+                test_index_before_wait_quantum = null;
+                var deleted = false;
+                try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_cancel_replacement(handle_ptr, .fromSlice("new"), &deleted));
+                try std.testing.expect(deleted);
+                try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_run_until_idle(handle_ptr));
+                const different = "{\"name\":\"new\",\"type\":\"graph\",\"edge_types\":[{\"name\":\"R\",\"field\":\"other_links\"}]}";
+                try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(handle_ptr, .fromSlice(different)));
+            }
+        };
+        Reuse.calls = 0;
+        Reuse.original_generation = 0;
+        Reuse.later_quantum = mode == 3;
+        test_index_before_wait_quantum = Reuse.hook;
+        defer test_index_before_wait_quantum = null;
+        try std.testing.expectEqual(capi.ErrorCode.cancelled, antfly_db_add_index_json(id, .fromSlice(if (mode == 2) wait_join else wait_replace)));
+        try std.testing.expectEqual(@as(usize, if (mode == 3) 2 else 1), Reuse.calls);
+        const guard = enterHandle(id, .read) orelse return error.TestUnexpectedResult;
+        defer guard.leave();
+        const database = guard.handle.database();
+        try std.testing.expect(database.indexGeneration("old") != null);
+        try std.testing.expect(database.indexGeneration("new").? != Reuse.original_generation);
     }
 }
