@@ -87,6 +87,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const conformance_fixtures = shared.conformance_fixtures;
     const target = shared.target;
     const optimize = shared.optimize;
+    @import("pkg/antfly-migrate/build_support.zig").add(b, target, optimize, "pkg/antfly-migrate", "pkg/antfly-embedded/include", "zig-out/lib");
     const vopr_mod = shared.vopr_mod;
     const strip = shared.strip;
     const lmdb_backend = shared.lmdb_backend;

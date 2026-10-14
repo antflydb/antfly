@@ -1,0 +1,1441 @@
+{
+  "codex_commit": "bcbea11dc64c4b87f50906f38a47fa176b800bca",
+  "schema_sha256": "1aaf7138747636935b3cdd6001e5bc96339fdc47c6fe9a064ffb85e0e99b2697",
+  "migrations": [
+    {
+      "version": 1,
+      "name": "codex state tables"
+    },
+    {
+      "version": 20,
+      "name": "agent message board tables"
+    },
+    {
+      "version": 21,
+      "name": "agent message board channel descriptions"
+    },
+    {
+      "version": 22,
+      "name": "thread read receipts"
+    }
+  ],
+  "statements": [
+    "CREATE TABLE IF NOT EXISTS codex_thread_sections (\n            id TEXT PRIMARY KEY,\n            name TEXT NOT NULL,\n            appearance TEXT\n        )",
+    "INSERT INTO codex_thread_sections (id, name) VALUES ('01984de2-8f74-7c91-a3b2-5c5e937cf318', 'Pinned') ON CONFLICT (id) DO NOTHING",
+    "CREATE TABLE IF NOT EXISTS codex_projects (\n            id TEXT PRIMARY KEY,\n            name TEXT NOT NULL,\n            metadata JSONB NOT NULL,\n            position BIGINT NOT NULL,\n            created_at_ms BIGINT NOT NULL,\n            updated_at_ms BIGINT NOT NULL\n        )",
+    "CREATE INDEX IF NOT EXISTS codex_projects_position ON codex_projects (position, id)",
+    "CREATE TABLE IF NOT EXISTS codex_project_roots (\n            project_id TEXT NOT NULL REFERENCES codex_projects (id) ON DELETE CASCADE,\n            position BIGINT NOT NULL,\n            path TEXT NOT NULL,\n            PRIMARY KEY (project_id, position)\n        )",
+    "CREATE TABLE IF NOT EXISTS codex_project_idempotency_keys (\n            key TEXT PRIMARY KEY,\n            project_id TEXT NOT NULL,\n            created_at_ms BIGINT NOT NULL\n        )",
+    "CREATE TABLE IF NOT EXISTS codex_threads (\n            id TEXT PRIMARY KEY,\n            rollout_path TEXT NOT NULL,\n            created_at BIGINT NOT NULL,\n            updated_at BIGINT NOT NULL,\n            created_at_ms BIGINT NOT NULL,\n            updated_at_ms BIGINT NOT NULL,\n            recency_at BIGINT NOT NULL,\n            recency_at_ms BIGINT NOT NULL,\n            source TEXT NOT NULL,\n            thread_source TEXT,\n            model_provider TEXT NOT NULL,\n            model TEXT,\n            reasoning_effort TEXT,\n            cwd TEXT NOT NULL,\n            title TEXT NOT NULL,\n            name TEXT,\n            preview TEXT NOT NULL DEFAULT '',\n            first_user_message TEXT NOT NULL DEFAULT '',\n            sandbox_policy TEXT NOT NULL,\n            approval_mode TEXT NOT NULL,\n            tokens_used BIGINT NOT NULL DEFAULT 0,\n            has_user_event BOOLEAN NOT NULL DEFAULT false,\n            archived BOOLEAN NOT NULL DEFAULT false,\n            archived_at BIGINT,\n            git_sha TEXT,\n            git_branch TEXT,\n            git_origin_url TEXT,\n            cli_version TEXT NOT NULL DEFAULT '',\n            agent_nickname TEXT,\n            agent_role TEXT,\n            agent_path TEXT,\n            memory_mode TEXT NOT NULL DEFAULT 'enabled',\n            history_mode TEXT NOT NULL DEFAULT 'legacy',\n            is_pinned BOOLEAN NOT NULL DEFAULT false,\n            thread_section_id TEXT REFERENCES codex_thread_sections (id) ON DELETE SET NULL,\n            section_position BIGINT,\n            section_entered_at_ms BIGINT,\n            project_id TEXT REFERENCES codex_projects (id) ON DELETE SET NULL,\n            originator TEXT,\n            daybreak_enabled BOOLEAN,\n            creator_user_id TEXT,\n            creator_account_id TEXT,\n            extra JSONB,\n            forked_from_id TEXT,\n            history_base_thread_id TEXT,\n            history_base_end_ordinal BIGINT,\n            subagent_history_start_ordinal BIGINT,\n            multi_agent_version TEXT,\n            next_ordinal BIGINT NOT NULL DEFAULT 0\n        )",
+    "CREATE INDEX IF NOT EXISTS codex_threads_created ON codex_threads (archived, created_at_ms DESC, id DESC)",
+    "CREATE INDEX IF NOT EXISTS codex_threads_updated ON codex_threads (archived, updated_at_ms DESC, id DESC)",
+    "CREATE INDEX IF NOT EXISTS codex_threads_recency ON codex_threads (archived, recency_at_ms DESC, id DESC)",
+    "CREATE INDEX IF NOT EXISTS codex_threads_cwd_created ON codex_threads (archived, cwd, created_at_ms DESC, id DESC)",
+    "CREATE INDEX IF NOT EXISTS codex_threads_cwd_updated ON codex_threads (archived, cwd, updated_at_ms DESC, id DESC)",
+    "CREATE INDEX IF NOT EXISTS codex_threads_cwd_recency ON codex_threads (archived, cwd, recency_at_ms DESC, id DESC)",
+    "CREATE INDEX IF NOT EXISTS codex_threads_visible_recency ON codex_threads (archived, recency_at_ms DESC, id DESC) WHERE preview <> ''",
+    "CREATE INDEX IF NOT EXISTS codex_threads_pinned_recency ON codex_threads (archived, recency_at_ms DESC, id DESC) WHERE is_pinned = true",
+    "CREATE INDEX IF NOT EXISTS codex_threads_section_recency ON codex_threads (archived, thread_section_id, recency_at_ms DESC, id DESC) WHERE thread_section_id IS NOT NULL",
+    "CREATE INDEX IF NOT EXISTS codex_threads_section_position ON codex_threads (archived, thread_section_id, section_position, id) WHERE thread_section_id IS NOT NULL",
+    "CREATE INDEX IF NOT EXISTS codex_threads_project ON codex_threads (project_id, archived, recency_at_ms DESC, id DESC) WHERE project_id IS NOT NULL",
+    "CREATE INDEX IF NOT EXISTS codex_threads_rollout_path ON codex_threads (rollout_path)",
+    "CREATE TABLE IF NOT EXISTS codex_thread_dynamic_tools (\n            thread_id TEXT NOT NULL REFERENCES codex_threads (id) ON DELETE CASCADE,\n            position BIGINT NOT NULL,\n            name TEXT NOT NULL,\n            description TEXT NOT NULL,\n            input_schema JSONB NOT NULL,\n            defer_loading BOOLEAN NOT NULL DEFAULT false,\n            namespace TEXT,\n            PRIMARY KEY (thread_id, position)\n        )",
+    "CREATE TABLE IF NOT EXISTS codex_thread_spawn_edges (\n            child_thread_id TEXT PRIMARY KEY,\n            parent_thread_id TEXT NOT NULL,\n            status TEXT NOT NULL\n        )",
+    "CREATE INDEX IF NOT EXISTS codex_thread_spawn_edges_parent ON codex_thread_spawn_edges (parent_thread_id, status)",
+    "CREATE TABLE IF NOT EXISTS codex_thread_attachments (\n            id TEXT PRIMARY KEY,\n            thread_id TEXT NOT NULL REFERENCES codex_threads (id) ON DELETE CASCADE,\n            attachment_type TEXT NOT NULL,\n            identity_key TEXT NOT NULL,\n            payload JSONB NOT NULL,\n            created_at BIGINT NOT NULL,\n            UNIQUE (thread_id, attachment_type, identity_key)\n        )",
+    "CREATE INDEX IF NOT EXISTS codex_thread_attachments_thread ON codex_thread_attachments (thread_id, created_at, id)",
+    "CREATE INDEX IF NOT EXISTS codex_thread_attachments_identity ON codex_thread_attachments (attachment_type, identity_key, thread_id)",
+    "CREATE TABLE IF NOT EXISTS codex_thread_turns (\n            thread_id TEXT NOT NULL,\n            turn_id TEXT NOT NULL,\n            rollout_ordinal BIGINT NOT NULL,\n            rollout_end_ordinal BIGINT,\n            root_turn_id TEXT,\n            status TEXT NOT NULL,\n            error_json JSONB,\n            started_at BIGINT,\n            completed_at BIGINT,\n            duration_ms BIGINT,\n            first_user_item_id TEXT,\n            final_agent_item_id TEXT,\n            latest_unphased_agent_item_id TEXT,\n            PRIMARY KEY (thread_id, turn_id),\n            UNIQUE (thread_id, rollout_ordinal)\n        )",
+    "CREATE INDEX IF NOT EXISTS codex_thread_turns_end ON codex_thread_turns (thread_id, rollout_end_ordinal, turn_id) WHERE rollout_end_ordinal IS NOT NULL",
+    "CREATE TABLE IF NOT EXISTS codex_thread_items (\n            thread_id TEXT NOT NULL,\n            turn_id TEXT NOT NULL,\n            item_id TEXT NOT NULL,\n            rollout_ordinal BIGINT NOT NULL,\n            updated_at_ordinal BIGINT NOT NULL DEFAULT 0,\n            item_type TEXT NOT NULL DEFAULT '',\n            item_json JSONB NOT NULL,\n            created_at_ms BIGINT NOT NULL,\n            started_at_ms BIGINT,\n            completed_at_ms BIGINT,\n            PRIMARY KEY (thread_id, turn_id, item_id),\n            UNIQUE (thread_id, rollout_ordinal)\n        )",
+    "CREATE INDEX IF NOT EXISTS codex_thread_items_turn ON codex_thread_items (thread_id, turn_id, rollout_ordinal)",
+    "CREATE INDEX IF NOT EXISTS codex_thread_items_updated ON codex_thread_items (thread_id, updated_at_ordinal)",
+    "CREATE INDEX IF NOT EXISTS codex_thread_items_turn_updated ON codex_thread_items (thread_id, turn_id, updated_at_ordinal)",
+    "CREATE INDEX IF NOT EXISTS codex_thread_items_user ON codex_thread_items (thread_id, rollout_ordinal) WHERE item_type = 'userMessage'",
+    "CREATE TABLE IF NOT EXISTS codex_thread_history_projection_state (\n            thread_id TEXT PRIMARY KEY,\n            next_rollout_ordinal BIGINT NOT NULL\n        )",
+    "CREATE TABLE IF NOT EXISTS codex_thread_realtime_items (\n            thread_id TEXT NOT NULL,\n            item_id TEXT NOT NULL,\n            rollout_ordinal BIGINT NOT NULL,\n            created_at_ms BIGINT NOT NULL,\n            item_type TEXT NOT NULL,\n            item_json JSONB NOT NULL,\n            PRIMARY KEY (thread_id, item_id),\n            UNIQUE (thread_id, rollout_ordinal)\n        )",
+    "CREATE TABLE IF NOT EXISTS codex_thread_goals (\n            thread_id TEXT PRIMARY KEY,\n            goal_id TEXT NOT NULL,\n            objective TEXT NOT NULL,\n            status TEXT NOT NULL CHECK (status = 'active' OR status = 'paused' OR status = 'blocked' OR status = 'usage_limited' OR status = 'budget_limited' OR status = 'complete'),\n            token_budget BIGINT,\n            tokens_used BIGINT NOT NULL DEFAULT 0,\n            time_used_seconds BIGINT NOT NULL DEFAULT 0,\n            created_at_ms BIGINT NOT NULL,\n            updated_at_ms BIGINT NOT NULL\n        )",
+    "CREATE TABLE IF NOT EXISTS codex_thread_goal_continuation_deferrals (\n            thread_id TEXT PRIMARY KEY REFERENCES codex_thread_goals (thread_id) ON DELETE CASCADE\n        )",
+    "CREATE TABLE IF NOT EXISTS codex_stage1_outputs (\n            version TEXT NOT NULL,\n            thread_id TEXT NOT NULL,\n            source_updated_at BIGINT NOT NULL,\n            raw_memory TEXT NOT NULL,\n            rollout_summary TEXT NOT NULL,\n            rollout_slug TEXT,\n            generated_at BIGINT NOT NULL,\n            usage_count BIGINT,\n            last_usage BIGINT,\n            selected_for_phase2 BOOLEAN NOT NULL DEFAULT false,\n            selected_for_phase2_source_updated_at BIGINT,\n            PRIMARY KEY (version, thread_id)\n        )",
+    "CREATE INDEX IF NOT EXISTS codex_stage1_outputs_source ON codex_stage1_outputs (version, source_updated_at DESC, thread_id DESC)",
+    "CREATE TABLE IF NOT EXISTS codex_jobs (\n            version TEXT NOT NULL,\n            kind TEXT NOT NULL,\n            job_key TEXT NOT NULL,\n            status TEXT NOT NULL,\n            worker_id TEXT,\n            ownership_token TEXT,\n            started_at BIGINT,\n            finished_at BIGINT,\n            lease_until BIGINT,\n            retry_at BIGINT,\n            retry_remaining BIGINT NOT NULL,\n            last_error TEXT,\n            input_watermark BIGINT,\n            last_success_watermark BIGINT,\n            PRIMARY KEY (version, kind, job_key)\n        )",
+    "CREATE INDEX IF NOT EXISTS codex_jobs_claim ON codex_jobs (version, kind, status, retry_at, lease_until)",
+    "CREATE TABLE IF NOT EXISTS codex_consolidation_progress (\n            version TEXT PRIMARY KEY,\n            max_thread_count BIGINT NOT NULL DEFAULT 0\n        )",
+    "CREATE TABLE IF NOT EXISTS codex_queued_items (\n            id TEXT PRIMARY KEY,\n            thread_id TEXT NOT NULL,\n            payload_json JSONB NOT NULL,\n            queue_order BIGINT NOT NULL,\n            created_at_ms BIGINT NOT NULL,\n            updated_at_ms BIGINT NOT NULL,\n            UNIQUE (thread_id, queue_order)\n        )",
+    "CREATE TABLE IF NOT EXISTS codex_queued_thread_revisions (\n            thread_id TEXT PRIMARY KEY,\n            revision BIGINT NOT NULL\n        )",
+    "CREATE INDEX IF NOT EXISTS codex_queued_thread_revisions_revision ON codex_queued_thread_revisions (revision)",
+    "CREATE TABLE IF NOT EXISTS codex_guardian_review_feedback (\n            id TEXT PRIMARY KEY,\n            thread_id TEXT NOT NULL REFERENCES codex_threads (id) ON DELETE CASCADE,\n            record TEXT NOT NULL,\n            record_bytes BIGINT NOT NULL\n        )",
+    "CREATE INDEX IF NOT EXISTS codex_guardian_review_feedback_thread ON codex_guardian_review_feedback (thread_id, id)",
+    "CREATE TABLE IF NOT EXISTS codex_remote_control_enrollments (\n            websocket_url TEXT NOT NULL,\n            account_id TEXT NOT NULL,\n            app_server_client_name TEXT NOT NULL,\n            server_id TEXT NOT NULL,\n            environment_id TEXT NOT NULL,\n            server_name TEXT NOT NULL,\n            updated_at BIGINT NOT NULL,\n            remote_control_enabled BOOLEAN,\n            PRIMARY KEY (websocket_url, account_id, app_server_client_name)\n        )",
+    "CREATE TABLE IF NOT EXISTS codex_external_agent_config_imports (\n            import_id TEXT PRIMARY KEY,\n            completed_at_ms BIGINT NOT NULL,\n            successes JSONB NOT NULL,\n            failures JSONB NOT NULL,\n            provider_id TEXT\n        )",
+    "CREATE INDEX IF NOT EXISTS codex_external_agent_config_imports_completed ON codex_external_agent_config_imports (completed_at_ms DESC, import_id DESC)",
+    "CREATE TABLE IF NOT EXISTS codex_backfill_state (\n            id BIGINT PRIMARY KEY CHECK (id = 1),\n            status TEXT NOT NULL,\n            last_watermark TEXT,\n            last_success_at BIGINT,\n            updated_at BIGINT NOT NULL\n        )",
+    "CREATE TABLE IF NOT EXISTS codex_rollout_migration_state (\n            migration_id TEXT PRIMARY KEY,\n            last_checked_thread_created_at BIGINT,\n            last_checked_thread_id TEXT,\n            updated_at BIGINT NOT NULL\n        )",
+    "CREATE TABLE IF NOT EXISTS codex_rollout_migration_skipped_rollouts (\n            migration_id TEXT NOT NULL,\n            rollout_path TEXT NOT NULL,\n            rollout_size_bytes BIGINT NOT NULL,\n            rollout_modified_at_ns BIGINT NOT NULL,\n            skip_reason TEXT NOT NULL,\n            skipped_at BIGINT NOT NULL,\n            PRIMARY KEY (migration_id, rollout_path)\n        )",
+    "CREATE TABLE IF NOT EXISTS codex_message_board_tombstones (\n            board TEXT PRIMARY KEY\n        )",
+    "CREATE TABLE IF NOT EXISTS codex_message_board_channels (\n            board TEXT NOT NULL,\n            name TEXT NOT NULL,\n            name_search TEXT NOT NULL,\n            created_at TEXT NOT NULL,\n            timestamp_us BIGINT NOT NULL,\n            author TEXT NOT NULL,\n            PRIMARY KEY (board, name)\n        )",
+    "CREATE TABLE IF NOT EXISTS codex_message_board_posts (\n            board TEXT NOT NULL,\n            id TEXT NOT NULL,\n            channel TEXT NOT NULL,\n            root TEXT NOT NULL,\n            is_root BOOLEAN NOT NULL,\n            author TEXT NOT NULL,\n            timestamp_us BIGINT NOT NULL,\n            seq BIGINT NOT NULL,\n            body_search TEXT NOT NULL,\n            payload JSONB NOT NULL,\n            request_id TEXT NOT NULL,\n            request JSONB NOT NULL,\n            PRIMARY KEY (board, id)\n        )",
+    "CREATE UNIQUE INDEX IF NOT EXISTS codex_message_board_posts_request ON codex_message_board_posts (board, request_id)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS codex_message_board_posts_seq ON codex_message_board_posts (board, seq)",
+    "CREATE INDEX IF NOT EXISTS codex_message_board_posts_channel ON codex_message_board_posts (board, channel, seq)",
+    "CREATE INDEX IF NOT EXISTS codex_message_board_posts_channel_timestamp ON codex_message_board_posts (board, channel, timestamp_us, seq)",
+    "CREATE INDEX IF NOT EXISTS codex_message_board_posts_roots_created ON codex_message_board_posts (board, channel, timestamp_us, seq) WHERE is_root = true",
+    "CREATE INDEX IF NOT EXISTS codex_message_board_posts_root ON codex_message_board_posts (board, root, seq)",
+    "CREATE INDEX IF NOT EXISTS codex_message_board_posts_root_timestamp ON codex_message_board_posts (board, root, timestamp_us, seq)",
+    "CREATE INDEX IF NOT EXISTS codex_message_board_posts_timestamp ON codex_message_board_posts (board, timestamp_us, seq)",
+    "CREATE TABLE IF NOT EXISTS codex_message_board_subscriptions (\n            board TEXT NOT NULL,\n            target TEXT NOT NULL,\n            agent TEXT NOT NULL,\n            PRIMARY KEY (board, target, agent)\n        )",
+    "CREATE TABLE IF NOT EXISTS codex_message_board_subscription_opt_outs (\n            board TEXT NOT NULL,\n            target TEXT NOT NULL,\n            agent TEXT NOT NULL,\n            PRIMARY KEY (board, target, agent)\n        )",
+    "ALTER TABLE codex_message_board_channels ADD COLUMN description TEXT",
+    "CREATE TABLE IF NOT EXISTS codex_thread_read_receipts (\n        thread_id TEXT PRIMARY KEY,\n        first_unread_turn TEXT,\n        revision TEXT NOT NULL,\n        last_published_turn TEXT\n    )"
+  ],
+  "migration_table": "CREATE TABLE IF NOT EXISTS codex_schema_migrations (\n    version BIGINT PRIMARY KEY,\n    name TEXT NOT NULL,\n    applied_at_ms BIGINT NOT NULL\n)",
+  "tables": {
+    "codex_thread_sections": {
+      "columns": [
+        {
+          "name": "id",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "name",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "appearance",
+          "type": "text",
+          "nullable": true
+        }
+      ],
+      "key": [
+        "id"
+      ]
+    },
+    "codex_projects": {
+      "columns": [
+        {
+          "name": "id",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "name",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "metadata",
+          "type": "json",
+          "nullable": false
+        },
+        {
+          "name": "position",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "created_at_ms",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "updated_at_ms",
+          "type": "integer",
+          "nullable": false
+        }
+      ],
+      "key": [
+        "id"
+      ]
+    },
+    "codex_project_roots": {
+      "columns": [
+        {
+          "name": "project_id",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "position",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "path",
+          "type": "text",
+          "nullable": false
+        }
+      ],
+      "key": [
+        "project_id",
+        "position"
+      ]
+    },
+    "codex_project_idempotency_keys": {
+      "columns": [
+        {
+          "name": "key",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "project_id",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "created_at_ms",
+          "type": "integer",
+          "nullable": false
+        }
+      ],
+      "key": [
+        "key"
+      ]
+    },
+    "codex_threads": {
+      "columns": [
+        {
+          "name": "id",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "rollout_path",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "created_at",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "updated_at",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "created_at_ms",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "updated_at_ms",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "recency_at",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "recency_at_ms",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "source",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "thread_source",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "model_provider",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "model",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "reasoning_effort",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "cwd",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "title",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "name",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "preview",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "first_user_message",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "sandbox_policy",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "approval_mode",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "tokens_used",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "has_user_event",
+          "type": "boolean",
+          "nullable": false
+        },
+        {
+          "name": "archived",
+          "type": "boolean",
+          "nullable": false
+        },
+        {
+          "name": "archived_at",
+          "type": "integer",
+          "nullable": true
+        },
+        {
+          "name": "git_sha",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "git_branch",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "git_origin_url",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "cli_version",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "agent_nickname",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "agent_role",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "agent_path",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "memory_mode",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "history_mode",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "is_pinned",
+          "type": "boolean",
+          "nullable": false
+        },
+        {
+          "name": "thread_section_id",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "section_position",
+          "type": "integer",
+          "nullable": true
+        },
+        {
+          "name": "section_entered_at_ms",
+          "type": "integer",
+          "nullable": true
+        },
+        {
+          "name": "project_id",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "originator",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "daybreak_enabled",
+          "type": "boolean",
+          "nullable": true
+        },
+        {
+          "name": "creator_user_id",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "creator_account_id",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "extra",
+          "type": "json",
+          "nullable": true
+        },
+        {
+          "name": "forked_from_id",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "history_base_thread_id",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "history_base_end_ordinal",
+          "type": "integer",
+          "nullable": true
+        },
+        {
+          "name": "subagent_history_start_ordinal",
+          "type": "integer",
+          "nullable": true
+        },
+        {
+          "name": "multi_agent_version",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "next_ordinal",
+          "type": "integer",
+          "nullable": false
+        }
+      ],
+      "key": [
+        "id"
+      ]
+    },
+    "codex_thread_dynamic_tools": {
+      "columns": [
+        {
+          "name": "thread_id",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "position",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "name",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "description",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "input_schema",
+          "type": "json",
+          "nullable": false
+        },
+        {
+          "name": "defer_loading",
+          "type": "boolean",
+          "nullable": false
+        },
+        {
+          "name": "namespace",
+          "type": "text",
+          "nullable": true
+        }
+      ],
+      "key": [
+        "thread_id",
+        "position"
+      ]
+    },
+    "codex_thread_spawn_edges": {
+      "columns": [
+        {
+          "name": "child_thread_id",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "parent_thread_id",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "status",
+          "type": "text",
+          "nullable": false
+        }
+      ],
+      "key": [
+        "child_thread_id"
+      ]
+    },
+    "codex_thread_attachments": {
+      "columns": [
+        {
+          "name": "id",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "thread_id",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "attachment_type",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "identity_key",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "payload",
+          "type": "json",
+          "nullable": false
+        },
+        {
+          "name": "created_at",
+          "type": "integer",
+          "nullable": false
+        }
+      ],
+      "key": [
+        "id"
+      ]
+    },
+    "codex_thread_turns": {
+      "columns": [
+        {
+          "name": "thread_id",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "turn_id",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "rollout_ordinal",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "rollout_end_ordinal",
+          "type": "integer",
+          "nullable": true
+        },
+        {
+          "name": "root_turn_id",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "status",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "error_json",
+          "type": "json",
+          "nullable": true
+        },
+        {
+          "name": "started_at",
+          "type": "integer",
+          "nullable": true
+        },
+        {
+          "name": "completed_at",
+          "type": "integer",
+          "nullable": true
+        },
+        {
+          "name": "duration_ms",
+          "type": "integer",
+          "nullable": true
+        },
+        {
+          "name": "first_user_item_id",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "final_agent_item_id",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "latest_unphased_agent_item_id",
+          "type": "text",
+          "nullable": true
+        }
+      ],
+      "key": [
+        "thread_id",
+        "turn_id"
+      ]
+    },
+    "codex_thread_items": {
+      "columns": [
+        {
+          "name": "thread_id",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "turn_id",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "item_id",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "rollout_ordinal",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "updated_at_ordinal",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "item_type",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "item_json",
+          "type": "json",
+          "nullable": false
+        },
+        {
+          "name": "created_at_ms",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "started_at_ms",
+          "type": "integer",
+          "nullable": true
+        },
+        {
+          "name": "completed_at_ms",
+          "type": "integer",
+          "nullable": true
+        }
+      ],
+      "key": [
+        "thread_id",
+        "turn_id",
+        "item_id"
+      ]
+    },
+    "codex_thread_history_projection_state": {
+      "columns": [
+        {
+          "name": "thread_id",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "next_rollout_ordinal",
+          "type": "integer",
+          "nullable": false
+        }
+      ],
+      "key": [
+        "thread_id"
+      ]
+    },
+    "codex_thread_realtime_items": {
+      "columns": [
+        {
+          "name": "thread_id",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "item_id",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "rollout_ordinal",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "created_at_ms",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "item_type",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "item_json",
+          "type": "json",
+          "nullable": false
+        }
+      ],
+      "key": [
+        "thread_id",
+        "item_id"
+      ]
+    },
+    "codex_thread_goals": {
+      "columns": [
+        {
+          "name": "thread_id",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "goal_id",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "objective",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "status",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "token_budget",
+          "type": "integer",
+          "nullable": true
+        },
+        {
+          "name": "tokens_used",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "time_used_seconds",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "created_at_ms",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "updated_at_ms",
+          "type": "integer",
+          "nullable": false
+        }
+      ],
+      "key": [
+        "thread_id"
+      ]
+    },
+    "codex_thread_goal_continuation_deferrals": {
+      "columns": [
+        {
+          "name": "thread_id",
+          "type": "text",
+          "nullable": false
+        }
+      ],
+      "key": [
+        "thread_id"
+      ]
+    },
+    "codex_stage1_outputs": {
+      "columns": [
+        {
+          "name": "version",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "thread_id",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "source_updated_at",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "raw_memory",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "rollout_summary",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "rollout_slug",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "generated_at",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "usage_count",
+          "type": "integer",
+          "nullable": true
+        },
+        {
+          "name": "last_usage",
+          "type": "integer",
+          "nullable": true
+        },
+        {
+          "name": "selected_for_phase2",
+          "type": "boolean",
+          "nullable": false
+        },
+        {
+          "name": "selected_for_phase2_source_updated_at",
+          "type": "integer",
+          "nullable": true
+        }
+      ],
+      "key": [
+        "version",
+        "thread_id"
+      ]
+    },
+    "codex_jobs": {
+      "columns": [
+        {
+          "name": "version",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "kind",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "job_key",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "status",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "worker_id",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "ownership_token",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "started_at",
+          "type": "integer",
+          "nullable": true
+        },
+        {
+          "name": "finished_at",
+          "type": "integer",
+          "nullable": true
+        },
+        {
+          "name": "lease_until",
+          "type": "integer",
+          "nullable": true
+        },
+        {
+          "name": "retry_at",
+          "type": "integer",
+          "nullable": true
+        },
+        {
+          "name": "retry_remaining",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "last_error",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "input_watermark",
+          "type": "integer",
+          "nullable": true
+        },
+        {
+          "name": "last_success_watermark",
+          "type": "integer",
+          "nullable": true
+        }
+      ],
+      "key": [
+        "version",
+        "kind",
+        "job_key"
+      ]
+    },
+    "codex_consolidation_progress": {
+      "columns": [
+        {
+          "name": "version",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "max_thread_count",
+          "type": "integer",
+          "nullable": false
+        }
+      ],
+      "key": [
+        "version"
+      ]
+    },
+    "codex_queued_items": {
+      "columns": [
+        {
+          "name": "id",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "thread_id",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "payload_json",
+          "type": "json",
+          "nullable": false
+        },
+        {
+          "name": "queue_order",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "created_at_ms",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "updated_at_ms",
+          "type": "integer",
+          "nullable": false
+        }
+      ],
+      "key": [
+        "id"
+      ]
+    },
+    "codex_queued_thread_revisions": {
+      "columns": [
+        {
+          "name": "thread_id",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "revision",
+          "type": "integer",
+          "nullable": false
+        }
+      ],
+      "key": [
+        "thread_id"
+      ]
+    },
+    "codex_guardian_review_feedback": {
+      "columns": [
+        {
+          "name": "id",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "thread_id",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "record",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "record_bytes",
+          "type": "integer",
+          "nullable": false
+        }
+      ],
+      "key": [
+        "id"
+      ]
+    },
+    "codex_remote_control_enrollments": {
+      "columns": [
+        {
+          "name": "websocket_url",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "account_id",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "app_server_client_name",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "server_id",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "environment_id",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "server_name",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "updated_at",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "remote_control_enabled",
+          "type": "boolean",
+          "nullable": true
+        }
+      ],
+      "key": [
+        "websocket_url",
+        "account_id",
+        "app_server_client_name"
+      ]
+    },
+    "codex_external_agent_config_imports": {
+      "columns": [
+        {
+          "name": "import_id",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "completed_at_ms",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "successes",
+          "type": "json",
+          "nullable": false
+        },
+        {
+          "name": "failures",
+          "type": "json",
+          "nullable": false
+        },
+        {
+          "name": "provider_id",
+          "type": "text",
+          "nullable": true
+        }
+      ],
+      "key": [
+        "import_id"
+      ]
+    },
+    "codex_backfill_state": {
+      "columns": [
+        {
+          "name": "id",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "status",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "last_watermark",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "last_success_at",
+          "type": "integer",
+          "nullable": true
+        },
+        {
+          "name": "updated_at",
+          "type": "integer",
+          "nullable": false
+        }
+      ],
+      "key": [
+        "id"
+      ]
+    },
+    "codex_rollout_migration_state": {
+      "columns": [
+        {
+          "name": "migration_id",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "last_checked_thread_created_at",
+          "type": "integer",
+          "nullable": true
+        },
+        {
+          "name": "last_checked_thread_id",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "updated_at",
+          "type": "integer",
+          "nullable": false
+        }
+      ],
+      "key": [
+        "migration_id"
+      ]
+    },
+    "codex_rollout_migration_skipped_rollouts": {
+      "columns": [
+        {
+          "name": "migration_id",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "rollout_path",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "rollout_size_bytes",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "rollout_modified_at_ns",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "skip_reason",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "skipped_at",
+          "type": "integer",
+          "nullable": false
+        }
+      ],
+      "key": [
+        "migration_id",
+        "rollout_path"
+      ]
+    },
+    "codex_message_board_tombstones": {
+      "columns": [
+        {
+          "name": "board",
+          "type": "text",
+          "nullable": false
+        }
+      ],
+      "key": [
+        "board"
+      ]
+    },
+    "codex_message_board_channels": {
+      "columns": [
+        {
+          "name": "board",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "name",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "name_search",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "created_at",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "timestamp_us",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "author",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "description",
+          "type": "text",
+          "nullable": true
+        }
+      ],
+      "key": [
+        "board",
+        "name"
+      ]
+    },
+    "codex_message_board_posts": {
+      "columns": [
+        {
+          "name": "board",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "id",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "channel",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "root",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "is_root",
+          "type": "boolean",
+          "nullable": false
+        },
+        {
+          "name": "author",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "timestamp_us",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "seq",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "body_search",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "payload",
+          "type": "json",
+          "nullable": false
+        },
+        {
+          "name": "request_id",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "request",
+          "type": "json",
+          "nullable": false
+        }
+      ],
+      "key": [
+        "board",
+        "id"
+      ]
+    },
+    "codex_message_board_subscriptions": {
+      "columns": [
+        {
+          "name": "board",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "target",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "agent",
+          "type": "text",
+          "nullable": false
+        }
+      ],
+      "key": [
+        "board",
+        "target",
+        "agent"
+      ]
+    },
+    "codex_message_board_subscription_opt_outs": {
+      "columns": [
+        {
+          "name": "board",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "target",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "agent",
+          "type": "text",
+          "nullable": false
+        }
+      ],
+      "key": [
+        "board",
+        "target",
+        "agent"
+      ]
+    },
+    "codex_thread_read_receipts": {
+      "columns": [
+        {
+          "name": "thread_id",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "first_unread_turn",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "revision",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "last_published_turn",
+          "type": "text",
+          "nullable": true
+        }
+      ],
+      "key": [
+        "thread_id"
+      ]
+    },
+    "codex_schema_migrations": {
+      "columns": [
+        {
+          "name": "version",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "name",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "applied_at_ms",
+          "type": "integer",
+          "nullable": false
+        }
+      ],
+      "key": [
+        "version"
+      ]
+    }
+  }
+}

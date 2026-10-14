@@ -6,6 +6,7 @@
     "zig/tools",
     "zig/examples",
     "zig/pkg/antfly-embedded",
+    "zig/pkg/antfly-migrate",
     "zig/pkg/antfly-client",
     "zig/pkg/antfly-server-api",
     "zig/pkg/inference",

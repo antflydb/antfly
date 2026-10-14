@@ -10,6 +10,8 @@ shared terminology is in the [glossary](glossary.mdx).
 - [Reference](reference/) — authentication, secrets, SDKs, formats, CLI packaging, and [licensing maintenance](reference/licensing.md).
 - [Operations](operations/) — object-storage operations and runtime verification history.
 - [Design](design/) — current architecture and technical decisions; the [Zig roadmap](../zig/ROADMAP.md#design-documents) indexes subsystem documents kept beside their code.
+  The [SQLite to aflite migration design](design/sqlite-aflite-migration.md) covers the standalone migration tool and application-owned mappings.
+  The [Codex migration profile](design/codex-sqlite-migration.md) covers its complete schema mappings, history ownership and lossless cutover gates.
 - [Plans](plans/README.md) — proposed and active work.
 - [UI](ui/react-antfly.mdx) — React integration.
 - [Implementation history](design/history.md) — dated evidence grouped by topic under design, reference, and operations.
