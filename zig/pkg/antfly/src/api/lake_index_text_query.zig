@@ -781,7 +781,7 @@ const Execution = struct {
             location.* = self.highlight_locations.get(hit.id) orelse return error.InvalidNativeLakeTextCorpus;
             index.* = position;
         }
-        std.mem.sort(usize, order, locations, struct {
+        std.mem.sort(usize, order, @as([]const StoredHighlightLocation, locations), struct {
             fn less(rows: []const StoredHighlightLocation, l: usize, r: usize) bool {
                 const segment_order = std.mem.order(u8, &rows[l].segment, &rows[r].segment);
                 if (segment_order != .eq) return segment_order == .lt;
