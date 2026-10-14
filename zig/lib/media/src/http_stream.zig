@@ -24,6 +24,13 @@ const live = @import("live_mp4.zig");
 /// otherwise it is destroyed when the callback returns, including on failure.
 pub const FragmentDelivery = struct {
     segment: ?live.Segment,
+    /// Successful callback return acknowledges automatically. On failure the
+    /// consumer may acknowledge an irreversible accepted side effect explicitly.
+    /// Taking ownership alone does not acknowledge queue/model acceptance.
+    acknowledged: bool = false,
+    pub fn acknowledge(self: *FragmentDelivery) void {
+        self.acknowledged = true;
+    }
     pub fn take(self: *FragmentDelivery) !live.Segment {
         const result = self.segment orelse return error.FragmentAlreadyTaken;
         self.segment = null;
@@ -31,6 +38,59 @@ pub const FragmentDelivery = struct {
     }
 };
 pub const StreamStats = struct { bytes: usize = 0, fragments: usize = 0, largest_pending_capacity: usize = 0 };
+/// Caller-owned, constant-space in-process prefix commitment. One ledger binds
+/// one immutable URL/range/init/epoch. Fresh resources require fresh ledgers.
+/// No automatic retry or durable/external exactly-once delivery is implied.
+pub const FragmentLedger = struct {
+    binding: ?[32]u8 = null,
+    prefix: [32]u8 = @splat(0),
+    acknowledged: usize = 0,
+    attempts: usize = 0,
+    complete: bool = false,
+    invalid: bool = false,
+    active: bool = false,
+    /// Explicit polling of an append-only live resource. HTTP EOF completes a
+    /// body version, not necessarily a manifest segment. Preserve prefix and
+    /// attempt/work budgets while verifying that version again on the next read.
+    pub fn reopen(self: *FragmentLedger) !void {
+        if (self.invalid) return error.SourceVersionChanged;
+        if (self.active or !self.complete) return error.InvalidMediaStreamState;
+        self.complete = false;
+    }
+};
+pub const ResumeOptions = struct {
+    ingest: live.Options = .{},
+    epoch: usize = 0,
+    max_attempts: usize = 8,
+    max_fragments: usize = 8192,
+};
+pub const ResumeStats = struct {
+    transport: StreamStats = .{},
+    replayed: usize = 0,
+    acknowledged: usize = 0,
+};
+fn resumeBinding(url: []const u8, range: ?hls.Range, initialization: []const u8, epoch: usize, control: source.Control) ![32]u8 {
+    var state = std.crypto.hash.sha2.Sha256.init(.{});
+    state.update("antfly-fmp4-replay-v1");
+    var header: [33]u8 = undefined;
+    std.mem.writeInt(u64, header[0..8], url.len, .big);
+    std.mem.writeInt(u64, header[8..16], epoch, .big);
+    header[16] = @intFromBool(range != null);
+    std.mem.writeInt(u64, header[17..25], if (range) |value| value.offset else 0, .big);
+    std.mem.writeInt(u64, header[25..33], if (range) |value| value.length else 0, .big);
+    state.update(&header);
+    state.update(url);
+    var offset: usize = 0;
+    while (offset < initialization.len) {
+        try control.check();
+        const end = @min(initialization.len, offset + 8192);
+        state.update(initialization[offset..end]);
+        offset = end;
+    }
+    var hash: [32]u8 = undefined;
+    state.final(&hash);
+    return hash;
+}
 pub const Limits = struct {
     max_resource_bytes: usize = 32 * 1024 * 1024,
     max_transferred_bytes: u64 = 1024 * 1024 * 1024,
@@ -279,6 +339,117 @@ pub fn Adapter(comptime http: type) type {
             if (ingest.pending.items.len != 0) try sink.publish(try ingest.finishSegment());
             self.charged_bytes -= cap - sink.stats.bytes;
             return sink.stats;
+        }
+        /// Explicit retry reconstructs framing from the start of the resource.
+        /// Already acknowledged fragments are suppressed only after hashing
+        /// their complete ordered descriptors and coded bytes. No new callback
+        /// runs before the old prefix matches. A changed prefix poisons the
+        /// ledger; transport/cancellation/admission failures remain retryable.
+        /// Caller must reconcile taken-but-unacknowledged snapshots on failure.
+        pub fn streamFmp4Resuming(self: *Self, base: []const u8, reference: []const u8, range: ?hls.Range, resource_limit: usize, initialization: []const u8, ledger: *FragmentLedger, options: ResumeOptions, context: *anyopaque, accept: *const fn (*anyopaque, *FragmentDelivery) anyerror!void) !ResumeStats {
+            try self.control.check();
+            if (ledger.active) return error.InvalidMediaStreamState;
+            if (ledger.invalid) return error.SourceVersionChanged;
+            try options.ingest.stream.control.check();
+            if (initialization.len > options.ingest.stream.max_bytes or initialization.len > options.ingest.max_ingested_bytes) return error.ResourceLimitExceeded;
+            const url = try resolve(self.allocator, self.root_url, base, reference, self.limits.max_uri_bytes);
+            defer self.allocator.free(url);
+            const binding = try resumeBinding(url, range, initialization, options.epoch, self.control);
+            if (ledger.binding) |previous| if (!std.mem.eql(u8, &previous, &binding)) {
+                ledger.invalid = true;
+                return error.SourceVersionChanged;
+            };
+            if (ledger.complete) return .{};
+            if (options.max_fragments == 0 or ledger.acknowledged > options.max_fragments or ledger.attempts >= options.max_attempts) return error.ResourceLimitExceeded;
+            var ingest_options = options.ingest;
+            if (ingest_options.stream.admission_pool == null) ingest_options.stream.admission_pool = self.pool;
+            ingest_options.max_segments = @min(ingest_options.max_segments, options.max_fragments);
+            const resource_identity = std.fmt.bytesToHex(binding, .lower);
+            var ingest = try live.Ingest.init(self.allocator, &resource_identity, initialization, ingest_options);
+            defer ingest.deinit();
+            ingest.epoch = options.epoch;
+            const Replay = struct {
+                adapter: *Self,
+                ledger: *FragmentLedger,
+                previous_count: usize,
+                previous_prefix: [32]u8,
+                state: std.crypto.hash.sha2.Sha256 = .init(.{}),
+                count: usize = 0,
+                stats: ResumeStats = .{},
+                context: *anyopaque,
+                accept: *const fn (*anyopaque, *FragmentDelivery) anyerror!void,
+                fn publish(raw: *anyopaque, delivery: *FragmentDelivery) !void {
+                    const replay: *@This() = @ptrCast(@alignCast(raw));
+                    try replay.adapter.control.check();
+                    const segment = &delivery.segment.?;
+                    var boundary: [16]u8 = undefined;
+                    std.mem.writeInt(u64, boundary[0..8], segment.ordinal, .big);
+                    std.mem.writeInt(u64, boundary[8..16], segment.reader.packets.len, .big);
+                    var candidate = replay.state;
+                    candidate.update(&boundary);
+                    // Payload leases remain transient; the ledger retains no
+                    // decoded pictures, packets, or per-fragment hash array.
+                    for (segment.reader.packets, 0..) |packet, index| {
+                        try replay.adapter.control.check();
+                        var header: [25]u8 = undefined;
+                        std.mem.writeInt(i64, header[0..8], packet.media_dts, .big);
+                        std.mem.writeInt(i64, header[8..16], packet.media_pts, .big);
+                        std.mem.writeInt(u32, header[16..20], packet.duration, .big);
+                        std.mem.writeInt(u32, header[20..24], packet.size, .big);
+                        header[24] = @intFromBool(packet.sync);
+                        var payload = try segment.reader.readPacket(index);
+                        defer payload.deinit();
+                        candidate.update(&header);
+                        var offset: usize = 0;
+                        while (offset < payload.bytes.len) {
+                            try replay.adapter.control.check();
+                            const end = @min(payload.bytes.len, offset + 8192);
+                            candidate.update(payload.bytes[offset..end]);
+                            offset = end;
+                        }
+                    }
+                    var hash_state = candidate;
+                    var hash: [32]u8 = undefined;
+                    hash_state.final(&hash);
+                    if (replay.count < replay.previous_count) {
+                        replay.count += 1;
+                        replay.state = candidate;
+                        replay.stats.replayed += 1;
+                        if (replay.count == replay.previous_count and !std.mem.eql(u8, &hash, &replay.previous_prefix)) {
+                            replay.ledger.invalid = true;
+                            return error.SourceVersionChanged;
+                        }
+                        return;
+                    }
+                    replay.accept(replay.context, delivery) catch |err| {
+                        if (delivery.acknowledged) replay.commit(candidate, hash);
+                        return err;
+                    };
+                    replay.commit(candidate, hash);
+                }
+                fn commit(replay: *@This(), candidate: std.crypto.hash.sha2.Sha256, hash: [32]u8) void {
+                    replay.state = candidate;
+                    replay.count += 1;
+                    replay.ledger.acknowledged = replay.count;
+                    replay.ledger.prefix = hash;
+                    replay.stats.acknowledged += 1;
+                }
+            };
+            var replay = Replay{ .adapter = self, .ledger = ledger, .previous_count = ledger.acknowledged, .previous_prefix = ledger.prefix, .context = context, .accept = accept };
+            ledger.active = true;
+            defer ledger.active = false;
+            const previous_requests = self.requests;
+            defer if (self.requests != previous_requests) {
+                ledger.attempts += 1;
+                ledger.binding = binding;
+            };
+            replay.stats.transport = try self.streamFmp4(base, reference, range, resource_limit, &ingest, &replay, Replay.publish);
+            if (replay.count < replay.previous_count) {
+                ledger.invalid = true;
+                return error.SourceVersionChanged;
+            }
+            ledger.complete = true;
+            return replay.stats;
         }
     };
 }

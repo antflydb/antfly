@@ -617,3 +617,95 @@ test "production HTTP HLS date-range v2 combined reload and full fallback preser
     try serving.await(std.testing.io);
     try std.testing.expectEqual(@as(usize, 4), transport.requests);
 }
+
+test "production HTTP fragment replay survives truncated chunked response without duplicate accepted fragments" {
+    const bytes = @embedFile("testdata/fragmented.mp4");
+    const State = struct {
+        first_delivered: std.Io.Event = .unset,
+        new_delivered: std.Io.Event = .unset,
+        sent_retry_tail: std.atomic.Value(bool) = .init(false),
+        count: usize = 0,
+        held: [6]?media.live_mp4.Segment = @splat(null),
+        fn serve(self: *@This(), listener: *http.TcpListener) !void {
+            for (0..2) |attempt| {
+                const accepted = try listener.accept();
+                var socket = accepted.socket;
+                defer socket.close();
+                try socket.setRecvTimeout(5000);
+                try socket.setSendTimeout(5000);
+                var request: [4096]u8 = undefined;
+                var used: usize = 0;
+                while (std.mem.indexOf(u8, request[0..used], "\r\n\r\n") == null) {
+                    if (used == request.len) return error.TestUnexpectedResult;
+                    const n = try socket.recv(request[used..]);
+                    if (n == 0) return error.UnexpectedEof;
+                    used += n;
+                }
+                try std.testing.expect(std.ascii.findIgnoreCase(request[0..used], "authorization: Bearer fixture-token\r\n") != null);
+                try std.testing.expect(std.ascii.findIgnoreCase(request[0..used], "accept-encoding: identity\r\n") != null);
+                try socket.sendAll("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
+                if (attempt == 0) {
+                    try chunk(&socket, bytes[797 .. 11206 + 8]);
+                    try self.first_delivered.wait(std.testing.io);
+                    // Close without a terminating chunk: the first accepted
+                    // fragment survives a genuinely incomplete HTTP response.
+                } else {
+                    const boundary = 20811 + 8;
+                    try chunk(&socket, bytes[797..boundary]);
+                    // Retry must suppress the old prefix, then deliver the next
+                    // fragment before the server is allowed to send the tail.
+                    try self.new_delivered.wait(std.testing.io);
+                    self.sent_retry_tail.store(true, .release);
+                    try chunk(&socket, bytes[boundary..]);
+                    try socket.sendAll("0\r\n\r\n");
+                }
+            }
+        }
+        fn chunk(socket: *http.Socket, body: []const u8) !void {
+            var header: [32]u8 = undefined;
+            try socket.sendAll(try std.fmt.bufPrint(&header, "{x}\r\n", .{body.len}));
+            try socket.sendAll(body);
+            try socket.sendAll("\r\n");
+        }
+        fn accept(raw: *anyopaque, delivery: *media.http_stream.FragmentDelivery) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.count >= self.held.len) return error.TestUnexpectedResult;
+            try std.testing.expectEqual(self.count, delivery.segment.?.ordinal);
+            if (self.count == 1) try std.testing.expect(!self.sent_retry_tail.load(.acquire));
+            self.held[self.count] = try delivery.take();
+            self.count += 1;
+            if (self.count == 1) self.first_delivered.set(std.testing.io);
+            if (self.count == 2) self.new_delivered.set(std.testing.io);
+        }
+    };
+    var state = State{};
+    defer for (&state.held) |*entry| if (entry.*) |*segment| segment.deinit();
+    var listener = try http.TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, std.testing.io);
+    defer listener.deinit();
+    const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/media.m4s", .{listener.getLocalAddress().getPort()});
+    defer a.free(url);
+    var client = http.Client.initWithConfig(a, std.testing.io, .{ .default_headers = &.{.{ "Authorization", "Bearer fixture-token" }} });
+    defer client.deinit();
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 4 * 1024 * 1024 } };
+    var transport = media.http_stream.Adapter(http){ .allocator = a, .client = &client, .root_url = url, .pool = &pool, .limits = .{ .timeout_ms = 5000 } };
+    var ledger = media.http_stream.FragmentLedger{};
+    var serving = try std.testing.io.concurrent(State.serve, .{ &state, &listener });
+    defer _ = serving.cancel(std.testing.io) catch {};
+    try std.testing.expectError(error.UnexpectedEof, transport.streamFmp4Resuming(url, "media.m4s", null, bytes.len, bytes[0..797], &ledger, .{}, &state, State.accept));
+    try std.testing.expectEqual(@as(usize, 1), ledger.acknowledged);
+    try std.testing.expect(!ledger.invalid and !ledger.complete);
+    const result = try transport.streamFmp4Resuming(url, "media.m4s", null, bytes.len, bytes[0..797], &ledger, .{}, &state, State.accept);
+    try serving.await(std.testing.io);
+    try std.testing.expectEqual(@as(usize, 1), result.replayed);
+    try std.testing.expectEqual(@as(usize, 5), result.acknowledged);
+    try std.testing.expectEqual(@as(usize, 2), transport.requests);
+    try std.testing.expect(ledger.complete);
+    for (&state.held) |*entry| {
+        var lease = try entry.*.?.reader.readPacket(0);
+        try std.testing.expect(lease.bytes.len > 0);
+        lease.deinit();
+        entry.*.?.deinit();
+        entry.* = null;
+    }
+    try std.testing.expectEqual(@as(usize, 0), pool.snapshot().host_bytes);
+}

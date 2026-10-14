@@ -2171,6 +2171,42 @@ retaining identical coded bytes. A production authenticated chunked server
 withholds its tail until the first fragment callback, making whole-response
 buffering fail the gate. See [source-bound qualification](../../zig/lib/media/testdata/http-fragments/README.md)
 for packet parity, ownership, range/failure/cancellation, growth and platform checks.
-This transport foundation does not yet enable availabilityTimeComplete=false,
-resumable partial-resource cursors or direct model coordinator delivery. Those
-and the complete non-CUDA objective remain active.
+AvailabilityTimeComplete=false and direct model coordinator delivery remain
+active implementation work. Resumable HTTP resources are described below.
+
+### Prefix-verified HTTP replay and live resource growth
+
+`http_stream.Adapter.streamFmp4Resuming` reconstructs automatic fMP4 framing on
+an explicit retry while retaining a constant-space caller-owned FragmentLedger.
+The ledger binds the resolved URL, byte range, initialization bytes and decoder
+epoch. Ordered native DTS/PTS, duration, size, sync flags, fragment boundaries and
+coded packet bytes commit the accepted prefix. A retry verifies that prefix
+before delivering any new fragment. Changed or shorter completed prefixes reject
+with SourceVersionChanged; cancellation, transport and admission failures retain
+accepted progress. A completed body is idempotent until the caller explicitly
+reopens it to poll an append-only live resource. Reopening preserves attempts,
+work charges and accepted-prefix verification. Snapshot identities bind the
+resource configuration without storing authentication query strings in them.
+
+Callback success acknowledges delivery. `FragmentDelivery.acknowledge` permits a
+consumer to record acceptance before a subsequent fallible side effect. Taking a
+snapshot transfers ownership independently: a taken but unacknowledged delivery
+can recur on retry, and the caller must reconcile or release that earlier owner.
+The ledger is single-consumer in-process state; durable effects still require
+caller-managed acknowledgements. Shared admission, byte/request/fragment/attempt
+ceilings, cancellation and producer backpressure remain active. HTTP EOF completes
+a body version; higher-level manifest segment completion is still caller work.
+
+Portable tests verify full MP4 packet-byte/timestamp parity after retry, ownership,
+acknowledgement boundaries, changed payload/native clocks/init/range/epoch,
+shortened resources, cancellation, reentrancy, work limits, allocation failure and
+unchanged/appended completed-body polling. A production authenticated chunked
+server closes without the terminating chunk after one accepted fragment, then
+withholds the retry tail until the first new callback. Retry verifies and skips
+one prior fragment and publishes five new independent snapshots. See
+[replay qualification](../../zig/lib/media/testdata/http-replay/README.md) for final sources, executable hashes,
+raw logs and macOS/actual Linux ARM64 execution.
+
+Manifest `availabilityTimeComplete=false`, Reader-selected resource cursors and
+direct live model coordinator delivery remain active implementation work. The
+complete non-CUDA objective stays open.
