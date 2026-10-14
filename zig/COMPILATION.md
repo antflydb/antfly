@@ -941,3 +941,72 @@ Zig extracts package sources into a local `zig-pkg/` cache, which is ignored by 
 Debug tools and ownership fixtures use `std.heap.SafeAllocator`; its `deinit()`
 returns a leak count. Memory-bounded fixtures retain a requested-byte cap outside
 the allocator metadata.
+
+### October 13 wolfspider experiment (opt-in)
+
+A paired cold-cache `antfly capi` build took **44m28s → 34m42s**, saving
+9m46s (21.97%). All baseline 73 and candidate 70 steps succeeded. The candidate
+executable finished at about 25m47s; the C library determined combined completion.
+
+| Artifact | Baseline bytes | Candidate bytes | Change |
+| --- | ---: | ---: | ---: |
+| antfly | 171,093,176 | 171,816,520 | +0.42% |
+| libantfly.dylib | 67,920,704 | 68,036,592 | +0.17% |
+
+This is a build-time improvement, with no binary-size win. The two new options
+remain disabled by default. Both builds used the same frozen source at
+`70fb8dd0ba` plus pre-existing workspace changes, the same control-catalog repair,
+and the same linker-map instrumentation. The PR is rebased onto newer main;
+these figures do not measure that rebase. Main has since removed ONNX Runtime
+and changed storage/linker composition. Do not enable either option by default
+from this single experiment.
+
+The shared host had 14 CPU cores, 36 GiB RAM, Darwin ARM64, Zig 0.17.0 and SDK
+26.4. Both builds used baseline CPU, stripped ReleaseFast, Metal/system BLAS,
+and disabled ONNX Runtime/CUDA/PJRT. An unrelated inference service and other
+work remained active. Existing swap usage was about 18.1 GiB and did not grow
+materially. Sampled aggregate build RSS fell from 12.61 to 12.01 GiB; this is
+summed process residency, not unique physical memory or a host memory limit.
+This is one paired run, not repeated or throughput qualification.
+
+The candidate compiled API alongside small units, then one PIC inference core,
+then storage alongside distributed (826–1522 s and 826–1121 s respectively).
+The shared core took about 340 s, Zig MaxRSS 8G; its server adapter took about
+20 s/901M. Baseline server/embedded inference took about 346 s/8G and 233 s/6G.
+The shared core retains a conservative 20 GiB Darwin admission reservation.
+Reduced reservations require the explicit option and matching compiler, SDK,
+host/target, baseline CPU, optimization, strip, sanitizer and backend settings.
+Other profiles retain their existing claims.
+
+The Apache inference owner contains HTTP serving, model ownership and CLI work.
+Its checked private boundary borrows IO/allocator callbacks and transports error
+names, reconstructed in the caller's error domain. Memory/callback ABI code has
+a common owner with compatibility namespaces. Enrichment reuses an archive
+outside sanitized server configurations. Unique-key/ordinal sorts use unstable
+sorting where ties are irrelevant; resident/recovery row preparation shares a
+concrete worker. Broader storage reuse and size reduction remain open.
+
+The measured release passed twelve inference CLI help paths, model-free HTTP
+health/readiness/model inventory, and graceful worker shutdown. No downloaded
+model or throughput comparison was performed. Raw measurement files are retained
+outside the repository. Use separate fresh local/global caches and install
+prefixes for each run:
+
+```sh
+export ZIG_GLOBAL_CACHE_DIR=/absolute/path/to/fresh-global-cache
+python3 tools/run_bounded_zig_build.py --zig /path/to/zig-0.17.0 -- \
+  build antfly capi -Dtarget=aarch64-macos -Dcpu=baseline \
+  -Doptimize=fast -Dstrip=true -Dmetal=true -Dsystem-blas=true \
+  -Dcuda=false -Dpjrt=false -Dantfly-version=build-study \
+  -Dshared-inference-core=true -Dmeasured-darwin-compile-memory=true \
+  --cache-dir /absolute/path/to/fresh-local-cache \
+  --prefix /absolute/path/to/new-install --summary all
+```
+
+On the measured older source also pass `-Donnx=false`; main no longer has that
+backend option. Release packaging forwards these options for `--product server`
+as `--shared-inference-core true --measured-darwin-compile-memory true`.
+Regenerate error names with
+`python3 zig/tools/generate_engine_errors.py --zig /path/to/pinned/zig`;
+`--check` verifies freshness. Run the model-free release check with
+`python3 zig/tools/check_shared_inference_core.py --server-binary --binary /path/to/antfly`.
