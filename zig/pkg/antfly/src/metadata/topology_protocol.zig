@@ -68,7 +68,11 @@ const std = @import("std");
 /// Version 36 decodes private UNIQUE publication admission, including durable
 /// pending namespace sources and fixed-size owner progress. It does not imply
 /// native owner build/install capability or enable a public SQL producer.
-pub const current_version: u16 = 36;
+/// Version 37 decodes dedicated schema-reader store capabilities and their
+/// versioned sparse/baseline envelopes. This is decoder support, not an ACK
+/// that any particular schema has been installed on a data owner.
+pub const current_version: u16 = 37;
+pub const schema_reader_capability_version: u16 = 37;
 pub const index_publication_admission_version: u16 = 36;
 pub const checks_catalog_identity_version: u16 = 35;
 /// Decoder floor for occupancy-capable reconciliation and name admission.

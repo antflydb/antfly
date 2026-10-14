@@ -331,6 +331,40 @@ const schema_version_prefix = "\x00\x00__metadata__:schema_v";
 /// it advertises in transactional table metadata.
 pub const storage_format_version: u32 = 31;
 
+/// A reader's two independent ceilings. Zero/zero is an unknown legacy
+/// observation, never evidence that a schema may be installed or restored.
+/// This describes implementation support, not a schema identity or owner ACK.
+pub const ReaderCapabilities = struct {
+    semantic_ceiling: u32 = 0,
+    encoding_ceiling: u32 = 0,
+
+    pub const current: ReaderCapabilities = .{
+        .semantic_ceiling = storage_format_version,
+        .encoding_ceiling = storage_format_version,
+    };
+
+    pub fn known(self: ReaderCapabilities) bool {
+        return self.semantic_ceiling != 0 or self.encoding_ceiling != 0;
+    }
+
+    /// Reported support must be an understood profile and belong to a live
+    /// process incarnation. The two ceilings need not be equal.
+    pub fn validForReporter(self: ReaderCapabilities, incarnation: u64) bool {
+        if (!self.known()) return true;
+        return incarnation != 0 and self.validProfile();
+    }
+
+    fn validProfile(self: ReaderCapabilities) bool {
+        return self.semantic_ceiling >= 11 and self.semantic_ceiling <= current.semantic_ceiling and
+            self.encoding_ceiling >= 11 and self.encoding_ceiling <= current.encoding_ceiling;
+    }
+
+    pub fn supports(self: ReaderCapabilities, requirements: ReaderRequirements) bool {
+        return self.validProfile() and
+            requirements.canDecodeFrame(self.encoding_ceiling, self.semantic_ceiling);
+    }
+};
+
 /// Requirements attached to one immutable schema identity. Semantic feature
 /// support and physical frame decoding are separate admission decisions.
 pub const ReaderRequirements = struct {
@@ -349,6 +383,41 @@ pub const ReaderRequirements = struct {
         return self.encoding_version != 0 and self.encoding_version <= decoder_ceiling and self.canInterpret(capability_ceiling);
     }
 };
+
+test "relational index system schema reader capabilities distinguish semantics frames and unknown reporters" {
+    const current = ReaderCapabilities.current;
+    try std.testing.expect(current.validForReporter(42));
+    try std.testing.expect(!current.validForReporter(0));
+    const unknown: ReaderCapabilities = .{};
+    try std.testing.expect(unknown.validForReporter(0));
+    try std.testing.expect(!unknown.known());
+    const requirement: ReaderRequirements = .{ .semantic_version = 30, .encoding_version = 31 };
+    try std.testing.expect(current.supports(requirement));
+    try std.testing.expect(!unknown.supports(requirement));
+    const profiles = [_]ReaderCapabilities{
+        .{ .semantic_ceiling = 29, .encoding_ceiling = 31 },
+        .{ .semantic_ceiling = 31, .encoding_ceiling = 30 },
+    };
+    for (profiles) |profile| {
+        try std.testing.expect(profile.validForReporter(42));
+        try std.testing.expect(!profile.supports(requirement));
+    }
+    const invalid = [_]ReaderCapabilities{
+        .{ .semantic_ceiling = 31 },
+        .{ .encoding_ceiling = 31 },
+        .{ .semantic_ceiling = 10, .encoding_ceiling = 31 },
+        .{ .semantic_ceiling = 31, .encoding_ceiling = 10 },
+        .{ .semantic_ceiling = 32, .encoding_ceiling = 31 },
+        .{ .semantic_ceiling = 31, .encoding_ceiling = 32 },
+    };
+    for (invalid) |profile| {
+        try std.testing.expect(profile.known());
+        try std.testing.expect(!profile.validForReporter(42));
+        try std.testing.expect(!profile.supports(requirement));
+    }
+    try std.testing.expect(!current.supports(.{ .semantic_version = 0, .encoding_version = 31 }));
+    try std.testing.expect(!current.supports(.{ .semantic_version = 30, .encoding_version = 0 }));
+}
 
 /// Minimum schema capability needed to preserve this layout's semantics.
 /// This is not a row/schema authentication token or a promise that a reader

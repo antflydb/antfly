@@ -3857,6 +3857,7 @@ const StoreStatusHeartbeatCache = struct {
     artifact_sources_protocol_version: u16 = 0,
     dense_native_storage_protocol_version: u16 = 0,
     relational_topology_protocol_version: u16 = 0,
+    schema_reader: antfly.metadata.table_manager.SchemaReaderCapabilities = .{},
     live: bool = true,
     health_class: []const u8 = "healthy",
     owns_health_class: bool = false,
@@ -18962,6 +18963,7 @@ pub const DataServer = struct {
             .artifact_sources_protocol_version = candidate_report.artifact_sources_protocol_version,
             .dense_native_storage_protocol_version = candidate_report.dense_native_storage_protocol_version,
             .relational_topology_protocol_version = candidate_report.relational_topology_protocol_version,
+            .schema_reader = candidate_report.schema_reader,
             .live = candidate_report.live,
             .health_class = candidate_report.health_class,
             .capacity_bytes = candidate_report.capacity_bytes,
@@ -19054,6 +19056,7 @@ pub const DataServer = struct {
                 .artifact_sources_protocol_version = cache.artifact_sources_protocol_version,
                 .dense_native_storage_protocol_version = cache.dense_native_storage_protocol_version,
                 .relational_topology_protocol_version = cache.relational_topology_protocol_version,
+                .schema_reader = cache.schema_reader,
                 .live = cache.live,
                 .health_class = cache.health_class,
                 .capacity_bytes = cache.capacity_bytes,
@@ -20366,6 +20369,7 @@ pub const DataServer = struct {
             .artifact_sources_protocol_version = cache.artifact_sources_protocol_version,
             .dense_native_storage_protocol_version = cache.dense_native_storage_protocol_version,
             .relational_topology_protocol_version = cache.relational_topology_protocol_version,
+            .schema_reader = cache.schema_reader,
             .live = cache.live,
             .health_class = health_class,
             .capacity_bytes = cache.capacity_bytes,
@@ -20412,6 +20416,7 @@ pub const DataServer = struct {
             .artifact_sources_protocol_version = report.artifact_sources_protocol_version,
             .dense_native_storage_protocol_version = report.dense_native_storage_protocol_version,
             .relational_topology_protocol_version = report.relational_topology_protocol_version,
+            .schema_reader = report.schema_reader,
             .live = report.live,
             .health_class = health_class,
             .owns_health_class = true,
@@ -29284,6 +29289,7 @@ fn storeRegistrationVisible(
         if (store.native_generation_restore_version != record.native_generation_restore_version) continue;
         if (store.dense_native_storage_protocol_version != record.dense_native_storage_protocol_version) continue;
         if (store.relational_topology_protocol_version != record.relational_topology_protocol_version) continue;
+        if (!std.meta.eql(store.schema_reader, record.schema_reader)) continue;
         return true;
     }
     return false;

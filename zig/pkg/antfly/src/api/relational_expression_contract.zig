@@ -250,7 +250,9 @@ pub fn canonicalizeOwnedSchema(alloc: std.mem.Allocator, schema: *wire.TableSche
     if (schema.relational_indexes) |indexes| for (@constCast(indexes)) |*index| {
         for (@constCast(index.keys)) |*key| if (key.expression) |*expression| try canonicalizeOwnedExpression(alloc, expression);
         if (index.where) |conditions| for (@constCast(conditions)) |*condition| {
-            if (condition.value) |value| condition.value = try columns.canonicalValue(alloc, condition.column, value);
+            if (condition.column) |column| {
+                if (condition.value) |value| condition.value = try columns.canonicalValue(alloc, column, value);
+            }
         };
     };
 }
@@ -347,6 +349,23 @@ test "relational declarations public expression grammar shares typed array numer
     inline for (@typeInfo(wire.RelationalExpressionOp).@"enum".field_names) |name| {
         try std.testing.expect(std.meta.stringToEnum(expressions.Op, name) != null);
     }
+}
+
+test "system catalog canonical schema preserves columnless constant index predicates" {
+    var predicates = [_]wire.RelationalIndexPredicate{
+        .{ .constant = true },
+        .{ .constant = false },
+        .{ .column = "id", .op = .eq, .value = .{ .number_string = "9007199254740993" } },
+    };
+    var indexes = [_]wire.RelationalIndexDefinition{
+        .{ .name = "id_idx", .keys = &.{.{ .column = "id" }}, .where = &predicates },
+    };
+    var schema: wire.TableSchema = .{ .relational_indexes = &indexes };
+    try canonicalizeOwnedSchema(std.testing.allocator, &schema);
+    try std.testing.expectEqual(@as(?bool, true), predicates[0].constant);
+    try std.testing.expectEqual(@as(?bool, false), predicates[1].constant);
+    try std.testing.expect(predicates[0].column == null and predicates[0].value == null);
+    try std.testing.expectEqualStrings("9007199254740993", predicates[2].value.?.number_string);
 }
 
 test "relational declarations canonical public expression copy preserves borrowed epoch nodes" {

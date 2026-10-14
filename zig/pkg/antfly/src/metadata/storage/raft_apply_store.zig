@@ -18647,17 +18647,22 @@ pub const RaftApplyStore = struct {
 
     fn applyStoreReportBaselineTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, bytes: []const u8) !void {
         if (bytes.len > store_report_baseline.max_chunk_bytes) return error.CatalogCommandTooLarge;
-        if (bytes.len >= 2 and std.mem.readInt(u16, bytes[0..2], .little) == 2) {
+        const envelope_version = if (bytes.len >= 2) std.mem.readInt(u16, bytes[0..2], .little) else 0;
+        if (envelope_version == 2 or envelope_version == 4) {
             var pos: usize = 2;
             const count = try readInt(bytes, &pos, u16);
             if (count < 2 or count > store_report_baseline.max_batch_chunks) return error.InvalidMetadataTransitionEncoding;
+            var carries_reader = false;
             for (0..count) |_| {
                 const len = try readInt(bytes, &pos, u32);
-                if (len < 2 or len > bytes.len - pos or std.mem.readInt(u16, bytes[pos..][0..2], .little) != 1) return error.InvalidMetadataTransitionEncoding;
+                if (len < 2 or len > bytes.len - pos) return error.InvalidMetadataTransitionEncoding;
+                const child_version = std.mem.readInt(u16, bytes[pos..][0..2], .little);
+                if (child_version != 1 and (child_version != 3 or envelope_version != 4)) return error.InvalidMetadataTransitionEncoding;
+                carries_reader = carries_reader or child_version == 3;
                 try self.applyStoreReportBaselineTxn(txn, group_id, bytes[pos..][0..len]);
                 pos += len;
             }
-            if (pos != bytes.len) return error.InvalidMetadataTransitionEncoding;
+            if (pos != bytes.len or (envelope_version == 4 and !carries_reader)) return error.InvalidMetadataTransitionEncoding;
             return;
         }
         var arena = std.heap.ArenaAllocator.init(self.alloc);
@@ -26961,6 +26966,116 @@ const store_record_extension_version: u16 = 5;
 const store_record_extension_relational_topology_version: u16 = 6;
 const store_record_extension_root_incarnation_version: u16 = 7;
 const store_record_extension_root_signing_version: u16 = 8;
+// V9 makes root identity independent of reader capabilities. Zero UUID/key
+// mean unsigned/absent here; V7/V8 retain their mandatory-root interpretation.
+const store_record_extension_schema_reader_version: u16 = 9;
+
+test "metadata raft apply store schema reader capabilities use explicit versions without requiring signed roots" {
+    const alloc = std.testing.allocator;
+    var record: metadata.StoreRecord = .{ .store_id = 1, .node_id = 2, .reporter_incarnation = 7 };
+    var old_extension: std.ArrayListUnmanaged(u8) = .empty;
+    defer old_extension.deinit(alloc);
+    try appendStoreRecordExtensions(alloc, &old_extension, record);
+    try std.testing.expectEqualStrings("afsx1", old_extension.items[0..5]);
+    try std.testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, old_extension.items[5..7], .little));
+    try std.testing.expectEqual(@as(usize, 27), old_extension.items.len);
+    record.schema_reader = metadata_table_manager.SchemaReaderCapabilities.current;
+    const encoded = try encodeStoreRecord(alloc, record);
+    defer alloc.free(encoded);
+    const decoded = try decodeStoreRecord(alloc, encoded);
+    defer metadata_table_manager.freeStore(alloc, decoded);
+    try std.testing.expectEqualDeep(record.schema_reader, decoded.schema_reader);
+    try std.testing.expectEqual(@as(u128, 0), decoded.replica_root_incarnation);
+    var extension: std.ArrayListUnmanaged(u8) = .empty;
+    defer extension.deinit(alloc);
+    try appendStoreRecordExtensions(alloc, &extension, record);
+    try std.testing.expectEqual(@as(u16, 9), std.mem.readInt(u16, extension.items[5..7], .little));
+    for (1..extension.items.len) |cut| {
+        var pos: usize = 0;
+        try std.testing.expectError(error.InvalidMetadataTransitionEncoding, readStoreRecordExtensions(extension.items[0..cut], &pos, &.{}));
+    }
+    // A forged old version must not reinterpret capability bytes as old facts.
+    extension.items[5] = 8;
+    var pos: usize = 0;
+    try std.testing.expectError(error.InvalidMetadataTransitionEncoding, readStoreRecordExtensions(extension.items, &pos, &.{}));
+    record.schema_reader.encoding_ceiling = 0;
+    try std.testing.expectError(error.InvalidStoreReporterFence, encodeStoreRecord(alloc, record));
+}
+
+test "metadata raft apply store schema reader registration and sparse replacement survive restart" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/schema-reader", .{tmp.sub_path});
+    defer alloc.free(root);
+    const record: metadata.StoreRecord = .{ .store_id = 1, .node_id = 2, .reporter_incarnation = 7, .status_generation = 1, .schema_reader = metadata_table_manager.SchemaReaderCapabilities.current };
+    var report = store_report_update.asReport(record);
+    report.status_generation = 2;
+    report.schema_reader.semantic_ceiling = 30;
+    {
+        var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+        defer store.deinit();
+        {
+            var txn = try store.store.beginWriteTxn();
+            errdefer txn.abort();
+            try store.applyTransitionCommandTxn(&txn, 21, .{ .initialize_metadata_incarnation = "0123456789abcdef0123456789abcdef".* });
+            try store.applyTransitionCommandTxn(&txn, 21, .{ .register_store = record });
+            try txn.commit();
+        }
+        const bytes = try encodeTestReportUpdate(&store, alloc, .{ .sequence = 1, .report = report });
+        defer alloc.free(bytes);
+        try applyTestReportUpdate(&store, bytes);
+    }
+    var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+    defer store.deinit();
+    const observed = (try store.readStore(alloc, 21, 1, false)).?;
+    defer metadata_table_manager.freeStore(alloc, observed);
+    try std.testing.expectEqualDeep(report.schema_reader, observed.schema_reader);
+    try std.testing.expectEqual(@as(u64, 7), observed.reporter_incarnation);
+    try std.testing.expectEqual(@as(u64, 2), observed.status_generation);
+    try std.testing.expect(runtime_status_protocol.profileSatisfies(
+        try store.getRuntimeStatusProtocolActivationVersion(21),
+        runtime_status_protocol.framed_index_record_version,
+    ));
+    try std.testing.expectEqual(@as(u64, 1), (try store.reportCursor(21, 1)).?.sequence);
+    // An old process cannot replace the installed report after restart.
+    report.reporter_incarnation = 6;
+    const stale = try encodeTestReportUpdate(&store, alloc, .{ .sequence = 2, .report = report });
+    defer alloc.free(stale);
+    try applyTestReportUpdate(&store, stale);
+    const unchanged = (try store.readStore(alloc, 21, 1, false)).?;
+    defer metadata_table_manager.freeStore(alloc, unchanged);
+    try std.testing.expectEqualDeep(observed.schema_reader, unchanged.schema_reader);
+    try std.testing.expectEqual(@as(u64, 7), unchanged.reporter_incarnation);
+}
+
+test "metadata raft apply store schema reader sparse and baseline envelopes reject downgraded framing" {
+    const alloc = std.testing.allocator;
+    const report: metadata.StoreStatusReport = .{ .store_id = 1, .reporter_incarnation = 7, .schema_reader = metadata_table_manager.SchemaReaderCapabilities.current };
+    const bytes = try encodeStoreReportUpdate(alloc, .{ .update = .{ .sequence = 1, .report = report }, .request_digest = @splat(1), .expected_header = @splat(2) });
+    defer alloc.free(bytes);
+    try std.testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, bytes[0..2], .little));
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const command = try decodeStoreReportUpdate(arena.allocator(), bytes);
+    try std.testing.expectEqualDeep(report.schema_reader, command.update.report.schema_reader);
+    bytes[0] = 1;
+    try std.testing.expectError(error.InvalidMetadataTransitionEncoding, decodeStoreReportUpdate(arena.allocator(), bytes));
+    const baseline = try encodeStoreReportBaseline(alloc, .{
+        .request = .{ .action = .prepare, .cursor = .{ .reporter_incarnation = 7, .sequence = 1, .digest = @splat(3) }, .chunk_count = 1, .total_bytes = 1, .report = report },
+        .expected_header = @splat(2),
+        .admission_cursor = null,
+    });
+    defer alloc.free(baseline);
+    try std.testing.expectEqual(@as(u16, 3), std.mem.readInt(u16, baseline[0..2], .little));
+    const decoded = try decodeStoreReportBaseline(arena.allocator(), baseline);
+    try std.testing.expectEqualDeep(report.schema_reader, decoded.request.report.schema_reader);
+    const batch = try encodeStoreReportBaselineBatch(alloc, &.{ baseline, baseline });
+    defer alloc.free(batch);
+    try std.testing.expectEqual(@as(u16, 4), std.mem.readInt(u16, batch[0..2], .little));
+    baseline[0] = 1;
+    try std.testing.expectError(error.InvalidMetadataTransitionEncoding, decodeStoreReportBaseline(arena.allocator(), baseline));
+}
 const reallocation_request_extension_magic = "afrr1";
 const reallocation_request_extension_version: u16 = 1;
 
@@ -27173,6 +27288,7 @@ fn admitDenseNativeStoreTxn(
 }
 
 fn admitRelationalTopologyStoreTxn(txn: *docstore.DocStore.Txn, group_id: u64, incoming: metadata.StoreRecord) !bool {
+    if (!incoming.schema_reader.validForReporter(incoming.reporter_incarnation)) return false;
     if (incoming.relational_topology_protocol_version > metadata_table_manager.relational_topology_protocol_version or
         (incoming.relational_topology_protocol_version != 0 and incoming.reporter_incarnation == 0)) return false;
     if (!metadata_table_manager.storeServesTableData(incoming.role)) return true;
@@ -27219,7 +27335,7 @@ fn storeRuntimeStatusRecordVersion(record: metadata.StoreRecord) ?u16 {
     for (record.runtime_statuses) |status| {
         if (status.schema_epoch != 0) return runtime_status_protocol.schema_epoch_record_version;
     }
-    if (record.relational_topology_protocol_version != 0) return runtime_status_protocol.framed_index_record_version;
+    if (record.relational_topology_protocol_version != 0 or record.schema_reader.known()) return runtime_status_protocol.framed_index_record_version;
     if (record.dense_native_storage_protocol_version != 0 or
         storeHasDenseNativeStorageStatus(record) or
         storeHasVectorProjectionStatus(record))
@@ -28350,7 +28466,7 @@ pub fn encodeAdmittedStoreReportBaseline(alloc: std.mem.Allocator, command: stor
     defer alloc.free(header);
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(alloc);
-    try appendInt(alloc, &out, u16, 1);
+    try appendInt(alloc, &out, u16, if (command.request.report.schema_reader.known()) 3 else 1);
     try appendInt(alloc, &out, u32, std.math.cast(u32, header.len) orelse return error.CatalogCommandTooLarge);
     try out.appendSlice(alloc, header);
     var record: metadata.StoreRecord = .{ .store_id = command.request.report.store_id, .node_id = 0 };
@@ -28366,7 +28482,14 @@ pub fn encodeStoreReportBaselineBatch(alloc: std.mem.Allocator, commands: []cons
     if (commands.len < 2 or commands.len > store_report_baseline.max_batch_chunks) return error.InvalidStoreReporterFence;
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(alloc);
-    try appendInt(alloc, &out, u16, 2);
+    var carries_reader = false;
+    for (commands) |command| {
+        if (command.len < 2) return error.InvalidMetadataTransitionEncoding;
+        const child_version = std.mem.readInt(u16, command[0..2], .little);
+        if (child_version != 1 and child_version != 3) return error.InvalidMetadataTransitionEncoding;
+        carries_reader = carries_reader or child_version == 3;
+    }
+    try appendInt(alloc, &out, u16, if (carries_reader) 4 else 2);
     try appendInt(alloc, &out, u16, @intCast(commands.len));
     for (commands) |command| {
         if (command.len > store_report_baseline.max_chunk_bytes -| (out.items.len + 4)) return error.CatalogCommandTooLarge;
@@ -28379,13 +28502,16 @@ pub fn encodeStoreReportBaselineBatch(alloc: std.mem.Allocator, commands: []cons
 fn decodeStoreReportBaseline(a: std.mem.Allocator, bytes: []const u8) !store_report_baseline.Command {
     if (bytes.len > store_report_baseline.max_chunk_bytes) return error.CatalogCommandTooLarge;
     var pos: usize = 0;
-    if (try readInt(bytes, &pos, u16) != 1) return error.InvalidMetadataTransitionEncoding;
+    const version = try readInt(bytes, &pos, u16);
+    if (version != 1 and version != 3) return error.InvalidMetadataTransitionEncoding;
     const len = try readInt(bytes, &pos, u32);
     if (len > bytes.len - pos) return error.InvalidMetadataTransitionEncoding;
     var command = (try std.json.parseFromSlice(store_report_baseline.Command, a, bytes[pos..][0..len], .{})).value;
     pos += len;
     const record = try readStoreRecord(a, bytes, &pos);
     if (pos != bytes.len or record.store_id != command.request.report.store_id) return error.InvalidMetadataTransitionEncoding;
+    if ((version == 3) != record.schema_reader.known() or
+        !std.meta.eql(record.schema_reader, command.request.report.schema_reader)) return error.InvalidMetadataTransitionEncoding;
     command.request.report.group_statuses = record.group_statuses;
     command.request.report.runtime_statuses = record.runtime_statuses;
     return command;
@@ -28395,7 +28521,7 @@ pub fn encodeStoreReportUpdate(alloc: std.mem.Allocator, command: store_report_u
     try command.update.validate(alloc);
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(alloc);
-    try appendInt(alloc, &out, u16, 1);
+    try appendInt(alloc, &out, u16, if (command.update.report.schema_reader.known()) 2 else 1);
     try appendInt(alloc, &out, u64, command.update.sequence);
     try appendInt(alloc, &out, u8, if (command.update.base != null) 1 else 0);
     if (command.update.base) |base| {
@@ -28426,7 +28552,8 @@ pub fn encodeStoreReportUpdate(alloc: std.mem.Allocator, command: store_report_u
 fn decodeStoreReportUpdate(a: std.mem.Allocator, bytes: []const u8) !store_report_update.Command {
     if (bytes.len > max_store_report_update_bytes) return error.CatalogCommandTooLarge;
     var pos: usize = 0;
-    if (try readInt(bytes, &pos, u16) != 1) return error.InvalidMetadataTransitionEncoding;
+    const version = try readInt(bytes, &pos, u16);
+    if (version != 1 and version != 2) return error.InvalidMetadataTransitionEncoding;
     const sequence = try readInt(bytes, &pos, u64);
     const has_base = try readInt(bytes, &pos, u8);
     if (has_base > 1) return error.InvalidMetadataTransitionEncoding;
@@ -28460,6 +28587,7 @@ fn decodeStoreReportUpdate(a: std.mem.Allocator, bytes: []const u8) !store_repor
     for (removals) |*id| id.* = try readInt(bytes, &pos, u64);
     const record = try readStoreRecord(a, bytes, &pos);
     if (pos != bytes.len) return error.InvalidMetadataTransitionEncoding;
+    if ((version == 2) != record.schema_reader.known()) return error.InvalidMetadataTransitionEncoding;
     return .{ .update = .{ .sequence = sequence, .base = base, .removed_groups = removals, .report = store_report_update.asReport(record) }, .request_digest = digest, .expected_header = expected_header, .admission_cursor = admission_cursor };
 }
 
@@ -28870,6 +28998,7 @@ fn appendStoreRecordExtensions(
     out: *std.ArrayListUnmanaged(u8),
     record: metadata.StoreRecord,
 ) !void {
+    if (!record.schema_reader.validForReporter(record.reporter_incarnation)) return error.InvalidStoreReporterFence;
     if (record.relational_topology_protocol_version > metadata_table_manager.relational_topology_protocol_version or
         (record.relational_topology_protocol_version != 0 and record.reporter_incarnation == 0) or
         (record.replica_root_incarnation != 0 and record.reporter_incarnation == 0) or
@@ -28899,10 +29028,12 @@ fn appendStoreRecordExtensions(
     const has_root_incarnation = record.replica_root_incarnation != 0;
     const has_root_signing = !std.mem.allEqual(u8, &record.replica_root_public_key, 0);
     if (observation_count == 0 and !has_reporter_fence and !has_artifact_protocol and
-        !has_native_restore_capability and !has_dense_native_protocol and !has_relational_topology and !has_root_incarnation and !has_root_signing) return;
+        !has_native_restore_capability and !has_dense_native_protocol and !has_relational_topology and !has_root_incarnation and !has_root_signing and !record.schema_reader.known()) return;
 
     try out.appendSlice(alloc, store_record_extension_magic);
-    const version: u16 = if (has_root_signing)
+    const version: u16 = if (record.schema_reader.known())
+        store_record_extension_schema_reader_version
+    else if (has_root_signing)
         store_record_extension_root_signing_version
     else if (has_root_incarnation)
         store_record_extension_root_incarnation_version
@@ -28936,6 +29067,10 @@ fn appendStoreRecordExtensions(
         try appendInt(alloc, out, u128, record.replica_root_incarnation);
     if (version >= store_record_extension_root_signing_version)
         try out.appendSlice(alloc, &record.replica_root_public_key);
+    if (version >= store_record_extension_schema_reader_version) {
+        try appendInt(alloc, out, u32, record.schema_reader.semantic_ceiling);
+        try appendInt(alloc, out, u32, record.schema_reader.encoding_ceiling);
+    }
     try appendInt(alloc, out, u32, observation_count);
     for (record.group_statuses, 0..) |status, status_index| {
         if (status.observed_reallocation_request_id == 0) continue;
@@ -29023,6 +29158,7 @@ fn readStoreRecord(alloc: std.mem.Allocator, encoded: []const u8, pos: *usize) !
         .native_generation_restore_version = extensions.native_generation_restore_version,
         .dense_native_storage_protocol_version = extensions.dense_native_storage_protocol_version,
         .relational_topology_protocol_version = extensions.relational_topology_protocol_version,
+        .schema_reader = extensions.schema_reader,
         .api_url = api_url,
         .raft_url = raft_url,
         .role = role,
@@ -29046,7 +29182,7 @@ fn readStoreRecordExtensions(
     encoded: []const u8,
     pos: *usize,
     group_statuses: []metadata.GroupStatusReport,
-) !struct { reporter_incarnation: u64 = 0, replica_root_incarnation: u128 = 0, replica_root_public_key: [32]u8 = @splat(0), status_generation: u64 = 0, native_generation_restore_version: u16 = 0, artifact_sources_protocol_version: u16 = 0, dense_native_storage_protocol_version: u16 = 0, relational_topology_protocol_version: u16 = 0 } {
+) !struct { reporter_incarnation: u64 = 0, replica_root_incarnation: u128 = 0, replica_root_public_key: [32]u8 = @splat(0), status_generation: u64 = 0, native_generation_restore_version: u16 = 0, artifact_sources_protocol_version: u16 = 0, dense_native_storage_protocol_version: u16 = 0, relational_topology_protocol_version: u16 = 0, schema_reader: metadata_table_manager.SchemaReaderCapabilities = .{} } {
     if (pos.* == encoded.len) return .{};
     if (pos.* + store_record_extension_magic.len > encoded.len or
         !std.mem.eql(
@@ -29067,7 +29203,8 @@ fn readStoreRecordExtensions(
         version != store_record_extension_version and
         version != store_record_extension_relational_topology_version and
         version != store_record_extension_root_incarnation_version and
-        version != store_record_extension_root_signing_version) return error.InvalidMetadataTransitionEncoding;
+        version != store_record_extension_root_signing_version and
+        version != store_record_extension_schema_reader_version) return error.InvalidMetadataTransitionEncoding;
     const reporter_incarnation = if (version >= store_record_extension_reporter_version)
         try readInt(encoded, pos, u64)
     else
@@ -29102,11 +29239,19 @@ fn readStoreRecordExtensions(
         if (pos.* + replica_root_public_key.len > encoded.len) return error.InvalidMetadataTransitionEncoding;
         @memcpy(&replica_root_public_key, encoded[pos.* .. pos.* + replica_root_public_key.len]);
         pos.* += replica_root_public_key.len;
-        if (std.mem.allEqual(u8, &replica_root_public_key, 0)) return error.InvalidMetadataTransitionEncoding;
+        if (version == store_record_extension_root_signing_version and std.mem.allEqual(u8, &replica_root_public_key, 0)) return error.InvalidMetadataTransitionEncoding;
     }
+    const schema_reader: metadata_table_manager.SchemaReaderCapabilities = if (version >= store_record_extension_schema_reader_version)
+        .{ .semantic_ceiling = try readInt(encoded, pos, u32), .encoding_ceiling = try readInt(encoded, pos, u32) }
+    else
+        .{};
+    if (!schema_reader.validForReporter(reporter_incarnation) or
+        (version == store_record_extension_schema_reader_version and !schema_reader.known()) or
+        (!std.mem.allEqual(u8, &replica_root_public_key, 0) and replica_root_incarnation == 0)) return error.InvalidMetadataTransitionEncoding;
     if (relational_topology_protocol_version > metadata_table_manager.relational_topology_protocol_version or
         (relational_topology_protocol_version != 0 and reporter_incarnation == 0) or
-        (version >= store_record_extension_root_incarnation_version and (replica_root_incarnation == 0 or reporter_incarnation == 0))) return error.InvalidMetadataTransitionEncoding;
+        (version >= store_record_extension_root_incarnation_version and version <= store_record_extension_root_signing_version and (replica_root_incarnation == 0 or reporter_incarnation == 0)) or
+        (replica_root_incarnation != 0 and reporter_incarnation == 0)) return error.InvalidMetadataTransitionEncoding;
     if (!metadata_table_manager.artifactSourcesProtocolValid(
         reporter_incarnation,
         artifact_sources_protocol_version,
@@ -29135,6 +29280,7 @@ fn readStoreRecordExtensions(
         .native_generation_restore_version = native_generation_restore_version,
         .dense_native_storage_protocol_version = dense_native_storage_protocol_version,
         .relational_topology_protocol_version = relational_topology_protocol_version,
+        .schema_reader = schema_reader,
     };
 }
 
@@ -40468,6 +40614,14 @@ test "relational index publication runtime status report GC resumes with bounded
 }
 
 test "system catalog baseline resumes after snapshot and activates atomically before sparse updates" {
+    try exerciseBaselineResume(.{});
+}
+
+test "system catalog schema reader baseline resumes and publishes capability atomically with report root" {
+    try exerciseBaselineResume(metadata_table_manager.SchemaReaderCapabilities.current);
+}
+
+fn exerciseBaselineResume(reader: metadata_table_manager.SchemaReaderCapabilities) !void {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -40480,14 +40634,16 @@ test "system catalog baseline resumes after snapshot and activates atomically be
         var txn = try store.store.beginWriteTxn();
         errdefer txn.abort();
         _ = try store.ensureDerivedCatalogIndexesTxn(&txn, 21);
-        try store.applyTransitionCommandTxn(&txn, 21, .{ .register_store = .{ .store_id = 20, .node_id = 30, .reporter_incarnation = 77, .group_statuses = &old_groups } });
+        try store.applyTransitionCommandTxn(&txn, 21, .{ .register_store = .{ .store_id = 20, .node_id = 30, .reporter_incarnation = 77, .schema_reader = reader, .group_statuses = &old_groups } });
         try txn.commit();
     }
     var groups: [130]metadata.GroupStatusReport = undefined;
     for (&groups, 0..) |*item, i| item.* = .{ .group_id = i + 100, .raft_term = i + 1 };
     var publisher: store_report_update.Publisher = .{};
     defer publisher.deinit(a);
-    var prepared = try publisher.prepare(a, .{ .store_id = 20, .reporter_incarnation = 77, .status_generation = 1, .group_statuses = &groups }, true, false);
+    var desired_reader = reader;
+    if (desired_reader.known()) desired_reader.semantic_ceiling = 30;
+    var prepared = try publisher.prepare(a, .{ .store_id = 20, .reporter_incarnation = 77, .status_generation = 1, .schema_reader = desired_reader, .group_statuses = &groups }, true, false);
     defer prepared.deinit(a);
     var plan = try store_report_baseline.Plan.init(a, &prepared);
     defer plan.deinit();
@@ -40504,6 +40660,7 @@ test "system catalog baseline resumes after snapshot and activates atomically be
         defer metadata_table_manager.freeStore(a, visible);
         try std.testing.expectEqual(@as(usize, 1), visible.group_statuses.len);
         try std.testing.expectEqual(@as(u64, 9), visible.group_statuses[0].group_id);
+        try std.testing.expectEqualDeep(reader, visible.schema_reader);
         try std.testing.expectEqual(null, try store.reportCursor(21, 20));
     }
     // Even a valid activation envelope cannot expose an incomplete generation.
@@ -40528,6 +40685,7 @@ test "system catalog baseline resumes after snapshot and activates atomically be
         defer metadata_table_manager.freeStore(a, visible);
         try std.testing.expectEqual(@as(usize, 130), visible.group_statuses.len);
         try std.testing.expectEqual(@as(u64, 100), visible.group_statuses[0].group_id);
+        try std.testing.expectEqualDeep(desired_reader, visible.schema_reader);
     }
     {
         const control = try store.readControlStores(a, 21, &.{ 9, 100 });
@@ -40536,10 +40694,11 @@ test "system catalog baseline resumes after snapshot and activates atomically be
         try std.testing.expectEqual(@as(usize, 1), control[0].group_statuses.len);
         try std.testing.expectEqual(@as(u64, 100), control[0].group_statuses[0].group_id);
         try std.testing.expectEqual(@as(usize, 0), control[0].runtime_statuses.len);
+        try std.testing.expectEqualDeep(desired_reader, control[0].schema_reader);
     }
     // A sparse replacement after root activation reads and writes that root.
     var replacement = [_]metadata.GroupStatusReport{.{ .group_id = 100, .raft_term = 999 }};
-    const update = try encodeTestReportUpdate(&store, a, .{ .sequence = plan.request.cursor.sequence + 1, .base = plan.request.cursor, .report = .{ .store_id = 20, .reporter_incarnation = 77, .status_generation = 1, .group_statuses = &replacement } });
+    const update = try encodeTestReportUpdate(&store, a, .{ .sequence = plan.request.cursor.sequence + 1, .base = plan.request.cursor, .report = .{ .store_id = 20, .reporter_incarnation = 77, .status_generation = 1, .schema_reader = desired_reader, .group_statuses = &replacement } });
     defer a.free(update);
     try applyTestReportUpdate(&store, update);
     const restored = try store.snapshotBuilder().buildSnapshot(a, 21);
@@ -40550,6 +40709,7 @@ test "system catalog baseline resumes after snapshot and activates atomically be
         defer metadata_table_manager.freeStore(a, visible);
         try std.testing.expectEqual(@as(usize, 130), visible.group_statuses.len);
         try std.testing.expectEqual(@as(u64, 999), visible.group_statuses[0].raft_term);
+        try std.testing.expectEqualDeep(desired_reader, visible.schema_reader);
     }
 }
 

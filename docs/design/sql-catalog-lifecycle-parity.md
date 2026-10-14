@@ -5167,6 +5167,64 @@ This is still required implementation, not a claim of a completed rollout gate.
 Original dispositions remain 479 implemented / 136 rejected / 73 superseded /
 898 unresolved; schema-reader component tests grant no original-case credit.
 
+### Dedicated schema-reader transport and decoder admission
+
+Store registration and status now carry independent semantic/ASCH reader
+ceilings, bound to the process reporter incarnation rather than data-Raft
+topology support. Unknown legacy observations remain absent from serialized
+JSON and cannot satisfy a schema requirement. Incomplete, unfenced and unknown
+future profiles fail admission. Cloning, report comparison, immutable catalog
+capability counts and heartbeat caches preserve the descriptor without rescanning
+schemas or runtime inventories.
+
+The binary store extension has an explicit version 9. Unlike versions 7/8,
+this version permits unsigned or absent physical roots independently of schema
+support, while retaining signed-root validation. Predecessor extensions keep
+their original interpretation. Sparse reports use envelope version 2; baseline
+singles/batches use versions 3/4. A capability-bearing record cannot be hidden
+under the predecessor report envelope. Baseline manifest and binary record
+capabilities must agree. Legacy records continue using their old versions.
+
+Metadata decoder profile 37 gates these facts before final single/batch append;
+HTTP readiness captures the same floor before taking the report lane. Runtime
+profile negotiation cannot strip this safety information as optional telemetry.
+The decoder profile does not activate a schema or imply a data-owner ACK.
+Automatic advertisement is intentionally not enabled yet: publication's durable
+monotonic reader floor, placement/registration admission against that floor,
+same-root schema identity acknowledgements and restore integration remain
+required. The earlier six-step activation plan therefore remains open.
+
+Tests cover separate ceilings, legacy JSON omission, reporter/stale-generation
+fences, owned copies, malformed/truncated extensions, downgraded framing and
+registration/sparse replacement through durable restart. The resumable baseline
+contract runs with both predecessor and reader-capable profiles, checking
+invisibility before activation, partial-upload snapshot recovery, atomic reader
+descriptor publication and subsequent sparse/snapshot preservation. Mixed-version
+proposal tests exercise the production final admission helpers with a version-36
+member and term, membership and metadata-incarnation changes after preflight.
+These are rollout-transport proofs, not original SQL-case completion credit.
+
+Broader Debug compilation also exposed a pre-existing owned-schema
+canonicalization error: constant partial-index predicates have no column.
+Canonicalization now preserves those predicates and only normalizes typed
+operands when a column exists, matching the raw-schema path. A regression test
+preserves both constant truth values and an exact integer operand.
+
+Debug qualification passed 407 transport/catalog/API tests and the expanded
+225-test baseline/coordinator/projection gate. Review additionally aligned
+storage's mandatory runtime-profile selection with service admission. Its final
+210-test durable catalog rerun passed, including profile activation through
+restart. The new fixture initializes a real metadata incarnation before
+registration; an uninitialized embedding fixture correctly cannot prove
+production profile activation.
+
+The combined SQL/pgwire/storage/transaction/DDL gate passed all 98 build steps:
+1,045 SQL tests (three existing skips), 117 pgwire tests, 267 native relational
+tests plus the native snapshot contract, 113 transaction tests and 27 mounted
+DDL tests plus its linked parser test. Formatting, license/product boundary,
+control-catalog freshness and original inventory integrity passed. Cache GC
+was previewed only; nothing was deleted. No original disposition changed.
+
 The unchanged sql-0671 declaration now also has an independently captured
 PostgreSQL fixture and native/mounted contracts. The complete declaration binds
 its UUID PRIMARY KEY, text replacement/lower, exact NUMERIC rounding and JSONB

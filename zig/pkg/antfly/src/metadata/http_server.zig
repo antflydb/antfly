@@ -4236,6 +4236,7 @@ fn parseStoreRecord(alloc: std.mem.Allocator, body: []const u8) !metadata_table_
         native_generation_restore_version: ?u16 = null,
         dense_native_storage_protocol_version: ?u16 = null,
         relational_topology_protocol_version: ?u16 = null,
+        schema_reader: metadata_table_manager.SchemaReaderCapabilities = .{},
         api_url: ?[]const u8 = null,
         raft_url: ?[]const u8 = null,
         role: ?[]const u8 = null,
@@ -4257,6 +4258,7 @@ fn parseStoreRecord(alloc: std.mem.Allocator, body: []const u8) !metadata_table_
     const parsed = try std.json.parseFromSlice(Parsed, alloc, body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
     defer parsed.deinit();
     if (parsed.value.store_id == 0 or parsed.value.node_id == 0) return error.InvalidNodeID;
+    if (!parsed.value.schema_reader.validForReporter(parsed.value.reporter_incarnation orelse 0)) return error.InvalidStoreReporterFence;
     if (!metadata_table_manager.reporterFenceValid(
         parsed.value.reporter_incarnation orelse 0,
         parsed.value.status_generation orelse 0,
@@ -4296,6 +4298,7 @@ fn parseStoreRecord(alloc: std.mem.Allocator, body: []const u8) !metadata_table_
         .native_generation_restore_version = parsed.value.native_generation_restore_version orelse 0,
         .dense_native_storage_protocol_version = parsed.value.dense_native_storage_protocol_version orelse 0,
         .relational_topology_protocol_version = parsed.value.relational_topology_protocol_version orelse 0,
+        .schema_reader = parsed.value.schema_reader,
         .api_url = try alloc.dupe(u8, parsed.value.api_url orelse ""),
         .raft_url = try alloc.dupe(u8, parsed.value.raft_url orelse ""),
         .role = try alloc.dupe(u8, parsed.value.role orelse "data"),
@@ -4392,6 +4395,7 @@ fn parseStoreStatusReportWithDefaultStoreID(alloc: std.mem.Allocator, body: []co
         artifact_sources_protocol_version: ?u16 = null,
         dense_native_storage_protocol_version: ?u16 = null,
         relational_topology_protocol_version: ?u16 = null,
+        schema_reader: metadata_table_manager.SchemaReaderCapabilities = .{},
         live: ?bool = null,
         health_class: ?[]const u8 = null,
         capacity_bytes: ?u64 = null,
@@ -4407,6 +4411,7 @@ fn parseStoreStatusReportWithDefaultStoreID(alloc: std.mem.Allocator, body: []co
 
     const parsed = try std.json.parseFromSlice(Parsed, alloc, body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
     defer parsed.deinit();
+    if (!parsed.value.schema_reader.validForReporter(parsed.value.reporter_incarnation orelse 0)) return error.InvalidStoreReporterFence;
     if (!metadata_table_manager.reporterFenceValid(
         parsed.value.reporter_incarnation orelse 0,
         parsed.value.status_generation orelse 0,
@@ -4445,6 +4450,7 @@ fn parseStoreStatusReportWithDefaultStoreID(alloc: std.mem.Allocator, body: []co
         .artifact_sources_protocol_version = parsed.value.artifact_sources_protocol_version orelse 0,
         .dense_native_storage_protocol_version = parsed.value.dense_native_storage_protocol_version orelse 0,
         .relational_topology_protocol_version = parsed.value.relational_topology_protocol_version orelse 0,
+        .schema_reader = parsed.value.schema_reader,
         .live = parsed.value.live orelse true,
         .health_class = try alloc.dupe(u8, parsed.value.health_class orelse "healthy"),
         .capacity_bytes = parsed.value.capacity_bytes orelse 0,
@@ -4694,6 +4700,40 @@ test "metadata status JSON preserves compact managed index admission state" {
     // an incomplete identity so it cannot authorize repair-state deletion.
     try std.testing.expectEqualStrings("", indexes[2].kind);
     try std.testing.expect(!indexes[2].coverage_identity_ready);
+}
+
+test "system catalog schema reader admission rejects incomplete unknown and unfenced capabilities" {
+    const alloc = std.testing.allocator;
+    const json =
+        \\{"store_id":20,"node_id":20,"reporter_incarnation":77,"schema_reader":{"semantic_ceiling":30,"encoding_ceiling":31}}
+    ;
+    const registration = try parseStoreRecord(alloc, json);
+    defer metadata_table_manager.freeStore(alloc, registration);
+    const heartbeat = try parseStoreStatusReport(alloc, json);
+    defer freeStoreStatusReport(alloc, heartbeat);
+    try std.testing.expectEqual(@as(u32, 30), registration.schema_reader.semantic_ceiling);
+    try std.testing.expectEqual(@as(u32, 31), registration.schema_reader.encoding_ceiling);
+    try std.testing.expectEqualDeep(registration.schema_reader, heartbeat.schema_reader);
+    try std.testing.expectEqual(@as(u16, 0), registration.relational_topology_protocol_version);
+    const invalid = [_][]const u8{
+        \\{"store_id":20,"node_id":20,"schema_reader":{"semantic_ceiling":30,"encoding_ceiling":31}}
+        ,
+        \\{"store_id":20,"node_id":20,"reporter_incarnation":77,"schema_reader":{"semantic_ceiling":30}}
+        ,
+        \\{"store_id":20,"node_id":20,"reporter_incarnation":77,"schema_reader":{"semantic_ceiling":32,"encoding_ceiling":31}}
+        ,
+        \\{"store_id":20,"node_id":20,"reporter_incarnation":77,"schema_reader":{"semantic_ceiling":30,"encoding_ceiling":32}}
+        ,
+    };
+    for (invalid) |body| {
+        try std.testing.expectError(error.InvalidStoreReporterFence, parseStoreRecord(alloc, body));
+        try std.testing.expectError(error.InvalidStoreReporterFence, parseStoreStatusReport(alloc, body));
+    }
+    const legacy = try parseStoreRecord(alloc,
+        \\{"store_id":20,"node_id":20}
+    );
+    defer metadata_table_manager.freeStore(alloc, legacy);
+    try std.testing.expect(!legacy.schema_reader.known());
 }
 
 test "relational topology admission JSON preserves capability in registrations and heartbeats" {
