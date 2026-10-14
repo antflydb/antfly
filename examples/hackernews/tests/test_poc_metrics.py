@@ -25,6 +25,33 @@ spec.loader.exec_module(poc)
 
 
 class LakeMetricEvidenceTests(unittest.TestCase):
+    def test_composed_profile_preserves_nested_native_work_without_double_counting(
+        self,
+    ):
+        timings = dict(
+            total=2360, definition=10, leaf=2250, native_leaf=1800, cursor=80
+        )
+        text = "antfly_lake_query_composed_total_calls_total 1\n" + "".join(
+            f"antfly_lake_query_composed_{phase}_nanoseconds_total {value * 1000000}\n"
+            for phase, value in timings.items()
+        )
+        delta = poc.lake_metric_deltas({}, poc.parse_lake_metrics(text))
+        profile = poc.composed_phase_profile(delta, 2366)
+        self.assertEqual(profile["native_leaves_ms"], 1800)
+        self.assertEqual(profile["composition_ms"], 20)
+        self.assertEqual(profile["outside_composed_ms"], 6)
+        self.assertEqual(
+            profile["total_ms"],
+            profile["definition_ms"]
+            + profile["leaves_ms"]
+            + profile["cursor_storage_ms"]
+            + profile["composition_ms"],
+        )
+        for calls in (0, 2):
+            delta["antfly_lake_query_composed_total_calls_total"] = calls
+            self.assertIsNone(poc.composed_phase_profile(delta, 2366))
+        self.assertIsNone(poc.composed_phase_profile({}, 2366))
+
     def test_aggregate_phases_survive_parsing_and_delta_capture(self):
         before = poc.parse_lake_metrics(
             'antfly_lake_query_phase_nanoseconds_total{phase="total"} 1000000000\n'

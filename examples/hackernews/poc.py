@@ -85,6 +85,33 @@ def lake_phase_profile(delta, elapsed_ms):
     }
 
 
+def composed_phase_profile(delta, elapsed_ms):
+    """Attribute serial composed work without adding nested native/leaf timers."""
+    phases = ("total", "definition", "leaf", "native_leaf", "cursor")
+    keys = {
+        phase: f"antfly_lake_query_composed_{phase}_nanoseconds_total"
+        for phase in phases
+    }
+    if delta.get("antfly_lake_query_composed_total_calls_total", 0) != 1 or not all(
+        key in delta for key in keys.values()
+    ):
+        return None
+    values = {phase: delta[key] / 1_000_000 for phase, key in keys.items()}
+    return {
+        "total_ms": values["total"],
+        "definition_ms": values["definition"],
+        "leaves_ms": values["leaf"],
+        "native_leaves_ms": values["native_leaf"],
+        "cursor_storage_ms": values["cursor"],
+        "composition_ms": round(
+            values["total"] - values["definition"] - values["leaf"] - values["cursor"],
+            3,
+        ),
+        "outside_composed_ms": round(elapsed_ms - values["total"], 3),
+        "scope": "Process counters for one serial composed query. Native leaves include durable snapshot capture/recovery and overlap leaves; lake totals also overlap leaves. Composition is the remainder after definition, leaves and cursor storage. Outside-composed time includes HTTP admission and transport.",
+    }
+
+
 def wait_for_index(
     read_status,
     deadline,
@@ -674,6 +701,11 @@ def main():
                     "lake_metrics_delta": delta,
                     "lake_phase_profile": (
                         lake_phase_profile(delta, elapsed)
+                        if delta is not None
+                        else None
+                    ),
+                    "composed_phase_profile": (
+                        composed_phase_profile(delta, elapsed)
                         if delta is not None
                         else None
                     ),

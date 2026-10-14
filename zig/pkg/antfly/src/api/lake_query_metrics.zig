@@ -19,7 +19,22 @@
 const std = @import("std");
 const local = @import("antfly_local_sources");
 const prom = @import("../common/health_server.zig");
-pub const Phase = enum { source, publication, index, ranking, hydration, highlight, total };
+pub const Phase = enum {
+    source,
+    publication,
+    index,
+    ranking,
+    hydration,
+    highlight,
+    total,
+    // Composed timings enclose leaf timings; native leaves include durable
+    // snapshot capture/recovery, which the lake executor does not measure.
+    composed_total,
+    composed_definition,
+    composed_leaf,
+    composed_native_leaf,
+    composed_cursor,
+};
 const count = @typeInfo(Phase).@"enum".field_names.len;
 pub const Stats = struct {
     best_first_calls: u64 = 0,
@@ -83,6 +98,8 @@ test "external lake metrics expose fallback and disk write reasons without paths
     var writer: std.Io.Writer = .fixed(&buffer);
     var metrics: Metrics = .{};
     metrics.record(.hydration, @import("antfly_platform").time.monotonicNs());
+    inline for (.{ Phase.composed_total, .composed_definition, .composed_leaf, .composed_native_leaf, .composed_cursor }) |phase|
+        metrics.record(phase, @import("antfly_platform").time.monotonicNs());
     try append(&writer, local.serverless_query_lake_serving_cache.Cache.Stats{ .disk_unavailable = "ConcurrencyUnavailable", .disk_hits = 7 }, @as(?local.serverless_query_lake_parquet_rowgroup.PersistentObjectRangeCacheStats, .{ .write_errors = 2, .last_write_error = "NoSpaceLeft", .drops_queue = 3 }), metrics.snapshot());
     const text = writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, text, "antfly_lake_cache_disk_init_attempts_total 0") != null);
@@ -91,4 +108,8 @@ test "external lake metrics expose fallback and disk write reasons without paths
     try std.testing.expect(std.mem.indexOf(u8, text, "reason=\"NoSpaceLeft\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "antfly_lake_disk_cache_drops_queue_total 3") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "antfly_lake_query_hydration_calls_total 1") != null);
+    inline for (.{ "total", "definition", "leaf", "native_leaf", "cursor" }) |phase| {
+        try std.testing.expect(std.mem.indexOf(u8, text, "antfly_lake_query_composed_" ++ phase ++ "_calls_total 1") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "antfly_lake_query_composed_" ++ phase ++ "_nanoseconds_total ") != null);
+    }
 }
