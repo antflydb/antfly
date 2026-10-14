@@ -230,6 +230,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         .target = target,
         .optimize = optimize,
         .pic = true,
+        .sanitize_thread = antfly_imports.sanitize_thread,
     });
     antfly_imports.storage_boundary.configure(capi_mod, false, false);
     capi_mod.addImport("antfly_platform", platform_mod);
@@ -267,12 +268,12 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         .optimize = optimize,
         .pic = true,
     });
-    if (antfly_imports.shared_inference_core) native_inference_mod.sanitize_thread = antfly_imports.sanitize_thread;
+    native_inference_mod.sanitize_thread = antfly_imports.sanitize_thread;
     antfly_imports.configureInference(b, native_inference_mod, link_libc);
     const native_inference = @import("shared_library.zig").addProviderArchive(
         b,
         native_inference_mod,
-        if (antfly_imports.shared_inference_core) "antfly-inference-core" else "antfly-embedded-inference",
+        "antfly-inference-core",
         @import("shared_library.zig").inferenceCompileMaxRss(target.result.os.tag, antfly_imports.shared_inference_core, antfly_imports.darwin_release_memory),
     );
     native_inference.link_function_sections = true;
@@ -301,7 +302,15 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         @import("source_owner.zig").registerStorageProvider(owner);
         break :blk owner;
     } else null;
-    const libantfly_link_mod = capi_mod;
+    // Release metadata belongs to the final product, never to a provider
+    // imported by unit tests or another independently compiled archive.
+    const libantfly_link_mod = if (native_storage != null) b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .pic = true,
+        .link_libc = link_libc,
+        .sanitize_thread = antfly_imports.sanitize_thread,
+    }) else capi_mod;
     libantfly_link_mod.strip = strip;
     // Final native library consumers need release metadata even in the
     // embedded-only composition. Attach it before creating link artifacts
@@ -318,6 +327,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         const probe_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/storage_owner_linkage_probe.zig"), .target = target, .optimize = optimize });
         probe_mod.addImport("storage_client", @import("shared_library.zig").storageConsumerModule(b, client_mod));
         probe_mod.linkLibrary(owner);
+        antfly_imports.build_info.link(probe_mod);
         probe_mod.linkLibrary(native_inference);
         probe_mod.linkLibrary(native_enrichment);
         const run = @import("shared_library.zig").addStorageProbe(b, probe_mod, "storage-owner-linkage-probe");

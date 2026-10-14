@@ -17,6 +17,7 @@
 //! parsing belongs here. One reader pins both a store snapshot and its schema;
 //! every page sees the same rows even if live writes, DDL, or GC race it.
 const std = @import("std");
+const storage_engine = @import("../engine_selection.zig");
 const time = @import("antfly_platform").time;
 const docstore = @import("../docstore.zig");
 const schema = @import("../schema.zig");
@@ -45,6 +46,12 @@ pub const PrimaryBound = struct { key: []const u8, inclusive: bool = true };
 pub const RowFilter = struct {
     context: *anyopaque,
     matches: *const fn (*anyopaque, Allocator, []const u8, codec.OrdinalRowView) anyerror!bool,
+    callback_dispatch: @import("../named_callback.zig").Dispatch = NativeBoundary.local_dispatch,
+    const NativeCallbacks = struct { matches: @FieldType(RowFilter, "matches") };
+    const NativeBoundary = @import("../named_callback.zig").Boundary(NativeCallbacks);
+    pub fn matchesRow(self: RowFilter, alloc: Allocator, key: []const u8, row: codec.OrdinalRowView) !bool {
+        return NativeBoundary.call("matches", self.callback_dispatch, self.matches, .{ self.context, alloc, key, row });
+    }
 };
 pub const Request = struct {
     include_primary_digest: bool = false,
@@ -494,6 +501,7 @@ pub const Reader = struct {
     }
 
     pub fn deinit(self: *Reader) void {
+        if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("relationalReaderDeinit", .{self}) catch @panic("incompatible storage owner");
         if (self.row_policy_lease) |*lease| lease.release();
         if (self.failed_row) |row| self.alloc.free(row.key);
         if (self.covering_projection) |*plan| plan.deinit();
@@ -636,6 +644,7 @@ pub const Reader = struct {
     /// Page continuation advances only after successful preparation. An OOM,
     /// cancellation, or corrupt row cannot silently consume part of the result.
     pub fn nextPage(self: *Reader, alloc: Allocator, io: ?std.Io, budget: Budget) !Page {
+        if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("relationalReaderNextPage", .{ self, alloc, io, budget });
         if (self.row_policy_lease) |*lease| try lease.checkAt(@intCast(@divFloor(time.realtimeNs(), std.time.ns_per_s)));
         var page = try self.nextPageFormat(alloc, io, budget, false);
         errdefer page.deinit();
@@ -647,6 +656,7 @@ pub const Reader = struct {
     /// and cached source-layout projection. Ranked queries must retain native
     /// SQL-null provenance rather than round-tripping through public JSON.
     pub fn lookupTypedRow(self: *Reader, alloc: Allocator, document: []const u8) !?Row {
+        if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("relationalReaderLookupTypedRow", .{ self, alloc, document });
         if (self.index != null) return error.InvalidRelationalRowsRequest;
         if (self.row_policy_lease) |*lease| try lease.checkAt(@intCast(@divFloor(time.realtimeNs(), std.time.ns_per_s)));
         var scratch = std.heap.ArenaAllocator.init(self.alloc);
@@ -665,7 +675,7 @@ pub const Reader = struct {
         for (self.source_conditions) |condition| {
             if (!(try condition.evaluate(temporary, &predicate_scratch, row)).matches()) return null;
         }
-        if (self.row_filter) |filter| if (!try filter.matches(filter.context, temporary, document, row)) return null;
+        if (self.row_filter) |filter| if (!try filter.matchesRow(temporary, document, row)) return null;
         const projected = try row.projectSqlTypedAlloc(alloc, self.selected.?);
         if (try typedSize(projected.value, 0) +| projected.sql_nulls.len +| document.len > 16 * 1024 * 1024)
             return error.RelationalRowResultTooLarge;
@@ -687,6 +697,7 @@ pub const Reader = struct {
     }
 
     pub fn nextTypedPage(self: *Reader, alloc: Allocator, io: ?std.Io, budget: Budget) !Page {
+        if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("relationalReaderNextTypedPage", .{ self, alloc, io, budget });
         if (self.row_policy_lease) |*lease| try lease.checkAt(@intCast(@divFloor(time.realtimeNs(), std.time.ns_per_s)));
         var page = try self.nextPageFormat(alloc, io, budget, true);
         errdefer page.deinit();
@@ -793,7 +804,7 @@ pub const Reader = struct {
                     }
                     if (self.row_filter) |filter| {
                         decoded_key = (try internal.decodeStoredDocumentRowKeyAlloc(temporary, key)).?;
-                        if (!try filter.matches(filter.context, temporary, decoded_key.?, row)) break :check false;
+                        if (!try filter.matchesRow(temporary, decoded_key.?, row)) break :check false;
                     }
                     break :check true;
                 };

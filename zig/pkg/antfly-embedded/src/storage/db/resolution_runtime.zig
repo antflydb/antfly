@@ -2256,6 +2256,7 @@ pub const ResolutionRuntime = struct {
     }
 
     pub fn deinit(self: *ResolutionRuntime) void {
+        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionDeinit", .{self}) catch @panic("incompatible storage owner");
         self.stop();
         self.store_handle.deinit();
         self.* = undefined;
@@ -2306,6 +2307,7 @@ pub const ResolutionRuntime = struct {
     }
 
     pub fn start(self: *ResolutionRuntime) !void {
+        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionStart", .{self});
         // Without io there is no background thread; the stage is then driven
         // synchronously via catchUp (e.g. from runUntilIdle).
         const io = self.io orelse return;
@@ -2319,6 +2321,7 @@ pub const ResolutionRuntime = struct {
     }
 
     pub fn stop(self: *ResolutionRuntime) void {
+        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionStop", .{self}) catch @panic("incompatible storage owner");
         self.shutdown_flag.store(true, .release);
         if (self.io) |io| {
             self.worker_mutex.lockUncancelable(io);
@@ -2349,6 +2352,7 @@ pub const ResolutionRuntime = struct {
     /// unchanged decisions use graph-only reconciliation. `applied_sequence`
     /// advances only after those durable writes.
     pub fn catchUp(self: *ResolutionRuntime) !void {
+        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionCatchUp", .{self});
         lockMutex(&self.catch_up_mutex);
         defer self.catch_up_mutex.unlock();
         return self.catchUpLocked(false);
@@ -2414,6 +2418,7 @@ pub const ResolutionRuntime = struct {
     /// Mark the resolver backfill dirty. `runReresolveBacklogWindow` then enqueues
     /// extraction artifacts in bounded windows into the normal replay pipeline.
     pub fn requestReresolveBacklog(self: *ResolutionRuntime) !void {
+        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionRequestReresolveBacklog", .{self});
         lockMutex(&self.catch_up_mutex);
         defer self.catch_up_mutex.unlock();
         defer self.notifyBackfill();
@@ -2432,6 +2437,7 @@ pub const ResolutionRuntime = struct {
     /// True when a prior resolver catalog mutation has durably marked corpus
     /// backfill dirty but the bounded reresolve backlog has not fully drained.
     pub fn hasReresolveBacklog(self: *ResolutionRuntime) !bool {
+        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionHasReresolveBacklog", .{self});
         lockMutex(&self.catch_up_mutex);
         defer self.catch_up_mutex.unlock();
         return (try hasReresolveCursor(&self.store_handle.store, resolver_catalog.reresolve_resume_key)) or
@@ -2442,6 +2448,7 @@ pub const ResolutionRuntime = struct {
     /// re-resolution. This does not run resolver work inline; it appends a replay
     /// record and lets `catchUp` process it through the normal stage.
     pub fn runReresolveBacklogWindow(self: *ResolutionRuntime) !ReresolveEnqueueResult {
+        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionRunReresolveBacklogWindow", .{self});
         lockMutex(&self.catch_up_mutex);
         defer self.catch_up_mutex.unlock();
         return self.runReresolveBacklogWindowLocked();
@@ -2515,6 +2522,7 @@ pub const ResolutionRuntime = struct {
     /// The review queue: every stored review-band mention awaiting curation.
     /// Caller owns the result (`freePendingReviews`).
     pub fn pendingReviews(self: *ResolutionRuntime, alloc: std.mem.Allocator) ![]PendingReview {
+        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionPendingReviews", .{ self, alloc });
         lockMutex(&self.catch_up_mutex);
         defer self.catch_up_mutex.unlock();
         const resolvers = try self.index_manager.listResolvers(self.alloc);

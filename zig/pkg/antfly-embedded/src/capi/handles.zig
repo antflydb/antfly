@@ -546,7 +546,7 @@ pub var handle_registry: HandleRegistry = .{};
 /// Access the one registry after the storage descriptor validates its layout.
 pub fn handleRegistry() *HandleRegistry {
     if (comptime @import("../storage/engine_selection.zig").enabled)
-        return @ptrCast(@alignCast(@import("../storage/engine.zig").call("registry", .{}) catch unreachable));
+        return @ptrCast(@alignCast(@import("antfly_source_root").antfly_sources.storage_engine.call("registry", .{}) catch unreachable));
     return &handle_registry;
 }
 

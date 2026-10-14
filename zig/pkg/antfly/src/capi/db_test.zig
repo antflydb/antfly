@@ -3003,9 +3003,17 @@ test "capi lite exposes hosted and status-only profiles" {
     const index_json =
         \\{"name":"full_text_index_v0","kind":"full_text","config_json":"{}"}
     ;
-    try std.testing.expectEqual(capi.ErrorCode.internal, antfly_db_add_index_json(hosted_handle, .{
+    // Native Lite admission accepts an identical existing configuration.
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(hosted_handle, .{
         .ptr = index_json,
         .len = index_json.len,
+    }));
+    const conflicting_index_json =
+        \\{"name":"full_text_index_v0","kind":"full_text","config_json":"{\"field\":\"title\"}"}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_add_index_json(hosted_handle, .{
+        .ptr = conflicting_index_json,
+        .len = conflicting_index_json.len,
     }));
 
     const writes = [_]capi.WriteIntent{.{

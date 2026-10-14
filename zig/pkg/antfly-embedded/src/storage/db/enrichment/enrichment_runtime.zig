@@ -5069,6 +5069,7 @@ const PlatformEnrichmentRuntime = struct {
     /// Refresh a detached runtime after the previously active worker has
     /// joined. Calling this on a live worker would race its in-memory state.
     pub fn reloadDurableState(self: *EnrichmentRuntime) !void {
+        if (comptime @import("../../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("enrichmentReloadDurableState", .{self});
         if (self.future != null) return error.EnrichmentRuntimeStarted;
         self.applied_sequence = try enrichment_state.loadAppliedSequence(self.alloc, self.store, scope_name);
         const persisted_status = try enrichment_state.loadRuntimeStatus(self.alloc, self.store, scope_name);
@@ -5163,6 +5164,7 @@ const PlatformEnrichmentRuntime = struct {
     }
 
     pub fn start(self: *EnrichmentRuntime) !void {
+        if (comptime @import("../../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("enrichmentStart", .{self});
         if (self.future != null) return;
         try self.prepareExecution();
         self.future = try (try self.backend_runtime.?.maintenanceScheduler()).registerClass(.producer, self, workerStep);
@@ -5222,6 +5224,7 @@ const PlatformEnrichmentRuntime = struct {
     }
 
     pub fn resumeFrom(self: *EnrichmentRuntime, sequence: u64, target_sequence: u64) !void {
+        if (comptime @import("../../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("enrichmentResumeFrom", .{ self, sequence, target_sequence });
         const io_impl = self.io_impl orelse return error.MissingBackendRuntimeIo;
         const io = io_impl.io();
         self.mutex.lockUncancelable(io);
@@ -5279,6 +5282,7 @@ const PlatformEnrichmentRuntime = struct {
         cancellation: CancellationToken,
         deadline_ns: ?u64,
     ) !void {
+        if (comptime @import("../../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("enrichmentWaitForAppliedWithVisibilityDeadline", .{ self, sequence, cancellation, deadline_ns });
         const io_impl = self.io_impl orelse return error.MissingBackendRuntimeIo;
         const io = io_impl.io();
         self.mutex.lockUncancelable(io);
@@ -5415,6 +5419,7 @@ const PlatformEnrichmentRuntime = struct {
     }
 
     pub fn catchUpUntil(self: *EnrichmentRuntime, sequence: u64) !void {
+        if (comptime @import("../../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("enrichmentCatchUpUntil", .{ self, sequence });
         try self.catchUpUntilGuarded(sequence, .{});
     }
 
@@ -5428,6 +5433,7 @@ const PlatformEnrichmentRuntime = struct {
         cancellation: CancellationToken,
         deadline_ns: ?u64,
     ) !void {
+        if (comptime @import("../../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("enrichmentCatchUpUntilWithVisibilityDeadline", .{ self, sequence, cancellation, deadline_ns });
         const io_impl = self.io_impl orelse return error.MissingBackendRuntimeIo;
         const io = io_impl.io();
         self.mutex.lockUncancelable(io);

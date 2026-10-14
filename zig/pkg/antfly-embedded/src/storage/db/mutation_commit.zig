@@ -245,7 +245,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         ) anyerror!void {
             if (comptime @import("../engine_selection.zig").enabled) {
                 prepared_row_allocator.captureIoDomain();
-                return @import("../engine.zig").call("batchPrepared", .{ self, req, profile, opts, generated_memo, prepared_row_allocator });
+                return @import("antfly_source_root").antfly_sources.storage_engine.call("batchPrepared", .{ self, req, profile, opts, generated_memo, prepared_row_allocator });
             }
             @setEvalBranchQuota(100_000);
             const maintenance_contract = @import("relational_index_maintenance_contract.zig");

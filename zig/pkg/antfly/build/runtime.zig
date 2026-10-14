@@ -297,6 +297,7 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
         const probe_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/storage_owner_linkage_probe.zig"), .target = target, .optimize = optimize });
         probe_mod.addImport("storage_client", @import("../../../build_support/embedded/shared_library.zig").storageConsumerModule(b, client));
         probe_mod.linkLibrary(owner);
+        production_antfly_imports.build_info.link(probe_mod);
         probe_mod.linkLibrary(options.native_inference);
         probe_mod.linkLibrary(options.native_enrichment);
         const run = @import("../../../build_support/embedded/shared_library.zig").addStorageProbe(b, probe_mod, "storage-server-owner-linkage-probe");

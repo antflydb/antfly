@@ -343,6 +343,10 @@ test "mapped restore admission receipt detects physical corruption" {
     try std.testing.expectError(error.InvalidRestoreGenerationAdmissionReceipt, GenerationAdmissionReceipt.decode(&bytes));
 }
 
+// Transported independently across the native storage boundary. An authored
+// name avoids compiler-local anonymous-type numbering in method contracts.
+pub const Finish = struct { scope: Digest, phase: Phase };
+
 pub const Control = union(enum) {
     begin: Scope,
     import_page: ImportPage,
@@ -350,7 +354,7 @@ pub const Control = union(enum) {
     /// as a preservation-only restore page.
     rewrite_page: ImportPage,
     install_generation_admissions: InstallGenerationAdmissions,
-    finish: struct { scope: Digest, phase: Phase },
+    finish: Finish,
     pub fn jsonStringify(self: @This(), jw: anytype) @TypeOf(jw.*).Error!void {
         try @import("relational_integrity_json.zig").write(self, jw);
     }

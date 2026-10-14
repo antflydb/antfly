@@ -73,7 +73,9 @@ pub fn addWithStorageOwner(b: *std.Build, module: *std.Build.Module, providers: 
     const elf = target.ofmt == .elf;
     // Mach-O archives compile without provider inputs. Only the final link
     // needs their emitted code, so LLVM owners can run independently.
-    const link_module = if (storage_owner != null and !macho) b.createModule(.{ .target = module.resolved_target, .optimize = module.optimize, .pic = true, .link_libc = module.link_libc }) else module;
+    // The caller supplies the source-less final consumer when using an owner.
+    // Keep its metadata and native link inputs on that final module.
+    const link_module = module;
     if (!macho) {
         if (storage_owner) |owner| link_module.linkLibrary(owner);
         for (providers) |provider| link_module.linkLibrary(provider);

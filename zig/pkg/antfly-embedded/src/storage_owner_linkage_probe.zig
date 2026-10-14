@@ -31,10 +31,18 @@ pub fn main(init: std.process.Init) !void {
     if (!engine.enabled) return error.ProbeRequiresSharedStorage;
     const descriptor = engine.descriptorForValidation();
     engine.validateDescriptor(descriptor) catch |err| {
-        inline for (.{ "table_layout", "db_layout", "core_layout", "handle_layout", "registry_layout", "backend_runtime_layout", "resource_manager_layout", "prepared_owner_layout", "prepared_allocator_layout", "embedding_memo_layout" }) |field| {
+        inline for (.{ "table_layout", "db_layout", "core_layout", "handle_layout", "registry_layout", "backend_runtime_layout", "resource_manager_layout", "prepared_owner_layout", "prepared_allocator_layout", "embedding_memo_layout", "async_context_layout", "enrichment_runtime_layout", "relationalReader_layout", "relationalSession_layout", "documentSession_layout", "index_manager_layout", "algebraic_index_layout", "docstore_layout", "rewrite_program_layout", "enrichment_set_layout", "backup_snapshot_layout", "resolution_runtime_layout", "promotion_runtime_layout", "pinned_snapshot_layout" }) |field| {
             const actual = @field(descriptor, field);
             const expected = @field(engine, field);
             std.debug.print("storage ABI {s}: actual={any} expected={any}\n", .{ field, actual, expected });
+        }
+        for (descriptor.index_manager_fields[0..descriptor.index_manager_field_count], engine.index_manager_fields) |actual, expected| {
+            if (!std.mem.eql(u8, std.mem.span(actual.type_name), std.mem.span(expected.type_name)) or actual.offset != expected.offset)
+                std.debug.print("index manager field {s}: owner={s} offset={d}; client={s} offset={d}\n", .{ std.mem.span(actual.name), std.mem.span(actual.type_name), actual.offset, std.mem.span(expected.type_name), expected.offset });
+        }
+        for (descriptor.table_fields[0..descriptor.table_field_count], engine.table_fields) |actual, expected| {
+            if (!std.mem.eql(u8, std.mem.span(actual.type_name), std.mem.span(expected.type_name)))
+                std.debug.print("method signature {s}: owner={s}; client={s}\n", .{ std.mem.span(actual.name), std.mem.span(actual.type_name), std.mem.span(expected.type_name) });
         }
         for (descriptor.db_fields[0..descriptor.db_field_count], engine.db_fields) |actual, expected| {
             if (actual.offset != expected.offset or actual.size != expected.size or !std.mem.eql(u8, std.mem.span(actual.type_name), std.mem.span(expected.type_name)))
@@ -57,11 +65,11 @@ pub fn main(init: std.process.Init) !void {
     engine.validateDescriptor(&incompatible) catch |err| {
         if (err != error.UnsupportedVersion) return err;
         try exerciseBorrowedRuntime(alloc, root, init.io);
-        return exercise(alloc, root, physical);
+        return exercise(alloc, root, physical, init.io);
     };
     return error.AcceptedIncompatibleStorageLayout;
 }
-fn exercise(alloc: std.mem.Allocator, root: []const u8, physical: []const u8) !void {
+fn exercise(alloc: std.mem.Allocator, root: []const u8, physical: []const u8, io: std.Io) !void {
     const db = try db_mod.DB.openOwned(alloc, physical, .{ .start_optional_runtimes = false, .start_index_workers = false });
     defer db.closeOwned();
     try db.batch(.{ .writes = &.{.{ .key = "shared-row", .value = "{\"n\":1}" }}, .sync_level = .write });
@@ -77,9 +85,29 @@ fn exercise(alloc: std.mem.Allocator, root: []const u8, physical: []const u8) !v
     var result = try db.search(alloc, .{});
     defer result.deinit();
     if (result.hits.len != 1) return error.SharedStorageQueryFailed;
+    if (try db_mod.DB.readRestoreStateForPathWithIo(alloc, io, root)) |_| return error.SharedStorageInvalidBatchAccepted;
+    const RangeArgs = std.meta.ArgsTuple(@typeInfo(@FieldType(engine.VTable, "portableDecoderBindRange")).pointer.child);
+    const range_args: RangeArgs = .{ alloc, db.core.store, .{ .start = "", .end = "" } };
+    try engine.call("portableDecoderBindRange", range_args);
+    try engine.call("portableDecoderBindRange", range_args);
+    try exerciseRelationalLifetime(alloc, root, io);
+    try exerciseForeignScan(alloc, db);
+    try exerciseReplicatedBatch(alloc, db);
     try db.sync(true);
     try db.reconfigureEnrichmentRuntimePaused(.{});
+    var runtime_options: db_mod.OpenOptions = .{ .enrichment = .{} };
+    if (try db.createDetachedEnrichmentRuntime(&runtime_options.enrichment.?)) |_| return error.SharedStorageInvalidBatchAccepted;
+    const ReplayArgs = std.meta.ArgsTuple(@typeInfo(@FieldType(engine.VTable, "applyDerivedBatchToIndexAsync")).pointer.child);
+    const replay_args: ReplayArgs = .{ db.async_context, .{}, .{ .name = "vector", .kind = .dense_vector }, .{} };
+    if (try engine.call("applyDerivedBatchToIndexAsync", replay_args)) return error.SharedStorageInvalidBatchAccepted;
+    const transaction = try db.beginTransaction(100);
+    try db.writeTransaction(transaction, .{ .writes = &.{.{ .key = "transaction-row", .value = "{\"n\":3}" }} });
+    try db.commitTransaction(transaction, 101);
+    const committed = (try db.get(alloc, "transaction-row")) orelse return error.SharedStorageReadBackFailed;
+    defer alloc.free(committed);
+    if (!std.mem.eql(u8, committed, "{\"n\":3}")) return error.SharedStorageReadBackFailed;
     try exercisePreparedWorker(alloc, db);
+    try exerciseFactoryAggregationBackup(alloc, db, root, physical, io);
     try exerciseForeignPredicate(alloc, db);
     try exerciseForeignHook(db);
     db.batch(.{ .row_policy_install_bundle = "reject-this-private-command" }) catch |err| {
@@ -145,6 +173,37 @@ fn exerciseForeignHook(db: *db_mod.DB) !void {
     return error.SharedStorageInvalidBatchAccepted;
 }
 
+fn exerciseForeignScan(alloc: std.mem.Allocator, db: *db_mod.DB) !void {
+    const Visitor = struct {
+        fn visit(ptr: ?*anyopaque, entry: db_mod.types.ScanVisitEntry) anyerror!void {
+            const count: *usize = @ptrCast(@alignCast(ptr.?));
+            if (!std.mem.eql(u8, entry.id, "shared-row")) return error.SharedStorageReadBackFailed;
+            count.* += 1;
+        }
+        fn fail(ptr: ?*anyopaque, _: db_mod.types.ScanVisitEntry) anyerror!void {
+            const count: *usize = @ptrCast(@alignCast(ptr.?));
+            count.* += 1;
+            return error.TestWindowFailed;
+        }
+    };
+    var count: usize = 0;
+    try db.scanVisit(alloc, "", "", .{}, .{ .context = &count, .visit = Visitor.visit });
+    if (count != 1) return error.SharedStorageReadBackFailed;
+    count = 0;
+    db.scanVisit(alloc, "", "", .{}, .{ .context = &count, .visit = Visitor.fail }) catch |err| {
+        if (err != error.TestWindowFailed or count != 1) return error.SharedStorageErrorIdentityLost;
+        return;
+    };
+    return error.SharedStorageInvalidBatchAccepted;
+}
+
+fn exerciseReplicatedBatch(alloc: std.mem.Allocator, db: *db_mod.DB) !void {
+    try db.applyReplicatedBatch(.{ .request = .{ .writes = &.{.{ .key = "replicated-row", .value = "{}" }} }, .receipt = .none }, 1);
+    const value = (try db.get(alloc, "replicated-row")) orelse return error.SharedStorageReadBackFailed;
+    defer alloc.free(value);
+    if (!std.mem.eql(u8, value, "{}")) return error.SharedStorageReadBackFailed;
+}
+
 fn exerciseBorrowedRuntime(alloc: std.mem.Allocator, root: []const u8, io: std.Io) !void {
     var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .manual, .borrowed_io = .{ .general = io } });
     defer runtime.deinit();
@@ -155,6 +214,34 @@ fn exerciseBorrowedRuntime(alloc: std.mem.Allocator, root: []const u8, io: std.I
     try db.batch(.{ .writes = &.{.{ .key = "borrowed-row", .value = "{}" }}, .sync_level = .write });
     const value = (try db.get(alloc, "borrowed-row")) orelse return error.SharedStorageReadBackFailed;
     defer alloc.free(value);
+    var options: db_mod.OpenOptions = .{ .enrichment = .{ .enable_without_producers = true } };
+    try db.initOptionalRuntimes(&options);
+    const enrichment = db.enrichment_runtime orelse return error.SharedStorageReadBackFailed;
+    try enrichment.reloadDurableState();
+    try enrichment.catchUpUntil(0);
+    try enrichment.waitForAppliedWithVisibilityDeadline(0, .{}, null);
+    var pinned = try db.core.pinPortableSnapshot();
+    defer pinned.deinit();
+    const destination = try std.fs.path.join(alloc, &.{ root, "pinned-materialization" });
+    defer alloc.free(destination);
+    try std.Io.Dir.cwd().createDirPath(io, destination);
+    const Receipt = struct {
+        calls: usize = 0,
+        fail: bool = false,
+        fn record(raw: *anyopaque, _: []const u8, size: u64, _: [32]u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (size == 0) return error.SharedStorageReadBackFailed;
+            if (self.fail) return error.TestWindowFailed;
+        }
+    };
+    var receipt: Receipt = .{};
+    if (try pinned.materializeWithSink(alloc, io, destination, .none, .{ .ptr = &receipt, .record_fn = Receipt.record }) == 0 or receipt.calls == 0)
+        return error.SharedStorageReadBackFailed;
+    receipt.fail = true;
+    if (pinned.materializeWithSink(alloc, io, destination, .none, .{ .ptr = &receipt, .record_fn = Receipt.record })) |_| {
+        return error.SharedStorageErrorIdentityLost;
+    } else |err| if (err != error.TestWindowFailed) return error.SharedStorageErrorIdentityLost;
 }
 
 fn exerciseForeignPredicate(alloc: std.mem.Allocator, db: *db_mod.DB) !void {
@@ -191,4 +278,76 @@ fn exercisePreparedWorker(alloc: std.mem.Allocator, db: *db_mod.DB) !void {
     try db.batchInternalPrepared(.{ .writes = &.{.{ .key = "prepared-row", .value = "{}" }}, .sync_level = .write }, null, .{}, &memo, &guard);
     const value = (try db.get(alloc, "prepared-row")) orelse return error.SharedStorageReadBackFailed;
     defer alloc.free(value);
+}
+
+// Exercise the real owner with a client-created filter retained across pages.
+// builtin.is_test is false here, unlike direct implementation unit tests.
+fn exerciseRelationalLifetime(alloc: std.mem.Allocator, root: []const u8, io: std.Io) !void {
+    const path = try std.fs.path.join(alloc, &.{ root, "relational" });
+    defer alloc.free(path);
+    const db = try db_mod.DB.openOwned(alloc, path, .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.closeOwned();
+    try db.setSchemaJson(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer"}},"additionalProperties":false}}}}
+    );
+    try db.batch(.{ .writes = &.{ .{ .key = "a", .value = "{\"n\":1}" }, .{ .key = "b", .value = "{\"n\":2}" } }, .sync_level = .write });
+    var fence = (try db.tryStatementReadFence()) orelse return error.SharedStorageQueryFailed;
+    var cut = try db.captureRelationalStatementSnapshot();
+    fence.release();
+    defer cut.deinit();
+    const Filter = struct {
+        fail: bool = false,
+        visits: usize = 0,
+        fn matches(raw: *anyopaque, _: std.mem.Allocator, _: []const u8, _: @typeInfo(@typeInfo(@FieldType(db_mod.DB.RelationalRows.RowFilter, "matches")).pointer.child).@"fn".param_types[3].?) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.visits += 1;
+            if (self.fail) return error.TestWindowFailed;
+            return true;
+        }
+    };
+    var filter: Filter = .{};
+    var reader = try db.beginRelationalRows(alloc, .{ .fields = &.{"n"}, .row_filter = .{ .context = &filter, .matches = Filter.matches } });
+    defer reader.deinit();
+    var page = try reader.nextTypedPage(alloc, io, .{ .rows = 1 });
+    defer page.deinit();
+    if (page.rows.len != 1) return error.SharedStorageQueryFailed;
+    var second = try reader.nextTypedPage(alloc, io, .{ .rows = 1 });
+    defer second.deinit();
+    if (second.rows.len != 1) return error.SharedStorageQueryFailed;
+    if (filter.visits != 2) return error.SharedStorageQueryFailed;
+    var failing = try db.beginRelationalRows(alloc, .{ .fields = &.{"n"}, .row_filter = .{ .context = &filter, .matches = Filter.matches } });
+    defer failing.deinit();
+    filter.fail = true;
+    if (failing.nextTypedPage(alloc, null, .{})) |unexpected| {
+        var cleanup = unexpected;
+        cleanup.deinit();
+        return error.SharedStorageErrorIdentityLost;
+    } else |err| if (err != error.TestWindowFailed) return error.SharedStorageErrorIdentityLost;
+    try db.catchUpPendingDerivedReplay();
+}
+
+fn exerciseFactoryAggregationBackup(alloc: std.mem.Allocator, database: *db_mod.DB, root: []const u8, physical: []const u8, io: std.Io) !void {
+    const write = client.antfly_sources.local_write;
+    var enrichment = try write.createManagedDbEnrichments(alloc, "{}", database.backend_runtime, null, null, null, "", null, null);
+    defer enrichment.deinit(alloc);
+    if (enrichment.generated) return error.SharedStorageInvalidBatchAccepted;
+    var result = try database.search(alloc, .{ .include_stored = true });
+    defer result.deinit();
+    const aggregations = try db_mod.aggregations.computeSearchAggregations(alloc, &.{.{ .name = "total", .type = "sum", .field = "n" }}, result, .{ .index_manager = database.core.index_manager, .doc_store = database.core.store });
+    defer db_mod.aggregations.deinitResults(alloc, aggregations);
+    if (aggregations.len != 1) return error.NativeAggregationCountMismatch;
+    if (!std.mem.eql(u8, aggregations[0].value_json orelse return error.NativeAggregationMissingValue, "4")) {
+        std.debug.print("native aggregation hits={d} value={s}\n", .{ result.hits.len, aggregations[0].value_json.? });
+        return error.NativeAggregationValueMismatch;
+    }
+    const destination = try std.fs.path.join(alloc, &.{ root, "native-backup" });
+    defer alloc.free(destination);
+    var snapshot = try write.prepareNativeBackupShardSnapshot(alloc, database, physical, 1, .{ .backup_root = destination, .backup_id = "probe", .io = io });
+    defer snapshot.deinit(alloc);
+    if (snapshot.owned_io_receiver == null) return error.NativeBackupReceiverMissing;
+    // Preparation has returned. Copy and destruction must retain the same
+    // stable receiving I/O rather than borrowing a dead preparation frame.
+    const shards = try write.copyPreparedNativeBackupShardSnapshot(alloc, &snapshot);
+    defer write.freeBackupShards(alloc, shards);
+    if (shards.len != 1 or shards[0].artifact_size_bytes == 0) return error.SharedStorageReadBackFailed;
 }

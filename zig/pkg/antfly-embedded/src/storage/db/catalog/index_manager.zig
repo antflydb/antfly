@@ -1316,6 +1316,11 @@ const SplitSide = enum {
     right,
 };
 
+pub const GraphMetricNotify = struct {
+    ptr: *anyopaque,
+    notify: *const fn (*anyopaque) void,
+};
+
 pub const IndexManager = struct {
     pub fn tryAcquireCatalogRead(self: *IndexManager) bool {
         const closed: u32 = @as(u32, 1) << 31;
@@ -1463,10 +1468,7 @@ pub const IndexManager = struct {
     graph_indexes: std.ArrayListUnmanaged(GraphIndex),
     /// The DB-owned lazy metric runtime is notified only after a graph metric
     /// configuration is installed. The callback must not take catalog_mutex.
-    graph_metric_notify: ?struct {
-        ptr: *anyopaque,
-        notify: *const fn (*anyopaque) void,
-    } = null,
+    graph_metric_notify: ?GraphMetricNotify = null,
     graph_ownership_cleanup_cursor: usize = 0,
     /// Lock-free cursors give bounded scheduler sweeps stable round-robin
     /// fairness while the catalog shared lock keeps the indexed slices stable.

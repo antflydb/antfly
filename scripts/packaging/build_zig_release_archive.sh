@@ -18,7 +18,7 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<'EOF'
-usage: build_zig_release_archive.sh --version VERSION --target TARGET --archive-name NAME --out-dir DIR [--product server|embedded|lite|inference] [--apple-providers true|false] [--metal true|false] [--system-blas true|false] [--optimize MODE] [--strip true|false] [--jobs N] [--shared-inference-core true|false] [--shared-storage-core true|false] [--measured-darwin-compile-memory true|false]
+usage: build_zig_release_archive.sh --version VERSION --target TARGET --archive-name NAME --out-dir DIR [--product server|embedded|lite|inference] [--apple-providers true|false] [--metal true|false] [--system-blas true|false] [--optimize MODE] [--strip true|false] [--jobs N]
 
 Builds the native Antfly Zig runtime and writes a release archive whose root
 contains:
@@ -48,9 +48,6 @@ system_blas=false
 optimize=fast
 strip=true
 jobs=
-shared_inference_core=false
-shared_storage_core=false
-measured_darwin_compile_memory=false
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -98,18 +95,6 @@ while [ "$#" -gt 0 ]; do
       jobs="${2:?missing --jobs value}"
       shift 2
       ;;
-    --shared-inference-core)
-      shared_inference_core="${2:?missing --shared-inference-core value}"
-      shift 2
-      ;;
-    --shared-storage-core)
-      shared_storage_core="${2:?missing --shared-storage-core value}"
-      shift 2
-      ;;
-    --measured-darwin-compile-memory)
-      measured_darwin_compile_memory="${2:?missing --measured-darwin-compile-memory value}"
-      shift 2
-      ;;
     -h|--help)
       usage
       exit 0
@@ -155,13 +140,6 @@ case "$strip" in
     exit 2
     ;;
 esac
-
-for setting in "$shared_inference_core" "$shared_storage_core" "$measured_darwin_compile_memory"; do
-  case "$setting" in
-    true|false) ;;
-    *) echo "shared core and compile memory settings must be true or false" >&2; exit 2 ;;
-  esac
-done
 
 case "$apple_providers" in
   true|false) ;;
@@ -242,10 +220,6 @@ zig_build_options=(
 )
 if [ "$product" = server ]; then
   zig_build_options+=(-Dantfly-bin-name=antfly -Dapple-providers="$apple_providers")
-  zig_build_options+=(-Dshared-inference-core="$shared_inference_core" -Dmeasured-darwin-compile-memory="$measured_darwin_compile_memory")
-fi
-if [ "$product" != inference ]; then
-  zig_build_options+=(-Dshared-storage-core="$shared_storage_core")
 fi
 
 zig_install_args=(

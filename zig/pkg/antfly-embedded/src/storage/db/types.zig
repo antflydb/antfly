@@ -1603,6 +1603,14 @@ pub const ScanVisitEntry = struct {
 pub const ScanVisitor = struct {
     context: ?*anyopaque,
     visit: *const fn (context: ?*anyopaque, entry: ScanVisitEntry) anyerror!void,
+    callback_dispatch: @import("../named_callback.zig").Dispatch = NativeBoundary.local_dispatch,
+
+    const NativeCallbacks = struct { visit: @FieldType(ScanVisitor, "visit") };
+    const NativeBoundary = @import("../named_callback.zig").Boundary(NativeCallbacks);
+
+    pub fn visitEntry(self: ScanVisitor, entry: ScanVisitEntry) anyerror!void {
+        return NativeBoundary.call("visit", self.callback_dispatch, self.visit, .{ self.context, entry });
+    }
 };
 
 pub const ScanResult = struct {

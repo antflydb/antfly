@@ -74,12 +74,12 @@ pub fn create(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lan
     return createWithOptions(b, target, optimize, .{});
 }
 
-pub const Options = struct { shared_core: bool = false, sanitize_thread: bool = false, error_names: ?*std.Build.Module = null };
+pub const Options = struct { error_names: ?*std.Build.Module = null };
 
 pub fn createWithOptions(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, options: Options) Modules {
     const supported_os = target.result.os.tag == .macos or target.result.os.tag == .linux;
     const supported_arch = target.result.cpu.arch == .aarch64 or target.result.cpu.arch == .x86_64;
-    const native = options.shared_core and !options.sanitize_thread and supported_os and supported_arch;
+    const native = supported_os and supported_arch;
     const engine_options = b.addOptions();
     engine_options.addOption(bool, "shared_storage_core", native);
     engine_options.addOption(bool, "storage_engine_owner", false);
