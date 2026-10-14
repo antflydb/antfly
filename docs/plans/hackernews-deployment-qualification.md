@@ -1039,3 +1039,43 @@ existing remote checkpoint references and retained-cursor recovery remain valid.
 Caching immutable read owners and qualification under controlled host limits
 remain separate work. The historical outliers remain unproven until attributed by
 retained request-local timings.
+
+
+### Native generation reuse runtime qualification, October 14
+
+The optimized executable built successfully from the production changes in
+`17a97cc139` (documentation cleanup at `59712a4d53`). Its SHA-256 is
+`dd9e3d820abced7fc6c84b5ca3a163e8eb5855eb95ed9eeeeead192105a49ae8`.
+The full HN matrix passes on the same 142,577 historical rows, 1,024 Parquet files
+and 1,000-row native current fixture. Filesystem storage runs on the shared macOS
+ARM64 host with OS caches retained and navigation warming enabled. Reports and
+request logs are retained locally outside the repository.
+
+| Measurement | Native generation reuse |
+| --- | ---: |
+| Cold highlighted archive search | 223 ms |
+| Warm archive search p95, 20 samples | 115 ms |
+| Archive search after restart | 103 ms |
+| Deep cursor replay after restart | 251 ms |
+| Cold union search | 192 ms |
+| Warm union p95 / maximum, 20 samples | 67 / 78 ms |
+| Cold saved-overlay search | 268 ms |
+| Warm saved-overlay p95 / maximum, 20 samples | 79 / 115 ms |
+| Indexed unordered equality filter | 90 ms |
+
+Both composed benchmarks meet the 2,000 ms cold and 750 ms warm local gates.
+Neither dedicated benchmark process retains a composed request above 750 ms;
+diagnostic drops are zero. Cold union native leaves take 7.7 ms and cold overlay
+native leaves take 88.8 ms. Readiness and the serial profiling delay allow background
+warming before these cold queries; these are cleared lake-cache measurements,
+not proof that a fresh native owner avoids its first capture.
+
+Correctness includes exact SQL count, metadata filters matching independent
+residual evaluation, projected highlights, stable identities and scores, 1,408
+unique paginated hits, and mutable composed cursor replay after restart. Forced
+residual correctness-oracle scans include requests lasting 1.42, 2.27 and 5.09
+seconds; they are distinct from the indexed search latency samples and remain
+recorded in the local request log. The historical failed warm matrix remains
+above rather than being replaced by this passing run. These bounded shared-host
+measurements do not prove the historical outlier's cause or qualify full-archive,
+concurrent-ingestion or Antfly Cloud service latency.
