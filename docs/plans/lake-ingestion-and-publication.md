@@ -827,3 +827,24 @@ roots or unqualified inventories retain complete reconciliation. Broad
 replacement uses a bounded sequential catalog walk. Source inventory processing and
 mandatory closure auditing remain separate costs; this optimization does not
 claim constant-time snapshot discovery or waive retention qualification.
+
+
+### Publication-bound file navigation and incremental delete proofs
+
+Native search resolves public/private file identities through authenticated paged
+navigation owned by the selected publication. Cold queries no longer build maps for
+every source file. GC and cloud closure ownership include these navigation pages;
+reader leases protect older publications independently of a refresh.
+
+Refresh planning persists the same exact object selectors and per-file delete
+fingerprints used to build native row identities. Authenticated subtree reductions
+skip unchanged prior file proofs, including on snapshots containing Iceberg deletes.
+Changed and removed files seek their native maintenance records, while incompatible
+or historical metadata retains complete reconciliation. Current snapshot discovery
+and fresh source coverage remain authoritative and may still enumerate files.
+
+Accepted-data enrichment status describes the composed table cut, with its actual
+WAL position, partition progress, and artifact-retention horizon. Reusable partition
+jobs have separate identities and cannot individually claim table-wide readiness.
+Retained cursor replay shares decoded immutable WAL groups across neighboring cuts,
+with independent admission and conservative accounting for all pinned buffers.

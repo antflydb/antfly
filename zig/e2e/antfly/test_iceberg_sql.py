@@ -1388,6 +1388,20 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
                 h.get("_highlights") and set(h["_source"]) == {"id"}
                 for h in hybrid_first["hits"]["hits"]
             )
+            enrichment = call(
+                "POST",
+                "/tables/wal_windows/lake/maintenance",
+                {"action": "enrichment_status"},
+            )
+            assert enrichment["version"] == 2, enrichment
+            assert enrichment["state"] == "ready", enrichment
+            assert (
+                enrichment["partition_count"] == enrichment["ready_partitions"] > 0
+            ), enrichment
+            assert enrichment["coverage_until_ms"] > int(time.time() * 1000), enrichment
+            assert enrichment["wal_lsn"] == accepted["read_receipt"]["wal_lsn"], (
+                enrichment
+            )
             hybrid_request["remote_snapshot"] = hybrid_first["remote_snapshot"]
 
             def retained_artifact(artifact_id, *, raw=False):

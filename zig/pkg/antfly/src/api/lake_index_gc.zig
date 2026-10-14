@@ -131,6 +131,12 @@ pub const Collector = struct {
             }
         }
         _ = try self.mark(.{ .artifact_id = publication.inventory.artifact_id, .checksum = publication.inventory.checksum, .byte_len = publication.inventory.byte_len });
+        if (publication.source_navigation) |ref| {
+            _ = try self.mark(.{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len });
+            try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
+            const navigation = try @import("lake_source_navigation.zig").load(a, self.store, ref, self.cancellation(), null);
+            for ([_]?@import("../serverless/graph_segment/page_tree.zig").Ref{ navigation.files, navigation.public, navigation.private }) |root| try self.markPages(a, navigation.domain, root, false);
+        }
         for (hydrated.declarations) |declaration| try self.markArtifact(a, declaration.artifact);
         for (hydrated.file_contributions) |contribution| try self.markArtifact(a, contribution.artifact);
 
@@ -460,7 +466,7 @@ pub const Collector = struct {
     }
 };
 
-test "external lake native GC retains shared aggregate blocks and durable reader roots" {
+test "external lake global frontier native GC retains shared aggregate blocks navigation and durable reader roots" {
     const a = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -480,6 +486,18 @@ test "external lake native GC retains shared aggregate blocks and durable reader
     store.upload_scope = scope;
     var inventory = try store.put("native inventory");
     defer inventory.deinit(a);
+    const navigation_api = @import("lake_source_navigation.zig");
+    const nav_files = try ca.alloc(local.serverless_external_source_types.FileEntry, 2);
+    nav_files[0] = .{ .file_id = @constCast("nav-a"), .object_uri = @constCast("file:///nav-a.parquet"), .etag = @constCast("qualified-a"), .byte_len = 128, .row_count = 0, .row_groups = &.{} };
+    nav_files[1] = .{ .file_id = @constCast("nav-b"), .object_uri = @constCast("file:///nav-b.parquet"), .etag = @constCast("qualified-b"), .byte_len = 128, .row_count = 0, .row_groups = &.{} };
+    var nav_source: local.serverless_query_lake_serving.ServingSource = undefined;
+    nav_source.inventory = .{ .format = .parquet, .source_id = @constCast("nav-source"), .source_uri = @constCast("file:///nav"), .snapshot_id = @constCast("first"), .schema_fingerprint = @constCast("schema"), .files = nav_files[0..1] };
+    nav_source.verified_files = null;
+    nav_source.prepared_deletes = null;
+    nav_source.scanner.iceberg_delete_plan = null;
+    var nav_provider: @import("lake_index_row_source.zig").Provider = .{ .source = &nav_source, .context = .{ .io = std.testing.io } };
+    const nav_old = try navigation_api.build(a, ca, &store, &nav_provider, null, .none);
+    const nav_old_root = try navigation_api.load(ca, store, nav_old.ref, .none, null);
     const spec: local.sql_operators.AggregateSpec = .{ .kind = .sum, .input_type = .integer };
     const recipe: local.sql_aggregate_materialization.Recipe = .{ .keys = &.{}, .inputs = &.{.{ .spec = spec, .column = .{ .path = "amount", .type = .integer, .nullable = false } }} };
     const group = try local.sql_operators.Grouped.create(a, &.{spec}, .{ .groups = 1, .bytes = 1024 * 1024 });
@@ -618,9 +636,12 @@ test "external lake native GC retains shared aggregate blocks and durable reader
     defer second_orphan.deinit(a);
     const second_scope = try stores.UploadScope.forPublication(domain, 2, std.testing.io);
     store.upload_scope = second_scope;
+    nav_source.inventory.files = nav_files;
+    nav_source.inventory.snapshot_id = @constCast("second");
+    const nav_new = try navigation_api.build(a, ca, &store, &nav_provider, nav_old_root, .none);
     const directory_two = try @import("lake_index_directory.zig").publishWithContributions(ca, &store, &.{ .{ .name = "sum", .binding = binding, .artifact = root }, .{ .name = row_root.name, .binding = row_binding, .artifact = row_root }, .{ .name = "text", .binding = text_binding, .artifact = text_ref }, .{ .name = "sparse", .binding = sparse_binding, .artifact = sparse_ref } }, &.{.{ .file = @splat(1), .recipe = recipe.fingerprint(), .name = "sum", .artifact = root }}, .none);
     var publication: local.metadata_lake_index_catalog.Publication = .{
-        .reader_protocol = 24,
+        .reader_protocol = local.metadata_lake_index_catalog.native_reader_protocol,
         .namespace = namespace,
         .generation = 1,
         .token = scope.attempt,
@@ -629,6 +650,7 @@ test "external lake native GC retains shared aggregate blocks and durable reader
         .base_source = .{ .external_parquet = .{ .format = .parquet_prefix, .source_uri = "s3://bucket/lake", .snapshot_id = "snapshot", .schema_fingerprint = "schema", .file_inventory_artifact = inventory.artifact_id } },
         .inventory = .{ .kind = .external_base_source, .artifact_id = inventory.artifact_id, .checksum = inventory.checksum, .byte_len = inventory.byte_len },
         .directory = directory_one,
+        .source_navigation = nav_old.ref,
     };
     const Harness = struct {
         a: A,
@@ -649,6 +671,7 @@ test "external lake native GC retains shared aggregate blocks and durable reader
     publication.generation = 2;
     publication.token = second_scope.attempt;
     publication.directory = directory_two;
+    publication.source_navigation = nav_new.ref;
     harness.state = try harness.state.synchronize(ca, .{ .namespace = namespace, .generation = 2, .published = publication });
     const authority: lease_api.Authority = .{ .ptr = &harness, .context = .{}, .read = Harness.read, .mutate = Harness.mutate };
     var planner: Collector = .{ .a = a, .table = 4, .authority = authority, .store = store, .identity = identity, .context = .{}, .options = .{ .dry_run = true, .max_deleted = 1 }, .token = @splat(7) };
@@ -695,10 +718,19 @@ test "external lake native GC retains shared aggregate blocks and durable reader
     defer a.free(retained_old_inventory);
     const retained_old_routes = try store.getAlloc(&try page_store.PageStore.identity(domain, old_serving_routes));
     defer a.free(retained_old_routes);
+    const retained_nav = try navigation_api.load(ca, store, nav_old.ref, .none, null);
+    for ([_]?tree.Ref{ retained_nav.files, retained_nav.public, retained_nav.private }) |ref| {
+        const bytes = try store.getAlloc(&try page_store.PageStore.identity(domain, ref.?));
+        defer a.free(bytes);
+        try std.testing.expectEqual(ref.?.bytes, bytes.len);
+    }
     harness.state = try harness.state.release(ca, @splat(9));
     var second: Collector = .{ .a = a, .table = 4, .authority = authority, .store = store, .identity = identity, .context = .{}, .options = .{ .dry_run = false }, .token = @splat(8) };
     try std.testing.expect((try second.run()).deleted >= 2);
     try std.testing.expectEqual(@as(usize, 1), harness.state.publications.len);
+    _ = try navigation_api.load(ca, store, nav_new.ref, .none, null);
+    try std.testing.expectError(error.FileNotFound, store.getAlloc(nav_old.ref.artifact_id));
+    for ([_]?tree.Ref{ nav_old_root.files, nav_old_root.public, nav_old_root.private }) |ref| try std.testing.expectError(error.FileNotFound, store.getAlloc(&try page_store.PageStore.identity(domain, ref.?)));
     for ([_]tree.Ref{ global_statistics, segment_statistics, serving_inventory, serving_routes, term_branches, term_leaves }) |ref| {
         const retained_statistics = try store.getAlloc(&try page_store.PageStore.identity(domain, ref));
         defer a.free(retained_statistics);

@@ -4168,3 +4168,80 @@ check without relying on allocator-specific parser peaks. New image and native
 replay footprints remain below 16 MiB for the 125,000-integer fixture. These are
 bounded correctness/workspace checks; archive-scale latency/RSS measurement and
 real-provider retention qualification remain deferred.
+
+### Protocol 46: paged file identities, delete-aware deltas, and shared replay groups
+
+Publication-bound source navigation now persists authenticated file proofs and
+public/private identity lookup trees. Search opens the small navigation root and
+resolves reached files through bounded pages. A request retains at most 512 memo
+entries within 4 MiB, a 512 KiB page cache, and bounded lookup scratch; it no longer
+constructs three archive-sized maps on a cold query. Immutable decoded navigation
+pages share the bounded process decode cache, so broad filters do not repeatedly
+decode the same lookup pages or charge cached pages as new I/O. Fresh coverage,
+source/schema/snapshot binding, cancellation, and reader authority remain mandatory
+on cache hits.
+Historical publications without navigation retain their existing mapping path.
+
+File proofs use the exact qualified object selectors, data sequence, partition
+metadata, inventory deletes, and prepared per-file position/equality-delete
+fingerprint used by native index construction. An authenticated set reduction on
+each file-tree subtree lets refresh planning skip unchanged prior records. Changed
+and removed file proofs point-seek only their corresponding native maintenance
+records. The publisher computes current identities once and shares them across
+native builders; delete-bearing snapshots now participate in this delta path.
+Legacy or incompatible proofs retain full reconciliation. Public IDs still fence
+snapshot identity, so a new snapshot bulk-builds its public reverse lookup tree.
+When a prior serving term directory is disabled, its replacement bootstraps
+complete positive contributions from the final serving inventory, including
+untouched packs. Signed deltas without a complete base cannot establish term
+absence or score bounds. This recovery reads summaries, not posting payloads.
+Source discovery and fresh coverage still enumerate the current snapshot; this
+change does not claim constant-time Iceberg manifest discovery or replace source
+validation. It removes full prior-inventory JSON decoding for native text planning
+and avoids reading unchanged prior file records when reductions qualify them.
+
+The catalog reader protocol fences source-navigation ownership. GC marks its root
+and every lookup/proof page in both complete traversal and resumable publication
+expansion. Directory deduplication must not suppress navigation expansion. An
+old reader's navigation remains protected until release, then becomes collectible;
+the one-job-budget GC regression exercises both transitions. Checkpoints retain the
+same navigation as their build. Cloud publication binding/certification includes
+the navigation root and its closure.
+Historical certificate preimages remain readable. Missing optional prior navigation
+migrates through full construction, and coordinator readiness checks its root.
+
+Retained search cuts now compose independently decoded immutable WAL row groups.
+A separate singleflight/admission coordinator prevents nested decoded-cache waits;
+bounded four-group scheduling preserves cold prefetch. Keys bind exact artifact
+identity, provider generation, codec version, and retention domain. Every cut still
+validates expiry, incarnation, recipe, and authority before borrowing a group.
+Composite residency conservatively charges all foreign buffers it keeps alive;
+uncached oversized legacy groups remain private and process-accounted. Eviction
+cannot invalidate either an older cut or a neighboring cut sharing its buffers.
+
+Recent vector partition jobs keep their reusable LSN-independent identities.
+Table-level enrichment status is now published only by composition under the actual
+WAL LSN, archive generation, incarnation, recipe, and cut. It reports required/ready
+partition counts, failures/retry timing, and the minimum covered artifact-retention
+horizon. CAS ordering prevents older archive/WAL cuts or incomplete observations
+from replacing ready coverage. A recipe/incarnation-specific status key prevents
+cross-generation completions from competing, and a small aggregate memo avoids
+status storage operations on warm ready queries.
+
+Live-provider retention qualification remains deferred and certificate enablement
+remains off by default. Qualification on merged main `0cba59bceb`:
+
+- Debug lake integration: 168 shared-engine and 293 server tests passed (461 total).
+- Focused navigation/frontier/WAL checks: 5 shared-engine and 50 server tests passed
+  (55 total), including selective delete-aware reconciliation, independent shared
+  row-group owners, composed-status CAS races, resumable navigation GC, and optional
+  term-directory recovery with untouched historical packs.
+- Production CLI build passed. All 17 selected real Parquet/Iceberg E2Es passed in
+  205.15 seconds, covering snapshot/schema evolution, position/equality deletes,
+  accepted text/vector cuts, restart, broad windows, metadata filters above the
+  old ID-list limit, fragmented layouts, signed timestamps, and incremental refresh.
+- Zig/Python formatting, whitespace, license headers, and the Apache product
+  boundary passed (2,038 source files).
+
+These checks establish correctness and bounded work for the covered fixtures;
+representative archive-scale latency and RSS benchmarks remain deferred.

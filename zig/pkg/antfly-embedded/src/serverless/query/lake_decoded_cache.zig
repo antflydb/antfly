@@ -44,11 +44,24 @@ pub const Item = struct {
     /// A decoded page pins its immutable chunk dictionary in this cache.
     dependency: ?*Item = null,
     dependencies: []const *Item = &.{},
+    /// Composite values can pin immutable payloads in a separate decode
+    /// coordinator. Separating admission prevents nested-flight deadlocks.
+    foreign_dependencies: []const Lease = &.{},
+    /// Conservative residency charge for buffers kept alive in other caches.
+    /// Shared dependencies may be counted twice, never omitted from admission.
+    foreign_bytes: usize = 0,
     touched: u64 = 0,
+    fn footprint(self: *const Item) usize {
+        return self.budget.live +| self.foreign_bytes;
+    }
     fn destroy(self: *Item, cache: *Cache) void {
         const parent = self.dependency;
         const a = self.budget.backing;
         for (self.dependencies) |item| cache.releaseLocked(item);
+        for (self.foreign_dependencies) |lease| {
+            std.debug.assert(lease.cache != cache);
+            lease.release();
+        }
         if (self.payload == .page_directory) self.payload.page_directory.deinit();
         if (self.payload == .prepared) self.payload.prepared.destroy(self.budget.allocator());
         if (self.payload == .snapshot) self.payload.snapshot.deinit(self.budget.allocator());
@@ -320,7 +333,7 @@ pub const Cache = struct {
         self.lock();
         defer self.mutex.unlock();
         const item = lease.item;
-        const size = item.budget.live;
+        const size = item.footprint();
         if (size > self.max_bytes or self.max_entries == 0 or self.entries.contains(key)) return;
         while (size > self.max_bytes -| self.bytes or self.entries.count() >= self.max_entries) {
             var oldest: ?[32]u8 = null;
@@ -334,7 +347,7 @@ pub const Cache = struct {
                 }
             }
             const removed = self.entries.fetchRemove(oldest orelse return).?;
-            self.bytes -= removed.value.budget.live;
+            self.bytes -= removed.value.footprint();
             removed.value.cached = false;
             removed.value.destroy(self);
         }
@@ -630,4 +643,23 @@ test "external lake shared decode failure does not impose a leader's smaller con
     defer result.release();
     try std.testing.expectEqual(@as(u8, 42), @as(*const u8, @ptrCast(result.item.payload.extension)).*);
     try std.testing.expectEqual(@as(usize, 0), cache.loading_bytes);
+}
+
+test "external lake foreign decoded dependencies obey composite residency budgets" {
+    const a = std.testing.allocator;
+    var groups: Cache = .{ .a = a };
+    defer groups.deinit();
+    var states: Cache = .{ .a = a, .max_bytes = 4096 };
+    defer states.deinit();
+    const group = try groups.create(16384);
+    _ = try group.item.arena.allocator().alloc(u8, 8192);
+    const state = try states.create(4096);
+    defer state.release();
+    const held = try state.item.arena.allocator().alloc(Lease, 1);
+    held[0] = group;
+    state.item.foreign_dependencies = held;
+    state.item.foreign_bytes = group.item.budget.live;
+    states.publish(@splat(9), state);
+    try std.testing.expect(!state.item.cached);
+    try std.testing.expectEqual(@as(usize, 0), states.bytes);
 }

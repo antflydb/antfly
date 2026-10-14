@@ -2269,7 +2269,7 @@ def test_native_remote_incremental_generations_keep_public_identity_and_file_art
                 if document.get("serving"):
                     # The publication carries the prior-snapshot proof used by
                     # append/replacement planning, including after cold restart.
-                    assert document.get("inventory_delta_version") == 1, document
+                    assert document.get("inventory_delta_version") == 2, document
                 if document.get("inventory_version") == 3:
                     chunks = {}
                     file_root = document["directories"]["files"]

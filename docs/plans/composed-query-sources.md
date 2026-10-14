@@ -272,7 +272,11 @@ reused after restart and during archive promotion. Leases fence stale completion
 Graceful cancellation conditionally releases unfinished claims with a separate
 one-second cleanup budget, including ambiguous successful claim writes recovered
 by random ownership token; hard crashes use the 120-second lease expiry. `{"action":"enrichment_status"}` on
-`/tables/{table}/lake/maintenance` reports completed/failed recent coverage. Jobs
+`/tables/{table}/lake/maintenance` reports composed table coverage under the actual
+WAL position, archive generation, incarnation, and recipe. Its version-2 status
+includes required/ready partition counts and the minimum covered artifact-retention
+horizon; reusable partition claims keep their separate version-1 job identity.
+Older completions cannot replace newer archive/WAL coverage. Jobs
 and segment artifacts retain for 24 hours; bounded background conditional cleanup
 collects expired state. Index work still obeys the bounded WAL, memory and request
 budgets; large jobs make vendor progress through durable memoized inputs. A live

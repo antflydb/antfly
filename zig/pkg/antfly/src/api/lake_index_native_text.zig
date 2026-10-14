@@ -299,7 +299,7 @@ pub const Root = struct {
         if (self.checkpoint_removed.len > 16384 or (self.checkpoint_removed.len != 0 and self.checkpoint_base == null)) return error.InvalidNativeLakeTextCorpus;
         if (self.pack_ownership) |ref| try ref.validate();
         if (self.source_layout_version > 1) return error.InvalidNativeLakeTextCorpus;
-        if (self.inventory_delta_version > 1 or (self.inventory_delta_version != 0 and self.inventory_version != 3)) return error.InvalidNativeLakeTextCorpus;
+        if (self.inventory_delta_version > 2 or (self.inventory_delta_version != 0 and self.inventory_version != 3)) return error.InvalidNativeLakeTextCorpus;
         if (self.source_routes_version > 1 or (self.source_routes != null and self.source_routes_version != 1)) return error.InvalidNativeLakeTextCorpus;
         if (self.source_routes) |ref| try ref.validate();
         if (self.open_tails.len != 0) {
@@ -815,10 +815,11 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         // An authenticated prior inventory replaces a full native file-catalog
         // census for ordinary append/replacement publication. Recovery and delete
         // migrations retain the complete reconciliation path.
-        const inventory_delta = if (paged_seed and baseline != null and seed.?.checkpoint_base == null) eligibleInventory(provider, baseline.?) else null;
-        var prepared_plan: ?state.Plan = if (inventory_delta) |inventory| try state.Plan.fromInventory(a, ca, provider, inventory) else null;
+        const native_delta = if (paged_seed and baseline != null and seed.?.checkpoint_base == null) eligibleDelta(provider, baseline.?) else null;
+        const inventory_delta = if (native_delta == null and paged_seed and baseline != null and seed.?.checkpoint_base == null) eligibleInventory(provider, baseline.?) else null;
+        var prepared_plan: ?state.Plan = if (native_delta) |delta| try state.Plan.fromDelta(a, ca, delta) else if (inventory_delta) |inventory| try state.Plan.fromInventory(a, ca, provider, inventory) else null;
         errdefer if (prepared_plan) |*value| value.deinit();
-        const baseline_records = if (inventory_delta) |inventory|
+        const baseline_records = if (native_delta) |delta| try changedDeltaRecords(ca, store.*, baseline.?, delta, cancellation) else if (inventory_delta) |inventory|
             try changedInventoryRecords(a, ca, store.*, baseline.?, provider, inventory, &prepared_plan.?, cancellation, 128 * 1024 * 1024)
         else if (baseline) |old| try text_directory.fileRecords(ca, old, store.*, null, cancellation) else &.{};
         const records = if (paged_seed) (if (baseline != null) baseline_records else try text_directory.fileRecords(ca, seed.?, store.*, null, cancellation)) else if (manifest_seed) try checkpointFiles(a, ca, seed.?, baseline_records, store.*, cancellation) else &.{};
@@ -1052,7 +1053,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             try removed_files.append(ca, record);
         }
         for (plan.files, file_manifests, plan.changed) |file, slot, changed| {
-            if (inventory_delta != null and !changed) continue;
+            if ((native_delta != null or inventory_delta != null) and !changed) continue;
             if (baseline_by_id.get(file.id)) |old| if (std.mem.eql(u8, &old.file.digest, &file.digest)) continue;
             try added_files.append(ca, .{ .file = file, .manifest = slot orelse return error.InvalidNativeLakeTextCorpus });
         }
@@ -1118,7 +1119,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         var root: Root = .{ .admission_version = 1, .statistics_version = 2, .term_statistics = global_statistics, .term_directory = directory, .seekable = true, .stored_projection = store_source, .domain = store.upload_scope.?.domain, .binding = binding, .config_json = spec.config_json, .recipe = recipe, .directories = directories, .inventory_version = 3, .file_count = @intCast(plan.files.len), .segment_count = totals.segments, .collection = try totals.finish(ca) };
         root.source_layout_version = 1;
         root.source_routes_version = 1;
-        root.inventory_delta_version = if (source.inventory.deleted_row_groups.len == 0 and (if (source.scanner.iceberg_delete_plan) |deletes| deletes.files.len == 0 else true)) 1 else 0;
+        root.inventory_delta_version = if (provider.native_delta != null) 2 else if (source.inventory.deleted_row_groups.len == 0 and (if (source.scanner.iceberg_delete_plan) |deletes| deletes.files.len == 0 else true)) 1 else 0;
         root.serving = try @import("lake_index_serving_compaction.zig").publishDelta(a, ca, store, root, baseline, .{ .removed = removed_files.items, .added = added_files.items }, &plan, provider.context, cancellation);
         try root.validate();
         const bytes = try std.json.Stringify.valueAlloc(ca, root, .{});
@@ -1135,6 +1136,26 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         try declarations.append(out, try std.json.parseFromSliceLeaky(Declared, out, owned, .{ .allocate = .alloc_always }));
     }
     return declarations.toOwnedSlice(out);
+}
+fn eligibleDelta(provider: *RowProvider, baseline: Root) ?@import("lake_source_navigation.zig").Delta {
+    const delta = provider.native_delta orelse return null;
+    const snapshot = delta.prior_snapshot orelse return null;
+    if (baseline.inventory_delta_version == 0 or baseline.file_count != delta.prior_count or
+        !std.mem.eql(u8, snapshot, baseline.binding.snapshot_id) or
+        !std.mem.eql(u8, delta.source, baseline.binding.source_id) or
+        !std.mem.eql(u8, delta.schema, baseline.binding.schema_fingerprint)) return null;
+    return delta;
+}
+fn changedDeltaRecords(a: A, store: stores.ArtifactStore, baseline: Root, delta: @import("lake_source_navigation.zig").Delta, token: Cancellation) ![]const text_directory.FileRecord {
+    var remaining: u64 = 128 * 1024 * 1024;
+    if (delta.prior_changed.len > 64 and delta.prior_changed.len * 4 >= baseline.file_count)
+        return text_directory.fileRecordsBudget(a, baseline, store, null, token, &remaining);
+    const result = try a.alloc(text_directory.FileRecord, delta.prior_changed.len);
+    for (delta.prior_changed, result) |old, *record| {
+        record.* = try text_directory.lookupFileBudget(a, baseline, store, null, token, old.id, &remaining);
+        if (!std.mem.eql(u8, &record.file.digest, &old.digest)) return error.InvalidNativeLakeFileState;
+    }
+    return result;
 }
 fn eligibleInventory(provider: *RowProvider, baseline: Root) ?local.serverless_external_source_types.Inventory {
     const prior = provider.previous_inventory orelse return null;

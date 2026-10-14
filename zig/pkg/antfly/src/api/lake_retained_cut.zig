@@ -303,6 +303,99 @@ pub const Pinned = struct {
         if (self.lease) |held| held.release();
     }
 };
+const DecodedGroup = struct { changes: []const ingestion.Batch.Change };
+const GroupLoader = struct {
+    store: stores.ArtifactStore,
+    ref: StateRef,
+    version: u8,
+    cancellation: Token,
+    fn decode(raw: *anyopaque, item: *local.serverless_query_lake_decoded_cache.Item) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        // Decode workers never allocate through a borrowed request arena.
+        // The temporary body and decoded values use this group's own budget.
+        var backend = self.store;
+        backend.allocator = item.budget.allocator();
+        const bytes = try readRetained(&backend, self.ref, self.cancellation);
+        defer backend.allocator.free(bytes);
+        const a = item.arena.allocator();
+        const value = try a.create(DecodedGroup);
+        value.* = .{ .changes = if (self.version == 2) try decodeChanges(a, bytes) else try std.json.parseFromSliceLeaky([]const ingestion.Batch.Change, a, bytes, .{ .allocate = .alloc_always }) };
+        if (value.changes.len > 65536) return error.LakeOverlayTooLarge;
+        item.payload = .{ .extension = value };
+    }
+};
+fn readSharedParts(item: *local.serverless_query_lake_decoded_cache.Item, cache: *local.serverless_query_lake_decoded_cache.Cache, store: stores.ArtifactStore, state: *State, expected_domain: [32]u8, expiry: u64, token: Token, context: local.serverless_query_lake_read_context.Context) !void {
+    if (state.change_parts.len > 16 or (state.change_parts.len != 0 and state.pending.count() != 0)) return error.InvalidQueryRequest;
+    const a = item.arena.allocator();
+    const leases = try a.alloc(local.serverless_query_lake_decoded_cache.Lease, state.change_parts.len);
+    var held: usize = 0;
+    errdefer for (leases[0..held]) |lease| lease.release();
+    const blocks = try a.alloc([]const ingestion.Batch.Change, state.change_parts.len);
+    const scheduler = local.sql_parallel_scheduler;
+    var rows: usize = 0;
+    var retained_bytes: usize = 0;
+    var first_part: usize = 0;
+    while (first_part < state.change_parts.len) {
+        const count = @min(4, state.change_parts.len - first_part);
+        var tasks: [4]?scheduler.Task(anyerror!local.serverless_query_lake_decoded_cache.Lease) = @splat(null);
+        var results: [4]?local.serverless_query_lake_decoded_cache.Lease = @splat(null);
+        defer {
+            for (&tasks) |*task| if (task.*) |pending| {
+                var running = pending;
+                if (running.cancel(context.io.?)) |lease| lease.release() else |_| {}
+            };
+            for (results) |result| if (result) |lease| lease.release();
+        }
+        for (state.change_parts[first_part..][0..count], 0..) |part, i| {
+            try validateStateRef(part, expected_domain, expiry);
+            try context.ensureActive();
+            try token.check();
+            if (context.io) |io| tasks[i] = scheduler.global().submitIoTransient(io, groupLimit(part), acquireGroup, .{ cache, store, part, state.version, expected_domain, token, context });
+            if (tasks[i] == null) results[i] = try acquireGroup(cache, store, part, state.version, expected_domain, token, context);
+        }
+        for (0..count) |i| {
+            if (tasks[i]) |pending| {
+                var running = pending;
+                tasks[i] = null;
+                results[i] = try running.await(context.io.?);
+            }
+            try context.ensureActive();
+            try token.check();
+            leases[held] = results[i].?;
+            results[i] = null;
+            const lease = leases[held];
+            held += 1;
+            retained_bytes = try std.math.add(usize, retained_bytes, lease.item.budget.peak);
+            if (retained_bytes > 256 * 1024 * 1024) return error.QueryCandidateBudgetExceeded;
+            const group: *const DecodedGroup = @ptrCast(@alignCast(lease.item.payload.extension));
+            blocks[first_part + i] = group.changes;
+            rows = try std.math.add(usize, rows, group.changes.len);
+            if (rows > 65536) return error.LakeOverlayTooLarge;
+        }
+        first_part += count;
+    }
+    if (blocks.len != 0) state.pending.change_blocks = blocks;
+    item.foreign_dependencies = leases;
+    for (leases) |lease| item.foreign_bytes += lease.item.budget.live;
+}
+fn groupLimit(part: StateRef) usize {
+    return @min(64 * 1024 * 1024, @as(usize, part.bytes) *| 32 +| 1024 * 1024);
+}
+fn acquireGroup(cache: *local.serverless_query_lake_decoded_cache.Cache, store: stores.ArtifactStore, part: StateRef, version: u8, expected_domain: [32]u8, token: Token, context: local.serverless_query_lake_read_context.Context) anyerror!local.serverless_query_lake_decoded_cache.Lease {
+    const key_ = @import("lake_wal_image.zig").digest(.{ .format = "decoded-retained-row-group-v1", .domain = expected_domain, .version = version, .ref = part });
+    var loader: GroupLoader = .{ .store = store, .ref = part, .version = version, .cancellation = token };
+    return cache.acquire(key_, groupLimit(part), context, .{ .ptr = &loader, .load = GroupLoader.decode }) catch |err| switch (err) {
+        error.OutOfMemory, error.SqlMemoryLimitExceeded => private: {
+            const value = try cache.create(256 * 1024 * 1024);
+            errdefer value.release();
+            try GroupLoader.decode(&loader, value.item);
+            try context.ensureActive();
+            try token.check();
+            break :private value;
+        },
+        else => return err,
+    };
+}
 const Decoded = struct { state: State, overlay: ?@import("lake_search_overlay.zig").Overlay };
 const StateLoader = struct {
     store: stores.ArtifactStore,
@@ -310,15 +403,18 @@ const StateLoader = struct {
     domain: [32]u8,
     expiry: u64,
     cancellation: Token,
+    groups: ?*local.serverless_query_lake_decoded_cache.Cache = null,
+    context: local.serverless_query_lake_read_context.Context = .{},
     fn decode(raw: *anyopaque, item: *local.serverless_query_lake_decoded_cache.Item) !void {
         const self: *@This() = @ptrCast(@alignCast(raw));
         const a = item.arena.allocator();
         const value = try a.create(Decoded);
-        value.* = try decodeState(a, &self.store, self.ref, self.domain, self.expiry, self.cancellation);
+        value.* = try decodeState(a, &self.store, self.ref, self.domain, self.expiry, self.cancellation, if (self.groups) |cache| .{ .item = item, .cache = cache, .context = self.context } else null);
         item.payload = .{ .extension = value };
     }
 };
-fn decodeState(a: A, store: *stores.ArtifactStore, ref: StateRef, expected_domain: [32]u8, expiry: u64, cancellation: Token) !Decoded {
+const GroupOwner = struct { item: *local.serverless_query_lake_decoded_cache.Item, cache: *local.serverless_query_lake_decoded_cache.Cache, context: local.serverless_query_lake_read_context.Context };
+fn decodeState(a: A, store: *stores.ArtifactStore, ref: StateRef, expected_domain: [32]u8, expiry: u64, cancellation: Token, groups: ?GroupOwner) !Decoded {
     const body = try readRetained(store, ref, cancellation);
     defer store.allocator.free(body);
     var state = try std.json.parseFromSliceLeaky(State, a, body, .{ .allocate = .alloc_always });
@@ -328,19 +424,22 @@ fn decodeState(a: A, store: *stores.ArtifactStore, ref: StateRef, expected_domai
         retained_bytes = std.math.add(usize, retained_bytes, part.bytes) catch return error.QueryCandidateBudgetExceeded;
         if (retained_bytes > max_bytes) return error.QueryCandidateBudgetExceeded;
     }
-    try readParts(a, store, &state, expected_domain, expiry, cancellation, if (store.providerStore()) |object| object.cloud_io else null);
+    if (groups) |owner| try readSharedParts(owner.item, owner.cache, store.*, &state, expected_domain, expiry, cancellation, owner.context) else try readParts(a, store, &state, expected_domain, expiry, cancellation, if (store.providerStore()) |object| object.cloud_io else null);
     const overlay = if (state.pending.count() != 0) try @import("lake_search_overlay.zig").Overlay.init(a, state.pending) else null;
     return .{ .state = state, .overlay = overlay };
 }
 pub fn load(a: A, store: *stores.ArtifactStore, store_identity: catalog.Digest, token: []const u8, table: local.common_topology_records.TableRecord, now: u64, cancellation: Token) !Descriptor {
-    const pin = try loadImpl(a, store, store_identity, token, table, now, cancellation, null, .{});
+    const pin = try loadImpl(a, store, store_identity, token, table, now, cancellation, null, .{}, null);
     defer pin.deinit();
     return pin.descriptor;
 }
 pub fn loadCached(a: A, store: *stores.ArtifactStore, store_identity: catalog.Digest, token: []const u8, table: local.common_topology_records.TableRecord, now: u64, cancellation: Token, cache: *local.serverless_query_lake_decoded_cache.Cache, context: local.serverless_query_lake_read_context.Context) !Pinned {
-    return loadImpl(a, store, store_identity, token, table, now, cancellation, cache, context);
+    return loadImpl(a, store, store_identity, token, table, now, cancellation, cache, context, null);
 }
-fn loadImpl(a: A, store: *stores.ArtifactStore, store_identity: catalog.Digest, token: []const u8, table: local.common_topology_records.TableRecord, now: u64, cancellation: Token, cache: ?*local.serverless_query_lake_decoded_cache.Cache, context: local.serverless_query_lake_read_context.Context) !Pinned {
+pub fn loadWithGroups(a: A, store: *stores.ArtifactStore, store_identity: catalog.Digest, token: []const u8, table: local.common_topology_records.TableRecord, now: u64, cancellation: Token, cache: *local.serverless_query_lake_decoded_cache.Cache, groups: *local.serverless_query_lake_decoded_cache.Cache, context: local.serverless_query_lake_read_context.Context) !Pinned {
+    return loadImpl(a, store, store_identity, token, table, now, cancellation, cache, context, groups);
+}
+fn loadImpl(a: A, store: *stores.ArtifactStore, store_identity: catalog.Digest, token: []const u8, table: local.common_topology_records.TableRecord, now: u64, cancellation: Token, cache: ?*local.serverless_query_lake_decoded_cache.Cache, context: local.serverless_query_lake_read_context.Context, groups: ?*local.serverless_query_lake_decoded_cache.Cache) !Pinned {
     var held: ?local.serverless_query_lake_decoded_cache.Lease = null;
     errdefer if (held) |lease| lease.release();
     var overlay: ?@import("lake_search_overlay.zig").Overlay = null;
@@ -363,7 +462,7 @@ fn loadImpl(a: A, store: *stores.ArtifactStore, store_identity: catalog.Digest, 
         try validateStateRef(lease.state, expected_domain, lease.expires_ms);
         const decoded: Decoded = if (cache) |memo| shared: {
             const key = @import("lake_wal_image.zig").digest(.{ .format = "retained-decoded-state-v1", .store = store_identity, .table = table.table_id, .incarnation = table.object_storage_generation, .ref = lease.state });
-            var loader: StateLoader = .{ .store = store.*, .ref = lease.state, .domain = expected_domain, .expiry = lease.expires_ms, .cancellation = cancellation };
+            var loader: StateLoader = .{ .store = store.*, .ref = lease.state, .domain = expected_domain, .expiry = lease.expires_ms, .cancellation = cancellation, .groups = groups, .context = context };
             const Check = struct {
                 token: Token,
                 parent: local.serverless_query_lake_read_context.Context,
@@ -376,6 +475,7 @@ fn loadImpl(a: A, store: *stores.ArtifactStore, store_identity: catalog.Digest, 
             var check: Check = .{ .token = cancellation, .parent = context };
             var checked = context;
             checked.checkpoint = .{ .ptr = &check, .check = Check.check };
+            loader.context = checked;
             // Cache admission is optional. Legacy JSON can need a larger
             // bounded workspace than native values or cache residency allows.
             // Private items still use the cache's process-accounted allocator.
@@ -392,7 +492,7 @@ fn loadImpl(a: A, store: *stores.ArtifactStore, store_identity: catalog.Digest, 
             };
             const value: *const Decoded = @ptrCast(@alignCast(held.?.item.payload.extension));
             break :shared value.*;
-        } else try decodeState(a, store, lease.state, expected_domain, lease.expires_ms, cancellation);
+        } else try decodeState(a, store, lease.state, expected_domain, lease.expires_ms, cancellation, null);
         const state = decoded.state;
         // A shared decode is data only: the current envelope still proves
         // every transitive scope covers this reader's independent lifetime.
@@ -606,6 +706,44 @@ test "external lake bounded WAL retained cuts survive reopening and fence expira
         try std.testing.expect(!pressure.item.cached);
         // Pinned data stays valid when residency admission is saturated.
         try std.testing.expectEqual(@as(usize, 2), warm.overlay.?.rows.count());
+    }
+    {
+        var uploads: Cache = .{ .budget = .{ .backing = a, .limit = 1024 * 1024 } };
+        defer uploads.deinit();
+        const original = try saveCached(sa, &artifacts, identity, std.testing.io, descriptor, .none, &uploads);
+        var groups: local.serverless_query_lake_decoded_cache.Cache = .{ .a = a };
+        defer groups.deinit();
+        var states: local.serverless_query_lake_decoded_cache.Cache = .{ .a = a };
+        defer states.deinit();
+        const old = try loadWithGroups(sa, &artifacts, identity, original, table, now + 1, .none, &states, &groups, .{ .io = std.testing.io });
+        defer old.deinit();
+        try std.testing.expectEqual(@as(usize, 2), old.lease.?.item.foreign_dependencies.len);
+        const replacement = try std.json.parseFromSliceLeaky(std.json.Value, sa, "{\"id\":0,\"body\":\"changed\"}", .{});
+        const next_image = try images.Image.update(a, image, .{ .lsn = 9, .key_fields = &.{"id"}, .changes = &.{.{ .op = .upsert, .row = replacement }} });
+        defer next_image.release();
+        var next = descriptor;
+        next.pending.lsn = 9;
+        next.pending.cut_identity = @splat(77);
+        next.pending.change_blocks = &next_image.blocks;
+        next.pending.block_digests = &next_image.block_digests;
+        const next_token = try saveCached(sa, &artifacts, identity, std.testing.io, next, .none, &uploads);
+        const recent = try loadWithGroups(sa, &artifacts, identity, next_token, table, now + 1, .none, &states, &groups, .{ .io = std.testing.io });
+        defer recent.deinit();
+        try std.testing.expect(old.lease.?.item != recent.lease.?.item);
+        var reused: usize = 0;
+        for (old.lease.?.item.foreign_dependencies) |previous_group| for (recent.lease.?.item.foreign_dependencies) |next_group| {
+            if (previous_group.item == next_group.item) reused += 1;
+        };
+        try std.testing.expectEqual(@as(usize, 1), reused);
+        try std.testing.expectEqual(@as(usize, 2), old.overlay.?.rows.count());
+        try std.testing.expectEqual(@as(usize, 2), recent.overlay.?.rows.count());
+        // Eviction cannot free groups pinned by either independent cut.
+        groups.max_bytes = 0;
+        const evict = try groups.create(128);
+        defer evict.release();
+        groups.publish(@splat(88), evict);
+        try std.testing.expectEqual(@as(usize, 2), old.overlay.?.rows.count());
+        try std.testing.expectError(error.DeadlineExceeded, loadWithGroups(sa, &artifacts, identity, next_token, table, now + 1, .none, &states, &groups, .{ .deadline_ns = 1 }));
     }
     {
         // Legacy issued cuts can exceed cache residency while remaining valid.

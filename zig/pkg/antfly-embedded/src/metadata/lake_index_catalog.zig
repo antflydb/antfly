@@ -26,7 +26,7 @@ pub const Digest = [32]u8;
 pub const Token = [16]u8;
 pub const DirectoryRef = struct { artifact_id: []const u8, checksum: []const u8, byte_len: u64, count: u32 };
 pub const max_directory_artifacts: usize = 4096;
-pub const native_reader_protocol: u16 = 45;
+pub const native_reader_protocol: u16 = 46;
 
 // Catalog envelopes must remain readable so reconciliation can replace older
 // derived formats. Serving still requires the current reader protocol.
@@ -116,6 +116,7 @@ pub const Publication = struct {
     published_at_ms: u64,
     base_source: base.BaseSourceDescriptor,
     inventory: artifacts.ArtifactRef,
+    source_navigation: ?artifacts.ArtifactRef = null,
     declarations: []const manifest.DeclaredArtifact = &.{},
     directory: ?DirectoryRef = null,
     cloud_generations: ?CloudGenerations = null,
@@ -126,9 +127,9 @@ pub const Publication = struct {
     contribution_ownership_version: u16 = 0,
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
         if (self.directory) |directory| {
-            try writer.write(.{ .reader_protocol = self.reader_protocol, .reuse_published = self.reuse_published, .store_locator = self.store_locator, .namespace = self.namespace, .generation = self.generation, .token = self.token, .signature = self.signature, .published_at_ms = self.published_at_ms, .base_source = self.base_source, .inventory = self.inventory, .directory = directory, .cloud_generations = self.cloud_generations });
+            try writer.write(.{ .reader_protocol = self.reader_protocol, .reuse_published = self.reuse_published, .store_locator = self.store_locator, .namespace = self.namespace, .generation = self.generation, .token = self.token, .signature = self.signature, .published_at_ms = self.published_at_ms, .base_source = self.base_source, .inventory = self.inventory, .source_navigation = self.source_navigation, .directory = directory, .cloud_generations = self.cloud_generations });
         } else {
-            try writer.write(.{ .reader_protocol = self.reader_protocol, .reuse_published = self.reuse_published, .store_locator = self.store_locator, .namespace = self.namespace, .generation = self.generation, .token = self.token, .signature = self.signature, .published_at_ms = self.published_at_ms, .base_source = self.base_source, .inventory = self.inventory, .declarations = self.declarations, .cloud_generations = self.cloud_generations });
+            try writer.write(.{ .reader_protocol = self.reader_protocol, .reuse_published = self.reuse_published, .store_locator = self.store_locator, .namespace = self.namespace, .generation = self.generation, .token = self.token, .signature = self.signature, .published_at_ms = self.published_at_ms, .base_source = self.base_source, .inventory = self.inventory, .source_navigation = self.source_navigation, .declarations = self.declarations, .cloud_generations = self.cloud_generations });
         }
     }
     pub fn validate(self: Publication) !void {
@@ -158,6 +159,10 @@ pub const Publication = struct {
         switch (self.base_source) {
             .external_parquet, .external_iceberg => {},
             else => return error.InvalidLakeIndexCatalog,
+        }
+        if (self.source_navigation) |navigation| {
+            if (self.reader_protocol < 46 or navigation.kind != .doc_values or navigation.metadata_version != 1) return error.InvalidLakeIndexCatalog;
+            try artifactValid(navigation);
         }
         try artifactValid(self.inventory);
         if (self.inventory.kind != .external_base_source) return error.InvalidLakeIndexCatalog;

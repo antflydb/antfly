@@ -132,6 +132,11 @@ fn durableDirectoryAvailable(a: A, store: *Store, ready: catalog.Publication, ca
         error.FileNotFound, error.NotFound, error.ArtifactIntegrityMismatch => return false,
         else => return err,
     };
+    const navigation = ready.source_navigation orelse return false;
+    _ = @import("lake_source_navigation.zig").load(arena.allocator(), handle, navigation, cancellation, null) catch |err| switch (err) {
+        error.FileNotFound, error.NotFound, error.ObjectNotFound, error.ArtifactIntegrityMismatch, error.InvalidNativeLakeFileState, error.CloudGenerationMapUnavailable => return false,
+        else => return err,
+    };
     if (document.declarations.len != directory.count) return error.InvalidLakeIndexCatalog;
     // Definition/source signatures do not change when reader formats advance.
     // An intact obsolete directory is not a reason to skip the required build.
@@ -489,6 +494,7 @@ test "external lake native coordinator fences ambiguous admission and reuses dur
     // A complete older directory is still a refresh obligation after a
     // reader-format upgrade, even when every source signature is unchanged.
     recovered.value.published.?.reader_protocol = 33;
+    recovered.value.published.?.source_navigation = null;
     const historical = try catalog.encode(a, recovered.value);
     if (mock.owned) |bytes| a.free(bytes);
     mock.owned = historical;
@@ -546,6 +552,7 @@ test "external lake native coordinator fences ambiguous admission and reuses dur
         try artifacts.delete(target.artifact_id);
         var forced = refreshed.value;
         forced.published.?.reader_protocol = 31;
+        forced.published.?.source_navigation = null;
         const forced_catalog = try catalog.encode(a, forced);
         a.free(mock.owned.?);
         mock.owned = forced_catalog;
@@ -657,6 +664,7 @@ test "external lake native coordinator fences ambiguous admission and reuses dur
             // clearing a checkpoint alone cannot retire a damaged publication.
             var forced = ordered_resumed.value;
             forced.published.?.reader_protocol = 31;
+            forced.published.?.source_navigation = null;
             const forced_catalog = try catalog.encode(a, forced);
             a.free(mock.owned.?);
             mock.owned = forced_catalog;

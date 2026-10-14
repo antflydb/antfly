@@ -37,6 +37,7 @@ const Builder = struct {
     token: Cancellation,
     pages: *pages_mod.PageStore,
     terms: *corpus.term_directory.Builder,
+    collect_term_deltas: bool = true,
     ownership: *corpus.text_directory.Mutations,
     source_routes: *corpus.text_directory.Mutations,
     open_packs: std.ArrayList(Chunk) = .empty,
@@ -62,6 +63,7 @@ const Builder = struct {
         try self.token.check();
     }
     fn contribution(self: *@This(), group: corpus.FileGroup, sign: i64) !void {
+        if (!self.collect_term_deltas) return;
         for (group.summaries, group.segments) |summary, segment| try self.terms.add(self.pages.store(), summary, corpus.term_directory.identity(segment.artifact_id), sign);
     }
     fn owner(self: *@This(), group: corpus.FileGroup, manifest: Chunk, deleting: bool) !void {
@@ -309,6 +311,7 @@ pub fn publishDelta(a: A, out: A, store: *stores.ArtifactStore, current: corpus.
     var scratch = std.heap.ArenaAllocator.init(a);
     defer scratch.deinit();
     if (prior) |old| {
+        builder.collect_term_deltas = old.term_directory.leaves != null;
         if (old.source_routes_version == 0) {
             for (try corpus.text_directory.fileRecords(ca, old, store.*, null, token)) |record| {
                 _ = scratch.reset(.free_all);
@@ -385,6 +388,29 @@ pub fn publishDelta(a: A, out: A, store: *stores.ArtifactStore, current: corpus.
     var root = current;
     root.serving = null;
     root.directories = try corpus.text_directory.publishManifests(a, store, builder.added.items, builder.removed.items, if (prior) |old| old.directories else .{}, current.domain, token, context.io.?);
+    root.file_count = builder.pack_count;
+    root.segment_count = builder.pack_count;
+    if (!builder.collect_term_deltas) {
+        // A disabled directory supplies no complete base for signed deltas.
+        // Bootstrap positive contributions from the final serving inventory,
+        // including untouched packs; postings and source files stay unopened.
+        const Bootstrap = struct {
+            pages: *pages_mod.PageStore,
+            terms: *corpus.term_directory.Builder,
+            context: local.serverless_query_lake_read_context.Context,
+            token: Cancellation,
+            pub fn check(self: *@This()) !void {
+                try self.context.ensureActive();
+                try self.token.check();
+            }
+            pub fn record(self: *@This(), entry: anytype) !void {
+                try self.check();
+                try self.terms.add(self.pages.store(), entry.route.summary, corpus.term_directory.identity(entry.route.ref.artifact_id), 1);
+            }
+        };
+        var bootstrap: Bootstrap = .{ .pages = &pages, .terms = &terms, .context = context, .token = token };
+        try corpus.text_directory.walkSegments(a, root, store.*, token, &bootstrap);
+    }
     root.term_directory = try terms.finish(pages.store(), if (prior) |old| old.term_directory else .{});
     root.source_layout_version = 1;
     root.source_routes_version = 1;
@@ -392,8 +418,6 @@ pub fn publishDelta(a: A, out: A, store: *stores.ArtifactStore, current: corpus.
     root.pack_ownership = try ownership.finish(if (prior) |old| old.pack_ownership else null);
     root.open_packs = builder.open_packs.items;
     root.open_tails = builder.open_tails.items;
-    root.file_count = builder.pack_count;
-    root.segment_count = builder.pack_count;
     root.serving_bytes = builder.serving_bytes;
     root.serving_metadata_bytes = builder.serving_metadata_bytes;
     try root.validate();
@@ -583,6 +607,30 @@ test "external lake global frontier cross file packs preserve coordinates ties r
         }
         try std.testing.expect(found);
     }
+    // Recover a complete optional directory while leaving the historical pack
+    // untouched. Delta-only positive entries would miss its quasar candidates;
+    // signed deletions against an absent base must never reach sorted build.
+    var disabled_serving = appended_root;
+    disabled_serving.term_directory = .{ .version = 2 };
+    var disabled_base = appended;
+    disabled_base.serving = try put(ca, ca, &store, disabled_serving, .none);
+    const original_tail = refs[128];
+    refs[128] = try Helper.file(ca, &store, 128, 200);
+    var bootstrapped = try Helper.root(ca, &store, refs);
+    var bootstrap_plan = try Helper.plan(ca, bootstrapped, store, "source-128");
+    defer bootstrap_plan.deinit();
+    bootstrapped.serving = try publish(a, ca, &store, bootstrapped, disabled_base, &bootstrap_plan, .{ .io = std.testing.io }, .none);
+    const complete = try Helper.reopen(ca, &store, bootstrapped);
+    try Helper.verify(ca, store, complete, 258);
+    var expected_terms: u64 = 0;
+    for (try corpus.text_directory.fileRecords(ca, complete, store, null, .none)) |pack| {
+        const group_ = try corpus.loadFileManifest(ca, store, pack.manifest, complete.domain, .none, null);
+        for (group_.summaries) |summary| if (summary) |ref| {
+            expected_terms += ref.records;
+        };
+    }
+    try std.testing.expectEqual(expected_terms, complete.term_directory.leaves.?.records);
+    refs[128] = original_tail;
     refs[0] = try Helper.file(ca, &store, 0, 99);
     var replaced = try Helper.root(ca, &store, refs);
     var replace_plan = try Helper.plan(ca, replaced, store, "source-0");

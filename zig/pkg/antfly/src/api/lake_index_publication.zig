@@ -306,7 +306,22 @@ fn buildAttempt(a: A, artifact_store: *stores.ArtifactStore, table: records.Tabl
         if (!present) try candidate_list.append(na, declaration);
     }
     const candidates = candidate_list.items;
-    var progress: BuildProgress = .{ .a = a, .store = &scoped, .cancellation = cancellation, .clock = clock, .lease = lease orelse .{ .ptr = undefined, .snapshot = undefined }, .saved = .{ .reader_protocol = attempt.reader_protocol, .reuse_published = reuse_published, .store_locator = attempt.store_locator, .namespace = current.value.namespace, .generation = attempt.generation, .token = attempt.token, .signature = signature, .published_at_ms = started, .base_source = base_source, .inventory = inventory } };
+    const navigation_api = @import("lake_source_navigation.zig");
+    var prior_navigation: ?navigation_api.Root = null;
+    if (current.value.published) |previous| {
+        if (reusable_directory and std.meta.eql(previous.namespace, current.value.namespace) and
+            std.mem.eql(u8, &previous.signature.credentials, &signature.credentials) and
+            std.mem.eql(u8, &previous.signature.store, &signature.store))
+            if (previous.source_navigation) |ref| {
+                prior_navigation = navigation_api.load(na, scoped, ref, cancellation, null) catch |err| switch (err) {
+                    error.FileNotFound, error.NotFound, error.ObjectNotFound, error.ArtifactIntegrityMismatch, error.InvalidNativeLakeFileState, error.CloudGenerationMapUnavailable, error.LakeIndexArtifactUnavailable => null,
+                    else => return err,
+                };
+            };
+    }
+    const navigation = try navigation_api.build(a, na, &scoped, &provider, prior_navigation, cancellation);
+    provider.native_delta = navigation.delta;
+    var progress: BuildProgress = .{ .a = a, .store = &scoped, .cancellation = cancellation, .clock = clock, .lease = lease orelse .{ .ptr = undefined, .snapshot = undefined }, .saved = .{ .reader_protocol = attempt.reader_protocol, .reuse_published = reuse_published, .store_locator = attempt.store_locator, .namespace = current.value.namespace, .generation = attempt.generation, .token = attempt.token, .signature = signature, .published_at_ms = started, .base_source = base_source, .inventory = inventory, .source_navigation = navigation.ref } };
     defer progress.deinit();
     if (lease) |owner| if (owner.save_checkpoint != null) {
         if (current.value.checkpoint) |saved| for (saved.declarations) |declaration| try progress.remember(declaration);
@@ -329,6 +344,7 @@ fn buildAttempt(a: A, artifact_store: *stores.ArtifactStore, table: records.Tabl
         if (reusable_directory and std.meta.eql(previous.namespace, current.value.namespace) and
             std.mem.eql(u8, &previous.signature.credentials, &signature.credentials) and
             std.mem.eql(u8, &previous.signature.store, &signature.store) and
+            (prior_navigation == null or previous_root != null) and
             source.inventory.deleted_row_groups.len == 0 and
             (if (source.scanner.iceberg_delete_plan) |plan| plan.files.len == 0 else true))
         {
@@ -396,7 +412,7 @@ fn buildAttempt(a: A, artifact_store: *stores.ArtifactStore, table: records.Tabl
         try cancellation.check();
     };
     var completed = try clock.now_ms(clock.ptr);
-    var publication: catalog.Publication = .{ .reader_protocol = attempt.reader_protocol, .store_locator = attempt.store_locator, .namespace = current.value.namespace, .generation = attempt.generation, .token = attempt.token, .signature = signature, .published_at_ms = completed, .base_source = base_source, .inventory = inventory, .directory = directory };
+    var publication: catalog.Publication = .{ .reader_protocol = attempt.reader_protocol, .store_locator = attempt.store_locator, .namespace = current.value.namespace, .generation = attempt.generation, .token = attempt.token, .signature = signature, .published_at_ms = completed, .base_source = base_source, .inventory = inventory, .source_navigation = navigation.ref, .directory = directory };
     if (cloud_writer) |*writer| try cloud_api.finish(na, writer, cloud_object.?, &publication, declarations, table.table_id, store_identity, context, cancellation, cloud_binding != null and cloud_object.?.cloud_certificate_until_ms != 0 and current.value.checkpoint == null);
     completed = try clock.now_ms(clock.ptr);
     publication.published_at_ms = completed;

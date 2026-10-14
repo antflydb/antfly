@@ -130,6 +130,17 @@ pub const Progress = struct {
             .publication => |publication| {
                 if (publication.cloud_generations) |cloud| try self.enqueue(.{ .generation_page = .{ .ref = cloud.root, .depth = 0 } });
                 try self.enqueue(.{ .chunk = .{ .artifact_id = publication.inventory.artifact_id, .checksum = publication.inventory.checksum, .byte_len = publication.inventory.byte_len } });
+                // Resumable GC expands publications directly instead of calling
+                // Collector.markPublication. Protect navigation independently of
+                // directory deduplication, including retained reader-only roots.
+                if (publication.source_navigation) |ref| {
+                    if (try self.expand(.{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, "source-navigation")) {
+                        try stores.chargeReadBudget(&collector.remaining_reads, ref.byte_len);
+                        const navigation = try @import("lake_source_navigation.zig").load(a, collector.store, ref, collector.cancellation(), null);
+                        if (!std.mem.eql(u8, &navigation.domain, &self.value.domain)) return error.InvalidNativeLakeGcReference;
+                        for ([_]?tree.Ref{ navigation.files, navigation.public, navigation.private }) |root| if (root) |page| try self.enqueue(.{ .page = .{ .ref = page, .ordered_rows = false } });
+                    }
+                }
                 var hydrated = publication;
                 if (publication.directory) |directory| {
                     if (!try self.expand(.{ .artifact_id = directory.artifact_id, .checksum = directory.checksum, .byte_len = directory.byte_len }, "directory")) return;

@@ -29,6 +29,7 @@ pub const Provider = struct {
     source: *serving.ServingSource,
     /// Borrowed authenticated prior inventory, shared by all native builders.
     previous_inventory: ?local.serverless_external_source_types.Inventory = null,
+    native_delta: ?@import("lake_source_navigation.zig").Delta = null,
     enrichment_columns: bool = false,
     vector_memo: ?@import("lake_vector_enrichment.zig").Memo = null,
     progress: ?BuildProgress = null,

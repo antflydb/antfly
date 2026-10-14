@@ -3985,6 +3985,7 @@ pub const ApiHttpServer = struct {
     lake_query_metrics: @import("lake_query_metrics.zig").Metrics = .{},
     lake_reader_leases: @import("lake_index_reader_lease.zig").Pool = .{},
     lake_recent_vector_jobs: @import("lake_recent_vectors.zig").Cache = .{},
+    lake_retained_groups: @import("antfly_local_sources").serverless_query_lake_decoded_cache.Cache = .{ .a = @import("antfly_platform").allocator.processAllocator(std.heap.smp_allocator) },
     lake_retained_payloads: @import("lake_retained_cut.zig").Cache = .{ .max_entries = 512, .budget = .{ .backing = @import("antfly_platform").allocator.processAllocator(std.heap.smp_allocator), .limit = 4 * 1024 * 1024 } },
     lake_recent_text: @import("lake_recent_text_cache.zig").Cache = .{},
     lake_wal_cuts: @import("lake_wal_cut_cache.zig").Cache = .{},
@@ -4760,6 +4761,7 @@ pub const ApiHttpServer = struct {
         self.lake_search_metadata.deinit();
         self.lake_reader_leases.deinit(self.embedding_provider_runtime.io);
         self.lake_read_cache.deinit();
+        self.lake_retained_groups.deinit();
         if (self.lake_cache_io) |io_impl| {
             io_impl.deinit();
             self.owner_alloc.destroy(io_impl);

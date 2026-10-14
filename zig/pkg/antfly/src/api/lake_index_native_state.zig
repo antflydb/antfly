@@ -45,6 +45,11 @@ pub fn recipe(table: local.common_topology_records.TableRecord, config: []const 
     return digest;
 }
 pub fn identity(a: A, provider: *Provider, input_file: local.serverless_external_source_types.FileEntry) ![32]u8 {
+    if (provider.native_delta) |delta| {
+        if (!std.mem.eql(u8, delta.source, provider.source.inventory.source_id) or !std.mem.eql(u8, delta.schema, provider.source.inventory.schema_fingerprint)) return error.ExternalLakeSnapshotMismatch;
+        const index = delta.by_id.get(input_file.file_id) orelse return error.ExternalLakeSnapshotMismatch;
+        return delta.files[index].digest;
+    }
     // Warm immutable plans retain an authenticated publication instead of
     // materializing every provider version into the fresh manifest inventory.
     // Private row keys must use those same versions as the index builder.
@@ -143,6 +148,12 @@ pub const Plan = struct {
             };
             try self.by_id.put(a, file.file_id, index);
         }
+        return self;
+    }
+    pub fn fromDelta(a: A, out: A, delta: @import("lake_source_navigation.zig").Delta) !Plan {
+        var self: Plan = .{ .a = a, .files = try out.dupe(File, delta.files), .changed = try a.dupe(bool, delta.changed) };
+        errdefer self.deinit();
+        for (self.files, 0..) |file, i| try self.by_id.put(a, file.id, i);
         return self;
     }
     pub fn fromInventory(a: A, out: A, provider: *Provider, prior: local.serverless_external_source_types.Inventory) !Plan {

@@ -82,7 +82,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
         cut_store.implementation.cloud_io = server.embedding_provider_runtime.io;
         var artifacts = cut_store.artifactStore();
         try server.prepareLakeCache();
-        retained_pin = try retained_api.loadCached(ra, &artifacts, cut_store.identity, token, table, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, retained_cancellation, &server.lake_read_cache.decoded, .{ .io = server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = local.storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) });
+        retained_pin = try retained_api.loadWithGroups(ra, &artifacts, cut_store.identity, token, table, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, retained_cancellation, &server.lake_read_cache.decoded, &server.lake_retained_groups, .{ .io = server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = local.storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) });
         retained = retained_pin.?.descriptor;
         table.lake_index_catalog_json = try local.metadata_lake_index_catalog.encode(ra, .{ .namespace = retained.?.publication.namespace, .generation = retained.?.publication.generation, .published = retained.?.publication });
     };
@@ -214,14 +214,30 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     if (req.remote_snapshot) |expected| {
         if (retained == null and !std.mem.eql(u8, expected, &snapshot_token)) return error.CatalogGenerationChanged;
     } else if (req.search_after.len != 0 or req.search_before.len != 0) return error.CatalogGenerationChanged;
+    const navigation_api = @import("lake_source_navigation.zig");
+    var navigation_pin: ?@import("lake_index_decoded_metadata.zig").Owned(navigation_api.Root) = null;
+    defer if (navigation_pin) |pin| pin.release();
+    var navigation: ?navigation_api.Resolver = null;
+    defer if (navigation) |*resolver| resolver.deinit();
+    var metadata: ?*@import("lake_index_search_metadata.zig").Entry = null;
+    defer if (metadata) |entry| entry.release();
     var owner: Execution = .{ .server = server, .table = sql_table, .source = &source, .store = &store, .domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(table.table_id, store.identity, selected.publication().namespace), .declarations = selected.publication().declarations, .context = context, .request = normalized, .schema_json = table.schema_json, .arena = ca, .result_allocator = a, .overlay = if (overlay != null) &overlay.? else null, .wal_cut = if (wal_cut != null) &wal_cut.? else null };
     defer owner.deinit();
     var proof: @import("lake_index_row_source.zig").Provider = .{ .source = &source, .context = context, .expected_delete_objects = selected.delete_objects };
-    const metadata = try server.lake_search_metadata.acquire(archive_digest, &proof);
-    defer metadata.release();
-    owner.files = metadata.files;
-    owner.private_files = metadata.private_files;
-    owner.private_digests = metadata.private_digests;
+    if (selected.publication().source_navigation) |ref| {
+        const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &server.lake_read_cache, .scope = store.identity, .context = context };
+        navigation_pin = try @import("lake_index_decoded_metadata.zig").acquire(navigation_api.Root, cached, store.artifactStore(), ref, retained_cancellation, navigation_api.load);
+        const root = navigation_pin.?.value.*;
+        if (!std.mem.eql(u8, &root.domain, &owner.domain) or !std.mem.eql(u8, root.source, source.inventory.source_id) or
+            !std.mem.eql(u8, root.schema, source.inventory.schema_fingerprint) or !std.mem.eql(u8, root.snapshot, source.inventory.snapshot_id) or root.count != source.inventory.files.len) return error.ExternalLakeSnapshotMismatch;
+        navigation = .{ .root = root, .store = store.artifactStore(), .cached = cached, .token = retained_cancellation };
+        owner.navigation = &navigation.?;
+    } else {
+        metadata = try server.lake_search_metadata.acquire(archive_digest, &proof);
+        owner.files = metadata.?.files;
+        owner.private_files = metadata.?.private_files;
+        owner.private_digests = metadata.?.private_digests;
+    }
     const publication_finished = @import("antfly_platform").time.monotonicNs();
     var effective = req;
     effective.cancellation = .{ .ptr = &owner, .is_cancelled_fn = Execution.canceled };
@@ -384,6 +400,7 @@ const Execution = struct {
     highlight_queries: ?[]const search.HighlightQuery = null,
     arena: A,
     result_allocator: A = std.heap.page_allocator,
+    navigation: ?*@import("lake_source_navigation.zig").Resolver = null,
     files: std.StringHashMapUnmanaged([]const u8) = .empty,
     private_files: std.StringHashMapUnmanaged([]const u8) = .empty,
     private_digests: std.StringHashMapUnmanaged([]const u8) = .empty,
@@ -396,6 +413,14 @@ const Execution = struct {
     sparse_entries: std.StringHashMapUnmanaged(*local.storage_db_catalog_index_manager.IndexManager.SparseIndex) = .empty,
     dense_entries: std.StringHashMapUnmanaged(*local.storage_db_catalog_index_manager.IndexManager.DenseIndex) = .empty,
     runtimes: std.ArrayList(*@import("lake_index_native_runtime_cache.zig").Entry) = .empty,
+    fn fileFor(self: *Execution, hex: []const u8, public: bool) !?[]const u8 {
+        if (self.navigation) |resolver| return resolver.file(self.arena, hex, public);
+        return if (public) self.files.get(hex) else self.private_files.get(hex);
+    }
+    fn privateDigest(self: *Execution, file: []const u8) ![]const u8 {
+        if (self.navigation) |resolver| return resolver.digest(self.arena, file);
+        return self.private_digests.get(file) orelse error.ExternalLakeSnapshotMismatch;
+    }
     fn vectorRequest(self: *Execution, req: types.SearchRequest) types.SearchRequest {
         var result = req;
         if (self.overlay != null or self.vector_include != null or self.vector_exclude != null or self.vector_include_provider != null or self.vector_exclude_provider != null) {
@@ -519,7 +544,7 @@ const Execution = struct {
         defer scratch.deinit();
         var files = selection_set.files.iterator();
         while (files.next()) |file| {
-            const digest = self.private_digests.get(file.key_ptr.*) orelse return error.ExternalLakeSnapshotMismatch;
+            const digest = try self.privateDigest(file.key_ptr.*);
             var blocks = file.value_ptr.iterator();
             while (blocks.next()) |block| {
                 try self.context.ensureActive();
@@ -571,7 +596,7 @@ const Execution = struct {
             return true;
         };
         const coordinate = try @import("lake_index_native_state.zig").coordinates(key);
-        const file = self.private_files.get(key[6..70]) orelse return error.ExternalLakeSnapshotMismatch;
+        const file = (try self.fileFor(key[6..70], false)) orelse return error.ExternalLakeSnapshotMismatch;
         if (self.overlay) |pending_overlay| if (pending_overlay.physical) |*mask| if (mask.contains(file, coordinate.group, coordinate.row)) return false;
         const ref: local.storage_rowsource_types.RowRef = .{ .external = .{ .source_id = self.source.inventory.source_id, .snapshot_id = self.source.inventory.snapshot_id, .file_id = file, .row_group_ordinal = coordinate.group, .row_ordinal = coordinate.row } };
         if (self.vector_include_provider) |*provider| if (!try provider.allows(ref)) return false;
@@ -623,10 +648,10 @@ const Execution = struct {
         if (self.overlay) |overlay| if (overlay.row(key) != null) return a.dupe(u8, key);
         const position = try @import("lake_index_native_state.zig").coordinates(key);
         if (std.mem.startsWith(u8, key, "lake1:")) {
-            if (!self.files.contains(key[6..70])) return error.ExternalLakeSnapshotMismatch;
+            if ((try self.fileFor(key[6..70], true)) == null) return error.ExternalLakeSnapshotMismatch;
             return units.rebind(a, member_key, key);
         }
-        const file = self.private_files.get(key[6..70]) orelse return error.ExternalLakeSnapshotMismatch;
+        const file = (try self.fileFor(key[6..70], false)) orelse return error.ExternalLakeSnapshotMismatch;
         const parent_key = try local.storage_rowsource_identity.allocId(a, .{ .external = .{ .source_id = self.source.inventory.source_id, .snapshot_id = self.source.inventory.snapshot_id, .file_id = file, .row_group_ordinal = position.group, .row_ordinal = position.row } });
         defer a.free(parent_key);
         return units.rebind(a, member_key, parent_key);
@@ -644,8 +669,8 @@ const Execution = struct {
         const self = from(raw);
         if (!std.mem.startsWith(u8, key, "lake1:")) return a.dupe(u8, member_key);
         const position = try @import("lake_index_native_state.zig").coordinates(key);
-        const file = self.files.get(key[6..70]) orelse return a.dupe(u8, key);
-        const digest = self.private_digests.get(file) orelse return error.ExternalLakeSnapshotMismatch;
+        const file = (try self.fileFor(key[6..70], true)) orelse return a.dupe(u8, key);
+        const digest = try self.privateDigest(file);
         const parent_key = try std.fmt.allocPrint(a, "lake2:{s}:{x:0>8}:{x:0>16}", .{ digest, position.group, position.row });
         defer a.free(parent_key);
         return units.rebind(a, member_key, parent_key);
@@ -882,7 +907,7 @@ const Execution = struct {
             const ia = input.allocator();
             const key = try publicKey(self, ia, hit.id);
             const position = try @import("lake_index_native_state.zig").coordinates(key);
-            const file = self.files.get(key[6..70]) orelse return error.ExternalLakeSnapshotMismatch;
+            const file = (try self.fileFor(key[6..70], true)) orelse return error.ExternalLakeSnapshotMismatch;
             const row: local.storage_rowsource_types.RowRef = .{ .external = .{ .source_id = self.source.inventory.source_id, .snapshot_id = self.source.inventory.snapshot_id, .file_id = file, .row_group_ordinal = position.group, .row_ordinal = position.row } };
             winner.* = .{ .index = index, .ordinal = (try identities.ordinal(a, &live, self.store.artifactStore(), cached, row)) orelse return error.InvalidNativeLakeTextCorpus };
         }
@@ -939,7 +964,7 @@ const Execution = struct {
             while (end < winners.len and std.mem.eql(u8, &winners[begin].location.segment, &winners[end].location.segment)) : (end += 1) {}
             _ = reader_arena.reset(.retain_capacity);
             const sa = reader_arena.allocator();
-            var child: Execution = .{ .server = self.server, .table = self.table, .source = self.source, .store = self.store, .domain = self.domain, .declarations = self.declarations, .context = self.context, .request = self.request, .schema_json = self.schema_json, .arena = sa, .result_allocator = sa, .files = self.files, .private_files = self.private_files, .private_digests = self.private_digests, .forced_selection = &.{winners[begin].location.segment} };
+            var child: Execution = .{ .server = self.server, .table = self.table, .source = self.source, .store = self.store, .domain = self.domain, .declarations = self.declarations, .context = self.context, .request = self.request, .schema_json = self.schema_json, .arena = sa, .result_allocator = sa, .navigation = self.navigation, .files = self.files, .private_files = self.private_files, .private_digests = self.private_digests, .forced_selection = &.{winners[begin].location.segment} };
             defer child.deinit();
             var pin = blk: {
                 const started = @import("antfly_platform").time.monotonicNs();
@@ -1124,7 +1149,7 @@ const Execution = struct {
             for (page.rows) |row| {
                 if (self.overlay) |overlay| {
                     const position = try @import("lake_index_native_state.zig").coordinates(row.id);
-                    const file = self.files.get(row.id[6..70]) orelse return error.ExternalLakeSnapshotMismatch;
+                    const file = (try self.fileFor(row.id[6..70], true)) orelse return error.ExternalLakeSnapshotMismatch;
                     if (overlay.physical.?.contains(file, position.group, position.row)) continue;
                 }
                 if (options.primary_key_reverse or self.overlay != null) {
@@ -1582,7 +1607,7 @@ const Execution = struct {
                 recent_scored = true;
                 ahead.prefetch(if (frontier != null) batch_limit else window_config.admission_window_segments, competitive_cutoff);
             }
-            var child: Execution = .{ .server = self.server, .table = self.table, .source = self.source, .store = self.store, .domain = self.domain, .declarations = self.declarations, .context = self.context, .request = self.request, .schema_json = self.schema_json, .arena = wa, .result_allocator = wa, .files = self.files, .private_files = self.private_files, .private_digests = self.private_digests, .typed_delivery = true, .forced_selection = window.identities, .prefetched_archive = if (prepared != null) &prepared.? else null, .overlay = self.overlay, .overlay_preparation = if (self.overlay != null) frontier orelse preparation else null, .recent_text_source = if (recent != null) &recent.? else null, .recent_text_window = recent_window };
+            var child: Execution = .{ .server = self.server, .table = self.table, .source = self.source, .store = self.store, .domain = self.domain, .declarations = self.declarations, .context = self.context, .request = self.request, .schema_json = self.schema_json, .arena = wa, .result_allocator = wa, .navigation = self.navigation, .files = self.files, .private_files = self.private_files, .private_digests = self.private_digests, .typed_delivery = true, .forced_selection = window.identities, .prefetched_archive = if (prepared != null) &prepared.? else null, .overlay = self.overlay, .overlay_preparation = if (self.overlay != null) frontier orelse preparation else null, .recent_text_source = if (recent != null) &recent.? else null, .recent_text_window = recent_window };
             defer child.deinit();
             var request = retrievalRequest(req);
             request.offset = 0;
@@ -1698,7 +1723,7 @@ const Execution = struct {
             while (segments.next()) |entry| {
                 _ = child_arena.reset(.retain_capacity);
                 const ca = child_arena.allocator();
-                var child: Execution = .{ .server = self.server, .table = self.table, .source = self.source, .store = self.store, .domain = self.domain, .declarations = self.declarations, .context = self.context, .request = self.request, .schema_json = self.schema_json, .arena = ca, .result_allocator = ca, .files = self.files, .private_files = self.private_files, .private_digests = self.private_digests, .typed_delivery = true, .forced_selection = &.{entry.key_ptr.*}, .candidate_rows = entry.value_ptr.items };
+                var child: Execution = .{ .server = self.server, .table = self.table, .source = self.source, .store = self.store, .domain = self.domain, .declarations = self.declarations, .context = self.context, .request = self.request, .schema_json = self.schema_json, .arena = ca, .result_allocator = ca, .navigation = self.navigation, .files = self.files, .private_files = self.private_files, .private_digests = self.private_digests, .typed_delivery = true, .forced_selection = &.{entry.key_ptr.*}, .candidate_rows = entry.value_ptr.items };
                 defer child.deinit();
                 var request = retrievalRequest(req);
                 request.index_name = name;
@@ -2237,7 +2262,7 @@ const Execution = struct {
                     const key = if (sorted) |row| row.keys[0].value.string else try publicKey(raw, ca, keys[input_position]);
                     mapped.* = key;
                     if (key.len != 96 or !std.mem.startsWith(u8, key, "lake1:") or key[70] != ':' or key[79] != ':') return error.ExternalLakeSnapshotMismatch;
-                    const file = self.files.get(key[6..70]) orelse return error.ExternalLakeSnapshotMismatch;
+                    const file = (try self.fileFor(key[6..70], true)) orelse return error.ExternalLakeSnapshotMismatch;
                     ref.* = .{ .external = .{ .source_id = self.source.inventory.source_id, .snapshot_id = self.source.inventory.snapshot_id, .file_id = file, .row_group_ordinal = std.fmt.parseUnsigned(u32, key[71..79], 16) catch return error.ExternalLakeSnapshotMismatch, .row_ordinal = std.fmt.parseUnsigned(u64, key[80..96], 16) catch return error.ExternalLakeSnapshotMismatch } };
                 }
                 var by_key: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(usize)) = .empty;
@@ -2691,6 +2716,7 @@ test "external lake hydration unions returned and highlight fields without unrel
     var server: server_api.ApiHttpServer = undefined;
     server.lake_query_metrics = .{};
     var owner: Execution = undefined;
+    owner.navigation = null;
     owner.server = &server;
     owner.arena = arena.allocator();
     owner.context = .{};
@@ -2726,6 +2752,7 @@ test "external lake typed sidecar hydration skips Parquet and owns final source 
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     var owner: Execution = undefined;
+    owner.navigation = null;
     owner.arena = arena.allocator();
     owner.context = .{ .io = std.testing.io };
     owner.hydration_fields = &.{"body"};
@@ -2820,6 +2847,7 @@ test "external lake sparse predicate planning defers broad masks and subtracts s
     const Set = @import("lake_index_physical_set.zig").Set;
     // Only the predicate-planning fields are needed; no HTTP/server is opened.
     var execution: Execution = undefined;
+    execution.navigation = null;
     execution.overlay = null;
     execution.active_recent = false;
     execution.vector_include = null;
@@ -2869,6 +2897,7 @@ test "external lake sparse predicate planning translates broad blocks within wor
     const Bitmap = local.encoding_roaring.RoaringBitmap;
     const Set = @import("lake_index_physical_set.zig").Set;
     var execution: Execution = undefined;
+    execution.navigation = null;
     execution.overlay = null;
     execution.active_recent = false;
     execution.vector_include_provider = null;
@@ -2949,6 +2978,7 @@ test "external lake sparse predicate planning defers exhausted masks to exact na
     const Bitmap = local.encoding_roaring.RoaringBitmap;
     const Set = @import("lake_index_physical_set.zig").Set;
     var execution: Execution = undefined;
+    execution.navigation = null;
     execution.overlay = null;
     execution.active_recent = false;
     var source: local.serverless_query_lake_serving.ServingSource = undefined;
@@ -3032,6 +3062,7 @@ test "external lake sparse predicate planning preflights effective windows and p
     const Bitmap = local.encoding_roaring.RoaringBitmap;
     const Set = @import("lake_index_physical_set.zig").Set;
     var execution: Execution = undefined;
+    execution.navigation = null;
     execution.overlay = null;
     execution.active_recent = false;
     execution.vector_include_provider = null;
@@ -3495,6 +3526,7 @@ test "external lake bounded WAL unit hydration chooses exact recent partition" {
     const second_decl: Declared = .{ .name = "vectors", .binding = undefined, .artifact = .{ .kind = .vector_segment, .metadata_version = 2, .artifact_id = &second_artifact, .checksum = second_artifact[7..71], .byte_len = 1 } };
     const runs = [_]vectors.Run{ .{ .prefix = '7', .digest = @splat(1), .declarations = &.{first_decl} }, .{ .prefix = 'd', .digest = @splat(2), .declarations = &.{second_decl} } };
     var execution: Execution = undefined;
+    execution.navigation = null;
     execution.context = .{ .io = std.testing.io };
     execution.arena = sa;
     execution.overlay = &overlay;

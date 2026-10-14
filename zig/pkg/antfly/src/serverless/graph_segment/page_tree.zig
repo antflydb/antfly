@@ -170,7 +170,7 @@ pub const Entry = struct {
     }
 };
 
-const Page = struct {
+pub const Page = struct {
     bytes: []u8,
     entries: []Entry,
     ref: Ref,
@@ -227,6 +227,12 @@ fn writeU64(bytes: []u8, offset: usize, value: u64) void {
 
 fn less(a: []const u8, b: []const u8) bool {
     return std.mem.order(u8, a, b) == .lt;
+}
+
+/// An independently owned authenticated page. Callers may retain its immutable
+/// bytes/entry views in a bounded decode cache, under the full ref and domain.
+pub fn readPage(alloc: Allocator, store: Store, ref: Ref) !Page {
+    return load(alloc, store, ref);
 }
 
 fn load(alloc: Allocator, store: Store, ref: Ref) !Page {
@@ -1217,7 +1223,13 @@ pub fn walkPage(alloc: Allocator, store: Store, root: Ref, visitor: anytype) any
     var page = try load(alloc, store, root);
     defer page.deinit(alloc);
     for (page.entries) |entry| {
-        if (entry.child) |child| try visitor.child(child) else try visitor.record(entry.key, entry.value);
+        if (entry.child) |child| {
+            const Visitor = switch (@typeInfo(@TypeOf(visitor))) {
+                .pointer => |pointer| pointer.child,
+                else => @TypeOf(visitor),
+            };
+            if (comptime @hasDecl(Visitor, "childSummary")) try visitor.childSummary(child, entry.aggregate) else try visitor.child(child);
+        } else try visitor.record(entry.key, entry.value);
     }
 }
 
