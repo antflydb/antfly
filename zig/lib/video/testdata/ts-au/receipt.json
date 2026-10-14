@@ -2,7 +2,7 @@
   "version": 1,
   "date": "2026-10-14",
   "basis_commit": "987912340f23b6b2441256ae43a08c4419520f5b",
-  "status": "focused normalization passed on macOS/Linux; broader device regression running",
+  "status": "focused normalization passed on macOS/Linux; historical broader device regression completed",
   "scope": "Incremental PES-to-owned-AVC normalization; acknowledged HTTP/Reader/model integration remains open",
   "compiler": "Zig 0.17.0",
   "optimization": "Debug",
@@ -43,8 +43,12 @@
     "Direct TS model coordinator delivery and pretrained preservation gate"
   ],
   "broader_device_regression": {
-    "status": "running",
-    "scope": "Build began before the final deterministic allocation-harness and no-AUD test changes; no pass claim yet."
+    "status": "passed",
+    "passed": 272,
+    "skipped": 2,
+    "total": 274,
+    "scope": "Build began before the final deterministic allocation-harness and no-AUD test changes. Historical regression evidence only; not a test of later HTTP/Reader integration.",
+    "log_sha256": "260017db262ca9264b5268d2f22edb51565ca56d111e81ed34cbb533c7ec1f01"
   },
   "commands": {
     "macos": "zig build --build-file zig/lib/video/build.zig test-video -Dvideo-test-filter=\"native TS\" -Doptimize=Debug --summary all",

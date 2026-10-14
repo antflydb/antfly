@@ -2229,7 +2229,30 @@ See [AU normalization qualification](../video/testdata/ts-au/README.md) for exac
 platform results and source/binary scope: the focused 16-test gate passes on
 macOS and actual Linux ARM64.
 
-Acknowledged HTTP/Reader replay and direct TS model coordinator delivery remain
-open. Existing TS inference remains buffered; this stage connects incremental
-PES extraction to the native video representation without claiming those later
-integrations or new pretrained parity.
+The HTTP/Reader and model integration is described below.
+
+### Streamed TS delivery and acknowledged replay
+
+`http_stream.Adapter.streamBody` shares the authenticated bounded byte transport
+between fMP4 framing and native TS normalization, including whole-object AES-CBC,
+identity encoding, exact range validation, cancellation and request/work admission.
+`TransportFactory.stream` supplies a callback-scoped parser session; the media
+library has no dependency on video codecs. `Reader.streamNext` uses that hook
+for TS resources while preserving the buffered `next` API.
+
+A session starts from the last validated resource's demux/configuration state.
+It binds that state, resource descriptor, resolved URL/range and encryption to
+its retry ledger. Accepted normalized units commit ordered metadata/payload
+hashes and output ordinals. A retry parses again from the same starting state,
+suppresses the accepted prefix and rejects a changed or shortened prefix before
+new delivery. Taking a snapshot alone does not acknowledge it. Configuration,
+continuity state and the manifest cursor commit only after validated HTTP EOF.
+Cancellation or consumer failure releases parser workspace while retaining the
+acknowledged ledger; retry remains caller driven. Buffered and streamed TS reads
+share a Reader lifetime byte budget, including bytes received by failed attempts.
+
+The model coordinator consumes owned normalized units as they arrive, allowing
+windows to complete before HTTP EOF. Its retained output is retried before the
+next HTTP request. See [TS streaming qualification](../video/testdata/ts-http/README.md)
+for platform results, checkpoint scope and the independent buffered comparison.
+TS LL-HLS parts remain unsupported; this does not change that declared policy.

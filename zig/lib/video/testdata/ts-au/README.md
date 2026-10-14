@@ -15,8 +15,9 @@ legacy no-AUD input, consumer failure and every allocation failure. The failure
 harness forces allocation movement so counts are reproducible across heaps.
 
 The focused suite passes 16/16 on macOS ARM64 and actual Linux ARM64.
-A separately requested broader device regression remains running; it is not
-counted as completed qualification in this receipt. Runtime uses
+The separately requested historical broader device regression completed with
+272 passing tests and two skips. It began before the final allocation-harness
+and no-AUD test changes; it does not qualify the later HTTP integration. Runtime uses
 native Zig. The underlying TS payload/decoded-picture fixtures already carry
 independent FFprobe/FFmpeg provenance. This phase qualifies AU normalization;
 acknowledged HTTP/Reader replay and direct TS model delivery remain open. It adds

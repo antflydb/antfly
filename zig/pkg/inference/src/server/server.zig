@@ -36616,15 +36616,18 @@ test "inference HTTP inline media body limit remains bounded and configurable" {
 }
 
 test "embeddinggemma2 video streamed pretrained windows preserve buffered vectors and retry output before more HTTP" {
-    try qualifyStreamedPretrainedHls(false, false);
+    try qualifyStreamedPretrainedHls(false, false, false);
 }
 test "embeddinggemma2 video encrypted streaming pretrained windows preserve buffered vectors and retry before more HTTP" {
-    try qualifyStreamedPretrainedHls(true, false);
+    try qualifyStreamedPretrainedHls(true, false, false);
 }
 test "embeddinggemma2 video LL HLS streamed pretrained parent repackaging preserves vectors and retained output retry" {
-    try qualifyStreamedPretrainedHls(false, true);
+    try qualifyStreamedPretrainedHls(false, true, false);
 }
-fn qualifyStreamedPretrainedHls(comptime encrypted: bool, comptime parts: bool) !void {
+test "embeddinggemma2 video TS streamed pretrained windows preserve buffered vectors and acknowledged HTTP retry" {
+    try qualifyStreamedPretrainedHls(false, false, true);
+}
+fn qualifyStreamedPretrainedHls(comptime encrypted: bool, comptime parts: bool, comptime ts: bool) !void {
     const stream_embedding = @import("../pipelines/embedding_gemma2.zig");
     const stream_media = @import("antfly_media");
     const stream_coordinator = @import("antfly_video").live_coordinator;
@@ -36639,8 +36642,10 @@ fn qualifyStreamedPretrainedHls(comptime encrypted: bool, comptime parts: bool) 
     const part_manifest = ll_prefix ++ "#EXT-X-PART:DURATION=0.5,URI=\"p0.m4s\",INDEPENDENT=YES\n";
     const full_manifest = ll_prefix ++ "#EXTINF:6,\nseg.mp4\n#EXT-X-ENDLIST\n";
     const part_body = @embedFile("../testdata/video/ll-part-half.m4s");
-    const manifest = if (parts) part_manifest else if (encrypted) "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:10\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXT-X-KEY:METHOD=AES-128,URI=\"key\"\n#EXTINF:6,\nseg.mp4\n#EXT-X-ENDLIST\n" else clear_manifest;
-    const wire_body = if (parts) @embedFile("../testdata/video/ll-parent-2s.mp4")[797..] else if (encrypted) @embedFile("../testdata/video/live-encrypted.bin") else bytes[797..];
+    const ts_bytes = @embedFile("../testdata/video/live-stream.ts");
+    const ts_manifest = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:10\n#EXTINF:6,\nseg.ts\n#EXT-X-ENDLIST\n";
+    const manifest = if (ts) ts_manifest else if (parts) part_manifest else if (encrypted) "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:10\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXT-X-KEY:METHOD=AES-128,URI=\"key\"\n#EXTINF:6,\nseg.mp4\n#EXT-X-ENDLIST\n" else clear_manifest;
+    const wire_body = if (ts) ts_bytes else if (parts) @embedFile("../testdata/video/ll-parent-2s.mp4")[797..] else if (encrypted) @embedFile("../testdata/video/live-encrypted.bin") else bytes[797..];
     const key = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f";
 
     const Fake = struct {
@@ -36649,9 +36654,9 @@ fn qualifyStreamedPretrainedHls(comptime encrypted: bool, comptime parts: bool) 
             complete: bool = false,
             pub fn get(self: *@This(), url: []const u8, _: anytype) !Response {
                 self.calls += 1;
-                if (std.mem.endsWith(u8, url, "list.m3u8")) return .{ .body = clear_manifest };
+                if (std.mem.endsWith(u8, url, "list.m3u8")) return .{ .body = if (ts) ts_manifest else clear_manifest };
                 if (std.mem.endsWith(u8, url, "init.mp4")) return .{ .body = bytes[0..797] };
-                return .{ .body = bytes[797..] };
+                return .{ .body = if (ts) ts_bytes else bytes[797..] };
             }
             pub fn getToWriter(self: *@This(), url: []const u8, options: anytype, writer: anytype, _: anytype, _: anytype) !Response {
                 self.complete = false;
@@ -36691,8 +36696,8 @@ fn qualifyStreamedPretrainedHls(comptime encrypted: bool, comptime parts: bool) 
         next_output: std.Io.Event = .unset,
         sent_tail: std.atomic.Value(bool) = .init(false),
         fn serve(self: *@This(), listener: *stream_http.TcpListener) !void {
-            for (0..(if (parts) @as(usize, 6) else if (encrypted) @as(usize, 5) else 4)) |request_index| {
-                const stage = if (parts and request_index >= 4) request_index - 2 else if (encrypted and request_index >= 3) request_index - 1 else request_index;
+            for (0..(if (ts) @as(usize, 3) else if (parts) @as(usize, 6) else if (encrypted) @as(usize, 5) else 4)) |request_index| {
+                const stage = if (ts) request_index + 1 else if (parts and request_index >= 4) request_index - 2 else if (encrypted and request_index >= 3) request_index - 1 else request_index;
                 const accepted = try listener.accept();
                 var socket = accepted.socket;
                 defer socket.close();
@@ -36708,7 +36713,7 @@ fn qualifyStreamedPretrainedHls(comptime encrypted: bool, comptime parts: bool) 
                 }
                 try std.testing.expect(std.ascii.findIgnoreCase(request[0..used], "authorization: Bearer fixture-token\r\n") != null);
                 try std.testing.expect(std.ascii.findIgnoreCase(request[0..used], "accept-encoding: identity\r\n") != null);
-                const path = if (parts) switch (request_index) {
+                const path = if (ts) (if (request_index == 0) "GET /live/list.m3u8 " else "GET /live/seg.ts ") else if (parts) switch (request_index) {
                     0, 3 => "GET /live/list.m3u8 ",
                     1 => "GET /live/init.mp4 ",
                     2 => "GET /live/p0.m4s ",
@@ -36719,7 +36724,7 @@ fn qualifyStreamedPretrainedHls(comptime encrypted: bool, comptime parts: bool) 
                     else => "GET /live/seg.mp4 ",
                 };
                 try std.testing.expect(std.mem.startsWith(u8, request[0..used], path));
-                if ((parts and request_index < 4) or request_index < 2 or (encrypted and request_index == 2)) {
+                if ((ts and request_index == 0) or (!ts and ((parts and request_index < 4) or request_index < 2 or (encrypted and request_index == 2)))) {
                     const response_body = if (request_index == 0) manifest else if (request_index == 1) bytes[0..797] else if (parts and request_index == 2) part_body else if (parts) full_manifest else key;
                     var header: [128]u8 = undefined;
                     try socket.sendAll(try std.fmt.bufPrint(&header, "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{response_body.len}));
@@ -36727,11 +36732,11 @@ fn qualifyStreamedPretrainedHls(comptime encrypted: bool, comptime parts: bool) 
                 } else {
                     try socket.sendAll("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
                     if (stage == 2) {
-                        const first_end = if (parts) 20775 + 8 - 797 else if (encrypted) ((20811 + 8 - 797 + 16 + 15) / 16) * 16 else 20811 + 8 - 797;
+                        const first_end = if (ts) 39668 else if (parts) 20775 + 8 - 797 else if (encrypted) ((20811 + 8 - 797 + 16 + 15) / 16) * 16 else 20811 + 8 - 797;
                         try chunk(&socket, wire_body[0..first_end]);
                         try self.first_output.wait(std.testing.io);
                     } else {
-                        const boundary = if (parts) 42920 + 8 - 797 else if (encrypted) ((42992 + 8 - 797 + 16 + 15) / 16) * 16 else 42992 + 8 - 797;
+                        const boundary = if (ts) 73132 else if (parts) 42920 + 8 - 797 else if (encrypted) ((42992 + 8 - 797 + 16 + 15) / 16) * 16 else 42992 + 8 - 797;
                         try chunk(&socket, wire_body[0..boundary]);
                         // The tail cannot exist until a pretrained model output
                         // has executed, acknowledged and released this gate.
@@ -36761,7 +36766,9 @@ fn qualifyStreamedPretrainedHls(comptime encrypted: bool, comptime parts: bool) 
     const Reader = stream_media.hls_live.Reader(stream_http);
     var serving = try std.testing.io.concurrent(Wire.serve, .{ &wire, &listener });
     defer _ = serving.cancel(std.testing.io) catch {};
-    var reader = try Reader.init(a, &transport, transport.root_url, .{});
+    var ts_codec = @import("antfly_video").transport_avc.Hls{ .allocator = a };
+    defer ts_codec.deinit();
+    var reader = try Reader.init(a, &transport, transport.root_url, .{ .transport_stream = if (ts) ts_codec.factory() else null });
     defer reader.deinit();
     try reader.reload();
     var flow = try stream_coordinator.Coordinator.init(a, .{ .duration_ns = std.time.ns_per_s, .max_frames = 1 });
@@ -36793,7 +36800,7 @@ fn qualifyStreamedPretrainedHls(comptime encrypted: bool, comptime parts: bool) 
                 std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(delivery.value.result.?.vector), &hash, .{});
                 try std.testing.expectEqual(self.first_hash.?, hash);
                 try std.testing.expectEqual(@as(usize, 0), delivery.value.ordinal);
-                try std.testing.expectEqual(@as(usize, if (parts) 5 else if (encrypted) 4 else 3), self.transport.requests);
+                try std.testing.expectEqual(@as(usize, if (ts) 2 else if (parts) 5 else if (encrypted) 4 else 3), self.transport.requests);
             }
             if (delivery.value.ordinal == 1) {
                 try std.testing.expect(!self.wire.sent_tail.load(.acquire));
@@ -36814,7 +36821,10 @@ fn qualifyStreamedPretrainedHls(comptime encrypted: bool, comptime parts: bool) 
         try reader.reload();
     }
     try std.testing.expectError(error.ConsumerFailure, stream.process(&reader, &capture, Capture.accept));
-    try std.testing.expectEqual(@as(usize, if (parts) 1 else 2), reader.stream_ledger.acknowledged);
+    const acknowledged_prefix = reader.stream_ledger.acknowledged;
+    if (ts) {
+        try std.testing.expect(reader.stream_ledger.acknowledged > 0);
+    } else try std.testing.expectEqual(@as(usize, if (parts) 1 else 2), reader.stream_ledger.acknowledged);
     try std.testing.expectEqual(@as(u64, 10), reader.next_sequence.?);
     try std.testing.expect(stream.pending != null and !stream.pending.?.acknowledged);
     try std.testing.expectEqual(@as(usize, 0), flow.ordinal);
@@ -36824,10 +36834,12 @@ fn qualifyStreamedPretrainedHls(comptime encrypted: bool, comptime parts: bool) 
     try std.testing.expectEqual(@as(usize, 6), capture.count);
     try std.testing.expectEqual(@as(usize, 6), stream.stats.windows);
     try std.testing.expect(capture.early >= 2);
-    try std.testing.expectEqual(@as(usize, if (parts) 6 else if (encrypted) 5 else 4), transport.requests);
+    try std.testing.expectEqual(@as(usize, if (ts) 3 else if (parts) 6 else if (encrypted) 5 else 4), transport.requests);
     var baseline_client = Fake.Client{};
     var baseline_transport = stream_media.http_stream.Adapter(Fake){ .allocator = a, .client = &baseline_client, .root_url = transport.root_url, .limits = transport.limits };
-    var baseline_reader = try stream_media.hls_live.Reader(Fake).init(a, &baseline_transport, transport.root_url, .{});
+    var baseline_ts = @import("antfly_video").transport_avc.Hls{ .allocator = a };
+    defer baseline_ts.deinit();
+    var baseline_reader = try stream_media.hls_live.Reader(Fake).init(a, &baseline_transport, transport.root_url, .{ .transport_stream = if (ts) baseline_ts.factory() else null });
     defer baseline_reader.deinit();
     try baseline_reader.reload();
     var baseline = try stream_coordinator.Coordinator.init(a, .{ .duration_ns = std.time.ns_per_s, .max_frames = 1 });
@@ -36844,7 +36856,7 @@ fn qualifyStreamedPretrainedHls(comptime encrypted: bool, comptime parts: bool) 
         for (expected.result.?.vector, actual.result.?.vector) |left, right| max_error = @max(max_error, @abs(left - right));
     }
     try std.testing.expect(max_error <= if (metal) @as(f32, 1e-3) else @as(f32, 1e-4));
-    std.debug.print("streamed live pretrained parts={} encrypted={} metal={} windows={d} callbacks={d} early={d} prefix=2 requests={d} max_error={d:.9}\n", .{ parts, encrypted, metal, capture.count, capture.calls, capture.early, transport.requests, max_error });
+    std.debug.print("streamed live pretrained ts={} parts={} encrypted={} metal={} windows={d} callbacks={d} early={d} prefix={d} requests={d} max_error={d:.9}\n", .{ ts, parts, encrypted, metal, capture.count, capture.calls, capture.early, acknowledged_prefix, transport.requests, max_error });
 }
 
 test "embeddinggemma2 video partial DASH pretrained windows preserve vectors across clean short EOF and growth" {

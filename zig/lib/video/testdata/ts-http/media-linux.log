@@ -1,0 +1,221 @@
+1/218 media_test_root.test_0...OK
+2/218 src.mod.test_0...OK
+3/218 src.dash_xml.test.DASH XML tree preserves hierarchy namespaces comments CDATA and escaped references...OK
+4/218 src.dash_xml.test.DASH XML rejects expansion malformed nesting duplicate attributes and resource exhaustion...OK
+5/218 src.dash_xml.test.DASH XML tree releases every failing allocation...OK
+6/218 src.ebml.test.EBML payload rejects invalid and truncated bounds...OK
+7/218 src.source.test.source independent leases, short reads, budgets, cancellation and cleanup...OK
+8/218 src.source.test.source provider failure and allocation failure release retention...OK
+9/218 src.source.test.source partial EOF, read count and total budgets clean up without refunding IO...OK
+10/218 src.source.test.file range adapter performs independent positional reads...OK
+11/218 src.source.test.source shared lease admission is retained and denied without provider reads...OK
+12/218 src.stream.test.sequential spool handles short reads, exact EOF, limits and retained leases...OK
+13/218 src.stream.test.sequential invalid providers and cancellation release admission...OK
+14/218 src.stream.test.sequential snapshots feed portable MP4 and WebM indexing...OK
+15/218 src.transport_stream.test.transport AVC PES payload clocks and order match independent FFprobe...OK
+16/218 src.transport_stream.test.transport extraction allocation failures and cancellation release all owners...OK
+17/218 src.transport_stream.test.transport CRC continuity truncation and timestamp rollover are explicit...OK
+18/218 src.transport_stream.test.transport invalid caller state fails without optional dereference...OK
+19/218 src.transport_stream.test.transport fuzz accepted seeds retain admitted packet bounds...OK
+20/218 src.transport_stream.test.transport fuzz bounded PSI PES and continuity...OK
+21/218 src.transport_stream.test.transport table completeness includes every numbered section...OK
+22/218 src.transport_stream.test.transport untimed continuation PES preserve original payload and timestamp anchors...OK
+23/218 src.transport_stream.test.incremental transport PES byte clocks and transactional state match buffered independent fixtures at every packet boundary...OK
+24/218 src.transport_stream.test.incremental transport allocation failure drains actual PES growth and fixed admission...OK
+25/218 src.transport_stream.test.incremental transport cancellation consumer failure truncated packets and limits release owners and prohibit reentry...OK
+26/218 src.transport_stream.test.incremental transport CRC continuity and dynamic growth denial fail before corrupt payload delivery...OK
+27/218 src.live_mp4.test.live MP4 partial segments preserve earlier packet leases and reject replay...OK
+28/218 src.live_mp4.test.live MP4 successive segments retain stable leases across bounded arrival chunks...OK
+29/218 src.live_mp4.test.live MP4 automatic framing handles every byte arrival and final EOF...OK
+30/218 src.live_mp4.test.live MP4 automatic framing validates partial extended headers and EOF sized payloads...OK
+31/218 src.live_mp4.test.live MP4 reconfiguration is transactional and preserves outstanding old epoch leases...OK
+32/218 src.live_mp4.test.live MP4 reconfiguration accepts new SPS and geometry at an explicit epoch boundary...OK
+33/218 src.hls.test.HLS fMP4 preserves sequence ranges initialization changes and discontinuities...OK
+34/218 src.hls.test.HLS fMP4 allocation failures release parsed segment storage...OK
+35/218 src.hls.test.HLS fMP4 rejects incomplete encrypted unsupported and overflowing playlists...OK
+36/218 src.hls.test.HLS encrypted maps freeze their declaration while media key rotates or becomes clear...OK
+37/218 src.hls.test.HLS identity keys coexist with ignored DRM formats and unsupported-only media fails...OK
+38/218 src.hls.test.HLS AES fuzz media key declarations and map scope...OK
+39/218 src.hls.test.HLS AES fuzz media seeds retain positive encrypted segment declarations through Smith...OK
+40/218 src.hls.test.HLS partial records retain parent sequence identities ranges and flags...OK
+41/218 src.hls.test.HLS partial records reject missing durations targets ranges and mid-parent config mutation...OK
+42/218 src.hls.test.HLS partial fuzz bounded attributes sequence ranges controls and hints...OK
+43/218 src.hls.test.HLS partial fuzz serialized seeds are positively accepted...OK
+44/218 src.hls.test.HLS delta merge owns inherited maps keys ranges and discontinuities...OK
+45/218 src.hls.test.HLS delta merge bounds history allocations admission and cancellation...OK
+46/218 src.hls.test.HLS delta rejects duplicate malformed unsupported and conflicting history...OK
+47/218 src.hls.test.HLS delta fuzz bounded merging with inherited encrypted state...OK
+48/218 src.hls.test.HLS delta fuzz serialized seeds merge positively...OK
+49/218 src.hls.test.HLS delta inherited identity scope still accepts alternate unsupported key formats...OK
+50/218 src.hls.test.HLS date-range v2 metadata preserves owned attributes resolved endpoints and PDT after history destruction...OK
+51/218 src.hls.test.HLS date-range augmentations validate exact durations and immutable attributes...OK
+52/218 src.hls.test.HLS date-range v2 requires history and rejects duplicate removals reintroduction and interval mutation...OK
+53/218 src.hls.test.HLS date-range ownership rolls back every allocation and shared admission...OK
+54/218 src.hls.test.HLS date-range fuzz immutable history and admission cleanup...OK
+55/218 src.hls.test.HLS date-range fuzz serialized seeds accept retained and augmented metadata...OK
+56/218 src.hls.test.HLS date-range admission denial leaves previous metadata usable...OK
+57/218 src.hls_master.test.HLS master retains variants renditions and selects explicit compatible video...OK
+58/218 src.hls_master.test.HLS master selection ties are independent of manifest variant ordering...OK
+59/218 src.hls_master.test.HLS master allocation denial cancellation and metadata admission reclaim all owners...OK
+60/218 src.hls_master.test.HLS master rejects mixed playlists invalid attributes and broken rendition groups...OK
+61/218 src.hls_master.test.HLS master fuzz parsing selection and shared metadata cleanup...OK
+62/218 src.hls_master.test.HLS master fuzz seeds reach variant selection through Smith serialization...OK
+63/218 src.hls_master.test.HLS master selection honors cancellation without releasing its live metadata owner...OK
+64/218 src.hls_master.test.HLS master public Apple configuration selects capped AVC without fetching alternate media...OK
+65/218 src.hls_master.test.HLS master duplicate video URI metadata ties retain deterministic audio-group selection...OK
+66/218 src.hls_master.test.HLS master validates AES session hints without applying them as media keys...OK
+67/218 src.hls_master.test.HLS master version nine discovers low latency media variants...OK
+68/218 src.hls_crypto.test.HLS streaming CBC matches independent OpenSSL vectors for every chunk boundary...OK
+69/218 src.hls_crypto.test.HLS streaming CBC terminalizes cancellation consumer failure truncated blocks and invalid padding...OK
+70/218 src.hls_crypto.test.HLS AES CBC matches independent OpenSSL vectors across block SIMD and padding boundaries...OK
+71/218 src.hls_crypto.test.HLS AES malformed ciphertext padding and mid-resource cancellation never succeed...OK
+72/218 src.hls_crypto.test.HLS AES identity declaration parses key format versions and big endian IV...OK
+73/218 src.hls_crypto.test.HLS AES fuzz CBC padding and bounded native decryption...OK
+74/218 src.hls_crypto.test.HLS AES fuzz cipher seed reaches independent plaintext through Smith...OK
+75/218 src.dash.test.DASH availability offsets use exact eligibility while preserving clocks and expiry...OK
+76/218 src.dash.test.DASH availability sums the selected BaseURL path and overrides inherited templates...OK
+77/218 src.dash.test.DASH availability selects only the chosen BaseURL alternative...OK
+78/218 src.dash.test.DASH availability expands open timelines with offset and requires finite INF extent...OK
+79/218 src.dash.test.DASH availability bounds unbounded INF timelines malformed precision and expansion...OK
+80/218 src.dash.test.DASH availability inherited addressing releases every failing allocation...OK
+81/218 src.dash.test.DASH explicit SegmentList clocks ranges and sequence use fMP4 ingest contract...OK
+82/218 src.dash.test.DASH parser releases allocations on every failure...OK
+83/218 src.dash.test.DASH templates own bounded expanded URI clocks and static last partial period...OK
+84/218 src.dash.test.DASH live timeline filters incomplete and expired segments with synchronized UTC...OK
+85/218 src.dash.test.DASH elapsed and UTC reject invalid calendar ambiguous and overflowing clocks...OK
+86/218 src.dash.test.DASH template expansion releases allocations on every failure...OK
+87/218 src.dash.test.DASH inherited templates select representations and resolve signed BaseURL chains...OK
+88/218 src.dash.test.DASH explicit escaped references remain owned after parsing...OK
+89/218 src.dash.test.DASH BaseURL alternatives relative manifests and invalid absolute URLs...OK
+90/218 src.dash.test.DASH namespace prefixes and selection identity are stable across descriptive XML edits...OK
+91/218 src.dash.test.DASH bandwidth ceiling chooses the largest eligible representation...OK
+92/218 src.dash.test.DASH inherited timeline children override nearer levels and reject critical features...OK
+93/218 src.dash.test.DASH multiple periods infer timing and preserve period-local sequence resets...OK
+94/218 src.dash.test.DASH combined periods release every failing allocation...OK
+95/218 src.dash.test.DASH announced period gaps preserve exact timing and cannot hide a skipped period...OK
+96/218 src.dash.test.DASH future timelines keep independent metadata and aggregate segment budgets...OK
+97/218 src.dash.test.DASH inherited addressing releases allocations on every failure...OK
+98/218 src.dash.test.DASH explicit timeline repeats start offsets and validates unavailable templates...OK
+99/218 src.dash.test.DASH partial availability opts into inherited complete flags without changing request clocks...OK
+100/218 src.dash.test.DASH partial availability follows nearest selected BaseURL and template inheritance...OK
+101/218 src.http_stream.test.HTTP media URI resolution pins origin and resolves dot segments queries and root paths...OK
+102/218 src.http_stream.test.HTTP media ranges require exact independent Content-Range bounds...OK
+103/218 src.http_stream.test.HTTP media adapter bounds transport work preserves auth client options and releases bodies...OK
+104/218 src.http_stream.test.HTTP sensitive resource wipes its complete owned allocation before release...OK
+105/218 src.http_fragment_test.test.HTTP streamed fragments publish before completion preserve independent packets and bound work...OK
+106/218 src.http_fragment_test.test.HTTP streamed fragments reject headers before delivery and poison entered failures...OK
+107/218 src.http_fragment_test.test.HTTP streamed fragments release every failing allocation including taken snapshots...OK
+108/218 src.http_fragment_test.test.HTTP streamed cancellation preserves taken fragments and preflight admission does not enter transport...OK
+109/218 src.http_fragment_test.test.HTTP fragment growth respects exact tight-budget fallback and complete pending byte ownership...OK
+110/218 src.http_fragment_test.test.HTTP streamed ranges validate headers before delivery and consume exactly the requested extent...OK
+111/218 src.http_fragment_test.test.HTTP fragment one-byte input uses bounded allocations and retains exact coded bytes...one-byte fragment: 10409 bytes, 15 allocations, 32767 allocated bytes, 16384 retained capacity
+OK
+112/218 src.http_fragment_test.test.HTTP fragment replay suppresses acknowledged prefix and preserves taken snapshots after restart...OK
+113/218 src.http_fragment_test.test.HTTP fragment replay distinguishes ownership from accepted irreversible side effects...OK
+114/218 src.http_fragment_test.test.HTTP fragment replay rejects changed coded prefix before any new delivery...OK
+115/218 src.http_fragment_test.test.HTTP fragment replay fails a shorter clean resource and preserves incomplete transport retries...OK
+116/218 src.http_fragment_test.test.HTTP fragment replay pre-entry admission does not bind or spend attempts and retry limits persist...OK
+117/218 src.http_fragment_test.test.HTTP fragment replay allocation failures release rebuilt snapshots prefix leases and taken owners...OK
+118/218 src.http_fragment_test.test.HTTP fragment replay binds initialization epoch and byte-range before requesting replacements...OK
+119/218 src.http_fragment_test.test.HTTP fragment replay compares native timing even when coded picture bytes are unchanged...OK
+120/218 src.http_fragment_test.test.HTTP fragment replay cancellation preserves acknowledgement and resumes without repeated callbacks...OK
+121/218 src.http_fragment_test.test.HTTP fragment replay bounds published work and rejects recursive use without spending a request...OK
+122/218 src.http_fragment_test.test.HTTP fragment replay reopens append-only live bodies and publishes only new coded fragments...OK
+123/218 src.http_fragment_test.test.HTTP encrypted fragment replay publishes before EOF and preserves independent coded bytes after retry...OK
+124/218 src.http_fragment_test.test.HTTP encrypted replay binds actual key and IV before entering transport...OK
+125/218 src.http_fragment_test.test.HTTP encrypted padding failure retains acknowledged prefix and healthy retry completes only after validated EOF...OK
+126/218 src.http_fragment_test.test.HTTP encrypted fragment retries release every failed allocation and independent plaintext snapshot...OK
+127/218 src.http_fragment_test.test.HTTP encrypted streaming charges fixed CBC workspace before transport admission...OK
+128/218 src.hls_live.test.live HLS HTTP reload and changed initialization preserve epochs and independent leases...OK
+129/218 src.hls_live.test.live HLS media transport retry does not repeat configuration and reload rejects mutation or gaps...OK
+130/218 src.hls_live.test.live HLS allocation failures release both configuration epochs and retained packets...OK
+131/218 src.hls_live.test.live DASH template reload uses refreshed clock retry and gap detection...OK
+132/218 src.hls_live.test.live DASH availability reload waits for exact offset boundary preserves identity and retries...OK
+133/218 src.hls_live.test.live DASH inherited BaseURL keeps authenticated origin pinned and retries safely...OK
+134/218 src.hls_live.test.DASH period transitions reset decoder epochs with repeated init URI and local numbering...OK
+135/218 src.hls_live.test.live DASH retains learned period endings across removal and rejects skipped pending media...OK
+136/218 src.hls_live.test.live DASH waits for incomplete periods and rejects an empty expired pending window...OK
+137/218 src.hls_live.test.live DASH reload and period reconfiguration release every failing allocation...OK
+138/218 src.hls_live.test.live HLS master selects media base and pins it across reload and epoch transitions...OK
+139/218 src.hls_live.test.live HLS master discovery failures retain uncommitted URL and release admission...OK
+140/218 src.hls_live.test.live HLS master refuses foreign-origin variants before authenticated transport...OK
+141/218 src.hls_live.test.live HLS master selection allocation failures release snapshots epochs and packet owners...OK
+142/218 src.hls_live.test.live HLS AES decrypts independent init and media fixtures with key rotation and held packets...OK
+143/218 src.hls_live.test.live HLS AES reload refreshes reused key URI and owns encrypted map declarations...OK
+144/218 src.hls_live.test.live HLS AES key and media errors preserve cursor and initialized retry state...OK
+145/218 src.hls_live.test.live HLS AES allocation failures release keys decrypted resources and held snapshots...OK
+146/218 src.hls_live.test.live HLS AES reload rejects changed encryption metadata in an overlapping segment...OK
+147/218 src.hls_live.test.live HLS AES reconfiguration decrypts a new map and preserves the previous packet lease...OK
+148/218 src.hls_live.test.live HLS AES foreign keys fail before fetching initialization or ciphertext...OK
+149/218 src.hls_live.test.live HLS partial reload consumes each part and acknowledges its parent without duplicate samples...OK
+150/218 src.hls_live.test.live HLS completed parent recovers unlisted tail and preserves cursor across HTTP retry...OK
+151/218 src.hls_live.test.live HLS parent fallback verifies encoded sample prefix and allows a clean retry after mutation...OK
+152/218 src.hls_live.test.live HLS partial parent fallback allocation failures release snapshots indexes and leases...OK
+153/218 src.hls_live.test.live HLS blocking reload preserves authentication query and rejects directive aliases...OK
+154/218 src.hls_live.test.live HLS blocking reload requests next part and retains canonical media URL...OK
+155/218 src.hls_live.test.live HLS independent AES partial objects and parent fallback preserve sample payloads...OK
+156/218 src.hls_live.test.live HLS delta reload merges inherited state and enforces snapshot age...OK
+157/218 src.hls_live.test.live HLS delta missing history retries once and failed fetch preserves snapshot...OK
+158/218 src.hls_live.test.live HLS delta request preserves query bytes and refuses directive aliases...OK
+159/218 src.hls_live.test.live HLS delta descriptor mutation retains committed snapshot and cursor...OK
+160/218 src.hls_live.test.live HLS delta reader releases planning and transport owners on every allocation failure...OK
+161/218 src.hls_live.test.live HLS combined blocking date-range directive preserves authentication and bounds...OK
+162/218 src.hls_live.test.live HLS v2 augments metadata combines blocking and falls back atomically on incomplete date history...OK
+163/218 src.hls_live.test.live Reader streaming retries preserve manifest cursor accepted fragments and metadata across reload...OK
+164/218 src.hls_live.test.live Reader streaming consumer acknowledgement updates accepted clocks before failure...OK
+165/218 src.hls_live.test.live Reader streaming reload mutation or removal keeps the committed snapshot and retry state...OK
+166/218 src.hls_live.test.live DASH Reader streaming marks only successful EOF as resource and period completion...OK
+167/218 src.hls_live.test.live Reader streaming allocation failures release manifests initialization and accepted snapshots...OK
+168/218 src.hls_live.test.live Reader streaming epochs keep global ordinals and permit buffered reads only after EOF...OK
+169/218 src.hls_live.test.live Reader streaming lifetime byte and accepted fragment limits remain cumulative...OK
+170/218 src.hls_live.test.partial DASH Reader retains sequence through clean EOF unchanged polls and append-only growth...OK
+171/218 src.hls_live.test.partial DASH declaration completion still fetches and validates an unfinished body...OK
+172/218 src.hls_live.test.partial DASH retries and body versions obey caller-configured attempt limits...OK
+173/218 src.hls_live.test.partial DASH append-only version allocation failures preserve owners and release prefix leases...OK
+174/218 src.hls_live.test.partial DASH rejects a new fragment decode gap without advancing accepted output...OK
+175/218 src.hls_live.test.live HLS encrypted streaming refreshes keys on reload and preserves accepted fragments across transport failure...OK
+176/218 src.hls_live.test.live HLS encrypted streaming reused key URI cannot change an accepted resource binding...OK
+177/218 src.hls_live.test.live HLS encrypted streaming rotates keys between resources without invalidating prior packets...OK
+178/218 src.hls_live.test.live HLS encrypted streaming allocation failures drain keys initialization and independent packets...OK
+179/218 src.hls_live.test.streamed LL HLS verifies parent prefix within a repackaged moof and emits each sample once...OK
+180/218 src.hls_live.test.streamed LL HLS parent resource prefix stays frozen across accepted suffix and consumer retry...OK
+181/218 src.hls_live.test.streamed LL HLS fully duplicate parent advances cursor without callback or duplicate ordinals...OK
+182/218 src.hls_live.test.streamed LL HLS failed unfinished part can transition to its advertised complete parent...OK
+183/218 src.hls_live.test.streamed LL HLS all allocation failures release prefix verification trim and independent owners...OK
+184/218 src.hls_live.test.streamed LL HLS truncated unverified parent prefix cannot commit corrupt samples or poison healthy retry...OK
+185/218 src.hls_live.test.streamed LL HLS verified parent mismatch fails before any new consumer callback...OK
+186/218 src.hls_live.test.streamed LL HLS parent remains pinned when a live reload advertises additional parts...OK
+187/218 src.hls_live.test.streamed LL HLS parent can follow a buffered part without reemitting its samples...OK
+188/218 src.hls_live.test.streamed LL HLS independently encrypted parts and repackaged parent preserve native packet parity...OK
+189/218 src.admission.test.shared admission is atomic and retains outputs until their owner releases...OK
+190/218 src.admission.test.shared admission serializes competing native worker reservations...OK
+191/218 src.admission.test.shared admission resizing retains ownership on denial and releases parse workspace...OK
+192/218 src.remote.test.version pinned object reads coalesce and leases survive eviction...OK
+193/218 src.remote.test.remote versions ranges wire budgets and cancellation fail closed...OK
+194/218 src.timeline.test.timeline signed rational scaling preserves negative ticks and overflow...OK
+195/218 src.mp4.test.MP4 index allocator charges moving growth overlap and releases failed probes...OK
+196/218 src.webm.test.webm rejects timestamp multiplication overflow without trapping...OK
+197/218 src.webm.test.webm track retains bounded display crop projection and Colour declarations...OK
+198/218 src.webm.test.webm display and Colour reject duplicate singleton fields malformed crop and nonfinite pose...OK
+199/218 src.webm_test.test.webm VP9 index agrees with ffprobe with bounded block probes...OK
+200/218 src.webm_test.test.webm malformed ranges limits and truncation release source leases...OK
+201/218 src.webm_test.test.webm rejects video lacing instead of returning the lace as one picture...OK
+202/218 src.webm_test.test.webm unknown-size Clusters preserve packets and validated Cues seek hints...OK
+203/218 src.webm_test.test.webm Cues budgets and fallback without Cues...OK
+204/218 src.webm_test.test.webm unknown-size consecutive Clusters terminate at sibling headers...OK
+205/218 src.webm_test.test.webm Segment Duration scales after Info parsing and rejects nonfinite values...OK
+206/218 src.mp4_test.test.mp4 video packet index matches independent ffprobe B-frame VFR rotation and multitrack receipts...OK
+207/218 src.mp4_test.test.mp4 tail metadata range reads skip mdat and retain packets across later reads...OK
+208/218 src.mp4_test.test.mp4 video malformed tables, metadata/index limits and fragment rejection release leases...OK
+209/218 src.mp4_test.test.mp4 rejects out-of-payload offsets and external data references...OK
+210/218 src.mp4_test.test.mp4 video allocation failure campaign cleans metadata and index...OK
+211/218 src.mp4_test.test.mp4 cancellation during table walk drains retained metadata and permits retry...OK
+212/218 src.mp4_test.test.fragmented mp4 packet offsets DTS PTS durations and sync match ffprobe...OK
+213/218 src.mp4_test.test.fragmented mp4 bad offsets missing tfdt and admission failures release metadata...OK
+214/218 src.mp4_test.test.MP4 packet indexes retain exact shared bytes instead of configured ceiling...OK
+215/218 src.mp4_test.test.MP4 index allocation and shared admission failures release construction owners...OK
+216/218 src.hls_dateranges.test.HLS date-range times compare exact fractions offsets and calendar boundaries...OK
+217/218 src.hls_dateranges.test.HLS date-range signed numeric extensions and empty intervals remain exact...OK
+218/218 src.dash_availability.test.DASH availability offsets retain signed decimal scientific precision and reject unsafe values...OK
+All 218 tests passed.
+7 fuzz tests found.

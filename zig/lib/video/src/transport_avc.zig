@@ -501,7 +501,7 @@ pub const Hls = struct {
         self.* = undefined;
     }
     pub fn factory(self: *Hls) media.hls_live.TransportFactory {
-        return .{ .context = self, .accept = accept };
+        return .{ .context = self, .accept = accept, .stream = @import("transport_avc_http.zig").begin };
     }
     fn accept(raw: *anyopaque, identity: []const u8, bytes: []const u8, item: media.hls.Segment, limits: media.live_mp4.Options, control: media.source.Control, pool: ?*media.admission.Pool) anyerror!media.live_mp4.Segment {
         const self: *Hls = @ptrCast(@alignCast(raw));
@@ -611,6 +611,8 @@ const TestHttp = struct {
         manifest: []const u8 = initial,
         calls: usize = 0,
         fail: bool = false,
+        complete: bool = false,
+        body_override: ?[]const u8 = null,
         pub fn get(self: *@This(), uri: []const u8, _: anytype) !Response {
             self.calls += 1;
             if (std.mem.endsWith(u8, uri, "list.m3u8")) return .{ .body = self.manifest };
@@ -618,6 +620,20 @@ const TestHttp = struct {
             if (std.mem.endsWith(u8, uri, "closed.ts")) return .{ .body = @embedFile("../testdata/transport/closed-split.ts") };
             if (std.mem.endsWith(u8, uri, "bframes.ts")) return .{ .body = @embedFile("../testdata/transport/bframes-split.ts") };
             return error.UnexpectedTransportResource;
+        }
+        pub fn getToWriter(self: *@This(), uri: []const u8, options: anytype, writer: anytype, _: anytype, _: anytype) !Response {
+            self.complete = false;
+            const response = try self.get(uri, options);
+            try writer.startResponse(response);
+            const bytes = self.body_override orelse response.body.?;
+            var offset: usize = 0;
+            while (offset < bytes.len) {
+                const end = @min(bytes.len, offset + 512);
+                try writer.writeAll(bytes[offset..end]);
+                offset = end;
+            }
+            self.complete = true;
+            return response;
         }
     };
     const Response = struct {
@@ -943,4 +959,179 @@ test "native TS incremental AVC PES aligned input without AUD retains the legacy
     for (records.items, 0..) |packet, ordinal| try normal.push(.{ .bytes = bytes.items[packet.offset..][0..packet.size], .packet = packet, .ordinal = ordinal });
     try normal.finish(null);
     try capture.parity(&expected);
+}
+
+test "native TS HTTP Reader streams normalized owned units and verifies acknowledged retry before new delivery" {
+    const a = std.testing.allocator;
+    var codec = Hls{ .allocator = a };
+    defer codec.deinit();
+    var client = TestHttp.Client{ .manifest = TestHttp.initial ++ "#EXT-X-ENDLIST\n" };
+    var transport = media.http_stream.Adapter(TestHttp){ .allocator = a, .client = &client, .root_url = "https://example.test/live/list.m3u8" };
+    var reader = try media.hls_live.Reader(TestHttp).init(a, &transport, transport.root_url, .{ .transport_stream = codec.factory() });
+    defer reader.deinit();
+    const Capture = struct {
+        units: AuCapture = .{},
+        fail: bool = true,
+        client: *TestHttp.Client,
+        early: usize = 0,
+        fn accept(raw: *anyopaque, delivery: *media.http_stream.FragmentDelivery) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.fail and self.units.count == 2) return error.ConsumerFailure;
+            if (!self.client.complete) self.early += 1;
+            try AuCapture.accept(&self.units, delivery);
+        }
+    };
+    var capture = Capture{ .client = &client };
+    defer capture.units.deinit();
+    try reader.reload();
+    try std.testing.expectError(error.ConsumerFailure, reader.streamNext(&capture, Capture.accept));
+    try std.testing.expectEqual(@as(usize, 2), codec.ordinal);
+    try std.testing.expectEqual(@as(usize, 2), reader.stream_ledger.acknowledged);
+    try std.testing.expectEqual(@as(u64, 10), reader.next_sequence.?);
+    try std.testing.expectError(error.PendingMediaSegment, reader.next());
+    capture.fail = false;
+    const result = (try reader.streamNext(&capture, Capture.accept)).?;
+    try std.testing.expectEqual(@as(usize, 2), result.replayed);
+    try std.testing.expectEqual(capture.units.count - 2, result.acknowledged);
+    try std.testing.expect(capture.early > 0);
+    try std.testing.expect(reader.ended());
+    var expected = try Reader.init(a, "http-ts-oracle", @embedFile("../testdata/transport/closed-split.ts"), .{}, .{});
+    defer expected.deinit();
+    try capture.units.parity(&expected);
+}
+fn httpTsAllocations(a: std.mem.Allocator) !void {
+    var no_resize = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    const scoped = no_resize.allocator();
+    var codec = Hls{ .allocator = scoped };
+    defer codec.deinit();
+    var client = TestHttp.Client{ .manifest = TestHttp.initial ++ "#EXT-X-ENDLIST\n" };
+    var transport = media.http_stream.Adapter(TestHttp){ .allocator = scoped, .client = &client, .root_url = "https://example.test/live/list.m3u8" };
+    var reader = try media.hls_live.Reader(TestHttp).init(scoped, &transport, transport.root_url, .{ .transport_stream = codec.factory() });
+    defer reader.deinit();
+    var capture = AuCapture{};
+    defer capture.deinit();
+    try reader.reload();
+    _ = try reader.streamNext(&capture, AuCapture.accept);
+}
+test "native TS HTTP Reader allocation failure releases session parser normalized units and cursor owners" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, httpTsAllocations, .{});
+}
+
+test "native TS HTTP acknowledged prefix mutation rejects before any new normalized unit" {
+    const a = std.testing.allocator;
+    const original = @embedFile("../testdata/transport/closed-split.ts");
+    const damaged = try a.dupe(u8, original);
+    defer a.free(damaged);
+    var demux = try media.transport_stream.demux(a, original, .{}, .{}, .{}, null);
+    defer demux.deinit();
+    const first = for (demux.packets) |packet| {
+        if (packet.size >= 64) break packet;
+    } else return error.MissingTestPayload;
+    const needle = demux.bytes[first.offset + first.size - 64 ..][0..8];
+    const at = std.mem.indexOf(u8, damaged, needle).?;
+    damaged[at + 7] ^= 1;
+    var codec = Hls{ .allocator = a };
+    defer codec.deinit();
+    var client = TestHttp.Client{ .manifest = TestHttp.initial ++ "#EXT-X-ENDLIST\n" };
+    var transport = media.http_stream.Adapter(TestHttp){ .allocator = a, .client = &client, .root_url = "https://example.test/live/list.m3u8" };
+    var reader = try media.hls_live.Reader(TestHttp).init(a, &transport, transport.root_url, .{ .transport_stream = codec.factory() });
+    defer reader.deinit();
+    const Capture = struct {
+        units: AuCapture = .{},
+        fn accept(raw: *anyopaque, delivery: *media.http_stream.FragmentDelivery) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.units.count == 2) return error.ConsumerFailure;
+            try AuCapture.accept(&self.units, delivery);
+        }
+    };
+    var capture = Capture{};
+    defer capture.units.deinit();
+    try reader.reload();
+    try std.testing.expectError(error.ConsumerFailure, reader.streamNext(&capture, Capture.accept));
+    client.body_override = damaged;
+    try std.testing.expectError(error.SourceVersionChanged, reader.streamNext(&capture, Capture.accept));
+    try std.testing.expectEqual(@as(usize, 2), capture.units.count);
+    try std.testing.expect(reader.stream_ledger.invalid);
+    try std.testing.expectEqual(@as(u64, 10), reader.next_sequence.?);
+}
+test "native TS HTTP validated EOF commits state and later discontinuity advances the decoder epoch" {
+    const a = std.testing.allocator;
+    var codec = Hls{ .allocator = a };
+    defer codec.deinit();
+    var client = TestHttp.Client{};
+    var transport = media.http_stream.Adapter(TestHttp){ .allocator = a, .client = &client, .root_url = "https://example.test/live/list.m3u8" };
+    var reader = try media.hls_live.Reader(TestHttp).init(a, &transport, transport.root_url, .{ .transport_stream = codec.factory() });
+    defer reader.deinit();
+    var capture = AuCapture{};
+    defer capture.deinit();
+    try reader.reload();
+    _ = try reader.streamNext(&capture, AuCapture.accept);
+    try std.testing.expect(codec.state.video_pid != null and codec.configuration != null);
+    const before = capture.count;
+    client.manifest = TestHttp.changed;
+    try reader.reload();
+    _ = try reader.streamNext(&capture, AuCapture.accept);
+    try std.testing.expectEqual(@as(usize, 1), codec.epoch);
+    try std.testing.expectEqual(@as(usize, 1), capture.held[before].?.epoch);
+    try std.testing.expect(reader.ended());
+    var lease = try capture.held[0].?.reader.readPacket(0);
+    defer lease.deinit();
+    try std.testing.expect(lease.bytes.len > 0);
+}
+
+test "native TS HTTP buffered and streaming reads share the Reader lifetime byte limit" {
+    const a = std.testing.allocator;
+    var codec = Hls{ .allocator = a };
+    defer codec.deinit();
+    var client = TestHttp.Client{ .manifest = TestHttp.changed };
+    var transport = media.http_stream.Adapter(TestHttp){ .allocator = a, .client = &client, .root_url = "https://example.test/live/list.m3u8" };
+    var reader = try media.hls_live.Reader(TestHttp).init(a, &transport, transport.root_url, .{
+        .transport_stream = codec.factory(),
+        .ingest = .{ .max_ingested_bytes = @embedFile("../testdata/transport/closed-split.ts").len },
+    });
+    defer reader.deinit();
+    try reader.reload();
+    var first = (try reader.next()).?;
+    defer first.deinit();
+    try std.testing.expectEqual(reader.options.ingest.max_ingested_bytes, reader.stream_ts_bytes);
+    const before = transport.requests;
+    var capture = AuCapture{};
+    defer capture.deinit();
+    try std.testing.expectError(error.ResourceLimitExceeded, reader.streamNext(&capture, AuCapture.accept));
+    try std.testing.expectEqual(before, transport.requests);
+    try std.testing.expectEqual(@as(usize, 0), capture.count);
+    try std.testing.expectEqual(@as(u64, 11), reader.next_sequence.?);
+}
+
+test "native TS HTTP cancellation after acknowledged delivery releases session and verifies retry" {
+    const a = std.testing.allocator;
+    const Capture = struct {
+        cancelled: bool = false,
+        units: AuCapture = .{},
+        fn check(raw: ?*const anyopaque) !void {
+            const self: *const @This() = @ptrCast(@alignCast(raw.?));
+            if (self.cancelled) return error.Cancelled;
+        }
+        fn accept(raw: *anyopaque, delivery: *media.http_stream.FragmentDelivery) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try AuCapture.accept(&self.units, delivery);
+            if (self.units.count == 1) self.cancelled = true;
+        }
+    };
+    var capture = Capture{};
+    defer capture.units.deinit();
+    var codec = Hls{ .allocator = a };
+    defer codec.deinit();
+    var client = TestHttp.Client{ .manifest = TestHttp.initial ++ "#EXT-X-ENDLIST\n" };
+    var transport = media.http_stream.Adapter(TestHttp){ .allocator = a, .client = &client, .root_url = "https://example.test/live/list.m3u8", .control = .{ .context = &capture, .check_fn = Capture.check } };
+    var reader = try media.hls_live.Reader(TestHttp).init(a, &transport, transport.root_url, .{ .transport_stream = codec.factory() });
+    defer reader.deinit();
+    try reader.reload();
+    try std.testing.expectError(error.Cancelled, reader.streamNext(&capture, Capture.accept));
+    try std.testing.expectEqual(@as(usize, 1), reader.stream_ledger.acknowledged);
+    try std.testing.expect(!reader.stream_ledger.active and codec.configuration == null);
+    capture.cancelled = false;
+    const result = (try reader.streamNext(&capture, Capture.accept)).?;
+    try std.testing.expectEqual(@as(usize, 1), result.replayed);
+    try std.testing.expect(reader.ended());
 }

@@ -3043,7 +3043,29 @@ See [AU normalization qualification](testdata/ts-au/README.md) for exact termina
 platform results and source/binary scope: the focused 16-test gate passes on
 macOS and actual Linux ARM64.
 
-Acknowledged HTTP/Reader replay and direct TS model coordinator delivery remain
-open. Existing TS inference remains buffered; this stage connects incremental
-PES extraction to the native video representation without claiming those later
-integrations or new pretrained parity.
+### Native TS HTTP sessions and model delivery
+
+`transport_avc.Hls.factory()` now exposes both buffered and streamed transport
+hooks. The streaming session composes bounded TS/PES extraction with AU duration
+lookahead and independently owned normalized snapshots. Shared HTTP byte delivery
+also supplies native whole-object AES-CBC decryption. A fixed session reservation,
+parser allocations, moving-growth overlap and staged AVCC participate in shared
+admission.
+
+Retries bind the starting continuity/program/configuration state and immutable
+resource descriptor. Accepted AU metadata/payload hashes suppress replay; prefix
+mutation rejects before any new output. Global output ordinals advance on
+acknowledgement, including explicit acknowledgement followed by consumer failure.
+Demux state, AVCC and discontinuity epoch commit at validated resource EOF. The
+manifest cursor stays on a failed resource, and buffered `next()` cannot bypass
+its pending ledger. Cancellation destroys transient parsing state and preserves
+accepted progress for a caller-driven retry.
+
+The pretrained gate uses a six-second packet-copy TS fixture, a real authenticated
+HTTP server and withheld response tails. It fails the first model output, verifies
+identical retained-vector retry before another HTTP request, then completes six
+windows. Results are compared with the existing buffered TS inference route.
+See [TS HTTP qualification](testdata/ts-http/README.md) for exact platform results
+and source/binary scope. This is reference preservation for the pinned fixture;
+end-user retrieval relevance is outside this gate. TS LL-HLS parts remain
+unsupported.

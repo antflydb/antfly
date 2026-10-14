@@ -19,9 +19,27 @@ const hls = @import("hls.zig");
 const network = @import("http_stream.zig");
 const live = @import("live_mp4.zig");
 const dash_cursor = @import("dash_cursor.zig");
+pub const TransportRequest = struct {
+    identity: []const u8,
+    item: hls.Segment,
+    limits: live.Options,
+    control: @import("source.zig").Control,
+    pool: ?*@import("admission.zig").Pool,
+    ledger: *network.FragmentLedger,
+    binding: [32]u8,
+    max_attempts: usize,
+    context: *anyopaque,
+    accept: *const fn (*anyopaque, *network.FragmentDelivery) anyerror!void,
+};
+pub const TransportSession = struct {
+    body: network.BodyConsumer,
+    result: *network.ResumeStats,
+    deinit: *const fn (*anyopaque) void,
+};
 pub const TransportFactory = struct {
     context: *anyopaque,
     accept: *const fn (*anyopaque, []const u8, []const u8, hls.Segment, live.Options, @import("source.zig").Control, ?*@import("admission.zig").Pool) anyerror!live.Segment,
+    stream: ?*const fn (*anyopaque, TransportRequest) anyerror!TransportSession = null,
 };
 pub const Clock = struct { context: ?*anyopaque = null, now_ns: *const fn (?*anyopaque) u64 };
 pub const Options = struct { max_resource_attempts: usize = 8, clock: ?Clock = null, playlist: hls.Limits = .{}, ingest: live.Options = .{}, selection: hls.master.Selection = .{}, transport_stream: ?TransportFactory = null };
@@ -126,6 +144,7 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
         stream_was_partial: bool = false,
         stream_sample_prefix: ?live.SamplesDigest = null,
         stream_call_active: bool = false,
+        stream_ts_bytes: u64 = 0,
         next_sequence: ?u64 = null,
         next_part: u32 = 0,
         part_progress: live.SamplesDigest = .{},
@@ -187,8 +206,11 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
             return &self.cached_key.?.bytes;
         }
         fn fetchResource(self: *Self, uri: []const u8, range: ?hls.Range, encryption: ?hls.crypto.Key, sequence: u64) !Resource {
+            return self.fetchResourceLimited(uri, range, encryption, sequence, self.options.ingest.stream.max_bytes);
+        }
+        fn fetchResourceLimited(self: *Self, uri: []const u8, range: ?hls.Range, encryption: ?hls.crypto.Key, sequence: u64, limit: usize) !Resource {
             const key = if (encryption) |declaration| try self.loadKey(declaration) else null;
-            var body = try self.transport.fetch(self.mediaUrl(), uri, range, self.options.ingest.stream.max_bytes);
+            var body = try self.transport.fetch(self.mediaUrl(), uri, range, limit);
             errdefer body.deinit();
             var bytes: []const u8 = body.bytes;
             if (encryption) |declaration| {
@@ -485,14 +507,15 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
         /// cannot silently drop or mutate
         /// the selected resource. next() cannot mix buffered consumption into an
         /// unfinished streaming resource. Accepted LL-HLS parts bind parent
-        /// fallback by samples, independent of moof boundaries. TS retains next().
+        /// fallback by samples, independent of moof boundaries. Native TS uses
+        /// the same body transport through its configured normalization hook.
         pub fn streamNext(self: *Self, context: *anyopaque, accept: *const fn (*anyopaque, *network.FragmentDelivery) anyerror!void) !?network.ResumeStats {
             try self.transport.control.check();
             if (self.stream_call_active) return error.InvalidMediaStreamState;
             const playlist = self.playlist orelse return error.MediaPlaylistRequired;
             const item = (try self.selectedResource(playlist)) orelse return null;
             if (item.part) |part| if (part.gap) return error.MediaStreamGap;
-            if (item.initialization.uri.len == 0) return error.UnsupportedStreamingResource;
+            if (item.initialization.uri.len == 0) return self.streamTransport(item, context, accept);
             if (self.ingest) |*ingest| if (ingest.pending.items.len != 0) return error.PendingMediaSegment;
             const key = try self.streamDescriptor(item);
             if (self.stream_key) |previous| {
@@ -586,6 +609,37 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
             self.stream_sample_prefix = null;
             return result;
         }
+        fn streamTransport(self: *Self, item: hls.Segment, context: *anyopaque, accept: *const fn (*anyopaque, *network.FragmentDelivery) anyerror!void) !?network.ResumeStats {
+            if (item.part != null) return error.UnsupportedHlsStreamingParts;
+            if (comptime !@hasDecl(manifest_parser, "master")) return error.UnsupportedContainer;
+            const factory = self.options.transport_stream orelse return error.UnsupportedStreamingResource;
+            const begin = factory.stream orelse return error.UnsupportedStreamingResource;
+            const key = try self.streamDescriptor(item);
+            if (self.stream_key) |previous| {
+                if (!std.meta.eql(previous, key)) return error.SourceVersionChanged;
+            } else {
+                self.stream_key = key;
+                self.stream_ledger = .{};
+            }
+            const encryption: ?network.Encryption = if (item.encryption) |declaration| .{ .key = try self.loadKey(declaration), .iv = declaration.mediaIv(item.sequence) } else null;
+            const binding = try self.transport.resourceBinding(self.mediaUrl(), item.uri, item.range, 0, key, encryption);
+            const session = try begin(factory.context, .{ .identity = self.mediaUrl(), .item = item, .limits = self.options.ingest, .control = self.transport.control, .pool = self.transport.pool, .ledger = &self.stream_ledger, .binding = binding, .max_attempts = self.options.max_resource_attempts, .context = context, .accept = accept });
+            defer session.deinit(session.body.context);
+            self.stream_call_active = true;
+            defer self.stream_call_active = false;
+            const before = self.transport.transferred_bytes;
+            defer self.stream_ts_bytes += self.transport.transferred_bytes - before;
+            const remaining = self.options.ingest.max_ingested_bytes -| self.stream_ts_bytes;
+            const cap: usize = @intCast(@min(self.options.ingest.stream.max_bytes, remaining));
+            const stats = try self.transport.streamBody(self.mediaUrl(), item.uri, item.range, cap, encryption, session.body);
+            var result = session.result.*;
+            result.transport = stats;
+            result.transport.fragments = result.replayed + result.acknowledged;
+            self.commitCursor(item);
+            self.stream_key = null;
+            self.stream_ledger = .{};
+            return result;
+        }
         pub fn next(self: *Self) !?live.Segment {
             if (self.stream_key != null or self.stream_call_active) return error.PendingMediaSegment;
             while (true) {
@@ -601,7 +655,11 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
                     if (comptime !@hasDecl(manifest_parser, "master")) return error.UnsupportedContainer;
                     if (item.part != null) return error.UnsupportedContainer;
                     const factory = self.options.transport_stream orelse return error.UnsupportedContainer;
-                    var resource = try self.fetchResource(item.uri, item.range, item.encryption, item.sequence);
+                    const before = self.transport.transferred_bytes;
+                    defer self.stream_ts_bytes += self.transport.transferred_bytes - before;
+                    const remaining = self.options.ingest.max_ingested_bytes -| self.stream_ts_bytes;
+                    const cap: usize = @intCast(@min(self.options.ingest.stream.max_bytes, remaining));
+                    var resource = try self.fetchResourceLimited(item.uri, item.range, item.encryption, item.sequence, cap);
                     defer resource.deinit();
                     const result = try factory.accept(factory.context, self.mediaUrl(), resource.bytes, item, self.options.ingest, self.transport.control, self.transport.pool);
                     self.commitCursor(item);

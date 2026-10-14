@@ -2304,3 +2304,22 @@ Next-AU DTS lookahead determines duration; ambiguity rejects rather than inventi
 clocks. Owned normalized snapshots and actual-allocation admission are qualified
 against buffered packet readers. Acknowledged HTTP/Reader replay and direct TS
 model integration remain open. Evidence: `zig/lib/video/testdata/ts-au/README.md`.
+
+### Streamed TS Reader and pretrained model integration
+
+Native TS now shares the authenticated incremental HTTP/AES byte transport with
+fMP4. A codec-owned session normalizes AUs into immutable packet snapshots and
+delivers them directly to the existing model window coordinator. The Reader
+retains its selected resource and acknowledged prefix across errors; replay
+binds the starting TS/configuration state and verifies accepted AU hashes before
+new delivery. Only validated EOF commits continuity/configuration and advances
+the manifest cursor. Buffered and streamed TS reads share their lifetime byte
+budget. Cancellation and every allocation-failure point release transient owners.
+
+The real HTTP checkpoint gate exercises before-EOF model output, retained-vector
+retry before the next HTTP request, replay suppression and six-window comparison
+with buffered TS inference. Platform and source/binary evidence is recorded in
+`zig/lib/video/testdata/ts-http/README.md`. TS LL-HLS parts remain unsupported.
+
+Latest `origin/main` was merged without conflicts at `a2a1aca1d8`, including
+`0cba59bceb`; ongoing video edits were preserved separately from that merge.

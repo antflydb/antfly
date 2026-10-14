@@ -1,0 +1,23 @@
+1/22 video_test_root.test_0...OK
+2/22 src.mod.test_0...OK
+3/22 src.transport_avc.test.native TS AVC packet adapter decodes every selected picture against independent FFmpeg...OK
+4/22 src.transport_avc.test.native TS AVC adapter allocation failures release normalized payload metadata and admission...OK
+5/22 src.transport_avc.test.native TS AVC HLS factory preserves packet leases through discontinuity and transport retry...OK
+6/22 src.transport_avc.test.native TS AVC HLS factory allocation failures reclaim both epochs and state...OK
+7/22 src.transport_avc.test.native TS AVC rejects reused or unowned PES timestamps...OK
+8/22 src.transport_avc.test.native TS AVC access units preserve Annex B leading zero bytes...OK
+9/22 src.transport_avc.test.native TS incremental AVC normalization joins split PES and preserves buffered packet clocks durations and payloads...OK
+10/22 src.transport_avc.test.native TS incremental AVC allocation failures release normalization configuration and retained snapshots...OK
+11/22 src.transport_avc.test.native TS incremental AVC consumer failure terminalizes without double-freeing transferred owners...OK
+12/22 src.transport_avc.test.native TS incremental AVC timed PES may begin in the previous AU and clocks belong to its later AUD...OK
+13/22 src.transport_avc.test.native TS incremental AVC rejects multiple AUD clocks missing duration and untimed first AU...OK
+14/22 src.transport_avc.test.native TS incremental AVC PES aligned input without AUD retains the legacy timing contract...OK
+15/22 src.transport_avc.test.native TS HTTP Reader streams normalized owned units and verifies acknowledged retry before new delivery...OK
+16/22 src.transport_avc.test.native TS HTTP Reader allocation failure releases session parser normalized units and cursor owners...OK
+17/22 src.transport_avc.test.native TS HTTP acknowledged prefix mutation rejects before any new normalized unit...OK
+18/22 src.transport_avc.test.native TS HTTP validated EOF commits state and later discontinuity advances the decoder epoch...OK
+19/22 src.transport_avc.test.native TS HTTP buffered and streaming reads share the Reader lifetime byte limit...OK
+20/22 src.transport_avc.test.native TS HTTP cancellation after acknowledged delivery releases session and verifies retry...OK
+21/22 src.codecs.test.test_0...OK
+22/22 src.webm_pictures.test_0...OK
+All 22 tests passed.

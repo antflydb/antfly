@@ -39,6 +39,13 @@ pub const FragmentDelivery = struct {
         return result;
     }
 };
+pub const BodyConsumer = struct {
+    context: *anyopaque,
+    write: *const fn (*anyopaque, []const u8) anyerror!void,
+    finish: ?*const fn (*anyopaque) anyerror!void = null,
+    /// Called only after request/work admission; failures consume that attempt.
+    entered: ?*const fn (*anyopaque) anyerror!void = null,
+};
 pub const StreamStats = struct { bytes: usize = 0, plaintext_bytes: usize = 0, fragments: usize = 0, largest_pending_capacity: usize = 0 };
 /// Caller-owned, constant-space in-process prefix commitment. One ledger binds
 /// one immutable URL/range/init/epoch. Fresh resources require fresh ledgers.
@@ -118,6 +125,19 @@ fn resumeBinding(url: []const u8, range: ?hls.Range, initialization: []const u8,
     state.final(&hash);
     return hash;
 }
+/// Commit an owned normalized/fMP4 unit using the same ordered sample format.
+pub fn hashFragment(state: std.crypto.hash.sha2.Sha256, segment: *live.Segment, control: source.Control) !std.crypto.hash.sha2.Sha256 {
+    try control.check();
+    var digest = live.SamplesDigest{ .state = state };
+    var boundary: [16]u8 = undefined;
+    std.mem.writeInt(u64, boundary[0..8], segment.ordinal, .big);
+    std.mem.writeInt(u64, boundary[8..16], segment.reader.packets.len, .big);
+    digest.state.update(&boundary);
+    try digest.extend(&segment.reader, 0, segment.reader.packets.len);
+    try control.check();
+    return digest.state;
+}
+
 pub const Limits = struct {
     max_resource_bytes: usize = 32 * 1024 * 1024,
     max_transferred_bytes: u64 = 1024 * 1024 * 1024,
@@ -214,6 +234,12 @@ pub fn Adapter(comptime http: type) type {
                 return false;
             }
         };
+        pub fn resourceBinding(self: *Self, base: []const u8, reference: []const u8, range: ?hls.Range, epoch: usize, context: [32]u8, encryption: ?Encryption) ![32]u8 {
+            try self.control.check();
+            const url = try resolve(self.allocator, self.root_url, base, reference, self.limits.max_uri_bytes);
+            defer self.allocator.free(url);
+            return resumeBinding(url, range, "", epoch, context, encryption, null, self.control);
+        }
         pub fn fetch(self: *Self, base: []const u8, reference: []const u8, range: ?hls.Range, resource_limit: usize) !Body {
             try self.control.check();
             if (self.requests >= self.limits.max_requests) return error.ResourceLimitExceeded;
@@ -280,6 +306,47 @@ pub fn Adapter(comptime http: type) type {
         pub fn streamFmp4WithEncryption(self: *Self, base: []const u8, reference: []const u8, range: ?hls.Range, resource_limit: usize, ingest: *live.Ingest, encryption: ?Encryption, context: *anyopaque, accept: *const fn (*anyopaque, *FragmentDelivery) anyerror!void) !StreamStats {
             try self.control.check();
             if (ingest.ended or ingest.pending.items.len != 0) return error.InvalidMediaStreamState;
+            const Frames = struct {
+                adapter: *Self,
+                ingest: *live.Ingest,
+                context: *anyopaque,
+                accept: *const fn (*anyopaque, *FragmentDelivery) anyerror!void,
+                count: usize = 0,
+                capacity: usize = 0,
+                fn publish(frame_sink: *@This(), segment: live.Segment, complete: bool) !void {
+                    var delivery = FragmentDelivery{ .segment = segment, .body_complete = complete };
+                    defer if (delivery.segment) |*owner| owner.deinit();
+                    try frame_sink.adapter.control.check();
+                    frame_sink.count += 1;
+                    try frame_sink.accept(frame_sink.context, &delivery);
+                }
+                fn write(raw: *anyopaque, bytes: []const u8) !void {
+                    const frame_sink: *@This() = @ptrCast(@alignCast(raw));
+                    try frame_sink.ingest.push(bytes);
+                    frame_sink.capacity = @max(frame_sink.capacity, frame_sink.ingest.pending.capacity);
+                    while (try frame_sink.ingest.nextSegment(false)) |segment| try frame_sink.publish(segment, false);
+                }
+                fn finish(raw: *anyopaque) !void {
+                    const frame_sink: *@This() = @ptrCast(@alignCast(raw));
+                    if (frame_sink.ingest.pending.items.len != 0) try frame_sink.publish(try frame_sink.ingest.finishSegment(), true);
+                }
+            };
+            var frames = Frames{ .adapter = self, .ingest = ingest, .context = context, .accept = accept };
+            const before = self.requests;
+            errdefer if (self.requests != before) {
+                ingest.ended = true;
+                ingest.discardSegment();
+            };
+            var stats = try self.streamBody(base, reference, range, resource_limit, encryption, .{ .context = &frames, .write = Frames.write, .finish = Frames.finish });
+            stats.fragments = frames.count;
+            stats.largest_pending_capacity = frames.capacity;
+            return stats;
+        }
+        /// Authenticated bounded plaintext byte delivery, optionally decoding
+        /// one whole-object AES-128 CBC resource. No retry or buffering policy is
+        /// hidden in the consumer; it owns its parsing/finalization state.
+        pub fn streamBody(self: *Self, base: []const u8, reference: []const u8, range: ?hls.Range, resource_limit: usize, encryption: ?Encryption, consumer: BodyConsumer) !StreamStats {
+            try self.control.check();
             if (self.requests >= self.limits.max_requests) return error.ResourceLimitExceeded;
             const url = try resolve(self.allocator, self.root_url, base, reference, self.limits.max_uri_bytes);
             defer self.allocator.free(url);
@@ -303,9 +370,7 @@ pub fn Adapter(comptime http: type) type {
             if (range) |requested| headers[1] = .{ "Range", try std.fmt.bufPrint(&range_buffer, "bytes={d}-{d}", .{ requested.offset, requested.offset + requested.length - 1 }) };
             const Sink = struct {
                 adapter: *Self,
-                ingest: *live.Ingest,
-                context: *anyopaque,
-                accept: *const fn (*anyopaque, *FragmentDelivery) anyerror!void,
+                consumer: BodyConsumer,
                 range: ?hls.Range,
                 cap: usize,
                 started: bool = false,
@@ -320,13 +385,6 @@ pub fn Adapter(comptime http: type) type {
                     } else if (response.status.code != 200) return error.UnexpectedHttpStatus;
                     if (response.header("Content-Encoding")) |encoding| if (!std.ascii.eqlIgnoreCase(encoding, "identity")) return error.UnsupportedMediaEncoding;
                     sink.started = true;
-                }
-                fn publish(sink: *@This(), segment: live.Segment, body_complete: bool) !void {
-                    var delivery = FragmentDelivery{ .segment = segment, .body_complete = body_complete };
-                    defer if (delivery.segment) |*owner| owner.deinit();
-                    try sink.adapter.control.check();
-                    sink.stats.fragments += 1;
-                    try sink.accept(sink.context, &delivery);
                 }
                 pub fn writeAll(sink: *@This(), bytes: []const u8) !void {
                     if (!sink.started) return error.InvalidMediaStreamState;
@@ -349,21 +407,16 @@ pub fn Adapter(comptime http: type) type {
                 fn writePlain(sink: *@This(), bytes: []const u8) !void {
                     try sink.adapter.control.check();
                     sink.stats.plaintext_bytes += bytes.len;
-                    try sink.ingest.push(bytes);
-                    sink.stats.largest_pending_capacity = @max(sink.stats.largest_pending_capacity, sink.ingest.pending.capacity);
-                    while (try sink.ingest.nextSegment(false)) |segment| try sink.publish(segment, false);
+                    try sink.consumer.write(sink.consumer.context, bytes);
                 }
             };
-            var sink = Sink{ .adapter = self, .ingest = ingest, .context = context, .accept = accept, .range = range, .cap = cap };
+            var sink = Sink{ .adapter = self, .consumer = consumer, .range = range, .cap = cap };
             if (encryption) |cipher| sink.decryptor = hls.crypto.Stream.init(cipher.key, cipher.iv, self.control);
             defer if (sink.decryptor) |*decryptor| decryptor.deinit();
             const cancel = Cancel{ .control = self.control };
             self.requests += 1;
             self.charged_bytes += cap;
-            errdefer {
-                ingest.ended = true;
-                ingest.discardSegment();
-            }
+            if (consumer.entered) |entered| try entered(consumer.context);
             var response = self.client.getToWriter(url, .{
                 .headers = headers[0..@as(usize, if (range != null) 2 else 1)],
                 .max_response_size = cap,
@@ -383,7 +436,7 @@ pub fn Adapter(comptime http: type) type {
             if (range) |requested| if (sink.stats.bytes != requested.length) return error.InvalidRemoteRange;
             if (sink.decryptor) |*decryptor| try decryptor.finish(&sink, Sink.writePlain);
             if (sink.stats.plaintext_bytes == 0) return error.EmptyMediaResource;
-            if (ingest.pending.items.len != 0) try sink.publish(try ingest.finishSegment(), true);
+            if (consumer.finish) |finish| try finish(consumer.context);
             self.charged_bytes -= cap - sink.stats.bytes;
             return sink.stats;
         }
