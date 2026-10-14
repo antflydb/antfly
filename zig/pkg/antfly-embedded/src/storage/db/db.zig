@@ -8110,7 +8110,7 @@ pub const DB = struct {
     /// Exactly one bounded physical page, or an observation of durable terminal
     /// progress. The receiving server must independently obtain live metadata
     /// permission. The disposable compilation cache cannot grant that permission.
-    pub fn stepNativeIndexOwnerBuild(self: *DB, request: NativeIndexOwnerBuildRequest, context: @import("../../api/operation.zig").RequestContext) !NativeIndexOwnerBuildResponse {
+    pub fn stepNativeIndexOwnerBuild(self: *DB, table_name: []const u8, request: NativeIndexOwnerBuildRequest, context: @import("../../api/operation.zig").RequestContext) !NativeIndexOwnerBuildResponse {
         try context.ensureActive();
         try request.validate();
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
@@ -8123,7 +8123,7 @@ pub const DB = struct {
         var budget = if (self.core.index_manager.resource_manager) |manager| resource_manager_mod.BudgetedAllocator.initReclaiming(manager, .relational_preparation_working_set, self.alloc, 1) else null;
         defer if (budget) |*value| value.deinit();
         const alloc = if (budget) |*value| value.allocator() else self.alloc;
-        var prepared = PreparedNativeIndexOwnerBuild.prepareControlled(alloc, io, self.core, lease.reservation(), request.budget, context) catch |err| {
+        var prepared = PreparedNativeIndexOwnerBuild.prepareControlled(alloc, io, self.core, table_name, lease.reservation(), request.budget, context) catch |err| {
             if (budget) |value| if (value.denied()) return error.ResourceBudgetExceeded;
             return err;
         };
@@ -8141,7 +8141,7 @@ pub const DB = struct {
             defer if (needs_recovery) self.scheduleDurableReplicationOutboxRecovery();
             var read = try self.core.store.beginReadTxn();
             defer read.abort();
-            var complete = try PreparedNativeIndexOwnerBuild.completion(&read, lease.reservation());
+            var complete = try PreparedNativeIndexOwnerBuild.completion(&read, table_name, lease.reservation());
             if (try durable_outbox_store.hasPendingTxn(&read)) {
                 complete.replication_pending = true;
                 complete.error_name = "ReplicationOutboxPending";
@@ -8158,8 +8158,8 @@ pub const DB = struct {
 
     /// Reservation retains its compiled candidate across bounded page prepares.
     /// Receiving workers must still independently authorize each metadata cut.
-    pub fn prepareNativeIndexOwnerBuild(self: *DB, reservation: *const PreparedNativeIndexOwnerControl, budget: RelationalIndexBuildBudget) !?PreparedNativeIndexOwnerBuild {
-        return PreparedNativeIndexOwnerBuild.prepare(self.alloc, self.backend_runtime.io(), self.core, reservation, budget);
+    pub fn prepareNativeIndexOwnerBuild(self: *DB, table_name: []const u8, reservation: *const PreparedNativeIndexOwnerControl, budget: RelationalIndexBuildBudget) !?PreparedNativeIndexOwnerBuild {
+        return PreparedNativeIndexOwnerBuild.prepare(self.alloc, self.backend_runtime.io(), self.core, table_name, reservation, budget);
     }
 
     pub fn applyPreparedNativeIndexOwnerBuild(self: *DB, prepared: *PreparedNativeIndexOwnerBuild, replay: ?NativeIndexReplay) !native_index_control.BuildOutcome {

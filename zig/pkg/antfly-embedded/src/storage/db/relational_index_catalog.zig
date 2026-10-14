@@ -656,6 +656,8 @@ pub const Controller = struct {
             std.mem.eql(u8, key, @import("relational_index_owner_job.zig").key) or
             std.mem.eql(u8, key, @import("relational_index_owner_job.zig").cancellation_cleanup_key) or
             std.mem.eql(u8, key, @import("relational_index_owner_control.zig").PreparedBuild.checkpoint_key) or
+            std.mem.eql(u8, key, @import("relational_index_private_claims.zig").SourceStream.head_key) or
+            std.mem.startsWith(u8, key, @import("relational_index_private_claims.zig").SourceStream.batch_prefix) or
             std.mem.startsWith(u8, key, @import("relational_index_private_claims.zig").prefix) or
             std.mem.startsWith(u8, key, @import("relational_index_private_claims.zig").registration_prefix) or
             std.mem.eql(u8, key, @import("relational_index_cancellation_intent.zig").key) or

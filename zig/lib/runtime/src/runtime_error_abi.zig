@@ -762,6 +762,7 @@ pub const Detail = enum(c_int) {
     invalid_schema_reader_requirements,
     private_index_root_recovery_required,
     invalid_relational_index_budget,
+    private_index_claim_backlog_full,
 };
 
 test "schema reader requirement validation preserves exact callback error identity" {
@@ -780,6 +781,7 @@ test "native index claim failures preserve typed callback boundary identities" {
         .{ error.PrivateIndexJobRequired, Code.retryable },
         .{ error.PrivateIndexRootRecoveryRequired, Code.retryable },
         .{ error.InvalidRelationalIndexBudget, Code.invalid_argument },
+        .{ error.PrivateIndexClaimBacklogFull, Code.retryable },
         .{ error.PrivateIndexPublicationRequired, Code.retryable },
         .{ error.InvalidPrivateIndexOwnerJob, Code.corrupt },
         .{ error.InvalidPrivateIndexInputs, Code.corrupt },
@@ -1070,6 +1072,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.PrivateIndexJobRequired => status(.retryable, .private_index_job_required),
         error.PrivateIndexRootRecoveryRequired => status(.retryable, .private_index_root_recovery_required),
         error.InvalidRelationalIndexBudget => status(.invalid_argument, .invalid_relational_index_budget),
+        error.PrivateIndexClaimBacklogFull => status(.retryable, .private_index_claim_backlog_full),
         error.PrivateIndexPublicationRequired => status(.retryable, .private_index_publication_required),
         error.InvalidPrivateIndexOwnerJob => status(.corrupt, .invalid_private_index_owner_job),
         error.InvalidPrivateIndexInputs => status(.corrupt, .invalid_private_index_inputs),
@@ -1802,6 +1805,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .private_index_job_required => "PrivateIndexJobRequired",
         .private_index_root_recovery_required => "PrivateIndexRootRecoveryRequired",
         .invalid_relational_index_budget => "InvalidRelationalIndexBudget",
+        .private_index_claim_backlog_full => "PrivateIndexClaimBacklogFull",
         .private_index_publication_required => "PrivateIndexPublicationRequired",
         .invalid_private_index_owner_job => "InvalidPrivateIndexOwnerJob",
         .invalid_private_index_inputs => "InvalidPrivateIndexInputs",

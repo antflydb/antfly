@@ -32,7 +32,7 @@ const pages = @import("relational_index_jobs.zig");
 const resources = @import("../resource_manager.zig");
 const RequestContext = @import("../../api/operation.zig").RequestContext;
 const Waiters = @import("../admission_waiter.zig").Fifo(void);
-pub const envelope_version = 22;
+pub const envelope_version = 23;
 pub const max_cancellation_wire_bytes = 32 * 1024;
 pub const max_encoded_inputs = std.base64.standard.Encoder.calcSize(inputs.max_bytes);
 pub const max_claim_wire_bytes = 6 * private_claims.max_bytes + 128 * 1024;
@@ -411,6 +411,8 @@ pub const BuildCompletion = struct {
     failure: pages.Failure,
     rows_scanned: u64,
     progress_digest: [32]u8,
+    claim_batches_pending: u64 = 0,
+    claim_bytes_pending: u64 = 0,
     position: Native,
     replication_pending: bool = false,
     error_name: ?[]const u8 = null,
@@ -420,6 +422,9 @@ pub const BuildCompletion = struct {
         try self.position.validate();
         if (!self.position.namespace.eql(request.identity.namespace) or
             std.mem.allEqual(u8, &self.progress_digest, 0) or
+            self.claim_batches_pending > private_claims.SourceStream.max_pending or
+            self.claim_bytes_pending > private_claims.SourceStream.max_pending_bytes or
+            (self.claim_batches_pending == 0) != (self.claim_bytes_pending == 0) or
             (self.state == .failed) != (self.failure != .none) or
             self.replication_pending != (self.error_name != null)) return error.InvalidRelationalIndexProgress;
     }
@@ -445,12 +450,13 @@ pub const BuildResponse = union(enum) {
 pub const PreparedBuild = struct {
     pub const ApplyOutcome = BuildOutcome;
     pub const checkpoint_key = jobs.key ++ ":build-page";
-    pub const checkpoint_len = 176;
+    pub const checkpoint_len = 208;
     alloc: Allocator,
     page: pages.Page,
     command: pages.Page.PrivateCommand,
     command_digest: [32]u8,
     progress_digest: [32]u8,
+    claim_batch: private_claims.SourceStream.PreparedSource,
     context: RequestContext = .{},
     payload: ?[]u8 = null,
     prefix_len: usize = 0,
@@ -458,20 +464,33 @@ pub const PreparedBuild = struct {
     /// Takes page ownership only on success.
     pub fn init(alloc: Allocator, page: pages.Page) !PreparedBuild {
         const command = try page.privateCommand();
-        return .{ .alloc = alloc, .page = page, .command = command, .command_digest = try command.digest(), .progress_digest = try command.encodedProgressDigest() };
+        const command_digest = try command.digest();
+        const progress_digest = try command.encodedProgressDigest();
+        var rows: [private_claims.max_claims]private_claims.SourceStream.Row = undefined;
+        var count: usize = 0;
+        for (command.candidates) |candidate| if (candidate.unique_tuple) |tuple| {
+            rows[count] = .{ .key = candidate.document, .tuple = tuple };
+            count += 1;
+        };
+        const claim_batch = try private_claims.SourceStream.PreparedSource.init(alloc, command.binding, command.source, progress_digest, switch (command.next.state) {
+            .building => .building,
+            .ready => .ready,
+            .failed => .failed,
+        }, rows[0..count]);
+        return .{ .alloc = alloc, .page = page, .command = command, .command_digest = command_digest, .progress_digest = progress_digest, .claim_batch = claim_batch };
     }
     /// Reuse the compiled reservation across pages. Only the page's source
     /// snapshot and scratch arena are renewed; no per-page schema compilation.
-    pub fn prepare(alloc: Allocator, io: ?std.Io, core: anytype, reservation: *const Prepared, budget: pages.Budget) !?PreparedBuild {
-        return prepareControlled(alloc, io, core, reservation, budget, .{});
+    pub fn prepare(alloc: Allocator, io: ?std.Io, core: anytype, table_name: []const u8, reservation: *const Prepared, budget: pages.Budget) !?PreparedBuild {
+        return prepareControlled(alloc, io, core, table_name, reservation, budget, .{});
     }
-    pub fn prepareControlled(alloc: Allocator, io: ?std.Io, core: anytype, reservation: *const Prepared, budget: pages.Budget, context: RequestContext) !?PreparedBuild {
+    pub fn prepareControlled(alloc: Allocator, io: ?std.Io, core: anytype, table_name: []const u8, reservation: *const Prepared, budget: pages.Budget, context: RequestContext) !?PreparedBuild {
         try context.ensureActive();
         if (reservation.command.effect != .reserved) return error.PrivateIndexOwnerJobChanged;
         const artifacts = if (reservation.artifacts) |*value| value else return error.InvalidPrivateIndexOwnerJob;
         var binding = reservation.command.binding;
         binding.phase = .reserved;
-        var page = (try pages.Page.preparePrivateControlled(alloc, io, core, binding, &artifacts.addition, budget, context)) orelse return null;
+        var page = (try pages.Page.preparePrivateClaims(alloc, io, core, binding, &artifacts.addition, budget, context, .{ .scope = .{ .table_name = table_name, .generation = artifacts.unique.generation, .schema_version = binding.physical_candidate.schema_version, .tuple_fingerprint = artifacts.unique.tuple.fingerprint, .nulls_not_distinct = artifacts.unique.nulls_not_distinct }, .tuple = artifacts.unique.tuple })) orelse return null;
         errdefer page.deinit();
         var result = try init(alloc, page);
         result.context = context;
@@ -488,12 +507,16 @@ pub const PreparedBuild = struct {
         defer manifest.deinit();
         var artifacts = try Artifacts.init(alloc, view, &read, manifest.bytes);
         defer artifacts.deinit();
+        if (!std.mem.eql(u8, &artifacts.unique.generation, &command.source.generation) or
+            !std.mem.eql(u8, &artifacts.unique.tuple.fingerprint, &command.source.tuple_fingerprint) or
+            artifacts.unique.nulls_not_distinct != command.source.nulls_not_distinct) return error.InvalidPrivateIndexClaimInventory;
         var page = try pages.Page.replayPrivate(alloc, core, &artifacts.addition, command);
         errdefer page.deinit();
         return try init(alloc, page);
     }
     pub fn deinit(self: *PreparedBuild) void {
         if (self.payload) |bytes| self.alloc.free(bytes);
+        self.claim_batch.deinit();
         self.page.deinit();
         self.* = undefined;
     }
@@ -520,8 +543,8 @@ pub const PreparedBuild = struct {
             if (err == error.NotFound) return null;
             return err;
         };
-        if (raw.len != checkpoint_len or !std.mem.eql(u8, raw[0..8], "AIBP\x01\x00\x00\x00") or
-            !std.mem.allEqual(u8, raw[137..144], 0) or !std.mem.eql(u8, raw[144..176], &hash(raw[0..144]))) return error.InvalidRelationalIndexProgress;
+        if (raw.len != checkpoint_len or !std.mem.eql(u8, raw[0..8], "AIBP\x02\x00\x00\x00") or
+            !std.mem.allEqual(u8, raw[137..144], 0) or !std.mem.eql(u8, raw[176..208], &hash(raw[0..176]))) return error.InvalidRelationalIndexProgress;
         // Copy before another store lookup can invalidate the borrowed value.
         const bytes = raw[0..checkpoint_len].*;
         if (!std.mem.eql(u8, bytes[8..40], &hash(&try binding.encode()))) return null;
@@ -535,9 +558,17 @@ pub const PreparedBuild = struct {
         return bytes;
     }
     pub fn verifyRecovery(txn: anytype, binding: jobs.Binding) !void {
-        _ = try checkpoint(txn, binding);
+        const bytes = try checkpoint(txn, binding);
+        try private_claims.SourceStream.verifyRecovery(txn, binding, if (bytes) |value| (try @import("receipt_position.zig").Position.decode(value[104..137])).native else null, if (bytes) |value| value[72..104].* else null, if (bytes) |value| value[144..176].* else null);
     }
-    pub fn completion(txn: anytype, reservation: *const Prepared) !BuildCompletion {
+    /// Pin the physical checkpoint and the complete bounded header chain in
+    /// the same snapshot before exposing source bytes to a delivery worker.
+    /// The owned batch is data, not a target acknowledgment or release proof.
+    pub fn peekClaimSource(alloc: Allocator, txn: anytype, binding: jobs.Binding) !?private_claims.SourceStream.OwnedBatch {
+        try verifyRecovery(txn, binding);
+        return private_claims.SourceStream.peek(alloc, txn, binding);
+    }
+    pub fn completion(txn: anytype, table_name: []const u8, reservation: *const Prepared) !BuildCompletion {
         const artifacts = if (reservation.artifacts) |*value| value else return error.InvalidPrivateIndexOwnerJob;
         var binding = reservation.command.binding;
         binding.phase = .reserved;
@@ -550,7 +581,9 @@ pub const PreparedBuild = struct {
         const progress = try pages.Progress.decode(try txn.get(&pages.progressKey(binding.index)));
         if (!progress.matches(index, owner) or progress.phase != .primary or progress.state == .building)
             return error.InvalidRelationalIndexProgress;
-        return .{ .binding = binding, .state = if (progress.state == .ready) .ready else .failed, .failure = progress.failure, .rows_scanned = progress.rows_scanned, .progress_digest = bytes[72..104].*, .position = (try @import("receipt_position.zig").Position.decode(bytes[104..137])).native };
+        const position = (try @import("receipt_position.zig").Position.decode(bytes[104..137])).native;
+        const source = try private_claims.SourceStream.requireLatest(txn, binding, .{ .table_name = table_name, .generation = artifacts.unique.generation, .schema_version = binding.physical_candidate.schema_version, .tuple_fingerprint = artifacts.unique.tuple.fingerprint, .nulls_not_distinct = artifacts.unique.nulls_not_distinct }, position, bytes[72..104].*, bytes[144..176].*);
+        return .{ .binding = binding, .state = if (progress.state == .ready) .ready else .failed, .failure = progress.failure, .rows_scanned = progress.rows_scanned, .progress_digest = bytes[72..104].*, .position = position, .claim_batches_pending = source.pending(), .claim_bytes_pending = source.pending_bytes };
     }
     pub fn stage(self: *PreparedBuild, core: anytype, txn: anytype, replay: ?Native) !BuildOutcome {
         try self.context.ensureActive();
@@ -560,6 +593,7 @@ pub const PreparedBuild = struct {
             if (std.mem.eql(u8, bytes[40..72], &self.command_digest)) {
                 if (!std.mem.eql(u8, bytes[72..104], &self.progress_digest)) return error.InvalidRelationalIndexProgress;
                 const position = (try @import("receipt_position.zig").Position.decode(bytes[104..137])).native;
+                _ = try private_claims.SourceStream.requireLatest(txn, binding, self.command.source, position, self.progress_digest, bytes[144..176].*);
                 if (replay) |expected| if (!std.meta.eql(position, expected)) return error.InvalidControlReceiptPosition;
                 return .{ .binding = binding, .page_digest = self.command_digest, .position = position, .duplicate = true };
             }
@@ -568,13 +602,15 @@ pub const PreparedBuild = struct {
         defer manager.deinit();
         try self.page.stage(core, &manager, txn);
         const position: Native = .{ .namespace = self.namespace(), .sequence = try source_authority.advance(txn, @import("online_source_contract.zig").namespaceBytes(self.namespace()), if (replay) |value| value.sequence else null) };
+        try self.claim_batch.stage(txn, binding, position);
         var bytes: [checkpoint_len]u8 = @splat(0);
-        @memcpy(bytes[0..8], "AIBP\x01\x00\x00\x00");
+        @memcpy(bytes[0..8], "AIBP\x02\x00\x00\x00");
         @memcpy(bytes[8..40], &hash(&try binding.encode()));
         @memcpy(bytes[40..72], &self.command_digest);
         @memcpy(bytes[72..104], &self.progress_digest);
         @memcpy(bytes[104..137], &try (@import("receipt_position.zig").Position{ .native = position }).encode());
-        @memcpy(bytes[144..176], &hash(bytes[0..144]));
+        @memcpy(bytes[144..176], self.claim_batch.header[288..320]);
+        @memcpy(bytes[176..208], &hash(bytes[0..176]));
         try txn.put(checkpoint_key, &bytes);
         return .{ .binding = binding, .page_digest = self.command_digest, .position = position, .duplicate = false };
     }
@@ -780,8 +816,10 @@ pub const BuildCache = struct {
 const Artifacts = struct {
     candidate: candidate_mod.Candidate,
     addition: physical.PrivateAddition,
+    unique: struct { tuple: @import("relational_index_keys.zig").TuplePlan, generation: integrity.Generation, nulls_not_distinct: bool },
 
     fn deinit(self: *Artifacts) void {
+        self.unique.tuple.deinit();
         self.addition.deinit();
         self.candidate.deinit();
     }
@@ -807,11 +845,27 @@ const Artifacts = struct {
         var existing = try physical.load(alloc, txn);
         defer if (existing) |*value| value.deinit();
         const job = try jobs.load(txn);
-        const addition = if (job != null and job.?.phase == .reserved)
+        var addition = if (job != null and job.?.phase == .reserved)
             try jobs.reopenPhysical(alloc, txn, before, after, view.name)
         else
             try physical.PrivateAddition.init(alloc, before, after, if (existing) |*value| value else null, definitions, view.name);
-        return .{ .candidate = candidate, .addition = addition };
+        errdefer addition.deinit();
+        const rules = try after_schema.relationalUniqueDefinitions(declaration_arena.allocator());
+        const unique = for (rules) |rule| {
+            if (std.mem.eql(u8, rule.name, view.name)) break rule;
+        } else return error.InvalidIndexPublicationCandidate;
+        if (unique.deferrable or unique.timing != .immediate or unique.expressions.len != 0 or
+            unique.where_expressions.len != 0 or unique.without_overlaps_period != null) return error.InvalidIndexPublicationCandidate;
+        const keys = if (unique.keys.len != 0) unique.keys else blk: {
+            const result = try declaration_arena.allocator().alloc(@import("../relational_index.zig").RelationalIndexKey, unique.columns.len);
+            for (result, unique.columns) |*entry, column| entry.* = .{ .column = column };
+            break :blk result;
+        };
+        const generation = (candidate.next.catalog.find(.unique, view.name) orelse return error.InvalidIndexPublicationCandidate).generation;
+        const allocation = try @import("relational_integrity_catalog.zig").privateIndexAllocationFromReservation(candidate.reservation.value, inputs.digest(candidate.reservation.value), namespace.table_id);
+        if (!std.mem.eql(u8, &allocation.generation, &generation)) return error.InvalidIndexPublicationCandidate;
+        const tuple = try @import("relational_index_keys.zig").TuplePlan.init(alloc, after.tableSchema().*, after.physicalLayout(), keys);
+        return .{ .candidate = candidate, .addition = addition, .unique = .{ .tuple = tuple, .generation = generation, .nulls_not_distinct = unique.nulls_not_distinct } };
     }
 };
 

@@ -235,10 +235,16 @@ pub const Budget = struct {
     }
 };
 
+pub const ClaimProjection = struct {
+    scope: @import("relational_index_private_claims.zig").SourceStream.Scope,
+    tuple: tuples.TuplePlan,
+};
+
 pub const Page = struct {
     arena: std.heap.ArenaAllocator,
     pinned: catalog.WriteSnapshot,
     private_job: ?owner_job.Binding = null,
+    claim_source: ?@import("relational_index_private_claims.zig").SourceStream.Scope = null,
     index_offset: usize,
     namespace_generation: u64,
     expected: ?[]const u8,
@@ -255,6 +261,7 @@ pub const Page = struct {
         document: []const u8 = "",
         hash: ?Digest = null,
         tuple: ?[]const u8 = null,
+        unique_tuple: ?[]const u8 = null,
         payload: []const u8 = "",
         observed_key: ?[]const u8 = null,
         observed_hash: Digest = @splat(0),
@@ -268,6 +275,7 @@ pub const Page = struct {
     /// scan would choose a different boundary on another machine.
     pub const PrivateCommand = struct {
         binding: owner_job.Binding,
+        source: @import("relational_index_private_claims.zig").SourceStream.Scope,
         expected: ?[]const u8,
         control: maintenance.Control,
         next: Progress,
@@ -290,7 +298,7 @@ pub const Page = struct {
                     var items: std.ArrayList(Candidate) = .empty;
                     var size: usize = 0;
                     while (try s.peekNextTokenType() != .array_end) {
-                        if (items.items.len >= 4096) return error.LengthMismatch;
+                        if (items.items.len >= @import("relational_index_private_claims.zig").max_claims) return error.LengthMismatch;
                         const value = try std.json.innerParse(Candidate, a, s, opts);
                         size = std.math.add(usize, size, candidateBytes(value) catch return error.Overflow) catch return error.Overflow;
                         if (size > max_bytes) return error.LengthMismatch;
@@ -300,18 +308,18 @@ pub const Page = struct {
                     return .{ .items = try items.toOwnedSlice(a) };
                 }
             };
-            const Wire = struct { binding: owner_job.Binding, expected: ?[]const u8, control: maintenance.Control, next: Progress, candidates: Bounded, failed_source: ?FailedSource, records_examined: usize };
+            const Wire = struct { binding: owner_job.Binding, source: @import("relational_index_private_claims.zig").SourceStream.Scope, expected: ?[]const u8, control: maintenance.Control, next: Progress, candidates: Bounded, failed_source: ?FailedSource, records_examined: usize };
             var limited = options;
             limited.max_value_len = @min(options.max_value_len.?, max_bytes);
             const wire = try std.json.innerParse(Wire, alloc, source, limited);
-            const result: PrivateCommand = .{ .binding = wire.binding, .expected = wire.expected, .control = wire.control, .next = wire.next, .candidates = wire.candidates.items, .failed_source = wire.failed_source, .records_examined = wire.records_examined };
+            const result: PrivateCommand = .{ .binding = wire.binding, .source = wire.source, .expected = wire.expected, .control = wire.control, .next = wire.next, .candidates = wire.candidates.items, .failed_source = wire.failed_source, .records_examined = wire.records_examined };
             result.validate() catch return error.UnexpectedToken;
             return result;
         }
 
         fn candidateBytes(candidate: Candidate) !usize {
             var size: usize = 0;
-            inline for (.{ candidate.primary, candidate.tuple, candidate.observed_key, candidate.delete_reverse }) |field| if (field) |value| {
+            inline for (.{ candidate.primary, candidate.tuple, candidate.unique_tuple, candidate.observed_key, candidate.delete_reverse }) |field| if (field) |value| {
                 size = std.math.add(usize, size, value.len) catch return error.TransactionTooLarge;
             };
             size = std.math.add(usize, size, candidate.document.len) catch return error.TransactionTooLarge;
@@ -320,9 +328,11 @@ pub const Page = struct {
 
         pub fn validate(self: PrivateCommand) !void {
             _ = try self.binding.encode();
+            try self.source.validate();
             if (self.binding.authority != .native or self.binding.phase != .reserved or
+                self.source.schema_version != self.binding.physical_candidate.schema_version or
                 self.next.id.mapKey() != self.binding.index.mapKey() or self.next.phase != .primary or
-                self.candidates.len > 4096 or self.records_examined > 4096 or
+                self.candidates.len > @import("relational_index_private_claims.zig").max_claims or self.records_examined > 4096 or
                 self.candidates.len > self.records_examined or
                 self.next.attempt != self.control.epoch or
                 !std.mem.eql(u8, &self.next.last_maintenance, &self.control.last_request) or
@@ -342,6 +352,7 @@ pub const Page = struct {
                 size += value.len;
             }
             for (self.candidates) |candidate| {
+                if ((candidate.tuple != null) != (candidate.unique_tuple != null)) return error.InvalidPrivateIndexClaimInventory;
                 size = std.math.add(usize, size, try candidateBytes(candidate)) catch return error.TransactionTooLarge;
             }
             if (self.failed_source) |failed| size = std.math.add(usize, size, failed.primary.len) catch return error.TransactionTooLarge;
@@ -353,6 +364,7 @@ pub const Page = struct {
             var state = std.crypto.hash.Blake3.init(.{});
             state.update("antfly private index build page v1");
             state.update(&try self.binding.encode());
+            state.update(&try self.source.digest());
             hashOptional(&state, self.expected);
             var storage: [header_len + max_cursor_bytes + 32]u8 = undefined;
             var fixed = std.heap.FixedBufferAllocator.init(&storage);
@@ -366,6 +378,7 @@ pub const Page = struct {
                 hashBytes(&state, candidate.document);
                 hashOptional(&state, if (candidate.hash) |*value| value else null);
                 hashOptional(&state, candidate.tuple);
+                hashOptional(&state, candidate.unique_tuple);
                 hashBytes(&state, candidate.payload);
                 hashOptional(&state, candidate.observed_key);
                 state.update(&candidate.observed_hash);
@@ -406,7 +419,7 @@ pub const Page = struct {
     };
 
     pub fn privateCommand(self: *const Page) !PrivateCommand {
-        var result: PrivateCommand = .{ .binding = self.private_job orelse return error.PrivateIndexJobRequired, .expected = self.expected, .control = self.control, .next = self.next, .candidates = self.candidates, .failed_source = self.failed_source, .records_examined = self.records_examined };
+        var result: PrivateCommand = .{ .binding = self.private_job orelse return error.PrivateIndexJobRequired, .source = self.claim_source orelse return error.InvalidPrivateIndexClaimInventory, .expected = self.expected, .control = self.control, .next = self.next, .candidates = self.candidates, .failed_source = self.failed_source, .records_examined = self.records_examined };
         result.binding.phase = .reserved;
         try result.validate();
         return result;
@@ -427,24 +440,46 @@ pub const Page = struct {
         var arena = std.heap.ArenaAllocator.init(alloc);
         errdefer arena.deinit();
         const a = arena.allocator();
+        var source = command.source;
+        source.table_name = try a.dupe(u8, source.table_name);
         const expected = if (command.expected) |value| try a.dupe(u8, value) else null;
         var next = command.next;
         next.cursor = try a.dupe(u8, next.cursor);
         const candidates = try a.dupe(Candidate, command.candidates);
         for (candidates) |*candidate| {
-            inline for (.{ "primary", "tuple", "observed_key", "delete_reverse" }) |field| if (@field(candidate, field)) |value| {
+            inline for (.{ "primary", "tuple", "unique_tuple", "observed_key", "delete_reverse" }) |field| if (@field(candidate, field)) |value| {
                 @field(candidate, field) = try a.dupe(u8, value);
             };
             candidate.document = try a.dupe(u8, candidate.document);
             candidate.payload = try a.dupe(u8, candidate.payload);
         }
         const failed: ?FailedSource = if (command.failed_source) |value| .{ .primary = try a.dupe(u8, value.primary), .hash = value.hash } else null;
-        return .{ .arena = arena, .pinned = .{ .head = addition.candidate.head, .plan = addition.plan.clone() }, .private_job = command.binding, .index_offset = offset, .namespace_generation = core.schemaNamespaceGeneration(), .expected = expected, .control = command.control, .next = next, .candidates = candidates, .failed_source = failed, .records_examined = command.records_examined };
+        return .{ .arena = arena, .pinned = .{ .head = addition.candidate.head, .plan = addition.plan.clone() }, .private_job = command.binding, .claim_source = source, .index_offset = offset, .namespace_generation = core.schemaNamespaceGeneration(), .expected = expected, .control = command.control, .next = next, .candidates = candidates, .failed_source = failed, .records_examined = command.records_examined };
     }
 
     fn prepareTuple(alloc: Allocator, payload_alloc: Allocator, core: anytype, pinned: catalog.WriteSnapshot, index: plans.BoundIndex, value: []const u8, document: []const u8, source: *?registry.SchemaView, projected: *?tuples.TuplePlan, projected_cover: *?@import("relational_index_cover.zig").Source, projected_predicate: *?@import("relational_index_predicate.zig").Source, encoded: *std.ArrayList(u8)) !?[]const u8 {
+        return prepareTupleWithClaims(alloc, payload_alloc, core, pinned, index, value, document, source, projected, projected_cover, projected_predicate, encoded, null);
+    }
+
+    const UniqueScratch = struct {
+        projection: ClaimProjection,
+        projected: ?tuples.TuplePlan = null,
+        encoded: std.ArrayList(u8) = .empty,
+        value: ?[]const u8 = null,
+        fn deinit(self: *UniqueScratch, alloc: Allocator) void {
+            if (self.projected) |*plan| plan.deinit();
+            self.encoded.deinit(alloc);
+        }
+    };
+
+    fn prepareTupleWithClaims(alloc: Allocator, payload_alloc: Allocator, core: anytype, pinned: catalog.WriteSnapshot, index: plans.BoundIndex, value: []const u8, document: []const u8, source: *?registry.SchemaView, projected: *?tuples.TuplePlan, projected_cover: *?@import("relational_index_cover.zig").Source, projected_predicate: *?@import("relational_index_predicate.zig").Source, encoded: *std.ArrayList(u8), unique: ?*UniqueScratch) !?[]const u8 {
+        if (unique) |scratch| scratch.value = null;
         const version = try row_store.rowSchemaVersion(value);
         if (source.* == null or source.*.?.version() != version) {
+            if (unique) |scratch| {
+                if (scratch.projected) |*plan| plan.deinit();
+                scratch.projected = null;
+            }
             if (projected.*) |*tuple| tuple.deinit();
             projected.* = null;
             if (projected_cover.*) |*cover| cover.deinit();
@@ -469,6 +504,12 @@ pub const Page = struct {
         }
         _ = try projected.*.?.append(alloc, encoded, typed);
         try records.admitForwardKey(encoded.items.len, document.len +| std.mem.count(u8, document, "\x00") +| 2);
+        if (unique) |scratch| {
+            if (scratch.projected == null) scratch.projected = try scratch.projection.tuple.projectSource(alloc, typed.table_schema, typed.layout);
+            scratch.encoded.clearRetainingCapacity();
+            try scratch.projected.?.appendUnique(alloc, &scratch.encoded, typed, scratch.projection.scope.nulls_not_distinct, document);
+            scratch.value = try payload_alloc.dupe(u8, scratch.encoded.items);
+        }
         return if (index.cover) |cover| try cover.encodeSource(payload_alloc, typed, &projected_cover.*.?) else "";
     }
 
@@ -494,6 +535,10 @@ pub const Page = struct {
     }
 
     pub fn preparePrivateControlled(alloc: Allocator, io: ?std.Io, core: anytype, binding: owner_job.Binding, addition: *const catalog.PrivateAddition, budget: Budget, context: @import("../../api/operation.zig").RequestContext) !?Page {
+        return preparePrivateClaims(alloc, io, core, binding, addition, budget, context, null);
+    }
+
+    pub fn preparePrivateClaims(alloc: Allocator, io: ?std.Io, core: anytype, binding: owner_job.Binding, addition: *const catalog.PrivateAddition, budget: Budget, context: @import("../../api/operation.zig").RequestContext, projection: ?ClaimProjection) !?Page {
         try context.ensureActive();
         try budget.validate();
         if (io) |runtime_io| try runtime_io.checkCancel();
@@ -504,14 +549,16 @@ pub const Page = struct {
         const name = for (addition.plan.boundIndexes()) |index| {
             if (index.id().mapKey() == binding.index.mapKey()) break index.name;
         } else return error.IndexNotFound;
-        return preparePinnedControlled(alloc, io, core, name, budget, .{ .head = addition.candidate.head, .plan = addition.plan.clone() }, binding, context);
+        var bounded = budget;
+        if (projection != null) bounded.records = @min(bounded.records, @import("relational_index_private_claims.zig").max_claims);
+        return preparePinnedControlled(alloc, io, core, name, bounded, .{ .head = addition.candidate.head, .plan = addition.plan.clone() }, binding, context, projection);
     }
 
     fn preparePinned(alloc: Allocator, io: ?std.Io, core: anytype, name: []const u8, budget: Budget, snapshot: catalog.WriteSnapshot, private_job: ?owner_job.Binding) !?Page {
-        return preparePinnedControlled(alloc, io, core, name, budget, snapshot, private_job, .{});
+        return preparePinnedControlled(alloc, io, core, name, budget, snapshot, private_job, .{}, null);
     }
 
-    fn preparePinnedControlled(alloc: Allocator, io: ?std.Io, core: anytype, name: []const u8, budget: Budget, snapshot: catalog.WriteSnapshot, private_job: ?owner_job.Binding, context: @import("../../api/operation.zig").RequestContext) !?Page {
+    fn preparePinnedControlled(alloc: Allocator, io: ?std.Io, core: anytype, name: []const u8, budget: Budget, snapshot: catalog.WriteSnapshot, private_job: ?owner_job.Binding, context: @import("../../api/operation.zig").RequestContext, projection: ?ClaimProjection) !?Page {
         const namespace_generation = core.schemaNamespaceGeneration();
         var pinned = snapshot;
         var transferred = false;
@@ -523,6 +570,11 @@ pub const Page = struct {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer if (!transferred) arena.deinit();
         const page_alloc = arena.allocator();
+        var claim_source: ?@import("relational_index_private_claims.zig").SourceStream.Scope = if (projection) |value| value.scope else null;
+        if (claim_source) |*value| {
+            try value.validate();
+            value.table_name = try page_alloc.dupe(u8, value.table_name);
+        }
         var read = try core.store.beginReadTxn();
         defer read.abort();
         if (private_job) |binding| try owner_job.requireReserved(&read, binding);
@@ -553,6 +605,9 @@ pub const Page = struct {
         defer if (projected_predicate) |*condition| condition.deinit();
         var encoded = std.ArrayList(u8).empty;
         defer encoded.deinit(alloc);
+        var unique: ?UniqueScratch = if (projection) |value| .{ .projection = value } else null;
+        defer if (unique) |*value| value.deinit(alloc);
+        var source_bytes: usize = if (claim_source) |value| value.table_name.len else 0;
         var inspected: usize = 0;
         var bytes: usize = 0;
         const started = platform_time.monotonicNs();
@@ -561,6 +616,7 @@ pub const Page = struct {
         var failed_source: ?FailedSource = null;
         var entry = try cursor.seekAtOrAfter(if (after.len == 0) lower else after);
         while (entry) |kv| : (entry = try cursor.seekAtOrAfter(after)) {
+            const before_cursor = after;
             try context.ensureActive();
             if (io) |runtime_io| try runtime_io.checkCancel();
             if (std.mem.order(u8, kv.key, upper) != .lt) break;
@@ -577,14 +633,29 @@ pub const Page = struct {
             const row = if (std.mem.eql(u8, kv.key, primary)) kv.value else try getOptional(&read, primary);
             if (row) |raw| {
                 bytes +|= raw.len;
-                const payload = prepareTuple(alloc, page_alloc, core, pinned, index, raw, document, &source, &projected, &projected_cover, &projected_predicate, &encoded) catch |err| {
+                const payload = prepareTupleWithClaims(alloc, page_alloc, core, pinned, index, raw, document, &source, &projected, &projected_cover, &projected_predicate, &encoded, if (unique) |*value| value else null) catch |err| {
                     progress.failure = classifyRowFailure(err) orelse return err;
                     progress.state = .failed;
                     failed_source = .{ .primary = primary, .hash = digest(raw) };
                     candidates.clearRetainingCapacity();
                     break;
                 };
-                try candidates.append(page_alloc, .{ .primary = primary, .document = document, .hash = digest(raw), .tuple = if (payload != null) try page_alloc.dupe(u8, encoded.items) else null, .payload = payload orelse "", .nonmember = payload == null });
+                const logical = if (unique) |value| value.value else null;
+                if (logical) |tuple| {
+                    const next_bytes = source_bytes + 8 + document.len + tuple.len;
+                    if (next_bytes > @import("relational_index_private_claims.zig").SourceStream.max_payload_bytes) {
+                        if (candidates.items.len == 0) return error.TransactionTooLarge;
+                        after = before_cursor;
+                        exhausted = false;
+                        break;
+                    }
+                    source_bytes = next_bytes;
+                    bytes +|= tuple.len;
+                }
+                bytes +|= encoded.items.len;
+                bytes +|= if (payload) |value| value.len else 0;
+                bytes +|= @sizeOf(Candidate);
+                try candidates.append(page_alloc, .{ .primary = primary, .document = document, .hash = digest(raw), .tuple = if (payload != null) try page_alloc.dupe(u8, encoded.items) else null, .unique_tuple = logical, .payload = payload orelse "", .nonmember = payload == null });
                 progress.rows_scanned = try std.math.add(u64, progress.rows_scanned, 1);
             } else {
                 // Also repair reverse-only orphans whose ownership record was
@@ -610,7 +681,7 @@ pub const Page = struct {
         }
         progress.cursor = if (failed_source == null and exhausted) "" else after;
         transferred = true;
-        return .{ .arena = arena, .pinned = pinned, .private_job = private_job, .index_offset = index_offset, .namespace_generation = namespace_generation, .expected = expected, .control = .{ .epoch = proof.maintenance_epoch, .last_request = proof.last_maintenance_request }, .next = progress, .candidates = candidates.items, .failed_source = failed_source, .records_examined = inspected };
+        return .{ .arena = arena, .pinned = pinned, .private_job = private_job, .claim_source = claim_source, .index_offset = index_offset, .namespace_generation = namespace_generation, .expected = expected, .control = .{ .epoch = proof.maintenance_epoch, .last_request = proof.last_maintenance_request }, .next = progress, .candidates = candidates.items, .failed_source = failed_source, .records_examined = inspected };
     }
 
     fn prepareDerived(alloc: Allocator, io: ?std.Io, core: anytype, name: []const u8, budget: Budget, snapshot: catalog.WriteSnapshot) !?Page {

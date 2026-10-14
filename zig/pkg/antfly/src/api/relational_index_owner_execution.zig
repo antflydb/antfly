@@ -268,7 +268,7 @@ pub fn claimHttpFailure(status: u16, body: []const u8) ?anyerror {
         408 => inline for (.{ error.Canceled, error.Cancelled, error.DeadlineExceeded }) |err| {
             if (std.mem.eql(u8, body, @errorName(err))) return err;
         },
-        503 => inline for (.{ error.InvalidPrivateIndexClaimReceipt, error.InvalidPrivateIndexClaimInventory, error.InvalidPrivateIndexOwnerJob, error.InvalidPrivateIndexInputs, error.InvalidPrivateIndexNativeReceipt, error.PrivateIndexJobRequired, error.PrivateIndexRootRecoveryRequired, error.PrivateIndexPublicationRequired, error.PrivateIndexCancellationPending, error.PrivateIndexCancellationRequired, error.ImmutableRelationalIndexDefinitionConflict, error.InvalidIndexPublicationCandidate, error.InvalidRelationalIndexProgress, error.MissingRelationalIndexDefinitions, error.RelationalIndexCatalogSchemaMismatch, error.InvalidPrivateIndexCancellation, error.ResourceBudgetExceeded }) |err| {
+        503 => inline for (.{ error.InvalidPrivateIndexClaimReceipt, error.InvalidPrivateIndexClaimInventory, error.InvalidPrivateIndexOwnerJob, error.InvalidPrivateIndexInputs, error.InvalidPrivateIndexNativeReceipt, error.PrivateIndexJobRequired, error.PrivateIndexRootRecoveryRequired, error.PrivateIndexPublicationRequired, error.PrivateIndexCancellationPending, error.PrivateIndexCancellationRequired, error.ImmutableRelationalIndexDefinitionConflict, error.InvalidIndexPublicationCandidate, error.InvalidRelationalIndexProgress, error.MissingRelationalIndexDefinitions, error.RelationalIndexCatalogSchemaMismatch, error.InvalidPrivateIndexCancellation, error.ResourceBudgetExceeded, error.PrivateIndexClaimBacklogFull }) |err| {
             if (std.mem.eql(u8, body, @errorName(err))) return err;
         },
         else => {},
@@ -984,7 +984,7 @@ test "relational index publication native cancellation receiver uses fixed permi
 }
 
 test "relational index publication claim HTTP errors preserve conflicts corruption and cancellation" {
-    inline for (.{ .{ 409, error.UniqueConstraintViolation }, .{ 409, error.PrivateIndexOwnerJobChanged }, .{ 409, error.PrivateIndexPublicationCanceled }, .{ 503, error.InvalidPrivateIndexClaimReceipt }, .{ 503, error.PrivateIndexJobRequired }, .{ 503, error.ResourceBudgetExceeded }, .{ 408, error.DeadlineExceeded } }) |entry| {
+    inline for (.{ .{ 409, error.UniqueConstraintViolation }, .{ 409, error.PrivateIndexOwnerJobChanged }, .{ 409, error.PrivateIndexPublicationCanceled }, .{ 503, error.InvalidPrivateIndexClaimReceipt }, .{ 503, error.PrivateIndexJobRequired }, .{ 503, error.ResourceBudgetExceeded }, .{ 503, error.PrivateIndexClaimBacklogFull }, .{ 408, error.DeadlineExceeded } }) |entry| {
         try std.testing.expectEqual(entry[1], claimHttpFailure(entry[0], @errorName(entry[1])).?);
     }
     try std.testing.expect(claimHttpFailure(200, "PrivateIndexOwnerJobChanged") == null);

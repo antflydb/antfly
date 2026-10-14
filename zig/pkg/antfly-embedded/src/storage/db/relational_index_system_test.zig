@@ -339,7 +339,7 @@ test "relational index build pages native owner control preserves committed cuts
         defer reservation.deinit();
         var page_count: u64 = 0;
         var examined: usize = 0;
-        while (try primary.prepareNativeIndexOwnerBuild(&reservation, .{ .records = 1, .time_ns = std.time.ns_per_s })) |owned| {
+        while (try primary.prepareNativeIndexOwnerBuild("items", &reservation, .{ .records = 1, .time_ns = std.time.ns_per_s })) |owned| {
             var build = owned;
             defer build.deinit();
             examined += build.command.records_examined;
@@ -383,7 +383,7 @@ test "relational index build pages native owner control preserves committed cuts
                 defer alloc.free(encoded);
                 try fault_txn.put(&@import("relational_index_jobs.zig").progressKey(binding.index), encoded);
                 std.crypto.hash.Blake3.hash(encoded, bytes[72..104], .{});
-                std.crypto.hash.Blake3.hash(bytes[0..144], bytes[144..176], .{});
+                std.crypto.hash.Blake3.hash(bytes[0..176], bytes[176..208], .{});
                 try fault_txn.put(db_mod.DB.PreparedNativeIndexOwnerBuild.checkpoint_key, &bytes);
                 try std.testing.expectError(error.InvalidRelationalIndexProgress, build.stage(primary.core, &fault_txn, null));
             }
@@ -409,6 +409,26 @@ test "relational index build pages native owner control preserves committed cuts
                 var reserved = binding;
                 reserved.phase = .reserved;
                 try db_mod.DB.PreparedNativeIndexOwnerBuild.verifyRecovery(&read, reserved);
+                const stream = @import("relational_index_private_claims.zig").SourceStream;
+                const head = (try stream.load(&read, reserved)).?;
+                try std.testing.expectEqual(page_count, head.pending());
+                try std.testing.expectEqual(@min(page_count, 3), head.emitted_rows);
+                try std.testing.expectEqual(outcome.position.sequence, head.last_sequence);
+                try std.testing.expectEqualSlices(u8, &build.claim_batch.header, try read.get(&stream.key(binding.id, page_count, false)));
+                try std.testing.expectEqualSlices(u8, build.claim_batch.payload, try read.get(&stream.key(binding.id, page_count, true)));
+                var batch = (try db_mod.DB.PreparedNativeIndexOwnerBuild.peekClaimSource(alloc, &read, reserved)).?;
+                defer batch.deinit();
+                try std.testing.expectEqual(@as(usize, 1), batch.rows().len);
+                try std.testing.expectEqualStrings("items", batch.scope.table_name);
+                // Even a structurally consistent consumed prefix is not
+                // authorized by any source-delivery closure yet.
+                var forged = head;
+                forged.consumed = 1;
+                forged.consumed_rows = batch.rows().len;
+                forged.consumed_sequence = (try batch.header.position()).sequence;
+                forged.consumed_digest = batch.header.digest();
+                forged.pending_bytes -= batch.header.storedBytes();
+                try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, forged.encode());
                 try std.testing.expectEqual(outcome.position.sequence, (try authority.load(&read)).?.sequence);
                 try std.testing.expectEqual(@as(u32, 1), db.core.schema.?.version);
             }
@@ -421,11 +441,54 @@ test "relational index build pages native owner control preserves committed cuts
             defer fault_txn.abort();
             var bytes = (try fault_txn.get(db_mod.DB.PreparedNativeIndexOwnerBuild.checkpoint_key))[0..db_mod.DB.PreparedNativeIndexOwnerBuild.checkpoint_len].*;
             bytes[72] ^= 1;
-            std.crypto.hash.Blake3.hash(bytes[0..144], bytes[144..176], .{});
+            std.crypto.hash.Blake3.hash(bytes[0..176], bytes[176..208], .{});
             try fault_txn.put(db_mod.DB.PreparedNativeIndexOwnerBuild.checkpoint_key, &bytes);
             var reserved = binding;
             reserved.phase = .reserved;
             try std.testing.expectError(error.InvalidRelationalIndexProgress, db_mod.DB.PreparedNativeIndexOwnerBuild.verifyRecovery(&fault_txn, reserved));
+        }
+        // Bounded header recovery does not read payloads. Delivery still
+        // rejects missing/corrupt bodies instead of acknowledging the batch.
+        for (0..3) |fault| {
+            const stream = @import("relational_index_private_claims.zig").SourceStream;
+            var fault_txn = try primary.core.store.beginWriteTxn();
+            defer fault_txn.abort();
+            var reserved = binding;
+            reserved.phase = .reserved;
+            const batch_key = stream.key(binding.id, 1, true);
+            if (fault == 0) {
+                try fault_txn.delete(&batch_key);
+                try std.testing.expectError(error.PrivateIndexRootRecoveryRequired, stream.peek(alloc, &fault_txn, reserved));
+            } else if (fault == 1) {
+                const body = try alloc.dupe(u8, try fault_txn.get(&batch_key));
+                defer alloc.free(body);
+                body[body.len - 1] ^= 1;
+                try fault_txn.put(&batch_key, body);
+                try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, stream.peek(alloc, &fault_txn, reserved));
+            } else {
+                try fault_txn.delete(&stream.key(binding.id, 1, false));
+                try std.testing.expectError(error.PrivateIndexRootRecoveryRequired, stream.peek(alloc, &fault_txn, reserved));
+                try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, db_mod.DB.PreparedNativeIndexOwnerBuild.verifyRecovery(&fault_txn, reserved));
+                continue;
+            }
+            try db_mod.DB.PreparedNativeIndexOwnerBuild.verifyRecovery(&fault_txn, reserved);
+        }
+        // Updating both checksums cannot disguise a different source progress
+        // from the independently retained physical page checkpoint.
+        {
+            const stream = @import("relational_index_private_claims.zig").SourceStream;
+            var fault_txn = try primary.core.store.beginWriteTxn();
+            defer fault_txn.abort();
+            var reserved = binding;
+            reserved.phase = .reserved;
+            var head = (try stream.load(&fault_txn, reserved)).?;
+            var header = (try fault_txn.get(&stream.key(binding.id, head.emitted, false)))[0..stream.header_len].*;
+            header[152] ^= 1;
+            std.crypto.hash.Blake3.hash(header[0..288], header[288..320], .{});
+            head.last_digest = header[288..320].*;
+            try fault_txn.put(&stream.key(binding.id, head.emitted, false), &header);
+            try fault_txn.put(stream.head_key, &try head.encode());
+            try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, db_mod.DB.PreparedNativeIndexOwnerBuild.verifyRecovery(&fault_txn, reserved));
         }
     }
     // Prepare first, then let a newer ordinary transport receipt win. The
@@ -720,7 +783,7 @@ test "relational index build pages identity dispatch caches immutable candidates
     const authority = @import("../source_authority.zig");
     const resources = @import("../resource_manager.zig");
     const before = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"},\"email\":{\"type\":\"string\"}},\"additionalProperties\":false}}}}";
-    const after = "{\"version\":2,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"},\"email\":{\"type\":\"string\"}},\"additionalProperties\":false}}},\"relational_indexes\":[{\"name\":\"email_idx\",\"keys\":[{\"column\":\"email\"}]}],\"unique_constraints\":[{\"name\":\"email_idx\",\"origin\":\"index\",\"columns\":[\"email\"]}]}";
+    const after = "{\"version\":2,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"},\"email\":{\"type\":\"string\"}},\"additionalProperties\":false}}},\"relational_indexes\":[{\"name\":\"email_idx\",\"keys\":[{\"column\":\"email\",\"direction\":\"desc\"}]}],\"unique_constraints\":[{\"name\":\"email_idx\",\"origin\":\"index\",\"columns\":[\"email\"]}]}";
     var directory = try @import("../../common/test_directory.zig").TestDirectory.init("native-index-build-dispatch");
     defer directory.cleanup();
     var resource_options: resources.Options = .{ .identity_allocator = alloc, .memory_budget = .{ .hard_limit_bytes = 1024 * 1024 * 1024 } };
@@ -739,7 +802,7 @@ test "relational index build pages identity dispatch caches immutable candidates
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const writes = try arena.allocator().alloc(db_mod.types.BatchWrite, 32);
-    for (writes, 0..) |*entry, i| entry.* = .{ .key = try std.fmt.allocPrint(arena.allocator(), "row{d:0>3}", .{i}), .value = try std.fmt.allocPrint(arena.allocator(), "{{\"id\":{d},\"email\":\"{d}@example.com\"}}", .{ i + 1, i }) };
+    for (writes, 0..) |*entry, i| entry.* = .{ .key = try std.fmt.allocPrint(arena.allocator(), "row{d:0>3}", .{i}), .value = if (i == 1) "{\"id\":2}" else try std.fmt.allocPrint(arena.allocator(), "{{\"id\":{d},\"email\":\"{d}@example.com\"}}", .{ i + 1, i }) };
     try db.batch(.{ .writes = writes });
     var candidate = try candidates.Candidate.prepare(alloc, 101, before, after, prior.value, "email_idx");
     defer candidate.deinit();
@@ -764,16 +827,16 @@ test "relational index build pages identity dispatch caches immutable candidates
     const request = try native.BuildRequest.init(identity, binding, .{ .records = 4, .time_ns = std.time.ns_per_s });
     var wrong = request;
     wrong.binding_digest[0] ^= 1;
-    try std.testing.expectError(error.PrivateIndexOwnerJobChanged, db.stepNativeIndexOwnerBuild(wrong, .{}));
+    try std.testing.expectError(error.PrivateIndexOwnerJobChanged, db.stepNativeIndexOwnerBuild("items", wrong, .{}));
     var canceled = std.atomic.Value(bool).init(true);
-    try std.testing.expectError(error.Canceled, db.stepNativeIndexOwnerBuild(request, .{ .cancellation = .fromAtomic(&canceled) }));
-    try std.testing.expectError(error.DeadlineExceeded, db.stepNativeIndexOwnerBuild(request, .{ .deadline_ns = 0 }));
+    try std.testing.expectError(error.Canceled, db.stepNativeIndexOwnerBuild("items", request, .{ .cancellation = .fromAtomic(&canceled) }));
+    try std.testing.expectError(error.DeadlineExceeded, db.stepNativeIndexOwnerBuild("items", request, .{ .deadline_ns = 0 }));
     try std.testing.expectEqual(@as(u64, 0), db.native_index_build_cache.compilations);
     const slice = @backingInt(resources.Slice.relational_preparation_working_set);
     {
         var denied = try manager.reserve(.relational_preparation_working_set, 16 * 1024 * 1024);
         defer denied.release();
-        try std.testing.expectError(error.ResourceBudgetExceeded, db.stepNativeIndexOwnerBuild(request, .{}));
+        try std.testing.expectError(error.ResourceBudgetExceeded, db.stepNativeIndexOwnerBuild("items", request, .{}));
         try std.testing.expect(!db.native_index_build_cache.compiling);
     }
     for ([_]usize{ 0, 1, 2, 4, 8, 16 }) |failure_index| {
@@ -791,7 +854,7 @@ test "relational index build pages identity dispatch caches immutable candidates
         }
     };
     var during: DuringPreparation = .{};
-    try std.testing.expectError(error.Canceled, db.stepNativeIndexOwnerBuild(request, .{ .cancellation = .{ .ptr = &during, .is_cancelled_fn = DuringPreparation.check } }));
+    try std.testing.expectError(error.Canceled, db.stepNativeIndexOwnerBuild("items", request, .{ .cancellation = .{ .ptr = &during, .is_cancelled_fn = DuringPreparation.check } }));
     try std.testing.expectEqual(@as(usize, 8), during.calls);
     {
         var read = try db.core.store.beginReadTxn();
@@ -802,7 +865,7 @@ test "relational index build pages identity dispatch caches immutable candidates
     var pages: usize = 0;
     var last_position: ?@import("receipt_position.zig").Native = null;
     while (true) {
-        const result = try db.stepNativeIndexOwnerBuild(request, .{});
+        const result = try db.stepNativeIndexOwnerBuild("items", request, .{});
         try result.validateFor(request);
         switch (result) {
             .advanced => |value| {
@@ -815,6 +878,11 @@ test "relational index build pages identity dispatch caches immutable candidates
                 try std.testing.expectEqual(.ready, value.state);
                 try std.testing.expectEqual(@as(u64, 32), value.rows_scanned);
                 try std.testing.expectEqual(last_position.?, value.position);
+                try std.testing.expectEqual(@as(u64, 9), value.claim_batches_pending);
+                try std.testing.expect(value.claim_bytes_pending > 0);
+                var invalid = value;
+                invalid.claim_bytes_pending = 0;
+                try std.testing.expectError(error.InvalidRelationalIndexProgress, invalid.validateFor(request));
                 try std.testing.expect(!value.replication_pending);
                 break;
             },
@@ -828,9 +896,47 @@ test "relational index build pages identity dispatch caches immutable candidates
     {
         var lease = try db.native_index_build_cache.acquire(std.testing.io, alloc, &manager, db.core, request, binding, .{});
         defer lease.deinit();
+        {
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            var batch = (try db_mod.DB.PreparedNativeIndexOwnerBuild.peekClaimSource(alloc, &read, binding)).?;
+            defer batch.deinit();
+            try std.testing.expectEqual(@as(usize, 4), batch.rows().len);
+            try std.testing.expectEqualStrings("items", batch.scope.table_name);
+            try std.testing.expectEqualStrings("row000", batch.rows()[0].key);
+            var view = (try db.core.acquireSchemaVersionView(1)).?;
+            defer view.release();
+            const key = try internal.relationalRowKeyAlloc(alloc, batch.rows()[0].key);
+            defer alloc.free(key);
+            const row = try @import("algebraic/relational_row_codec.zig").ordinalRowView(try read.get(key), view.tableSchema().*, view.physicalLayout());
+            const unique = lease.reservation().artifacts.?.unique;
+            const expected = (try @import("../../api/relational_integrity.zig").encodeUnique(alloc, unique.tuple, row, unique.nulls_not_distinct, batch.rows()[0].key)).?;
+            defer alloc.free(expected);
+            try std.testing.expectEqualSlices(u8, expected, batch.rows()[0].tuple);
+            var physical = try lease.reservation().artifacts.?.addition.plan.boundIndexes()[0].tuple.projectSource(alloc, row.table_schema, row.layout);
+            defer physical.deinit();
+            var encoded: std.ArrayList(u8) = .empty;
+            defer encoded.deinit(alloc);
+            _ = try physical.append(alloc, &encoded, row);
+            try std.testing.expect(!std.mem.eql(u8, encoded.items, expected));
+            const nullable_key = try internal.relationalRowKeyAlloc(alloc, batch.rows()[1].key);
+            defer alloc.free(nullable_key);
+            const nullable = try @import("algebraic/relational_row_codec.zig").ordinalRowView(try read.get(nullable_key), view.tableSchema().*, view.physicalLayout());
+            const equality = @import("../../api/relational_integrity.zig");
+            const distinct = (try equality.encodeUnique(alloc, unique.tuple, nullable, false, batch.rows()[1].key)).?;
+            defer alloc.free(distinct);
+            const another = (try equality.encodeUnique(alloc, unique.tuple, nullable, false, "another-row")).?;
+            defer alloc.free(another);
+            const not_distinct = (try equality.encodeUnique(alloc, unique.tuple, nullable, true, batch.rows()[1].key)).?;
+            defer alloc.free(not_distinct);
+            try std.testing.expectEqualSlices(u8, distinct, batch.rows()[1].tuple);
+            try std.testing.expect(std.mem.endsWith(u8, distinct, batch.rows()[1].key));
+            try std.testing.expect(!std.mem.eql(u8, distinct, another));
+            try std.testing.expect(distinct.len > not_distinct.len);
+        }
         db.native_index_build_cache.evict(std.testing.io);
         try std.testing.expect(manager.snapshot().slices[slice].used_bytes > 0);
-        try std.testing.expect((try native.PreparedBuild.prepare(alloc, std.testing.io, db.core, lease.reservation(), request.budget)) == null);
+        try std.testing.expect((try native.PreparedBuild.prepare(alloc, std.testing.io, db.core, "items", lease.reservation(), request.budget)) == null);
     }
     try std.testing.expectEqual(@as(u64, 0), manager.snapshot().slices[slice].used_bytes);
     {
@@ -851,7 +957,7 @@ test "relational index build pages identity dispatch caches immutable candidates
             fn run(self: *@This()) std.Io.Cancelable!void {
                 defer self.done.set(self.io);
                 try self.start.wait(self.io);
-                self.response = self.owner.stepNativeIndexOwnerBuild(self.request, self.context) catch |err| {
+                self.response = self.owner.stepNativeIndexOwnerBuild("items", self.request, self.context) catch |err| {
                     self.err = err;
                     return;
                 };
@@ -921,7 +1027,7 @@ test "relational index build pages identity dispatch caches immutable candidates
     }
     db.close();
     db = try db_mod.DB.open(alloc, directory.path(), options);
-    const recovered = try db.stepNativeIndexOwnerBuild(request, .{});
+    const recovered = try db.stepNativeIndexOwnerBuild("items", request, .{});
     try recovered.validateFor(request);
     try std.testing.expectEqual(last_position.?, recovered.complete.position);
     try std.testing.expectEqual(@as(u32, 1), db.core.schema.?.version);
@@ -935,9 +1041,112 @@ test "relational index build pages identity dispatch caches immutable candidates
     defer cancellation.deinit();
     _ = try db.applyPreparedNativeIndexOwnerCancellation(&cancellation, null);
     try std.testing.expect(db.native_index_build_cache.entry == null);
-    try std.testing.expectError(error.PrivateIndexPublicationCanceled, db.stepNativeIndexOwnerBuild(request, .{}));
+    try std.testing.expectError(error.PrivateIndexPublicationCanceled, db.stepNativeIndexOwnerBuild("items", request, .{}));
     db.close();
     try std.testing.expectEqual(@as(u64, 0), manager.snapshot().slices[slice].used_bytes);
+}
+
+test "relational index build pages claim backlog rejects the whole page and cancellation retires exact queue keys" {
+    const native = @import("relational_index_owner_control.zig");
+    const catalog = @import("relational_integrity_catalog.zig");
+    const candidates = @import("relational_index_candidate.zig");
+    const authority = @import("../source_authority.zig");
+    const resources = @import("../resource_manager.zig");
+    const before = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"},\"email\":{\"type\":\"string\"}},\"additionalProperties\":false}}}}";
+    const after = "{\"version\":2,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"},\"email\":{\"type\":\"string\"}},\"additionalProperties\":false}}},\"relational_indexes\":[{\"name\":\"email_idx\",\"keys\":[{\"column\":\"email\"}]}],\"unique_constraints\":[{\"name\":\"email_idx\",\"origin\":\"index\",\"columns\":[\"email\"]}]}";
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("native-index-claim-backlog");
+    defer directory.cleanup();
+    var resource_options: resources.Options = .{ .identity_allocator = alloc, .memory_budget = .{ .hard_limit_bytes = 1024 * 1024 * 1024 } };
+    resource_options.budgets[@backingInt(resources.Slice.relational_preparation_working_set)] = .{ .hard_limit_bytes = 16 * 1024 * 1024 };
+    var manager = resources.ResourceManager.init(resource_options);
+    defer manager.deinit(alloc);
+    const options: db_mod.OpenOptions = .{ .start_optional_runtimes = false, .primary_backend = .{ .lsm = .{} }, .online_source_authority = .native, .identity_namespace = .{ .table_id = 101, .shard_id = 11, .range_id = 12 }, .resource_manager = &manager };
+    var db = try db_mod.DB.open(alloc, directory.path(), options);
+    defer db.close();
+    try db.setSchemaJson(alloc, before);
+    var parsed = try @import("../../schema/mod.zig").parseValidatedTableSchema(alloc, before);
+    defer parsed.deinit(alloc);
+    var prior = try @import("../../schema/relational_declarations.zig").compileCatalog(alloc, parsed, 101, null);
+    defer prior.deinit();
+    try db.core.store.putBatch(&.{.{ .key = catalog.key, .value = prior.value }}, &.{});
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const writes = try arena.allocator().alloc(db_mod.types.BatchWrite, 64);
+    for (writes, 0..) |*entry, i| entry.* = .{ .key = try std.fmt.allocPrint(arena.allocator(), "row{d:0>3}", .{i}), .value = try std.fmt.allocPrint(arena.allocator(), "{{\"id\":{d},\"email\":\"{d}@example.com\"}}", .{ i + 1, i }) };
+    try db.batch(.{ .writes = writes });
+    var candidate = try candidates.Candidate.prepare(alloc, 101, before, after, prior.value, "email_idx");
+    defer candidate.deinit();
+    var admission = try db.prepareNativeIndexOwnerAdmission(.{
+        .id = @splat(1),
+        .plan_digest = @splat(2),
+        .owner_digest = @splat(3),
+        .ordinal = 0,
+        .fence = .{ .role = .index_build, .transition_id = 7, .attempt = 1, .owner_group_id = 11, .peer_group_id = 11, .namespace = options.identity_namespace.?, .catalog_digest = @import("relational_index_inputs.zig").digest(prior.value) },
+        .candidate_digest = @import("relational_index_inputs.zig").digest(candidate.next.value),
+        .reservation_digest = @import("relational_index_inputs.zig").digest(candidate.reservation.value),
+    }, candidate.inputs.bytes);
+    defer admission.deinit();
+    _ = try db.applyPreparedNativeIndexOwnerControl(&admission, null);
+    for ([_]@import("relational_index_owner_job.zig").NativeEffect{ .fenced, .reserved }) |effect| {
+        var command = try db.prepareNativeIndexOwnerControl(.{ .binding = admission.command.binding, .effect = effect });
+        defer command.deinit();
+        _ = try db.applyPreparedNativeIndexOwnerControl(&command, null);
+    }
+    const identity: native.Identity = .{ .id = admission.command.binding.id, .plan_digest = admission.command.binding.plan_digest, .owner_digest = admission.command.binding.owner_digest, .ordinal = 0, .namespace = options.identity_namespace.?, .owner_group_id = 11 };
+    const binding = (try db.nativeIndexOwnerState(identity)).?;
+    const request = try native.BuildRequest.init(identity, binding, .{ .records = 1, .time_ns = std.time.ns_per_s });
+    const stream = @import("relational_index_private_claims.zig").SourceStream;
+    const page_jobs = @import("relational_index_jobs.zig");
+    for (0..stream.max_pending) |i| {
+        const outcome = try db.stepNativeIndexOwnerBuild("items", request, .{});
+        try std.testing.expectEqual(@as(u64, 4 + i), outcome.advanced.position.sequence);
+    }
+    var previous_head: [stream.Head.encoded_len]u8 = undefined;
+    var previous_progress: []u8 = undefined;
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        previous_head = (try read.get(stream.head_key))[0..stream.Head.encoded_len].*;
+        previous_progress = try alloc.dupe(u8, try read.get(&page_jobs.progressKey(binding.index)));
+        const head = (try stream.load(&read, binding)).?;
+        try std.testing.expectEqual(@as(u64, 64), head.pending());
+        try std.testing.expectEqual(@as(u64, 64), head.emitted_rows);
+        try std.testing.expectEqual(stream.State.building, head.state);
+        try db_mod.DB.PreparedNativeIndexOwnerBuild.verifyRecovery(&read, binding);
+    }
+    defer alloc.free(previous_progress);
+    // EOF would publish a ready progress record and advance the native cut.
+    // Backpressure must roll both back with the rejected source batch.
+    try std.testing.expectError(error.PrivateIndexClaimBacklogFull, db.stepNativeIndexOwnerBuild("items", request, .{}));
+    db.close();
+    db = try db_mod.DB.open(alloc, directory.path(), options);
+    try std.testing.expectError(error.PrivateIndexClaimBacklogFull, db.stepNativeIndexOwnerBuild("items", request, .{}));
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqualSlices(u8, &previous_head, try read.get(stream.head_key));
+        try std.testing.expectEqualSlices(u8, previous_progress, try read.get(&page_jobs.progressKey(binding.index)));
+        try std.testing.expectEqual(@as(u64, 67), (try authority.load(&read)).?.sequence);
+        try std.testing.expectError(error.NotFound, read.get(&stream.key(binding.id, 65, false)));
+        try std.testing.expectError(error.NotFound, read.get(&stream.key(binding.id, 65, true)));
+    }
+    var cancellation = try db.prepareNativeIndexOwnerCancellation(native.Admission.fromBinding(binding));
+    defer cancellation.deinit();
+    _ = try db.applyPreparedNativeIndexOwnerCancellation(&cancellation, null);
+    var cleanup = try db.prepareNativeIndexOwnerCleanup(identity);
+    defer cleanup.deinit();
+    _ = try db.applyPreparedNativeIndexOwnerCleanup(&cleanup, null);
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect(try stream.load(&read, binding) == null);
+        for (1..65) |ordinal| {
+            try std.testing.expectError(error.NotFound, read.get(&stream.key(binding.id, ordinal, false)));
+            try std.testing.expectError(error.NotFound, read.get(&stream.key(binding.id, ordinal, true)));
+        }
+        try std.testing.expectError(error.NotFound, read.get(db_mod.DB.PreparedNativeIndexOwnerBuild.checkpoint_key));
+        try std.testing.expectEqual(@as(u32, 1), db.core.schema.?.version);
+    }
 }
 
 test "relational index system SQL precise schema publication upgrades catalog atomically and survives LSM reopen" {

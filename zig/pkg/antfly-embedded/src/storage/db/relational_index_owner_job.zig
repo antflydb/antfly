@@ -882,6 +882,7 @@ pub fn stageCancellationCleanupWithReplay(txn: anytype, manager: *transactions.T
     const record: CancellationCleanupRecord = .{ .intent = cancellation.Intent.fromBinding(binding), .position = position, .claim_allocation = allocation.allocation };
     try txn.put(cancellation_cleanup_key, &try record.encode());
     try txn.put(&queue_key, &gc.initial(binding.index));
+    try @import("relational_index_private_claims.zig").SourceStream.stageCanceled(txn, binding);
     // No page can resume after this exact cancellation has queued its data.
     // Retire the bounded retry slot before GC removes the progress it binds.
     try txn.delete(@import("relational_index_owner_control.zig").PreparedBuild.checkpoint_key);
@@ -902,6 +903,7 @@ pub fn requireCancellationArtifactsRetired(txn: anytype, binding: Binding) !void
     _ = try requireCancellationCleanup(txn, binding);
     const gc = @import("relational_index_gc.zig");
     if (try optional(txn, &gc.key(binding.index)) != null or
+        try optional(txn, @import("relational_index_private_claims.zig").SourceStream.head_key) != null or
         try optional(txn, &@import("relational_index_jobs.zig").progressKey(binding.index)) != null or
         try optional(txn, &@import("relational_index_maintenance_contract.zig").controlKey(binding.index)) != null)
         return error.PrivateIndexCancellationPending;

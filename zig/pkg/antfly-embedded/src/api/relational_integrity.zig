@@ -394,16 +394,10 @@ pub fn encodeUnique(alloc: Allocator, current: tuples.TuplePlan, optional_row: ?
     const row = optional_row orelse return null;
     var projected = if (row.layout == current.layout) current else try current.projectSource(alloc, row.table_schema, row.layout);
     defer if (row.layout != current.layout) projected.deinit();
-    var result = try projected.encodeAlloc(alloc, row);
-    if (!result.has_null or nulls_not_distinct) return result.bytes;
-    defer result.deinit(alloc);
-    var output: std.Io.Writer.Allocating = .init(alloc);
-    errdefer output.deinit();
-    try output.writer.writeAll(result.bytes);
-    try output.writer.writeAll("partial-null-witness-v1");
-    try output.writer.writeInt(u32, std.math.cast(u32, row_key.len) orelse return error.TransactionTooLarge, .big);
-    try output.writer.writeAll(row_key);
-    return try output.toOwnedSlice();
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(alloc);
+    try projected.appendUnique(alloc, &output, row, nulls_not_distinct, row_key);
+    return try output.toOwnedSlice(alloc);
 }
 
 test "distributed txn typed integrity expansion matches composite parent claim without float conversion" {

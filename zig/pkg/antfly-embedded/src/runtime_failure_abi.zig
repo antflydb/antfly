@@ -758,6 +758,7 @@ pub const Status = enum(u32) {
     invalid_schema_reader_requirements = 798,
     private_index_root_recovery_required = 799,
     invalid_relational_index_budget = 800,
+    private_index_claim_backlog_full = 801,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

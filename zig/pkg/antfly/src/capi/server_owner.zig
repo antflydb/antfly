@@ -4031,7 +4031,7 @@ pub fn storageOwnerNativeIndexControlJson(
             .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null,
             .cancellation = ownerQueryCancellation(&request.control),
         };
-        const result = handle.db.stepNativeIndexOwnerBuild(parsed.value, context) catch |err| return storageOwnerStatusFromError(err);
+        const result = handle.db.stepNativeIndexOwnerBuild(request.table_name.slice(), parsed.value, context) catch |err| return storageOwnerStatusFromError(err);
         return response.finish(result, out_response);
     }
     if (request.operation == .receipt) {

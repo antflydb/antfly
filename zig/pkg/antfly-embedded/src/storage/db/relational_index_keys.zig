@@ -374,6 +374,21 @@ pub const TuplePlan = struct {
         return .{ .alloc = alloc, .plan = self, .batch = batch, .inputs = inputs, .values = values, .scratch = .init(alloc), .external_values = external_values };
     }
 
+    /// Shared UNIQUE equality encoding for mutations and private backfills.
+    /// NULLS DISTINCT retains an exact row witness; it must not alias another
+    /// NULL-containing row or silently disappear from MATCH PARTIAL coverage.
+    pub fn appendUnique(self: TuplePlan, alloc: Allocator, out: *std.ArrayList(u8), row: rows.OrdinalRowView, nulls_not_distinct: bool, row_key: []const u8) !void {
+        const start = out.items.len;
+        errdefer out.shrinkRetainingCapacity(start);
+        const has_null = try self.append(alloc, out, row);
+        if (!has_null or nulls_not_distinct) return;
+        try out.appendSlice(alloc, "partial-null-witness-v1");
+        var length: [4]u8 = undefined;
+        std.mem.writeInt(u32, &length, std.math.cast(u32, row_key.len) orelse return error.TransactionTooLarge, .big);
+        try out.appendSlice(alloc, &length);
+        try out.appendSlice(alloc, row_key);
+    }
+
     /// Append into the transaction's region or a reusable scratch buffer.
     /// Failure restores the original length, including on late corrupt cells.
     pub fn append(self: TuplePlan, alloc: Allocator, out: *std.ArrayList(u8), row: rows.OrdinalRowView) !bool {

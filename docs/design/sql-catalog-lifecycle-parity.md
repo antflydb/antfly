@@ -6116,3 +6116,64 @@ receipt production and the atomic current-proof/reader-floor/catalog/schema
 decision. Data-Raft execution is not substituted with native authority. Enable
 and qualify the original public index/ALTER cohorts only when these remaining
 boundaries and their distributed recovery faults are complete.
+
+### Durable logical claim-source pages
+
+Native private builds now prepare a logical UNIQUE tuple alongside each physical
+index member from the same decoded typed row. Mutations and backfills share the
+NULL-distinct witness encoder. The cached logical constraint plan remains
+independent of physical index direction; source equality keys are not physical
+DESC sort keys. Historical layouts use projected plans without reparsing JSON.
+The table name comes from the validated physical-root route, not an untrusted
+request body or a mutable SQL alias.
+
+Each native page stages its source batch, physical index writes, progress,
+source cut, retry checkpoint and durable mirror outbox in one transaction.
+Preparation owns and hashes payloads before serialized apply. Source batches
+hold at most 128 rows and 1 MiB of payload. Compact headers and separate bodies
+are retained in a generation/job-bound queue capped at 64 pending batches or
+8 MiB of actual stored batch/key bytes. Capacity rejection rolls back the whole
+page, including a would-be EOF/ready transition and native clock advance.
+Completion exposes the retained claim debt instead of reporting global UNIQUE
+readiness.
+
+The unreleased native control envelope is version 23. The AIBP version-two,
+208-byte checkpoint independently retains the latest source-header digest as
+well as prepared-command/progress commitments and the native position. Recovery
+checks at most 64 compact headers, their chain, exact cut, allocation generation,
+progress and terminal state; it does not read large source payloads at startup.
+The native source reader verifies that checkpoint and header chain in its pinned
+snapshot before reading and checking one owned body. Missing bodies require root
+recovery rather than a successful delivery acknowledgment. Cancellation deletes
+only the exact bounded queue keys in the same ordered cleanup transaction, before
+generation-local physical GC; it never scans unrelated table rows for source debt.
+
+There is deliberately no consumption/ACK producer yet. Nonzero consumed counters
+are rejected until ordered authenticated complete-delivery closures are
+implemented. A mirror ACK, physical ready result, empty transient RPC response or
+source queue counter cannot certify distributed uniqueness or publish the schema.
+
+The initial producer and subsequent queue/fault revision each passed 87/87 focused
+Debug steps. The latter includes seven native page tests, six C-ABI tests,
+14 private-candidate prerequisites, 32 publication tests and 46 runtime-contract
+tests; counts overlap. Native evidence covers retained source bytes through
+mirror failure/reopen/duplicate standby replay, corruption/missing bodies,
+checksummed header substitution, logical versus DESC physical encoding, a full
+64-batch backlog rejecting EOF across reopen, and exact cancellation cleanup.
+Final checkpoint/consumption hardening passed 87/87 Debug steps. A subsequent
+test-only revision also passed 87/87 steps, directly exercising the native
+checkpoint-verified source reader and a NULL-containing backfill row. Its
+logical tuple matches ordinary mutation encoding, differs for another primary
+witness under NULLS DISTINCT, and drops that witness under NULLS NOT DISTINCT.
+No failures or leaks remained. The final log is
+`/private/tmp/antfly-native-index-claim-source-reader-debug.log`.
+Inventory, Apache-boundary, licensing and control-catalog checks passed;
+cache GC was previewed only and deleted nothing. No original case, public
+activation, throughput improvement, full release pass or push is claimed.
+Original dispositions remain 483 implemented / 862 unresolved.
+
+Next delivery boundary: authenticated source-to-target claim draining and
+complete source/target seals, provenance-backed root repair, native validated/
+installed/released receipt production, then the atomic current-proof/reader-floor/
+catalog/schema decision. Qualify unchanged original public index/ALTER cohorts
+against PostgreSQL only after those boundaries and recovery faults are complete.
