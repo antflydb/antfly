@@ -68,6 +68,9 @@ pub fn Snapshot(comptime DB: type) type {
             }
             var cut: @import("native_query_cut.zig").Request = .{ .id = &copied.cut_id, .table_id = copied.table_id, .expires_ms = copied.expires_ms, .create = true };
             stage = "capture";
+            // Install cleanup before capture so a failed publication/open/bind
+            // cannot leave a statement generation consuming admission capacity.
+            errdefer db.releaseStatementQueryCut(cut);
             try db.captureQueryCutAtStatementFence(cut, fence, cancellation);
             cut.create = false;
             stage = "open";
@@ -306,6 +309,7 @@ pub fn Snapshot(comptime DB: type) type {
             const self = cast(ptr);
             if (self.references.fetchSub(1, .acq_rel) != 1) return;
             self.db.close();
+            self.source.releaseStatementQueryCut(.{ .id = &self.input.cut_id, .table_id = self.input.table_id, .expires_ms = self.input.expires_ms });
             self.policy.release();
             self.arena.deinit();
             self.a.destroy(self);

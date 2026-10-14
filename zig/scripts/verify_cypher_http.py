@@ -671,6 +671,13 @@ def main():
                             and "CypherTransactionConflict" in failure[3]
                         )
                         or (
+                            failure[2] == 429
+                            and json.loads(failure[3]).get("write_outcome")
+                            == "not_started"
+                            and json.loads(failure[3]).get("error")
+                            == "SqlWriteCapacityUnavailable"
+                        )
+                        or (
                             failure[2] == 503
                             and json.loads(failure[3]).get("write_outcome")
                             == "not_started"

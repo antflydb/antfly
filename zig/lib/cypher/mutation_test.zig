@@ -323,3 +323,26 @@ test "deleting a relationship preserves its row binding for aggregate counts" {
     try std.testing.expectEqual(@as(i64, 1), result.rows[0][0].integer);
     try std.testing.expectEqual(@as(usize, 0), fixture.relationships.len);
 }
+
+test "CREATE and MERGE reject redeclaration of bound node labels and properties" {
+    var fixture = Fixture.init();
+    defer fixture.arena.deinit();
+    for ([_][]const u8{
+        "CREATE (n:Person {name:'Ada'}) CREATE (n:Person) RETURN n",
+        "CREATE (n:Person {name:'Ada'}) CREATE (n {name:'Bob'}) RETURN n",
+        "CREATE (n:Person {name:'Ada'}) MERGE (n:Person {name:'Bob'}) RETURN n",
+        "CREATE (n:Person {name:'Ada'}) MERGE (n {name:'Bob'})-[r:KNOWS]->(m:Person) ON CREATE SET n.name='Changed' RETURN n",
+        "CREATE (n:Person)-[:KNOWS]->(n:Person) RETURN n",
+        "MERGE (n:Person)-[:KNOWS]->(n {name:'Ada'}) RETURN n",
+        "CREATE (n:Person) WITH n CALL { WITH n CREATE (n:Person) } RETURN n",
+    }) |query| {
+        try std.testing.expectError(error.CypherVariableConflict, fixture.run(query));
+        try std.testing.expectEqual(@as(usize, 0), fixture.nodes.len);
+        try std.testing.expectEqual(@as(usize, 0), fixture.relationships.len);
+        try std.testing.expectEqual(@as(usize, 0), fixture.commits);
+    }
+    var valid = try fixture.run("CREATE (a:Person {name:'Ada'}), (b:Person {name:'Bob'}) CREATE (a)-[:KNOWS]->(b) MERGE (a)-[:KNOWS]->(b) RETURN a.name,b.name");
+    defer valid.deinit();
+    try std.testing.expectEqual(@as(usize, 2), fixture.nodes.len);
+    try std.testing.expectEqual(@as(usize, 1), fixture.relationships.len);
+}

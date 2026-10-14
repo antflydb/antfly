@@ -18,6 +18,7 @@
 import json
 import os
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -153,6 +154,90 @@ def test_graph_operator_ceilings_cover_sql_and_staged_graphs(monkeypatch, ceilin
                 ["a"],
                 ["b"],
             ]
+    finally:
+        client.close()
+        server.stop()
+
+
+def test_completed_graph_statements_release_cuts_and_reject_bound_redeclarations():
+    binary = os.environ.get("ANTFLY_BIN", str(conftest.DEFAULT_ANTFLY_BIN))
+    if not Path(binary).exists():
+        pytest.skip("native Antfly binary is unavailable")
+    server = conftest.StandaloneAntflyServer(
+        binary, "127.0.0.1", conftest.find_free_port(), pgwire=True
+    )
+    client = requests.Session()
+    client.auth = ("admin", conftest.AUTH_BOOTSTRAP_PASSWORD)
+    base = server.api_url.rstrip("/")
+
+    def post(path, body, expected=200):
+        response = client.post(base + path, json=body, timeout=30)
+        assert response.status_code == expected, response.text
+        return response.json()
+
+    def query(statement):
+        return post("/graphs/g/query", {"query": statement})
+
+    try:
+        post("/sql", {"statement": "CREATE TABLE docs (id TEXT)"})
+        post("/tables/docs/indexes/links", {"type": "graph"}, expected=201)
+        post(
+            "/graphs/g",
+            {
+                "labels": [{"name": "Document", "table": "docs"}],
+                "relationships": [
+                    {
+                        "name": "LINK",
+                        "index": "links",
+                        "source_label": "Document",
+                        "target_label": "Document",
+                        "stored_type": "link",
+                    }
+                ],
+            },
+            expected=201,
+        )
+        query("CREATE (:Document {id:'a'})")
+        for _ in range(80):
+            assert query("MATCH (n:Document) RETURN count(n)")["rows"] == [
+                [{"type": "integer", "value": "1"}]
+            ]
+            assert post(
+                "/sql",
+                {
+                    "statement": "SELECT id FROM GRAPH_TABLE(g MATCH (n IS Document) COLUMNS (n.id AS id)) x"
+                },
+            )["rows"] == [["a"]]
+        # Each failed evaluation also opens a cut; these must be reclaimed.
+        for _ in range(70):
+            response = client.post(
+                base + "/graphs/g/query",
+                json={"query": "MATCH (n:Document) RETURN 1/0"},
+                timeout=30,
+            )
+            assert response.status_code == 400, response.text
+            assert response.json()["code"] != "QueryCandidateBudgetExceeded"
+        for statement in (
+            "MATCH (n:Document) CREATE (n:Document {id:'changed'}) RETURN n",
+            "MATCH (n:Document) MERGE (n:Document {id:'changed'}) RETURN n",
+            "MATCH (n:Document) MERGE (n {id:'changed'})-[:LINK]->(:Document {id:'b'}) ON CREATE SET n.id='changed' RETURN n",
+        ):
+            rejected = post("/graphs/g/query", {"query": statement}, expected=400)
+            assert rejected["code"] == "CypherVariableConflict", rejected
+        assert query("MATCH (n:Document) RETURN n.id")["rows"] == [
+            [{"type": "string", "value": "a"}]
+        ]
+        query("MATCH (a:Document {id:'a'}) CREATE (a)-[:LINK]->(:Document {id:'b'})")
+        assert query("MATCH (n:Document) RETURN count(n)")["rows"] == [
+            [{"type": "integer", "value": "2"}]
+        ]
+        # The client can receive the response before the handler's deferred
+        # final-reader cleanup completes. Allow that cleanup to finish.
+        deadline = time.monotonic() + 5
+        while list(server.root.rglob("query-cut.json")) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert list(server.root.rglob("query-cut.json")) == []
+        assert "Cypher statement cut cleanup failed" not in server.log_path.read_text()
     finally:
         client.close()
         server.stop()

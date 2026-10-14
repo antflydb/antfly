@@ -732,6 +732,11 @@ misrepresent the original query result.
   cut at prepare; production writes do not materialize a predicate per row.
   CREATE preserves explicit nulls through SQL default evaluation and validates
   requested labels after defaults and generated columns have been normalized.
+  CREATE/MERGE reject labels or properties on an already-bound node before
+  opening storage; plain bound endpoints remain valid. Statement-owned local
+  cuts are reclaimed after their final reader closes, including setup and
+  execution failures, so completed queries do not consume retained-cut capacity.
+  Published continuation cuts retain their existing expiry lifecycle.
   MERGE rejects null node and relationship keys during pattern evaluation and
   rolls back earlier writes in the same statement. Keys referencing nodes in
   the same pattern are checked once those nodes are bound. Relationship aliases resolve

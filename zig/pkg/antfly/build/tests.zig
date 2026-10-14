@@ -2669,7 +2669,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("lake-integration-test", "Run public lake binding and SQL cursor integration tests").dependOn(&addFilteredTestRunArtifact(b, lake_integration_tests).step);
     const cypher_capture_tests = b.addTest(.{
         .root_module = lake_integration_mod,
-        .filters = &.{"external lake Cypher execution reads immutable native document and graph cuts"},
+        .filters = &.{ "external lake Cypher execution reads immutable native document and graph cuts", "statement cut cleanup protects readers and immediately frees admission" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("cypher-native-capture-test", "Verify immutable materialization and native capture capabilities")

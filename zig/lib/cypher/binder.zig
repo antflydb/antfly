@@ -72,6 +72,11 @@ const Binder = struct {
         if (path.selector != .all and (path.edges.len != 1 or create)) return error.CypherInvalidShortestPath;
         for (path.nodes) |node| {
             for (node.labels) |label| if (self.graph.label(label) == null) return error.UnknownGraphLabel;
+            // Bound nodes may be reused as endpoints, but CREATE/MERGE
+            // cannot redeclare their labels or properties.
+            if (create) if (node.alias) |alias| {
+                if (find(scope.*, alias) != null and (node.labels.len != 0 or node.properties.len != 0)) return error.CypherVariableConflict;
+            };
             try self.declare(scope, node.alias, .node);
         }
         for (path.edges) |edge| {

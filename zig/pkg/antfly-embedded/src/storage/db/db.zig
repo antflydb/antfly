@@ -19543,6 +19543,24 @@ pub const DB = struct {
         _ = try self.snapshotInternalWithStatementFence(cache_id, true, control.token(), control.deadline_ns, null, false, request, fence);
     }
 
+    /// Statement cuts are local, unpublished generations with no continuation
+    /// cursor. Reclaim them only after the statement's final reader closes.
+    pub fn releaseStatementQueryCut(self: *DB, request: @import("native_query_cut.zig").Request) void {
+        self.discardStatementQueryCut(request) catch |err| {
+            std.log.warn("Cypher statement cut cleanup failed: {s}", .{@errorName(err)});
+        };
+    }
+    fn discardStatementQueryCut(self: *DB, request: @import("native_query_cut.zig").Request) !void {
+        const cut = @import("native_query_cut.zig");
+        const io = self.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
+        const control: cut.Control = .{ .parent = .none, .deadline_ns = monotonicTimeNs() +| 5 * std.time.ns_per_s };
+        var guard = try cut.lock(self.alloc, io, self.core.path, control.token());
+        defer guard.deinit();
+        const cache_id = try request.cacheId(self.alloc, self.core.identity_namespace);
+        defer self.alloc.free(cache_id);
+        try cut.discardStatement(self.alloc, io, self.core.path, cache_id);
+    }
+
     fn captureQueryCutInternal(self: *DB, request: @import("native_query_cut.zig").Request, cancellation: types.CancellationToken, publish: bool) !void {
         try request.validate(@import("native_query_cut.zig").nowMs());
         _ = try request.namespace(self.core.identity_namespace);
