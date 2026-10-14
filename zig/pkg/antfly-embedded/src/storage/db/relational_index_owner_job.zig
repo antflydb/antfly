@@ -88,10 +88,38 @@ fn nonzero(bytes: []const u8) bool {
     return !std.mem.allEqual(u8, bytes, 0);
 }
 fn optional(txn: anytype, physical_key: []const u8) !?[]const u8 {
-    return txn.get(physical_key) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
+    return txn.get(physical_key) catch |err| {
+        // In-memory/read-only adapters may expose only NotFound. An exhaustive
+        // switch with an else prong does not compile for that valid contract.
+        // Preserve every other native read failure instead of treating it as
+        // absence of an owner job or its durable fencing state.
+        if (err == error.NotFound) return null;
+        return err;
     };
+}
+
+test "relational index candidate optional owner reads preserve narrow and fallible transaction contracts" {
+    const Narrow = struct {
+        pub fn get(_: @This(), _: []const u8) error{NotFound}![]const u8 {
+            return error.NotFound;
+        }
+    };
+    const Fallible = struct {
+        result: error{ NotFound, ReadFailed }![]const u8,
+        pub fn get(self: @This(), _: []const u8) error{ NotFound, ReadFailed }![]const u8 {
+            return self.result;
+        }
+    };
+    try std.testing.expectEqual(@as(?[]const u8, null), try optional(Narrow{}, key));
+    try std.testing.expectEqual(@as(?[]const u8, null), try optional(Fallible{ .result = error.NotFound }, key));
+    try std.testing.expectError(error.ReadFailed, optional(Fallible{ .result = error.ReadFailed }, key));
+    try std.testing.expectEqual(@as(?cancellation.Record, null), try cancellation.load(Narrow{}));
+    try std.testing.expectError(error.ReadFailed, cancellation.load(Fallible{ .result = error.ReadFailed }));
+    const fence: topology.Fence = .{ .role = .index_build, .transition_id = 1, .attempt = 1, .owner_group_id = 2, .peer_group_id = 2, .namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 }, .catalog_digest = @splat(1) };
+    try std.testing.expectError(error.PrivateIndexJobRequired, requireActive(Narrow{}, fence));
+    try std.testing.expectError(error.ReadFailed, requireActive(Fallible{ .result = error.ReadFailed }, fence));
+    try std.testing.expectEqualStrings("", (try optional(Fallible{ .result = "" }, key)).?);
+    try std.testing.expectEqualStrings("binding", (try optional(Fallible{ .result = "binding" }, key)).?);
 }
 
 /// One fixed-size binding per owner. Full job IDs are retained; the topology

@@ -9,13 +9,13 @@ a completion claim. PostgreSQL is the SQL standard and independent test oracle.
 ## Baseline and priorities
 
 The [original inventory](sql/parity-inventory.md) remains authoritative:
-479 implemented / 136 rejected / 73 superseded / 898 unresolved. Counts below
+483 implemented / 136 rejected / 105 superseded / 862 unresolved. Counts below
 are unresolved family pools, not promises that one implementation closes them.
 
 | Priority | Pool | Cases | Shared delivery boundary |
 | --- | --- | ---: | --- |
-| 1 | DDL, catalog and sessions | 340 | Public relation ownership, schema/index activation and retirement, session lifecycle and recovery |
-| 2 | Source/joined mutations and MERGE/recursion | 131 | Captured source ownership, bounded selection, atomic commit and distributed failure evidence |
+| 1 | DDL, catalog and sessions | 308 | Public relation ownership, schema/index activation and retirement, session lifecycle and recovery |
+| 2 | Source/joined mutations and MERGE/recursion | 128 | Captured source ownership, bounded selection, atomic commit and distributed failure evidence |
 | 3 | Read and query | 131 | Faithful typed fixtures, binding/correlation, endpoint results and diagnostics |
 | 4 | Document writes | 70 | Document-specific schema/index profiles, complete postimages and integrity admission |
 | 5 | Historically unsupported writes | 92 | Individual PostgreSQL contract review, implementations or proven required rejections |
@@ -5494,3 +5494,112 @@ Final formatting, control-catalog freshness, Apache boundary, license and
 original inventory checks passed. The inventory remains 479 implemented,
 136 rejected, 73 superseded and 898 unresolved; none of this transport work
 earns original-case completion credit.
+
+### Original-case reconciliation: defaults and array-parameter transport
+
+Original sql-1109 through sql-1140 are now explicitly superseded by PostgreSQL's
+prohibition on subqueries in persistent column defaults. This is not support
+for 32 executable defaults. The exact statements return SQLSTATE 0A000 in the
+independent PostgreSQL 18.6 oracle, preserve schema and complete seeded row
+postimages, and fail native compiler/public HTTP admission before any catalog
+callback. The compiler also verifies the exact diagnostic. The immutable source
+inventory and source-owned statements/parameters are unchanged. The disposition
+ledger names separate Debug compiler/public and PostgreSQL gates for this cohort.
+The resulting count is 479 implemented, 136 rejected, 105 superseded and
+866 unresolved; feature implementations remain at 479.
+
+The independent array-read oracle now obtains parameter identities from actual
+PostgreSQL Parse/Describe rather than forcing every API JSON-transported value
+to jsonb. Only a server-described text[] slot admits a flat string/SQL-NULL
+sequence; JSONB arrays remain JSONB when PostgreSQL binds that domain. Unsupported
+array adapters and mismatched parameter counts fail explicitly. Parse/Describe
+executes no statement and creates no named prepared resource. All nine existing
+golden campaigns still match, including the original 14 stored-array reads;
+the full reference-generator regression suite passed 120 tests.
+
+The expanded oracle covers twelve additional unchanged original statements:
+sql-0190, sql-0194, sql-0211 through sql-0213, sql-0280, sql-0283,
+sql-0285 through sql-0287, sql-0295 and sql-0296. These remain unresolved.
+Mounted native HTTP rejects their raw JSON-array parameters with 22023 under
+the existing strict public transport contract. That contract requires a
+SQLArrayValue envelope or PostgreSQL array text; it must not be silently relaxed
+or bypassed by changing the source-owned parameter fixture. A public transport
+decision is pending before activating this twelve-case campaign. sql-0292 also
+remains unresolved: its exact array-transform predicate needs a dedicated
+exercising seed, not an empty-result exception or a change to the earlier golden.
+
+The Debug mounted gate exposed generic optional-read switches that failed to
+compile for valid NotFound-only adapters. Owner/cancellation, identity and source
+authority reads now retain every non-absence error without an unreachable else
+prong. The native regression exercises narrow and fallible adapters through
+requireActive, and actual memory/LSM candidate tests retain their fencing,
+cancellation and recovery assertions. Updated test provisioning publishes the
+live-directory marker and real seeded-row identities in the same transaction;
+it does not weaken production directory admission. All 14 candidate tests pass.
+
+Next original-case batches must be selected by shared execution boundary and
+case volume, not by infrastructure-test totals. The largest remaining pool is
+308 DDL/catalog/session cases, followed by the 131 source/joined mutation and
+MERGE/recursion pool. Independent read cohorts must not wait for all catalog
+rollout machinery. Compiler discovery is useful routing evidence only: its
+admitted-shape counts do not establish public, durable or distributed parity.
+
+Qualification at this checkpoint: the focused default-admission Debug public
+gate passed 80/80 steps, the compiler default test passed, and all 20 inventory
+auditor tests passed. This is not a passing expanded array-read or full public
+API gate: the twelve transport cases remain red and uncredited pending the
+contract decision above. The macOS Debug public-owner compiler measured
+16,310,960,128 bytes against its older 15 GiB reservation. Its reservation is
+now 20 GiB (at least 25% headroom); the focused gate rerun passed without the
+underestimated-bound diagnostic. Other platforms and optimization modes keep
+their previous scheduling bounds. No runtime memory limit was increased.
+
+### Exact zero-effect mutations and recursive-source reconciliation
+
+The mutation oracle now represents explicitly qualified zero-effect success,
+not just positive affected-row counts. sql-1432 (self INSERT SELECT with
+ON CONFLICT DO NOTHING) and sql-1462 (VALUES with the same conflict policy)
+bind their untouched statements to fixed source digests and a real logical
+primary-key profile. Independent observers must find a bounded, nonempty
+conflicting population. Initial and final states of every table share the same
+streaming row/byte admission; zero affected rows, empty RETURNING and identical
+complete postimages are all required. Unlisted zero-effect cases, changed source
+text, missing primary ownership, empty populations and quota failures cannot
+acquire completion credit. The previous 48 positive mutation contracts remain
+unchanged; the checked campaign now contains those 48 plus two qualified no-ops.
+
+Native HTTP execution additionally retains the primary version, content digest
+and exact JSON at every seeded key in all three tables. It proves that the
+self-source mutation opens exactly one native source range read, and that the
+VALUES conflict adds no full-table read or multi-relation capture. The initial
+test incorrectly expected the multi-relation callback for a single-owner read;
+source inspection established that this path pins its own native range view.
+The corrected assertion checks that actual access path, not merely a zero
+affected count. No production mutation shortcut or weaker uniqueness profile
+was introduced to make these cases pass.
+
+The same Debug gate reran the complete existing source-mutation campaign and
+qualified original recursive mutations sql-0012 and sql-0013, whose executable
+coverage had not been reconciled into their dispositions. Their exact recursive
+source produces duplicate candidates; native set-valued UPDATE/DELETE effects
+match PostgreSQL with activated logical PKs and complete three-table postimages.
+This closes those original native fixture contracts, not arbitrary distributed
+recursive workloads or their remaining fault/scaling obligations.
+
+The combined mounted Debug gate passed 80/80 steps, both selected tests and
+owner audits, without skips or leaks. The full PostgreSQL oracle regression
+suite passed 122 tests. Read and streaming-mutation parameter adaptation now
+share server Parse/Describe identities; a separate regression retains JSONB
+arrays as JSONB while typed text-array path arguments stay SQL arrays. The
+inventory is now 483 implemented / 136 rejected / 105 superseded / 862 unresolved.
+The twelve raw-array transport cases remain unresolved and the expanded native
+array campaign in the uncommitted worktree remains red pending its public-contract decision. No broad public
+API/SQL release pass is claimed, and nothing has been pushed.
+
+The combined Debug public-owner compile reported MaxRSS:18G. Its macOS Debug
+reservation is now 24 GiB, retaining at least 25% headroom against a conservative
+19 GiB envelope for that rounded observation. Earlier 20 GiB reservations below
+refer to their historical qualification checkpoint or the separate data owner;
+Linux and non-Debug bounds remain unchanged. This is build scheduling, not
+runtime memory admission. Array-transport experiments are not included in the
+verified checkpoint commit; their twelve original dispositions remain open.

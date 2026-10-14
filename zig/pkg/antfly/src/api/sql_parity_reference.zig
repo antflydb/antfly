@@ -419,6 +419,7 @@ pub const PostgresMutationReference = struct {
         rows: []const []const Json,
         sql_nulls: []const []const bool,
         final_tables: std.json.ArrayHashMap(Rows),
+        noop_contract: ?struct { kind: []const u8, eligible_rows: usize } = null,
     },
 };
 
@@ -455,6 +456,7 @@ pub fn runPostgresMutations(alloc: std.mem.Allocator, handler: anytype, tables: 
     var corpus = try fixtures.Corpus.init(alloc);
     defer corpus.deinit();
     const TransactionWrite = @import("antfly_local_sources").storage_db_types.TransactionWrite;
+    const NoopPrimary = struct { table: usize, key: []const u8, before: @import("antfly_local_sources").storage_db_types.LookupResult };
     try std.testing.expectEqual(reference.profile.additional_tables.len + 1, tables.len);
     for (ids, 0..) |id, ordinal| {
         errdefer std.debug.print("POSTGRES MUTATION CASE {s}\n", .{id});
@@ -500,11 +502,45 @@ pub fn runPostgresMutations(alloc: std.mem.Allocator, handler: anytype, tables: 
                 try std.testing.expectEqualStrings(prior.json, current.json);
             }
         }
+        var noop_primaries: std.ArrayList(NoopPrimary) = .empty;
+        defer for (noop_primaries.items) |*primary| primary.before.deinit(a);
+        if (expected.noop_contract) |contract| {
+            try std.testing.expectEqualStrings("primary_conflict_do_nothing", contract.kind);
+            try std.testing.expectEqual(@as(i64, 0), expected.affected);
+            try std.testing.expectEqual(@as(usize, 1), reference.profile.primary_key.len);
+            try std.testing.expectEqualStrings("id", reference.profile.primary_key[0]);
+            const source_insert = std.mem.eql(u8, id, "sql-1432");
+            if (!source_insert and !std.mem.eql(u8, id, "sql-1462")) return error.InvalidNoopMutationFixture;
+            var eligible: usize = 0;
+            for (reference.profile.rows) |seed| {
+                const value = seed.value.object.get(if (source_insert) "status" else "id") orelse continue;
+                if (value == .string and std.mem.eql(u8, value.string, if (source_insert) "ready" else "u1")) eligible += 1;
+            }
+            try std.testing.expect(eligible > 0 and eligible <= 4096);
+            try std.testing.expectEqual(eligible, contract.eligible_rows);
+            for (tables, 0..) |table, index| {
+                const seeds = if (index == 0) reference.profile.rows else reference.profile.additional_tables[index - 1].rows;
+                for (seeds) |seed| {
+                    if (noop_primaries.items.len == 4096) return error.InvalidNoopMutationFixture;
+                    var before = (try table.db.lookup(a, seed.key, .{ .include_primary_digest = true })) orelse return error.MissingNoopPrimary;
+                    errdefer before.deinit(a);
+                    try std.testing.expect(before.version != null and before.expected_content_digest != null);
+                    try noop_primaries.append(a, .{ .table = index, .key = seed.key, .before = before });
+                }
+            }
+        }
         const response = try execute(a, handler, try corpus.get(id));
         defer response.deinit();
         const result = response.value;
         try std.testing.expectEqualStrings(expected.command_tag, result.command_tag);
         try std.testing.expectEqual(expected.affected, result.rows_affected);
+        for (noop_primaries.items) |primary| {
+            var after = (try tables[primary.table].db.lookup(a, primary.key, .{ .include_primary_digest = true })) orelse return error.MissingNoopPrimary;
+            defer after.deinit(a);
+            try std.testing.expectEqual(primary.before.version, after.version);
+            try std.testing.expectEqual(primary.before.expected_content_digest, after.expected_content_digest);
+            try std.testing.expectEqualStrings(primary.before.json, after.json);
+        }
         try std.testing.expectEqual(expected.columns.len, result.columns.len);
         try std.testing.expectEqual(expected.columns.len, expected.column_oids.len);
         for (result.columns, expected.columns, expected.column_oids) |column, name, oid| {

@@ -2,6 +2,10 @@
   "ledger_format": 1,
   "inventory_sha256": "c203a4dcf0094b75e1d3764e90beebddaf844a9ce604543c0a4dbc0ffe8ae173",
   "gates": {
+    "sql-original-noop-mutations-debug": {"command":["zig","build","public-api-parity-test","-Doptimize=Debug","-j2","-Dtest-filter=httpx SQL PostgreSQL no-op conflicts preserve primary versions and retain one source read"],"cwd":"zig","timeout_seconds":1800},
+    "sql-schema-default-native-debug": {"command":["zig","build","sql-test","-Doptimize=Debug","-j2","-Dtest-filter=SQL catalog default admission matches PostgreSQL subquery prohibition"],"cwd":"zig","timeout_seconds":1800},
+    "sql-schema-default-public-debug": {"command":["zig","build","public-api-parity-test","-Doptimize=Debug","-j2","-Dtest-filter=httpx SQL malformed catalog requests fail before publication"],"cwd":"zig","timeout_seconds":1800},
+    "sql-schema-default-postgres": {"command":["uv","run","--no-project","--with","psycopg[binary]==3.3.6","python","-m","unittest","test_generate_sql_postgres_reference.PostgresReferenceTest.test_original_catalog_subquery_defaults_are_not_postgres_features"],"cwd":"scripts","timeout_seconds":120},
     "sql-original-digest-read": {
       "command": ["zig", "build", "public-api-parity-test", "--cache-dir", ".zig-cache/sql-parity-evidence", "-Dtest-filter=httpx SQL PostgreSQL original digest read preserves case nulls and duplicate results"],
       "cwd": "zig",
@@ -540,13 +544,21 @@
     },
     {
       "id": "sql-0012",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original recursive CTE mutation passes mounted native HTTP against activated logical primary keys and PostgreSQL command counts, RETURNING labels/types/NULL flags and complete postimages of all three fixture tables. Duplicate recursive candidates retain set-valued target effects. This is native single-owner execution evidence; broader distributed recursive fault and scaling qualification remains separate.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL mutations capture native source relations and complete storage","gate":"sql-postgres-correlated-mutations"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL mutations capture native source relations and complete storage","gate":"sql-postgres-mutation-reference"}
+      ]
     },
     {
       "id": "sql-0013",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original recursive CTE mutation passes mounted native HTTP against activated logical primary keys and PostgreSQL command counts, RETURNING labels/types/NULL flags and complete postimages of all three fixture tables. Duplicate recursive candidates retain set-valued target effects. This is native single-owner execution evidence; broader distributed recursive fault and scaling qualification remains separate.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL mutations capture native source relations and complete storage","gate":"sql-postgres-correlated-mutations"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL mutations capture native source relations and complete storage","gate":"sql-postgres-mutation-reference"}
+      ]
     },
     {
       "id": "sql-0014",
@@ -10615,163 +10627,323 @@
     },
     {
       "id": "sql-1109",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The original subquery-default contract is superseded by PostgreSQL's 0A000 prohibition, not implemented as an executable default. The unchanged statement is independently rejected by PostgreSQL with unchanged catalog/data postimages and by mounted native SQL before any catalog callback; the compiler also checks the exact diagnostic.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/sql/parity_case_test.zig","test":"SQL catalog default admission matches PostgreSQL subquery prohibition","gate":"sql-schema-default-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-public-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-postgres"}
+      ]
     },
     {
       "id": "sql-1110",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The original subquery-default contract is superseded by PostgreSQL's 0A000 prohibition, not implemented as an executable default. The unchanged statement is independently rejected by PostgreSQL with unchanged catalog/data postimages and by mounted native SQL before any catalog callback; the compiler also checks the exact diagnostic.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/sql/parity_case_test.zig","test":"SQL catalog default admission matches PostgreSQL subquery prohibition","gate":"sql-schema-default-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-public-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-postgres"}
+      ]
     },
     {
       "id": "sql-1111",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The original subquery-default contract is superseded by PostgreSQL's 0A000 prohibition, not implemented as an executable default. The unchanged statement is independently rejected by PostgreSQL with unchanged catalog/data postimages and by mounted native SQL before any catalog callback; the compiler also checks the exact diagnostic.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/sql/parity_case_test.zig","test":"SQL catalog default admission matches PostgreSQL subquery prohibition","gate":"sql-schema-default-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-public-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-postgres"}
+      ]
     },
     {
       "id": "sql-1112",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The original subquery-default contract is superseded by PostgreSQL's 0A000 prohibition, not implemented as an executable default. The unchanged statement is independently rejected by PostgreSQL with unchanged catalog/data postimages and by mounted native SQL before any catalog callback; the compiler also checks the exact diagnostic.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/sql/parity_case_test.zig","test":"SQL catalog default admission matches PostgreSQL subquery prohibition","gate":"sql-schema-default-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-public-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-postgres"}
+      ]
     },
     {
       "id": "sql-1113",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The original subquery-default contract is superseded by PostgreSQL's 0A000 prohibition, not implemented as an executable default. The unchanged statement is independently rejected by PostgreSQL with unchanged catalog/data postimages and by mounted native SQL before any catalog callback; the compiler also checks the exact diagnostic.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/sql/parity_case_test.zig","test":"SQL catalog default admission matches PostgreSQL subquery prohibition","gate":"sql-schema-default-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-public-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-postgres"}
+      ]
     },
     {
       "id": "sql-1114",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The original subquery-default contract is superseded by PostgreSQL's 0A000 prohibition, not implemented as an executable default. The unchanged statement is independently rejected by PostgreSQL with unchanged catalog/data postimages and by mounted native SQL before any catalog callback; the compiler also checks the exact diagnostic.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/sql/parity_case_test.zig","test":"SQL catalog default admission matches PostgreSQL subquery prohibition","gate":"sql-schema-default-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-public-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-postgres"}
+      ]
     },
     {
       "id": "sql-1115",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The original subquery-default contract is superseded by PostgreSQL's 0A000 prohibition, not implemented as an executable default. The unchanged statement is independently rejected by PostgreSQL with unchanged catalog/data postimages and by mounted native SQL before any catalog callback; the compiler also checks the exact diagnostic.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/sql/parity_case_test.zig","test":"SQL catalog default admission matches PostgreSQL subquery prohibition","gate":"sql-schema-default-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-public-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-postgres"}
+      ]
     },
     {
       "id": "sql-1116",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The original subquery-default contract is superseded by PostgreSQL's 0A000 prohibition, not implemented as an executable default. The unchanged statement is independently rejected by PostgreSQL with unchanged catalog/data postimages and by mounted native SQL before any catalog callback; the compiler also checks the exact diagnostic.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/sql/parity_case_test.zig","test":"SQL catalog default admission matches PostgreSQL subquery prohibition","gate":"sql-schema-default-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-public-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-postgres"}
+      ]
     },
     {
       "id": "sql-1117",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The original subquery-default contract is superseded by PostgreSQL's 0A000 prohibition, not implemented as an executable default. The unchanged statement is independently rejected by PostgreSQL with unchanged catalog/data postimages and by mounted native SQL before any catalog callback; the compiler also checks the exact diagnostic.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/sql/parity_case_test.zig","test":"SQL catalog default admission matches PostgreSQL subquery prohibition","gate":"sql-schema-default-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-public-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-postgres"}
+      ]
     },
     {
       "id": "sql-1118",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The original subquery-default contract is superseded by PostgreSQL's 0A000 prohibition, not implemented as an executable default. The unchanged statement is independently rejected by PostgreSQL with unchanged catalog/data postimages and by mounted native SQL before any catalog callback; the compiler also checks the exact diagnostic.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/sql/parity_case_test.zig","test":"SQL catalog default admission matches PostgreSQL subquery prohibition","gate":"sql-schema-default-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-public-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-postgres"}
+      ]
     },
     {
       "id": "sql-1119",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The original subquery-default contract is superseded by PostgreSQL's 0A000 prohibition, not implemented as an executable default. The unchanged statement is independently rejected by PostgreSQL with unchanged catalog/data postimages and by mounted native SQL before any catalog callback; the compiler also checks the exact diagnostic.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/sql/parity_case_test.zig","test":"SQL catalog default admission matches PostgreSQL subquery prohibition","gate":"sql-schema-default-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-public-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-postgres"}
+      ]
     },
     {
       "id": "sql-1120",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The original subquery-default contract is superseded by PostgreSQL's 0A000 prohibition, not implemented as an executable default. The unchanged statement is independently rejected by PostgreSQL with unchanged catalog/data postimages and by mounted native SQL before any catalog callback; the compiler also checks the exact diagnostic.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/sql/parity_case_test.zig","test":"SQL catalog default admission matches PostgreSQL subquery prohibition","gate":"sql-schema-default-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-public-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-postgres"}
+      ]
     },
     {
       "id": "sql-1121",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The original subquery-default contract is superseded by PostgreSQL's 0A000 prohibition, not implemented as an executable default. The unchanged statement is independently rejected by PostgreSQL with unchanged catalog/data postimages and by mounted native SQL before any catalog callback; the compiler also checks the exact diagnostic.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/sql/parity_case_test.zig","test":"SQL catalog default admission matches PostgreSQL subquery prohibition","gate":"sql-schema-default-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-public-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-postgres"}
+      ]
     },
     {
       "id": "sql-1122",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The original subquery-default contract is superseded by PostgreSQL's 0A000 prohibition, not implemented as an executable default. The unchanged statement is independently rejected by PostgreSQL with unchanged catalog/data postimages and by mounted native SQL before any catalog callback; the compiler also checks the exact diagnostic.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/sql/parity_case_test.zig","test":"SQL catalog default admission matches PostgreSQL subquery prohibition","gate":"sql-schema-default-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-public-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-postgres"}
+      ]
     },
     {
       "id": "sql-1123",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The original subquery-default contract is superseded by PostgreSQL's 0A000 prohibition, not implemented as an executable default. The unchanged statement is independently rejected by PostgreSQL with unchanged catalog/data postimages and by mounted native SQL before any catalog callback; the compiler also checks the exact diagnostic.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/sql/parity_case_test.zig","test":"SQL catalog default admission matches PostgreSQL subquery prohibition","gate":"sql-schema-default-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-public-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-postgres"}
+      ]
     },
     {
       "id": "sql-1124",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The original subquery-default contract is superseded by PostgreSQL's 0A000 prohibition, not implemented as an executable default. The unchanged statement is independently rejected by PostgreSQL with unchanged catalog/data postimages and by mounted native SQL before any catalog callback; the compiler also checks the exact diagnostic.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/sql/parity_case_test.zig","test":"SQL catalog default admission matches PostgreSQL subquery prohibition","gate":"sql-schema-default-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-public-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-postgres"}
+      ]
     },
     {
       "id": "sql-1125",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The original subquery-default contract is superseded by PostgreSQL's 0A000 prohibition, not implemented as an executable default. The unchanged statement is independently rejected by PostgreSQL with unchanged catalog/data postimages and by mounted native SQL before any catalog callback; the compiler also checks the exact diagnostic.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/sql/parity_case_test.zig","test":"SQL catalog default admission matches PostgreSQL subquery prohibition","gate":"sql-schema-default-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-public-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-postgres"}
+      ]
     },
     {
       "id": "sql-1126",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The original subquery-default contract is superseded by PostgreSQL's 0A000 prohibition, not implemented as an executable default. The unchanged statement is independently rejected by PostgreSQL with unchanged catalog/data postimages and by mounted native SQL before any catalog callback; the compiler also checks the exact diagnostic.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/sql/parity_case_test.zig","test":"SQL catalog default admission matches PostgreSQL subquery prohibition","gate":"sql-schema-default-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-public-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-postgres"}
+      ]
     },
     {
       "id": "sql-1127",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The original subquery-default contract is superseded by PostgreSQL's 0A000 prohibition, not implemented as an executable default. The unchanged statement is independently rejected by PostgreSQL with unchanged catalog/data postimages and by mounted native SQL before any catalog callback; the compiler also checks the exact diagnostic.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/sql/parity_case_test.zig","test":"SQL catalog default admission matches PostgreSQL subquery prohibition","gate":"sql-schema-default-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-public-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-postgres"}
+      ]
     },
     {
       "id": "sql-1128",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The original subquery-default contract is superseded by PostgreSQL's 0A000 prohibition, not implemented as an executable default. The unchanged statement is independently rejected by PostgreSQL with unchanged catalog/data postimages and by mounted native SQL before any catalog callback; the compiler also checks the exact diagnostic.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/sql/parity_case_test.zig","test":"SQL catalog default admission matches PostgreSQL subquery prohibition","gate":"sql-schema-default-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-public-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-postgres"}
+      ]
     },
     {
       "id": "sql-1129",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The original subquery-default contract is superseded by PostgreSQL's 0A000 prohibition, not implemented as an executable default. The unchanged statement is independently rejected by PostgreSQL with unchanged catalog/data postimages and by mounted native SQL before any catalog callback; the compiler also checks the exact diagnostic.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/sql/parity_case_test.zig","test":"SQL catalog default admission matches PostgreSQL subquery prohibition","gate":"sql-schema-default-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-public-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-postgres"}
+      ]
     },
     {
       "id": "sql-1130",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The original subquery-default contract is superseded by PostgreSQL's 0A000 prohibition, not implemented as an executable default. The unchanged statement is independently rejected by PostgreSQL with unchanged catalog/data postimages and by mounted native SQL before any catalog callback; the compiler also checks the exact diagnostic.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/sql/parity_case_test.zig","test":"SQL catalog default admission matches PostgreSQL subquery prohibition","gate":"sql-schema-default-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-public-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-postgres"}
+      ]
     },
     {
       "id": "sql-1131",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The original subquery-default contract is superseded by PostgreSQL's 0A000 prohibition, not implemented as an executable default. The unchanged statement is independently rejected by PostgreSQL with unchanged catalog/data postimages and by mounted native SQL before any catalog callback; the compiler also checks the exact diagnostic.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/sql/parity_case_test.zig","test":"SQL catalog default admission matches PostgreSQL subquery prohibition","gate":"sql-schema-default-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-public-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-postgres"}
+      ]
     },
     {
       "id": "sql-1132",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The original subquery-default contract is superseded by PostgreSQL's 0A000 prohibition, not implemented as an executable default. The unchanged statement is independently rejected by PostgreSQL with unchanged catalog/data postimages and by mounted native SQL before any catalog callback; the compiler also checks the exact diagnostic.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/sql/parity_case_test.zig","test":"SQL catalog default admission matches PostgreSQL subquery prohibition","gate":"sql-schema-default-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-public-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-postgres"}
+      ]
     },
     {
       "id": "sql-1133",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The original subquery-default contract is superseded by PostgreSQL's 0A000 prohibition, not implemented as an executable default. The unchanged statement is independently rejected by PostgreSQL with unchanged catalog/data postimages and by mounted native SQL before any catalog callback; the compiler also checks the exact diagnostic.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/sql/parity_case_test.zig","test":"SQL catalog default admission matches PostgreSQL subquery prohibition","gate":"sql-schema-default-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-public-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-postgres"}
+      ]
     },
     {
       "id": "sql-1134",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The original subquery-default contract is superseded by PostgreSQL's 0A000 prohibition, not implemented as an executable default. The unchanged statement is independently rejected by PostgreSQL with unchanged catalog/data postimages and by mounted native SQL before any catalog callback; the compiler also checks the exact diagnostic.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/sql/parity_case_test.zig","test":"SQL catalog default admission matches PostgreSQL subquery prohibition","gate":"sql-schema-default-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-public-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-postgres"}
+      ]
     },
     {
       "id": "sql-1135",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The original subquery-default contract is superseded by PostgreSQL's 0A000 prohibition, not implemented as an executable default. The unchanged statement is independently rejected by PostgreSQL with unchanged catalog/data postimages and by mounted native SQL before any catalog callback; the compiler also checks the exact diagnostic.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/sql/parity_case_test.zig","test":"SQL catalog default admission matches PostgreSQL subquery prohibition","gate":"sql-schema-default-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-public-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-postgres"}
+      ]
     },
     {
       "id": "sql-1136",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The original subquery-default contract is superseded by PostgreSQL's 0A000 prohibition, not implemented as an executable default. The unchanged statement is independently rejected by PostgreSQL with unchanged catalog/data postimages and by mounted native SQL before any catalog callback; the compiler also checks the exact diagnostic.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/sql/parity_case_test.zig","test":"SQL catalog default admission matches PostgreSQL subquery prohibition","gate":"sql-schema-default-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-public-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-postgres"}
+      ]
     },
     {
       "id": "sql-1137",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The original subquery-default contract is superseded by PostgreSQL's 0A000 prohibition, not implemented as an executable default. The unchanged statement is independently rejected by PostgreSQL with unchanged catalog/data postimages and by mounted native SQL before any catalog callback; the compiler also checks the exact diagnostic.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/sql/parity_case_test.zig","test":"SQL catalog default admission matches PostgreSQL subquery prohibition","gate":"sql-schema-default-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-public-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-postgres"}
+      ]
     },
     {
       "id": "sql-1138",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The original subquery-default contract is superseded by PostgreSQL's 0A000 prohibition, not implemented as an executable default. The unchanged statement is independently rejected by PostgreSQL with unchanged catalog/data postimages and by mounted native SQL before any catalog callback; the compiler also checks the exact diagnostic.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/sql/parity_case_test.zig","test":"SQL catalog default admission matches PostgreSQL subquery prohibition","gate":"sql-schema-default-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-public-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-postgres"}
+      ]
     },
     {
       "id": "sql-1139",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The original subquery-default contract is superseded by PostgreSQL's 0A000 prohibition, not implemented as an executable default. The unchanged statement is independently rejected by PostgreSQL with unchanged catalog/data postimages and by mounted native SQL before any catalog callback; the compiler also checks the exact diagnostic.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/sql/parity_case_test.zig","test":"SQL catalog default admission matches PostgreSQL subquery prohibition","gate":"sql-schema-default-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-public-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-postgres"}
+      ]
     },
     {
       "id": "sql-1140",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The original subquery-default contract is superseded by PostgreSQL's 0A000 prohibition, not implemented as an executable default. The unchanged statement is independently rejected by PostgreSQL with unchanged catalog/data postimages and by mounted native SQL before any catalog callback; the compiler also checks the exact diagnostic.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/sql/parity_case_test.zig","test":"SQL catalog default admission matches PostgreSQL subquery prohibition","gate":"sql-schema-default-native-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-public-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL malformed catalog requests fail before publication","gate":"sql-schema-default-postgres"}
+      ]
     },
     {
       "id": "sql-1141",
@@ -13969,8 +14141,12 @@
     },
     {
       "id": "sql-1432",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original statement is independently verified as a successful zero-effect INSERT under a real logical primary key and a nonempty conflicting source population. Mounted native HTTP matches PostgreSQL counts, RETURNING labels/types/NULL provenance and complete three-table postimages, and additionally preserves every primary version and digest. INSERT SELECT uses one retained source range read; VALUES conflicts add no full-table read. This does not reinterpret raw JSON-array parameters or weaken fixture constraints.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL no-op conflicts preserve primary versions and retain one source read","gate":"sql-original-noop-mutations-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL no-op conflicts preserve primary versions and retain one source read","gate":"sql-postgres-mutation-reference"}
+      ]
     },
     {
       "id": "sql-1433",
@@ -14165,8 +14341,12 @@
     },
     {
       "id": "sql-1462",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original statement is independently verified as a successful zero-effect INSERT under a real logical primary key and a nonempty conflicting source population. Mounted native HTTP matches PostgreSQL counts, RETURNING labels/types/NULL provenance and complete three-table postimages, and additionally preserves every primary version and digest. INSERT SELECT uses one retained source range read; VALUES conflicts add no full-table read. This does not reinterpret raw JSON-array parameters or weaken fixture constraints.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL no-op conflicts preserve primary versions and retain one source read","gate":"sql-original-noop-mutations-debug"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL no-op conflicts preserve primary versions and retain one source read","gate":"sql-postgres-mutation-reference"}
+      ]
     },
     {
       "id": "sql-1463",

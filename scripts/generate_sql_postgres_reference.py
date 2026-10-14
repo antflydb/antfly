@@ -30,6 +30,7 @@ from copy import deepcopy
 from datetime import date, datetime, time
 from decimal import Decimal
 import getpass
+import hashlib
 import json
 import math
 import os
@@ -426,16 +427,68 @@ def array_reference(data, oid):
     return {"dimensions": dimensions, "values": values, "sql_nulls": nulls}
 
 
-def parameters(case):
+def parameters(case, inferred_oids=None):
     from psycopg.types.json import Jsonb
 
+    if inferred_oids is not None and len(inferred_oids) != len(case["params"]):
+        raise ValueError("PostgreSQL parameter description cardinality mismatch")
     result = []
-    for cell in case["params"]:
+    for index, cell in enumerate(case["params"]):
         value = parameter(cell)
         if isinstance(cell, dict) and "json" in cell:
-            value = Jsonb(json.loads(value) if isinstance(value, str) else value)
+            value = json.loads(value) if isinstance(value, str) else value
+            oid = inferred_oids[index] if inferred_oids is not None else None
+            if oid == 1009:
+                # The source tag is its API JSON transport, not a jsonb SQL
+                # declaration. Only the independent server's parameter type
+                # may identify this as text[], never SQL text heuristics or
+                # the fact that its payload happens to be a JSON array.
+                if value is not None and (
+                    not isinstance(value, list)
+                    or any(
+                        item is not None and not isinstance(item, str) for item in value
+                    )
+                ):
+                    raise ValueError(
+                        "text[] parameter requires string or SQL NULL elements"
+                    )
+            elif oid in ARRAY_TYPES:
+                raise ValueError(
+                    "array parameter requires an explicit element-domain adapter"
+                )
+            else:
+                value = Jsonb(value)
         result.append(value)
     return result
+
+
+def describe_parameter_oids(connection, case):
+    """Ask PostgreSQL to bind the unchanged statement before adapting API JSON.
+
+    Parse/Describe of the unnamed statement executes no SQL and retains no
+    named prepared resource. The subsequent raw cursor still executes the
+    original statement and positional values, without inserted casts.
+    """
+    import psycopg
+
+    prepared = connection.pgconn.prepare(
+        b"", case["sql"].encode(connection.info.encoding)
+    )
+    if prepared.status != psycopg.pq.ExecStatus.COMMAND_OK:
+        raise psycopg.errors.error_from_result(prepared, connection.info.encoding)
+    described = connection.pgconn.describe_prepared(b"")
+    if described.status != psycopg.pq.ExecStatus.COMMAND_OK:
+        raise psycopg.errors.error_from_result(described, connection.info.encoding)
+    return [described.param_type(index) for index in range(described.nparams)]
+
+
+def execution_parameters(connection, case):
+    inferred_oids = (
+        describe_parameter_oids(connection, case)
+        if any(isinstance(cell, dict) and "json" in cell for cell in case["params"])
+        else None
+    )
+    return parameters(case, inferred_oids)
 
 
 def create_table(db, name, props, rows, identity=False):
@@ -564,7 +617,9 @@ def execute(db, case, read=False):
 
 
 def cursor_result(cursor, case, read, allow_empty=False):
-    cursor.execute(case["sql"], parameters(case), binary=True)
+    cursor.execute(
+        case["sql"], execution_parameters(cursor.connection, case), binary=True
+    )
     # DECLARE ... FOR accepts SELECT, not arbitrary mutation statements.
     tag = "SELECT" if read else cursor.statusmessage.split()[0]
     if (read and tag != "SELECT") or (
@@ -687,6 +742,42 @@ def mutation_profile(constraint_profile="base"):
     return profile
 
 
+# Explicit zero-effect contracts, not a blanket exemption for empty fixtures.
+# Hashes bind the unchanged source statement; independent observers prove the
+# conflicting source population before the original mutation executes.
+MUTATION_NOOP_OBSERVERS = {
+    "sql-1432": (
+        "534b804c6a4a346076d39299fa092a7ea3df42318782e07c140cf163dab5fa15",
+        "SELECT count(*) FROM public.usage_records WHERE status = 'ready'",
+    ),
+    "sql-1462": (
+        "c482ec8edadb210d392d7db106be8ef2761fe87888781c6a586d8d33828d9854",
+        "SELECT count(*) FROM public.usage_records WHERE id = 'u1'",
+    ),
+}
+
+
+def mutation_noop_contract(db, case, profile, row_limit):
+    observer = MUTATION_NOOP_OBSERVERS.get(case["id"])
+    if observer is None:
+        return None
+    digest, query = observer
+    if (
+        hashlib.sha256(case["sql"].encode("utf-8")).hexdigest() != digest
+        or case["params"]
+        or profile.get("primary_key") != ["id"]
+    ):
+        raise ValueError(
+            "zero-effect mutation requires its exact source and primary owner"
+        )
+    eligible = db.execute(query).fetchone()[0]
+    if not 0 < eligible <= row_limit:
+        raise ValueError(
+            "zero-effect mutation has no bounded conflicting source population"
+        )
+    return {"kind": "primary_conflict_do_nothing", "eligible_rows": eligible}
+
+
 def mutation_reference(
     db, cases, profile, row_limit=ROW_LIMIT, byte_limit=16 * 1024 * 1024
 ):
@@ -772,6 +863,23 @@ def mutation_reference(
             "rows": rows,
             "sql_nulls": nulls,
         }
+
+    def capture_tables(tables, budget, label="mutation final state"):
+        states = {}
+        for table in tables:
+            columns = list(properties(table["schema"]))
+            query = sql.SQL("SELECT {} FROM public.{} ORDER BY {}").format(
+                sql.SQL(",").join(map(sql.Identifier, columns)),
+                sql.Identifier(table["name"]),
+                sql.SQL(",").join(map(sql.Identifier, columns)),
+            )
+            with StreamingMutationCursor(db) as cursor:
+                state = collect(cursor, query, None, budget, label)
+            if state.pop("command_tag") != "SELECT":
+                raise ValueError("invalid table state command")
+            state.pop("affected")
+            states[table["name"]] = state
+        return states
 
     tables = [
         {
@@ -871,11 +979,17 @@ def mutation_reference(
                     )
                 with db.transaction(force_rollback=True):
                     remaining = [byte_limit]
+                    noop = mutation_noop_contract(db, case, profile, row_limit)
+                    before = (
+                        capture_tables(tables, remaining, "mutation initial state")
+                        if noop is not None
+                        else None
+                    )
                     with StreamingMutationCursor(db) as cursor:
                         entry = collect(
                             cursor,
                             case["sql"],
-                            parameters(case),
+                            execution_parameters(db, case),
                             remaining,
                             "mutation RETURNING",
                         )
@@ -883,26 +997,28 @@ def mutation_reference(
                     affected = entry["affected"]
                     if tag not in {"INSERT", "UPDATE", "DELETE", "MERGE"}:
                         raise ValueError("statement is not a mutation")
-                    if affected is None or not 0 < affected <= row_limit:
+                    if affected is None or not 0 <= affected <= row_limit:
                         raise ValueError(
                             "mutation is non-exercising or exceeds row budget"
                         )
-                    entry.update(id=case["id"], final_tables={})
-                    for table in tables:
-                        columns = list(properties(table["schema"]))
-                        query = sql.SQL("SELECT {} FROM public.{} ORDER BY {}").format(
-                            sql.SQL(",").join(map(sql.Identifier, columns)),
-                            sql.Identifier(table["name"]),
-                            sql.SQL(",").join(map(sql.Identifier, columns)),
+                    if noop is None and affected == 0:
+                        raise ValueError(
+                            "mutation is non-exercising without a zero-effect contract"
                         )
-                        with StreamingMutationCursor(db) as cursor:
-                            state = collect(
-                                cursor, query, None, remaining, "mutation final state"
+                    entry.update(
+                        id=case["id"], final_tables=capture_tables(tables, remaining)
+                    )
+                    if noop is not None:
+                        if (
+                            tag != "INSERT"
+                            or affected != 0
+                            or entry["rows"]
+                            or entry["final_tables"] != before
+                        ):
+                            raise ValueError(
+                                "zero-effect mutation changed its result or table state"
                             )
-                        if state.pop("command_tag") != "SELECT":
-                            raise ValueError("invalid final state command")
-                        state.pop("affected")
-                        entry["final_tables"][table["name"]] = state
+                        entry["noop_contract"] = noop
                     entries.append(entry)
             except (psycopg.Error, ValueError, KeyError, TypeError) as error:
                 excluded.append(

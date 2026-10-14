@@ -13381,6 +13381,12 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
 }
 
 test "httpx SQL malformed catalog requests fail before publication" {
+    // Exact original default-subquery contracts, superseded by PostgreSQL's
+    // 0A000 prohibition rather than treated as implemented subquery defaults:
+    // sql-1109, sql-1110, sql-1111, sql-1112, sql-1113, sql-1114, sql-1115, sql-1116,
+    // sql-1117, sql-1118, sql-1119, sql-1120, sql-1121, sql-1122, sql-1123, sql-1124,
+    // sql-1125, sql-1126, sql-1127, sql-1128, sql-1129, sql-1130, sql-1131, sql-1132,
+    // sql-1133, sql-1134, sql-1135, sql-1136, sql-1137, sql-1138, sql-1139, sql-1140.
     const alloc = std.testing.allocator;
     const Source = struct {
         publications: usize = 0,
@@ -13414,6 +13420,8 @@ test "httpx SQL malformed catalog requests fail before publication" {
             const diagnostic = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
             defer diagnostic.deinit();
             try std.testing.expectEqualStrings(code, diagnostic.value.object.get("code").?.string);
+            if (std.mem.indexOf(u8, sql, "DEFAULT (SELECT") != null)
+                try std.testing.expectEqualStrings("subqueries are not allowed in schema defaults", diagnostic.value.object.get("message").?.string);
         }
     };
     for ([_][]const u8{ "CREATE TABLE broken (", "CREATE TABLE broken (n bigint", "CREATE TABLE broken (n bigint CONSTRAINT only_name" }) |sql|
@@ -14477,6 +14485,11 @@ test "httpx SQL PostgreSQL regex mutations preserve complete native postimages" 
     try postgresNativeMutationCampaigns(&.{ "sql-1443", "sql-1471", "sql-1473", "sql-1474", "sql-1475" });
 }
 
+test "httpx SQL PostgreSQL no-op conflicts preserve primary versions and retain one source read" {
+    // Exact original sources: sql-1432 (INSERT SELECT), sql-1462 (VALUES).
+    try postgresNativeMutationCampaigns(&.{ "sql-1432", "sql-1462" });
+}
+
 test "httpx SQL PostgreSQL named conflict targets preserve complete native postimages" {
     try postgresNativeMutationCampaigns(&.{"sql-1463"});
 }
@@ -14663,6 +14676,14 @@ fn postgresNativeMutationCampaignsWithReadPolicy(comptime selected: []const []co
             reference.profile.admission_probes = probes;
         }
         try parity.runPostgresMutations(alloc, &handler, &tables, &source.records, reference, if (selected.len != 0) selected else campaign.ids);
+        if (comptime selected.len == 2 and std.mem.eql(u8, selected[0], "sql-1432") and std.mem.eql(u8, selected[1], "sql-1462")) {
+            // A single-owner source uses one retained native range view, not
+            // the multi-relation statement-capture callback. VALUES conflict
+            // resolution must not add a full source/table read.
+            try std.testing.expectEqual(@as(usize, 0), source.captures);
+            try std.testing.expectEqual(@as(usize, 1), source.unbounded_reads.load(.monotonic));
+            try std.testing.expect(source.lookup_calls.load(.monotonic) > 0);
+        }
         completed_campaigns += 1;
         if (unique) {
             // Logical UNIQUE ownership must resolve through native point

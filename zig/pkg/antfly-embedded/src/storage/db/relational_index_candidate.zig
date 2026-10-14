@@ -402,9 +402,7 @@ fn testOwnerJobAdmission(comptime Backend: type, comptime existing: bool, compti
         errdefer txn.abort();
         try txn.put(catalog.key, prior.value);
         if (initial) |*value| _ = try value.stage(&txn);
-        var namespace_bytes: [24]u8 = undefined;
-        @import("doc_identity.zig").encodeNamespace(&namespace_bytes, fence.namespace);
-        try txn.put(&@import("../internal_keys.zig").identity_namespace_key, &namespace_bytes);
+        try @import("doc_identity.zig").writeNamespaceTxn(&txn, fence.namespace);
         for ([_][]const u8{ "a", "b", "c" }, [_][]const u8{
             "{\"id\":1,\"email\":\"a@example.org\"}", "{\"id\":2,\"email\":\"b@example.org\"}", "{\"id\":3,\"email\":\"c@example.org\"}",
         }) |document, json| {
@@ -413,6 +411,7 @@ fn testOwnerJobAdmission(comptime Backend: type, comptime existing: bool, compti
             const row = try @import("relational_store.zig").encodeValueForSchemaAlloc(a, json, before_schema);
             defer a.free(row);
             try txn.put(primary, row);
+            _ = try @import("doc_identity.zig").ensureOrdinalForNamespaceTxn(a, &txn, fence.namespace, 1, document);
         }
         try txn.commit();
     }
@@ -1529,7 +1528,7 @@ fn testCancellationIntent(comptime Backend: type, comptime prior_phase: enum { a
         errdefer txn.abort();
         try txn.put(catalog.key, prior.value);
         const bytes = @import("online_source_contract.zig").namespaceBytes(fence.namespace);
-        try txn.put(&@import("../internal_keys.zig").identity_namespace_key, &bytes);
+        try @import("doc_identity.zig").writeNamespaceTxn(&txn, fence.namespace);
         try authority.bind(&txn, .native, bytes);
         try txn.commit();
     }

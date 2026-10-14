@@ -313,10 +313,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = antfly_test_mod,
         .filters = compileFiltersWithAnchors(b, &.{"api module compiles"}, public_api_parity_runtime_filters),
         // The macOS debug root includes the complete public transport,
-        // generated-contract, and native-index surface. Debug test
-        // compilation currently peaks at 15.09 GB; reserve the measured
-        // envelope so the scheduler does not reject a successful compile.
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 15 else 7) * 1024 * 1024 * 1024,
+        // generated-contract, and native-index surface. The current Debug
+        // owner reported MaxRSS:18G; 24 GiB retains at least 25% headroom even
+        // against a conservative 19 GiB envelope for that rounded measurement.
+        // Other optimization/platform bounds are unchanged.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos and optimize == .debug) 24 else if (target.result.os.tag == .macos) 15 else 7) * 1024 * 1024 * 1024,
         .test_runner = .{
             .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,

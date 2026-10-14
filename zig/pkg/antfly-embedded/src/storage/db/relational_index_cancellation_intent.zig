@@ -107,9 +107,9 @@ pub const Record = struct {
 };
 
 fn optional(txn: anytype, item: []const u8) !?[]const u8 {
-    return txn.get(item) catch |err| switch (err) {
-        error.NotFound => null,
-        else => return err,
+    return txn.get(item) catch |err| {
+        if (err == error.NotFound) return null;
+        return err;
     };
 }
 

@@ -38,6 +38,8 @@ from generate_sql_postgres_reference import (
     aggregate_read_profile,
     aggregate_order_observer,
     normalize_ordered_contract,
+    parameters,
+    describe_parameter_oids,
     set_read_profile,
     mutation_reference,
     SEEDS,
@@ -46,6 +48,27 @@ from generate_sql_postgres_reference import (
 
 
 class ReferenceExtensionTest(unittest.TestCase):
+    def test_json_parameter_transport_uses_only_server_declared_array_identity(self):
+        from psycopg.types.json import Jsonb
+
+        case = {"params": [{"json": '["hot", null]'}, {"json": '["hot", null]'}]}
+        values = parameters(case, [1009, 3802])
+        self.assertEqual(["hot", None], values[0])
+        self.assertIsInstance(values[1], Jsonb)
+        self.assertEqual(["hot", None], values[1].obj)
+        self.assertIsInstance(parameters(case)[0], Jsonb)
+        self.assertEqual([None], parameters({"params": [{"json": "null"}]}, [1009]))
+        for payload in ("[1]", "[{}]", '"hot"', "{}"):
+            with (
+                self.subTest(payload=payload),
+                self.assertRaisesRegex(ValueError, "text\\[\\]"),
+            ):
+                parameters({"params": [{"json": payload}]}, [1009])
+        with self.assertRaisesRegex(ValueError, "cardinality"):
+            parameters(case, [1009])
+        with self.assertRaisesRegex(ValueError, "explicit element-domain"):
+            parameters({"params": [{"json": "[1]"}]}, [1007])
+
     def test_clock_functions_require_a_dedicated_native_clock_contract(self):
         for expression in (
             "now()",
@@ -243,6 +266,43 @@ class PostgresReferenceTest(unittest.TestCase):
         cls.server = postgres()
         cls.db = cls.server.__enter__()
         cls.addClassCleanup(cls.server.__exit__, None, None, None)
+
+    def test_parameter_description_keeps_sql_array_and_jsonb_transport_distinct(self):
+        import psycopg
+
+        case = {
+            "sql": "SELECT $1::text[], $2::jsonb, $3::text[]",
+            "params": [
+                {"json": '["hot", null]'},
+                {"json": '["hot", null]'},
+                {"json": "[]"},
+            ],
+        }
+        with self.db.transaction(force_rollback=True):
+            before = self.db.execute(
+                "SELECT count(*) FROM pg_prepared_statements"
+            ).fetchone()
+            oids = describe_parameter_oids(self.db, case)
+            self.assertEqual([1009, 3802, 1009], oids)
+            with psycopg.RawCursor(self.db) as cursor:
+                cursor.execute(case["sql"], parameters(case, oids), binary=True)
+                self.assertEqual((["hot", None], ["hot", None], []), cursor.fetchone())
+                self.assertEqual(
+                    oids, [column.type_code for column in cursor.description]
+                )
+            self.assertEqual(
+                before,
+                self.db.execute(
+                    "SELECT count(*) FROM pg_prepared_statements"
+                ).fetchone(),
+            )
+        with self.assertRaises(psycopg.errors.UndefinedTable) as failure:
+            with self.db.transaction(force_rollback=True):
+                describe_parameter_oids(
+                    self.db,
+                    {"sql": "SELECT * FROM missing_parameter_owner WHERE id = $1"},
+                )
+        self.assertEqual("42P01", failure.exception.sqlstate)
 
     def test_index_namespace_ownership_search_path_and_diagnostics(self):
         import psycopg
@@ -1559,9 +1619,13 @@ class PostgresReferenceTest(unittest.TestCase):
         for case in selected:
             with self.subTest(id=case["id"]):
                 with self.db.transaction(force_rollback=True):
-                    if case["sql"].upper().startswith("ALTER"):
+                    altering = case["sql"].upper().startswith("ALTER")
+                    if altering:
                         self.db.execute(
                             "CREATE TABLE usage_records(id uuid, status text, amount bigint)"
+                        )
+                        self.db.execute(
+                            "INSERT INTO usage_records VALUES ('00000000-0000-0000-0000-000000000001', 'unchanged', 7)"
                         )
                     import psycopg
 
@@ -1569,6 +1633,26 @@ class PostgresReferenceTest(unittest.TestCase):
                         with self.db.transaction(force_rollback=True):
                             self.db.execute(case["sql"])
                     self.assertEqual(error.exception.sqlstate, "0A000")
+                    if altering:
+                        self.assertEqual(
+                            [("unchanged", 7)],
+                            self.db.execute(
+                                "SELECT status, amount FROM usage_records"
+                            ).fetchall(),
+                        )
+                        self.assertEqual(
+                            (0,),
+                            self.db.execute(
+                                "SELECT count(*) FROM pg_attrdef WHERE adrelid = 'usage_records'::regclass"
+                            ).fetchone(),
+                        )
+                    else:
+                        self.assertEqual(
+                            (None,),
+                            self.db.execute(
+                                "SELECT to_regclass('usage_records')"
+                            ).fetchone(),
+                        )
 
     def test_original_generated_subqueries_are_not_postgres_features(self):
         import json
@@ -1724,6 +1808,96 @@ class PostgresReferenceTest(unittest.TestCase):
         self.assertIsNone(
             self.db.execute("SELECT to_regclass('public.usage_records')").fetchone()[0]
         )
+
+    def test_original_noop_mutations_require_conflicting_sources_and_unchanged_postimages(
+        self,
+    ):
+        import json
+        from generate_sql_postgres_reference import mutation_profile
+
+        original = json.loads((FIXTURES / "sql_parity_inventory.json").read_text())[
+            "entries"
+        ]
+        cases = [case for case in original if case["id"] in {"sql-1432", "sql-1462"}]
+        self.assertEqual(2, len(cases))
+        profile = mutation_profile()
+        result = mutation_reference(self.db, cases, profile)
+        self.assertEqual([], result["excluded"])
+        self.assertEqual([0, 0], [entry["affected"] for entry in result["entries"]])
+        for entry in result["entries"]:
+            self.assertEqual("INSERT", entry["command_tag"])
+            self.assertEqual([], entry["rows"])
+            self.assertEqual(
+                {"kind": "primary_conflict_do_nothing", "eligible_rows": 1},
+                entry["noop_contract"],
+            )
+        self.assertEqual(
+            result["entries"][0]["final_tables"], result["entries"][1]["final_tables"]
+        )
+        self.assertEqual(3, len(result["entries"][0]["final_tables"]))
+        for changed_case, changed_profile, message in (
+            (
+                cases[0] | {"sql": "DELETE FROM usage_records WHERE id='u1'"},
+                profile,
+                "exact source",
+            ),
+            (cases[0], profile | {"primary_key": []}, "primary owner"),
+            (
+                cases[0],
+                profile
+                | {
+                    "rows": [
+                        row | {"value": row["value"] | {"status": "not-ready"}}
+                        for row in profile["rows"]
+                    ]
+                },
+                "conflicting source population",
+            ),
+            (
+                self.case("UPDATE usage_records SET status=status WHERE false"),
+                profile,
+                "without a zero-effect contract",
+            ),
+        ):
+            with self.subTest(message=message):
+                rejected = mutation_reference(self.db, [changed_case], changed_profile)
+                self.assertEqual([], rejected["entries"])
+                self.assertIn(message, rejected["excluded"][0]["reason"])
+        bounded = mutation_reference(self.db, cases, profile, byte_limit=1)
+        self.assertEqual([], bounded["entries"])
+        self.assertEqual(2, len(bounded["excluded"]))
+        self.assertTrue(
+            all(
+                "initial state exceeds byte budget" in case["reason"]
+                for case in bounded["excluded"]
+            )
+        )
+        self.assertIsNone(
+            self.db.execute("SELECT to_regclass('public.usage_records')").fetchone()[0]
+        )
+
+    def test_mutation_stream_uses_server_parameter_identity_without_retyping_jsonb_arrays(
+        self,
+    ):
+        cases = [
+            self.case(
+                "UPDATE usage_records SET metadata=jsonb_set(metadata,$1::text[],$2::jsonb,true) WHERE id='u1' RETURNING metadata",
+                [{"json": '["source"]'}, {"json": '"changed"'}],
+            ),
+            self.case(
+                "UPDATE usage_records SET metadata=$1::jsonb WHERE id='u1' RETURNING metadata",
+                [{"json": '["source",null]'}],
+            ),
+        ]
+        result = mutation_reference(self.db, cases, self.mutation_profile())
+        self.assertEqual([], result["excluded"])
+        first, second = result["entries"]
+        self.assertEqual([[{"source": "changed"}]], first["rows"])
+        self.assertEqual([[["source", None]]], second["rows"])
+        for entry in result["entries"]:
+            self.assertEqual(1, entry["affected"])
+            self.assertEqual([3802], entry["column_oids"])
+            self.assertEqual([[False]], entry["sql_nulls"])
 
     def test_mutation_stream_joined_and_conflict_profiles_capture_every_table(self):
         profile = self.mutation_profile()
@@ -2197,15 +2371,20 @@ class PostgresReferenceTest(unittest.TestCase):
         self.assertEqual(235, len(requested))
         cases = [case for case in inventory if case["id"] in requested]
         result = mutation_reference(self.db, cases, profile)
-        self.assertEqual(48, len(result["entries"]))
-        self.assertEqual(187, len(result["excluded"]))
+        self.assertEqual(50, len(result["entries"]))
+        self.assertEqual(185, len(result["excluded"]))
         self.assertEqual(
             requested, {case["id"] for case in result["entries"] + result["excluded"]}
         )
         self.assertEqual(profile, golden["profile"])
         self.assertEqual(golden["entries"], result["entries"])
         for entry in result["entries"]:
-            self.assertGreater(entry["affected"], 0)
+            if entry["id"] in {"sql-1432", "sql-1462"}:
+                self.assertEqual(0, entry["affected"])
+                self.assertEqual(1, entry["noop_contract"]["eligible_rows"])
+            else:
+                self.assertGreater(entry["affected"], 0)
+                self.assertNotIn("noop_contract", entry)
             self.assertEqual(
                 {"usage_records", "archived_records", "source_records"},
                 set(entry["final_tables"]),
