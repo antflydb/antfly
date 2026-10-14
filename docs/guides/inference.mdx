@@ -204,6 +204,14 @@ The chunkers `fixed_bert` and `fixed_bpe` are built in and need no download. Chu
 - **Memory.** Model loads and requests reserve memory before they allocate. The reservation comes from one process envelope shared with storage and caches. Set the envelope with `--process-memory-budget-mb` or `ANTFLY_PROCESS_MEMORY_BUDGET_MB` on `antfly standalone` or `antfly inference run`. Otherwise the cgroup limit is used, and host memory without a cgroup limit. In Kubernetes Burstable pods, set it below the container limit. A request that can never fit returns `MODEL_RESOURCE_LIMIT`. Temporary pressure returns a retryable `MODEL_RESOURCE_BUSY` once idle models have been evicted.
 - **Query priority.** Background enrichment yields to query-time work in the same database process. Embedding backfill pauses (up to 5 s) while a query-time embed is running, and background generation pauses while an interactive generate or chat request is in flight. Backfill that receives `503` retries with backoff.
 
+### Inspecting and controlling the runtime cache
+
+`GET /ai/v1/models/runtime` returns a side-effect-free snapshot of runtimes that are loading or published in the local process. Reading the snapshot does not acquire a model handle, increment its active-request count, or renew its idle timer. `last_used_ms` is an elapsed age, not a wall-clock timestamp. A `loaded` entry means the runtime is published in the cache; consult `backend`, `device`, and `residency_mode` separately because streamed and backend-managed runtimes do not imply that every tensor is GPU-resident.
+
+`POST /ai/v1/models/load` accepts `{"task":"generator","model":"owner/model"}` and synchronously waits for the same shared load flight used by an inference request. It is an optional warm-up: ordinary inference still loads on demand, and a successful response does not prove that an inference request will succeed. The released runtime follows the normal `keep_alive`, capacity, and resource-pressure eviction policy; this endpoint does not pin it.
+
+Each snapshot entry has an opaque, process-scoped `runtime_id`. Pass that exact value to `POST /ai/v1/models/unload` as `{"runtime_id":"..."}`. Unload is idempotent when the entry is already absent. It returns `409` while that incarnation is loading or in use, and for a runtime managed by startup preload configuration. It never drains or force-cancels requests, and a stale ID cannot unload a replacement incarnation. Composite transcriber runtimes follow the same rules. Built-in fixed chunking has no model runtime, and seq2seq rewriter runtimes remain unavailable.
+
 ### When to Split Inference Out
 
 Embedded inference suits a single machine and models that fit comfortably beside the database's caches. Run `antfly inference run` (or an operator `InferencePool`) and point `inference.api_url` at it when:

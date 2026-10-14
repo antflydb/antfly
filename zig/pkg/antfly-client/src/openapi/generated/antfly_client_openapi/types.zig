@@ -5069,6 +5069,14 @@ pub const ConnectedModel = struct {
     dimensions: ?i64 = null,
     /// True when this model is referenced by a configured embedder, generator, reranker, or chunker.
     configured: ?bool = null,
+    /// Inference capabilities advertised by the provider for this model and task.
+    capabilities: ?[]const []const u8 = null,
+    /// Input modalities accepted by the provider's resolved executor.
+    inputs: ?[]const []const u8 = null,
+    /// Pull-time qualified request profile for this exact artifact, when available.
+    qualified_limits: ?std.json.ArrayHashMap(std.json.Value) = null,
+    /// Whether this provider permits clients to show model download commands.
+    allow_downloads: ?bool = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -5076,6 +5084,10 @@ pub const ConnectedModel = struct {
         .{ "display_name", "display_name", true },
         .{ "dimensions", "dimensions", true },
         .{ "configured", "configured", true },
+        .{ "capabilities", "capabilities", true },
+        .{ "inputs", "inputs", true },
+        .{ "qualified_limits", "qualified_limits", true },
+        .{ "allow_downloads", "allow_downloads", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -5100,6 +5112,22 @@ pub const ConnectedModel = struct {
         }
         if (self.configured) |value| {
             try jw.objectField("configured");
+            try jw.write(value);
+        }
+        if (self.capabilities) |value| {
+            try jw.objectField("capabilities");
+            try jw.write(value);
+        }
+        if (self.inputs) |value| {
+            try jw.objectField("inputs");
+            try jw.write(value);
+        }
+        if (self.qualified_limits) |value| {
+            try jw.objectField("qualified_limits");
+            try jw.write(value);
+        }
+        if (self.allow_downloads) |value| {
+            try jw.objectField("allow_downloads");
             try jw.write(value);
         }
         try jw.endObject();
@@ -24407,6 +24435,8 @@ pub const InferenceEmbeddingUsage = struct {
 };
 
 pub const InferenceError = struct {
+    /// Active runtime users when a lifecycle operation returns a busy conflict.
+    active_requests: ?i64 = null,
     /// Stable machine-readable error code
     @"error": []const u8,
     /// Human-readable error description
@@ -24424,6 +24454,7 @@ pub const InferenceError = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "active_requests", "active_requests", true },
         .{ "error", "error", false },
         .{ "message", "message", true },
         .{ "reason", "reason", true },
@@ -24443,6 +24474,10 @@ pub const InferenceError = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.active_requests) |value| {
+            try jw.objectField("active_requests");
+            try jw.write(value);
+        }
         try jw.objectField("error");
         try jw.write(self.@"error");
         if (self.message) |value| {
@@ -25723,6 +25758,183 @@ pub const InferenceModelRef = struct {
         }
         try jw.endObject();
     }
+};
+
+pub const InferenceModelRuntime = struct {
+    /// Opaque process-scoped incarnation identifier used for exact unload.
+    runtime_id: []const u8,
+    state: InferenceModelRuntimeState,
+    runtime_kind: InferenceModelRuntimeKind,
+    active_requests: i64,
+    /// Whether startup preload configuration prevents explicit unload.
+    startup_managed: bool,
+    /// Selected execution backend when known.
+    backend: ?[]const u8 = null,
+    /// Selected device class when known.
+    device: ?[]const u8 = null,
+    residency_mode: InferenceModelRuntimeResidencyMode,
+    /// Elapsed milliseconds since the runtime was last released after use.
+    last_used_ms: i64,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "runtime_id", "runtime_id", false },
+        .{ "state", "state", false },
+        .{ "runtime_kind", "runtime_kind", false },
+        .{ "active_requests", "active_requests", false },
+        .{ "startup_managed", "startup_managed", false },
+        .{ "backend", "backend", true },
+        .{ "device", "device", true },
+        .{ "residency_mode", "residency_mode", false },
+        .{ "last_used_ms", "last_used_ms", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("runtime_id");
+        try jw.write(self.runtime_id);
+        try jw.objectField("state");
+        try jw.write(self.state);
+        try jw.objectField("runtime_kind");
+        try jw.write(self.runtime_kind);
+        try jw.objectField("active_requests");
+        try jw.write(self.active_requests);
+        try jw.objectField("startup_managed");
+        try jw.write(self.startup_managed);
+        if (self.backend) |value| {
+            try jw.objectField("backend");
+            try jw.write(value);
+        }
+        if (self.device) |value| {
+            try jw.objectField("device");
+            try jw.write(value);
+        }
+        try jw.objectField("residency_mode");
+        try jw.write(self.residency_mode);
+        try jw.objectField("last_used_ms");
+        try jw.write(self.last_used_ms);
+        try jw.endObject();
+    }
+};
+
+pub const InferenceModelRuntimeKind = enum {
+    primary,
+    composite,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .primary => "primary",
+            .composite => "composite",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "primary", .primary },
+            .{ "composite", .composite },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const InferenceModelRuntimeLoadRequest = struct {
+    task: InferenceModelKind,
+    model: []const u8,
+};
+
+pub const InferenceModelRuntimeLoadResponse = struct {
+    outcome: []const u8,
+    model: InferenceModelRuntimeModel,
+};
+
+pub const InferenceModelRuntimeModel = struct {
+    task: InferenceModelKind,
+    model: []const u8,
+    load_state: []const u8,
+    runtimes: []const InferenceModelRuntime,
+};
+
+/// Weight storage policy reported by the selected runtime.
+pub const InferenceModelRuntimeResidencyMode = enum {
+    backend_managed,
+    streamed,
+    resident,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .backend_managed => "backend_managed",
+            .streamed => "streamed",
+            .resident => "resident",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "backend_managed", .backend_managed },
+            .{ "streamed", .streamed },
+            .{ "resident", .resident },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const InferenceModelRuntimeResponse = struct {
+    object: []const u8,
+    models: []const InferenceModelRuntimeModel,
+};
+
+pub const InferenceModelRuntimeState = enum {
+    loading,
+    loaded,
+    in_use,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .loading => "loading",
+            .loaded => "loaded",
+            .in_use => "in_use",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "loading", .loading },
+            .{ "loaded", .loaded },
+            .{ "in_use", .in_use },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const InferenceModelRuntimeUnloadRequest = struct {
+    runtime_id: []const u8,
+};
+
+pub const InferenceModelRuntimeUnloadResponse = struct {
+    outcome: []const u8,
 };
 
 pub const InferenceModelsResponse = struct {

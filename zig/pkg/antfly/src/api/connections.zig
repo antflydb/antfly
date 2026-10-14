@@ -65,6 +65,10 @@ pub const ConnectedModel = struct {
     display_name: ?[]const u8 = null,
     dimensions: ?u32 = null,
     configured: ?bool = null,
+    capabilities: ?[]const []const u8 = null,
+    inputs: ?[]const []const u8 = null,
+    qualified_limits: ?std.json.Value = null,
+    allow_downloads: ?bool = null,
 };
 
 pub const InferenceConnection = struct {
@@ -450,10 +454,7 @@ pub const Cache = struct {
 
         pub fn deinitOwned(self: *Entry, alloc: Allocator) void {
             if (self.err_name.len > 0) alloc.free(self.err_name);
-            for (self.models) |*model| {
-                alloc.free(model.name);
-                if (model.display_name) |value| alloc.free(value);
-            }
+            for (self.models) |*model| model.deinit(alloc);
             if (self.models.len > 0) alloc.free(self.models);
             self.* = undefined;
         }
@@ -517,18 +518,23 @@ pub const Cache = struct {
         var copied: usize = 0;
         errdefer {
             for (models[0..copied]) |*model| {
-                alloc.free(model.name);
-                if (model.display_name) |value| alloc.free(value);
+                model.deinit(alloc);
             }
             alloc.free(models);
         }
         for (entry.models, 0..) |model, i| {
-            models[i] = .{
+            var copied_model: list_models.ListedModel = .{
                 .name = try alloc.dupe(u8, model.name),
-                .display_name = if (model.display_name) |value| try alloc.dupe(u8, value) else null,
                 .kind = model.kind,
                 .dimensions = model.dimensions,
+                .allow_downloads = model.allow_downloads,
             };
+            errdefer copied_model.deinit(alloc);
+            copied_model.display_name = if (model.display_name) |value| try alloc.dupe(u8, value) else null;
+            copied_model.capabilities = try dupeStringList(alloc, model.capabilities);
+            copied_model.inputs = try dupeStringList(alloc, model.inputs);
+            copied_model.qualified_limits_json = if (model.qualified_limits_json) |value| try alloc.dupe(u8, value) else null;
+            models[i] = copied_model;
             copied = i + 1;
         }
         return .{
@@ -539,6 +545,26 @@ pub const Cache = struct {
         };
     }
 };
+
+fn dupeStringList(alloc: Allocator, values: []const []const u8) ![][]u8 {
+    if (values.len == 0) return &.{};
+    const owned = try alloc.alloc([]u8, values.len);
+    var copied: usize = 0;
+    errdefer {
+        for (owned[0..copied]) |value| alloc.free(value);
+        alloc.free(owned);
+    }
+    for (values, owned) |value, *destination| {
+        destination.* = try alloc.dupe(u8, value);
+        copied += 1;
+    }
+    return owned;
+}
+
+fn dupeStringListConst(alloc: Allocator, values: []const []const u8) ![]const []const u8 {
+    const owned = try dupeStringList(alloc, values);
+    return owned;
+}
 
 /// Deduped inference provider instance gathered from configs.
 const Instance = struct {
@@ -1066,6 +1092,13 @@ fn modelsMapAlloc(arena: Allocator, models: []const list_models.ListedModel, ins
             .display_name = if (model.display_name) |value| try arena.dupe(u8, value) else null,
             .dimensions = model.dimensions,
             .configured = if (instance.configured_models.contains(model.name)) true else null,
+            .capabilities = if (model.capabilities.len > 0) try dupeStringListConst(arena, model.capabilities) else null,
+            .inputs = if (model.inputs.len > 0) try dupeStringListConst(arena, model.inputs) else null,
+            .qualified_limits = if (model.qualified_limits_json) |json|
+                try std.json.parseFromSliceLeaky(std.json.Value, arena, json, .{})
+            else
+                null,
+            .allow_downloads = model.allow_downloads,
         });
     }
     var map = std.json.ArrayHashMap([]const ConnectedModel){};
@@ -1666,21 +1699,37 @@ test "connection filesystem probes use the explicit filesystem authority" {
 test "connection cache remains valid across every allocation failure" {
     const Runner = struct {
         fn run(alloc: std.mem.Allocator) !void {
+            var source = try list_models.parseAntflyModels(alloc,
+                \\{ "allow_downloads": false, "embedders": { "owner/model": {
+                \\  "dimensions": 768, "capabilities": ["dense", "sparse"],
+                \\  "inputs": ["text", "image"], "qualified_limits": { "max_tokens": 256 }
+                \\} } }
+            );
+            defer source.deinit(alloc);
+            source.models[0].display_name = try alloc.dupe(u8, "Model");
             var cache = Cache.init(alloc);
             defer cache.deinit();
             try cache.store("provider", .{
                 .captured_at_ns = 1,
                 .ok = false,
                 .err_name = @constCast("first failure"),
+                .models = source.models,
             });
             try cache.store("provider", .{
                 .captured_at_ns = 2,
                 .ok = true,
+                .models = source.models,
             });
-            const entry = (try cache.lookupCopy(alloc, "provider", 2, 1)).?;
-            var owned = entry;
+            var owned = (try cache.lookupCopy(alloc, "provider", 2, 1)).?;
             defer owned.deinitOwned(alloc);
             try std.testing.expect(owned.ok);
+            try std.testing.expectEqual(@as(usize, 1), owned.models.len);
+            const model = owned.models[0];
+            try std.testing.expectEqualStrings("Model", model.display_name.?);
+            try std.testing.expectEqualStrings("dense", model.capabilities[0]);
+            try std.testing.expectEqualStrings("image", model.inputs[1]);
+            try std.testing.expectEqualStrings("{\"max_tokens\":256}", model.qualified_limits_json.?);
+            try std.testing.expectEqual(@as(?bool, false), model.allow_downloads);
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});

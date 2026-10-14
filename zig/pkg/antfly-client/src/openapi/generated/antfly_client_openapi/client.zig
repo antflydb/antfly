@@ -633,6 +633,37 @@ pub const Client = struct {
         return ApiResponse(types.InferenceModelsResponse).fromResponse(self.allocator, &resp);
     }
 
+    /// Load a model into the local runtime cache
+    /// POST /ai/v1/models/load
+    pub fn loadModelRuntime(self: *@This(), body: types.InferenceModelRuntimeLoadRequest) !ApiResponse(types.InferenceModelRuntimeLoadResponse) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/models/load", .{self.base_url});
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.InferenceModelRuntimeLoadResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// Inspect locally cached model runtimes
+    /// GET /ai/v1/models/runtime
+    pub fn listModelRuntimes(self: *@This()) !ApiResponse(types.InferenceModelRuntimeResponse) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/models/runtime", .{self.base_url});
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.InferenceModelRuntimeResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// Unload one exact local runtime incarnation
+    /// POST /ai/v1/models/unload
+    pub fn unloadModelRuntime(self: *@This(), body: types.InferenceModelRuntimeUnloadRequest) !ApiResponse(types.InferenceModelRuntimeUnloadResponse) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/models/unload", .{self.base_url});
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.InferenceModelRuntimeUnloadResponse).fromResponse(self.allocator, &resp);
+    }
+
     /// Read text from images (OCR/document understanding)
     /// POST /ai/v1/read
     pub fn readImages(self: *@This(), body: types.InferenceReadRequest) !ApiResponse(types.InferenceReadResponse) {

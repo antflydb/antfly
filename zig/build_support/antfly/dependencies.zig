@@ -731,6 +731,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
             .shared_lib_root = "",
         },
         .backend = .{
+            .allow_downloads = b.option(bool, "allow-downloads", "Advertise support for model acquisition") orelse true,
             .enable_metal = inference_enable_metal,
             .enable_cuda = inference_enable_cuda,
             .cuda_artifacts = inference_cuda_artifacts,

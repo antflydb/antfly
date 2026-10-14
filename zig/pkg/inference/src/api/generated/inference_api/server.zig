@@ -52,6 +52,16 @@ pub fn parseGenerateBatchContentBody(allocator: std.mem.Allocator, body: []const
     return std.json.parseFromSlice(types.GenerateBatchRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Parse the JSON request body for loadModelRuntime.
+pub fn parseLoadModelRuntimeBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.ModelRuntimeLoadRequest) {
+    return std.json.parseFromSlice(types.ModelRuntimeLoadRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Parse the JSON request body for unloadModelRuntime.
+pub fn parseUnloadModelRuntimeBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.ModelRuntimeUnloadRequest) {
+    return std.json.parseFromSlice(types.ModelRuntimeUnloadRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Parse the JSON request body for predict.
 pub fn parsePredictBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.PredictRequest) {
     return std.json.parseFromSlice(types.PredictRequest, allocator, body, .{ .ignore_unknown_fields = true });
@@ -143,6 +153,9 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/generate", .operation_id = "generateContent", .request_body = .buffered, .streaming_response = true },
     .{ .method = "POST", .path = "/generate/batch", .operation_id = "generateBatchContent", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/models", .operation_id = "listModels", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/models/load", .operation_id = "loadModelRuntime", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/models/runtime", .operation_id = "listModelRuntimes", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/models/unload", .operation_id = "unloadModelRuntime", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/predict", .operation_id = "predict", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/predictors", .operation_id = "listPredictors", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/read", .operation_id = "readImages", .request_body = .buffered, .streaming_response = false },
@@ -178,6 +191,9 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "generateContent")) @compileError("ServerRouter: Impl missing required method 'generateContent'");
         if (!@hasDecl(Impl, "generateBatchContent")) @compileError("ServerRouter: Impl missing required method 'generateBatchContent'");
         if (!@hasDecl(Impl, "listModels")) @compileError("ServerRouter: Impl missing required method 'listModels'");
+        if (!@hasDecl(Impl, "loadModelRuntime")) @compileError("ServerRouter: Impl missing required method 'loadModelRuntime'");
+        if (!@hasDecl(Impl, "listModelRuntimes")) @compileError("ServerRouter: Impl missing required method 'listModelRuntimes'");
+        if (!@hasDecl(Impl, "unloadModelRuntime")) @compileError("ServerRouter: Impl missing required method 'unloadModelRuntime'");
         if (!@hasDecl(Impl, "predict")) @compileError("ServerRouter: Impl missing required method 'predict'");
         if (!@hasDecl(Impl, "listPredictors")) @compileError("ServerRouter: Impl missing required method 'listPredictors'");
         if (!@hasDecl(Impl, "readImages")) @compileError("ServerRouter: Impl missing required method 'readImages'");
@@ -211,6 +227,9 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/generate", httpx.Handler.bind(self.impl, generateContent));
             try server.post("/generate/batch", httpx.Handler.bind(self.impl, generateBatchContent));
             try server.get("/models", httpx.Handler.bind(self.impl, listModels));
+            try server.post("/models/load", httpx.Handler.bind(self.impl, loadModelRuntime));
+            try server.get("/models/runtime", httpx.Handler.bind(self.impl, listModelRuntimes));
+            try server.post("/models/unload", httpx.Handler.bind(self.impl, unloadModelRuntime));
             try server.post("/predict", httpx.Handler.bind(self.impl, predict));
             try server.get("/predictors", httpx.Handler.bind(self.impl, listPredictors));
             try server.post("/read", httpx.Handler.bind(self.impl, readImages));
@@ -283,6 +302,24 @@ pub fn ServerRouter(comptime Impl: type) type {
         /// GET /models
         fn listModels(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.listModels(ctx);
+        }
+
+        /// Load a model into the local runtime cache
+        /// POST /models/load
+        fn loadModelRuntime(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.loadModelRuntime(ctx);
+        }
+
+        /// Inspect locally cached model runtimes
+        /// GET /models/runtime
+        fn listModelRuntimes(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.listModelRuntimes(ctx);
+        }
+
+        /// Unload one exact local runtime incarnation
+        /// POST /models/unload
+        fn unloadModelRuntime(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.unloadModelRuntime(ctx);
         }
 
         /// Run a traditional ML predictor
@@ -381,6 +418,9 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn generateContent(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn generateBatchContent(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn listModels(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn loadModelRuntime(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn listModelRuntimes(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn unloadModelRuntime(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn predict(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn listPredictors(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn readImages(self: *Impl, ctx: *httpx.Context) !httpx.Response

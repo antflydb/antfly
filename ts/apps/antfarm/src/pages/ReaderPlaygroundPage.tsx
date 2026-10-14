@@ -5,7 +5,6 @@ import {
   CardContent,
   CardHeader,
   CardTitle,
-  DashboardPage,
   DashboardPageActions,
   DashboardPageDescription,
   DashboardPageHeader,
@@ -25,20 +24,28 @@ import {
   TabsList,
   TabsTrigger,
 } from "@antfly/design-system";
-import { ReloadIcon } from "@radix-ui/react-icons";
 import { Clock, Copy, FileText, Hash, RotateCcw, ScanLine, Upload, X, Zap } from "lucide-react";
 import type React from "react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  AIWorkflowContextBar,
+  AIWorkflowPage,
+  AIWorkflowSubmitButton,
+} from "@/components/ai-workflow";
 import { PlaygroundEmptyState } from "@/components/branded-empty-state";
 import { BackendInfoBar } from "@/components/playground/BackendInfoBar";
 import { NoModelsGuide } from "@/components/playground/NoModelsGuide";
 import { useApiConfig } from "@/hooks/use-api-config";
-import { useSelectedInferenceModelNames } from "@/hooks/use-connections";
-import { fetchWithRetry } from "@/lib/utils";
+import { useSelectedInferenceModels } from "@/hooks/use-connections";
+import { useModelSelection } from "@/hooks/use-model-selection";
+import { findIndexedResult, modelsAcceptingInput } from "@/lib/inference-playground-contracts";
+import { beginAbortableRequest, fetchInferenceJson, finishAbortableRequest } from "@/lib/utils";
 
 // --- Local type definitions ---
 
 interface ReadResult {
+  object: "read";
+  index: number;
   text: string;
   fields?: Record<string, string>;
   regions?: TextRegion[];
@@ -52,8 +59,9 @@ interface TextRegion {
 }
 
 interface ReadResponse {
+  object: "list";
   model: string;
-  results: ReadResult[];
+  data: ReadResult[];
 }
 
 interface UploadedImage {
@@ -135,18 +143,15 @@ function copyToClipboard(text: string) {
 // --- Component ---
 
 const ReaderPlaygroundPage: React.FC = () => {
-  const { inferenceUrl } = useApiConfig();
+  const { inferenceUrl, inferenceApiUrl, inferenceConnectionId } = useApiConfig();
 
   // Shared state
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [processingTime, setProcessingTime] = useState<number | null>(null);
-  const [availableReaders, setAvailableReaders] = useState<string[]>([]);
-  const [modelsLoaded, setModelsLoaded] = useState(false);
   const abortControllerRef = useRef<AbortController | null>(null);
 
   // Image OCR state
-  const [selectedReaderModel, setSelectedReaderModel] = useState("");
   const [images, setImages] = useState<UploadedImage[]>([]);
   const [prompt, setPrompt] = useState("");
   const [maxTokens, setMaxTokens] = useState<string>("");
@@ -159,16 +164,29 @@ const ReaderPlaygroundPage: React.FC = () => {
 
   // Refs
   const imageInputRef = useRef<HTMLInputElement>(null);
-  const { models: connectionModels, loading: modelsLoading } =
-    useSelectedInferenceModelNames("reader");
+  const { models: connectedModels, loading: modelsLoading } = useSelectedInferenceModels("reader");
+  const connectionModels = useMemo(
+    () => modelsAcceptingInput(connectedModels, "image").map((model) => model.name),
+    [connectedModels]
+  );
+  const availableReaders = connectionModels;
+  const modelsLoaded = !modelsLoading;
+  const { model: selectedReaderModel, setModel: setSelectedReaderModel } = useModelSelection({
+    models: availableReaders,
+  });
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: model/backend identity invalidates in-flight results
   useEffect(() => {
-    setAvailableReaders(connectionModels);
-    setSelectedReaderModel((current) =>
-      current && connectionModels.includes(current) ? current : connectionModels[0] || ""
-    );
-    setModelsLoaded(!modelsLoading);
-  }, [connectionModels, modelsLoading]);
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = null;
+    setIsLoading(false);
+    setReadResult(null);
+    setError(null);
+    setProcessingTime(null);
+    setSelectedImageIndex(0);
+    setOutputTab("text");
+    return () => abortControllerRef.current?.abort();
+  }, [selectedReaderModel, inferenceApiUrl, inferenceConnectionId]);
 
   // Auto-set prompt based on selected model (only when prompt is empty or a known auto-value)
   useEffect(() => {
@@ -246,11 +264,7 @@ const ReaderPlaygroundPage: React.FC = () => {
       return;
     }
 
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
-    }
-
-    abortControllerRef.current = new AbortController();
+    const controller = beginAbortableRequest(abortControllerRef);
     setIsLoading(true);
     setError(null);
     setReadResult(null);
@@ -266,28 +280,27 @@ const ReaderPlaygroundPage: React.FC = () => {
       if (maxTokens && Number.parseInt(maxTokens, 10) > 0)
         body.max_tokens = Number.parseInt(maxTokens, 10);
 
-      const response = await fetchWithRetry(inferenceUrl("read"), {
+      const data = await fetchInferenceJson<ReadResponse>(inferenceUrl("read"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
-        signal: abortControllerRef.current.signal,
+        signal: controller.signal,
       });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(errorText || `HTTP ${response.status}`);
-      }
-
-      const data: ReadResponse = await response.json();
+      if (abortControllerRef.current !== controller || controller.signal.aborted) return;
       setReadResult(data);
       setProcessingTime(performance.now() - startTime);
       setSelectedImageIndex(0);
       setOutputTab("text");
     } catch (err) {
-      if (err instanceof Error && err.name === "AbortError") return;
+      if (
+        abortControllerRef.current !== controller ||
+        controller.signal.aborted ||
+        (err instanceof Error && err.name === "AbortError")
+      )
+        return;
       setError(err instanceof Error ? err.message : "Failed to connect to inference");
     } finally {
-      setIsLoading(false);
+      if (finishAbortableRequest(abortControllerRef, controller)) setIsLoading(false);
     }
   };
 
@@ -297,6 +310,7 @@ const ReaderPlaygroundPage: React.FC = () => {
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
     }
+    abortControllerRef.current = null;
     setImages([]);
     setPrompt("");
     setMaxTokens("");
@@ -323,10 +337,7 @@ const ReaderPlaygroundPage: React.FC = () => {
   };
 
   // Current result for selected image
-  const currentResult =
-    readResult?.results && readResult.results.length > selectedImageIndex
-      ? readResult.results[selectedImageIndex]
-      : null;
+  const currentResult = readResult ? findIndexedResult(readResult.data, selectedImageIndex) : null;
 
   const hasFields = currentResult?.fields && Object.keys(currentResult.fields).length > 0;
   const hasRegions = currentResult?.regions && currentResult.regions.length > 0;
@@ -348,7 +359,7 @@ const ReaderPlaygroundPage: React.FC = () => {
   }, [outputTab, hasFields, hasRegions]);
 
   return (
-    <DashboardPage className="h-full space-y-3">
+    <AIWorkflowPage className="h-full space-y-3">
       <DashboardPageHeader>
         <div>
           <DashboardPageTitle className="font-aeonik">Reader Playground</DashboardPageTitle>
@@ -367,13 +378,12 @@ const ReaderPlaygroundPage: React.FC = () => {
           </Button>
         </DashboardPageActions>
       </DashboardPageHeader>
-
-      <BackendInfoBar />
-
+      <AIWorkflowContextBar>
+        <BackendInfoBar />
+      </AIWorkflowContextBar>
       {modelsLoaded && availableReaders.length === 0 && (
         <NoModelsGuide modelType="reader" typeName="reader" />
       )}
-
       {/* Content */}
       <div className="space-y-6">
         {/* Config */}
@@ -431,33 +441,29 @@ const ReaderPlaygroundPage: React.FC = () => {
               </div>
             </div>
             <FormActions>
-              <Button
+              <AIWorkflowSubmitButton
                 onClick={handleReadImages}
                 disabled={isLoading || images.length === 0 || !selectedReaderModel}
+                running={isLoading}
+                runningLabel="Reading…"
+                onCancel={() => {
+                  abortControllerRef.current?.abort();
+                  abortControllerRef.current = null;
+                  setIsLoading(false);
+                }}
               >
-                {isLoading ? (
-                  <>
-                    <ReloadIcon className="h-4 w-4 mr-2 animate-spin" />
-                    Reading...
-                  </>
-                ) : (
-                  <>
-                    <ScanLine className="h-4 w-4 mr-2" />
-                    Read Images
-                  </>
-                )}
-              </Button>
+                <ScanLine className="h-4 w-4 mr-2" />
+                Read Images
+              </AIWorkflowSubmitButton>
             </FormActions>
           </CardContent>
         </Card>
-
         {/* Error */}
         {error && (
           <div className="p-4 bg-destructive/10 border border-destructive/30 rounded-none text-destructive text-sm">
             {error}
           </div>
         )}
-
         {/* Stats */}
         {readResult && (
           <DashboardToolbar className="flex-row items-center gap-3 md:items-center">
@@ -477,7 +483,6 @@ const ReaderPlaygroundPage: React.FC = () => {
             )}
           </DashboardToolbar>
         )}
-
         {/* Side-by-side panels */}
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           {/* Input: Upload & Previews */}
@@ -583,18 +588,24 @@ const ReaderPlaygroundPage: React.FC = () => {
               {readResult && currentResult ? (
                 <div className="space-y-4">
                   {/* Image selector if multiple results */}
-                  {readResult.results.length > 1 && (
+                  {readResult.data.length > 1 && (
                     <div className="flex gap-1 flex-wrap">
-                      {images.slice(0, readResult.results.length).map((img, idx) => (
-                        <Button
-                          key={`image-${img.id}`}
-                          variant={selectedImageIndex === idx ? "default" : "outline"}
-                          size="sm"
-                          onClick={() => setSelectedImageIndex(idx)}
-                        >
-                          Image {idx + 1}
-                        </Button>
-                      ))}
+                      {[...readResult.data]
+                        .sort((a, b) => a.index - b.index)
+                        .map((item) => {
+                          const image = images[item.index];
+                          if (!image) return null;
+                          return (
+                            <Button
+                              key={`image-${image.id}`}
+                              variant={selectedImageIndex === item.index ? "default" : "outline"}
+                              size="sm"
+                              onClick={() => setSelectedImageIndex(item.index)}
+                            >
+                              Image {item.index + 1}
+                            </Button>
+                          );
+                        })}
                     </div>
                   )}
 
@@ -772,7 +783,6 @@ const ReaderPlaygroundPage: React.FC = () => {
           </Card>
         </div>
       </div>
-
       {/* Help text */}
       <div className="text-xs text-muted-foreground space-y-1">
         <p>
@@ -780,7 +790,7 @@ const ReaderPlaygroundPage: React.FC = () => {
           Donut, Florence, TrOCR). Set a prompt to guide extraction for specific models.
         </p>
       </div>
-    </DashboardPage>
+    </AIWorkflowPage>
   );
 };
 

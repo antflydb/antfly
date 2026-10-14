@@ -53,4 +53,55 @@ describe("transformConnectionModels", () => {
     expect(models).toHaveLength(1);
     expect(models[0]).toMatchObject({ name: "Acme Chat", source: "acme/chat" });
   });
+
+  it("preserves server-advertised execution metadata", () => {
+    const models = transformConnectionModels([
+      {
+        id: "local-inference",
+        name: "local-inference",
+        kind: "inference",
+        status: "connected",
+        capabilities: ["models.extractor"],
+        inference: {
+          provider: "antfly",
+          models: {
+            extractors: [
+              {
+                name: "acme/extract",
+                capabilities: ["relations", "answers"],
+                inputs: ["text"],
+                qualified_limits: { max_tokens: 512 },
+                allow_downloads: true,
+              },
+            ],
+          },
+        },
+      } as unknown as Connection,
+    ]);
+
+    expect(models[0]).toMatchObject({
+      capabilities: ["relations", "answers"],
+      inputs: ["text"],
+      qualifiedLimits: { max_tokens: 512 },
+      allowDownloads: true,
+    });
+  });
+
+  it("keeps unsupported seq2seq models out of the active catalog", () => {
+    const models = transformConnectionModels([
+      {
+        id: "local-inference",
+        name: "local-inference",
+        kind: "inference",
+        status: "connected",
+        capabilities: [],
+        inference: {
+          provider: "antfly",
+          models: { rewriters: [{ name: "acme/rewrite" }] },
+        },
+      },
+    ]);
+
+    expect(models).toEqual([]);
+  });
 });

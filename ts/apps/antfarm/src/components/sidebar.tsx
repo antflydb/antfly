@@ -35,7 +35,6 @@ import {
   PanelLeft,
   Plug,
   Plus,
-  Repeat2,
   RotateCw,
   ScanLine,
   Scissors,
@@ -371,7 +370,7 @@ export function AppSidebar({ currentSection, onSectionChange, ...props }: AppSid
 
         {isProductEnabled("inference") && (
           <SidebarGroup>
-            <SidebarGroupLabel className="mono-label">Models</SidebarGroupLabel>
+            <SidebarGroupLabel className="mono-label">AI workspace</SidebarGroupLabel>
             <SidebarGroupContent>
               <SidebarMenu>
                 <SidebarMenuItem>
@@ -388,7 +387,7 @@ export function AppSidebar({ currentSection, onSectionChange, ...props }: AppSid
                       }}
                     >
                       <Library className="size-4" />
-                      <span>Runtime</span>
+                      <span>Models</span>
                     </a>
                   </SidebarMenuButton>
                 </SidebarMenuItem>
@@ -430,24 +429,6 @@ export function AppSidebar({ currentSection, onSectionChange, ...props }: AppSid
                     >
                       <Tag className="size-4" />
                       <span>Extract</span>
-                    </a>
-                  </SidebarMenuButton>
-                </SidebarMenuItem>
-                <SidebarMenuItem>
-                  <SidebarMenuButton
-                    asChild
-                    isActive={isPath("/inference/playground/rewrite")}
-                    tooltip="Rewrite"
-                  >
-                    <a
-                      href="/inference/playground/rewrite"
-                      onClick={(event) => {
-                        event.preventDefault();
-                        navigate("/inference/playground/rewrite");
-                      }}
-                    >
-                      <Repeat2 className="size-4" />
-                      <span>Rewrite</span>
                     </a>
                   </SidebarMenuButton>
                 </SidebarMenuItem>

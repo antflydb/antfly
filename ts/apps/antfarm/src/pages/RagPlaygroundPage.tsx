@@ -10,12 +10,7 @@ import {
   Collapsible,
   CollapsibleContent,
   CollapsibleTrigger,
-  DashboardPage,
   DashboardPageActions,
-  DashboardPageDescription,
-  DashboardPageHeader,
-  DashboardPageTitle,
-  DashboardToolbar,
   Input,
   Label,
   Separator,
@@ -44,7 +39,8 @@ import {
   Zap,
 } from "lucide-react";
 import type React from "react";
-import { useCallback, useMemo, useReducer, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
+import { AIWorkflowHeader, AIWorkflowPage } from "@/components/ai-workflow";
 import { chatGPTErrorMessage, useChatGPT } from "@/components/chatgpt-provider";
 import {
   formatGeneratorSummary,
@@ -62,6 +58,7 @@ import {
   pipelineReducer,
   type SearchStepData,
 } from "@/components/rag/pipeline-types";
+import { AskModeNavigation, RetrievalContextBar } from "@/components/retrieval-context";
 import { useApiConfig } from "@/hooks/use-api-config";
 import { useGeneratorPreference } from "@/hooks/use-generator-preference";
 import { useTable } from "@/hooks/use-table";
@@ -186,7 +183,7 @@ const RagPlaygroundPage: React.FC = () => {
   const [generatorOverride, setGeneratorOverride] = useState<GeneratorConfig | null>(null);
   const [limit, setLimit] = useState(10);
   const [steps, setSteps] = useState<StepsConfig>(DEFAULT_STEPS);
-  const [settingsOpen, setSettingsOpen] = useState(true);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const effectiveGenerator = generatorOverride ?? dashboardGenerator ?? null;
   const effectiveGeneratorModel =
     effectiveGenerator && "model" in effectiveGenerator ? effectiveGenerator.model : undefined;
@@ -200,6 +197,22 @@ const RagPlaygroundPage: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
   const [processingTime, setProcessingTime] = useState<number | null>(null);
   const [contextOpen, setContextOpen] = useState(false);
+  const [resetVersion, setResetVersion] = useState(0);
+
+  const requestControllerRef = useRef<AbortController | null>(null);
+  const handleController = useCallback((controller: AbortController) => {
+    requestControllerRef.current = controller;
+  }, []);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: Request context changes invalidate the active run and its results.
+  useEffect(() => {
+    setIsLoading(false);
+    setError(null);
+    setProcessingTime(null);
+    dispatchPipeline({ type: "RESET" });
+    return () => {
+      requestControllerRef.current?.abort();
+    };
+  }, [apiUrl, selectedTable, selectedIndex, effectiveGenerator]);
 
   const startTimeRef = useRef<number>(0);
 
@@ -210,6 +223,9 @@ const RagPlaygroundPage: React.FC = () => {
   const searchCompletedRef = useRef(false);
 
   const handleReset = () => {
+    requestControllerRef.current?.abort();
+    setResetVersion((version) => version + 1);
+    setIsLoading(false);
     setQuery("");
     setError(null);
     setProcessingTime(null);
@@ -544,6 +560,7 @@ const RagPlaygroundPage: React.FC = () => {
                 </CollapsibleContent>
               </Collapsible>
             )}
+            onController={handleController}
             onStreamStart={handleStreamStart}
             onStreamEnd={handleStreamEnd}
             onError={handleError}
@@ -572,6 +589,7 @@ const RagPlaygroundPage: React.FC = () => {
       limit,
       selectedIndex,
       contextOpen,
+      handleController,
       handleStreamStart,
       handleStreamEnd,
       handleError,
@@ -585,37 +603,42 @@ const RagPlaygroundPage: React.FC = () => {
   );
 
   return (
-    <Antfly url={apiUrl} table={selectedTable || ""}>
-      <DashboardPage className="h-full space-y-3">
-        <DashboardPageHeader>
-          <div>
-            <DashboardPageTitle className="font-aeonik">RAG Playground</DashboardPageTitle>
-            <DashboardPageDescription>
-              Query your documents with AI-powered retrieval and generation
-            </DashboardPageDescription>
-          </div>
-          <DashboardPageActions>
-            <Button variant="outline" onClick={handleReset}>
-              <RotateCcw className="h-4 w-4 mr-2" />
-              Reset
-            </Button>
-          </DashboardPageActions>
-        </DashboardPageHeader>
+    <Antfly
+      key={`${resetVersion}:${apiUrl}:${selectedTable}:${selectedIndex}:${JSON.stringify(effectiveGenerator)}`}
+      url={apiUrl}
+      table={selectedTable || ""}
+    >
+      <AIWorkflowPage className="h-full" aria-busy={isLoading}>
+        <AIWorkflowHeader
+          eyebrow="Retrieval"
+          title="Answer pipeline"
+          description="Inspect retrieval, generation, and the evidence behind an answer."
+          actions={
+            <DashboardPageActions>
+              {isLoading ? (
+                <Button
+                  variant="outline"
+                  onClick={() => {
+                    requestControllerRef.current?.abort();
+                    setIsLoading(false);
+                    dispatchPipeline({ type: "STOP" });
+                  }}
+                >
+                  Stop
+                </Button>
+              ) : null}
+              <Button variant="outline" onClick={handleReset}>
+                <RotateCcw className="h-4 w-4 mr-2" />
+                Reset
+              </Button>
+            </DashboardPageActions>
+          }
+        />
 
-        {/* Active Table/Index Indicator */}
-        {selectedTable ? (
-          <DashboardToolbar className="flex-row items-center gap-2 text-sm text-muted-foreground md:items-center">
-            <Badge>{selectedTable}</Badge>
-            {selectedIndex && <Badge>{selectedIndex}</Badge>}
-          </DashboardToolbar>
-        ) : (
-          <DashboardToolbar className="border-dashed text-sm text-muted-foreground">
-            Select a table from the sidebar to get started.
-          </DashboardToolbar>
-        )}
-
+        <AskModeNavigation />
+        <RetrievalContextBar />
         {/* Main Grid */}
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,360px)_minmax(0,1fr)] gap-6">
           {/* Left Column - Query & Settings */}
           <div className="space-y-4">
             {/* Query Card */}
@@ -633,7 +656,10 @@ const RagPlaygroundPage: React.FC = () => {
                       <Textarea
                         placeholder="Enter your question..."
                         value={value}
-                        onChange={(e) => onChange(e.target.value)}
+                        onChange={(e) => {
+                          setQuery(e.target.value);
+                          onChange(e.target.value);
+                        }}
                         className="min-h-[100px] resize-none"
                         onKeyDown={(e) => {
                           if (
@@ -679,7 +705,10 @@ const RagPlaygroundPage: React.FC = () => {
               <Collapsible open={settingsOpen} onOpenChange={setSettingsOpen}>
                 <CardHeader className="pb-3">
                   <CollapsibleTrigger asChild>
-                    <div className="flex items-center justify-between cursor-pointer">
+                    <button
+                      type="button"
+                      className="flex w-full items-center justify-between text-left"
+                    >
                       <CardTitle className="text-lg flex items-center gap-2">
                         <Settings className="h-4 w-4" />
                         Settings
@@ -689,7 +718,7 @@ const RagPlaygroundPage: React.FC = () => {
                       ) : (
                         <ChevronRight className="h-4 w-4" />
                       )}
-                    </div>
+                    </button>
                   </CollapsibleTrigger>
                 </CardHeader>
                 <CollapsibleContent>
@@ -906,7 +935,7 @@ const RagPlaygroundPage: React.FC = () => {
             follow-up questions, and confidence scoring in Settings.
           </p>
         </div>
-      </DashboardPage>
+      </AIWorkflowPage>
     </Antfly>
   );
 };

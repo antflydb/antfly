@@ -12014,6 +12014,141 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/InferenceError'
+  /ai/v1/models/runtime:
+    get:
+      summary: Inspect locally cached model runtimes
+      description: >
+        Returns a side-effect-free snapshot of model runtimes that are loading or
+
+        cached by this inference process. Reading this endpoint does not keep a
+
+        runtime alive or renew its idle eviction timer. A loaded runtime is a
+
+        published cache entry; its weights may still use a streamed, paged, or
+
+        backend-managed storage policy.
+      operationId: listModelRuntimes
+      responses:
+        '200':
+          description: Runtime snapshot retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceModelRuntimeResponse'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '401':
+          description: Authentication is enabled and valid credentials were not supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '503':
+          description: The unified Antfly server also returns this status when authentication is enabled
+            but its backend is not ready.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+  /ai/v1/models/load:
+    post:
+      summary: Load a model into the local runtime cache
+      description: >
+        Resolves and loads the same runtime used by an inference request, waits
+
+        for the shared load flight to finish, and releases the request handle.
+
+        The resulting runtime follows the normal idle and resource-pressure
+
+        eviction policy and is not pinned by this operation.
+      operationId: loadModelRuntime
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InferenceModelRuntimeLoadRequest'
+      responses:
+        '200':
+          description: The runtime load completed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceModelRuntimeLoadResponse'
+        '400':
+          description: Invalid or unsupported model task
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '404':
+          description: Model not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '503':
+          $ref: '#/components/responses/TransientCapacity'
+          description: Inference service unavailable. The unified Antfly server also returns this status
+            when authentication is enabled but its backend is not ready.
+        '401':
+          description: Authentication is enabled and valid credentials were not supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+  /ai/v1/models/unload:
+    post:
+      summary: Unload one exact local runtime incarnation
+      description: >
+        Evicts the exact runtime identified by runtime_id only when it is idle.
+
+        Missing or stale identifiers are idempotent and never evict a replacement
+
+        incarnation. Loading, active, and startup-managed runtimes return 409.
+      operationId: unloadModelRuntime
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InferenceModelRuntimeUnloadRequest'
+      responses:
+        '200':
+          description: Runtime unloaded or already absent
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceModelRuntimeUnloadResponse'
+        '400':
+          description: Invalid runtime identifier
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '409':
+          description: Runtime is loading, in use, or managed by startup preload configuration
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '401':
+          description: Authentication is enabled and valid credentials were not supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '503':
+          description: The unified Antfly server also returns this status when authentication is enabled
+            but its backend is not ready.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
   /ai/v1/embeddings:
     post:
       summary: Create embeddings (OpenAI-compatible)
@@ -15090,6 +15225,23 @@ components:
           type: boolean
           description: True when this model is referenced by a configured embedder, generator, reranker,
             or chunker.
+        capabilities:
+          type: array
+          items:
+            type: string
+          description: Inference capabilities advertised by the provider for this model and task.
+        inputs:
+          type: array
+          items:
+            type: string
+          description: Input modalities accepted by the provider's resolved executor.
+        qualified_limits:
+          type: object
+          additionalProperties: true
+          description: Pull-time qualified request profile for this exact artifact, when available.
+        allow_downloads:
+          type: boolean
+          description: Whether this provider permits clients to show model download commands.
     InferenceConnection:
       type: object
       required:
@@ -36511,6 +36663,10 @@ components:
       required:
         - error
       properties:
+        active_requests:
+          type: integer
+          minimum: 0
+          description: Active runtime users when a lifecycle operation returns a busy conflict.
         error:
           type: string
           description: Stable machine-readable error code
@@ -37912,6 +38068,139 @@ components:
           items:
             type: string
           description: List of input modalities this model accepts, such as `text`, `image`, or `audio`
+    InferenceModelRuntimeState:
+      type: string
+      enum:
+        - loading
+        - loaded
+        - in_use
+    InferenceModelRuntimeKind:
+      type: string
+      enum:
+        - primary
+        - composite
+    InferenceModelRuntimeResidencyMode:
+      type: string
+      description: Weight storage policy reported by the selected runtime.
+      enum:
+        - backend_managed
+        - streamed
+        - resident
+    InferenceModelRuntime:
+      type: object
+      required:
+        - runtime_id
+        - state
+        - runtime_kind
+        - active_requests
+        - startup_managed
+        - residency_mode
+        - last_used_ms
+      properties:
+        runtime_id:
+          type: string
+          description: Opaque process-scoped incarnation identifier used for exact unload.
+        state:
+          $ref: '#/components/schemas/InferenceModelRuntimeState'
+        runtime_kind:
+          $ref: '#/components/schemas/InferenceModelRuntimeKind'
+        active_requests:
+          type: integer
+          minimum: 0
+        startup_managed:
+          type: boolean
+          description: Whether startup preload configuration prevents explicit unload.
+        backend:
+          type: string
+          description: Selected execution backend when known.
+        device:
+          type: string
+          description: Selected device class when known.
+        residency_mode:
+          $ref: '#/components/schemas/InferenceModelRuntimeResidencyMode'
+        last_used_ms:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Elapsed milliseconds since the runtime was last released after use.
+    InferenceModelRuntimeModel:
+      type: object
+      required:
+        - task
+        - model
+        - load_state
+        - runtimes
+      properties:
+        task:
+          $ref: '#/components/schemas/InferenceModelKind'
+        model:
+          type: string
+        load_state:
+          type: string
+          enum:
+            - idle
+            - loading
+        runtimes:
+          type: array
+          items:
+            $ref: '#/components/schemas/InferenceModelRuntime'
+    InferenceModelRuntimeResponse:
+      type: object
+      required:
+        - object
+        - models
+      properties:
+        object:
+          type: string
+          enum:
+            - model_runtime
+        models:
+          type: array
+          items:
+            $ref: '#/components/schemas/InferenceModelRuntimeModel'
+    InferenceModelRuntimeLoadRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - task
+        - model
+      properties:
+        task:
+          $ref: '#/components/schemas/InferenceModelKind'
+        model:
+          type: string
+          minLength: 1
+    InferenceModelRuntimeLoadResponse:
+      type: object
+      required:
+        - outcome
+        - model
+      properties:
+        outcome:
+          type: string
+          enum:
+            - loaded
+        model:
+          $ref: '#/components/schemas/InferenceModelRuntimeModel'
+    InferenceModelRuntimeUnloadRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - runtime_id
+      properties:
+        runtime_id:
+          type: string
+          minLength: 1
+    InferenceModelRuntimeUnloadResponse:
+      type: object
+      required:
+        - outcome
+      properties:
+        outcome:
+          type: string
+          enum:
+            - unloaded
+            - already_unloaded
     InferenceDecideRequest:
       type: object
       additionalProperties: false

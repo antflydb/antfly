@@ -150,6 +150,7 @@ from .confidence_step_config import ConfidenceStepConfig
 from .configure_extension_request import ConfigureExtensionRequest
 from .conjunction_query import ConjunctionQuery
 from .connected_model import ConnectedModel
+from .connected_model_qualified_limits import ConnectedModelQualifiedLimits
 from .connected_model_type import ConnectedModelType
 from .connection import Connection
 from .connection_kind import ConnectionKind
@@ -862,6 +863,20 @@ from .inference_model_kind import InferenceModelKind
 from .inference_model_quantization import InferenceModelQuantization
 from .inference_model_ref import InferenceModelRef
 from .inference_model_ref_cuda_precision import InferenceModelRefCudaPrecision
+from .inference_model_runtime import InferenceModelRuntime
+from .inference_model_runtime_kind import InferenceModelRuntimeKind
+from .inference_model_runtime_load_request import InferenceModelRuntimeLoadRequest
+from .inference_model_runtime_load_response import InferenceModelRuntimeLoadResponse
+from .inference_model_runtime_load_response_outcome import InferenceModelRuntimeLoadResponseOutcome
+from .inference_model_runtime_model import InferenceModelRuntimeModel
+from .inference_model_runtime_model_load_state import InferenceModelRuntimeModelLoadState
+from .inference_model_runtime_residency_mode import InferenceModelRuntimeResidencyMode
+from .inference_model_runtime_response import InferenceModelRuntimeResponse
+from .inference_model_runtime_response_object import InferenceModelRuntimeResponseObject
+from .inference_model_runtime_state import InferenceModelRuntimeState
+from .inference_model_runtime_unload_request import InferenceModelRuntimeUnloadRequest
+from .inference_model_runtime_unload_response import InferenceModelRuntimeUnloadResponse
+from .inference_model_runtime_unload_response_outcome import InferenceModelRuntimeUnloadResponseOutcome
 from .inference_models_response import InferenceModelsResponse
 from .inference_models_response_chunkers import InferenceModelsResponseChunkers
 from .inference_models_response_data_item import InferenceModelsResponseDataItem
@@ -1660,6 +1675,7 @@ __all__ = (
     "ConfigureExtensionRequest",
     "ConjunctionQuery",
     "ConnectedModel",
+    "ConnectedModelQualifiedLimits",
     "ConnectedModelType",
     "Connection",
     "ConnectionKind",
@@ -2364,6 +2380,20 @@ __all__ = (
     "InferenceModelQuantization",
     "InferenceModelRef",
     "InferenceModelRefCudaPrecision",
+    "InferenceModelRuntime",
+    "InferenceModelRuntimeKind",
+    "InferenceModelRuntimeLoadRequest",
+    "InferenceModelRuntimeLoadResponse",
+    "InferenceModelRuntimeLoadResponseOutcome",
+    "InferenceModelRuntimeModel",
+    "InferenceModelRuntimeModelLoadState",
+    "InferenceModelRuntimeResidencyMode",
+    "InferenceModelRuntimeResponse",
+    "InferenceModelRuntimeResponseObject",
+    "InferenceModelRuntimeState",
+    "InferenceModelRuntimeUnloadRequest",
+    "InferenceModelRuntimeUnloadResponse",
+    "InferenceModelRuntimeUnloadResponseOutcome",
     "InferenceModelsResponse",
     "InferenceModelsResponseChunkers",
     "InferenceModelsResponseDataItem",

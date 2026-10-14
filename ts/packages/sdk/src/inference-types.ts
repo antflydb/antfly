@@ -112,3 +112,16 @@ export interface RequestOptions {
   /** AbortSignal to cancel the request */
   signal?: AbortSignal;
 }
+
+// Local model runtime lifecycle contracts.
+export type ModelRuntimeState = components["schemas"]["InferenceModelRuntimeState"];
+export type ModelRuntimeKind = components["schemas"]["InferenceModelRuntimeKind"];
+export type ModelRuntimeResidencyMode = components["schemas"]["InferenceModelRuntimeResidencyMode"];
+export type ModelRuntime = components["schemas"]["InferenceModelRuntime"];
+export type ModelRuntimeModel = components["schemas"]["InferenceModelRuntimeModel"];
+export type ModelRuntimeResponse = components["schemas"]["InferenceModelRuntimeResponse"];
+export type ModelRuntimeLoadRequest = components["schemas"]["InferenceModelRuntimeLoadRequest"];
+export type ModelRuntimeLoadResponse = components["schemas"]["InferenceModelRuntimeLoadResponse"];
+export type ModelRuntimeUnloadRequest = components["schemas"]["InferenceModelRuntimeUnloadRequest"];
+export type ModelRuntimeUnloadResponse =
+  components["schemas"]["InferenceModelRuntimeUnloadResponse"];

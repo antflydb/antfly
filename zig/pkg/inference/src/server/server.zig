@@ -4031,11 +4031,14 @@ pub const Node = struct {
         else
             null;
         errdefer if (hard_cancellation_watchdog) |watchdog| watchdog.destroy();
+        var runtime_epoch_bytes: [8]u8 = undefined;
+        try fillRandomBytes(&runtime_epoch_bytes);
+        const runtime_epoch = std.mem.readInt(u64, &runtime_epoch_bytes, .little);
         var node: Node = .{
             .config = config,
             .allocator = allocator,
             .session_manager = session_manager,
-            .model_manager = model_manager_mod.ModelManager.init(allocator, session_manager),
+            .model_manager = model_manager_mod.ModelManager.initWithRuntimeEpoch(allocator, session_manager, runtime_epoch),
             .registry = registry_mod.ModelRegistry.init(allocator, config.models_dir),
             .extraction_reader_resolver = extractors_mod.ReaderResolver.init(allocator),
             .tabular_registry = tabular_mod.registry.Registry.init(allocator),
@@ -6044,7 +6047,8 @@ pub const Node = struct {
             .generator => try self.warmGeneratorWithBackend(allocator, model.name, model.backend, a4b_request),
             .embedder => try self.warmEmbedder(allocator, model.name, model.backend, materialize_optional_sessions),
             .reranker => try self.warmReranker(allocator, model.name, model.backend),
-            .chunker, .classifier, .rewriter, .reader, .transcriber, .extractor => try self.warmLoadOnlyModel(allocator, model),
+            .transcriber => try self.warmTranscriber(allocator, model),
+            .chunker, .classifier, .rewriter, .reader, .extractor => try self.warmLoadOnlyModel(allocator, model),
         }
         if (materialize_optional_sessions and model.kind != .embedder) {
             try self.materializeWarmModelOptionalSessions(allocator, model);
@@ -6279,6 +6283,36 @@ pub const Node = struct {
         defer model_handle.release();
         model_handle.pin();
         std.log.info("loaded inference {s} model={s} elapsed_ms={d}", .{ @tagName(model.kind), model.name, elapsedMs(started_at_ns, embedTimingNowNs()) });
+    }
+
+    fn warmTranscriber(self: *Node, allocator: std.mem.Allocator, model: WarmModel) !void {
+        if (model.name.len == 0) return error.InvalidGenerationRequest;
+        var owned_io: ?std.Io.Threaded = null;
+        defer if (owned_io) |*io_impl| io_impl.deinit();
+        const io = self.inferenceIo(allocator, null, &owned_io);
+        const model_path = try self.resolveModelPath(io, model.name, "transcribers");
+        defer self.allocator.free(model_path);
+        const enc_dec_mod = @import("../pipelines/encoder_decoder.zig");
+        if (enc_dec_mod.findEncoderDecoderPaths(allocator, model_path)) |paths| {
+            defer allocator.free(paths.encoder);
+            defer allocator.free(paths.decoder);
+            const preferred_backends = if (model.backend) |backend|
+                singleBackendPreference(backend)
+            else
+                self.model_manager.session_manager.preferred_backends;
+            var handle = try self.model_manager.acquireCompositeRuntimeWithPreferredBackends(
+                model_path,
+                &.{ paths.encoder, paths.decoder },
+                preferred_backends,
+                .transcriber,
+                .whisper,
+                null,
+            );
+            defer handle.release();
+            handle.markStartupManaged();
+            return;
+        } else |_| {}
+        try self.warmLoadOnlyModel(allocator, model);
     }
 
     pub fn embedDenseJsonInputDirect(
@@ -16623,9 +16657,10 @@ pub const Node = struct {
         var config = try rebel_mod.loadConfig(allocator, model_path);
         var config_owned = true;
         errdefer if (config_owned) config.deinit();
-        var runtime_handle = try self.model_manager.acquireCompositeRuntime(
+        var runtime_handle = try self.model_manager.acquireCompositeRuntimeForModelType(
             model_path,
             &.{ paths.encoder, paths.decoder },
+            .extractor,
             .seq2seq,
             execution_control,
         );
@@ -20159,6 +20194,312 @@ pub const Node = struct {
         return image_datas;
     }
 
+    fn runtimeModelKind(model_type: manifest_mod.ModelType) api.ModelKind {
+        return switch (model_type) {
+            .generator => .generator,
+            .embedder => .embedder,
+            .reranker => .reranker,
+            .chunker => .chunker,
+            .classifier => .classifier,
+            .rewriter => .rewriter,
+            .reader => .reader,
+            .transcriber => .transcriber,
+            .extractor => .extractor,
+        };
+    }
+
+    fn runtimeTaskDir(task: api.ModelKind) []const u8 {
+        return switch (task) {
+            .generator => "generators",
+            .embedder => "embedders",
+            .reranker => "rerankers",
+            .chunker => "chunkers",
+            .classifier => "classifiers",
+            .rewriter => "rewriters",
+            .reader => "readers",
+            .transcriber => "transcribers",
+            .extractor => "extractors",
+        };
+    }
+
+    fn runtimeListingTask(task: api.ModelKind) []const u8 {
+        return if (task == .classifier) "deciders" else runtimeTaskDir(task);
+    }
+
+    const runtime_model_tasks = [_]api.ModelKind{
+        .generator,
+        .embedder,
+        .reranker,
+        .chunker,
+        .classifier,
+        .rewriter,
+        .reader,
+        .transcriber,
+        .extractor,
+    };
+
+    fn runtimeManifestMatchesTask(
+        preferred_task: ?api.ModelKind,
+        task: api.ModelKind,
+        manifest: *const manifest_mod.ModelManifest,
+    ) bool {
+        if (preferred_task) |wanted| return task == wanted;
+        return manifestMatchesModelListingTask(
+            runtimeListingTask(task),
+            @tagName(manifest.model_type),
+            manifest,
+        );
+    }
+
+    fn runtimeTaskBit(task: api.ModelKind) u16 {
+        for (runtime_model_tasks, 0..) |candidate, index| {
+            if (candidate == task) return @as(u16, 1) << @intCast(index);
+        }
+        unreachable;
+    }
+
+    fn runtimeManifestTaskMask(manifest: *const manifest_mod.ModelManifest) u16 {
+        var mask: u16 = 0;
+        for (runtime_model_tasks) |task| {
+            if (runtimeManifestMatchesTask(null, task, manifest)) mask |= runtimeTaskBit(task);
+        }
+        return mask;
+    }
+
+    fn stripRuntimeTaskPrefix(identifier: []const u8) []const u8 {
+        for (runtime_model_tasks) |task| {
+            const scope = runtimeTaskDir(task);
+            if (std.mem.startsWith(u8, identifier, scope) and
+                identifier.len > scope.len and identifier[scope.len] == std.fs.path.sep)
+            {
+                return identifier[scope.len + 1 ..];
+            }
+        }
+        return identifier;
+    }
+
+    fn runtimeDevice(backend: ?backends_mod.BackendType) ?[]const u8 {
+        return switch (backend orelse return null) {
+            .native, .wasm => "cpu",
+            .metal, .cuda => "gpu",
+            .pjrt => "accelerator",
+        };
+    }
+
+    fn apiRuntime(
+        allocator: std.mem.Allocator,
+        entry: model_manager_mod.RuntimeSnapshotEntry,
+    ) !api.ModelRuntime {
+        return .{
+            .runtime_id = try std.fmt.allocPrint(allocator, "{x:0>32}", .{entry.runtime_id}),
+            .state = switch (entry.state) {
+                .loading => .loading,
+                .loaded => .loaded,
+                .in_use => .in_use,
+            },
+            .runtime_kind = switch (entry.runtime_kind) {
+                .primary => .primary,
+                .composite => .composite,
+            },
+            .active_requests = @intCast(entry.active_requests),
+            .startup_managed = entry.startup_managed,
+            .backend = if (entry.backend) |backend| @tagName(backend) else null,
+            .device = runtimeDevice(entry.backend),
+            .residency_mode = switch (entry.residency_mode) {
+                .backend_managed => .backend_managed,
+                .streamed => .streamed,
+                .resident => .resident,
+            },
+            .last_used_ms = @intCast(entry.last_used_ms),
+        };
+    }
+
+    fn runtimeIdentifier(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        canonical_models_dir: []const u8,
+        entry: model_manager_mod.RuntimeSnapshotEntry,
+        task: api.ModelKind,
+    ) !?[]const u8 {
+        _ = self;
+        _ = task;
+        const identifier = (try loadedModelRequestIdentifierAlloc(
+            allocator,
+            io,
+            canonical_models_dir,
+            entry.model_dir,
+        )) orelse return null;
+        return stripRuntimeTaskPrefix(identifier);
+    }
+
+    fn runtimeModelsAlloc(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        only_runtime_id: ?model_manager_mod.RuntimeId,
+        preferred_task: ?api.ModelKind,
+    ) ![]const api.ModelRuntimeModel {
+        var snapshot = try self.model_manager.runtimeSnapshot(allocator, runtimeManifestTaskMask);
+        defer snapshot.deinit();
+        if (snapshot.entries.len == 0) return try allocator.alloc(api.ModelRuntimeModel, 0);
+        const canonical_models_dir = try realPathExistingAlloc(allocator, io, self.config.models_dir);
+        defer allocator.free(canonical_models_dir);
+
+        const Group = struct {
+            task: api.ModelKind,
+            model: []const u8,
+            loading: bool = false,
+            runtimes: std.ArrayList(api.ModelRuntime) = .empty,
+        };
+        var groups = std.ArrayList(Group).empty;
+        for (snapshot.entries) |entry| {
+            if (only_runtime_id) |wanted| if (entry.runtime_id != wanted) continue;
+            var task_mask = entry.task_mask;
+            var listing_manifest: ?manifest_mod.ModelManifest = null;
+            defer if (listing_manifest) |*manifest| manifest.deinit();
+            if (preferred_task == null and task_mask == 0 and entry.model_type == null) {
+                listing_manifest = (manifest_mod.loadListingCandidateFromDir(allocator, entry.model_dir) catch null) orelse continue;
+                if (listing_manifest) |*manifest| task_mask = runtimeManifestTaskMask(manifest);
+            }
+            for (runtime_model_tasks) |task| {
+                if (preferred_task) |wanted| {
+                    if (task != wanted) continue;
+                } else if (task_mask != 0) {
+                    if (task_mask & runtimeTaskBit(task) == 0) continue;
+                } else if (entry.model_type == null or runtimeModelKind(entry.model_type.?) != task) continue;
+                const model = (try self.runtimeIdentifier(
+                    allocator,
+                    io,
+                    canonical_models_dir,
+                    entry,
+                    task,
+                )) orelse continue;
+                var group_index: ?usize = null;
+                for (groups.items, 0..) |group, index| {
+                    if (group.task == task and std.mem.eql(u8, group.model, model)) {
+                        group_index = index;
+                        break;
+                    }
+                }
+                if (group_index == null) {
+                    try groups.append(allocator, .{ .task = task, .model = model });
+                    group_index = groups.items.len - 1;
+                }
+                const group = &groups.items[group_index.?];
+                group.loading = group.loading or entry.state == .loading;
+                try group.runtimes.append(allocator, try apiRuntime(allocator, entry));
+            }
+        }
+
+        const result = try allocator.alloc(api.ModelRuntimeModel, groups.items.len);
+        for (groups.items, result) |*group, *model| {
+            model.* = .{
+                .task = group.task,
+                .model = group.model,
+                .load_state = if (group.loading) "loading" else "idle",
+                .runtimes = try group.runtimes.toOwnedSlice(allocator),
+            };
+        }
+        groups.deinit(allocator);
+        return result;
+    }
+
+    pub fn listModelRuntimes(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        const models = try self.runtimeModelsAlloc(ctx.allocator, ctx.io, null, null);
+        return ctx.json(api.ModelRuntimeResponse{ .object = "model_runtime", .models = models });
+    }
+
+    pub fn loadModelRuntime(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        var parsed = (try ctx.parseJson(api.ModelRuntimeLoadRequest)) orelse
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "Request body required" });
+        defer parsed.deinit();
+        const request = parsed.value;
+        if (request.task == .rewriter or
+            (request.task == .chunker and canonicalFixedChunkModel(request.model) != null))
+        {
+            return ctx.status(400).json(.{
+                .@"error" = "MODEL_RUNTIME_UNAVAILABLE",
+                .message = if (request.task == .rewriter)
+                    "rewriter runtimes are not supported"
+                else
+                    "fixed chunking is built in and has no model runtime",
+            });
+        }
+
+        const execution_control = httpInferenceExecutionControl(self, ctx);
+        execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
+        const model_path = if (request.task == .reader)
+            self.resolveReadRequestModelPath(ctx.allocator, ctx.io, request.model)
+        else
+            self.resolveRequestModelPath(ctx.allocator, ctx.io, request.model, runtimeTaskDir(request.task));
+        const resolved_path = model_path catch |err| return requestModelResolutionError(ctx, err);
+        defer ctx.allocator.free(resolved_path);
+
+        var manifest = manifest_mod.loadFromDir(ctx.allocator, resolved_path) catch |err|
+            return modelLoadFailureResponse(ctx, err);
+        defer manifest.deinit();
+        if (!manifestMatchesModelListingTask(runtimeListingTask(request.task), @tagName(manifest.model_type), &manifest)) {
+            return ctx.status(400).json(.{ .@"error" = "INVALID_MODEL", .message = "model does not support the requested task" });
+        }
+
+        var runtime_id: model_manager_mod.RuntimeId = 0;
+        if (request.task == .transcriber) {
+            const enc_dec_mod = @import("../pipelines/encoder_decoder.zig");
+            if (enc_dec_mod.findEncoderDecoderPaths(ctx.allocator, resolved_path)) |paths| {
+                defer ctx.allocator.free(paths.encoder);
+                defer ctx.allocator.free(paths.decoder);
+                var handle = self.model_manager.acquireCompositeRuntime(
+                    resolved_path,
+                    &.{ paths.encoder, paths.decoder },
+                    .whisper,
+                    execution_control,
+                ) catch |err| return modelLoadFailureResponse(ctx, err);
+                runtime_id = handle.get().runtime_id;
+                handle.release();
+            } else |_| {
+                var handle = self.model_manager.acquireFromDirWithControl(resolved_path, execution_control) catch |err|
+                    return modelLoadFailureResponse(ctx, err);
+                runtime_id = handle.get().runtime_id;
+                handle.release();
+            }
+        } else {
+            var handle = self.model_manager.acquireFromDirWithControl(resolved_path, execution_control) catch |err|
+                return modelLoadFailureResponse(ctx, err);
+            runtime_id = handle.get().runtime_id;
+            handle.release();
+        }
+
+        const models = try self.runtimeModelsAlloc(ctx.allocator, ctx.io, runtime_id, request.task);
+        if (models.len == 0) {
+            return ctx.json(api.ModelRuntimeLoadResponse{
+                .outcome = "loaded",
+                .model = .{
+                    .task = request.task,
+                    .model = request.model,
+                    .load_state = "idle",
+                    .runtimes = &.{},
+                },
+            });
+        }
+        return ctx.json(api.ModelRuntimeLoadResponse{ .outcome = "loaded", .model = models[0] });
+    }
+
+    pub fn unloadModelRuntime(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        var parsed = (try ctx.parseJson(api.ModelRuntimeUnloadRequest)) orelse
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "Request body required" });
+        defer parsed.deinit();
+        const runtime_id = model_manager_mod.parseRuntimeId(parsed.value.runtime_id) catch
+            return ctx.status(400).json(.{ .@"error" = "INVALID_RUNTIME_ID", .message = "runtime_id is invalid" });
+        return switch (self.model_manager.unloadRuntime(runtime_id)) {
+            .unloaded => ctx.json(api.ModelRuntimeUnloadResponse{ .outcome = "unloaded" }),
+            .already_unloaded => ctx.json(api.ModelRuntimeUnloadResponse{ .outcome = "already_unloaded" }),
+            .loading => ctx.status(409).json(.{ .@"error" = "RUNTIME_LOADING", .message = "runtime is still loading", .retryable = true }),
+            .in_use => |active| ctx.status(409).json(.{ .@"error" = "RUNTIME_IN_USE", .message = "runtime is serving active requests", .retryable = true, .active_requests = active }),
+            .startup_managed => ctx.status(409).json(.{ .@"error" = "RUNTIME_PRELOAD_MANAGED", .message = "runtime is managed by startup preload configuration", .retryable = false }),
+        };
+    }
+
     pub fn listModels(self: *Node, ctx: *httpx.Context) !httpx.Response {
         const json_body = try self.listModelsJsonAlloc(ctx.allocator, ctx.io);
         defer ctx.allocator.free(json_body);
@@ -20485,7 +20826,13 @@ pub const Node = struct {
         }
         try buf.appendSlice(a, "{\"object\":\"list\",\"data\":[");
         try buf.appendSlice(a, openai_data.items);
-        try buf.appendSlice(a, "],");
+        try buf.appendSlice(a, if (build_options.allow_downloads) "],\"allow_downloads\":true," else "],\"allow_downloads\":false,");
+        try buf.appendSlice(a, "\"backends\":{");
+        try buf.appendSlice(a, if (build_options.enable_native) "\"native\":true," else "\"native\":false,");
+        try buf.appendSlice(a, if (build_options.enable_metal) "\"metal\":true," else "\"metal\":false,");
+        try buf.appendSlice(a, if (build_options.enable_cuda) "\"cuda\":true," else "\"cuda\":false,");
+        try buf.appendSlice(a, if (build_options.enable_pjrt) "\"xla\":true," else "\"xla\":false,");
+        try buf.appendSlice(a, if (build_options.enable_wasm) "\"wasm\":true}," else "\"wasm\":false},");
         try buf.appendSlice(a, body.items);
         try buf.append(a, '}');
 
@@ -24962,12 +25309,14 @@ const InferenceHttpRouteAdmission = enum { none, inference };
 fn inferenceHttpRouteAdmission(comptime method: []const u8, comptime path: []const u8) InferenceHttpRouteAdmission {
     if (comptime std.mem.eql(u8, method, "GET")) {
         if (comptime std.mem.eql(u8, path, "/models") or
+            std.mem.eql(u8, path, "/models/runtime") or
             std.mem.eql(u8, path, "/predictors") or
             std.mem.eql(u8, path, "/transcription/sessions/:session_id") or
             std.mem.eql(u8, path, "/transcription/sessions/:session_id/events")) return .none;
     } else if (comptime std.mem.eql(u8, method, "DELETE")) {
         if (comptime std.mem.eql(u8, path, "/transcription/sessions/:session_id")) return .none;
     } else if (comptime std.mem.eql(u8, method, "POST")) {
+        if (comptime std.mem.eql(u8, path, "/models/unload")) return .none;
         if (comptime std.mem.eql(u8, path, "/chat/completions") or
             std.mem.eql(u8, path, "/chunk") or
             std.mem.eql(u8, path, "/dictate") or
@@ -24980,6 +25329,7 @@ fn inferenceHttpRouteAdmission(comptime method: []const u8, comptime path: []con
             std.mem.eql(u8, path, "/extract") or
             std.mem.eql(u8, path, "/generate") or
             std.mem.eql(u8, path, "/generate/batch") or
+            std.mem.eql(u8, path, "/models/load") or
             std.mem.eql(u8, path, "/predict") or
             std.mem.eql(u8, path, "/read") or
             std.mem.eql(u8, path, "/rerank") or
@@ -25033,8 +25383,10 @@ fn PrefixedServer(comptime prefix: []const u8, comptime Inner: type) type {
         models_handler: ?httpx.Handler = null,
 
         pub fn post(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
-            comptime std.debug.assert(inferenceHttpRouteAdmission("POST", path) == .inference);
-            const wrapped = httpx.Handler.wrap(self.node, handler, admittedInferenceHandler);
+            const wrapped = if (comptime inferenceHttpRouteAdmission("POST", path) == .inference)
+                httpx.Handler.wrap(self.node, handler, admittedInferenceHandler)
+            else
+                handler;
             if (comptime inferenceRouteStreamsRawBody(path) and @hasDecl(Inner, "postStreamingRaw"))
                 try self.inner.postStreamingRaw(prefix ++ path, wrapped)
             else if (comptime inferenceRouteSupportsFramedAttachments(path) and @hasDecl(Inner, "postStreaming"))
@@ -25075,8 +25427,10 @@ fn AiPrefixedServer(comptime prefix: []const u8, comptime Inner: type) type {
 
         pub fn post(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
             if (comptime isMlOnlyRoute(path)) return;
-            comptime std.debug.assert(inferenceHttpRouteAdmission("POST", path) == .inference);
-            const wrapped = httpx.Handler.wrap(self.node, handler, admittedInferenceHandler);
+            const wrapped = if (comptime inferenceHttpRouteAdmission("POST", path) == .inference)
+                httpx.Handler.wrap(self.node, handler, admittedInferenceHandler)
+            else
+                handler;
             if (comptime inferenceRouteStreamsRawBody(path) and @hasDecl(Inner, "postStreamingRaw"))
                 try self.inner.postStreamingRaw(prefix ++ path, wrapped)
             else if (comptime inferenceRouteSupportsFramedAttachments(path) and @hasDecl(Inner, "postStreaming"))
@@ -26406,9 +26760,9 @@ test "read admission reserves default batch bytes and image pressure without ove
         null,
         0,
     );
-    try std.testing.expectEqual(4 * read_admission_bytes_per_unit, small_capacity.byte_cap);
-    try std.testing.expectEqual(4 * read_admission_bytes_per_unit, small_capacity.resident_byte_cap);
-    try std.testing.expectEqual(@as(usize, 4), small_capacity.units);
+    try std.testing.expectEqual(2 * read_admission_bytes_per_unit, small_capacity.byte_cap);
+    try std.testing.expectEqual(2 * read_admission_bytes_per_unit, small_capacity.resident_byte_cap);
+    try std.testing.expectEqual(@as(usize, 2), small_capacity.units);
 
     const overflow = readRequestAdmissionForLimits(
         std.math.maxInt(usize),
@@ -26418,7 +26772,7 @@ test "read admission reserves default batch bytes and image pressure without ove
         null,
         0,
     );
-    try std.testing.expectEqual(32 * read_admission_bytes_per_unit, overflow.byte_cap);
+    try std.testing.expectEqual(16 * read_admission_bytes_per_unit, overflow.byte_cap);
     var admission = inference_admission_mod.InferenceAdmission.init(32);
     try std.testing.expectEqual(@as(usize, 32), admission.capacityUnits(overflow.units));
 
@@ -26427,7 +26781,7 @@ test "read admission reserves default batch bytes and image pressure without ove
         (32 * read_admission_bytes_per_unit - default_max_request_media_bytes) / read_decoded_working_bytes_per_pixel,
         single.decoded_pixel_cap,
     );
-    try std.testing.expectEqual(@as(usize, 0), small_capacity.decoded_pixel_cap);
+    try std.testing.expectEqual(@as(usize, 2 * 1024 * 1024), small_capacity.decoded_pixel_cap);
     const dimension_limited = readRequestAdmissionForLimits(2, default_max_read_batch_bytes, default_max_request_media_bytes, 32, 2048, 0);
     try std.testing.expectEqual(@as(usize, 2 * 2048 * 2048), dimension_limited.decoded_pixel_cap);
     const unlimited_admission = readRequestAdmissionForLimits(max_read_batch_images, default_max_read_batch_bytes, default_max_request_media_bytes, 0, null, 0);
@@ -27862,6 +28216,14 @@ test "Qwen3-VL read routing admits only generation bundles" {
     try std.testing.expect(isQwen3VlReadModel(&generation_manifest));
     try std.testing.expect(manifestMatchesModelListingTask("generators", "generator", &generation_manifest));
     try std.testing.expect(manifestMatchesModelListingTask("readers", "generator", &generation_manifest));
+    try std.testing.expect(Node.runtimeManifestMatchesTask(null, .generator, &generation_manifest));
+    try std.testing.expect(Node.runtimeManifestMatchesTask(null, .reader, &generation_manifest));
+    try std.testing.expect(Node.runtimeManifestMatchesTask(.reader, .reader, &generation_manifest));
+    try std.testing.expect(!Node.runtimeManifestMatchesTask(.reader, .generator, &generation_manifest));
+    const runtime_task_mask = Node.runtimeManifestTaskMask(&generation_manifest);
+    try std.testing.expect(runtime_task_mask & Node.runtimeTaskBit(.generator) != 0);
+    try std.testing.expect(runtime_task_mask & Node.runtimeTaskBit(.reader) != 0);
+    try std.testing.expectEqualStrings("owner/qwen", Node.stripRuntimeTaskPrefix("generators/owner/qwen"));
 
     generation_manifest.model_type = .reranker;
     try std.testing.expect(!isQwen3VlReadModel(&generation_manifest));
@@ -27874,6 +28236,84 @@ test "Qwen3-VL read routing admits only generation bundles" {
     defer generic_generator.deinit();
     try std.testing.expect(!isQwen3VlReadModel(&generic_generator));
     try std.testing.expect(!manifestMatchesModelListingTask("readers", "generator", &generic_generator));
+}
+
+test "runtime unload bypasses inference admission while load remains admitted" {
+    try std.testing.expectEqual(InferenceHttpRouteAdmission.none, inferenceHttpRouteAdmission("POST", "/models/unload"));
+    try std.testing.expectEqual(InferenceHttpRouteAdmission.inference, inferenceHttpRouteAdmission("POST", "/models/load"));
+    try std.testing.expectEqual(InferenceHttpRouteAdmission.none, inferenceHttpRouteAdmission("GET", "/models/runtime"));
+}
+
+test "runtime model snapshot keeps a published runtime visible after its manifest disappears" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "models");
+    const models_root = try tmp.dir.realPathFileAlloc(std.testing.io, "models", allocator);
+    defer allocator.free(models_root);
+    const missing_model_dir = try std.fs.path.join(allocator, &.{ models_root, "generators", "owner", "removed" });
+    var missing_model_dir_owned = true;
+    errdefer if (missing_model_dir_owned) allocator.free(missing_model_dir);
+
+    var node = try Node.init(allocator, .{ .models_dir = models_root });
+    defer node.deinit();
+    const Probe = struct {
+        closed: bool = false,
+        fn run(_: *anyopaque, _: []const backends_mod.Tensor, a: std.mem.Allocator) ![]backends_mod.Tensor {
+            return a.alloc(backends_mod.Tensor, 0);
+        }
+        fn info(_: *anyopaque) []const backends_mod.TensorInfo {
+            return &.{};
+        }
+        fn backend(_: *anyopaque) backends_mod.BackendType {
+            return .native;
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.closed = true;
+        }
+        const vtable = backends_mod.Session.VTable{
+            .run = run,
+            .inputInfo = info,
+            .outputInfo = info,
+            .backend = backend,
+            .close = close,
+        };
+    };
+    var probe = Probe{};
+    const model = try allocator.create(model_manager_mod.LoadedModel);
+    var model_owned = true;
+    errdefer if (model_owned) allocator.destroy(model);
+    model.* = .{
+        .runtime_id = 0x1234,
+        .manifest = .{ .allocator = allocator, .model_type = .generator },
+        .hf_tok = null,
+        .sp_tok = null,
+        .session = .{ .ptr = &probe, .vtable = &Probe.vtable },
+        .session_manager = &node.model_manager.session_manager,
+        .model_manager = &node.model_manager,
+        .model_dir = missing_model_dir,
+        .allocator = allocator,
+        .prompt_prefix_cache = runtime.kv.prompt_cache.PromptPrefixCache.init(allocator),
+        .native_generation_graph_cache = graph_mod.cache.GraphCache.init(allocator),
+    };
+    missing_model_dir_owned = false;
+    errdefer if (model_owned) model.deinit();
+    const runtime_key = try allocator.dupe(u8, "runtime-snapshot-missing-manifest");
+    var runtime_key_owned = true;
+    errdefer if (runtime_key_owned) allocator.free(runtime_key);
+    try node.model_manager.loaded.put(allocator, runtime_key, model);
+    runtime_key_owned = false;
+    model_owned = false;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const models = try node.runtimeModelsAlloc(arena.allocator(), std.testing.io, null, null);
+    try std.testing.expectEqual(@as(usize, 1), models.len);
+    try std.testing.expectEqual(api.ModelKind.generator, models[0].task);
+    try std.testing.expectEqualStrings("owner/removed", models[0].model);
+    try std.testing.expectEqual(@as(usize, 1), models[0].runtimes.len);
+    try std.testing.expectEqualStrings("00000000000000000000000000001234", models[0].runtimes[0].runtime_id);
 }
 
 test "read model resolution falls back to generators and keeps reader precedence" {
@@ -28352,6 +28792,9 @@ test "registerRoutesOn prefixes embed aliases and metrics route" {
     try std.testing.expect(server.hasRoute(.post, public_api_prefix ++ "/generate/batch"));
     try std.testing.expect(server.hasRoute(.get, public_api_prefix ++ "/models"));
     try std.testing.expectEqual(@as(usize, 1), server.routeCount(.get, public_api_prefix ++ "/models"));
+    try std.testing.expect(server.hasRoute(.get, public_api_prefix ++ "/models/runtime"));
+    try std.testing.expect(server.hasRoute(.post, public_api_prefix ++ "/models/load"));
+    try std.testing.expect(server.hasRoute(.post, public_api_prefix ++ "/models/unload"));
     try std.testing.expect(server.hasRoute(.get, public_api_prefix ++ "/metrics"));
     try std.testing.expect(server.hasRoute(.post, public_api_prefix ++ "/dictate"));
     try std.testing.expect(server.hasRoute(.post, public_api_prefix ++ "/transcription/sessions"));
@@ -29534,6 +29977,9 @@ test "registerRoutesOn supports alternate prefixes through the shared router" {
     try std.testing.expect(server.hasRoute(.post, "/custom/v9/embed"));
     try std.testing.expect(server.hasRoute(.post, "/custom/v9/embeddings"));
     try std.testing.expect(server.hasRoute(.get, "/custom/v9/models"));
+    try std.testing.expect(server.hasRoute(.get, "/custom/v9/models/runtime"));
+    try std.testing.expect(server.hasRoute(.post, "/custom/v9/models/load"));
+    try std.testing.expect(server.hasRoute(.post, "/custom/v9/models/unload"));
     try std.testing.expect(server.hasRoute(.get, "/custom/v9/metrics"));
 }
 
@@ -34959,10 +35405,14 @@ fn readRequestAdmissionForLimits(
     else
         std.math.mul(usize, max_concurrent_units, read_admission_bytes_per_unit) catch std.math.maxInt(usize);
     const aggregate_image_cap = std.math.mul(usize, image_count, configured_per_image_byte_cap) catch std.math.maxInt(usize);
-    const available_download_bytes = if (max_concurrent_units == 0)
+    // Leave bounded admission capacity for decoded image working memory.
+    // Consuming the whole envelope with a worst-case encoded reservation gives
+    // every image a zero-pixel ceiling before its real dimensions are known.
+    const encoded_resident_cap = if (max_concurrent_units == 0)
         configured_batch_byte_cap
     else
-        capacity_bytes -| inline_source_bytes;
+        capacity_bytes / 2;
+    const available_download_bytes = encoded_resident_cap -| inline_source_bytes;
     const byte_cap = @min(@min(configured_batch_byte_cap, available_download_bytes), aggregate_image_cap);
     const resident_byte_cap = std.math.add(usize, inline_source_bytes, byte_cap) catch std.math.maxInt(usize);
     const byte_units = admissionUnitsFor(resident_byte_cap, read_admission_bytes_per_unit);
