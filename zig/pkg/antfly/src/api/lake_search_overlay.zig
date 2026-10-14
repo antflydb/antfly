@@ -65,7 +65,7 @@ pub const Overlay = struct {
             const clause = try std.json.Stringify.valueAlloc(a, .{ .conjuncts = conjunction.items }, .{});
             try disjunction.append(a, try std.json.parseFromSliceLeaky(V, a, clause, .{}));
             if (change.op == .upsert) {
-                const id = try std.fmt.allocPrint(a, "wal1:{s}", .{local.serverless_external_source_mod.lake_catalog.types.digestHex(try std.json.Stringify.valueAlloc(a, identity.items, .{}))});
+                const id = try ingestion.rowId(a, pending.key_fields, change.row, pending.key_identity);
                 try result.rows.put(a, id, change.row);
             }
         }

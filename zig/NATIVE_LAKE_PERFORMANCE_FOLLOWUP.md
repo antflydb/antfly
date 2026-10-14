@@ -3952,3 +3952,79 @@ Post-qualification `make gc` preserved active worktree caches and completed its
 Zig/Rust/Go phases; uv cache pruning reached the 55-second watchdog and its own
 process group was stopped. Completed E2E fixture output was removed; logs remain
 in `/private/tmp`.
+
+
+## Reusable retained state and exact recent delivery (protocol 44)
+
+Accepted images use the ingestion layer's canonical stable-key identity, including
+numeric equivalence such as negative and positive zero. Retained pending data
+records its key encoding explicitly; legacy descriptors keep their original
+JSON-array identities so existing tokens replay the same opaque row IDs. Upserts
+and deletes use one identity function throughout warm image maintenance and cold
+reconstruction.
+
+Final unit/chunk hydration resolves the exact declared artifact for the winning
+row's stable-prefix run. Equal index names in different recent runs cannot alias.
+Delivery borrows an already-open matching runtime or acquires and releases one
+exact runtime, retaining the query's provider selectors and authority.
+
+Archive file maps are keyed by immutable publication and schema, independently
+of the accepted WAL head. Selection, permissions, source coverage and reader
+leases are still checked on every query. Recent vector preparation uses borrowed
+immutable row-prefix views and a bounded ready-job metadata memo; hits avoid
+copying row maps or fetching ready jobs. Entries are scoped to store, table
+incarnation, recipe, archive and cut, and must outlive the entire new cursor.
+Renewal and misses retain the durable claim/CAS path.
+
+Retained tokens reference a fresh small lease envelope containing their current
+reader token and full configured expiry. Envelopes share an immutable state
+object and at most sixteen independently reusable row-group objects. Modern WAL
+images supply cached partition digests, so unchanged rows need neither walking
+nor serialization on warm queries. A changed cut rewrites only changed groups
+and its compact state. Payloads expire after 24 hours; reuse requires retention
+past the new envelope expiry. Expiring envelopes therefore cannot collect data
+still referenced by a later envelope. State and row groups use the existing
+retained-cut GC domain and bounded collector, without another reachability graph.
+
+The process memo stores only copied artifact references, under a 4 MiB/512-entry
+bound; vector job metadata has a 32 MiB/128-entry bound. Both attach to the process
+resource manager, support eviction, and retain no clients or authority contexts.
+A restart reads the exact durable state and groups. Cold group reads use the
+shared I/O scheduler with four concurrent reads, memory reservations and an
+inline fallback under saturation. Combined encoded state remains bounded by
+40 MiB and 65,536 changes; provider version selectors and checksums are verified
+for every object. Missing nested objects invalidate the cut consistently.
+
+Native regressions cover canonical upsert/delete and replay, exact multi-run
+hydration, zero-copy views, memo eviction/expiry, fresh lease/state reuse,
+changed-group reuse, restart, legacy descriptors and collection. The real
+Iceberg fixture checks fresh envelope sharing, unchanged row groups and vector
+runs after a new accepted update, plus pinned replay across restart.
+
+Protocol 44 fences the new retained envelope and key-encoding fields. Provider
+retention qualification remains deferred and disabled by default. These changes
+remove repeated work; archive-scale throughput, latency and RSS remain separate
+benchmark qualification.
+
+
+Protocol-44 qualification, including `origin/main` at `2c8240e703`:
+
+- Debug server: 49/49 build steps; full Debug lake suites: 95/95 steps,
+  442 integration and 44 focused test executions, without failures or leaks.
+- ReleaseFast focused and object-store suites: 54/54 build steps; all 44 focused
+  executions and 92 object-store tests passed, with two live-provider skips.
+- Real Parquet/Iceberg E2Es: eleven archive/index cases passed in the full
+  selection. All four accepted-cut variants passed the corrected fixture in
+  55.99 seconds (seven deselected), including state/group reuse, full fresh
+  cursor expiry and restart. All fifteen distinct selected cases have passing
+  results. Retained groups include tombstones; vector runs include live rows,
+  so the fixture asserts one changed group rather than equating those counts.
+- Apache boundary verified 2,037 sources. License headers, formatting of all
+  74 changed Zig files, Python formatting/name checks and Git whitespace passed.
+- Refetched main remained `2c8240e703`; the branch already contains that commit.
+
+The repository cache collector preserved this worktree's active cache and
+completed its Zig/Rust/Go phases before uv pruning reached the 55-second
+watchdog. Obsolete test/server/library output in this worktree was pruned to
+restore the E2E suite's production disk-admission headroom. No other worktree's
+active outputs were changed.

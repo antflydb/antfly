@@ -54,6 +54,7 @@ pub const Prepared = struct {
     declarations: []const Declared,
     cloud_generations: ?local.metadata_lake_index_catalog.CloudGenerations = null,
 };
+pub const Cache = @import("lake_metadata_memo.zig").Memo(Prepared);
 fn scopeDomain(table: u64, identity: [32]u8) [32]u8 {
     var hash = std.crypto.hash.Blake3.init(.{});
     hash.update("native-lake-recent-vector-generations-v1");
@@ -66,7 +67,7 @@ fn scopeDomain(table: u64, identity: [32]u8) [32]u8 {
     return result;
 }
 fn cutDigest(a: A, table: local.common_topology_records.TableRecord, publication: local.metadata_lake_index_catalog.Publication, overlay: *const overlay_api.Overlay) ![32]u8 {
-    const bytes = try std.json.Stringify.valueAlloc(a, .{ .table = table.table_id, .generation = table.object_storage_generation, .desired = local.metadata_lake_index_catalog.desiredFingerprint(table), .publication = publication.generation, .source = publication.signature.source, .format = "partitioned-recent-vectors-v2", .cut = overlay.contentIdentity() }, .{});
+    const bytes = try std.json.Stringify.valueAlloc(a, .{ .table = table.table_id, .generation = table.object_storage_generation, .desired = local.metadata_lake_index_catalog.desiredFingerprint(table), .publication = publication.generation, .source = publication.signature.source, .format = "partitioned-recent-vectors-v3", .key_identity = overlay.pending.key_identity, .cut = overlay.contentIdentity() }, .{});
     defer a.free(bytes);
     var digest: [32]u8 = undefined;
     std.crypto.hash.Blake3.hash(bytes, &digest, .{});
@@ -78,12 +79,12 @@ fn jobKey(a: A, store: *Store, table: u64, cut: [32]u8) ![]u8 {
 fn cancellation(context: Context) Cancellation {
     return if (context.cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn } else .none;
 }
-pub fn prepare(a: A, table: local.common_topology_records.TableRecord, publication: local.metadata_lake_index_catalog.Publication, overlay: *const overlay_api.Overlay, declarations: []const Declared, store: *Store, context: Context, options: local.inference_managed_embedder.InitOptions, build: bool, cut_expires_ms: u64) !Prepared {
+pub fn prepare(a: A, table: local.common_topology_records.TableRecord, publication: local.metadata_lake_index_catalog.Publication, overlay: *const overlay_api.Overlay, declarations: []const Declared, store: *Store, context: Context, options: local.inference_managed_embedder.InitOptions, build: bool, cut_expires_ms: u64, memo: ?*Cache) !Prepared {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const sa = arena.allocator();
     const parts = try overlay.partitions(sa);
-    if (parts.len == 0) return prepareWhole(a, table, publication, overlay, declarations, store, context, options, build, cut_expires_ms);
+    if (parts.len == 0) return prepareWhole(a, table, publication, overlay, declarations, store, context, options, build, cut_expires_ms, memo);
     var runs: std.ArrayList(Run) = .empty;
     var start: usize = 0;
     while (start < parts.len) {
@@ -92,29 +93,38 @@ pub fn prepare(a: A, table: local.common_topology_records.TableRecord, publicati
         var end = start + 1;
         while (end < parts.len and parts[end].prefix >> 8 == prefix) : (end += 1) {}
         var hash = std.crypto.hash.Blake3.init(.{});
-        var subset: overlay_api.Overlay = .{ .pending = .{ .lsn = 0, .key_fields = overlay.pending.key_fields, .changes = &.{} }, .key_filter = "" };
+        var subset: overlay_api.Overlay = .{ .pending = .{ .key_identity = overlay.pending.key_identity, .lsn = 0, .key_fields = overlay.pending.key_fields }, .rows = overlay.rows.subset(prefix), .key_filter = "" };
         for (parts[start..end]) |part| {
             var number: [2]u8 = undefined;
             std.mem.writeInt(u16, &number, part.prefix, .big);
             hash.update(&number);
             hash.update(&part.digest);
-            for (part.ids) |id| try subset.rows.put(sa, id, overlay.row(id).?);
         }
         var digest: [32]u8 = undefined;
         hash.final(&digest);
         subset.pending.cut_identity = digest;
-        const prepared = try prepareWhole(a, table, publication, &subset, declarations, store, context, options, build, cut_expires_ms);
+        const prepared = try prepareWhole(a, table, publication, &subset, declarations, store, context, options, build, cut_expires_ms, memo);
         try runs.append(a, .{ .prefix = prefix, .digest = digest, .declarations = prepared.declarations, .cloud_generations = prepared.cloud_generations });
         start = end;
     }
     return .{ .declarations = runs.items[0].declarations, .runs = try runs.toOwnedSlice(a) };
 }
-fn prepareWhole(a: A, table: local.common_topology_records.TableRecord, publication: local.metadata_lake_index_catalog.Publication, overlay: *const overlay_api.Overlay, declarations: []const Declared, store: *Store, context: Context, options: local.inference_managed_embedder.InitOptions, build: bool, cut_expires_ms: u64) !Prepared {
+fn prepareWhole(a: A, table: local.common_topology_records.TableRecord, publication: local.metadata_lake_index_catalog.Publication, overlay: *const overlay_api.Overlay, declarations: []const Declared, store: *Store, context: Context, options: local.inference_managed_embedder.InitOptions, build: bool, cut_expires_ms: u64, memo: ?*Cache) !Prepared {
     try context.ensureActive();
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const scratch = arena.allocator();
     const cut = try cutDigest(scratch, table, publication, overlay);
+    var cache_hash = std.crypto.hash.Blake3.init(.{});
+    cache_hash.update(&store.identity);
+    cache_hash.update(&cut);
+    var cache_key: [32]u8 = undefined;
+    cache_hash.final(&cache_key);
+    const now = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
+    if (memo) |cache| if (try cache.get(a, cache_key, @max(now, cut_expires_ms))) |ready| {
+        try context.ensureActive();
+        return ready;
+    };
     const key = try jobKey(scratch, store, table.table_id, cut);
     var client = store.opened.client;
     var saved = client.getObject(store.opened.bucket, key, .{ .max_response_bytes = 2 * 1024 * 1024, .cancellation = if (context.cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn } else null }) catch |err| switch (err) {
@@ -122,10 +132,10 @@ fn prepareWhole(a: A, table: local.common_topology_records.TableRecord, publicat
         else => return err,
     };
     defer if (saved) |*value| value.deinit(client.allocator);
-    const now = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
     var job: Job = if (saved) |value| try std.json.parseFromSliceLeaky(Job, scratch, value.body, .{ .allocate = .alloc_always }) else .{ .table_id = table.table_id, .object_generation = table.object_storage_generation, .wal_lsn = overlay.pending.lsn, .archive_generation = publication.generation, .desired = local.metadata_lake_index_catalog.desiredFingerprint(table), .cut = cut };
     if (job.version != 1 or !std.mem.eql(u8, &job.cut, &cut) or job.table_id != table.table_id or job.object_generation != table.object_storage_generation or job.wal_lsn != overlay.pending.lsn or job.archive_generation != publication.generation or !std.mem.eql(u8, &job.desired, &local.metadata_lake_index_catalog.desiredFingerprint(table))) return error.CatalogGenerationChanged;
     if (job.state == .ready and job.expires_ms > @max(now, cut_expires_ms)) {
+        if (memo) |cache| cache.put(cache_key, .{ .declarations = job.declarations, .cloud_generations = job.cloud_generations }, job.expires_ms);
         const encoded = try std.json.Stringify.valueAlloc(scratch, Prepared{ .declarations = job.declarations, .cloud_generations = job.cloud_generations }, .{});
         return std.json.parseFromSliceLeaky(Prepared, a, encoded, .{ .allocate = .alloc_always });
     }
@@ -214,6 +224,7 @@ fn prepareWhole(a: A, table: local.common_topology_records.TableRecord, publicat
         if (status_write) |*value| value.deinit(client.allocator);
     }
     if (job.state != .ready) return error.IndexRebuilding;
+    if (memo) |cache| cache.put(cache_key, .{ .declarations = job.declarations, .cloud_generations = job.cloud_generations }, job.expires_ms);
     const encoded = try std.json.Stringify.valueAlloc(scratch, Prepared{ .declarations = job.declarations, .cloud_generations = job.cloud_generations }, .{});
     return std.json.parseFromSliceLeaky(Prepared, a, encoded, .{ .allocate = .alloc_always });
 }
@@ -434,7 +445,7 @@ pub fn collect(store: *Store, table: u64, context: Context) !void {
     try artifacts.visitScopedUploads(scopeDomain(table, store.identity), .{ .ptr = &visitor, .visit = Visitor.visit, .fencing_cutoff = now -| 30_000, .max_entries = 128 }, cancellation(context));
 }
 
-test "external lake interrupted enrichment claims release conditionally without replacing a newer worker" {
+test "external lake bounded WAL interrupted enrichment claims release conditionally without replacing a newer worker" {
     const a = std.testing.allocator;
     var directory = try local.common_test_directory.TestDirectory.init("lake-enrichment-release");
     defer directory.cleanup();
@@ -483,7 +494,7 @@ test "external lake interrupted enrichment claims release conditionally without 
 
 // A ten-minute generation can serve a five-minute cut, but cannot be bound
 // into an hour-long cursor, even while it remains ready and unexpired.
-test "external lake recent vectors require retention through the entire query cut" {
+test "external lake bounded WAL recent vectors require retention through the entire query cut" {
     const alloc = std.testing.allocator;
     var directory = try local.common_test_directory.TestDirectory.init("lake-recent-retention");
     defer directory.cleanup();
@@ -505,7 +516,19 @@ test "external lake recent vectors require retention through the entire query cu
     var client = store.opened.client;
     var saved = try client.putObject(store.opened.bucket, key, try std.json.Stringify.valueAlloc(a, job, .{}), .{});
     defer saved.deinit(client.allocator);
-    try std.testing.expectEqual(@as(usize, 0), (try prepare(a, table, publication, &overlay, &.{}, &store, .{}, .{}, false, now + 300_000)).declarations.len);
-    try std.testing.expectError(error.IndexRebuilding, prepare(a, table, publication, &overlay, &.{}, &store, .{}, .{}, false, now + 3_600_000));
-    try std.testing.expectError(error.IndexRebuilding, prepare(a, table, publication, &overlay, &.{}, &store, .{}, .{}, false, job.expires_ms));
+    try std.testing.expectEqual(@as(usize, 0), (try prepare(a, table, publication, &overlay, &.{}, &store, .{}, .{}, false, now + 300_000, null)).declarations.len);
+    try std.testing.expectError(error.IndexRebuilding, prepare(a, table, publication, &overlay, &.{}, &store, .{}, .{}, false, now + 3_600_000, null));
+    try std.testing.expectError(error.IndexRebuilding, prepare(a, table, publication, &overlay, &.{}, &store, .{}, .{}, false, job.expires_ms, null));
+    var memo: Cache = .{ .budget = .{ .backing = alloc, .limit = 1024 * 1024 } };
+    defer memo.deinit();
+    _ = try prepare(a, table, publication, &overlay, &.{}, &store, .{}, .{}, false, now + 300_000, &memo);
+    try client.deleteObject(store.opened.bucket, key, .{});
+    _ = try prepare(a, table, publication, &overlay, &.{}, &store, .{}, .{}, false, now + 300_001, &memo);
+    try std.testing.expectEqual(@as(u64, 1), memo.hits);
+    // Requiring longer retention falls back to the durable job path; neither
+    // a hit nor a stale in-process entry can extend artifact retention.
+    try std.testing.expectError(error.IndexRebuilding, prepare(a, table, publication, &overlay, &.{}, &store, .{}, .{}, false, job.expires_ms, &memo));
+    var other = table;
+    other.object_storage_generation += 1;
+    try std.testing.expectError(error.IndexRebuilding, prepare(a, other, publication, &overlay, &.{}, &store, .{}, .{}, false, now + 300_000, &memo));
 }

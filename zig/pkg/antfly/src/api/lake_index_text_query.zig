@@ -59,6 +59,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     if (req.remote_snapshot) |token| if (std.mem.startsWith(u8, token, retained_api.prefix)) {
         var cut_store = try Store.openNative(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir);
         defer cut_store.deinit();
+        cut_store.implementation.cloud_io = server.embedding_provider_runtime.io;
         var artifacts = cut_store.artifactStore();
         retained = try retained_api.load(ra, &artifacts, cut_store.identity, token, table, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, retained_cancellation);
         table.lake_index_catalog_json = try local.metadata_lake_index_catalog.encode(ra, .{ .namespace = retained.?.publication.namespace, .generation = retained.?.publication.generation, .published = retained.?.publication });
@@ -174,6 +175,10 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     std.mem.writeInt(u64, &table_id, table.table_id, .little);
     snapshot_hash.update(&table_id);
     snapshot_hash.update(publication_bytes);
+    var archive_hash = snapshot_hash;
+    archive_hash.update(table.schema_json);
+    var archive_digest: [32]u8 = undefined;
+    archive_hash.final(&archive_digest);
     if (overlay) |value| {
         var lsn_bytes: [8]u8 = undefined;
         std.mem.writeInt(u64, &lsn_bytes, value.pending.lsn, .little);
@@ -191,7 +196,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     var owner: Execution = .{ .server = server, .table = sql_table, .source = &source, .store = &store, .domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(table.table_id, store.identity, selected.publication().namespace), .declarations = selected.publication().declarations, .context = context, .request = normalized, .schema_json = table.schema_json, .arena = ca, .result_allocator = a, .overlay = if (overlay != null) &overlay.? else null, .wal_cut = if (wal_cut != null) &wal_cut.? else null };
     defer owner.deinit();
     var proof: @import("lake_index_row_source.zig").Provider = .{ .source = &source, .context = context, .expected_delete_objects = selected.delete_objects };
-    const metadata = try server.lake_search_metadata.acquire(snapshot_digest, &proof);
+    const metadata = try server.lake_search_metadata.acquire(archive_digest, &proof);
     defer metadata.release();
     owner.files = metadata.files;
     owner.private_files = metadata.private_files;
@@ -205,7 +210,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     } else false;
     owner.cloud_generations = selected.publication().cloud_generations;
     if (has_vectors) if (owner.overlay) |pending_overlay| {
-        const prepared: @import("lake_recent_vectors.zig").Prepared = if (retained) |cut| .{ .declarations = cut.recent, .cloud_generations = cut.recent_cloud, .runs = cut.recent_runs } else @import("lake_recent_vectors.zig").prepare(ca, current_table, selected.publication(), pending_overlay, owner.declarations, &store, context, .{ .antfly_provider = server.antfly_provider, .io = server.embedding_provider_runtime.io, .bounded_http_request = true, .deadline_ns = normalized.deadline_ns, .cancellation = retained_cancellation, .secret_store = server.cfg.secret_store, .remote_content = server.cfg.remote_content, .inference_api_url = server.configuredInferenceAPIURL(), .inference_api_key = server.cfg.inference_api_key, .provider_runtime = &server.embedding_provider_runtime, .source_table = table.name }, build_recent, cut_expires_ms) catch |err| {
+        const prepared: @import("lake_recent_vectors.zig").Prepared = if (retained) |cut| .{ .declarations = cut.recent, .cloud_generations = cut.recent_cloud, .runs = cut.recent_runs } else @import("lake_recent_vectors.zig").prepare(ca, current_table, selected.publication(), pending_overlay, owner.declarations, &store, context, .{ .antfly_provider = server.antfly_provider, .io = server.embedding_provider_runtime.io, .bounded_http_request = true, .deadline_ns = normalized.deadline_ns, .cancellation = retained_cancellation, .secret_store = server.cfg.secret_store, .remote_content = server.cfg.remote_content, .inference_api_url = server.configuredInferenceAPIURL(), .inference_api_key = server.cfg.inference_api_key, .provider_runtime = &server.embedding_provider_runtime, .source_table = table.name }, build_recent, cut_expires_ms, &server.lake_recent_vector_jobs) catch |err| {
             server.notifyLakeCommit(table.name) catch {};
             return err;
         };
@@ -270,7 +275,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     const serving_token: []const u8 = if (retained != null) req.remote_snapshot.? else if (req.remote_snapshot != null) &snapshot_token else cut: {
         var artifacts = store.artifactStore();
         if (cut_expires_ms <= @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms) return error.DeadlineExceeded;
-        break :cut try retained_api.save(ra, &artifacts, store.identity, server.embedding_provider_runtime.io, .{ .expires_ms = cut_expires_ms, .table_id = table.table_id, .object_generation = table.object_storage_generation, .desired = local.metadata_lake_index_catalog.desiredFingerprint(current_table), .publication = publication, .reader_token = lease.retainedToken(), .pending = retained_pending, .catalog_metadata = retained_metadata, .published_only = published_only, .recent = owner.recent_declarations, .recent_cloud = owner.recent_cloud, .recent_runs = owner.recent_runs }, retained_cancellation);
+        break :cut try retained_api.saveCached(ra, &artifacts, store.identity, server.embedding_provider_runtime.io, .{ .expires_ms = cut_expires_ms, .table_id = table.table_id, .object_generation = table.object_storage_generation, .desired = local.metadata_lake_index_catalog.desiredFingerprint(current_table), .publication = publication, .reader_token = lease.retainedToken(), .pending = retained_pending, .catalog_metadata = retained_metadata, .published_only = published_only, .recent = owner.recent_declarations, .recent_cloud = owner.recent_cloud, .recent_runs = owner.recent_runs }, retained_cancellation, &server.lake_retained_payloads);
     };
     var meta: local.api_query.QueryResponseMeta = .{ .remote_snapshot = serving_token, .shard_count = 1, .took_ms = @intCast((@import("antfly_platform").time.monotonicNs() -| total_started) / std.time.ns_per_ms) };
     defer meta.deinit(a);
@@ -1772,13 +1777,6 @@ const Execution = struct {
         self.recent_dense_entries.clearRetainingCapacity();
         self.recent_sparse_entries.clearRetainingCapacity();
     }
-    fn recentRuntime(self: *Execution, runtime: *@import("lake_index_native_runtime_cache.zig").Entry) bool {
-        var dense_entries = self.recent_dense_entries.valueIterator();
-        while (dense_entries.next()) |entry| if (runtime.dense_entry == entry.*) return true;
-        var sparse_entries = self.recent_sparse_entries.valueIterator();
-        while (sparse_entries.next()) |entry| if (runtime.sparse_entry == entry.*) return true;
-        return false;
-    }
     fn searchDense(raw: ?*anyopaque, a: A, req: types.SearchRequest, query: types.DenseKnnQuery) !types.SearchResult {
         const self = from(raw);
         if (self.recent_declarations.len == 0) return searchDensePart(raw, a, req, query);
@@ -1914,6 +1912,32 @@ const Execution = struct {
         return values[0];
     }
     fn attachGraph(_: ?*anyopaque, _: A, _: types.SearchRequest, _: *types.SearchResult, _: []const local.storage_db_query_graph_exec.NamedResultSet) !void {}
+    const PayloadRuntime = struct { entry: *@import("lake_index_native_runtime_cache.zig").Entry, owned: bool };
+    fn payloadRuntime(self: *Execution, name: []const u8, public_parent: []const u8) !PayloadRuntime {
+        try self.context.ensureActive();
+        const recent = if (self.overlay) |overlay| overlay.row(public_parent) != null else false;
+        const run: ?@import("lake_recent_vectors.zig").Run = if (recent and self.recent_runs.len != 0) for (self.recent_runs) |candidate| {
+            if (std.mem.startsWith(u8, public_parent, "wal1:") and public_parent.len > 5 and candidate.prefix == public_parent[5]) break candidate;
+        } else return error.InvalidChunkArtifact else null;
+        const declarations = if (run) |value| value.declarations else if (recent) self.recent_declarations else self.declarations;
+        const declaration = for (declarations) |candidate| {
+            if (std.mem.eql(u8, candidate.name, name) and (candidate.artifact.kind == .vector_segment or candidate.artifact.kind == .sparse_segment)) break candidate;
+        } else return error.InvalidChunkArtifact;
+        const dense_entries = if (recent) &self.recent_dense_entries else &self.dense_entries;
+        const sparse_entries = if (recent) &self.recent_sparse_entries else &self.sparse_entries;
+        const key = if (recent) declaration.artifact.artifact_id else declaration.name;
+        for (self.runtimes.items) |runtime| {
+            if (runtime.dense_entry) |entry| {
+                if (dense_entries.get(key) == entry) return .{ .entry = runtime, .owned = false };
+            } else if (runtime.sparse_entry) |entry| {
+                if (sparse_entries.get(key) == entry) return .{ .entry = runtime, .owned = false };
+            }
+        }
+        // Deferred fusion/delivery reopens one exact run at a time. It must not
+        // pin every winning partition or alias equal index names across runs.
+        const runtime = try self.server.lake_native_runtimes.acquire(self.server, declaration, try @import("lake_recent_vectors.zig").runtimeDomain(declaration), self.store.identity, self.context, if (run) |value| value.cloud_generations else if (recent) self.recent_cloud else self.cloud_generations);
+        return .{ .entry = runtime, .owned = true };
+    }
     fn unitPayload(self: *Execution, a: A, key: []const u8) ![]u8 {
         try self.context.ensureActive();
         const unit_key = local.storage_internal_keys.isDocumentUnitArtifactRecordKey(key);
@@ -1921,41 +1945,14 @@ const Execution = struct {
         var artifact_ref = if (unit_key or chunk_key) (try local.storage_db_artifact_ids.decodeArtifactRefAlloc(a, key)) orelse return error.InvalidChunkArtifact else null;
         defer if (artifact_ref) |*ref| ref.deinit(a);
         const public_parent = if (artifact_ref) |ref| ref.document_id else try @import("lake_enrichment_units.zig").parent(key);
-        const old_active = self.active_recent;
-        const old_run = self.recent_run;
-        defer {
-            self.active_recent = old_active;
-            self.recent_run = old_run;
-        }
-        if (self.overlay != null and self.overlay.?.row(public_parent) != null and self.recent_runs.len != 0 and std.mem.startsWith(u8, public_parent, "wal1:")) {
-            self.active_recent = true;
-            self.recent_run = for (self.recent_runs) |run| {
-                if (public_parent.len > 5 and run.prefix == public_parent[5]) break run;
-            } else return error.InvalidChunkArtifact;
-            const name = if (artifact_ref) |ref| named: {
-                const suffix = if (unit_key) "_sources" else "_chunks";
-                if (!std.mem.endsWith(u8, ref.name, suffix)) return error.InvalidChunkArtifact;
-                break :named ref.name[0 .. ref.name.len - suffix.len];
-            } else if (self.unit_runtime) |runtime| if (runtime.dense_entry) |entry| entry.config.name else runtime.sparse_entry.?.config.name else return error.InvalidChunkArtifact;
-            for (self.recent_run.?.declarations) |declaration| if (std.mem.eql(u8, declaration.name, name)) {
-                if (declaration.artifact.kind == .vector_segment) _ = try denseIndex(self, name) else _ = try sparseIndex(self, name);
-                break;
-            };
-        }
-        var runtime = self.unit_runtime orelse return error.InvalidChunkArtifact;
-        if (artifact_ref) |ref| {
+        const index_name = if (artifact_ref) |ref| named: {
             const suffix = if (unit_key) "_sources" else "_chunks";
             if (!std.mem.endsWith(u8, ref.name, suffix)) return error.InvalidChunkArtifact;
-            const index_name = ref.name[0 .. ref.name.len - suffix.len];
-            const recent = if (self.overlay) |overlay| overlay.row(public_parent) != null else false;
-            runtime = for (self.runtimes.items) |candidate| {
-                if (candidate.dense_entry) |entry| {
-                    if (std.mem.eql(u8, index_name, entry.config.name) and (self.recentRuntime(candidate) == recent)) break candidate;
-                } else if (candidate.sparse_entry) |entry| {
-                    if (std.mem.eql(u8, index_name, entry.config.name) and (self.recentRuntime(candidate) == recent)) break candidate;
-                }
-            } else return error.InvalidChunkArtifact;
-        }
+            break :named ref.name[0 .. ref.name.len - suffix.len];
+        } else if (self.unit_runtime) |runtime| if (runtime.dense_entry) |entry| entry.config.name else runtime.sparse_entry.?.config.name else return error.InvalidChunkArtifact;
+        const selected = try self.payloadRuntime(index_name, public_parent);
+        defer if (selected.owned) selected.entry.release();
+        const runtime = selected.entry;
         const entry_name = if (runtime.dense_entry) |entry| entry.config.name else runtime.sparse_entry.?.config.name;
         const source_name = try std.fmt.allocPrint(a, "{s}_sources", .{entry_name});
         defer a.free(source_name);
@@ -3362,4 +3359,79 @@ test "external lake global frontier fallback windows merge packed logical ties w
         defer a.free(expected);
         try std.testing.expectEqualStrings(expected, hit.id);
     }
+}
+
+test "external lake bounded WAL unit hydration chooses exact recent partition" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const sa = arena.allocator();
+    const Manager = local.storage_db_catalog_index_manager.IndexManager;
+    const Runtime = @import("lake_index_native_runtime_cache.zig").Entry;
+    const vectors = @import("lake_recent_vectors.zig");
+    var first_backend = local.storage_lsm_backend.Backend.init(a, .{});
+    defer first_backend.close();
+    var second_backend = local.storage_lsm_backend.Backend.init(a, .{});
+    defer second_backend.close();
+    const first_id = "wal1:7aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const second_id = "wal1:daaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const first_source = try @import("lake_enrichment_units.zig").sourceKey(sa, first_id, 0);
+    const second_source = try @import("lake_enrichment_units.zig").sourceKey(sa, second_id, 0);
+    {
+        var write = try first_backend.beginWrite();
+        defer write.abort();
+        try write.put(.{ .name = "lake_units" }, first_source, "{\"text\":\"first\"}");
+        try write.commit();
+    }
+    {
+        var write = try second_backend.beginWrite();
+        defer write.abort();
+        try write.put(.{ .name = "lake_units" }, second_source, "{\"text\":\"second\"}");
+        try write.commit();
+    }
+    var first_dense: Manager.DenseIndex = undefined;
+    first_dense.config.name = @constCast("vectors");
+    first_dense.field_name = @constCast("body");
+    var second_dense: Manager.DenseIndex = undefined;
+    second_dense.config.name = @constCast("vectors");
+    second_dense.field_name = @constCast("body");
+    var first_runtime: Runtime = undefined;
+    first_runtime.dense_entry = &first_dense;
+    first_runtime.sparse_entry = null;
+    first_runtime.vectors = &first_backend;
+    var second_runtime: Runtime = undefined;
+    second_runtime.dense_entry = &second_dense;
+    second_runtime.sparse_entry = null;
+    second_runtime.vectors = &second_backend;
+    var overlay: overlay_api.Overlay = .{ .pending = .{ .lsn = 2, .key_fields = &.{"id"} }, .key_filter = "" };
+    try overlay.rows.put(sa, first_id, .{ .object = .empty });
+    try overlay.rows.put(sa, second_id, .{ .object = .empty });
+    const scope: @import("../serverless/artifacts/store.zig").UploadScope = .{ .domain = @splat(1), .attempt = @splat(2) };
+    const first_artifact = try scope.artifactId(&(@as([64]u8, @splat('a'))));
+    const second_artifact = try scope.artifactId(&(@as([64]u8, @splat('b'))));
+    const Declared = local.serverless_segment_sidecar_manifest.DeclaredArtifact;
+    const first_decl: Declared = .{ .name = "vectors", .binding = undefined, .artifact = .{ .kind = .vector_segment, .metadata_version = 2, .artifact_id = &first_artifact, .checksum = first_artifact[7..71], .byte_len = 1 } };
+    const second_decl: Declared = .{ .name = "vectors", .binding = undefined, .artifact = .{ .kind = .vector_segment, .metadata_version = 2, .artifact_id = &second_artifact, .checksum = second_artifact[7..71], .byte_len = 1 } };
+    const runs = [_]vectors.Run{ .{ .prefix = '7', .digest = @splat(1), .declarations = &.{first_decl} }, .{ .prefix = 'd', .digest = @splat(2), .declarations = &.{second_decl} } };
+    var execution: Execution = undefined;
+    execution.context = .{ .io = std.testing.io };
+    execution.arena = sa;
+    execution.overlay = &overlay;
+    execution.active_recent = false;
+    execution.recent_run = null;
+    execution.recent_runs = &runs;
+    execution.unit_runtime = &first_runtime;
+    execution.recent_dense_entries = .empty;
+    execution.recent_sparse_entries = .empty;
+    execution.runtimes = .empty;
+    try execution.runtimes.appendSlice(sa, &.{ &first_runtime, &second_runtime });
+    try execution.recent_dense_entries.put(sa, &first_artifact, &first_dense);
+    try execution.recent_dense_entries.put(sa, &second_artifact, &second_dense);
+    const first_key = try local.storage_internal_keys.documentUnitArtifactKeyAlloc(sa, first_id, "vectors_sources", "0");
+    const second_key = try local.storage_internal_keys.documentUnitArtifactKeyAlloc(sa, second_id, "vectors_sources", "0");
+    const one = try execution.unitPayload(a, first_key);
+    defer a.free(one);
+    const two = try execution.unitPayload(a, second_key);
+    defer a.free(two);
+    try std.testing.expect(std.mem.indexOf(u8, two, "second") != null);
 }

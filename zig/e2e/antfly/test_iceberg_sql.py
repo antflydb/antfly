@@ -1332,20 +1332,42 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
             )
             hybrid_request["remote_snapshot"] = hybrid_first["remote_snapshot"]
 
-            def retained_runs(token):
-                checksum = token.split(":")[2]
+            def retained_artifact(artifact_id):
+                checksum = artifact_id.split(":")[1]
                 paths = list((server.root / "artifacts").rglob(checksum))
-                assert paths, token
+                assert paths, artifact_id
                 payload = paths[0].read_bytes()
                 if payload.startswith(b"AFOBJ001"):
                     payload = payload[84 + struct.unpack_from("<I", payload, 16)[0] :]
-                descriptor = json.loads(payload)
-                return descriptor["publication"]["generation"], {
-                    run["prefix"]: run for run in descriptor["recent_runs"]
-                }
+                return json.loads(payload)
 
-            old_generation, old_runs = retained_runs(hybrid_first["remote_snapshot"])
+            def retained_state(token):
+                envelope = retained_artifact(token[len("lake2:") :])
+                assert envelope["version"] == 2, envelope
+                state = retained_artifact(envelope["state"]["id"])
+                return (
+                    envelope,
+                    state,
+                    {run["prefix"]: run for run in state["recent_runs"]},
+                )
+
+            old_envelope, old_state, old_runs = retained_state(
+                hybrid_first["remote_snapshot"]
+            )
+            old_generation = old_state["publication"]["generation"]
             assert set(old_runs) == {ord("7"), ord("d")}, old_runs
+            # A new query gets a fresh full lease but reuses immutable cut data.
+            fresh_request = dict(hybrid_request)
+            fresh_request.pop("remote_snapshot")
+            started_ms = time.time_ns() // 1_000_000
+            fresh = call("POST", "/tables/wal_windows/query", fresh_request)
+            finished_ms = time.time_ns() // 1_000_000
+            fresh_envelope, _, _ = retained_state(fresh["remote_snapshot"])
+            assert fresh_envelope["state"] == old_envelope["state"]
+            assert fresh_envelope["expires_ms"] >= old_envelope["expires_ms"]
+            assert started_ms + 300_000 <= fresh_envelope["expires_ms"]
+            assert fresh_envelope["expires_ms"] <= finished_ms + 300_000
+            assert len(fresh_envelope["reader_token"]) == 16
             newer = call(
                 "POST",
                 "/tables/wal_windows/lake/changes",
@@ -1389,8 +1411,16 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
                     response.text + server.debug_logs()
                 )
                 time.sleep(0.1)
-            new_generation, new_runs = retained_runs(latest["remote_snapshot"])
+            _, new_state, new_runs = retained_state(latest["remote_snapshot"])
+            new_generation = new_state["publication"]["generation"]
             assert new_generation == old_generation, (old_generation, new_generation)
+            old_parts = {part["id"] for part in old_state["change_parts"]}
+            new_parts = {part["id"] for part in new_state["change_parts"]}
+            # Tombstones also occupy retained row groups, even though they
+            # do not produce vector runs. Only id=1000's group should change.
+            assert len(old_parts - new_parts) == 1, (old_parts, new_parts)
+            assert len(new_parts - old_parts) == 1, (old_parts, new_parts)
+            assert old_parts & new_parts, (old_parts, new_parts)
             assert old_runs[ord("d")] == new_runs[ord("d")], (old_runs, new_runs)
             assert old_runs[ord("7")]["digest"] != new_runs[ord("7")]["digest"]
             assert (

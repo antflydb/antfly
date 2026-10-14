@@ -335,6 +335,12 @@ candidate evaluation; independent top-K lists are not automatically a correct
 global top-K. Cursor tokens must bind both archive and overlay coverage, and
 expire explicitly if their retained generation is unavailable.
 
+Accepted native rows use the same canonical key identity as ingestion, including
+numeric equivalence. Retained data records its encoding so legacy opaque row IDs
+stay stable during replay. Final unit/chunk delivery resolves the exact declared
+artifact for the winning stable-prefix run, even when several runs share an
+index name.
+
 Preserve the existing freshness contract: consume only proved index coverage;
 scan uncovered data through a correct bounded fallback, wait/reject when the
 requested visibility cannot be met, or serve an older snapshot only when the
@@ -355,6 +361,24 @@ history inline; deletion availability and accumulated generations must not add
 work to a foreground search. Local cut admission still enforces capacity and
 protects active readers. Deployments must keep the background artifact collector
 enabled, or run explicit maintenance when they disable automatic collection.
+
+Lake search cursors issue a fresh small lease envelope per query, with its current
+reader token and full configured retention period. Envelopes reference reusable
+immutable state and at most sixteen row groups; unchanged groups survive WAL
+updates without reserialization. Cached partition digests avoid walking the full
+suffix on warm queries. Payload reuse requires expiry beyond the new envelope's
+expiry, and the bounded retained-cut collector observes both expiry classes.
+Restart loads exact provider-qualified state and row objects, using the shared
+I/O scheduler with four concurrent reads and a bounded inline fallback. Combined
+encoded state remains limited to 40 MiB and 65,536 changes.
+
+Archive file maps depend on publication and schema rather than the WAL head.
+Recent vector planning borrows immutable prefix views and memoizes ready job
+metadata only through its proved retention interval. Bounded, resource-accounted
+memos hold copied identities and declarations; every query still validates source
+coverage, permissions and reader authority. See the protocol-44 implementation
+and qualification details in
+[`NATIVE_LAKE_PERFORMANCE_FOLLOWUP.md`](../../zig/NATIVE_LAKE_PERFORMANCE_FOLLOWUP.md).
 
 Filesystem object-store prefix listings descend only through the prefix's
 complete path components. The final partial component remains a string filter,

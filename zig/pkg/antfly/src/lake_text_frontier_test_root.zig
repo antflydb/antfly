@@ -16,6 +16,9 @@
 pub const antfly_sources = @import("source_owner_physical.zig");
 
 test {
+    _ = @import("api/lake_metadata_memo.zig");
+    _ = @import("api/lake_retained_cut.zig");
+    _ = @import("api/lake_recent_vectors.zig");
     _ = @import("serverless/artifacts/cloud_generations.zig");
     _ = @import("api/lake_generation_envelope.zig");
     _ = @import("api/lake_index_serving_compaction.zig");

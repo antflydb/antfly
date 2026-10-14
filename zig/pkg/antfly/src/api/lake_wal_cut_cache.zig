@@ -223,7 +223,7 @@ pub const Cache = struct {
         const delta = try ingestion.normalizePending(a, cut, suffix.lsn, suffix.records);
         const image = try @import("lake_wal_image.zig").Image.update(owner.budget.backing, if (extension != null) previous.?.image else null, delta);
         owner.image = image;
-        const pending: ingestion.Pending = .{ .base_lsn = cut, .lsn = suffix.lsn, .key_fields = image.key_fields, .changes = &.{}, .change_blocks = &image.blocks, .cut_identity = key(@splat(0), cut, head) };
+        const pending: ingestion.Pending = .{ .key_identity = .canonical, .base_lsn = cut, .lsn = suffix.lsn, .key_fields = image.key_fields, .changes = &.{}, .change_blocks = &image.blocks, .block_digests = &image.block_digests, .cut_identity = key(@splat(0), cut, head) };
         owner.overlay = .{ .pending = pending, .rows = .{ .image = image }, .key_filter = "" };
     }
 };

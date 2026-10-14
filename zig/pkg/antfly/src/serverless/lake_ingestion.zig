@@ -198,7 +198,22 @@ pub fn watermark(a: A, binding: Binding, options: Options, context: Context) !u6
     return store.watermark(a);
 }
 
+pub const KeyIdentity = enum { legacy_json, canonical };
+pub fn rowId(a: A, keys: []const []const u8, row: V, encoding: KeyIdentity) ![]u8 {
+    const encoded = if (encoding == .canonical)
+        try local.serverless_external_source_mod.lake_catalog.row_commit.stable_key.identity(a, keys, row, &.{})
+    else legacy: {
+        const values = try a.alloc(V, keys.len);
+        defer a.free(values);
+        for (keys, values) |key, *value| value.* = row.object.get(key) orelse return error.InvalidWal;
+        break :legacy try std.json.Stringify.valueAlloc(a, values, .{});
+    };
+    defer a.free(encoded);
+    return std.fmt.allocPrint(a, "wal1:{s}", .{local.serverless_external_source_mod.lake_catalog.types.digestHex(encoded)});
+}
 pub const Pending = struct {
+    key_identity: KeyIdentity = .legacy_json,
+    block_digests: []const [32]u8 = &.{},
     cut_identity: ?[32]u8 = null,
     base_lsn: u64 = 0,
     lsn: u64,
@@ -222,10 +237,13 @@ pub const Pending = struct {
         }
         result.changes = changes;
         result.change_blocks = &.{};
+        result.block_digests = &.{};
         return result;
     }
     pub fn jsonStringify(self: @This(), stream: anytype) @TypeOf(stream.*).Error!void {
         try stream.beginObject();
+        try stream.objectField("key_identity");
+        try stream.write(self.key_identity);
         try stream.objectField("cut_identity");
         try stream.write(self.cut_identity);
         try stream.objectField("base_lsn");

@@ -67,6 +67,7 @@ pub const Part = struct {
     changes: []const Change = &.{},
     ids: []const []const u8 = &.{},
     fingerprint: [32]u8 = @splat(0),
+    wire_digest: [32]u8 = @splat(0),
     key_filter: []const u8 = "",
     pub fn release(self: *Part) void {
         if (self.refs.fetchSub(1, .acq_rel) != 1) return;
@@ -126,6 +127,7 @@ pub const Part = struct {
         }
         self.entries = entries;
         self.changes = changes;
+        self.wire_digest = digest(changes);
         self.ids = live.items;
         self.key_filter = try std.json.Stringify.valueAlloc(a, .{ .disjuncts = clauses.items }, .{});
         hash.final(&self.fingerprint);
@@ -141,6 +143,7 @@ pub const Image = struct {
     a: A,
     parts: [256]?*Part = @splat(null),
     blocks: [256][]const Change = @splat(&.{}),
+    block_digests: [256][32]u8 = @splat(@splat(0)),
     key_fields: []const []const u8 = &.{},
     row_count: usize = 0,
     change_count: usize = 0,
@@ -173,10 +176,7 @@ pub const Image = struct {
         const sa = scratch.allocator();
         var changed: [256]std.ArrayList(Entry) = @splat(.empty);
         for (delta.changes) |change| {
-            var values: std.ArrayList(V) = .empty;
-            for (keys) |key| try values.append(sa, change.row.object.get(key) orelse return error.InvalidWal);
-            const encoded = try std.json.Stringify.valueAlloc(sa, values.items, .{});
-            const id = try std.fmt.allocPrint(sa, "wal1:{s}", .{local.serverless_external_source_mod.lake_catalog.types.digestHex(encoded)});
+            const id = try ingestion.rowId(sa, keys, change.row, .canonical);
             try changed[partition(id)].append(sa, .{ .id = id, .change = change });
         }
         for (&self.parts, changed) |*part, changes| if (changes.items.len != 0) {
@@ -185,10 +185,11 @@ pub const Image = struct {
             part.* = next;
             self.rebuilt_rows += next.entries.len;
         };
-        for (self.parts, &self.blocks) |part, *block| if (part) |held| {
+        for (self.parts, &self.blocks, &self.block_digests) |part, *block, *fingerprint| if (part) |held| {
             self.row_count += held.ids.len;
             self.change_count += held.changes.len;
             block.* = held.changes;
+            fingerprint.* = held.wire_digest;
         };
         var retained: usize = 0;
         for (self.parts) |part| if (part) |held| {
@@ -205,10 +206,30 @@ pub const Rows = struct {
     pub const empty: @This() = .{};
     local_rows: std.StringHashMapUnmanaged(V) = .empty,
     image: ?*const Image = null,
+    selected_prefix: ?u8 = null,
+    fn selected(self: Rows, index: usize) bool {
+        return if (self.selected_prefix) |prefix| index >> 4 == (std.fmt.charToDigit(prefix, 16) catch return false) else true;
+    }
+    pub fn subset(self: Rows, prefix: u8) Rows {
+        var view = self;
+        view.selected_prefix = prefix;
+        return view;
+    }
     pub fn count(self: Rows) usize {
-        return if (self.image) |image| image.row_count else self.local_rows.count();
+        if (self.selected_prefix == null) return if (self.image) |image| image.row_count else self.local_rows.count();
+        var n: usize = 0;
+        if (self.image) |image| {
+            for (image.parts, 0..) |part, i| if (self.selected(i)) if (part) |held| {
+                n += held.ids.len;
+            };
+        } else {
+            var it = self.iterator();
+            while (it.next() != null) n += 1;
+        }
+        return n;
     }
     pub fn get(self: Rows, id: []const u8) ?V {
+        if (!self.selected(partition(id))) return null;
         const image = self.image orelse return self.local_rows.get(id);
         const part = image.parts[partition(id)] orelse return null;
         var lo: usize = 0;
@@ -221,30 +242,32 @@ pub const Rows = struct {
         return part.entries[lo].change.row;
     }
     pub fn put(self: *Rows, a: A, id: []const u8, value: V) !void {
-        std.debug.assert(self.image == null);
+        std.debug.assert(self.image == null and self.selected_prefix == null);
         try self.local_rows.put(a, id, value);
     }
     pub fn clearRetainingCapacity(self: *Rows) void {
-        std.debug.assert(self.image == null);
+        std.debug.assert(self.image == null and self.selected_prefix == null);
         self.local_rows.clearRetainingCapacity();
     }
     pub fn remove(self: *Rows, id: []const u8) bool {
-        std.debug.assert(self.image == null);
+        std.debug.assert(self.image == null and self.selected_prefix == null);
         return self.local_rows.remove(id);
     }
     pub const Iterator = struct {
         local_iterator: ?std.StringHashMapUnmanaged(V).Iterator = null,
+        selected_prefix: ?u8 = null,
         image: ?*const Image = null,
         part: usize = 0,
         row: usize = 0,
         pub fn next(self: *@This()) ?struct { key_ptr: *const []const u8, value_ptr: *const V } {
+            const view: Rows = .{ .selected_prefix = self.selected_prefix };
             if (self.local_iterator) |*it| {
-                const entry = it.next() orelse return null;
-                return .{ .key_ptr = entry.key_ptr, .value_ptr = entry.value_ptr };
+                while (it.next()) |entry| if (view.selected(partition(entry.key_ptr.*))) return .{ .key_ptr = entry.key_ptr, .value_ptr = entry.value_ptr };
+                return null;
             }
             const image = self.image orelse return null;
             while (self.part < image.parts.len) {
-                if (image.parts[self.part]) |part| while (self.row < part.entries.len) {
+                if (view.selected(self.part)) if (image.parts[self.part]) |part| while (self.row < part.entries.len) {
                     const entry = &part.entries[self.row];
                     self.row += 1;
                     if (entry.change.op == .upsert) return .{ .key_ptr = &entry.id, .value_ptr = &entry.change.row };
@@ -263,7 +286,7 @@ pub const Rows = struct {
         }
     };
     pub fn iterator(self: *const Rows) Iterator {
-        return if (self.image) |image| .{ .image = image } else .{ .local_iterator = self.local_rows.iterator() };
+        return if (self.image) |image| .{ .image = image, .selected_prefix = self.selected_prefix } else .{ .local_iterator = self.local_rows.iterator(), .selected_prefix = self.selected_prefix };
     }
     pub fn keyIterator(self: *const Rows) KeyIterator {
         return .{ .iterator = self.iterator() };
@@ -283,6 +306,14 @@ test "external lake bounded WAL images share unchanged rows without ancestor own
     var image = try Image.update(a, null, .{ .lsn = 1, .key_fields = keys, .changes = &.{ .{ .op = .upsert, .row = first }, .{ .op = .upsert, .row = last } } });
     defer image.release();
     const untouched = image.parts[partition(last_id)].?;
+    const prefix_rows = (Rows{ .image = image }).subset(last_id[5]);
+    try std.testing.expectEqual(image, prefix_rows.image.?);
+    try std.testing.expectEqual(@as(usize, 0), prefix_rows.local_rows.count());
+    try std.testing.expectEqual(@as(usize, 1), prefix_rows.count());
+    try std.testing.expect(prefix_rows.get(first_id) == null);
+    var selected = prefix_rows.iterator();
+    try std.testing.expectEqualStrings(last_id, selected.next().?.key_ptr.*);
+    try std.testing.expect(selected.next() == null);
     for (0..24) |i| {
         const json = try std.fmt.allocPrint(sa, "{{\"id\":0,\"body\":\"updated-{d}\"}}", .{i});
         const row = try std.json.parseFromSliceLeaky(V, sa, json, .{});
@@ -312,4 +343,28 @@ test "external lake bounded WAL images share unchanged rows without ancestor own
         }
     };
     try std.testing.checkAllAllocationFailures(a, Failure.run, .{ image, ingestion.Pending{ .lsn = 100, .key_fields = keys, .changes = &.{.{ .op = .upsert, .row = first }} } });
+}
+
+test "external lake bounded WAL equivalent numeric keys replace" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const sa = arena.allocator();
+    const old = try std.json.parseFromSliceLeaky(V, sa, "{\"id\":-0.0,\"body\":\"old\"}", .{});
+    const new = try std.json.parseFromSliceLeaky(V, sa, "{\"id\":0.0,\"body\":\"new\"}", .{});
+    const stable = local.serverless_external_source_mod.lake_catalog.row_commit.stable_key;
+    try std.testing.expectEqualStrings(try stable.identity(sa, &.{"id"}, old, &.{}), try stable.identity(sa, &.{"id"}, new, &.{}));
+    const first = try Image.update(a, null, .{ .lsn = 1, .key_fields = &.{"id"}, .changes = &.{.{ .op = .upsert, .row = old }} });
+    defer first.release();
+    const second = try Image.update(a, first, .{ .lsn = 2, .key_fields = &.{"id"}, .changes = &.{.{ .op = .upsert, .row = new }} });
+    defer second.release();
+    try std.testing.expectEqual(@as(usize, 1), second.row_count);
+    const encoded = try std.json.Stringify.valueAlloc(sa, ingestion.Pending{ .lsn = 2, .key_fields = second.key_fields, .key_identity = .canonical, .change_blocks = &second.blocks }, .{});
+    const recovered = try std.json.parseFromSliceLeaky(ingestion.Pending, sa, encoded, .{});
+    const overlay = try @import("lake_search_overlay.zig").Overlay.init(sa, recovered);
+    const key = try ingestion.rowId(sa, &.{"id"}, new, .canonical);
+    try std.testing.expectEqualStrings("new", overlay.row(key).?.object.get("body").?.string);
+    const deleted = try Image.update(a, second, .{ .lsn = 3, .key_fields = &.{"id"}, .changes = &.{.{ .op = .delete, .row = new }} });
+    defer deleted.release();
+    try std.testing.expectEqual(@as(usize, 0), deleted.row_count);
 }

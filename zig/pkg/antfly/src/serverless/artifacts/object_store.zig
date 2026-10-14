@@ -387,8 +387,8 @@ pub const ObjectStore = struct {
         try cancellation.check();
         const selected_generation = try self.generation(artifact_id, cancellation);
         defer if (selected_generation) |value| std.heap.page_allocator.free(value);
-        const key = try keyForArtifactIdAlloc(self.alloc, self.prefix, artifact_id);
-        defer self.alloc.free(key);
+        const key = try keyForArtifactIdAlloc(alloc, self.prefix, artifact_id);
+        defer alloc.free(key);
         var client = self.client;
         client.allocator = alloc;
         // Fetch the complete body: a prefix Range GET cannot prove object length.

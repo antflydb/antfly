@@ -3984,6 +3984,8 @@ pub const ApiHttpServer = struct {
     lake_cache_start_mutex: std.Io.Mutex = .init,
     lake_query_metrics: @import("lake_query_metrics.zig").Metrics = .{},
     lake_reader_leases: @import("lake_index_reader_lease.zig").Pool = .{},
+    lake_recent_vector_jobs: @import("lake_recent_vectors.zig").Cache = .{},
+    lake_retained_payloads: @import("lake_retained_cut.zig").Cache = .{ .max_entries = 512, .budget = .{ .backing = @import("antfly_platform").allocator.processAllocator(std.heap.smp_allocator), .limit = 4 * 1024 * 1024 } },
     lake_recent_text: @import("lake_recent_text_cache.zig").Cache = .{},
     lake_wal_cuts: @import("lake_wal_cut_cache.zig").Cache = .{},
     lake_native_runtimes: @import("lake_index_native_runtime_cache.zig").Cache = .{},
@@ -4748,6 +4750,8 @@ pub const ApiHttpServer = struct {
         self.query_embedding_cache.deinit(self.inferenceCacheBudget());
         self.sql_plan_cache.deinit(queryEmbeddingCacheIo(self.cfg));
         self.sql_schema_cache.deinit();
+        self.lake_recent_vector_jobs.deinit();
+        self.lake_retained_payloads.deinit();
         self.lake_recent_text.deinit();
         self.lake_wal_cuts.deinit();
         self.lake_native_runtimes.deinit();
@@ -12962,6 +12966,8 @@ pub const ApiHttpServer = struct {
     /// Called after authorization and before any lake reader is opened.
     /// All aliases and public transports share this server-owned cache.
     pub fn prepareLakeCache(self: *ApiHttpServer) !void {
+        self.lake_recent_vector_jobs.attach(self.shared_resource_manager orelse &self.local_resource_manager);
+        self.lake_retained_payloads.attach(self.shared_resource_manager orelse &self.local_resource_manager);
         self.lake_recent_text.attach(self.shared_resource_manager orelse &self.local_resource_manager);
         self.lake_wal_cuts.attach(self.shared_resource_manager orelse &self.local_resource_manager);
         self.lake_native_runtimes.attach(self.shared_resource_manager orelse &self.local_resource_manager);
