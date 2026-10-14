@@ -59,6 +59,7 @@ const types = @import("types.zig");
 pub fn ImplementationFor(comptime D: type) type {
     return struct {
         const Implementation = @This();
+        const S = Implementation;
         const preparation = @import("mutation_preparation.zig").ImplementationFor(Implementation, D);
         const commit = @import("mutation_commit.zig").ImplementationFor(Implementation, D);
         const materialization = @import("mutation_materialization.zig").ImplementationFor(Implementation, D);
@@ -141,7 +142,7 @@ pub fn ImplementationFor(comptime D: type) type {
                     var cursor: ?[]u8 = null;
                     defer if (cursor) |key| alloc.free(key);
                     while (true) {
-                        const existing = try db.core.store.scanPrefixKeysPage(alloc, prefix, cursor, 256);
+                        const existing = try S.ownerField(db, "core").*.store.scanPrefixKeysPage(alloc, prefix, cursor, 256);
                         defer freeOwnedKeySlice(alloc, existing);
                         if (existing.len == 0) break;
                         for (existing) |key| {
@@ -749,6 +750,166 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const validateGraphEdgeMetadataJson = materialization.validateGraphEdgeMetadataJson;
         pub const vectorIndexConsumesChunkKey = materialization.vectorIndexConsumesChunkKey;
         pub const waitForCachedBool = commit.waitForCachedBool;
+        // Live field borrows keep mutexes, caches and recovery scratch with their
+        // actual owner. The synchronous worker never copies owned descriptors.
+        pub const PreparedBatchOwner = struct {
+            recovery: bool,
+            context: *anyopaque,
+            get_fn: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!?[]u8,
+            bulk_fn: *const fn (*anyopaque) bool,
+            schedule_fn: *const fn (*anyopaque) void,
+            wait_fn: *const fn (*anyopaque, types.SyncLevel, u64, ManagedSyncTargets, types.CancellationToken, bool) anyerror!void,
+            resolved_wait_fn: *const fn (*anyopaque, types.SyncLevel, u64, types.CancellationToken) anyerror!void,
+            local_execution: *@FieldType(Execution, "local_execution"),
+            rewrite_program_cache: *@FieldType(Execution, "rewrite_program_cache"),
+            rewrite_tail_cache: *@FieldType(Execution, "rewrite_tail_cache"),
+            restore_decoder_cache: *@FieldType(Execution, "restore_decoder_cache"),
+            alloc: *@FieldType(Execution, "alloc"),
+            runtime_alloc: *@FieldType(Execution, "runtime_alloc"),
+            open_mode: *@FieldType(Execution, "open_mode"),
+            primary_backend: *@FieldType(Execution, "primary_backend"),
+            primary_lsm_storage: *@FieldType(Execution, "primary_lsm_storage"),
+            physical_root_mode: *@FieldType(Execution, "physical_root_mode"),
+            index_backends: *@FieldType(Execution, "index_backends"),
+            core: *@FieldType(Execution, "core"),
+            root_incarnation: *@FieldType(Execution, "root_incarnation"),
+            async_context: *@FieldType(Execution, "async_context"),
+            backend_runtime: *@FieldType(Execution, "backend_runtime"),
+            backend_owner_id: *@FieldType(Execution, "backend_owner_id"),
+            repair_cleanup_owner_id: *@FieldType(Execution, "repair_cleanup_owner_id"),
+            executor: *@FieldType(Execution, "executor"),
+            secret_store: *@FieldType(Execution, "secret_store"),
+            remote_content: *@FieldType(Execution, "remote_content"),
+            enrichment_runtime: *@FieldType(Execution, "enrichment_runtime"),
+            resolution_runtime: *@FieldType(Execution, "resolution_runtime"),
+            promotion_runtime: *@FieldType(Execution, "promotion_runtime"),
+            ttl_cleanup_context: *@FieldType(Execution, "ttl_cleanup_context"),
+            transaction_recovery_identity_context: *@FieldType(Execution, "transaction_recovery_identity_context"),
+            transaction_recovery_local_context: *@FieldType(Execution, "transaction_recovery_local_context"),
+            text_merge_runtime: *@FieldType(Execution, "text_merge_runtime"),
+            sparse_compaction_runtime: *@FieldType(Execution, "sparse_compaction_runtime"),
+            last_run_until_idle_no_progress: *@FieldType(Execution, "last_run_until_idle_no_progress"),
+            shadow: *@FieldType(Execution, "shadow"),
+            bulk_identity: *@FieldType(Execution, "bulk_identity"),
+            embedding_activity: *@FieldType(Execution, "embedding_activity"),
+            active_index_repairs: *@FieldType(Execution, "active_index_repairs"),
+            graph_restore_parse_cache: *@FieldType(Execution, "graph_restore_parse_cache"),
+            pub const derivedCoverageAppliesToIndex = Implementation.derivedCoverageAppliesToIndex;
+            pub const acquireReplicationMutationShared = Implementation.acquireReplicationMutationShared;
+            pub const acquireTransactionSchemaView = Implementation.acquireTransactionSchemaView;
+            pub const artifactMaterializationsReady = Implementation.artifactMaterializationsReady;
+            pub const maintenanceRequiresOrderedApply = Implementation.maintenanceRequiresOrderedApply;
+            pub const batchContext = Implementation.batchContext;
+            pub const batchInternalPrepared = Implementation.batchInternalPrepared;
+            pub const batchInternalWithPreparationAllocator = Implementation.batchInternalWithPreparationAllocator;
+            pub const captureTransformReadSnapshot = Implementation.captureTransformReadSnapshot;
+            pub const captureGeneratedWriteReadSnapshot = Implementation.captureGeneratedWriteReadSnapshot;
+            pub const validateGeneratedWriteReadSnapshot = Implementation.validateGeneratedWriteReadSnapshot;
+            pub const GeneratedWriteReadSnapshot = Implementation.GeneratedWriteReadSnapshot;
+            pub const clearActiveIndexRepairsLocked = Implementation.clearActiveIndexRepairsLocked;
+            pub const clearBulkIngestIdentityAllNewLocked = Implementation.clearBulkIngestIdentityAllNewLocked;
+            pub const clearDurableReplicationOutbox = Implementation.clearDurableReplicationOutbox;
+            pub const clearLiveDocSetCache = Implementation.clearLiveDocSetCache;
+            pub const clearNonVisibleDocSetCache = Implementation.clearNonVisibleDocSetCache;
+            pub const deleteDocumentArtifactChildRangeOutboxEntry = Implementation.deleteDocumentArtifactChildRangeOutboxEntry;
+            pub const denseRepairWriteBackpressured = Implementation.denseRepairWriteBackpressured;
+            pub const drainDocumentArtifactChildRangeOutbox = Implementation.drainDocumentArtifactChildRangeOutbox;
+            pub const enforcePortableRuntimeGate = Implementation.enforcePortableRuntimeGate;
+            pub const enforceReplicationWriteGate = Implementation.enforceReplicationWriteGate;
+            pub const enforceRowPolicyMutationLocked = Implementation.enforceRowPolicyMutationLocked;
+            pub const ensureDurableReplicationStartupBarrier = Implementation.ensureDurableReplicationStartupBarrier;
+            pub const failIfIdentityOrdinalExhaustedForNewUpserts = Implementation.failIfIdentityOrdinalExhaustedForNewUpserts;
+            pub const finalizePendingRowPolicyReceiptLocked = Implementation.finalizePendingRowPolicyReceiptLocked;
+            pub const flushDurableReplicationOutboxes = Implementation.flushDurableReplicationOutboxes;
+            pub const flushDurableReplicationOutboxesLocked = Implementation.flushDurableReplicationOutboxesLocked;
+            pub const flushTransactionReplicationOutbox = Implementation.flushTransactionReplicationOutbox;
+            pub const hasConfiguredResolvers = Implementation.hasConfiguredResolvers;
+            pub const lockApplyForPortableRuntime = Implementation.lockApplyForPortableRuntime;
+            pub const markPrecomputedEnrichmentAppliedForSync = Implementation.markPrecomputedEnrichmentAppliedForSync;
+            pub const maybeFinalizePendingRowPolicyPublication = Implementation.maybeFinalizePendingRowPolicyPublication;
+            pub const mirrorReplicationEncodedBatchMutationCommit = Implementation.mirrorReplicationEncodedBatchMutationCommit;
+            pub const mirrorReplicationReplayPayloadCommit = Implementation.mirrorReplicationReplayPayloadCommit;
+            pub const noPendingEnrichmentReplayThrough = Implementation.noPendingEnrichmentReplayThrough;
+            pub const notifyResolverReplayRuntimes = Implementation.notifyResolverReplayRuntimes;
+            pub const notifyResolverReplayRuntimesForced = Implementation.notifyResolverReplayRuntimesForced;
+            pub const pendingRowPolicyReceipt = Implementation.pendingRowPolicyReceipt;
+            pub const preflightReplicationBatchSyncCommit = Implementation.preflightReplicationBatchSyncCommit;
+            pub const prepareMergeArtifactEffects = Implementation.prepareMergeArtifactEffects;
+            pub const rememberBulkIngestAllNewIdentityUpserts = Implementation.rememberBulkIngestAllNewIdentityUpserts;
+            pub const replicationMutationBarrier = Implementation.replicationMutationBarrier;
+            pub const resolveTransactionIntentsInternal = Implementation.resolveTransactionIntentsInternal;
+            pub const resolveTransactionIntentsPrepared = Implementation.resolveTransactionIntentsPrepared;
+            pub const restoreStagingStatus = Implementation.restoreStagingStatus;
+            pub const shouldApplySplitReplicationLocked = Implementation.shouldApplySplitReplicationLocked;
+            pub const unchangedDerivedReplayTargetsServiceable = Implementation.unchangedDerivedReplayTargetsServiceable;
+            pub const validateLiveReplicationIntegrityEffects = Implementation.validateLiveReplicationIntegrityEffects;
+            pub const validateMergeCleanupPageLocked = Implementation.validateMergeCleanupPageLocked;
+            pub const validatePreparedSchemaViewLocked = Implementation.validatePreparedSchemaViewLocked;
+            pub const validateResolvedKeyOwnership = Implementation.validateResolvedKeyOwnership;
+            pub const validateRestoreStagingReplicationEffects = Implementation.validateRestoreStagingReplicationEffects;
+            pub const validateTransformReadSnapshot = Implementation.validateTransformReadSnapshot;
+            pub const waitForResolvedTransactionSync = Implementation.waitForResolvedTransactionSync;
+            pub fn from(receiver: anytype) PreparedBatchOwner {
+                const Receiver = @TypeOf(receiver);
+                const Callbacks = struct {
+                    fn get(ptr: *anyopaque, alloc: Allocator, key: []const u8) anyerror!?[]u8 {
+                        if (comptime Receiver == *Execution) return error.PreparedReadSetChanged;
+                        const original: Receiver = @ptrCast(@alignCast(ptr));
+                        return original.get(alloc, key);
+                    }
+                    fn bulk(ptr: *anyopaque) bool {
+                        const original: Receiver = @ptrCast(@alignCast(ptr));
+                        return original.bulkSessionActive();
+                    }
+                    fn schedule(ptr: *anyopaque) void {
+                        const original: Receiver = @ptrCast(@alignCast(ptr));
+                        original.scheduleDurableReplicationOutboxRecovery();
+                    }
+                    fn wait(ptr: *anyopaque, level: types.SyncLevel, version: u64, targets: ManagedSyncTargets, cancellation: types.CancellationToken, explicit: bool) anyerror!void {
+                        const original: Receiver = @ptrCast(@alignCast(ptr));
+                        return original.waitForSyncLevelWithCancellation(level, version, targets, cancellation, explicit);
+                    }
+                    fn resolvedWait(ptr: *anyopaque, level: types.SyncLevel, version: u64, cancellation: types.CancellationToken) anyerror!void {
+                        const original: Receiver = @ptrCast(@alignCast(ptr));
+                        return original.waitForResolvedTransactionSyncWithCancellation(level, version, cancellation);
+                    }
+                };
+                var view: PreparedBatchOwner = undefined;
+                inline for (@typeInfo(Execution).@"struct".field_names) |field| @field(view, field) = &@field(receiver, field);
+                view.recovery = Receiver == *Execution;
+                view.context = @ptrCast(receiver);
+                view.get_fn = if (Receiver == *Execution) null else &Callbacks.get;
+                view.bulk_fn = &Callbacks.bulk;
+                view.schedule_fn = &Callbacks.schedule;
+                view.wait_fn = &Callbacks.wait;
+                view.resolved_wait_fn = &Callbacks.resolvedWait;
+                return view;
+            }
+            pub fn get(self: *PreparedBatchOwner, alloc: Allocator, key: []const u8) anyerror!?[]u8 {
+                const callback = self.get_fn orelse return error.PreparedReadSetChanged;
+                return callback(self.context, alloc, key);
+            }
+            pub fn bulkSessionActive(self: *PreparedBatchOwner) bool {
+                return self.bulk_fn(self.context);
+            }
+            pub fn scheduleDurableReplicationOutboxRecovery(self: *PreparedBatchOwner) void {
+                self.schedule_fn(self.context);
+            }
+            pub fn waitForSyncLevelWithCancellation(self: *PreparedBatchOwner, level: types.SyncLevel, version: u64, targets: ManagedSyncTargets, cancellation: types.CancellationToken, explicit: bool) anyerror!void {
+                return self.wait_fn(self.context, level, version, targets, cancellation, explicit);
+            }
+            pub fn waitForResolvedTransactionSyncWithCancellation(self: *PreparedBatchOwner, level: types.SyncLevel, version: u64, cancellation: types.CancellationToken) anyerror!void {
+                return self.resolved_wait_fn(self.context, level, version, cancellation);
+            }
+        };
+        pub inline fn ownerField(receiver: anytype, comptime field: []const u8) if (@TypeOf(receiver) == *PreparedBatchOwner or @TypeOf(receiver) == *const PreparedBatchOwner) @TypeOf(@field(receiver, field)) else @TypeOf(&@field(receiver, field)) {
+            if (@TypeOf(receiver) == *PreparedBatchOwner or @TypeOf(receiver) == *const PreparedBatchOwner) return @field(receiver, field);
+            return &@field(receiver, field);
+        }
+        pub inline fn isRecoveryExecution(receiver: anytype) bool {
+            if (@TypeOf(receiver) == *PreparedBatchOwner or @TypeOf(receiver) == *const PreparedBatchOwner) return receiver.recovery;
+            return @TypeOf(receiver) == *Execution;
+        }
         pub const Execution = struct {
             local_execution: *LocalExecutionState,
             rewrite_program_cache: @import("../rewrite_program_cache.zig").Cache = .{},
@@ -854,12 +1015,12 @@ pub fn ImplementationFor(comptime D: type) type {
 
             pub fn waitForResolvedTransactionSyncWithCancellation(self: *@This(), sync_level: types.SyncLevel, _: u64, _: types.CancellationToken) !void {
                 std.debug.assert(sync_level == .propose);
-                try self.executor.checkSyncLevelHealth(sync_level);
+                try S.ownerField(self, "executor").*.checkSyncLevelHealth(sync_level);
             }
 
             pub fn waitForSyncLevelWithCancellation(self: *@This(), sync_level: types.SyncLevel, _: u64, _: ManagedSyncTargets, _: types.CancellationToken, _: bool) !void {
                 std.debug.assert(sync_level == .propose);
-                try self.executor.checkSyncLevelHealth(sync_level);
+                try S.ownerField(self, "executor").*.checkSyncLevelHealth(sync_level);
             }
 
             pub fn bulkSessionActive(_: *@This()) bool {
@@ -867,16 +1028,16 @@ pub fn ImplementationFor(comptime D: type) type {
             }
 
             pub fn deinitScratch(self: *@This()) void {
-                const filesystem_io = self.backend_runtime.filesystemIo() orelse std.Options.debug_io;
-                self.restore_decoder_cache.deinit(filesystem_io);
-                self.rewrite_program_cache.deinit(filesystem_io);
-                self.rewrite_tail_cache.deinit(filesystem_io);
-                if (self.graph_restore_parse_cache) |*cache| cache.deinit(self.alloc);
-                if (self.last_run_until_idle_no_progress) |*diagnostic| diagnostic.deinit(self.alloc);
-                self.embedding_activity.deinit(self.alloc);
+                const filesystem_io = S.ownerField(self, "backend_runtime").*.filesystemIo() orelse std.Options.debug_io;
+                S.ownerField(self, "restore_decoder_cache").*.deinit(filesystem_io);
+                S.ownerField(self, "rewrite_program_cache").*.deinit(filesystem_io);
+                S.ownerField(self, "rewrite_tail_cache").*.deinit(filesystem_io);
+                if (S.ownerField(self, "graph_restore_parse_cache").*) |*cache| cache.deinit(S.ownerField(self, "alloc").*);
+                if (S.ownerField(self, "last_run_until_idle_no_progress").*) |*diagnostic| diagnostic.deinit(S.ownerField(self, "alloc").*);
+                S.ownerField(self, "embedding_activity").*.deinit(S.ownerField(self, "alloc").*);
                 self.clearActiveIndexRepairsLocked();
-                self.active_index_repairs.deinit(self.alloc);
-                self.bulk_identity.deinit(self.alloc);
+                S.ownerField(self, "active_index_repairs").*.deinit(S.ownerField(self, "alloc").*);
+                S.ownerField(self, "bulk_identity").*.deinit(S.ownerField(self, "alloc").*);
             }
 
             comptime {
@@ -913,25 +1074,25 @@ pub fn ImplementationFor(comptime D: type) type {
 
             pub fn borrow(db: anytype) @This() {
                 return .{
-                    .local_execution = db.local_execution,
-                    .alloc = db.alloc,
-                    .runtime_alloc = db.runtime_alloc,
-                    .open_mode = db.open_mode,
-                    .primary_backend = db.primary_backend,
-                    .primary_lsm_storage = db.primary_lsm_storage,
-                    .physical_root_mode = db.physical_root_mode,
-                    .index_backends = db.index_backends,
-                    .core = db.core,
-                    .root_incarnation = db.root_incarnation,
-                    .async_context = db.async_context,
-                    .backend_runtime = db.backend_runtime,
-                    .backend_owner_id = db.backend_owner_id,
-                    .repair_cleanup_owner_id = db.repair_cleanup_owner_id,
-                    .executor = db.executor,
-                    .ttl_cleanup_context = db.ttl_cleanup_context,
-                    .transaction_recovery_identity_context = db.transaction_recovery_identity_context,
-                    .secret_store = db.secret_store,
-                    .remote_content = db.remote_content,
+                    .local_execution = S.ownerField(db, "local_execution").*,
+                    .alloc = S.ownerField(db, "alloc").*,
+                    .runtime_alloc = S.ownerField(db, "runtime_alloc").*,
+                    .open_mode = S.ownerField(db, "open_mode").*,
+                    .primary_backend = S.ownerField(db, "primary_backend").*,
+                    .primary_lsm_storage = S.ownerField(db, "primary_lsm_storage").*,
+                    .physical_root_mode = S.ownerField(db, "physical_root_mode").*,
+                    .index_backends = S.ownerField(db, "index_backends").*,
+                    .core = S.ownerField(db, "core").*,
+                    .root_incarnation = S.ownerField(db, "root_incarnation").*,
+                    .async_context = S.ownerField(db, "async_context").*,
+                    .backend_runtime = S.ownerField(db, "backend_runtime").*,
+                    .backend_owner_id = S.ownerField(db, "backend_owner_id").*,
+                    .repair_cleanup_owner_id = S.ownerField(db, "repair_cleanup_owner_id").*,
+                    .executor = S.ownerField(db, "executor").*,
+                    .ttl_cleanup_context = S.ownerField(db, "ttl_cleanup_context").*,
+                    .transaction_recovery_identity_context = S.ownerField(db, "transaction_recovery_identity_context").*,
+                    .secret_store = S.ownerField(db, "secret_store").*,
+                    .remote_content = S.ownerField(db, "remote_content").*,
                 };
             }
 
@@ -940,31 +1101,31 @@ pub fn ImplementationFor(comptime D: type) type {
             /// Its scratch allocations are released before returning to the driver.
             pub fn mutation(self: *const @This()) Execution {
                 return .{
-                    .local_execution = self.local_execution,
-                    .alloc = self.alloc,
-                    .runtime_alloc = self.runtime_alloc,
-                    .open_mode = self.open_mode,
-                    .primary_backend = self.primary_backend,
-                    .primary_lsm_storage = self.primary_lsm_storage,
-                    .physical_root_mode = self.physical_root_mode,
-                    .index_backends = self.index_backends,
-                    .core = self.core,
-                    .root_incarnation = self.root_incarnation,
-                    .async_context = self.async_context,
-                    .backend_runtime = self.backend_runtime,
-                    .backend_owner_id = self.backend_owner_id,
-                    .repair_cleanup_owner_id = self.repair_cleanup_owner_id,
-                    .executor = self.executor,
-                    .secret_store = self.secret_store,
-                    .remote_content = self.remote_content,
-                    .enrichment_runtime = self.async_context.enrichment_runtime,
-                    .resolution_runtime = self.async_context.resolution_runtime,
-                    .promotion_runtime = self.async_context.promotion_runtime,
-                    .ttl_cleanup_context = self.ttl_cleanup_context,
-                    .transaction_recovery_identity_context = self.transaction_recovery_identity_context,
+                    .local_execution = S.ownerField(self, "local_execution").*,
+                    .alloc = S.ownerField(self, "alloc").*,
+                    .runtime_alloc = S.ownerField(self, "runtime_alloc").*,
+                    .open_mode = S.ownerField(self, "open_mode").*,
+                    .primary_backend = S.ownerField(self, "primary_backend").*,
+                    .primary_lsm_storage = S.ownerField(self, "primary_lsm_storage").*,
+                    .physical_root_mode = S.ownerField(self, "physical_root_mode").*,
+                    .index_backends = S.ownerField(self, "index_backends").*,
+                    .core = S.ownerField(self, "core").*,
+                    .root_incarnation = S.ownerField(self, "root_incarnation").*,
+                    .async_context = S.ownerField(self, "async_context").*,
+                    .backend_runtime = S.ownerField(self, "backend_runtime").*,
+                    .backend_owner_id = S.ownerField(self, "backend_owner_id").*,
+                    .repair_cleanup_owner_id = S.ownerField(self, "repair_cleanup_owner_id").*,
+                    .executor = S.ownerField(self, "executor").*,
+                    .secret_store = S.ownerField(self, "secret_store").*,
+                    .remote_content = S.ownerField(self, "remote_content").*,
+                    .enrichment_runtime = S.ownerField(self, "async_context").*.enrichment_runtime,
+                    .resolution_runtime = S.ownerField(self, "async_context").*.resolution_runtime,
+                    .promotion_runtime = S.ownerField(self, "async_context").*.promotion_runtime,
+                    .ttl_cleanup_context = S.ownerField(self, "ttl_cleanup_context").*,
+                    .transaction_recovery_identity_context = S.ownerField(self, "transaction_recovery_identity_context").*,
                     .transaction_recovery_local_context = null,
-                    .text_merge_runtime = self.async_context.text_merge_runtime,
-                    .sparse_compaction_runtime = self.async_context.sparse_compaction_runtime,
+                    .text_merge_runtime = S.ownerField(self, "async_context").*.text_merge_runtime,
+                    .sparse_compaction_runtime = S.ownerField(self, "async_context").*.sparse_compaction_runtime,
                     .shadow = null,
                 };
             }

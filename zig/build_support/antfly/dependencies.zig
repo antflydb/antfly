@@ -1111,6 +1111,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     inference_host_mod.addImport("antfly_inference_worker_wire", inference_worker_wire_mod);
     inference_host_mod.addImport("antfly_inference_provider_failure", inference_provider_failure_mod);
     const shared_inference_core = b.option(bool, "shared-inference-core", "Reuse one Apache inference engine for the server and embedded library") orelse false;
+    const shared_storage_core = b.option(bool, "shared-storage-core", "Share an Apache archive for bulk storage ordinal operations") orelse false;
     const measured_darwin_memory = b.option(bool, "measured-darwin-compile-memory", "Use native SDK 26.4 stripped Metal/BLAS ReleaseFast compiler admission claims") orelse false;
     const baseline_cpu = std.Target.Cpu.baseline(target.result.cpu.arch, target.result.os);
     const darwin_release_memory = measured_darwin_memory and optimize == .fast and strip and !sanitize_thread and
@@ -1148,7 +1149,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     }
     const antfly_imports = AntflyRootImports{
         .sql_parser = sql_parser_mod,
-        .storage_boundary = @import("../embedded/storage_boundary.zig").create(b, target, optimize),
+        .storage_boundary = @import("../embedded/storage_boundary.zig").createWithOptions(b, target, optimize, .{ .shared_core = shared_storage_core, .sanitize_thread = sanitize_thread }),
         .cancellation = cancellation_mod,
         .cache_budget = cache_budget_mod,
         .runtime_abi = runtime_abi_mod,
@@ -1271,6 +1272,19 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     };
     inference_engine_mod.addImport("engine_memory", antfly_imports.storage_boundary.memory);
     runtime_abi_mod.addImport("antfly_test_error_logs", antfly_imports.storage_boundary.test_error_logs);
+    const ordinal_tests = b.addTest(.{ .root_module = antfly_imports.storage_boundary.ordinals });
+    b.step("storage-ordinal-core-test", "Verify bulk storage operations through the configured implementation")
+        .dependOn(&b.addRunArtifact(ordinal_tests).step);
+    const doc_set_tests_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/storage_doc_set_test_root.zig"), .target = target, .optimize = optimize });
+    doc_set_tests_mod.addImport("storage_ordinals", antfly_imports.storage_boundary.ordinals);
+    const doc_set_tests = b.addTest(.{ .root_module = doc_set_tests_mod });
+    b.step("storage-doc-set-test", "Verify storage set representations, ownership and bulk operations")
+        .dependOn(&b.addRunArtifact(doc_set_tests).step);
+    const ordinal_bench_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/storage/ordinals/benchmark.zig"), .target = target, .optimize = optimize });
+    ordinal_bench_mod.addImport("storage_ordinals", antfly_imports.storage_boundary.ordinals);
+    const ordinal_bench = b.addExecutable(.{ .name = "storage-ordinal-bench", .root_module = ordinal_bench_mod });
+    b.step("storage-ordinal-core-bench", "Compare bulk ordinal calls with inline storage algorithms")
+        .dependOn(&b.addRunArtifact(ordinal_bench).step);
     // SQL shape fixtures reach native schema and storage contracts, but do not
     // need the inference/API module graph of a full storage owner.
     antfly_imports.configureRuntimeContracts(usermgr_mod);

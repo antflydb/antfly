@@ -1010,3 +1010,55 @@ Regenerate error names with
 `python3 zig/tools/generate_engine_errors.py --zig /path/to/pinned/zig`;
 `--check` verifies freshness. Run the model-free release check with
 `python3 zig/tools/check_shared_inference_core.py --server-binary --binary /path/to/antfly`.
+
+### October 13 merged-main follow-up (draft qualification)
+
+A second paired cold-cache macOS ARM64 `antfly capi` build, based on merged
+main `7aa031f49d`, took **35m39s → 29m24s** (17.55% faster). Both runs completed
+successfully. This comparison measures the follow-up against the already shared
+inference/admission implementation; it does not use the older 44m28s baseline.
+
+| Artifact | Baseline bytes | Candidate bytes | Change |
+| --- | ---: | ---: | ---: |
+| antfly | 178,399,544 | 176,102,600 | -1.29% |
+| libantfly.dylib | 71,561,920 | 69,398,944 | -3.02% |
+
+Both builds used the same 14-core, 36 GiB wolfspider host, Zig 0.17.0, SDK 26.4,
+ARM64 baseline CPU, ReleaseFast, `-Dstrip=true`, Metal/system BLAS and disabled
+CUDA/PJRT. Both enabled shared inference and measured Darwin reservations. The
+candidate additionally enabled `-Dshared-storage-core=true`. A missing serverless
+resolver import on this main revision was repaired identically in both snapshots.
+Unrelated host work remained running. Sampled aggregate build RSS increased from
+12.39 to 14.58 GiB; summed process residency is not unique physical memory.
+This is one cold-cache pair, not repeated build-time or cross-platform qualification.
+
+The follow-up changes are:
+
+- Compile Mach-O C API objects without waiting for inference/enrichment providers;
+  attach those archives at the final shared-library link instead. The measured
+  scheduler still started C API code generation only after storage completed,
+  so removing this dependency alone did not establish C API overlap.
+- Reserve 12 GiB for the shared inference core only on the already qualified
+  measured Darwin profile. Other profiles retain their existing reservations.
+- Use a compact sorted error-name catalog with binary search, retaining lossless
+  compiler-local error identity. Its generated test checks every catalog entry.
+- Share one concrete prepared mutation worker between resident and recovery
+  receivers. Its borrowed view points into live owner fields; it does not copy
+  caches or synchronization state. The C API linker map now contains one large
+  worker (1,924,960 bytes), replacing two workers (1,954,196 and 1,842,160 bytes).
+- Add an opt-in storage ordinal archive owned by `antfly-embedded/src/storage/ordinals`.
+  Calls operate on caller-owned scalar buffers. Small sorts and small set merges
+  remain inline; union remains inline because the native union probe regressed.
+  Unsupported targets and thread-sanitized builds retain the inline implementation.
+
+The storage option is disabled by default. Release packaging forwards it with
+`--shared-storage-core true`. Qualification includes 48 ordinal/document-set tests
+in each inline/shared mode, runtime contracts, mutation preparation/replay/SQL
+transform tests, native foreign-key and relational-index suites, the Apache source
+boundary audit, release C consumer linkage, and model-free inference CLI/HTTP
+lifecycle checks. Broader throughput, Linux, sanitizer and full integration
+qualification remain pending. Raw JSON, logs and linker maps stay outside the repo.
+
+The cold measurement snapshot predates relocating the ordinal sources into the
+embedded package; both implementations passed their 48 tests after relocation.
+Later rebases must be validated separately and do not change these historical figures.

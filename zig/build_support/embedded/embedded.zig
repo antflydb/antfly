@@ -272,7 +272,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         b,
         native_inference_mod,
         if (antfly_imports.shared_inference_core) "antfly-inference-core" else "antfly-embedded-inference",
-        @as(u64, if (antfly_imports.shared_inference_core and target.result.os.tag == .macos) 20 else if (antfly_imports.darwin_release_memory) 8 else 12) * 1024 * 1024 * 1024,
+        @import("shared_library.zig").inferenceCompileMaxRss(target.result.os.tag, antfly_imports.shared_inference_core, antfly_imports.darwin_release_memory),
     );
     native_inference.link_function_sections = true;
     native_inference.link_data_sections = true;
@@ -291,14 +291,12 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     );
     const libantfly_link_mod = capi_mod;
     libantfly_link_mod.strip = strip;
-    libantfly_link_mod.linkLibrary(native_inference);
-    libantfly_link_mod.linkLibrary(native_enrichment);
     // Final native library consumers need release metadata even in the
     // embedded-only composition. Attach it before creating link artifacts
     // and before any consumer can cache this module's dependency graph.
     antfly_imports.build_info.link(libantfly_link_mod);
     addMacosSdkPaths(b, libantfly_link_mod, target);
-    const libantfly = @import("shared_library.zig").add(b, libantfly_link_mod);
+    const libantfly = @import("shared_library.zig").add(b, libantfly_link_mod, &.{ native_inference, native_enrichment });
     const install_libantfly = libantfly.install;
     b.dependOnFileContents(b.path("pkg/antfly-embedded/libantfly.pc.in"));
     const pc_path = b.root.join(b.allocator, "pkg/antfly-embedded/libantfly.pc.in") catch @panic("OOM");

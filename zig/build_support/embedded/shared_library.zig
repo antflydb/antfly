@@ -21,6 +21,22 @@ pub fn llvmBackend(target: std.Target) ?bool {
     return if (target.ofmt == .elf) true else null;
 }
 
+pub fn inferenceCompileMaxRss(os: std.Target.Os.Tag, shared: bool, measured_darwin: bool) u64 {
+    const gib = 1024 * 1024 * 1024;
+    if (os == .macos and shared) return (if (measured_darwin) @as(u64, 12) else 20) * gib;
+    return (if (os == .macos and measured_darwin) @as(u64, 8) else 12) * gib;
+}
+
+test "qualified inference core keeps peak margin and fits beside API compilation" {
+    const gib = 1024 * 1024 * 1024;
+    const claim = inferenceCompileMaxRss(.macos, true, true);
+    // Fresh merged-main MaxRSS 9G upper bound, plus at least 25%.
+    try std.testing.expect(claim >= 9 * gib + 9 * gib / 4);
+    try std.testing.expect(claim + 14 * gib <= 28 * gib);
+    try std.testing.expect(inferenceCompileMaxRss(.macos, true, false) + 14 * gib > 28 * gib);
+    try std.testing.expectEqual(12 * gib, inferenceCompileMaxRss(.linux, true, false));
+}
+
 /// Provider archives borrow std.Io executors from the C API and Lite CLI. Internal Zig
 /// callbacks must use the same backend calling convention as their owner.
 pub fn addProviderArchive(b: *std.Build, module: *std.Build.Module, name: []const u8, max_rss: u64) *std.Build.Step.Compile {
@@ -47,10 +63,13 @@ pub const Library = struct {
     }
 };
 
-pub fn add(b: *std.Build, module: *std.Build.Module) Library {
+pub fn add(b: *std.Build, module: *std.Build.Module, providers: []const *std.Build.Step.Compile) Library {
     const target = module.resolved_target.?.result;
     const macho = target.os.tag == .macos;
     const elf = target.ofmt == .elf;
+    // Mach-O archives compile without provider inputs. Only the final link
+    // needs their emitted code, so LLVM owners can run independently.
+    if (!macho) for (providers) |provider| module.linkLibrary(provider);
     const header = b.path("pkg/antfly-embedded/include/antfly.h");
     var exports: ?std.Build.LazyPath = null;
     if (macho or elf) {
@@ -103,6 +122,12 @@ pub fn add(b: *std.Build, module: *std.Build.Module) Library {
         // Traverse imports without caching Module.getGraph: composition owners
         // still add build-info imports after this helper returns.
         addLinks(b, run, module, &visited, &libraries);
+        for (providers) |provider| {
+            if (!(libraries.getOrPut(provider) catch @panic("OOM")).found_existing) {
+                run.addFileArg(provider.getEmittedBin());
+                addLinks(b, run, provider.root_module, &visited, &libraries);
+            }
+        }
         break :blk output;
     } else blk: {
         compile.link_gc_sections = true;

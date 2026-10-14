@@ -63,6 +63,8 @@ PACKAGE_ENTRYPOINTS = (
 # Generated data modules resolve to their producers. Only Zig's standard library
 # and build-generated configuration constants terminate traversal.
 SOURCE_MODULES = {
+    "storage_ordinals": ("zig/pkg/antfly-embedded/src/storage/ordinals/root.zig",),
+    "storage_ordinal_options": (),
     "antfly_apple_native": ("zig/lib/apple_native/src/mod.zig",),
     "root": tuple(SOURCE_ROOT + name for name in ENTRYPOINTS) + PACKAGE_ENTRYPOINTS,
     "antfly_local_sources": ("zig/pkg/antfly-embedded/src/source_catalog.zig",),

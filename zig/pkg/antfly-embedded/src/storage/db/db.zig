@@ -44775,7 +44775,7 @@ const relationalColumns = local_mutation.relationalColumns;
 
 const encodeStoreLookupKeyAlloc = local_mutation.encodeStoreLookupKeyAlloc;
 
-const encodeStoreLookupKeyWithPinnedSchemaAlloc = execution_resources.encodeStoreLookupKeyWithPinnedSchemaAlloc;
+const encodeStoreLookupKeyWithPinnedSchemaAlloc = local_mutation.encodeStoreLookupKeyWithPinnedSchemaAlloc;
 
 const documentRangeLowerAlloc = local_mutation.documentRangeLowerAlloc;
 
@@ -45112,13 +45112,14 @@ fn remoteRenderConfig(
     var config: template_remote.RenderConfig = .{};
     if (maybe_db) |db| {
         if (comptime @hasField(template_remote.RenderConfig, "secret_store")) {
-            config.secret_store = db.secret_store;
+            config.secret_store = local_mutation.ownerField(db, "secret_store").*;
         }
         if (comptime @hasField(template_remote.RenderConfig, "remote_content")) {
-            config.remote_content = db.remote_content;
+            config.remote_content = local_mutation.ownerField(db, "remote_content").*;
         }
         if (comptime @hasField(template_remote.RenderConfig, "io")) {
-            config.io = db.backend_runtime.inferenceIo() orelse db.backend_runtime.io();
+            const runtime = local_mutation.ownerField(db, "backend_runtime").*;
+            config.io = runtime.inferenceIo() orelse runtime.io();
         }
     }
     if (comptime @hasField(template_remote.RenderConfig, "max_media_parts")) {
