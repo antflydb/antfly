@@ -135,33 +135,7 @@ pub const Catalog = struct {
             if (!self.mode_initialized or self.storage_mode != schema.storage_mode or
                 self.active_schema_version != schema.version)
                 return error.TableCatalogSchemaMismatch;
-            if (self.schema_format_version < 16) for (schema.relational_columns) |column| {
-                if (column.sql_element_type != null) return error.UnsupportedTableCapabilityVersion;
-            };
-            if (self.schema_format_version < 17) for (schema.relational_columns) |column| {
-                if (column.column_type == .sql_array) return error.UnsupportedTableCapabilityVersion;
-            };
-            if (self.schema_format_version < 18 and schema.requires_typed_expressions) return error.UnsupportedTableCapabilityVersion;
-            if (self.schema_format_version < 19 and schema.requires_predicate_expressions) return error.UnsupportedTableCapabilityVersion;
-            if (self.schema_format_version < 21 and schema.requires_exact_numeric_expressions) return error.UnsupportedTableCapabilityVersion;
-            if (self.schema_format_version < 22 and schema.requires_exact_numeric_validation) return error.UnsupportedTableCapabilityVersion;
-            if (self.schema_format_version < 23 and schema.requires_numeric_modifiers) return error.UnsupportedTableCapabilityVersion;
-            if (self.schema_format_version < 24 and schema.requires_array_expressions) return error.UnsupportedTableCapabilityVersion;
-            if (self.schema_format_version < 25 and schema.requires_array_constructors) return error.UnsupportedTableCapabilityVersion;
-            if (self.schema_format_version < 26 and schema.requires_constant_index_predicates) return error.UnsupportedTableCapabilityVersion;
-            if (self.schema_format_version < 27 and schema.requires_text_expressions) return error.UnsupportedTableCapabilityVersion;
-            if (self.schema_format_version < 28 and schema.requires_numeric_functions) return error.UnsupportedTableCapabilityVersion;
-            if (self.schema_format_version < 29 and schema.requires_jsonb_display) return error.UnsupportedTableCapabilityVersion;
-            if (self.schema_format_version < 30 and schema.requires_json_expressions) return error.UnsupportedTableCapabilityVersion;
-            if (self.schema_format_version < 31) {
-                if (schema.requires_jsonb_array_display) return error.UnsupportedTableCapabilityVersion;
-                for (schema.relational_columns) |column| {
-                    if (column.column_type == .sql_array and column.sql_element_type == .jsonb) return error.UnsupportedTableCapabilityVersion;
-                }
-            }
-            if (self.schema_format_version < 20) for (schema.relational_columns) |column| {
-                if (column.column_type == .numeric or column.sql_element_type == .numeric) return error.UnsupportedTableCapabilityVersion;
-            };
+            if (self.schema_format_version < schema_mod.requiredReaderVersion(schema)) return error.UnsupportedTableCapabilityVersion;
             return;
         }
         if (self.storage_mode != .document or self.active_schema_version != 0)

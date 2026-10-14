@@ -5097,3 +5097,99 @@ ownership improvements and exact original-case campaigns also remain open.
 Original dispositions stay 479 implemented / 136 rejected / 73 superseded /
 898 unresolved. These public component/restart contracts are not a substitute
 for the unchanged original sql-0671 multi-column declaration and its full proof.
+
+### Shared immutable schema-reader requirements
+
+Schema serialization and the durable table catalog now use one minimum-reader
+calculation covering all expression flags, precise builtin identities, NUMERIC
+modifiers and JSONB arrays. Independent tests exercise every feature floor,
+one-version-too-old serialization, exact-version round trips and typed-column
+requirements. A compile-time test requires extending that contract when another
+requires_* field is added. Catalog mismatch still remains distinct from an
+unsupported reader capability; this calculation does not authenticate schemas.
+
+ReaderRequirements separates semantic_version from encoding_version. An old
+reader may interpret a layout's logical features but cannot necessarily decode
+a newer ASCH frame carrying that layout. Restore/transport admission must check
+both ceilings. Text-search projection serialization explicitly drops public row
+authority alongside other relational features, retaining its existing legacy
+document projection bytes rather than leaking row requirements into that format.
+
+Every immutable schema epoch caches its reader requirements at construction.
+Pinned SchemaView access is constant time and remains attached to the original
+generation across publication. A measured 10,000-access test verifies unchanged
+allocation and reference counts, including after a newer JSON-expression epoch
+is installed. This supplies the owner-side primitive for capability observations;
+it does not yet add a distributed ACK or publication barrier.
+
+The rollout audit against the merged origin/main snapshot 832c9d6659 establishes
+three distinct mechanisms which must not be conflated: metadata command decoding
+(that snapshot advertises 33, this branch 36), schema semantics/ASCH decoding
+(that snapshot supports 25, this branch 31), and store relational
+topology protocol 2 (Raft/FK coordination). The last capability is advertised
+conditionally on a data Raft runtime and is not a schema-reader capability for
+serving-only owners. Bumping/reusing it would impose the wrong contract.
+
+Remaining distributed activation implementation:
+
+1. Add a dedicated, reporter-incarnation-bound schema-reader capability to store
+   registration and reports, separate from topology coordination. Bind the
+   validated schema requirement to metadata publication and an explicit new
+   decoder profile, preserving predecessor command interpretation. Final append
+   classification must cover CREATE, replacement, FK/UNIQUE publication, restore
+   staging and topology/extension paths, not only public SQL ingress.
+2. Capture readiness before the catalog lane, then revalidate the same term,
+   metadata incarnation and complete joint/configured membership under the lane.
+   Activate a durable monotonic schema-reader floor atomically with publication;
+   subsequent registration and placement must not introduce an older reader.
+   Do not derive trust solely from an optional user-controlled capability field.
+3. Extend owner installation progress with exact schema/public-definition
+   identity and capability information from the same pinned root observation as
+   the installed schema/index state. Current table/node/version-only progress
+   is insufficient. Bind evidence to the reporter incarnation and current
+   group/range/root ownership; retirement, resharding or same-version namespace
+   replacement must invalidate stale proofs. Delta suppression must compare the
+   full proof, and reconciliation must index it once per immutable round.
+4. Use versioned progress commands/storage rather than extending legacy fixed
+   record bytes under their old opcode. Require all metadata decoders before
+   appending the new frame. Missing/legacy capability observations remain unknown
+   for new features and cannot authorize schema cutover.
+5. Apply the same contract to document and relational restore publication.
+   Manifest admission includes actual physical schema versions, even when their
+   semantic requirement is lower. Verify the staged owner before publishing its
+   namespace; preserve bounded streaming, cancellation and resumable cleanup.
+6. Add mixed-version and distributed fault tests for joint membership changes,
+   downgrade/registration races, stale same-version ACKs, reporter/root ABA,
+   partial group coverage, cancellation and unknown physical frame versions.
+   No failed proof may publish a schema, finalize a rewrite or expose staged rows.
+
+This is still required implementation, not a claim of a completed rollout gate.
+Original dispositions remain 479 implemented / 136 rejected / 73 superseded /
+898 unresolved; schema-reader component tests grant no original-case credit.
+
+The unchanged sql-0671 declaration now also has an independently captured
+PostgreSQL fixture and native/mounted contracts. The complete declaration binds
+its UUID PRIMARY KEY, text replacement/lower, exact NUMERIC rounding and JSONB
+source extraction together. Inputs cover NULL propagation, half-away-from-zero
+rounding, a result beyond binary64's exact integer domain and JSON numeric
+display 123.00. Its derived semantic reader floor is 30, not its ASCH encoding
+version 31. Native logical restore rejects forged generated source text.
+
+The mounted contract opens a real namespaced native owner, prepares PRIMARY KEY
+integrity commands through the production mutation planner and actual owner
+catalog/read port, and commits all prepared writes, predicates and claims in
+one transaction. It then closes/reopens the LSM database and reads the generated
+outputs through the public SQL handler. Initial fixture attempts correctly hit
+the table-identity and coordinated-write guards; assigning a stable table/shard/
+range namespace and using real integrity preparation preserved both guards.
+This still does not execute the original CREATE through distributed catalog
+publication or qualify a mixed-version rollout, so the case remains unresolved.
+
+Final production-source Debug qualification passed the full SQL/pgwire/native/
+transaction/catalog gate (98/98 steps). The final native run including the
+original declaration passed 267 tests with no leaks (50/50 steps); the final
+mounted catalog suite passed 27 tests plus its linked parser test (53/53 steps).
+Five focused reader/original contracts and all eight independent PostgreSQL
+generated-expression tests passed. Formatting, Apache boundary/license checks,
+control-catalog freshness and original inventory integrity passed. No original
+disposition changed, and no rollout barrier is claimed by these results.

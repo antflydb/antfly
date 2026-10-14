@@ -13842,6 +13842,81 @@ test "httpx SQL catalog JSON generated rows preserve public DDL and restart sema
     }
 }
 
+test "httpx SQL catalog original multi column generated rows match PostgreSQL after restart" {
+    const alloc = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    const Input = struct { id: []const u8, status: ?[]const u8, amount: []const u8, fee: []const u8, metadata_json: []const u8 };
+    const fixture = try std.json.parseFromSlice(struct { id: []const u8, inputs: []const Input, rows: []const [4]?[]const u8 }, alloc, local.sql_parity_fixtures.generated_original_reference, .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
+    var corpus = try local.sql_parity_fixtures.Corpus.init(alloc);
+    defer corpus.deinit();
+    const original = try corpus.get(fixture.value.id);
+    var create = try local.sql_compiler.compile(alloc, original.sql, .{});
+    defer create.deinit();
+    var directory = try local.common_test_directory.TestDirectory.init("antfly-httpx-original-generated");
+    defer directory.cleanup();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const schema = try local.sql_ddl_runtime.createSchemaAlloc(a, create.statement.create_table);
+    const options: db_mod.OpenOptions = .{ .identity_namespace = .{ .table_id = 7, .shard_id = 8, .range_id = 9 }, .start_optional_runtimes = false, .start_index_workers = false };
+    {
+        var seed = try db_mod.DB.open(alloc, directory.path(), options);
+        defer seed.close();
+        try seed.setSchemaJson(alloc, schema);
+        const writes = try a.alloc(db_mod.types.TransactionWrite, fixture.value.inputs.len);
+        for (fixture.value.inputs, writes) |input, *write| {
+            var row: std.json.Value = .{ .object = .empty };
+            try row.object.put(a, "id", .{ .string = input.id });
+            try row.object.put(a, "status", if (input.status) |status| .{ .string = status } else .null);
+            try row.object.put(a, "amount", .{ .string = input.amount });
+            try row.object.put(a, "fee", .{ .string = input.fee });
+            try row.object.put(a, "metadata", try std.json.parseFromSliceLeaky(std.json.Value, a, input.metadata_json, .{ .parse_numbers = false }));
+            write.* = .{ .key = input.id, .value = try std.json.Stringify.valueAlloc(a, row, .{}) };
+        }
+        var seed_reads = table_reads.BoundTableReadSource.init("generated_expr_records", 8, &seed, raft_mod.read_gate.alreadyReadSafeBarrier());
+        var coordinated = try local.api_relational_integrity_commit.prepare(alloc, seed_reads.source(), &.{.{ .table_id = 7, .name = "generated_expr_records", .schema_json = schema }}, &.{.{ .table_name = "generated_expr_records", .writes = writes }});
+        defer coordinated.deinit();
+        try std.testing.expectEqual(@as(usize, 1), coordinated.tables.len);
+        const prepared = coordinated.tables[0];
+        try std.testing.expect(prepared.integrity_commands.len != 0);
+        try std.testing.expectEqual(@as(usize, 0), prepared.range_guards.len);
+        const txn = try seed.beginTransactionWithId(@splat(42), 42);
+        try seed.writeTransaction(txn, .{ .writes = prepared.writes, .deletes = prepared.deletes, .transforms = prepared.transforms, .predicates = prepared.predicates, .schema_version = prepared.schema_version, .integrity = prepared.integrity, .integrity_commands = prepared.integrity_commands, .relational_schema_version = prepared.relational_schema_version, .relational_integrity_generation_set = prepared.relational_integrity_generation_set });
+        try seed.commitTransaction(txn, 43);
+    }
+    var db = try db_mod.DB.open(alloc, directory.path(), options);
+    defer db.close();
+    const Source = @import("sql_parity_sources.zig").Tables(1);
+    var source: Source = .{
+        .records = .{.{ .table_id = 7, .name = "generated_expr_records", .schema_json = schema }},
+        .reads = .{table_reads.BoundTableReadSource.init("generated_expr_records", 8, &db, raft_mod.read_gate.alreadyReadSafeBarrier())},
+    };
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer backend_runtime.deinit();
+    var server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr() }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.systemCatalog, .supports_query_definitions = true } }, source.source(), null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+    defer request.deinit();
+    request.body = "{\"statement\":\"SELECT id, status_slug, CAST(amount_cents AS text) AS cents, source_key FROM generated_expr_records ORDER BY id\"}";
+    var context = httpx.Context.init(alloc, std.testing.io, &request);
+    defer context.deinit();
+    var response = try handler.executeSQL(&context);
+    defer response.deinit();
+    if (response.status.code != 200) std.debug.print("original generated read rejected: {s}\n", .{response.body orelse ""});
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    const result = try std.json.parseFromSlice(sql_wire.SQLResponse, a, response.body.?, .{});
+    try std.testing.expectEqual(fixture.value.rows.len, result.value.rows.len);
+    for (result.value.rows, result.value.sql_nulls.?, fixture.value.rows) |row, flags, expected| {
+        try std.testing.expectEqual(@as(usize, 4), row.len);
+        for (row, flags, expected) |value, sql_null, golden| {
+            try std.testing.expectEqual(golden == null, sql_null);
+            if (golden) |text| try std.testing.expectEqualStrings(text, value.string);
+        }
+    }
+}
+
 test "httpx SQL generated immutable planning preserves PostgreSQL stored rows after restart" {
     const alloc = std.testing.allocator;
     const local = @import("antfly_local_sources");

@@ -331,6 +331,168 @@ const schema_version_prefix = "\x00\x00__metadata__:schema_v";
 /// it advertises in transactional table metadata.
 pub const storage_format_version: u32 = 31;
 
+/// Requirements attached to one immutable schema identity. Semantic feature
+/// support and physical frame decoding are separate admission decisions.
+pub const ReaderRequirements = struct {
+    semantic_version: u32,
+    encoding_version: u32,
+
+    pub fn fromSchema(schema: TableSchema) ReaderRequirements {
+        return .{ .semantic_version = requiredReaderVersion(schema), .encoding_version = schema.decoded_format_version };
+    }
+
+    pub fn canInterpret(self: ReaderRequirements, capability_ceiling: u32) bool {
+        return self.semantic_version >= 11 and self.semantic_version <= capability_ceiling;
+    }
+
+    pub fn canDecodeFrame(self: ReaderRequirements, decoder_ceiling: u32, capability_ceiling: u32) bool {
+        return self.encoding_version != 0 and self.encoding_version <= decoder_ceiling and self.canInterpret(capability_ceiling);
+    }
+};
+
+/// Minimum schema capability needed to preserve this layout's semantics.
+/// This is not a row/schema authentication token or a promise that a reader
+/// can decode an arbitrary physical frame: transported ASCH bytes must also
+/// satisfy their declared encoding version. Callers must validate the schema
+/// before treating its requirements as authority.
+pub fn requiredReaderVersion(schema: TableSchema) u32 {
+    var version: u32 = 11;
+    if (schema.declared_fields.len != 0 or schema.exact_fields.len != 0) version = 12;
+    if (schema.storage_mode != .document or schema.requires_public_schema or schema.relational_columns.len != 0) version = 13;
+    for (schema.full_text_documents) |document| {
+        if (document.declared_paths.len != 0 or document.unindexed_paths.len != 0) version = @max(version, 14);
+    }
+    if (schema.external_base_source != null) version = @max(version, 15);
+    inline for (.{
+        .{ "requires_typed_expressions", 18 },
+        .{ "requires_predicate_expressions", 19 },
+        .{ "requires_exact_numeric_expressions", 21 },
+        .{ "requires_exact_numeric_validation", 22 },
+        .{ "requires_numeric_modifiers", 23 },
+        .{ "requires_array_expressions", 24 },
+        .{ "requires_array_constructors", 25 },
+        .{ "requires_constant_index_predicates", 26 },
+        .{ "requires_text_expressions", 27 },
+        .{ "requires_numeric_functions", 28 },
+        .{ "requires_jsonb_display", 29 },
+        .{ "requires_json_expressions", 30 },
+        .{ "requires_jsonb_array_display", 31 },
+    }) |requirement| {
+        if (@field(schema, requirement[0])) version = @max(version, requirement[1]);
+    }
+    for (schema.relational_columns) |column| {
+        if (column.sql_element_type != null) version = @max(version, 16);
+        if (column.column_type == .sql_array) version = @max(version, 17);
+        if (column.column_type == .numeric or column.sql_element_type == .numeric) version = @max(version, 20);
+        if (column.numeric_modifier != null) version = @max(version, 23);
+        if (column.column_type == .sql_array and column.sql_element_type == .jsonb) version = @max(version, 31);
+    }
+    return version;
+}
+
+test "relational index system schema reader requirements cover every durable expression gate" {
+    const a = std.testing.allocator;
+    // Independent expected floors: adding another requires_* field must extend
+    // this contract, not silently default to a predecessor reader profile.
+    comptime {
+        var fields: usize = 0;
+        for (@typeInfo(TableSchema).@"struct".field_names) |name| {
+            if (std.mem.startsWith(u8, name, "requires_")) fields += 1;
+        }
+        if (fields != 14) @compileError("extend the independent schema reader capability contract for every requires_* field");
+    }
+    inline for (.{
+        .{ "requires_typed_expressions", 18 },
+        .{ "requires_predicate_expressions", 19 },
+        .{ "requires_exact_numeric_expressions", 21 },
+        .{ "requires_exact_numeric_validation", 22 },
+        .{ "requires_numeric_modifiers", 23 },
+        .{ "requires_array_expressions", 24 },
+        .{ "requires_array_constructors", 25 },
+        .{ "requires_constant_index_predicates", 26 },
+        .{ "requires_text_expressions", 27 },
+        .{ "requires_numeric_functions", 28 },
+        .{ "requires_jsonb_display", 29 },
+        .{ "requires_json_expressions", 30 },
+        .{ "requires_jsonb_array_display", 31 },
+    }) |expected| {
+        var schema: TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true };
+        @field(schema, expected[0]) = true;
+        if (comptime std.mem.eql(u8, expected[0], "requires_array_constructors")) schema.requires_array_expressions = true;
+        if (comptime std.mem.eql(u8, expected[0], "requires_exact_numeric_validation")) schema.relational_columns = &.{.{ .name = "n", .path = "n", .column_type = .numeric, .sql_element_type = .numeric }};
+        try std.testing.expectEqual(@as(u32, expected[1]), requiredReaderVersion(schema));
+        try std.testing.expectError(error.UnsupportedVersion, serializeSchemaFormat(a, schema, expected[1] - 1));
+        const bytes = try serializeSchemaFormat(a, schema, expected[1]);
+        defer a.free(bytes);
+        const restored = try deserializeSchema(a, bytes);
+        defer freeSchema(a, restored);
+        try std.testing.expectEqual(@as(u32, expected[1]), requiredReaderVersion(restored));
+        try std.testing.expectEqual(@as(u32, expected[1]), restored.decoded_format_version);
+    }
+}
+
+test "relational index system schema reader requirements keep text projection independent from row authority" {
+    const a = std.testing.allocator;
+    const relational: TableSchema = .{ .storage_mode = .relational, .requires_public_schema = true, .requires_json_expressions = true, .requires_jsonb_display = true };
+    try std.testing.expectEqual(@as(u32, 30), requiredReaderVersion(relational));
+    const projected = try serializeTextProjectionSchema(a, relational);
+    defer a.free(projected);
+    const restored = try deserializeSchema(a, projected);
+    defer freeSchema(a, restored);
+    try std.testing.expectEqual(StorageMode.document, restored.storage_mode);
+    try std.testing.expect(!restored.requires_public_schema);
+    try std.testing.expect(!restored.requires_json_expressions);
+    try std.testing.expect(!restored.requires_jsonb_display);
+    try std.testing.expectEqual(@as(u32, 11), requiredReaderVersion(restored));
+    const document: TableSchema = .{};
+    const expected = try serializeTextProjectionSchema(a, document);
+    defer a.free(expected);
+    try std.testing.expectEqualSlices(u8, expected, projected);
+}
+
+test "relational index system schema reader requirements preserve precise column and frame identity" {
+    const a = std.testing.allocator;
+    const unknown: ReaderRequirements = .{ .semantic_version = 0, .encoding_version = 0 };
+    try std.testing.expect(!unknown.canInterpret(storage_format_version));
+    try std.testing.expect(!unknown.canDecodeFrame(storage_format_version, storage_format_version));
+    const unknown_frame: ReaderRequirements = .{ .semantic_version = 13, .encoding_version = 0 };
+    try std.testing.expect(unknown_frame.canInterpret(13));
+    try std.testing.expect(!unknown_frame.canDecodeFrame(storage_format_version, storage_format_version));
+    for ([_]struct { column: RelationalColumn, version: u32 }{
+        .{ .column = .{ .name = "v", .path = "v", .column_type = .integer }, .version = 13 },
+        .{ .column = .{ .name = "v", .path = "v", .column_type = .integer, .sql_element_type = .int16 }, .version = 16 },
+        .{ .column = .{ .name = "v", .path = "v", .column_type = .sql_array, .sql_element_type = .text }, .version = 17 },
+        .{ .column = .{ .name = "v", .path = "v", .column_type = .numeric, .sql_element_type = .numeric }, .version = 20 },
+        .{ .column = .{ .name = "v", .path = "v", .column_type = .sql_array, .sql_element_type = .numeric }, .version = 20 },
+        .{ .column = .{ .name = "v", .path = "v", .column_type = .numeric, .sql_element_type = .numeric, .numeric_modifier = .{ .precision = 4, .scale = -2 } }, .version = 23 },
+        .{ .column = .{ .name = "v", .path = "v", .column_type = .sql_array, .sql_element_type = .jsonb }, .version = 31 },
+    }) |expected| {
+        const schema: TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .requires_numeric_modifiers = expected.column.numeric_modifier != null, .relational_columns = &.{expected.column} };
+        try std.testing.expectEqual(expected.version, requiredReaderVersion(schema));
+        const bytes = try serializeSchemaFormat(a, schema, expected.version);
+        defer a.free(bytes);
+        const restored = try deserializeSchema(a, bytes);
+        defer freeSchema(a, restored);
+        try std.testing.expectEqual(expected.version, requiredReaderVersion(restored));
+        // The same semantic layout can occupy a newer ASCH frame. A receiver
+        // must check the frame decoder ceiling as well as semantic capability.
+        const current_bytes = try serializeSchema(a, schema);
+        defer a.free(current_bytes);
+        const current = try deserializeSchema(a, current_bytes);
+        defer freeSchema(a, current);
+        try std.testing.expectEqual(expected.version, requiredReaderVersion(current));
+        try std.testing.expectEqual(storage_format_version, current.decoded_format_version);
+        const original_requirements = ReaderRequirements.fromSchema(restored);
+        try std.testing.expect(original_requirements.canDecodeFrame(expected.version, expected.version));
+        try std.testing.expect(!original_requirements.canInterpret(expected.version - 1));
+        const current_requirements = ReaderRequirements.fromSchema(current);
+        try std.testing.expect(current_requirements.canInterpret(expected.version));
+        try std.testing.expect(current_requirements.canDecodeFrame(storage_format_version, expected.version));
+        if (expected.version < storage_format_version) try std.testing.expect(!current_requirements.canDecodeFrame(expected.version, expected.version));
+        try std.testing.expect(!current_requirements.canDecodeFrame(storage_format_version, expected.version - 1));
+    }
+}
+
 /// Serialize a TableSchema to bytes. Caller owns the returned slice.
 pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
     return serializeSchemaFormat(alloc, schema, storage_format_version);
@@ -424,6 +586,7 @@ pub fn serializeTextProjectionSchema(alloc: Allocator, schema: TableSchema) ![]u
     var projection_schema = schema;
     projection_schema.declared_fields = &.{};
     projection_schema.storage_mode = .document;
+    projection_schema.requires_public_schema = false;
     projection_schema.external_base_source = null;
     projection_schema.relational_columns = &.{};
     projection_schema.requires_typed_expressions = false;
@@ -462,7 +625,7 @@ fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: 
         return error.InvalidSchema;
     }
     if (format_version < 13 and
-        (schema.storage_mode != .document or schema.relational_columns.len != 0))
+        (schema.storage_mode != .document or schema.requires_public_schema or schema.relational_columns.len != 0))
     {
         return error.InvalidSchema;
     }
@@ -471,33 +634,7 @@ fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: 
             if (doc.declared_paths.len != 0 or doc.unindexed_paths.len != 0) return error.InvalidSchema;
         }
     }
-    if (format_version < 16) for (schema.relational_columns) |column| {
-        if (column.sql_element_type != null) return error.UnsupportedVersion;
-    };
-    if (format_version < 17) for (schema.relational_columns) |column| {
-        if (column.column_type == .sql_array) return error.UnsupportedVersion;
-    };
-    if (format_version < 18 and schema.requires_typed_expressions) return error.UnsupportedVersion;
-    if (format_version < 19 and schema.requires_predicate_expressions) return error.UnsupportedVersion;
-    if (format_version < 21 and schema.requires_exact_numeric_expressions) return error.UnsupportedVersion;
-    if (format_version < 22 and schema.requires_exact_numeric_validation) return error.UnsupportedVersion;
-    if (format_version < 23 and schema.requires_numeric_modifiers) return error.UnsupportedVersion;
-    if (format_version < 24 and schema.requires_array_expressions) return error.UnsupportedVersion;
-    if (format_version < 25 and schema.requires_array_constructors) return error.UnsupportedVersion;
-    if (format_version < 26 and schema.requires_constant_index_predicates) return error.UnsupportedVersion;
-    if (format_version < 27 and schema.requires_text_expressions) return error.UnsupportedVersion;
-    if (format_version < 28 and schema.requires_numeric_functions) return error.UnsupportedVersion;
-    if (format_version < 29 and schema.requires_jsonb_display) return error.UnsupportedVersion;
-    if (format_version < 30 and schema.requires_json_expressions) return error.UnsupportedVersion;
-    if (format_version < 31) {
-        if (schema.requires_jsonb_array_display) return error.UnsupportedVersion;
-        for (schema.relational_columns) |column| {
-            if (column.column_type == .sql_array and column.sql_element_type == .jsonb) return error.UnsupportedVersion;
-        }
-    }
-    if (format_version < 20) for (schema.relational_columns) |column| {
-        if (column.column_type == .numeric or column.sql_element_type == .numeric) return error.UnsupportedVersion;
-    };
+    if (format_version < requiredReaderVersion(schema)) return error.UnsupportedVersion;
 
     var buf = std.ArrayListUnmanaged(u8).empty;
     errdefer buf.deinit(alloc);

@@ -1435,6 +1435,53 @@ test "relational index system public JSON SQL DDL retains defaults generated CHE
     try std.testing.expectError(error.RelationalCheckViolation, validator.prepareTypedValue(owned, a, &sql_null, &.{}, false));
 }
 
+test "relational index system original multi column generated declaration matches PostgreSQL values and reader requirements" {
+    const a = std.testing.allocator;
+    const Input = struct { id: []const u8, status: ?[]const u8, amount: []const u8, fee: []const u8, metadata_json: []const u8 };
+    var fixture = try std.json.parseFromSlice(struct { reference: []const u8, id: []const u8, inputs: []const Input, rows: []const [4]?[]const u8 }, a, @embedFile("../sql/fixtures/sql_generated_original_reference.json"), .{});
+    defer fixture.deinit();
+    try std.testing.expectEqualStrings("PostgreSQL exact SQL", fixture.value.reference);
+    var corpus = try @import("../sql/parity_fixtures.zig").Corpus.init(a);
+    defer corpus.deinit();
+    const original = try corpus.get(fixture.value.id);
+    var create = try @import("../sql/compiler.zig").compile(a, original.sql, .{});
+    defer create.deinit();
+    const schema_json = try @import("../sql/ddl_runtime.zig").createSchemaAlloc(a, create.statement.create_table);
+    defer a.free(schema_json);
+    var validator = try CompiledTableValidator.init(a, schema_json);
+    defer validator.deinit(a);
+    const runtime = try deriveRuntimeTableSchema(a, validator.schema);
+    defer storage_schema.freeSchema(a, runtime);
+    try std.testing.expect(runtime.requires_text_expressions);
+    try std.testing.expect(runtime.requires_numeric_functions);
+    try std.testing.expect(runtime.requires_json_expressions);
+    try std.testing.expectEqual(@as(u32, 30), storage_schema.requiredReaderVersion(runtime));
+    try std.testing.expectEqual(fixture.value.inputs.len, fixture.value.rows.len);
+    for (fixture.value.inputs, fixture.value.rows) |input, expected| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const owned = arena.allocator();
+        var row: std.json.Value = .{ .object = .empty };
+        try row.object.put(owned, "id", .{ .string = input.id });
+        try row.object.put(owned, "status", if (input.status) |status| .{ .string = status } else .null);
+        try row.object.put(owned, "amount", .{ .string = input.amount });
+        try row.object.put(owned, "fee", .{ .string = input.fee });
+        try row.object.put(owned, "metadata", try std.json.parseFromSliceLeaky(std.json.Value, owned, input.metadata_json, .{ .parse_numbers = false }));
+        const prepared = try validator.prepareTypedValueWithNulls(owned, a, &row, &.{}, false);
+        defer prepared.deinit(owned);
+        try std.testing.expectEqualStrings(expected[0].?, row.object.get("id").?.string);
+        for ([_][]const u8{ "status_slug", "amount_cents", "source_key" }, expected[1..]) |name, value| {
+            const actual = row.object.get(name).?;
+            if (value) |text| {
+                try std.testing.expectEqualStrings(text, if (actual == .number_string) actual.number_string else actual.string);
+            } else try std.testing.expectEqual(std.json.Value.null, actual);
+        }
+        try validator.prepareTypedValue(owned, a, &row, prepared.fields, true);
+        row.object.getPtr("source_key").?.* = .{ .string = "forged" };
+        try std.testing.expectError(error.InvalidRelationalGeneratedValue, validator.prepareTypedValue(owned, a, &row, prepared.fields, true));
+    }
+}
+
 test "relational declarations public NUMERIC SQL DDL retains defaults generated CHECK and expression index domains" {
     const a = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);

@@ -15,11 +15,12 @@
 
 """Independent generated-expression planning and failure-timing contracts."""
 
+import json
 import unittest
 
 import psycopg
 
-from generate_sql_generated_reference import reference
+from generate_sql_generated_reference import FIXTURE, reference
 from generate_sql_postgres_reference import postgres
 
 
@@ -34,6 +35,40 @@ class GeneratedReferenceTest(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.server.__exit__(None, None, None)
+
+    def test_original_multi_column_generation_contract(self):
+        fixture = json.loads(
+            FIXTURE.with_name("sql_generated_original_reference.json").read_text()
+        )
+        inventory = json.loads(
+            FIXTURE.with_name("sql_parity_inventory.json").read_text()
+        )
+        original = next(
+            case for case in inventory["entries"] if case["id"] == fixture["id"]
+        )
+        self.assertEqual("PostgreSQL exact SQL", fixture["reference"])
+        with self.db.transaction():
+            self.db.execute(original["sql"])
+            with self.db.cursor() as cursor:
+                cursor.executemany(
+                    "INSERT INTO generated_expr_records (id,status,amount,fee,metadata) "
+                    "VALUES (%s::uuid,%s,%s::numeric,%s::numeric,%s::jsonb)",
+                    [
+                        (
+                            row["id"],
+                            row["status"],
+                            row["amount"],
+                            row["fee"],
+                            row["metadata_json"],
+                        )
+                        for row in fixture["inputs"]
+                    ],
+                )
+            rows = self.db.execute(
+                "SELECT id::text,status_slug,amount_cents::text,source_key FROM generated_expr_records ORDER BY id"
+            ).fetchall()
+            self.assertEqual(fixture["rows"], [list(row) for row in rows])
+            self.db.execute("DROP TABLE generated_expr_records")
 
     def test_complete_admission_and_row_contracts(self):
         self.assertEqual(42, len(self.result["entries"]))
