@@ -461,6 +461,10 @@ pub const DocStore = struct {
     /// Process-local wake hint, published only after successful row/schema
     /// commits. Durable mutation IDs and timers remain the restart authority.
     columnar_revision: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    /// Owner-local invalidation for retained-query reuse. Includes primary
+    /// metadata/graph/enrichment commits which need not append source replay.
+    /// Increment before attempting commit: ambiguous backend outcomes invalidate.
+    query_generation_revision: @import("antfly_platform").atomic.Value(u64) = .init(0),
     // 0 unknown, 1 no retention catalog, 2 catalog may exist. Admission marks
     // this before its commit; an aborted admission merely leaves a safe probe.
     retained_effects_cache: std.atomic.Value(u8) = .init(0),
@@ -589,6 +593,7 @@ pub const DocStore = struct {
         }
 
         pub fn commit(self: *Txn) !void {
+            if (self.columnar_owner) |owner| _ = owner.query_generation_revision.fetchAdd(1, .release);
             errdefer self.retained.poisoned = true;
             // A backend error need not prove that its commit was absent.
             // Reload the durable cut on the next observation, but never
@@ -1103,6 +1108,7 @@ pub const DocStore = struct {
         }
 
         pub fn commit(self: *Batch) !void {
+            if (self.columnar_owner) |owner| _ = owner.query_generation_revision.fetchAdd(1, .release);
             errdefer self.retained.poisoned = true;
             errdefer if (self.columnar_owner) |owner| owner.committed_replay_next_cached.store(0, .release);
             try self.retained.stage(self.alloc, self.asTxn());
