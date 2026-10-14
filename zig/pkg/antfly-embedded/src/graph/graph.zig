@@ -9444,15 +9444,20 @@ pub const GraphIndex = struct {
     fn deleteGraphDocuments(self: *GraphIndex, doc_keys: []const []const u8, include_incoming: bool) !void {
         if (doc_keys.len == 0) return;
         try self.ensureLegacyOwnerDirectory();
+        // Pin one coherent outgoing/reverse generation for the whole batch.
+        // Prefixes and pagination use this immutable view while retirement
+        // checks consult current contribution state before each mutation.
+        var reads = try self.beginReadEdgeTxns(.both);
+        defer reads.deinit();
         for (doc_keys) |doc_key| {
             const incident_prefix = try graphIndexEdgePrefixAlloc(self.alloc, doc_key, self.index_name, "");
             defer self.alloc.free(incident_prefix);
             const producer: ?[]const u8 = if (include_incoming) null else doc_key;
             const legacy_prefix = try legacyProducerPrefixAlloc(self.alloc, doc_key);
             defer self.alloc.free(legacy_prefix);
-            try self.deleteGraphDocPrefixFromStore(legacy_prefix, .out, false, true, doc_key);
-            try self.deleteGraphDocPrefixFromStore(incident_prefix, .out, false, false, producer);
-            if (include_incoming) try self.deleteGraphDocPrefix(incident_prefix, .in, false);
+            try self.deleteGraphDocPrefixFromSnapshot(legacy_prefix, .out, false, true, doc_key, &reads);
+            try self.deleteGraphDocPrefixFromSnapshot(incident_prefix, .out, false, false, producer, &reads);
+            if (include_incoming) try self.deleteGraphDocPrefixFromSnapshot(incident_prefix, .in, false, true, null, &reads);
             var owner_prefix = std.ArrayListUnmanaged(u8).empty;
             defer owner_prefix.deinit(self.alloc);
             try internal_keys.appendDocumentPrefix(&owner_prefix, self.alloc, doc_key);
@@ -9460,15 +9465,15 @@ pub const GraphIndex = struct {
             try internal_keys.appendEncodedComponent(&owner_prefix, self.alloc, "graph_index_owner");
             try internal_keys.appendEncodedComponent(&owner_prefix, self.alloc, self.index_name);
             try owner_prefix.append(self.alloc, internal_keys.graph_edge_record_kind);
-            try self.deleteGraphDocPrefixFromStore(owner_prefix.items, .out, true, false, doc_key);
+            try self.deleteGraphDocPrefixFromSnapshot(owner_prefix.items, .out, true, false, doc_key, &reads);
             const reverse_owner_prefix = try std.mem.concat(self.alloc, u8, &.{ relationship_owner_prefix, owner_prefix.items });
             defer self.alloc.free(reverse_owner_prefix);
-            try self.deleteGraphDocPrefixFromStore(reverse_owner_prefix, .out, true, true, doc_key);
+            try self.deleteGraphDocPrefixFromSnapshot(reverse_owner_prefix, .out, true, true, doc_key, &reads);
             var intent_prefix = std.ArrayListUnmanaged(u8).empty;
             defer intent_prefix.deinit(self.alloc);
             try intent_prefix.appendSlice(self.alloc, doc_clear_intent_prefix);
             try internal_keys.appendEncodedComponent(&intent_prefix, self.alloc, doc_key);
-            try self.deleteGraphDocPrefixFromStore(intent_prefix.items, .out, false, true, producer);
+            try self.deleteGraphDocPrefixFromSnapshot(intent_prefix.items, .out, false, true, producer, &reads);
         }
     }
 
@@ -9641,10 +9646,14 @@ pub const GraphIndex = struct {
     }
 
     fn deleteGraphDocPrefixFromStore(self: *GraphIndex, prefix: []const u8, direction: EdgeDirection, owner_records: bool, reverse_store: bool, producer: ?[]const u8) !void {
+        return self.deleteGraphDocPrefixFromSnapshot(prefix, direction, owner_records, reverse_store, producer, null);
+    }
+
+    fn deleteGraphDocPrefixFromSnapshot(self: *GraphIndex, prefix: []const u8, direction: EdgeDirection, owner_records: bool, reverse_store: bool, producer: ?[]const u8, reads: ?*OwnershipReads) !void {
         var after: ?[]u8 = null;
         defer if (after) |key| self.alloc.free(key);
         while (true) {
-            const page = try self.deleteGraphDocPrefixPageFromStore(self.alloc, prefix, direction, owner_records, after, reverse_store, producer, false);
+            const page = try self.deleteGraphDocPrefixPageWithSnapshot(self.alloc, prefix, direction, owner_records, after, reverse_store, producer, false, reads);
             if (after) |key| self.alloc.free(key);
             after = page.next_cursor;
             if (!page.pending) return;
@@ -9656,6 +9665,10 @@ pub const GraphIndex = struct {
     }
 
     fn deleteGraphDocPrefixPageFromStore(self: *GraphIndex, alloc: Allocator, prefix: []const u8, direction: EdgeDirection, owner_records: bool, after: ?[]const u8, reverse_store: bool, producer: ?[]const u8, bounded_work: bool) !GraphDocCleanupPage {
+        return self.deleteGraphDocPrefixPageWithSnapshot(alloc, prefix, direction, owner_records, after, reverse_store, producer, bounded_work, null);
+    }
+
+    fn deleteGraphDocPrefixPageWithSnapshot(self: *GraphIndex, alloc: Allocator, prefix: []const u8, direction: EdgeDirection, owner_records: bool, after: ?[]const u8, reverse_store: bool, producer: ?[]const u8, bounded_work: bool, reads: ?*OwnershipReads) !GraphDocCleanupPage {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const scratch = arena.allocator();
@@ -9667,8 +9680,10 @@ pub const GraphIndex = struct {
         var last: ?[]const u8 = null;
         var done = false;
         {
-            var txn = if (reverse_store) try self.beginReadReverseTxn() else try self.beginReadOutgoingTxn();
-            defer txn.abort();
+            var txn = if (reads) |snapshot|
+                (if (reverse_store) snapshot.incoming.? else snapshot.outgoing.?)
+            else if (reverse_store) try self.beginReadReverseTxn() else try self.beginReadOutgoingTxn();
+            defer if (reads == null) txn.abort();
             var cursor = try txn.openCursor();
             defer cursor.close();
             cursor.setUpperBound(upper);
