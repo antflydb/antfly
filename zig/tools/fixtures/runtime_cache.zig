@@ -336,6 +336,9 @@ fn inspect(module: *std.Build.Module, unit: runtime.RuntimeLibraryUnit, metadata
     var imports = module.import_table.iterator();
     while (imports.next()) |entry| {
         const name = entry.key_ptr.*;
+        if (unit == .enrichment_compute and
+            (std.mem.eql(u8, name, "kernel_owner_abi") or std.mem.eql(u8, name, "local_query_client")))
+            std.debug.panic("compute archive depends on storage contract {s}", .{name});
         if (std.mem.eql(u8, name, "vopr"))
             std.debug.panic("{s} archive depends on simulation test support", .{@tagName(unit)});
         if (std.mem.eql(u8, name, "lmdb_engine"))

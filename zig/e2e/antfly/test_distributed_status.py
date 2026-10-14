@@ -616,8 +616,14 @@ def test_non_host_api_reports_remote_index_status_from_metadata_heartbeat(
 
         def admit_reference() -> dict[str, Any] | None:
             baseline = raw_store()
-            assert baseline["reporter_incarnation"] != 0
-            assert baseline["runtime_statuses"]
+            # A full report already in flight at SIGSTOP can replace the
+            # earlier baseline. Re-establish the persisted index prerequisite
+            # for this exact generation before sending its sparse reference.
+            if int(baseline.get("reporter_incarnation", 0)) == 0 or not any(
+                _runtime_report_has_index(runtime, index_name, store_id=2)
+                for runtime in baseline.get("runtime_statuses", [])
+            ):
+                return None
             report = dict(baseline)
             report["runtime_statuses"] = []
             report["available_bytes"] = max(0, int(baseline["available_bytes"]) - 123)

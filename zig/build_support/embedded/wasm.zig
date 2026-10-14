@@ -34,7 +34,10 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     // ReleaseSafe avoids LLVM inference miscompilation and V8's local-variable
     // limit for unoptimized database batch functions.
     const optimize: std.lang.Optimize = .safe;
-    const strip = b.option(bool, "wasm-strip", "Strip embedded WASM debug information") orelse false;
+    // Browser bundles retain ReleaseSafe checks but do not need DWARF in the
+    // shipped module. Keep debugger metadata an explicit opt-in: it accounts
+    // for most of the bundle size and its Linux LLVM build exhausted 24 GiB.
+    const strip = b.option(bool, "wasm-strip", "Strip embedded WASM debug information") orelse true;
     const wasm_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
         .os_tag = .freestanding,
@@ -419,10 +422,11 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     const antfly_wasm = b.addExecutable(.{
         .name = "antfly_wasm",
         .root_module = antfly_wasm_mod,
-        // Cold ReleaseSafe LLVM codegen measured 18.45 GB. Reserve 20 GiB
-        // with headroom so full-suite admission does not overlap it with
-        // the large native engine archives beyond the build memory budget.
-        .max_rss = 20 * 1024 * 1024 * 1024,
+        // Keep the production bundle's existing conservative reservation.
+        // The optional DWARF build exceeded the 24 GiB runner envelope; its
+        // larger reservation makes a bounded CI invocation reject that
+        // profile before spending time on a build which cannot fit.
+        .max_rss = (if (strip) @as(u64, 20) else 32) * 1024 * 1024 * 1024,
     });
     antfly_wasm.entry = .disabled;
     antfly_wasm.rdynamic = true;

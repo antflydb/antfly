@@ -243,8 +243,11 @@ Build the bundle and run its smoke test under Node:
 - `zig build wasm-test`
 
 The browser artifact uses ReleaseSafe to avoid LLVM inference miscompilation
-and browser limits on unoptimized functions. Use `-Dwasm-strip=true` to omit
-debug information from the distributable browser module.
+and browser limits on unoptimized functions. Distributable modules omit DWARF
+debug information by default while retaining runtime safety checks. Use
+`-Dwasm-strip=false` for a debugger build. That profile reserves 32 GiB for
+compiler admission and needs a corresponding `--maxrss` budget; the stripped
+profile retains its 20 GiB reservation.
 
 Artifacts are installed under:
 

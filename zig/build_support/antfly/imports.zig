@@ -315,15 +315,15 @@ pub const AntflyRootImports = struct {
             "openai_api",     "pdf",                "query_openapi",     "reader_config",
             "readers",        "regex",              "reranking",         "scraping",
             "synthesizing",   "transcribing",       "vector",            "fst",
-            "schema_openapi", "sql_regex",
+            "schema_openapi", "sql_regex",          "resolver",
         }) |field| self.addImport(mod, field);
     }
 
     const storage_imports = .{
         "admin_openapi",            "casbin",           "extraction_openapi",
         "inference_config_openapi", "internal_openapi", "matcher",
-        "middleware_openapi",       "raft_engine",      "resolver",
-        "s3_openapi",               "scraping_openapi", "vectorindex",
+        "middleware_openapi",       "raft_engine",      "s3_openapi",
+        "scraping_openapi",         "vectorindex",
     };
     const api_imports = .{
         "inference_api",
@@ -338,7 +338,6 @@ pub const AntflyRootImports = struct {
         "mcp",
         "matcher",
         "raft_engine",
-        "resolver",
         "toon",
         "usermgr_openapi",
         "public_server_openapi",
@@ -358,9 +357,9 @@ pub const AntflyRootImports = struct {
     pub fn configureEmbedded(self: @This(), b: *std.Build, mod: *std.Build.Module, link_libc: bool) void {
         self.configureDatabase(mod, link_libc);
         inline for (.{
-            "casbin",     "extraction_openapi", "inference_config_openapi",
-            "matcher",    "middleware_openapi", "resolver",
-            "s3_openapi", "scraping_openapi",   "vectorindex",
+            "casbin",           "extraction_openapi", "inference_config_openapi",
+            "matcher",          "middleware_openapi", "s3_openapi",
+            "scraping_openapi", "vectorindex",
         }) |field| self.addImport(mod, field);
         mod.addImport("antfly_lite_options", self.lite_options);
         mod.addImport("antfly_font", self.font);
@@ -390,7 +389,10 @@ pub const AntflyRootImports = struct {
         mod.addOptions("build_options", options);
         // Document/media compute has no physical storage handle, including in
         // the independently compiled public embedded enrichment archive.
-        self.storage_boundary.configureProfile(mod, true, false, self.boundary_profile);
+        // This constructor also builds the shared embedded compute archive,
+        // whose caller may carry the default full storage profile. Declare
+        // only compute contracts so storage ABI edits cannot invalidate it.
+        self.storage_boundary.configureProfile(mod, true, false, .enrichment);
         mod.addImport("antfly_platform", self.platform);
         mod.addImport("antfly_cancellation", self.cancellation);
         mod.addImport("antfly_template_content", self.template_content);

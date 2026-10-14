@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -54,6 +55,12 @@ func TestInferenceRuntimeContract(t *testing.T) {
 	}
 	root := t.TempDir()
 	modelDir := filepath.Join(root, "models")
+	if cached := os.Getenv("ANTFLY_RUNTIME_MODEL_CACHE"); cached != "" {
+		if !filepath.IsAbs(cached) {
+			t.Fatal("ANTFLY_RUNTIME_MODEL_CACHE must be an absolute fixture directory")
+		}
+		modelDir = cached
+	}
 	const model = "BAAI/bge-small-en-v1.5"
 	const generator = "shibatch/tiny1m"
 	const generatorRef = generator + ":gguf:Q4_K_M"
@@ -169,7 +176,8 @@ func TestInferenceRuntimeContract(t *testing.T) {
 					env = append(env, key+"="+value)
 				}
 			}
-			// Keep host credentials and cached models out of the child process.
+			// Keep host credentials and implicit model paths out of the child.
+			// An explicitly supplied fixture cache is mapped only through models_dir.
 			mapArgs := func(args []string) []string {
 				mapped := append([]string(nil), args...)
 				for i, arg := range mapped {
@@ -186,9 +194,14 @@ func TestInferenceRuntimeContract(t *testing.T) {
 			}
 			for _, init := range sts.Spec.Template.Spec.InitContainers {
 				if !downloaded[init.Args[2]] {
-					cmd := exec.CommandContext(ctx, binary, mapArgs(init.Args)...)
-					cmd.Env = env
-					out, err := cmd.CombinedOutput()
+					out, err := pullRuntimeModel(ctx, func() ([]byte, error) {
+						// Each attempt executes the actual generated init command.
+						// Model pulls are idempotent fixture acquisition; config,
+						// identity and inference assertions are never retried here.
+						cmd := exec.CommandContext(ctx, binary, mapArgs(init.Args)...)
+						cmd.Env = env
+						return cmd.CombinedOutput()
+					})
 					if err != nil {
 						t.Fatalf("operator model pull failed: %v\n%s", err, out)
 					}
@@ -289,4 +302,92 @@ func TestInferenceRuntimeContract(t *testing.T) {
 			g.Expect(strings.Join(env, "\n")).To(ContainSubstring("ANTFLY_INFERENCE_REQUIRED_BACKEND=native"))
 		})
 	}
+}
+
+// Keep acquisition retries outside runtime/config assertions. The supported
+// released binary can encounter a transient DNS SERVFAIL while fetching a
+// public fixture. Only exact transport diagnostics qualify, and the enclosing
+// scenario deadline bounds both the command and backoff.
+func pullRuntimeModel(ctx context.Context, run func() ([]byte, error)) ([]byte, error) {
+	const attempts = 3
+	var output []byte
+	var err error
+	for attempt := 0; attempt < attempts; attempt++ {
+		if canceled := ctx.Err(); canceled != nil {
+			return output, canceled
+		}
+		output, err = run()
+		if err == nil || !transientModelPull(output) || attempt == attempts-1 {
+			return output, err
+		}
+		timer := time.NewTimer(time.Second << attempt)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return output, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return output, err
+}
+
+func transientModelPull(output []byte) bool {
+	for _, name := range []string{"NameServerFailure", "TemporaryNameServerFailure", "ConnectionTimedOut", "ConnectionResetByPeer", "NetworkUnreachable", "HostUnreachable", "ConnectionRefused"} {
+		if bytes.Contains(output, []byte("(error."+name+")")) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestRuntimeModelPullRetry(t *testing.T) {
+	failure := errors.New("model pull failed")
+	t.Run("transient DNS failure resolves", func(t *testing.T) {
+		attempts := 0
+		output, err := pullRuntimeModel(context.Background(), func() ([]byte, error) {
+			attempts++
+			if attempts == 1 {
+				return []byte("startup failed (error.NameServerFailure)"), failure
+			}
+			return []byte("published"), nil
+		})
+		if err != nil || string(output) != "published" || attempts != 2 {
+			t.Fatalf("attempts=%d output=%s err=%v", attempts, output, err)
+		}
+	})
+	for _, diagnostic := range []string{"UnknownHostName", "Unauthorized", "ChecksumMismatch", "InvalidConfig"} {
+		t.Run("permanent "+diagnostic, func(t *testing.T) {
+			attempts := 0
+			_, err := pullRuntimeModel(context.Background(), func() ([]byte, error) {
+				attempts++
+				return []byte("startup failed (error." + diagnostic + ")"), failure
+			})
+			if !errors.Is(err, failure) || attempts != 1 {
+				t.Fatalf("attempts=%d err=%v", attempts, err)
+			}
+		})
+	}
+	t.Run("cancellation stops backoff", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		attempts := 0
+		_, err := pullRuntimeModel(ctx, func() ([]byte, error) {
+			attempts++
+			cancel()
+			return []byte("startup failed (error.NameServerFailure)"), failure
+		})
+		if !errors.Is(err, context.Canceled) || attempts != 1 {
+			t.Fatalf("attempts=%d err=%v", attempts, err)
+		}
+	})
+	t.Run("persistent transport failure is bounded", func(t *testing.T) {
+		attempts := 0
+		_, err := pullRuntimeModel(context.Background(), func() ([]byte, error) {
+			attempts++
+			return []byte("startup failed (error.NameServerFailure)"), failure
+		})
+		if !errors.Is(err, failure) || attempts != 3 {
+			t.Fatalf("attempts=%d err=%v", attempts, err)
+		}
+	})
 }

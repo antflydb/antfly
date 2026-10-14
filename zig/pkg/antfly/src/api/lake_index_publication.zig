@@ -115,9 +115,15 @@ const BuildProgress = struct {
         } else try self.declarations.append(self.a, owned);
     }
     fn save(raw: *anyopaque, declaration: local.serverless_segment_sidecar_manifest.DeclaredArtifact) !void {
+        return saveBatch(raw, &.{declaration});
+    }
+    fn saveBatch(raw: *anyopaque, completed: []const local.serverless_segment_sidecar_manifest.DeclaredArtifact) !void {
+        if (completed.len == 0) return;
         const self: *@This() = @ptrCast(@alignCast(raw));
-        try self.cancellation.check();
-        try self.remember(declaration);
+        for (completed) |declaration| {
+            try self.cancellation.check();
+            try self.remember(declaration);
+        }
         var scratch = std.heap.ArenaAllocator.init(self.a);
         defer scratch.deinit();
         const declarations = try scratch.allocator().alloc(local.serverless_segment_sidecar_manifest.DeclaredArtifact, self.declarations.items.len);
@@ -244,7 +250,7 @@ fn buildAttempt(a: A, artifact_store: *stores.ArtifactStore, table: records.Tabl
     defer progress.deinit();
     if (lease) |owner| if (owner.save_checkpoint != null) {
         if (current.value.checkpoint) |saved| for (saved.declarations) |declaration| try progress.remember(declaration);
-        provider.progress = .{ .ptr = &progress, .save = BuildProgress.save };
+        provider.progress = .{ .ptr = &progress, .save = BuildProgress.save, .save_batch = BuildProgress.saveBatch };
     };
     const previous_contributions = if (current.value.published) |previous| if (reusable_directory and std.meta.eql(previous.namespace, current.value.namespace) and std.mem.eql(u8, &previous.signature.credentials, &signature.credentials) and std.mem.eql(u8, &previous.signature.store, &signature.store)) previous.file_contributions else &.{} else &.{};
     const contributions_api = @import("lake_index_contributions.zig");
@@ -292,7 +298,10 @@ fn buildAttempt(a: A, artifact_store: *stores.ArtifactStore, table: records.Tabl
     defer manifest.deinit(a);
     const native = @import("lake_index_native_aggregates.zig").buildIndexed(a, na, table, source, &scoped, &provider, cancellation, reusable, previous_contributions, &contribution_index) catch |err| return constructionFailure(err, "aggregate_build", attempt.generation);
     const native_declarations = native.declarations;
-    for (native_declarations) |declaration| provider.checkpoint(declaration) catch |err| return constructionFailure(err, "aggregate_checkpoint", attempt.generation);
+    // Aggregate construction already completes the entire set before this
+    // boundary. Publishing every growing prefix writes quadratic directory
+    // bytes and metadata commits without saving any earlier build work.
+    provider.checkpointBatch(native_declarations) catch |err| return constructionFailure(err, "aggregate_checkpoint", attempt.generation);
     const ordered = @import("lake_index_native_rows.zig").buildIncremental(a, na, table, source, &scoped, &provider, cancellation, reusable, candidates) catch |err| return constructionFailure(err, "ordered_build", attempt.generation);
     for (ordered) |declaration| provider.checkpoint(declaration) catch |err| return constructionFailure(err, "ordered_checkpoint", attempt.generation);
     const text = @import("lake_index_native_text.zig").buildIncremental(a, na, table, source, base_source, &scoped, &provider, cancellation, reusable, candidates) catch |err| return constructionFailure(err, "text_build", attempt.generation);
@@ -380,10 +389,12 @@ test "external lake native publication builds scoped text artifacts and fences e
     // Before bounded ownership this exhausted 1 MiB after 116 saves.
     const Checkpoints = struct {
         count: usize = 0,
+        last_declarations: usize = 0,
         fn save(raw: *anyopaque, saved: catalog.Publication) !void {
             try saved.validate();
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.count += 1;
+            self.last_declarations = @intCast(saved.directory.?.count);
         }
     };
     var checkpoint_budget: local.sql_memory_budget = .{ .backing = a, .limit = 1024 * 1024 };
@@ -399,6 +410,18 @@ test "external lake native publication builds scoped text artifacts and fences e
         for (0..1000) |_| try BuildProgress.save(&progress, parsed.value.published.?.declarations[0]);
         try std.testing.expectEqual(@as(usize, 1000), checkpoints.count);
         try std.testing.expectEqual(@as(usize, 1), progress.declarations.items.len);
+        var batch: [16]local.serverless_segment_sidecar_manifest.DeclaredArtifact = undefined;
+        var names: [16][32]u8 = undefined;
+        for (&batch, &names, 0..) |*declaration, *name, index| {
+            declaration.* = parsed.value.published.?.declarations[0];
+            declaration.name = try std.fmt.bufPrint(name, "batch-{d}", .{index});
+        }
+        // One completed set has one durable checkpoint containing every
+        // declaration, alongside the earlier resumable declaration.
+        try BuildProgress.saveBatch(&progress, &batch);
+        try std.testing.expectEqual(@as(usize, 1001), checkpoints.count);
+        try std.testing.expectEqual(@as(usize, 17), checkpoints.last_declarations);
+        try std.testing.expectEqual(@as(usize, 17), progress.declarations.items.len);
     }
     try std.testing.expectEqual(@as(usize, 0), checkpoint_budget.live);
 
