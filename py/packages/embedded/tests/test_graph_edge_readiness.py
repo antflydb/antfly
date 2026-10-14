@@ -968,8 +968,9 @@ for path, accepted in [(sys.argv[2], True), (sys.argv[3], False), (sys.argv[4], 
     if handle.value:
         lib.antfly_db_close(handle)
 """
-    subprocess.run([sys.executable, "-c", script, previous, str(plain), str(identity), str(pending)], check=True, timeout=60)
-
+    subprocess.run(
+        [sys.executable, "-c", script, previous, str(plain), str(identity), str(pending)], check=True, timeout=60
+    )
 
     # A previously opened Lite writer must also reject mutation after the
     # registration commit, when its connection refreshes the catalog.
