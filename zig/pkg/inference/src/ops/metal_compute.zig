@@ -5202,6 +5202,86 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return self.trainingAdamWManyF32(inputs, opts);
     }
 
+    /// A fresh, mutable resident f32 tensor, as a snapshot would produce.
+    fn residentFreshF32(self: *MetalCompute, shape: []const i32) !CT {
+        const runtime = self.provider_impl.raw_decode_runtime orelse return error.UnsupportedResidentTrainingPrimitive;
+        const count = try ops.resident_training.shapeElements(i32, shape, .{});
+        var output = try MetalTensor.deviceAllocateFresh(@ptrCast(runtime), count * 4, .private, shape);
+        errdefer output.deinit();
+        const result = try self.ctFromOwnedMetalTensor(output);
+        toBuf(result).mutable_state = true;
+        return result;
+    }
+
+    fn trainingAccumulateIntoManyF32Op(ctx: *anyopaque, inputs: []const ops.TrainingAccumulateIntoInput, divisor: f32, renormalize: f32, outputs: []CT) anyerror!void {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (self.residentExternalFrame()) return error.ResidentTrainingExternalFrame;
+        if (inputs.len == 0) return;
+        const batch = try self.allocator.alloc(metal_runtime.TrainingAccumulateInto, inputs.len);
+        defer self.allocator.free(batch);
+        var made: usize = 0;
+        errdefer for (outputs[0..made]) |output| self.computeBackend().free(output);
+        for (inputs, 0..) |input, i| {
+            outputs[i] = try self.residentFreshF32(input.shape);
+            made += 1;
+            const output = try self.residentTrainingTensor(outputs[i], .f32, .{});
+            if (output.elemCount() != input.elem_count) return error.InvalidResidentTrainingShape;
+            batch[i] = .{
+                .previous = if (input.previous) |tensor| try self.residentTrainingTensor(tensor, .f32, .{}) else null,
+                .grad = if (input.grad) |tensor| try self.residentTrainingTensor(tensor, .f32, .{}) else null,
+                .output = output,
+                .elem_count = input.elem_count,
+            };
+        }
+        if (!try metal_runtime.decoderRuntimeTrainingAccumulateIntoManyF32(self.provider_impl, batch, divisor, renormalize))
+            return error.UnsupportedResidentTrainingPrimitive;
+    }
+
+    fn trainingAdamWIntoManyF32Op(ctx: *anyopaque, inputs: []const ops.TrainingAdamWBatchInput, shapes: []const []const i32, opts: ops.TrainingAdamWBatchOptions, outputs: []ops.TrainingAdamWOutputs) anyerror!void {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (opts.pytorch_fused != null) return error.DeviceTrainingUnavailable;
+        if (self.residentExternalFrame()) return error.ResidentTrainingExternalFrame;
+        if (inputs.len == 0) return;
+        const batch = try self.allocator.alloc(metal_runtime.TrainingAdamWInto, inputs.len);
+        defer self.allocator.free(batch);
+        const cb = self.computeBackend();
+        var made: usize = 0;
+        errdefer for (outputs[0..made]) |output| {
+            cb.free(output.weight);
+            cb.free(output.m);
+            cb.free(output.v);
+        };
+        for (inputs, shapes, 0..) |input, shape, i| {
+            const weight = try self.residentFreshF32(shape);
+            errdefer cb.free(weight);
+            const m = try self.residentFreshF32(shape);
+            errdefer cb.free(m);
+            const v = try self.residentFreshF32(shape);
+            outputs[i] = .{ .weight = weight, .m = m, .v = v };
+            made += 1;
+            batch[i] = .{
+                .weight = try self.residentTrainingTensor(input.weight, .f32, .{}),
+                .grad = try self.residentTrainingTensor(input.grad, .f32, .{}),
+                .m = try self.residentTrainingTensor(input.m, .f32, .{}),
+                .v = try self.residentTrainingTensor(input.v, .f32, .{}),
+                .weight_out = try self.residentTrainingTensor(weight, .f32, .{}),
+                .m_out = try self.residentTrainingTensor(m, .f32, .{}),
+                .v_out = try self.residentTrainingTensor(v, .f32, .{}),
+                .elem_count = input.elem_count,
+                .bias_correction1 = input.bias_correction1,
+                .bias_correction2 = input.bias_correction2,
+            };
+        }
+        if (!try metal_runtime.decoderRuntimeTrainingAdamWIntoManyF32(self.provider_impl, batch, .{
+            .lr = opts.lr,
+            .beta1 = opts.beta1,
+            .beta2 = opts.beta2,
+            .eps = opts.eps,
+            .weight_decay = opts.weight_decay,
+            .grad_scale = opts.grad_scale,
+        })) return error.MetalTrainingAdamWUnavailable;
+    }
+
     fn trainingSumSquaresManyF32Op(ctx: *anyopaque, inputs: []const ops.TrainingSumSquaresInput) anyerror!f32 {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         return self.trainingSumSquaresManyF32(inputs);
@@ -32359,6 +32439,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.trainingZeroF32 = trainingZeroF32Op;
         vt.trainingAccumulateF32 = trainingAccumulateF32Op;
         vt.trainingAdamWManyF32 = trainingAdamWManyF32Op;
+        vt.trainingAccumulateIntoManyF32 = trainingAccumulateIntoManyF32Op;
+        vt.trainingAdamWIntoManyF32 = trainingAdamWIntoManyF32Op;
         vt.residentTrainingBeginBatch = residentTrainingBeginBatchOp;
         vt.residentTrainingEndBatch = residentTrainingEndBatchOp;
         vt.trainingSumSquaresManyF32 = trainingSumSquaresManyF32Op;

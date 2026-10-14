@@ -9883,6 +9883,96 @@ pub fn decoderRuntimeTrainingAdamWManyF32(
     return true;
 }
 
+fn trainingRef(tensor: MetalTensor, elem_count: usize) !TrainingRef {
+    if (!tensor.isDevice() or elem_count == 0 or elem_count > tensor.elemCount()) return error.InvalidTrainingTensor;
+    return .{ .handle = tensor.deviceHandle(), .offset = tensor.deviceByteOffset() };
+}
+
+pub const TrainingAccumulateInto = struct {
+    previous: ?MetalTensor,
+    grad: ?MetalTensor,
+    output: MetalTensor,
+    elem_count: usize,
+};
+
+/// output = (previous + grad / divisor) * renormalize per item, out of place.
+pub fn decoderRuntimeTrainingAccumulateIntoManyF32(self: anytype, batch: []const TrainingAccumulateInto, divisor: f32, renormalize: f32) !bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
+    if (batch.len == 0) return true;
+    const allocator = std.heap.page_allocator;
+    const refs = try allocator.alloc(TrainingRef, batch.len * 3);
+    defer allocator.free(refs);
+    const counts = try allocator.alloc(usize, batch.len);
+    defer allocator.free(counts);
+    for (batch, 0..) |item, i| {
+        refs[i] = if (item.previous) |previous| try trainingRef(previous, item.elem_count) else .{};
+        refs[batch.len + i] = if (item.grad) |grad| try trainingRef(grad, item.elem_count) else .{};
+        refs[2 * batch.len + i] = try trainingRef(item.output, item.elem_count);
+        counts[i] = item.elem_count;
+    }
+    const rc = termite_metal_decode_runtime_training_accumulate_into_many_f32(runtime, refs.ptr, refs[batch.len..].ptr, refs[2 * batch.len ..].ptr, counts.ptr, batch.len, divisor, renormalize);
+    if (rc != 0) return error.MetalTrainingAccumulateFailed;
+    return true;
+}
+
+pub const TrainingAdamWInto = struct {
+    weight: MetalTensor,
+    grad: MetalTensor,
+    m: MetalTensor,
+    v: MetalTensor,
+    weight_out: MetalTensor,
+    m_out: MetalTensor,
+    v_out: MetalTensor,
+    elem_count: usize,
+    bias_correction1: f32,
+    bias_correction2: f32,
+};
+
+/// AdamW reading weight/m/v and writing new buffers; grad is cleared.
+pub fn decoderRuntimeTrainingAdamWIntoManyF32(self: anytype, batch: []const TrainingAdamWInto, opts: TrainingAdamWBatchOptions) !bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
+    if (batch.len == 0) return true;
+    const allocator = std.heap.page_allocator;
+    const refs = try allocator.alloc(TrainingRef, batch.len * 7);
+    defer allocator.free(refs);
+    const counts = try allocator.alloc(usize, batch.len);
+    defer allocator.free(counts);
+    const corrections = try allocator.alloc(f32, batch.len * 2);
+    defer allocator.free(corrections);
+    const n = batch.len;
+    for (batch, 0..) |item, i| {
+        for ([_]MetalTensor{ item.weight, item.grad, item.m, item.v, item.weight_out, item.m_out, item.v_out }, 0..) |tensor, k|
+            refs[k * n + i] = try trainingRef(tensor, item.elem_count);
+        counts[i] = item.elem_count;
+        corrections[i] = item.bias_correction1;
+        corrections[n + i] = item.bias_correction2;
+    }
+    const rc = termite_metal_decode_runtime_training_adamw_into_many_f32(
+        runtime,
+        refs.ptr,
+        refs[n..].ptr,
+        refs[2 * n ..].ptr,
+        refs[3 * n ..].ptr,
+        refs[4 * n ..].ptr,
+        refs[5 * n ..].ptr,
+        refs[6 * n ..].ptr,
+        counts.ptr,
+        corrections.ptr,
+        corrections[n..].ptr,
+        n,
+        opts.lr,
+        opts.beta1,
+        opts.beta2,
+        opts.eps,
+        opts.weight_decay,
+        opts.grad_scale,
+    );
+    if (rc != 0) return error.MetalTrainingAdamWFailed;
+    return true;
+}
+
 pub fn decoderRuntimeTrainingSumSquaresF32(
     self: anytype,
     input: MetalTensor,
@@ -22416,6 +22506,37 @@ pub extern fn termite_metal_decode_runtime_training_adamw_many_f32(
     m_offsets: [*]const usize,
     v_handles: [*]const ?*anyopaque,
     v_offsets: [*]const usize,
+    elem_counts: [*]const usize,
+    bias_correction1s: [*]const f32,
+    bias_correction2s: [*]const f32,
+    input_count: usize,
+    lr: f32,
+    beta1: f32,
+    beta2: f32,
+    eps: f32,
+    weight_decay: f32,
+    grad_scale: f32,
+) c_int;
+pub const TrainingRef = extern struct { handle: ?*const anyopaque = null, offset: usize = 0 };
+pub extern fn termite_metal_decode_runtime_training_accumulate_into_many_f32(
+    runtime: ?*RawMetalDecodeRuntime,
+    previous: [*]const TrainingRef,
+    grad: [*]const TrainingRef,
+    output: [*]const TrainingRef,
+    elem_counts: [*]const usize,
+    input_count: usize,
+    divisor: f32,
+    renormalize: f32,
+) c_int;
+pub extern fn termite_metal_decode_runtime_training_adamw_into_many_f32(
+    runtime: ?*RawMetalDecodeRuntime,
+    weight: [*]const TrainingRef,
+    grad: [*]const TrainingRef,
+    m: [*]const TrainingRef,
+    v: [*]const TrainingRef,
+    weight_out: [*]const TrainingRef,
+    m_out: [*]const TrainingRef,
+    v_out: [*]const TrainingRef,
     elem_counts: [*]const usize,
     bias_correction1s: [*]const f32,
     bias_correction2s: [*]const f32,
