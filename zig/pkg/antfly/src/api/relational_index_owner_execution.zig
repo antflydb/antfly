@@ -298,7 +298,12 @@ pub const ClaimRequest = struct {
 /// A physical progress response is never a signed build-completion receipt.
 pub const ClaimResponse = union(enum) {
     acknowledged,
-    applied: struct { root_generation: u64, outcome: native.ClaimOutcome },
+    applied: struct {
+        root_generation: u64,
+        outcome: native.ClaimOutcome,
+        signed_delivery: ?publication.RootProof = null,
+        signing_failure: ?SigningFailure = null,
+    },
 
     pub fn validate(self: ClaimResponse, request: ClaimRequest) !void {
         try request.validate(request.group_id);
@@ -310,6 +315,12 @@ pub const ClaimResponse = union(enum) {
                     binding.fence.owner_group_id != request.group_id or binding.fence.namespace.table_id != request.table_id)
                     return error.InvalidPrivateIndexClaimReceipt;
                 try value.outcome.validateFor(.{ .binding = binding, .claims = request.claims });
+                if (value.signed_delivery) |proof| {
+                    if (value.signing_failure != null or proof.root_generation != value.root_generation or proof.authority != .native)
+                        return error.InvalidPrivateIndexClaimReceipt;
+                    (publication.NativeSigningView{ .identity = proof.identity, .reporter_incarnation = proof.reporter_incarnation, .binding_digest = proof.authority.native }).validate(proof.identity.metadata_incarnation) catch return error.InvalidPrivateIndexClaimReceipt;
+                    proof.verify(try value.outcome.deliveryDigest()) catch return error.InvalidPrivateIndexClaimReceipt;
+                }
             },
         }
     }
@@ -337,7 +348,48 @@ pub const ClaimResult = union(enum) {
     applied: struct {
         root_generation: u64,
         outcome: std.json.Parsed(native.ClaimOutcome),
+        signing: ?struct { view: publication.NativeSigningView, delivery_digest: ?[32]u8, root_generation: u64 } = null,
+        signed_delivery: ?publication.RootProof = null,
+        signing_failure: ?SigningFailure = null,
     },
+
+    pub fn needsSigning(self: *const ClaimResult) bool {
+        return switch (self.*) {
+            .acknowledged => false,
+            .applied => |value| value.signing != null and value.signed_delivery == null and
+                !value.outcome.value.replication_pending and value.outcome.value.error_name == null,
+        };
+    }
+
+    /// Post-commit decoration of exact delivery, never publication authority.
+    /// Current enrollment/placement and complete source coverage still need
+    /// independent verification before a source batch may be consumed.
+    pub fn signNative(self: *ClaimResult, root: local.storage_db_root_signing_identity.State, node_id: u64, store_id: u64, reporter_incarnation: u64) !void {
+        if (self.* != .applied) return error.NativeIndexSigningUnavailable;
+        const value = &self.applied;
+        const context = value.signing orelse return error.NativeIndexSigningUnavailable;
+        try context.view.validate(context.view.identity.metadata_incarnation);
+        const delivery_digest = try value.outcome.value.deliveryDigest();
+        if (node_id != context.view.identity.node_id or store_id != context.view.identity.store_id or
+            reporter_incarnation != context.view.reporter_incarnation or
+            value.root_generation != context.root_generation or context.delivery_digest == null or
+            !std.mem.eql(u8, &context.delivery_digest.?, &delivery_digest)) return error.IndexOwnerReceiptChanged;
+        value.signed_delivery = try (publication.RootProof{
+            .identity = context.view.identity,
+            .reporter_incarnation = reporter_incarnation,
+            .authority = .{ .native = context.view.binding_digest },
+            .root_generation = value.root_generation,
+            .signature = undefined,
+        }).sign(root, delivery_digest);
+        value.signing_failure = null;
+    }
+
+    pub fn signingFailed(self: *ClaimResult, failure: SigningFailure) void {
+        if (self.* == .applied) {
+            self.applied.signed_delivery = null;
+            self.applied.signing_failure = failure;
+        }
+    }
 
     pub fn deinit(self: *ClaimResult) void {
         switch (self.*) {
@@ -350,7 +402,7 @@ pub const ClaimResult = union(enum) {
     pub fn response(self: *const ClaimResult) ClaimResponse {
         return switch (self.*) {
             .acknowledged => .acknowledged,
-            .applied => |value| .{ .applied = .{ .root_generation = value.root_generation, .outcome = value.outcome.value } },
+            .applied => |value| .{ .applied = .{ .root_generation = value.root_generation, .outcome = value.outcome.value, .signed_delivery = value.signed_delivery, .signing_failure = value.signing_failure } },
         };
     }
 };
@@ -371,13 +423,21 @@ pub fn claimStep(alloc: std.mem.Allocator, source: anytype, metadata: anytype, t
     const identity = try permission.value.nativeExecutionIdentity(lookup);
     var state = try source.nativeIndexOwnerState(alloc, request.group_id, table_name, identity, context);
     defer state.deinit();
-    const command = try permission.value.nativeClaims(lookup, state.value orelse return error.GenerationAdmissionPending, request.claims);
+    const command = try permission.value.nativeClaims(lookup, state.value orelse return error.PrivateIndexRootRecoveryRequired, request.claims);
     const rooted = try source.applyNativeIndexOwnerClaimsAtRoot(alloc, request.group_id, table_name, command, context);
     errdefer rooted.outcome.deinit();
     try rooted.outcome.value.validateFor(command);
     // Preserve committed/pending progress even if cancellation arrived during
     // dispatch. Never replay a new effect to recover an uncertain result.
-    return .{ .applied = .{ .root_generation = rooted.root_generation, .outcome = rooted.outcome } };
+    return .{ .applied = .{
+        .root_generation = rooted.root_generation,
+        .outcome = rooted.outcome,
+        .signing = if (permission.value.native_signing) |view| .{
+            .view = view,
+            .delivery_digest = if (rooted.outcome.value.replication_pending or rooted.outcome.value.error_name != null) null else try rooted.outcome.value.deliveryDigest(),
+            .root_generation = rooted.root_generation,
+        } else null,
+    } };
 }
 
 pub const CancellationResult = union(enum) {
@@ -685,6 +745,7 @@ const TestDriver = struct {
         if (self.cancel_after_commit) |signal| signal.store(true, .release);
         return .{ .root_generation = self.root_generation, .outcome = try parsed(native.ClaimOutcome, alloc, .{
             .binding = command.binding,
+            .claims_digest = try command.digest(),
             .position = .{ .namespace = command.binding.fence.namespace, .sequence = 3 },
             .claims_added = command.claims.len,
             .duplicate = false,
@@ -1031,6 +1092,15 @@ test "relational index publication claim receiver binds fresh build permission w
         driver.value.head = next.head;
         driver.value.owner = next.owner;
     }
+    const seed: [32]u8 = @splat(9);
+    const pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
+    const root: local.storage_db_root_signing_identity.State = .{ .seed = seed, .public_key = pair.public_key.toBytes(), .root_incarnation = 7 };
+    const root_binding: @import("../metadata/standalone_native_owner.zig").Binding = .{ .metadata_incarnation = @splat('1'), .node_id = 2, .store_id = 3, .root_incarnation = 7 };
+    driver.value.native_signing = .{
+        .identity = .{ .metadata_incarnation = root_binding.metadata_incarnation, .node_id = 2, .store_id = 3, .root_incarnation = 7, .public_key = root.public_key },
+        .reporter_incarnation = 4,
+        .binding_digest = try root_binding.digest(),
+    };
     const permission = driver.value;
     const binding = driver.binding;
     const request: ClaimRequest = .{
@@ -1039,6 +1109,39 @@ test "relational index publication claim receiver binds fresh build permission w
         .id = plan.id,
         .claims = &.{.{ .tuple = "receiver\x00\xff", .parent_table = plan.before.name, .parent_key = "row", .schema_version = 2 }},
     };
+    {
+        const first = request.claims[0];
+        var second = first;
+        second.tuple = "another-tuple";
+        const command: native.ClaimCommand = .{ .binding = binding.?, .claims = &.{ first, second, first } };
+        try std.testing.expectEqual(@as(usize, 2), (try command.commitment()).count);
+        var reordered = command;
+        reordered.claims = &.{ second, first };
+        try std.testing.expectEqual(try command.digest(), try reordered.digest());
+        reordered.claims = &.{first};
+        try std.testing.expect(!std.mem.eql(u8, &try command.digest(), &try reordered.digest()));
+        second = first;
+        second.parent_key = "conflicting-owner";
+        reordered.claims = &.{ first, second };
+        try std.testing.expectError(error.UniqueConstraintViolation, reordered.digest());
+        const Claim = @TypeOf(first);
+        var full: [128]Claim = undefined;
+        for (&full, 0..) |*claim, i| {
+            claim.* = first;
+            claim.tuple = try std.fmt.allocPrint(arena.allocator(), "tuple-{d}", .{i});
+            claim.parent_key = try std.fmt.allocPrint(arena.allocator(), "row-{d}", .{i});
+        }
+        reordered.claims = &full;
+        const maximum = try reordered.commitment();
+        try std.testing.expectEqual(@as(usize, 128), maximum.count);
+        std.mem.reverse(Claim, &full);
+        try std.testing.expectEqual(maximum.digest, try reordered.digest());
+        var overflow: [129]Claim = undefined;
+        @memcpy(overflow[0..128], &full);
+        overflow[128] = full[0];
+        reordered.claims = &overflow;
+        try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, reordered.commitment());
+    }
     var result = try claimStep(alloc, &driver, &driver, plan.before.name, request, .{});
     defer result.deinit();
     try std.testing.expect(result == .applied);
@@ -1048,6 +1151,52 @@ test "relational index publication claim receiver binds fresh build permission w
     try std.testing.expectEqual(@as(u64, 9), result.applied.root_generation);
     driver.root_generation += 1;
     try std.testing.expectEqual(@as(u64, 9), result.applied.root_generation);
+    try std.testing.expect(result.needsSigning());
+    try std.testing.expectError(error.IndexOwnerReceiptChanged, result.signNative(root, 2, 3, 5));
+    result.applied.outcome.value.position.sequence += 1;
+    try std.testing.expectError(error.IndexOwnerReceiptChanged, result.signNative(root, 2, 3, 4));
+    result.applied.outcome.value.position.sequence -= 1;
+    result.applied.root_generation += 1;
+    try std.testing.expectError(error.IndexOwnerReceiptChanged, result.signNative(root, 2, 3, 4));
+    result.applied.root_generation -= 1;
+    try result.signNative(root, 2, 3, 4);
+    try std.testing.expect(!result.needsSigning());
+    try result.response().validate(request);
+    const signed = result.response().applied;
+    const not_a_publication: publication.SignedReceipt = .{
+        .receipt = .{
+            .owner = permission.owner.owner,
+            .action = .validated,
+            .position = .{ .native = signed.outcome.position },
+            .candidate_digest = permission.head.candidate_digest,
+            .reservation_digest = permission.head.reservation_digest,
+            .evidence_digest = signed.outcome.claims_digest,
+        },
+        .proof = signed.signed_delivery.?,
+    };
+    try std.testing.expectError(error.InvalidIndexOwnerReceipt, not_a_publication.verifySignature());
+    try std.testing.expectEqual(@as(u64, 9), signed.signed_delivery.?.root_generation);
+    var bad = signed;
+    bad.signed_delivery.?.signature[0] ^= 1;
+    try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, (ClaimResponse{ .applied = bad }).validate(request));
+    bad = signed;
+    bad.root_generation += 1;
+    try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, (ClaimResponse{ .applied = bad }).validate(request));
+    bad = signed;
+    bad.outcome.position.sequence += 1;
+    try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, (ClaimResponse{ .applied = bad }).validate(request));
+    bad = signed;
+    bad.outcome.claims_digest[0] ^= 1;
+    try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, (ClaimResponse{ .applied = bad }).validate(request));
+    bad = signed;
+    bad.outcome.claims_added = 2;
+    var duplicates = request;
+    duplicates.claims = &.{ request.claims[0], request.claims[0] };
+    try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, (ClaimResponse{ .applied = bad }).validate(duplicates));
+    result.signingFailed(.identity_unavailable);
+    try std.testing.expect(result.applied.signed_delivery == null);
+    try std.testing.expectEqual(signed.outcome.position, result.applied.outcome.value.position);
+    try result.signNative(root, 2, 3, 4);
     driver = .{ .value = permission, .binding = binding };
     try std.testing.expectError(error.GenerationPublicationChanged, claimStep(alloc, &driver, &driver, "wrong table", request, .{}));
     try std.testing.expectEqual(@as(usize, 0), driver.inspections);
@@ -1055,7 +1204,9 @@ test "relational index publication claim receiver binds fresh build permission w
     driver.value.owner = prepared.owners[0];
     try std.testing.expectError(error.GenerationPublicationChanged, claimStep(alloc, &driver, &driver, plan.before.name, request, .{}));
     driver = .{ .value = permission };
-    try std.testing.expectError(error.GenerationAdmissionPending, claimStep(alloc, &driver, &driver, plan.before.name, request, .{}));
+    try std.testing.expectError(error.PrivateIndexRootRecoveryRequired, claimStep(alloc, &driver, &driver, plan.before.name, request, .{}));
+    try std.testing.expectEqual(@as(usize, 0), driver.claim_batches);
+    try std.testing.expectEqual(@as(usize, 0), driver.admissions);
     driver.binding = binding;
     driver.binding.?.owner_digest[0] ^= 1;
     try std.testing.expectError(error.PrivateIndexOwnerJobChanged, claimStep(alloc, &driver, &driver, plan.before.name, request, .{}));
@@ -1073,6 +1224,8 @@ test "relational index publication claim receiver binds fresh build permission w
     try std.testing.expect(signal.load(.acquire));
     try std.testing.expect(pending.applied.outcome.value.replication_pending);
     try std.testing.expectEqualStrings("ReplicationOutboxPending", pending.applied.outcome.value.error_name.?);
+    try std.testing.expect(!pending.needsSigning());
+    try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, pending.signNative(root, 2, 3, 4));
 
     const build_control: Request = .{ .table_id = request.table_id, .group_id = request.group_id, .id = request.id, .operation = .build, .build_budget = .{ .records = 7 } };
     driver = .{ .value = permission, .binding = binding };

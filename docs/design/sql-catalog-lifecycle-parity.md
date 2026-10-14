@@ -6177,3 +6177,57 @@ complete source/target seals, provenance-backed root repair, native validated/
 installed/released receipt production, then the atomic current-proof/reader-floor/
 catalog/schema decision. Qualify unchanged original public index/ALTER cohorts
 against PostgreSQL only after those boundaries and recovery faults are complete.
+
+### Exact target-delivery commitments and pinned-root signatures
+
+Private target claim outcomes now include a canonical set commitment bound to
+the actual reserved job. Preparation computes it before apply exclusion.
+Commitment validation uses at most 128 stack entries and no allocator or JSON
+encoding; request order and identical duplicates do not change the set digest.
+Different subsets retain different digests even when their maximum immutable
+claim-creation cut happens to coincide. Conflicting parent identities for one
+tuple fail as UNIQUE violations. Claimed write counts cannot exceed the
+deduplicated set size. Replay/retry outcomes reuse the prepared commitment.
+
+The native receiver can decorate committed, fully mirrored delivery with the
+existing enrolled-root signature machinery. The signing context pins the
+complete logical delivery digest and the generation of the lease that applied
+the claims, not a later routing/root observation. Delivery commits to the job,
+exact set and actual native cut. Node/store/reporter identity must match the
+fresh permission view; signing loads the existing key and never creates a
+replacement. Unavailable or changed signing identity preserves committed
+progress as an explicit signing failure. Pending mirror results cannot be
+signed. The data runtime shares its post-commit key-loading/error path between
+owner-stage results and claim-delivery results.
+
+The signature has a distinct logical domain and is not a validated publication
+receipt. Verification of the signature alone also does not prove current
+placement, authorization of a source subset, complete source-batch coverage,
+target EOF inventory completeness, or journal-backed replacement-root recovery.
+The source-consumption guard remains closed. Still required are canonical
+source-to-owner partitioning/splitting, authenticated source-subset provenance,
+fresh target authority checks, durable complete-delivery closures, source/target
+seals and their ordered recovery/cleanup paths before activation.
+Partitioning must account for target claim/inventory overhead as well as source
+body bytes: a 1-MiB source batch is not necessarily a 1-MiB target request.
+Single-row target admission must be checked before persisting an undeliverable
+source batch; multi-row batches must split by actual destination and byte budget.
+
+The first revision passed the 87-step focused Debug gates. The combined final
+Debug run passed 136/136 steps, including the data-runtime gate and stronger
+context/count checks. Tests cover set
+reordering/coalescing, conflicting tuple owners, changed commitments, signatures,
+cuts and applying-root generations, pending mirrors, retained progress on signing
+failure, and rejection of delivery signatures as validated publication receipts.
+The final receiver refinement reports root recovery required when fresh reserved
+metadata permission refers to a missing physical job; it never re-admits it.
+Its additional Debug publication/data-runtime run passed 110/110 steps, including
+128-claim set order independence, rejection of a 129th claim before stack
+admission, and signed-cut tampering. The combined run's log is
+`/private/tmp/antfly-native-claim-delivery-final-debug.log`; the final receiver
+log is `/private/tmp/antfly-native-claim-delivery-root-recovery-debug.log`.
+Counts overlap and are not original SQL cases. No failures or leaks remained.
+Static inventory, Apache-boundary, licensing and control-catalog checks passed.
+No original-case credit, public activation,
+throughput improvement, release pass or push is claimed; dispositions remain
+483 implemented / 862 unresolved.

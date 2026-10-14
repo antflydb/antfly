@@ -11619,7 +11619,9 @@ pub const DataServer = struct {
         // proposals. Never dispatch them through an unconfigured authority.
         if (self.api_server_cfg.deployment_mode != .standalone or self.data_raft != null) return error.UnsupportedNativeIndexOwner;
         const owners = try self.ensureKernelOwnerSource();
-        return antfly.public_api.relational_index_owner_execution.claimStep(alloc, owners, &self.status_source, table_name, request, context);
+        var result = try antfly.public_api.relational_index_owner_execution.claimStep(alloc, owners, &self.status_source, table_name, request, context);
+        if (result.needsSigning()) self.signNativeIndexOwnerResult(alloc, &result);
+        return result;
     }
 
     fn nativeIndexOwnerControl(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: antfly.public_api.relational_index_owner_execution.Request, context: antfly.public_api.operation.RequestContext) !antfly.public_api.relational_index_owner_execution.Result {
@@ -11636,7 +11638,7 @@ pub const DataServer = struct {
         return result;
     }
 
-    fn signNativeIndexOwnerResult(self: *DataServer, alloc: std.mem.Allocator, result: *antfly.public_api.relational_index_owner_execution.Result) void {
+    fn signNativeIndexOwnerResult(self: *DataServer, alloc: std.mem.Allocator, result: anytype) void {
         const registration = self.store_registration orelse {
             result.signingFailed(.identity_unavailable);
             return;

@@ -97,6 +97,7 @@ pub const ClaimCommand = struct {
             var bytes: usize = 0;
             for (self.items) |claim| {
                 if (claim.state != .live or claim.action != .restrict or claim.target_tuple != null or
+                    claim.tuple.len == 0 or claim.parent_table.len == 0 or claim.parent_key.len == 0 or
                     !std.mem.allEqual(u8, &claim.action_id, 0)) return error.InvalidPrivateIndexClaimInventory;
                 bytes = std.math.add(usize, bytes, private_claims.claim_entry_overhead) catch return error.TransactionTooLarge;
                 for ([_][]const u8{ claim.tuple, claim.parent_table, claim.parent_key }) |field| bytes = std.math.add(usize, bytes, field.len) catch return error.TransactionTooLarge;
@@ -131,8 +132,61 @@ pub const ClaimCommand = struct {
         if (self.binding.authority != .native or self.binding.phase != .reserved) return error.InvalidPrivateIndexClaimInventory;
         try (BoundedClaims{ .items = self.claims }).validate();
         for (self.claims) |claim| {
-            if (claim.schema_version != self.binding.physical_candidate.schema_version) return error.InvalidPrivateIndexClaimInventory;
+            if (claim.schema_version != self.binding.physical_candidate.schema_version or
+                claim.tuple.len == 0 or claim.parent_table.len == 0 or claim.parent_key.len == 0) return error.InvalidPrivateIndexClaimInventory;
         }
+    }
+
+    /// Canonical set commitment: bounded stack sorting, no allocation or
+    /// JSON encoding. Identical retries/regrouping preserve claim identity.
+    pub fn digest(self: ClaimCommand) !integrity.Digest {
+        return (try self.commitment()).digest;
+    }
+
+    pub fn commitment(self: ClaimCommand) !struct { digest: integrity.Digest, count: usize } {
+        try self.validate();
+        const Item = struct { tuple: integrity.Digest, value: integrity.Digest };
+        var items: [private_claims.max_claims]Item = undefined;
+        for (self.claims, items[0..self.claims.len]) |claim, *item| {
+            item.tuple = integrity.hash(claim.tuple);
+            var state = std.crypto.hash.Blake3.init(.{});
+            state.update("antfly/private-unique-live-claim/v1");
+            state.update(&item.tuple);
+            var version: [4]u8 = undefined;
+            std.mem.writeInt(u32, &version, claim.schema_version, .little);
+            state.update(&version);
+            for ([_][]const u8{ claim.parent_table, claim.parent_key }) |field| {
+                var length: [8]u8 = undefined;
+                std.mem.writeInt(u64, &length, field.len, .little);
+                state.update(&length);
+                state.update(field);
+            }
+            state.final(&item.value);
+        }
+        const active = items[0..self.claims.len];
+        std.mem.sort(Item, active, {}, struct {
+            fn less(_: void, a: Item, b: Item) bool {
+                return std.mem.order(u8, &a.tuple, &b.tuple) == .lt;
+            }
+        }.less);
+        var state = std.crypto.hash.Blake3.init(.{});
+        state.update("antfly/private-unique-claim-set/v1");
+        state.update(&try self.binding.encode());
+        var previous: ?Item = null;
+        var count: usize = 0;
+        for (active) |item| {
+            if (previous) |prior| if (std.mem.eql(u8, &prior.tuple, &item.tuple)) {
+                if (!std.mem.eql(u8, &prior.value, &item.value)) return error.UniqueConstraintViolation;
+                continue;
+            };
+            state.update(&item.tuple);
+            state.update(&item.value);
+            count += 1;
+            previous = item;
+        }
+        var result: integrity.Digest = undefined;
+        state.final(&result);
+        return .{ .digest = result, .count = count };
     }
 };
 
@@ -275,6 +329,7 @@ pub const ClaimCleanupMaintenanceOutcome = struct {
 
 pub const ClaimOutcome = struct {
     binding: jobs.Binding,
+    claims_digest: integrity.Digest,
     position: Native,
     duplicate: bool,
     claims_added: usize = 0,
@@ -284,15 +339,34 @@ pub const ClaimOutcome = struct {
     /// Physical delivery acknowledgement only, never a publication signature.
     /// Check a decoded provider result before a receiver can use its cut.
     pub fn validateFor(self: ClaimOutcome, command: ClaimCommand) !void {
-        try command.validate();
+        const expected_set = try command.commitment();
         const actual = self.binding.encode() catch return error.InvalidPrivateIndexClaimReceipt;
         const expected = try command.binding.encode();
         self.position.validate() catch return error.InvalidPrivateIndexClaimReceipt;
         if (!std.mem.eql(u8, &actual, &expected) or
+            !std.mem.eql(u8, &self.claims_digest, &expected_set.digest) or
             !self.position.namespace.eql(command.binding.fence.namespace) or
-            self.claims_added > command.claims.len or
+            self.claims_added > expected_set.count or
             self.duplicate != (self.claims_added == 0) or
             self.replication_pending != (self.error_name != null)) return error.InvalidPrivateIndexClaimReceipt;
+    }
+
+    /// Sign only committed, fully mirrored delivery. This domain cannot be
+    /// confused with a publication/validation receipt.
+    pub fn deliveryDigest(self: ClaimOutcome) !integrity.Digest {
+        _ = try self.binding.encode();
+        try self.position.validate();
+        if (self.binding.authority != .native or !self.position.namespace.eql(self.binding.fence.namespace) or
+            self.replication_pending or self.error_name != null or std.mem.allEqual(u8, &self.claims_digest, 0))
+            return error.InvalidPrivateIndexClaimReceipt;
+        var state = std.crypto.hash.Blake3.init(.{});
+        state.update("antfly/private-unique-delivery/v1");
+        state.update(&try self.binding.encode());
+        state.update(&self.claims_digest);
+        state.update(&try (@import("receipt_position.zig").Position{ .native = self.position }).encode());
+        var result: integrity.Digest = undefined;
+        state.final(&result);
+        return result;
     }
 };
 
@@ -301,6 +375,7 @@ pub const PreparedClaims = struct {
     alloc: Allocator,
     batch: private_claims.Prepared,
     command: ClaimCommand,
+    claims_digest: integrity.Digest,
     payload: ?[]u8 = null,
     prefix_len: usize = 0,
 
@@ -310,7 +385,7 @@ pub const PreparedClaims = struct {
         errdefer batch.deinit();
         const owned = try batch.arena.allocator().alloc(integrity.Claim, batch.entries.len);
         for (owned, batch.entries) |*claim, entry| claim.* = try integrity.Claim.decode(&entry.address.claimKey(), entry.value);
-        return .{ .alloc = alloc, .batch = batch, .command = .{ .binding = command.binding, .claims = owned } };
+        return .{ .alloc = alloc, .batch = batch, .command = .{ .binding = command.binding, .claims = owned }, .claims_digest = try command.digest() };
     }
 
     pub fn deinit(self: *PreparedClaims) void {
@@ -328,14 +403,14 @@ pub const PreparedClaims = struct {
         try (Frame{ .effect = .{ .claims = self.command }, .position = position }).validate();
     }
     pub fn replayDuplicateOutcome(self: *const PreparedClaims, position: Native) ClaimOutcome {
-        return .{ .binding = self.command.binding, .position = position, .duplicate = true };
+        return .{ .binding = self.command.binding, .claims_digest = self.claims_digest, .position = position, .duplicate = true };
     }
     pub fn stage(self: *PreparedClaims, core: anytype, txn: anytype, replay: ?Native) !ClaimOutcome {
         // Actual receiving range, checked under apply exclusion; no caller-set
         // ownership flag or row owner's routing assumption is accepted.
         for (self.batch.entries) |entry| if (!core.byteRange().contains(&entry.address.routing)) return error.KeyOutOfRange;
         const result = try self.batch.stageOrdered(txn, replay);
-        return .{ .binding = self.command.binding, .position = result.position, .duplicate = result.duplicate, .claims_added = result.claims_added };
+        return .{ .binding = self.command.binding, .claims_digest = self.claims_digest, .position = result.position, .duplicate = result.duplicate, .claims_added = result.claims_added };
     }
     pub fn hasPublicationReceipt(_: *const PreparedClaims) bool {
         return false;

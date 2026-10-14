@@ -1369,6 +1369,9 @@ test "storage owner native index raw admission and bounded controls preserve loc
         const claimed = parsed_claimed.value;
         try claimed.validateFor(prepared_claims.command);
         var invalid_receipt = claimed;
+        invalid_receipt.claims_digest[0] ^= 1;
+        try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, invalid_receipt.validateFor(prepared_claims.command));
+        invalid_receipt = claimed;
         invalid_receipt.position.namespace.range_id += 1;
         try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, invalid_receipt.validateFor(prepared_claims.command));
         invalid_receipt = claimed;
