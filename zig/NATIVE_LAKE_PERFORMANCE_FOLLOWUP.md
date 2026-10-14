@@ -3725,7 +3725,10 @@ complete tuple/public-ID ordering. Each batch admits only the serving packs
 containing its rows and lowers those rows into native ordinal constraints under
 the same pinned statistics and source authority. A full top-K proves early stop.
 Backward pages use the reverse tuple order. Incomplete ordering or an unproductive
-bounded prefix returns to bounded text windows. A small requested page does not
+bounded prefix returns to bounded text windows. Proved segment subsets have their
+own byte/count-bounded cursor: neither a hard-coded 64-segment shortcut nor a
+small percentage of the archive can force complete subset admission or widen the
+selection back to unrelated packs. A small requested page does not
 require full text-corpus admission. Accepted overlays and full-match evaluation
 retain complete window traversal. Early-stopped totals are explicit lower bounds.
 

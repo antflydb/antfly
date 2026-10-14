@@ -4703,6 +4703,9 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(
         profile_definition["schema"]["relational_indexes"][0]["name"] = (
             "profile_amount_idx"
         )
+        profile_definition["schema"]["relational_indexes"][0]["keys"] = [
+            {"column": "amount", "direction": "desc", "nulls": "last"}
+        ]
         profile_definition["indexes"] = {
             "body_text": {"type": "full_text", "store_source": True}
         }
@@ -4811,7 +4814,7 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(
             ordered = call("POST", "/tables/profile_text/query", ordered_query)
             assert ordered["profile"]["sort"]["selection_reason"] == (
                 "bounded_ordered_lake_index"
-            ), ordered
+            ), json.dumps(ordered["profile"], sort_keys=True)
             assert [h["_source"]["amount"] for h in ordered["hits"]["hits"]] == list(
                 range(200, 193, -1)
             )

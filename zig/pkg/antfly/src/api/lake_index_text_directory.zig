@@ -799,6 +799,16 @@ test "external lake exact segment admission skips missing unrelated descriptors 
     var windows = try RoutingCursor.create(a, window_root, store, cached, .none);
     defer windows.deinit();
     var window_ids: [2]Id = undefined;
+    const subset = [_]Id{ corpus.term_directory.identity(segments[0].artifact_id), corpus.term_directory.identity(segments[8].artifact_id) };
+    const selected_windows = try SelectedCursor.create(a, window_root, store, cached, .none, &subset);
+    defer selected_windows.deinit();
+    try std.testing.expectError(error.InvalidNativeLakeTextCorpus, selected_windows.nextBounded(&window_ids, 0));
+    for (subset) |id| {
+        const selected_window = (try selected_windows.nextBounded(&window_ids, max_segment_bytes)).?;
+        try std.testing.expectEqual(@as(usize, 1), selected_window.identities.len);
+        try std.testing.expectEqual(id, selected_window.identities[0]);
+    }
+    try std.testing.expect(try selected_windows.nextBounded(&window_ids, max_segment_bytes) == null);
     var visited: usize = 0;
     while (try windows.next(&window_ids)) |window| {
         try std.testing.expectEqual(@as(u64, visited), window.doc_offset);
@@ -1120,3 +1130,53 @@ pub const RoutingCursor = struct {
 /// pair has the same order as a full immutable routing walk, without summing all
 /// earlier files' documents or admitting their inventories.
 pub const Position = struct { file: Id, rank: u32, recent: bool = false };
+
+/// A proved subset can span many windows. Never widen it to the full archive
+/// or admit every selected segment simply because it is a small percentage.
+pub const SelectedCursor = struct {
+    a: A,
+    budget: local.sql_memory_budget,
+    scratch: std.heap.ArenaAllocator = undefined,
+    reader: Reader,
+    root: corpus.Root,
+    identities: []const Id,
+    position: usize = 0,
+    pending_bytes: ?u64 = null,
+    pub fn create(a: A, root: corpus.Root, store: stores.ArtifactStore, cached: ?artifacts.CachedRead, token: Cancellation, identities: []const Id) !*SelectedCursor {
+        const self = try a.create(SelectedCursor);
+        self.* = .{ .a = a, .budget = .{ .backing = a, .limit = 8 * 1024 * 1024 }, .reader = .{ .store = store, .cached = cached, .token = token }, .root = root, .identities = identities };
+        self.scratch = .init(self.budget.allocator());
+        self.reader.init(root.domain);
+        return self;
+    }
+    pub fn deinit(self: *SelectedCursor) void {
+        const a = self.a;
+        self.scratch.deinit();
+        a.destroy(self);
+    }
+    pub fn nextBounded(self: *SelectedCursor, output: []Id, max_bytes: u64) !?RoutingCursor.Window {
+        if (output.len == 0 or max_bytes == 0) return error.InvalidNativeLakeTextCorpus;
+        try self.reader.check();
+        var count: usize = 0;
+        var bytes: u64 = 0;
+        while (count < output.len and self.position < self.identities.len) {
+            try self.reader.check();
+            const id = self.identities[self.position];
+            const size = self.pending_bytes orelse blk: {
+                _ = self.scratch.reset(.retain_capacity);
+                break :blk try segmentBytes(self.scratch.allocator(), self.reader.pages.store(), self.root, id);
+            };
+            if (count != 0 and size > max_bytes -| bytes) {
+                self.pending_bytes = size;
+                break;
+            }
+            self.pending_bytes = null;
+            output[count] = id;
+            count += 1;
+            self.position += 1;
+            bytes +|= size;
+            if (bytes >= max_bytes) break;
+        }
+        return if (count == 0) null else .{ .identities = output[0..count], .doc_offset = 0 };
+    }
+};

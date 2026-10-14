@@ -1412,6 +1412,8 @@ const Execution = struct {
         }
 
         var reader: ?*@import("lake_index_text_directory.zig").RoutingCursor = null;
+        var selected_reader: ?*@import("lake_index_text_directory.zig").SelectedCursor = null;
+        defer if (selected_reader) |value| value.deinit();
         if (frontier == null) {
             var selection_scratch = std.heap.ArenaAllocator.init(plan_budget.allocator());
             defer selection_scratch.deinit();
@@ -1421,8 +1423,10 @@ const Execution = struct {
                 error.OutOfMemory => null,
                 else => return err,
             };
-            if (subset) |selected_ids| if (selected_ids.len <= 64 or selected_ids.len < root.segment_count / 2) return null;
-            reader = try @import("lake_index_text_directory.zig").RoutingCursor.create(std.heap.page_allocator, root, self.store.artifactStore(), cached, cancellation);
+            if (subset) |selected_ids| {
+                const owned_ids = try self.arena.dupe([32]u8, selected_ids);
+                selected_reader = try @import("lake_index_text_directory.zig").SelectedCursor.create(std.heap.page_allocator, root, self.store.artifactStore(), cached, cancellation, owned_ids);
+            } else reader = try @import("lake_index_text_directory.zig").RoutingCursor.create(std.heap.page_allocator, root, self.store.artifactStore(), cached, cancellation);
         }
         defer if (reader) |value| value.deinit();
         const paging = local.storage_db_query_control_contract.componentPaging(req);
@@ -1437,6 +1441,7 @@ const Execution = struct {
         const Navigation = struct {
             frontier: ?*frontier_mod,
             reader: ?*@import("lake_index_text_directory.zig").RoutingCursor,
+            selected: ?*@import("lake_index_text_directory.zig").SelectedCursor,
             max_bytes: u64,
             fn next(raw: *anyopaque, output: [][32]u8, cutoff: ?f32) !?@import("lake_index_text_directory.zig").RoutingCursor.Window {
                 const self_: *@This() = @ptrCast(@alignCast(raw));
@@ -1444,10 +1449,11 @@ const Execution = struct {
                     const selected_ids = (try value.nextWindow(output, cutoff, self_.max_bytes)) orelse return null;
                     return .{ .identities = selected_ids, .doc_offset = 0 };
                 }
+                if (self_.selected) |value| return value.nextBounded(output, self_.max_bytes);
                 return self_.reader.?.nextBounded(output, self_.max_bytes);
             }
         };
-        var navigation: Navigation = .{ .frontier = frontier, .reader = reader, .max_bytes = window_config.admission_window_bytes };
+        var navigation: Navigation = .{ .frontier = frontier, .reader = reader, .selected = selected_reader, .max_bytes = window_config.admission_window_bytes };
         var ahead = @import("lake_text_window_ahead.zig").init(.{ .ptr = &navigation, .next = Navigation.next }, self.context.io);
         defer ahead.deinit();
         // Reuse the region even when the caller is itself an arena: freeing a
