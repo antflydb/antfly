@@ -742,7 +742,9 @@ misrepresent the original query result.
   Entity results after deletion contain no cached properties. Deletion is
   shared across subqueries and DETACH DELETE aliases. Retained aliases resolve
   active document-derived replacements; a removed contribution has no readable
-  cached properties. CREATE/MERGE reject deleted endpoints, and overlays and
+  cached properties. Observing a missing derived contribution does not record
+  an explicit deletion; restoring its source field restores readable aliases
+  with the same identity. CREATE/MERGE reject deleted endpoints, and overlays and
   commit plans also validate live endpoints.
   MERGE rejects null node and relationship keys during pattern evaluation and
   rolls back earlier writes in the same statement. Keys referencing nodes in

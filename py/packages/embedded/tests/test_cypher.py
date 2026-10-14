@@ -290,3 +290,31 @@ def test_document_derived_aliases_resolve_replacements_and_deleted_contents(requ
                 )
             assert invalid.value.graph_code == "CypherDeletedEntity"
             assert database.sql("SELECT ref,x FROM docs WHERE _id='a'")["rows"] == [["b", "2"]]
+
+        for observation in (
+            "WITH a,b,r,count(r) AS seen",
+            "WITH a,b,r,elementId(r) AS seen",
+            "WITH a,b,r,r AS missing",
+        ):
+            row = database.cypher_json(
+                "knowledge",
+                {
+                    "query": "MATCH (a:Document {id:'a'})-[r:LINK]->(b) SET a.ref=null "
+                    + observation
+                    + " SET a.ref=antfly.documentKey(b) WITH a,b,r MATCH (a)-[s:LINK]->(b) RETURN r.weight,s.weight"
+                },
+            )["rows"][0]
+            assert row == [{"type": "number", "value": 1}] * 2
+        row = database.cypher_json(
+            "knowledge",
+            {
+                "query": "MATCH p=(a:Document {id:'a'})-[r:LINK]->(b) WITH a,b,p,[r] AS list,{edge:r} AS map SET a.ref=null WITH a,b,p,list,map,relationships(p)[0] AS missing SET a.ref=antfly.documentKey(b) RETURN missing.weight,list[0].weight,map.edge.weight,relationships(p)[0].weight"
+            },
+        )["rows"][0]
+        assert row == [{"type": "number", "value": 1}] * 4
+        assert database.sql("SELECT ref,x FROM docs WHERE _id='a'")["rows"] == [["b", "2"]]
+    with af.open_hosted(aflite_path) as database:
+        row = database.cypher_json("knowledge", {"query": "MATCH (a:Document {id:'a'})-[r:LINK]->(b) RETURN r.weight"})[
+            "rows"
+        ][0]
+        assert row == [{"type": "number", "value": 1}]

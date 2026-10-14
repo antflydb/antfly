@@ -64,7 +64,15 @@ def main():
     try:
         call(
             f"/tables/{table}",
-            {"num_shards": args.shards, "indexes": {"links": {"type": "graph"}}},
+            {
+                "num_shards": args.shards,
+                "indexes": {
+                    "links": {
+                        "type": "graph",
+                        "edge_types": [{"name": "link", "field": "ref"}],
+                    }
+                },
+            },
         )
         created_table = True
         call(
@@ -144,7 +152,29 @@ def main():
         assert row[4]["value"]["labels"] == []
         assert row[5]["value"]["properties"]["value"] == {}
         assert row[6]["value"]["properties"]["value"] == {}
-        print("14 authenticated Cypher mutation semantics checks passed")
+        assert query(
+            "MATCH (a:Document {id:'a'}),(b:Document {id:'b'}) SET a.ref=antfly.documentKey(b) WITH a MATCH (a)-[r:LINK]->(b) RETURN r.weight"
+        ) == [[{"type": "number", "value": 1}]]
+        row = query(
+            "MATCH (a:Document {id:'a'})-[r:LINK]->(b) SET a.ref=null WITH a,b,r,count(r) AS seen SET a.ref=antfly.documentKey(b) WITH a,b,r MATCH (a)-[s:LINK]->(b) RETURN r.weight,s.weight"
+        )[0]
+        assert row == [{"type": "number", "value": 1}] * 2
+        row = query(
+            "MATCH p=(a:Document {id:'a'})-[r:LINK]->(b) WITH a,b,p,[r] AS list,{edge:r} AS map SET a.ref=null WITH a,b,p,list,map,relationships(p)[0] AS missing SET a.ref=antfly.documentKey(b) RETURN missing.weight,list[0].weight,map.edge.weight,relationships(p)[0].weight"
+        )[0]
+        assert row == [{"type": "number", "value": 1}] * 4
+        missing = call(
+            f"/graphs/{graph}/query",
+            {
+                "query": "MATCH (a:Document {id:'a'})-[r:LINK]->(b) SET a.ref=null RETURN r.weight"
+            },
+            status=400,
+        )
+        assert missing["code"] == "CypherDeletedEntity", missing
+        assert query("MATCH (a:Document {id:'a'})-[r:LINK]->(b) RETURN r.weight") == [
+            [{"type": "number", "value": 1}]
+        ]
+        print("18 authenticated Cypher mutation semantics checks passed")
     finally:
         if created_graph:
             call(f"/graphs/{graph}", method="DELETE")

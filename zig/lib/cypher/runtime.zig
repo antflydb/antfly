@@ -630,6 +630,9 @@ const Engine = struct {
     }
     fn requireLiveContents(self: *Engine, value: v.Value) !void {
         if (self.isDeleted(value)) return error.CypherDeletedEntity;
+        if (value == .relationship) if (self.backend.vtable.get_relationship) |get_relationship| {
+            if (try get_relationship(self.backend.ptr, self.a, .{ .identity = value.relationship.identity, .index = value.relationship.index }) == null) return error.CypherDeletedEntity;
+        };
     }
     fn readValue(self: *Engine, value: v.Value) anyerror!v.Value {
         const project_node = self.backend.vtable.project_node;
@@ -653,8 +656,13 @@ const Engine = struct {
             .relationship => |retained| blk: {
                 const relationship = if (self.backend.vtable.get_relationship) |get_relationship|
                     (try get_relationship(self.backend.ptr, self.a, .{ .identity = retained.identity, .index = retained.index })) orelse {
-                        try self.recordDeletion(.{ .relationship = .{ .identity = retained.identity, .index = retained.index } });
-                        return self.readValue(value);
+                        // A derived contribution can disappear and return with
+                        // the same identity. Reads must not record a permanent
+                        // deletion; only mutation callbacks establish one.
+                        const missing = try self.a.create(v.Relationship);
+                        missing.* = retained.*;
+                        missing.properties = &.{};
+                        break :blk .{ .relationship = missing };
                     }
                 else
                     retained;

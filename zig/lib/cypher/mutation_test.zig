@@ -466,3 +466,45 @@ test "MATCH does not resurrect a deleted bound node" {
     try std.testing.expectEqual(@as(i64, 0), result.rows[0][0].integer);
     try std.testing.expectEqual(@as(usize, 0), fixture.nodes.len);
 }
+
+test "reading missing postimages does not delete restored relationship identities" {
+    const Adapter = struct {
+        fn getRelationship(ptr: *anyopaque, a: A, identity: v.RelationshipIdentity) !?*const v.Relationship {
+            const fixture = Fixture.self(ptr);
+            const visible = (v.Value{ .node = fixture.nodes[0] }).property("visible");
+            if (visible == .boolean and !visible.boolean) return null;
+            return Fixture.getRelationship(ptr, a, identity);
+        }
+    };
+    var fixture = Fixture.init();
+    defer fixture.arena.deinit();
+    var vtable = fixture.backend().vtable.*;
+    vtable.get_relationship = Adapter.getRelationship;
+    const backend: b.Backend = .{ .ptr = &fixture, .vtable = &vtable };
+    for ([_][]const u8{
+        "CREATE (a:Person {visible:true})-[r:KNOWS {x:42}]->(b:Person) SET a.visible=false WITH a,b,r,count(r) AS seen SET a.visible=true WITH a,b,r MATCH (a)-[s:KNOWS]->(b) RETURN r.x,s.x",
+        "CREATE p=(a:Person {visible:true})-[r:KNOWS {x:42}]->(b:Person) WITH a,b,p,[r] AS list,{r:r} AS map SET a.visible=false WITH a,b,p,list,map,relationships(p)[0] AS missing SET a.visible=true RETURN missing.x,list[0].x,map.r.x,relationships(p)[0].x",
+    }) |query| {
+        // Each scenario uses a separate fixture so the adapter observes its
+        // source node, independently of graph cardinality from earlier runs.
+        fixture.nodes = &.{};
+        fixture.relationships = &.{};
+        var diagnostic: root.compiler.Diagnostic = .{};
+        var compiled = try root.compiler.compile(std.testing.allocator, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        var result = try root.runtime.execute(std.testing.allocator, backend, graph, &compiled, &.{}, .{});
+        defer result.deinit();
+        for (result.rows[0]) |cell| try std.testing.expectEqual(@as(i64, 42), cell.integer);
+    }
+    for ([_][]const u8{ "r.x", "properties(r)", "r{.*}" }) |expression| {
+        fixture.nodes = &.{};
+        fixture.relationships = &.{};
+        const query = try std.fmt.allocPrint(std.testing.allocator, "CREATE (a:Person {{visible:true}})-[r:KNOWS {{x:42}}]->(:Person) SET a.visible=false RETURN {s}", .{expression});
+        defer std.testing.allocator.free(query);
+        var diagnostic: root.compiler.Diagnostic = .{};
+        var compiled = try root.compiler.compile(std.testing.allocator, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        try std.testing.expectError(error.CypherDeletedEntity, root.runtime.execute(std.testing.allocator, backend, graph, &compiled, &.{}, .{}));
+        try std.testing.expectEqual(@as(usize, 0), fixture.nodes.len);
+    }
+}
