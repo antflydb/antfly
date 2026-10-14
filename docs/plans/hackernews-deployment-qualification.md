@@ -868,3 +868,26 @@ These changes address demonstrated startup work and repeated hydration work.
 They do not establish the cause of the original already-ready-cache stall or
 eliminate host paging. Keep the retained failures and require controlled-host,
 full-archive and managed Cloud qualification before treating latency as passed.
+
+[Follow-up evidence](../../examples/hackernews/cache-startup-qualification-20261013.json)
+records the optimized build at `05420a779c` and three immediate-start cycles on
+the same 142,577-row fixture. First searches take 116–371 ms; a retained 128-hit
+cursor issued as the first request after restart takes 361–421 ms. Each cycle
+checks 1,408 unique paginated hits and preserves IDs, scores, projected fields
+and highlights. Health metrics refresh periodically, so a sampled disk-ready
+gauge is not an instantaneous proof of readiness. These are shared-host samples,
+not a controlled before/after comparison or proof of the historic stall's cause.
+
+The complete HN matrix passes keyword, filter, highlight, concurrent, composed
+union/overlay and restart-pagination correctness. Search restart is 167 ms and
+cursor restart 657 ms. A cold saved-overlay request takes 2,366 ms and fails the
+2,000 ms criterion: measured lake work accounts for 524 ms, leaving 1,842 ms
+outside those phases. Five cache-cleared follow-up probes take 291–672 ms without
+reproducing that stall. Preserve the failure; its cause remains unproven.
+
+Validation passes 47 embedded cache tests, three focused API tests, and 25 Python
+tests with nine subtests. Native tests have no skips, failures or leaks. The fresh
+native-source fixture verifies grouped highlight acquisition, reordered hits,
+identity mismatch rejection and cancellation independently of the HN timings.
+The complete optimized executable also requires the resolver import in the
+serverless object-runtime dependency set; the follow-up fixes that missing import.
