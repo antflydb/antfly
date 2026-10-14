@@ -197,6 +197,40 @@ fn findChunkContentField(obj: *const std.json.ObjectMap) ?std.json.Value {
     return null;
 }
 
+/// The old JSON round trip normalized arbitrary-precision numeric lexemes.
+/// Preserve that contract without serializing strings or ordinary scalars.
+fn normalizeLoadedNumbers(alloc: Allocator, root: *std.json.Value) !void {
+    const work = @import("antfly_platform").allocator.reclaimingScratch(alloc);
+    var pending: std.ArrayListUnmanaged(*std.json.Value) = .empty;
+    defer pending.deinit(work);
+    try pending.append(work, root);
+    while (pending.pop()) |value| switch (value.*) {
+        .number_string => |bytes| {
+            var parsed = try std.json.parseFromSlice(std.json.Value, work, bytes, .{});
+            defer parsed.deinit();
+            switch (parsed.value) {
+                .integer, .float => {
+                    alloc.free(bytes);
+                    value.* = parsed.value;
+                },
+                .number_string => |normalized| if (!std.mem.eql(u8, normalized, bytes)) {
+                    const owned = try alloc.dupe(u8, normalized);
+                    alloc.free(bytes);
+                    value.* = .{ .number_string = owned };
+                },
+                else => return error.SyntaxError,
+            }
+        },
+        .object => |*object| for (object.values()) |*child| {
+            if (child.* == .number_string or child.* == .object or child.* == .array) try pending.append(work, child);
+        },
+        .array => |*array| for (array.items) |*child| {
+            if (child.* == .number_string or child.* == .object or child.* == .array) try pending.append(work, child);
+        },
+        else => {},
+    };
+}
+
 fn projectWithSelectionAndOutput(alloc: Allocator, output: Allocator, doc_key: []const u8, raw: []const u8, selection: FieldSelectionPlan, loader: SpecialFieldLoader, prepared: ?*const document_query.SpanProjectionPlan) ![]u8 {
     var values: [3]?std.json.Value = @splat(null);
     defer for (&values) |*value| if (value.*) |*owned| freeJsonValue(alloc, owned);
@@ -204,12 +238,11 @@ fn projectWithSelectionAndOutput(alloc: Allocator, output: Allocator, doc_key: [
     if (selection.special.all_artifacts) values[0] = try loader.load_artifacts(loader.ctx, alloc, doc_key);
     if (selection.special.all_chunks) values[1] = try loader.load_chunks(loader.ctx, alloc, doc_key);
     if (selection.special.all_embeddings) values[2] = try loader.load_embeddings(loader.ctx, alloc, doc_key);
+    for (&values) |*value| if (value.*) |*logical| try normalizeLoadedNumbers(alloc, logical);
     var sources: [3]document_query.ProjectionSource = undefined;
     var count: usize = 0;
-    defer for (sources[0..count]) |source| alloc.free(source.raw);
     for (values, names) |value, name| if (value) |logical| {
-        const bytes = try std.json.Stringify.valueAlloc(alloc, logical, .{});
-        sources[count] = .{ .name = name, .raw = bytes };
+        sources[count] = .{ .name = name, .value = logical };
         count += 1;
     };
     if (prepared) |plan| return (try document_query.lookupJsonWithSources(alloc, output, raw, plan, sources[0..count])).json;
@@ -219,49 +252,17 @@ fn projectWithSelectionAndOutput(alloc: Allocator, output: Allocator, doc_key: [
         return (try document_query.lookupJsonWithSources(alloc, output, raw, &plan, sources[0..count])).json;
     }
     if (count == 0) return (try document_query.lookupJsonWithOutput(alloc, output, raw, selection.projection)).json;
-    // Unsupported wildcard/exclusion forms keep the DOM projection contract,
-    // but their input overlay is streamed from raw spans, never parsed/cloned.
-    const merged = try mergeProjectionSources(alloc, raw, sources[0..count]);
-    defer alloc.free(merged);
-    return (try document_query.lookupJsonWithOutput(alloc, output, merged, selection.projection)).json;
-}
-fn mergeProjectionSources(alloc: Allocator, raw: []const u8, sources: []const document_query.ProjectionSource) ![]u8 {
-    var arena = std.heap.ArenaAllocator.init(alloc);
+    // Legacy selectors still decode the primary, but loaded special fields
+    // remain logical values throughout projection. No intermediate JSON body.
+    var arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
     defer arena.deinit();
-    const a = arena.allocator();
-    const JsonView = @import("json_view.zig").View;
-    var view = JsonView.init(a, raw);
-    const selector = try @import("json_projection_plan.zig").compile(a, &.{});
-    try view.prepareProjectionWithOptions(selector, .all, .object_only, .{ .retain_root_fields = true });
-    var writer = std.Io.Writer.Allocating.init(alloc);
-    defer writer.deinit();
-    writer.writer.writeByte('{') catch return error.OutOfMemory;
-    var emitted = false;
-    if (view.root.children) |children| {
-        const names = try a.alloc([]const u8, children.len);
-        var it = view.root.object_index.iterator();
-        while (it.next()) |entry| names[entry.value_ptr.*] = entry.key_ptr.*;
-        for (names, children) |name, child| {
-            const bytes = for (sources) |source| {
-                if (std.mem.eql(u8, name, source.name)) break source.raw;
-            } else child.node.raw;
-            if (emitted) writer.writer.writeByte(',') catch return error.OutOfMemory;
-            emitted = true;
-            std.json.Stringify.value(name, .{}, &writer.writer) catch return error.OutOfMemory;
-            writer.writer.writeByte(':') catch return error.OutOfMemory;
-            writer.writer.writeAll(bytes) catch return error.OutOfMemory;
-        }
-    }
-    for (sources) |source| {
-        if (view.root.object_index.contains(source.name)) continue;
-        if (emitted) writer.writer.writeByte(',') catch return error.OutOfMemory;
-        emitted = true;
-        std.json.Stringify.value(source.name, .{}, &writer.writer) catch return error.OutOfMemory;
-        writer.writer.writeByte(':') catch return error.OutOfMemory;
-        writer.writer.writeAll(source.raw) catch return error.OutOfMemory;
-    }
-    writer.writer.writeByte('}') catch return error.OutOfMemory;
-    return writer.toOwnedSlice();
+    const scratch = arena.allocator();
+    var root = try std.json.parseFromSliceLeaky(std.json.Value, scratch, raw, .{});
+    if (root != .object) root = .{ .object = .empty };
+    for (sources[0..count]) |source| try root.object.put(scratch, source.name, source.value);
+    var projected = try document_query.projectLookupView(scratch, root, selection.projection);
+    defer document_query.deinitProjectionView(scratch, &projected);
+    return document_query.serializeWithOutput(scratch, output, projected);
 }
 
 test "ordered artifact inventory public projections transfer nested ownership across allocation faults" {
@@ -398,4 +399,77 @@ test "public graph metric borrowed wire local search shares plans and bounds syn
         try std.testing.expect(!req.document_projection_plan.?.matches(.{ .fields = &.{"different"}, .include_all_fields = false }));
         try std.testing.expect(!req.document_projection_plan.?.matches(.{ .fields = fields, .include_all_fields = true }));
     }
+}
+
+test "public graph metric borrowed wire decoded special fields preserve numeric and ordered selector contracts" {
+    const Fixture = struct {
+        fn load(_: ?*anyopaque, a: Allocator, _: []const u8) !?std.json.Value {
+            var parsed = try std.json.parseFromSlice(std.json.Value, a, "{\"n\":1.00,\"big\":123456789012345678901234567890,\"arr\":[{\"x\":1e2,\"y\":\"escaped\\ntext\"},{\"x\":2}],\"nested\":{\"a\":3}}", .{ .parse_numbers = false });
+            defer parsed.deinit();
+            return try cloneJsonValue(a, parsed.value);
+        }
+        fn none(_: ?*anyopaque, _: Allocator, _: []const u8) !?std.json.Value {
+            return null;
+        }
+        fn run(a: Allocator) !void {
+            const loader: SpecialFieldLoader = .{ .ctx = null, .load_embeddings = load, .load_chunks = none, .load_artifacts = none };
+            const raw = "{\"title\":\"retained\",\"_embeddings\":{\"old\":0}}";
+            const merged = "{\"title\":\"retained\",\"_embeddings\":{\"n\":1.00,\"big\":123456789012345678901234567890,\"arr\":[{\"x\":1e2,\"y\":\"escaped\\ntext\"},{\"x\":2}],\"nested\":{\"a\":3}}}";
+            const cases = [_][]const []const u8{
+                &.{"_embeddings"},                                                  &.{"_embeddings.*"},
+                &.{ "_embeddings", "_embeddings.arr.1.x", "_embeddings.nested.a" }, &.{ "_embeddings", "_embeddings.arr.x", "_embeddings.arr.0" },
+                &.{ "_embeddings", "-_embeddings.nested", "title" },                &.{ "*", "_embeddings", "-_embeddings.arr.0.y" },
+                &.{ "_embeddings", "-_embeddings" },
+            };
+            for (cases) |fields| {
+                const opts: types.LookupOptions = .{ .fields = fields, .include_all_fields = false };
+                var expected = try document_query.lookupJson(a, merged, opts);
+                defer expected.deinit(a);
+                const result = try projectLookupStoredBytesWithOutput(a, a, "doc", raw, opts, loader);
+                defer a.free(result);
+                try std.testing.expectEqualStrings(expected.json, result);
+            }
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "public graph metric borrowed wire decoded embedding projection fits bounded row scratch" {
+    const a = std.testing.allocator;
+    const Counter = @import("../../lite/test_allocator.zig").BudgetAllocator;
+    const Loader = struct {
+        fn none(_: ?*anyopaque, _: Allocator, _: []const u8) !?std.json.Value {
+            return null;
+        }
+        fn load(ctx: ?*anyopaque, alloc: Allocator, _: []const u8) !?std.json.Value {
+            const value: *const std.json.Value = @ptrCast(@alignCast(ctx.?));
+            return try cloneJsonValue(alloc, value.*);
+        }
+    };
+    var source_arena = std.heap.ArenaAllocator.init(a);
+    defer source_arena.deinit();
+    const s = source_arena.allocator();
+    var vectors: std.json.ObjectMap = .empty;
+    for (0..64) |i| {
+        var array = std.json.Array.init(s);
+        try array.ensureTotalCapacity(1536);
+        for (0..1536) |j| try array.append(.{ .float = @as(f64, @floatFromInt(j)) / 1536 });
+        try vectors.put(s, try std.fmt.allocPrint(s, "v{d}", .{i}), .{ .array = array });
+    }
+    var logical: std.json.Value = .{ .object = vectors };
+    const loader: SpecialFieldLoader = .{ .ctx = &logical, .load_embeddings = Loader.load, .load_chunks = Loader.none, .load_artifacts = Loader.none };
+    var budget: Counter = .{ .backing = a, .limit = 32 * 1024 * 1024 };
+    const result = result: {
+        var arena = std.heap.ArenaAllocator.init(budget.allocator());
+        defer arena.deinit();
+        break :result try projectLookupStoredBytesWithOutput(arena.allocator(), a, "doc", "{}", .{ .fields = &.{"_embeddings"}, .include_all_fields = false }, loader);
+    };
+    defer a.free(result);
+    try std.testing.expectEqual(@as(usize, 0), budget.live);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, result, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 64), parsed.value.object.get("_embeddings").?.object.count());
+    try std.testing.expectEqual(@as(usize, 1536), parsed.value.object.get("_embeddings").?.object.get("v63").?.array.items.len);
+    std.debug.print("DECODED_EMBEDDINGS output_bytes={d} scratch_peak={d}\n", .{ result.len, budget.peak });
 }

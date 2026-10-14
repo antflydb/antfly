@@ -101,15 +101,16 @@ pub const SpanProjectionPlan = struct {
 
 /// Per-row spans and projection containers use scratch; selector plans can be
 /// shared across the request and remain immutable during row preparation.
-pub const ProjectionSource = struct { name: []const u8, raw: []const u8 };
+pub const ProjectionSource = struct { name: []const u8, value: std.json.Value };
 pub fn lookupJsonWithPlan(alloc: Allocator, output: Allocator, raw: []const u8, plan: *const SpanProjectionPlan) !types.LookupResult {
     return lookupJsonWithSources(alloc, output, raw, plan, &.{});
 }
 /// Synthetic fields replace their primary counterparts without constructing a
-/// DOM of the primary document. Their views live only for this row.
+/// DOM of the primary document. Sources remain borrowed until serialization
+/// completes; projected containers are independent so later paths can mutate them.
 pub fn lookupJsonWithSources(alloc: Allocator, output: Allocator, raw: []const u8, plan: *const SpanProjectionPlan, sources: []const ProjectionSource) !types.LookupResult {
     if (plan.passthrough and sources.len == 0) return .{ .json = try output.dupe(u8, raw) };
-    var arena = std.heap.ArenaAllocator.init(alloc);
+    var arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
     defer arena.deinit();
     const a = arena.allocator();
     const JsonView = @import("query/json_view.zig").View;
@@ -117,15 +118,7 @@ pub fn lookupJsonWithSources(alloc: Allocator, output: Allocator, raw: []const u
     view.parse_numbers = true;
     try view.prepareProjectionWithOptions(plan.selector, .all, .object_only, .{ .retain_root_fields = plan.include_all or plan.passthrough, .root_excluded = plan.excluded });
     const overlays = try a.alloc(JsonView.RootSource, sources.len);
-    for (sources, overlays) |source, *overlay| {
-        const source_view = try a.create(JsonView);
-        source_view.* = JsonView.init(a, source.raw);
-        source_view.parse_numbers = true;
-        if (plan.selector.fields.get(source.name)) |selected| {
-            if (selected.fields.count() != 0) try source_view.prepareProjection(selected, .all, .any_container);
-        }
-        overlay.* = .{ .name = source.name, .view = source_view };
-    }
+    for (sources, overlays) |source, *overlay| overlay.* = .{ .name = source.name, .value = source.value };
     view.root_sources = overlays;
     var projected: std.json.ObjectMap = .empty;
     if (plan.include_all or plan.passthrough) {
@@ -265,6 +258,12 @@ fn applyIncludePattern(
     while (parts.next()) |part| try path.append(alloc, part);
     if (path.items.len == 0) return;
     try applyIncludeRecursive(borrowed, alloc, src, dst, path.items, 0);
+}
+
+/// Clone projection containers while borrowing immutable scalar storage.
+/// Source owners must remain alive until the projected result is serialized.
+pub fn applyIncludeBorrowedPath(alloc: Allocator, src: std.json.ObjectMap, dst: *std.json.ObjectMap, parts: []const []const u8) Allocator.Error!void {
+    return applyIncludeRecursive(true, alloc, src, dst, parts, 0);
 }
 
 pub fn applyIncludePath(alloc: Allocator, src: std.json.ObjectMap, dst: *std.json.ObjectMap, parts: []const []const u8) Allocator.Error!void {
@@ -947,7 +946,7 @@ test "public graph metric borrowed wire compact fanout object spans bound total 
         try input.writer.writeAll("{\"a\":{\"b\":1,\"c\":2},\"skip\":3}");
     }
     try input.writer.writeAll("]}");
-    var counter: Counter = .{ .backing = a, .limit = 20 * 1024 * 1024 };
+    var counter: Counter = .{ .backing = a, .limit = (if (@import("builtin").mode == .debug) @as(usize, 20) else 12) * 1024 * 1024 };
     var plan = (try SpanProjectionPlan.init(a, .{ .fields = &.{"items.a.b"}, .include_all_fields = false })).?;
     defer plan.deinit();
     var result = try lookupJsonWithPlan(counter.allocator(), a, input.written(), &plan);

@@ -29,25 +29,130 @@ pub const View = struct {
     materialized_values: usize = 0,
     parse_numbers: bool = false,
     root_sources: []const RootSource = &.{},
-    pub const RootSource = struct { name: []const u8, view: *View };
+    pub const RootSource = struct {
+        name: []const u8,
+        value: Value,
+        fn include(self: @This(), alloc: Allocator, dst: *std.json.ObjectMap, path: []const []const u8) !void {
+            var source = std.json.ObjectMap.empty;
+            try source.put(alloc, self.name, self.value);
+            try @import("../document_query.zig").applyIncludeBorrowedPath(alloc, source, dst, path);
+        }
+    };
+
+    /// Small prepared objects use dense selector slots, not a minimum-size
+    /// hash table per object. Wide and lazily discovered objects keep hashing.
+    pub const ObjectIndex = struct {
+        const Hash = std.StringHashMapUnmanaged(usize);
+        const Entry = struct { name: []const u8, index: usize = std.math.maxInt(usize) };
+        storage: union(enum) { map: Hash, compact: []Entry } = .{ .map = .empty },
+        pub const empty: ObjectIndex = .{};
+        fn selected(a: Allocator, selector: *const Selector) !ObjectIndex {
+            const entries = try a.alloc(Entry, selector.fields.count());
+            var it = selector.fields.iterator();
+            for (entries) |*entry| entry.* = .{ .name = try a.dupe(u8, it.next().?.key_ptr.*) };
+            return .{ .storage = .{ .compact = entries } };
+        }
+        fn canonicalName(self: *const @This(), name: []const u8) ?[]const u8 {
+            return switch (self.storage) {
+                .map => null,
+                .compact => |entries| for (entries) |entry| {
+                    if (std.mem.eql(u8, entry.name, name)) break entry.name;
+                } else null,
+            };
+        }
+        pub fn get(self: *const @This(), name: []const u8) ?usize {
+            return switch (self.storage) {
+                .map => |map| map.get(name),
+                .compact => |entries| for (entries) |entry| {
+                    if (std.mem.eql(u8, entry.name, name)) break entry.index;
+                } else null,
+            };
+        }
+        pub fn contains(self: *const @This(), name: []const u8) bool {
+            return self.get(name) != null;
+        }
+        pub fn count(self: *const @This()) u32 {
+            return switch (self.storage) {
+                .map => |map| map.count(),
+                .compact => |entries| @intCast(entries.len),
+            };
+        }
+        fn clearRetainingCapacity(self: *@This()) void {
+            switch (self.storage) {
+                .map => |*map| map.clearRetainingCapacity(),
+                .compact => |entries| for (entries) |*entry| {
+                    entry.index = std.math.maxInt(usize);
+                },
+            }
+        }
+        fn put(self: *@This(), a: Allocator, name: []const u8, index: usize) !void {
+            switch (self.storage) {
+                .map => |*map| try map.put(a, name, index),
+                .compact => |entries| {
+                    for (entries) |*entry| if (std.mem.eql(u8, entry.name, name)) {
+                        entry.index = index;
+                        return;
+                    };
+                    // Preserve general insertion behavior for callers outside
+                    // preparation; publish promotion only after it succeeds.
+                    var map: Hash = .empty;
+                    for (entries) |entry| try map.put(a, entry.name, entry.index);
+                    try map.put(a, name, index);
+                    self.storage = .{ .map = map };
+                },
+            }
+        }
+        const Iterator = union(enum) {
+            map: Hash.Iterator,
+            compact: struct { entries: []Entry, offset: usize = 0 },
+            const Result = struct { key_ptr: *const []const u8, value_ptr: *usize };
+            fn next(self: *@This()) ?Result {
+                switch (self.*) {
+                    .map => |*it| {
+                        const e = it.next() orelse return null;
+                        return .{ .key_ptr = e.key_ptr, .value_ptr = e.value_ptr };
+                    },
+                    .compact => |*it| {
+                        if (it.offset == it.entries.len) return null;
+                        const e = &it.entries[it.offset];
+                        it.offset += 1;
+                        return .{ .key_ptr = &e.name, .value_ptr = &e.index };
+                    },
+                }
+            }
+        };
+        pub fn iterator(self: *const @This()) Iterator {
+            return switch (self.storage) {
+                .map => |*map| .{ .map = map.iterator() },
+                .compact => |entries| .{ .compact = .{ .entries = entries } },
+            };
+        }
+    };
 
     pub const Node = struct {
         raw: []const u8,
         children: ?[]Child = null,
-        object_index: std.StringHashMapUnmanaged(usize) = .empty,
+        object_index: ObjectIndex = .empty,
         array_index: std.AutoHashMapUnmanaged(usize, ?*Node) = .empty,
-        // Pack index completeness into the logical-cache tag; this has the
-        // same footprint as ?Value, avoiding another byte on every span node.
-        logical: union(enum) { empty, object_complete, value: Value, complete_value: Value } = .empty,
+        // Keep numeric predicate caches inline without reserving a full Value
+        // in every span. Strings use compact descriptors; containers use Values.
+        logical: union(enum) {
+            empty,
+            null,
+            bool: bool,
+            integer: i64,
+            float: f64,
+            string: *[]const u8,
+            number_string: *[]const u8,
+            container: *Value,
+        } = .empty,
+        object_complete: bool = false,
 
         fn objectComplete(self: Node) bool {
-            return self.logical == .object_complete or self.logical == .complete_value;
+            return self.object_complete;
         }
         fn markObjectComplete(self: *Node, complete: bool) void {
-            self.logical = switch (self.logical) {
-                .value, .complete_value => |value| if (complete) .{ .complete_value = value } else .{ .value = value },
-                .empty, .object_complete => if (complete) .object_complete else .empty,
-            };
+            self.object_complete = complete;
         }
 
         fn kind(self: Node) u8 {
@@ -96,7 +201,7 @@ pub const View = struct {
         _ = try scanner.next();
         if (try scanner.next() != .end_of_document) return error.SyntaxError;
         node.children = try entries.toOwnedSlice(self.alloc);
-        node.object_index = index;
+        node.object_index = .{ .storage = .{ .map = index } };
         node.markObjectComplete(object);
         return node.children.?;
     }
@@ -207,6 +312,7 @@ pub const View = struct {
                 if (self.object) {
                     node.children = null;
                     node.object_index.clearRetainingCapacity();
+                    if (!self.retain_all and self.selected.?.fields.count() <= 8) node.object_index = try ObjectIndex.selected(a, self.selected.?);
                     node.markObjectComplete(false);
                     return;
                 }
@@ -315,7 +421,7 @@ pub const View = struct {
                     };
                     if (policy == .all or frame.node != null) if ((try frame.names.getOrPut(frame.arena.allocator(), name)).found_existing) return error.DuplicateField;
                     frame.retain = frame.wants(name);
-                    frame.name = if (frame.retain) try alloc.dupe(u8, name) else name;
+                    frame.name = if (frame.retain) (frame.node.?.object_index.canonicalName(name) orelse try alloc.dupe(u8, name)) else name;
                     frame.key = false;
                     continue;
                 }
@@ -345,13 +451,32 @@ pub const View = struct {
 
     pub fn materialize(self: *View, node: *Node) !Value {
         switch (node.logical) {
-            .value, .complete_value => |value| return value,
-            else => {},
+            .empty => {},
+            .container => |value| return value.*,
+            .null => return .null,
+            .bool => |value| return .{ .bool = value },
+            .integer => |value| return .{ .integer = value },
+            .float => |value| return .{ .float = value },
+            .string => |value| return .{ .string = value.* },
+            .number_string => |value| return .{ .number_string = value.* },
         }
-        // Predicates share the document evaluator's numeric interpretation.
-        // Projection below separately retains exact stored number lexemes.
         const value = try std.json.parseFromSliceLeaky(Value, self.alloc, node.raw, .{});
-        node.logical = if (node.objectComplete()) .{ .complete_value = value } else .{ .value = value };
+        node.logical = switch (value) {
+            .null => .null,
+            .bool => |v| .{ .bool = v },
+            .integer => |v| .{ .integer = v },
+            .float => |v| .{ .float = v },
+            .string, .number_string => |v| blk: {
+                const cached = try self.alloc.create([]const u8);
+                cached.* = v;
+                break :blk if (value == .string) .{ .string = cached } else .{ .number_string = cached };
+            },
+            .object, .array => blk: {
+                const cached = try self.alloc.create(Value);
+                cached.* = value;
+                break :blk .{ .container = cached };
+            },
+        };
         self.materialized_values += 1;
         return value;
     }
@@ -410,7 +535,7 @@ pub const View = struct {
     pub fn includeRoot(self: *View, alloc: Allocator, dst: *std.json.ObjectMap, path: []const []const u8) !void {
         if (path.len == 0) return;
         for (self.root_sources) |source| if (std.mem.eql(u8, source.name, path[0])) {
-            return source.view.includeNode(alloc, dst, path[0], &source.view.root, path[1..]);
+            return source.include(alloc, dst, path);
         };
         if (self.root.kind() != '{') return;
         if (try self.field(&self.root, path[0])) |node|
@@ -442,19 +567,25 @@ pub const View = struct {
                 const replacement = for (self.root_sources) |source| {
                     if (std.mem.eql(u8, source.name, field_name)) break source;
                 } else null;
-                if (replacement) |source| try source.view.includeNode(alloc, dst, field_name, &source.view.root, &.{}) else try self.includeNode(alloc, dst, field_name, &child.node, &.{});
+                if (replacement) |source| try source.include(alloc, dst, &.{field_name}) else try self.includeNode(alloc, dst, field_name, &child.node, &.{});
             }
         }
         for (self.root_sources) |source| {
-            if (self.root.object_index.contains(source.name)) continue;
+            // Planned misses occupy compact slots too. Only a real child
+            // means this source was already emitted in primary field order.
+            if (self.root.object_index.get(source.name)) |i| if (i < children_in_order.len) continue;
             const omit = for (excluded) |name| {
                 if (std.mem.eql(u8, name, source.name)) break true;
             } else false;
-            if (!omit) try source.view.includeNode(alloc, dst, source.name, &source.view.root, &.{});
+            if (!omit) try source.include(alloc, dst, &.{source.name});
         }
     }
 
     fn includeNode(self: *View, alloc: Allocator, dst: *std.json.ObjectMap, name: []const u8, node: *Node, path: []const []const u8) anyerror!void {
+        // A single selected field is common in fanout. Reserve one dense
+        // entry instead of ArrayHashMap's default multi-entry growth slab.
+        // Subsequent fields use the ordinary map growth/indexing contract.
+        if (dst.entries.capacity == 0) try dst.entries.setCapacity(alloc, 1);
         if (path.len == 0) {
             // Projection mutates merged objects. Never lend a cached logical
             // container to it: subsequent paths must still see the original.
@@ -625,4 +756,53 @@ test "public graph metric borrowed wire partial JSON object caches survive predi
     try view.includeRootExcept(s, &all, &.{});
     const body = try std.json.Stringify.valueAlloc(s, Value{ .object = all }, .{});
     try std.testing.expectEqualStrings(view.root.raw, body);
+}
+
+test "public graph metric borrowed wire compact object projections retain unplanned fields across allocation faults" {
+    const Fixture = struct {
+        fn run(a: Allocator) !void {
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const s = arena.allocator();
+            const raw = "{\"obj\":{\"k0\":0,\"k1\":1,\"k2\":2,\"k3\":3,\"k4\":4,\"k5\":5,\"k6\":6,\"k7\":7,\"k8\":8,\"k9\":9}}";
+            const fields = [_][]const u8{ "obj.k0", "obj.k1", "obj.k2", "obj.k3", "obj.k4", "obj.k5", "obj.k6", "obj.k7", "obj.k8" };
+            for ([_]usize{ 1, 8, 9 }) |count| {
+                var view = View.init(s, raw);
+                view.parse_numbers = true;
+                {
+                    var plan = (try @import("../document_query.zig").SpanProjectionPlan.init(a, .{ .fields = fields[0..count], .include_all_fields = false })).?;
+                    defer plan.deinit();
+                    try view.prepareProjection(plan.selector, .all, .object_only);
+                    var result: std.json.ObjectMap = .empty;
+                    for (plan.paths) |path| try view.includeRoot(s, &result, path.parts);
+                    const obj = result.get("obj").?.object;
+                    try std.testing.expectEqual(count, obj.count());
+                    for (0..count) |i| {
+                        var name: [16]u8 = undefined;
+                        const key = try std.fmt.bufPrint(&name, "k{d}", .{i});
+                        try std.testing.expectEqual(@as(i64, @intCast(i)), obj.get(key).?.integer);
+                    }
+                }
+                // Rebuild a complete lazy index after the selector owner dies.
+                var values: std.ArrayListUnmanaged(Value) = .empty;
+                try view.collect(&.{ "obj", "k9" }, false, &values);
+                try std.testing.expectEqual(@as(i64, 9), values.items[0].integer);
+                values.clearRetainingCapacity();
+                try view.collect(&.{ "obj", "k0" }, false, &values);
+                try std.testing.expectEqual(@as(i64, 0), values.items[0].integer);
+            }
+            var empty = View.init(s, "{}");
+            {
+                var plan = (try @import("../document_query.zig").SpanProjectionPlan.init(a, .{ .fields = &.{"missing"}, .include_all_fields = false })).?;
+                defer plan.deinit();
+                try empty.prepareProjection(plan.selector, .all, .object_only);
+            }
+            empty.root_sources = &.{.{ .name = "missing", .value = .{ .integer = 5 } }};
+            var result: std.json.ObjectMap = .empty;
+            try empty.includeRootExcept(s, &result, &.{});
+            try std.testing.expectEqual(@as(i64, 5), result.get("missing").?.integer);
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }
