@@ -946,7 +946,10 @@ test "public graph metric borrowed wire compact fanout object spans bound total 
         try input.writer.writeAll("{\"a\":{\"b\":1,\"c\":2},\"skip\":3}");
     }
     try input.writer.writeAll("]}");
-    var counter: Counter = .{ .backing = a, .limit = (if (@import("builtin").mode == .debug) @as(usize, 20) else 12) * 1024 * 1024 };
+    var counter: Counter = .{ .backing = a, .limit = (switch (@import("builtin").mode) {
+        .debug, .safe => @as(usize, 20),
+        .fast, .small => 12,
+    }) * 1024 * 1024 };
     var plan = (try SpanProjectionPlan.init(a, .{ .fields = &.{"items.a.b"}, .include_all_fields = false })).?;
     defer plan.deinit();
     var result = try lookupJsonWithPlan(counter.allocator(), a, input.written(), &plan);
