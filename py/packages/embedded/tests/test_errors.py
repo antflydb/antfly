@@ -33,7 +33,7 @@ pytestmark = pytest.mark.usefixtures("require_native")
 
 # 0-10 and 255 are the defined antfly_error_code values; 127 exercises the
 # "unknown code" fallback on both sides.
-CODES = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 255, 127]
+CODES = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 255, 127]
 
 
 def test_error_code_metadata_matches_c_abi() -> None:

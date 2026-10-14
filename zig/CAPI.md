@@ -520,3 +520,60 @@ The runner includes Rust's embedded SQLx integration. Model-dependent inference
 suites are excluded by default; set `ANTFLY_SDK_NATIVE_INFERENCE=1` to include
 them after installing their required models. This is separate from the remote
 PostgreSQL driver matrix in `scripts/test_pgwire_drivers.py`.
+
+
+### Replacement retry and publication boundaries
+
+Replacement `retry_count` counts consecutive transient failures since the last
+acknowledged source/replay checkpoint. A durable forward step resets the count
+and backoff; volatile progress does not. `total_retry_count` never resets and
+bounds each accepted job to 64 lifetime retries; status exposes that count and
+`max_total_retries`. Persisted deadlines more than 3.2 seconds ahead of the
+scheduler's wall clock are clamped and saved once, including after reopen. Explicit resource exhaustion, full-disk
+and temporary remote failures retry up to four times. Unclassified
+`Unexpected`, `InputOutput`, `ReadFailed` and `WriteFailed` errors fail immediately
+rather than assuming storage corruption is transient. A failure after a newer
+checkpoint uses that checkpoint for both retry accounting and recovery.
+
+Replacement ownership uses an IO mutex. Blocking cancellation and deletion park
+on it; backoff sleeps occur after releasing it. Regular activation catch-up has
+a 100 ms cooperative budget. After eight attempts its budget rises to at most
+one second, still limited by an explicit wait deadline. The durable journal
+sequence and intra-entry cursor survive each yield. These are cooperative work
+budgets: a storage operation already underway, including fsync, may overrun one.
+There is no unlimited escalated drain. Sustained producers can require further
+bounded rounds; the old graph remains available until activation commits.
+
+A successful replacement wait observes the catalog under the publication read
+lease. The write lease spans the atomic catalog transaction and old-index
+retirement, so an entry appended provisionally during installation cannot make
+wait return success before commit. If a missing job races publication, wait
+checks the committed catalog again before returning cancellation.
+`ANTFLY_CANCELLED` describes the operation: it covers replacement cancellation,
+progress/stream callbacks returning false, and IO/mutex interruption. Interrupting
+an owner preserves accepted work and its durable checkpoint rather than marking
+the job failed. Completion may have raced interruption; inspect current state.
+
+
+Pending replacements temporarily require reader version 2, because an older
+writer's journal cleanup does not honor shadow retention. Registration publishes
+this fence and a versioned resolver envelope with the build marker. Libraries
+that predate the epoch key reject that envelope through their strict parser;
+already-open Lite writers encounter it when refreshing their connection. Failed
+jobs release replay retention but keep their reservation fence until cancellation.
+Swap and cancellation remove the temporary fence in their catalog transaction
+once no reservations remain. Cancellation rejects a foreign serving generation
+with `ANTFLY_REPLACEMENT_CONFIGURATION_MISMATCH`, leaving the catalog and job intact.
+A separate baseline preserves any permanent reader requirement from resolver
+features; a plain completed replacement returns to version 1. Named tables
+aggregate permanent requirements into the root baseline; temporary child fences
+never become permanent root requirements. This also excludes
+older read-only handles during the build, since older libraries do not distinguish
+reader and writer compatibility epochs.
+
+In-process writers block on the apply lock during replacement activation: the
+ordinary work budget is 100 ms, escalating to about 1 s after eight attempts.
+The current batch and durability checkpoint may overrun that cooperative budget.
+Clock-backoff correction leaves queued jobs unchanged on replicas, write-gated
+handles and databases requiring ordered maintenance; it never chooses a local
+write merely to shorten a retry deadline.

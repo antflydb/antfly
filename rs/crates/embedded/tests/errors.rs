@@ -39,7 +39,7 @@ fn c_description(code: i32) -> String {
 /// the Go binding's `ErrorCode` cover (`ANTFLY_CANCELLED` = 10 is the
 /// caller-cancelled-a-callback code used by `Inference::pull`/
 /// `Inference::generate_stream`).
-const ALL_CODES: &[i32] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 255];
+const ALL_CODES: &[i32] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 255];
 
 #[test]
 fn error_names_match_c_abi_for_every_known_code() {
