@@ -2145,9 +2145,9 @@ transport retries and already retained packet leases.
 INF supports finite advertised repeat/Period extents from availabilityStartTime;
 it never invents an unbounded future timeline or makes data available before
 that global instant. Existing segment/planning limits and checked int64 offset
-sums apply. Sub-nanosecond nonzero offsets and availabilityTimeComplete=false
-remain explicit unsupported policies. This is complete-segment request timing;
-incremental partial-DASH delivery and broader live-origin qualification remain
+sums apply. Sub-nanosecond nonzero offsets remain unsupported. The default
+complete-segment policy rejects availabilityTimeComplete=false; its explicit
+streaming opt-in is described below. Broader live-origin qualification remains
 in the active non-CUDA scope. See [source-bound qualification](../../zig/lib/media/testdata/dash-availability/README.md)
 for exact-boundary, inheritance, live reload, cleanup and platform evidence.
 
@@ -2171,8 +2171,8 @@ retaining identical coded bytes. A production authenticated chunked server
 withholds its tail until the first fragment callback, making whole-response
 buffering fail the gate. See [source-bound qualification](../../zig/lib/media/testdata/http-fragments/README.md)
 for packet parity, ownership, range/failure/cancellation, growth and platform checks.
-AvailabilityTimeComplete=false and direct model coordinator delivery remain
-active implementation work. Resumable HTTP resources are described below.
+Partial availability and direct model coordinator delivery are implemented in
+the Reader extensions described below. Resumable HTTP resources follow.
 
 ### Prefix-verified HTTP replay and live resource growth
 
@@ -2207,8 +2207,8 @@ one prior fragment and publishes five new independent snapshots. See
 [replay qualification](../../zig/lib/media/testdata/http-replay/README.md) for final sources, executable hashes,
 raw logs and macOS/actual Linux ARM64 execution.
 
-Manifest `availabilityTimeComplete=false` remains active implementation work.
-Reader-selected complete-resource streaming and model delivery are described below.
+Reader-selected streaming, model delivery and explicit partial availability
+are described below.
 The complete non-CUDA objective stays open.
 
 ### Reader-selected streaming model delivery
@@ -2245,10 +2245,19 @@ clock is explicit: 60 pictures, six one-second fragments, presentation interval
 0.2–6.2 seconds. See [streaming model qualification](../../zig/lib/media/testdata/reader-stream/README.md) for source,
 binary, completion, ownership and platform evidence.
 
-This API currently streams complete plaintext fMP4 resources. Encrypted media,
-normalized TS and LL-HLS part/parent reconciliation retain buffered Reader APIs.
-Partial-DASH availability policies, append-only selected-resource cursor completion
-and those additional streaming formats remain active work. Reader transport and
+This complete-resource qualification predates the partial-DASH opt-in described
+below. Encrypted media, normalized TS and LL-HLS part/parent reconciliation retain
+buffered Reader APIs; their incremental streaming extensions remain active work. Reader transport and
 model controls are explicit borrowed controls whose owners outlive retained state;
 no callback-scoped control address is stored in the immutable source snapshots.
 The complete non-CUDA objective remains active.
+
+
+Partial DASH availability now has an explicit streaming selection opt-in, native
+continuous-duration completion and caller-paced prefix-verified growing-body
+polls. HTTP EOF alone does not advance the manifest cursor. Portable Reader and
+authenticated HTTP qualification cover short, unchanged and completed versions;
+pretrained CPU/Metal partial-DASH vectors match buffered complete-DASH exactly
+for all six windows. Linux checkpoint execution is running without a completion
+claim; AES/TS/LL-HLS streaming remains open. See
+`zig/lib/media/testdata/partial-dash/README.md`.

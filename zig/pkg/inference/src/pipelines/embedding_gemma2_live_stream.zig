@@ -131,6 +131,7 @@ pub const Stream = struct {
     }
     /// Process one Reader-selected resource; callbacks can execute before EOF.
     /// Explicit retry drains retained output before requesting any more bytes.
+    /// Returns false for a still-growing partial body; polling is caller-paced.
     /// Reader owns its transport cancellation; control owns model/delivery work.
     pub fn process(self: *Stream, reader: anytype, context: *anyopaque, accept: *const fn (*anyopaque, *Delivery) anyerror!void) !bool {
         try self.control.check();
@@ -159,12 +160,14 @@ pub const Stream = struct {
         };
         var sink = Sink{ .stream = self, .context = context, .accept = accept };
         const result = try reader.streamNext(&sink, Sink.publish);
-        if (result != null) self.stats.resources += 1;
+        if (result) |progress| if (progress.resource_complete) {
+            self.stats.resources += 1;
+        };
         if (reader.ended()) {
             try self.coordinator.finish();
             try self.drain(context, accept);
         }
-        return result != null;
+        return if (result) |progress| progress.resource_complete else false;
     }
 };
 

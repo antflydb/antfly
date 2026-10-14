@@ -36815,3 +36815,213 @@ test "embeddinggemma2 video streamed pretrained windows preserve buffered vector
     try std.testing.expect(max_error <= if (metal) @as(f32, 1e-3) else @as(f32, 1e-4));
     std.debug.print("streamed live pretrained metal={} windows={d} callbacks={d} early={d} prefix=2 requests={d} max_error={d:.9}\n", .{ metal, capture.count, capture.calls, capture.early, transport.requests, max_error });
 }
+
+test "embeddinggemma2 video partial DASH pretrained windows preserve vectors across clean short EOF and growth" {
+    const stream_embedding = @import("../pipelines/embedding_gemma2.zig");
+    const stream_media = @import("antfly_media");
+    const stream_coordinator = @import("antfly_video").live_coordinator;
+    const StreamAPI = stream_embedding.LiveStream;
+    const StreamDelivery = stream_embedding.LiveStreamDelivery;
+    const model = platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_MODEL") orelse return error.SkipZigTest;
+    const metal = platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_METAL");
+    const a = std.testing.allocator;
+    const bytes = @embedFile("../testdata/video/live-fragmented.mp4");
+    const manifest = "<MPD xmlns='urn:mpeg:dash:schema:mpd:2011'><Period duration='PT6S'><AdaptationSet><Representation id='v'><SegmentList duration='6' availabilityTimeComplete='false'><Initialization sourceURL='init.mp4'/><SegmentURL media='seg.mp4'/></SegmentList></Representation></AdaptationSet></Period></MPD>";
+    const complete_manifest = "<MPD xmlns='urn:mpeg:dash:schema:mpd:2011'><Period duration='PT6S'><AdaptationSet><Representation id='v'><SegmentList duration='6'><Initialization sourceURL='init.mp4'/><SegmentURL media='seg.mp4'/></SegmentList></Representation></AdaptationSet></Period></MPD>";
+    const Fake = struct {
+        pub const Client = struct {
+            calls: usize = 0,
+            complete: bool = false,
+            pub fn get(self: *@This(), url: []const u8, _: anytype) !Response {
+                self.calls += 1;
+                if (std.mem.endsWith(u8, url, "list.mpd")) return .{ .body = complete_manifest };
+                if (std.mem.endsWith(u8, url, "init.mp4")) return .{ .body = bytes[0..797] };
+                return .{ .body = bytes[797..] };
+            }
+            pub fn getToWriter(self: *@This(), url: []const u8, options: anytype, writer: anytype, _: anytype, _: anytype) !Response {
+                self.complete = false;
+                const response = try self.get(url, options);
+                try writer.startResponse(response);
+                const body = response.body.?;
+                var offset: usize = 0;
+                while (offset < body.len) {
+                    const end = @min(body.len, offset + 128);
+                    try writer.writeAll(body[offset..end]);
+                    offset = end;
+                }
+                self.complete = true;
+                return response;
+            }
+        };
+        pub const Response = struct {
+            body: ?[]const u8,
+            status: struct { code: u16 } = .{ .code = 200 },
+            pub fn header(_: @This(), _: []const u8) ?[]const u8 {
+                return null;
+            }
+            pub fn deinit(_: *@This()) void {}
+        };
+    };
+    var node = try Node.init(a, .{ .models_dir = std.fs.path.dirname(model).?, .allow_unknown_models = true, .process_termination_available = true, .generation_budget_overrides = .{ .host_limit_bytes = 6 * 1024 * 1024 * 1024, .backend_limit_bytes = 12 * 1024 * 1024 * 1024, .combined_limit_bytes = 18 * 1024 * 1024 * 1024, .scratch_limit_bytes = 8 * 1024 * 1024 * 1024 } });
+    defer node.deinit();
+    try node.attachIo(std.testing.io);
+    node.session_manager.required_backend = if (metal) .metal else .native;
+    node.model_manager.session_manager.required_backend = if (metal) .metal else .native;
+    var handle = try node.model_manager.acquireFromDirWithControl(model, node.extractionExecutionControl(null));
+    defer handle.release();
+    const loaded = handle.get();
+    const stream_http = @import("httpx");
+    const Wire = struct {
+        first_output: std.Io.Event = .unset,
+        next_output: std.Io.Event = .unset,
+        sent_tail: std.atomic.Value(bool) = .init(false),
+        fn serve(self: *@This(), listener: *stream_http.TcpListener) !void {
+            for (0..5) |request_index| {
+                const accepted = try listener.accept();
+                var socket = accepted.socket;
+                defer socket.close();
+                try socket.setRecvTimeout(5000);
+                try socket.setSendTimeout(5000);
+                var request: [4096]u8 = undefined;
+                var used: usize = 0;
+                while (std.mem.indexOf(u8, request[0..used], "\r\n\r\n") == null) {
+                    if (used == request.len) return error.TestUnexpectedResult;
+                    const n = try socket.recv(request[used..]);
+                    if (n == 0) return error.UnexpectedEof;
+                    used += n;
+                }
+                try std.testing.expect(std.ascii.findIgnoreCase(request[0..used], "authorization: Bearer fixture-token\r\n") != null);
+                try std.testing.expect(std.ascii.findIgnoreCase(request[0..used], "accept-encoding: identity\r\n") != null);
+                const path = switch (request_index) {
+                    0 => "GET /live/list.mpd ",
+                    1 => "GET /live/init.mp4 ",
+                    else => "GET /live/seg.mp4 ",
+                };
+                try std.testing.expect(std.mem.startsWith(u8, request[0..used], path));
+                if (request_index < 2) {
+                    const body = if (request_index == 0) manifest else bytes[0..797];
+                    var header: [128]u8 = undefined;
+                    try socket.sendAll(try std.fmt.bufPrint(&header, "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{body.len}));
+                    try socket.sendAll(body);
+                } else {
+                    try socket.sendAll("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
+                    if (request_index == 2) {
+                        try chunk(&socket, bytes[797 .. 20811 + 8]);
+                        try self.first_output.wait(std.testing.io);
+                    } else if (request_index == 3) {
+                        try chunk(&socket, bytes[797..20811]);
+                        try socket.sendAll("0\r\n\r\n");
+                    } else {
+                        const boundary = 42992 + 8;
+                        try chunk(&socket, bytes[797..boundary]);
+                        // The tail cannot exist until a pretrained model output
+                        // has executed, acknowledged and released this gate.
+                        try self.next_output.wait(std.testing.io);
+                        self.sent_tail.store(true, .release);
+                        try chunk(&socket, bytes[boundary..]);
+                        try socket.sendAll("0\r\n\r\n");
+                    }
+                }
+            }
+        }
+        fn chunk(socket: *stream_http.Socket, body: []const u8) !void {
+            var header: [32]u8 = undefined;
+            try socket.sendAll(try std.fmt.bufPrint(&header, "{x}\r\n", .{body.len}));
+            try socket.sendAll(body);
+            try socket.sendAll("\r\n");
+        }
+    };
+    var wire = Wire{};
+    var listener = try stream_http.TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, std.testing.io);
+    defer listener.deinit();
+    const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/live/list.mpd", .{listener.getLocalAddress().getPort()});
+    defer a.free(url);
+    var client = stream_http.Client.initWithConfig(a, std.testing.io, .{ .default_headers = &.{.{ "Authorization", "Bearer fixture-token" }} });
+    defer client.deinit();
+    var transport = stream_media.http_stream.Adapter(stream_http){ .allocator = a, .client = &client, .root_url = url, .limits = .{ .max_resource_bytes = 128 * 1024, .timeout_ms = 300_000 } };
+    const Reader = stream_media.dash_live.Reader(stream_http);
+    var serving = try std.testing.io.concurrent(Wire.serve, .{ &wire, &listener });
+    defer _ = serving.cancel(std.testing.io) catch {};
+    var reader = try Reader.init(a, &transport, transport.root_url, .{ .selection = .{ .allow_partial_availability = true } });
+    defer reader.deinit();
+    try reader.reload();
+    var flow = try stream_coordinator.Coordinator.init(a, .{ .duration_ns = std.time.ns_per_s, .max_frames = 1 });
+    defer flow.deinit();
+    var stream = try StreamAPI.init(a, loaded.session, loaded.getTokenizer(), &flow, null, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null), null);
+    defer stream.deinit();
+    const Capture = struct {
+        transport: *stream_media.http_stream.Adapter(stream_http),
+        wire: *Wire,
+        calls: usize = 0,
+        count: usize = 0,
+        first_hash: ?[32]u8 = null,
+        early: usize = 0,
+        outputs: [6]?stream_embedding.LiveResult = @splat(null),
+        fn accept(raw: *anyopaque, delivery: *StreamDelivery) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            std.debug.print("stream callback ordinal={d} calls={d} count={d} requests={d} tail={}\n", .{ delivery.value.ordinal, self.calls, self.count, self.transport.requests, self.wire.sent_tail.load(.acquire) });
+            if (!self.wire.sent_tail.load(.acquire)) self.early += 1;
+            if (self.calls == 1) {
+                var hash: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(delivery.value.result.?.vector), &hash, .{});
+                self.first_hash = hash;
+                self.wire.first_output.set(std.testing.io);
+                return error.ConsumerFailure;
+            }
+            if (self.calls == 2) {
+                var hash: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(delivery.value.result.?.vector), &hash, .{});
+                try std.testing.expectEqual(self.first_hash.?, hash);
+                try std.testing.expectEqual(@as(usize, 0), delivery.value.ordinal);
+                try std.testing.expectEqual(@as(usize, 3), self.transport.requests);
+            }
+            if (delivery.value.ordinal == 1) {
+                try std.testing.expect(!self.wire.sent_tail.load(.acquire));
+                self.wire.next_output.set(std.testing.io);
+            }
+            try std.testing.expect(self.count < self.outputs.len);
+            self.outputs[self.count] = try delivery.copy(std.testing.allocator);
+            self.count += 1;
+        }
+    };
+    var capture = Capture{ .transport = &transport, .wire = &wire };
+    defer for (&capture.outputs) |*entry| if (entry.*) |value| if (value.result) |result| a.free(result.vector);
+    try std.testing.expectError(error.ConsumerFailure, stream.process(&reader, &capture, Capture.accept));
+    try std.testing.expectEqual(@as(usize, 2), reader.stream_ledger.acknowledged);
+    try std.testing.expectEqual(@as(u64, 1), reader.dash_position.?.sequence);
+    try std.testing.expect(stream.pending != null and !stream.pending.?.acknowledged);
+    try std.testing.expectEqual(@as(usize, 0), flow.ordinal);
+    try std.testing.expect(!try stream.process(&reader, &capture, Capture.accept));
+    try std.testing.expect(!reader.ended());
+    try std.testing.expectEqual(@as(u64, 1), reader.dash_position.?.sequence);
+    try std.testing.expectEqual(@as(usize, 0), stream.stats.resources);
+    try std.testing.expect(try stream.process(&reader, &capture, Capture.accept));
+    try std.testing.expectEqual(@as(usize, 1), stream.stats.resources);
+    try serving.await(std.testing.io);
+    try std.testing.expect(reader.ended());
+    try std.testing.expectEqual(@as(usize, 6), capture.count);
+    try std.testing.expectEqual(@as(usize, 6), stream.stats.windows);
+    try std.testing.expect(capture.early >= 2);
+    try std.testing.expectEqual(@as(usize, 5), transport.requests);
+    var baseline_client = Fake.Client{};
+    var baseline_transport = stream_media.http_stream.Adapter(Fake){ .allocator = a, .client = &baseline_client, .root_url = transport.root_url, .limits = transport.limits };
+    var baseline_reader = try stream_media.dash_live.Reader(Fake).init(a, &baseline_transport, transport.root_url, .{});
+    defer baseline_reader.deinit();
+    try baseline_reader.reload();
+    var baseline = try stream_coordinator.Coordinator.init(a, .{ .duration_ns = std.time.ns_per_s, .max_frames = 1 });
+    defer baseline.deinit();
+    var max_error: f32 = 0;
+    for (capture.outputs, 0..) |entry, ordinal| {
+        const actual = entry.?;
+        const expected = (try stream_embedding.embedNextLive(a, loaded.session, loaded.getTokenizer(), &baseline, &baseline_reader, null, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null))).?;
+        defer if (expected.result) |result| a.free(result.vector);
+        try std.testing.expectEqual(ordinal, actual.ordinal);
+        try std.testing.expectEqual(expected.source_start_ns, actual.source_start_ns);
+        try std.testing.expectEqual(expected.source_end_ns, actual.source_end_ns);
+        try std.testing.expectEqual(expected.result.?.input_tokens, actual.result.?.input_tokens);
+        for (expected.result.?.vector, actual.result.?.vector) |left, right| max_error = @max(max_error, @abs(left - right));
+    }
+    try std.testing.expect(max_error <= if (metal) @as(f32, 1e-3) else @as(f32, 1e-4));
+    std.debug.print("partial DASH live pretrained metal={} windows={d} callbacks={d} early={d} prefix=2 requests={d} max_error={d:.9}\n", .{ metal, capture.count, capture.calls, capture.early, transport.requests, max_error });
+}

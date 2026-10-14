@@ -133,6 +133,8 @@ pub const Clock = struct {
     now: *const fn (?*anyopaque) i64,
 };
 pub const ReaderOptions = struct {
+    /// Bounded caller-paced attempts/body versions for one selected resource.
+    max_resource_attempts: usize = 8,
     playlist: Limits = .{},
     ingest: @import("live_mp4.zig").Options = .{},
     clock: ?Clock = null,
@@ -247,6 +249,7 @@ const Expansion = struct {
     now: i128 = 0, // period-relative scaled nanoseconds (ticks * 1e9)
     availability_offset: availability.Offset = .{ .finite = 0 },
     availability_started: bool = true,
+    availability_complete: bool = true,
     depth: ?u64 = null, // UTC milliseconds
     period_end: ?u128 = null, // sample ticks * 1e9, excluding offset
     media: ?[]const u8 = null,
@@ -343,7 +346,7 @@ const Expansion = struct {
             const number = self.sequence + @as(u64, @intCast(index));
             const time = start + duration * @as(u64, @intCast(index));
             const address = try self.template(self.media.?, number, time);
-            try self.segments.append(self.a, .{ .uri = address, .range = null, .initialization = self.initialization.?, .sequence = number, .discontinuity_sequence = 0, .duration_seconds = @as(f64, @floatFromInt(duration)) / @as(f64, @floatFromInt(self.scale)), .discontinuity = false, .dash = .{ .start_ticks = time, .duration_ticks = duration, .timescale = @intCast(self.scale), .presentation_offset = self.offset } });
+            try self.segments.append(self.a, .{ .uri = address, .range = null, .initialization = self.initialization.?, .sequence = number, .discontinuity_sequence = 0, .duration_seconds = @as(f64, @floatFromInt(duration)) / @as(f64, @floatFromInt(self.scale)), .discontinuity = false, .availability_complete = self.availability_complete, .dash = .{ .start_ticks = time, .duration_ticks = duration, .timescale = @intCast(self.scale), .presentation_offset = self.offset } });
         }
         self.sequence = end_sequence;
     }
@@ -360,7 +363,7 @@ pub fn parseAt(a: std.mem.Allocator, bytes: []const u8, limits: Limits, now_unix
 pub fn parseAtWithSelection(a: std.mem.Allocator, bytes: []const u8, limits: Limits, now_unix_ms: ?i64, selection: Selection) !Playlist {
     return hierarchy.parse(a, bytes, limits, now_unix_ms, selection, parseRepresentation, elapsed, dateTime);
 }
-fn parseRepresentation(a: std.mem.Allocator, scratch: std.mem.Allocator, bytes: []const u8, limits: Limits, now_unix_ms: ?i64) !Playlist {
+fn parseRepresentation(a: std.mem.Allocator, scratch: std.mem.Allocator, bytes: []const u8, limits: Limits, now_unix_ms: ?i64, allow_partial: bool) !Playlist {
     if (bytes.len > limits.max_bytes) return error.ResourceLimitExceeded;
     if (!std.unicode.utf8ValidateSlice(bytes)) return error.MalformedDash;
     // Decoded attributes must survive until the hierarchy planner has copied
@@ -447,7 +450,8 @@ fn parseRepresentation(a: std.mem.Allocator, scratch: std.mem.Allocator, bytes: 
             state.sequence = try integer(tag.get("startNumber") orelse "1");
             state.offset = try integer(tag.get("presentationTimeOffset") orelse "0");
             if (tag.get("availabilityTimeOffset")) |value| state.availability_offset = try availability.parse(value);
-            if (tag.get("availabilityTimeComplete")) |value| if (!std.mem.eql(u8, value, "true")) return error.UnsupportedDash;
+            if (tag.get("availabilityTimeComplete")) |value| state.availability_complete = try availability.complete(value);
+            if (!state.availability_complete and !allow_partial) return error.UnsupportedDash;
             if (template_mode) {
                 state.media = try uri(tag.get("media"), limits);
                 // Validate even an early live snapshot with no available segments.
@@ -467,7 +471,7 @@ fn parseRepresentation(a: std.mem.Allocator, scratch: std.mem.Allocator, bytes: 
             if (!tag.empty) return error.MalformedDash;
             if (state.segments.items.len >= limits.max_segments) return error.ResourceLimitExceeded;
             const start_ticks = std.math.mul(u64, @intCast(state.segments.items.len), explicit_duration.?) catch return error.MalformedDash;
-            try state.segments.append(a, .{ .uri = try uri(tag.get("media"), limits), .range = try byteRange(tag.get("mediaRange")), .initialization = state.initialization orelse return error.MalformedDash, .sequence = state.sequence, .discontinuity_sequence = 0, .duration_seconds = @as(f64, @floatFromInt(explicit_duration.?)) / @as(f64, @floatFromInt(state.scale)), .discontinuity = false, .dash = .{ .start_ticks = start_ticks, .duration_ticks = explicit_duration.?, .timescale = @intCast(state.scale), .presentation_offset = state.offset } });
+            try state.segments.append(a, .{ .uri = try uri(tag.get("media"), limits), .range = try byteRange(tag.get("mediaRange")), .initialization = state.initialization orelse return error.MalformedDash, .sequence = state.sequence, .discontinuity_sequence = 0, .duration_seconds = @as(f64, @floatFromInt(explicit_duration.?)) / @as(f64, @floatFromInt(state.scale)), .discontinuity = false, .availability_complete = state.availability_complete, .dash = .{ .start_ticks = start_ticks, .duration_ticks = explicit_duration.?, .timescale = @intCast(state.scale), .presentation_offset = state.offset } });
             state.sequence = std.math.add(u64, state.sequence, 1) catch return error.MalformedDash;
             state.target = std.math.divCeil(u64, explicit_duration.?, state.scale) catch return error.MalformedDash;
         } else if (depth == 5 and template_mode and std.mem.eql(u8, tag.name, "SegmentTimeline")) {
@@ -948,4 +952,43 @@ test "DASH explicit timeline repeats start offsets and validates unavailable tem
     const overflow = try std.mem.replaceOwned(u8, a, mpd, "r='1'", "r='18446744073709551615'");
     defer a.free(overflow);
     try std.testing.expectError(error.MalformedDash, parse(a, overflow, .{}));
+}
+
+test "DASH partial availability opts into inherited complete flags without changing request clocks" {
+    const a = std.testing.allocator;
+    const manifest = "<MPD xmlns='urn:mpeg:dash:schema:mpd:2011' type='dynamic' availabilityStartTime='1970-01-01T00:00:00Z'><BaseURL availabilityTimeComplete='false'>https://media.example/live/</BaseURL><Period duration='PT6S'><SegmentTemplate duration='6' availabilityTimeOffset='5' initialization='init.mp4' media='seg-$Number$.m4s'/><AdaptationSet><Representation id='v'/></AdaptationSet></Period></MPD>";
+    try std.testing.expectError(error.UnsupportedDash, parseAt(a, manifest, .{}, 1000));
+    var early = try parseAtWithSelection(a, manifest, .{}, 999, .{ .allow_partial_availability = true });
+    defer early.deinit();
+    try std.testing.expectEqual(@as(usize, 0), early.segments.len);
+    var available = try parseAtWithSelection(a, manifest, .{}, 1000, .{ .allow_partial_availability = true });
+    defer available.deinit();
+    try std.testing.expectEqual(@as(usize, 1), available.segments.len);
+    try std.testing.expect(!available.segments[0].availability_complete);
+    try std.testing.expectEqual(@as(u64, 6), available.segments[0].dash.?.duration_ticks);
+    const overridden = try std.mem.replaceOwned(u8, a, manifest, "duration='6' availabilityTimeOffset", "duration='6' availabilityTimeComplete='true' availabilityTimeOffset");
+    defer a.free(overridden);
+    var complete = try parseAt(a, overridden, .{}, 1000);
+    defer complete.deinit();
+    try std.testing.expect(complete.segments[0].availability_complete);
+    const false_template = try std.mem.replaceOwned(u8, a, overridden, "availabilityTimeComplete='true'", "availabilityTimeComplete='0'");
+    defer a.free(false_template);
+    var inherited = try parseAtWithSelection(a, false_template, .{}, 1000, .{ .allow_partial_availability = true });
+    defer inherited.deinit();
+    try std.testing.expect(!inherited.segments[0].availability_complete);
+}
+test "DASH partial availability follows nearest selected BaseURL and template inheritance" {
+    const a = std.testing.allocator;
+    const manifest = "<MPD xmlns='urn:mpeg:dash:schema:mpd:2011'><BaseURL availabilityTimeComplete='false'>https://media.example/live/</BaseURL><Period duration='PT6S'><SegmentTemplate duration='6' initialization='init.mp4' media='seg-$Number$.m4s'/><AdaptationSet><BaseURL availabilityTimeComplete='true'>https://media.example/live/</BaseURL><Representation id='v'/></AdaptationSet></Period></MPD>";
+    var complete = try parse(a, manifest, .{});
+    defer complete.deinit();
+    try std.testing.expect(complete.segments[0].availability_complete);
+    const partial = try std.mem.replaceOwned(u8, a, manifest, "<Representation id='v'/>", "<Representation id='v'><SegmentTemplate availabilityTimeComplete='false'/></Representation>");
+    defer a.free(partial);
+    var opted_in = try parseAtWithSelection(a, partial, .{}, null, .{ .allow_partial_availability = true });
+    defer opted_in.deinit();
+    try std.testing.expect(!opted_in.segments[0].availability_complete);
+    const invalid = try std.mem.replaceOwned(u8, a, manifest, "availabilityTimeComplete='true'", "availabilityTimeComplete='maybe'");
+    defer a.free(invalid);
+    try std.testing.expectError(error.MalformedDash, parseAtWithSelection(a, invalid, .{}, null, .{ .allow_partial_availability = true }));
 }

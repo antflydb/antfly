@@ -79,6 +79,8 @@ pub const Segment = struct {
     discontinuity: bool,
     part: ?Part = null,
     dash: ?DashTiming = null,
+    /// False permits published immutable fragments before resource completion.
+    availability_complete: bool = true,
     encryption: ?crypto.Key = null,
     /// Preserve an explicit identity METHOD=NONE as well as AES across delta updates.
     identity_key_declared: bool = false,

@@ -24,12 +24,12 @@ pub const TransportFactory = struct {
     accept: *const fn (*anyopaque, []const u8, []const u8, hls.Segment, live.Options, @import("source.zig").Control, ?*@import("admission.zig").Pool) anyerror!live.Segment,
 };
 pub const Clock = struct { context: ?*anyopaque = null, now_ns: *const fn (?*anyopaque) u64 };
-pub const Options = struct { clock: ?Clock = null, playlist: hls.Limits = .{}, ingest: live.Options = .{}, selection: hls.master.Selection = .{}, transport_stream: ?TransportFactory = null };
+pub const Options = struct { max_resource_attempts: usize = 8, clock: ?Clock = null, playlist: hls.Limits = .{}, ingest: live.Options = .{}, selection: hls.master.Selection = .{}, transport_stream: ?TransportFactory = null };
 fn sameInitialization(left: hls.Initialization, right: hls.Initialization) bool {
     return std.mem.eql(u8, left.uri, right.uri) and std.meta.eql(left.range, right.range) and hls.crypto.same(left.encryption, right.encryption);
 }
 fn sameSegment(left: hls.Segment, right: hls.Segment) bool {
-    return std.mem.eql(u8, left.uri, right.uri) and std.meta.eql(left.range, right.range) and sameInitialization(left.initialization, right.initialization) and hls.crypto.same(left.encryption, right.encryption) and left.discontinuity_sequence == right.discontinuity_sequence and left.duration_seconds == right.duration_seconds and (if (left.program_date_time) |date| right.program_date_time == null or hls.dateranges.Instant.order(date, right.program_date_time.?) == .eq else true) and std.meta.eql(left.part, right.part) and (if (left.dash) |timing| right.dash != null and dash_cursor.sameTiming(timing, right.dash.?) else right.dash == null);
+    return std.mem.eql(u8, left.uri, right.uri) and std.meta.eql(left.range, right.range) and sameInitialization(left.initialization, right.initialization) and hls.crypto.same(left.encryption, right.encryption) and left.discontinuity_sequence == right.discontinuity_sequence and left.duration_seconds == right.duration_seconds and (left.availability_complete == right.availability_complete or (!left.availability_complete and right.availability_complete)) and (if (left.program_date_time) |date| right.program_date_time == null or hls.dateranges.Instant.order(date, right.program_date_time.?) == .eq else true) and std.meta.eql(left.part, right.part) and (if (left.dash) |timing| right.dash != null and dash_cursor.sameTiming(timing, right.dash.?) else right.dash == null);
 }
 
 fn segmentOrder(left: hls.Segment, right: hls.Segment) std.math.Order {
@@ -121,6 +121,9 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
         stream_ledger: network.FragmentLedger = .{},
         stream_key: ?[32]u8 = null,
         stream_base_ordinal: usize = 0,
+        stream_start_decode_time: ?i64 = null,
+        stream_track_scale: u32 = 0,
+        stream_was_partial: bool = false,
         stream_call_active: bool = false,
         next_sequence: ?u64 = null,
         next_part: u32 = 0,
@@ -436,6 +439,7 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
             try self.transport.control.check();
             var canonical = item;
             if (canonical.dash) |*timing| {
+                canonical.availability_complete = true;
                 // Compatible live reloads may announce Period end/next-period
                 // bounds without changing this selected resource's identity.
                 timing.period.duration_ms = null;
@@ -449,9 +453,16 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
             try hash.writer.flush();
             return hash.hasher.finalResult();
         }
+        fn completeResource(self: *const Self, item: hls.Segment, start: i64, end: i64, scale: u32) bool {
+            if (!self.stream_was_partial) return true;
+            const timing = item.dash orelse return false;
+            return (@as(i128, end) - start) * timing.timescale >= @as(i128, timing.duration_ticks) * scale;
+        }
         /// Stream one selected plaintext fMP4 resource with callback backpressure.
         /// Fragment acceptance survives failures; the manifest cursor commits
-        /// only after successful EOF. Retry/reload cannot silently drop or mutate
+        /// only after successful EOF and, for partial DASH, a continuous native
+        /// decode span covering the advertised resource duration. Retry/reload
+        /// cannot silently drop or mutate
         /// the selected resource. next() cannot mix buffered consumption into an
         /// unfinished streaming resource. AES/TS/LL-HLS parts retain next().
         pub fn streamNext(self: *Self, context: *anyopaque, accept: *const fn (*anyopaque, *network.FragmentDelivery) anyerror!void) !?network.ResumeStats {
@@ -470,8 +481,12 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
                 try self.prepareInitialization(item);
                 self.stream_key = key;
                 self.stream_base_ordinal = self.ingest.?.segments;
+                self.stream_start_decode_time = null;
+                self.stream_track_scale = 0;
+                self.stream_was_partial = !item.availability_complete;
                 self.stream_ledger = .{};
             }
+            if (self.stream_ledger.complete) try self.stream_ledger.reopen();
             const Sink = struct {
                 owner: *Self,
                 item: hls.Segment,
@@ -484,6 +499,13 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
                     if (unit.reader.packets.len == 0) return error.EmptyMediaResource;
                     const first = unit.reader.packets[0];
                     if (ingest.next_decode_time) |expected_time| if (first.media_dts < expected_time) return error.NonMonotonicMediaSegment;
+                    if (sink.owner.stream_was_partial) {
+                        var expected_time = if (sink.owner.stream_start_decode_time != null) ingest.next_decode_time.? else first.media_dts;
+                        for (unit.reader.packets) |packet| {
+                            if (packet.media_dts != expected_time) return error.MediaStreamGap;
+                            expected_time = try std.math.add(i64, packet.media_dts, packet.duration);
+                        }
+                    }
                     const last = unit.reader.packets[unit.reader.packets.len - 1];
                     const decode_end = try std.math.add(i64, last.media_dts, last.duration);
                     const ordinal = try std.math.add(usize, sink.owner.stream_base_ordinal, unit.ordinal);
@@ -492,17 +514,24 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
                     if (sink.item.dash) |timing| {
                         var mapped = timing;
                         mapped.fragment_index = ordinal - sink.owner.stream_base_ordinal;
-                        mapped.resource_complete = delivery.body_complete;
+                        const start = sink.owner.stream_start_decode_time orelse first.media_dts;
+                        mapped.resource_complete = delivery.body_complete and sink.owner.completeResource(sink.item, start, decode_end, unit.reader.track.timescale);
                         unit.dash_timing = mapped;
                     }
                     if (comptime @hasDecl(manifest_parser, "master")) unit.hls_timing = .{ .sequence = sink.item.sequence, .discontinuity_sequence = sink.item.discontinuity_sequence };
+                    const start_decode = sink.owner.stream_start_decode_time orelse first.media_dts;
+                    const track_scale = unit.reader.track.timescale;
                     sink.accept(sink.context, delivery) catch |err| {
                         if (delivery.acknowledged) {
+                            sink.owner.stream_start_decode_time = start_decode;
+                            sink.owner.stream_track_scale = track_scale;
                             ingest.next_decode_time = decode_end;
                             ingest.segments = ordinal + 1;
                         }
                         return err;
                     };
+                    sink.owner.stream_start_decode_time = start_decode;
+                    sink.owner.stream_track_scale = track_scale;
                     ingest.next_decode_time = decode_end;
                     ingest.segments = ordinal + 1;
                 }
@@ -518,7 +547,12 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
             defer self.ingest.?.ingested_bytes += self.transport.transferred_bytes - transferred_before;
             const remaining = self.ingest.?.options.max_ingested_bytes -| self.ingest.?.ingested_bytes;
             const resource_limit: usize = @intCast(@min(options.stream.max_bytes, remaining));
-            const result = try self.transport.streamFmp4Resuming(self.mediaUrl(), item.uri, item.range, resource_limit, self.ingest.?.initialization.bytes, &self.stream_ledger, .{ .ingest = options, .epoch = self.ingest.?.epoch, .resource_context = key }, &sink, Sink.publish);
+            var result = try self.transport.streamFmp4Resuming(self.mediaUrl(), item.uri, item.range, resource_limit, self.ingest.?.initialization.bytes, &self.stream_ledger, .{ .ingest = options, .epoch = self.ingest.?.epoch, .max_attempts = self.options.max_resource_attempts, .resource_context = key }, &sink, Sink.publish);
+            result.resource_complete = if (self.stream_start_decode_time) |start| self.completeResource(item, start, self.ingest.?.next_decode_time.?, self.stream_track_scale) else false;
+            if (!result.resource_complete) {
+                if (item.availability_complete) return error.IncompleteMediaSegment;
+                return result;
+            }
             self.commitCursor(item);
             self.stream_key = null;
             self.stream_ledger = .{};
@@ -534,6 +568,7 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
                 else
                     self.selectHls(playlist) orelse return null;
                 if (item.part) |part| if (part.gap) return error.MediaStreamGap;
+                if (!item.availability_complete) return error.StreamingMediaRequired;
                 if (item.initialization.uri.len == 0) {
                     if (comptime !@hasDecl(manifest_parser, "master")) return error.UnsupportedContainer;
                     if (item.part != null) return error.UnsupportedContainer;
@@ -585,6 +620,8 @@ const FakeHttp = struct {
         fail_media: bool = false,
         fail_stream_prefix: bool = false,
         stream_complete: bool = false,
+        stream_prefix_bytes: ?usize = null,
+        stream_body: ?[]const u8 = null,
         pub fn get(self: *@This(), url: []const u8, options: anytype) !Response {
             self.calls += 1;
             if (options.cancellation.is_cancelled_fn(options.cancellation.ptr)) return error.Cancelled;
@@ -607,7 +644,8 @@ const FakeHttp = struct {
             self.stream_complete = false;
             const response = try self.get(url, options);
             try writer.startResponse(response);
-            const body = response.body.?;
+            const available = self.stream_body orelse response.body.?;
+            const body = available[0..@min(available.len, self.stream_prefix_bytes orelse available.len)];
             var offset: usize = 0;
             while (offset < body.len) {
                 if (self.fail_stream_prefix and offset >= 11206 - 797 + 8) return error.ConnectionReset;
@@ -1796,4 +1834,141 @@ test "live Reader streaming lifetime byte and accepted fragment limits remain cu
         try std.testing.expect(reader.ingest.?.ingested_bytes <= reader.options.ingest.max_ingested_bytes);
         try std.testing.expectEqual(@as(u64, 10), reader.next_sequence.?);
     }
+}
+
+const partial_manifest = "<MPD xmlns='urn:mpeg:dash:schema:mpd:2011'><Period duration='PT6S'><AdaptationSet><Representation id='v'><SegmentList timescale='1000' duration='6000' availabilityTimeComplete='false'><Initialization sourceURL='init.mp4'/><SegmentURL media='seg.mp4'/></SegmentList></Representation></AdaptationSet></Period></MPD>";
+const PartialReader = ReaderWithManifest(FakeHttp, @import("dash.zig"));
+const PartialCapture = struct {
+    held: [8]?live.Segment = @splat(null),
+    count: usize = 0,
+    completions: usize = 0,
+    fn deinit(self: *@This()) void {
+        for (&self.held) |*entry| if (entry.*) |*unit| unit.deinit();
+    }
+    fn accept(raw: *anyopaque, delivery: *network.FragmentDelivery) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const timing = delivery.segment.?.dash_timing.?;
+        if (timing.resource_complete) self.completions += 1;
+        try std.testing.expectEqual(timing.resource_complete, timing.finishesPeriod());
+        try std.testing.expectEqual(self.count, delivery.segment.?.ordinal);
+        self.held[self.count] = try delivery.take();
+        self.count += 1;
+    }
+};
+test "partial DASH Reader retains sequence through clean EOF unchanged polls and append-only growth" {
+    const a = std.testing.allocator;
+    var client = FakeHttp.Client{ .manifest = partial_manifest, .stream_prefix_bytes = 20811 - 797 };
+    var transport = network.Adapter(FakeHttp){ .allocator = a, .client = &client, .root_url = "https://example.test/live/list.mpd" };
+    var reader = try PartialReader.init(a, &transport, transport.root_url, .{ .selection = .{ .allow_partial_availability = true } });
+    defer reader.deinit();
+    try reader.reload();
+    try std.testing.expectError(error.StreamingMediaRequired, reader.next());
+    try std.testing.expectEqual(@as(usize, 1), client.calls);
+    var capture = PartialCapture{};
+    defer capture.deinit();
+    const first = (try reader.streamNext(&capture, PartialCapture.accept)).?;
+    try std.testing.expect(!first.resource_complete);
+    try std.testing.expectEqual(@as(usize, 2), capture.count);
+    try std.testing.expectEqual(@as(usize, 0), capture.completions);
+    try std.testing.expect(!reader.ended());
+    try std.testing.expectEqual(@as(u64, 1), reader.dash_position.?.sequence);
+    try std.testing.expectError(error.PendingMediaSegment, reader.next());
+    const unchanged = (try reader.streamNext(&capture, PartialCapture.accept)).?;
+    try std.testing.expectEqual(@as(usize, 2), unchanged.replayed);
+    try std.testing.expectEqual(@as(usize, 0), unchanged.acknowledged);
+    try std.testing.expect(!unchanged.resource_complete);
+    try reader.reload();
+    client.stream_prefix_bytes = null;
+    const complete = (try reader.streamNext(&capture, PartialCapture.accept)).?;
+    try std.testing.expect(complete.resource_complete);
+    try std.testing.expectEqual(@as(usize, 2), complete.replayed);
+    try std.testing.expectEqual(@as(usize, 4), complete.acknowledged);
+    try std.testing.expectEqual(@as(usize, 6), capture.count);
+    try std.testing.expectEqual(@as(usize, 1), capture.completions);
+    try std.testing.expect(reader.ended());
+    try std.testing.expectEqual(@as(u64, 2), reader.dash_position.?.sequence);
+}
+test "partial DASH declaration completion still fetches and validates an unfinished body" {
+    const a = std.testing.allocator;
+    const final_manifest = try std.mem.replaceOwned(u8, a, partial_manifest, "availabilityTimeComplete='false'", "availabilityTimeComplete='true'");
+    defer a.free(final_manifest);
+    var client = FakeHttp.Client{ .manifest = partial_manifest, .stream_prefix_bytes = 20811 - 797 };
+    var transport = network.Adapter(FakeHttp){ .allocator = a, .client = &client, .root_url = "https://example.test/live/list.mpd" };
+    var reader = try PartialReader.init(a, &transport, transport.root_url, .{ .selection = .{ .allow_partial_availability = true } });
+    defer reader.deinit();
+    try reader.reload();
+    var capture = PartialCapture{};
+    defer capture.deinit();
+    _ = try reader.streamNext(&capture, PartialCapture.accept);
+    client.manifest = final_manifest;
+    try reader.reload();
+    try std.testing.expectError(error.IncompleteMediaSegment, reader.streamNext(&capture, PartialCapture.accept));
+    try std.testing.expectEqual(@as(usize, 2), capture.count);
+    try std.testing.expectEqual(@as(u64, 1), reader.dash_position.?.sequence);
+    client.stream_prefix_bytes = null;
+    const complete = (try reader.streamNext(&capture, PartialCapture.accept)).?;
+    try std.testing.expect(complete.resource_complete);
+    try std.testing.expect(reader.ended());
+}
+test "partial DASH retries and body versions obey caller-configured attempt limits" {
+    var client = FakeHttp.Client{ .manifest = partial_manifest, .stream_prefix_bytes = 20811 - 797 };
+    var transport = network.Adapter(FakeHttp){ .allocator = std.testing.allocator, .client = &client, .root_url = "https://example.test/live/list.mpd" };
+    var reader = try PartialReader.init(std.testing.allocator, &transport, transport.root_url, .{ .max_resource_attempts = 1, .selection = .{ .allow_partial_availability = true } });
+    defer reader.deinit();
+    try reader.reload();
+    var capture = PartialCapture{};
+    defer capture.deinit();
+    _ = try reader.streamNext(&capture, PartialCapture.accept);
+    try std.testing.expectError(error.ResourceLimitExceeded, reader.streamNext(&capture, PartialCapture.accept));
+    try std.testing.expectEqual(@as(usize, 3), client.calls);
+    try std.testing.expect(!reader.ended());
+}
+fn partialAllocationRun(a: std.mem.Allocator) !void {
+    var client = FakeHttp.Client{ .manifest = partial_manifest, .stream_prefix_bytes = 20811 - 797 };
+    var transport = network.Adapter(FakeHttp){ .allocator = a, .client = &client, .root_url = "https://example.test/live/list.mpd" };
+    var reader = try PartialReader.init(a, &transport, transport.root_url, .{ .selection = .{ .allow_partial_availability = true } });
+    defer reader.deinit();
+    try reader.reload();
+    var capture = PartialCapture{};
+    defer capture.deinit();
+    _ = try reader.streamNext(&capture, PartialCapture.accept);
+    client.stream_prefix_bytes = null;
+    _ = try reader.streamNext(&capture, PartialCapture.accept);
+}
+test "partial DASH append-only version allocation failures preserve owners and release prefix leases" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, partialAllocationRun, .{});
+}
+
+test "partial DASH rejects a new fragment decode gap without advancing accepted output" {
+    const a = std.testing.allocator;
+    const original = @embedFile("../testdata/fragmented.mp4")[797..];
+    const changed = try a.dupe(u8, original);
+    defer a.free(changed);
+    const third = 20811 - 797;
+    const tfdt = third + std.mem.indexOf(u8, changed[third..], "tfdt").?;
+    if (changed[tfdt + 4] == 1) {
+        const field = changed[tfdt + 8 ..][0..8];
+        std.mem.writeInt(u64, field, std.mem.readInt(u64, field, .big) + 1024, .big);
+    } else {
+        const field = changed[tfdt + 8 ..][0..4];
+        std.mem.writeInt(u32, field, std.mem.readInt(u32, field, .big) + 1024, .big);
+    }
+    var client = FakeHttp.Client{ .manifest = partial_manifest, .stream_prefix_bytes = third };
+    var transport = network.Adapter(FakeHttp){ .allocator = a, .client = &client, .root_url = "https://example.test/live/list.mpd" };
+    var reader = try PartialReader.init(a, &transport, transport.root_url, .{ .selection = .{ .allow_partial_availability = true } });
+    defer reader.deinit();
+    try reader.reload();
+    var capture = PartialCapture{};
+    defer capture.deinit();
+    _ = try reader.streamNext(&capture, PartialCapture.accept);
+    client.stream_prefix_bytes = null;
+    client.stream_body = changed;
+    try std.testing.expectError(error.MediaStreamGap, reader.streamNext(&capture, PartialCapture.accept));
+    try std.testing.expectEqual(@as(usize, 2), capture.count);
+    try std.testing.expectEqual(@as(u64, 1), reader.dash_position.?.sequence);
+    client.stream_body = null;
+    const result = (try reader.streamNext(&capture, PartialCapture.accept)).?;
+    try std.testing.expect(result.resource_complete);
+    try std.testing.expectEqual(@as(usize, 6), capture.count);
+    try std.testing.expect(reader.ended());
 }

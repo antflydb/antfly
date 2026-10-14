@@ -69,6 +69,8 @@ pub const ResumeOptions = struct {
     resource_context: [32]u8 = @splat(0),
 };
 pub const ResumeStats = struct {
+    /// Reader may withhold manifest completion across a successful partial EOF.
+    resource_complete: bool = true,
     transport: StreamStats = .{},
     replayed: usize = 0,
     acknowledged: usize = 0,

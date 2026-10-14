@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! DASH representation selection and inherited addressing. Segment timing stays
 //! in the existing representation planner. Generated references are owned.
@@ -17,6 +29,8 @@ pub const Selection = struct {
     /// Required when resolving relative BaseURL hierarchies. Live readers supply
     /// their actual manifest URL; authenticated transport still pins the origin.
     manifest_url: ?[]const u8 = null,
+    /// Opt in only when using Reader.streamNext for incomplete available media.
+    allow_partial_availability: bool = false,
 };
 fn named(tree: xml.Tree, index: usize, name: []const u8) !bool {
     const node = tree.nodes[index];
@@ -148,7 +162,7 @@ const Addressing = struct {
         }
     }
 };
-fn baseAt(a: std.mem.Allocator, tree: xml.Tree, level: usize, current: []const u8, selection: Selection, limit: usize, offset: *availability.Offset) ![]const u8 {
+fn baseAt(a: std.mem.Allocator, tree: xml.Tree, level: usize, current: []const u8, selection: Selection, limit: usize, offset: *availability.Offset, complete: *bool) ![]const u8 {
     var child = tree.nodes[level].first_child;
     var count: usize = 0;
     var chosen: ?usize = null;
@@ -172,7 +186,10 @@ fn baseAt(a: std.mem.Allocator, tree: xml.Tree, level: usize, current: []const u
             offset.* = try offset.add(try availability.parse(attribute.value));
             continue;
         }
-        if (std.mem.eql(u8, attribute.name, "availabilityTimeComplete") and std.mem.eql(u8, attribute.value, "true")) continue;
+        if (std.mem.eql(u8, attribute.name, "availabilityTimeComplete")) {
+            complete.* = try availability.complete(attribute.value);
+            continue;
+        }
         return error.UnsupportedDash;
     }
     const reference = std.mem.trim(u8, node.text.items, " \t\r\n");
@@ -256,8 +273,9 @@ fn planPeriod(a: std.mem.Allocator, scratch: std.mem.Allocator, tree: xml.Tree, 
     var base: []const u8 = selection.manifest_url orelse "";
     var addressing = Addressing{};
     var availability_offset: availability.Offset = .{ .finite = 0 };
+    var availability_complete = true;
     for (levels) |level| {
-        base = try baseAt(scratch, tree, level, base, selection, limits.max_uri_bytes, &availability_offset);
+        base = try baseAt(scratch, tree, level, base, selection, limits.max_uri_bytes, &availability_offset, &availability_complete);
         if (level != 0) try addressing.inherit(scratch, tree, level);
         var child = tree.nodes[level].first_child;
         while (child) |index| : (child = tree.nodes[index].next_sibling) {
@@ -277,6 +295,14 @@ fn planPeriod(a: std.mem.Allocator, scratch: std.mem.Allocator, tree: xml.Tree, 
     };
     if (!has_offset and (availability_offset == .infinite or availability_offset.finite != 0))
         try addressing.attributes.append(scratch, .{ .name = "availabilityTimeOffset", .value = try availability_offset.text(scratch) });
+    var has_complete = false;
+    for (addressing.attributes.items) |attribute| if (std.mem.eql(u8, attribute.name, "availabilityTimeComplete")) {
+        availability_complete = try availability.complete(attribute.value);
+        has_complete = true;
+    };
+    if (!availability_complete and !selection.allow_partial_availability) return error.UnsupportedDash;
+    if (!has_complete and !availability_complete)
+        try addressing.attributes.append(scratch, .{ .name = "availabilityTimeComplete", .value = "false" });
     var output: std.ArrayList(u8) = .empty;
     try output.appendSlice(scratch, "<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\"");
     try attrs(scratch, &output, tree.nodes[0].attributes);
@@ -301,7 +327,7 @@ fn planPeriod(a: std.mem.Allocator, scratch: std.mem.Allocator, tree: xml.Tree, 
     try output.appendSlice(scratch, addressing.kind.?);
     try output.appendSlice(scratch, "></Representation></AdaptationSet></Period></MPD>");
     if (output.items.len > limits.max_bytes or output.items.len > limits.max_planning_bytes) return error.ResourceLimitExceeded;
-    var parsed = try parse_one(a, scratch, output.items, limits, now);
+    var parsed = try parse_one(a, scratch, output.items, limits, now, selection.allow_partial_availability);
     defer parsed.deinit();
     // A reordered representation list or a changed codec/configuration cannot
     // silently switch a live reader when its default selection is used.

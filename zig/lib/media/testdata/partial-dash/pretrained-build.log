@@ -1,0 +1,22 @@
+1/38 server.server.test.embeddinggemma2 video partial DASH pretrained windows preserve vectors across clean short EOF and growth...SKIP
+1 selected; 0 passed; 1 skipped.
+Build Summary: 14/14 steps succeeded
+test-inference-unit success
++- run test success 534ms
+   +- compile test debug native success 57s MaxRSS:3G
+      +- WriteFile macos-sdk-libc.txt success
+      +- run exe jit-source-identity (metal_identity.zig) success 118ms
+      |  +- compile exe jit-source-identity safe native success 7s MaxRSS:283M
+      |     +- WriteFile macos-sdk-libc.txt (reused)
+      +- options success
+      +- WriteFile video_prepare_shader.h success
+      +- WriteFile tokenizer.json success
+      +- run exe patch_sentencepiece_proto (sentencepiece_proto) success 106ms
+      |  +- compile exe patch_sentencepiece_proto safe native success 7s MaxRSS:285M
+      |  |  +- WriteFile macos-sdk-libc.txt (reused)
+      |  +- run exe protoc-zig (sentencepiece_proto_raw) success 109ms
+      |  |  +- compile exe protoc-zig safe native success 9s MaxRSS:326M
+      |  |     +- WriteFile macos-sdk-libc.txt (reused)
+      |  +- run exe protoc-zig (sentencepiece_proto_raw) (+1 more reused dependencies)
+      +- options success
+

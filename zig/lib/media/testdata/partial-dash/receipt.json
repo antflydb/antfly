@@ -1,0 +1,100 @@
+{
+  "version": 1,
+  "date": "2026-10-14",
+  "basis_commit": "279da7b15b951d9abac34541d08de384cf603583",
+  "status": "pass; additional Linux pretrained execution running",
+  "results": {
+    "macos_arm64": {
+      "media_passed": 193,
+      "http_passed": 14,
+      "model_unit_passed": 42,
+      "model_unit_skipped": 1
+    },
+    "linux_arm64": {
+      "media_passed": 193,
+      "http_passed": 14,
+      "runtime": "native ARM64 Linux VM",
+      "image_id": "sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1",
+      "network": "none; loopback only",
+      "workdir": "/tmp"
+    }
+  },
+  "source_sha256": {
+    "zig/lib/media/src/dash.zig": "51b6f832fc45c4ff52342e9a54a8efe5a6def8736b2a85b621a9f63cc5070ab7",
+    "zig/lib/media/src/dash_availability.zig": "6a7bd4772e2c124a05774323a2f0209a343b9cd414c239afc1486297339ea3b9",
+    "zig/lib/media/src/dash_hierarchy.zig": "1a228a95dbcddc6c018cfccf568ae56d0016b7f5f8f3f342c35bb90d59bffb81",
+    "zig/lib/media/src/hls.zig": "82dd31bb2e9aa4d9883d85fa4388590a8d4bd75c1b5895b6baceb98011cef8ed",
+    "zig/lib/media/src/hls_live.zig": "c179e5067812460d5a5b5e4d6bf1853e90f8e87e7f32e4106aa123e6f4cb6046",
+    "zig/lib/media/src/http_stream.zig": "a6798f24ba1b781a2fc21d6d55dd3125f14a1f22b3637290875ff9c0dce6074c",
+    "zig/lib/media/http_live_test_root.zig": "85aa0068e61dd8997f3f9c0d68314e98b8f24a217c1e0b808e73e771e7dae649",
+    "zig/pkg/inference/src/pipelines/embedding_gemma2_live_stream.zig": "9a5279bee7bef0f679e1ea69783fbe560b1cf9ccf01c68147c5618cbd8c5e496",
+    "zig/pkg/inference/src/server/server.zig": "0a13bdbbbe25eaceca3877a71fb748194b5fdd3a56975516aa44329346eba6bd"
+  },
+  "source_scope": "All production executable changes are qualified. Two API documentation comments were clarified after builds, in hls_live.zig and embedding_gemma2_live_stream.zig; no executable statements changed. The 42-pass model-unit run predates the added optional partial-DASH checkpoint test; that declaration is separately built and executed.",
+  "binary_sha256": {
+    "zig/zig-out/bin/partial-dash-media-macos": "c7d737e105a1541d17703b9a40e6b065539d10a465732ee31e23a53758444d56",
+    "zig/zig-out/bin/partial-dash-media-linux": "5c708ef4f79828c11c7f2a7789d9c0a7534c98ed940c29c5691eb2ea3e9aff4a",
+    "zig/zig-out/bin/media-http-tests": "9fc06d5d8f8c71e4b6c5508b62e7929abe5363db2b9c9f2d57b8edfdfd67ff6a",
+    ".zig-cache/o/876da9418c8ab27de717dce5ee93be7a/test": "c47ed68bec3badbb343e9e48595054eef1244e7573b55993d82320e4091c3613",
+    "zig/.zig-cache/o/2c8922d325791564729c8e0d365f1963/test": "ed47e70ad84976aca4cb74a945a1129726fc86737c8322be44a0329e395b6f50",
+    "zig/zig-out/bin/antfly-inference-tests": "22d4a19978ef7338d0c9001e2ec7fd07755eea5f0e28da670b6ee6887b784689"
+  },
+  "pretrained": {
+    "revision": "914f7f89142e33e77833254d9c9b90c3cef7303b",
+    "checkpoint_sha256": "197a32965d4b1105faf060417baa899e193fb73cd401f42ec9295234d5553d79",
+    "metal": {
+      "status": "passed",
+      "windows": 6,
+      "callbacks": 7,
+      "before_tail_callbacks": 3,
+      "requests": 5,
+      "vector_max_error": 0.0,
+      "exit_code": 0
+    },
+    "cpu": {
+      "status": "passed",
+      "windows": 6,
+      "callbacks": 7,
+      "before_tail_callbacks": 3,
+      "requests": 5,
+      "vector_max_error": 0.0,
+      "exit_code": 0
+    },
+    "linux_arm64": {
+      "status": "running"
+    }
+  },
+  "fixture_sha256": "8b0d6caa76acfa98258536bce04d1ae058ba2ff2c4dcfb4e109cd289bea8d8be",
+  "scope_limits": [
+    "Generated six-second AVC fixture; not broad live-origin interoperability",
+    "No independent new PyTorch retrieval-quality claim",
+    "Linux pretrained partial-DASH test is currently running; no completion claim yet.",
+    "AES/TS/LL-HLS streaming remains buffered"
+  ],
+  "compiler": "Zig 0.17.0",
+  "optimization": "Debug",
+  "commands": {
+    "media": "zig test zig/lib/media/media_test_root.zig -O Debug",
+    "linux_media_build": "zig test zig/lib/media/media_test_root.zig -O Debug -target aarch64-linux-musl --test-no-exec",
+    "http": "zig build test-media-http -Doptimize=Debug --summary all (from zig/lib/media)",
+    "linux_http_build": "zig build install-media-http-tests -Doptimize=Debug -Dtarget=aarch64-linux-musl --prefix ../../zig-out --summary all (from zig/lib/media)",
+    "model_unit": "zig build test-inference-unit -Dtest-filter=\"embeddinggemma2 video\" -Dmetal=true --summary all (from zig/pkg/inference)",
+    "pretrained_build": "zig build --build-file zig/pkg/inference/build.zig test-inference-unit -Dtest-filter=\"embeddinggemma2 video partial DASH pretrained\" -Dmetal=true --summary all",
+    "pretrained_run": "ANTFLY_EMBEDDINGGEMMA2_MODEL=<pinned directory> ANTFLY_EMBEDDINGGEMMA2_METAL=<false or true> <recorded binary> --test-filter \"embeddinggemma2 video partial DASH pretrained\"",
+    "pretrained_linux_build": "zig build --build-file zig/pkg/inference/build.zig test-bin -Dtest-filter=\"embeddinggemma2 video partial DASH pretrained\" -Dtarget=aarch64-linux-musl -Dmetal=false -Doptimize=Debug --prefix zig/zig-out --summary all",
+    "linux_runtime": "docker run --rm --network=none --read-only --workdir=/tmp --tmpfs /tmp:size=128m -v <binary>:/qualify/test:ro -v <checkpoint>:/qualify/model:ro -e ANTFLY_EMBEDDINGGEMMA2_MODEL=/qualify/model -e ANTFLY_EMBEDDINGGEMMA2_METAL=false --entrypoint /qualify/test <pinned image> --test-filter \"embeddinggemma2 video partial DASH pretrained\""
+  },
+  "log_sha256": {
+    "http-linux-build.log": "f8c255c53218a3f23f6487a12ef56fd8eb75ef233abc300a678d0b7df3ad5af5",
+    "pretrained-cpu.log": "22b5f9fd83a58392704dfe2bd8a00937620e74811f4d5e9227b56fd42b2140c0",
+    "http-macos.log": "978d41b6aeb70845c0edbb1792dcfde81b532d940c149aa9ed964e82224424d5",
+    "media-linux-build.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "media-linux.log": "f97cfae9b60e8d6bb6d3c1df70b7b4e39c56837e7ab609c09c71e75dde060c21",
+    "media-macos.log": "f97cfae9b60e8d6bb6d3c1df70b7b4e39c56837e7ab609c09c71e75dde060c21",
+    "model-unit.log": "35a32771591435b690530b418c41be8932a8bd8b8ffc92be4748d659278431fd",
+    "pretrained-linux-build.log": "e528a417d089de7513a9ba93d158271a17e029fe2cb4fbf50f5597ef2a9a9a2b",
+    "pretrained-metal.log": "dc5e4b6cd69e5c9381dd437fd953fc44afb1b973ce408705f56460e4515f8ff2",
+    "http-linux.log": "615bace414d6bbe3ab1f12f6d8c63a5e2b72ec776da9b93163a75572fa983ced",
+    "pretrained-build.log": "3a2d2db3327ddca29d13e6b1349d69226912af4a16b7a688001c69969dbbff4f"
+  }
+}

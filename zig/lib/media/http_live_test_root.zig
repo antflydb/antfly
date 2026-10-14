@@ -709,3 +709,57 @@ test "production HTTP fragment replay survives truncated chunked response withou
     }
     try std.testing.expectEqual(@as(usize, 0), pool.snapshot().host_bytes);
 }
+
+test "production partial DASH authenticates growing HTTP versions and advances only after native duration" {
+    const manifest = "<MPD xmlns='urn:mpeg:dash:schema:mpd:2011'><Period duration='PT6S'><AdaptationSet><Representation id='v'><SegmentList timescale='1000' duration='6000' availabilityTimeComplete='false'><Initialization sourceURL='init.mp4'/><SegmentURL media='seg.mp4'/></SegmentList></Representation></AdaptationSet></Period></MPD>";
+    const original = @embedFile("testdata/fragmented.mp4");
+    const Capture = struct {
+        count: usize = 0,
+        complete: usize = 0,
+        held: ?media.live_mp4.Segment = null,
+        fn accept(raw: *anyopaque, delivery: *media.http_stream.FragmentDelivery) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(self.count, delivery.segment.?.ordinal);
+            if (delivery.segment.?.dash_timing.?.resource_complete) self.complete += 1;
+            if (self.count == 0) self.held = try delivery.take();
+            self.count += 1;
+        }
+    };
+    var server = try http.testing_mod.TestServer.start(a, std.testing.io, &.{
+        .{ .path = "/live/list.mpd", .assert_request = Verify.auth, .respond = .{ .body = manifest } },
+        .{ .path = "/live/init.mp4", .assert_request = Verify.auth, .respond = .{ .body = original[0..797] } },
+        .{ .path = "/live/seg.mp4", .assert_request = Verify.auth, .max_uses = 2, .respond = .{ .body = original[797..20811] } },
+        .{ .path = "/live/seg.mp4", .assert_request = Verify.auth, .respond = .{ .body = original[797..] } },
+    });
+    defer server.deinit();
+    var client = http.Client.initWithConfig(a, std.testing.io, .{ .default_headers = &.{.{ "Authorization", "Bearer fixture-token" }} });
+    defer client.deinit();
+    const url = try std.fmt.allocPrint(a, "{s}/live/list.mpd", .{server.baseUrl()});
+    defer a.free(url);
+    var transport = media.http_stream.Adapter(http){ .allocator = a, .client = &client, .root_url = url };
+    var reader = try media.dash_live.Reader(http).init(a, &transport, url, .{ .selection = .{ .allow_partial_availability = true } });
+    defer reader.deinit();
+    var serving = try std.testing.io.concurrent(Verify.serve, .{ &server, 5 });
+    defer _ = serving.cancel(std.testing.io) catch {};
+    var capture = Capture{};
+    defer if (capture.held) |*unit| unit.deinit();
+    try reader.reload();
+    const first = (try reader.streamNext(&capture, Capture.accept)).?;
+    try std.testing.expect(!first.resource_complete);
+    try std.testing.expectEqual(@as(usize, 2), capture.count);
+    try std.testing.expect(!reader.ended());
+    const unchanged = (try reader.streamNext(&capture, Capture.accept)).?;
+    try std.testing.expect(!unchanged.resource_complete);
+    try std.testing.expectEqual(@as(usize, 2), unchanged.replayed);
+    try std.testing.expectEqual(@as(usize, 2), capture.count);
+    const final = (try reader.streamNext(&capture, Capture.accept)).?;
+    try std.testing.expect(final.resource_complete);
+    try std.testing.expectEqual(@as(usize, 2), final.replayed);
+    try std.testing.expectEqual(@as(usize, 6), capture.count);
+    try std.testing.expectEqual(@as(usize, 1), capture.complete);
+    try std.testing.expect(reader.ended());
+    try serving.await(std.testing.io);
+    var packet = try capture.held.?.reader.readPacket(0);
+    defer packet.deinit();
+    try std.testing.expect(packet.bytes.len != 0);
+}
