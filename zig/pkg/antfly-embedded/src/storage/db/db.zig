@@ -576,6 +576,8 @@ pub const OpenOptions = struct {
         degree_canary,
     };
 
+    /// External owners drive historical index work outside their capture fence.
+    defer_index_backfill_on_open: bool = false,
     table_storage: ?table_storage_mod.Settings = null,
     open_mode: OpenOptions.OpenMode = .writer,
     /// An authenticated restore decoder needs rows and schema layouts, never
@@ -4071,7 +4073,7 @@ pub const DB = struct {
                 profile.load_indexes_ns = elapsedSince(load_indexes_started_ns);
             } else {
                 const load_indexes_started_ns = monotonicTimeNs();
-                try db.core.loadIndexes();
+                if (opts.defer_index_backfill_on_open) try db.core.loadIndexesDeferredBackfill() else try db.core.loadIndexes();
                 profile.load_indexes_ns = elapsedSince(load_indexes_started_ns);
             }
             if (!openModeRequiresReadOnlyBackends(opts.open_mode)) try finishGraphMergeImport(&db, null);

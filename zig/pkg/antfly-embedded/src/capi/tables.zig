@@ -183,6 +183,7 @@ pub fn get(handle: *h.Handle, name: []const u8) !*h.db_mod.DB {
 }
 
 pub fn create(handle: *h.Handle, name: []const u8, schema: []const u8, if_not_exists: bool) !void {
+    @import("sql_ddl.zig").invalidate(handle);
     try requireDatabase(handle);
     if (!h.liteOpenModeCanWrite(handle.open_mode)) return error.SqlReadOnlyTransaction;
     if (name.len == 0 or name.len > 1024 or std.mem.indexOfScalar(u8, name, 0) != null or !std.unicode.utf8ValidateSlice(name)) return error.InvalidSqlParameters;
@@ -394,8 +395,6 @@ pub export fn antfly_db_open_table(ptr: ?*anyopaque, name: h.capi.Slice, out: *?
     defer guard.leave();
     const root = guard.handle;
     requireDatabase(root) catch |err| return h.capi.mapError(err);
-    @import("sql_commit.zig").recover(root) catch |err| return h.capi.mapError(err);
-    @import("sql_ddl.zig").recover(root) catch |err| return h.capi.mapError(err);
     var i: usize = 0;
     while (i < root.table_handles.items.len) {
         if (h.handle_registry.enter(root.table_handles.items[i])) |entry| {

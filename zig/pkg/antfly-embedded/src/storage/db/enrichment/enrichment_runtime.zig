@@ -3551,7 +3551,65 @@ fn assetProducerProduceBorrowedRasterBatchReportedGuarded(
     return produced;
 }
 
-fn embedDenseWithRetry(
+fn computationKey(provider: embedder_mod.DenseEmbedder, name: []const u8, text: []const u8, dims: u32) ?[32]u8 {
+    const key_fn = provider.computation_key_fn orelse return null;
+    return key_fn(provider.ptr, name, text, dims) catch null;
+}
+
+fn cacheableVector(vector: []const f32, dims: u32) bool {
+    if (vector.len != dims) return false;
+    for (vector) |value| if (!std.math.isFinite(value)) return false;
+    return true;
+}
+
+fn embedDenseWithRetry(provider: embedder_mod.DenseEmbedder, runtime: *EnrichmentRuntime, name: []const u8, text: []const u8, dims: u32) ![]f32 {
+    const cache = runtime.dense_result_cache orelse return embedDenseWithRetryUncached(provider, runtime, name, text, dims);
+    const key = computationKey(provider, name, text, dims) orelse return embedDenseWithRetryUncached(provider, runtime, name, text, dims);
+    try runtime.active_provider_guard.check();
+    if (try cache.lookup(cache.ptr, runtime.alloc, key)) |vector| return vector;
+    const vector = try embedDenseWithRetryUncached(provider, runtime, name, text, dims);
+    if (cacheableVector(vector, dims)) cache.remember(cache.ptr, key, vector);
+    return vector;
+}
+
+fn embedDenseBatchWithRetry(provider: embedder_mod.DenseEmbedder, runtime: *EnrichmentRuntime, name: []const u8, texts: []const []const u8, dims: u32) ![]const []const f32 {
+    const cache = runtime.dense_result_cache orelse return embedDenseBatchWithRetryUncached(provider, runtime, name, texts, dims);
+    if (provider.computation_key_fn == null) return embedDenseBatchWithRetryUncached(provider, runtime, name, texts, dims);
+    try runtime.active_provider_guard.check();
+    const keys = try runtime.alloc.alloc(?[32]u8, texts.len);
+    defer runtime.alloc.free(keys);
+    const vectors = try runtime.alloc.alloc([]const f32, texts.len);
+    @memset(vectors, &.{});
+    errdefer embedder_mod.freeDenseEmbeddingBatch(runtime.alloc, vectors);
+    var misses: std.ArrayList(usize) = .empty;
+    defer misses.deinit(runtime.alloc);
+    var missing_texts: std.ArrayList([]const u8) = .empty;
+    defer missing_texts.deinit(runtime.alloc);
+    for (texts, 0..) |text, i| {
+        keys[i] = computationKey(provider, name, text, dims);
+        if (keys[i]) |key| if (try cache.lookup(cache.ptr, runtime.alloc, key)) |vector| {
+            vectors[i] = vector;
+            continue;
+        };
+        try misses.append(runtime.alloc, i);
+        try missing_texts.append(runtime.alloc, text);
+    }
+    if (misses.items.len != 0) {
+        const computed = try embedDenseBatchWithRetryUncached(provider, runtime, name, missing_texts.items, dims);
+        defer runtime.alloc.free(computed);
+        if (computed.len != misses.items.len) {
+            for (computed) |vector| runtime.alloc.free(vector);
+            return error.InvalidEmbeddingResponse;
+        }
+        for (computed, misses.items) |vector, index| {
+            vectors[index] = vector;
+            if (keys[index]) |key| if (cacheableVector(vector, dims)) cache.remember(cache.ptr, key, vector);
+        }
+    }
+    return vectors;
+}
+
+fn embedDenseWithRetryUncached(
     dense_embedder: embedder_mod.DenseEmbedder,
     runtime: *EnrichmentRuntime,
     embedding_name: []const u8,
@@ -3590,7 +3648,7 @@ fn embedDenseWithRetry(
     }
 }
 
-fn embedDenseBatchWithRetry(
+fn embedDenseBatchWithRetryUncached(
     dense_embedder: embedder_mod.DenseEmbedder,
     runtime: *EnrichmentRuntime,
     embedding_name: []const u8,
@@ -4349,6 +4407,7 @@ fn inheritProcessTelemetryUnlocked(runtime: anytype, previous: types.EnrichmentS
 pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     alloc: Allocator,
     status_hook: ?StatusHook = null,
+    dense_result_cache: ?embedder_mod.DenseResultCache = null,
     shared_pdf_windows: ?*SharedPdfWindowScheduler = null,
     /// Borrowed from the owning DB, which stops and destroys this runtime
     /// before releasing BackendRuntime.
@@ -4979,6 +5038,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     isolated_failed_indexes: std.StringHashMapUnmanaged(void) = .empty,
     isolated_failed_sources: std.StringHashMapUnmanaged(void) = .empty,
     status_hook: ?StatusHook = null,
+    dense_result_cache: ?embedder_mod.DenseResultCache = null,
     future: ?background_runtime_mod.MaintenanceScheduler.Handle = null,
 
     pub fn init(

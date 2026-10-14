@@ -51,6 +51,7 @@ pub fn Adapter(comptime native: type) type {
 
         fn ddl(ptr: *anyopaque, allocators: catalog.DdlAllocators, request: catalog.Ddl) !catalog.DdlOutcome {
             const self: *Self = @ptrCast(@alignCast(ptr));
+            if (self.handle) |handle| @import("sql_ddl.zig").invalidate(handle);
             if (self.read_only) return error.SqlReadOnlyTransaction;
             const handle = self.handle orelse return error.UnsupportedSqlExecution;
             if (self.transaction) |session| if (session.active) return error.UnsupportedSqlExecution;
@@ -240,6 +241,22 @@ pub fn Adapter(comptime native: type) type {
             range: []const topology.RangeRecord,
         };
 
+        fn databaseRequiresCoordination(db: *DB) bool {
+            var view = db.core.acquireSchemaView() orelse return false;
+            defer view.release();
+            return view.hasCoordinatedConstraints();
+        }
+
+        pub fn localRequiresCoordination(self: *Self) bool {
+            if (databaseRequiresCoordination(self.db)) return true;
+            if (self.handle) |handle| {
+                if (databaseRequiresCoordination(&handle.db)) return true;
+                var tables = handle.embedded_tables.valueIterator();
+                while (tables.next()) |table| if (databaseRequiresCoordination(&table.*.db)) return true;
+            }
+            return false;
+        }
+
         pub fn localCatalog(self: *Self, alloc: std.mem.Allocator, version: u32) !LocalCatalog {
             // Coordinated constraints require the complete dependency catalog;
             // ordinary reads can proceed against healthy referenced tables.
@@ -270,8 +287,9 @@ pub fn Adapter(comptime native: type) type {
                 return;
             };
             if (identity.table_id == 0) return error.CoordinatedConstraintsRequireTableIdentity;
-            const parsed = try native.public_api.tables.parseValidatedTableSchema(alloc, json);
-            if (expected) |version| if (parsed.version != version) return error.PreparedGenerationChanged;
+            var view = db.core.acquireSchemaView() orelse return error.IntegrityCatalogUnavailable;
+            defer view.release();
+            if (expected) |version| if (view.version() != version) return error.PreparedGenerationChanged;
             tables[used.*] = .{ .table_id = identity.table_id, .name = name, .schema_json = json };
             ranges[used.*] = .{ .group_id = identity.shard_id, .range_id = identity.range_id, .table_id = identity.table_id, .start_key = "", .doc_identity_shard_id = identity.shard_id, .doc_identity_range_id = identity.range_id };
             used.* += 1;
@@ -304,17 +322,17 @@ pub fn Adapter(comptime native: type) type {
             return error.UnsupportedSqlExecution;
         }
 
-        fn resolveConflictOwners(ptr: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, target: catalog.ConflictTarget, mutations: []const catalog.Mutation) ![]const catalog.ConflictOwner {
+        fn resolveConflictOwners(ptr: *anyopaque, alloc: std.mem.Allocator, scratch_alloc: std.mem.Allocator, table: catalog.Table, target: catalog.ConflictTarget, mutations: []const catalog.Mutation) ![]const catalog.ConflictOwner {
             const adapter_owner: *Self = @ptrCast(@alignCast(ptr));
             var selected_adapter = try adapter_owner.selected(table.physical_name);
             const self = &selected_adapter;
             if (self.read_only) return error.SqlReadOnlyTransaction;
             if (!std.mem.eql(u8, table.physical_name, self.table_name)) return error.UndefinedTable;
             if (target.constraint_name == null and target.columns.len == 0 and target.expressions.len == 0) {
-                const json = (try self.db.getSchemaJson(alloc)) orelse return error.IntegrityCatalogUnavailable;
-                const parsed = try native.public_api.tables.parseValidatedTableSchema(alloc, json);
-                if (parsed.version != table.schema_version) return error.PreparedGenerationChanged;
-                if (!try integrity.requiresCoordination(alloc, json)) {
+                var view = self.db.core.acquireSchemaView() orelse return error.IntegrityCatalogUnavailable;
+                defer view.release();
+                if (view.version() != table.schema_version) return error.PreparedGenerationChanged;
+                if (!view.hasCoordinatedConstraints()) {
                     const output = try alloc.alloc(catalog.ConflictOwner, mutations.len);
                     @memset(output, .{ .key = null, .identity = null, .guard = null, .primary_only = true });
                     return output;
@@ -324,7 +342,7 @@ pub fn Adapter(comptime native: type) type {
             const writes = try dependencies.sql_mutation_images.writes(types.BatchWrite, alloc, mutations);
             const target_predicates = try dependencies.sql_conflict_predicate.toNative(alloc, target.conditions);
             const keys = try dependencies.sql_conflict_predicate.expressionsToNative(alloc, target.expressions);
-            const owners = try integrity.resolveConflictTargetOwners(alloc, self.localSource(), metadata.table, metadata.range, self.table_name, table.schema_version, .{ .columns = target.columns, .expressions = keys, .predicate = target_predicates, .constraint_name = target.constraint_name }, writes, if (self.transaction) |session| if (session.active) try session.commitRequests(alloc) else &.{} else &.{}, .{});
+            const owners = try integrity.resolveConflictTargetOwnersWithScratch(alloc, scratch_alloc, self.localSource(), metadata.table, metadata.range, self.table_name, table.schema_version, .{ .columns = target.columns, .expressions = keys, .predicate = target_predicates, .constraint_name = target.constraint_name }, writes, if (self.transaction) |session| if (session.active) try session.commitRequests(alloc) else &.{} else &.{}, .{});
             const output = try alloc.alloc(catalog.ConflictOwner, owners.len);
             for (owners, output) |*owner, *out| out.* = .{ .key = owner.key, .identity = owner.identity, .identities = owner.identities, .guard = owner };
             return output;
@@ -749,8 +767,10 @@ pub fn Adapter(comptime native: type) type {
             const request: types.BatchRequest = .{ .writes = writes.items, .deletes = deletes.items, .predicates = predicates, .schema_version = table.schema_version, .relational_schema_version = if (table.storage_mode == .relational) table.schema_version else null };
             var prepared: ?integrity.Prepared = null;
             defer if (prepared) |*value| value.deinit();
-            const schema_json = (try self.db.getSchemaJson(temporary)) orelse return error.IntegrityCatalogUnavailable;
-            if (try integrity.requiresCoordination(temporary, schema_json)) {
+            var view = self.db.core.acquireSchemaView() orelse return error.IntegrityCatalogUnavailable;
+            defer view.release();
+            if (view.version() != table.schema_version) return error.PreparedGenerationChanged;
+            if (view.hasCoordinatedConstraints()) {
                 const metadata = try self.localCatalog(temporary, table.schema_version);
                 var generation: ?[32]u8 = null;
                 var commands: std.ArrayList(@typeInfo(@FieldType(types.BatchRequest, "integrity_commands")).pointer.child) = .empty;

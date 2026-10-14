@@ -1209,6 +1209,10 @@ pub const DBCore = struct {
         try self.index_manager.load(self.store);
     }
 
+    pub fn loadIndexesDeferredBackfill(self: *DBCore) !void {
+        try self.index_manager.loadDeferredBackfill(self.store);
+    }
+
     pub fn loadIndexesForRestore(self: *DBCore) !void {
         try self.index_manager.loadForRestore(self.store);
     }

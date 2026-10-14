@@ -11564,6 +11564,10 @@ pub const IndexManager = struct {
         self.storeGeneratedEnrichmentTargetCache(false);
     }
 
+    pub fn loadDeferredBackfill(self: *IndexManager, store: anytype) !void {
+        try self.loadWithBackfill(store, false, false);
+    }
+
     pub fn loadNoBackfill(self: *IndexManager, store: anytype) !void {
         try self.loadWithBackfill(store, false, true);
     }

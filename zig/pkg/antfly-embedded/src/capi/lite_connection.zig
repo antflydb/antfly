@@ -24,6 +24,10 @@ const std = h.std;
 const native = h.lite_backend.native;
 const alloc = std.heap.c_allocator;
 
+const memo_mod = @import("antfly_inference_query_embedding_cache");
+const cache_budget = @import("antfly_cache_budget");
+const embedding_memo_bytes = 16 * 1024 * 1024;
+
 // Foreign threads can immediately reenter after a read. Ticket ordering keeps
 // a stream of short reads from starving queued writers and maintenance.
 const QueuedMutex = struct {
@@ -100,7 +104,7 @@ fn releaseGate(gate: *PathGate) void {
 
 // Compatible connections borrow one persistent generation and one maintenance
 // worker. SQL sessions, cursor IDs, and child handles remain connection-local.
-const Owner = struct {
+pub const Owner = struct {
     path: []const u8,
     options: api.LiteResolvedOpenOptions,
     owned_ttl_owner_id: ?[]u8 = null,
@@ -113,29 +117,47 @@ const Owner = struct {
     wake: std.Io.Event = .unset,
     current: ?*h.Handle = null,
     retired: std.ArrayList(*h.Handle) = .empty,
+    maintenance_snapshot: ?*h.Handle = null,
+    maintenance_table_cursor: usize = 0,
+    maintenance_round_pending: bool = false,
+    embedding_memo: ?memo_mod.QueryEmbeddingCache = null,
+    embedding_memo_budget: cache_budget.CacheBudget = .init(embedding_memo_bytes),
 
     /// Caller holds the path lease, so the checkpoint and catalog cannot race
     /// a different process's publication. Cursor continuation deliberately
     /// uses its pinned generation without reopening the connection.
     pub fn refresh(self: *Owner) !*h.Handle {
+        var known_maintenance: ?*h.Handle = null;
         if (self.current) |current| {
             var probe = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.path, .{ .read_only = true, .internal_reader = true });
             defer probe.close();
             const file = &current.owned_lite_backend.?.native_docstore.?.file;
             const same_inode = (try probe.file.stat(probe.runtime())).inode == (try file.file.stat(file.runtime())).inode;
-            if (same_inode and std.meta.eql(probe.header, file.header)) return current;
+            if (current.maintenance_references == 0 and same_inode and std.meta.eql(probe.header, file.header)) return current;
+            if (self.maintenance_snapshot) |snapshot| {
+                const captured = &snapshot.owned_lite_backend.?.native_docstore.?.file;
+                if (std.meta.eql(probe.header, captured.header) and
+                    (try probe.file.stat(probe.runtime())).inode == (try captured.file.stat(captured.runtime())).inode) known_maintenance = snapshot;
+            }
         }
         var options = self.options;
         options.externally_locked = true;
         const replacement = try api.openLiteHandleAllocWithRuntime(alloc, self.path, options, false, h.handleLockIo(), null);
         errdefer h.closeHandle(replacement);
         if (self.current) |previous| {
+            if (known_maintenance) |snapshot| {
+                replacement.sql_commit_recovery_needed = previous.sql_commit_recovery_needed or snapshot.sql_commit_recovery_needed;
+                replacement.sql_ddl_recovery_needed = previous.sql_ddl_recovery_needed or snapshot.sql_ddl_recovery_needed;
+            }
+            inheritReclamationTelemetry(replacement.owned_lite_backend.?.native_docstore.?, previous.owned_lite_backend.?.native_docstore.?);
             try self.retired.append(alloc, previous);
             previous.lease_snapshot = true;
             // Cursor continuation can only read this generation. Make every
             // namespace's shared native store reject publication immediately.
-            previous.owned_lite_backend.?.native_docstore.?.read_only = true;
-            previous.owned_lite_backend.?.native_docstore.?.file.read_only = true;
+            if (previous.maintenance_references == 0) {
+                previous.owned_lite_backend.?.native_docstore.?.read_only = true;
+                previous.owned_lite_backend.?.native_docstore.?.file.read_only = true;
+            }
         }
         // Child table handles outlive snapshots. Drop borrowed producers before
         // collectRetired releases their old provider (even if addresses are reused).
@@ -162,7 +184,7 @@ const Owner = struct {
         while (i < self.retired.items.len) {
             const retired = self.retired.items[i];
             const retained = retained: {
-                if (retired.query_borrows > 0) break :retained true;
+                if (retired.query_borrows > 0 or retired.maintenance_references != 0) break :retained true;
                 for (self.connections.items) |connection| {
                     // attach moves this connection's registry onto the current
                     // root. Inspect its actual owner during query resume too.
@@ -198,64 +220,255 @@ const Owner = struct {
             runtime.stats().applied_sequence < database.core.nextEnrichmentSequence();
     }
 
+    fn lookupEmbedding(ptr: *anyopaque, a: std.mem.Allocator, key: [32]u8) !?[]f32 {
+        const self: *Owner = @ptrCast(@alignCast(ptr));
+        return self.embedding_memo.?.lookup(&self.embedding_memo_budget, a, key);
+    }
+
+    fn rememberEmbedding(ptr: *anyopaque, key: [32]u8, vector: []const f32) void {
+        const self: *Owner = @ptrCast(@alignCast(ptr));
+        self.embedding_memo.?.remember(&self.embedding_memo_budget, key, vector);
+    }
+
+    // Admission never waits while a storage operation owns DB/index locks.
+    // A foreground owner can therefore refresh its own runtime and publish
+    // without a lock-order cycle with detached maintenance.
+    fn enterMaintenanceWriter(ptr: *anyopaque) !void {
+        const root: *h.Handle = @ptrCast(@alignCast(ptr));
+        const self = root.maintenance_owner.?;
+        root.maintenance_admission_mutex.lockUncancelable(h.handleLockIo());
+        defer root.maintenance_admission_mutex.unlock(h.handleLockIo());
+        if (root.maintenance_writer_references != 0) {
+            root.maintenance_writer_references += 1;
+            return;
+        }
+        if (self.stopping.load(.acquire)) return error.Canceled;
+        if (!self.gate.mutex.tryLock()) return error.EnrichmentWaitCanceled;
+        errdefer self.gate.mutex.unlock(h.handleLockIo());
+        if (self.current) |current| if (needsOutcomeReconciliation(current)) return error.EnrichmentWaitCanceled;
+        var lease = native.lockWriterPathWithIo(alloc, h.handleLockIo(), self.path) catch |err| switch (err) {
+            error.FileBusy, error.WouldBlock => return error.EnrichmentWaitCanceled,
+            else => return err,
+        };
+        errdefer lease.close();
+        var probe = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.path, .{ .read_only = true, .internal_reader = true });
+        defer probe.close();
+        const file = &root.owned_lite_backend.?.native_docstore.?.file;
+        if ((try probe.file.stat(probe.runtime())).inode != (try file.file.stat(file.runtime())).inode or
+            !std.meta.eql(probe.header, file.header)) return error.EnrichmentWaitCanceled;
+        root.maintenance_writer_lease = lease;
+        root.maintenance_writer_references = 1;
+    }
+
+    fn leaveMaintenanceWriter(ptr: *anyopaque) void {
+        const root: *h.Handle = @ptrCast(@alignCast(ptr));
+        const self = root.maintenance_owner.?;
+        root.maintenance_admission_mutex.lockUncancelable(h.handleLockIo());
+        defer root.maintenance_admission_mutex.unlock(h.handleLockIo());
+        std.debug.assert(root.maintenance_writer_references != 0);
+        root.maintenance_writer_references -= 1;
+        if (root.maintenance_writer_references != 0) return;
+        var lease = root.maintenance_writer_lease.?;
+        root.maintenance_writer_lease = null;
+        self.notifyMutation();
+        lease.close();
+        self.gate.mutex.unlock(h.handleLockIo());
+    }
+
+    fn closeMaintenanceSnapshot(root: *h.Handle) void {
+        root.lease_snapshot = true;
+        const store = root.owned_lite_backend.?.native_docstore.?;
+        store.read_only = true;
+        store.file.read_only = true;
+        h.closeHandle(root);
+    }
+
+    fn needsOutcomeReconciliation(root: *h.Handle) bool {
+        const store = root.owned_lite_backend.?.native_docstore.?;
+        return root.sql_decision_uncertain or store.file.checkpoint_publication_uncertain or store.secret_store_uncertain;
+    }
+
+    fn inheritReclamationTelemetry(destination: anytype, source: anytype) void {
+        const stats = &destination.maintenance_policy.status;
+        const previous = source.maintenance_policy.status;
+        if (previous.rewrite_count > stats.rewrite_count) stats.last_reclaimed_bytes = previous.last_reclaimed_bytes;
+        stats.assessment_count = @max(stats.assessment_count, previous.assessment_count);
+        stats.rewrite_count = @max(stats.rewrite_count, previous.rewrite_count);
+    }
+
+    fn refreshMaintenanceSnapshot(self: *Owner, foreground: *h.Handle) !*h.Handle {
+        const file = &foreground.owned_lite_backend.?.native_docstore.?.file;
+        if (self.maintenance_snapshot) |snapshot| {
+            const captured = &snapshot.owned_lite_backend.?.native_docstore.?.file;
+            if (snapshot.db_live and std.meta.eql(file.header, captured.header) and
+                (try file.file.stat(file.runtime())).inode == (try captured.file.stat(captured.runtime())).inode) return snapshot;
+        }
+        var options = self.options;
+        options.externally_locked = true;
+        options.artifact_reader_fence = true;
+        const snapshot = try api.openLiteHandleAllocWithRuntime(alloc, self.path, options, false, h.handleLockIo(), null);
+        snapshot.lease_snapshot = true;
+        snapshot.sql_commit_recovery_needed = foreground.sql_commit_recovery_needed;
+        snapshot.sql_ddl_recovery_needed = foreground.sql_ddl_recovery_needed;
+        const store = snapshot.owned_lite_backend.?.native_docstore.?;
+        if (self.maintenance_snapshot) |old| {
+            // Policy scheduling and telemetry belong to this connection;
+            // assessment caches and page roots belong to the new generation.
+            store.maintenance_policy = old.owned_lite_backend.?.native_docstore.?.maintenance_policy;
+            closeMaintenanceSnapshot(old);
+        }
+        if (comptime h.builtin.is_test) {
+            const source = foreground.owned_lite_backend.?.native_docstore.?;
+            if (source.test_maintenance_hook != null) {
+                store.maintenance_policy = source.maintenance_policy;
+                store.test_maintenance_hook = source.test_maintenance_hook;
+            }
+        }
+        self.maintenance_snapshot = snapshot;
+        return snapshot;
+    }
+
+    /// Captures one table under the connection fence. The pinned runtime owns
+    /// all provider/catalog state while computation runs outside that fence.
+    /// Native writer admission below revalidates inode and checkpoint for every
+    /// short publication, including staged artifacts and index segments.
+    fn maintenanceTurn(self: *Owner) !bool {
+        const io = h.handleLockIo();
+        if (self.stopping.load(.acquire)) return false;
+        if (!self.gate.mutex.tryLock()) return true;
+        var gate_locked = true;
+        defer if (gate_locked) self.gate.mutex.unlock(io);
+        var lease = try native.lockWriterPathWithIo(alloc, io, self.path);
+        var lease_held = true;
+        defer if (lease_held) lease.close();
+        const foreground = try self.refresh();
+        if (needsOutcomeReconciliation(foreground)) return false;
+        try @import("sql_commit.zig").recover(foreground);
+        try @import("sql_ddl.zig").recover(foreground);
+        try @import("tables.zig").loadAvailable(foreground);
+        if (self.options.open_mode == .writer) {
+            if (hasPendingGeneratedEnrichment(&foreground.db)) self.maintenance_pending = true;
+            var tables = foreground.embedded_tables.valueIterator();
+            while (tables.next()) |table| {
+                if (hasPendingGeneratedEnrichment(&table.*.db)) self.maintenance_pending = true;
+            }
+        }
+        const count = foreground.embedded_tables.count() + 1;
+        const ordinal = self.maintenance_table_cursor % count;
+        var database = &foreground.db;
+        var selected: ?*@import("tables.zig").Table = null;
+        if (ordinal != 0) {
+            var tables = foreground.embedded_tables.valueIterator();
+            for (0..ordinal) |_| selected = tables.next().?.*;
+            database = &selected.?.db;
+        }
+        self.maintenance_table_cursor = (ordinal + 1) % count;
+        // TTL is a short publication for the selected table, never a drain of
+        // every namespace under one file lease.
+        const now = std.Io.Clock.awake.now(io).nanoseconds;
+        if (now >= self.next_ttl_ns) {
+            if (database.ttl_runtime) |ttl| try ttl.runOnce();
+            if (self.maintenance_table_cursor == 0) {
+                const config = self.options.ttl_cleanup orelse h.db_mod.ttl_runtime.Config{};
+                self.next_ttl_ns = now + @as(i96, config.interval_ms) * std.time.ns_per_ms;
+            }
+        }
+        const run_database = self.maintenance_pending;
+        // Native maintenance owns independent catalog/provider state. Opening
+        // only its selected namespace avoids rebuilding every foreground table
+        // merely because inference or segment construction is still running.
+        // Hosted/manual runtimes retain their caller-supplied provider borrow.
+        const independent = self.options.profile == .native;
+        const root = if (independent) try self.refreshMaintenanceSnapshot(foreground) else foreground;
+        if (independent) {
+            database = if (selected) |table| try @import("tables.zig").get(root, table.name) else &root.db;
+            // Only construction uses inode-fenced reads. Sources opened by
+            // mutation/publication retain the normal immutable-range leases.
+            root.owned_lite_backend.?.native_docstore.?.artifact_reader_fence = false;
+        }
+        root.maintenance_references += 1;
+        root.maintenance_owner = self;
+        const store = root.owned_lite_backend.?.native_docstore.?;
+        if (database.enrichment_runtime) |runtime| {
+            if (self.embedding_memo == null) self.embedding_memo = memo_mod.QueryEmbeddingCache.init(alloc, io, .{ .max_bytes = embedding_memo_bytes, .ttl_ns = std.time.ns_per_min });
+            runtime.dense_result_cache = .{ .ptr = self, .lookup = lookupEmbedding, .remember = rememberEmbedding };
+        }
+        store.writer_admission = .{ .ptr = root, .enter = enterMaintenanceWriter, .leave = leaveMaintenanceWriter };
+        lease.close();
+        lease_held = false;
+        self.gate.mutex.unlock(io);
+        gate_locked = false;
+
+        const cancellation = h.db_mod.types.CancellationToken.fromAtomic(&self.stopping);
+        var pending = if (run_database) database.runBackgroundMaintenanceWithCancellation(cancellation) catch true else false;
+        if (database.enrichment_runtime) |runtime| runtime.dense_result_cache = null;
+        if (independent) {
+            // End the input fences before reclamation. Keeping them in an
+            // idle runtime would needlessly prevent in-place page service.
+            @import("tables.zig").closeAll(root);
+            root.embedded_tables = .empty;
+            root.db.closeImmutableSnapshot();
+            root.db_live = false;
+        }
+        store.maintainOnce(false) catch {
+            pending = true;
+        };
+
+        self.gate.mutex.lockUncancelable(io);
+        defer self.gate.mutex.unlock(io);
+        store.writer_admission = null;
+        root.maintenance_owner = null;
+        root.maintenance_references -= 1;
+        if (independent) inheritReclamationTelemetry(self.current.?.owned_lite_backend.?.native_docstore.?, store);
+        if (!independent and self.current != root) {
+            store.read_only = true;
+            store.file.read_only = true;
+        }
+        const changed = if (independent)
+            !std.meta.eql(self.current.?.owned_lite_backend.?.native_docstore.?.file.header, store.file.header)
+        else
+            self.current != root;
+        self.maintenance_round_pending = self.maintenance_round_pending or pending or changed;
+        if (self.maintenance_table_cursor == 0) {
+            // Mutations arriving during the detached turn still wake the owner;
+            // replay debt is inspected again under the next capture fence.
+            self.maintenance_pending = self.maintenance_round_pending;
+            self.maintenance_round_pending = false;
+        }
+        self.collectRetired();
+        return self.maintenance_pending or self.maintenance_table_cursor != 0;
+    }
+
+    pub fn maintenanceTurnForTest(self: *Owner) !bool {
+        std.debug.assert(h.builtin.is_test);
+        return self.maintenanceTurn();
+    }
+
     fn maintenanceLoop(self: *Owner) void {
         const io = h.handleLockIo();
         var next_wait_ms: i64 = 1000;
+        var earliest_turn_ns: i96 = 0;
         while (!self.stopping.load(.acquire)) {
             self.wake.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(next_wait_ms), .clock = .awake } }) catch {};
             self.wake.reset();
             if (self.stopping.load(.acquire)) break;
-            self.gate.mutex.lockUncancelable(io);
-            defer self.gate.mutex.unlock(io);
-            if (self.stopping.load(.acquire)) break;
-            var lease = native.lockWriterPathWithIo(alloc, io, self.path) catch continue;
-            defer lease.close();
-            // A contended open can defer its first generation. Initialize it
-            // under the lease so idle maintenance can resume without an API call.
-            const root = self.refresh() catch continue;
-            const cancellation = h.db_mod.types.CancellationToken.fromAtomic(&self.stopping);
-            // A reopened generation can have durable producer debt without
-            // this connection ever receiving a mutation notification. Inspect
-            // every table under the lease, including namespaces not yet used
-            // by a foreground call. Keep writer_no_replay's explicit policy.
-            if (self.options.open_mode == .writer) {
-                @import("tables.zig").loadAvailable(root) catch continue;
-                if (hasPendingGeneratedEnrichment(&root.db)) self.maintenance_pending = true;
-                var tables = root.embedded_tables.valueIterator();
-                while (tables.next()) |table| {
-                    if (hasPendingGeneratedEnrichment(&table.*.db)) self.maintenance_pending = true;
-                }
+            const now = std.Io.Clock.awake.now(io).nanoseconds;
+            if (now < earliest_turn_ns) {
+                // Coalesce mutation wakes while a round is already pending;
+                // an event must not bypass its per-table scheduling quantum.
+                next_wait_ms = @intCast(@divCeil(earliest_turn_ns - now, std.time.ns_per_ms));
+                continue;
             }
-            if (self.maintenance_pending) {
-                self.maintenance_pending = false;
-                self.maintenance_pending = (root.db.runBackgroundMaintenanceWithCancellation(cancellation) catch true) or self.maintenance_pending;
-                var tables = root.embedded_tables.valueIterator();
-                while (tables.next()) |table| {
-                    if (self.stopping.load(.acquire)) break;
-                    self.maintenance_pending = (table.*.db.runBackgroundMaintenanceWithCancellation(cancellation) catch true) or self.maintenance_pending;
-                }
-            }
-            @import("entity_sink.zig").collectEmbeddingCache(root, false) catch {};
-            if (!self.stopping.load(.acquire)) {
-                const now = std.Io.Clock.awake.now(io).nanoseconds;
-                if (now >= self.next_ttl_ns) {
-                    const config = self.options.ttl_cleanup orelse h.db_mod.ttl_runtime.Config{};
-                    self.next_ttl_ns = now + @as(i96, config.interval_ms) * std.time.ns_per_ms;
-                    if (root.db.ttl_runtime) |ttl| ttl.runOnce() catch {};
-                    var tables = root.embedded_tables.valueIterator();
-                    while (tables.next()) |table| if (table.*.db.ttl_runtime) |ttl| ttl.runOnce() catch {};
-                }
-                root.owned_lite_backend.?.native_docstore.?.maintainOnce(false) catch {};
-            }
-            self.collectRetired();
-            // Keep durable page work moving without retaining the path lease
-            // or spinning on a temporarily blocked maintenance page.
-            next_wait_ms = if (self.maintenance_pending) 100 else 1000;
+            const pending = self.maintenanceTurn() catch true;
+            next_wait_ms = if (pending) 100 else 1000;
+            earliest_turn_ns = std.Io.Clock.awake.now(io).nanoseconds + if (pending) @as(i96, 100 * std.time.ns_per_ms) else 0;
         }
     }
 
     fn deinit(self: *Owner) void {
         if (self.worker) |worker| worker.join();
+        if (self.maintenance_snapshot) |snapshot| closeMaintenanceSnapshot(snapshot);
+        if (self.embedding_memo) |*memo| memo.deinit(&self.embedding_memo_budget);
         for (self.retired.items) |retired| h.closeHandle(retired);
         if (self.current) |current| {
             current.lease_snapshot = true;

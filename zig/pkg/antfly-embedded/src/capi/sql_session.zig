@@ -41,7 +41,14 @@ pub fn requestSession(handle: *h.Handle, request_json: []const u8) !?*Session {
     return if (parsed.value.session_id) |id| handle.sql_sessions.get(id) orelse return error.SqlConnectionNotFound else null;
 }
 
-const Entry = struct { table: catalog.Table, mutation: catalog.Mutation };
+const Entry = struct {
+    table: catalog.Table,
+    mutation: catalog.Mutation,
+    // The owned postimage is serialized once. Integrity/commit reuse it;
+    // readers decode into their own bounded overlay instead of retaining a
+    // second DOM for every staged row. Stored mutation.row is always null.
+    encoded_row: ?[]const u8 = null,
+};
 const Savepoint = struct { name: []const u8, length: usize };
 pub const Session = struct {
     handle: *h.Handle,
@@ -67,6 +74,13 @@ pub const Session = struct {
     }
 
     pub fn stage(self: *Session, table: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
+        return self.stageOwned(table, mutations) catch |err| {
+            if ((err == error.OutOfMemory or err == error.WriteFailed) and self.budget.exhausted) return error.SqlProgramLimitExceeded;
+            return err;
+        };
+    }
+
+    fn stageOwned(self: *Session, table: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
         if (!self.active) return error.SqlTransactionNotActive;
         if (self.failed) return error.SqlTransactionAborted;
         if (self.read_only) return error.SqlReadOnlyTransaction;
@@ -74,12 +88,16 @@ pub const Session = struct {
         errdefer self.entries.items.len = before;
         const a = self.arena.allocator();
         for (mutations) |mutation| {
-            const bytes = if (mutation.row) |row| try std.json.Stringify.valueAlloc(a, row, .{}) else "";
+            // Reclaim the serialization builder's excess capacity, retaining
+            // only the exact postimage shared by the overlay and commit path.
+            const bytes = if (mutation.row) |row| try std.json.Stringify.valueAlloc(self.budget.allocator(), row, .{}) else "";
+            defer if (mutation.row != null) self.budget.allocator().free(bytes);
             self.bytes +|= bytes.len +| mutation.key.len +| 256;
             if (self.bytes > sql.runtime.resource_limits.default_memory_bytes or self.entries.items.len >= 4096) return error.SqlProgramLimitExceeded;
             var copy = mutation;
             copy.key = try a.dupe(u8, mutation.key);
-            copy.row = if (mutation.row != null) try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{ .parse_numbers = false }) else null;
+            const encoded = if (mutation.row != null) try a.dupe(u8, bytes) else null;
+            copy.row = null;
             copy.json_null_fields = try a.alloc([]const u8, mutation.json_null_fields.len);
             for (mutation.json_null_fields, @constCast(copy.json_null_fields)) |field, *out| out.* = try a.dupe(u8, field);
             copy.conflict_guard = null;
@@ -87,7 +105,7 @@ pub const Session = struct {
             var saved_table = table;
             saved_table.physical_name = try a.dupe(u8, table.physical_name);
             saved_table.columns = &.{};
-            try self.entries.append(a, .{ .table = saved_table, .mutation = copy });
+            try self.entries.append(a, .{ .table = saved_table, .mutation = copy, .encoded_row = encoded });
         }
         try self.validateStaged(table, before);
         return .committed;
@@ -100,13 +118,8 @@ pub const Session = struct {
         defer arena.deinit();
         const a = arena.allocator();
         var adapter = sql.Adapter(h.antfly){ .handle = self.handle, .db = try @import("tables.zig").get(self.handle, target.physical_name), .table_name = target.physical_name };
+        if (!adapter.localRequiresCoordination()) return;
         const metadata = try adapter.localCatalog(a, target.schema_version);
-        var coordinated = false;
-        for (metadata.table) |table| if (try d.api_relational_integrity_commit.requiresCoordination(a, table.schema_json)) {
-            coordinated = true;
-            break;
-        };
-        if (!coordinated) return;
         const requests = try self.commitRequests(a);
         const previous = try requestsForEntries(a, self.entries.items[0..statement_start]);
         const statement = try requestsForEntries(a, self.entries.items[statement_start..]);
@@ -127,7 +140,7 @@ pub const Session = struct {
                     };
                 };
                 if (original) |bytes| if (std.mem.eql(u8, bytes, write.value)) continue;
-                var mutation: catalog.Mutation = .{ .expected_version = 0, .key = try owned.dupe(u8, write.key), .row = try std.json.parseFromSliceLeaky(std.json.Value, owned, write.value, .{ .parse_numbers = false }) };
+                var mutation: catalog.Mutation = .{ .expected_version = 0, .key = try owned.dupe(u8, write.key), .row = null };
                 mutation.json_null_fields = try owned.alloc([]const u8, write.json_null_fields.len);
                 for (write.json_null_fields, @constCast(mutation.json_null_fields)) |field, *out| out.* = try owned.dupe(u8, field);
                 for (request.predicates) |predicate| if (std.mem.eql(u8, predicate.key, write.key)) {
@@ -137,7 +150,7 @@ pub const Session = struct {
                     break;
                 };
                 if (self.entries.items.len >= 4096) return error.SqlProgramLimitExceeded;
-                try self.entries.append(owned, .{ .table = saved_table, .mutation = mutation });
+                try self.entries.append(owned, .{ .table = saved_table, .mutation = mutation, .encoded_row = try owned.dupe(u8, write.value) });
             }
             for (request.deletes) |key| {
                 const already = outer: for (requests) |input| {
@@ -208,8 +221,8 @@ pub const Session = struct {
             const m = entry.mutation;
             try group.predicates.append(a, .{ .key = m.key, .expected_version = m.expected_version, .expected_content_digest = m.expected_content_digest, .unique_absence = m.unique_absence });
             if (m.predicate_only) continue;
-            if (m.row) |row| {
-                const json = try std.json.Stringify.valueAlloc(a, row, .{});
+            if (entry.encoded_row != null or m.row != null) {
+                const json = if (entry.encoded_row) |bytes| try a.dupe(u8, bytes) else try std.json.Stringify.valueAlloc(a, m.row.?, .{});
                 errdefer a.free(json);
                 try group.writes.append(a, .{ .key = m.key, .value = json, .json_null_fields = m.json_null_fields });
             } else try group.deletes.append(a, m.key);
