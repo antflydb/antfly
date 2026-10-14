@@ -493,8 +493,10 @@ antfly_error_code antfly_db_set_resolver_namespace_json(antfly_db *db, antfly_sl
  * serves until background activation. Identical requests are idempotent.
  * Acts as add when the old index is absent. Optional wait:{timeout_ms:N}
  * waits for activation; deadline BUSY leaves the accepted shadow running.
- * Waiting releases admission between work quanta; cancellation returns
- * ANTFLY_CANCELLED. Precondition failures are ANTFLY_REPLACEMENT_FAILED,
+ * Waiting releases admission between work quanta and remains bound to the
+ * admitted generation. Cancellation or target-name reuse returns ANTFLY_CANCELLED;
+ * a different generation under the same name never completes the original wait.
+ * Precondition failures are ANTFLY_REPLACEMENT_FAILED,
  * ANTFLY_REPLACEMENT_PENDING or ANTFLY_REPLACEMENT_CONFIGURATION_MISMATCH.
  * pending_work_stats_json reports progress, retry_count, retry_after_ns and
  * last_error. Consecutive transient failures retry four times with persisted

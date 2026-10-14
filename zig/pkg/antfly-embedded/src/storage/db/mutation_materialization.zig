@@ -505,7 +505,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             while (final_it.next()) |entry| : (artifact_index += 1) {
                 artifact_keys[artifact_index] = entry.key_ptr.*;
             }
-            std.mem.sort([]const u8, artifact_keys, {}, struct {
+            std.mem.sortUnstable([]const u8, artifact_keys, {}, struct {
                 fn lessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
                     return std.mem.order(u8, lhs, rhs) == .lt;
                 }
@@ -1214,7 +1214,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 defer artifact_ref.deinit(alloc);
                 try appendUniqueOwnedKey(alloc, &artifact_names, artifact_ref.name);
             }
-            std.mem.sort([]u8, artifact_names.items, {}, struct {
+            std.mem.sortUnstable([]u8, artifact_names.items, {}, struct {
                 fn lessThan(_: void, lhs: []u8, rhs: []u8) bool {
                     return std.mem.order(u8, lhs, rhs) == .lt;
                 }
@@ -4233,7 +4233,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             return try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = obj }, .{});
         }
 
-        pub fn buildDerivedBatch(
+        pub noinline fn buildDerivedBatch(
             alloc: Allocator,
             req: types.BatchRequest,
             extracted: []const mapper.ExtractedWrite,
@@ -8343,7 +8343,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
             }
             if (removed_indices.items.len == 0) return;
-            std.mem.sort(usize, removed_indices.items, {}, std.sort.asc(usize));
+            std.mem.sortUnstable(usize, removed_indices.items, {}, std.sort.asc(usize));
 
             const kept_len = owned.writes.len - removed_indices.items.len;
             const kept = try owned.alloc.alloc(mapper.DenseEmbeddingWrite, kept_len);

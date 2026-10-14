@@ -3942,7 +3942,7 @@ pub const IndexManager = struct {
                 for (refs.embedding_names) |name| try hashes.append(self.alloc, internal_keys.embeddingArtifactScopeHashForName(name));
             } else try hashes.append(self.alloc, internal_keys.embeddingArtifactScopeHashForName(refs.embedding_name orelse cfg.name));
         }
-        std.mem.sort(u64, hashes.items, {}, std.sort.asc(u64));
+        std.mem.sortUnstable(u64, hashes.items, {}, std.sort.asc(u64));
         return hashes.toOwnedSlice(self.alloc);
     }
 
@@ -3960,7 +3960,7 @@ pub const IndexManager = struct {
                 offset += 1;
             }
         }
-        std.mem.sort(u64, hashes, {}, std.sort.asc(u64));
+        std.mem.sortUnstable(u64, hashes, {}, std.sort.asc(u64));
         var unique_count: usize = 0;
         for (hashes) |hash| {
             if (unique_count != 0 and hashes[unique_count - 1] == hash) continue;
@@ -24807,7 +24807,7 @@ pub const IndexManager = struct {
         }
 
         const candidate_vector_ids = vector_ids_storage[0..filled];
-        std.mem.sort(u64, candidate_vector_ids, {}, std.sort.asc(u64));
+        std.mem.sortUnstable(u64, candidate_vector_ids, {}, std.sort.asc(u64));
         var unique_count: usize = 0;
         var previous: ?u64 = null;
         for (candidate_vector_ids) |vector_id| {
@@ -26472,7 +26472,7 @@ pub const IndexManager = struct {
 
         const sorted_ordinals = try alloc.dupe(doc_identity.DocOrdinal, ordinals);
         defer alloc.free(sorted_ordinals);
-        std.mem.sort(doc_identity.DocOrdinal, sorted_ordinals, {}, docOrdinalLessThan);
+        std.mem.sortUnstable(doc_identity.DocOrdinal, sorted_ordinals, {}, docOrdinalLessThan);
 
         const IdentityOrdinalKey = @TypeOf(internal_keys.identityOrdinalToDocKey(0));
         var key_storage = try alloc.alloc(IdentityOrdinalKey, sorted_ordinals.len);
@@ -30950,7 +30950,7 @@ pub const IndexManager = struct {
 
         var sorted_ordinals = try alloc.dupe(doc_identity.DocOrdinal, ordinals);
         defer alloc.free(sorted_ordinals);
-        std.mem.sort(doc_identity.DocOrdinal, sorted_ordinals, {}, docOrdinalLessThan);
+        std.mem.sortUnstable(doc_identity.DocOrdinal, sorted_ordinals, {}, docOrdinalLessThan);
         const unique_ordinals = sorted_ordinals[0..uniqueSortedDocOrdinals(sorted_ordinals)];
 
         var out = try std.ArrayListUnmanaged(u64).initCapacity(alloc, unique_ordinals.len);
@@ -30977,7 +30977,7 @@ pub const IndexManager = struct {
 
         var sorted_ordinals = try alloc.dupe(doc_identity.DocOrdinal, ordinals);
         defer alloc.free(sorted_ordinals);
-        std.mem.sort(doc_identity.DocOrdinal, sorted_ordinals, {}, docOrdinalLessThan);
+        std.mem.sortUnstable(doc_identity.DocOrdinal, sorted_ordinals, {}, docOrdinalLessThan);
         const unique_ordinals = sorted_ordinals[0..uniqueSortedDocOrdinals(sorted_ordinals)];
 
         var cached_out = std.ArrayListUnmanaged(u64).empty;
