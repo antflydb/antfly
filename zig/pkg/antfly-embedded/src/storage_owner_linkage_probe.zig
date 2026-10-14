@@ -298,6 +298,20 @@ fn exerciseForeignPredicate(alloc: std.mem.Allocator, db: *db_mod.DB) !void {
             return error.TestWindowFailed;
         }
     };
+    const Accept = struct {
+        fn allows(ptr: *anyopaque, _: []const u8) anyerror!bool {
+            const count: *usize = @ptrCast(@alignCast(ptr));
+            count.* += 1;
+            return true;
+        }
+    };
+    var accepted: usize = 0;
+    var captured = try db.searchWithCapturedRequest(alloc, .{ .native_key_predicate = .{ .ptr = &accepted, .allows = Accept.allows } });
+    defer captured.result.deinit();
+    const retained = captured.request.native_key_predicate orelse return error.SharedStorageErrorIdentityLost;
+    if (retained.ptr != @as(*anyopaque, @ptrCast(&accepted)) or retained.allows != Accept.allows)
+        return error.SharedStorageErrorIdentityLost;
+    if (!try retained.allows(retained.ptr, "vector-row")) return error.SharedStorageErrorIdentityLost;
     var count: usize = 0;
     const snapshot = try db.searchRequestAtCurrentIdentityGeneration(.{ .native_key_predicate = .{ .ptr = &count, .allows = Callback.allows } });
     const predicate = snapshot.native_key_predicate orelse return error.SharedStorageErrorIdentityLost;

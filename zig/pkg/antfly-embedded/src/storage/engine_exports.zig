@@ -1581,7 +1581,9 @@ fn searchWithCapturedRequest(self: *DB, alloc: std.mem.Allocator, req: types.Sea
     var source = req.native_key_predicate;
     var received = req;
     if (source) |*predicate| received.native_key_predicate = predicate.receiver();
-    return .{ .value = self.searchWithCapturedRequest(alloc, received) catch |err| return .{ .failure = .init(@errorName(err)) } };
+    var result = self.searchWithCapturedRequest(alloc, received) catch |err| return .{ .failure = .init(@errorName(err)) };
+    result.request.native_key_predicate = req.native_key_predicate;
+    return .{ .value = result };
 }
 
 fn preflightSearchRequest(self: *DB, alloc: std.mem.Allocator, req: types.SearchRequest, max_work: u32) engine.Outcome(@import("db/query/search_exec.zig").RuntimePreflightSummary) {
@@ -2024,12 +2026,12 @@ comptime {
                 return @ptrCast(&@field(Exports, name));
             }
         };
-        @export(&Accessor.get, .{ .name = "antfly_storage_engine_" ++ name ++ "_v20", .visibility = .hidden });
+        @export(&Accessor.get, .{ .name = "antfly_storage_engine_" ++ name ++ "_v21", .visibility = .hidden });
     }
     @export(&clearError, .{ .name = "antfly_storage_error_clear_v1", .visibility = .hidden });
     @export(&errorCode, .{ .name = "antfly_storage_error_code_v1", .visibility = .hidden });
     @export(&errorDetail, .{ .name = "antfly_storage_error_detail_v1", .visibility = .hidden });
     @export(&setError, .{ .name = "antfly_storage_error_set_v1", .visibility = .hidden });
     @export(&getAggregationDescriptor, .{ .name = "antfly_storage_engine_get_aggregation_descriptor_v1", .visibility = .hidden });
-    @export(&getDescriptor, .{ .name = "antfly_storage_engine_get_descriptor_v20", .visibility = .hidden });
+    @export(&getDescriptor, .{ .name = "antfly_storage_engine_get_descriptor_v21", .visibility = .hidden });
 }

@@ -412,7 +412,8 @@ fn processChangedExtractionWithConfigOptions(
 
     const candidate_batch = if (candidate_source) |source| try source.beginBatch(gpa, &.{cfg.table}) else null;
     defer if (candidate_batch) |batch| batch.deinit(gpa);
-    const batch_source = if (candidate_batch) |batch| batch.source else null;
+    var receiving_source = if (candidate_batch) |batch| batch.source.receive() else null;
+    const batch_source = if (receiving_source) |*receiver| receiver.sourceView() else null;
 
     const sibling_excludes = try siblingClaimedLabelsAlloc(gpa, resolvers, cfg);
     defer freeSiblingClaimedLabels(gpa, sibling_excludes);

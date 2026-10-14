@@ -51380,9 +51380,9 @@ fn appendResolutionRecordWithHook(
     defer if (snapshot_replay) |*lease| lease.release();
 
     var cache_batch: ?resolution_runtime_mod.CandidateSource.CacheBatch = null;
-    if (ctx.cache_source) |source| if (source.vtable.embedding_cache_prepare) |prepare| {
-        cache_batch = prepare(source.ptr, batch_ctx.alloc, batch_ctx.store) catch null;
-    };
+    if (ctx.cache_source) |source| {
+        cache_batch = source.prepareCache(batch_ctx.alloc, batch_ctx.store) catch null;
+    }
     var cache_committed = false;
     defer if (cache_batch) |batch| batch.finish(batch.ptr, cache_committed);
     const extra_writes = if (cache_batch) |batch| batch.writes.len else 0;
@@ -51434,7 +51434,7 @@ fn appendResolutionRecordWithHook(
     releaseReplicationMutationShared(&replication_mutation);
 
     try deferred_replication_gates.waitForDurabilityAndAuthority(batch_ctx.replication_write_gate);
-    if (cache_batch == null) if (ctx.cache_source) |source| if (source.vtable.embedding_cache_flush) |flush| flush(source.ptr) catch {};
+    if (cache_batch == null) if (ctx.cache_source) |source| source.flushCache() catch {};
     before_handoff_publish.run();
     try publishResolutionHandoffContext(&batch_ctx, write);
     notifyResolverReplayRuntimesForCatalog(ctx.index_manager, ctx.resolution_runtime, ctx.promotion_runtime, sequence);
