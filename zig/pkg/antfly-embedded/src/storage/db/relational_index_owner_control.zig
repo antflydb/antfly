@@ -32,7 +32,7 @@ const pages = @import("relational_index_jobs.zig");
 const resources = @import("../resource_manager.zig");
 const RequestContext = @import("../../api/operation.zig").RequestContext;
 const Waiters = @import("../admission_waiter.zig").Fifo(void);
-pub const envelope_version = 23;
+pub const envelope_version = 24;
 pub const max_cancellation_wire_bytes = 32 * 1024;
 pub const max_encoded_inputs = std.base64.standard.Encoder.calcSize(inputs.max_bytes);
 pub const max_claim_wire_bytes = 6 * private_claims.max_bytes + 128 * 1024;
@@ -65,6 +65,7 @@ pub const Identity = struct {
 pub const SourceRead = struct {
     binding: jobs.Binding,
     batch: ?private_claims.SourceStream.OwnedBatch = null,
+    consumed: ?private_claims.SourceStream.Consumption = null,
     replication_pending: bool = false,
     error_name: ?[]const u8 = null,
 
@@ -81,7 +82,9 @@ pub const SourceRead = struct {
             b.fence.owner_group_id != identity.owner_group_id or !b.fence.namespace.eql(identity.namespace) or
             !std.mem.eql(u8, &b.id, &identity.id) or !std.mem.eql(u8, &b.plan_digest, &identity.plan_digest) or
             !std.mem.eql(u8, &b.owner_digest, &identity.owner_digest) or self.replication_pending != (self.error_name != null) or
-            (self.replication_pending and self.batch != null)) return error.InvalidPrivateIndexClaimInventory;
+            (self.replication_pending and (self.batch != null or self.consumed != null))) return error.InvalidPrivateIndexClaimInventory;
+        if (self.consumed) |record| try record.requireFor(self.binding);
+        try requireSourcePrefix(self.binding, if (self.batch) |batch| batch.header else null, self.consumed);
     }
 
     pub fn digest(self: *const SourceRead) !integrity.Digest {
@@ -100,6 +103,7 @@ pub const SourceWire = struct {
     binding: jobs.Binding,
     header: ?private_claims.SourceStream.Header = null,
     payload_b64: ?[]const u8 = null,
+    consumed: ?private_claims.SourceStream.Consumption = null,
     replication_pending: bool = false,
     error_name: ?[]const u8 = null,
 
@@ -108,9 +112,10 @@ pub const SourceWire = struct {
     pub fn requireIdentity(self: SourceWire, identity: Identity) !void {
         if (self.replication_pending != (self.error_name != null)) return error.InvalidPrivateIndexClaimInventory;
         if (self.error_name) |name| if (!std.mem.eql(u8, name, "ReplicationOutboxPending")) return error.InvalidPrivateIndexClaimInventory;
-        try (SourceRead{ .binding = self.binding, .replication_pending = self.replication_pending, .error_name = self.error_name }).requireIdentity(identity);
+        try (SourceRead{ .binding = self.binding, .consumed = self.consumed, .replication_pending = self.replication_pending, .error_name = self.error_name }).requireIdentity(identity);
         if ((self.header == null) != (self.payload_b64 == null) or (self.replication_pending and self.header != null)) return error.InvalidPrivateIndexClaimInventory;
         if (self.header) |header| _ = try private_claims.SourceStream.Header.decode(&header.bytes, self.binding, std.mem.readInt(u64, header.bytes[104..112], .little));
+        try requireSourcePrefix(self.binding, self.header, self.consumed);
         if (self.payload_b64) |encoded| if (encoded.len > max_payload_b64) return error.InvalidPrivateIndexClaimInventory;
     }
 
@@ -122,7 +127,7 @@ pub const SourceWire = struct {
     pub fn decode(self: SourceWire, alloc: Allocator, identity: Identity) !SourceRead {
         try self.requireIdentity(identity);
         // The parsed wire arena may be released immediately after decoding.
-        var result: SourceRead = .{ .binding = self.binding, .replication_pending = self.replication_pending, .error_name = if (self.replication_pending) "ReplicationOutboxPending" else null };
+        var result: SourceRead = .{ .binding = self.binding, .consumed = self.consumed, .replication_pending = self.replication_pending, .error_name = if (self.replication_pending) "ReplicationOutboxPending" else null };
         try result.requireIdentity(identity);
         if ((self.header == null) != (self.payload_b64 == null) or (self.replication_pending and self.header != null)) return error.InvalidPrivateIndexClaimInventory;
         if (self.payload_b64) |encoded| {
@@ -138,6 +143,19 @@ pub const SourceWire = struct {
         return result;
     }
 };
+
+/// Wire observations cannot splice a valid old consumed prefix into another
+/// first-pending batch. This remains structural data, not a source signature.
+fn requireSourcePrefix(binding: jobs.Binding, header: ?private_claims.SourceStream.Header, consumed: ?private_claims.SourceStream.Consumption) !void {
+    const batch = header orelse return;
+    const ordinal = std.mem.readInt(u64, batch.bytes[104..112], .little);
+    if (consumed) |record| {
+        try record.requireFor(binding);
+        if (record.accepted.ordinal == std.math.maxInt(u64) or ordinal != record.accepted.ordinal + 1 or record.accepted.state != .building or
+            !std.mem.eql(u8, batch.bytes[256..288], &record.accepted.batch_digest) or !std.mem.eql(u8, batch.bytes[40..72], &record.accepted.scope_digest) or
+            (try batch.position()).sequence <= record.accepted.source_sequence) return error.InvalidPrivateIndexClaimInventory;
+    } else if (ordinal != 1 or !std.mem.allEqual(u8, batch.bytes[256..288], 0)) return error.InvalidPrivateIndexClaimInventory;
+}
 
 fn sourceHeaderCommitment(binding: jobs.Binding, header: private_claims.SourceStream.Header) !integrity.Digest {
     _ = try private_claims.SourceStream.Header.decode(&header.bytes, binding, std.mem.readInt(u64, header.bytes[104..112], .little));
@@ -305,11 +323,13 @@ pub const Effect = union(enum) {
     cancel_cleanup: jobs.Binding,
     claims: ClaimCommand,
     build: pages.Page.PrivateCommand,
+    consume: ConsumeCommand,
 
     pub fn namespace(self: Effect) @FieldType(Native, "namespace") {
         return switch (self) {
             .control, .cancel_control => |value| value.binding.fence.namespace,
             .claims => |value| value.binding.fence.namespace,
+            .consume => |value| value.binding.fence.namespace,
             .build => |value| value.binding.fence.namespace,
             .cancel_intent => |value| value.fence.namespace,
             .cancel_cleanup => |value| value.fence.namespace,
@@ -320,6 +340,7 @@ pub const Effect = union(enum) {
         switch (self) {
             .control, .cancel_control => |value| try value.validate(),
             .claims => |value| try value.validate(),
+            .consume => |value| try value.validate(),
             .build => |value| try value.validate(),
             .cancel_intent => |value| try value.validate(),
             .cancel_cleanup => |value| {
@@ -466,6 +487,86 @@ pub const ClaimOutcome = struct {
         var result: integrity.Digest = undefined;
         state.final(&result);
         return result;
+    }
+};
+
+pub const ConsumeCommand = struct {
+    binding: jobs.Binding,
+    accepted: private_claims.SourceStream.Accepted,
+    pub fn validate(self: ConsumeCommand) !void {
+        _ = try self.binding.encode();
+        try self.accepted.validate();
+        var binding_digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(&try self.binding.encode(), &binding_digest, .{});
+        if (self.binding.authority != .native or self.binding.phase != .reserved or
+            !std.mem.eql(u8, &self.accepted.binding_digest, &binding_digest)) return error.InvalidPrivateIndexClaimReceipt;
+    }
+};
+
+pub const ConsumeOutcome = struct {
+    binding: jobs.Binding,
+    accepted: private_claims.SourceStream.Accepted,
+    record: ?private_claims.SourceStream.Consumption,
+    position: Native,
+    duplicate: bool,
+    replication_pending: bool = false,
+    error_name: ?[]const u8 = null,
+    pub fn validateFor(self: ConsumeOutcome, command: ConsumeCommand) !void {
+        try command.validate();
+        if (!std.mem.eql(u8, &try self.binding.encode(), &try command.binding.encode()) or
+            !std.mem.eql(u8, &try self.accepted.encode(), &try command.accepted.encode()) or
+            self.replication_pending != (self.error_name != null)) return error.InvalidPrivateIndexNativeReceipt;
+        const record = self.record orelse return error.InvalidPrivateIndexNativeReceipt;
+        try record.requireFor(self.binding);
+        if (!std.mem.eql(u8, &record.accepted.decision_digest, &self.accepted.decision_digest) or !std.meta.eql(record.position, self.position)) return error.InvalidPrivateIndexNativeReceipt;
+    }
+};
+
+/// Off-lock canonical preparation and the same native apply/outbox machinery
+/// as build/claims. Metadata authorization belongs to the receiving server.
+pub const PreparedConsumption = struct {
+    pub const ApplyOutcome = ConsumeOutcome;
+    alloc: Allocator,
+    command: ConsumeCommand,
+    prepared: private_claims.SourceStream.PreparedConsumption,
+    payload: ?[]u8 = null,
+    prefix_len: usize = 0,
+    pub fn init(alloc: Allocator, txn: anytype, command: ConsumeCommand) !PreparedConsumption {
+        try command.validate();
+        try PreparedBuild.verifyRecovery(txn, command.binding);
+        return .{ .alloc = alloc, .command = command, .prepared = try private_claims.SourceStream.PreparedConsumption.init(alloc, txn, command.binding, command.accepted) };
+    }
+    pub fn deinit(self: *PreparedConsumption) void {
+        if (self.payload) |bytes| self.alloc.free(bytes);
+        self.prepared.deinit();
+        self.* = undefined;
+    }
+    pub fn validate(self: *const PreparedConsumption) !void {
+        try self.command.validate();
+    }
+    pub fn namespace(self: *const PreparedConsumption) @FieldType(Native, "namespace") {
+        return self.command.binding.fence.namespace;
+    }
+    pub fn validateReplay(self: *const PreparedConsumption, position: Native) !void {
+        try (Frame{ .effect = .{ .consume = self.command }, .position = position }).validate();
+    }
+    pub fn replayDuplicateOutcome(self: *const PreparedConsumption, position: Native) ConsumeOutcome {
+        return .{ .binding = self.command.binding, .accepted = self.command.accepted, .record = null, .position = position, .duplicate = true };
+    }
+    pub fn stage(self: *PreparedConsumption, _: anytype, txn: anytype, replay: ?Native) !ConsumeOutcome {
+        try PreparedBuild.verifyRecovery(txn, self.command.binding);
+        const result = try self.prepared.stage(txn, replay);
+        return .{ .binding = self.command.binding, .accepted = self.command.accepted, .record = result.record, .position = result.record.position, .duplicate = result.duplicate };
+    }
+    pub fn hasPublicationReceipt(_: *const PreparedConsumption) bool {
+        return false;
+    }
+    pub fn populateReceipt(_: *const PreparedConsumption, _: anytype, _: *ConsumeOutcome) !void {}
+    pub fn preparePayload(self: *PreparedConsumption) !void {
+        try prepareNativePayload(self, "consume", self.command, max_cancellation_wire_bytes);
+    }
+    pub fn finalizePayload(self: *PreparedConsumption, position: Native) ![]const u8 {
+        return finalizeNativePayload(self, position);
     }
 };
 

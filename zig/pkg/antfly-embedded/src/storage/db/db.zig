@@ -7966,6 +7966,14 @@ pub const DB = struct {
                     defer prepared.deinit();
                     _ = try self.applyPreparedNativeIndexOwnerClaims(&prepared, .{ .position = frame.position, .lsn = sequence });
                 },
+                .consume => |command| {
+                    var prepared = self.prepareNativeIndexSourceConsumption(command) catch |err| {
+                        if (try self.replicationMutationAlreadyApplied(sequence)) return;
+                        return err;
+                    };
+                    defer prepared.deinit();
+                    _ = try self.applyPreparedNativeIndexSourceConsumption(&prepared, .{ .position = frame.position, .lsn = sequence });
+                },
                 .control => |command| {
                     var prepared = self.prepareNativeIndexOwnerControl(command) catch |err| {
                         // Another replay may retire inputs during preparation.
@@ -8054,6 +8062,8 @@ pub const DB = struct {
         }
         var result: native_index_control.SourceRead = .{ .binding = binding, .batch = try PreparedNativeIndexOwnerBuild.peekClaimSource(alloc, &read, binding) };
         errdefer result.deinit();
+        const Source = @import("relational_index_private_claims.zig").SourceStream;
+        if (try Source.load(&read, binding)) |head| result.consumed = try Source.loadConsumption(&read, binding, head);
         try context.ensureActive();
         return result;
     }
@@ -8238,6 +8248,19 @@ pub const DB = struct {
 
     pub fn prepareNativeIndexOwnerCancellation(self: *DB, intent: NativeIndexOwnerAdmission) !PreparedNativeIndexOwnerCancellation {
         return PreparedNativeIndexOwnerCancellation.init(self.alloc, intent);
+    }
+
+    pub const PreparedNativeIndexSourceConsumption = native_index_control.PreparedConsumption;
+    pub const NativeIndexSourceConsumptionOutcome = native_index_control.ConsumeOutcome;
+    /// Private execution only. The server independently observes durable
+    /// metadata acceptance; no ordinary mutation/API body selects this effect.
+    pub fn prepareNativeIndexSourceConsumption(self: *DB, command: native_index_control.ConsumeCommand) !PreparedNativeIndexSourceConsumption {
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        return PreparedNativeIndexSourceConsumption.init(self.alloc, &read, command);
+    }
+    pub fn applyPreparedNativeIndexSourceConsumption(self: *DB, prepared: *PreparedNativeIndexSourceConsumption, replay: ?NativeIndexReplay) !NativeIndexSourceConsumptionOutcome {
+        return self.applyPreparedNativeIndexEffect(prepared, replay);
     }
 
     pub const PreparedNativeIndexOwnerCleanup = native_index_control.PreparedCleanup;

@@ -27,6 +27,32 @@ const primary_mod = @import("antfly_server_test_sources").local_test_sources.sto
 const time = @import("antfly_platform").time;
 const alloc = std.testing.allocator;
 
+/// Synthetic metadata decision for storage-engine qualification only. Public
+/// receivers must fetch real durable acceptance from independent metadata.
+fn sourceDecision(binding: @import("relational_index_owner_job.zig").Binding, header: @import("relational_index_private_claims.zig").SourceStream.Header, previous: ?@import("relational_index_private_claims.zig").SourceStream.Accepted, logical_digest: [32]u8) !@import("relational_index_private_claims.zig").SourceStream.Accepted {
+    const Source = @import("relational_index_private_claims.zig").SourceStream;
+    var binding_digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(&try binding.encode(), &binding_digest, .{});
+    const count = std.mem.readInt(u32, header.bytes[96..100], .little);
+    var result: Source.Accepted = .{
+        .metadata_incarnation = @splat('1'),
+        .binding_digest = binding_digest,
+        .scope_digest = header.bytes[40..72].*,
+        .ordinal = std.mem.readInt(u64, header.bytes[104..112], .little),
+        .rows = (if (previous) |value| value.rows else @as(u64, 0)) + count,
+        .batch_rows = count,
+        .source_sequence = (try header.position()).sequence,
+        .batch_digest = header.digest(),
+        .logical_digest = logical_digest,
+        .previous_decision = if (previous) |value| value.decision_digest else @splat(0),
+        .decision_digest = @splat(0),
+        .state = @fromBackingInt(@intCast(header.bytes[184])),
+    };
+    result.decision_digest = result.computedDigest();
+    try result.requireFor(binding, header);
+    return result;
+}
+
 test {
     _ = @import("antfly_server_test_sources").local_test_sources.storage_relational_read_set;
     _ = @import("antfly_server_test_sources").local_test_sources.storage_retained_read_registry;
@@ -498,6 +524,80 @@ test "relational index build pages native owner control preserves committed cuts
             try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, db_mod.DB.PreparedNativeIndexOwnerBuild.verifyRecovery(&fault_txn, reserved));
         }
     }
+    // Deliver actual claims on both replicas, then consume only the source
+    // batch covered by the test metadata decision. The same native outbox and
+    // transport marker must carry deletion plus the retained consumption cut.
+    {
+        const native = @import("relational_index_owner_control.zig");
+        const Source = @import("relational_index_private_claims.zig").SourceStream;
+        var reserved = binding;
+        reserved.phase = .reserved;
+        var read = try primary.core.store.beginReadTxn();
+        var batch = (try db_mod.DB.PreparedNativeIndexOwnerBuild.peekClaimSource(alloc, &read, reserved)).?;
+        read.abort();
+        defer batch.deinit();
+        const command: native.ClaimCommand = .{ .binding = reserved, .claims = &.{.{ .parent_table = batch.scope.table_name, .parent_key = batch.rows()[0].key, .tuple = batch.rows()[0].tuple, .schema_version = reserved.physical_candidate.schema_version }} };
+        var claims = try primary.prepareNativeIndexOwnerClaims(command);
+        defer claims.deinit();
+        if (publisher.payload) |bytes| alloc.free(bytes);
+        publisher.payload = null;
+        publisher.lsn = 8;
+        publisher.fail = false;
+        primary.local_execution.replication_async_batch_mirror = publisher.asMirror();
+        const delivered = try primary.applyPreparedNativeIndexOwnerClaims(&claims, null);
+        try delivered.validateFor(command);
+        const claim_payload = try claims.finalizePayload(delivered.position);
+        try replication_ingress.applyRecord(&standby, .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 8, .previous_lsn = 7, .payload = claim_payload });
+        const accepted = try sourceDecision(reserved, batch.header, null, try command.digest());
+        var consume = try primary.prepareNativeIndexSourceConsumption(.{ .binding = reserved, .accepted = accepted });
+        defer consume.deinit();
+        if (publisher.payload) |bytes| alloc.free(bytes);
+        publisher.payload = null;
+        publisher.lsn = 9;
+        publisher.fail = true;
+        const pending = try primary.applyPreparedNativeIndexSourceConsumption(&consume, null);
+        try pending.validateFor(consume.command);
+        try std.testing.expect(pending.replication_pending);
+        try std.testing.expect(pending.position.sequence > (try batch.header.position()).sequence);
+        const identity: native.Identity = .{ .id = reserved.id, .plan_digest = reserved.plan_digest, .owner_digest = reserved.owner_digest, .ordinal = reserved.ordinal, .namespace = reserved.fence.namespace, .owner_group_id = reserved.fence.owner_group_id };
+        var blocked = try primary.readNativeIndexClaimSource(alloc, identity, .{});
+        defer blocked.deinit();
+        try std.testing.expect(blocked.replication_pending and blocked.batch == null and blocked.consumed == null);
+        const payload = try consume.finalizePayload(pending.position);
+        primary.local_execution.replication_async_batch_mirror = null;
+        primary.close();
+        primary = try db_mod.DB.open(alloc, primary_dir.path(), options);
+        publisher.fail = false;
+        primary.local_execution.replication_async_batch_mirror = publisher.asMirror();
+        try primary.flushDurableReplicationOutboxes();
+        const duplicate = try primary.applyPreparedNativeIndexSourceConsumption(&consume, null);
+        try std.testing.expect(duplicate.duplicate and !duplicate.replication_pending);
+        try std.testing.expectEqual(pending.position, duplicate.position);
+        const record: @import("replication_record.zig").Record = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 9, .previous_lsn = 8, .payload = payload };
+        var decoded = try effects.decodeBatchMutationRequest(alloc, record);
+        defer decoded.deinit();
+        var gap = try replication_ingress.normalizeBatch(decoded.value);
+        gap.index_owner_control.?.position.sequence += 1;
+        gap.receipt = .{ .native = gap.index_owner_control.?.position };
+        try std.testing.expectError(error.InvalidControlReceiptPosition, standby.applyReplicatedBatch(gap, 9));
+        try std.testing.expectEqual(@as(u64, 8), try standby.replicationAppliedSequence());
+        try replication_ingress.applyRecord(&standby, record);
+        try replication_ingress.applyRecord(&standby, record);
+        for ([_]*db_mod.DB{ &primary, &standby }) |db| {
+            var check = try db.core.store.beginReadTxn();
+            defer check.abort();
+            try db_mod.DB.PreparedNativeIndexOwnerBuild.verifyRecovery(&check, reserved);
+            const head = (try Source.load(&check, reserved)).?;
+            try std.testing.expectEqual(@as(u64, 1), head.consumed);
+            try std.testing.expectEqual(@as(u64, 3), head.pending());
+            try std.testing.expectError(error.NotFound, check.get(&Source.key(binding.id, 1, true)));
+            const retained = (try Source.loadConsumption(&check, reserved, head)).?;
+            try std.testing.expectEqualDeep(pending.record.?, retained);
+            try std.testing.expectEqual(pending.position.sequence, (try authority.load(&check)).?.sequence);
+        }
+        primary.local_execution.replication_async_batch_mirror = null;
+    }
+
     // Prepare first, then let a newer ordinary transport receipt win. The
     // apply-lock recheck must suppress the old effect and retain the newer LSN.
     var stale = try standby.prepareNativeIndexOwnerControl(.{ .effect = .fenced, .binding = binding });
@@ -1083,6 +1183,74 @@ test "relational index build pages identity dispatch caches immutable candidates
         var read = try db.core.store.beginReadTxn();
         defer read.abort();
         try std.testing.expectEqual(delivered_position.?.sequence, (try authority.load(&read)).?.sequence);
+    }
+    // Consume the actual nine queued pages, including empty EOF, without
+    // recompiling the candidate or changing the physical build checkpoint.
+    {
+        const Source = @import("relational_index_private_claims.zig").SourceStream;
+        var previous: ?Source.Accepted = null;
+        for (0..9) |i| {
+            var source = try db.readNativeIndexClaimSource(alloc, identity, .{});
+            defer source.deinit();
+            const header = source.batch.?.header;
+            var claims: [@import("relational_index_private_claims.zig").max_claims]@import("relational_integrity_contract.zig").Claim = undefined;
+            for (source.batch.?.rows(), 0..) |row, index| claims[index] = .{ .parent_table = source.batch.?.scope.table_name, .parent_key = row.key, .tuple = row.tuple, .schema_version = binding.physical_candidate.schema_version };
+            var logical_digest: [32]u8 = @splat(7);
+            if (source.batch.?.count != 0) {
+                const delivered_command: native.ClaimCommand = .{ .binding = binding, .claims = claims[0..source.batch.?.count] };
+                var delivered = try db.prepareNativeIndexOwnerClaims(delivered_command);
+                defer delivered.deinit();
+                const result = try db.applyPreparedNativeIndexOwnerClaims(&delivered, null);
+                try result.validateFor(delivered_command);
+                logical_digest = try delivered_command.digest();
+            }
+            const accepted = try sourceDecision(binding, header, previous, logical_digest);
+            var prepared = try db.prepareNativeIndexSourceConsumption(.{ .binding = binding, .accepted = accepted });
+            defer prepared.deinit();
+            {
+                var aborted = try db.core.store.beginWriteTxn();
+                defer aborted.abort();
+                _ = try prepared.prepared.stage(&aborted, null);
+            }
+            const outcome = try db.applyPreparedNativeIndexSourceConsumption(&prepared, null);
+            try outcome.validateFor(prepared.command);
+            try std.testing.expect(!outcome.duplicate and !outcome.replication_pending);
+            const duplicate = try db.applyPreparedNativeIndexSourceConsumption(&prepared, null);
+            try duplicate.validateFor(prepared.command);
+            try std.testing.expect(duplicate.duplicate);
+            try std.testing.expectEqual(outcome.position, duplicate.position);
+            var check = try db.core.store.beginReadTxn();
+            defer check.abort();
+            try db_mod.DB.PreparedNativeIndexOwnerBuild.verifyRecovery(&check, binding);
+            const head = (try Source.load(&check, binding)).?;
+            try std.testing.expectEqual(@as(u64, i + 1), head.consumed);
+            try std.testing.expectEqual(@as(u64, 8 - i), head.pending());
+            try std.testing.expectEqual(accepted.rows, head.consumed_rows);
+            try std.testing.expectEqual((try header.position()).sequence, head.consumed_sequence);
+            try std.testing.expect(outcome.position.sequence > head.consumed_sequence);
+            try std.testing.expectError(error.NotFound, check.get(&Source.key(binding.id, accepted.ordinal, true)));
+            try std.testing.expectEqual(outcome.position.sequence, (try authority.load(&check)).?.sequence);
+            previous = accepted;
+        }
+        try std.testing.expectEqual(@as(u64, 32), previous.?.rows);
+        db.close();
+        db = try db_mod.DB.open(alloc, directory.path(), options);
+        var source = try db.readNativeIndexClaimSource(alloc, identity, .{});
+        defer source.deinit();
+        try source.requireIdentity(identity);
+        try std.testing.expect(source.batch == null and source.consumed != null);
+        try std.testing.expectEqual(Source.State.ready, source.consumed.?.accepted.state);
+        try std.testing.expectEqual(previous.?.decision_digest, source.consumed.?.accepted.decision_digest);
+        {
+            var missing = try db.core.store.beginWriteTxn();
+            defer missing.abort();
+            try missing.delete(Source.consumption_key);
+            try std.testing.expectError(error.PrivateIndexRootRecoveryRequired, db_mod.DB.PreparedNativeIndexOwnerBuild.verifyRecovery(&missing, binding));
+        }
+        const complete = try db.stepNativeIndexOwnerBuild("items", request, .{});
+        try std.testing.expectEqual(@as(u64, 0), complete.complete.claim_batches_pending);
+        try std.testing.expectEqual(last_position.?, complete.complete.position);
+        try std.testing.expectEqual(@as(u32, 1), db.core.schema.?.version);
     }
     var cancellation = try db.prepareNativeIndexOwnerCancellation(native.Admission.fromBinding(binding));
     defer cancellation.deinit();

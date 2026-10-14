@@ -101,25 +101,11 @@ pub const Consumed = struct {
     proof: publication.RootProof,
 
     pub fn digest(self: Consumed) !Digest {
-        try self.position.validate();
         if (self.ordinal == 0 or self.proof.authority != .native or
             !nonzero(&self.metadata_incarnation) or !nonzero(&self.binding_digest) or
             !nonzero(&self.batch_digest) or !nonzero(&self.decision_digest) or
             !equal(self.metadata_incarnation, self.proof.identity.metadata_incarnation)) return error.InvalidPrivateIndexClaimReceipt;
-        var state = std.crypto.hash.Blake3.init(.{});
-        state.update("antfly/private-unique-source-consumed/v1");
-        state.update(&self.metadata_incarnation);
-        state.update(&self.binding_digest);
-        state.update(&self.batch_digest);
-        state.update(&self.decision_digest);
-        var numbers: [16]u8 = undefined;
-        std.mem.writeInt(u64, numbers[0..8], self.ordinal, .little);
-        std.mem.writeInt(u64, numbers[8..16], self.rows, .little);
-        state.update(&numbers);
-        state.update(&try (positions.Position{ .native = self.position }).encode());
-        var result: Digest = undefined;
-        state.final(&result);
-        return result;
+        return (Source.ConsumedPrefix{ .metadata_incarnation = self.metadata_incarnation, .binding_digest = self.binding_digest, .ordinal = self.ordinal, .batch_digest = self.batch_digest, .decision_digest = self.decision_digest, .rows = self.rows, .position = self.position }).digest();
     }
     pub fn verify(self: Consumed) !void {
         self.proof.verify(try self.digest()) catch return error.InvalidPrivateIndexClaimReceipt;
@@ -145,17 +131,11 @@ pub const Head = struct {
     previous_provenance: Digest,
     state: Source.State,
 
+    pub fn accepted(self: Head) Source.Accepted {
+        return .{ .metadata_incarnation = self.metadata_incarnation, .binding_digest = self.binding_digest, .scope_digest = self.scope_digest, .ordinal = self.ordinal, .rows = self.rows, .batch_rows = self.batch_rows, .source_sequence = self.source_sequence, .batch_digest = self.batch_digest, .logical_digest = self.logical_digest, .previous_decision = self.previous_decision, .decision_digest = self.decision_digest, .state = self.state };
+    }
     fn decision(self: Head) Digest {
-        var state = std.crypto.hash.Blake3.init(.{});
-        state.update("antfly/private-unique-accepted-decision/v1");
-        inline for (.{ "metadata_incarnation", "binding_digest", "scope_digest", "batch_digest", "logical_digest", "previous_decision" }) |field| state.update(&@field(self, field));
-        var numbers: [32]u8 = undefined;
-        inline for (.{ "ordinal", "rows", "batch_rows", "source_sequence" }, 0..) |field, i| std.mem.writeInt(u64, numbers[i * 8 ..][0..8], @field(self, field), .little);
-        state.update(&numbers);
-        state.update(&.{@backingInt(self.state)});
-        var result: Digest = undefined;
-        state.final(&result);
-        return result;
+        return self.accepted().computedDigest();
     }
     fn prefixDigest(self: Head) Digest {
         var state = std.crypto.hash.Blake3.init(.{});

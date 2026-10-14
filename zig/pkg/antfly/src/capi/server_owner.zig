@@ -4047,7 +4047,7 @@ pub fn storageOwnerNativeIndexControlJson(
         } else null;
         defer if (encoded) |bytes| alloc.free(bytes);
         if (encoded) |bytes| _ = std.base64.standard.Encoder.encode(bytes, result.batch.?.payload);
-        const wire: native.SourceWire = .{ .binding = result.binding, .header = if (result.batch) |batch| batch.header else null, .payload_b64 = encoded, .replication_pending = result.replication_pending, .error_name = result.error_name };
+        const wire: native.SourceWire = .{ .binding = result.binding, .header = if (result.batch) |batch| batch.header else null, .payload_b64 = encoded, .consumed = result.consumed, .replication_pending = result.replication_pending, .error_name = result.error_name };
         context.ensureActive() catch |err| return storageOwnerStatusFromError(err);
         const response = std.json.Stringify.valueAlloc(std.heap.c_allocator, wire, .{}) catch |err| return storageOwnerStatusFromError(err);
         if (response.len > native.SourceWire.max_wire_bytes) {

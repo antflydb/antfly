@@ -6615,3 +6615,70 @@ backed missing-root repair, actual data-Raft execution, terminal native evidence
 and atomic schema/catalog activation remain unfinished. Public UNIQUE activation
 is still guarded. Original dispositions remain 483 implemented / 862 unresolved;
 component tests do not change them. No full release pass or push is claimed.
+
+### Native consumption transaction and independent recovery anchor
+
+The shared Apache storage layer now owns the accepted-decision data contract
+and consumption-prefix digest. Metadata heads convert to that same contract;
+the metadata decision and signed consumption domains remain unchanged. This
+avoids a parallel ELv2/native implementation of the bytes a consumer must bind.
+The core data contract is not metadata authentication: the receiving server must
+independently fetch durable acceptance and current execution permission before
+invoking it. No public consume receiver/selector has been enabled in this step.
+
+Native consumption has a prepared transaction effect using the existing native
+apply, durable outbox and standby replay machinery. Preparation verifies the
+checkpoint, exact reserved job, first pending canonical body and metadata
+decision/header identity off-lock. Serialized staging repeats job/cancellation,
+consumed-prefix, cumulative-row, source-header and body-hash checks. It accepts
+tail emission after preparation but never advances a changed consumed prefix.
+All validation/encoding precedes the first write; deletion, retained record,
+source head, actual native sequence and mirror outbox share the outer atomic
+transaction. Any write/outbox failure must abort that transaction.
+
+AICQ v2 binds one retained 736-byte consumption record. The record owns the
+accepted decision, original consumed header, later applying cut and previous
+consumption-record digest. Consumed sequence is the original source cut, not
+the ACK cut: queued batches may have been built before ACK publication. Exact
+retry returns the retained cut without another sequence or transport record.
+Full-prefix consumption still retains header/progress evidence independently
+of the deleted queue. Missing/mismatched anchors or a consumption cut beyond
+the actual native authority fail recovery. Cancellation retires the record and
+the exact pending ordinal keys in its existing atomic cleanup effect.
+
+The private native mutation envelope is v24 and compiled-owner ABI v81. Standby
+replays the prepared decision against its actual matching pending body, not a
+rescan or a caller-selected cut. A gap does not move its applied marker; duplicate
+transport replay keeps the same marker. Source reads include the actual retained
+consumption record only after mirror debt clears. Wire validation rejects a
+consumed prefix spliced into another first-pending header or scope. This record
+is data, not a signature: metadata advancement still needs the separately signed
+consumption statement from the actual applying root.
+
+Real native fixtures deliver actual target claims before consuming sources.
+They exercise rollback before commit, repeated consumption without a new cut,
+all nine queued batches including empty EOF, original physical build-cut
+retention, reopen, missing-anchor rejection, mirror failure and outbox recovery,
+standby gaps, and exact replay. Their metadata decisions are explicitly synthetic
+storage-engine inputs, not independent metadata-server or original SQL proof.
+The initial engine gate passed 53/53 Debug steps in
+`/private/tmp/antfly-source-consumption-native-debug.log`. Expanded qualification
+is recorded in `/private/tmp/antfly-source-consumption-full-debug-v2.log`.
+That final Debug run passed 129/129 steps: 40 publication, four service/ACK,
+eight native page, six C-ABI, three leased-owner, 14 candidate prerequisite and
+46 runtime-contract tests, plus the decoder barrier. Counts overlap; no failures
+or leaks were reported. The expanded fixture delivers all actual target claims
+before consumption. The added test's module-constant typo was corrected without
+changing expectations. Boundary, license, inventory, control-catalog, formatting
+and diff checks passed. A sandbox-blocked Python timezone initialization was
+confirmed by stack sampling; the read-only checks completed outside that
+sandbox. GC was preview-only and deleted nothing.
+
+Still required: a receiving-server consume operation that fetches metadata
+acceptance independently, its compiled-owner dispatch and resource/deadline
+admission, root-signed consumption publication, producer retry/orchestration,
+and end-to-end cross-service fault tests. EOF/inventory seals, missing-root repair,
+real data-Raft execution and terminal schema/catalog activation also remain
+unfinished. Public UNIQUE activation stays guarded. Original dispositions are
+unchanged at 483 implemented / 862 unresolved; no SQL completion, full release
+pass, throughput improvement or push is claimed.
