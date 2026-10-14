@@ -407,6 +407,24 @@ pub fn flashAttentionHost(
     num_heads: usize,
     head_dim: usize,
 ) ![]f32 {
+    return flashAttentionHostWithIo(allocator, null, Q, K, V, bias, mask, batch, seq_len, num_heads, head_dim);
+}
+
+/// Bounded independent head lanes on the caller's Io owner. Per-lane scratch
+/// is allocated before dispatch; workers never allocate or share output rows.
+pub fn flashAttentionHostWithIo(
+    allocator: std.mem.Allocator,
+    io: ?std.Io,
+    Q: []const f32,
+    K: []const f32,
+    V: []const f32,
+    bias: ?[]const f32,
+    mask: []const i64,
+    batch: usize,
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+) ![]f32 {
     if (num_heads == 0 or head_dim == 0) return error.InvalidAttentionShape;
     const H = std.math.mul(usize, num_heads, head_dim) catch return error.InvalidAttentionShape;
     const expected = std.math.mul(usize, std.math.mul(usize, batch, seq_len) catch return error.InvalidAttentionShape, H) catch return error.InvalidAttentionShape;
@@ -418,25 +436,87 @@ pub fn flashAttentionHost(
     const bias_shared_len = std.math.mul(usize, num_heads, seq_sq) catch return error.InvalidAttentionShape;
     const bias_batched_len = std.math.mul(usize, batch, bias_shared_len) catch return error.InvalidAttentionShape;
     const output_elems = std.math.mul(usize, batch, seq_len) catch return error.InvalidAttentionShape;
+    if (io) |handle| try handle.checkCancel();
     const output = try allocator.alloc(f32, std.math.mul(usize, output_elems, H) catch return error.InvalidAttentionShape);
     errdefer allocator.free(output);
     @memset(output, 0.0);
 
-    const bq = @min(BLOCK_Q, seq_len);
-    const bkv = @min(BLOCK_KV, seq_len);
-    const score_tile = try allocator.alloc(f32, std.math.mul(usize, bq, bkv) catch return error.InvalidAttentionShape);
+    if (output.len == 0) return output;
+    const head_count = try std.math.mul(usize, batch, num_heads);
+    const lanes = if (io != null and seq_len >= 256) @min(head_count, @min(pool.max_workers, @max(1, pool.cachedCpuCount()))) else 1;
+    const bq: usize = @min(BLOCK_Q, seq_len);
+    const bkv: usize = @min(BLOCK_KV, seq_len);
+    const score_tile = try allocator.alloc(f32, std.math.mul(usize, try std.math.mul(usize, bq, bkv), lanes) catch return error.InvalidAttentionShape);
     defer allocator.free(score_tile);
-    const row_max = try allocator.alloc(f32, bq);
+    const row_max = try allocator.alloc(f32, bq * lanes);
     defer allocator.free(row_max);
-    const row_sum = try allocator.alloc(f32, bq);
+    const row_sum = try allocator.alloc(f32, bq * lanes);
     defer allocator.free(row_sum);
 
-    for (0..batch) |b| {
-        const mask_base = b * seq_len;
-        for (0..num_heads) |h| {
+    var contexts: [pool.max_workers]FlashHeadWork = undefined;
+    var jobs: [pool.max_workers]pool.Job = undefined;
+    const per_lane = head_count / lanes;
+    const extra = head_count % lanes;
+    for (contexts[0..lanes], jobs[0..lanes], 0..) |*ctx, *job, lane| {
+        const first = per_lane * lane + @min(lane, extra);
+        const end = first + per_lane + @intFromBool(lane < extra);
+        ctx.* = .{ .io = io, .Q = Q, .K = K, .V = V, .bias = bias, .mask = mask, .seq_len = seq_len, .num_heads = num_heads, .head_dim = head_dim, .scale = scale, .seq_sq = seq_sq, .bias_shared_len = bias_shared_len, .bias_batched_len = bias_batched_len, .head_start = first, .head_end = end, .output = output, .score_tile = score_tile[lane * bq * bkv ..][0 .. bq * bkv], .row_max = row_max[lane * bq ..][0..bq], .row_sum = row_sum[lane * bq ..][0..bq] };
+        job.* = .{ .fn_ptr = FlashHeadWork.run, .ctx = ctx };
+    }
+    if (io) |handle| {
+        try pool.dispatchJobsIo(handle, jobs[0..lanes]);
+        try handle.checkCancel();
+    } else FlashHeadWork.run(&contexts[0]);
+    for (contexts[0..lanes]) |ctx| if (ctx.cancelled) return error.Canceled;
+
+    return output;
+}
+
+const FlashHeadWork = struct {
+    io: ?std.Io,
+    Q: []const f32,
+    K: []const f32,
+    V: []const f32,
+    bias: ?[]const f32,
+    mask: []const i64,
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+    scale: f32,
+    seq_sq: usize,
+    bias_shared_len: usize,
+    bias_batched_len: usize,
+    head_start: usize,
+    head_end: usize,
+    output: []f32,
+    score_tile: []f32,
+    row_max: []f32,
+    row_sum: []f32,
+    cancelled: bool = false,
+    fn run(raw: *anyopaque) void {
+        const self: *FlashHeadWork = @ptrCast(@alignCast(raw));
+        const Q = self.Q;
+        const K = self.K;
+        const V = self.V;
+        const bias = self.bias;
+        const mask = self.mask;
+        const seq_len = self.seq_len;
+        const num_heads = self.num_heads;
+        const head_dim = self.head_dim;
+        const scale = self.scale;
+        const seq_sq = self.seq_sq;
+        const bias_shared_len = self.bias_shared_len;
+        const bias_batched_len = self.bias_batched_len;
+        const output = self.output;
+        const score_tile = self.score_tile;
+        const row_max = self.row_max;
+        const row_sum = self.row_sum;
+        for (self.head_start..self.head_end) |bh_idx| {
+            const b = bh_idx / num_heads;
+            const h = bh_idx % num_heads;
+            const mask_base = b * seq_len;
             // Head-major: each (b, h) occupies a contiguous [seq, head_dim]
             // slab in Q/K/V/output starting at (b * num_heads + h) * seq * head_dim.
-            const bh_idx = b * num_heads + h;
             const bh_offset = bh_idx * seq_len * head_dim;
 
             // Position-bias offset for this (b, h) -- either head-shared
@@ -455,6 +535,10 @@ pub fn flashAttentionHost(
 
             var q_start: usize = 0;
             while (q_start < seq_len) {
+                if (self.io) |handle| handle.checkCancel() catch {
+                    self.cancelled = true;
+                    return;
+                };
                 const q_end = @min(q_start + BLOCK_Q, seq_len);
                 const cur_bq = q_end - q_start;
 
@@ -465,6 +549,10 @@ pub fn flashAttentionHost(
 
                 var kv_start: usize = 0;
                 while (kv_start < seq_len) {
+                    if (self.io) |handle| handle.checkCancel() catch {
+                        self.cancelled = true;
+                        return;
+                    };
                     const kv_end = @min(kv_start + BLOCK_KV, seq_len);
                     const cur_bkv = kv_end - kv_start;
 
@@ -586,9 +674,7 @@ pub fn flashAttentionHost(
             }
         }
     }
-
-    return output;
-}
+};
 
 /// Segment-masked attention for tree-packed sequences.
 ///
@@ -2789,4 +2875,89 @@ test "segmentAttentionDropoutKeep is deterministic and disables at probability 0
     const b = segmentAttentionDropoutKeep(999, 1, 0, 2, 10, 3, 7, 0.4);
     try std.testing.expectEqual(a, b);
     try std.testing.expect(a == 0 or @abs(a - 1.0 / 0.6) < 1e-6);
+}
+
+test "flash attention Io lanes preserve exact masked biased results and inline progress" {
+    const a = std.testing.allocator;
+    const batch = 2;
+    const heads = 3;
+    const seq = 257;
+    const dim = 65;
+    const count = batch * heads * seq * dim;
+    const q = try a.alloc(f32, count);
+    defer a.free(q);
+    const k = try a.alloc(f32, count);
+    defer a.free(k);
+    const v = try a.alloc(f32, count);
+    defer a.free(v);
+    var rng = std.Random.DefaultPrng.init(50177);
+    for (q, k, v) |*x, *y, *z| {
+        x.* = rng.random().float(f32) * 2 - 1;
+        y.* = rng.random().float(f32) * 2 - 1;
+        z.* = rng.random().float(f32) * 2 - 1;
+    }
+    const mask = try a.alloc(i64, batch * seq);
+    defer a.free(mask);
+    for (mask, 0..) |*x, i| x.* = if (i >= seq or i % 7 == 0) 0 else 1;
+    const bias = try a.alloc(f32, batch * heads * seq * seq);
+    defer a.free(bias);
+    for (bias) |*x| x.* = rng.random().float(f32) * 0.5;
+    for ([_]usize{ seq * seq, heads * seq * seq, bias.len }) |length| {
+        const serial = try flashAttentionHost(a, q, k, v, bias[0..length], mask, batch, seq, heads, dim);
+        defer a.free(serial);
+        const parallel = try flashAttentionHostWithIo(a, std.testing.io, q, k, v, bias[0..length], mask, batch, seq, heads, dim);
+        defer a.free(parallel);
+        try std.testing.expectEqualSlices(f32, serial, parallel);
+        var bounded = std.Io.Threaded.init(a, .{ .async_limit = .limited(0), .concurrent_limit = .limited(0) });
+        defer bounded.deinit();
+        const inline_result = try flashAttentionHostWithIo(a, bounded.io(), q, k, v, bias[0..length], mask, batch, seq, heads, dim);
+        defer a.free(inline_result);
+        try std.testing.expectEqualSlices(f32, serial, inline_result);
+    }
+}
+fn flashIoAllocationFailure(a: std.mem.Allocator) !void {
+    const count = 2 * 257 * 8;
+    const input = try a.alloc(f32, count);
+    defer a.free(input);
+    @memset(input, 0.25);
+    const mask = try a.alloc(i64, 257);
+    defer a.free(mask);
+    @memset(mask, 1);
+    const result = try flashAttentionHostWithIo(a, std.testing.io, input, input, input, null, mask, 1, 257, 2, 8);
+    defer a.free(result);
+}
+test "flash attention parallel scratch rolls back every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, flashIoAllocationFailure, .{});
+}
+
+test "flash attention cancellation drains parallel lanes and permits exact retry" {
+    const Probe = struct {
+        var calls: std.atomic.Value(u32) = .init(0);
+        fn check(_: ?*anyopaque) std.Io.Cancelable!void {
+            try std.testing.io.checkCancel();
+            if (calls.fetchAdd(1, .acq_rel) >= 3) return error.Canceled;
+        }
+    };
+    const a = std.testing.allocator;
+    const count = 4 * 513 * 16;
+    const input = try a.alloc(f32, count);
+    defer a.free(input);
+    for (input, 0..) |*value, i| value.* = @sin(@as(f32, @floatFromInt(i % 117))) * 0.5;
+    const mask = try a.alloc(i64, 513);
+    defer a.free(mask);
+    @memset(mask, 1);
+    var table = std.testing.io.vtable.*;
+    table.checkCancel = Probe.check;
+    var controlled = std.testing.io;
+    controlled.vtable = &table;
+    Probe.calls.store(0, .release);
+    try std.testing.expectError(error.Canceled, flashAttentionHostWithIo(a, controlled, input, input, input, null, mask, 1, 513, 4, 16));
+    const drained = Probe.calls.load(.acquire);
+    try std.testing.io.sleep(std.Io.Duration.fromMilliseconds(20), .awake);
+    try std.testing.expectEqual(drained, Probe.calls.load(.acquire));
+    const retry = try flashAttentionHostWithIo(a, std.testing.io, input, input, input, null, mask, 1, 513, 4, 16);
+    defer a.free(retry);
+    const expected = try flashAttentionHost(a, input, input, input, null, mask, 1, 513, 4, 16);
+    defer a.free(expected);
+    try std.testing.expectEqualSlices(f32, expected, retry);
 }

@@ -1,0 +1,6 @@
+1/5 gemm.test.transposed GEMM candidate tiles match independent F64 across tails and row slices...OK
+2/5 primitives.test.dot and axpy match expected results...OK
+3/5 primitives.test.softmaxRow matches scalar reference...OK
+4/5 primitives.test.softmaxRow handles -inf saturation (masked attention)...OK
+5/5 primitives.test.expSubtractAndSum matches scalar reference for flash softmax block...OK
+All 5 tests passed.

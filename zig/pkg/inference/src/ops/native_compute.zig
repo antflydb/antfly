@@ -7551,8 +7551,9 @@ fn sdpaOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, mask: []const i64, attn
         mask.len >= effective_batch * effective_seq_len and
         (bias == null or bias.?.len == bias_seq_len or bias.?.len == bias_shared_len or bias.?.len == bias_batched_len);
     if (flash_eligible) {
-        const flash_output = try linalg.flashAttentionHost(
+        const flash_output = try linalg.flashAttentionHostWithIo(
             self.allocator,
+            self.io,
             q_data,
             k_data,
             v_data,

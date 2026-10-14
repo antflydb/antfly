@@ -1,0 +1,54 @@
+1/53 mod.test_0...OK
+2/53 mod.test.l2 normalize...OK
+3/53 mod.test.sgemm identity multiply...OK
+4/53 mod.test.sgemmTransA computes A^T @ B...OK
+5/53 mod.test.meanPool with mask...OK
+6/53 mod.test.sgemmTransB threaded path matches reference...OK
+7/53 mod.test.sgemmTransB Io path matches sync via std.Io.Threaded...OK
+8/53 mod.test.sgemmTransBSync is safe under concurrent callers...OK
+9/53 mod.test.sgemmTransB j-outer covers j and m tails...OK
+10/53 mod.test.sgemm Kc-blocked path matches reference for large K...OK
+11/53 mod.test.sgemmTransBF16Weights matches sgemmTransB on round-tripped weights...OK
+12/53 mod.test.sgemmTransBSync matches reference across MR/NR/K tail boundaries...OK
+13/53 mod.test.sgemmSync matches reference across MR/NR/K tail boundaries...OK
+14/53 mod.test.sgemmTransBSync matches reference for CLIP/CLAP production shapes...OK
+15/53 gemm.test.transposed GEMM candidate tiles match independent F64 across tails and row slices...OK
+16/53 primitives.test.dot and axpy match expected results...OK
+17/53 primitives.test.softmaxRow matches scalar reference...OK
+18/53 primitives.test.softmaxRow handles -inf saturation (masked attention)...OK
+19/53 primitives.test.expSubtractAndSum matches scalar reference for flash softmax block...OK
+20/53 pool.test.dispatchJobs runs every submitted job exactly once...OK
+21/53 pool.test.dispatchJobs handles a single job inline on the calling thread...OK
+22/53 pool.test.dispatchJobs is reentry-safe across repeated submissions...OK
+23/53 pool.test.Sync pool drains concurrent callers with bounded and unavailable capacity...OK
+24/53 pool.test.Sync pool completes inline while its only worker is occupied...OK
+25/53 cpu_budget.test.CPU quota uses whole cores with a one-worker floor...OK
+26/53 cpu_budget.test.CPU quota follows nested and subtree-mounted cgroup ancestors...OK
+27/53 x86.test.AVX2 requires all CPU features and OS vector state...OK
+28/53 x86.test.x86 kernel selection is stable during concurrent first use...SKIP
+29/53 attention.test.embeddinggemma2 segment range gap masking preserves independent visibility and lane bits...OK
+30/53 attention.test.t5RelativePositionBucket matches small exact buckets...OK
+31/53 attention.test.ropeCore applies expected rotation...OK
+32/53 attention.test.channelAttention preserves identical channels...OK
+33/53 attention.test.channelAttention matches scalar reference...OK
+34/53 attention.test.crossAttentionHost matches masked hand calculation...OK
+35/53 attention.test.flashCausalAttentionHost matches reference for CLIP-text shape...OK
+36/53 attention.test.flashAttentionHost returns zero rows when every key is masked...OK
+37/53 attention.test.flashCausalAttentionHost returns zero row when offsets mask all keys...OK
+38/53 attention.test.flashCausalAttentionHost uses local bias columns with kv offset...OK
+39/53 attention.test.flashAttentionHost matches materialized softmax (small, no bias)...OK
+40/53 attention.test.flashAttentionHost matches materialized softmax (large, with bias)...OK
+41/53 attention.test.debertaDisentangledAttentionHost matches scalar sanity case...OK
+42/53 attention.test.debertaDisentangledAttentionHost threaded path matches scalar reference...OK
+43/53 attention.test.segmentAttentionHost parallel heads match independent F64 visibility and serial bits...OK
+44/53 attention.test.segmentAttentionHost parallel scratch allocation failures clean up and cancellation permits retry...OK
+45/53 attention.test.segmentAttentionHost cancellation drains running parallel heads before scratch release...OK
+46/53 attention.test.segmentAttentionHost matches dense masked softmax with ranges, window, and fewer queries...OK
+47/53 attention.test.segmentTrainingAttentionForwardHost matches dense masked softmax (global, local window, and tree segments)...OK
+48/53 attention.test.segmentTrainingAttentionBackwardHost gradients match finite differences (with and without dropout)...OK
+49/53 attention.test.segmentAttentionDropoutKeep is deterministic and disables at probability 0...OK
+50/53 attention.test.flash attention Io lanes preserve exact masked biased results and inline progress...OK
+51/53 attention.test.flash attention parallel scratch rolls back every allocation failure...OK
+52/53 attention.test.flash attention cancellation drains parallel lanes and permits exact retry...OK
+53/53 attention_layout.test.padTokensToWindows and unpadWindowTokens round-trip...OK
+52 passed; 1 skipped; 0 failed.

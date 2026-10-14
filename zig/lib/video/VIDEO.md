@@ -2634,3 +2634,32 @@ runs overlapping. Application/transport timeouts are distinct; the previous
 Linux concurrent-load failure remains failed. CPU SIMD/performance, overloaded
 scheduling, broader codec/display/fuzz and the full non-CUDA scope stay active.
 See [qualification receipts](testdata/deadline-model-validation/README.md).
+
+### Bounded portable vision attention and ARM64 SIMD
+
+Native bidirectional SDPA now schedules independent head slabs on the caller's
+existing Io owner, with at most eight lanes and a cached CPU-budget bound.
+Scratch is allocated before dispatch (at most about 512 KiB); workers do not
+allocate or share output rows. Query/key tile boundaries check cancellation,
+and all lanes drain before scratch or output is released. Short sequences and
+callers without Io retain serial execution. ARM64 transposed GEMM uses a
+four-wide portable Zig SIMD 4x4 tile, selected by paired shape measurements;
+ordinary GEMM and other architecture dispatch are unchanged.
+
+The 53-case linalg suite passes on macOS ARM64 (50 pass, three platform skips)
+and actual Linux ARM64 (52 pass, one skip). It checks independent F64 GEMM
+agreement, tails, f16 inputs, exact serial/parallel attention with masks and bias,
+allocation rollback, cancellation/drain and retry. Fresh CPU servers preserve
+pretrained real-clip vectors and pass reset/retry, half-close and concurrent
+completion accounting. In a sequential before/after macOS comparison, the
+52-second Sintel clip request falls from 60.96 to 40.17 seconds and the
+four-request concurrency-two batch from 147.53 to 86.40 seconds. These are
+small shared-host samples, not production throughput estimates. The optimized
+Linux server also passes that four-request load gate within the unchanged
+6 GiB envelope and 180-second per-request budgets; requests take 118–128
+seconds. Its previous failed campaign remains historical evidence.
+
+See the [source-bound attention qualification receipt](testdata/attention-model-validation/README.md) for raw measurements,
+expanded-format model checks, reproduction and limitations. Broader sustained
+load, hard-stop recovery, codec/display/fuzz coverage, transfer telemetry and
+the complete non-CUDA objective remain open.

@@ -1,0 +1,25 @@
+Build Summary: 17/17 steps succeeded
+bench-server success
++- install antfly-inference-bench-server success
+   +- compile exe antfly-inference-bench-server fast native success 6m MaxRSS:5G
+      +- WriteFile macos-sdk-libc.txt cached
+      +- WriteFile cached
+      +- compile obj antfly-build-info fast native cached 44ms MaxRSS:31M
+      |  +- WriteFile macos-sdk-libc.txt (reused)
+      |  +- options cached
+      +- compile obj antfly-build-info fast native (+2 more reused dependencies)
+      +- options cached
+      +- run exe jit-source-identity (metal_identity.zig) cached
+      |  +- compile exe jit-source-identity safe native cached 46ms MaxRSS:31M
+      |     +- WriteFile macos-sdk-libc.txt (reused)
+      +- WriteFile tokenizer.json cached
+      +- WriteFile video_prepare_shader.h cached
+      +- run exe patch_sentencepiece_proto (sentencepiece_proto) cached
+      |  +- compile exe patch_sentencepiece_proto safe native cached 46ms MaxRSS:31M
+      |  |  +- WriteFile macos-sdk-libc.txt (reused)
+      |  +- run exe protoc-zig (sentencepiece_proto_raw) cached
+      |  |  +- compile exe protoc-zig safe native cached 46ms MaxRSS:31M
+      |  |     +- WriteFile macos-sdk-libc.txt (reused)
+      |  +- run exe protoc-zig (sentencepiece_proto_raw) (+1 more reused dependencies)
+      +- options cached
+

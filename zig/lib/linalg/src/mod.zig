@@ -340,6 +340,7 @@ pub const t5RelativePositionBucket = attention.t5RelativePositionBucket;
 pub const ropeCore = attention.ropeCore;
 pub const flashCausalAttentionHost = attention.flashCausalAttentionHost;
 pub const flashAttentionHost = attention.flashAttentionHost;
+pub const flashAttentionHostWithIo = attention.flashAttentionHostWithIo;
 pub const segmentAttentionHost = attention.segmentAttentionHost;
 pub const segmentAttentionHostWithGemm = attention.segmentAttentionHostWithGemm;
 pub const segmentAttentionHostWithGemmParallelIo = attention.segmentAttentionHostWithGemmParallelIo;

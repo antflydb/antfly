@@ -1727,6 +1727,13 @@ pub fn build(b: *std.Build) void {
     const run_linalg_tests = b.addRunArtifact(linalg_tests);
     const linalg_test_step = b.step("test-linalg", "Run linalg tests");
     linalg_test_step.dependOn(&run_linalg_tests.step);
+    inline for (.{ .{ "attention", "attention_benchmark.zig" }, .{ "transb", "transb_benchmark.zig" } }) |entry| {
+        const benchmark = b.addExecutable(.{ .name = "antfly-linalg-" ++ entry[0], .root_module = b.createModule(.{ .root_source_file = b.path(b.fmt("{s}/lib/linalg/{s}", .{ shared_lib_root, entry[1] })), .target = target, .optimize = optimize }) });
+        runtime_build.addX86Kernels(b, benchmark.root_module, b.path(b.pathJoin(&.{ shared_lib_root, "lib/linalg" })), target, optimize);
+        const run = b.addRunArtifact(benchmark);
+        run.has_side_effects = true;
+        b.step("bench-linalg-" ++ entry[0], "Measure portable linalg " ++ entry[0] ++ " kernels").dependOn(&run.step);
+    }
 
     // Tokenizer-only tests
     const tok_tests = b.addTest(.{

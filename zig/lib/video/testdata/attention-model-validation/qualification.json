@@ -1,0 +1,150 @@
+{
+  "goal_status": "active",
+  "status": "bounded CPU attention and ARM64 transposed SIMD qualification; broader non-CUDA work remains open",
+  "base_commit": "9e8a883d87bd6b9142a89a11a8e73f41387821b3",
+  "compiler": "Zig 0.17.0",
+  "compiler_sha256": "1c5f706db0ed6d55451940f31dc05a6177d05696bc1fa5d853696d04c718b523",
+  "source_sha256": {
+    "zig/lib/linalg/src/attention.zig": "9410453900dcfa4129712ccea0ebcf8b4d05c0311bbb380e797d2beb292dab4f",
+    "zig/lib/linalg/src/gemm.zig": "a2e783b940a1b0305a24e459e095a51816e8350d37f81ad839dc782ad8bfcb62",
+    "zig/lib/linalg/src/mod.zig": "755d06caf9811a0cc84cd4dd1597670f0cac94c1a48d4402f0a50f6cfbeb88e8",
+    "zig/lib/linalg/src/pool.zig": "592dc27f91eff27967abcc38038e3b2dd154ed0dbade13e0c8efc31b41e75de3",
+    "zig/lib/linalg/src/cpu_budget.zig": "1f71369a797caefa05bafaf0bf18c90a0f944927bbb00b976aa45e364ee57320",
+    "zig/lib/linalg/attention_benchmark.zig": "3fdaf5a0dcbee30daa6241c420cc398c4d85af998f749acb440b98398dcef214",
+    "zig/lib/linalg/transb_benchmark.zig": "bc8e730a2a1373a937d9ecc30d553a02de9bed45ece31fbf2219215dc80ad824",
+    "zig/pkg/inference/build.zig": "54da83cd0b976655eee37fd40141c0d91bb03c569582cdfff83247c3ee5282b3",
+    "zig/pkg/inference/src/ops/native_compute.zig": "80feb0515399b21b95b523a5951bebbedaa4c978143f65179b6405bc44a4331d",
+    "tools/embeddinggemma2/compare.py": "a88ff65d38baa53957832f6d9fc474b2fed06786feff6e018054a34e12cfa9a1",
+    "tools/embeddinggemma2/video_compare.py": "d0547268643ae18bc83a353a3dceaf63a18fc70dda656f0b559e4be261006124"
+  },
+  "macos_binary_sha256": "65bc5262808ecd9ffd804984c93eaa12e64b080e599ad2d644440765e1781251",
+  "linux_binary_sha256": "9af9d6d590f7464ebbc34b03e415780244f123f2e8424493c9d8c3bf765176f8",
+  "baseline_macos_binary_sha256": "aaa110c623acb5f2a16b808ccceb1df20bea1bbc4943a12dc9f2c58d3b13a27a",
+  "linux_image": "sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1",
+  "checkpoint_receipt_sha256": "ac45c79dbad7752950dc5c731ee4e9d214540d290b63082e12ce3f51b1fd064e",
+  "linalg_tests": {
+    "macos_arm64": {
+      "passed": 50,
+      "skipped": 3,
+      "failed": 0
+    },
+    "linux_arm64": {
+      "passed": 52,
+      "skipped": 1,
+      "failed": 0
+    }
+  },
+  "results": {
+    "before-native": {
+      "status": "pass",
+      "corpus_sha256": "ef300ad53a40d6c503ab27271e1e21bc61ae9a1e4722b62746f891161757fbd0",
+      "reference_sha256": "a71da18bd0b809af773128b0cad46c34e60e33792de65da9f001e594602260cf",
+      "sustained_status": "pass",
+      "sustained_wall_seconds": 147.53055633301847,
+      "completion_accounting_pass": true,
+      "peak_process_tree_rss_bytes": 1978286080
+    },
+    "after-native": {
+      "status": "pass",
+      "corpus_sha256": "ef300ad53a40d6c503ab27271e1e21bc61ae9a1e4722b62746f891161757fbd0",
+      "reference_sha256": "a71da18bd0b809af773128b0cad46c34e60e33792de65da9f001e594602260cf",
+      "sustained_status": "pass",
+      "sustained_wall_seconds": 86.40128433296923,
+      "completion_accounting_pass": true,
+      "peak_process_tree_rss_bytes": 1825210368
+    },
+    "after-linux": {
+      "status": "pass",
+      "corpus_sha256": "ef300ad53a40d6c503ab27271e1e21bc61ae9a1e4722b62746f891161757fbd0",
+      "reference_sha256": "a71da18bd0b809af773128b0cad46c34e60e33792de65da9f001e594602260cf",
+      "sustained_status": "pass",
+      "sustained_wall_seconds": 246.10542332100158,
+      "completion_accounting_pass": true,
+      "peak_process_tree_rss_bytes": 1612591104
+    },
+    "gbr-native": {
+      "status": "pass",
+      "corpus_sha256": "41935507a87ac8369c40b491a8c83713675fe550d8c38d4f40f70551f4350c12",
+      "reference_sha256": "f12b2f62a6dfb388bd45aace12c83932398e17ebcea0492e626889ded103319f",
+      "sustained_status": "pass",
+      "sustained_wall_seconds": 11.899207666981965,
+      "completion_accounting_pass": true,
+      "peak_process_tree_rss_bytes": 1948909568
+    },
+    "after-metal": {
+      "status": "pass",
+      "corpus_sha256": "ef300ad53a40d6c503ab27271e1e21bc61ae9a1e4722b62746f891161757fbd0",
+      "reference_sha256": "a71da18bd0b809af773128b0cad46c34e60e33792de65da9f001e594602260cf",
+      "sustained_status": "pass",
+      "sustained_wall_seconds": 77.54802674998064,
+      "completion_accounting_pass": true,
+      "peak_process_tree_rss_bytes": 1999798272
+    },
+    "gbr-linux": {
+      "status": "pass",
+      "corpus_sha256": "41935507a87ac8369c40b491a8c83713675fe550d8c38d4f40f70551f4350c12",
+      "reference_sha256": "f12b2f62a6dfb388bd45aace12c83932398e17ebcea0492e626889ded103319f",
+      "sustained_status": "pass",
+      "sustained_wall_seconds": 57.88012898499437,
+      "completion_accounting_pass": true,
+      "peak_process_tree_rss_bytes": 1601912832
+    }
+  },
+  "tile_median_speedups": {
+    "macos": {
+      "(64, 118, 64)": 1.22785536531263,
+      "(64, 256, 64)": 1.2650256315672108,
+      "(64, 256, 256)": 1.2518934147682328,
+      "(127, 131, 65)": 1.0402402961415054,
+      "(256, 512, 512)": 1.3618445885736845
+    },
+    "linux": {
+      "(64, 118, 64)": 1.2495933381284514,
+      "(64, 256, 64)": 1.3131204991780532,
+      "(64, 256, 256)": 1.386770032456229,
+      "(127, 131, 65)": 1.0844443633520136,
+      "(256, 512, 512)": 1.353207782983864
+    }
+  },
+  "limitations": [
+    "Small shared-host timing campaign; no confidence interval or production-throughput claim.",
+    "Final direct attention microbenchmarks overlapped other work; before/after macOS real-clip runs were sequential.",
+    "Linux ARM64 compares against pinned macOS PyTorch oracle; fresh Linux PyTorch and Linux x86_64 runtime remain unqualified.",
+    "Previous Linux load failure retained in concurrent-model-validation; fresh optimized Linux rerun passes without raised gates.",
+    "No new unsafe-driver hard-stop recovery, arbitrary codec conformance or broad relevance qualification."
+  ],
+  "artifacts_sha256": {
+    "after-linux.json": "5ac8c0ec73ef91a7a1a42da93f7e49fccef64ff4d7d6aaa6cc1d10ab75fb32c6",
+    "after-linux.log": "c65c5ffc656ad458b99c3d74337e4df6d9e74b3de7f64def9367efd2b1991b21",
+    "after-linux.server.log": "c56e17dc93e97be6ba079ea7c4c9bc7fac1b8bd3a912ebfe33e5408f256748fd",
+    "after-metal.json": "b280efa0f54553ce5fc28d15cc3c29550f4785ac0536f5fc61d9e918251640fa",
+    "after-metal.log": "bba8d59dd73ddbd9066e32c81edc4d05c40b69d4444560972823e7d0f49d2662",
+    "after-metal.server.log": "4b9ec343dd5ff10ceba6ff17c1775758ddbf4ac1f826d9e79984f48bb5083fc4",
+    "after-native.json": "6524688c0aa6b3fe426be3e5830d115baf028fef71b3fe95c170a76e39494c45",
+    "after-native.log": "4a3faeb613d0d7f02d1f21fc0d9fe0f2842773f7c2093ce436c3ef76dd3ed4a7",
+    "after-native.server.log": "a3c7d346af1a7b13e7ebc1f477d81e4f31cc925e278dd50fefbd44e1a9c9f2af",
+    "attention-build-hook.log": "21162fc63452b4cbaaef97e11677200cd344955e4a863f560e1fcbec18781215",
+    "attention-linux.jsonl": "2cee15425ae55c66774d73d1020955d0c6f2d62c104aad453b3aa413e460898c",
+    "attention-macos.jsonl": "7afa54fa1a14344ebb970455ca6f9304fd61261796aa6f85ad4516e5dfda2954",
+    "before-native.json": "7bdafb6e1c53eac9e90d106298023047e36ffea5120cfcf3ee3c65d4f34a9571",
+    "before-native.log": "361a2531f228220d4700ebae76f68cdc5fa784ac747011e8b552d982d41e344e",
+    "before-native.server.log": "d2ca0ec67c57f1662d0e268ad2d5b9f911c742d214ec966f40d50aaa37a8b1d4",
+    "gbr-linux.json": "479f415ce0c5a1c89ef7b3f180902b2371e828232eff65663e0e01cc43aa24e4",
+    "gbr-linux.log": "79ccbd96374a8be9c593c977b5b19b5d86731f54de43c49b0f03be4cd23a87cb",
+    "gbr-linux.server.log": "c861d0582a137543151597de1feec9b4d97bb438cf4288d228d0a00962e5b859",
+    "gbr-native.json": "9d8578e13569334bcd57345b85f03c59903a90ed5da4634fd07618c8c5cc6bb2",
+    "gbr-native.log": "d9731cc439f93a4f7e7d622956f532bd6a38acffad217f59dbcc29b99cd174bb",
+    "gbr-native.server.log": "663be8dcac9f274a87b4a97098ed7c5ede63b003d7aee1e73551640c6e7709a0",
+    "linalg-linux.log": "a88203bef5f644ac57af9be239457eac61121dff03115c18f0fc1a1c7e762bf1",
+    "linalg-macos.log": "5178101ce201f172183fc9dac583f82aae23a9d1d9bcf259f4ece32f33489be7",
+    "linux-build.log": "06ebb9dc58158268e0432c79c49068d9f0bd1d25f8471d5ba78be5cd79771979",
+    "macos-build.log": "c80b0359baf419754c6a27cfa70b05544d04e5edd5aa62e23e8ac97dd4a5abf0",
+    "transb-build-hook.log": "ebc5145dd398d80ae31e05d4db8e1fd38774ac31369e2ff25ae7c07a88a055ae",
+    "transb-f64.log": "74fe1a06359294c7191437309d3d335ebffc87c4f60b672e15d65f8d061e3fbb",
+    "transb-linux-build.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "transb-linux.jsonl": "6fc218a192022d313819ed5334785e8548161ed4d216b1f228a060e0f8533afb",
+    "transb-linux.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "transb-macos.jsonl": "218f4d327bb483e1e39003245b24937ca1a171a30670efcaeee8d301a11d214d",
+    "transb-macos.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  }
+}
