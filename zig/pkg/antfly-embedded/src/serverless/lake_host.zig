@@ -17,21 +17,44 @@
 const std = @import("std");
 const binding = @import("external_source/catalog_binding.zig");
 const stores = @import("object_store_support.zig");
+const catalog = @import("external_source/lake_catalog/mod.zig");
 pub const Binding = binding.Binding;
 pub const OpenedObjectStore = stores.OpenedObjectStore;
 
+pub const SnapshotPin = struct { ptr: *anyopaque, check: *const fn (*anyopaque) anyerror!void, deinit: *const fn (*anyopaque) void };
+
 pub const OpenOptions = struct {
+    snapshot_pin_resolver: ?struct { ptr: *const anyopaque, acquire: *const fn (*const anyopaque, std.mem.Allocator, binding.Binding, []const u8, []const u8, catalog.types.Context) anyerror!?SnapshotPin } = null,
     file_bucket: []const u8 = "antfly",
     resolver: ?Resolver = null,
+    catalog_resolver: ?CatalogResolver = null,
+    pub const CatalogResolver = struct {
+        ptr: *const anyopaque,
+        load_fn: *const fn (*const anyopaque, std.mem.Allocator, binding.Binding, catalog.types.Context) anyerror!catalog.types.Table,
+    };
     pub const Resolver = struct {
         ptr: *const anyopaque,
         open_fn: *const fn (*const anyopaque, std.mem.Allocator, binding.Binding) anyerror!stores.OpenedObjectStore,
     };
     pub fn open(self: OpenOptions, alloc: std.mem.Allocator, source: binding.Binding) !stores.OpenedObjectStore {
-        try source.validateReadOnlyMvp();
+        try source.validateSupported();
         if (self.resolver) |resolver| return resolver.open_fn(resolver.ptr, alloc, source);
         if (source.credential_ref != null) return error.ExternalLakeCredentialRefNotFound;
         return stores.OpenedObjectStore.initRemoteUriWithOptions(alloc, source.source_uri, self.file_bucket, .{ .ensure_bucket = false });
+    }
+
+    pub fn resolveCatalog(self: OpenOptions, alloc: std.mem.Allocator, source: binding.Binding, opened: stores.OpenedObjectStore, context: catalog.types.Context) !catalog.types.Table {
+        const config = source.catalog orelse return error.InvalidLakeCatalog;
+        try config.validate();
+        // Host policy may bind immutable metadata for either catalog kind.
+        // Consulting it first prevents managed catalogs from silently reopening
+        // the current pointer instead of a transaction's retained cut.
+        if (self.catalog_resolver) |resolver| return resolver.load_fn(resolver.ptr, alloc, source, context);
+        if (config.type == .managed) {
+            const managed: catalog.managed.Managed = .{ .client = opened.client, .bucket = opened.bucket, .prefix = opened.prefix, .source_uri = source.source_uri, .context = context };
+            return managed.load(alloc);
+        }
+        return error.LakeCatalogConnectionRequired;
     }
 };
 

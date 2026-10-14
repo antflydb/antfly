@@ -25,6 +25,7 @@ const common_secrets = @import("antfly_local_sources").common_secrets;
 const catalog_binding = @import("antfly_local_sources").serverless_external_source_catalog_binding;
 const object_store_support = @import("antfly_local_sources").serverless_object_store_support;
 const remote_uri = @import("antfly_local_sources").serverless_remote_uri;
+const lake_catalog = @import("antfly_local_sources").serverless_external_source_mod.lake_catalog;
 
 const Allocator = std.mem.Allocator;
 
@@ -46,6 +47,15 @@ pub fn openNativeArtifactObjectStoreAlloc(
     return switch (external_io.protocol) {
         .s3 => try openCredentialedS3PrefixAlloc(alloc, secret_store, external_io, bucket, prefix, read_only),
         .gcs => try openCredentialedGcsPrefixAlloc(alloc, secret_store, external_io, bucket, prefix, read_only),
+        .filesystem => blk: {
+            const root = external_io.root orelse return error.NativeArtifactStorageUnauthorized;
+            try validateFilesystemSourceRelativePath(prefix);
+            const path = try resolveFilesystemSourcePathAlloc(alloc, root, prefix);
+            defer alloc.free(path);
+            const uri = try std.fmt.allocPrint(alloc, "file://{s}", .{path});
+            defer alloc.free(uri);
+            break :blk try object_store_support.OpenedObjectStore.initFileUriWithOptions(alloc, uri, bucket, .{ .ensure_bucket = !read_only });
+        },
         else => error.NativeArtifactStorageUnauthorized,
     };
 }
@@ -53,17 +63,190 @@ pub fn openNativeArtifactObjectStoreAlloc(
 pub const BindingObjectStoreOpenOptions = struct {
     /// Borrowed options must outlive synchronous lake source opening.
     pub fn lakeOptions(self: *const @This()) @import("antfly_local_sources").serverless_lake_host.OpenOptions {
-        return .{ .file_bucket = self.file_bucket, .resolver = .{ .ptr = self, .open_fn = openLake } };
+        return .{ .file_bucket = self.file_bucket, .resolver = .{ .ptr = self, .open_fn = openLake }, .catalog_resolver = .{ .ptr = self, .load_fn = loadLakeCatalog }, .snapshot_pin_resolver = .{ .ptr = self, .acquire = acquireSnapshotPin } };
+    }
+    fn acquireSnapshotPin(raw: *const anyopaque, a: Allocator, source: catalog_binding.Binding, snapshot: []const u8, uuid: []const u8, context: lake_catalog.types.Context) anyerror!?@import("antfly_local_sources").serverless_lake_host.SnapshotPin {
+        _ = a;
+        const pin_alloc = @import("antfly_platform").allocator.processAllocator(std.heap.smp_allocator);
+        const self: *const @This() = @ptrCast(@alignCast(raw));
+        if (source.catalog == null or self.node_config == null or self.node_config.?.storage.artifacts.connection == null or snapshot.len == 0) return null;
+        const pins = @import("lake_snapshot_pins.zig");
+        var opened = try openNativeArtifactObjectStoreAlloc(pin_alloc, self.node_config.?, self.secret_store, false);
+        errdefer opened.deinit();
+        const prefix = try pins.namespace(pin_alloc, opened.prefix, source, uuid);
+        errdefer pin_alloc.free(prefix);
+        const id = try pin_alloc.dupe(u8, snapshot);
+        errdefer pin_alloc.free(id);
+        const owner = try pin_alloc.create(pins.Owner);
+        errdefer pin_alloc.destroy(owner);
+        owner.* = .{ .a = pin_alloc, .opened = opened, .prefix = prefix, .snapshot = id, .parent = context, .io = context.io orelse return error.LakeSnapshotReadLeaseExpired };
+        return try owner.start();
     }
     fn openLake(raw: *const anyopaque, alloc: Allocator, source: catalog_binding.Binding) anyerror!object_store_support.OpenedObjectStore {
         const self: *const @This() = @ptrCast(@alignCast(raw));
         return openBindingObjectStoreAlloc(alloc, source, self.*);
     }
+    fn loadLakeCatalog(raw: *const anyopaque, alloc: Allocator, source: catalog_binding.Binding, context: lake_catalog.types.Context) anyerror!lake_catalog.types.Table {
+        const self: *const @This() = @ptrCast(@alignCast(raw));
+        var result = try executeLakeCatalogAlloc(alloc, source, self.*, context, .load);
+        if (self.retained_catalog_metadata) |retained| {
+            defer result.deinit(alloc);
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const scratch = arena.allocator();
+            const current = try lake_catalog.metadata.parse(scratch, result.table.metadata_json);
+            const pinned = try lake_catalog.metadata.parse(scratch, retained.metadata_json);
+            const current_uuid = try lake_catalog.metadata.str(try lake_catalog.metadata.get(current, "table-uuid"));
+            const pinned_uuid = try lake_catalog.metadata.str(try lake_catalog.metadata.get(pinned, "table-uuid"));
+            if (!std.mem.eql(u8, current_uuid, pinned_uuid)) return error.ExternalLakeSnapshotMismatch;
+            const location = try alloc.dupe(u8, retained.metadata_location);
+            errdefer alloc.free(location);
+            return .{ .metadata_location = location, .metadata_json = try alloc.dupe(u8, retained.metadata_json) };
+        }
+        return result.table;
+    }
+    /// Server-authenticated metadata; load still verifies external incarnation.
+    retained_catalog_metadata: ?lake_catalog.types.Table = null,
     file_bucket: []const u8 = "antfly",
     node_config: ?*const common_config.Config = null,
     secret_store: ?*common_secrets.FileStore = null,
     read_only: bool = true,
+    catalog_table_id: u64 = 0,
+    catalog_generation: u64 = 0,
 };
+
+pub const CatalogOperation = union(enum) {
+    load,
+    create: lake_catalog.types.Commit,
+    commit: lake_catalog.types.Commit,
+    retire: lake_catalog.managed.Retirement,
+    resolve: struct { id: []const u8, hash: []const u8 },
+};
+pub const CatalogResult = union(enum) {
+    table: lake_catalog.types.Table,
+    outcome: lake_catalog.types.Outcome,
+    pub fn deinit(self: *CatalogResult, a: Allocator) void {
+        if (self.* == .table) self.table.deinit(a);
+    }
+};
+
+pub fn executeLakeCatalogAlloc(a: Allocator, binding: catalog_binding.Binding, options: BindingObjectStoreOpenOptions, context: lake_catalog.types.Context, operation: CatalogOperation) !CatalogResult {
+    try context.ensureActive();
+    try binding.validateSupported();
+    const config = binding.catalog orelse return error.InvalidLakeCatalog;
+    const mutation = operation == .create or operation == .commit or operation == .retire;
+    if (mutation and binding.write_policy != .iceberg_writer) return error.ExternalLakeReadOnly;
+    var source_options = options;
+    source_options.read_only = !mutation or config.type == .rest;
+    var opened = try openBindingObjectStoreAlloc(a, binding, source_options);
+    defer opened.deinit();
+    var catalog: lake_catalog.Catalog = undefined;
+    if (config.type == .managed) {
+        catalog = .{ .managed = .{ .client = opened.client, .bucket = opened.bucket, .prefix = opened.prefix, .source_uri = binding.source_uri, .context = context } };
+        return executeCatalog(a, &catalog, operation);
+    }
+    const node = options.node_config orelse return error.LakeCatalogConnectionRequired;
+    const connection = node.connections.get(config.connection.?) orelse return error.LakeCatalogConnectionRequired;
+    if (connection.kind != .external_io or !hasConnectionCapability(connection, "lake_catalog_read") or (mutation and !hasConnectionCapability(connection, "lake_catalog_write"))) return error.LakeCatalogForbidden;
+    const external = connection.external_io orelse return error.LakeCatalogForbidden;
+    if (external.protocol != .http) return error.LakeCatalogForbidden;
+    try ensureCatalogOriginAllowed(config.uri.?, external.hosts);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var headers: std.ArrayList([2][]const u8) = .empty;
+    var header_it = external.headers.iterator();
+    while (header_it.next()) |entry| {
+        // Connection headers are node policy; references are resolved per call
+        // so rotated credentials never become table metadata or cache identity.
+        const value = try common_secrets.resolveReferenceOwned(scratch, options.secret_store, entry.value_ptr.*);
+        if (std.mem.indexOfAny(u8, value, "\r\n\x00") != null or std.mem.indexOfAny(u8, entry.key_ptr.*, "\r\n\x00") != null) return error.LakeCatalogForbidden;
+        if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Idempotency-Key") or std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Host") or std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Content-Length")) return error.LakeCatalogForbidden;
+        try headers.append(scratch, .{ entry.key_ptr.*, value });
+    }
+    var io_impl: ?std.Io.Threaded = if (context.io == null) std.Io.Threaded.init(a, .{}) else null;
+    defer if (io_impl) |*io| io.deinit();
+    var http = @import("httpx").Client.initWithConfig(a, context.io orelse io_impl.?.io(), .{ .keep_alive = false, .cookies_enabled = false, .max_response_size = lake_catalog.types.max_metadata_bytes, .timeouts = .{ .connect_ms = 10_000, .read_ms = 30_000, .write_ms = 30_000 } });
+    defer http.deinit();
+    var transport: lake_catalog.rest.HttpTransport = .{ .client = &http, .headers = headers.items };
+    var journal_store: ?object_store_support.OpenedObjectStore = null;
+    defer if (journal_store) |*store| store.deinit();
+    var journal: ?lake_catalog.rest.Journal = null;
+    if (mutation or operation == .resolve) {
+        journal_store = try openNativeArtifactObjectStoreAlloc(a, node, options.secret_store, !mutation);
+        const authority = try std.json.Stringify.valueAlloc(scratch, .{ .source = binding.source_uri, .catalog = config }, .{});
+        const prefix = try std.fmt.allocPrint(scratch, "{s}/lake-catalog/{d}/{d}/{s}", .{ journal_store.?.prefix, options.catalog_table_id, options.catalog_generation, lake_catalog.types.digestHex(authority) });
+        journal = .{ .client = journal_store.?.client, .bucket = journal_store.?.bucket, .prefix = prefix };
+    }
+    catalog = .{ .rest = .{ .config = config, .transport = transport.transport(), .context = context, .journal = journal, .now_ms = @intCast(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms) } };
+    return executeCatalog(a, &catalog, operation);
+}
+/// Invoke a separately authorized provider maintenance controller. Antfly never
+/// deletes external-catalog files through its ordinary source credentials.
+pub fn executeExternalMaintenanceAlloc(a: Allocator, binding: catalog_binding.Binding, options: BindingObjectStoreOpenOptions, context: lake_catalog.types.Context, uuid: []const u8, metadata_location: []const u8, protected: []const []const u8, policy: lake_catalog.maintenance.Policy) ![]u8 {
+    try context.ensureActive();
+    try binding.validateSupported();
+    if (binding.write_policy != .iceberg_writer) return error.ExternalLakeReadOnly;
+    const config = binding.catalog orelse return error.InvalidLakeCatalog;
+    if (config.type != .rest) return error.InvalidLakeMaintenanceProvider;
+    const integration = config.maintenance orelse return error.LakeVacuumCatalogCoordinationRequired;
+    try integration.validate();
+    const node = options.node_config orelse return error.LakeCatalogConnectionRequired;
+    const connection = node.connections.get(integration.connection) orelse return error.LakeCatalogConnectionRequired;
+    if (connection.kind != .external_io or !hasConnectionCapability(connection, "lake_maintenance")) return error.LakeCatalogForbidden;
+    const external = connection.external_io orelse return error.LakeCatalogForbidden;
+    if (external.protocol != .http) return error.LakeCatalogForbidden;
+    try ensureCatalogOriginAllowed(integration.uri, external.hosts);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var headers: std.ArrayList([2][]const u8) = .empty;
+    var header_it = external.headers.iterator();
+    while (header_it.next()) |entry| {
+        const value = try common_secrets.resolveReferenceOwned(scratch, options.secret_store, entry.value_ptr.*);
+        if (std.mem.indexOfAny(u8, value, "\r\n\x00") != null or std.mem.indexOfAny(u8, entry.key_ptr.*, "\r\n\x00") != null) return error.LakeCatalogForbidden;
+        if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Idempotency-Key") or std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Host") or std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Content-Length")) return error.LakeCatalogForbidden;
+        try headers.append(scratch, .{ entry.key_ptr.*, value });
+    }
+    var opened = try openNativeArtifactObjectStoreAlloc(a, node, options.secret_store, false);
+    defer opened.deinit();
+    const identity = try std.json.Stringify.valueAlloc(scratch, .{ .source = binding.source_uri, .catalog = config, .uuid = uuid }, .{});
+    const journal_prefix = try std.fmt.allocPrint(scratch, "{s}/lake-provider-maintenance/{d}/{d}/{s}", .{ opened.prefix, options.catalog_table_id, options.catalog_generation, lake_catalog.types.digestHex(identity) });
+    const reader_prefix = try @import("lake_snapshot_pins.zig").namespace(scratch, opened.prefix, binding, uuid);
+    var io_impl: ?std.Io.Threaded = if (context.io == null) std.Io.Threaded.init(a, .{}) else null;
+    defer if (io_impl) |*io| io.deinit();
+    var http = @import("httpx").Client.initWithConfig(a, context.io orelse io_impl.?.io(), .{ .keep_alive = false, .cookies_enabled = false, .max_response_size = 16384, .timeouts = .{ .connect_ms = 10_000, .read_ms = 30_000, .write_ms = 30_000 } });
+    defer http.deinit();
+    var transport: lake_catalog.rest.HttpTransport = .{ .client = &http, .headers = headers.items };
+    const controller: lake_catalog.maintenance.Controller = .{ .config = integration, .catalog = config, .transport = transport.transport(), .journal = .{ .client = opened.client, .bucket = opened.bucket, .prefix = journal_prefix }, .context = context };
+    return controller.run(a, binding.source_uri, uuid, metadata_location, protected, .{ .connection = node.storage.artifacts.connection.?, .bucket = opened.bucket, .prefix = reader_prefix }, policy);
+}
+fn executeCatalog(a: Allocator, catalog: *lake_catalog.Catalog, operation: CatalogOperation) !CatalogResult {
+    return switch (operation) {
+        .load => .{ .table = try catalog.load(a) },
+        .create => |c| .{ .table = try catalog.create(a, c.id, c.body, c.timestamp_ms) },
+        .commit => |c| .{ .table = try catalog.commit(a, c) },
+        .retire => |r| .{ .table = try catalog.retire(a, r) },
+        .resolve => |c| .{ .outcome = try catalog.resolve(a, c.id, c.hash) },
+    };
+}
+fn uriHost(component: std.Uri.Component) []const u8 {
+    return switch (component) {
+        .raw => |v| v,
+        .percent_encoded => |v| v,
+    };
+}
+fn ensureCatalogOriginAllowed(uri: []const u8, allowed: []const []u8) !void {
+    const requested = try std.Uri.parse(uri);
+    for (allowed) |origin| {
+        const candidate = std.Uri.parse(origin) catch continue;
+        if (candidate.host == null or requested.host == null or candidate.user != null or candidate.password != null) continue;
+        if (!std.ascii.eqlIgnoreCase(candidate.scheme, requested.scheme) or !std.ascii.eqlIgnoreCase(uriHost(candidate.host.?), uriHost(requested.host.?))) continue;
+        const default_port: u16 = if (std.ascii.eqlIgnoreCase(requested.scheme, "https")) 443 else 80;
+        if ((candidate.port orelse default_port) == (requested.port orelse default_port)) return;
+    }
+    return error.LakeCatalogForbidden;
+}
 
 pub fn openBindingObjectStoreAlloc(
     alloc: Allocator,
@@ -90,7 +273,7 @@ fn openCredentialedBindingObjectStoreAlloc(
     const node_config = options.node_config orelse return error.ExternalLakeCredentialRefNotFound;
     const connection = node_config.connections.get(credential.ref_id) orelse return error.ExternalLakeCredentialRefNotFound;
     if (connection.kind != .external_io) return error.UnsupportedExternalLakeCredentialRef;
-    if (!hasConnectionCapability(connection, "lake_read")) return error.UnsupportedExternalLakeCredentialRef;
+    if (!hasConnectionCapability(connection, "lake_read") or (!options.read_only and !hasConnectionCapability(connection, "lake_write"))) return error.UnsupportedExternalLakeCredentialRef;
     const external_io = connection.external_io orelse return error.UnsupportedExternalLakeCredentialRef;
 
     var parsed = try remote_uri.parseAlloc(alloc, binding.source_uri);

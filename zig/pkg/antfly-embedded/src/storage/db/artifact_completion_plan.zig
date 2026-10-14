@@ -141,7 +141,7 @@ pub const Plan = struct {
         defer scratch.deinit();
         const a = scratch.allocator();
         const indexes = if (catalogs.indexes.len == 0) &.{} else try @import("catalog/index_manager.zig").deserializeCatalog(a, catalogs.indexes);
-        const resolver_configs = if (catalogs.resolvers.len == 0) &.{} else try resolvers.deserializeCatalog(a, catalogs.resolvers);
+        const resolver_configs = if (catalogs.resolvers.len == 0) &.{} else try resolvers.deserializeActiveCatalog(a, catalogs.resolvers);
         const enrichment_configs = if (catalogs.enrichments.len == 0) &.{} else try enrichments.deserializeCatalog(a, catalogs.enrichments);
         return compileWithChildren(alloc, catalogs.digest(), templates, indexes, resolver_configs, enrichment_configs);
     }

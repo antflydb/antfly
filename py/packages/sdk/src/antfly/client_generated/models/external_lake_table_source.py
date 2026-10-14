@@ -14,6 +14,7 @@ from ..types import UNSET, Unset
 if TYPE_CHECKING:
     from ..models.external_lake_credential_ref import ExternalLakeCredentialRef
     from ..models.external_lake_snapshot_selector import ExternalLakeSnapshotSelector
+    from ..models.lake_catalog_config import LakeCatalogConfig
 
 
 T = TypeVar("T", bound="ExternalLakeTableSource")
@@ -21,8 +22,9 @@ T = TypeVar("T", bound="ExternalLakeTableSource")
 
 @_attrs_define
 class ExternalLakeTableSource:
-    """Read-only authoritative Parquet or Iceberg source. A serving statement pins its inventory and object versions before
-    returning rows.
+    """Authoritative Parquet or Iceberg source. A serving statement pins its inventory and object versions before returning
+    rows. Iceberg catalog commits require an explicit writable catalog binding; ordinary row mutations remain
+    unsupported.
 
         Attributes:
             kind (ExternalLakeTableSourceKind):
@@ -30,14 +32,18 @@ class ExternalLakeTableSource:
             format_ (ExternalLakeTableSourceFormat):
             uri (str):
             schema_fingerprint (str | Unset):  Default: 'auto'.
-            write_policy (ExternalLakeTableSourceWritePolicy | Unset):  Default:
-                ExternalLakeTableSourceWritePolicy.READ_ONLY.
+            write_policy (ExternalLakeTableSourceWritePolicy | Unset): iceberg_writer authorizes explicit Iceberg catalog
+                commits and requires catalog plus a current snapshot selector. It does not enable ordinary row batch writes.
+                Default: ExternalLakeTableSourceWritePolicy.READ_ONLY.
             object_mutability (ExternalLakeTableSourceObjectMutability | Unset): Set immutable only when data files are
                 never replaced at an existing URI. Allows authenticated provider-version proofs from retained index generations
                 to be reused for unchanged data files. Metadata and delete files are still verified. Default:
                 ExternalLakeTableSourceObjectMutability.MUTABLE.
             credentials (ExternalLakeCredentialRef | Unset):
             snapshot (ExternalLakeSnapshotSelector | Unset):
+            catalog (LakeCatalogConfig | Unset): Catalog authority is independent of S3/GCS storage and deployment. managed
+                uses a conditional durable head under the table root. rest uses a named HTTP connection; raw secrets are
+                forbidden. Omit to retain explicit metadata URI/version-hint discovery.
     """
 
     kind: ExternalLakeTableSourceKind
@@ -49,6 +55,7 @@ class ExternalLakeTableSource:
     object_mutability: ExternalLakeTableSourceObjectMutability | Unset = ExternalLakeTableSourceObjectMutability.MUTABLE
     credentials: ExternalLakeCredentialRef | Unset = UNSET
     snapshot: ExternalLakeSnapshotSelector | Unset = UNSET
+    catalog: LakeCatalogConfig | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         kind = self.kind.value
@@ -77,6 +84,10 @@ class ExternalLakeTableSource:
         if not isinstance(self.snapshot, Unset):
             snapshot = self.snapshot.to_dict()
 
+        catalog: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.catalog, Unset):
+            catalog = self.catalog.to_dict()
+
         field_dict: dict[str, Any] = {}
 
         field_dict.update(
@@ -97,6 +108,8 @@ class ExternalLakeTableSource:
             field_dict["credentials"] = credentials
         if snapshot is not UNSET:
             field_dict["snapshot"] = snapshot
+        if catalog is not UNSET:
+            field_dict["catalog"] = catalog
 
         return field_dict
 
@@ -104,6 +117,7 @@ class ExternalLakeTableSource:
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.external_lake_credential_ref import ExternalLakeCredentialRef
         from ..models.external_lake_snapshot_selector import ExternalLakeSnapshotSelector
+        from ..models.lake_catalog_config import LakeCatalogConfig
 
         d = dict(src_dict)
         kind = ExternalLakeTableSourceKind(d.pop("kind"))
@@ -144,6 +158,13 @@ class ExternalLakeTableSource:
         else:
             snapshot = ExternalLakeSnapshotSelector.from_dict(_snapshot)
 
+        _catalog = d.pop("catalog", UNSET)
+        catalog: LakeCatalogConfig | Unset
+        if isinstance(_catalog, Unset):
+            catalog = UNSET
+        else:
+            catalog = LakeCatalogConfig.from_dict(_catalog)
+
         external_lake_table_source = cls(
             kind=kind,
             table_id=table_id,
@@ -154,6 +175,7 @@ class ExternalLakeTableSource:
             object_mutability=object_mutability,
             credentials=credentials,
             snapshot=snapshot,
+            catalog=catalog,
         )
 
         return external_lake_table_source

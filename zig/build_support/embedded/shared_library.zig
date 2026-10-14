@@ -16,6 +16,23 @@
 //! Final shared-library exports belong to the public header, never to linked archives.
 const std = @import("std");
 
+/// Executor owners and provider archives must share the internal Zig callback ABI.
+pub fn llvmBackend(target: std.Target) ?bool {
+    return if (target.ofmt == .elf) true else null;
+}
+
+/// Provider archives borrow std.Io executors from the C API and Lite CLI. Internal Zig
+/// callbacks must use the same backend calling convention as their owner.
+pub fn addProviderArchive(b: *std.Build, module: *std.Build.Module, name: []const u8, max_rss: u64) *std.Build.Step.Compile {
+    return b.addLibrary(.{
+        .name = name,
+        .linkage = .static,
+        .root_module = module,
+        .use_llvm = llvmBackend(module.resolved_target.?.result),
+        .max_rss = max_rss,
+    });
+}
+
 pub const Library = struct {
     binary: std.Build.LazyPath,
     compile: ?*std.Build.Step.Compile,
@@ -47,11 +64,23 @@ pub fn add(b: *std.Build, module: *std.Build.Module) Library {
         .linkage = if (macho) .static else .dynamic,
         .name = if (macho) "antfly-capi-objects" else "antfly",
         .root_module = module,
-        .max_rss = 12 * 1024 * 1024 * 1024,
+        // ELF version scripts must also hide compiler-provided Debug UBSan
+        // symbols. Use the linker that applies the final export boundary to
+        // every linked object, including those runtime objects.
+        .use_lld = if (elf) true else null,
+        // Zig's Debug self-hosted backend cannot link through LLD. Keep the
+        // code generator compatible with the required ELF export linker.
+        .use_llvm = llvmBackend(target),
+        // Mach-O ReleaseSafe codegen measured 12.92 GB; match the C API
+        // test estimate so fresh builds can schedule the complete archive.
+        .max_rss = @as(usize, if (macho) 14 else 12) * 1024 * 1024 * 1024,
     });
     const binary = if (macho) blk: {
         module.pic = true;
         compile.bundle_compiler_rt = true;
+        // The external Mach-O linker cannot add Zig's C/ObjC sanitizer
+        // runtime. Own it in the final archive alongside compiler-rt.
+        compile.bundle_ubsan_rt = true;
         const linker = b.option([]const u8, "macos-linker", "Mach-O linker executable (ld on macOS, ld64.lld for cross builds)") orelse
             if (b.graph.host.result.os.tag == .macos) "/usr/bin/ld" else "ld64.lld";
         const run = command(b, "link-macho");
@@ -64,6 +93,10 @@ pub fn add(b: *std.Build, module: *std.Build.Module) Library {
         run.addFileArg(compile.getEmittedBin());
         run.addArg("--output");
         const output = run.addOutputFileArg("libantfly.dylib");
+        // Retain atom sizes and archive owners alongside the cached binary.
+        // Release archives contain only the library, not this diagnostic map.
+        run.addArg("--map");
+        _ = run.addOutputFileArg("libantfly.map");
         run.addArg("--");
         var visited: std.AutoHashMap(*std.Build.Module, void) = .init(b.allocator);
         var libraries: std.AutoHashMap(*std.Build.Step.Compile, void) = .init(b.allocator);

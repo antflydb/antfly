@@ -331,7 +331,27 @@ pub const CTCRecognizer = struct {
         var input_tensor = try backends.Tensor.initFloat32(self.allocator, input_name, &shape, pixel_values);
         defer input_tensor.deinit();
 
-        const outputs = try self.session.runWithControl(&.{input_tensor}, self.allocator, control);
+        var permit = try self.session.admit(try self.session.planRun(&.{input_tensor}, null));
+        defer permit.deinit();
+        if (try permit.runResidentWithControl(&.{input_tensor}, self.allocator, control)) |resident_outputs| {
+            var resident = resident_outputs;
+            defer resident.deinit();
+            if (resident.outputs.len == 0) return error.NoRecognitionOutput;
+            if (try ctc_decode.decodeResident(self.allocator, resident.backend, resident.outputs[0], self.char_dict)) |decoded| {
+                return .{ .text = decoded.text, .confidence = decoded.confidence };
+            }
+            // Reuse this forward if reduction is unsupported; exporting its
+            // logits is cheaper than executing the entire recognizer again.
+            const output_shape = try resident.backend.tensorShape(resident.outputs[0], self.allocator);
+            defer self.allocator.free(output_shape);
+            const output_values = try resident.backend.toFloat32(resident.outputs[0], self.allocator);
+            defer self.allocator.free(output_values);
+            var host_output = try backends.Tensor.initFloat32(self.allocator, "ctc_logits", output_shape, output_values);
+            defer host_output.deinit();
+            const decoded = try ctc_decode.decodeFromTensor(self.allocator, &host_output, self.char_dict);
+            return .{ .text = decoded.text, .confidence = decoded.confidence };
+        }
+        const outputs = try permit.runWithControl(&.{input_tensor}, self.allocator, control);
         defer freeTensorSlice(self.allocator, outputs);
         if (outputs.len == 0) return error.NoRecognitionOutput;
 
@@ -1199,4 +1219,52 @@ test "sortRegionsByPredictedOrder reorders regions by model scores" {
     try std.testing.expectEqualDeep([4]f64{ 0, 10, 10, 20 }, regions[0].bbox);
     try std.testing.expectEqualDeep([4]f64{ 0, 25, 10, 35 }, regions[1].bbox);
     try std.testing.expectEqualDeep([4]f64{ 0, 40, 10, 50 }, regions[2].bbox);
+}
+
+test "media residency OCR recognition reuses resident outputs when reduction is unsupported" {
+    const allocator = std.testing.allocator;
+    const ops = @import("../ops/ops.zig");
+    const native = @import("../ops/native_compute.zig");
+    const ResidentOutputs = @import("../backends/session.zig").ResidentOutputs;
+    const Fixture = struct {
+        cb: *const ops.ComputeBackend,
+        calls: usize = 0,
+        fn run(_: *anyopaque, _: []const backends.Tensor, _: std.mem.Allocator) ![]backends.Tensor {
+            return error.UnexpectedSecondForward;
+        }
+        fn resident(raw: *anyopaque, _: []const backends.Tensor, alloc: std.mem.Allocator) !?ResidentOutputs {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            const outputs = try alloc.alloc(ops.CT, 1);
+            errdefer alloc.free(outputs);
+            outputs[0] = try self.cb.fromFloat32Shape(&.{ 0, 0.9, 0.1, 0, 0.8, 0.2, 0.9, 0, 0.1, 0, 0.2, 0.8 }, &.{ 1, 4, 3 });
+            return .{ .outputs = outputs, .backend = self.cb, .allocator = alloc };
+        }
+        fn info(_: *anyopaque) []const backends.TensorInfo {
+            return &.{};
+        }
+        fn backend(_: *anyopaque) backends.BackendType {
+            return .native;
+        }
+        fn close(_: *anyopaque) void {}
+        const vtable = backends.Session.VTable{ .run = run, .runResident = resident, .inputInfo = info, .outputInfo = info, .backend = backend, .close = close };
+    };
+    var weights = native.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    defer weights.deinitOwned();
+    var compute = native.NativeCompute.init(allocator, &weights, null);
+    defer compute.deinit();
+    for ([_]bool{ true, false }) |supported| {
+        var table = compute.computeBackend().vtable.*;
+        if (!supported) table.takeRows = null;
+        const cb = ops.ComputeBackend{ .ptr = &compute, .vtable = &table };
+        var fixture = Fixture{ .cb = &cb };
+        var recognizer = CTCRecognizer{ .allocator = allocator, .session = .{ .ptr = &fixture, .vtable = &Fixture.vtable }, .char_dict = try ctc_decode.loadCharDictBytes(allocator, "A\né", false), .preprocess = .{ .width = 2, .height = 2 } };
+        defer recognizer.deinit();
+        var pixels: [12]u8 = @splat(255);
+        const result = try recognizer.recognize(.{ .data = &pixels, .width = 2, .height = 2, .channels = 3 }, null);
+        defer allocator.free(result.text);
+        try std.testing.expectEqualStrings("Aé", result.text);
+        try std.testing.expectApproxEqAbs(@as(f64, 0.85), result.confidence, 1e-6);
+        try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    }
 }

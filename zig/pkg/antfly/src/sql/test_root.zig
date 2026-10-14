@@ -14,16 +14,33 @@
 // limitations.
 
 test {
+    _ = @import("parity_case_test.zig");
     _ = @import("window_test.zig");
     _ = @import("subquery_test.zig");
     _ = @import("recursive_test.zig");
+    _ = @import("lateral_test.zig");
     _ = @import("merge_test.zig");
     _ = @import("antfly_local_sources").sql_aggregate_binding;
     _ = @import("antfly_local_sources").sql_compiler;
+    _ = @import("antfly_local_sources").sql_schema_ddl;
     _ = @import("antfly_local_sources").sql_scalar;
+    _ = @import("antfly_local_sources").sql_parameter_frame;
+    _ = @import("antfly_local_sources").sql_bound_scalars;
+    _ = @import("antfly_local_sources").sql_replay_rows;
+    _ = @import("antfly_local_sources").sql_array_value;
+    _ = @import("antfly_local_sources").sql_numeric_value;
+    _ = @import("antfly_local_sources").sql_numeric_binary;
+    _ = @import("antfly_local_sources").sql_numeric_key;
+    _ = @import("antfly_local_sources").sql_numeric_aggregate;
+    _ = @import("antfly_local_sources").sql_array_binary;
+    _ = @import("antfly_local_sources").sql_array_storage;
+    _ = @import("antfly_local_sources").sql_array_comparison;
+    _ = @import("antfly_local_sources").sql_row_value;
+    _ = @import("antfly_local_sources").sql_array_wire;
     _ = @import("antfly_local_sources").sql_decision_eval;
     _ = @import("antfly_local_sources").sql_describe;
     _ = @import("antfly_local_sources").sql_runtime;
+    _ = @import("antfly_local_sources").sql_relation_runtime;
     _ = @import("insert_test.zig");
     _ = @import("returning_test.zig");
     _ = @import("conflict_test.zig");

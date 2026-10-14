@@ -27,6 +27,16 @@ pub const Key = struct {
     path: []const u8,
     type: @import("ast.zig").ColumnType,
     nullable: bool,
+    element_type: ?@import("array_value.zig").ElementType = null,
+    numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null,
+
+    pub fn fromColumn(column: catalog.Column) Key {
+        const descriptor = scalar.columnType(column);
+        return .{ .path = column.path, .type = column.type, .nullable = column.nullable, .element_type = descriptor.element_type, .numeric_modifier = descriptor.numeric_modifier };
+    }
+    pub fn definition(self: Key) scalar.Column {
+        return .{ .name = self.path, .type = self.type, .nullable = self.nullable, .element_type = self.element_type, .numeric_modifier = self.numeric_modifier };
+    }
 };
 pub const Input = struct {
     spec: operators.AggregateSpec,
@@ -40,13 +50,14 @@ pub const Recipe = struct {
 
     pub fn fingerprint(self: Recipe) [32]u8 {
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
-        hash.update("native-sql-aggregate-recipe-v1");
+        hash.update("native-sql-aggregate-recipe-v2");
         word(&hash, self.keys.len);
         for (self.keys) |key| keyHash(&hash, key);
         word(&hash, self.inputs.len);
         for (self.inputs) |input| {
             part(&hash, @tagName(input.spec.kind));
             if (input.spec.input_type) |kind| part(&hash, @tagName(kind)) else part(&hash, "*");
+            if (input.spec.input_element) |identity| part(&hash, @tagName(identity)) else part(&hash, "*");
             hash.update(&.{ @intFromBool(input.spec.distinct), @intFromBool(input.column != null) });
             if (input.column) |column| keyHash(&hash, column);
         }
@@ -63,7 +74,7 @@ pub const Recipe = struct {
     }
 };
 fn keyEql(left: Key, right: Key) bool {
-    return left.type == right.type and left.nullable == right.nullable and std.mem.eql(u8, left.path, right.path);
+    return left.type == right.type and left.nullable == right.nullable and left.element_type == right.element_type and @import("../common/sql_builtin_type.zig").NumericModifier.eql(left.numeric_modifier, right.numeric_modifier) and std.mem.eql(u8, left.path, right.path);
 }
 fn word(hash: *std.crypto.hash.sha2.Sha256, value: usize) void {
     var bytes: [8]u8 = undefined;
@@ -78,6 +89,13 @@ fn keyHash(hash: *std.crypto.hash.sha2.Sha256, key: Key) void {
     part(hash, key.path);
     part(hash, @tagName(key.type));
     hash.update(&.{@intFromBool(key.nullable)});
+    if (key.element_type) |identity| part(hash, @tagName(identity)) else part(hash, "*");
+    if (key.numeric_modifier) |modifier| {
+        var bytes: [4]u8 = undefined;
+        std.mem.writeInt(u16, bytes[0..2], modifier.precision, .little);
+        std.mem.writeInt(i16, bytes[2..4], modifier.scale, .little);
+        part(hash, &bytes);
+    } else part(hash, "*");
 }
 fn direct(table: catalog.Table, columns: []const scalar.Column, program: scalar.Program) !?Key {
     if (program.instructions.len != 1 or program.root != 0 or program.instructions[0].operation != .column) return null;
@@ -85,7 +103,7 @@ fn direct(table: catalog.Table, columns: []const scalar.Column, program: scalar.
     if (ordinal >= columns.len) return error.InvalidSqlBackendResponse;
     const column = table.column(columns[ordinal].name) catch return null;
     if (std.mem.eql(u8, column.name, "_id") or program.output_type.kind != column.type) return null;
-    return .{ .path = column.path, .type = column.type, .nullable = column.nullable };
+    return Key.fromColumn(column);
 }
 
 /// The result borrows column names from the request-owned table. Arrays belong
@@ -95,6 +113,10 @@ pub fn fromBound(a: A, table: catalog.Table, bound: binding.Bound) !?Recipe {
     if (bound.input.predicate != null) return null;
     if (bound.specs.len != bound.inputs.len or bound.inputs.len != bound.filters.len or bound.group_count > bound.input.projections.len) return error.InvalidSqlBackendResponse;
     for (bound.filters) |filter| if (filter != null) return null;
+    return recipeFromBound(a, table, bound);
+}
+
+fn recipeFromBound(a: A, table: catalog.Table, bound: binding.Bound) !?Recipe {
     const keys = try a.alloc(Key, bound.group_count);
     errdefer a.free(keys);
     for (keys, bound.input.projections[0..keys.len]) |*key, program| {
@@ -124,6 +146,56 @@ pub fn fromBound(a: A, table: catalog.Table, bound: binding.Bound) !?Recipe {
     return .{ .keys = keys, .inputs = inputs };
 }
 
+/// A residual may consume stored groups only when it is constant for every
+/// source row in that group. Keep this proof separate from recipe identity:
+/// persisted states always describe the unfiltered source.
+pub const Reuse = struct { recipe: Recipe, key_columns: []const u32 };
+pub fn reuseFromBound(a: A, table: catalog.Table, bound: binding.Bound) !?Reuse {
+    if (bound.specs.len != bound.inputs.len or bound.inputs.len != bound.filters.len or bound.group_count > bound.input.projections.len) return error.InvalidSqlBackendResponse;
+    const columns = try a.alloc(u32, bound.group_count);
+    errdefer a.free(columns);
+    for (columns, bound.input.projections[0..bound.group_count]) |*column, optional| {
+        const program = optional orelse return error.InvalidSqlBackendResponse;
+        if (program.instructions.len != 1 or program.instructions[0].operation != .column) {
+            a.free(columns);
+            return null;
+        }
+        column.* = program.instructions[0].operation.column;
+    }
+    if (bound.input.predicate) |program| if (!groupConstant(program, columns)) {
+        a.free(columns);
+        return null;
+    };
+    for (bound.filters) |optional| if (optional) |slot| {
+        if (slot >= bound.input.projections.len) return error.InvalidSqlBackendResponse;
+        if (!groupConstant(bound.input.projections[slot] orelse return error.InvalidSqlBackendResponse, columns)) {
+            a.free(columns);
+            return null;
+        }
+    };
+    const recipe = (try recipeFromBound(a, table, bound)) orelse {
+        a.free(columns);
+        return null;
+    };
+    return .{ .recipe = recipe, .key_columns = columns };
+}
+fn groupConstant(program: scalar.Program, columns: []const u32) bool {
+    for (program.instructions) |instruction| switch (instruction.operation) {
+        .literal, .parameter, .in_list => {},
+        .column => |column| if (std.mem.indexOfScalar(u32, columns, column) == null) return false,
+        .unary => |unary| switch (unary.op) {
+            .positive, .negative => return false,
+            else => {},
+        },
+        .binary => |binary| switch (binary.op) {
+            .eq, .neq, .lt, .lte, .gt, .gte, .@"and", .@"or", .is_distinct, .is_not_distinct => {},
+            else => return false,
+        },
+        else => return false,
+    };
+    return true;
+}
+
 /// COUNT(*) has a dedicated compiler path. It still uses the same semantic
 /// identity and exact partial provider, avoiding a second index protocol.
 pub fn countFromProvider(context: anytype, table: catalog.Table) !?u64 {
@@ -146,10 +218,9 @@ pub fn countFromProvider(context: anytype, table: catalog.Table) !?u64 {
         if (pages > context.limits.scan_pages or partials.len > context.limits.scan_rows -| records) return error.SqlProgramLimitExceeded;
         records += partials.len;
         for (partials) |partial| {
-            if (partial.keys.len != 0 or partial.aggregates.len != 1) return error.InvalidSqlBackendResponse;
+            if (partial.keys.len != 0 or try @import("aggregate_partial.zig").partialCount(partial) != 1) return error.InvalidSqlBackendResponse;
             if (partial.aggregate_slots) |slots| if (slots.len != 1 or slots[0] != 0) return error.InvalidSqlBackendResponse;
-            var state = try @import("aggregate_partial.zig").decode(a, partial.aggregates[0], spec);
-            defer state.deinit();
+            const state = try @import("aggregate_partial.zig").read(a, partial, 0, spec);
             count = std.math.add(u64, count, state.count) catch return error.SqlNumericOutOfRange;
             if (count > std.math.maxInt(i64)) return error.SqlNumericOutOfRange;
         }
@@ -225,4 +296,22 @@ test "SQL native materialization recipe proves bound columns and null semantics"
             try std.testing.expect(!std.mem.eql(u8, &count_star.?, &fingerprint));
         } else try std.testing.expect(!std.mem.eql(u8, &count_column.?, &fingerprint));
     }
+}
+
+test "external lake aggregate identity preserves exact scalar types and numeric modifiers" {
+    const base: catalog.Column = .{ .name = "k", .path = "k", .type = .number, .element_type = .numeric };
+    const exact = Key.fromColumn(base);
+    var approximate = base;
+    approximate.element_type = .float64;
+    var constrained = base;
+    constrained.numeric_modifier = .{ .precision = 20, .scale = 3 };
+    const count: Input = .{ .spec = .{ .kind = .count }, .column = null };
+    const recipe: Recipe = .{ .keys = &.{exact}, .inputs = &.{count} };
+    for ([_]Key{ Key.fromColumn(approximate), Key.fromColumn(constrained), .{ .path = "k", .type = .number, .nullable = true } }) |other| {
+        const changed: Recipe = .{ .keys = &.{other}, .inputs = &.{count} };
+        try std.testing.expect(!recipe.eql(changed));
+        try std.testing.expect(!std.mem.eql(u8, &recipe.fingerprint(), &changed.fingerprint()));
+    }
+    try std.testing.expectEqual(.numeric, exact.definition().element_type.?);
+    try std.testing.expectEqual(@as(i16, 3), Key.fromColumn(constrained).definition().numeric_modifier.?.scale);
 }

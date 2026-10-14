@@ -196,6 +196,83 @@ class CosineTests(unittest.TestCase):
 
 
 class RunCellTests(unittest.TestCase):
+    def test_query_benchmark_sends_same_rendered_input_and_erases_reference(self):
+        calls = []
+
+        def request(url, model, texts, timeout, **kwargs):
+            calls.append((url, texts, kwargs))
+            return 10.0, [[1.0, 0.0]], model, 3 if url == "http://antfly" else 4
+
+        args = self.args(
+            task_type="query",
+            query_prefix="Instruct: task\nQuery:",
+            instruction="task",
+            reference_slots_url="http://reference/slots",
+        )
+        batches = [
+            (["Instruct: task\nQuery:first"], [4]),
+            (["Instruct: task\nQuery:second"], [4]),
+        ]
+        with (
+            mock.patch.object(benchmark, "request_embeddings", side_effect=request),
+            mock.patch.object(
+                benchmark, "erase_reference_slots", return_value=[0]
+            ) as erase,
+        ):
+            benchmark.run_cell(args, batches, "exact:test")
+        self.assertEqual(2, erase.call_count)
+        antfly = [call for call in calls if call[0] == "http://antfly"]
+        reference = [call for call in calls if call[0] == "http://reference"]
+        self.assertEqual([["first"], ["second"]], [call[1] for call in antfly])
+        self.assertEqual(
+            [batch[0] for batch in batches], [call[1] for call in reference]
+        )
+        self.assertEqual(
+            {
+                "request_options": {
+                    "task_type": "RETRIEVAL_QUERY",
+                    "instruction": "task",
+                }
+            },
+            antfly[0][2],
+        )
+
+    def test_query_cache_purge_failure_prevents_measurement(self):
+        args = self.args(
+            task_type="query",
+            query_prefix="prefix",
+            instruction=None,
+            reference_slots_url="http://reference/slots",
+        )
+        with (
+            mock.patch.object(
+                benchmark,
+                "erase_reference_slots",
+                side_effect=ValueError("active slot"),
+            ),
+            mock.patch.object(
+                benchmark, "request_embeddings", return_value=(1.0, [[1.0]], "model", 3)
+            ) as request,
+        ):
+            with self.assertRaisesRegex(ValueError, "active slot"):
+                benchmark.run_cell(args, [(["prefixbody"], [4])], "exact:test")
+        self.assertEqual(1, request.call_count)
+
+    def test_common_query_prefix_requires_explicit_erasure(self):
+        cases = [
+            {"id": "a", "text": "prefix a", "token_ids": [1, 2]},
+            {"id": "b", "text": "prefix b", "token_ids": [1, 3]},
+        ]
+        with self.assertRaisesRegex(ValueError, "first token"):
+            benchmark.validate_cache_neutral_cases(cases, 2)
+        benchmark.validate_cache_neutral_cases(cases, 2, erased_reference_slots=True)
+        with self.assertRaisesRegex(ValueError, "texts"):
+            benchmark.validate_cache_neutral_cases(
+                [cases[0], {**cases[1], "text": cases[0]["text"]}],
+                2,
+                erased_reference_slots=True,
+            )
+
     @staticmethod
     def args(**overrides: object) -> SimpleNamespace:
         values = {

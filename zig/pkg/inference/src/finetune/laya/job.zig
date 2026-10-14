@@ -107,7 +107,7 @@ pub const Config = struct {
     /// encoder: only the decision head trains, so a trunk shared with other
     /// heads keeps its exact output.
     freeze_layers: u32 = 0,
-    /// Low-rank adaptation (models/laya/LAYA.md, "LoRA for Laya training").
+    /// Low-rank adaptation (models/laya/LAYA.md, "LoRA").
     /// Null trains every unfrozen parameter directly, as before.
     lora: ?Lora = null,
     /// Force the flash-style fused segment attention (roadmap step 2c) even

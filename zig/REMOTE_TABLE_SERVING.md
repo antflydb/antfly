@@ -8,6 +8,11 @@ snapshot-bound indexes and materializations, a bounded local cache, and one nati
 query planner across HTTP rows, search, SQL, and PostgreSQL wire delivery. An index
 configuration is desired state; only a verified published generation is query-ready.
 
+[Lake ingestion, change capture, and publication](../docs/plans/lake-ingestion-and-publication.md)
+describes proposed source notifications, catalog commits, writable archives, and
+recent-change merging. These extend the serving contracts here; object events
+alone must not establish source commitment or index readiness.
+
 ## Implementation status
 
 The serving path now connects the existing persistent range cache beneath shared
@@ -37,6 +42,50 @@ contact the source. Real Parquet and Iceberg API tests close and restart the cac
 owner, run SQL again, and assert disk hits with zero repeated provider range reads.
 Separate tests cover credential/version isolation, unversioned-read rejection,
 bounded priority eviction across restart, and unavailable local cache fallback.
+
+### Diagnosing cold queries and restart reuse
+
+The write worker has its own server-owned `std.Io` executor: it does not consume
+the last request executor slot. Initialization failures preserve source reads and
+retry opportunistically on a later request after a 30-second cooldown (no request
+sleeps; a successful retry clears the unavailability reason). A published owner
+bypasses startup
+locking on warm queries. Accepted writes drain during graceful shutdown; abrupt
+termination may lose queued cache writes, never authoritative source data.
+
+If a configured cache directory stays empty, inspect these process metrics before
+changing cache sizes or adding prewarming:
+
+- `antfly_lake_cache_disk_ready` and `antfly_lake_cache_disk_unavailable{reason}`:
+  check the effective local root, node-user permissions, one owner per directory,
+  and executor/resource admission. `WouldBlock` means another owner holds the root.
+- `antfly_lake_disk_cache_writes_completed_total`, `write_errors_total`,
+  `last_write_error{reason}`, `queued_entries`, and `queued_bytes`: distinguish an
+  unavailable owner, accepted pending work, and failed publication.
+- `antfly_lake_disk_cache_writes_dropped_total` and `drops_*_total`: distinguish
+  policy, queue, memory, capacity, allocation, and shutdown admission refusal.
+
+Run the same authorized highlighted query before and after a graceful restart
+with the same root and credentials. Compare per-run deltas of
+`antfly_lake_cache_provider_reads_total`, `provider_bytes_total`, `disk_hits_total`,
+and `disk_bytes_total`; process counters reset on restart. Immutable payloads can
+be reused, while decoded navigation is rebuilt and publication/source authority
+must still be revalidated. Changed versions, eviction, or a new credential scope
+legitimately cause fresh remote reads. A cached payload is never offline authority.
+
+Use `antfly_lake_query_{source,publication,index,ranking,hydration,highlight,total}`
+`_calls_total` / `_nanoseconds_total` to separate phases. Timings include failed
+work and can overlap; do not add them to infer request latency. Empty-cache reads
+use bounded parallel range/segment acquisition and packed authenticated units.
+For eligible single-text-index results, covered display/highlight fields come
+from stored sidecars; uncovered fields stay on delete-aware Parquet projection.
+Hydration uses a request-owned 1 MiB decoded-block LRU, preserving ranked order
+and reusing blocks across hits/segments. One oversized block may be held alone
+and is released before another block is decoded; the scope closes with the batch.
+
+The local restart regression denies all provider reads after rebuilding the cache
+owner and still ranks, hydrates, and highlights successfully. It does not prove
+the cause of missing files in a deployed cache or measure live GCS latency.
 
 The integrated serving paths are:
 
@@ -106,6 +155,118 @@ the completed build with that original coverage proof. The native maintenance
 worker uses this adapter and fencing protocol. Native aggregate cursors consume
 the catalog selection proof before opening exact aggregate state. Search and row
 candidate consumers remain open.
+
+## Lake index publication operations
+
+These operational contracts were folded in from the SQL extraction design
+(`docs/design/sql/extraction.md`); its dated log is
+[here](../docs/design/sql/history/lake-integration-log.md).
+
+Declaration and publication:
+
+- External tables accept opt-in indexes at creation or through the index
+  endpoint. Public algebraic recipes (for example `{"type":"algebraic",
+  "derive_from_schema":true,"aggregates":[{"name":"rows","op":"count"}]}`) are
+  expanded once into the canonical definition used by installation and
+  publication; the storage engine receives only its strict runtime config.
+  Each index accepts at most 64 recipes, and admission checks the shared
+  4,096-declaration directory ceiling before committing definitions.
+- Native metadata protocol 23 stores a checksum, length and immutable artifact
+  reference for the publication directory instead of embedding declarations in
+  the 256 KiB catalog record; the directory is bounded to 16 MiB. Legacy inline
+  catalogs stay readable. Cached directory/inventory bytes never replace fresh
+  source, credential and store validation; source object checks run in batches
+  of up to eight through the shared scheduler.
+- Builds renew a five-minute ownership lease with a separate heartbeat and have
+  a separate 24-hour request deadline. A lost or ambiguous metadata CAS is
+  terminal and never replayed; provider cancellation callbacks perform no
+  metadata writes. Upload completion publishes through an exact table-definition
+  CAS against an owned snapshot of the latest fence.
+- Published and queryable are separate states. Remote `CREATE INDEX` and the
+  relational index API use the schema definition as the durable build
+  obligation; publication is asynchronous and readiness explicit. Ordered
+  indexes use the native tuple encoder and partial-index rules with a physical
+  file/group/row tie; SQL equality prefixes select them automatically, with a
+  scan fallback only before an artifact is selected. Integers never cross
+  floating point.
+- Unchanged aggregate roots survive definition-only updates when the complete
+  source/schema, credentials, store and recipe proofs match. Exact mergeable
+  recipes persist per-file contributions (at most 16,384 entries, live files and
+  desired recipes only). Deletion-bearing sources, floating keys/extrema and
+  non-associative floating reductions always use a complete scan.
+
+Readers and retention:
+
+- Reader authority lives in native metadata independently of definition CAS.
+  One renewable publication lease per process/session protects an old
+  generation across replacement and DROP and fences every cache read when
+  renewal fails. Retirement atomically closes new reader admission; a bounded
+  collector marks directories, inventories, contributions and all aggregate,
+  graph and ordered-index descendants before its scoped upload census, preserves
+  pending upload attempts and resumes the exact retirement cut. Deleting old
+  attempt namespaces alone is unsafe; a protocol upgrade alone cannot prove old
+  readers have drained (protocol 24/25 publications declare their reader
+  contract).
+- Retained publications record a physical store locator and named connection,
+  never credentials; reopening rejects a connection redirected to another
+  endpoint, root, bucket or prefix. Each durable table incarnation has a random
+  upload namespace, and store bindings are recorded when an attempt is admitted.
+- Backup manifests preserve schema and index rebuild obligations, not
+  publication authority; restore creates an unpublished external table and
+  rebuilds against its authorized source.
+- Ordered search pages carry `remote_snapshot` alongside the sort tuple; replay
+  must echo it and a changed publication fails closed. The token grants no
+  access and retains no artifacts.
+
+Artifact GC runs on a separate bounded cleanup scheduling owner, drains before
+reader/cache teardown and enumerates DROP tombstones through native metadata.
+Configure it under `lake_indexes.artifact_gc`:
+
+| Key | Default |
+| --- | --- |
+| `enabled` | `true` |
+| `dry_run` | `false` (dry runs report eligible/deleted counts without changing authority or objects) |
+| `interval_ms` | `30000` |
+| `max_deleted` | `4096` per pass |
+| `max_marked` | `262144` artifacts |
+| `max_read_bytes` | 512 MiB of root reads |
+
+Native text, sparse and dense serving:
+
+- Full-text indexes opt in to duplicated source with
+  `{"type":"full_text","field":"body","store_source":true}` (default `false`).
+  Segments retain only the indexed source projection, so eligible single-text
+  queries highlight from authenticated stored-source blocks without adding the
+  body to the Parquet projection. Text artifact metadata version 9 records
+  stored projection coverage; existing publications need a format refresh, and
+  older unattested artifacts fall back to Parquet until rebuilt.
+- Seekable text readers coalesce a fully requested, authenticated 1 MiB pack
+  into one GET; partial cold reads keep 256 KiB units. Prefetch admits at most
+  four units/packs (4 MiB) concurrently and shares singleflight keys with
+  required reads. Pack and unit digests are both enforced.
+- The process text corpus cache shares a 256 MiB heap budget
+  (`lake_indexes.text_cache.max_heap_bytes`) across entries; the encoded corpus
+  limit is 512 MiB. Native request runtimes enforce a 256 MiB per-request heap
+  limit. Read-only HBC recovery never creates directories or repairs WAL tails.
+- Physical range planning groups the complete coalescing compatibility class
+  (object version, codec, decoded-column identity) before sorting offsets.
+
+Cold-query metrics and qualification: server request stats include
+`lake_range_cache` and `lake_disk_cache`; health endpoints expose
+`antfly_lake_cache_*`, `antfly_lake_disk_cache_*`, the per-phase
+`antfly_lake_query_{phase}_{calls,nanoseconds}_total` families described above,
+and `antfly_lake_query_phase_nanoseconds_total{phase=total|publication|search|hydration|delivery}`
+for completed indexed searches (hydration is nested in search and delivery; do
+not sum phases). Inspect `disk_unavailable`, `disk_init_attempts` and
+`disk_init_failures` before treating an empty disk directory as a query problem.
+A disabled cache, or one without a resolvable root, starts no disk owner;
+configure `lake_cache.root` explicitly on nodes without a local storage base
+directory. To qualify a deployment, run the same highlighted query against one
+pinned publication, wait for queued writes to drain, and record provider
+requests/bytes, disk hits and elapsed time; restart with the same cache volume
+and credentials and repeat; then repeat with an empty cache directory. Compare
+counter deltas on an otherwise idle node, since shared counters are not
+per-request attribution. Public lake `took_ms` includes cold setup.
 
 ## Native execution and delivery
 
@@ -406,8 +567,8 @@ runtime before the persistent read cache shuts down.
 Ordered native indexes now accept signed datetime keys. The tuple encoding is
 version 2 and the desired-publication fingerprint is version 5; a generation or
 cursor built with the older encoding cannot be admitted under the new format.
-The encoding keeps signed nanoseconds ordered without losing the existing local
-unsigned timestamp domain.
+The encoding keeps signed nanoseconds ordered while retaining legacy unsigned
+column readability. Native mapped text columns now use the signed format below.
 
 SQL can automatically choose leading equality prefixes and a range on the next
 index key. A scan's requested ordering is separate from the provider's ordering
@@ -1044,15 +1205,24 @@ disjunctions require every branch to be exact. An indexed conjunct may narrow
 a residual predicate, but an exclusion never discards rows using a superset.
 Unsupported expressions retain the shared exact residual evaluator.
 
-The consumer builds a Roaring bitmap in the pinned text snapshot's document
-number space. Both selective and broad predicates seek the tuple bounds in an immutable
+The consumer produces exact membership in the pinned text snapshot's document
+number space. A selective metadata predicate materializes a Roaring bitmap from
+its immutable compressed row-set tree. A broad exact whole-index conjunction
+can defer membership until the text filter has supplied segment-local candidates.
+Those candidates invert through the shared native-to-physical directory and
+point-probe the authenticated reverse tree against the same tuple bounds. Point
+work is capped across all segments/count passes by the cheaper index/scan
+full-membership estimate; exceeding it uses the existing exact scan/index/
+intersection planner and materializes one compressed bitmap for every later pass.
+Complex Boolean predicates and residual expressions retain the existing planner.
+Both selective and broad materializations seek the tuple bounds in the immutable
 compressed row-set tree. Contiguous per-tuple/file/group physical blocks encode
 as extents; scattered selections encode as Roaring sets. Broad categorical
 predicates consume blocks rather than one forward record per matching row.
 Initial publication aggregates the sorted tuple stream; incremental publication
 replaces only changed-file blocks through bounded spill and copy-on-write pages.
 The forward/reverse trees remain available for SQL seeks and file replacement;
-predicate evaluation does not scan the unrelated physical reverse tree. Native text metadata version 8
+full predicate materialization does not scan the unrelated physical reverse tree. Native text metadata version 8
 publishes a delete-aware physical-row ordinal directory per file. Contiguous
 2^20-row blocks need only an ordinal base and extent; blocks with holes use an
 authenticated Roaring bitmap and rank. Group identifiers and the high bits of
@@ -1127,3 +1297,135 @@ I/O, then queues its segment directories and row-hole children. Checkpoints can
 therefore advance between files without materializing the corpus-wide serving
 metadata. Serving and collection share file-manifest identity, scope, and child
 validation. Inline retained root formats continue using their existing walkers.
+
+Native execution now includes sparse ordinal intersection, narrowed vector
+residuals, compatible ordered-index top-N, bulk bitmap counts, and normalized
+temporal predicates. [Native lake performance follow-up](NATIVE_LAKE_PERFORMANCE_FOLLOWUP.md)
+describes their contracts, differential and E2E validation, fallback shapes,
+and remaining large-archive measurements.
+
+
+Native sparse recipe v5 stores transactionally maintained physical ordinal maps
+in 1024-row checkpoint blocks, alongside identity/update forward locators. Broad
+predicates translate compressed row selections by block and reject disjoint posting blocks through backward-compatible ordinal range trailers before decoding; Unextended ranges and older checkpoints retain read fallbacks. Exact winner collection uses a bounded heap when the checkpoint proves
+complete identities. Nonpositive dot products remain matches when terms overlap.
+
+Vector residual evaluation retains only unresolved predicate dependencies and
+passes compressed physical selections to one pinned Parquet cursor. Direct
+column expressions use shared leaf predicates with Boolean page masks; nested
+paths retain document evaluation. Ordered text search uses a membership/row-goal
+cost check, consumes proven index row references without Parquet hydration, and
+supports equality-prefix bounds and inclusive forward and backward seeks. Complete public-ID
+boundary ties remain in the native collector. `profile.sort.ordered_scanned_count`
+reports traversed physical references before membership filtering. Signed native
+datetime sort values and reverse persistent-tree cursors use the contracts below.
+
+
+### Signed native ordering, reverse seeks, and embedded pruning
+
+Mapped native datetime doc values and public sort cursors share signed i128 Unix
+nanoseconds with SQL; public cursors retain normalized RFC3339 transport. Native
+wire tag 7 stores 16-byte signed values, and readers retain legacy unsigned tag-0
+compatibility. Producer recipe v3 fences older projections during rebuilds.
+Search-before walks the immutable ordered tree backward from its upper bound,
+retaining boundary ties for public-ID comparison and the existing probe guards.
+
+Complete sparse checkpoints score encoded postings document at a time with one
+score accumulator and k winners. Paged immutable segments retain one block per
+active stream under a shared 64 MiB block budget and a separate navigation byte
+budget; stream count has no fixed 4096 cliff. Legacy segments retain their encoded
+byte admission. Selective filters seek the block covering the next selected
+ordinal and use the same quantized scorer as broad/unfiltered searches. Contributions retain source/term/chunk addition order.
+Conservative block score bounds include absent terms and both signed endpoints;
+pruning compares score and native ordinal together to preserve ties. Only
+producer-attested unique streams use score bounds; older repeated postings
+retain conservative accumulation. Prepared bitmap ranks reject
+disjoint ordinal blocks using authenticated trailers without decoding posting
+arrays. Legacy checkpoints, unresolved key predicates, and queries exceeding
+either stream or posting-byte admission retain the bounded spill path: at most
+65,536 partial scores, ordinal/sequence sorting, cancellation, native capacity
+reservations, and a 1 GiB spill input budget. Hosts without spill I/O reject
+overflow admission. Posting payloads remain compatible.
+
+Native date-range parsing, lowering, and serialization now share signed i128
+bounds with datetime doc values, including pre-epoch nanoseconds. Ordered provider
+pulls enforce the remaining physical-row budget internally, so rows absent from
+the text corpus cannot bypass fallback. Residual dictionary kernels memoize only
+reached entries and retain shared leaf semantics; canonical integer term equality
+and supported i64/f64 numeric ranges use eight-lane comparisons with selection,
+null, and active masks. Boolean terms and scalar null/existence predicates also
+have typed kernels. Mixed wide bounds and nonfinite values retain shared leaf
+semantics. Native date-histogram collectors and nested bucket keys retain signed
+i128 nanoseconds and share UTC interval truncation across pre-epoch dates and
+calendar boundaries.
+
+Parquet statistics and standard page directories prune both Parquet and Iceberg
+scans. Standard split-block Bloom filters additionally prune equality misses by
+reading a small header and one 32-byte block through the shared range cache.
+Inventory v18 carries optional Bloom offsets and lengths, retaining older codec
+readability. Unknown algorithms, physical interpretations and malformed headers
+fall back to scans; exact residual evaluation remains authoritative.
+
+Paged sparse roots (`ASPSPG02`) occupy 32 bytes and reference 64-term directory
+pages plus independently seekable posting KV blocks by segment/term/final ordinal.
+Optional lossless `ASP2` transport packs positive ordinal gaps, preserving V1 weight
+bytes and canonical f32 scoring; blocks that cannot shrink, including repeated
+legacy ordinals, stay raw. `ASPSSEG1`, `ASPSPG01` and raw block readers remain
+supported. Native sparse recipe v8 and catalog definition v9 fence older remote
+publications for rebuild. Physical mappings and visibility checks use bounded
+cursor leases; live-row rank/select caches use four reusable fixed buffers.
+Visibility lanes retain their lower-bound result and proven missing interval,
+including EOF. Requests within that interval reuse the lease; backward requests
+outside it seek again. Absent tombstone or epoch families therefore do not restart
+an LSM merge cursor for every candidate. Positive epoch families additionally
+admit 64-ordinal pages after two probes demonstrate locality in a block. Up to
+32 prefixes keep independent cursors/pages, so interleaved segments reuse their
+pages without evicting one another. Other prefixes and scattered first probes
+retain point reads. Page fills copy epoch bytes, propagate read failures, and
+remain bound to the original read transaction. Fresh bitmap lower-bound probes
+binary-search container keys rather than walking preceding containers.
+Disk-proof capture uses independent
+epoch and deletion lanes to preserve forward locality across both families.
+
+Compaction pins inputs and reserves a durable intent under the apply gate. Modern
+proof capture, merging, directory spooling and staging run outside that gate.
+Directory pages and guarded term/interval routes stage together; queries require
+the generation root in the same snapshot. A short activation validates and
+replaces roots. Locator refresh reacquires the gate for at most 256 records and
+rechecks generation/incarnation validity. Bounded retirement runs outside the
+apply gate, using directory pages as route ledgers. Durable intents recover
+abandoned staging and interrupted locator refresh while backend snapshots retain
+old readers.
+Direct ordered-index builds exceeding eight definitions share one union-projection
+replay across bounded cohorts; its changed-file union preserves incremental seed
+reuse and avoids decoding unchanged files. Publication continues sharing its
+existing replay across native builders. See the
+[performance contracts](NATIVE_LAKE_PERFORMANCE_FOLLOWUP.md) for validation and
+remaining archive measurements.
+
+Paged sparse roots also carry conservative authenticated native ordinal bounds.
+Positive selections reject disjoint segments before opening posting streams,
+avoiding a first-block read from every later segment for a point query. Older
+paged roots without the optional bounds retain the ordinary read path. The
+multi-segment regression admits only the overlapping stream and reads one block.
+
+### Shared directories and public-ID tie seeks
+
+The bounded native text corpus cache owns the physical/native ordinal directory,
+including its typed block and delete-bitmap references. Every query phase borrows
+the same immutable directory under its corpus pin. Decoded ordered-row roots
+likewise cache snapshot-bound public file digests and a sorted file-slot directory.
+An explicit verified-root handle retains structural validation under the decoded
+metadata lease; each reader still checks the requested fingerprint and uses the
+request's cancellation, publication lease, and credential-scoped store capability.
+Warm reader initialization therefore avoids repeating an O(files) validation.
+
+Ordered-row recipe v6 includes a tuple/file count tree. It supports complete
+public-ID tie ordering without duplicating every row into another sort tree or
+rewriting retained rows when snapshot-bound public file digests change. Bounded
+spill grouping constructs the directory; incremental updates adjust changed
+counts with copy-on-write. GC retains these pages while any publication reader
+is active. Complete-key search cursors seek within the boundary file/row and
+stop within large equal-key groups; older or partially ordered indexes retain
+the existing native collector fallback. Public request and cursor formats stay
+the same, and normal publication/rebuild upgrades older index artifacts.

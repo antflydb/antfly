@@ -14,7 +14,8 @@
 // limitations.
 
 //! One projected, delete-aware scan feeds independent bounded native builders.
-//! The replay is statement-owned columnar spill, with direct per-file seeks.
+//! Replay retains at most one file. Whole-source consumers stream ordinarily;
+//! per-file consumers share a bounded replay without an archive-wide spool.
 const std = @import("std");
 const local = @import("antfly_local_sources");
 const rows = local.storage_rowsource_types;
@@ -122,6 +123,13 @@ pub fn changedFilesIndexed(a: A, out: A, provider: *Provider, store: @import("..
             .text_segment => text: {
                 const native = @import("lake_index_native_text.zig");
                 if (declaration.artifact.metadata_version != native.metadata_version) return null;
+                const directory = try native.loadRootDirectory(ca, store, declaration.artifact, cancellation, null);
+                if (directory.inventory_version == 3) {
+                    const records = try native.text_directory.fileRecords(ca, directory, store, null, cancellation);
+                    const files = try ca.alloc(state.File, records.len);
+                    for (files, records) |*file, record| file.* = record.file;
+                    break :text files;
+                }
                 const root = try native.loadRoot(ca, store, declaration.artifact, cancellation, null);
                 const files = try ca.alloc(state.File, root.file_groups.len);
                 for (files, root.file_groups) |*file, group| file.* = group.file;
@@ -139,7 +147,7 @@ pub fn changedFilesIndexed(a: A, out: A, provider: *Provider, store: @import("..
             },
             .ordered_row_index => ordered: {
                 const native = @import("lake_index_ordered_rows.zig");
-                if (declaration.artifact.metadata_version != native.metadata_version) return null;
+                if (!native.supportsBuildMetadata(declaration.artifact.metadata_version)) return null;
                 const root = try native.loadRoot(ca, store, declaration.artifact, cancellation, null);
                 if (root.file_fingerprints.len != root.files.len) return null;
                 const files = try ca.alloc(state.File, root.files.len);
@@ -164,6 +172,10 @@ pub const Replay = struct {
     kinds: []rows.ColumnKind = &.{},
     files: []Range = &.{},
     ready: bool = false,
+    captured_file: ?usize = null,
+    readers: usize = 0,
+    mutex: std.Io.Mutex = .init,
+    max_spill_bytes: u64 = 1024 * 1024 * 1024,
     only_files: ?[]const bool = null,
     const Range = struct { begin: spill.Sequential.Position, end: u64 };
     pub fn init(a: A, provider: *Provider, columns: []const []const u8) Replay {
@@ -181,11 +193,20 @@ pub const Replay = struct {
         const self: *Replay = @ptrCast(@alignCast(raw));
         try self.provider.context.ensureActive();
     }
-    fn capture(self: *Replay, a: A, original: Binding, cancellation: Cancellation) !void {
-        if (self.ready) return;
+    fn capture(self: *Replay, a: A, original: Binding, file_index: usize, cancellation: Cancellation) !void {
+        if (self.ready and self.captured_file == file_index) return;
+        if (self.readers != 0) return error.LakeReplayBusy;
+        if (self.run) |*run| {
+            run.close();
+            self.manager.deinit();
+            self.run = null;
+        }
+        _ = self.arena.reset(.free_all);
+        self.ready = false;
+        self.captured_file = file_index;
         const io = self.provider.context.io orelse return error.UnsupportedSqlExecution;
         if (self.run != null) return error.InvalidSqlSpill;
-        self.manager = .{ .alloc = self.budget.allocator(), .io = io, .context = self, .checkpoint = check };
+        self.manager = .{ .alloc = self.budget.allocator(), .io = io, .context = self, .checkpoint = check, .max_bytes = self.max_spill_bytes };
         self.run = spill.Sequential.init(&self.manager, 512 * 1024) catch |err| {
             self.manager.deinit();
             return err;
@@ -200,8 +221,8 @@ pub const Replay = struct {
         for (self.provider.source.inventory.files, 0..) |file, index| try by_id.put(a, file.file_id, index);
         var input = self.provider.*;
         input.replay = null;
-        input.only_file = null;
-        input.only_files = self.only_files;
+        input.only_file = file_index;
+        input.only_files = null;
         var binding = original;
         binding.column_bindings = self.columns;
         const source = try input.provider().open_with_cancellation_fn.?(input.provider().ptr, a, binding, cancellation);
@@ -311,7 +332,30 @@ pub const Replay = struct {
             } else false;
             if (!present) return null;
         }
-        try self.capture(a, binding, cancellation);
+        const file_index = only_file orelse return null;
+        const io = self.provider.context.io orelse return null;
+        try self.mutex.lock(io);
+        defer self.mutex.unlock(io);
+        if (self.readers != 0 and self.captured_file != file_index) return null;
+        if (self.only_files) |needed| {
+            if (needed.len != self.provider.source.inventory.files.len or file_index >= needed.len) return error.SidecarSourceBindingMismatch;
+            if (!needed[file_index]) return null;
+        }
+        // Oversized individual files retain the ordinary streaming path. The
+        // replay optimization must never make an otherwise valid scan fail.
+        self.capture(a, binding, file_index, cancellation) catch |err| switch (err) {
+            error.SqlProgramLimitExceeded => {
+                if (self.run) |*run| {
+                    run.close();
+                    self.manager.deinit();
+                    self.run = null;
+                }
+                _ = self.arena.reset(.free_all);
+                self.ready = false;
+                return null;
+            },
+            else => return err,
+        };
         const range: Range = if (only_file) |file| blk: {
             if (file >= self.files.len) return error.SidecarSourceBindingMismatch;
             break :blk self.files[file];
@@ -319,6 +363,7 @@ pub const Replay = struct {
         const cursor = try a.create(Cursor);
         errdefer a.destroy(cursor);
         cursor.* = .{ .owner = self, .reader = try self.run.?.readerSealed(a, range.begin, range.end), .arena = .init(a), .columns = binding.column_bindings, .cancellation = cancellation };
+        self.readers += 1;
         return .{ .kind = binding.source_kind, .ctx = cursor, .next_batch = Cursor.next, .deinit_fn = Cursor.deinit };
     }
     const Cursor = struct {
@@ -332,6 +377,10 @@ pub const Replay = struct {
             const self: *Cursor = @ptrCast(@alignCast(raw));
             if (self.block) |block| block.release();
             self.reader.deinit();
+            const io = self.owner.provider.context.io.?;
+            self.owner.mutex.lockUncancelable(io);
+            self.owner.readers -= 1;
+            self.owner.mutex.unlock(io);
             self.arena.deinit();
             a.destroy(self);
         }
@@ -365,3 +414,64 @@ pub const Replay = struct {
         }
     };
 };
+
+test "external lake bounded replay releases files and falls back for oversized single files" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("bounded-lake-replay");
+    defer directory.cleanup();
+    var fs = try local.storage_object_storage.FilesystemObjectStorage.init(a, directory.path());
+    defer fs.deinit();
+    var client = fs.client();
+    try client.makeBucket("antfly");
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const values = try ca.alloc([]const u8, 2048);
+    for (values, 0..) |*value, index| {
+        var input: [8]u8 = undefined;
+        std.mem.writeInt(u64, &input, index, .little);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(&input, &digest, .{});
+        value.* = try ca.dupe(u8, &std.fmt.bytesToHex(digest, .lower));
+    }
+    const data = try local.serverless_query_lake_parquet_rowgroup.buildTestPlainI64AndByteArrayParquetObjectAlloc(ca, &.{}, &.{.{ .column_id = "body", .field_id = 1, .converted_type = 0, .values = values }});
+    for ([_][]const u8{ "a.parquet", "b.parquet" }) |name| {
+        var put = try client.putObject("antfly", name, data, .{});
+        put.deinit(a);
+    }
+    const schema = try std.fmt.allocPrint(ca,
+        \\{{"version":1,"storage_mode":"relational","default_type":"row","base_source":{{"kind":"external","table_id":"lake","format":"parquet","uri":"file://{s}","schema_fingerprint":"schema"}},"document_schemas":{{"row":{{"schema":{{"type":"object","properties":{{"body":{{"type":"string"}}}},"additionalProperties":false}}}}}}}}
+    , .{directory.path()});
+    var external = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, schema)).?;
+    defer external.deinit(a);
+    var source = try local.serverless_query_lake_serving.ServingSource.open(a, .{ .storage_mode = .relational, .external_base_source = external }, .{});
+    defer source.deinit();
+    var provider: Provider = .{ .source = &source, .context = .{ .io = std.testing.io } };
+    var replay = Replay.init(a, &provider, &.{"body"});
+    defer replay.deinit();
+    replay.max_spill_bytes = 160 * 1024;
+    const binding: Binding = .{ .source_kind = .external_parquet, .source_id = source.inventory.source_id, .snapshot_id = source.inventory.snapshot_id, .schema_fingerprint = source.inventory.schema_fingerprint, .sidecar_kind = .text, .index_config_hash = "test", .column_bindings = &.{"body"}, .row_ref_kind = .external };
+    var total_spill: u64 = 0;
+    for (0..2) |file| {
+        const rows_source = (try replay.open(a, binding, file, .none)).?;
+        defer rows_source.deinit(a);
+        var count: usize = 0;
+        while (try rows_source.next(a)) |batch| {
+            try batch.validate();
+            for (batch.row_refs, 0..) |ref, index| {
+                try std.testing.expectEqualStrings(source.inventory.files[file].file_id, ref.external.file_id);
+                try std.testing.expectEqualStrings(values[count + index], batch.columns[0].values.bytes[index]);
+            }
+            count += batch.rowCount();
+        }
+        try std.testing.expectEqual(values.len, count);
+        try std.testing.expect(replay.manager.peak_bytes <= replay.max_spill_bytes);
+        total_spill += replay.manager.peak_bytes;
+    }
+    try std.testing.expect(total_spill > replay.max_spill_bytes);
+    replay.max_spill_bytes = 1;
+    // Select another file to discard the successful cache before admission.
+    try std.testing.expect((try replay.open(a, binding, 0, .none)) == null);
+    try std.testing.expect(replay.run == null);
+    try std.testing.expectEqual(@as(usize, 0), replay.readers);
+}

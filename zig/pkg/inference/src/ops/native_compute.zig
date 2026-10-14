@@ -3973,6 +3973,8 @@ fn shouldBorrowEmbeddingTensor(name: []const u8) bool {
 
 fn shouldBorrowTypedWeightTensor(self: *const NativeCompute, name: []const u8, tensor: *const tensor_mod.Tensor) bool {
     if (shouldBorrowEmbeddingTensor(name)) return true;
+    if (self.borrow_typed_matrix_weights and tensor.shape.len == 2 and
+        (tensor.dtype == .f16 or tensor.dtype == .bf16)) return true;
     if (!self.borrow_bf16_linear_weights) return false;
     if (tensor.dtype != .bf16 or tensor.shape.len != 2) return false;
     if (std.mem.eql(u8, name, "lm_head.weight") or std.mem.eql(u8, name, "cls.output.weight")) return true;
@@ -4024,6 +4026,10 @@ fn tensorF32View(self: *NativeCompute, tensor: *const tensor_mod.Tensor) !Weight
     return .{ .data = converted, .owned = converted };
 }
 
+/// Row count from which f16 source-tensor linears convert weight blocks to
+/// f32 and use system BLAS instead of the direct f16 kernel.
+const f16_direct_gemm_max_rows_with_blas: usize = 32;
+
 fn linearNoBiasSourceTensorChunked(
     self: *NativeCompute,
     input: []const f32,
@@ -4048,7 +4054,9 @@ fn linearNoBiasSourceTensorChunked(
     // Fast path: f16 weights, naturally aligned, can be consumed directly by
     // sgemmTransBF16Weights without materializing an f32 copy.  This halves
     // the weight bandwidth -- the dominant cost for transformer linear ops.
-    if (tensor.dtype == .f16) {
+    // Prefill-sized inputs are compute-bound instead; with system BLAS the
+    // blocked f32 conversion below is several times faster there.
+    if (tensor.dtype == .f16 and (rows < f16_direct_gemm_max_rows_with_blas or !native.useBlas())) {
         if (tensor.asFloat16IfAligned()) |weight_f16| {
             try self.dispatchSgemmTransBF16Weights(
                 rows,
@@ -4235,6 +4243,10 @@ pub const NativeCompute = struct {
     /// Opt in only for qualified model families whose projection consumers
     /// accept typed weights. Other native/PJRT callers keep their load policy.
     borrow_bf16_linear_weights: bool = false,
+    /// Borrow every resident 2-D f16/bf16 weight for typed GEMM. Only for
+    /// sessions whose 2-D weights are consumed exclusively by linear ops
+    /// (native Moondream reads its embedding table on the host).
+    borrow_typed_matrix_weights: bool = false,
     /// Granted only to immutable EmbeddingGemma2 inference sessions. The
     /// WeightStore owns admitted mirrors; request contexts only borrow them.
     cache_embeddinggemma2_bf16_weights: bool = false,
@@ -6050,7 +6062,8 @@ fn embeddingLookup(ctx: *anyopaque, weight: CT, ids: []const i64, total: usize, 
     defer maybeDiscardMappedWeightAfterUse(self, weight);
     const out_len = std.math.mul(usize, total, dim) catch return error.UnsupportedShape;
     const out = try self.allocator.alloc(f32, out_len);
-    errdefer self.allocator.free(out);
+    var raw_owned = true;
+    errdefer if (raw_owned) self.allocator.free(out);
     const weight_buf = toBuf(weight);
     if (weight_buf.quantized_storage) |storage| {
         const rows = try quantizedEmbeddingRows(storage, dim);
@@ -6171,7 +6184,11 @@ fn embeddingLookup(ctx: *anyopaque, weight: CT, ids: []const i64, total: usize, 
             @memcpy(out[i * dim .. (i + 1) * dim], emb_table[idx * dim .. (idx + 1) * dim]);
         }
     }
-    return self.makeBuf(out, true);
+    const result = try self.makeBuf(out, true);
+    raw_owned = false;
+    errdefer freeTensor(self, result);
+    _ = try self.withLogicalShape(result, &.{ @intCast(total), @intCast(dim) });
+    return result;
 }
 
 const QuantLinearKind = enum {
@@ -36739,6 +36756,16 @@ fn multiplyOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
 
 fn conv1dOp(ctx: *anyopaque, input: CT, weight: CT, bias: CT, batch: usize, in_channels: usize, out_channels: usize, time_steps: usize, kernel_size: usize, stride: usize, padding: usize) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    // NCT/OIK is the height-one NCHW/OIHW layout. Share the accelerated,
+    // bounded convolution implementation and retain scalar execution when
+    // its optional im2col workspace cannot be admitted.
+    if (conv2dOp(ctx, input, weight, bias, batch, in_channels, out_channels, 1, time_steps, 1, kernel_size, 1, stride, 0, padding, 1)) |result| {
+        return self.withLogicalShape(result, &.{ @intCast(batch), @intCast(out_channels), @intCast((time_steps + 2 * padding - kernel_size) / stride + 1) });
+    } else |err| switch (err) {
+        error.OutOfMemory, error.UnsupportedShape => {},
+        else => return err,
+    }
+
     defer maybeDiscardMappedWeightAfterUse(self, weight);
     const in_data = getData(input);
     const w_data = getData(weight);
@@ -36828,6 +36855,19 @@ fn conv2dOp(ctx: *anyopaque, input: CT, weight: CT, bias: CT, batch: usize, in_c
     }
     const output = try self.allocator.alloc(f32, output_elems);
     errdefer self.allocator.free(output);
+
+    if (groups == 1 and kernel_h == 1 and kernel_w == 1 and stride_h == 1 and stride_w == 1 and padding_h == 0 and padding_w == 0) {
+        // Pointwise convolution is already a matrix product in channel-major
+        // storage. No im2col buffer or output transpose is needed.
+        for (0..batch) |b| {
+            const batch_out = output[b * out_channels * output_area ..][0 .. out_channels * output_area];
+            for (0..out_channels) |oc| @memset(batch_out[oc * output_area ..][0..output_area], bias_data[oc]);
+            const batch_input = input_data[b * in_channels * output_area ..][0 .. in_channels * output_area];
+            try self.dispatchSgemm(out_channels, output_area, in_channels, 1.0, weight_data, batch_input, 1.0, batch_out);
+        }
+        const result = try self.makeBuf(output, true);
+        return self.withLogicalShape(result, &.{ @intCast(batch), @intCast(out_channels), @intCast(out_h), @intCast(out_w) });
+    }
 
     if (groups == 1) {
         const rows = output_area;
@@ -51723,6 +51763,71 @@ test "native conv ops preserve runtime logical shape" {
     try std.testing.expectEqualSlices(i64, &.{ 2, 1, 2, 2 }, conv2_shape);
 }
 
+test "native conv1d preserves channel order bias padding and stride" {
+    const allocator = std.testing.allocator;
+    var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    var input_values = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
+    var weights = [_]f32{ 1, 0, -1, 0.5, 1, 0, 0.5, 0.25, -0.5, 1, -1, 0.5 };
+    var pointwise_weights = [_]f32{ 2, 0.5, -1, 1 };
+    var biases = [_]f32{ 0.25, -0.25 };
+    const input = try compute.makeBuf(&input_values, false);
+    defer cb.free(input);
+    const weight = try compute.makeBuf(&weights, false);
+    defer cb.free(weight);
+    const pointwise_weight = try compute.makeBuf(&pointwise_weights, false);
+    defer cb.free(pointwise_weight);
+    const bias = try compute.makeBuf(&biases, false);
+    defer cb.free(bias);
+    const strided = try cb.conv1d(input, weight, bias, 2, 2, 2, 4, 3, 2, 1);
+    defer cb.free(strided);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 2, 2 }, tensorStoredShape(strided).?);
+    try std.testing.expectEqualSlices(f32, &.{ 3.25, 8.25, -3, 2.5, 3.25, 20.25, -9, 8.5 }, getData(strided));
+    const pointwise = try cb.conv1d(input, pointwise_weight, bias, 2, 2, 2, 4, 1, 1, 0);
+    defer cb.free(pointwise);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 2, 4 }, tensorStoredShape(pointwise).?);
+    try std.testing.expectEqualSlices(f32, &.{ 4.75, 7.25, 9.75, 12.25, 3.75, 3.75, 3.75, 3.75, 24.75, 27.25, 29.75, 32.25, 3.75, 3.75, 3.75, 3.75 }, getData(pointwise));
+    try std.testing.expectError(error.InvalidInputShape, cb.conv1d(input, weight, bias, 2, 2, 2, 4, 3, 0, 1));
+    try std.testing.expectError(error.InvalidInputShape, cb.conv1d(input, weight, bias, 2, 2, 2, 3, 3, 1, 0));
+
+    const WorkspaceAdmission = struct {
+        backing: std.mem.Allocator,
+        rejected: bool = false,
+        fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            // The general convolution's 2 x 6 im2col matrix is optional.
+            if (len == 12 * @sizeOf(f32) and !self.rejected) {
+                self.rejected = true;
+                return null;
+            }
+            return self.backing.rawAlloc(len, alignment, ret_addr);
+        }
+        fn resize(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, len: usize, ret_addr: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.backing.rawResize(memory, alignment, len, ret_addr);
+        }
+        fn remap(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, len: usize, ret_addr: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.backing.rawRemap(memory, alignment, len, ret_addr);
+        }
+        fn free(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.backing.rawFree(memory, alignment, ret_addr);
+        }
+        const vtable: std.mem.Allocator.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
+    };
+    var admission: WorkspaceAdmission = .{ .backing = allocator };
+    compute.allocator = .{ .ptr = &admission, .vtable = &WorkspaceAdmission.vtable };
+    defer compute.allocator = allocator;
+    const bounded = try cb.conv1d(input, weight, bias, 2, 2, 2, 4, 3, 2, 1);
+    defer cb.free(bounded);
+    try std.testing.expect(admission.rejected);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 2, 2 }, tensorStoredShape(bounded).?);
+    try std.testing.expectEqualSlices(f32, getData(strided), getData(bounded));
+}
+
 test "native rejects mismatched shaped buffers before conv2d" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
@@ -52316,4 +52421,31 @@ test "native integer numeric views retain exact bytes and propagate allocation f
     const exact = (try cb.exportTensorData(output, a)).?;
     defer a.free(exact.payload.bytes);
     try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]i64{ 9007199254740993, 9007199254740994 }), exact.payload.bytes);
+}
+
+test "native embedding rows preserve shape through Gemma PLE arithmetic and layer slicing" {
+    const allocator = std.testing.allocator;
+    var weights = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &weights, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const weight = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6, 7, 8 }, &.{ 2, 4 });
+    defer cb.free(weight);
+    const tokens = try cb.embeddingLookup(weight, &.{ 1, 0 }, 2, 4);
+    defer cb.free(tokens);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 4 }, tensorStoredShape(tokens).?);
+    const scalar = try cb.fromFloat32Shape(&.{2}, &.{1});
+    defer cb.free(scalar);
+    const scaled = try cb.multiply(tokens, scalar);
+    defer cb.free(scaled);
+    const projection = try cb.fromFloat32Shape(&.{ 1, 1, 1, 1, 2, 2, 2, 2 }, &.{ 2, 4 });
+    defer cb.free(projection);
+    const combined = try cb.add(scaled, projection);
+    defer cb.free(combined);
+    const normalized = (try cb.multiplyScalar(combined, 0.5)).?;
+    defer cb.free(normalized);
+    const layer = try cb.sliceLastDim(normalized, 2, 4);
+    defer cb.free(layer);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 2 }, tensorStoredShape(layer).?);
+    try std.testing.expectEqualSlices(f32, &.{ 7.5, 8.5, 4, 5 }, getData(layer));
 }

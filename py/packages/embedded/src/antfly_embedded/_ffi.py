@@ -70,7 +70,7 @@ class ABIVersionError(RuntimeError):
 
 # The Antfly C ABI version this binding was written against
 # (antfly_abi_version() in antfly.h).
-SUPPORTED_ABI_VERSION = 2
+SUPPORTED_ABI_VERSION = 3
 
 # The only threading contract libantfly implements (ANTFLY_THREADING_SERIALIZED).
 THREADING_SERIALIZED = 1
@@ -151,7 +151,8 @@ class AntflyOpenOptions(ctypes.Structure):
         ("inference_kv_budget_mb", ctypes.c_uint32),
         ("inference_scratch_budget_mb", ctypes.c_uint32),
         ("busy_timeout_ms", ctypes.c_uint64),
-        ("reserved", ctypes.c_uint64 * 8),
+        ("reserved", ctypes.c_uint64 * 6),
+        ("models_dir", AntflySlice),
     ]
 
 
@@ -247,6 +248,8 @@ _ERR = ctypes.c_int  # antfly_error_code (C enum, backed by `int`)
 _FUNCTIONS: list[tuple[str, list[object], object]] = [
     ("antfly_abi_version", [], ctypes.c_uint32),
     ("antfly_open_options_size", [], ctypes.c_uint32),
+    ("antfly_last_error_detail", [], ctypes.c_char_p),
+    ("antfly_last_error_code", [], _ERR),
     ("antfly_error_code_name", [_ERR], ctypes.c_char_p),
     ("antfly_error_code_description", [_ERR], ctypes.c_char_p),
     ("antfly_open_options_init", [_OPTS_P], _ERR),
@@ -259,6 +262,7 @@ _FUNCTIONS: list[tuple[str, list[object], object]] = [
     ("antfly_db_capabilities_json", [_VOID_P, _BUF_P], _ERR),
     ("antfly_db_replay_generated_enrichments_json", [_VOID_P, _BUF_P], _ERR),
     ("antfly_db_backup", [_VOID_P, _BUF_P], _ERR),
+    ("antfly_db_backup_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),
     ("antfly_db_import_backup", [_VOID_P, AntflySlice], _ERR),
     (
         "antfly_restore_backup_json",
@@ -324,8 +328,15 @@ _FUNCTIONS: list[tuple[str, list[object], object]] = [
     ("antfly_db_get_schema_json", [_VOID_P, _BUF_P], _ERR),
     ("antfly_db_set_schema_json", [_VOID_P, AntflySlice], _ERR),
     ("antfly_db_list_indexes_json", [_VOID_P, _BUF_P], _ERR),
+    ("antfly_db_render_resolver_key_json", [_VOID_P, AntflySlice, AntflySlice, _BUF_P], _ERR),
+    ("antfly_db_resolve_query_json", [_VOID_P, AntflySlice, AntflySlice, _BUF_P], _ERR),
+    ("antfly_db_list_resolver_identities_json", [_VOID_P, _BUF_P], _ERR),
+    ("antfly_db_drop_resolver_identity", [_VOID_P, AntflySlice, ctypes.POINTER(ctypes.c_bool)], _ERR),
+    ("antfly_db_set_resolver_namespace_json", [_VOID_P, AntflySlice, AntflySlice], _ERR),
+    ("antfly_db_merge_resolver_keys_json", [_VOID_P, AntflySlice, AntflySlice], _ERR),
     ("antfly_db_add_index_json", [_VOID_P, AntflySlice], _ERR),
     ("antfly_db_delete_index", [_VOID_P, AntflySlice, ctypes.POINTER(ctypes.c_bool)], _ERR),
+    ("antfly_db_cancel_replacement", [_VOID_P, AntflySlice, ctypes.POINTER(ctypes.c_bool)], _ERR),
     ("antfly_db_list_enrichments_json", [_VOID_P, _BUF_P], _ERR),
     ("antfly_db_add_enrichment_json", [_VOID_P, AntflySlice], _ERR),
     (
@@ -334,6 +345,16 @@ _FUNCTIONS: list[tuple[str, list[object], object]] = [
         _ERR,
     ),
     ("antfly_db_scan_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),
+    ("antfly_db_sql_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),
+    ("antfly_db_open_table", [_VOID_P, AntflySlice, ctypes.POINTER(_VOID_P)], _ERR),
+    ("antfly_db_create_table_json", [_VOID_P, AntflySlice, AntflySlice], _ERR),
+    ("antfly_db_drop_table", [_VOID_P, AntflySlice], _ERR),
+    ("antfly_db_list_tables_json", [_VOID_P, _BUF_P], _ERR),
+    ("antfly_db_sql_session_open", [_VOID_P, ctypes.POINTER(ctypes.c_uint64)], _ERR),
+    ("antfly_db_sql_session_close", [_VOID_P, ctypes.c_uint64], _ERR),
+    ("antfly_db_sql_open_cursor_json", [_VOID_P, AntflySlice, ctypes.POINTER(ctypes.c_uint64), _BUF_P], _ERR),
+    ("antfly_db_sql_fetch_cursor_json", [_VOID_P, ctypes.c_uint64, ctypes.c_uint32, _BUF_P], _ERR),
+    ("antfly_db_sql_close_cursor", [_VOID_P, ctypes.c_uint64], _ERR),
     ("antfly_db_stats_json", [_VOID_P, _BUF_P], _ERR),
     ("antfly_db_search_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),
     ("antfly_db_search_dense_wire", [_VOID_P, AntflySlice, _BUF_P], _ERR),

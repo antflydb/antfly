@@ -4,6 +4,12 @@ This document describes the serverless architecture being built from
 `antfly-zig` code, and tracks how much of it exists today versus what is still
 planned.
 
+The proposed shared source-connector and writable Parquet/Iceberg architecture is
+in [Lake ingestion, change capture, and publication](../docs/plans/lake-ingestion-and-publication.md).
+It reuses the durable WAL/catalog/artifact substrate while keeping native
+fragments independent of external table formats. Managed lake writes and a
+recent/archive merge are additional work, not implied by today's WAL ingest.
+
 The core serving path is implemented and tested under
 `pkg/antfly/src/serverless/`: append-only WAL ingest, background builders that
 publish immutable manifests and per-index artifacts, object-storage-backed

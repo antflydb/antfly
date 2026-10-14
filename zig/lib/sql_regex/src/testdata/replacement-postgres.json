@@ -1,0 +1,166 @@
+{
+  "format": 1,
+  "collation": "C",
+  "entries": [
+    {
+      "id": "whole-match-unicode",
+      "pattern": ".",
+      "input": "雪😀",
+      "replacement": "<\\&>",
+      "flags": 3,
+      "start": 0,
+      "occurrence": 0,
+      "expected": "<雪><😀>"
+    },
+    {
+      "id": "global-empty",
+      "pattern": "",
+      "input": "雪😀",
+      "replacement": "X",
+      "flags": 3,
+      "start": 0,
+      "occurrence": 0,
+      "expected": "X雪X😀X"
+    },
+    {
+      "id": "empty-after-nonempty",
+      "pattern": ".*",
+      "input": "雪😀",
+      "replacement": "X",
+      "flags": 3,
+      "start": 0,
+      "occurrence": 0,
+      "expected": "XX"
+    },
+    {
+      "id": "unmatched-capture",
+      "pattern": "(a)?(b)",
+      "input": "b",
+      "replacement": "<\\1>:<\\2>",
+      "flags": 3,
+      "start": 0,
+      "occurrence": 0,
+      "expected": "<>:<b>"
+    },
+    {
+      "id": "missing-group",
+      "pattern": "(a)",
+      "input": "a",
+      "replacement": "<\\9>",
+      "flags": 3,
+      "start": 0,
+      "occurrence": 0,
+      "expected": "<>"
+    },
+    {
+      "id": "unknown-escapes",
+      "pattern": "a",
+      "input": "a",
+      "replacement": "\\q\\0",
+      "flags": 3,
+      "start": 0,
+      "occurrence": 0,
+      "expected": "\\q\\0"
+    },
+    {
+      "id": "literal-backslash",
+      "pattern": "a",
+      "input": "a",
+      "replacement": "\\\\",
+      "flags": 3,
+      "start": 0,
+      "occurrence": 0,
+      "expected": "\\"
+    },
+    {
+      "id": "trailing-backslash",
+      "pattern": "a",
+      "input": "a",
+      "replacement": "x\\",
+      "flags": 3,
+      "start": 0,
+      "occurrence": 0,
+      "expected": "x\\"
+    },
+    {
+      "id": "capture-one-then-digit",
+      "pattern": "(a)",
+      "input": "a",
+      "replacement": "\\12",
+      "flags": 3,
+      "start": 0,
+      "occurrence": 0,
+      "expected": "a2"
+    },
+    {
+      "id": "escaped-capture-literal",
+      "pattern": "(a)",
+      "input": "a",
+      "replacement": "\\\\1-\\1",
+      "flags": 3,
+      "start": 0,
+      "occurrence": 0,
+      "expected": "\\1-a"
+    },
+    {
+      "id": "second-occurrence",
+      "pattern": ".",
+      "input": "雪😀a",
+      "replacement": "<\\&>",
+      "flags": 3,
+      "start": 0,
+      "occurrence": 2,
+      "expected": "雪<😀>a"
+    },
+    {
+      "id": "start-and-occurrence",
+      "pattern": ".",
+      "input": "雪😀abc",
+      "replacement": "X",
+      "flags": 3,
+      "start": 2,
+      "occurrence": 2,
+      "expected": "雪😀aXc"
+    },
+    {
+      "id": "start-beyond-input",
+      "pattern": ".",
+      "input": "雪",
+      "replacement": "X",
+      "flags": 3,
+      "start": 5,
+      "occurrence": 0,
+      "expected": "雪"
+    },
+    {
+      "id": "missing-occurrence",
+      "pattern": "a",
+      "input": "aba",
+      "replacement": "X",
+      "flags": 3,
+      "start": 0,
+      "occurrence": 3,
+      "expected": "aba"
+    },
+    {
+      "id": "empty-replacement",
+      "pattern": "a",
+      "input": "aba",
+      "replacement": "",
+      "flags": 3,
+      "start": 0,
+      "occurrence": 0,
+      "expected": "b"
+    },
+    {
+      "id": "nonzero-lookbehind",
+      "pattern": "(?<=雪)😀|$",
+      "input": "雪😀雪😀",
+      "replacement": "<\\&>",
+      "flags": 3,
+      "start": 2,
+      "occurrence": 0,
+      "expected": "雪😀雪<😀><>"
+    }
+  ]
+}

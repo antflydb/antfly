@@ -187,7 +187,7 @@ const RuntimeProgress = struct {
 fn matchesAnyFilter(name: []const u8, filters: []const []const u8) bool {
     for (filters) |filter| {
         if (filter.len == 0) continue;
-        if (std.mem.indexOf(u8, name, filter) != null) return true;
+        if (if (filter[0] == '^') std.mem.startsWith(u8, name, filter[1..]) else std.mem.indexOf(u8, name, filter) != null) return true;
     }
     return false;
 }

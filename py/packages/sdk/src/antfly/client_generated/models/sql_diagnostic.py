@@ -17,6 +17,8 @@ class SQLDiagnostic:
     Attributes:
         code (str): Five-character SQLSTATE error code.
         message (str): Human-readable diagnostic with no sensitive parameter values.
+        column_name (str | Unset): Public column identifier for a column constraint violation; no row values are
+            included.
         position (int | Unset): Optional one-based character position in the submitted SQL statement.
         transaction_id (str | Unset): Native transaction receipt for reconciliation when a mutation outcome is unknown.
         retryable (bool | Unset): False for SQLSTATE 40003; never replay a mutation whose outcome is unknown.
@@ -27,6 +29,7 @@ class SQLDiagnostic:
 
     code: str
     message: str
+    column_name: str | Unset = UNSET
     position: int | Unset = UNSET
     transaction_id: str | Unset = UNSET
     retryable: bool | Unset = UNSET
@@ -36,6 +39,8 @@ class SQLDiagnostic:
         code = self.code
 
         message = self.message
+
+        column_name = self.column_name
 
         position = self.position
 
@@ -55,6 +60,8 @@ class SQLDiagnostic:
                 "message": message,
             }
         )
+        if column_name is not UNSET:
+            field_dict["column_name"] = column_name
         if position is not UNSET:
             field_dict["position"] = position
         if transaction_id is not UNSET:
@@ -73,6 +80,8 @@ class SQLDiagnostic:
 
         message = d.pop("message")
 
+        column_name = d.pop("column_name", UNSET)
+
         position = d.pop("position", UNSET)
 
         transaction_id = d.pop("transaction_id", UNSET)
@@ -89,6 +98,7 @@ class SQLDiagnostic:
         sql_diagnostic = cls(
             code=code,
             message=message,
+            column_name=column_name,
             position=position,
             transaction_id=transaction_id,
             retryable=retryable,

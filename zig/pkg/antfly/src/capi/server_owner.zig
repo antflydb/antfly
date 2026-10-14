@@ -135,6 +135,7 @@ pub const raft_catalog = antfly.raft_catalog;
 pub const kernel_runtime_services = antfly.kernel_runtime_services;
 
 pub const StorageOwnerContext = struct {
+    native_queries: ?*@import("../api/native_query_repository.zig").Repository = null,
     allocator_bridge: ?kernel_runtime_services.memory.Allocator = null,
     io_receiver: ?kernel_runtime_services.executor.Receiver = null,
     alloc: Allocator,
@@ -190,6 +191,11 @@ pub const StorageOwnerContext = struct {
         if (self.auth_backend) |*backend| backend.close();
         if (self.lite_backend) |*backend| backend.deinit();
         if (self.remote_content_security) |*parsed| parsed.deinit();
+        if (self.native_queries) |repository| {
+            self.backend_runtime.ptr().query_cut_repository = null;
+            repository.deinit();
+            self.alloc.destroy(repository);
+        }
         self.backend_runtime.deinit();
         self.resources.deinit();
         // The standard allocator adapter points into this context. Copy its
@@ -854,6 +860,26 @@ pub fn storageOwnerContextConfigureSecrets(context: ?*anyopaque, store: ?*anyopa
     return .ok;
 }
 
+pub fn storageOwnerContextConfigureNativeQueries(context: ?*anyopaque, setup: kernel_owner_abi.BorrowedBytes) callconv(.c) kernel_owner_abi.Status {
+    const owner = asStorageOwnerContext(context) orelse return .invalid_argument;
+    owner.lock();
+    defer owner.mutex.unlock();
+    if (owner.active_owners != 0) return .busy;
+    const Repository = @import("../api/native_query_repository.zig").Repository;
+    const next = owner.alloc.create(Repository) catch |err| return storageOwnerStatusFromError(err);
+    next.* = Repository.initFromSetup(owner.alloc, setup.slice(), owner.secret_store) catch |err| {
+        owner.alloc.destroy(next);
+        return storageOwnerStatusFromError(err);
+    };
+    if (owner.native_queries) |previous| {
+        previous.deinit();
+        owner.alloc.destroy(previous);
+    }
+    owner.native_queries = next;
+    owner.backend_runtime.ptr().query_cut_repository = next.capability();
+    return .ok;
+}
+
 pub fn storageOwnerContextConfigureRemoteContentSecurity(
     context: ?*anyopaque,
     security_json: kernel_owner_abi.BorrowedBytes,
@@ -1409,6 +1435,35 @@ pub fn metadataApplyStoreClose(store_ptr: ?*anyopaque) callconv(.c) void {
     if (context) |value| value.release();
 }
 
+pub fn metadataApplyStoreRelationPublication(
+    store_ptr: ?*anyopaque,
+    request: *const kernel_owner_abi.MetadataRelationPublicationRequest,
+    out_result: *kernel_owner_abi.MetadataRelationPublicationResult,
+) callconv(.c) kernel_owner_abi.Status {
+    out_result.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asMetadataApplyStore(store_ptr) orelse return .invalid_argument;
+    if (request.operation != .step and request.expected_state.len != 0) return .invalid_argument;
+    switch (request.operation) {
+        .step => {
+            const r = @import("antfly_local_sources").system_catalog_relation_reconciliation;
+            if (request.expected_state.len != r.State.encoded_len or request.expected_state.ptr == null) return .invalid_argument;
+            const state = r.State.decode(request.expected_state.slice()) catch return .invalid_argument;
+            if (state.group_id != request.group_id) return .invalid_argument;
+            const proof = handle.store.stepRelationPublicationProof(state, request.now_ns) catch |err| return storageOwnerStatusFromError(err);
+            if (proof) |value| {
+                const root = if (value.root) |generation| generation.encode() catch |err| return storageOwnerStatusFromError(err) else @as([30]u8, @splat(0));
+                out_result.* = .{ .ready = 1, .has_root = @intFromBool(value.root != null), .applied_index = value.applied_index, .root = root };
+            }
+        },
+        .cancel => handle.store.cancelRelationPublicationProof(request.group_id) catch |err| return storageOwnerStatusFromError(err),
+        .close => handle.store.closeRelationPublicationProof(request.group_id),
+        .expire => handle.store.expireRelationPublicationProofs(request.now_ns) catch |err| return storageOwnerStatusFromError(err),
+        _ => return .invalid_argument,
+    }
+    return .ok;
+}
+
 pub fn metadataApplyStoreApplyBatch(
     store_ptr: ?*anyopaque,
     request: *const kernel_owner_abi.MetadataApplyBatchRequest,
@@ -1781,7 +1836,12 @@ pub fn metadataApplyStoreProjection(
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
                 .catalog_resolve_many => |input| {
-                    const value = handle.store.resolveSystemCatalogIdentities(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    if (request.control.version != kernel_owner_abi.abi_version) break :blk .invalid_abi;
+                    const context: @import("antfly_local_sources").api_operation.RequestContext = .{
+                        .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null,
+                        .cancellation = ownerQueryCancellation(&request.control),
+                    };
+                    const value = handle.store.resolveSystemCatalogIdentitiesWithContext(a, group_id, input, context) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
                 .catalog_write_validation => |name| {
@@ -1794,6 +1854,14 @@ pub fn metadataApplyStoreProjection(
                 },
                 .catalog_query_definition => |input| {
                     const value = handle.store.queryTableDefinition(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .relation_source_tracking => {
+                    const value = handle.store.relationSourceTrackingActive(group_id) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .relation_reconciliation_work => {
+                    const value = handle.store.relationReconciliationWork(group_id) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
                 .topology_activation => {
@@ -5947,8 +6015,10 @@ pub fn searchStorageKernelQueryJson(
     table_reads_api.checkQueryDeadline(controls) catch |err|
         return storageOwnerQueryFailure(err, .execute_internal_query, out_failure);
     if (comptime capi_build_options.linked_storage) {
-        handle.prepareSearchRequest(controls) catch |err|
+        handle.prepareSearchRequest(controls) catch |err| {
+            if (err == error.CatalogGenerationChanged) std.log.warn("local query preparation conflict", .{});
             return storageOwnerQueryFailure(err, .execute_internal_query, out_failure);
+        };
         const response = local_query_client.executeJsonAlloc(
             std.heap.c_allocator,
             @ptrCast(&handle.db),
@@ -5961,6 +6031,7 @@ pub fn searchStorageKernelQueryJson(
             request.control.cancellation_fn,
             out_failure,
         ) catch |err| {
+            if (err == error.CatalogGenerationChanged) std.log.warn("local query provider conflict operation={d} provider_error={s}", .{ out_failure.operation, out_failure.boundedErrorName() });
             // A valid provider failure already carries the exact envelope.
             // Consumer-side allocation/protocol failures originate in this
             // outer operation and receive their own identity.

@@ -184,6 +184,54 @@ pub const Source = struct {
         return try self.vtable.collect_enrichment_document_groups(self.ptr, alloc, from_sequence);
     }
 
+    /// Stop only between complete replay records. Every key in a sequence
+    /// must be processed before advancing the durable applied checkpoint.
+    /// Bound discovery rather than rebuilding the remaining backlog. The
+    /// document limit is soft: a single record must retain all of its keys.
+    pub const EnrichmentWindow = struct {
+        groups: []PendingDocumentGroup,
+        last_sequence: u64,
+    };
+
+    pub const EnrichmentWindowLimits = struct {
+        max_records: usize = 0,
+        max_document_groups: usize = 0,
+        max_input_bytes: usize = 0,
+    };
+
+    pub fn collectEnrichmentDocumentGroupsWindow(self: Source, alloc: Allocator, from_sequence: u64, limits: EnrichmentWindowLimits) !EnrichmentWindow {
+        var pending = std.StringHashMapUnmanaged(PendingDocumentGroup).empty;
+        errdefer cleanupPendingDocumentGroupMap(alloc, &pending);
+        var scratch: change_journal_mod.BorrowedBinaryRecordScratch = .{};
+        defer scratch.deinit(alloc);
+        const Context = struct {
+            groups: EnrichmentGroupContext,
+            max_document_groups: usize,
+            max_input_bytes: usize,
+            input_bytes: usize = 0,
+            last_sequence: u64 = 0,
+
+            fn consume(ptr: *anyopaque, sequence: u64, encoded: []const u8) !void {
+                const ctx: *@This() = @ptrCast(@alignCast(ptr));
+                try EnrichmentGroupContext.consume(&ctx.groups, sequence, encoded);
+                // Backend callbacks report StopReplayChunk before updating
+                // their own progress. Record this complete sequence here.
+                ctx.last_sequence = sequence;
+                ctx.input_bytes +|= encoded.len;
+                if ((ctx.max_document_groups != 0 and ctx.groups.pending.count() >= ctx.max_document_groups) or
+                    (ctx.max_input_bytes != 0 and ctx.input_bytes >= ctx.max_input_bytes))
+                    return StopReplayChunk.StopReplayChunk;
+            }
+        };
+        var ctx: Context = .{
+            .groups = .{ .alloc = alloc, .pending = &pending, .scratch = &scratch },
+            .max_document_groups = limits.max_document_groups,
+            .max_input_bytes = limits.max_input_bytes,
+        };
+        const stats = try self.forEachMatchingRecord(alloc, from_sequence, .enrichment, limits.max_records, &ctx, Context.consume);
+        return .{ .groups = try pendingDocumentGroupsToOwnedSlice(alloc, &pending), .last_sequence = @max(stats.last_sequence, ctx.last_sequence) };
+    }
+
     pub fn isSequenceVisible(self: Source, sequence: u64) !bool {
         return try self.vtable.is_sequence_visible(self.ptr, sequence);
     }
@@ -626,13 +674,7 @@ const EnrichmentGroupContext = struct {
 };
 
 fn collectEnrichmentDocumentGroups(replay_source: Source, alloc: Allocator, from_sequence: u64) ![]PendingDocumentGroup {
-    var pending = std.StringHashMapUnmanaged(PendingDocumentGroup).empty;
-    errdefer cleanupPendingDocumentGroupMap(alloc, &pending);
-    var scratch: change_journal_mod.BorrowedBinaryRecordScratch = .{};
-    defer scratch.deinit(alloc);
-    var ctx: EnrichmentGroupContext = .{ .alloc = alloc, .pending = &pending, .scratch = &scratch };
-    _ = try replay_source.forEachMatchingRecord(alloc, from_sequence, .enrichment, 0, &ctx, EnrichmentGroupContext.consume);
-    return pendingDocumentGroupsToOwnedSlice(alloc, &pending);
+    return (try replay_source.collectEnrichmentDocumentGroupsWindow(alloc, from_sequence, .{ .max_records = 0 })).groups;
 }
 
 fn primaryStoreIsSequenceVisible(ptr: *anyopaque, sequence: u64) !bool {
@@ -794,6 +836,176 @@ test "replay source collects changed documents from replay stream" {
     try std.testing.expectEqualStrings("doc:b", groups[0].doc_key);
     try std.testing.expectEqual(@as(u64, 2), groups[1].sequence);
     try std.testing.expectEqualStrings("doc:a", groups[1].doc_key);
+}
+
+test "replay source enrichment windows retain complete sequences and empty record progress" {
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
+    var backend = mem_backend_mod.Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    for (1..1025) |sequence| {
+        const record = try change_journal_mod.encodeRecord(alloc, .{
+            .sequence = sequence,
+            .changed_doc_keys = if (sequence == 2) &.{} else &.{ "doc:a", "doc:b" },
+            .target_hints = &.{.enrichment},
+        });
+        defer alloc.free(record);
+        try store.appendReplayOpaque(alloc, sequence, record);
+    }
+    const source = Source.fromPrimaryStore(&store, null, null);
+    const first = try source.collectEnrichmentDocumentGroupsWindow(alloc, 0, .{ .max_records = 1 });
+    defer freePendingDocumentGroups(alloc, first.groups);
+    try std.testing.expectEqual(@as(u64, 1), first.last_sequence);
+    try std.testing.expectEqual(@as(usize, 2), first.groups.len);
+    for (first.groups) |group| try std.testing.expectEqual(@as(u64, 1), group.sequence);
+
+    const empty = try source.collectEnrichmentDocumentGroupsWindow(alloc, first.last_sequence, .{ .max_records = 1 });
+    defer freePendingDocumentGroups(alloc, empty.groups);
+    try std.testing.expectEqual(@as(u64, 2), empty.last_sequence);
+    try std.testing.expectEqual(@as(usize, 0), empty.groups.len);
+
+    const next = try source.collectEnrichmentDocumentGroupsWindow(alloc, empty.last_sequence, .{ .max_records = 128 });
+    defer freePendingDocumentGroups(alloc, next.groups);
+    try std.testing.expectEqual(@as(u64, 130), next.last_sequence);
+    try std.testing.expectEqual(@as(usize, 2), next.groups.len);
+    for (next.groups) |group| try std.testing.expectEqual(@as(u64, 130), group.sequence);
+
+    var applied = next.last_sequence;
+    while (applied < 1024) {
+        const window = try source.collectEnrichmentDocumentGroupsWindow(alloc, applied, .{ .max_records = 128 });
+        defer freePendingDocumentGroups(alloc, window.groups);
+        try std.testing.expect(window.last_sequence > applied and window.last_sequence <= applied + 128);
+        applied = window.last_sequence;
+    }
+    const exhausted = try source.collectEnrichmentDocumentGroupsWindow(alloc, applied, .{ .max_records = 128 });
+    defer freePendingDocumentGroups(alloc, exhausted.groups);
+    try std.testing.expectEqual(@as(u64, 0), exhausted.last_sequence);
+    try std.testing.expectEqual(@as(usize, 0), exhausted.groups.len);
+}
+
+test "replay source enrichment windows resume journal and unhinted primary records" {
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
+    var journal = try change_journal_mod.Journal.open("enrichment-window-journal", .{ .backend = .lsm_memory });
+    defer journal.close();
+    for (1..5) |sequence| {
+        const encoded = try change_journal_mod.encodeRecord(alloc, .{
+            .sequence = sequence,
+            .changed_doc_keys = if (sequence == 2) &.{} else &.{ "doc:a", "doc:b" },
+            .target_hints = if (sequence == 1) &.{.full_text} else &.{.enrichment},
+        });
+        defer alloc.free(encoded);
+        _ = try journal.appendOpaque(encoded);
+    }
+    const journal_source = Source.fromJournal(&journal);
+    const empty = try journal_source.collectEnrichmentDocumentGroupsWindow(alloc, 0, .{ .max_records = 1 });
+    defer freePendingDocumentGroups(alloc, empty.groups);
+    try std.testing.expectEqual(@as(u64, 2), empty.last_sequence);
+    try std.testing.expectEqual(@as(usize, 0), empty.groups.len);
+    const complete = try journal_source.collectEnrichmentDocumentGroupsWindow(alloc, empty.last_sequence, .{ .max_records = 1 });
+    defer freePendingDocumentGroups(alloc, complete.groups);
+    try std.testing.expectEqual(@as(u64, 3), complete.last_sequence);
+    try std.testing.expectEqual(@as(usize, 2), complete.groups.len);
+    for (complete.groups) |group| try std.testing.expectEqual(@as(u64, 3), group.sequence);
+    const tail = try journal_source.collectEnrichmentDocumentGroupsWindow(alloc, complete.last_sequence, .{ .max_records = 1 });
+    defer freePendingDocumentGroups(alloc, tail.groups);
+    try std.testing.expectEqual(@as(u64, 4), tail.last_sequence);
+
+    var backend = mem_backend_mod.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try docstore_mod.DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    {
+        // A legacy all-record lane can consume its scan budget without
+        // finding any enrichment. That is progress, not end of replay.
+        var batch = try store.beginWriteBatch();
+        errdefer batch.abort();
+        try batch.put(internal_keys.replay_meta_init_key[0..], "");
+        for (1..primary_store_fallback_scan_budget_min + 2) |sequence| {
+            const encoded = try change_journal_mod.encodeRecord(alloc, .{
+                .sequence = sequence,
+                .changed_doc_keys = &.{ "doc:a", "doc:b" },
+                .target_hints = if (sequence <= primary_store_fallback_scan_budget_min) &.{.full_text} else &.{.enrichment},
+            });
+            defer alloc.free(encoded);
+            const key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, sequence);
+            try batch.put(&key, encoded);
+        }
+        try batch.commit();
+    }
+    const source = Source.fromPrimaryStore(&store, null, null);
+    const skipped = try source.collectEnrichmentDocumentGroupsWindow(alloc, 0, .{ .max_records = 1 });
+    defer freePendingDocumentGroups(alloc, skipped.groups);
+    try std.testing.expectEqual(@as(u64, primary_store_fallback_scan_budget_min), skipped.last_sequence);
+    try std.testing.expectEqual(@as(usize, 0), skipped.groups.len);
+    const resumed = try source.collectEnrichmentDocumentGroupsWindow(alloc, skipped.last_sequence, .{ .max_records = 1 });
+    defer freePendingDocumentGroups(alloc, resumed.groups);
+    try std.testing.expectEqual(@as(u64, primary_store_fallback_scan_budget_min + 1), resumed.last_sequence);
+    try std.testing.expectEqual(@as(usize, 2), resumed.groups.len);
+}
+
+test "replay source enrichment windows coalesce repeated updates and stop after complete document groups" {
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
+    var journal = try change_journal_mod.Journal.open("enrichment-group-window", .{ .backend = .lsm_memory });
+    defer journal.close();
+    var backend = mem_backend_mod.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try docstore_mod.DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{ .name = "hinted" }));
+    defer store.close();
+    var fallback_backend = mem_backend_mod.Backend.init(alloc, .{});
+    defer fallback_backend.close();
+    var fallback = try docstore_mod.DocStore.openRuntime(alloc, try fallback_backend.runtimeStore(alloc, .{}));
+    defer fallback.close();
+    {
+        var batch = try fallback.beginWriteBatch();
+        errdefer batch.abort();
+        try batch.put(internal_keys.replay_meta_init_key[0..], "");
+        for (1..259) |sequence| {
+            const encoded = try change_journal_mod.encodeRecord(alloc, .{
+                .sequence = sequence,
+                .changed_doc_keys = if (sequence <= 256) &.{"doc:a"} else if (sequence == 257) &.{ "doc:b", "doc:c", "doc:d" } else &.{"doc:e"},
+                .target_hints = &.{.enrichment},
+            });
+            defer alloc.free(encoded);
+            _ = try journal.appendOpaque(encoded);
+            try store.appendReplayOpaque(alloc, sequence, encoded);
+            const key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, sequence);
+            try batch.put(&key, encoded);
+        }
+        try batch.commit();
+    }
+    for ([_]Source{ Source.fromJournal(&journal), Source.fromPrimaryStore(&store, null, null), Source.fromPrimaryStore(&fallback, null, null) }) |source| {
+        const record_bound = try source.collectEnrichmentDocumentGroupsWindow(alloc, 0, .{ .max_records = 8, .max_document_groups = 2 });
+        defer freePendingDocumentGroups(alloc, record_bound.groups);
+        try std.testing.expectEqual(@as(u64, 8), record_bound.last_sequence);
+        try std.testing.expectEqual(@as(usize, 1), record_bound.groups.len);
+
+        const byte_bound = try source.collectEnrichmentDocumentGroupsWindow(alloc, 0, .{ .max_records = 4096, .max_document_groups = 128, .max_input_bytes = 1 });
+        defer freePendingDocumentGroups(alloc, byte_bound.groups);
+        try std.testing.expectEqual(@as(u64, 1), byte_bound.last_sequence);
+        try std.testing.expectEqual(@as(usize, 1), byte_bound.groups.len);
+
+        const first = try source.collectEnrichmentDocumentGroupsWindow(alloc, 0, .{ .max_records = 4096, .max_document_groups = 2 });
+        defer freePendingDocumentGroups(alloc, first.groups);
+        try std.testing.expectEqual(@as(u64, 257), first.last_sequence);
+        try std.testing.expectEqual(@as(usize, 4), first.groups.len);
+        try std.testing.expectEqualStrings("doc:a", first.groups[0].doc_key);
+        try std.testing.expectEqual(@as(u64, 256), first.groups[0].sequence);
+        for (first.groups[1..]) |group| try std.testing.expectEqual(@as(u64, 257), group.sequence);
+        const resumed = try source.collectEnrichmentDocumentGroupsWindow(alloc, first.last_sequence, .{ .max_records = 4096, .max_document_groups = 2 });
+        defer freePendingDocumentGroups(alloc, resumed.groups);
+        try std.testing.expectEqual(@as(u64, 258), resumed.last_sequence);
+        try std.testing.expectEqual(@as(usize, 1), resumed.groups.len);
+        try std.testing.expectEqualStrings("doc:e", resumed.groups[0].doc_key);
+    }
 }
 
 test "replay source stops after first matching record" {

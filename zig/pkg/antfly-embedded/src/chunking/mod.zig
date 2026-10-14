@@ -17,6 +17,7 @@ pub const chunk = @import("chunk.zig");
 pub const types = @import("types.zig");
 pub const fixed = @import("fixed.zig");
 pub const inference = @import("inference.zig");
+pub const Provider = @import("provider.zig").Provider;
 
 test {
     _ = chunk;

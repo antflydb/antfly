@@ -17,7 +17,6 @@ const std = @import("std");
 const wire = @import("antfly_schema_openapi");
 const schema = @import("../storage/schema.zig");
 const codec = @import("../storage/db/algebraic/relational_row_codec.zig");
-const predicate = @import("../storage/db/relational_predicate.zig");
 const tuples = @import("../storage/db/relational_index_keys.zig");
 const impl = @import("table_schema_impl.zig");
 const expressions = @import("relational_expression.zig");
@@ -32,6 +31,7 @@ pub fn valueFromJson(alloc: Allocator, kind: schema.RelationalColumnType, value:
         else
             impl.documentIntegerToI64(value) orelse return error.InvalidBatchRequest },
         .number => .{ .number = impl.documentNumberToF64(value) orelse return error.InvalidBatchRequest },
+        .numeric => .{ .numeric = try @import("../sql/numeric_storage.zig").encodeJsonAlloc(alloc, value) },
         .boolean => if (value == .bool) .{ .boolean = value.bool } else error.InvalidBatchRequest,
         .datetime => .{ .datetime = signedDateTime(value) orelse return error.InvalidBatchRequest },
         .blob => blk: {
@@ -47,37 +47,47 @@ pub fn valueFromJson(alloc: Allocator, kind: schema.RelationalColumnType, value:
     };
 }
 
-const Compiled = union(enum) {
-    comparison: predicate.Plan,
-    expression: expressions.Plan,
-    pub fn deinit(self: *Compiled) void {
-        switch (self.*) {
-            inline else => |*plan| plan.deinit(),
-        }
-    }
-};
-
-fn compile(alloc: Allocator, table: schema.TableSchema, layout: *const codec.PhysicalLayout, definition: wire.RelationalCheckConstraint) !Compiled {
+fn compile(alloc: Allocator, table: schema.TableSchema, layout: *const codec.PhysicalLayout, definition: wire.RelationalCheckConstraint) !expressions.Plan {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     if (definition.expression) |expression| {
         if (definition.column != null or definition.op != null or definition.value != null or definition.collation != null) return error.InvalidSchemaUpdateRequest;
         const json = try std.json.Stringify.valueAlloc(arena.allocator(), expression, .{});
         const value = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), json, .{ .parse_numbers = false });
-        return .{ .expression = try expressions.Plan.init(alloc, table, value, .boolean) };
+        return expressions.Plan.init(alloc, table, value, .boolean);
     }
     const column = definition.column orelse return error.InvalidSchemaUpdateRequest;
     const operation = definition.op orelse return error.InvalidSchemaUpdateRequest;
+    const unary = operation == .is_null or operation == .is_not_null;
+    const literal = definition.value orelse .null;
+    if (unary and literal != .null) return error.InvalidRelationalPredicate;
+    // CHECK operands live in the logical row domain, not the independently
+    // versioned ordered-key domain. Resolve once against the pinned layout;
+    // arrays and wide logical values need no synthetic key allocation.
+    if (table.storage_mode != .relational) return error.InvalidRelationalIndexDefinition;
+    if (layout.schema_version != table.version or layout.column_count != table.relational_columns.len) return error.RelationalRowSchemaMismatch;
     const ordinal = layout.ordinalForName(table.relational_columns, column) orelse return error.RelationalIndexColumnNotFound;
-    const value = try valueFromJson(arena.allocator(), table.relational_columns[ordinal].column_type, definition.value orelse .null, true);
-    return .{ .comparison = try predicate.Plan.init(alloc, table, layout, .{
-        .column = column,
-        .op = switch (operation) {
-            inline else => |op| @field(@import("../storage/relational_index.zig").RelationalCheckOp, @tagName(op)),
-        },
-        .value = value,
-        .collation = definition.collation,
-    }) };
+    const bound = table.relational_columns[ordinal];
+    if (definition.collation) |collation| _ = try expressions.foldAsciiCollation(bound.column_type, collation);
+    const a = arena.allocator();
+    var reference: std.json.Value = .{ .object = .empty };
+    try reference.object.put(a, "op", .{ .string = "column" });
+    try reference.object.put(a, "column", .{ .string = column });
+    var args: std.json.Value = .{ .array = .init(a) };
+    try args.array.append(reference);
+    if (!unary) {
+        var operand: std.json.Value = .{ .object = .empty };
+        try operand.object.put(a, "op", .{ .string = "literal" });
+        try operand.object.put(a, "type", .{ .string = @tagName(bound.column_type) });
+        if (bound.column_type == .sql_array) try operand.object.put(a, "sql_type", .{ .string = @tagName(bound.sql_element_type orelse return error.InvalidRelationalExpressionType) });
+        try operand.object.put(a, "value", literal);
+        try args.array.append(operand);
+    }
+    var expression: std.json.Value = .{ .object = .empty };
+    try expression.object.put(a, "op", .{ .string = @tagName(operation) });
+    try expression.object.put(a, "args", args);
+    if (!unary) if (definition.collation) |collation| try expression.object.put(a, "collation", .{ .string = collation });
+    return expressions.Plan.init(alloc, table, expression, .boolean);
 }
 
 pub fn validateDefinitions(alloc: Allocator, table: schema.TableSchema, definitions: []const wire.RelationalCheckConstraint) !void {
@@ -89,11 +99,9 @@ pub fn validateDefinitions(alloc: Allocator, table: schema.TableSchema, definiti
     for (definitions) |definition| {
         var plan = try compile(alloc, table, &layout, definition);
         defer plan.deinit();
-        if (plan == .expression) {
-            nodes += plan.expression.nodes.len;
-            literals += plan.expression.literal_bytes;
-            if (nodes > 4096 or literals > expressions.max_allocated_bytes) return error.RelationalExpressionBudgetExceeded;
-        }
+        nodes += plan.nodes.len;
+        literals += plan.literal_bytes;
+        if (nodes > 4096 or literals > expressions.max_allocated_bytes) return error.RelationalExpressionBudgetExceeded;
     }
 }
 
@@ -104,7 +112,7 @@ pub const Set = struct {
     table: schema.TableSchema,
     layout: codec.PhysicalLayout,
     definitions: []const wire.RelationalCheckConstraint,
-    plans: []Compiled,
+    plans: []expressions.Plan,
     /// Borrowed immutable schema names, deduplicated across every CHECK form.
     dependency_fields: []const []const u8 = &.{},
     identity: [32]u8 = undefined,
@@ -125,17 +133,8 @@ pub const Set = struct {
             std.mem.writeInt(u64, &size, definition.name.len, .little);
             state.update(&size);
             state.update(definition.name);
-            switch (plan) {
-                .comparison => |comparison| {
-                    state.update(&comparison.tuple.fingerprint);
-                    state.update(&.{ @backingInt(comparison.op), @intFromBool(comparison.operand_null) });
-                    state.update(comparison.operand);
-                },
-                .expression => |expression| {
-                    state.update("immutable boolean expression v1");
-                    state.update(&expression.fingerprint);
-                },
-            }
+            state.update("immutable boolean expression v1");
+            state.update(&plan.fingerprint);
             state.final(entry);
         }
         std.mem.sort([32]u8, entries, {}, struct {
@@ -158,30 +157,25 @@ pub const Set = struct {
         errdefer alloc.destroy(set);
         set.* = .{ .alloc = alloc, .table = table, .layout = try codec.PhysicalLayout.init(alloc, table), .definitions = definitions, .plans = undefined };
         errdefer set.layout.deinit();
-        set.plans = try alloc.alloc(Compiled, definitions.len);
+        set.plans = try alloc.alloc(expressions.Plan, definitions.len);
         errdefer alloc.free(set.plans);
         var initialized: usize = 0;
         errdefer for (set.plans[0..initialized]) |*plan| plan.deinit();
+        var node_count: usize = 0;
+        var literal_bytes: usize = 0;
         for (definitions, set.plans) |definition, *plan| {
             plan.* = try compile(alloc, table, &set.layout, definition);
             initialized += 1;
+            node_count += plan.nodes.len;
+            literal_bytes += plan.literal_bytes;
+            if (node_count > 4096 or literal_bytes > expressions.max_allocated_bytes) return error.RelationalExpressionBudgetExceeded;
         }
         var needed = try alloc.alloc(bool, table.relational_columns.len);
         defer alloc.free(needed);
         @memset(needed, false);
-        var node_count: usize = 0;
-        var literal_bytes: usize = 0;
-        for (set.plans) |plan| switch (plan) {
-            .comparison => |comparison| {
-                needed[comparison.tuple.keys[0].ordinal] = true;
-            },
-            .expression => |expression| {
-                node_count += expression.nodes.len;
-                literal_bytes += expression.literal_bytes;
-                for (expression.dependencies) |ordinal| needed[ordinal] = true;
-            },
-        };
-        if (node_count > 4096 or literal_bytes > expressions.max_allocated_bytes) return error.RelationalExpressionBudgetExceeded;
+        for (set.plans) |plan| {
+            for (plan.dependencies) |ordinal| needed[ordinal] = true;
+        }
         var field_count: usize = 0;
         for (needed) |selected| if (selected) {
             field_count += 1;
@@ -212,6 +206,11 @@ pub const Set = struct {
         return null;
     }
 
+    pub fn firstViolationJsonWithExecution(self: *const Set, execution: *expressions.Execution, value: std.json.Value) !?usize {
+        if (try self.firstJsonWithExecution(execution, value, false)) |failure| return failure.index;
+        return null;
+    }
+
     pub const Failure = struct { index: usize, reason: anyerror = error.RelationalCheckViolation };
 
     /// Invalid deterministic expression results become durable invalid-row
@@ -220,29 +219,33 @@ pub const Set = struct {
         return self.firstJson(alloc, value, true);
     }
 
+    pub fn firstFailureJsonWithExecution(self: *const Set, execution: *expressions.Execution, value: std.json.Value) !?Failure {
+        return self.firstJsonWithExecution(execution, value, true);
+    }
+
     fn firstJson(self: *const Set, alloc: Allocator, value: std.json.Value, activation: bool) !?Failure {
-        if (value != .object) return error.InvalidBatchRequest;
-        var scratch = std.ArrayList(u8).empty;
-        defer scratch.deinit(alloc);
-        var arena = std.heap.ArenaAllocator.init(alloc);
-        defer arena.deinit();
         var budget: usize = expressions.max_allocated_bytes;
-        for (self.definitions, self.plans, 0..) |definition, *plan, i| {
-            const accepted = switch (plan.*) {
-                .comparison => |*comparison| blk: {
-                    const ordinal = comparison.tuple.keys[0].ordinal;
-                    const scalar = try valueFromJson(arena.allocator(), self.table.relational_columns[ordinal].column_type, value.object.get(definition.column.?) orelse .null, false);
-                    break :blk (try comparison.evaluateValue(alloc, &scratch, scalar)).satisfiesCheck();
-                },
-                .expression => |*expression| blk: {
-                    const result = expression.evaluateJsonWithBudget(arena.allocator(), value, &budget) catch |err| {
-                        if (activation and isDeterministicFailure(err)) return .{ .index = i, .reason = err };
-                        return err;
-                    };
-                    break :blk result == .null or result.boolean;
-                },
+        var execution = expressions.Execution.init(alloc, &budget);
+        return self.firstJsonWithExecution(&execution, value, activation);
+    }
+
+    fn firstJsonWithExecution(self: *const Set, execution: *expressions.Execution, value: std.json.Value, activation: bool) !?Failure {
+        try execution.charge(0);
+        var owner: expressions.ExecutionScratch = undefined;
+        owner.init(execution);
+        defer owner.deinit();
+        return self.firstJsonInner(execution, value, activation) catch |err| return owner.failure(err);
+    }
+
+    fn firstJsonInner(self: *const Set, execution: *expressions.Execution, value: std.json.Value, activation: bool) !?Failure {
+        if (value != .object) return error.InvalidBatchRequest;
+        for (self.plans, 0..) |*plan, i| {
+            try execution.charge(1);
+            const result = plan.evaluateJsonWithExecution(execution, value) catch |err| {
+                if (activation and isDeterministicFailure(err)) return .{ .index = i, .reason = err };
+                return err;
             };
-            if (!accepted) return .{ .index = i };
+            if (result != .null and !result.boolean) return .{ .index = i };
         }
         return null;
     }
@@ -254,50 +257,50 @@ pub const Set = struct {
         return null;
     }
 
+    pub fn firstViolationRowWithExecution(self: *const Set, execution: *expressions.Execution, row: codec.OrdinalRowView) !?usize {
+        if (try self.firstRowWithExecution(execution, row, false)) |failure| return failure.index;
+        return null;
+    }
+
     pub fn firstFailureRow(self: *const Set, alloc: Allocator, row: codec.OrdinalRowView) !?Failure {
         return self.firstRow(alloc, row, true);
     }
 
+    pub fn firstFailureRowWithExecution(self: *const Set, execution: *expressions.Execution, row: codec.OrdinalRowView) !?Failure {
+        return self.firstRowWithExecution(execution, row, true);
+    }
+
     fn firstRow(self: *const Set, alloc: Allocator, row: codec.OrdinalRowView, activation: bool) !?Failure {
-        var scratch = std.ArrayList(u8).empty;
-        defer scratch.deinit(alloc);
-        var arena = std.heap.ArenaAllocator.init(alloc);
-        defer arena.deinit();
         var budget: usize = expressions.max_allocated_bytes;
-        for (self.definitions, self.plans, 0..) |definition, *plan, i| {
-            if (plan.* == .expression) {
-                const result = plan.expression.evaluateRowWithBudget(arena.allocator(), row, &budget) catch |err| {
-                    if (activation and isDeterministicFailure(err)) return .{ .index = i, .reason = err };
-                    return err;
-                };
-                if (result != .null and !result.boolean) return .{ .index = i };
-                continue;
-            }
-            const comparison = &plan.comparison;
-            const scalar: tuples.Value = scalar: {
-                const ordinal = row.ordinalForName(definition.column.?) orelse break :scalar .null;
-                const current = comparison.tuple.keys[0].ordinal;
-                const kind = row.table_schema.relational_columns[ordinal].column_type;
-                if (kind != self.table.relational_columns[current].column_type) return error.RelationalIndexColumnTypeMismatch;
-                const cell = (try row.findCell(ordinal)) orelse break :scalar .null;
-                if (cell.is_null) break :scalar .null;
-                break :scalar switch (kind) {
-                    .string => .{ .string = cell.value.bytes_val },
-                    .blob => .{ .blob = cell.value.bytes_val },
-                    .integer => .{ .integer = cell.value.i64_val },
-                    .number => .{ .number = cell.value.f64_val },
-                    .boolean => .{ .boolean = cell.value.bool_val },
-                    .datetime => .{ .datetime = cell.value.u64_val },
-                    else => return error.UnsupportedRelationalIndexColumn,
-                };
+        var execution = expressions.Execution.init(alloc, &budget);
+        return self.firstRowWithExecution(&execution, row, activation);
+    }
+
+    fn firstRowWithExecution(self: *const Set, execution: *expressions.Execution, row: codec.OrdinalRowView, activation: bool) !?Failure {
+        try execution.charge(0);
+        var owner: expressions.ExecutionScratch = undefined;
+        owner.init(execution);
+        defer owner.deinit();
+        return self.firstRowInner(execution, row, activation) catch |err| return owner.failure(err);
+    }
+
+    fn firstRowInner(self: *const Set, execution: *expressions.Execution, row: codec.OrdinalRowView, activation: bool) !?Failure {
+        for (self.plans, 0..) |*plan, i| {
+            try execution.charge(1);
+            const result = plan.evaluateRowWithExecution(execution, row) catch |err| {
+                if (activation and isDeterministicFailure(err)) return .{ .index = i, .reason = err };
+                return err;
             };
-            if (!(try comparison.evaluateValue(alloc, &scratch, scalar)).satisfiesCheck()) return .{ .index = i };
+            if (result != .null and !result.boolean) return .{ .index = i };
         }
         return null;
     }
 };
 
 fn isDeterministicFailure(err: anyerror) bool {
+    // A shared invocation can exhaust admission because of earlier plans,
+    // not this row's contents. Never persist that as a CHECK violation.
+    if (err == error.RelationalExpressionBudgetExceeded) return false;
     return @import("relational_expression_errors.zig").isInvalidInput(err) or err == error.RelationalIndexColumnTypeMismatch or err == error.InvalidBatchRequest;
 }
 

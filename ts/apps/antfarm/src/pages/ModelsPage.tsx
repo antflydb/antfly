@@ -52,6 +52,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { ErrorState, NoResultsState } from "@/components/branded-empty-state";
 import { ConnectedProvidersSummary } from "@/components/ConnectedProvidersSummary";
+import { RuntimeProfiles } from "@/components/models/RuntimeProfiles";
 import { isProductEnabled } from "@/config/products";
 import {
   type Backend,
@@ -911,7 +912,7 @@ const TypeContextBanner: React.FC<{
 // Main page component
 const ModelsPage: React.FC = () => {
   const { models, types, quantizationOptions, loading, error, retry } = useInferenceRegistry();
-  const { apiUrl } = useApiConfig();
+  const { apiUrl, inferenceApiUrl } = useApiConfig();
   const navigate = useNavigate();
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedType, setSelectedType] = useState<ModelType | "all">("all");
@@ -1186,6 +1187,15 @@ const ModelsPage: React.FC = () => {
           ))}
         </div>
       </DashboardToolbar>
+
+      {filteredModels.length > 0 && (
+        <RuntimeProfiles
+          key={JSON.stringify([apiUrl, inferenceApiUrl])}
+          models={filteredModels}
+          endpointKey={JSON.stringify([apiUrl, inferenceApiUrl])}
+          onDetails={handleModelClick}
+        />
+      )}
 
       {/* Type Context Banner - shows when a specific type is selected */}
       {selectedType !== "all" && (

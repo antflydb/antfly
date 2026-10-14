@@ -68,13 +68,19 @@ or newly built Antfly binary:
 ```bash
 ANTFLY_RUNTIME_BIN=/absolute/path/to/antfly GOWORK=off go test \
   -tags runtimeintegration ./controllers/inference \
-  -run '^TestInferenceRuntimeContract$' -count=1 -v -timeout=20m
+  -run '^Test(InferenceRuntimeContract|RuntimeModelPullRetry)$' -count=1 -v -timeout=20m
 ```
 
 This explicit integration target fails if its binary is absent or its model
 cannot be downloaded; ordinary offline unit tests do not run it. Downloads and
 runtime state use isolated temporary directories, and server process groups are
-terminated on completion or timeout. When advancing the supported runtime,
+terminated on completion or timeout. Set `ANTFLY_RUNTIME_MODEL_CACHE` to an
+absolute model directory to reuse local fixtures explicitly; isolated child
+home directories keep the missing-directory negative control independent of
+that cache. Public model acquisition retries exact transient transport failures
+at most three times within the existing scenario deadline. Configuration,
+identity, checksum, and inference failures remain fatal.
+When advancing the supported runtime,
 update both the release version and SHA256 in `antfly-operator-go.yml` and run
 this same target against the candidate binary. This test does not exercise
 container packaging, real Kubernetes scheduling, or GPU execution; retain those

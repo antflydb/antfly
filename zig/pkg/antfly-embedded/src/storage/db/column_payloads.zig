@@ -48,6 +48,7 @@ pub fn identity(value_type: dv.ValueType, values: []const ?dv.TypedValue) [32]u8
     for (values, 0..) |maybe_value, row| if (maybe_value) |value| {
         hashInt(&hash, u32, @intCast(row));
         switch (value) {
+            .datetime_ns => |v| hashInt(&hash, i128, v),
             .u64_val => |v| hashInt(&hash, u64, v),
             .i64_val => |v| hashInt(&hash, i64, v),
             .f64_val => |v| hashInt(&hash, u64, @bitCast(v)),

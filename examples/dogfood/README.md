@@ -225,8 +225,8 @@ What remains:
 - Entity nodes are canonical label-free `entity/<slug>` keys minted
   deterministically by the resolver (`entity/raft`); `dogfood entity`
   slugifies a bare name into that namespace. Canonical entity *documents* are minted for
-  the `entities` table by the promotion stage, which stays pending in
-  embedded Lite (no cross-table entity sink); the graph topology, mention
+  the `entities` table by the atomic promotion stage in embedded Lite;
+  `runUntilIdle` drains recursive enrichment across named tables. The graph topology, mention
   edges, and canonical keys do not depend on it.
 - Re-ingesting without `-reset` reconciles changed sections but does not
   discover deleted files (path/heading-derived keys are upsert-only);

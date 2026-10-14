@@ -19,6 +19,7 @@
 const std = @import("std");
 pub const backend = @import("backend.zig");
 const values = @import("values.zig");
+const formatting = @import("formatting.zig");
 const commands = @import("session_commands.zig");
 const settings_catalog = @import("antfly_local_sources").sql_setting_catalog;
 const Spool = @import("cursor_spool.zig").Store;
@@ -104,19 +105,23 @@ pub const Session = struct {
     session_id: ?[]u8 = null,
     status: backend.TransactionStatus = .idle,
     prepared: std.StringHashMapUnmanaged(Prepared) = .empty,
-    portals: std.StringHashMapUnmanaged(Portal) = .empty,
+    // Results borrow their portal allocator until release. Registry growth and
+    // removal must never move that allocator.
+    portals: std.StringHashMapUnmanaged(*Portal) = .empty,
     sql_cursors: std.StringHashMapUnmanaged(SqlCursor) = .empty,
     cursor_budget: ?*Budget = null,
     cursor_epoch: u64 = 0,
     statement_timeout: ?u32 = null,
     application_name: commands.ApplicationName = .{},
+    lake_visibility: commands.ReadRequirements = .{},
+    read_receipt_budget: @import("antfly_local_sources").sql_read_requirements.WaitBudget = .{},
     namespace_setting: ?commands.SearchPath = null,
     catalog_settings: ?settings_catalog.OverlayState = null,
     request_namespace: ?[]const u8 = null,
     request_search_path: ?commands.SearchPath = null,
     transaction_namespace: ?commands.Namespace = null,
-    timeout_transaction: ?struct { before: ?u32, committed: ?u32, namespace_before: ?commands.SearchPath, namespace_committed: ?commands.SearchPath, application_before: commands.ApplicationName, application_committed: commands.ApplicationName } = null,
-    savepoints: std.ArrayList(struct { name: []const u8, epoch: u64, timeout: ?u32, committed_timeout: ?u32, namespace: ?commands.SearchPath, committed_namespace: ?commands.SearchPath, application: commands.ApplicationName, committed_application: commands.ApplicationName, catalog: ?settings_catalog.OverlayState.Savepoint = null }) = .empty,
+    timeout_transaction: ?struct { before: ?u32, committed: ?u32, namespace_before: ?commands.SearchPath, namespace_committed: ?commands.SearchPath, application_before: commands.ApplicationName, application_committed: commands.ApplicationName, lake_before: commands.ReadRequirements, lake_committed: commands.ReadRequirements } = null,
+    savepoints: std.ArrayList(struct { name: []const u8, epoch: u64, timeout: ?u32, committed_timeout: ?u32, namespace: ?commands.SearchPath, committed_namespace: ?commands.SearchPath, application: commands.ApplicationName, committed_application: commands.ApplicationName, lake: commands.ReadRequirements, committed_lake: commands.ReadRequirements, catalog: ?settings_catalog.OverlayState.Savepoint = null }) = .empty,
     skip_until_sync: bool = false,
     backend_pid: i32 = 0,
     cancel_key: i32 = 0,
@@ -162,7 +167,7 @@ pub const Session = struct {
         self.setDeadline(self.limits.startup_timeout_ms);
         const started = self.startup() catch |err| {
             if (err == error.Canceled) return err;
-            try self.sendError(sqlstate(err), @errorName(err));
+            if (self.diagnostic.code != null) try self.sendDiagnostic('E', self.diagnostic, null) else try self.sendError(sqlstate(err), @errorName(err));
             try self.writer.flush();
             return err;
         };
@@ -197,6 +202,7 @@ pub const Session = struct {
                             self.statement_timeout = settings.before;
                             self.namespace_setting = settings.namespace_before;
                             self.application_name = settings.application_before;
+                            self.lake_visibility = settings.lake_before;
                         }
                         self.timeout_transaction = null;
                         self.transaction_namespace = null;
@@ -251,10 +257,23 @@ pub const Session = struct {
                             if (database != null) return error.ProtocolViolation;
                             database = value;
                         } else if (std.mem.eql(u8, key, "client_encoding")) {
-                            if (!std.ascii.eqlIgnoreCase(value, "UTF8") and !std.ascii.eqlIgnoreCase(value, "UTF-8")) return error.UnsupportedEncoding;
+                            formatting.validateEncoding(value) catch |err| {
+                                self.diagnostic.set("22021", "unsupported startup parameter client_encoding; only UTF8 is supported", null, null);
+                                return err;
+                            };
                         } else if (std.mem.eql(u8, key, "application_name")) {
                             self.application_name = try commands.ApplicationName.init(value);
+                        } else if (formatting.lookup(key)) |setting| {
+                            setting.validate(value) catch |err| {
+                                var buffer: [256]u8 = undefined;
+                                const startup_message = std.fmt.bufPrint(&buffer, "unsupported value for startup parameter {s}; effective value is {s}", .{ setting.name(), setting.value() }) catch "unsupported startup parameter value";
+                                self.diagnostic.set("0A000", startup_message, null, null);
+                                return err;
+                            };
                         } else {
+                            var buffer: [256]u8 = undefined;
+                            const startup_message = std.fmt.bufPrint(&buffer, "unsupported startup parameter: {s}", .{key}) catch "unsupported startup parameter";
+                            self.diagnostic.set("0A000", startup_message, null, null);
                             // Never accept unchecked search_path/options that
                             // could silently change resolution or permissions.
                             return error.UnsupportedStartupOption;
@@ -287,10 +306,8 @@ pub const Session = struct {
                     try self.parameterStatus("server_version", "16.0-antfly");
                     try self.parameterStatus("server_encoding", "UTF8");
                     try self.parameterStatus("client_encoding", "UTF8");
-                    try self.parameterStatus("DateStyle", "ISO, MDY");
-                    try self.parameterStatus("TimeZone", "UTC");
+                    inline for (std.meta.tags(formatting.Setting)) |setting| try self.parameterStatus(setting.name(), setting.value());
                     try self.parameterStatus("integer_datetimes", "on");
-                    try self.parameterStatus("standard_conforming_strings", "on");
                     var key: [8]u8 = undefined;
                     std.mem.writeInt(i32, key[0..4], self.backend_pid, .big);
                     std.mem.writeInt(i32, key[4..8], self.cancel_key, .big);
@@ -323,6 +340,7 @@ pub const Session = struct {
     fn request(self: *Session, statement: []const u8, parameters: []const std.json.Value, types: []const backend.Type) backend.Request {
         return .{
             .statement = statement,
+            .scratch_allocator = self.alloc,
             .parameters = parameters,
             .parameter_types = types,
             .database = self.database,
@@ -330,6 +348,9 @@ pub const Session = struct {
             .search_path = self.effectiveSearchPath(),
             .session_namespace = if (self.transaction_namespace) |*value| value.slice() else null,
             .session_id = self.session_id,
+            .lake_visibility = if (self.lake_visibility.visibility == .accepted) .accepted else .committed,
+            .read_requirements = self.lake_visibility,
+            .read_receipt_budget = &self.read_receipt_budget,
             .setting_overlay = if (self.catalog_settings) |*state| state.values() else &.{},
             .limit = self.limits.result_rows,
             .io = self.io,
@@ -340,12 +361,20 @@ pub const Session = struct {
     }
 
     fn describe(self: *Session, alloc: std.mem.Allocator, statement: []const u8, types: []const backend.Type) !backend.Description {
+        return self.describeTyped(alloc, statement, types, &.{});
+    }
+
+    fn describeTyped(self: *Session, alloc: std.mem.Allocator, statement: []const u8, types: []const backend.Type, descriptors: []const backend.Parameter) !backend.Description {
         if (try commands.settingCommand(alloc, statement)) |setting| {
             if (types.len != 0) return error.InvalidParameter;
             return .{ .columns = switch (setting) {
                 .search_path => |value| if (value == .show) &.{.{ .name = "search_path", .type = .string }} else &.{},
                 .statement_timeout => |value| if (value == .show) &.{.{ .name = "statement_timeout", .type = .string }} else &.{},
+                .lake_visibility => |value| if (value == .show) &.{.{ .name = "antfly.lake_visibility", .type = .string }} else &.{},
+                .read_visibility => |value| if (value == .show) &.{.{ .name = "antfly.read_visibility", .type = .string }} else &.{},
+                .read_requirements => |value| if (value == .show) &.{.{ .name = "antfly.read_requirements", .type = .string }} else &.{},
                 .application_name => |value| if (value == .show) &.{.{ .name = "application_name", .type = .string }} else &.{},
+                .formatting => |value| if (value.action == .show) try alloc.dupe(backend.Column, &.{.{ .name = value.kind.name(), .type = .string }}) else &.{},
                 .client_encoding => |value| if (value == .show) &.{.{ .name = "client_encoding", .type = .string }} else &.{},
                 .catalog => |value| if (value == .show) &.{.{ .name = value.show, .type = .string }} else &.{},
                 .reset_all => &.{},
@@ -355,20 +384,66 @@ pub const Session = struct {
         self.cancel_requested.store(false, .release);
         self.executing.store(true, .release);
         defer self.executing.store(false, .release);
-        const req = self.request(statement, &.{}, types);
+        var req = self.request(statement, &.{}, types);
+        req.parameter_descriptors = descriptors;
         try req.check();
         const result = try self.source.vtable.describe(self.source.context, alloc, self.identity orelse return error.AuthenticationFailed, req);
         if (result.columns.len > self.limits.columns or result.parameter_types.len > self.limits.parameters) return error.ProgramLimitExceeded;
+        if (result.parameter_descriptors.len != 0) {
+            if (result.parameter_descriptors.len != result.parameter_types.len) return error.InvalidParameter;
+            for (result.parameter_descriptors, result.parameter_types) |descriptor, kind| {
+                const inferred = try values.parameterFromOid(try values.parameterOid(descriptor));
+                if (inferred.kind == null) {
+                    if (kind != .unknown) return error.InvalidParameter;
+                } else if (!std.mem.eql(u8, @tagName(inferred.kind.?), @tagName(kind))) return error.InvalidParameter;
+            }
+        }
         return result;
     }
 
+    /// Recompile against the current catalog before an unstarted execution.
+    /// Preserve the client's fixed parameter/result contract; retain fresh
+    /// schema and settings guards so concurrent changes still fence admission.
+    /// Never call this for a suspended portal or an already admitted mutation.
+    fn cachedPlanChanged(self: *Session) anyerror {
+        self.diagnostic.set("0A000", "cached plan must not change result type", null, null);
+        return error.CachedPlanResultTypeChanged;
+    }
+
+    fn rebindCached(self: *Session, alloc: std.mem.Allocator, statement: []const u8, original: backend.Description) !backend.Description {
+        const current = try self.describeTyped(alloc, statement, original.parameter_types, original.parameter_descriptors);
+        if (!cachedColumnsEqual(original.columns, current.columns) or
+            original.parameter_types.len != current.parameter_types.len)
+            return self.cachedPlanChanged();
+        for (original.parameter_types, current.parameter_types, 0..) |before, after, i| {
+            const before_oid = if (original.parameter_descriptors.len == original.parameter_types.len)
+                try values.parameterOid(original.parameter_descriptors[i])
+            else
+                try values.oid(before);
+            const after_oid = if (current.parameter_descriptors.len == current.parameter_types.len)
+                try values.parameterOid(current.parameter_descriptors[i])
+            else
+                try values.oid(after);
+            if (before_oid != after_oid) return self.cachedPlanChanged();
+        }
+        return current;
+    }
+
     fn execute(self: *Session, alloc: std.mem.Allocator, statement: []const u8, parameters: []const std.json.Value, types: []const backend.Type, binding_guard: ?[]const u8, setting_epoch: ?u64) !backend.Result {
+        return self.executeTyped(alloc, statement, parameters, types, &.{}, binding_guard, setting_epoch);
+    }
+
+    fn executeTyped(self: *Session, alloc: std.mem.Allocator, statement: []const u8, parameters: []const std.json.Value, types: []const backend.Type, descriptors: []const backend.Parameter, binding_guard: ?[]const u8, setting_epoch: ?u64) !backend.Result {
         if (try commands.settingCommand(alloc, statement)) |setting| {
             if (parameters.len != 0 or types.len != 0) return error.InvalidParameter;
             return switch (setting) {
                 .search_path => |value| self.executeSearchPathSetting(alloc, statement, value),
                 .statement_timeout => |value| self.executeTimeoutSetting(alloc, value),
+                .lake_visibility => |value| self.executeLakeVisibilitySetting(alloc, value, "antfly.lake_visibility"),
+                .read_visibility => |value| self.executeLakeVisibilitySetting(alloc, value, "antfly.read_visibility"),
+                .read_requirements => |value| self.executeReadRequirementsSetting(alloc, value),
                 .application_name => |value| self.executeApplicationNameSetting(alloc, value),
+                .formatting => |value| self.executeFormattingSetting(alloc, value),
                 .client_encoding => |value| self.executeEncodingSetting(alloc, value),
                 .catalog => |value| self.executeCatalogSetting(alloc, statement, value),
                 .reset_all => self.executeResetAll(),
@@ -379,6 +454,7 @@ pub const Session = struct {
         self.executing.store(true, .release);
         defer self.executing.store(false, .release);
         var req = self.request(statement, parameters, types);
+        req.parameter_descriptors = descriptors;
         req.binding_guard = binding_guard;
         req.setting_epoch = setting_epoch;
         try req.check();
@@ -410,12 +486,12 @@ pub const Session = struct {
         self.status = result.transaction_status;
         if (previous_status == .idle and self.status == .in_transaction) {
             try self.settingsState().begin();
-            self.timeout_transaction = .{ .before = self.statement_timeout, .committed = self.statement_timeout, .namespace_before = self.namespace_setting, .namespace_committed = self.namespace_setting, .application_before = self.application_name, .application_committed = self.application_name };
+            self.timeout_transaction = .{ .before = self.statement_timeout, .committed = self.statement_timeout, .namespace_before = self.namespace_setting, .namespace_committed = self.namespace_setting, .application_before = self.application_name, .application_committed = self.application_name, .lake_before = self.lake_visibility, .lake_committed = self.lake_visibility };
             self.transaction_namespace = try commands.Namespace.init(req.namespace orelse "public");
         }
         if (control) |value| switch (value) {
             .savepoint => {
-                self.savepoints.appendAssumeCapacity(.{ .name = savepoint_name.?, .epoch = self.cursor_epoch, .timeout = self.statement_timeout, .committed_timeout = if (self.timeout_transaction) |settings| settings.committed else self.statement_timeout, .namespace = self.namespace_setting, .committed_namespace = if (self.timeout_transaction) |settings| settings.namespace_committed else self.namespace_setting, .application = self.application_name, .committed_application = if (self.timeout_transaction) |settings| settings.application_committed else self.application_name, .catalog = if (self.catalog_settings) |*state| try state.savepoint() else null });
+                self.savepoints.appendAssumeCapacity(.{ .name = savepoint_name.?, .epoch = self.cursor_epoch, .timeout = self.statement_timeout, .committed_timeout = if (self.timeout_transaction) |settings| settings.committed else self.statement_timeout, .namespace = self.namespace_setting, .committed_namespace = if (self.timeout_transaction) |settings| settings.namespace_committed else self.namespace_setting, .application = self.application_name, .committed_application = if (self.timeout_transaction) |settings| settings.application_committed else self.application_name, .lake = self.lake_visibility, .committed_lake = if (self.timeout_transaction) |settings| settings.lake_committed else self.lake_visibility, .catalog = if (self.catalog_settings) |*state| try state.savepoint() else null });
                 savepoint_name = null;
             },
             .release, .rollback_to => |name| {
@@ -429,10 +505,12 @@ pub const Session = struct {
                             self.statement_timeout = self.savepoints.items[index].timeout;
                             self.namespace_setting = self.savepoints.items[index].namespace;
                             self.application_name = self.savepoints.items[index].application;
+                            self.lake_visibility = self.savepoints.items[index].lake;
                             if (self.timeout_transaction) |*settings| {
                                 settings.committed = self.savepoints.items[index].committed_timeout;
                                 settings.namespace_committed = self.savepoints.items[index].committed_namespace;
                                 settings.application_committed = self.savepoints.items[index].committed_application;
+                                settings.lake_committed = self.savepoints.items[index].committed_lake;
                             }
                         }
                         const keep = index + @as(usize, if (value == .rollback_to) 1 else 0);
@@ -454,6 +532,7 @@ pub const Session = struct {
             self.statement_timeout = if (std.ascii.eqlIgnoreCase(result.command_tag, "COMMIT")) settings.committed else settings.before;
             self.namespace_setting = if (std.ascii.eqlIgnoreCase(result.command_tag, "COMMIT")) settings.namespace_committed else settings.namespace_before;
             self.application_name = if (std.ascii.eqlIgnoreCase(result.command_tag, "COMMIT")) settings.application_committed else settings.application_before;
+            self.lake_visibility = if (std.ascii.eqlIgnoreCase(result.command_tag, "COMMIT")) settings.lake_committed else settings.lake_before;
             self.timeout_transaction = null;
             self.transaction_namespace = null;
         };
@@ -519,6 +598,51 @@ pub const Session = struct {
         return result;
     }
 
+    fn executeReadRequirementsSetting(self: *Session, alloc: std.mem.Allocator, setting: commands.ReadRequirementsSetting) !backend.Result {
+        if (self.status == .failed) return error.InFailedSqlTransaction;
+        var result: backend.Result = .{ .command_tag = if (setting == .show) "SHOW" else if (setting == .reset) "RESET" else "SET", .transaction_status = self.status, .session_id = self.session_id };
+        if (setting == .show) {
+            result.columns = &.{.{ .name = "antfly.read_requirements", .type = .string }};
+            const row = try alloc.alloc(std.json.Value, 1);
+            row[0] = .{ .string = try std.json.Stringify.valueAlloc(alloc, self.lake_visibility, .{ .emit_null_optional_fields = false }) };
+            const rows = try alloc.alloc([]const std.json.Value, 1);
+            rows[0] = row;
+            result.rows = rows;
+            return result;
+        }
+        const update = if (setting == .reset) (commands.ReadRequirementsSetting{ .set = .{ .local = false, .value = .{} } }).set else setting.set;
+        if (update.local and self.status != .in_transaction) return error.NoActiveSqlTransaction;
+        try update.value.validate(.sql);
+        self.lake_visibility = update.value;
+        if (!update.local) if (self.timeout_transaction) |*settings| {
+            settings.lake_committed = update.value;
+        };
+        return result;
+    }
+
+    fn executeLakeVisibilitySetting(self: *Session, alloc: std.mem.Allocator, setting: commands.LakeVisibilitySetting, name: []const u8) !backend.Result {
+        if (self.status == .failed) return error.InFailedSqlTransaction;
+        var result: backend.Result = .{ .command_tag = if (setting == .show) "SHOW" else if (setting == .reset) "RESET" else "SET", .transaction_status = self.status, .session_id = self.session_id };
+        if (setting == .show) {
+            const columns = try alloc.alloc(backend.Column, 1);
+            columns[0] = .{ .name = name, .type = .string };
+            result.columns = columns;
+            const row = try alloc.alloc(std.json.Value, 1);
+            row[0] = .{ .string = try alloc.dupe(u8, @tagName(self.lake_visibility.visibility orelse .committed)) };
+            const rows = try alloc.alloc([]const std.json.Value, 1);
+            rows[0] = row;
+            result.rows = rows;
+            return result;
+        }
+        const update = if (setting == .reset) (commands.LakeVisibilitySetting{ .set = .{ .local = false, .value = .committed } }).set else setting.set;
+        if (update.local and self.status != .in_transaction) return error.NoActiveSqlTransaction;
+        self.lake_visibility.visibility = if (update.value == .accepted) .accepted else .committed;
+        if (!update.local) if (self.timeout_transaction) |*settings| {
+            settings.lake_committed.visibility = self.lake_visibility.visibility;
+        };
+        return result;
+    }
+
     fn executeApplicationNameSetting(self: *Session, alloc: std.mem.Allocator, setting: commands.ApplicationNameSetting) !backend.Result {
         if (self.status == .failed) return error.InFailedSqlTransaction;
         var result: backend.Result = .{ .command_tag = if (setting == .show) "SHOW" else if (setting == .reset) "RESET" else "SET", .transaction_status = self.status, .session_id = self.session_id };
@@ -551,6 +675,22 @@ pub const Session = struct {
             rows[0] = row;
             result.rows = rows;
         } else if (setting == .set and setting.set.local and self.status != .in_transaction) return error.NoActiveSqlTransaction;
+        return result;
+    }
+
+    fn executeFormattingSetting(self: *Session, alloc: std.mem.Allocator, setting: commands.FormattingSetting) !backend.Result {
+        if (self.status == .failed) return error.InFailedSqlTransaction;
+        if (setting.local and self.status != .in_transaction) return error.NoActiveSqlTransaction;
+        var result: backend.Result = .{ .command_tag = switch (setting.action) {
+            .show => "SHOW",
+            .set => "SET",
+            .reset => "RESET",
+        }, .transaction_status = self.status, .session_id = self.session_id };
+        if (setting.action == .show) {
+            result.columns = try alloc.dupe(backend.Column, &.{.{ .name = setting.kind.name(), .type = .string }});
+            const row = try alloc.dupe(std.json.Value, &.{.{ .string = setting.kind.value() }});
+            result.rows = try alloc.dupe([]const std.json.Value, &.{row});
+        }
         return result;
     }
 
@@ -612,6 +752,7 @@ pub const Session = struct {
         self.statement_timeout = null;
         self.namespace_setting = null;
         self.application_name = .{};
+        self.lake_visibility = .{};
         if (self.catalog_settings) |*state| state.resetAll();
         // RESET ALL is a session-level change even inside a transaction.
         // Savepoint snapshots can still roll it back locally; a committed
@@ -620,6 +761,7 @@ pub const Session = struct {
             settings.committed = null;
             settings.namespace_committed = null;
             settings.application_committed = .{};
+            settings.lake_committed = .{};
         }
         return .{ .command_tag = "RESET", .transaction_status = self.status, .session_id = self.session_id };
     }
@@ -646,11 +788,12 @@ pub const Session = struct {
         var cursor = Cursor{ .bytes = payload };
         switch (tag) {
             'Q' => {
+                self.read_receipt_budget = .{};
                 const statement = try cursor.string();
                 try cursor.finish();
                 self.removePortal("");
                 self.removePrepared("");
-                if (std.mem.trim(u8, statement, " \t\r\n;").len == 0) {
+                if (try commands.isEmptyQuery(statement)) {
                     try self.message('I', "");
                 } else {
                     var arena = std.heap.ArenaAllocator.init(self.alloc);
@@ -695,16 +838,18 @@ pub const Session = struct {
                 const a = arena.allocator();
                 const declared = try a.alloc(u32, count);
                 const types = try a.alloc(backend.Type, count);
-                for (declared, types) |*oid, *kind| {
+                const descriptors = try a.alloc(backend.Parameter, count);
+                for (declared, types, descriptors) |*oid, *kind, *descriptor| {
                     oid.* = try cursor.int(u32);
                     kind.* = try values.fromOid(oid.*);
+                    descriptor.* = try values.parameterFromOid(oid.*);
                 }
                 try cursor.finish();
-                const description = try self.describe(a, statement, types);
+                const description = try self.describeTyped(a, statement, types, descriptors);
                 if (count > description.parameter_types.len) return error.InvalidParameter;
                 const oids = try a.alloc(u32, description.parameter_types.len);
                 for (oids, description.parameter_types, 0..) |*oid, kind, index| {
-                    oid.* = if (index < declared.len and declared[index] != 0) declared[index] else values.oid(kind);
+                    oid.* = if (index < declared.len and declared[index] != 0) declared[index] else if (description.parameter_descriptors.len == oids.len) try values.parameterOid(description.parameter_descriptors[index]) else try values.oid(kind);
                 }
                 const owned_statement = try a.dupe(u8, statement);
                 const owned_name = try self.alloc.dupe(u8, name);
@@ -726,6 +871,13 @@ pub const Session = struct {
                 var transferred = false;
                 errdefer if (!transferred) arena.deinit();
                 const a = arena.allocator();
+                const previous_namespace = self.request_namespace;
+                const previous_search_path = self.request_search_path;
+                self.request_namespace = statement.namespace;
+                defer self.request_namespace = previous_namespace;
+                self.request_search_path = statement.search_path;
+                defer self.request_search_path = previous_search_path;
+                const current = try self.rebindCached(a, statement.statement, statement.description);
                 const format_count = try cursor.int(u16);
                 if (format_count > self.limits.parameters) return error.ProgramLimitExceeded;
                 const formats = try a.alloc(u16, format_count);
@@ -757,16 +909,20 @@ pub const Session = struct {
                 try cursor.finish();
                 const text = try a.dupe(u8, statement.statement);
                 const description = backend.Description{
-                    .columns = try cloneColumns(a, statement.description.columns),
+                    .columns = current.columns,
                     .parameter_types = types,
-                    .binding_guard = if (statement.description.binding_guard) |guard| try a.dupe(u8, guard) else null,
-                    .setting_epoch = statement.description.setting_epoch,
+                    .parameter_descriptors = current.parameter_descriptors,
+                    .binding_guard = current.binding_guard,
+                    .setting_epoch = current.setting_epoch,
                 };
                 const owned_name = try self.alloc.dupe(u8, name);
                 errdefer if (!transferred) self.alloc.free(owned_name);
                 self.removePortal(name);
                 const namespace = try a.dupe(u8, statement.namespace);
-                try self.portals.put(self.alloc, owned_name, .{ .arena = arena, .statement = text, .parameters = parameters, .types = types, .formats = result_formats, .description = description, .namespace = namespace, .search_path = statement.search_path });
+                const portal = try self.alloc.create(Portal);
+                errdefer if (!transferred) self.alloc.destroy(portal);
+                portal.* = .{ .arena = arena, .statement = text, .parameters = parameters, .types = types, .formats = result_formats, .description = description, .namespace = namespace, .search_path = statement.search_path };
+                try self.portals.put(self.alloc, owned_name, portal);
                 transferred = true;
                 try self.message('2', "");
             },
@@ -777,12 +933,21 @@ pub const Session = struct {
                 switch (target) {
                     'S' => {
                         const prepared = self.prepared.get(name) orelse return error.InvalidStatementName;
+                        var arena = std.heap.ArenaAllocator.init(self.alloc);
+                        defer arena.deinit();
+                        const previous_namespace = self.request_namespace;
+                        const previous_search_path = self.request_search_path;
+                        self.request_namespace = prepared.namespace;
+                        defer self.request_namespace = previous_namespace;
+                        self.request_search_path = prepared.search_path;
+                        defer self.request_search_path = previous_search_path;
+                        const description = try self.rebindCached(arena.allocator(), prepared.statement, prepared.description);
                         var bytes = std.Io.Writer.Allocating.init(self.alloc);
                         defer bytes.deinit();
                         try bytes.writer.writeInt(u16, @intCast(prepared.parameter_oids.len), .big);
                         for (prepared.parameter_oids) |oid| try bytes.writer.writeInt(u32, oid, .big);
                         try self.message('t', bytes.written());
-                        try self.rowDescription(prepared.description.columns, &.{});
+                        try self.rowDescription(description.columns, &.{});
                     },
                     'P' => {
                         const portal = self.portals.get(name) orelse return error.InvalidPortalName;
@@ -796,7 +961,7 @@ pub const Session = struct {
                 const requested = try cursor.int(i32);
                 if (requested < 0) return error.ProtocolViolation;
                 try cursor.finish();
-                const portal = self.portals.getPtr(name) orelse return error.InvalidPortalName;
+                const portal = self.portals.get(name) orelse return error.InvalidPortalName;
                 const previous_namespace = self.request_namespace;
                 const previous_search_path = self.request_search_path;
                 self.request_namespace = portal.namespace;
@@ -810,12 +975,15 @@ pub const Session = struct {
                     portal.stream = null;
                 };
                 if (!portal.stream_opened) {
+                    self.read_receipt_budget = .{};
+                    portal.description = try self.rebindCached(portal.arena.allocator(), portal.statement, portal.description);
                     portal.stream_opened = true;
                     if (self.source.vtable.open_stream) |open| if (try commands.settingCommand(portal.arena.allocator(), portal.statement) == null) {
                         self.cancel_requested.store(false, .release);
                         self.executing.store(true, .release);
                         defer self.executing.store(false, .release);
                         var req = self.request(portal.statement, portal.parameters, portal.types);
+                        req.parameter_descriptors = portal.description.parameter_descriptors;
                         req.binding_guard = portal.description.binding_guard;
                         req.setting_epoch = portal.description.setting_epoch;
                         portal.stream = try open(self.source.context, self.alloc, self.identity orelse return error.AuthenticationFailed, req);
@@ -827,7 +995,7 @@ pub const Session = struct {
                     return;
                 }
                 if (portal.result == null) {
-                    portal.result = try self.execute(portal.arena.allocator(), portal.statement, portal.parameters, portal.types, portal.description.binding_guard, portal.description.setting_epoch);
+                    portal.result = try self.executeTyped(portal.arena.allocator(), portal.statement, portal.parameters, portal.types, portal.description.parameter_descriptors, portal.description.binding_guard, portal.description.setting_epoch);
                     const result = portal.result.?;
                     if (!columnsEqual(portal.description.columns, result.columns)) return error.ResultShapeChanged;
                 }
@@ -883,10 +1051,10 @@ pub const Session = struct {
                 var arena = std.heap.ArenaAllocator.init(self.alloc);
                 errdefer arena.deinit();
                 const a = arena.allocator();
-                const description = try self.describe(a, prepare.statement, prepare.types);
+                const description = try self.describeTyped(a, prepare.statement, prepare.types, prepare.descriptors);
                 if (prepare.types.len > description.parameter_types.len) return error.InvalidParameter;
                 const oids = try a.alloc(u32, description.parameter_types.len);
-                for (oids, description.parameter_types) |*oid, kind| oid.* = values.oid(kind);
+                for (oids, description.parameter_types, 0..) |*oid, kind, index| oid.* = if (description.parameter_descriptors.len == oids.len) try values.parameterOid(description.parameter_descriptors[index]) else try values.oid(kind);
                 const sql = try a.dupe(u8, prepare.statement);
                 const name = try self.alloc.dupe(u8, prepare.name);
                 errdefer self.alloc.free(name);
@@ -916,17 +1084,19 @@ pub const Session = struct {
                 defer self.request_namespace = previous_namespace;
                 self.request_search_path = prepared.search_path;
                 defer self.request_search_path = previous_search_path;
-                if (execute_command.expressions.len != prepared.description.parameter_types.len) return error.InvalidParameter;
+                const description = try self.rebindCached(alloc, prepared.statement, prepared.description);
+                if (execute_command.expressions.len != description.parameter_types.len) return error.InvalidParameter;
                 const evaluator = self.source.vtable.evaluate_parameters orelse return error.UnsupportedSqlExecution;
                 self.cancel_requested.store(false, .release);
                 self.executing.store(true, .release);
                 defer self.executing.store(false, .release);
-                const req = self.request(prepared.statement, &.{}, prepared.description.parameter_types);
+                var req = self.request(prepared.statement, &.{}, description.parameter_types);
+                req.parameter_descriptors = description.parameter_descriptors;
                 try req.check();
                 const parameters = try evaluator(self.source.context, alloc, self.identity orelse return error.AuthenticationFailed, req, execute_command.expressions);
-                if (parameters.len != prepared.description.parameter_types.len) return error.InvalidParameter;
-                if (try self.simpleStreamParameters(prepared.statement, parameters, prepared.description.parameter_types, prepared.description.binding_guard, prepared.description.setting_epoch)) return true;
-                var result = try self.execute(alloc, prepared.statement, parameters, prepared.description.parameter_types, prepared.description.binding_guard, prepared.description.setting_epoch);
+                if (parameters.len != description.parameter_types.len) return error.InvalidParameter;
+                if (try self.simpleStreamParameters(prepared.statement, parameters, description.parameter_types, description.parameter_descriptors, description.binding_guard, description.setting_epoch)) return true;
+                var result = try self.executeTyped(alloc, prepared.statement, parameters, description.parameter_types, description.parameter_descriptors, description.binding_guard, description.setting_epoch);
                 defer result.deinit();
                 if (result.columns.len > 0) try self.rowDescription(result.columns, &.{});
                 if (result.sql_nulls) |flags| if (flags.len != result.rows.len) return error.InvalidResult;
@@ -1120,13 +1290,13 @@ pub const Session = struct {
     fn fillCursor(self: *Session, cursor: *SqlCursor, through: usize) !void {
         const spool = &cursor.spool.?;
         const req = self.cursorRequest(cursor);
-        while (!cursor.exhausted and spool.rows.items.len < through) {
+        while (!cursor.exhausted and spool.row_count < through) {
             try req.check();
             const stream = cursor.stream orelse return error.InvalidResult;
             {
                 var arena = std.heap.ArenaAllocator.init(self.alloc);
                 defer arena.deinit();
-                const wanted: u32 = @intCast(@min(through - spool.rows.items.len, @min(self.limits.result_rows, 256)));
+                const wanted: u32 = @intCast(@min(through - spool.row_count, @min(self.limits.result_rows, 256)));
                 var page = try stream.next(stream.context, arena.allocator(), req, wanted);
                 defer page.result.deinit();
                 if (page.result.mutation_outcome != null or page.result.continuation != null or page.result.session_id != null or page.result.rowCount() > wanted or !columnsEqual(cursor.description.columns, page.result.columns)) return error.InvalidResult;
@@ -1154,28 +1324,36 @@ pub const Session = struct {
         var target: i64 = switch (fetch.direction) {
             .forward => spool.position +| @as(i64, if (fetch.count == 0) 0 else 1),
             .backward => spool.position -| @as(i64, if (fetch.count == 0) 0 else 1),
-            .absolute => if (fetch.offset < 0) @as(i64, @intCast(spool.rows.items.len)) + 1 +| fetch.offset else fetch.offset,
+            .absolute => if (fetch.offset < 0) @as(i64, @intCast(spool.row_count)) + 1 +| fetch.offset else fetch.offset,
             .relative => spool.position +| fetch.offset,
         };
         const single = fetch.direction == .absolute or fetch.direction == .relative or fetch.count == 0;
         var remaining: u64 = if (single) 1 else fetch.count;
         if (!fetch.move) try self.rowDescription(cursor.description.columns, &.{});
         var emitted: u64 = 0;
+        var row_bytes = std.Io.Writer.Allocating.init(self.alloc);
+        defer row_bytes.deinit();
         while (remaining != 0) : (remaining -= 1) {
             try req.check();
-            if (target > 0 and @as(u64, @intCast(target)) > spool.rows.items.len and !cursor.exhausted) {
+            if (target > 0 and @as(u64, @intCast(target)) > spool.row_count and !cursor.exhausted) {
                 const wanted: usize = @intCast(@min(@as(u64, @intCast(target)) +| @min(remaining - 1, 255), std.math.maxInt(usize)));
                 try self.fillCursor(cursor, wanted);
             }
-            const end: i64 = @intCast(spool.rows.items.len + 1);
+            const end: i64 = @intCast(spool.row_count + 1);
             spool.position = std.math.clamp(target, 0, end);
             if (target <= 0 or target >= end) break;
             if (emitted != 0 and emitted % 256 == 0) {
                 _ = validation.reset(.retain_capacity);
                 try self.validateSpooledCursor(cursor, validation.allocator(), req);
             }
-            const row = spool.rows.items[@intCast(target - 1)];
-            if (!fetch.move) try self.dataRow(cursor.description.columns, &.{}, row.values, row.nulls);
+            if (!fetch.move) {
+                row_bytes.writer.end = 0;
+                try row_bytes.writer.writeInt(u16, @intCast(cursor.description.columns.len), .big);
+                for (cursor.description.columns, 0..) |column, index| try self.appendDataCell(&row_bytes, self.alloc, column, 0, try spool.cell(@intCast(target - 1), index), cursor.description.columns.len - index);
+                if (row_bytes.written().len > self.limits.frame_bytes -| 4) return error.ProgramLimitExceeded;
+                try self.message('D', row_bytes.written());
+                self.trimRowBuffer(&row_bytes);
+            }
             emitted += 1;
             if (emitted % 256 == 0) try self.writer.flush();
             if (single) break;
@@ -1269,10 +1447,11 @@ pub const Session = struct {
     fn removePortal(self: *Session, name: []const u8) void {
         if (self.portals.fetchRemove(name)) |entry| {
             self.alloc.free(entry.key);
-            var value = entry.value;
+            const value = entry.value;
             if (value.stream) |stream| stream.close(stream.context);
             if (value.result) |*result| result.deinit();
             value.arena.deinit();
+            self.alloc.destroy(value);
         }
     }
 
@@ -1280,9 +1459,11 @@ pub const Session = struct {
         var it = self.portals.iterator();
         while (it.next()) |entry| {
             self.alloc.free(entry.key_ptr.*);
-            if (entry.value_ptr.stream) |stream| stream.close(stream.context);
-            if (entry.value_ptr.result) |*result| result.deinit();
-            entry.value_ptr.arena.deinit();
+            const portal = entry.value_ptr.*;
+            if (portal.stream) |stream| stream.close(stream.context);
+            if (portal.result) |*result| result.deinit();
+            portal.arena.deinit();
+            self.alloc.destroy(portal);
         }
         self.portals.clearRetainingCapacity();
     }
@@ -1292,6 +1473,7 @@ pub const Session = struct {
         self.executing.store(true, .release);
         defer self.executing.store(false, .release);
         var req = self.request(portal.statement, portal.parameters, portal.types);
+        req.parameter_descriptors = portal.description.parameter_descriptors;
         req.binding_guard = portal.description.binding_guard;
         req.setting_epoch = portal.description.setting_epoch;
         var remaining: usize = if (requested == 0) std.math.maxInt(usize) else @intCast(requested);
@@ -1326,10 +1508,10 @@ pub const Session = struct {
     }
 
     fn simpleStream(self: *Session, statement: []const u8) !bool {
-        return self.simpleStreamParameters(statement, &.{}, &.{}, null, null);
+        return self.simpleStreamParameters(statement, &.{}, &.{}, &.{}, null, null);
     }
 
-    fn simpleStreamParameters(self: *Session, statement: []const u8, parameters: []const std.json.Value, types: []const backend.Type, binding_guard: ?[]const u8, setting_epoch: ?u64) !bool {
+    fn simpleStreamParameters(self: *Session, statement: []const u8, parameters: []const std.json.Value, types: []const backend.Type, descriptors: []const backend.Parameter, binding_guard: ?[]const u8, setting_epoch: ?u64) !bool {
         var settings_arena = std.heap.ArenaAllocator.init(self.alloc);
         defer settings_arena.deinit();
         if (try commands.settingCommand(settings_arena.allocator(), statement) != null) return false;
@@ -1338,6 +1520,7 @@ pub const Session = struct {
         self.executing.store(true, .release);
         defer self.executing.store(false, .release);
         var req = self.request(statement, parameters, types);
+        req.parameter_descriptors = descriptors;
         req.binding_guard = binding_guard;
         req.setting_epoch = setting_epoch;
         const stream = (try open(self.source.context, self.alloc, self.identity orelse return error.AuthenticationFailed, req)) orelse return false;
@@ -1347,7 +1530,7 @@ pub const Session = struct {
             .parameters = parameters,
             .types = types,
             .formats = &.{},
-            .description = .{ .columns = stream.columns, .parameter_types = types, .binding_guard = binding_guard, .setting_epoch = setting_epoch },
+            .description = .{ .columns = stream.columns, .parameter_types = types, .parameter_descriptors = descriptors, .binding_guard = binding_guard, .setting_epoch = setting_epoch },
             .stream = stream,
             .stream_opened = true,
         };
@@ -1439,27 +1622,29 @@ pub const Session = struct {
             try bytes.writer.writeByte(0);
             try bytes.writer.writeInt(u32, 0, .big);
             try bytes.writer.writeInt(u16, 0, .big);
-            try bytes.writer.writeInt(u32, values.oid(column.type), .big);
-            try bytes.writer.writeInt(i16, values.typeSize(column.type), .big);
-            try bytes.writer.writeInt(i32, -1, .big);
+            try bytes.writer.writeInt(u32, try values.columnOid(column), .big);
+            try bytes.writer.writeInt(i16, values.columnTypeSize(column), .big);
+            try bytes.writer.writeInt(i32, try values.columnModifier(column), .big);
             try bytes.writer.writeInt(u16, formatAt(formats, index), .big);
         }
         try self.message('T', bytes.written());
     }
 
-    fn dataRow(self: *Session, columns: []const backend.Column, formats: []const u16, row: []const std.json.Value, null_flags: ?[]const bool) !void {
-        if (row.len != columns.len) return error.InvalidResult;
-        if (null_flags) |flags| if (flags.len != row.len) return error.InvalidResult;
-        var bytes = std.Io.Writer.Allocating.init(self.alloc);
-        defer bytes.deinit();
-        try self.encodeDataRow(&bytes, columns, formats, row, null_flags);
-        try self.message('D', bytes.written());
+    fn trimRowBuffer(self: *Session, bytes: *std.Io.Writer.Allocating) void {
+        if (bytes.writer.buffer.len > 64 * 1024) {
+            bytes.deinit();
+            bytes.* = std.Io.Writer.Allocating.init(self.alloc);
+        }
     }
     fn encodeDataRow(self: *Session, bytes: *std.Io.Writer.Allocating, columns: []const backend.Column, formats: []const u16, row: []const std.json.Value, null_flags: ?[]const bool) !void {
         if (row.len != columns.len) return error.InvalidResult;
         if (null_flags) |flags| if (flags.len != row.len) return error.InvalidResult;
         try bytes.writer.writeInt(u16, @intCast(row.len), .big);
         for (row, columns, 0..) |value, column, index| {
+            const payload_limit = self.limits.frame_bytes -| 4;
+            const remaining_headers = (row.len - index) * 4;
+            if (bytes.written().len > payload_limit or remaining_headers > payload_limit - bytes.written().len) return error.ProgramLimitExceeded;
+            const cell_limit = payload_limit - bytes.written().len - remaining_headers;
             const sql_null = if (null_flags) |flags| flags[index] else value == .null;
             if (sql_null) {
                 if (value != .null) return error.InvalidResult;
@@ -1468,12 +1653,29 @@ pub const Session = struct {
             }
             const position = bytes.written().len;
             try bytes.writer.writeInt(i32, 0, .big);
-            try values.encodeInto(self.alloc, &bytes.writer, column.type, formatAt(formats, index), value);
+            try values.encodeColumnInto(self.alloc, &bytes.writer, column, formatAt(formats, index), value, cell_limit);
             const length = bytes.written().len - position - 4;
             if (length > self.limits.frame_bytes -| 4 or length > std.math.maxInt(i32)) return error.ProgramLimitExceeded;
             std.mem.writeInt(i32, bytes.writer.buffer[position..][0..4], @intCast(length), .big);
         }
         if (bytes.written().len > self.limits.frame_bytes -| 4) return error.ProgramLimitExceeded;
+    }
+    fn appendDataCell(self: *Session, bytes: *std.Io.Writer.Allocating, scratch: std.mem.Allocator, column: backend.Column, format: u16, value: backend.Cell, remaining_columns: usize) !void {
+        const payload_limit = self.limits.frame_bytes -| 4;
+        const remaining_headers = std.math.mul(usize, remaining_columns, 4) catch return error.ProgramLimitExceeded;
+        if (bytes.written().len > payload_limit or remaining_headers > payload_limit - bytes.written().len) return error.ProgramLimitExceeded;
+        const cell_limit = payload_limit - bytes.written().len - remaining_headers;
+        if (value.sql_null) {
+            if (value.value != .null or value.array != null or value.numeric != null) return error.InvalidResult;
+            try bytes.writer.writeInt(i32, -1, .big);
+            return;
+        }
+        const position = bytes.written().len;
+        try bytes.writer.writeInt(i32, 0, .big);
+        try values.encodeCellInto(scratch, &bytes.writer, column, format, value, cell_limit);
+        const length = bytes.written().len - position - 4;
+        if (length > std.math.maxInt(i32)) return error.ProgramLimitExceeded;
+        std.mem.writeInt(i32, bytes.writer.buffer[position..][0..4], @intCast(length), .big);
     }
     fn dataResult(self: *Session, result: backend.Result, formats: []const u16) !void {
         const cells = result.cells orelse return self.dataRows(result.columns, formats, result.rows, result.sql_nulls);
@@ -1483,25 +1685,16 @@ pub const Session = struct {
         var scratch = std.heap.ArenaAllocator.init(self.alloc);
         defer scratch.deinit();
         for (0..cells.count) |row| {
-            _ = scratch.reset(.retain_capacity);
+            if (!scratch.reset(.{ .retain_with_limit = 64 * 1024 })) _ = scratch.reset(.free_all);
             bytes.writer.end = 0;
             try bytes.writer.writeInt(u16, @intCast(result.columns.len), .big);
             for (result.columns, 0..) |column, index| {
                 const value = try result.cell(scratch.allocator(), row, index);
-                if (value.sql_null) {
-                    if (value.value != .null) return error.InvalidResult;
-                    try bytes.writer.writeInt(i32, -1, .big);
-                    continue;
-                }
-                const position = bytes.written().len;
-                try bytes.writer.writeInt(i32, 0, .big);
-                try values.encodeInto(scratch.allocator(), &bytes.writer, column.type, formatAt(formats, index), value.value);
-                const length = bytes.written().len - position - 4;
-                if (length > self.limits.frame_bytes -| 4 or length > std.math.maxInt(i32)) return error.ProgramLimitExceeded;
-                std.mem.writeInt(i32, bytes.writer.buffer[position..][0..4], @intCast(length), .big);
+                try self.appendDataCell(&bytes, scratch.allocator(), column, formatAt(formats, index), value, result.columns.len - index);
             }
             if (bytes.written().len > self.limits.frame_bytes -| 4) return error.ProgramLimitExceeded;
             try self.message('D', bytes.written());
+            self.trimRowBuffer(&bytes);
         }
     }
 
@@ -1513,6 +1706,7 @@ pub const Session = struct {
             bytes.writer.end = 0;
             try self.encodeDataRow(&bytes, columns, formats, row, if (flags) |bits| bits[index] else null);
             try self.message('D', bytes.written());
+            self.trimRowBuffer(&bytes);
         }
     }
 };
@@ -1549,10 +1743,55 @@ fn cloneColumns(alloc: std.mem.Allocator, columns: []const backend.Column) ![]co
     for (result) |*column| column.name = try alloc.dupe(u8, column.name);
     return result;
 }
+fn cachedColumnsEqual(a: []const backend.Column, b: []const backend.Column) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| if (left.type != right.type or left.element_type != right.element_type or
+        !@import("antfly_local_sources").sql_scalar.NumericModifier.eql(left.numeric_modifier, right.numeric_modifier)) return false;
+    return true;
+}
+
 fn columnsEqual(a: []const backend.Column, b: []const backend.Column) bool {
     if (a.len != b.len) return false;
-    for (a, b) |left, right| if (left.type != right.type or !std.mem.eql(u8, left.name, right.name)) return false;
+    for (a, b) |left, right| if (left.type != right.type or left.element_type != right.element_type or !@import("antfly_local_sources").sql_scalar.NumericModifier.eql(left.numeric_modifier, right.numeric_modifier) or !std.mem.eql(u8, left.name, right.name)) return false;
     return true;
+}
+
+test "pgwire result shape fences array element identity across prepared and cursor pages" {
+    const int4 = [_]backend.Column{.{ .name = "items", .type = .array, .element_type = .int32 }};
+    const int8 = [_]backend.Column{.{ .name = "items", .type = .array, .element_type = .int64 }};
+    const missing = [_]backend.Column{.{ .name = "items", .type = .array }};
+    const json = [_]backend.Column{.{ .name = "items", .type = .json }};
+    try std.testing.expect(columnsEqual(&int4, &int4));
+    try std.testing.expect(!columnsEqual(&int4, &int8));
+    try std.testing.expect(!columnsEqual(&int4, &missing));
+    try std.testing.expect(!columnsEqual(&int4, &json));
+    try std.testing.expect(cachedColumnsEqual(&int4, &int4));
+    try std.testing.expect(!cachedColumnsEqual(&int4, &int8));
+    try std.testing.expect(!cachedColumnsEqual(&int4, &missing));
+    var renamed = int4;
+    renamed[0].name = "renamed";
+    try std.testing.expect(cachedColumnsEqual(&int4, &renamed));
+}
+
+test "pgwire NUMERIC result identity fences precision scale and unconstrained results" {
+    const scalar = [_]backend.Column{.{ .name = "n", .type = .number, .element_type = .numeric, .numeric_modifier = .{ .precision = 4, .scale = 2 } }};
+    var changed = scalar;
+    changed[0].numeric_modifier.?.scale = 1;
+    try std.testing.expect(columnsEqual(&scalar, &scalar));
+    try std.testing.expect(!columnsEqual(&scalar, &changed));
+    try std.testing.expect(!cachedColumnsEqual(&scalar, &changed));
+    changed[0].numeric_modifier = null;
+    try std.testing.expect(!columnsEqual(&scalar, &changed));
+    try std.testing.expect(!cachedColumnsEqual(&scalar, &changed));
+}
+
+test "pgwire typed parameter failures retain actionable PostgreSQL SQLSTATEs" {
+    try std.testing.expectEqualStrings("22P02", sqlstate(error.SqlInvalidTextRepresentation));
+    try std.testing.expectEqualStrings("22P03", sqlstate(error.InvalidSqlBinaryRepresentation));
+    try std.testing.expectEqualStrings("42804", sqlstate(error.SqlBinaryTypeMismatch));
+    try std.testing.expectEqualStrings("22003", sqlstate(error.SqlNumericOutOfRange));
+    try std.testing.expectEqualStrings("22021", sqlstate(error.SqlInvalidTextEncoding));
+    try std.testing.expectEqualStrings("42P08", sqlstate(error.ConflictingSqlParameterTypes));
 }
 
 fn sqlstate(err: anyerror) []const u8 {
@@ -1564,6 +1803,13 @@ fn sqlstate(err: anyerror) []const u8 {
         error.UniqueConstraintViolation => "23505",
         error.ForeignKeyParentMissing, error.ForeignKeyReferenced => "23503",
         error.InvalidParameter => "22P02",
+        error.SqlInvalidTextRepresentation, error.InvalidSqlArrayShape => "22P02",
+        error.InvalidSqlBinaryRepresentation, error.SqlBinaryTypeMismatch => @import("antfly_local_sources").sql_errors.describe(err).code,
+        error.SqlNumericOutOfRange => "22003",
+        error.SqlInvalidTextEncoding => "22021",
+        error.SqlArraySubscriptError => "2202E",
+        error.ConflictingSqlParameterTypes => "42P08",
+        error.UnknownSqlParameterType => "42P18",
         error.InvalidStatementName => "26000",
         error.InvalidPortalName => "34000",
         error.InvalidCursorName => "34000",
@@ -1574,10 +1820,16 @@ fn sqlstate(err: anyerror) []const u8 {
         error.OutOfMemory, error.ProgramLimitExceeded => "54000",
         error.SyntaxError => "42601",
         error.InvalidSqlSyntax => "42601",
+        error.InvalidReadRequirements, error.ReadReceiptGenerationMismatch => "22023",
+        error.UnsupportedReadVisibility => "0A000",
+        error.ReadRequirementNotReady => "53300",
+        error.ReadSnapshotTooOld => "40001",
         error.InFailedSqlTransaction => "25P02",
         error.CursorMustBeInTransaction, error.NoActiveSqlTransaction => "25P01",
         error.CursorNotScrollable => "55000",
         error.InvalidSqlParameters, error.InvalidSqlParameter, error.InvalidSqlNumber, error.SqlTypeMismatch, error.InvalidSqlLimit, error.InvalidSettingValue => "22023",
+        error.SqlSubstringError => "22011",
+        error.InvalidSqlCharacterCode => "54000",
         error.SqlNotNullViolation => "23502",
         error.SqlProgramLimitExceeded, error.SqlResultTooLarge, error.SqlLimitExceeded, error.SettingLimitExceeded => "54000",
         error.UnknownSetting => "42704",
@@ -1585,11 +1837,11 @@ fn sqlstate(err: anyerror) []const u8 {
         error.UnknownColumn => "42703",
         error.UnknownTable => "42P01",
         error.UnsupportedSqlExecution, error.UnsupportedSqlShape, error.SqlStatementSnapshotRequired => "0A000",
-        error.UnsupportedStartupOption => "0A000",
+        error.UnsupportedStartupOption, error.UnsupportedFormattingSetting => "0A000",
         error.UnsupportedEncoding => "22021",
         error.PortalExecutionFailed => "55000",
         error.TooManyConnections, error.SqlWriteCapacityUnavailable => "53300",
-        error.UnsupportedParameterType, error.UnsupportedParameterFormat, error.UnsupportedResultFormat, error.UnsupportedProtocolMessage, error.UnsupportedContinuation, error.UnsupportedResultPrecision, error.UnsupportedStatement, error.ResultShapeChanged => "0A000",
+        error.CachedPlanResultTypeChanged, error.UnsupportedParameterType, error.UnsupportedParameterFormat, error.UnsupportedResultFormat, error.UnsupportedProtocolMessage, error.UnsupportedContinuation, error.UnsupportedResultPrecision, error.UnsupportedStatement, error.ResultShapeChanged => "0A000",
         else => "XX000",
     };
 }

@@ -68,6 +68,20 @@ pub const Set = struct {
             },
         }
     }
+    /// Bound planning work without enumerating selected physical rows.
+    pub fn boundedCardinality(self: *const Set, limit: usize) ?usize {
+        var total: usize = 0;
+        var files = self.files.valueIterator();
+        while (files.next()) |blocks| {
+            var values = blocks.valueIterator();
+            while (values.next()) |bitmap| {
+                const count = bitmap.cardinality();
+                if (count > limit - total) return null;
+                total += count;
+            }
+        }
+        return total;
+    }
     pub fn contains(self: *const Set, file: []const u8, group: u32, row: u64) bool {
         const blocks = self.files.getPtr(file) orelse return false;
         const bitmap = blocks.getPtr(.{ .group = group, .high = @intCast(row >> 32) }) orelse return false;

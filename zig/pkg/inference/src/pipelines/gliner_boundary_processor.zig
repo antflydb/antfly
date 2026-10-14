@@ -393,7 +393,7 @@ const Builder = struct {
             if (self.words.items.len - prefix_count >= self.options.max_text_words) return error.BoundaryTextLimitExceeded;
             const start = pos;
             pos = wordEnd(effective_text, pos, self.options.word_splitter);
-            const lowered = try lower(self.allocator, effective_text[start..pos]);
+            const lowered = try lowerTextWord(self.allocator, effective_text[start..pos]);
             const source: ?ByteRange = if (start < original_text.len) .{ .start = start, .end = @min(pos, original_text.len) } else null;
             try self.appendWord(lowered, source, pos > original_text.len);
         }
@@ -530,12 +530,12 @@ const Builder = struct {
         var first_positions = std.StringHashMapUnmanaged(usize).empty;
         for (self.words.items, 0..) |word, i| {
             try self.options.check();
-            const folded = try lower(self.allocator, word.text);
+            const folded = try lowerTextWord(self.allocator, word.text);
             const entry = try first_positions.getOrPut(self.allocator, folded);
             if (!entry.found_existing) entry.value_ptr.* = i;
         }
         for (self.enum_choices.items) |*choice| {
-            const folded = try lower(self.allocator, self.words.items[choice.start].text);
+            const folded = try lowerTextWord(self.allocator, self.words.items[choice.start].text);
             choice.score_start = first_positions.get(folded).?;
         }
     }
@@ -688,8 +688,9 @@ fn finalSigma(token: []const u8, start: usize) bool {
     }
     return true;
 }
-fn lower(allocator: Allocator, token: []const u8) ![]const u8 {
+pub fn lowerTextWord(allocator: Allocator, token: []const u8) ![]const u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(allocator);
     var pos: usize = 0;
     while (pos < token.len) : (pos = nextCodepoint(token, pos)) {
         const cp = codepoint(token, pos);

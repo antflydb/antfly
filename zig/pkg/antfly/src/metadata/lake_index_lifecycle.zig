@@ -50,6 +50,7 @@ pub const State = struct {
     reader_upload_floor: ?u64 = null,
     current: ?u64 = null,
     pending: ?catalog.Attempt = null,
+    checkpoint: ?catalog.Publication = null,
     dropped: bool = false,
     publications: []const catalog.Publication = &.{},
     readers: []const Reader = &.{},
@@ -59,6 +60,13 @@ pub const State = struct {
     pub fn findPublication(self: State, generation: u64) ?catalog.Publication {
         for (self.publications) |publication| if (publication.generation == generation) return publication;
         return null;
+    }
+    /// Partial construction is a GC root, but cannot admit a query reader.
+    pub fn gcPublications(self: State, a: A) ![]const catalog.Publication {
+        const all = try a.alloc(catalog.Publication, self.publications.len + @as(usize, if (self.checkpoint != null) 1 else 0));
+        @memcpy(all[0..self.publications.len], self.publications);
+        if (self.checkpoint) |saved| all[self.publications.len] = saved;
+        return all;
     }
     fn retired(self: State, generation: u64) bool {
         if (self.collection) |collection| for (collection.retired) |old| if (generation == old) return true;
@@ -73,6 +81,10 @@ pub const State = struct {
         }
         if (self.reader_upload_floor) |floor| if (floor == 0 or floor > self.generation) return error.InvalidLakeIndexLifecycle;
         if (self.namespace) |namespace| if (std.mem.allEqual(u8, &namespace, 0)) return error.InvalidLakeIndexLifecycle;
+        if (self.checkpoint) |saved| {
+            try saved.validate();
+            if (self.dropped or saved.generation > self.generation or !std.meta.eql(saved.namespace, self.namespace)) return error.InvalidLakeIndexLifecycle;
+        }
         var prior: u64 = 0;
         for (self.publications) |publication| {
             try publication.validate();
@@ -112,6 +124,8 @@ pub const State = struct {
         next.generation = catalog_state.generation;
         next.namespace = catalog_state.namespace;
         next.pending = catalog_state.pending;
+        next.checkpoint = catalog_state.checkpoint;
+        if (catalog_state.checkpoint) |saved| if (saved.store_locator) |locator| try next.retainStore(a, saved.signature.store, locator);
         if (next.reader_upload_floor == null) {
             if (catalog_state.pending) |pending| if (pending.reader_protocol >= 24) {
                 next.reader_upload_floor = pending.generation;
@@ -156,6 +170,7 @@ pub const State = struct {
     pub fn drop(self: State) !State {
         var next = try self.advance();
         next.dropped = true;
+        next.checkpoint = null;
         next.current = null;
         next.pending = null;
         try next.validate();
@@ -220,7 +235,8 @@ pub const State = struct {
             if (!protected) try retired_generations.append(a, publication.generation);
         }
         var next = try self.advance();
-        const cutoff = if (self.pending) |pending| pending.generation else self.generation +| 1;
+        var cutoff = if (self.pending) |pending| pending.generation else self.generation +| 1;
+        if (self.checkpoint) |saved| cutoff = @min(cutoff, saved.generation);
         next.collection = .{ .token = token, .store = store, .namespace = self.namespace, .expires_ms = std.math.add(u64, now, lease_ms) catch return error.InvalidLakeIndexLifecycle, .upload_cutoff = cutoff, .upload_floor = self.reader_upload_floor orelse cutoff, .retired = try retired_generations.toOwnedSlice(a) };
         try next.validate();
         return next;
@@ -264,7 +280,7 @@ pub const State = struct {
                 if (std.mem.eql(u8, &publication.signature.store, &store.identity)) break true;
             } else false;
             const has_pending = if (next.pending) |pending| std.mem.eql(u8, &pending.signature.store, &store.identity) else false;
-            if (!std.mem.eql(u8, &collection.store, &store.identity) or has_publication or has_pending) try stores.append(a, store);
+            if (!std.mem.eql(u8, &collection.store, &store.identity) or has_publication or has_pending or (if (next.checkpoint) |saved| std.mem.eql(u8, &saved.signature.store, &store.identity) else false)) try stores.append(a, store);
         }
         next.stores = try stores.toOwnedSlice(a);
         try next.validate();
@@ -307,6 +323,16 @@ pub const Mutation = union(enum) {
             .finish_collection => |m| state.finishCollection(a, m.token, m.now_ms),
         };
     }
+    /// Admission runs before any command is appended. A publication race is
+    /// an explicit snapshot conflict, also across the native runtime ABI.
+    pub fn preflight(self: Mutation, scratch: A, state: State) !void {
+        const next = self.apply(scratch, state) catch |err| switch (err) {
+            error.LakeIndexGenerationRetired => return error.ExternalLakeSnapshotMismatch,
+            else => return err,
+        };
+        const bytes = try encode(scratch, next);
+        scratch.free(bytes);
+    }
 };
 pub fn parse(a: A, bytes: []const u8) !State {
     if (bytes.len > max_bytes) return error.InvalidLakeIndexLifecycle;
@@ -341,6 +367,7 @@ test "external lake native lifecycle protects readers across replacement and DRO
     state = try state.acquire(a, @splat(9), 1, 100);
     state = try state.synchronize(a, .{ .generation = 2, .published = testPublication(2) });
     try std.testing.expectError(error.LakeIndexGenerationRetired, state.acquire(a, @splat(8), 1, 101));
+    try std.testing.expectError(error.ExternalLakeSnapshotMismatch, (Mutation{ .acquire = .{ .token = @splat(8), .generation = 1, .now_ms = 101 } }).preflight(a, state));
     state = try state.renew(a, @splat(9), 101);
     state = try state.beginCollection(a, @splat(7), @splat(4), 102);
     try std.testing.expectEqual(@as(usize, 0), state.collection.?.retired.len);
@@ -446,9 +473,38 @@ pub fn mutateOnService(svc: anytype, a: A, write: Write, request: @import("antfl
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
     const before = try parse(a, try store.getLakeIndexLifecycle(a, svc.metadata_group_id, write.table_id));
     if (before.revision != write.expected_revision) return error.CatalogGenerationChanged;
-    _ = try encode(a, try write.mutation.apply(a, before));
+    try write.mutation.preflight(a, before);
     const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .mutate_lake_index_lifecycle = .{ .table_id = write.table_id, .expected_revision = write.expected_revision, .mutation = write.mutation } });
     svc.waitForTransitionApplied(receipt) catch return error.MetadataMutationOutcomeUnknown;
     const observed = try parse(a, try store.getLakeIndexLifecycle(a, svc.metadata_group_id, write.table_id));
     if (observed.revision <= write.expected_revision or !write.mutation.observed(observed)) return error.MetadataMutationOutcomeUnknown;
+}
+
+test "external lake resumable checkpoint is fenced and protected without becoming queryable" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const saved = testPublication(2);
+    var building = try (catalog.State{ .generation = 1, .published = testPublication(1) }).begin(saved.signature, saved.token, saved.published_at_ms - 1, 100);
+    building.pending.?.reader_protocol = saved.reader_protocol;
+    building.pending.?.store_locator = saved.store_locator;
+    const checkpointed = try building.saveCheckpoint(saved, saved.published_at_ms);
+    try std.testing.expectEqual(@as(u64, 1), checkpointed.published.?.generation);
+    try std.testing.expectError(error.LakeIndexPublicationFenceChanged, building.saveCheckpoint(saved, saved.published_at_ms + 100));
+    var forged = saved;
+    forged.token = @splat(9);
+    try std.testing.expectError(error.LakeIndexPublicationFenceChanged, building.saveCheckpoint(forged, saved.published_at_ms));
+    const failed = try checkpointed.fail(saved.token, "interrupted", 200);
+    building = try failed.begin(saved.signature, @splat(3), 200, 100);
+    try std.testing.expect(building.checkpoint != null);
+    var changed = saved.signature;
+    changed.source = @splat(8);
+    try std.testing.expect((try failed.begin(changed, @splat(3), 200, 100)).checkpoint == null);
+    var lifecycle = try (State{}).synchronize(ca, failed);
+    try std.testing.expectEqual(@as(usize, 2), (try lifecycle.gcPublications(ca)).len);
+    try std.testing.expectError(error.LakeIndexGenerationRetired, lifecycle.acquire(ca, @splat(4), 2, 200));
+    lifecycle = try lifecycle.beginCollection(ca, @splat(5), saved.signature.store, 200);
+    try std.testing.expectEqual(@as(u64, 2), lifecycle.collection.?.upload_cutoff);
+    try std.testing.expect((try lifecycle.drop()).checkpoint == null);
 }

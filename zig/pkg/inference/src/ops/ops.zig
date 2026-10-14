@@ -1062,6 +1062,7 @@ pub const NativeQuantTimingStats = struct {
     metal_runtime_generated_rms_norm_calls: u64 = 0,
     metal_runtime_prepared_frame_fast_path_calls: u64 = 0,
     metal_runtime_prepared_frame_fallback_calls: u64 = 0,
+    metal_runtime_full_vocab_nucleus_sample_calls: u64 = 0,
     metal_runtime_compute_encoder_count: u64 = 0,
     metal_runtime_blit_encoder_count: u64 = 0,
     metal_runtime_last_frame_compute_encoder_count: u64 = 0,
@@ -2318,17 +2319,21 @@ pub const ComputeBackend = struct {
         /// attn_bias: optional [num_heads, seq_len, seq_len] additive bias (e.g. T5 relative position bias), or null.
         /// Returns: [batch*seq_len, num_heads*head_dim].
         scaledDotProductAttention: *const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, mask: []const i64, attn_bias: ?CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT,
+        /// Inclusive local half-window, without materializing a dense bias mask.
+        slidingWindowAttention: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, mask: []const i64, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize, half_window: usize) anyerror!?CT = null,
 
         /// Inclusive symmetric window; padding masks keys, never introduces causality.
         /// Token-major Q/K/V and output: [batch*seq_len, num_heads*head_dim].
         encoderLocalAttention: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, mask: []const i64, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize, radius: usize) anyerror!CT = null,
         layaActionFeatures: ?*const fn (ctx: *anyopaque, request: *const LayaActionFeaturesRequest) anyerror!CT = null,
         packedGegluExact: ?*const fn (ctx: *anyopaque, input: CT, rows: usize, width: usize) anyerror!?CT = null,
+        splitQkvRope: ?*const fn (ctx: *anyopaque, input: CT, batch: usize, seq: usize, heads: usize, dim: usize, theta: f32) anyerror!?SplitLastDim3Result = null,
 
-        /// Optional Qwen3-VL vision-attention route. It has the same unmasked,
+        /// Optional model-scoped vision-attention routes. They have the same unmasked,
         /// unbiased semantics as scaledDotProductAttention with an empty mask,
         /// but lets a backend select a model-scoped kernel without changing
         /// unrelated vision encoders that happen to share a tensor shape.
+        scaledDotProductAttentionGemma4Vision: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT = null,
         scaledDotProductAttentionQwen3VlVision: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT = null,
 
         /// Optional bidirectional attention with no mask. This is equivalent
@@ -2884,6 +2889,11 @@ pub const ComputeBackend = struct {
         /// sample-logits buffer by the most recent decode frame's fused
         /// lm-head tail.
         decoderRuntimeSampleResidentLogits: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeSampleResidentLogitsRequest) anyerror!?usize = null,
+
+        /// Preflight the exact resident-logits sampling contract. Backends
+        /// must return false before a decode frame is submitted when any
+        /// requested transform cannot be honored exactly.
+        decoderRuntimeResidentLogitsSamplingSupported: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeSampleResidentLogitsRequest) bool = null,
 
         /// Upload dense linear parameters into a backend-owned whole-token
         /// runtime slot. Weight shape is [out_dim, in_dim], bias shape is
@@ -4153,6 +4163,14 @@ pub const ComputeBackend = struct {
         return op(self.ptr, input, rows, width);
     }
 
+    /// Optional split of packed [batch*seq, 3*heads*dim] QKV, applying full-head
+    /// split-half RoPE to Q/K at positions 0..seq-1 in each batch row. Returns
+    /// three independently owned tensors; V is copied without rotation.
+    pub fn splitQkvRope(self: *const ComputeBackend, input: CT, batch: usize, seq: usize, heads: usize, dim: usize, theta: f32) !?SplitLastDim3Result {
+        const op = self.vtable.splitQkvRope orelse return null;
+        return op(self.ptr, input, batch, seq, heads, dim, theta);
+    }
+
     pub fn layaActionFeatures(self: *const ComputeBackend, request: *const LayaActionFeaturesRequest) !?CT {
         if (self.vtable.layaActionFeatures) |f| return try f(self.ptr, request);
         return null;
@@ -4160,6 +4178,15 @@ pub const ComputeBackend = struct {
 
     pub fn scaledDotProductAttention(self: *const ComputeBackend, Q: CT, K: CT, V: CT, mask: []const i64, attn_bias: ?CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) !CT {
         return self.vtable.scaledDotProductAttention(self.ptr, Q, K, V, mask, attn_bias, batch, seq_len, num_heads, head_dim);
+    }
+
+    /// Unmasked, token-major Gemma4 vision attention. Providers without the
+    /// qualified model-specific kernel retain portable unmasked attention.
+    pub fn scaledDotProductAttentionGemma4Vision(self: *const ComputeBackend, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) !CT {
+        if (self.vtable.scaledDotProductAttentionGemma4Vision) |f| {
+            return f(self.ptr, Q, K, V, batch, seq_len, num_heads, head_dim);
+        }
+        return self.scaledDotProductAttention(Q, K, V, &.{}, null, batch, seq_len, num_heads, head_dim);
     }
 
     /// Runs Qwen3-VL's unmasked vision attention. Backends that do not expose
@@ -5232,6 +5259,13 @@ pub const ComputeBackend = struct {
             return op(self.ptr, request);
         }
         return null;
+    }
+
+    pub fn decoderRuntimeResidentLogitsSamplingSupported(self: *const ComputeBackend, request: *const DecoderRuntimeSampleResidentLogitsRequest) bool {
+        if (self.vtable.decoderRuntimeResidentLogitsSamplingSupported) |op| {
+            return op(self.ptr, request);
+        }
+        return false;
     }
 
     pub fn decoderRuntimePrepareLinear(self: *const ComputeBackend, request: *const DecoderRuntimePrepareLinearRequest) !bool {

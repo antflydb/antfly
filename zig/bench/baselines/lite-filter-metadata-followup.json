@@ -1,0 +1,694 @@
+{
+  "baseline_commit": "d3a436b0634398fa5b76173f5d0d602f4a6e7071",
+  "method": "ReleaseSafe fixtures on the same development host; one warmup then 20 samples. Baseline behavior reproduced inside fixtures. Source bytes count positional range callbacks, not disk reads; metadata probes count warm cache clock increments, not disk reads. Timings are fixture timings, not production throughput or RSS.",
+  "samples": {
+    "merge filters deleted positions before decoding": [
+      [
+        "1/1 section.inverted.test.merge filters deleted positions before decoding across current and legacy records...LITE_DELETION_FILTER legacy=false early=false documents=256 survivors=8 elapsed_ns=4340000 position_source_bytes=565358 peak=37765",
+        "LITE_DELETION_FILTER legacy=false early=true documents=256 survivors=8 elapsed_ns=7000 position_source_bytes=54 peak=1938",
+        "LITE_DELETION_FILTER legacy=true early=false documents=256 survivors=8 elapsed_ns=1661000 position_source_bytes=508680 peak=37004",
+        "LITE_DELETION_FILTER legacy=true early=true documents=256 survivors=8 elapsed_ns=18000 position_source_bytes=776 peak=2202"
+      ],
+      [
+        "1/1 section.inverted.test.merge filters deleted positions before decoding across current and legacy records...LITE_DELETION_FILTER legacy=false early=false documents=256 survivors=8 elapsed_ns=4339000 position_source_bytes=565358 peak=37765",
+        "LITE_DELETION_FILTER legacy=false early=true documents=256 survivors=8 elapsed_ns=6000 position_source_bytes=54 peak=1938",
+        "LITE_DELETION_FILTER legacy=true early=false documents=256 survivors=8 elapsed_ns=1572000 position_source_bytes=508680 peak=37004",
+        "LITE_DELETION_FILTER legacy=true early=true documents=256 survivors=8 elapsed_ns=15000 position_source_bytes=776 peak=2202"
+      ],
+      [
+        "1/1 section.inverted.test.merge filters deleted positions before decoding across current and legacy records...LITE_DELETION_FILTER legacy=false early=false documents=256 survivors=8 elapsed_ns=4316000 position_source_bytes=565358 peak=37765",
+        "LITE_DELETION_FILTER legacy=false early=true documents=256 survivors=8 elapsed_ns=7000 position_source_bytes=54 peak=1938",
+        "LITE_DELETION_FILTER legacy=true early=false documents=256 survivors=8 elapsed_ns=1536000 position_source_bytes=508680 peak=37004",
+        "LITE_DELETION_FILTER legacy=true early=true documents=256 survivors=8 elapsed_ns=14000 position_source_bytes=776 peak=2202"
+      ],
+      [
+        "1/1 section.inverted.test.merge filters deleted positions before decoding across current and legacy records...LITE_DELETION_FILTER legacy=false early=false documents=256 survivors=8 elapsed_ns=4046000 position_source_bytes=565358 peak=37765",
+        "LITE_DELETION_FILTER legacy=false early=true documents=256 survivors=8 elapsed_ns=6000 position_source_bytes=54 peak=1938",
+        "LITE_DELETION_FILTER legacy=true early=false documents=256 survivors=8 elapsed_ns=1571000 position_source_bytes=508680 peak=37004",
+        "LITE_DELETION_FILTER legacy=true early=true documents=256 survivors=8 elapsed_ns=13000 position_source_bytes=776 peak=2202"
+      ],
+      [
+        "1/1 section.inverted.test.merge filters deleted positions before decoding across current and legacy records...LITE_DELETION_FILTER legacy=false early=false documents=256 survivors=8 elapsed_ns=4369000 position_source_bytes=565358 peak=37765",
+        "LITE_DELETION_FILTER legacy=false early=true documents=256 survivors=8 elapsed_ns=7000 position_source_bytes=54 peak=1938",
+        "LITE_DELETION_FILTER legacy=true early=false documents=256 survivors=8 elapsed_ns=1577000 position_source_bytes=508680 peak=37004",
+        "LITE_DELETION_FILTER legacy=true early=true documents=256 survivors=8 elapsed_ns=26000 position_source_bytes=776 peak=2202"
+      ],
+      [
+        "1/1 section.inverted.test.merge filters deleted positions before decoding across current and legacy records...LITE_DELETION_FILTER legacy=false early=false documents=256 survivors=8 elapsed_ns=4259000 position_source_bytes=565358 peak=37765",
+        "LITE_DELETION_FILTER legacy=false early=true documents=256 survivors=8 elapsed_ns=8000 position_source_bytes=54 peak=1938",
+        "LITE_DELETION_FILTER legacy=true early=false documents=256 survivors=8 elapsed_ns=1529000 position_source_bytes=508680 peak=37004",
+        "LITE_DELETION_FILTER legacy=true early=true documents=256 survivors=8 elapsed_ns=13000 position_source_bytes=776 peak=2202"
+      ],
+      [
+        "1/1 section.inverted.test.merge filters deleted positions before decoding across current and legacy records...LITE_DELETION_FILTER legacy=false early=false documents=256 survivors=8 elapsed_ns=4529000 position_source_bytes=565358 peak=37765",
+        "LITE_DELETION_FILTER legacy=false early=true documents=256 survivors=8 elapsed_ns=7000 position_source_bytes=54 peak=1938",
+        "LITE_DELETION_FILTER legacy=true early=false documents=256 survivors=8 elapsed_ns=1529000 position_source_bytes=508680 peak=37004",
+        "LITE_DELETION_FILTER legacy=true early=true documents=256 survivors=8 elapsed_ns=20000 position_source_bytes=776 peak=2202"
+      ],
+      [
+        "1/1 section.inverted.test.merge filters deleted positions before decoding across current and legacy records...LITE_DELETION_FILTER legacy=false early=false documents=256 survivors=8 elapsed_ns=4472000 position_source_bytes=565358 peak=37765",
+        "LITE_DELETION_FILTER legacy=false early=true documents=256 survivors=8 elapsed_ns=7000 position_source_bytes=54 peak=1938",
+        "LITE_DELETION_FILTER legacy=true early=false documents=256 survivors=8 elapsed_ns=2554000 position_source_bytes=508680 peak=37004",
+        "LITE_DELETION_FILTER legacy=true early=true documents=256 survivors=8 elapsed_ns=23000 position_source_bytes=776 peak=2202"
+      ],
+      [
+        "1/1 section.inverted.test.merge filters deleted positions before decoding across current and legacy records...LITE_DELETION_FILTER legacy=false early=false documents=256 survivors=8 elapsed_ns=4270000 position_source_bytes=565358 peak=37765",
+        "LITE_DELETION_FILTER legacy=false early=true documents=256 survivors=8 elapsed_ns=7000 position_source_bytes=54 peak=1938",
+        "LITE_DELETION_FILTER legacy=true early=false documents=256 survivors=8 elapsed_ns=1545000 position_source_bytes=508680 peak=37004",
+        "LITE_DELETION_FILTER legacy=true early=true documents=256 survivors=8 elapsed_ns=22000 position_source_bytes=776 peak=2202"
+      ],
+      [
+        "1/1 section.inverted.test.merge filters deleted positions before decoding across current and legacy records...LITE_DELETION_FILTER legacy=false early=false documents=256 survivors=8 elapsed_ns=4265000 position_source_bytes=565358 peak=37765",
+        "LITE_DELETION_FILTER legacy=false early=true documents=256 survivors=8 elapsed_ns=7000 position_source_bytes=54 peak=1938",
+        "LITE_DELETION_FILTER legacy=true early=false documents=256 survivors=8 elapsed_ns=1543000 position_source_bytes=508680 peak=37004",
+        "LITE_DELETION_FILTER legacy=true early=true documents=256 survivors=8 elapsed_ns=10000 position_source_bytes=776 peak=2202"
+      ],
+      [
+        "1/1 section.inverted.test.merge filters deleted positions before decoding across current and legacy records...LITE_DELETION_FILTER legacy=false early=false documents=256 survivors=8 elapsed_ns=4179000 position_source_bytes=565358 peak=37765",
+        "LITE_DELETION_FILTER legacy=false early=true documents=256 survivors=8 elapsed_ns=8000 position_source_bytes=54 peak=1938",
+        "LITE_DELETION_FILTER legacy=true early=false documents=256 survivors=8 elapsed_ns=1566000 position_source_bytes=508680 peak=37004",
+        "LITE_DELETION_FILTER legacy=true early=true documents=256 survivors=8 elapsed_ns=17000 position_source_bytes=776 peak=2202"
+      ],
+      [
+        "1/1 section.inverted.test.merge filters deleted positions before decoding across current and legacy records...LITE_DELETION_FILTER legacy=false early=false documents=256 survivors=8 elapsed_ns=4180000 position_source_bytes=565358 peak=37765",
+        "LITE_DELETION_FILTER legacy=false early=true documents=256 survivors=8 elapsed_ns=6000 position_source_bytes=54 peak=1938",
+        "LITE_DELETION_FILTER legacy=true early=false documents=256 survivors=8 elapsed_ns=1509000 position_source_bytes=508680 peak=37004",
+        "LITE_DELETION_FILTER legacy=true early=true documents=256 survivors=8 elapsed_ns=12000 position_source_bytes=776 peak=2202"
+      ],
+      [
+        "1/1 section.inverted.test.merge filters deleted positions before decoding across current and legacy records...LITE_DELETION_FILTER legacy=false early=false documents=256 survivors=8 elapsed_ns=4229000 position_source_bytes=565358 peak=37765",
+        "LITE_DELETION_FILTER legacy=false early=true documents=256 survivors=8 elapsed_ns=7000 position_source_bytes=54 peak=1938",
+        "LITE_DELETION_FILTER legacy=true early=false documents=256 survivors=8 elapsed_ns=1645000 position_source_bytes=508680 peak=37004",
+        "LITE_DELETION_FILTER legacy=true early=true documents=256 survivors=8 elapsed_ns=15000 position_source_bytes=776 peak=2202"
+      ],
+      [
+        "1/1 section.inverted.test.merge filters deleted positions before decoding across current and legacy records...LITE_DELETION_FILTER legacy=false early=false documents=256 survivors=8 elapsed_ns=4550000 position_source_bytes=565358 peak=37765",
+        "LITE_DELETION_FILTER legacy=false early=true documents=256 survivors=8 elapsed_ns=6000 position_source_bytes=54 peak=1938",
+        "LITE_DELETION_FILTER legacy=true early=false documents=256 survivors=8 elapsed_ns=1529000 position_source_bytes=508680 peak=37004",
+        "LITE_DELETION_FILTER legacy=true early=true documents=256 survivors=8 elapsed_ns=12000 position_source_bytes=776 peak=2202"
+      ],
+      [
+        "1/1 section.inverted.test.merge filters deleted positions before decoding across current and legacy records...LITE_DELETION_FILTER legacy=false early=false documents=256 survivors=8 elapsed_ns=4104000 position_source_bytes=565358 peak=37765",
+        "LITE_DELETION_FILTER legacy=false early=true documents=256 survivors=8 elapsed_ns=6000 position_source_bytes=54 peak=1938",
+        "LITE_DELETION_FILTER legacy=true early=false documents=256 survivors=8 elapsed_ns=1531000 position_source_bytes=508680 peak=37004",
+        "LITE_DELETION_FILTER legacy=true early=true documents=256 survivors=8 elapsed_ns=12000 position_source_bytes=776 peak=2202"
+      ],
+      [
+        "1/1 section.inverted.test.merge filters deleted positions before decoding across current and legacy records...LITE_DELETION_FILTER legacy=false early=false documents=256 survivors=8 elapsed_ns=4396000 position_source_bytes=565358 peak=37765",
+        "LITE_DELETION_FILTER legacy=false early=true documents=256 survivors=8 elapsed_ns=7000 position_source_bytes=54 peak=1938",
+        "LITE_DELETION_FILTER legacy=true early=false documents=256 survivors=8 elapsed_ns=1669000 position_source_bytes=508680 peak=37004",
+        "LITE_DELETION_FILTER legacy=true early=true documents=256 survivors=8 elapsed_ns=16000 position_source_bytes=776 peak=2202"
+      ],
+      [
+        "1/1 section.inverted.test.merge filters deleted positions before decoding across current and legacy records...LITE_DELETION_FILTER legacy=false early=false documents=256 survivors=8 elapsed_ns=4220000 position_source_bytes=565358 peak=37765",
+        "LITE_DELETION_FILTER legacy=false early=true documents=256 survivors=8 elapsed_ns=7000 position_source_bytes=54 peak=1938",
+        "LITE_DELETION_FILTER legacy=true early=false documents=256 survivors=8 elapsed_ns=1569000 position_source_bytes=508680 peak=37004",
+        "LITE_DELETION_FILTER legacy=true early=true documents=256 survivors=8 elapsed_ns=15000 position_source_bytes=776 peak=2202"
+      ],
+      [
+        "1/1 section.inverted.test.merge filters deleted positions before decoding across current and legacy records...LITE_DELETION_FILTER legacy=false early=false documents=256 survivors=8 elapsed_ns=4276000 position_source_bytes=565358 peak=37765",
+        "LITE_DELETION_FILTER legacy=false early=true documents=256 survivors=8 elapsed_ns=6000 position_source_bytes=54 peak=1938",
+        "LITE_DELETION_FILTER legacy=true early=false documents=256 survivors=8 elapsed_ns=1554000 position_source_bytes=508680 peak=37004",
+        "LITE_DELETION_FILTER legacy=true early=true documents=256 survivors=8 elapsed_ns=11000 position_source_bytes=776 peak=2202"
+      ],
+      [
+        "1/1 section.inverted.test.merge filters deleted positions before decoding across current and legacy records...LITE_DELETION_FILTER legacy=false early=false documents=256 survivors=8 elapsed_ns=4276000 position_source_bytes=565358 peak=37765",
+        "LITE_DELETION_FILTER legacy=false early=true documents=256 survivors=8 elapsed_ns=6000 position_source_bytes=54 peak=1938",
+        "LITE_DELETION_FILTER legacy=true early=false documents=256 survivors=8 elapsed_ns=1504000 position_source_bytes=508680 peak=37004",
+        "LITE_DELETION_FILTER legacy=true early=true documents=256 survivors=8 elapsed_ns=10000 position_source_bytes=776 peak=2202"
+      ],
+      [
+        "1/1 section.inverted.test.merge filters deleted positions before decoding across current and legacy records...LITE_DELETION_FILTER legacy=false early=false documents=256 survivors=8 elapsed_ns=4454000 position_source_bytes=565358 peak=37765",
+        "LITE_DELETION_FILTER legacy=false early=true documents=256 survivors=8 elapsed_ns=7000 position_source_bytes=54 peak=1938",
+        "LITE_DELETION_FILTER legacy=true early=false documents=256 survivors=8 elapsed_ns=1488000 position_source_bytes=508680 peak=37004",
+        "LITE_DELETION_FILTER legacy=true early=true documents=256 survivors=8 elapsed_ns=18000 position_source_bytes=776 peak=2202"
+      ]
+    ],
+    "stored block metadata batches preserve rows": [
+      [
+        "1/1 segment.test.stored block metadata batches preserve rows and bound warm cache probes...LITE_STORED_METADATA batch=false rounds=100 cache_probes=26000 elapsed_ns=303000 table_scratch_bytes=24",
+        "LITE_STORED_METADATA batch=true rounds=100 cache_probes=500 elapsed_ns=44000 table_scratch_bytes=3096"
+      ],
+      [
+        "1/1 segment.test.stored block metadata batches preserve rows and bound warm cache probes...LITE_STORED_METADATA batch=false rounds=100 cache_probes=26000 elapsed_ns=387000 table_scratch_bytes=24",
+        "LITE_STORED_METADATA batch=true rounds=100 cache_probes=500 elapsed_ns=45000 table_scratch_bytes=3096"
+      ],
+      [
+        "1/1 segment.test.stored block metadata batches preserve rows and bound warm cache probes...LITE_STORED_METADATA batch=false rounds=100 cache_probes=26000 elapsed_ns=293000 table_scratch_bytes=24",
+        "LITE_STORED_METADATA batch=true rounds=100 cache_probes=500 elapsed_ns=43000 table_scratch_bytes=3096"
+      ],
+      [
+        "1/1 segment.test.stored block metadata batches preserve rows and bound warm cache probes...LITE_STORED_METADATA batch=false rounds=100 cache_probes=26000 elapsed_ns=290000 table_scratch_bytes=24",
+        "LITE_STORED_METADATA batch=true rounds=100 cache_probes=500 elapsed_ns=46000 table_scratch_bytes=3096"
+      ],
+      [
+        "1/1 segment.test.stored block metadata batches preserve rows and bound warm cache probes...LITE_STORED_METADATA batch=false rounds=100 cache_probes=26000 elapsed_ns=309000 table_scratch_bytes=24",
+        "LITE_STORED_METADATA batch=true rounds=100 cache_probes=500 elapsed_ns=43000 table_scratch_bytes=3096"
+      ],
+      [
+        "1/1 segment.test.stored block metadata batches preserve rows and bound warm cache probes...LITE_STORED_METADATA batch=false rounds=100 cache_probes=26000 elapsed_ns=328000 table_scratch_bytes=24",
+        "LITE_STORED_METADATA batch=true rounds=100 cache_probes=500 elapsed_ns=45000 table_scratch_bytes=3096"
+      ],
+      [
+        "1/1 segment.test.stored block metadata batches preserve rows and bound warm cache probes...LITE_STORED_METADATA batch=false rounds=100 cache_probes=26000 elapsed_ns=313000 table_scratch_bytes=24",
+        "LITE_STORED_METADATA batch=true rounds=100 cache_probes=500 elapsed_ns=44000 table_scratch_bytes=3096"
+      ],
+      [
+        "1/1 segment.test.stored block metadata batches preserve rows and bound warm cache probes...LITE_STORED_METADATA batch=false rounds=100 cache_probes=26000 elapsed_ns=295000 table_scratch_bytes=24",
+        "LITE_STORED_METADATA batch=true rounds=100 cache_probes=500 elapsed_ns=44000 table_scratch_bytes=3096"
+      ],
+      [
+        "1/1 segment.test.stored block metadata batches preserve rows and bound warm cache probes...LITE_STORED_METADATA batch=false rounds=100 cache_probes=26000 elapsed_ns=305000 table_scratch_bytes=24",
+        "LITE_STORED_METADATA batch=true rounds=100 cache_probes=500 elapsed_ns=44000 table_scratch_bytes=3096"
+      ],
+      [
+        "1/1 segment.test.stored block metadata batches preserve rows and bound warm cache probes...LITE_STORED_METADATA batch=false rounds=100 cache_probes=26000 elapsed_ns=293000 table_scratch_bytes=24",
+        "LITE_STORED_METADATA batch=true rounds=100 cache_probes=500 elapsed_ns=43000 table_scratch_bytes=3096"
+      ],
+      [
+        "1/1 segment.test.stored block metadata batches preserve rows and bound warm cache probes...LITE_STORED_METADATA batch=false rounds=100 cache_probes=26000 elapsed_ns=299000 table_scratch_bytes=24",
+        "LITE_STORED_METADATA batch=true rounds=100 cache_probes=500 elapsed_ns=43000 table_scratch_bytes=3096"
+      ],
+      [
+        "1/1 segment.test.stored block metadata batches preserve rows and bound warm cache probes...LITE_STORED_METADATA batch=false rounds=100 cache_probes=26000 elapsed_ns=301000 table_scratch_bytes=24",
+        "LITE_STORED_METADATA batch=true rounds=100 cache_probes=500 elapsed_ns=44000 table_scratch_bytes=3096"
+      ],
+      [
+        "1/1 segment.test.stored block metadata batches preserve rows and bound warm cache probes...LITE_STORED_METADATA batch=false rounds=100 cache_probes=26000 elapsed_ns=308000 table_scratch_bytes=24",
+        "LITE_STORED_METADATA batch=true rounds=100 cache_probes=500 elapsed_ns=46000 table_scratch_bytes=3096"
+      ],
+      [
+        "1/1 segment.test.stored block metadata batches preserve rows and bound warm cache probes...LITE_STORED_METADATA batch=false rounds=100 cache_probes=26000 elapsed_ns=311000 table_scratch_bytes=24",
+        "LITE_STORED_METADATA batch=true rounds=100 cache_probes=500 elapsed_ns=46000 table_scratch_bytes=3096"
+      ],
+      [
+        "1/1 segment.test.stored block metadata batches preserve rows and bound warm cache probes...LITE_STORED_METADATA batch=false rounds=100 cache_probes=26000 elapsed_ns=344000 table_scratch_bytes=24",
+        "LITE_STORED_METADATA batch=true rounds=100 cache_probes=500 elapsed_ns=45000 table_scratch_bytes=3096"
+      ],
+      [
+        "1/1 segment.test.stored block metadata batches preserve rows and bound warm cache probes...LITE_STORED_METADATA batch=false rounds=100 cache_probes=26000 elapsed_ns=293000 table_scratch_bytes=24",
+        "LITE_STORED_METADATA batch=true rounds=100 cache_probes=500 elapsed_ns=44000 table_scratch_bytes=3096"
+      ],
+      [
+        "1/1 segment.test.stored block metadata batches preserve rows and bound warm cache probes...LITE_STORED_METADATA batch=false rounds=100 cache_probes=26000 elapsed_ns=297000 table_scratch_bytes=24",
+        "LITE_STORED_METADATA batch=true rounds=100 cache_probes=500 elapsed_ns=56000 table_scratch_bytes=3096"
+      ],
+      [
+        "1/1 segment.test.stored block metadata batches preserve rows and bound warm cache probes...LITE_STORED_METADATA batch=false rounds=100 cache_probes=26000 elapsed_ns=319000 table_scratch_bytes=24",
+        "LITE_STORED_METADATA batch=true rounds=100 cache_probes=500 elapsed_ns=45000 table_scratch_bytes=3096"
+      ],
+      [
+        "1/1 segment.test.stored block metadata batches preserve rows and bound warm cache probes...LITE_STORED_METADATA batch=false rounds=100 cache_probes=26000 elapsed_ns=302000 table_scratch_bytes=24",
+        "LITE_STORED_METADATA batch=true rounds=100 cache_probes=500 elapsed_ns=48000 table_scratch_bytes=3096"
+      ],
+      [
+        "1/1 segment.test.stored block metadata batches preserve rows and bound warm cache probes...LITE_STORED_METADATA batch=false rounds=100 cache_probes=26000 elapsed_ns=305000 table_scratch_bytes=24",
+        "LITE_STORED_METADATA batch=true rounds=100 cache_probes=500 elapsed_ns=43000 table_scratch_bytes=3096"
+      ]
+    ],
+    "streamed common postings merge matches": {
+      "before": [
+        [
+          "1/1 section.inverted.test.streamed common postings merge matches sorting fallback with bounded scratch...LITE_POSTINGS_MERGE documents=50000 streamed_peak=416045 fallback_peak=3799515 streamed_ns=4394000 fallback_ns=4568000 writes=1"
+        ],
+        [
+          "1/1 section.inverted.test.streamed common postings merge matches sorting fallback with bounded scratch...LITE_POSTINGS_MERGE documents=50000 streamed_peak=416045 fallback_peak=3799515 streamed_ns=5054000 fallback_ns=4182000 writes=1"
+        ],
+        [
+          "1/1 section.inverted.test.streamed common postings merge matches sorting fallback with bounded scratch...LITE_POSTINGS_MERGE documents=50000 streamed_peak=416045 fallback_peak=3799515 streamed_ns=4472000 fallback_ns=4476000 writes=1"
+        ],
+        [
+          "1/1 section.inverted.test.streamed common postings merge matches sorting fallback with bounded scratch...LITE_POSTINGS_MERGE documents=50000 streamed_peak=416045 fallback_peak=3799515 streamed_ns=4350000 fallback_ns=4612000 writes=1"
+        ],
+        [
+          "1/1 section.inverted.test.streamed common postings merge matches sorting fallback with bounded scratch...LITE_POSTINGS_MERGE documents=50000 streamed_peak=416045 fallback_peak=3799515 streamed_ns=4824000 fallback_ns=4504000 writes=1"
+        ],
+        [
+          "1/1 section.inverted.test.streamed common postings merge matches sorting fallback with bounded scratch...LITE_POSTINGS_MERGE documents=50000 streamed_peak=416045 fallback_peak=3799515 streamed_ns=4559000 fallback_ns=4252000 writes=1"
+        ],
+        [
+          "1/1 section.inverted.test.streamed common postings merge matches sorting fallback with bounded scratch...LITE_POSTINGS_MERGE documents=50000 streamed_peak=416045 fallback_peak=3799515 streamed_ns=4513000 fallback_ns=5098000 writes=1"
+        ],
+        [
+          "1/1 section.inverted.test.streamed common postings merge matches sorting fallback with bounded scratch...LITE_POSTINGS_MERGE documents=50000 streamed_peak=416045 fallback_peak=3799515 streamed_ns=4929000 fallback_ns=4796000 writes=1"
+        ],
+        [
+          "1/1 section.inverted.test.streamed common postings merge matches sorting fallback with bounded scratch...LITE_POSTINGS_MERGE documents=50000 streamed_peak=416045 fallback_peak=3799515 streamed_ns=4475000 fallback_ns=4473000 writes=1"
+        ],
+        [
+          "1/1 section.inverted.test.streamed common postings merge matches sorting fallback with bounded scratch...LITE_POSTINGS_MERGE documents=50000 streamed_peak=416045 fallback_peak=3799515 streamed_ns=4501000 fallback_ns=4419000 writes=1"
+        ],
+        [
+          "1/1 section.inverted.test.streamed common postings merge matches sorting fallback with bounded scratch...LITE_POSTINGS_MERGE documents=50000 streamed_peak=416045 fallback_peak=3799515 streamed_ns=4603000 fallback_ns=4414000 writes=1"
+        ],
+        [
+          "1/1 section.inverted.test.streamed common postings merge matches sorting fallback with bounded scratch...LITE_POSTINGS_MERGE documents=50000 streamed_peak=416045 fallback_peak=3799515 streamed_ns=4515000 fallback_ns=4537000 writes=1"
+        ],
+        [
+          "1/1 section.inverted.test.streamed common postings merge matches sorting fallback with bounded scratch...LITE_POSTINGS_MERGE documents=50000 streamed_peak=416045 fallback_peak=3799515 streamed_ns=4586000 fallback_ns=4430000 writes=1"
+        ],
+        [
+          "1/1 section.inverted.test.streamed common postings merge matches sorting fallback with bounded scratch...LITE_POSTINGS_MERGE documents=50000 streamed_peak=416045 fallback_peak=3799515 streamed_ns=4682000 fallback_ns=4865000 writes=1"
+        ],
+        [
+          "1/1 section.inverted.test.streamed common postings merge matches sorting fallback with bounded scratch...LITE_POSTINGS_MERGE documents=50000 streamed_peak=416045 fallback_peak=3799515 streamed_ns=4663000 fallback_ns=4626000 writes=1"
+        ],
+        [
+          "1/1 section.inverted.test.streamed common postings merge matches sorting fallback with bounded scratch...LITE_POSTINGS_MERGE documents=50000 streamed_peak=416045 fallback_peak=3799515 streamed_ns=4577000 fallback_ns=4415000 writes=1"
+        ],
+        [
+          "1/1 section.inverted.test.streamed common postings merge matches sorting fallback with bounded scratch...LITE_POSTINGS_MERGE documents=50000 streamed_peak=416045 fallback_peak=3799515 streamed_ns=4692000 fallback_ns=4466000 writes=1"
+        ],
+        [
+          "1/1 section.inverted.test.streamed common postings merge matches sorting fallback with bounded scratch...LITE_POSTINGS_MERGE documents=50000 streamed_peak=416045 fallback_peak=3799515 streamed_ns=4617000 fallback_ns=4448000 writes=1"
+        ],
+        [
+          "1/1 section.inverted.test.streamed common postings merge matches sorting fallback with bounded scratch...LITE_POSTINGS_MERGE documents=50000 streamed_peak=416045 fallback_peak=3799515 streamed_ns=4868000 fallback_ns=4502000 writes=1"
+        ],
+        [
+          "1/1 section.inverted.test.streamed common postings merge matches sorting fallback with bounded scratch...LITE_POSTINGS_MERGE documents=50000 streamed_peak=416045 fallback_peak=3799515 streamed_ns=4422000 fallback_ns=4363000 writes=1"
+        ]
+      ],
+      "after": [
+        [
+          "1/1 section.inverted.test.streamed common postings merge matches sorting fallback with bounded scratch...LITE_POSTINGS_MERGE documents=50000 streamed_peak=416045 fallback_peak=3799515 streamed_ns=4531000 fallback_ns=4410000 writes=1"
+        ],
+        [
+          "1/1 section.inverted.test.streamed common postings merge matches sorting fallback with bounded scratch...LITE_POSTINGS_MERGE documents=50000 streamed_peak=416045 fallback_peak=3799515 streamed_ns=4942000 fallback_ns=4679000 writes=1"
+        ],
+        [
+          "1/1 section.inverted.test.streamed common postings merge matches sorting fallback with bounded scratch...LITE_POSTINGS_MERGE documents=50000 streamed_peak=416045 fallback_peak=3799515 streamed_ns=4539000 fallback_ns=4674000 writes=1"
+        ],
+        [
+          "1/1 section.inverted.test.streamed common postings merge matches sorting fallback with bounded scratch...LITE_POSTINGS_MERGE documents=50000 streamed_peak=416045 fallback_peak=3799515 streamed_ns=4761000 fallback_ns=4552000 writes=1"
+        ],
+        [
+          "1/1 section.inverted.test.streamed common postings merge matches sorting fallback with bounded scratch...LITE_POSTINGS_MERGE documents=50000 streamed_peak=416045 fallback_peak=3799515 streamed_ns=4670000 fallback_ns=4694000 writes=1"
+        ],
+        [
+          "1/1 section.inverted.test.streamed common postings merge matches sorting fallback with bounded scratch...LITE_POSTINGS_MERGE documents=50000 streamed_peak=416045 fallback_peak=3799515 streamed_ns=4896000 fallback_ns=4406000 writes=1"
+        ],
+        [
+          "1/1 section.inverted.test.streamed common postings merge matches sorting fallback with bounded scratch...LITE_POSTINGS_MERGE documents=50000 streamed_peak=416045 fallback_peak=3799515 streamed_ns=4685000 fallback_ns=4593000 writes=1"
+        ],
+        [
+          "1/1 section.inverted.test.streamed common postings merge matches sorting fallback with bounded scratch...LITE_POSTINGS_MERGE documents=50000 streamed_peak=416045 fallback_peak=3799515 streamed_ns=4671000 fallback_ns=4686000 writes=1"
+        ],
+        [
+          "1/1 section.inverted.test.streamed common postings merge matches sorting fallback with bounded scratch...LITE_POSTINGS_MERGE documents=50000 streamed_peak=416045 fallback_peak=3799515 streamed_ns=4675000 fallback_ns=4577000 writes=1"
+        ],
+        [
+          "1/1 section.inverted.test.streamed common postings merge matches sorting fallback with bounded scratch...LITE_POSTINGS_MERGE documents=50000 streamed_peak=416045 fallback_peak=3799515 streamed_ns=4487000 fallback_ns=4485000 writes=1"
+        ],
+        [
+          "1/1 section.inverted.test.streamed common postings merge matches sorting fallback with bounded scratch...LITE_POSTINGS_MERGE documents=50000 streamed_peak=416045 fallback_peak=3799515 streamed_ns=4609000 fallback_ns=4746000 writes=1"
+        ],
+        [
+          "1/1 section.inverted.test.streamed common postings merge matches sorting fallback with bounded scratch...LITE_POSTINGS_MERGE documents=50000 streamed_peak=416045 fallback_peak=3799515 streamed_ns=4648000 fallback_ns=4966000 writes=1"
+        ],
+        [
+          "1/1 section.inverted.test.streamed common postings merge matches sorting fallback with bounded scratch...LITE_POSTINGS_MERGE documents=50000 streamed_peak=416045 fallback_peak=3799515 streamed_ns=4649000 fallback_ns=4856000 writes=1"
+        ],
+        [
+          "1/1 section.inverted.test.streamed common postings merge matches sorting fallback with bounded scratch...LITE_POSTINGS_MERGE documents=50000 streamed_peak=416045 fallback_peak=3799515 streamed_ns=5350000 fallback_ns=4479000 writes=1"
+        ],
+        [
+          "1/1 section.inverted.test.streamed common postings merge matches sorting fallback with bounded scratch...LITE_POSTINGS_MERGE documents=50000 streamed_peak=416045 fallback_peak=3799515 streamed_ns=4609000 fallback_ns=4294000 writes=1"
+        ],
+        [
+          "1/1 section.inverted.test.streamed common postings merge matches sorting fallback with bounded scratch...LITE_POSTINGS_MERGE documents=50000 streamed_peak=416045 fallback_peak=3799515 streamed_ns=4693000 fallback_ns=4520000 writes=1"
+        ],
+        [
+          "1/1 section.inverted.test.streamed common postings merge matches sorting fallback with bounded scratch...LITE_POSTINGS_MERGE documents=50000 streamed_peak=416045 fallback_peak=3799515 streamed_ns=4655000 fallback_ns=4403000 writes=1"
+        ],
+        [
+          "1/1 section.inverted.test.streamed common postings merge matches sorting fallback with bounded scratch...LITE_POSTINGS_MERGE documents=50000 streamed_peak=416045 fallback_peak=3799515 streamed_ns=4943000 fallback_ns=4869000 writes=1"
+        ],
+        [
+          "1/1 section.inverted.test.streamed common postings merge matches sorting fallback with bounded scratch...LITE_POSTINGS_MERGE documents=50000 streamed_peak=416045 fallback_peak=3799515 streamed_ns=5079000 fallback_ns=4632000 writes=1"
+        ],
+        [
+          "1/1 section.inverted.test.streamed common postings merge matches sorting fallback with bounded scratch...LITE_POSTINGS_MERGE documents=50000 streamed_peak=416045 fallback_peak=3799515 streamed_ns=4548000 fallback_ns=4370000 writes=1"
+        ]
+      ]
+    },
+    "v23 positional merges and historical spills": {
+      "before": [
+        [
+          "1/1 section.inverted.test.v23 positional merges and historical spills consume immutable packed records...LITE_LEGACY_PACKED ranged=false docs=256 positions=4096 peak=67168 elapsed_ns=151000 source_reads=0 source_bytes=0",
+          "LITE_LEGACY_SPILL ranged=false elapsed_ns=796000 peak=458727 input_bytes=138496",
+          "LITE_LEGACY_PACKED ranged=true docs=256 positions=4096 peak=84232 elapsed_ns=231000 source_reads=1280 source_bytes=262912",
+          "LITE_LEGACY_SPILL ranged=true elapsed_ns=815000 peak=458727 input_bytes=138496"
+        ],
+        [
+          "1/1 section.inverted.test.v23 positional merges and historical spills consume immutable packed records...LITE_LEGACY_PACKED ranged=false docs=256 positions=4096 peak=67168 elapsed_ns=139000 source_reads=0 source_bytes=0",
+          "LITE_LEGACY_SPILL ranged=false elapsed_ns=773000 peak=458727 input_bytes=138496",
+          "LITE_LEGACY_PACKED ranged=true docs=256 positions=4096 peak=84232 elapsed_ns=165000 source_reads=1280 source_bytes=262912",
+          "LITE_LEGACY_SPILL ranged=true elapsed_ns=927000 peak=458727 input_bytes=138496"
+        ],
+        [
+          "1/1 section.inverted.test.v23 positional merges and historical spills consume immutable packed records...LITE_LEGACY_PACKED ranged=false docs=256 positions=4096 peak=67168 elapsed_ns=174000 source_reads=0 source_bytes=0",
+          "LITE_LEGACY_SPILL ranged=false elapsed_ns=786000 peak=458727 input_bytes=138496",
+          "LITE_LEGACY_PACKED ranged=true docs=256 positions=4096 peak=84232 elapsed_ns=153000 source_reads=1280 source_bytes=262912",
+          "LITE_LEGACY_SPILL ranged=true elapsed_ns=839000 peak=458727 input_bytes=138496"
+        ],
+        [
+          "1/1 section.inverted.test.v23 positional merges and historical spills consume immutable packed records...LITE_LEGACY_PACKED ranged=false docs=256 positions=4096 peak=67168 elapsed_ns=149000 source_reads=0 source_bytes=0",
+          "LITE_LEGACY_SPILL ranged=false elapsed_ns=807000 peak=458727 input_bytes=138496",
+          "LITE_LEGACY_PACKED ranged=true docs=256 positions=4096 peak=84232 elapsed_ns=166000 source_reads=1280 source_bytes=262912",
+          "LITE_LEGACY_SPILL ranged=true elapsed_ns=759000 peak=458727 input_bytes=138496"
+        ],
+        [
+          "1/1 section.inverted.test.v23 positional merges and historical spills consume immutable packed records...LITE_LEGACY_PACKED ranged=false docs=256 positions=4096 peak=67168 elapsed_ns=143000 source_reads=0 source_bytes=0",
+          "LITE_LEGACY_SPILL ranged=false elapsed_ns=772000 peak=458727 input_bytes=138496",
+          "LITE_LEGACY_PACKED ranged=true docs=256 positions=4096 peak=84232 elapsed_ns=179000 source_reads=1280 source_bytes=262912",
+          "LITE_LEGACY_SPILL ranged=true elapsed_ns=1299000 peak=458727 input_bytes=138496"
+        ],
+        [
+          "1/1 section.inverted.test.v23 positional merges and historical spills consume immutable packed records...LITE_LEGACY_PACKED ranged=false docs=256 positions=4096 peak=67168 elapsed_ns=142000 source_reads=0 source_bytes=0",
+          "LITE_LEGACY_SPILL ranged=false elapsed_ns=766000 peak=458727 input_bytes=138496",
+          "LITE_LEGACY_PACKED ranged=true docs=256 positions=4096 peak=84232 elapsed_ns=159000 source_reads=1280 source_bytes=262912",
+          "LITE_LEGACY_SPILL ranged=true elapsed_ns=840000 peak=458727 input_bytes=138496"
+        ],
+        [
+          "1/1 section.inverted.test.v23 positional merges and historical spills consume immutable packed records...LITE_LEGACY_PACKED ranged=false docs=256 positions=4096 peak=67168 elapsed_ns=140000 source_reads=0 source_bytes=0",
+          "LITE_LEGACY_SPILL ranged=false elapsed_ns=958000 peak=458727 input_bytes=138496",
+          "LITE_LEGACY_PACKED ranged=true docs=256 positions=4096 peak=84232 elapsed_ns=153000 source_reads=1280 source_bytes=262912",
+          "LITE_LEGACY_SPILL ranged=true elapsed_ns=878000 peak=458727 input_bytes=138496"
+        ],
+        [
+          "1/1 section.inverted.test.v23 positional merges and historical spills consume immutable packed records...LITE_LEGACY_PACKED ranged=false docs=256 positions=4096 peak=67168 elapsed_ns=174000 source_reads=0 source_bytes=0",
+          "LITE_LEGACY_SPILL ranged=false elapsed_ns=860000 peak=458727 input_bytes=138496",
+          "LITE_LEGACY_PACKED ranged=true docs=256 positions=4096 peak=84232 elapsed_ns=178000 source_reads=1280 source_bytes=262912",
+          "LITE_LEGACY_SPILL ranged=true elapsed_ns=760000 peak=458727 input_bytes=138496"
+        ],
+        [
+          "1/1 section.inverted.test.v23 positional merges and historical spills consume immutable packed records...LITE_LEGACY_PACKED ranged=false docs=256 positions=4096 peak=67168 elapsed_ns=175000 source_reads=0 source_bytes=0",
+          "LITE_LEGACY_SPILL ranged=false elapsed_ns=808000 peak=458727 input_bytes=138496",
+          "LITE_LEGACY_PACKED ranged=true docs=256 positions=4096 peak=84232 elapsed_ns=162000 source_reads=1280 source_bytes=262912",
+          "LITE_LEGACY_SPILL ranged=true elapsed_ns=817000 peak=458727 input_bytes=138496"
+        ],
+        [
+          "1/1 section.inverted.test.v23 positional merges and historical spills consume immutable packed records...LITE_LEGACY_PACKED ranged=false docs=256 positions=4096 peak=67168 elapsed_ns=143000 source_reads=0 source_bytes=0",
+          "LITE_LEGACY_SPILL ranged=false elapsed_ns=799000 peak=458727 input_bytes=138496",
+          "LITE_LEGACY_PACKED ranged=true docs=256 positions=4096 peak=84232 elapsed_ns=160000 source_reads=1280 source_bytes=262912",
+          "LITE_LEGACY_SPILL ranged=true elapsed_ns=1338000 peak=458727 input_bytes=138496"
+        ],
+        [
+          "1/1 section.inverted.test.v23 positional merges and historical spills consume immutable packed records...LITE_LEGACY_PACKED ranged=false docs=256 positions=4096 peak=67168 elapsed_ns=203000 source_reads=0 source_bytes=0",
+          "LITE_LEGACY_SPILL ranged=false elapsed_ns=915000 peak=458727 input_bytes=138496",
+          "LITE_LEGACY_PACKED ranged=true docs=256 positions=4096 peak=84232 elapsed_ns=164000 source_reads=1280 source_bytes=262912",
+          "LITE_LEGACY_SPILL ranged=true elapsed_ns=875000 peak=458727 input_bytes=138496"
+        ],
+        [
+          "1/1 section.inverted.test.v23 positional merges and historical spills consume immutable packed records...LITE_LEGACY_PACKED ranged=false docs=256 positions=4096 peak=67168 elapsed_ns=146000 source_reads=0 source_bytes=0",
+          "LITE_LEGACY_SPILL ranged=false elapsed_ns=820000 peak=458727 input_bytes=138496",
+          "LITE_LEGACY_PACKED ranged=true docs=256 positions=4096 peak=84232 elapsed_ns=162000 source_reads=1280 source_bytes=262912",
+          "LITE_LEGACY_SPILL ranged=true elapsed_ns=869000 peak=458727 input_bytes=138496"
+        ],
+        [
+          "1/1 section.inverted.test.v23 positional merges and historical spills consume immutable packed records...LITE_LEGACY_PACKED ranged=false docs=256 positions=4096 peak=67168 elapsed_ns=148000 source_reads=0 source_bytes=0",
+          "LITE_LEGACY_SPILL ranged=false elapsed_ns=809000 peak=458727 input_bytes=138496",
+          "LITE_LEGACY_PACKED ranged=true docs=256 positions=4096 peak=84232 elapsed_ns=170000 source_reads=1280 source_bytes=262912",
+          "LITE_LEGACY_SPILL ranged=true elapsed_ns=1034000 peak=458727 input_bytes=138496"
+        ],
+        [
+          "1/1 section.inverted.test.v23 positional merges and historical spills consume immutable packed records...LITE_LEGACY_PACKED ranged=false docs=256 positions=4096 peak=67168 elapsed_ns=151000 source_reads=0 source_bytes=0",
+          "LITE_LEGACY_SPILL ranged=false elapsed_ns=801000 peak=458727 input_bytes=138496",
+          "LITE_LEGACY_PACKED ranged=true docs=256 positions=4096 peak=84232 elapsed_ns=176000 source_reads=1280 source_bytes=262912",
+          "LITE_LEGACY_SPILL ranged=true elapsed_ns=813000 peak=458727 input_bytes=138496"
+        ],
+        [
+          "1/1 section.inverted.test.v23 positional merges and historical spills consume immutable packed records...LITE_LEGACY_PACKED ranged=false docs=256 positions=4096 peak=67168 elapsed_ns=153000 source_reads=0 source_bytes=0",
+          "LITE_LEGACY_SPILL ranged=false elapsed_ns=869000 peak=458727 input_bytes=138496",
+          "LITE_LEGACY_PACKED ranged=true docs=256 positions=4096 peak=84232 elapsed_ns=157000 source_reads=1280 source_bytes=262912",
+          "LITE_LEGACY_SPILL ranged=true elapsed_ns=1218000 peak=458727 input_bytes=138496"
+        ],
+        [
+          "1/1 section.inverted.test.v23 positional merges and historical spills consume immutable packed records...LITE_LEGACY_PACKED ranged=false docs=256 positions=4096 peak=67168 elapsed_ns=146000 source_reads=0 source_bytes=0",
+          "LITE_LEGACY_SPILL ranged=false elapsed_ns=1177000 peak=458727 input_bytes=138496",
+          "LITE_LEGACY_PACKED ranged=true docs=256 positions=4096 peak=84232 elapsed_ns=158000 source_reads=1280 source_bytes=262912",
+          "LITE_LEGACY_SPILL ranged=true elapsed_ns=1073000 peak=458727 input_bytes=138496"
+        ],
+        [
+          "1/1 section.inverted.test.v23 positional merges and historical spills consume immutable packed records...LITE_LEGACY_PACKED ranged=false docs=256 positions=4096 peak=67168 elapsed_ns=150000 source_reads=0 source_bytes=0",
+          "LITE_LEGACY_SPILL ranged=false elapsed_ns=784000 peak=458727 input_bytes=138496",
+          "LITE_LEGACY_PACKED ranged=true docs=256 positions=4096 peak=84232 elapsed_ns=180000 source_reads=1280 source_bytes=262912",
+          "LITE_LEGACY_SPILL ranged=true elapsed_ns=843000 peak=458727 input_bytes=138496"
+        ],
+        [
+          "1/1 section.inverted.test.v23 positional merges and historical spills consume immutable packed records...LITE_LEGACY_PACKED ranged=false docs=256 positions=4096 peak=67168 elapsed_ns=165000 source_reads=0 source_bytes=0",
+          "LITE_LEGACY_SPILL ranged=false elapsed_ns=1171000 peak=458727 input_bytes=138496",
+          "LITE_LEGACY_PACKED ranged=true docs=256 positions=4096 peak=84232 elapsed_ns=152000 source_reads=1280 source_bytes=262912",
+          "LITE_LEGACY_SPILL ranged=true elapsed_ns=942000 peak=458727 input_bytes=138496"
+        ],
+        [
+          "1/1 section.inverted.test.v23 positional merges and historical spills consume immutable packed records...LITE_LEGACY_PACKED ranged=false docs=256 positions=4096 peak=67168 elapsed_ns=148000 source_reads=0 source_bytes=0",
+          "LITE_LEGACY_SPILL ranged=false elapsed_ns=1154000 peak=458727 input_bytes=138496",
+          "LITE_LEGACY_PACKED ranged=true docs=256 positions=4096 peak=84232 elapsed_ns=157000 source_reads=1280 source_bytes=262912",
+          "LITE_LEGACY_SPILL ranged=true elapsed_ns=895000 peak=458727 input_bytes=138496"
+        ],
+        [
+          "1/1 section.inverted.test.v23 positional merges and historical spills consume immutable packed records...LITE_LEGACY_PACKED ranged=false docs=256 positions=4096 peak=67168 elapsed_ns=138000 source_reads=0 source_bytes=0",
+          "LITE_LEGACY_SPILL ranged=false elapsed_ns=839000 peak=458727 input_bytes=138496",
+          "LITE_LEGACY_PACKED ranged=true docs=256 positions=4096 peak=84232 elapsed_ns=158000 source_reads=1280 source_bytes=262912",
+          "LITE_LEGACY_SPILL ranged=true elapsed_ns=998000 peak=458727 input_bytes=138496"
+        ]
+      ],
+      "after": [
+        [
+          "1/1 section.inverted.test.v23 positional merges and historical spills consume immutable packed records...LITE_LEGACY_PACKED ranged=false docs=256 positions=4096 peak=67168 elapsed_ns=156000 source_reads=0 source_bytes=0",
+          "LITE_LEGACY_SPILL ranged=false elapsed_ns=737000 peak=458727 input_bytes=138496",
+          "LITE_LEGACY_PACKED ranged=true docs=256 positions=4096 peak=84232 elapsed_ns=188000 source_reads=1280 source_bytes=262912",
+          "LITE_LEGACY_SPILL ranged=true elapsed_ns=926000 peak=458727 input_bytes=138496"
+        ],
+        [
+          "1/1 section.inverted.test.v23 positional merges and historical spills consume immutable packed records...LITE_LEGACY_PACKED ranged=false docs=256 positions=4096 peak=67168 elapsed_ns=148000 source_reads=0 source_bytes=0",
+          "LITE_LEGACY_SPILL ranged=false elapsed_ns=1171000 peak=458727 input_bytes=138496",
+          "LITE_LEGACY_PACKED ranged=true docs=256 positions=4096 peak=84232 elapsed_ns=167000 source_reads=1280 source_bytes=262912",
+          "LITE_LEGACY_SPILL ranged=true elapsed_ns=864000 peak=458727 input_bytes=138496"
+        ],
+        [
+          "1/1 section.inverted.test.v23 positional merges and historical spills consume immutable packed records...LITE_LEGACY_PACKED ranged=false docs=256 positions=4096 peak=67168 elapsed_ns=155000 source_reads=0 source_bytes=0",
+          "LITE_LEGACY_SPILL ranged=false elapsed_ns=783000 peak=458727 input_bytes=138496",
+          "LITE_LEGACY_PACKED ranged=true docs=256 positions=4096 peak=84232 elapsed_ns=160000 source_reads=1280 source_bytes=262912",
+          "LITE_LEGACY_SPILL ranged=true elapsed_ns=866000 peak=458727 input_bytes=138496"
+        ],
+        [
+          "1/1 section.inverted.test.v23 positional merges and historical spills consume immutable packed records...LITE_LEGACY_PACKED ranged=false docs=256 positions=4096 peak=67168 elapsed_ns=142000 source_reads=0 source_bytes=0",
+          "LITE_LEGACY_SPILL ranged=false elapsed_ns=1069000 peak=458727 input_bytes=138496",
+          "LITE_LEGACY_PACKED ranged=true docs=256 positions=4096 peak=84232 elapsed_ns=182000 source_reads=1280 source_bytes=262912",
+          "LITE_LEGACY_SPILL ranged=true elapsed_ns=1329000 peak=458727 input_bytes=138496"
+        ],
+        [
+          "1/1 section.inverted.test.v23 positional merges and historical spills consume immutable packed records...LITE_LEGACY_PACKED ranged=false docs=256 positions=4096 peak=67168 elapsed_ns=143000 source_reads=0 source_bytes=0",
+          "LITE_LEGACY_SPILL ranged=false elapsed_ns=911000 peak=458727 input_bytes=138496",
+          "LITE_LEGACY_PACKED ranged=true docs=256 positions=4096 peak=84232 elapsed_ns=163000 source_reads=1280 source_bytes=262912",
+          "LITE_LEGACY_SPILL ranged=true elapsed_ns=824000 peak=458727 input_bytes=138496"
+        ],
+        [
+          "1/1 section.inverted.test.v23 positional merges and historical spills consume immutable packed records...LITE_LEGACY_PACKED ranged=false docs=256 positions=4096 peak=67168 elapsed_ns=140000 source_reads=0 source_bytes=0",
+          "LITE_LEGACY_SPILL ranged=false elapsed_ns=865000 peak=458727 input_bytes=138496",
+          "LITE_LEGACY_PACKED ranged=true docs=256 positions=4096 peak=84232 elapsed_ns=168000 source_reads=1280 source_bytes=262912",
+          "LITE_LEGACY_SPILL ranged=true elapsed_ns=915000 peak=458727 input_bytes=138496"
+        ],
+        [
+          "1/1 section.inverted.test.v23 positional merges and historical spills consume immutable packed records...LITE_LEGACY_PACKED ranged=false docs=256 positions=4096 peak=67168 elapsed_ns=162000 source_reads=0 source_bytes=0",
+          "LITE_LEGACY_SPILL ranged=false elapsed_ns=806000 peak=458727 input_bytes=138496",
+          "LITE_LEGACY_PACKED ranged=true docs=256 positions=4096 peak=84232 elapsed_ns=159000 source_reads=1280 source_bytes=262912",
+          "LITE_LEGACY_SPILL ranged=true elapsed_ns=819000 peak=458727 input_bytes=138496"
+        ],
+        [
+          "1/1 section.inverted.test.v23 positional merges and historical spills consume immutable packed records...LITE_LEGACY_PACKED ranged=false docs=256 positions=4096 peak=67168 elapsed_ns=146000 source_reads=0 source_bytes=0",
+          "LITE_LEGACY_SPILL ranged=false elapsed_ns=712000 peak=458727 input_bytes=138496",
+          "LITE_LEGACY_PACKED ranged=true docs=256 positions=4096 peak=84232 elapsed_ns=180000 source_reads=1280 source_bytes=262912",
+          "LITE_LEGACY_SPILL ranged=true elapsed_ns=807000 peak=458727 input_bytes=138496"
+        ],
+        [
+          "1/1 section.inverted.test.v23 positional merges and historical spills consume immutable packed records...LITE_LEGACY_PACKED ranged=false docs=256 positions=4096 peak=67168 elapsed_ns=156000 source_reads=0 source_bytes=0",
+          "LITE_LEGACY_SPILL ranged=false elapsed_ns=842000 peak=458727 input_bytes=138496",
+          "LITE_LEGACY_PACKED ranged=true docs=256 positions=4096 peak=84232 elapsed_ns=155000 source_reads=1280 source_bytes=262912",
+          "LITE_LEGACY_SPILL ranged=true elapsed_ns=768000 peak=458727 input_bytes=138496"
+        ],
+        [
+          "1/1 section.inverted.test.v23 positional merges and historical spills consume immutable packed records...LITE_LEGACY_PACKED ranged=false docs=256 positions=4096 peak=67168 elapsed_ns=380000 source_reads=0 source_bytes=0",
+          "LITE_LEGACY_SPILL ranged=false elapsed_ns=1167000 peak=458727 input_bytes=138496",
+          "LITE_LEGACY_PACKED ranged=true docs=256 positions=4096 peak=84232 elapsed_ns=222000 source_reads=1280 source_bytes=262912",
+          "LITE_LEGACY_SPILL ranged=true elapsed_ns=838000 peak=458727 input_bytes=138496"
+        ],
+        [
+          "1/1 section.inverted.test.v23 positional merges and historical spills consume immutable packed records...LITE_LEGACY_PACKED ranged=false docs=256 positions=4096 peak=67168 elapsed_ns=145000 source_reads=0 source_bytes=0",
+          "LITE_LEGACY_SPILL ranged=false elapsed_ns=813000 peak=458727 input_bytes=138496",
+          "LITE_LEGACY_PACKED ranged=true docs=256 positions=4096 peak=84232 elapsed_ns=250000 source_reads=1280 source_bytes=262912",
+          "LITE_LEGACY_SPILL ranged=true elapsed_ns=1268000 peak=458727 input_bytes=138496"
+        ],
+        [
+          "1/1 section.inverted.test.v23 positional merges and historical spills consume immutable packed records...LITE_LEGACY_PACKED ranged=false docs=256 positions=4096 peak=67168 elapsed_ns=153000 source_reads=0 source_bytes=0",
+          "LITE_LEGACY_SPILL ranged=false elapsed_ns=810000 peak=458727 input_bytes=138496",
+          "LITE_LEGACY_PACKED ranged=true docs=256 positions=4096 peak=84232 elapsed_ns=201000 source_reads=1280 source_bytes=262912",
+          "LITE_LEGACY_SPILL ranged=true elapsed_ns=1171000 peak=458727 input_bytes=138496"
+        ],
+        [
+          "1/1 section.inverted.test.v23 positional merges and historical spills consume immutable packed records...LITE_LEGACY_PACKED ranged=false docs=256 positions=4096 peak=67168 elapsed_ns=163000 source_reads=0 source_bytes=0",
+          "LITE_LEGACY_SPILL ranged=false elapsed_ns=890000 peak=458727 input_bytes=138496",
+          "LITE_LEGACY_PACKED ranged=true docs=256 positions=4096 peak=84232 elapsed_ns=158000 source_reads=1280 source_bytes=262912",
+          "LITE_LEGACY_SPILL ranged=true elapsed_ns=858000 peak=458727 input_bytes=138496"
+        ],
+        [
+          "1/1 section.inverted.test.v23 positional merges and historical spills consume immutable packed records...LITE_LEGACY_PACKED ranged=false docs=256 positions=4096 peak=67168 elapsed_ns=161000 source_reads=0 source_bytes=0",
+          "LITE_LEGACY_SPILL ranged=false elapsed_ns=3527000 peak=458727 input_bytes=138496",
+          "LITE_LEGACY_PACKED ranged=true docs=256 positions=4096 peak=84232 elapsed_ns=320000 source_reads=1280 source_bytes=262912",
+          "LITE_LEGACY_SPILL ranged=true elapsed_ns=1339000 peak=458727 input_bytes=138496"
+        ],
+        [
+          "1/1 section.inverted.test.v23 positional merges and historical spills consume immutable packed records...LITE_LEGACY_PACKED ranged=false docs=256 positions=4096 peak=67168 elapsed_ns=159000 source_reads=0 source_bytes=0",
+          "LITE_LEGACY_SPILL ranged=false elapsed_ns=1044000 peak=458727 input_bytes=138496",
+          "LITE_LEGACY_PACKED ranged=true docs=256 positions=4096 peak=84232 elapsed_ns=167000 source_reads=1280 source_bytes=262912",
+          "LITE_LEGACY_SPILL ranged=true elapsed_ns=852000 peak=458727 input_bytes=138496"
+        ],
+        [
+          "1/1 section.inverted.test.v23 positional merges and historical spills consume immutable packed records...LITE_LEGACY_PACKED ranged=false docs=256 positions=4096 peak=67168 elapsed_ns=160000 source_reads=0 source_bytes=0",
+          "LITE_LEGACY_SPILL ranged=false elapsed_ns=819000 peak=458727 input_bytes=138496",
+          "LITE_LEGACY_PACKED ranged=true docs=256 positions=4096 peak=84232 elapsed_ns=163000 source_reads=1280 source_bytes=262912",
+          "LITE_LEGACY_SPILL ranged=true elapsed_ns=1235000 peak=458727 input_bytes=138496"
+        ],
+        [
+          "1/1 section.inverted.test.v23 positional merges and historical spills consume immutable packed records...LITE_LEGACY_PACKED ranged=false docs=256 positions=4096 peak=67168 elapsed_ns=145000 source_reads=0 source_bytes=0",
+          "LITE_LEGACY_SPILL ranged=false elapsed_ns=1016000 peak=458727 input_bytes=138496",
+          "LITE_LEGACY_PACKED ranged=true docs=256 positions=4096 peak=84232 elapsed_ns=165000 source_reads=1280 source_bytes=262912",
+          "LITE_LEGACY_SPILL ranged=true elapsed_ns=1007000 peak=458727 input_bytes=138496"
+        ],
+        [
+          "1/1 section.inverted.test.v23 positional merges and historical spills consume immutable packed records...LITE_LEGACY_PACKED ranged=false docs=256 positions=4096 peak=67168 elapsed_ns=145000 source_reads=0 source_bytes=0",
+          "LITE_LEGACY_SPILL ranged=false elapsed_ns=906000 peak=458727 input_bytes=138496",
+          "LITE_LEGACY_PACKED ranged=true docs=256 positions=4096 peak=84232 elapsed_ns=162000 source_reads=1280 source_bytes=262912",
+          "LITE_LEGACY_SPILL ranged=true elapsed_ns=1289000 peak=458727 input_bytes=138496"
+        ],
+        [
+          "1/1 section.inverted.test.v23 positional merges and historical spills consume immutable packed records...LITE_LEGACY_PACKED ranged=false docs=256 positions=4096 peak=67168 elapsed_ns=165000 source_reads=0 source_bytes=0",
+          "LITE_LEGACY_SPILL ranged=false elapsed_ns=820000 peak=458727 input_bytes=138496",
+          "LITE_LEGACY_PACKED ranged=true docs=256 positions=4096 peak=84232 elapsed_ns=162000 source_reads=1280 source_bytes=262912",
+          "LITE_LEGACY_SPILL ranged=true elapsed_ns=848000 peak=458727 input_bytes=138496"
+        ],
+        [
+          "1/1 section.inverted.test.v23 positional merges and historical spills consume immutable packed records...LITE_LEGACY_PACKED ranged=false docs=256 positions=4096 peak=67168 elapsed_ns=153000 source_reads=0 source_bytes=0",
+          "LITE_LEGACY_SPILL ranged=false elapsed_ns=1453000 peak=458727 input_bytes=138496",
+          "LITE_LEGACY_PACKED ranged=true docs=256 positions=4096 peak=84232 elapsed_ns=155000 source_reads=1280 source_bytes=262912",
+          "LITE_LEGACY_SPILL ranged=true elapsed_ns=1613000 peak=458727 input_bytes=138496"
+        ]
+      ]
+    }
+  },
+  "medians": {
+    "merge filters deleted positions before decoding": {
+      "LITE_DELETION_FILTER.legacy=false.early=false.documents": 256.0,
+      "LITE_DELETION_FILTER.legacy=false.early=false.survivors": 8.0,
+      "LITE_DELETION_FILTER.legacy=false.early=false.elapsed_ns": 4276000.0,
+      "LITE_DELETION_FILTER.legacy=false.early=false.position_source_bytes": 565358.0,
+      "LITE_DELETION_FILTER.legacy=false.early=false.peak": 37765.0,
+      "LITE_DELETION_FILTER.legacy=false.early=true.documents": 256.0,
+      "LITE_DELETION_FILTER.legacy=false.early=true.survivors": 8.0,
+      "LITE_DELETION_FILTER.legacy=false.early=true.elapsed_ns": 7000.0,
+      "LITE_DELETION_FILTER.legacy=false.early=true.position_source_bytes": 54.0,
+      "LITE_DELETION_FILTER.legacy=false.early=true.peak": 1938.0,
+      "LITE_DELETION_FILTER.legacy=true.early=false.documents": 256.0,
+      "LITE_DELETION_FILTER.legacy=true.early=false.survivors": 8.0,
+      "LITE_DELETION_FILTER.legacy=true.early=false.elapsed_ns": 1549500.0,
+      "LITE_DELETION_FILTER.legacy=true.early=false.position_source_bytes": 508680.0,
+      "LITE_DELETION_FILTER.legacy=true.early=false.peak": 37004.0,
+      "LITE_DELETION_FILTER.legacy=true.early=true.documents": 256.0,
+      "LITE_DELETION_FILTER.legacy=true.early=true.survivors": 8.0,
+      "LITE_DELETION_FILTER.legacy=true.early=true.elapsed_ns": 15000.0,
+      "LITE_DELETION_FILTER.legacy=true.early=true.position_source_bytes": 776.0,
+      "LITE_DELETION_FILTER.legacy=true.early=true.peak": 2202.0
+    },
+    "stored block metadata batches preserve rows": {
+      "LITE_STORED_METADATA.batch=false.rounds": 100.0,
+      "LITE_STORED_METADATA.batch=false.cache_probes": 26000.0,
+      "LITE_STORED_METADATA.batch=false.elapsed_ns": 304000.0,
+      "LITE_STORED_METADATA.batch=false.table_scratch_bytes": 24.0,
+      "LITE_STORED_METADATA.batch=true.rounds": 100.0,
+      "LITE_STORED_METADATA.batch=true.cache_probes": 500.0,
+      "LITE_STORED_METADATA.batch=true.elapsed_ns": 44000.0,
+      "LITE_STORED_METADATA.batch=true.table_scratch_bytes": 3096.0
+    },
+    "streamed common postings merge matches": {
+      "before": {
+        "LITE_POSTINGS_MERGE.documents": 50000.0,
+        "LITE_POSTINGS_MERGE.streamed_peak": 416045.0,
+        "LITE_POSTINGS_MERGE.fallback_peak": 3799515.0,
+        "LITE_POSTINGS_MERGE.streamed_ns": 4581500.0,
+        "LITE_POSTINGS_MERGE.fallback_ns": 4474500.0,
+        "LITE_POSTINGS_MERGE.writes": 1.0
+      },
+      "after": {
+        "LITE_POSTINGS_MERGE.documents": 50000.0,
+        "LITE_POSTINGS_MERGE.streamed_peak": 416045.0,
+        "LITE_POSTINGS_MERGE.fallback_peak": 3799515.0,
+        "LITE_POSTINGS_MERGE.streamed_ns": 4670500.0,
+        "LITE_POSTINGS_MERGE.fallback_ns": 4585000.0,
+        "LITE_POSTINGS_MERGE.writes": 1.0
+      }
+    },
+    "v23 positional merges and historical spills": {
+      "before": {
+        "LITE_LEGACY_PACKED.ranged=false.docs": 256.0,
+        "LITE_LEGACY_PACKED.ranged=false.positions": 4096.0,
+        "LITE_LEGACY_PACKED.ranged=false.peak": 67168.0,
+        "LITE_LEGACY_PACKED.ranged=false.elapsed_ns": 148500.0,
+        "LITE_LEGACY_PACKED.ranged=false.source_reads": 0.0,
+        "LITE_LEGACY_PACKED.ranged=false.source_bytes": 0.0,
+        "LITE_LEGACY_SPILL.ranged=false.elapsed_ns": 808500.0,
+        "LITE_LEGACY_SPILL.ranged=false.peak": 458727.0,
+        "LITE_LEGACY_SPILL.ranged=false.input_bytes": 138496.0,
+        "LITE_LEGACY_PACKED.ranged=true.docs": 256.0,
+        "LITE_LEGACY_PACKED.ranged=true.positions": 4096.0,
+        "LITE_LEGACY_PACKED.ranged=true.peak": 84232.0,
+        "LITE_LEGACY_PACKED.ranged=true.elapsed_ns": 162000.0,
+        "LITE_LEGACY_PACKED.ranged=true.source_reads": 1280.0,
+        "LITE_LEGACY_PACKED.ranged=true.source_bytes": 262912.0,
+        "LITE_LEGACY_SPILL.ranged=true.elapsed_ns": 876500.0,
+        "LITE_LEGACY_SPILL.ranged=true.peak": 458727.0,
+        "LITE_LEGACY_SPILL.ranged=true.input_bytes": 138496.0
+      },
+      "after": {
+        "LITE_LEGACY_PACKED.ranged=false.docs": 256.0,
+        "LITE_LEGACY_PACKED.ranged=false.positions": 4096.0,
+        "LITE_LEGACY_PACKED.ranged=false.peak": 67168.0,
+        "LITE_LEGACY_PACKED.ranged=false.elapsed_ns": 154000.0,
+        "LITE_LEGACY_PACKED.ranged=false.source_reads": 0.0,
+        "LITE_LEGACY_PACKED.ranged=false.source_bytes": 0.0,
+        "LITE_LEGACY_SPILL.ranged=false.elapsed_ns": 877500.0,
+        "LITE_LEGACY_SPILL.ranged=false.peak": 458727.0,
+        "LITE_LEGACY_SPILL.ranged=false.input_bytes": 138496.0,
+        "LITE_LEGACY_PACKED.ranged=true.docs": 256.0,
+        "LITE_LEGACY_PACKED.ranged=true.positions": 4096.0,
+        "LITE_LEGACY_PACKED.ranged=true.peak": 84232.0,
+        "LITE_LEGACY_PACKED.ranged=true.elapsed_ns": 166000.0,
+        "LITE_LEGACY_PACKED.ranged=true.source_reads": 1280.0,
+        "LITE_LEGACY_PACKED.ranged=true.source_bytes": 262912.0,
+        "LITE_LEGACY_SPILL.ranged=true.elapsed_ns": 890500.0,
+        "LITE_LEGACY_SPILL.ranged=true.peak": 458727.0,
+        "LITE_LEGACY_SPILL.ranged=true.input_bytes": 138496.0
+      }
+    }
+  },
+  "platform": {
+    "system": "Darwin",
+    "machine": "arm64",
+    "logical_cpus": 14
+  },
+  "bounds": {
+    "stored_document_table_stack_bytes": 3096,
+    "stored_location_rows": 129,
+    "position_materialization_cap_in_survivor_fixture_bytes": 64,
+    "new_retained_heap_structures": 0
+  },
+  "limitations": [
+    "Deletion fixture counts direct positional source callbacks, not backing-file I/O; native page authentication can read beyond those callbacks.",
+    "Metadata baseline reproduces the previous point-lookup eligibility traversal; it is a warm-cache microbenchmark, not a full stored merge.",
+    "Baseline and candidate production binaries are compared for common and legacy no-deletion merges; both use ReleaseSafe and the same fixtures.",
+    "No 0.5 CPU / 2 GiB soak or production throughput/RSS qualification was rerun.",
+    "No universal zero-CPU-overhead claim; ordinary merge timing distributions overlap, with slightly higher candidate medians in this development-host run."
+  ]
+}

@@ -204,7 +204,7 @@ pub const Entry = struct {
             index.setExternalVectorBatchScratchLoader(loader, dense.VectorLoader.loadMany);
             try index.activateExperimentalPostingReads(0);
             const entry = try a.create(Manager.DenseIndex);
-            entry.* = .{ .apply_mutex = mutex, .config = .{ .name = name, .kind = .dense_vector, .config_json = root.config_json }, .field_name = try a.dupe(u8, root.binding.column_bindings[0]), .dims = root.dims, .metric = config.metric, .external = true, .chunk_name = null, .embedding_name = null, .native_physical_v2 = true, .index = index };
+            entry.* = .{ .apply_mutex = mutex, .config = .{ .name = name, .kind = .dense_vector, .config_json = root.config_json }, .field_name = try a.dupe(u8, root.binding.column_bindings[0]), .dims = root.dims, .metric = config.metric, .external = true, .chunk_name = try @import("lake_enrichment_units.zig").chunkName(a, name, root.config_json), .embedding_name = null, .supports_unit_grouping = true, .native_physical_v2 = true, .index = index };
             self.dense_entry = entry;
         } else {
             self.sparse_metadata = try @import("lake_index_decoded_metadata.zig").acquire(sparse.Root, cached, self.store.artifactStore(), declaration.artifact, .none, sparse.loadRoot);
@@ -213,7 +213,7 @@ pub const Entry = struct {
             reader.* = .{ .root = root.generation, .prefix = path, .store = self.store.artifactStore(), .context = context, .cache = cached, .scratch = self.budget.allocator(), .max_block_bytes = 8 * 1024 * 1024 };
             self.reader = reader;
             const entry = try a.create(Manager.SparseIndex);
-            entry.* = .{ .apply_mutex = mutex, .config = .{ .name = name, .kind = .sparse_vector, .config_json = root.config_json }, .field_name = try a.dupe(u8, root.binding.column_bindings[0]), .external = true, .chunk_name = null, .embedding_name = null, .rebuild_root_path = path, .index = try local.sparse_sparse.SparseIndex.open(self.budget.allocator(), path, .{ .lsm_storage = reader.storage(), .lsm_options = .{ .backend = .{ .read_only = true, .create_if_missing = false } } }) };
+            entry.* = .{ .apply_mutex = mutex, .config = .{ .name = name, .kind = .sparse_vector, .config_json = root.config_json }, .field_name = try a.dupe(u8, root.binding.column_bindings[0]), .external = true, .chunk_name = try @import("lake_enrichment_units.zig").chunkName(a, name, root.config_json), .embedding_name = null, .supports_unit_grouping = true, .rebuild_root_path = path, .index = try local.sparse_sparse.SparseIndex.open(self.budget.allocator(), path, .{ .lsm_storage = reader.storage(), .lsm_options = .{ .backend = .{ .read_only = true, .create_if_missing = false } } }) };
             self.sparse_entry = entry;
         }
     }

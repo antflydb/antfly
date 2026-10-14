@@ -43,20 +43,6 @@ const addFilteredTestRunArtifact = antfly_tests_build.addFilteredTestRunArtifact
 const addRuntimeTestFilters = antfly_tests_build.addRuntimeTestFilters;
 const dependOnAll = antfly_tests_build.dependOnAll;
 
-fn defaultInferenceOnnxRoot(b: *std.Build, target: std.Build.ResolvedTarget) []const u8 {
-    const platform_str = switch (target.result.os.tag) {
-        .macos => "darwin",
-        .linux => "linux",
-        else => "unknown",
-    };
-    const arch_str = switch (target.result.cpu.arch) {
-        .aarch64 => "arm64",
-        .x86_64 => "amd64",
-        else => "unknown",
-    };
-    return b.fmt("pkg/inference/onnxruntime/{s}-{s}", .{ platform_str, arch_str });
-}
-
 fn addLocalHttpxModule(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
@@ -84,7 +70,6 @@ pub const Shared = struct {
     sanitize_thread: bool,
     runtime_artifact_role: ?RuntimeArtifactRole,
     antfly_bin_name: []const u8,
-    inference_enable_onnx: bool,
     inference_enable_metal: bool,
     inference_enable_cuda: bool,
     antfly_version: []const u8,
@@ -183,13 +168,6 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     if (!link_libc and lmdb_backend == .c) {
         @panic("-Dlink-libc=false requires -Dlmdb_backend=zig");
     }
-    const inference_onnx_option = b.option(bool, "onnx", "Enable ONNX Runtime support for embedded inference");
-    const inference_enable_onnx = if (link_libc)
-        inference_onnx_option orelse false
-    else
-        false;
-    const inference_onnx_root_opt = b.option([]const u8, "onnx-root", "Path to ONNX Runtime root for embedded inference");
-    const inference_onnx_root = inference_onnx_root_opt orelse defaultInferenceOnnxRoot(b, target);
     const inference_enable_metal = if (link_libc)
         b.option(bool, "metal", "Enable Apple Metal kernels for embedded inference") orelse (target.result.os.tag == .macos)
     else
@@ -336,8 +314,11 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     // transitive tests require different owner roots. Select the SQL and
     // row-policy contract namespaces at compile time, while allowing explicit
     // caller filters.
-    const sql_tests = b.addTest(.{ .root_module = sql_test_mod, .filters = selectTestFilters(b, &.{ "sql.", "system_catalog.policies" }) });
-    const run_sql_tests = b.addRunArtifact(sql_tests);
+    const sql_tests = b.addTest(.{ .root_module = sql_test_mod, .filters = selectTestFilters(b, &.{ "sql.", "common.sql_array_layout", "system_catalog.policies" }) });
+    // Use the same exact-filter runner as extracted SQL owners. Besides
+    // consistent failure/leak attribution, this keeps compile-only anonymous
+    // reachability anchors out of runtime selection.
+    const run_sql_tests = addFilteredTestRunArtifact(b, sql_tests);
     // The native SQL contract corpus is larger than the parser-only owner but
     // remains below the full database compilation and integration test roots.
     sql_tests.step.max_rss = 3072 * 1024 * 1024;
@@ -346,10 +327,31 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     // is independent of the executor's per-statement memory admission tests.
     run_sql_tests.step.max_rss = 384 * 1024 * 1024;
     b.step("sql-test", "Run SQL compilation, catalog binding, and native execution contract tests").dependOn(&run_sql_tests.step);
+    const relation_name_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/system_catalog/relation_names.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    const run_relation_name_tests = b.addRunArtifact(relation_name_tests);
+    relation_name_tests.root_module.addImport("antfly_platform", platform_mod);
+    b.step("system-catalog-relation-test", "Test namespace ownership and atomic catalog publication plans")
+        .dependOn(&run_relation_name_tests.step);
+    run_sql_tests.step.dependOn(&run_relation_name_tests.step);
+    const relation_reconciliation_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/system_catalog/relation_reconciliation.zig"),
+        .target = target,
+        .optimize = optimize,
+    }), .filters = selectTestFilters(b, &.{"relation_reconciliation.test."}) });
+    relation_reconciliation_tests.root_module.addImport("antfly_platform", platform_mod);
+    const run_relation_reconciliation_tests = b.addRunArtifact(relation_reconciliation_tests);
+    b.step("system-catalog-reconciliation-test", "Test resumable, fenced relation ownership reconciliation")
+        .dependOn(&run_relation_reconciliation_tests.step);
+    run_sql_tests.step.dependOn(&run_relation_reconciliation_tests.step);
     const pgwire_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/pgwire_test_root.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = strip,
         .link_libc = link_libc,
     });
     @import("../embedded/source_owner.zig").attach(pgwire_test_mod);
@@ -363,7 +365,10 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .filters = buildArguments(b) orelse &.{"pgwire"},
     });
     const run_pgwire_tests = b.addRunArtifact(pgwire_tests);
-    pgwire_tests.step.max_rss = 1024 * 1024 * 1024;
+    // Honor stripped CI builds: cold framing/array compiles fit the original
+    // 1 GiB reservation. Debugger builds exceeded it, so reserve their larger
+    // working set separately. The 64 MiB runtime bound is unchanged.
+    pgwire_tests.step.max_rss = (if (strip) @as(usize, 1) else 2) * 1024 * 1024 * 1024;
     run_pgwire_tests.step.max_rss = 64 * 1024 * 1024;
     b.step("pgwire-test", "Run PostgreSQL wire framing, session, and lifecycle tests").dependOn(&run_pgwire_tests.step);
     const openapi_root_check = addOpenApiRootCheckStep(b);
@@ -573,6 +578,8 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     });
     regex_mod.addImport("antfly_fst", fst_mod);
     regex_mod.addImport("antfly_platform", platform_mod);
+    const sql_regex_mod = @import("../../lib/sql_regex/build.zig").createModule(b, target, optimize, b.path("lib/sql_regex"));
+    regex_mod.addImport("antfly_capture_regex", sql_regex_mod.import_table.get("antfly_capture_regex").?);
     const jsonschema_mod = b.createModule(.{
         .root_source_file = b.path("lib/jsonschema/src/mod.zig"),
         .target = target,
@@ -596,12 +603,12 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     });
     a2a_mod.addImport("antfly-json", json_mod);
     const matcher_mod = b.addModule("antfly_matcher", .{
-        .root_source_file = b.path("lib/matcher/src/mod.zig"),
+        .root_source_file = b.path("pkg/antfly-embedded/matcher/src/mod.zig"),
         .target = target,
         .optimize = optimize,
     });
     const resolver_mod = b.addModule("antfly_resolver", .{
-        .root_source_file = b.path("lib/resolver/src/mod.zig"),
+        .root_source_file = b.path("pkg/antfly-embedded/resolver/src/mod.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -724,8 +731,6 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
             .shared_lib_root = "",
         },
         .backend = .{
-            .enable_onnx = inference_enable_onnx,
-            .onnx_root = inference_onnx_root,
             .enable_metal = inference_enable_metal,
             .enable_cuda = inference_enable_cuda,
             .cuda_artifacts = inference_cuda_artifacts,
@@ -1109,6 +1114,27 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     inference_host_mod.addImport("antfly_inference_worker_rpc", inference_worker_rpc_mod);
     inference_host_mod.addImport("antfly_inference_worker_wire", inference_worker_wire_mod);
     inference_host_mod.addImport("antfly_inference_provider_failure", inference_provider_failure_mod);
+    const shared_inference_core = b.option(bool, "shared-inference-core", "Reuse one Apache inference engine for the server and embedded library") orelse false;
+    const measured_darwin_memory = b.option(bool, "measured-darwin-compile-memory", "Use native SDK 26.4 stripped Metal/BLAS ReleaseFast compiler admission claims") orelse false;
+    const baseline_cpu = std.Target.Cpu.baseline(target.result.cpu.arch, target.result.os);
+    const darwin_release_memory = measured_darwin_memory and optimize == .fast and strip and !sanitize_thread and
+        std.mem.eql(u8, @import("builtin").zig_version_string, "0.17.0") and
+        b.graph.host.result.os.tag == .macos and b.graph.host.result.cpu.arch == .aarch64 and
+        target.result.os.tag == .macos and target.result.cpu.arch == .aarch64 and
+        target.result.cpu.model == baseline_cpu.model and target.result.cpu.features.eql(baseline_cpu.features) and
+        inference_enable_metal and inference_enable_system_blas and
+        !inference_enable_cuda and !inference_enable_pjrt and
+        @import("antfly_platform").macosSdkMatchesVersion(b, target, "26.4");
+    const engine_options = b.addOptions();
+    engine_options.addOption(bool, "shared_inference_core", shared_inference_core);
+    const inference_engine_mod = b.createModule(.{ .root_source_file = b.path("pkg/inference/src/host/engine.zig"), .target = target, .optimize = optimize });
+    inference_engine_mod.addOptions("engine_options", engine_options);
+    inference_engine_mod.addImport("engine_errors", b.createModule(.{ .root_source_file = b.path("pkg/inference/src/host/engine_errors.zig"), .target = target, .optimize = optimize }));
+    inference_engine_mod.addImport("antfly_runtime_abi", runtime_abi_mod);
+    inference_engine_mod.addImport("inference_server", inference_server_mod);
+    inference_engine_mod.addImport("httpx", httpx_mod);
+    inference_engine_mod.addImport("antfly_inference_host", inference_host_mod);
+    inference_engine_mod.addImport("antfly_inference_engine", inference_engine_mod);
     const inference_openai_tests = b.addTest(.{ .root_module = inference_openai_mod });
     b.step("antfly-embedded-inference-openai-test", "Run embedded inference OpenAI provider tests")
         .dependOn(&b.addRunArtifact(inference_openai_tests).step);
@@ -1156,6 +1182,10 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .inference_runtime_paths = inference_runtime_paths_mod,
         .inference_query_embedding_cache = inference_query_embedding_cache_mod,
         .inference_host = inference_host_mod,
+        .inference_engine = inference_engine_mod,
+        .shared_inference_core = shared_inference_core,
+        .darwin_release_memory = darwin_release_memory,
+        .sanitize_thread = sanitize_thread,
         .build_info = build_info,
 
         .build_options = build_options,
@@ -1216,6 +1246,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .casbin = casbin_mod,
         .fst = fst_mod,
         .regex = regex_mod,
+        .sql_regex = sql_regex_mod,
         .json = json_mod,
         .jsonschema = jsonschema_mod,
         .mcp = mcp_mod,
@@ -1242,6 +1273,8 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .platform_target = target,
         .filesystem_capacity_source_file = b.path("lib/platform/src/filesystem_capacity.c"),
     };
+    inference_engine_mod.addImport("engine_memory", antfly_imports.storage_boundary.memory);
+    runtime_abi_mod.addImport("antfly_test_error_logs", antfly_imports.storage_boundary.test_error_logs);
     // SQL shape fixtures reach native schema and storage contracts, but do not
     // need the inference/API module graph of a full storage owner.
     antfly_imports.configureRuntimeContracts(usermgr_mod);
@@ -1250,6 +1283,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     sql_test_mod.addImport("antfly_platform", platform_mod);
     sql_test_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
     sql_test_mod.addImport("antfly_regex", regex_mod);
+    sql_test_mod.addImport("antfly_sql_regex", sql_regex_mod);
     sql_test_mod.addImport("antfly_hash", hash_mod);
     sql_test_mod.addImport("bloom", bloom_mod);
     sql_test_mod.link_libc = link_libc;
@@ -1263,6 +1297,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     refinement_bench_mod.addImport("antfly_platform", platform_mod);
     refinement_bench_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
     refinement_bench_mod.addImport("antfly_regex", regex_mod);
+    refinement_bench_mod.addImport("antfly_sql_regex", sql_regex_mod);
     refinement_bench_mod.addImport("antfly_hash", hash_mod);
     refinement_bench_mod.addImport("bloom", bloom_mod);
     refinement_bench_mod.link_libc = link_libc;
@@ -1290,7 +1325,6 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .sanitize_thread = sanitize_thread,
         .runtime_artifact_role = runtime_artifact_role,
         .antfly_bin_name = antfly_bin_name,
-        .inference_enable_onnx = inference_enable_onnx,
         .inference_enable_metal = inference_enable_metal,
         .inference_enable_cuda = inference_enable_cuda,
         .build_info = build_info,

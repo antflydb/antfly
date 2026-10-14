@@ -24,8 +24,28 @@ from pathlib import Path
 
 import pytest
 
-from antfly_embedded import errors
+from antfly_embedded import _ffi, errors
+from antfly_embedded._database import Database
 from antfly_embedded._library import find_library, library_file_names
+
+
+def test_open_table_rejects_success_without_a_handle(monkeypatch: pytest.MonkeyPatch) -> None:
+    closed = []
+
+    class NullTableLibrary:
+        def antfly_db_open_table(self, handle, name, out):
+            return errors.OK
+
+        def antfly_db_close(self, handle):
+            closed.append(handle.value)
+
+    library = NullTableLibrary()
+    monkeypatch.setattr(_ffi, "get_lib", lambda: library)
+    with Database(7) as database:
+        with pytest.raises(errors.InternalError, match="antfly_db_open_table.*null handle"):
+            database.open_table("items")
+        assert database._active == 0
+    assert closed == [7]
 
 
 def test_error_code_name_and_description_are_stable() -> None:
@@ -92,3 +112,49 @@ def test_find_library_uses_lib_dir_env_var(tmp_path: Path, monkeypatch: pytest.M
     monkeypatch.delenv("ANTFLY_LIBRARY", raising=False)
     monkeypatch.setenv("ANTFLY_LIB_DIR", str(tmp_path))
     assert find_library() == lib_path
+
+
+def test_native_error_detail_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Library:
+        def antfly_last_error_code(self):
+            return errors.INVALID_ARGUMENT
+
+        def antfly_last_error_detail(self):
+            return b"MissingIndexType"
+
+    monkeypatch.setattr(_ffi, "_lib", Library())
+    with pytest.raises(errors.InvalidArgumentError, match="MissingIndexType"):
+        errors.raise_for_code(errors.INVALID_ARGUMENT)
+
+
+def test_unrelated_native_detail_is_not_attached(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Library:
+        def antfly_last_error_code(self):
+            return errors.INVALID_ARGUMENT
+
+        def antfly_last_error_detail(self):
+            return b"MissingIndexType"
+
+    monkeypatch.setattr(_ffi, "_lib", Library())
+    with pytest.raises(errors.NotFoundError) as result:
+        errors.raise_for_code(errors.NOT_FOUND)
+    assert "MissingIndexType" not in str(result.value)
+
+
+def test_models_directory_survives_options_marshalling(monkeypatch: pytest.MonkeyPatch) -> None:
+    import ctypes
+    import gc
+
+    import antfly_embedded
+
+    class Library:
+        def antfly_open_options_init(self, options):
+            return errors.OK
+
+    monkeypatch.setattr(_ffi, "get_lib", lambda: Library())
+    options, keep_alive = antfly_embedded._build_c_options(
+        antfly_embedded.OpenOptions(models_dir=Path("/tmp/model-café"))
+    )
+    gc.collect()
+    assert ctypes.string_at(options.models_dir.ptr, options.models_dir.len) == "/tmp/model-café".encode()
+    assert keep_alive is not None

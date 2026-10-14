@@ -32,15 +32,21 @@ fn newReceipt(alloc: std.mem.Allocator, target: domain.Target, table_id: u64, ve
     return .{ .database = database, .namespace = namespace, .table = table, .table_id = try std.fmt.allocPrint(alloc, "{d}", .{table_id}), .schema_version = version, .state = .pending };
 }
 
-fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, alloc: std.mem.Allocator, target: domain.Target, ddl: @import("antfly_local_sources").sql_ast.CatalogDdl) !catalog.DdlOutcome {
+const RelationAdmission = struct { table: domain.ResolvedTable, guard: domain.RelationMutationGuard };
+const SearchPath = @import("../pgwire/search_path.zig").Path;
+
+fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, allocators: catalog.DdlAllocators, target: domain.Target, ddl: @import("antfly_local_sources").sql_ast.CatalogDdl, admission: ?RelationAdmission) !catalog.DdlOutcome {
+    const alloc = allocators.result;
     if (!server.source.vtable.supports_query_definitions) return error.UnsupportedSqlExecution;
-    var arena = std.heap.ArenaAllocator.init(alloc);
+    var arena = std.heap.ArenaAllocator.init(allocators.scratch);
     defer arena.deinit();
     const a = arena.allocator();
-    const bytes = try server.source.systemCatalog(a, context, .{ .resolve_many = .{ .targets = &.{target}, .include_query_definitions = true } });
-    const snapshot = try std.json.parseFromSliceLeaky(domain.ResolvedMany, a, bytes, .{ .allocate = .alloc_always });
-    if (snapshot.tables.len != 1) return error.InvalidSqlBackendResponse;
-    const table = snapshot.tables[0] orelse return error.TableNotFound;
+    const table = if (admission) |captured| captured.table else blk: {
+        const bytes = try server.source.systemCatalog(a, context, .{ .resolve_many = .{ .targets = &.{target}, .include_query_definitions = true } });
+        const snapshot = try std.json.parseFromSliceLeaky(domain.ResolvedMany, a, bytes, .{ .allocate = .alloc_always });
+        if (snapshot.tables.len != 1) return error.InvalidSqlBackendResponse;
+        break :blk snapshot.tables[0] orelse return error.TableNotFound;
+    };
     const definition = table.query_definition orelse return error.InvalidSqlBackendResponse;
     var parsed = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(a, definition.schema_json);
     defer parsed.deinit(a);
@@ -94,8 +100,8 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
         return .{ .mutation_outcome = if (publication.state == .admission_unknown) null else .committed_pending, .receipt = receipt };
     }
     if (ddl.schema_change) |change| switch (change) {
-        .add_column => |column| if (!column.nullable or column.default_value != null)
-            return rewriteSchema(server, identity, context, alloc, target, table.name, table.table_id, native.version, updated, if (column.default_value != null) &.{column.name} else &.{}),
+        .add_column => |column| if (!column.nullable or column.default_expression != null or column.generated_expression != null)
+            return rewriteSchema(server, identity, context, alloc, target, table.name, table.table_id, native.version, updated, if (column.default_expression != null) &.{column.name} else &.{}),
         .add_unique => |constraint| if (constraint.primary)
             return rewriteSchema(server, identity, context, alloc, target, table.name, table.table_id, native.version, updated, &.{}),
         else => {},
@@ -116,13 +122,19 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
         alloc.free(value.table);
         alloc.free(value.table_id);
     };
+    // SQL index DDL has no local shard owner for an external table. Reserve
+    // its publication wakeup before consensus, then activate only after the
+    // exact mutation succeeds; the inventory sweep remains crash recovery.
+    var lake_commit = if (native.external_base_source != null) try server.prepareLakeCommit(table.name) else null;
+    defer if (lake_commit) |*prepared| prepared.deinit(server);
     // Physical identity is immutable and never reused; native schema CAS also
     // fences concurrent schema changes. Never replay an uncertain submission.
-    const version = submitSchema(server, context, alloc, table.name, table.table_id, native.version, updated, retirement, validation) catch |err| {
+    const version = submitSchema(server, context, alloc, table.name, table.table_id, native.version, updated, retirement, validation, if (admission) |captured| captured.guard else null) catch |err| {
         if (err == error.ForeignKeyReferenced) return error.SqlDependentConstraint;
         if (err == error.MetadataMutationOutcomeUnknown or err == error.OutOfMemory) return error.SqlMutationOutcomeUnknown;
         return err;
     };
+    if (lake_commit) |*prepared| server.activateLakeCommit(prepared);
     if (receipt) |*value| {
         value.schema_version = version;
         awaitActivation(server, context, alloc, table.name, value) catch {
@@ -276,8 +288,19 @@ fn requiresRetirement(alloc: std.mem.Allocator, before: []const u8, after: std.j
     return false;
 }
 
-fn submitSchema(server: *server_mod.ApiHttpServer, context: operation.RequestContext, alloc: std.mem.Allocator, physical: []const u8, table_id: u64, expected_version: u32, body: []const u8, retirement: bool, validation: bool) !u32 {
+fn submitSchema(server: *server_mod.ApiHttpServer, context: operation.RequestContext, alloc: std.mem.Allocator, physical: []const u8, table_id: u64, expected_version: u32, body: []const u8, retirement: bool, validation: bool, guard: ?domain.RelationMutationGuard) !u32 {
+    const next_version = if (validation) expected_version else std.math.add(u32, expected_version, 1) catch return error.SqlLimitExceeded;
     if (!retirement and !validation) {
+        if (guard) |owner| {
+            var private = context;
+            private.setting_admin = true;
+            const bytes = try server.source.systemCatalog(alloc, private, .{ .relation_schema_mutate = .{ .guard = owner, .schema_json = body } });
+            defer alloc.free(bytes);
+            var result = std.json.parseFromSlice(@import("../system_catalog/server_call.zig").RelationReplacementResult, alloc, bytes, .{}) catch return error.MetadataMutationOutcomeUnknown;
+            defer result.deinit();
+            if (result.value.schema_version != next_version) return error.MetadataMutationOutcomeUnknown;
+            return result.value.schema_version;
+        }
         var result = try server.source.mutateSchema(alloc, physical, .replace, body, expected_version);
         defer result.deinit(alloc);
         return result.version;
@@ -295,13 +318,223 @@ fn submitSchema(server: *server_mod.ApiHttpServer, context: operation.RequestCon
     var replacement = try @import("relational_retirement_worker.zig").beginControlled(alloc, reader, snapshot.tables, snapshot.ranges, physical, body, false, context);
     defer replacement.deinit();
     try context.ensureActive();
+    if (guard) |owner| {
+        var private = context;
+        private.setting_admin = true;
+        const bytes = try server.source.systemCatalog(alloc, private, .{ .relation_replace = .{ .guard = owner, .expected = table.*, .replacement = replacement.table } });
+        defer alloc.free(bytes);
+        var result = std.json.parseFromSlice(@import("../system_catalog/server_call.zig").RelationReplacementResult, alloc, bytes, .{}) catch return error.MetadataMutationOutcomeUnknown;
+        defer result.deinit();
+        // The retirement reservation still serves the predecessor schema.
+        // Await the target epoch, not the currently active predecessor epoch.
+        return next_version;
+    }
     try server.source.replaceTableDefinition(table.*, replacement.table);
-    return std.math.add(u32, expected_version, 1) catch unreachable;
+    return next_version;
+}
+
+fn authorizeIndexTable(identity: ?server_mod.AuthenticatedIdentity, alloc: std.mem.Allocator, target: domain.Target) !void {
+    const resource = try target.resourceNameAlloc(alloc);
+    defer alloc.free(resource);
+    if (identity) |authenticated| if (!server_mod.permissionsAllow(authenticated.permissions, .table, resource, .admin)) return error.Forbidden;
+}
+
+test "SQL catalog schema exhaustion is definite nonadmission for replacement and retirement" {
+    const Source = struct {
+        fn status(_: *anyopaque) !@import("../metadata/api.zig").MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+    var source: Source = .{};
+    const alloc = std.testing.allocator;
+    // No mutation or snapshot callbacks: overflow must be detected before
+    // preparing a reservation or calling any durable admission machinery.
+    var server = server_mod.ApiHttpServer.init(alloc, .{}, .{ .ptr = &source, .vtable = &.{ .status = Source.status } }, null, null);
+    defer server.deinit();
+    for ([_]bool{ false, true }) |retirement| {
+        try std.testing.expectError(error.SqlLimitExceeded, submitSchema(&server, .{}, alloc, "items", 17, std.math.maxInt(u32), "{}", retirement, false, null));
+    }
+}
+
+fn executeIndex(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, database: []const u8, namespace: []const u8, allocators: catalog.DdlAllocators, ddl: @import("antfly_local_sources").sql_ast.CatalogDdl, path: ?*const SearchPath) !catalog.DdlOutcome {
+    // Preserve these statement contracts until their distributed build,
+    // dependency and atomic multi-owner protocols are active. Never implement
+    // them as a blocking alias or a sequence of independently committed drops.
+    if (ddl.concurrently or ddl.cascade or ddl.index_targets.len > 1) return error.UnsupportedSqlShape;
+    if (!server.source.vtable.supports_query_definitions) return error.UnsupportedSqlExecution;
+    var arena = std.heap.ArenaAllocator.init(allocators.scratch);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const creating = ddl.action == .create;
+    if (!creating and ddl.action != .drop) return error.UnsupportedSqlShape;
+    const name = if (creating) ddl.index_table orelse return error.InvalidSqlSyntax else ddl.name;
+    var target: domain.Target = .{ .database = name.database orelse database, .namespace = name.namespace orelse namespace, .table = name.table };
+    try target.validate();
+    const use_path = name.namespace == null and name.database == null and path != null;
+    if (creating and !use_path) try authorizeIndexTable(identity, a, target);
+    // Resolve the complete bounded search path in one immutable catalog cut.
+    // Independent lookups could otherwise select a shadowed owner after churn.
+    var candidates: [SearchPath.max_namespaces * 2]domain.RelationTarget = undefined;
+    const stride: usize = if (creating) 2 else 1;
+    const namespaces: usize = if (use_path) path.?.len else 1;
+    if (namespaces > SearchPath.max_namespaces) return error.InvalidParameter;
+    for (0..namespaces) |i| {
+        const scope = if (use_path) path.?.entries[i].slice() else target.namespace;
+        candidates[i * stride] = .{ .database = target.database, .namespace = scope, .name = name.table };
+        if (creating) candidates[i * stride + 1] = .{ .database = target.database, .namespace = scope, .name = ddl.name.table };
+    }
+    if (namespaces == 0) return if (creating) error.TableNotFound else error.SqlIndexNotFound;
+    const lookup: domain.ResolveMany = .{ .relations = candidates[0 .. namespaces * stride], .include_query_definitions = true };
+    const bytes = try server.source.systemCatalog(a, context, .{ .resolve_many = lookup });
+    const resolved = try std.json.parseFromSliceLeaky(domain.ResolvedMany, a, bytes, .{ .allocate = .alloc_always });
+    try resolved.validateRelations(lookup);
+    var selected: usize = 0;
+    while (selected < lookup.relations.len and resolved.relations[selected] == null) : (selected += stride) {}
+    const owner = if (selected < lookup.relations.len) resolved.relations[selected].? else {
+        if (!creating and ddl.conditional) return .{};
+        return if (creating) error.TableNotFound else error.SqlIndexNotFound;
+    };
+    const owner_target = lookup.relations[selected];
+    target.namespace = owner_target.namespace;
+    const table_target: domain.Target = .{ .database = target.database, .namespace = target.namespace, .table = owner.logical_table };
+    // Object-kind diagnostics must not expose another table's index or
+    // constraint ownership before authorizing its logical table.
+    try authorizeIndexTable(identity, a, table_target);
+    if (creating) {
+        if (owner.owner.kind != .table) return error.SqlWrongObjectType;
+        if (resolved.relations[selected + 1] != null) {
+            if (ddl.conditional) return .{};
+            return error.SqlIndexAlreadyExists;
+        }
+    } else switch (owner.owner.kind) {
+        .index => {},
+        .constraint_index => return error.SqlConstraintOwnedIndex,
+        else => return error.SqlWrongObjectType,
+    }
+    var transition = ddl;
+    transition.kind = .table;
+    transition.action = .alter_schema;
+    transition.name = .{ .database = table_target.database, .namespace = table_target.namespace, .table = table_target.table };
+    return alterSchema(server, identity, context, allocators, table_target, transition, .{
+        .table = owner.table,
+        .guard = .{ .target = owner_target, .logical_table = owner.logical_table, .owner = owner.owner, .incarnation = resolved.relation_epoch.?.incarnation },
+    });
 }
 
 pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, database: []const u8, namespace: []const u8, alloc: std.mem.Allocator, input: catalog.Ddl) !catalog.DdlOutcome {
+    return executeWithPath(server, identity, context, database, namespace, alloc, input, null);
+}
+
+pub fn executeWithPath(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, database: []const u8, namespace: []const u8, alloc: std.mem.Allocator, input: catalog.Ddl, path: ?*const SearchPath) !catalog.DdlOutcome {
+    return executeWithAllocators(server, identity, context, database, namespace, .{ .result = alloc, .scratch = alloc }, input, path);
+}
+
+const GeneratedNames = struct { schema_json: []const u8, names: []const []const u8 };
+
+/// Bind automatic backing-index names using attested relation absence. Every
+/// lookup must observe the same source epoch; admission still checks collisions
+/// atomically, so a concurrent claimant is a definite retryable rejection.
+fn chooseGeneratedNames(server: *server_mod.ApiHttpServer, context: operation.RequestContext, alloc: std.mem.Allocator, scratch: std.mem.Allocator, target: domain.Target, schema_json: []const u8, generated: []const []const u8) !GeneratedNames {
+    if (generated.len == 0) return .{ .schema_json = schema_json, .names = &.{} };
+    var working = std.heap.ArenaAllocator.init(scratch);
+    defer working.deinit();
+    const temporary_schema = working.allocator();
+    var schema = try std.json.parseFromSliceLeaky(std.json.Value, temporary_schema, schema_json, .{ .allocate = .alloc_always, .parse_numbers = false });
+    var used: std.StringHashMapUnmanaged(void) = .empty;
+    try used.put(temporary_schema, target.table, {});
+    for ([_][]const u8{ "unique_constraints", "foreign_keys", "checks", "relational_indexes" }) |key| {
+        if (schema.object.get(key)) |entries| for (entries.array.items) |entry| {
+            try used.put(temporary_schema, entry.object.get("name").?.string, {});
+        };
+    }
+    var changed = false;
+    const chosen = try alloc.alloc([]const u8, generated.len);
+    var epoch: ?@import("antfly_local_sources").system_catalog_relation_reconciliation.Epoch = null;
+    for (generated, chosen) |base, *out| {
+        var ordinal: u64 = 0;
+        while (true) : (ordinal += 1) {
+            try context.ensureActive();
+            var attempt = std.heap.ArenaAllocator.init(scratch);
+            defer attempt.deinit();
+            const temporary = attempt.allocator();
+            const candidate = if (ordinal == 0) base else try suffixedConstraintName(temporary, base, ordinal);
+            if (ordinal != 0 and used.contains(candidate)) continue;
+            if (std.mem.eql(u8, candidate, target.table)) continue;
+            const relations = [_]domain.RelationTarget{.{ .database = target.database, .namespace = target.namespace, .name = candidate }};
+            const lookup: domain.ResolveMany = .{ .relations = &relations, .name_allocation = true, .expected_relation_epoch = epoch };
+            const bytes = try server.source.systemCatalog(temporary, context, .{ .resolve_many = lookup });
+            const resolved = try std.json.parseFromSliceLeaky(domain.ResolvedMany, temporary, bytes, .{ .allocate = .alloc_always });
+            try resolved.validateRelations(lookup);
+            epoch = resolved.relation_epoch;
+            if (resolved.relations[0] != null) continue;
+            changed = changed or !std.mem.eql(u8, candidate, base);
+            out.* = try alloc.dupe(u8, candidate);
+            try used.put(temporary_schema, out.*, {});
+            break;
+        }
+        for (schema.object.getPtr("unique_constraints").?.array.items) |*entry| {
+            if (std.mem.eql(u8, entry.object.get("name").?.string, base)) {
+                try entry.object.put(temporary_schema, "name", .{ .string = out.* });
+                break;
+            }
+        }
+    }
+    return .{ .schema_json = if (changed) try std.json.Stringify.valueAlloc(alloc, schema, .{}) else schema_json, .names = chosen };
+}
+
+fn suffixedConstraintName(alloc: std.mem.Allocator, base: []const u8, ordinal: u64) ![]const u8 {
+    const separator = std.mem.lastIndexOfScalar(u8, base, '_') orelse return error.InvalidCatalogRecord;
+    const suffix = try std.fmt.allocPrint(alloc, "{s}{d}", .{ base[separator..], ordinal });
+    defer alloc.free(suffix);
+    var length = @min(separator, 63 - suffix.len);
+    while (length != 0 and length < base.len and base[length] & 0xc0 == 0x80) length -= 1;
+    return std.fmt.allocPrint(alloc, "{s}{s}", .{ base[0..length], suffix });
+}
+
+/// IF NOT EXISTS applies to the requested table, never to an index-name
+/// conflict. A taken automatically selected name can be retried safely only
+/// after the authority has rejected the create before durable admission.
+fn createConflict(server: *server_mod.ApiHttpServer, context: operation.RequestContext, alloc: std.mem.Allocator, target: domain.Target, names: []const []const u8, conditional: bool, err: anyerror, scratch: std.mem.Allocator) !catalog.DdlOutcome {
+    if (err != error.CatalogAlreadyExists and err != error.TableAlreadyExists) return err;
+    const lookup: domain.ResolveMany = .{ .targets = &.{target} };
+    const bytes = try server.source.systemCatalog(alloc, context, .{ .resolve_many = lookup });
+    const resolved = try std.json.parseFromSliceLeaky(domain.ResolvedMany, alloc, bytes, .{ .allocate = .alloc_always });
+    try resolved.validateRelations(lookup);
+    if (resolved.tables.len != 1) return error.InvalidCatalogRecord;
+    if (resolved.tables[0] != null) return if (conditional) .{} else err;
+    // The authority's table-exists result needs no relation publication or
+    // name batch. Only a rejected create of an absent table needs that read.
+    var epoch: ?@import("antfly_local_sources").system_catalog_relation_reconciliation.Epoch = null;
+    var occupied = false;
+    var offset: usize = 0;
+    while (offset < names.len) {
+        try context.ensureActive();
+        var batch_arena = std.heap.ArenaAllocator.init(scratch);
+        defer batch_arena.deinit();
+        const a = batch_arena.allocator();
+        const count = @min(@as(usize, 256), names.len - offset);
+        const relations = try a.alloc(domain.RelationTarget, count);
+        for (relations, names[offset..][0..count]) |*relation, name| relation.* = .{ .database = target.database, .namespace = target.namespace, .name = name };
+        const batch: domain.ResolveMany = .{ .relations = relations, .name_allocation = true, .expected_relation_epoch = epoch };
+        const reply = try server.source.systemCatalog(a, context, .{ .resolve_many = batch });
+        const cut = try std.json.parseFromSliceLeaky(domain.ResolvedMany, a, reply, .{ .allocate = .alloc_always });
+        try cut.validateRelations(batch);
+        epoch = cut.relation_epoch;
+        for (cut.relations) |relation| if (relation != null) {
+            occupied = true;
+        };
+        offset += count;
+    }
+    if (occupied) return error.CatalogGenerationChanged;
+    return err;
+}
+
+pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, database: []const u8, namespace: []const u8, allocators: catalog.DdlAllocators, input: catalog.Ddl, path: ?*const SearchPath) !catalog.DdlOutcome {
+    const alloc = allocators.result;
     try context.ensureActive();
     if (input == .policy_ddl) return @import("sql_policy_ddl.zig").execute(server, identity, context, database, namespace, alloc, input.policy_ddl);
+    if (input == .catalog_ddl and input.catalog_ddl.kind == .index)
+        return executeIndex(server, identity, context, database, namespace, allocators, input.catalog_ddl, path);
     const name = switch (input) {
         .create_table => |v| v.name,
         .drop_table => |v| v.table,
@@ -312,6 +545,7 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     try target.validate();
     const kind: domain.Kind = switch (input) {
         .catalog_ddl => |ddl| switch (ddl.kind) {
+            .index => unreachable,
             inline else => |tag| @field(domain.Kind, @tagName(tag)),
         },
         .policy_ddl => unreachable,
@@ -322,11 +556,12 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     defer alloc.free(resource);
     // Check logical scope before any catalog lookup, including IF EXISTS.
     const permission_kind: @import("../usermgr/mod.zig").ResourceType = switch (kind) {
+        .query_source => .table,
         inline else => |tag| @field(@import("../usermgr/mod.zig").ResourceType, @tagName(tag)),
     };
     if (identity) |authenticated| if (!server_mod.permissionsAllow(authenticated.permissions, permission_kind, resource, .admin)) return error.Forbidden;
     if (input == .catalog_ddl and input.catalog_ddl.action == .alter_schema)
-        return alterSchema(server, identity, context, alloc, target, input.catalog_ddl);
+        return alterSchema(server, identity, context, allocators, target, input.catalog_ddl, null);
     if (input == .catalog_ddl and input.catalog_ddl.action == .truncate)
         return @import("sql_truncate.zig").execute(server, identity, context, database, namespace, alloc, input.catalog_ddl);
     var request: domain.Request = .{ .mutation = .{ .action = switch (input) {
@@ -338,10 +573,11 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
         },
         .policy_ddl => unreachable,
     }, .kind = kind, .database = target.database, .namespace = target.namespace, .name = target.table } };
-    var arena = std.heap.ArenaAllocator.init(alloc);
+    var arena = std.heap.ArenaAllocator.init(allocators.scratch);
     defer arena.deinit();
     const a = arena.allocator();
     var creation_receipt: ?catalog.DdlReceipt = null;
+    var generated_names: []const []const u8 = &.{};
     var receipt_transferred = false;
     defer if (!receipt_transferred) if (creation_receipt) |receipt| {
         alloc.free(receipt.database);
@@ -355,19 +591,21 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
             request.physical_name = try server.catalogStorageNameAlloc(a);
             // Explicit empty search indexes avoids building a full-text index
             // on every SQL table. SQL indexes are added through native DDL.
-            const bound_schema = try server.bindForeignKeySchema(a, target, request.physical_name.?, create.schema_json, "", identity, context);
+            const selected = try chooseGeneratedNames(server, context, a, allocators.scratch, target, create.schema_json, create.generated_constraint_names);
+            generated_names = selected.names;
+            const bound_schema = try server.bindForeignKeySchema(a, target, request.physical_name.?, selected.schema_json, "", identity, context);
             if (try @import("../metadata/fk_generation_publication.zig").schemaHasForeignKeys(a, bound_schema) and
                 try @import("relational_witness_ddl.zig").needed(a, bound_schema, ""))
                 return error.ForeignKeyPartialSupportIndexRequired;
             const schema_value = try std.json.parseFromSliceLeaky(std.json.Value, a, bound_schema, .{ .parse_numbers = false });
             const body = try std.json.Stringify.valueAlloc(a, .{ .schema = schema_value, .indexes = std.json.Value{ .object = .empty } }, .{});
-            var parsed = try tables.parseStoredCreateTableRequest(alloc, body);
+            var parsed = try tables.parseStoredCreateTableRequest(allocators.scratch, body);
             parsed.storage = .{};
-            defer parsed.deinit(alloc);
-            if (create.tablespace) |tablespace| parsed.tablespace_name = try alloc.dupe(u8, tablespace);
+            defer parsed.deinit(allocators.scratch);
+            if (create.tablespace) |tablespace| parsed.tablespace_name = try allocators.scratch.dupe(u8, tablespace);
             if (try @import("../metadata/fk_generation_publication.zig").schemaHasForeignKeys(a, bound_schema)) {
-                const plan = @import("fk_initial_create_plan_builder.zig").build(server, a, context, identity, target, parsed) catch |err| switch (err) {
-                    error.CatalogAlreadyExists, error.TableAlreadyExists => if (create.if_not_exists) return .{} else return err,
+                const plan = @import("fk_initial_create_plan_builder.zig").buildWithScratch(server, a, allocators.scratch, context, identity, target, parsed) catch |err| switch (err) {
+                    error.CatalogAlreadyExists, error.TableAlreadyExists => return createConflict(server, context, a, target, generated_names, create.if_not_exists, err, allocators.scratch),
                     else => return err,
                 };
                 var receipt = try newReceipt(alloc, target, plan.child.table_id, 0);
@@ -380,7 +618,7 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
                 }
                 const hex = std.fmt.bytesToHex(plan.id, .lower);
                 receipt.fk_generation_publication_id = try alloc.dupe(u8, &hex);
-                const accepted = try server.submitFkInitialCreatePlan(a, context, plan);
+                const accepted = server.submitFkInitialCreatePlan(allocators.scratch, context, plan) catch |err| return createConflict(server, context, a, target, generated_names, create.if_not_exists, err, allocators.scratch);
                 receipt.state = if (accepted.state == .admission_unknown) .admission_unknown else .pending;
                 receipt.diagnostic = if (accepted.state == .admission_unknown)
                     "Initial FK table admission is unresolved. Retain the publication ID, refresh table status, and do not replay CREATE."
@@ -417,12 +655,27 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
         // Conditional DDL observes the authority's atomic outcome; there is no
         // existence preflight and no retry of an ambiguous durable submission.
         switch (input) {
-            .create_table => |create| if (create.if_not_exists and (err == error.CatalogAlreadyExists or err == error.TableAlreadyExists)) return .{},
+            .create_table => |create| if (err == error.CatalogAlreadyExists or err == error.TableAlreadyExists) return createConflict(server, context, a, target, generated_names, create.if_not_exists, err, allocators.scratch),
             .drop_table => |drop| if (drop.if_exists and (err == error.CatalogNotFound or err == error.TableNotFound)) return .{},
             .catalog_ddl => |ddl| if (ddl.conditional and ((ddl.action == .create and err == error.CatalogAlreadyExists) or (ddl.action == .drop and err == error.CatalogNotFound))) return .{},
             .policy_ddl => unreachable,
         }
         if (err == error.MetadataMutationOutcomeUnknown) return error.SqlMutationOutcomeUnknown;
+        // Native catalog errors are intentionally resource-neutral. SQL's
+        // diagnostic identity depends on the admitted target kind; translate
+        // only after atomic conditional outcomes and uncertain commits.
+        if (err == error.CatalogAlreadyExists) return switch (kind) {
+            .database => error.SqlDuplicateDatabase,
+            .namespace => error.SqlDuplicateNamespace,
+            .tablespace => error.SqlDuplicateTablespace,
+            .table, .query_source => err,
+        };
+        if (err == error.CatalogNotFound) return switch (kind) {
+            .database => error.DatabaseNotFound,
+            .namespace => error.NamespaceNotFound,
+            .tablespace => error.TablespaceNotFound,
+            .table, .query_source => err,
+        };
         return err;
     };
     defer alloc.free(response);
@@ -500,7 +753,7 @@ fn activationPause(server: *server_mod.ApiHttpServer, context: operation.Request
 
 test "SQL catalog DDL schema validates through native public admission" {
     const alloc = std.testing.allocator;
-    var compiled = try @import("antfly_local_sources").sql_compiler.compile(alloc, "CREATE TABLE items (id BIGINT NOT NULL DEFAULT 9007199254740993, label TEXT DEFAULT NULL, payload JSON DEFAULT NULL, created TIMESTAMPTZ DEFAULT '2026-09-21T00:00:00Z', enabled BOOLEAN DEFAULT TRUE, amount DOUBLE PRECISION DEFAULT 1.5)", .{});
+    var compiled = try @import("antfly_local_sources").sql_compiler.compile(alloc, "CREATE TABLE items (id BIGINT NOT NULL DEFAULT 9007199254740993, label TEXT DEFAULT NULL, payload JSON DEFAULT NULL, created TIMESTAMPTZ DEFAULT '2026-09-21T00:00:00Z', enabled BOOLEAN DEFAULT TRUE, amount DOUBLE PRECISION DEFAULT 1.5, exact_amount NUMERIC DEFAULT 9007199254740993.2500 CHECK (exact_amount>=9007199254740993.25))", .{});
     defer compiled.deinit();
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -515,23 +768,197 @@ test "SQL catalog DDL schema validates through native public admission" {
     defer parsed.deinit(alloc);
     const native = try @import("antfly_local_sources").schema_mod.deriveRuntimeTableSchema(alloc, parsed);
     defer @import("antfly_local_sources").storage_schema.freeSchema(alloc, native);
-    try std.testing.expectEqual(@as(usize, 6), native.relational_columns.len);
+    try std.testing.expectEqual(@as(usize, 7), native.relational_columns.len);
     try std.testing.expectEqual(@import("antfly_local_sources").storage_schema.StorageMode.relational, native.storage_mode);
     try std.testing.expect(parsed.column_defaults != null);
+    try std.testing.expect(native.requires_exact_numeric_expressions);
+    try std.testing.expect(native.requires_exact_numeric_validation);
+    var validator = try @import("antfly_local_sources").schema_mod.CompiledTableValidator.init(alloc, request.schema_json.?);
+    defer validator.deinit(alloc);
+    var row: std.json.Value = .{ .object = .empty };
+    try validator.prepareValue(a, alloc, &row);
+    try std.testing.expectEqualStrings("9007199254740993.2500", row.object.get("exact_amount").?.number_string);
+}
+
+test "SQL index DDL drops the exact qualified owner without a catalog snapshot" {
+    const Source = struct {
+        present: bool = true,
+        attested: bool = true,
+        invalid_reply: bool = false,
+        reply_version: u32 = 8,
+        path_lookup: bool = false,
+        shadow_index: bool = false,
+        kind: @import("antfly_local_sources").system_catalog_relation_names.Kind = .index,
+        writes: usize = 0,
+        reads: usize = 0,
+        const schema =
+            \\{"version":7,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}},"relational_indexes":[{"name":"items_id","keys":[{"column":"id"}]}]}
+        ;
+        fn status(_: *anyopaque) !@import("../metadata/api.zig").MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn run(raw: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (call == .resolve_many) {
+                self.reads += 1;
+                const request = call.resolve_many;
+                try std.testing.expectEqual(@as(usize, 0), request.targets.len);
+                try std.testing.expectEqual(@as(usize, if (self.path_lookup) 2 else 1), request.relations.len);
+                try std.testing.expect(request.include_query_definitions);
+                if (self.path_lookup) try std.testing.expectEqualStrings("public", request.relations[0].namespace);
+                try std.testing.expectEqualStrings("tenant", request.relations[request.relations.len - 1].namespace);
+                try std.testing.expectEqualStrings("items_id", request.relations[0].name);
+                const table: @import("../metadata/table_manager.zig").TableRecord = .{ .table_id = 17, .name = "table:immutable-17", .schema_json = schema };
+                var resolved = domain.ResolvedTable.fromTable(table);
+                resolved.query_definition = domain.QueryDefinition.fromTable(table);
+                var relations: [2]?domain.ResolvedRelation = @splat(null);
+                relations[request.relations.len - 1] = if (self.present) .{ .table = resolved, .logical_table = "items", .owner = .{ .table_id = 17, .schema_version = 7, .schema_digest = @splat(1), .kind = self.kind } } else null;
+                if (self.path_lookup and self.shadow_index) {
+                    var shadow = resolved;
+                    shadow.table_id = 18;
+                    shadow.name = "table:immutable-18";
+                    shadow.query_definition.?.table_id = 18;
+                    relations[0] = .{ .table = shadow, .logical_table = "shadow", .owner = .{ .table_id = 18, .schema_version = 7, .schema_digest = @splat(1), .kind = .index } };
+                }
+                return std.json.Stringify.valueAlloc(alloc, domain.ResolvedMany{ .revision = 9, .tables = &.{}, .relations = relations[0..request.relations.len], .relation_epoch = if (self.attested) .{ .revision = 9, .incarnation = @splat(1) } else null }, .{});
+            }
+            try std.testing.expect(call == .relation_schema_mutate);
+            try std.testing.expect(context.setting_admin);
+            const mutation = call.relation_schema_mutate;
+            try std.testing.expectEqualStrings(if (self.shadow_index) "public" else "tenant", mutation.guard.target.namespace);
+            try std.testing.expectEqualStrings("items_id", mutation.guard.target.name);
+            try std.testing.expectEqualStrings(if (self.shadow_index) "shadow" else "items", mutation.guard.logical_table);
+            try std.testing.expectEqual(@as(u64, if (self.shadow_index) 18 else 17), mutation.guard.owner.table_id);
+            try std.testing.expectEqual(@as(u32, 7), mutation.guard.owner.schema_version);
+            var candidate = try std.json.parseFromSlice(std.json.Value, alloc, mutation.schema_json, .{});
+            defer candidate.deinit();
+            try std.testing.expectEqual(@as(usize, 0), candidate.value.object.get("relational_indexes").?.array.items.len);
+            self.writes += 1;
+            if (self.invalid_reply) return alloc.dupe(u8, "{invalid");
+            return std.json.Stringify.valueAlloc(alloc, @import("../system_catalog/server_call.zig").RelationReplacementResult{ .schema_version = self.reply_version }, .{});
+        }
+    };
+    const alloc = std.testing.allocator;
+    var source: Source = .{};
+    // No admin_snapshot or mutate_schema callback: ordinary index DDL must
+    // use the captured relation and the metadata owner's table-local prepare.
+    var server = server_mod.ApiHttpServer.init(alloc, .{}, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.run, .supports_query_definitions = true } }, null, null);
+    defer server.deinit();
+    var statement = try @import("antfly_local_sources").sql_compiler.compile(alloc, "DROP INDEX tenant.items_id", .{});
+    defer statement.deinit();
+    const input: catalog.Ddl = .{ .catalog_ddl = statement.statement.catalog_ddl };
+    _ = try execute(&server, null, .{}, "default", "public", alloc, input);
+    try std.testing.expectEqual(@as(usize, 1), source.writes);
+    const denied: server_mod.AuthenticatedIdentity = .{ .username = @constCast("reader") };
+    try std.testing.expectError(error.Forbidden, execute(&server, denied, .{}, "default", "public", alloc, input));
+    try std.testing.expectEqual(@as(usize, 1), source.writes);
+    source.kind = .table;
+    try std.testing.expectError(error.Forbidden, execute(&server, denied, .{}, "default", "public", alloc, input));
+    try std.testing.expectError(error.SqlWrongObjectType, execute(&server, null, .{}, "default", "public", alloc, input));
+    source.kind = .constraint_index;
+    try std.testing.expectError(error.Forbidden, execute(&server, denied, .{}, "default", "public", alloc, input));
+    try std.testing.expectError(error.SqlConstraintOwnedIndex, execute(&server, null, .{}, "default", "public", alloc, input));
+    try std.testing.expectEqual(@as(usize, 1), source.writes);
+    source.kind = .index;
+    source.present = false;
+    try std.testing.expectError(error.SqlIndexNotFound, execute(&server, null, .{}, "default", "public", alloc, input));
+    var conditional = try @import("antfly_local_sources").sql_compiler.compile(alloc, "DROP INDEX IF EXISTS tenant.items_id", .{});
+    defer conditional.deinit();
+    _ = try execute(&server, null, .{}, "default", "public", alloc, .{ .catalog_ddl = conditional.statement.catalog_ddl });
+    source.attested = false;
+    try std.testing.expectError(error.TableTopologyUpgradeRequired, execute(&server, null, .{}, "default", "public", alloc, .{ .catalog_ddl = conditional.statement.catalog_ddl }));
+    source.attested = true;
+    source.present = true;
+    source.invalid_reply = true;
+    try std.testing.expectError(error.SqlMutationOutcomeUnknown, execute(&server, null, .{}, "default", "public", alloc, input));
+    try std.testing.expectEqual(@as(usize, 2), source.writes);
+    source.invalid_reply = false;
+    source.reply_version = 7;
+    try std.testing.expectError(error.SqlMutationOutcomeUnknown, execute(&server, null, .{}, "default", "public", alloc, input));
+    try std.testing.expectEqual(@as(usize, 3), source.writes);
+    var path: SearchPath = .{};
+    try path.append(try @import("../pgwire/search_path.zig").Namespace.init("public"));
+    try path.append(try @import("../pgwire/search_path.zig").Namespace.init("tenant"));
+    source.reply_version = 8;
+    // Qualified names ignore the connection path entirely.
+    _ = try executeWithPath(&server, null, .{}, "default", "public", alloc, input, &path);
+    source.path_lookup = true;
+    var unqualified = try @import("antfly_local_sources").sql_compiler.compile(alloc, "DROP INDEX items_id", .{});
+    defer unqualified.deinit();
+    const path_input: catalog.Ddl = .{ .catalog_ddl = unqualified.statement.catalog_ddl };
+    const reads_before = source.reads;
+    _ = try executeWithPath(&server, null, .{}, "default", "public", alloc, path_input, &path);
+    try std.testing.expectEqual(reads_before + 1, source.reads);
+    try std.testing.expectEqual(@as(usize, 5), source.writes);
+    try std.testing.expectError(error.Forbidden, executeWithPath(&server, denied, .{}, "default", "public", alloc, path_input, &path));
+    try std.testing.expectEqual(@as(usize, 5), source.writes);
+    // DROP binds the index itself, not the namespace of a preferred table.
+    // Authorization failure on that first owner cannot fall through the path.
+    source.shadow_index = true;
+    _ = try executeWithPath(&server, null, .{}, "default", "public", alloc, path_input, &path);
+    try std.testing.expectError(error.Forbidden, executeWithPath(&server, denied, .{}, "default", "public", alloc, path_input, &path));
+    try std.testing.expectEqual(@as(usize, 6), source.writes);
 }
 
 test "SQL catalog ALTER submits native schema CAS without client generations" {
     const Source = struct {
         updates: usize = 0,
+        path_lookup: bool = false,
+        index_exists: bool = false,
+        external_lake: bool = false,
+        uncertain: bool = false,
+        scheduler_server: ?*server_mod.ApiHttpServer = null,
+        fn schema(self: *const @This()) []const u8 {
+            return if (self.external_lake)
+                "{\"version\":7,\"storage_mode\":\"relational\",\"base_source\":{\"kind\":\"external\",\"format\":\"parquet\",\"uri\":\"file:///fixture\",\"table_id\":\"items\",\"schema_fingerprint\":\"auto\"},\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}},\"additionalProperties\":false}}}}"
+            else
+                "{\"version\":7,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}},\"additionalProperties\":false}}}}";
+        }
         fn status(_: *anyopaque) !@import("../metadata/api.zig").MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{} };
         }
-        fn run(_: *anyopaque, alloc: std.mem.Allocator, _: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+        fn run(raw: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (call == .relation_schema_mutate) {
+                try std.testing.expect(context.setting_admin);
+                try std.testing.expectEqual(@as(u64, 17), call.relation_schema_mutate.guard.owner.table_id);
+                try std.testing.expectEqualStrings("items", call.relation_schema_mutate.guard.logical_table);
+                if (self.path_lookup) try std.testing.expectEqualStrings("tenant", call.relation_schema_mutate.guard.target.namespace);
+                var result = try mutate(raw, alloc, "table:immutable-17", .replace, call.relation_schema_mutate.schema_json, call.relation_schema_mutate.guard.owner.schema_version);
+                defer result.deinit(alloc);
+                return std.json.Stringify.valueAlloc(alloc, @import("../system_catalog/server_call.zig").RelationReplacementResult{ .schema_version = result.version }, .{});
+            }
             try std.testing.expect(call == .resolve_many);
-            return std.json.Stringify.valueAlloc(alloc, .{ .revision = 9, .tables = .{.{ .table_id = 17, .name = "table:immutable-17", .query_definition = .{ .schema_json = "{\"version\":7,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}},\"additionalProperties\":false}}}}", .read_schema_json = "", .indexes_json = "{}" } }} }, .{});
+            if (call.resolve_many.relations.len != 0) {
+                try std.testing.expectEqual(@as(usize, if (self.path_lookup) 4 else 2), call.resolve_many.relations.len);
+                try std.testing.expectEqualStrings("items", call.resolve_many.relations[0].name);
+                const table: @import("../metadata/table_manager.zig").TableRecord = .{ .table_id = 17, .name = "table:immutable-17", .schema_json = self.schema() };
+                var resolved = domain.ResolvedTable.fromTable(table);
+                resolved.query_definition = domain.QueryDefinition.fromTable(table);
+                var relations: [4]?domain.ResolvedRelation = @splat(null);
+                const selected: usize = if (self.path_lookup) 2 else 0;
+                const table_owner: domain.ResolvedRelation = .{ .table = resolved, .logical_table = "items", .owner = .{ .table_id = 17, .schema_version = 7, .schema_digest = @splat(1), .kind = .table } };
+                var index_owner = table_owner;
+                index_owner.owner.kind = .index;
+                relations[selected] = table_owner;
+                if (self.index_exists) relations[selected + 1] = index_owner;
+                if (self.path_lookup) {
+                    try std.testing.expectEqualStrings("public", call.resolve_many.relations[0].namespace);
+                    try std.testing.expectEqualStrings("tenant", call.resolve_many.relations[2].namespace);
+                    // An index in an earlier namespace with no matching
+                    // table must not collide with the selected table's index.
+                    relations[1] = index_owner;
+                }
+                return std.json.Stringify.valueAlloc(alloc, domain.ResolvedMany{ .revision = 9, .tables = &.{}, .relations = relations[0..call.resolve_many.relations.len], .relation_epoch = .{ .revision = 9, .incarnation = @splat(1) } }, .{});
+            }
+            return std.json.Stringify.valueAlloc(alloc, .{ .revision = 9, .tables = .{.{ .table_id = 17, .name = "table:immutable-17", .query_definition = .{ .schema_json = self.schema(), .read_schema_json = "", .indexes_json = "{}" } }} }, .{});
         }
         fn mutate(raw: *anyopaque, alloc: std.mem.Allocator, name: []const u8, mode: tables.SchemaMutationMode, body: []const u8, expected: ?u32) !tables.SchemaMutationResult {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.scheduler_server) |scheduler| {
+                try std.testing.expectEqual(@as(usize, 1), scheduler.index_installation_reserved_slots);
+                if (self.uncertain) return error.MetadataMutationOutcomeUnknown;
+            }
             self.updates += 1;
             try std.testing.expectEqualStrings("table:immutable-17", name);
             try std.testing.expectEqual(tables.SchemaMutationMode.replace, mode);
@@ -569,6 +996,52 @@ test "SQL catalog ALTER submits native schema CAS without client generations" {
     const checked = try execute(&server, null, .{}, "default", "public", result_arena.allocator(), .{ .catalog_ddl = check.statement.catalog_ddl });
     try std.testing.expectEqual(catalog.MutationOutcome.committed_pending, checked.mutation_outcome);
     try std.testing.expectEqual(@as(usize, 5), source.updates);
+    for ([_][]const u8{
+        "ALTER TABLE items ADD COLUMN n integer DEFAULT (2+3)",
+        "ALTER TABLE items ADD COLUMN g bigint GENERATED ALWAYS AS (id+1) STORED",
+    }) |sql| {
+        var compiled = try @import("antfly_local_sources").sql_compiler.compile(alloc, sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectError(error.SqlSchemaRewriteRequiresMetadataOwner, execute(&server, null, .{}, "default", "public", result_arena.allocator(), .{ .catalog_ddl = compiled.statement.catalog_ddl }));
+        try std.testing.expectEqual(@as(usize, 5), source.updates);
+    }
+    var path: SearchPath = .{};
+    try path.append(try @import("../pgwire/search_path.zig").Namespace.init("public"));
+    try path.append(try @import("../pgwire/search_path.zig").Namespace.init("tenant"));
+    source.path_lookup = true;
+    var scoped = try @import("antfly_local_sources").sql_compiler.compile(alloc, "CREATE INDEX items_id ON items (id)", .{});
+    defer scoped.deinit();
+    const scoped_input: catalog.Ddl = .{ .catalog_ddl = scoped.statement.catalog_ddl };
+    _ = try executeWithPath(&server, null, .{}, "default", "public", alloc, scoped_input, &path);
+    try std.testing.expectEqual(@as(usize, 6), source.updates);
+    source.index_exists = true;
+    try std.testing.expectError(error.SqlIndexAlreadyExists, executeWithPath(&server, null, .{}, "default", "public", alloc, scoped_input, &path));
+    var conditional_index = try @import("antfly_local_sources").sql_compiler.compile(alloc, "CREATE INDEX IF NOT EXISTS items_id ON items (id)", .{});
+    defer conditional_index.deinit();
+    _ = try executeWithPath(&server, null, .{}, "default", "public", alloc, .{ .catalog_ddl = conditional_index.statement.catalog_ddl }, &path);
+    try std.testing.expectEqual(@as(usize, 6), source.updates);
+    // Hold worker admission independently of the periodic sweep. Successful
+    // external SQL DDL must still install a keyed publication obligation.
+    var backend = try @import("antfly_local_sources").storage_background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend.deinit();
+    source.external_lake = true;
+    source.path_lookup = false;
+    source.index_exists = false;
+    var lake_server = server_mod.ApiHttpServer.init(alloc, .{ .backend_runtime = backend.ptr() }, server.source, null, null);
+    defer lake_server.deinit();
+    source.scheduler_server = &lake_server;
+    lake_server.lake_index_recovery_after_ns = std.math.maxInt(u64);
+    try backend.ptr().durable_jobs.pauseOwner(lake_server.index_installation_owner_id);
+    _ = try execute(&lake_server, null, .{}, "default", "public", alloc, scoped_input);
+    try std.testing.expectEqual(@as(usize, 0), lake_server.index_installation_reserved_slots);
+    try std.testing.expectEqual(@as(usize, 1), lake_server.index_installation_queue.items.len);
+    try std.testing.expectEqualStrings("table:immutable-17", lake_server.index_installation_queue.items[0].table_name);
+    try std.testing.expectEqualStrings("__lake_publication", lake_server.index_installation_queue.items[0].index_name);
+    const admitted_generation = lake_server.index_installation_queue.items[0].generation;
+    source.uncertain = true;
+    try std.testing.expectError(error.SqlMutationOutcomeUnknown, execute(&lake_server, null, .{}, "default", "public", alloc, scoped_input));
+    try std.testing.expectEqual(@as(usize, 0), lake_server.index_installation_reserved_slots);
+    try std.testing.expectEqual(admitted_generation, lake_server.index_installation_queue.items[0].generation);
 }
 
 test "SQL catalog DDL authorizes before lookup and handles atomic conditional outcomes" {
@@ -581,6 +1054,11 @@ test "SQL catalog DDL authorizes before lookup and handles atomic conditional ou
         fn run(raw: *anyopaque, alloc: std.mem.Allocator, _: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.calls += 1;
+            if (call == .resolve_many) {
+                try std.testing.expectEqual(@as(usize, 1), call.resolve_many.targets.len);
+                try std.testing.expectEqualStrings("events", call.resolve_many.targets[0].table);
+                return std.json.Stringify.valueAlloc(alloc, domain.ResolvedMany{ .revision = 1, .tables = &.{.{ .table_id = 17, .name = "table:events" }} }, .{});
+            }
             try std.testing.expect(call == .mutate);
             try std.testing.expectEqualStrings("analytics", call.mutate.mutation.database);
             try std.testing.expectEqualStrings("reporting", call.mutate.mutation.namespace);
@@ -602,13 +1080,13 @@ test "SQL catalog DDL authorizes before lookup and handles atomic conditional ou
     try std.testing.expectEqual(@as(usize, 0), source.calls);
     source.failure = error.CatalogAlreadyExists;
     try std.testing.expectEqual(catalog.MutationOutcome.committed, (try execute(&server, null, .{}, "default", "public", alloc, input)).mutation_outcome);
-    try std.testing.expectEqual(@as(usize, 1), source.calls);
+    try std.testing.expectEqual(@as(usize, 2), source.calls);
     source.failure = error.MetadataMutationOutcomeUnknown;
     try std.testing.expectError(error.SqlMutationOutcomeUnknown, execute(&server, null, .{}, "default", "public", alloc, input));
-    try std.testing.expectEqual(@as(usize, 2), source.calls);
+    try std.testing.expectEqual(@as(usize, 3), source.calls);
     source.failure = error.CatalogNotFound;
     try std.testing.expectEqual(catalog.MutationOutcome.committed, (try execute(&server, null, .{}, "default", "public", alloc, .{ .drop_table = .{ .table = input.create_table.name, .if_exists = true } })).mutation_outcome);
-    try std.testing.expectEqual(@as(usize, 3), source.calls);
+    try std.testing.expectEqual(@as(usize, 4), source.calls);
 }
 
 test "SQL UUID prepared CREATE TABLE commits and replays catalog topology only on execute" {
@@ -824,4 +1302,100 @@ test "SQL UUID prepared CREATE TABLE commits and replays catalog topology only o
     const remaining = try store.listRanges(alloc, 21);
     defer store.freeRanges(alloc, remaining);
     try std.testing.expectEqual(@as(usize, 0), remaining.len);
+}
+
+test "SQL catalog automatic constraint names observe namespace collisions and admission races" {
+    const Source = struct {
+        reads: usize = 0,
+        churn: bool = false,
+        unattested: bool = false,
+        target_exists: bool = false,
+        claimed: bool = false,
+        fn status(_: *anyopaque) !@import("../metadata/api.zig").MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn run(raw: *anyopaque, alloc: std.mem.Allocator, _: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(call == .resolve_many);
+            const lookup = call.resolve_many;
+            self.reads += 1;
+            const relations = try alloc.alloc(?domain.ResolvedRelation, lookup.relations.len);
+            defer alloc.free(relations);
+            @memset(relations, null);
+            const table: domain.ResolvedTable = .{ .table_id = 17, .name = "table:17" };
+            if (lookup.relations.len != 0) {
+                try std.testing.expect(lookup.relations.len <= 256);
+                try std.testing.expect(lookup.name_allocation);
+                try std.testing.expectEqualStrings("tenant", lookup.relations[0].namespace);
+                for (lookup.relations, relations) |relation, *slot| {
+                    const name = relation.name;
+                    if (self.claimed or std.mem.eql(u8, name, "foo_pkey") or std.mem.eql(u8, name, "foo_pkey1"))
+                        slot.* = .{ .table = table, .logical_table = "holder", .owner = .{ .table_id = 17, .schema_version = 1, .schema_digest = @splat(1), .kind = .index } };
+                }
+            }
+            const targets = [_]?domain.ResolvedTable{if (self.target_exists) table else null};
+            return std.json.Stringify.valueAlloc(alloc, domain.ResolvedMany{
+                .revision = 9,
+                .tables = targets[0..lookup.targets.len],
+                .relations = relations[0..lookup.relations.len],
+                .relation_epoch = if (self.unattested) null else .{ .revision = if (self.churn and ((lookup.targets.len == 0 and lookup.expected_relation_epoch != null))) 10 else 9, .incarnation = @splat(1) },
+            }, .{});
+        }
+    };
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var source: Source = .{};
+    var server = server_mod.ApiHttpServer.init(alloc, .{}, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.run, .supports_query_definitions = true } }, null, null);
+    defer server.deinit();
+    var compiled = try @import("antfly_local_sources").sql_compiler.compile(alloc, "CREATE TABLE foo(id TEXT PRIMARY KEY, n BIGINT, CONSTRAINT foo_pkey2 UNIQUE(n))", .{});
+    defer compiled.deinit();
+    const schema = try @import("antfly_local_sources").sql_ddl_runtime.createSchemaAlloc(a, compiled.statement.create_table);
+    const target: domain.Target = .{ .database = "default", .namespace = "tenant", .table = "foo" };
+    const selected = try chooseGeneratedNames(&server, .{}, a, alloc, target, schema, &.{"foo_pkey"});
+    try std.testing.expectEqualStrings("foo_pkey3", selected.names[0]);
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, selected.schema_json, .{});
+    const constraints = parsed.object.get("unique_constraints").?.array.items;
+    try std.testing.expectEqualStrings("foo_pkey3", constraints[0].object.get("name").?.string);
+    try std.testing.expectEqualStrings("foo_pkey2", constraints[1].object.get("name").?.string);
+    source.churn = true;
+    source.reads = 0;
+    try std.testing.expectError(error.CatalogGenerationChanged, chooseGeneratedNames(&server, .{}, a, alloc, target, schema, &.{"foo_pkey"}));
+    source.churn = false;
+    source.unattested = true;
+    try std.testing.expectError(error.TableTopologyUpgradeRequired, chooseGeneratedNames(&server, .{}, a, alloc, target, schema, &.{"foo_pkey"}));
+    source.unattested = false;
+    source.claimed = true;
+    try std.testing.expectError(error.CatalogGenerationChanged, createConflict(&server, .{}, a, target, selected.names, true, error.CatalogAlreadyExists, alloc));
+    source.target_exists = true;
+    _ = try createConflict(&server, .{}, a, target, selected.names, true, error.CatalogAlreadyExists, alloc);
+    try std.testing.expectError(error.CatalogAlreadyExists, createConflict(&server, .{}, a, target, selected.names, false, error.CatalogAlreadyExists, alloc));
+    source.target_exists = false;
+    source.claimed = false;
+    try std.testing.expectError(error.CatalogAlreadyExists, createConflict(&server, .{}, a, target, &.{}, true, error.CatalogAlreadyExists, alloc));
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, createConflict(&server, .{}, a, target, selected.names, true, error.MetadataMutationOutcomeUnknown, alloc));
+    // An existing table short-circuits before any relation batch, even at
+    // the largest supported schema width. An absent table uses bounded batches
+    // whose answers must all belong to the same epoch.
+    const many_names = try a.alloc([]const u8, 513);
+    @memset(many_names, "available_key");
+    source.target_exists = true;
+    source.reads = 0;
+    _ = try createConflict(&server, .{}, a, target, many_names, true, error.CatalogAlreadyExists, alloc);
+    try std.testing.expectEqual(@as(usize, 1), source.reads);
+    source.target_exists = false;
+    source.reads = 0;
+    try std.testing.expectError(error.CatalogAlreadyExists, createConflict(&server, .{}, a, target, many_names, true, error.CatalogAlreadyExists, alloc));
+    try std.testing.expectEqual(@as(usize, 4), source.reads);
+    source.claimed = true;
+    source.reads = 0;
+    try std.testing.expectError(error.CatalogGenerationChanged, createConflict(&server, .{}, a, target, many_names, true, error.CatalogAlreadyExists, alloc));
+    source.churn = true;
+    source.reads = 0;
+    try std.testing.expectError(error.CatalogGenerationChanged, createConflict(&server, .{}, a, target, many_names, true, error.CatalogAlreadyExists, alloc));
+    const long_name = try suffixedConstraintName(a, "éééééééééééééééééééééééééééé_pkey", 123);
+    try std.testing.expect(long_name.len <= 63);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(long_name));
+    try std.testing.expect(std.mem.endsWith(u8, long_name, "_pkey123"));
 }

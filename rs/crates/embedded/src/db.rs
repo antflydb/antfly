@@ -20,11 +20,13 @@ use std::path::Path;
 use antfly_embedded_sys::{self as sys, antfly_buffer, antfly_db, antfly_error_code, antfly_slice};
 
 use crate::error::{Error, Result};
-use crate::ffi::{HandleGate, borrow_slice, check, path_has_suffix, path_to_cstring, take_buffer};
+use crate::ffi::{
+    HandleGate, borrow_slice, check, path_has_suffix, path_to_bytes, path_to_cstring, take_buffer,
+};
 use crate::options::{GraphDirection, OpenOptions, WriteIntent};
 
 /// The Antfly C ABI version this binding expects.
-pub const SUPPORTED_ABI_VERSION: u32 = 2;
+pub const SUPPORTED_ABI_VERSION: u32 = 3;
 
 /// The only threading mode libantfly provides: any thread may call any
 /// method on a [`Database`] concurrently. See [`threading_mode`].
@@ -75,9 +77,10 @@ pub fn validate_abi() -> Result<()> {
 ///
 /// `Database` is safe for concurrent use from multiple threads, like
 /// `*sql.DB` in the Go binding: libantfly runs in serialized threading mode
-/// (see [`threading_mode`]) -- reads run in parallel, writes on one handle
-/// queue behind each other instead of failing with `Busy`, and schema or
-/// index changes wait for in-flight calls. [`Database::close`] (and
+/// (see [`threading_mode`]). Lite calls queue on the connection and coordinate
+/// with other connections to the same file. Streaming SQL readers keep their
+/// pinned snapshots while other connections publish changes. Schema or index
+/// changes wait for in-flight calls. [`Database::close`] (and
 /// [`Drop`]) wait for in-flight calls to finish; calls made after close
 /// return [`Error::InvalidArgument`].
 pub struct Database {
@@ -91,19 +94,45 @@ pub struct Database {
 // SAFETY: libantfly's only threading mode is "serialized" (see
 // `antfly_threading_mode`, `ANTFLY_THREADING_SERIALIZED`, and
 // zig/CAPI.md "Thread Safety"): any thread may call any exported function on
-// any handle concurrently -- reads run in parallel, writes on one handle
-// queue behind each other, and schema/admin changes wait for in-flight
-// calls. `HandleGate` above only prevents calling into a handle after
-// `antfly_db_close` has returned (a use-after-free libantfly itself cannot
-// guard against); nothing about `*mut antfly_db` here is thread-affine.
+// any handle concurrently. Lite calls queue on their connection; managed
+// owners coordinate reads, writes, and admin calls inside the engine.
+// `HandleGate` above coordinates Rust close with in-flight calls; nothing
+// about `*mut antfly_db` here is thread-affine.
 unsafe impl Send for Database {}
 unsafe impl Sync for Database {}
+
+/// A document handle borrowing a table's owning database.
+pub struct Table<'db> {
+    database: Database,
+    _owner: &'db Database,
+}
+impl std::ops::Deref for Table<'_> {
+    type Target = Database;
+    fn deref(&self) -> &Database {
+        &self.database
+    }
+}
 
 impl Database {
     fn from_handle(handle: *mut antfly_db) -> Database {
         Database {
             gate: HandleGate::new(handle),
         }
+    }
+
+    /// Opens a table-scoped document, schema, index, and enrichment handle.
+    /// Close it before dropping the table. Closing the owner invalidates it.
+    pub fn open_table(&self, name: &str) -> Result<Table<'_>> {
+        self.with_handle(|handle| {
+            let mut table = std::ptr::null_mut();
+            check(unsafe {
+                sys::antfly_db_open_table(handle, borrow_slice(name.as_bytes()), &mut table)
+            })?;
+            Ok(Table {
+                database: Self::from_handle(table),
+                _owner: self,
+            })
+        })
     }
 
     /// Runs `f` with the live handle, or returns [`Error::InvalidArgument`]
@@ -270,6 +299,10 @@ impl Database {
         c_opts.inference_scratch_budget_mb = options.scratch_budget_mb;
         c_opts.inference_process_memory_budget_mb = options.process_memory_budget_mb;
         c_opts.busy_timeout_ms = options.busy_timeout_ms();
+        let models_dir_bytes = options.models_dir.as_deref().map(path_to_bytes);
+        if let Some(bytes) = &models_dir_bytes {
+            c_opts.models_dir = borrow_slice(bytes);
+        }
 
         if let Some(ttl) = &options.ttl_cleanup {
             c_opts.flags |= sys::ANTFLY_OPEN_FLAG_TTL_CLEANUP;
@@ -338,6 +371,14 @@ impl Database {
     /// which restores or imports into either storage kind.
     pub fn backup(&self) -> Result<Vec<u8>> {
         self.read_buffer(|h, out| unsafe { sys::antfly_db_backup(h, out) })
+    }
+
+    /// Export with optional {"tables":[...]} scope; default is always included.
+    /// Full backups fail closed if any table is unavailable.
+    pub fn backup_json(&self, options: impl AsRef<[u8]>) -> Result<Vec<u8>> {
+        self.with_input_output(options.as_ref(), |h, input, out| unsafe {
+            sys::antfly_db_backup_json(h, input, out)
+        })
     }
 
     /// Imports a portable Antfly backup archive into this empty database.
@@ -480,6 +521,79 @@ impl Database {
         self.read_buffer(|h, out| unsafe { sys::antfly_db_list_indexes_json(h, out) })
     }
 
+    /// Render the durable template and follow key aliases, without writes or ANN search.
+    pub fn render_resolver_key_json(
+        &self,
+        resolver: &str,
+        mention: impl AsRef<[u8]>,
+    ) -> Result<Vec<u8>> {
+        self.with_input_output(mention.as_ref(), |h, input, out| unsafe {
+            sys::antfly_db_render_resolver_key_json(
+                h,
+                borrow_slice(resolver.as_bytes()),
+                input,
+                out,
+            )
+        })
+    }
+
+    /// Resolve text or extraction mentions, including aliases and ANN, without writes.
+    pub fn resolve_query_json(&self, resolver: &str, request: impl AsRef<[u8]>) -> Result<Vec<u8>> {
+        self.with_input_output(request.as_ref(), |h, input, out| unsafe {
+            sys::antfly_db_resolve_query_json(h, borrow_slice(resolver.as_bytes()), input, out)
+        })
+    }
+
+    /// Persist a {"key","target"} redirect. Drain to re-key existing resolution edges.
+    pub fn merge_resolver_keys_json(
+        &self,
+        resolver: &str,
+        request: impl AsRef<[u8]>,
+    ) -> Result<()> {
+        self.with_input(request.as_ref(), |h, input| unsafe {
+            sys::antfly_db_merge_resolver_keys_json(h, borrow_slice(resolver.as_bytes()), input)
+        })
+    }
+
+    /// List active and retired identities, including durable merges.
+    pub fn resolver_identities_json(&self) -> Result<Vec<u8>> {
+        self.read_buffer(|h, out| unsafe { sys::antfly_db_list_resolver_identities_json(h, out) })
+    }
+
+    /// Discard retired identity metadata; artifacts and canonical rows remain.
+    /// Delete source documents for artifact cleanup, then explicitly delete
+    /// unused canonical rows. Busy is retryable.
+    pub fn drop_resolver_identity(&self, name: &str) -> Result<bool> {
+        self.with_handle(|handle| {
+            let mut deleted = false;
+            check(unsafe {
+                sys::antfly_db_drop_resolver_identity(
+                    handle,
+                    borrow_slice(name.as_bytes()),
+                    &mut deleted,
+                )
+            })?;
+            Ok(deleted)
+        })
+    }
+
+    /// Atomically reset or migrate resolver identities; drain afterward.
+    /// Retry the identical request on Busy.
+    pub fn set_resolver_namespace_json(
+        &self,
+        resolver: &str,
+        request: impl AsRef<[u8]>,
+    ) -> Result<()> {
+        self.with_input(request.as_ref(), |h, input| unsafe {
+            sys::antfly_db_set_resolver_namespace_json(h, borrow_slice(resolver.as_bytes()), input)
+        })
+    }
+
+    /// Add or replace an index; retry the identical request on Busy.
+    /// A graph replaces command registers a resumable background shadow. The
+    /// old index serves until activation; absent old indexes behave like add.
+    /// Optional wait:{timeout_ms:N} waits for activation. A deadline Busy leaves
+    /// the accepted shadow running; pending work stats expose its progress.
     pub fn add_index_json(&self, config: impl AsRef<[u8]>) -> Result<()> {
         self.with_input(config.as_ref(), |h, input| unsafe {
             sys::antfly_db_add_index_json(h, input)
@@ -487,11 +601,27 @@ impl Database {
     }
 
     /// Deletes an index by name and reports whether it existed.
+    /// Retire an index, returning whether it existed. Busy is retryable.
     pub fn delete_index(&self, name: &str) -> Result<bool> {
         self.with_handle(|handle| {
             let mut deleted = false;
             check(unsafe {
                 sys::antfly_db_delete_index(handle, borrow_slice(name.as_bytes()), &mut deleted)
+            })?;
+            Ok(deleted)
+        })
+    }
+
+    /// Cancel a running or failed shadow by its new name; idempotent.
+    pub fn cancel_replacement(&self, name: &str) -> Result<bool> {
+        self.with_handle(|handle| {
+            let mut deleted = false;
+            check(unsafe {
+                sys::antfly_db_cancel_replacement(
+                    handle,
+                    borrow_slice(name.as_bytes()),
+                    &mut deleted,
+                )
             })?;
             Ok(deleted)
         })

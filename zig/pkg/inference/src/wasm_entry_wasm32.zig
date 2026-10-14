@@ -15,6 +15,14 @@
 
 const std = @import("std");
 const exports_profile = @import("web/exports_wasm32.zig");
+pub const panic = std.debug.FullPanic(browserPanic);
+var panic_message: [512]u8 = undefined;
+fn browserPanic(message: []const u8, _: ?usize) noreturn {
+    const len = @min(message.len, panic_message.len);
+    @memcpy(panic_message[0..len], message[0..len]);
+    @import("web/extraction_api.zig").last_error = panic_message[0..len];
+    @trap();
+}
 
 comptime {
     _ = exports_profile;

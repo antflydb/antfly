@@ -24,6 +24,13 @@ pub const OwnedExternalTableBinding = struct {
     credential_scope: ?[]u8 = null,
     snapshot_value: ?[]u8 = null,
     schema_fingerprint: []u8,
+    catalog_owned: ?std.json.Parsed(@import("lake_catalog/types.zig").Config) = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        // Allocation ownership is private; fingerprints retain the prior wire
+        // representation and include catalog configuration through binding.
+        try jw.write(.{ .binding = self.binding, .table_id = self.table_id, .source_uri = self.source_uri, .credential_ref_id = self.credential_ref_id, .credential_scope = self.credential_scope, .snapshot_value = self.snapshot_value, .schema_fingerprint = self.schema_fingerprint });
+    }
 
     pub fn deinit(self: *OwnedExternalTableBinding, alloc: Allocator) void {
         alloc.free(self.table_id);
@@ -32,6 +39,7 @@ pub const OwnedExternalTableBinding = struct {
         if (self.credential_scope) |value| alloc.free(value);
         if (self.snapshot_value) |value| alloc.free(value);
         alloc.free(self.schema_fingerprint);
+        if (self.catalog_owned) |*value| value.deinit();
         self.* = undefined;
     }
 };
@@ -127,6 +135,8 @@ pub fn externalBindingFromSchemaJsonAlloc(
         return error.InvalidExternalTableBinding;
     } else .read_only;
 
+    const catalog_owned = if (source.get("catalog")) |value| try std.json.parseFromValue(@import("lake_catalog/types.zig").Config, alloc, value, .{ .allocate = .alloc_always }) else null;
+    errdefer if (catalog_owned) |value| value.deinit();
     const binding = external_binding.Binding{
         .table_id = table_id,
         .format = format,
@@ -142,9 +152,10 @@ pub fn externalBindingFromSchemaJsonAlloc(
         },
         .schema_fingerprint = schema_fingerprint,
         .write_policy = write_policy,
+        .catalog = if (catalog_owned) |value| value.value else null,
         .object_mutability = if (source.get("object_mutability")) |_| std.meta.stringToEnum(external_binding.ObjectMutability, try requiredJsonString(source, "object_mutability")) orelse return error.InvalidExternalTableBinding else .mutable,
     };
-    try binding.validateReadOnlyMvp();
+    try binding.validateSupported();
 
     return .{
         .binding = binding,
@@ -154,6 +165,7 @@ pub fn externalBindingFromSchemaJsonAlloc(
         .credential_scope = credential_scope,
         .snapshot_value = snapshot_value,
         .schema_fingerprint = schema_fingerprint,
+        .catalog_owned = catalog_owned,
     };
 }
 
@@ -178,15 +190,22 @@ pub fn cloneAlloc(alloc: Allocator, source: OwnedExternalTableBinding) !OwnedExt
     const scope = if (b.credential_ref) |c| try alloc.dupe(u8, c.scope) else null;
     errdefer if (scope) |v| alloc.free(v);
     const snapshot = if (b.snapshot_mode.pinnedSnapshotId()) |v| try alloc.dupe(u8, v) else null;
+    errdefer if (snapshot) |v| alloc.free(v);
+    const catalog_owned = if (b.catalog) |catalog| blk: {
+        const bytes = try std.json.Stringify.valueAlloc(alloc, catalog, .{});
+        defer alloc.free(bytes);
+        break :blk try std.json.parseFromSlice(@import("lake_catalog/types.zig").Config, alloc, bytes, .{ .allocate = .alloc_always });
+    } else null;
     var binding = b;
     binding.table_id = table_id;
     binding.source_uri = uri;
     binding.schema_fingerprint = fingerprint;
+    binding.catalog = if (catalog_owned) |value| value.value else null;
     binding.credential_ref = if (ref) |v| .{ .ref_id = v, .scope = scope.? } else null;
     binding.snapshot_mode = switch (b.snapshot_mode) {
         .current => .current,
         .snapshot_id => .{ .snapshot_id = snapshot.? },
         .object_version_digest => .{ .object_version_digest = snapshot.? },
     };
-    return .{ .binding = binding, .table_id = table_id, .source_uri = uri, .schema_fingerprint = fingerprint, .credential_ref_id = ref, .credential_scope = scope, .snapshot_value = snapshot };
+    return .{ .binding = binding, .table_id = table_id, .source_uri = uri, .schema_fingerprint = fingerprint, .credential_ref_id = ref, .credential_scope = scope, .snapshot_value = snapshot, .catalog_owned = catalog_owned };
 }

@@ -416,6 +416,7 @@ const FallbackNativeBackend = struct {
     backend: ComputeBackend,
 
     pub fn deinit(self: *FallbackNativeBackend, allocator: std.mem.Allocator) void {
+        if (comptime @import("builtin").os.tag == .freestanding) unreachable;
         self.backend.deinit();
         native_mod.deinitPrefetchQueue(self.weight_store);
         self.weight_store.resident_weights.deinit(allocator);
@@ -474,7 +475,6 @@ fn graphRuntimeRequireNoHostAssistedRequested() bool {
 fn parsePartitionReportTarget(value: []const u8) ?BackendKind {
     if (std.ascii.eqlIgnoreCase(value, "native")) return .native;
     if (std.ascii.eqlIgnoreCase(value, "metal")) return .metal;
-    if (std.ascii.eqlIgnoreCase(value, "onnx")) return .onnx;
     if (std.ascii.eqlIgnoreCase(value, "pjrt")) return .pjrt;
     if (std.ascii.eqlIgnoreCase(value, "cuda")) return .cuda;
     if (std.ascii.eqlIgnoreCase(value, "wasm")) return .wasm;
@@ -735,7 +735,6 @@ fn dumpPartitionReport(
 fn backendKindForPartition(kind: BackendKind) BackendKind {
     return switch (kind) {
         .metal => .metal,
-        .onnx => .onnx,
         .pjrt => .pjrt,
         .cuda => .cuda,
         .wasm => .wasm,

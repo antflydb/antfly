@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub const callback_abi = @import("runtime_callback_abi.zig");
 pub const error_abi = @import("runtime_error_abi.zig");
 pub const http_abi = @import("runtime_http_abi.zig");
 pub const native_abi = @import("runtime_native_abi.zig");

@@ -89,7 +89,10 @@ test "resumable closure bounds discovery and emission and cleans up every alloca
             .state = null,
         });
     }
-    try std.testing.checkAllAllocationFailures(allocator, Fixture.check, .{directory});
+    // Arena growth must take the same allocation path in the baseline and
+    // failure inventory, independent of address-specific in-place remapping.
+    var no_resize = @import("../lite/test_allocator.zig").NoResizeAllocator{ .backing = allocator };
+    try std.testing.checkAllAllocationFailures(no_resize.allocator(), Fixture.check, .{directory});
     var limited = try ClosureJob.init(allocator, directory, &.{directory.at(0)}, 2, false);
     defer limited.deinit(allocator);
     while (!try limited.step(allocator, 1)) {}

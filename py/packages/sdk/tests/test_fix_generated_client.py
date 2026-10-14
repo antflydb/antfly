@@ -3,8 +3,8 @@ from pathlib import Path
 import pytest
 
 from fix_generated_client import (
-    FILES,
     EMBED_REQUEST,
+    FILES,
     NDJSON_HEADER,
     NDJSON_RESPONSE,
     RELATIONAL_QUERY,
@@ -32,11 +32,11 @@ def write_generated_files(root: Path, signature_count: int) -> None:
     path = root / EMBED_REQUEST
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        "        input_: list[str] | str\n" +
-        "        if isinstance(self.input_, list):\n" * 3 +
-        "        model_identity = self.model_identity\n" +
-        "                input_type_1 = cast(list[str], data)\n" +
-        "            return cast(\n"
+        "        input_: list[str] | str\n"
+        + "        if isinstance(self.input_, list):\n" * 3
+        + "        model_identity = self.model_identity\n"
+        + "                input_type_1 = cast(list[str], data)\n"
+        + "            return cast(\n"
     )
 
 

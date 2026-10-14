@@ -154,14 +154,23 @@ export interface WriteOptions {
 }
 
 // SQL types. Integer result values are exact decimal strings.
+export type ReadReceipt = components["schemas"]["ReadReceipt"];
+export type ReadRequirements = components["schemas"]["ReadRequirements"];
 export type SQLRequest = components["schemas"]["SQLRequest"];
 export type SQLConnectionOpenRequest = components["schemas"]["SQLConnectionOpenRequest"];
 export type SQLConnectionResponse = components["schemas"]["SQLConnectionResponse"];
 export type SQLPrepareRequest = components["schemas"]["SQLPrepareRequest"];
 export type SQLPreparedExecutionRequest = components["schemas"]["SQLPreparedExecutionRequest"];
 export type SQLPreparedResponse = components["schemas"]["SQLPreparedResponse"];
+export type SQLParameterDescriptor = components["schemas"]["SQLParameterDescriptor"];
 export type SQLResponse = components["schemas"]["SQLResponse"];
+export type SQLArrayDimension = components["schemas"]["SQLArrayDimension"];
+export type SQLArrayColumnSchema = components["schemas"]["SQLArrayColumnSchema"];
+export type SQLBuiltinType = components["schemas"]["SQLBuiltinType"];
+export type SQLArrayElementType = components["schemas"]["SQLArrayElementType"];
+export type SQLArrayValue = components["schemas"]["SQLArrayValue"];
 export type SQLColumn = components["schemas"]["SQLColumn"];
+export type SQLNumericModifier = components["schemas"]["SQLNumericModifier"];
 export type SQLColumnType = components["schemas"]["SQLColumnType"];
 export type SQLDiagnostic = components["schemas"]["SQLDiagnostic"];
 export type SQLMutationOutcome = components["schemas"]["SQLMutationOutcome"];
@@ -172,6 +181,8 @@ export type CommittedMutationOutcome = components["schemas"]["CommittedMutationO
 export type CreateTableRequest = components["schemas"]["CreateTableRequest"];
 export type TableSchema = components["schemas"]["TableSchema"];
 export type RelationalUniqueConstraint = components["schemas"]["RelationalUniqueConstraint"];
+export type RelationalUniqueConstraintOrigin =
+  components["schemas"]["RelationalUniqueConstraintOrigin"];
 export type RelationalForeignKeyConstraint =
   components["schemas"]["RelationalForeignKeyConstraint"];
 export type RelationalRow = components["schemas"]["RelationalRow"];
@@ -711,3 +722,16 @@ export type RenameCatalogResourceRequest = components["schemas"]["RenameCatalogR
 export type ChatGPTAccount = components["schemas"]["ChatGPTAccount"];
 export type ChatGPTBegin = components["schemas"]["ChatGPTBegin"];
 export type ChatGPTOutcome = components["schemas"]["ChatGPTOutcome"];
+
+/** Require a query or SQL read to include an ingestion write receipt. */
+export function readAfterWrite(receipt: ReadReceipt, waitMs = 5000): ReadRequirements {
+  return {
+    visibility: "accepted",
+    after_write: {
+      table_id: receipt.table_id,
+      object_generation: receipt.object_generation,
+      wal_lsn: receipt.wal_lsn,
+    },
+    wait_ms: waitMs,
+  };
+}

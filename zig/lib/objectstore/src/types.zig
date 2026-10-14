@@ -243,6 +243,11 @@ pub const GetResult = struct {
     response_status: ?u16 = null,
     response_etag_strong: bool = false,
     response_range: ?ContentRange = null,
+    /// The provider enforced the supplied If-Match condition on this successful
+    /// GET. Media and JSON metadata can expose different ETag representations;
+    /// callers may use this proof instead of comparing those representations.
+    /// Hosts that do not supply this proof retain response-evidence validation.
+    conditional_etag_verified: bool = false,
     body: []u8,
     metadata: ObjectMetadata,
 
@@ -254,6 +259,8 @@ pub const GetResult = struct {
 };
 
 pub const ListEntry = struct {
+    /// Provider-computed earliest deletion/replacement time, not user metadata.
+    retention_until_ms: ?u64 = null,
     key: []u8,
     etag: ?[]u8 = null,
     size: u64,

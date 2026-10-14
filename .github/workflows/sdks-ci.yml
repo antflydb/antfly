@@ -56,8 +56,11 @@ jobs:
       github.run_attempt == 1) }}
     needs: admission
     name: sdks-ci
-    runs-on: arc-antfly-standard-runtime
+    # Multi-language build caches exceed the runtime runner’s 10 GiB overlay.
+    runs-on: arc-antfly-heavy
     timeout-minutes: 60
+    env:
+      SDK_CI_WORK_DIR: /mnt/cache/antfly/sdk/${{ github.run_id }}-${{ github.run_attempt }}
     outputs:
       antfarm_e2e: ${{ steps.scopes.outputs.antfarm_e2e }}
     steps:
@@ -66,6 +69,24 @@ jobs:
           ref: ${{ inputs.head_sha || github.sha }}
           persist-credentials: false
           fetch-depth: 0
+
+      - name: Prepare SDK build caches
+        run: |
+          mkdir -p "$SDK_CI_WORK_DIR"/{tmp,cargo-phases,cargo-target,cargo-home,rustup,go-build,go-mod,gopath,uv-cache,python,pnpm-store,xdg}
+          {
+            echo "TMPDIR=$SDK_CI_WORK_DIR/tmp"
+            echo "ANTFLY_CARGO_TARGET_PARENT=$SDK_CI_WORK_DIR/cargo-phases"
+            echo "CARGO_TARGET_DIR=$SDK_CI_WORK_DIR/cargo-target"
+            echo "CARGO_HOME=$SDK_CI_WORK_DIR/cargo-home"
+            echo "RUSTUP_HOME=$SDK_CI_WORK_DIR/rustup"
+            echo "GOCACHE=$SDK_CI_WORK_DIR/go-build"
+            echo "GOMODCACHE=$SDK_CI_WORK_DIR/go-mod"
+            echo "GOPATH=$SDK_CI_WORK_DIR/gopath"
+            echo "UV_CACHE_DIR=$SDK_CI_WORK_DIR/uv-cache"
+            echo "UV_PYTHON_INSTALL_DIR=$SDK_CI_WORK_DIR/python"
+            echo "PNPM_STORE_PATH=$SDK_CI_WORK_DIR/pnpm-store"
+            echo "XDG_CACHE_HOME=$SDK_CI_WORK_DIR/xdg"
+          } >> "$GITHUB_ENV"
 
       - name: Sample ARC runner disk use
         uses: ./.github/actions/runner-disk-audit
@@ -105,7 +126,7 @@ jobs:
         uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
 
       - name: Set up Node.js
-        if: steps.scopes.outputs.sdk == 'true' || steps.scopes.outputs.typescript == 'true' || steps.scopes.outputs.format_typescript == 'true'
+        if: steps.scopes.outputs.sdk == 'true' || steps.scopes.outputs.typescript == 'true' || steps.scopes.outputs.format_typescript == 'true' || steps.scopes.outputs.release == 'true'
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version-file: ts/package.json
@@ -171,7 +192,7 @@ jobs:
       - name: Install TypeScript tooling
         if: steps.scopes.outputs.sdk == 'true' || steps.scopes.outputs.typescript == 'true' || steps.scopes.outputs.format_typescript == 'true'
         working-directory: ts
-        run: pnpm install --frozen-lockfile
+        run: pnpm install --frozen-lockfile --store-dir "$PNPM_STORE_PATH"
 
       - name: Check Zig formatting
         if: steps.scopes.outputs.format_zig == 'true'
@@ -219,6 +240,14 @@ jobs:
           path: ts/apps/antfarm/dist
           if-no-files-found: error
           retention-days: 7
+
+      - name: Retire SDK compiler scratch
+        if: always()
+        run: |
+          # Keep reusable dependency caches until Actions finishes its post
+          # steps. The runner's ephemeral PVC owns their final lifetime.
+          echo "TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
+          rm -rf -- "$SDK_CI_WORK_DIR/tmp" "$SDK_CI_WORK_DIR/cargo-phases" "$SDK_CI_WORK_DIR/cargo-target"
 
   playwright:
     if: >-

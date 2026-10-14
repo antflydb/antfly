@@ -207,6 +207,36 @@ pub fn parsePageDirectory(a: Allocator, offset_bytes: []const u8, column_bytes: 
     return .{ .arena = arena, .pages = directory };
 }
 
+pub const BloomHeader = struct { header_bytes: usize, bitset_bytes: usize };
+/// Recognize only the standardized BLOCK / XXHASH / UNCOMPRESSED contract.
+/// Unknown unions remain a scan fallback, never negative evidence.
+pub fn parseBloomHeader(bytes: []const u8) !?BloomHeader {
+    var reader = try pageIndexReader(bytes, 256);
+    var previous: i16 = 0;
+    var size: ?usize = null;
+    var seen: u8 = 0;
+    while (try reader.readFieldHeader(&previous)) |field| {
+        if (field.id == 1) {
+            if (size != null) return error.InvalidParquetMetadata;
+            size = @intCast(try reader.readRequiredI32NonNegative(field.type));
+        } else if (field.id >= 2 and field.id <= 4) {
+            if (field.type != .struct_) return null;
+            const mask = @as(u8, 1) << @as(u3, @intCast(field.id - 2));
+            if (seen & mask != 0) return null;
+            seen |= mask;
+            var union_previous: i16 = 0;
+            const entry = (try reader.readFieldHeader(&union_previous)) orelse return null;
+            if (entry.id != 1 or entry.type != .struct_) return null;
+            var empty_previous: i16 = 0;
+            if (try reader.readFieldHeader(&empty_previous) != null) return null;
+            if (try reader.readFieldHeader(&union_previous) != null) return null;
+        } else try reader.skip(field.type);
+    }
+    const count = size orelse return null;
+    if (seen != 7 or count == 0 or count % 32 != 0) return null;
+    return .{ .header_bytes = reader.cursor, .bitset_bytes = count };
+}
+
 fn mapDecodeLimitError(err: anyerror) anyerror {
     return switch (err) {
         error.DecodedArtifactTooLarge => error.ParquetMetadataTooLarge,
@@ -536,6 +566,8 @@ fn cloneColumnChunkAlloc(alloc: Allocator, chunk: external_source.ColumnChunk) !
         .encoding = encoding,
         .physical_type = physical_type,
         .type_length = chunk.type_length,
+        .bloom_filter_offset = chunk.bloom_filter_offset,
+        .bloom_filter_length = chunk.bloom_filter_length,
         .offset_index_offset = chunk.offset_index_offset,
         .offset_index_length = chunk.offset_index_length,
         .column_index_offset = chunk.column_index_offset,
@@ -987,6 +1019,8 @@ fn parseColumnChunk(alloc: Allocator, reader: *Reader, file_len: u64) !external_
         .stats_min_f64 = meta.stats_min_f64,
         .stats_max_f64 = meta.stats_max_f64,
         .nullable = false,
+        .bloom_filter_offset = meta.bloom_filter_offset,
+        .bloom_filter_length = meta.bloom_filter_length,
         .offset_index_offset = offset_index_offset,
         .offset_index_length = offset_index_length,
         .column_index_offset = column_index_offset,
@@ -1006,6 +1040,8 @@ const ColumnMetadata = struct {
     total_uncompressed_size: u64,
     data_page_offset: ?u64 = null,
     dictionary_page_offset: ?u64 = null,
+    bloom_filter_offset: ?u64 = null,
+    bloom_filter_length: ?u32 = null,
     stats_min_i64: ?i64 = null,
     stats_max_i64: ?i64 = null,
     stats_min_bytes: ?[]u8 = null,
@@ -1045,6 +1081,8 @@ fn parseColumnMetadata(alloc: Allocator, reader: *Reader) !ColumnMetadata {
     var total_uncompressed_size: ?u64 = null;
     var data_page_offset: ?u64 = null;
     var dictionary_page_offset: ?u64 = null;
+    var bloom_offset: ?u64 = null;
+    var bloom_length: ?u32 = null;
     var raw_statistics: RawColumnStatistics = .{};
     defer raw_statistics.deinit(alloc);
     errdefer if (column_id) |value| alloc.free(value);
@@ -1063,6 +1101,8 @@ fn parseColumnMetadata(alloc: Allocator, reader: *Reader) !ColumnMetadata {
             9 => data_page_offset = try reader.readRequiredU64(field.type),
             11 => dictionary_page_offset = try reader.readRequiredU64(field.type),
             12 => raw_statistics = try parseColumnStatisticsAlloc(alloc, reader, field.type),
+            14 => bloom_offset = try reader.readRequiredU64(field.type),
+            15 => bloom_length = @intCast(try reader.readRequiredI32NonNegative(field.type)),
             else => try reader.skip(field.type),
         }
     }
@@ -1081,6 +1121,8 @@ fn parseColumnMetadata(alloc: Allocator, reader: *Reader) !ColumnMetadata {
         .physical_type = got_physical_type,
         .total_compressed_size = total_compressed_size orelse return error.InvalidParquetMetadata,
         .total_uncompressed_size = total_uncompressed_size orelse 0,
+        .bloom_filter_offset = bloom_offset,
+        .bloom_filter_length = bloom_length,
         .data_page_offset = data_page_offset,
         .dictionary_page_offset = dictionary_page_offset,
         .stats_min_i64 = stats.min_i64,
@@ -2206,5 +2248,19 @@ test "external lake integer annotations preserve legacy and modern signedness" {
         const modern = try parseIntegerLogicalTypeNameAlloc(a, &reader, .struct_);
         defer a.free(modern);
         try std.testing.expectEqualStrings(name, modern);
+    }
+}
+
+test "external lake standard Bloom headers reject unsupported algorithms and truncated unions" {
+    const header = [_]u8{ 0x15, 0x40, 0x1c, 0x1c, 0, 0, 0x1c, 0x1c, 0, 0, 0x1c, 0x1c, 0, 0, 0 };
+    const parsed = (try parseBloomHeader(&header)).?;
+    try std.testing.expectEqual(header.len, parsed.header_bytes);
+    try std.testing.expectEqual(@as(usize, 32), parsed.bitset_bytes);
+    var unknown = header;
+    unknown[3] = 0x2c;
+    try std.testing.expectEqual(null, try parseBloomHeader(&unknown));
+    for (0..header.len) |end| {
+        const partial = parseBloomHeader(header[0..end]) catch null;
+        try std.testing.expectEqual(null, partial);
     }
 }

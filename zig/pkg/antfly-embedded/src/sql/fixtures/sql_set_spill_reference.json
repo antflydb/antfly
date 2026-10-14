@@ -1,0 +1,11 @@
+{
+  "format": 1,
+  "input_rows": 16384,
+  "entries": [
+    {"sql":"SELECT n FROM items UNION SELECT n FROM items","expected":"8192","sum":"33550336","maximum":8191,"multiplicity":1},
+    {"sql":"SELECT n FROM items INTERSECT SELECT n FROM items","expected":"8192","sum":"33550336","maximum":8191,"multiplicity":1},
+    {"sql":"SELECT n FROM items INTERSECT ALL SELECT n FROM items","expected":"16384","sum":"67100672","maximum":8191,"multiplicity":2},
+    {"sql":"SELECT n FROM items EXCEPT SELECT n FROM items WHERE n>=4096","expected":"4096","sum":"8386560","maximum":4095,"multiplicity":1},
+    {"sql":"SELECT n FROM items EXCEPT ALL SELECT n FROM items WHERE n>=4096","expected":"8192","sum":"16773120","maximum":4095,"multiplicity":2}
+  ]
+}

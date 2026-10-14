@@ -19,6 +19,7 @@ const selectTestFilters = @import("../../../build_support/antfly/test_support.zi
 const compileFiltersWithAnchors = @import("../../../build_support/antfly/test_support.zig").compileFiltersWithAnchors;
 const addFilteredTestRunArtifactWithRuntimeFilters = @import("../../../build_support/antfly/test_support.zig").addFilteredTestRunArtifactWithRuntimeFilters;
 const addFilteredTestRunArtifact = @import("../../../build_support/antfly/test_support.zig").addFilteredTestRunArtifact;
+const addCuratedTestRunArtifact = @import("../../../build_support/antfly/test_support.zig").addCuratedTestRunArtifact;
 
 pub const AddTestsOptions = struct {
     api_http_runtime_test_mod: *std.Build.Module,
@@ -371,6 +372,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "api http server requires auth for ARD tenant catalog when auth is enabled",
         "api http server serves ARD OpenAPI, skill, resource, and registry endpoints",
         "api http server filters extension mcp tools by trusted principal table permissions",
+        "api http server serves document lookup through mcp tool",
         "ARD search filters scoped catalog entries",
         "ARD search requires text while explore accepts filter-only requests",
         "ARD search supports publisher and metadata filters",
@@ -419,6 +421,21 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     run_lib_api_auth_tests.step.dependOn(&openapi_root_check.step);
     const lib_api_auth_test_step = b.step("antfly-api-auth-test", "Run focused API auth/usermgr HTTP tests");
     lib_api_auth_test_step.dependOn(&run_lib_api_auth_tests.step);
+
+    // The real MCP transport/database security regression does not need the
+    // monolithic library discovery root or its full-suite memory reservation.
+    const mcp_auth_filters = &.{"api http server serves document lookup through mcp tool"};
+    const mcp_auth_tests = b.addTest(.{
+        .name = "api-mcp-auth-tests",
+        .root_module = options.api_http_runtime_test_mod,
+        .filters = mcp_auth_filters,
+        .test_runner = .{
+            .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    b.step("antfly-api-mcp-auth-test", "Run real MCP trusted-principal authorization regressions")
+        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, mcp_auth_tests, mcp_auth_filters).step);
 
     const authorization_sink_filters = [_][]const u8{
         "api http server document scan requires table read permission",
@@ -669,6 +686,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "api session maintenance recovers crash window after durable 2pc commit",
             "api session maintenance skips live commit execution and acknowledgement",
             "session maintenance activation follows current range leadership without follower RPCs",
+            "api http server serves status using control metadata without diagnostic transfers",
             "transaction commit execution yields through caller io and preserves ownership on cancellation",
             "transaction session registry adopts durable session ownership",
             "transaction session registry only adopts durable sessions after lease expiry",
@@ -1671,6 +1689,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-relational-rows-test", "Run generated relational row and schema boundary contracts").dependOn(&addFilteredTestRunArtifact(b, api_relational_row_contract_tests).step);
+    b.step("antfly-schema-expression-test", "Run durable expression semantics and bounded preparation contracts")
+        .dependOn(&addCuratedTestRunArtifact(b, api_relational_row_contract_tests, &.{"relational declarations"}).step);
     const restore_lookup_authority_tests = b.addTest(.{
         .root_module = api_public_table_http_docid_test_mod,
         .filters = &.{ "private restore lookup plan identity", "compiled lookup wire preserves binary scope", "ancestors-only hierarchy survives the internal wire re-encode without a stray group_by" },
@@ -2271,7 +2291,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&addFilteredTestRunArtifact(b, hosted_self_fk_diagnostic_tests).step);
     const hosted_cte_runtime_tests = b.addTest(.{
         .root_module = hosted_self_fk_test_mod,
-        .filters = &.{ "mounted hosted prepared CTE mutations and recursive read retain owner fences", "hosted CTE MERGE retries only proven precommit read unavailability", "SQL pgwire MERGE completion reports committed affected rows" },
+        .filters = &.{ "mounted hosted prepared CTE mutations and recursive read retain owner fences", "hosted CTE MERGE retries only proven precommit read unavailability", "SQL pgwire MERGE completion reports committed affected rows", "SQL unknown mutation keeps native reconciliation receipt without allocation", "public table batch handler maps write unavailable errors" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-hosted-cte-runtime-test", "Run linked hosted prepared CTE and recursive owner-snapshot regression")

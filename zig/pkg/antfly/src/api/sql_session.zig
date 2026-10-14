@@ -36,6 +36,12 @@ pub const Coordinator = struct {
         const lease = server.txn_sessions.tryAcquireCommitExecution(id) orelse return error.SqlWriteCapacityUnavailable;
         defer lease.release();
         const info = server.txn_sessions.getInfo(id) orelse return error.SqlTransactionNotActive;
+        var lake_validation: @import("sql_execution.zig").Adapter = .{ .server = server, .identity = self.identity, .context = self.context };
+        lake_validation.validateAcceptedSerializable(alloc, id) catch |err| {
+            if (err != error.SqlWriteConflict) return err;
+            if (!server.txn_sessions.removeBeforeExecution(alloc, id)) return .{ .outcome = .unknown, .reconciliation_id = id };
+            return .{ .outcome = .aborted, .reconciliation_id = id };
+        };
         var request = (try server.txn_sessions.cloneCommitRequest(alloc, id, null)) orelse {
             if (!server.txn_sessions.commitBeforeExecution(alloc, id)) return .{ .outcome = .unknown, .reconciliation_id = id };
             return .{ .outcome = .committed, .reconciliation_id = id };

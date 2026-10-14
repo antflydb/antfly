@@ -854,12 +854,12 @@ pub fn ImplementationFor(comptime D: type) type {
 
             pub fn waitForResolvedTransactionSyncWithCancellation(self: *@This(), sync_level: types.SyncLevel, _: u64, _: types.CancellationToken) !void {
                 std.debug.assert(sync_level == .propose);
-                try self.executor.failIfUnhealthy();
+                try self.executor.checkSyncLevelHealth(sync_level);
             }
 
             pub fn waitForSyncLevelWithCancellation(self: *@This(), sync_level: types.SyncLevel, _: u64, _: ManagedSyncTargets, _: types.CancellationToken, _: bool) !void {
                 std.debug.assert(sync_level == .propose);
-                try self.executor.failIfUnhealthy();
+                try self.executor.checkSyncLevelHealth(sync_level);
             }
 
             pub fn bulkSessionActive(_: *@This()) bool {

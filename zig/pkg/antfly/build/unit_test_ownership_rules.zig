@@ -159,7 +159,9 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
             "api.openapi_contract.test.metadata openapi module generates extractor surface for routed endpoints",
             "api.query.consumerTests.Suite.test.",
             "metadata.storage.raft_apply_store.test.",
+            "storage.db.query.document_authority.test.",
             "storage.db.query.graph_exec.test.",
+            "storage.db.query.search_exec.test.public graph metric borrowed wire",
             "storage.db.types.test.",
         },
     },
@@ -168,11 +170,10 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
         .artifact = "test",
         .selection = "storage-kernel query request preserves final projection while raw retrieval defers it",
         .skip = &.{
-            "api.sql_catalog.test.SQL catalog ALTER submits native schema CAS without client generations",
-            "api.sql_catalog.test.SQL catalog DDL authorizes before lookup and handles atomic conditional outcomes",
-            "api.sql_catalog.test.SQL catalog DDL schema validates through native public admission",
-            "api.sql_session_overlay.test.SQL session overlay merges pages and suppresses replaced and deleted rows",
-            "api.sql_session_overlay.test.SQL session overlay preserves JSON null independently of SQL NULL",
+            // Public API parity owns these complete SQL helper namespaces.
+            "api.sql_catalog.test.",
+            "api.sql_session_overlay.test.",
+            "storage.db.table_catalog.test.",
             "api.sql_execution.test.",
             "api.sql_pgwire.test.",
             "api.sql_schema_cache.test.",
@@ -301,6 +302,8 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
         .artifact = "test",
         .selection = "graph.query.",
         .skip = &.{
+            // Introducer owns physical-score read helper regressions.
+            "graph.score_read.test.",
             "storage.hot_standby.native_topology_receipt_integration_test.test.",
             "storage.backend_erased.test.",
             "storage.db.db.test.",
@@ -323,11 +326,22 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
         },
     },
     .{
+        .source = "pkg/antfly/src/capi_test_root.zig",
+        .artifact = "test",
+        .selection = "issue1015",
+        .skip = &.{
+            // C ABI regressions borrow the implementation; storage owns its tests.
+            "storage.",
+        },
+    },
+    .{
         .source = "pkg/antfly-embedded/src/introducer.zig",
         .artifact = "test",
         .selection = "all",
         .skip = &.{
             "common.cancellation.test.",
+            "runtime_callback_abi.test.",
+            "section.typed_doc_values.test.external lake",
             "storage.",
             "common.bounded_worker_lane.",
             "common.maintenance_scheduler.",
@@ -343,7 +357,7 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
         .selection = "lake",
         .skip = &.{
             "common.config.",
-            "index.",
+            "^index.",
             "introducer.",
             // Sidecar terminology does not make engine or segment contracts Lake-owned.
             "segment.test.",
@@ -655,6 +669,7 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
         .selection = "standalone runtime module compiles",
         .skip = &.{
             "common.config.test.",
+            "system_catalog.domain.test.external lake",
         },
     },
     .{

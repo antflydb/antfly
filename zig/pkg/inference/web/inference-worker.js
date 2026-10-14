@@ -16,6 +16,10 @@
 import { createWasmAbi } from './runtime/wasm-abi.js';
 import { streamRegisterSafetensors } from './runtime/safetensors-stream.js';
 import { streamRegisterGguf } from './runtime/gguf-stream.js';
+import { ExtractionSession } from './runtime/extraction-session.js';
+
+// Replaced with a content identity when preparing the npm runtime assets.
+const INFERENCE_RUNTIME_ID = '__ANTFLY_RUNTIME_ID__';
 
 // Inference Worker: runs Antfly inference WASM module in a dedicated Web Worker.
 //
@@ -45,11 +49,7 @@ let wasm = null;
 let abi = null;
 let sab = null;   // SharedArrayBuffer
 let ctrl = null;  // Int32Array view of control region (first 16 ints)
-
-// ONNX Runtime Web (lazy, optional)
-let ort = null;
-let onnxSessions = new Map();
-let onnxNextId = 1;
+let extraction = null;
 
 const DATA_OFFSET = 64;
 const TEXT_ENCODER = new TextEncoder();
@@ -60,7 +60,7 @@ const TEXT_DECODER = new TextDecoder();
 function gpuSync(msg) {
   Atomics.store(ctrl, 0, 0);   // response not ready
   self.postMessage({ type: 'gpu-sync', ...msg });
-  Atomics.wait(ctrl, 0, 0);    // block until main thread signals
+  if (Atomics.wait(ctrl, 0, 0, 30000) === 'timed-out') throw new Error('WebGPU bridge timed out');
   return ctrl[1];               // result value
 }
 
@@ -179,6 +179,9 @@ function getGpuImports(memoryFn) {
     gpu_matmul_transb: (a, b, out, m, n, k) => {
       gpuAsync({ cmd: 'matmul_transb', a, b, out, m, n, k });
     },
+    gpu_matmul_transb_f16: (a, b, out, m, n, k) => gpuAsync({ cmd: 'matmul_transb_f16', a, b, out, m, n, k }),
+    gpu_modern_op: (input, indices, out, len, mode, dim, stride, offset, seq, theta) => gpuAsync({ cmd: 'modern_op', input, indices, out, len, mode, dim, stride, offset, seq, theta }),
+    gpu_attention_local: (q, k, v, mask, out, batch, seqLen, numHeads, headDim, window) => gpuAsync({ cmd: 'attention_local', q, k, v, mask, out, batch, seqLen, numHeads, headDim, window }),
 
     gpu_add: (a, b, out, len) => {
       gpuAsync({ cmd: 'add', a, b, out, len });
@@ -512,8 +515,12 @@ self.onmessage = async (e) => {
   try {
     switch (type) {
       case 'init': {
+        if (e.data.expectedRuntimeId && e.data.expectedRuntimeId !== INFERENCE_RUNTIME_ID) {
+          self.postMessage({ type: 'error', id, message: 'Inference worker JavaScript is incompatible; prepare matching runtime assets', code: 'RUNTIME_INCOMPATIBLE', fatal: true });
+          return;
+        }
         sab = e.data.sharedBuffer;
-        ctrl = new Int32Array(sab, 0, 16);
+        ctrl = sab ? new Int32Array(sab, 0, 16) : null;
 
         const wasmUrls = e.data.wasmUrls ?? (e.data.wasmUrl ? [e.data.wasmUrl] : []);
         const hasGpu = e.data.hasGpu;
@@ -618,6 +625,9 @@ self.onmessage = async (e) => {
             gpu_matmul_transb_iq3_xxs_mmv: () => {},
             gpu_matmul_transb_iq3_s_mmv: () => {},
             gpu_attention: () => {},
+            gpu_attention_local: () => {},
+            gpu_matmul_transb_f16: () => {},
+            gpu_modern_op: () => {},
             gpu_deberta_disentangled_attention: () => {},
             gpu_causal_attention: () => {},
             gpu_gqa_causal_attention: () => {},
@@ -635,11 +645,27 @@ self.onmessage = async (e) => {
         abi = createWasmAbi(wasm);
         wasmMemory = wasm.memory;
         wasm.init();
+        extraction = new ExtractionSession(wasm, abi);
 
-        self.postMessage({ type: 'init-done', id });
+        self.postMessage({ type: 'init-done', id, runtimeId: INFERENCE_RUNTIME_ID });
         break;
       }
 
+      case 'extraction-load': {
+        const model = await extraction.load(e.data.files, e.data.precision, progress => self.postMessage({ type: 'progress', id, ...progress }));
+        self.postMessage({ type: 'extraction-load-done', id, model });
+        break;
+      }
+      case 'extraction-run': {
+        const result = extraction.run(e.data.request, e.data.validateOnly, e.data.task);
+        self.postMessage({ type: 'extraction-run-done', id, result });
+        break;
+      }
+      case 'extraction-unload': {
+        extraction.unload();
+        self.postMessage({ type: 'extraction-unload-done', id });
+        break;
+      }
       case 'load-model': {
         const { modelBytes, configJson, format } = e.data;
 
@@ -2043,69 +2069,8 @@ self.onmessage = async (e) => {
         self.postMessage({ type: 'gpt-forward-cached-multimodal-gemma4-done', id, output }, [output.buffer]);
         break;
       }
-
-      // --- ONNX Runtime Web worker handlers ---
-
-      case 'onnx-init': {
-        const { wasmPaths, executionProviders } = e.data;
-        try {
-          ort = await import('onnxruntime-web');
-        } catch (_) {
-          throw new Error('onnxruntime-web not available in worker. Add it to your importmap or bundle.');
-        }
-        if (wasmPaths) {
-          ort.env.wasm.wasmPaths = wasmPaths;
-        }
-        self.postMessage({ type: 'onnx-init-done', id });
-        break;
-      }
-
-      case 'load-onnx-model': {
-        if (!ort) throw new Error('Call onnx-init first');
-        const { modelBytes, executionProviders } = e.data;
-        const session = await ort.InferenceSession.create(modelBytes.buffer, {
-          executionProviders: executionProviders || ['wasm'],
-        });
-        const handle = onnxNextId++;
-        onnxSessions.set(handle, session);
-        self.postMessage({ type: 'load-onnx-model-done', id, handle });
-        break;
-      }
-
-      case 'onnx-infer': {
-        if (!ort) throw new Error('Call onnx-init first');
-        const { sessionHandle, feeds } = e.data;
-        const session = onnxSessions.get(sessionHandle);
-        if (!session) throw new Error(`ONNX session ${sessionHandle} not found`);
-
-        // Convert serialized feeds to ORT Tensors
-        const ortFeeds = {};
-        for (const [name, tensor] of Object.entries(feeds)) {
-          ortFeeds[name] = new ort.Tensor(tensor.type, tensor.data, tensor.dims);
-        }
-
-        const results = await session.run(ortFeeds);
-
-        // Serialize outputs
-        const outputs = {};
-        for (const [name, tensor] of Object.entries(results)) {
-          outputs[name] = { data: tensor.data, dims: Array.from(tensor.dims), type: tensor.type };
-        }
-        self.postMessage({ type: 'onnx-infer-done', id, outputs });
-        break;
-      }
-
-      case 'unload-onnx-model': {
-        const session = onnxSessions.get(e.data.handle);
-        if (session) {
-          await session.release();
-          onnxSessions.delete(e.data.handle);
-        }
-        self.postMessage({ type: 'unload-onnx-model-done', id });
-        break;
-      }
     }
   } catch (err) {
-    self.postMessage({ type: 'error', id, message: err.message });
+    self.postMessage({ type: 'error', id, message: err.message, fatal: err instanceof WebAssembly.RuntimeError || err?.cause instanceof WebAssembly.RuntimeError });
   }
 };

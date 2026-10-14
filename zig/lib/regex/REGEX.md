@@ -7,6 +7,14 @@ scanning.
 
 ## Components
 
+- `src/captures.zig`: a separate native Unicode capture interface, exported as
+  `captures`. It supports typed basic/extended/advanced/literal options,
+  immutable programs, character spans, caller allocators and cancellation/work
+  budgets. It does not change the byte/FST grammar described below. The SQL
+  adapter in `lib/sql_regex` supplies PostgreSQL option parsing, diagnostics,
+  bounded scratch/LRU ownership and replacement semantics. See that adapter's
+  README for capture dissection, backreference and assertion execution details.
+
 - `src/automaton.zig`: compiles a regex to a Thompson NFA, then lazily
   determinizes it (on-the-fly powerset/subset construction) into a DFA used to
   implement the `fst.Automaton` interface. `pkg/antfly/src/search/query.zig`

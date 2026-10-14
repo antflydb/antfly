@@ -20,7 +20,7 @@ const Type = @import("backend.zig").Type;
 pub const Direction = enum { forward, backward, absolute, relative };
 pub const Fetch = struct { name: []const u8, count: u32 = 1, direction: Direction = .forward, offset: i64 = 0, move: bool = false };
 pub const Command = union(enum) {
-    prepare: struct { name: []const u8, types: []const Type, statement: []const u8 },
+    prepare: struct { name: []const u8, types: []const Type, descriptors: []const @import("backend.zig").Parameter, statement: []const u8 },
     execute: struct { name: []const u8, expressions: []const []const u8 },
     deallocate: ?[]const u8,
     declare_cursor: struct { name: []const u8, statement: []const u8, scroll: bool = false, hold: bool = false },
@@ -68,7 +68,16 @@ pub const ApplicationName = struct {
 pub const ApplicationNameSetting = union(enum) { show, set: struct { local: bool, value: ApplicationName }, reset };
 pub const EncodingSetting = union(enum) { show, set: struct { local: bool }, reset };
 pub const CatalogSetting = union(enum) { show: []const u8, set: struct { name: []const u8, value: []const u8, local: bool }, reset: []const u8, reset_local: []const u8 };
+pub const LakeVisibility = enum { committed, accepted };
+pub const ReadRequirements = @import("antfly_local_sources").sql_read_requirements.Requirements;
+pub const ReadRequirementsSetting = union(enum) { show, reset, set: struct { local: bool, value: ReadRequirements } };
+pub const LakeVisibilitySetting = union(enum) { show, reset, set: struct { local: bool, value: LakeVisibility } };
+pub const FormattingSetting = struct { kind: @import("formatting.zig").Setting, action: enum { show, set, reset }, local: bool = false };
 pub const Setting = union(enum) {
+    formatting: FormattingSetting,
+    lake_visibility: LakeVisibilitySetting,
+    read_visibility: LakeVisibilitySetting,
+    read_requirements: ReadRequirementsSetting,
     search_path: SearchPathSetting,
     statement_timeout: TimeoutSetting,
     application_name: ApplicationNameSetting,
@@ -81,6 +90,10 @@ pub const Setting = union(enum) {
 /// The protocol uses one classifier for Describe, Execute, and both streaming
 /// paths. A locally owned setting must never be sent to the SQL read provider.
 pub fn settingCommand(alloc: std.mem.Allocator, input: []const u8) !?Setting {
+    if (try readRequirementsSetting(alloc, input)) |value| return .{ .read_requirements = value };
+    if (try visibilitySetting(alloc, input, "antfly.read_visibility")) |value| return .{ .read_visibility = value };
+    if (try lakeVisibilitySetting(alloc, input)) |value| return .{ .lake_visibility = value };
+    if (try formattingSetting(alloc, input)) |value| return .{ .formatting = value };
     if (try searchPathSetting(alloc, input)) |value| return .{ .search_path = value };
     if (try timeoutSetting(alloc, input)) |value| return .{ .statement_timeout = value };
     if (try applicationNameSetting(alloc, input)) |value| return .{ .application_name = value };
@@ -189,7 +202,7 @@ pub fn encodingSetting(alloc: std.mem.Allocator, input: []const u8) !?EncodingSe
     const value = if (quoted) try p.quoted(input[p.pos]) else try p.word();
     try p.finish();
     if (!std.ascii.eqlIgnoreCase(value, "default") or quoted) {
-        if (!std.ascii.eqlIgnoreCase(value, "UTF8") and !std.ascii.eqlIgnoreCase(value, "UTF-8")) return error.UnsupportedEncoding;
+        try @import("formatting.zig").validateEncoding(value);
     }
     return .{ .set = .{ .local = local } };
 }
@@ -212,7 +225,8 @@ test "pgwire client encoding remains UTF-8 across SET SHOW and RESET" {
 }
 
 test "pgwire RESET ALL is one complete connection setting command" {
-    // sql-0045: local syntax coverage; custom app.* catalog parity is pending.
+    // sql-0045: local syntax coverage; app.* catalog parity is covered by
+    // pgwire-original-session-commands.
     const alloc = std.testing.allocator;
     try std.testing.expect((try settingCommand(alloc, "RESET ALL;")).? == .reset_all);
     try std.testing.expectError(error.InvalidSqlSyntax, settingCommand(alloc, "RESET ALL; SELECT 1"));
@@ -220,8 +234,8 @@ test "pgwire RESET ALL is one complete connection setting command" {
 }
 
 test "pgwire DISCARD ALL requires one complete command" {
-    // sql-0047: syntax and connection ownership only; original catalog scope
-    // also includes custom settings and remains unresolved.
+    // sql-0047: syntax and connection ownership only; custom app.* settings
+    // are covered by pgwire-original-session-commands.
     const alloc = std.testing.allocator;
     try std.testing.expect((try settingCommand(alloc, "DISCARD ALL;")).? == .discard_all);
     try std.testing.expectError(error.InvalidSqlSyntax, settingCommand(alloc, "DISCARD ALL; SELECT 1"));
@@ -462,6 +476,7 @@ const Parser = struct {
     fn quoted(self: *Parser, quote: u8) ![]const u8 {
         if (!try self.take(quote)) return error.InvalidSqlSyntax;
         var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(self.alloc);
         while (self.pos < self.input.len) {
             const ch = self.input[self.pos];
             self.pos += 1;
@@ -492,6 +507,25 @@ const Parser = struct {
         const result = try self.alloc.dupe(u8, std.mem.trim(u8, self.input[start..self.pos], " \t\r\n"));
         for (result) |*ch| ch.* = std.ascii.toLower(ch.*);
         return result;
+    }
+    // Comments separate tokens just like whitespace. Do not concatenate across
+    // them (U/* comment */TC must not become UTC), or stop before validating
+    // the rest of the command. Commas remain available to DateStyle lists.
+    fn formattingValue(self: *Parser) ![]const u8 {
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(self.alloc);
+        while (true) {
+            try self.space();
+            if (self.pos == self.input.len or self.input[self.pos] == ';') break;
+            const start = self.pos;
+            while (self.pos < self.input.len and self.input[self.pos] != ';' and
+                !std.ascii.isWhitespace(self.input[self.pos]) and
+                !std.mem.startsWith(u8, self.input[self.pos..], "--") and
+                !std.mem.startsWith(u8, self.input[self.pos..], "/*")) self.pos += 1;
+            if (out.items.len != 0) try out.append(self.alloc, ' ');
+            try out.appendSlice(self.alloc, self.input[start..self.pos]);
+        }
+        return out.toOwnedSlice(self.alloc);
     }
     fn finish(self: *Parser) !void {
         _ = try self.take(';');
@@ -543,12 +577,40 @@ const Parser = struct {
     }
 };
 
+test "pgwire SQL PREPARE retains primitive widths and array element descriptors" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const command = (try parse(arena.allocator(), "PREPARE q(smallint,integer,bigint,real,double precision,bigint[][],jsonb[],uuid[]) AS SELECT 1", 16)).?.prepare;
+    const expected = [_]u32{ 21, 23, 20, 700, 701, 1016, 3807, 2951 };
+    for (command.descriptors, expected) |descriptor, oid| try std.testing.expectEqual(oid, try @import("values.zig").parameterOid(descriptor));
+    try std.testing.expectError(error.UnsupportedParameterType, parse(arena.allocator(), "PREPARE q(numeric[]) AS SELECT 1", 16));
+    try std.testing.expectError(error.UnsupportedParameterType, parse(arena.allocator(), "PREPARE q(json[]) AS SELECT 1", 16));
+}
+
+fn preparedTypeOid(name: []const u8) !u32 {
+    const Entry = struct { name: []const u8, oid: u32 };
+    for ([_]Entry{
+        .{ .name = "smallint", .oid = 21 },  .{ .name = "int2", .oid = 21 },
+        .{ .name = "integer", .oid = 23 },   .{ .name = "int", .oid = 23 },
+        .{ .name = "int4", .oid = 23 },      .{ .name = "bigint", .oid = 20 },
+        .{ .name = "int8", .oid = 20 },      .{ .name = "real", .oid = 700 },
+        .{ .name = "float4", .oid = 700 },   .{ .name = "float8", .oid = 701 },
+        .{ .name = "numeric", .oid = 1700 }, .{ .name = "decimal", .oid = 1700 },
+        .{ .name = "text", .oid = 25 },      .{ .name = "varchar", .oid = 1043 },
+        .{ .name = "boolean", .oid = 16 },   .{ .name = "bool", .oid = 16 },
+        .{ .name = "uuid", .oid = 2950 },    .{ .name = "json", .oid = 114 },
+        .{ .name = "jsonb", .oid = 3802 },   .{ .name = "timestamptz", .oid = 1184 },
+    }) |entry| if (std.ascii.eqlIgnoreCase(name, entry.name)) return entry.oid;
+    return error.UnsupportedParameterType;
+}
+
 pub fn parse(alloc: std.mem.Allocator, input: []const u8, max_parameters: usize) !?Command {
     var p: Parser = .{ .alloc = alloc, .input = input };
     const verb = p.word() catch return null;
     if (std.ascii.eqlIgnoreCase(verb, "prepare")) {
         const name = try p.name();
         var types: std.ArrayList(Type) = .empty;
+        var descriptors: std.ArrayList(@import("backend.zig").Parameter) = .empty;
         if (try p.take('(')) {
             while (true) {
                 if (types.items.len == max_parameters) return error.ProgramLimitExceeded;
@@ -556,13 +618,24 @@ pub fn parse(alloc: std.mem.Allocator, input: []const u8, max_parameters: usize)
                 if (std.ascii.eqlIgnoreCase(type_name, "double")) {
                     if (!std.ascii.eqlIgnoreCase(try p.word(), "precision")) return error.UnsupportedParameterType;
                     type_name = "float8";
-                } else if (std.ascii.eqlIgnoreCase(type_name, "int2") or std.ascii.eqlIgnoreCase(type_name, "int4") or std.ascii.eqlIgnoreCase(type_name, "smallint")) {
-                    type_name = "integer";
-                } else if (std.ascii.eqlIgnoreCase(type_name, "decimal") or std.ascii.eqlIgnoreCase(type_name, "float4")) {
-                    type_name = "numeric";
                 }
-                const kind: Type = if (std.ascii.eqlIgnoreCase(type_name, "integer") or std.ascii.eqlIgnoreCase(type_name, "int") or std.ascii.eqlIgnoreCase(type_name, "bigint") or std.ascii.eqlIgnoreCase(type_name, "int8")) .integer else if (std.ascii.eqlIgnoreCase(type_name, "text") or std.ascii.eqlIgnoreCase(type_name, "varchar")) .string else if (std.ascii.eqlIgnoreCase(type_name, "boolean") or std.ascii.eqlIgnoreCase(type_name, "bool")) .boolean else if (std.ascii.eqlIgnoreCase(type_name, "json") or std.ascii.eqlIgnoreCase(type_name, "jsonb")) .json else if (std.ascii.eqlIgnoreCase(type_name, "timestamptz")) .datetime else if (std.ascii.eqlIgnoreCase(type_name, "numeric") or std.ascii.eqlIgnoreCase(type_name, "real") or std.ascii.eqlIgnoreCase(type_name, "float8")) .number else return error.UnsupportedParameterType;
+                const scalar_oid = try preparedTypeOid(type_name);
+                var descriptor = try @import("values.zig").parameterFromOid(scalar_oid);
+                var kind = try @import("values.zig").fromOid(scalar_oid);
+                var rank: usize = 0;
+                while (try p.take('[')) {
+                    if (!try p.take(']')) return error.InvalidSqlSyntax;
+                    rank += 1;
+                    if (rank > 6) return error.ProgramLimitExceeded;
+                    // NUMERIC/json/varchar arrays need their own physical
+                    // descriptor/codec; do not substitute float8/jsonb/text.
+                    if (scalar_oid == 1700 or scalar_oid == 114 or scalar_oid == 1043 or scalar_oid == 1184) return error.UnsupportedParameterType;
+                    if (descriptor.element_type == null) return error.UnsupportedParameterType;
+                    descriptor.kind = .array;
+                    kind = .array;
+                }
                 try types.append(alloc, kind);
+                try descriptors.append(alloc, descriptor);
                 if (try p.take(')')) break;
                 if (!try p.take(',')) return error.InvalidSqlSyntax;
             }
@@ -570,7 +643,7 @@ pub fn parse(alloc: std.mem.Allocator, input: []const u8, max_parameters: usize)
         if (!std.ascii.eqlIgnoreCase(try p.word(), "as")) return error.InvalidSqlSyntax;
         try p.space();
         if (p.pos == input.len) return error.InvalidSqlSyntax;
-        return .{ .prepare = .{ .name = name, .types = try types.toOwnedSlice(alloc), .statement = input[p.pos..] } };
+        return .{ .prepare = .{ .name = name, .types = try types.toOwnedSlice(alloc), .descriptors = try descriptors.toOwnedSlice(alloc), .statement = input[p.pos..] } };
     }
     if (std.ascii.eqlIgnoreCase(verb, "execute")) {
         const name = try p.name();
@@ -706,4 +779,163 @@ test "pgwire SQL session command parser preserves scalar spans and quoted names"
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+/// Connection-owned execution policy, independent of custom catalog settings.
+pub fn lakeVisibilitySetting(alloc: std.mem.Allocator, input: []const u8) !?LakeVisibilitySetting {
+    return visibilitySetting(alloc, input, "antfly.lake_visibility");
+}
+
+fn visibilitySetting(alloc: std.mem.Allocator, input: []const u8, expected_name: []const u8) !?LakeVisibilitySetting {
+    var p: Parser = .{ .alloc = alloc, .input = input };
+    const verb = p.word() catch return null;
+    const setting = std.ascii.eqlIgnoreCase(verb, "set");
+    const showing = std.ascii.eqlIgnoreCase(verb, "show");
+    const resetting = std.ascii.eqlIgnoreCase(verb, "reset");
+    if (!setting and !showing and !resetting) return null;
+    const saved = p.pos;
+    const modifier = p.word() catch return null;
+    const local = setting and std.ascii.eqlIgnoreCase(modifier, "local");
+    if (!setting or (!local and !std.ascii.eqlIgnoreCase(modifier, "session"))) p.pos = saved;
+    const name = p.settingName() catch |err| return if (err == error.OutOfMemory) err else null;
+    defer alloc.free(name);
+    if (!std.mem.eql(u8, name, expected_name)) return null;
+    if (!setting) {
+        try p.finish();
+        return if (showing) .show else .reset;
+    }
+    if (!try p.take('=')) if (!std.ascii.eqlIgnoreCase(try p.word(), "to")) return error.InvalidSqlSyntax;
+    try p.space();
+    const quoted = p.pos < input.len and input[p.pos] == '\'';
+    const value = if (quoted) try p.quoted('\'') else try p.word();
+    defer if (quoted) alloc.free(value);
+    try p.finish();
+    const selected: LakeVisibility = if (std.ascii.eqlIgnoreCase(value, "accepted")) .accepted else if (std.ascii.eqlIgnoreCase(value, "committed") or (!quoted and std.ascii.eqlIgnoreCase(value, "default"))) .committed else return error.InvalidParameter;
+    return .{ .set = .{ .local = local, .value = selected } };
+}
+
+pub fn readRequirementsSetting(alloc: std.mem.Allocator, input: []const u8) !?ReadRequirementsSetting {
+    var p: Parser = .{ .alloc = alloc, .input = input };
+    const verb = p.word() catch return null;
+    const setting = std.ascii.eqlIgnoreCase(verb, "set");
+    const showing = std.ascii.eqlIgnoreCase(verb, "show");
+    const resetting = std.ascii.eqlIgnoreCase(verb, "reset");
+    if (!setting and !showing and !resetting) return null;
+    const saved = p.pos;
+    const modifier = p.word() catch return null;
+    const local = setting and std.ascii.eqlIgnoreCase(modifier, "local");
+    if (!setting or (!local and !std.ascii.eqlIgnoreCase(modifier, "session"))) p.pos = saved;
+    const name = p.settingName() catch |err| return if (err == error.OutOfMemory) err else null;
+    defer alloc.free(name);
+    if (!std.mem.eql(u8, name, "antfly.read_requirements")) return null;
+    if (!setting) {
+        try p.finish();
+        return if (showing) .show else .reset;
+    }
+    if (!try p.take('=')) if (!std.ascii.eqlIgnoreCase(try p.word(), "to")) return error.InvalidSqlSyntax;
+    try p.space();
+    const quoted = p.pos < input.len and input[p.pos] == '\'';
+    const value = if (quoted) try p.quoted('\'') else try p.word();
+    defer if (quoted) alloc.free(value);
+    try p.finish();
+    const selected: ReadRequirements = if (!quoted and std.ascii.eqlIgnoreCase(value, "default")) .{} else std.json.parseFromSliceLeaky(ReadRequirements, alloc, value, .{}) catch return error.InvalidParameter;
+    try selected.validate(.sql);
+    return .{ .set = .{ .local = local, .value = selected } };
+}
+
+test "pgwire accepted lake visibility is scoped and consumes a complete statement" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectEqual(LakeVisibility.accepted, (try settingCommand(a, "SET LOCAL antfly.lake_visibility TO 'accepted'")).?.lake_visibility.set.value);
+    try std.testing.expect((try settingCommand(a, "SHOW antfly.lake_visibility")).?.lake_visibility == .show);
+    try std.testing.expect((try settingCommand(a, "RESET antfly.lake_visibility")).?.lake_visibility == .reset);
+    try std.testing.expectError(error.InvalidParameter, settingCommand(a, "SET antfly.lake_visibility = 'eventual'"));
+    try std.testing.expectError(error.InvalidSqlSyntax, settingCommand(a, "SET antfly.lake_visibility = 'accepted'; SELECT 1"));
+}
+
+pub fn formattingSetting(alloc: std.mem.Allocator, input: []const u8) !?FormattingSetting {
+    var p: Parser = .{ .alloc = alloc, .input = input };
+    const verb = p.word() catch return null;
+    const action: @FieldType(FormattingSetting, "action") = if (std.ascii.eqlIgnoreCase(verb, "show")) .show else if (std.ascii.eqlIgnoreCase(verb, "set")) .set else if (std.ascii.eqlIgnoreCase(verb, "reset")) .reset else return null;
+    var name = p.word() catch return null;
+    var local = false;
+    if (action == .set and (std.ascii.eqlIgnoreCase(name, "local") or std.ascii.eqlIgnoreCase(name, "session"))) {
+        local = std.ascii.eqlIgnoreCase(name, "local");
+        name = try p.word();
+    }
+    const kind = @import("formatting.zig").lookup(name) orelse return null;
+    if (action == .set) {
+        if (!try p.take('=')) if (!std.ascii.eqlIgnoreCase(try p.word(), "to")) return error.InvalidSqlSyntax;
+        try p.space();
+        const quoted = p.pos < input.len and (input[p.pos] == '\'' or input[p.pos] == '"');
+        const value = if (quoted) try p.quoted(input[p.pos]) else try p.formattingValue();
+        if (quoted or !std.ascii.eqlIgnoreCase(value, "default")) try kind.validate(value);
+    }
+    try p.finish();
+    return .{ .kind = kind, .action = action, .local = local };
+}
+
+test "pgwire fixed formatting SQL grammar validates SET and complete commands" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    for ([_][]const u8{ "SET DateStyle TO ISO, MDY", "SET TimeZone = 'UTC'", "SET LOCAL extra_float_digits = -15", "SET IntervalStyle = postgres", "SET standard_conforming_strings TO on", "RESET DateStyle", "SHOW TimeZone" }) |sql|
+        try std.testing.expect((try settingCommand(alloc, sql)).? == .formatting);
+    try std.testing.expectError(error.UnsupportedFormattingSetting, settingCommand(alloc, "SET TimeZone = 'America/New_York'"));
+    try std.testing.expectError(error.UnsupportedFormattingSetting, settingCommand(alloc, "SET extra_float_digits = 4"));
+    try std.testing.expectError(error.InvalidSqlSyntax, settingCommand(alloc, "SHOW DateStyle; SELECT 1"));
+    try std.testing.expectError(error.InvalidSqlSyntax, settingCommand(alloc, "SET TimeZone = 'UTC'; SELECT 1"));
+}
+
+/// PostgreSQL EmptyQueryResponse includes comment-only liveness probes (pgx).
+/// Use the same nested-comment scanner as connection commands, without a plan.
+pub fn isEmptyQuery(input: []const u8) !bool {
+    var p: Parser = .{ .alloc = undefined, .input = input };
+    while (try p.take(';')) {}
+    return p.pos == input.len;
+}
+
+test "pgwire empty queries include driver ping and nested comments" {
+    for ([_][]const u8{ "", " ; ; ", "-- ping", "/* outer /* inner */ */; -- ping" }) |sql| try std.testing.expect(try isEmptyQuery(sql));
+    try std.testing.expect(!try isEmptyQuery("-- ping\nSELECT 1"));
+    try std.testing.expect(!try isEmptyQuery("SELECT '-- ping'"));
+    try std.testing.expectError(error.InvalidSqlSyntax, isEmptyQuery("/* unterminated"));
+}
+
+test "pgwire formatting SET comments separate tokens and preserve command boundaries" {
+    const Case = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            for ([_][]const u8{
+                "SET extra_float_digits = 3 -- comment",
+                "SET extra_float_digits = 3/* nested /* comment */ */",
+                "SET DateStyle = ISO/* comment */,/* comment */MDY",
+                "SET TimeZone = UTC /* comment */; -- trailing",
+                "SET TimeZone = 'UTC' /* comment */",
+                "SET extra_float_digits = default -- comment",
+            }) |sql| try std.testing.expect((try settingCommand(a, sql)).? == .formatting);
+            try std.testing.expectError(error.UnsupportedFormattingSetting, settingCommand(a, "SET TimeZone = U/* comment */TC"));
+            try std.testing.expectError(error.UnsupportedFormattingSetting, settingCommand(a, "SET extra_float_digits = 3 /* comment */ SELECT 1"));
+            try std.testing.expectError(error.InvalidSqlSyntax, settingCommand(a, "SET extra_float_digits = 3 /* unterminated"));
+            try std.testing.expectError(error.InvalidSqlSyntax, settingCommand(a, "SET TimeZone = UTC /* comment */; SELECT 1"));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "pgwire canonical read settings parse receipts and reject unsupported visibility" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectEqual(LakeVisibility.accepted, (try settingCommand(a, "SET LOCAL ANTFLY.READ_VISIBILITY = accepted")).?.read_visibility.set.value);
+    const read = (try settingCommand(a, "SET LOCAL antfly.read_requirements = '{\"visibility\":\"accepted\",\"after_write\":{\"table_id\":2,\"object_generation\":3,\"wal_lsn\":10},\"wait_ms\":0}'")).?.read_requirements.set;
+    try std.testing.expect(read.local);
+    try std.testing.expectEqual(@as(u64, 10), read.value.after_write.?.wal_lsn);
+    try std.testing.expectEqual(@as(?u32, 0), read.value.wait_ms);
+    try std.testing.expectError(error.UnsupportedReadVisibility, settingCommand(a, "SET antfly.read_requirements = '{\"visibility\":\"published\"}'"));
+    try std.testing.expectError(error.InvalidReadRequirements, settingCommand(a, "SET antfly.read_requirements = '{\"wait_ms\":60001}'"));
+    try std.testing.expectError(error.InvalidParameter, settingCommand(a, "SET antfly.read_requirements = '{\"through\":{}}'"));
 }

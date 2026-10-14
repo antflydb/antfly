@@ -1252,6 +1252,77 @@ components:
       schema:
         type: string
   schemas:
+    LakeCatalogCreateRequest:
+      type: object
+      additionalProperties: false
+      required: [commit_id, schema]
+      properties:
+        commit_id:
+          type: string
+          minLength: 1
+          maxLength: 256
+          description: Stable identifier reused with exactly the same request after timeout or restart.
+        schema:
+          type: object
+          additionalProperties: true
+          description: Iceberg schema including schema-id and persistent field IDs.
+        partition-spec:
+          type: object
+          additionalProperties: true
+        write-order:
+          type: object
+          additionalProperties: true
+        properties:
+          type: object
+          additionalProperties:
+            type: string
+    LakeCatalogCommitRequest:
+      type: object
+      additionalProperties: false
+      required: [commit_id, expected_metadata_location, requirements, updates]
+      properties:
+        commit_id:
+          type: string
+          minLength: 1
+          maxLength: 256
+        expected_metadata_location:
+          type: string
+          minLength: 1
+        requirements:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+          description: Standard Iceberg REST table requirements, validated against the authoritative state.
+        updates:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+          description: Standard Iceberg REST metadata updates. Upload data/delete/manifest files before committing. A lake commit does not establish Antfly index visibility.
+    LakeCatalogResponse:
+      type: object
+      required: [state]
+      properties:
+        state:
+          type: string
+          enum: [loaded, lake_committed, committed, not_committed, unknown]
+        commit_id:
+          type: string
+        request_hash:
+          type: string
+          description: Opaque request digest for outcome resolution.
+        metadata_location:
+          type: string
+        metadata:
+          type: object
+          additionalProperties: true
+        binding_ready:
+          type: boolean
+          description: False if lake creation committed but native schema binding still needs the same initialization request replayed.
+        searchable:
+          type: boolean
+          description: A catalog commit alone does not make a matching index publication searchable.
     ChatGPTAuthorize:
       type: object
       properties:
@@ -1309,8 +1380,54 @@ components:
           type: boolean
     SQLColumnType:
       type: string
-      description: Logical SQL result type. Integer values are decimal strings to preserve exact precision in every client.
-      enum: [string, uuid, integer, number, boolean, datetime, json, unknown]
+      description: Logical SQL result type. Integer values and numbers with element_type numeric are decimal strings to preserve exact precision in every client.
+      enum: [string, uuid, integer, number, boolean, datetime, json, array, unknown]
+    SQLArrayElementType:
+      $ref: "schema.yaml#/components/schemas/SQLArrayElementType"
+    SQLArrayDimension:
+      type: object
+      additionalProperties: false
+      required: [length, lower_bound]
+      properties:
+        length:
+          type: integer
+          minimum: 1
+          maximum: 2147483647
+        lower_bound:
+          type: integer
+          minimum: -2147483648
+          maximum: 2147483647
+    SQLArrayValue:
+      type: object
+      additionalProperties: false
+      required: [dimensions, values, sql_nulls]
+      description: |
+        Non-NULL SQL array result. Elements are flat, row-major values using the
+        column's element_type. Their count equals the product of dimension
+        lengths. Empty arrays have no dimensions and no elements. Integer
+        elements are canonical decimal strings. Exact numeric elements are
+        decimal strings preserving display scale, or NaN, Infinity and -Infinity.
+        Floating elements are JSON
+        numbers, or the strings NaN, Infinity and -Infinity. Element null flags
+        distinguish SQL NULL from the JSON literal null in jsonb arrays. A NULL
+        array is an outer null result cell, not an empty array or this envelope.
+      properties:
+        dimensions:
+          type: array
+          maxItems: 6
+          items:
+            $ref: "#/components/schemas/SQLArrayDimension"
+        values:
+          type: array
+          maxItems: 65536
+          items:
+            x-go-type: json.RawMessage
+        sql_nulls:
+          type: array
+          maxItems: 65536
+          description: Exactly one flag per value. True requires a null value; false permits a JSON null only for jsonb elements.
+          items:
+            type: boolean
     SQLColumn:
       type: object
       additionalProperties: false
@@ -1321,6 +1438,12 @@ components:
           description: Display label. Labels need not be unique; rows use matching ordinal positions.
         type:
           $ref: "#/components/schemas/SQLColumnType"
+        element_type:
+          $ref: "#/components/schemas/SQLArrayElementType"
+          description: Required for array columns and exact NUMERIC number columns. Identifies scalar widths when supplied. The descriptor applies even to NULL or empty arrays.
+        numeric_modifier:
+          $ref: "schema.yaml#/components/schemas/SQLNumericModifier"
+          description: Present only for constrained NUMERIC scalar or array results. Prepared result metadata is stable before execution-time constant folding.
     SQLPrepareRequest:
       type: object
       additionalProperties: false
@@ -1346,6 +1469,8 @@ components:
       type: object
       additionalProperties: false
       properties:
+        read_requirements:
+          $ref: '#/components/schemas/ReadRequirements'
         parameters:
           type: array
           maxItems: 1024
@@ -1403,10 +1528,22 @@ components:
           type: string
         namespace:
           type: string
+    SQLParameterDescriptor:
+      type: object
+      additionalProperties: false
+      required: [type, nullable]
+      description: Immutable positional input contract. Element identity also preserves primitive widths; array inputs require it. Unknown slots have no SQL constraint.
+      properties:
+        type:
+          $ref: '#/components/schemas/SQLColumnType'
+        element_type:
+          $ref: '#/components/schemas/SQLArrayElementType'
+        nullable:
+          type: boolean
     SQLPreparedResponse:
       type: object
       additionalProperties: false
-      required: [prepared_id, expires_at_ms, owner_node_id, parameter_types, columns]
+      required: [prepared_id, expires_at_ms, owner_node_id, parameter_types, parameter_descriptors, columns]
       properties:
         prepared_id:
           type: string
@@ -1423,6 +1560,12 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/SQLColumnType'
+        parameter_descriptors:
+          type: array
+          maxItems: 1024
+          description: Precise positional contracts, aligned with parameter_types. Array arguments use the lossless SQLArrayValue envelope or PostgreSQL array text; plain JSON arrays are not SQL arrays.
+          items:
+            $ref: '#/components/schemas/SQLParameterDescriptor'
         columns:
           type: array
           items:
@@ -1524,6 +1667,7 @@ components:
     SQLRequest:
       type: object
       additionalProperties: false
+      not: {required: [read_requirements, lake_visibility]}
       required: [statement]
       description: |
         Execute one SQL statement. Parameters are positional (`$1`, `$2`, ...),
@@ -1535,6 +1679,13 @@ components:
         Request bodies are limited to 4 MiB, preparation to 8 MiB of allocated
         memory, and encoded results to a 16 MiB allocation budget.
       properties:
+        read_requirements:
+          $ref: '#/components/schemas/ReadRequirements'
+        lake_visibility:
+          deprecated: true
+          type: string
+          enum: [committed, accepted]
+          description: Read visibility for writable Iceberg sources. Accepted pins typed WAL changes over the committed snapshot; unavailable coverage fails closed. HTTP sessions and prepared executions inside a transaction retain the first accepted read cut for each table, including across savepoint rollback. Cuts expire after one hour. Serializable write transactions over external sources are not supported. Prefer read_requirements.visibility; this field is a deprecated alias.
         statement:
           type: string
           minLength: 1
@@ -1587,6 +1738,8 @@ components:
         is JSON null; sql_nulls distinguishes it from a JSON column containing
         the JSON literal null. Integer-typed values are exact decimal strings; datetime
         values are strings. Objects and arrays in JSON columns remain JSON.
+        Array-typed columns contain SQLArrayValue envelopes, with their element
+        descriptor in the corresponding SQLColumn. They are not JSON columns.
       properties:
         columns:
           type: array
@@ -1681,6 +1834,9 @@ components:
         message:
           type: string
           description: Human-readable diagnostic with no sensitive parameter values.
+        column_name:
+          type: string
+          description: Public column identifier for a column constraint violation; no row values are included.
         position:
           type: integer
           minimum: 1
@@ -9245,14 +9401,67 @@ components:
               minItems: 2
               maxItems: 64
               items: {type: string}
+    ReadReceipt:
+      type: object
+      additionalProperties: false
+      description: Opaque write receipt returned by ingestion. Pass it back unchanged to require a read including that write; it is a minimum freshness frontier, not an exact snapshot.
+      required: [table_id, object_generation, wal_lsn]
+      properties:
+        table_id: {type: integer, format: uint64}
+        object_generation: {type: integer, format: uint64}
+        wal_lsn: {type: integer, format: uint64}
+    ReadRequirements:
+      type: object
+      additionalProperties: false
+      description: Freshness requirements for writable Iceberg reads. Search supports accepted and published (default accepted); SQL supports accepted and committed (default committed). Unsupported visibility modes fail explicitly. Cannot be combined with legacy lake_read or lake_visibility. A pinned transaction snapshot never advances to satisfy a newer receipt.
+      properties:
+        visibility:
+          type: string
+          enum: [accepted, committed, published]
+          description: Accepted includes durable WAL writes; committed reads an Iceberg commit; published reads the search index generation. These are distinct visibility stages.
+        after_write:
+          $ref: '#/components/schemas/ReadReceipt'
+        wait_ms:
+          x-go-type-skip-optional-pointer: false
+          type: integer
+          format: uint32
+          minimum: 0
+          maximum: 60000
+          description: Readiness wait budget within the query or statement timeout. Defaults to 5000 ms when requirements are supplied; zero fails immediately if coverage is unavailable.
+    LakeReadReceipt:
+      type: object
+      additionalProperties: false
+      required: [table_id, object_generation, wal_lsn]
+      properties:
+        table_id: {type: integer, format: uint64}
+        object_generation: {type: integer, format: uint64}
+        wal_lsn: {type: integer, format: uint64}
+    LakeReadRequirement:
+      type: object
+      additionalProperties: false
+      properties:
+        visibility:
+          type: string
+          enum: [accepted, published]
+          description: Accepted requires current WAL visibility; vector/hybrid reads wait for matching publication. Published explicitly permits the retained archive generation. Applies to native writable Iceberg reads.
+        through:
+          $ref: '#/components/schemas/LakeReadReceipt'
+        wait_ms:
+          type: integer
+          format: uint32
+          minimum: 0
+          maximum: 60000
+          description: Bounded readiness wait, default 5000 ms when lake_read is supplied; also bounded by query timeout and cancellation.
     QueryRequest: # Based on remoteindex.Query
       type: object
       not:
         anyOf:
+          - required: [read_requirements, lake_read]
           - description: Hierarchy grouping requires an explicit top-level field projection.
             allOf:
               - required: [hierarchy]
                 properties:
+
                   hierarchy:
                     required: [group_by]
               - not:
@@ -9355,9 +9564,14 @@ components:
                   - required: [foreign_sources]
                   - required: [remote_snapshot]
       properties:
+        read_requirements:
+          $ref: '#/components/schemas/ReadRequirements'
+        lake_read:
+          deprecated: true
+          $ref: '#/components/schemas/LakeReadRequirement'
         remote_snapshot:
           type: string
-          description: Opaque remote index snapshot token returned by a previous query. Required when replaying search_after or search_before against an external table; a changed publication returns 409.
+          description: Opaque retained snapshot token returned by an ordered native or external-table query. Echo with search_after or search_before. Native and lake cuts expire within the configured retention period (default five minutes; maximum one hour); missing, expired or incompatible generations return 409.
         evaluate:
           $ref: "#/components/schemas/QueryEvaluation"
         table_target:
@@ -9967,8 +10181,61 @@ components:
                 Strategy for merging legacy graph results with search results:
                 - union: Include nodes from both search and graph results
                 - intersection: Only include nodes appearing in both
+    ComposedTableSource:
+      type: object
+      additionalProperties: false
+      required: [table]
+      properties:
+        table:
+          type: string
+          minLength: 1
+          description: Literal native table name. Each source is independently authorized.
+    ComposedSourceOverlay:
+      type: object
+      additionalProperties: false
+      required: [base, changes, key]
+      properties:
+        base:
+          $ref: '#/components/schemas/ComposedTableSource'
+        changes:
+          $ref: '#/components/schemas/ComposedTableSource'
+        key:
+          type: array
+          minItems: 1
+          maxItems: 8
+          items: {type: string, minLength: 1}
+        tombstone_field:
+          type: string
+          default: deleted
+          description: Boolean field on change rows; true hides the base row. Changes must retain one latest row/tombstone per stable key. Row-policy identities are currently unsupported for keyed composition.
+    SavedQuerySource:
+      type: object
+      required: [source_id, name, source]
+      properties:
+        source_id: {type: integer, format: uint64}
+        name: {type: string}
+        source:
+          $ref: '#/components/schemas/ComposedQuerySource'
+    ComposedQuerySource:
+      type: object
+      additionalProperties: false
+      properties:
+        saved:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: Immutable source name from the Antfly catalog. Saved definitions contain literal table leaves, preventing recursive expansion.
+        union:
+          type: array
+          minItems: 2
+          maxItems: 16
+          items:
+            $ref: '#/components/schemas/ComposedTableSource'
+        overlay:
+          $ref: '#/components/schemas/ComposedSourceOverlay'
+      description: Specify exactly one of saved, union or overlay. Union preserves duplicates and table provenance. Overlay suppresses replaced base keys and tombstones before ranking using indexed unfiltered change lookups. Inputs are streamed in bounded pages; result pages allow at most 4096 hits. Large overlay totals are lower bounds unless count is explicitly requested; exact count streams the full visible relation within the request deadline.
     GlobalStatefulQueryRequest:
-      description: A stateful global query. The target table is required on this route.
+      description: A stateful global query. Specify a table target or a composed source.
       allOf:
         - $ref: '#/components/schemas/StatefulQueryRequest'
         - type: object
@@ -9976,8 +10243,16 @@ components:
             table:
               type: string
               minLength: 1
-              description: Name of the table to query.
-          required: [table]
+              description: Name of the table to query; mutually exclusive with source.
+            source:
+              $ref: '#/components/schemas/ComposedQuerySource'
+            source_ranking:
+              type: string
+              enum: [rrf]
+              description: Explicit reciprocal rank scoring across source lists after visibility resolution. Required for score ordering; shared corpus BM25 is not implemented. Constant 60, equal source weights.
+            source_cursor:
+              type: string
+              description: Opaque composed continuation retaining per-leaf native generations or archive publications and accepted WAL cuts for the configured retention period from their creation (default five minutes; maximum one hour). Publication and restart preserve the cut. Authorization, policy, recipe, source and table incarnation changes invalidate it. Leaf search_after/search_before tuples are unsupported.
     Analyses:
       x-go-type-skip-optional-pointer: false
       type: object
@@ -10256,6 +10531,10 @@ components:
           type: integer
           format: int64
           description: Candidate documents considered by sort execution.
+        ordered_scanned_count:
+          type: integer
+          format: int64
+          description: Ordered lake entries traversed before native membership filtering.
         cursor_rejected_count:
           type: integer
           format: int64
@@ -10722,6 +11001,10 @@ components:
         - _id
         - _score
       properties:
+        _table:
+          type: string
+          description: Source table provenance for composed query hits; equal IDs from union inputs remain distinct.
+
         _computed:
           type: object
           additionalProperties: true
@@ -10921,9 +11204,17 @@ components:
         - took
         - status
       properties:
+        source_ranking:
+          type: string
+          enum: [rrf, ordered]
+          description: Ranking contract for a composed result.
+        next_source_cursor:
+          type: string
+          description: Opaque continuation for composed queries. Pass as source_cursor with the same query; valid until the earliest retained leaf cut expires (default five minutes; maximum one hour). Publication and restart preserve it; authorization and incarnation fences remain enforced.
+
         remote_snapshot:
           type: string
-          description: Opaque remote publication and schema fence to echo with ordered pagination. This token does not grant access or retain the publication.
+          description: Opaque snapshot to echo with ordered pagination. Native tokens retain the complete physical generation; lake tokens retain the archive publication, metadata and accepted WAL cut, for the configured retention period (default five minutes; maximum one hour). Every use rechecks access, incarnation and recipe. Unavailable retained generations return 409.
         evaluation:
           type: object
           additionalProperties: true
@@ -11744,6 +12035,258 @@ components:
               - $ref: "#/components/schemas/TableStorageUnreadableError"
 
 paths:
+  /tables/{tableName}/lake/catalog:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: getLakeCatalog
+      tags: [table_management]
+      summary: getLakeCatalog
+      description: Native Iceberg catalog operation for managed or external REST authority. Catalog mutations require table admin permission and iceberg_writer policy. These endpoints commit already prepared lake files and automatically schedule matching index publication. A committed response does not imply that those indexes are already searchable. Native row transactions use lake/changes.
+      responses:
+        "200":
+          description: Authoritative catalog result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LakeCatalogResponse"
+        "400":
+          description: Invalid or unsupported catalog request
+        "403":
+          description: Unauthorized catalog operation
+        "404":
+          description: Table or lake catalog not found
+        "409":
+          description: Binding, incarnation, or commit conflict
+        "503":
+          description: Catalog authority unavailable
+        "504":
+          description: Request deadline exceeded
+    post:
+      operationId: initializeLakeCatalog
+      tags: [table_management]
+      summary: initializeLakeCatalog
+      description: Native Iceberg catalog operation for managed or external REST authority. Catalog mutations require table admin permission and iceberg_writer policy. These endpoints commit already prepared lake files and automatically schedule matching index publication. A committed response does not imply that those indexes are already searchable. Native row transactions use lake/changes.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LakeCatalogCreateRequest"
+      responses:
+        "200":
+          description: Authoritative catalog result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LakeCatalogResponse"
+        "202":
+          description: Commit outcome is uncertain; resolve or retry the same commit ID and request. Do not checkpoint or delete files yet.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LakeCatalogResponse"
+        "400":
+          description: Invalid or unsupported catalog request
+        "403":
+          description: Unauthorized catalog operation
+        "404":
+          description: Table or lake catalog not found
+        "409":
+          description: Binding, incarnation, or commit conflict
+        "503":
+          description: Catalog authority unavailable
+        "504":
+          description: Request deadline exceeded
+  /tables/{tableName}/lake/changes:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: ingestLakeChanges
+      tags: [table_management]
+      summary: ingestLakeChanges
+      description: Durably accept one complete CDC transaction for native WAL-to-Iceberg writing. A stable batch ID, source epoch, key fields and predecessor checkpoint are required. Upserts are complete row images; deletes contain only key fields. Acceptance precedes catalog commitment and index publication. Native text searches compose a bounded accepted-WAL suffix with the pinned archive publication. Requires table admin permission and iceberg_writer policy.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [batch_id, source, epoch, checkpoint, key_fields, changes]
+              properties:
+                batch_id: {type: string, minLength: 1, maxLength: 256}
+                source: {type: string, minLength: 1, maxLength: 256}
+                epoch: {type: string, minLength: 1, maxLength: 256}
+                checkpoint: {type: string, minLength: 1, maxLength: 1024}
+                expected_checkpoint: {type: string, nullable: true}
+                key_fields:
+                  type: array
+                  minItems: 1
+                  maxItems: 32
+                  items: {type: string}
+                changes:
+                  type: array
+                  minItems: 1
+                  maxItems: 16384
+                  items:
+                    type: object
+                    required: [op, row]
+                    properties:
+                      op: {type: string, enum: [upsert, delete]}
+                      row: {type: object, additionalProperties: true}
+      responses:
+        "202":
+          description: Durable WAL acceptance; retry the same transaction after an ambiguous response. Native text search can compose a bounded accepted-WAL overlay before catalog/index publication; SQL defaults to committed snapshots and can opt into accepted visibility with read_requirements.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  state: {type: string}
+                  read_receipt:
+                    $ref: '#/components/schemas/ReadReceipt'
+                  wal_lsn: {type: integer, format: uint64}
+                  table_id: {type: integer, format: uint64}
+                  object_generation: {type: integer, format: uint64}
+                  searchable: {type: boolean}
+        "400": {description: Invalid transaction or unsupported row type}
+        "403": {description: Unauthorized ingestion}
+        "404": {description: Table or catalog not found}
+        "409": {description: "Source, predecessor checkpoint or batch identity conflict"}
+        "503": {description: Durable ingestion unavailable}
+        "504": {description: Request deadline exceeded}
+  /tables/{tableName}/lake/maintenance:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+    post:
+      operationId: maintainLakeTable
+      tags: [table_management]
+      summary: Maintain a writable Iceberg table
+      description: Plan or execute bounded compaction, snapshot/file vacuum, or covered WAL cleanup. A stable operation ID resumes saved catalog intents after uncertainty. Defaults to dry run. Destructive file vacuum requires an explicit exclusive ownership and external-reader retention agreement; only native ownership proofs authorize object deletion. Current snapshots, named refs, native serving readers and durable snapshot pins remain protected. Compact and vacuum commits automatically schedule index publication.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [action]
+              properties:
+                action: {type: string, enum: [compact, vacuum, wal_gc, status, enrichment_status]}
+                operation_id: {type: string, minLength: 1, maxLength: 256, description: Required for compact/vacuum/wal_gc; omitted for scheduler or enrichment status.}
+                dry_run: {type: boolean, default: true}
+                exclusive_ownership: {type: boolean, default: false}
+                max_rows: {type: integer, format: uint64, minimum: 1, maximum: 16384, default: 16384}
+                max_bytes: {type: integer, format: uint64, minimum: 1, maximum: 33554432, default: 33554432}
+                retain_ms: {type: integer, format: uint64, minimum: 600000, default: 604800000}
+                keep_latest: {type: integer, minimum: 1, maximum: 1024, default: 2}
+                max_deleted: {type: integer, minimum: 1, maximum: 4096, default: 4096}
+      responses:
+        "200":
+          description: Bounded maintenance result; complete false requires another pass with the same operation ID.
+          content:
+            application/json:
+              schema: {type: object, additionalProperties: true}
+        "400": {description: Invalid maintenance limits}
+        "403": {description: "Missing admin permission, writer policy or ownership agreement"}
+        "404": {description: Table or catalog not found}
+        "409": {description: Conditional conflict or conflicting saved operation}
+        "503": {description: Maintenance unavailable or uncertain outcome; retry the same operation ID}
+        "504": {description: Request deadline exceeded}
+  /tables/{tableName}/lake/commits:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: commitLakeCatalog
+      tags: [table_management]
+      summary: commitLakeCatalog
+      description: Native Iceberg catalog operation for managed or external REST authority. Catalog mutations require table admin permission and iceberg_writer policy. These endpoints commit already prepared lake files and automatically schedule matching index publication. A committed response does not imply that those indexes are already searchable. Native row transactions use lake/changes.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LakeCatalogCommitRequest"
+      responses:
+        "200":
+          description: Authoritative catalog result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LakeCatalogResponse"
+        "202":
+          description: Commit outcome is uncertain; resolve or retry the same commit ID and request. Do not checkpoint or delete files yet.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LakeCatalogResponse"
+        "400":
+          description: Invalid or unsupported catalog request
+        "403":
+          description: Unauthorized catalog operation
+        "404":
+          description: Table or lake catalog not found
+        "409":
+          description: Binding, incarnation, or commit conflict
+        "503":
+          description: Catalog authority unavailable
+        "504":
+          description: Request deadline exceeded
+  /tables/{tableName}/lake/commits/{commitId}:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: commitId
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: request_hash
+        in: query
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: getLakeCommitOutcome
+      tags: [table_management]
+      summary: getLakeCommitOutcome
+      description: Native Iceberg catalog operation for managed or external REST authority. Catalog mutations require table admin permission and iceberg_writer policy. These endpoints commit already prepared lake files and automatically schedule matching index publication. A committed response does not imply that those indexes are already searchable. Native row transactions use lake/changes.
+      responses:
+        "200":
+          description: Authoritative catalog result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LakeCatalogResponse"
+        "400":
+          description: Invalid or unsupported catalog request
+        "403":
+          description: Unauthorized catalog operation
+        "404":
+          description: Table or lake catalog not found
+        "409":
+          description: Binding, incarnation, or commit conflict
+        "503":
+          description: Catalog authority unavailable
+        "504":
+          description: Request deadline exceeded
   /status:
     get:
       summary: Get cluster status
@@ -16039,6 +16582,81 @@ paths:
           $ref: "#/components/responses/NotFound"
         "500":
           $ref: "#/components/responses/InternalServerError"
+
+  /sources:
+    get:
+      summary: List saved query sources
+      tags: [table_management]
+      operationId: listQuerySources
+      responses:
+        "200":
+          description: Immutable catalog source definitions
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/SavedQuerySource'
+  /sources/{sourceName}:
+    parameters:
+      - name: sourceName
+        in: path
+        required: true
+        schema: {type: string, maxLength: 128}
+    get:
+      summary: Get saved query source
+      tags: [table_management]
+      operationId: getQuerySource
+      responses:
+        "200":
+          description: Source definition and immutable incarnation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SavedQuerySource'
+        "404":
+          $ref: '#/components/responses/NotFound'
+    post:
+      summary: Create saved query source
+      description: Creates an immutable union or keyed overlay in the Antfly metadata catalog. Reads require permission on the saved name and every input table. Drop and recreate to change a definition; existing cursors cannot switch incarnations.
+      tags: [table_management]
+      operationId: createQuerySource
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [source]
+              properties:
+                source:
+                  $ref: '#/components/schemas/ComposedQuerySource'
+      responses:
+        "201":
+          description: Source created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SavedQuerySource'
+        "202":
+          description: Committed with visibility pending
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogMutationVisibilityPending'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "409":
+          description: Source already exists
+    delete:
+      summary: Drop saved query source
+      tags: [table_management]
+      operationId: dropQuerySource
+      responses:
+        "204":
+          description: Source dropped
+        "404":
+          $ref: '#/components/responses/NotFound'
 
   /tablespaces:
     get:

@@ -14,6 +14,8 @@
 # limitations under the License.
 
 import unittest
+import tempfile
+from pathlib import Path
 from summarize_zig_compile_memory import GIB, summarize
 
 
@@ -38,6 +40,38 @@ class SummaryTests(unittest.TestCase):
         )
         self.assertFalse(report["aggregate_is_same_poll"])
         self.assertEqual(report["units"]["cli"]["minimum_reservation_gib"], 1)
+
+    def test_response_files_survive_cache_removal_and_attribute_large_and_embedded_units(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = root / "args"
+            args.write_text(
+                '--name antfly-runtime-api_kernel -Ofast -Mroot="path with spaces/root.zig"'
+            )
+            trace = f"header\nnow\t0\t10\t1024\t1\tzig build-lib @{args}\t0\n"
+            retained = root / "retained"
+            report = summarize(trace, capture_dir=retained)
+            self.assertEqual(
+                report["units"]["api_kernel"]["peak_rss_bytes"], 1024 * 1024
+            )
+            args.unlink()
+            self.assertEqual(summarize(trace, response_dir=retained), report)
+            args.write_text("--name antfly-embedded-inference -Ofast")
+            self.assertIn("embedded_inference", summarize(trace)["units"])
+            args.write_text("--name antfly-capi-objects -Ofast")
+            self.assertIn("capi_objects", summarize(trace)["units"])
+
+    def test_missing_and_recursive_response_files_are_not_silently_unattributed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = Path(directory) / "args"
+            trace = f"header\nnow\t0\t10\t1024\t1\tzig build-lib @{args}\t0\n"
+            with self.assertRaisesRegex(ValueError, "response file unavailable"):
+                summarize(trace)
+            args.write_text(f"@{args}")
+            with self.assertRaisesRegex(ValueError, "recursive compiler response file"):
+                summarize(trace)
 
 
 if __name__ == "__main__":

@@ -43,15 +43,26 @@ import (
 
 // Re-export commonly used types from oapi package
 type (
+	ReadReceipt                 = oapi.ReadReceipt
+	ReadRequirements            = oapi.ReadRequirements
+	ReadRequirementsVisibility  = oapi.ReadRequirementsVisibility
 	SQLRequest                  = oapi.SQLRequest
 	SQLPrepareRequest           = oapi.SQLPrepareRequest
 	SQLPreparedExecutionRequest = oapi.SQLPreparedExecutionRequest
 	SQLPreparedResponse         = oapi.SQLPreparedResponse
+	SQLParameterDescriptor      = oapi.SQLParameterDescriptor
 	SQLResponse                 = oapi.SQLResponse
 	SQLColumn                   = oapi.SQLColumn
+	SQLNumericModifier          = oapi.SQLNumericModifier
 	SQLColumnType               = oapi.SQLColumnType
 	SQLDiagnostic               = oapi.SQLDiagnostic
 	SQLMutationOutcome          = oapi.SQLMutationOutcome
+	SQLArrayColumnSchema        = oapi.SQLArrayColumnSchema
+	SQLArrayColumnSchemaType    = oapi.SQLArrayColumnSchemaType
+	SQLBuiltinType              = oapi.SQLBuiltinType
+	SQLArrayDimension           = oapi.SQLArrayDimension
+	SQLArrayElementType         = oapi.SQLArrayElementType
+	SQLArrayValue               = oapi.SQLArrayValue
 	// Table and Index types
 	CreateTableRequest                    = oapi.CreateTableRequest
 	TableStatus                           = oapi.TableStatus
@@ -66,6 +77,7 @@ type (
 	RelationalExpressionType              = oapi.RelationalExpressionType
 	RelationalCheckConstraint             = oapi.RelationalCheckConstraint
 	RelationalUniqueConstraint            = oapi.RelationalUniqueConstraint
+	RelationalUniqueConstraintOrigin      = oapi.RelationalUniqueConstraintOrigin
 	RelationalForeignKeyConstraint        = oapi.RelationalForeignKeyConstraint
 	RelationalRow                         = oapi.RelationalRow
 	RelationalRowCondition                = oapi.RelationalRowCondition
@@ -654,23 +666,25 @@ func (c CreatedIndex) requireKind(expected IndexType) error {
 }
 
 const (
-	TableStorageModeDocument            = oapi.TableStorageModeDocument
-	TableStorageModeRelational          = oapi.TableStorageModeRelational
-	RelationalIndexKeyDirectionAsc      = oapi.RelationalIndexKeyDirectionAsc
-	RelationalIndexKeyDirectionDesc     = oapi.RelationalIndexKeyDirectionDesc
-	RelationalIndexKeyNullsDefault      = oapi.RelationalIndexKeyNullsDefault
-	RelationalIndexKeyNullsFirst        = oapi.RelationalIndexKeyNullsFirst
-	RelationalIndexKeyNullsLast         = oapi.RelationalIndexKeyNullsLast
-	RelationalComparisonOpEq            = oapi.RelationalComparisonOpEq
-	RelationalComparisonOpNe            = oapi.RelationalComparisonOpNe
-	RelationalComparisonOpGt            = oapi.RelationalComparisonOpGt
-	RelationalComparisonOpGte           = oapi.RelationalComparisonOpGte
-	RelationalComparisonOpLt            = oapi.RelationalComparisonOpLt
-	RelationalComparisonOpLte           = oapi.RelationalComparisonOpLte
-	RelationalComparisonOpIsNull        = oapi.RelationalComparisonOpIsNull
-	RelationalComparisonOpIsNotNull     = oapi.RelationalComparisonOpIsNotNull
-	RelationalComparisonOpIsDistinct    = oapi.RelationalComparisonOpIsDistinct
-	RelationalComparisonOpIsNotDistinct = oapi.RelationalComparisonOpIsNotDistinct
+	TableStorageModeDocument                   = oapi.TableStorageModeDocument
+	RelationalUniqueConstraintOriginConstraint = oapi.RelationalUniqueConstraintOriginConstraint
+	RelationalUniqueConstraintOriginIndex      = oapi.RelationalUniqueConstraintOriginIndex
+	TableStorageModeRelational                 = oapi.TableStorageModeRelational
+	RelationalIndexKeyDirectionAsc             = oapi.RelationalIndexKeyDirectionAsc
+	RelationalIndexKeyDirectionDesc            = oapi.RelationalIndexKeyDirectionDesc
+	RelationalIndexKeyNullsDefault             = oapi.RelationalIndexKeyNullsDefault
+	RelationalIndexKeyNullsFirst               = oapi.RelationalIndexKeyNullsFirst
+	RelationalIndexKeyNullsLast                = oapi.RelationalIndexKeyNullsLast
+	RelationalComparisonOpEq                   = oapi.RelationalComparisonOpEq
+	RelationalComparisonOpNe                   = oapi.RelationalComparisonOpNe
+	RelationalComparisonOpGt                   = oapi.RelationalComparisonOpGt
+	RelationalComparisonOpGte                  = oapi.RelationalComparisonOpGte
+	RelationalComparisonOpLt                   = oapi.RelationalComparisonOpLt
+	RelationalComparisonOpLte                  = oapi.RelationalComparisonOpLte
+	RelationalComparisonOpIsNull               = oapi.RelationalComparisonOpIsNull
+	RelationalComparisonOpIsNotNull            = oapi.RelationalComparisonOpIsNotNull
+	RelationalComparisonOpIsDistinct           = oapi.RelationalComparisonOpIsDistinct
+	RelationalComparisonOpIsNotDistinct        = oapi.RelationalComparisonOpIsNotDistinct
 
 	QueryHitsTotalRelationExact = oapi.QueryHitsTotalRelationExact
 	QueryHitsTotalRelationGte   = oapi.QueryHitsTotalRelationGte
@@ -1050,4 +1064,20 @@ func ValidateToolName(name ChatToolName) error {
 		return nil
 	}
 	return fmt.Errorf("unknown tool name %q; valid tools: %v", name, allToolNames)
+}
+
+const (
+	ReadRequirementsVisibilityAccepted  = oapi.ReadRequirementsVisibilityAccepted
+	ReadRequirementsVisibilityCommitted = oapi.ReadRequirementsVisibilityCommitted
+	ReadRequirementsVisibilityPublished = oapi.ReadRequirementsVisibilityPublished
+)
+
+// ReadAfterWrite requires a query or SQL read to include an ingestion receipt.
+// An omitted wait uses the server's default; passing zero requests an immediate check.
+func ReadAfterWrite(receipt ReadReceipt, waitMs ...uint32) ReadRequirements {
+	result := ReadRequirements{Visibility: oapi.ReadRequirementsVisibilityAccepted, AfterWrite: receipt}
+	if len(waitMs) > 0 {
+		result.WaitMs = &waitMs[0]
+	}
+	return result
 }

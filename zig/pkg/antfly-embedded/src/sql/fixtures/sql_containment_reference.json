@@ -1,0 +1,125 @@
+{
+  "reference": "PostgreSQL exact SQL",
+  "entries": [
+    {
+      "sql": "'{\"a\":null}'::jsonb ? 'a'",
+      "value": true
+    },
+    {
+      "sql": "'{}'::jsonb ? 'missing'",
+      "value": false
+    },
+    {
+      "sql": "'[\"a\",[\"b\"]]'::jsonb ? 'b'",
+      "value": false
+    },
+    {
+      "sql": "'\"a\"'::jsonb ? 'a'",
+      "value": true
+    },
+    {
+      "sql": "'null'::jsonb ? 'null'",
+      "value": false
+    },
+    {
+      "sql": "NULL::jsonb ? 'a'",
+      "value": null
+    },
+    {
+      "sql": "'{\"a\":[1,2]}'::jsonb @> '{\"a\":1}'::jsonb",
+      "value": false
+    },
+    {
+      "sql": "'[1,2]'::jsonb @> '1'::jsonb",
+      "value": true
+    },
+    {
+      "sql": "'[[1,2]]'::jsonb @> '[1]'::jsonb",
+      "value": false
+    },
+    {
+      "sql": "'[[1,2]]'::jsonb @> '[[1]]'::jsonb",
+      "value": true
+    },
+    {
+      "sql": "'[{\"a\":1,\"b\":2}]'::jsonb @> '[{\"a\":1}]'::jsonb",
+      "value": true
+    },
+    {
+      "sql": "'{\"a\":null,\"b\":2}'::jsonb @> '{\"a\":null}'::jsonb",
+      "value": true
+    },
+    {
+      "sql": "'[1,2,2]'::jsonb @> '[2,2]'::jsonb",
+      "value": true
+    },
+    {
+      "sql": "'1.000'::jsonb @> '1'::jsonb",
+      "value": true
+    },
+    {
+      "sql": "'null'::jsonb @> 'null'::jsonb",
+      "value": true
+    },
+    {
+      "sql": "NULL::jsonb @> 'null'::jsonb",
+      "value": null
+    },
+    {
+      "sql": "ARRAY['a','b'] @> ARRAY['b','b']",
+      "value": true
+    },
+    {
+      "sql": "ARRAY['a',NULL] @> ARRAY[NULL]::text[]",
+      "value": false
+    },
+    {
+      "sql": "ARRAY[]::text[] @> ARRAY[]::text[]",
+      "value": true
+    },
+    {
+      "sql": "ARRAY['a'] @> NULL::text[]",
+      "value": null
+    },
+    {
+      "sql": "cardinality(string_to_array('',' '))",
+      "value": 0
+    },
+    {
+      "sql": "cardinality(string_to_array('a,,b,',','))",
+      "value": 4
+    },
+    {
+      "sql": "cardinality(string_to_array('é🙂',NULL))",
+      "value": 2
+    },
+    {
+      "sql": "cardinality(string_to_array('a,b',''))",
+      "value": 1
+    },
+    {
+      "sql": "string_to_array('read write',' ') @> ARRAY['read']",
+      "value": true
+    },
+    {
+      "sql": "string_to_array('read write',' ') @> ARRAY['read','absent']",
+      "value": false
+    },
+    {
+      "sql": "string_to_array('a,NULL,b',',','NULL') @> ARRAY[NULL]::text[]",
+      "value": false
+    },
+    {
+      "sql": "cardinality(string_to_array(NULL,' '))",
+      "value": null
+    },
+    {
+      "sql": "string_to_array('aaaaabaaaaab','aaab') @> ARRAY['aa','']",
+      "value": true
+    },
+    {
+      "sql": "string_to_array('é🙂',NULL) @> ARRAY['🙂']",
+      "value": true
+    }
+  ]
+}

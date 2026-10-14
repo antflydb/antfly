@@ -40,11 +40,9 @@ pub fn addCommands(ctx: Context, install_default: bool) *std.Build.Step.Compile 
 
     const bench_server = b.addExecutable(.{
         .name = "antfly-inference-bench-server",
-        // The production server plus owned codec reconstruction reached 6.65 GB
-        // on Linux; Metal builds reached 7.96 GB. Reserve 8 GiB for compilation.
-        // The all-backend server build peaked at 10 GiB with current sources.
-        // This is compiler scheduling capacity, independent of runtime limits.
-        .max_rss = @as(usize, 12) * 1024 * 1024 * 1024,
+        // Retain video codec compiler headroom and main's larger Darwin Metal
+        // allowance for the production prepared-pipeline benchmark.
+        .max_rss = @as(usize, if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) 14 else 12) * 1024 * 1024 * 1024,
         .root_module = b.createModule(.{
             .root_source_file = ctx.path("src/benchmark_server.zig"),
             .target = ctx.target,

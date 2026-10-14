@@ -13,8 +13,8 @@ unsupported SQL shapes executable.
 SQL-language `PREPARE name [(types...)] AS statement`, `EXECUTE name
 [(expressions...)]`, and `DEALLOCATE [PREPARE] name|ALL` use the same bounded,
 connection-owned registry as wire Parse/Bind. Names survive transaction commit
-and are released on disconnect. Execution preserves the prepared catalog
-identity guard, rechecks current credentials, binds typed values without SQL
+and are released on disconnect. Execution rebinds against the current catalog while preserving the parameter
+and result type contract, rechecks current credentials, binds typed values without SQL
 interpolation, and uses pull streaming for eligible reads. EXECUTE arguments
 are bounded scalar expressions; column references, parameters, and subqueries
 are not an argument-evaluation escape hatch into table reads. These commands
@@ -88,9 +88,15 @@ process's port separately when running multiple nodes on one host.
   Execute suspends/resumes the same snapshot/result
   without replaying a statement or mutation. A statement can be closed
   independently of its portals. Opaque backend continuation tokens are rejected.
-- Prepared native statements retain a catalog revision and every physical table
-  ID/name and schema-version fence through Bind. Execute rejects changed bindings before
-  reading or mutating, including a same-shaped dropped/recreated table.
+- Cached statements recompile before Bind and before an unstarted Execute, using
+  their fixed parameter types and saved namespace/search path. Compatible DDL,
+  including an added unselected column or index, transparently refreshes the
+  catalog guard. Changed result types fail with `0A000` and PostgreSQL's
+  `cached plan must not change result type` message before reading or mutation
+  admission. Rebinding also refreshes the settings epoch; execution validates
+  that fresh epoch to fence concurrent setting catalog changes.
+  Suspended portals keep their original snapshot; execution never replays an
+  admitted mutation. Concurrent DDL after rebinding still meets a schema fence.
 - Extended-query errors drain queued messages until Sync. Backend transaction
   state is reflected by ReadyForQuery, and disconnect abandons session state.
 - Separate CancelRequest connections with cryptographically random secrets;
@@ -105,6 +111,30 @@ encodings, and binary representation guesses are rejected. Passwords may only
 be accepted on loopback by default; remote binding requires explicit deployment
 acknowledgement of an externally protected transport. This override supplies no
 TLS itself.
+
+## DDL admission and readiness
+
+Standalone completes initial durable relation catalog publication before opening
+public HTTP or PostgreSQL listeners. This also applies on restart with persisted
+tables. Publication uses bounded control rounds without a fixed total startup
+deadline. SIGINT/SIGTERM cancel the wait; terminal publication failures
+for the current source epoch fail startup.
+HA retains its separate writer/replica authority contract.
+
+`53300` with `retryable:true` for relation catalog publication means no schema
+change was admitted. Wait briefly and retry the complete DDL. Standalone's
+metadata control loop advances the same bounded relation publication protocol
+as clustered metadata; publication is asynchronous after catalog changes.
+
+`55000` with a DDL receipt in `DETAIL` means the declaration committed and
+activation is pending. For an initial FK table, poll for the table to become
+visible, then use it. For changes to an existing table, inspect its schema and
+constraint status. Retain the receipt and do not replay the DDL.
+
+`40003` means the admission or mutation outcome is unknown. Retain the receipt,
+including any FK publication ID, and inspect durable status before deciding
+what to do next. This is not a retry signal. A failed operation before admission
+does not reserve a hidden table or parent publication lock.
 
 ## Resource and lifecycle contract
 
@@ -158,3 +188,32 @@ parameters/results, statement/portal ownership, authentication ordering,
 extended error recovery, allocation bounds, protected transport, active-backend
 shutdown, and authenticated cancellation at connection capacity. The network
 cases use local loopback sockets and need socket access in sandboxed runners.
+
+## Driver formatting contract and conformance
+
+Startup also accepts asyncpg's quoted UTF-8 encoding and UTF8/UTF-8/UTF_8
+aliases; the effective client_encoding stays UTF8. Startup accepts case-insensitive `DateStyle` (ISO with optional MDY/DMY/YMD),
+`TimeZone` (UTC, Etc/UTC, GMT, +00, Z, GMT+00:00, UTC+00:00),
+`extra_float_digits` (-15 through 3), `IntervalStyle=postgres`, and
+`standard_conforming_strings=on` (also true/1). These negotiate the fixed native
+output contract: ISO, MDY; UTC; round-trippable floats (reported as 3);
+PostgreSQL intervals; standard strings. They do not install alternative input
+parsers or lossy float renderers. `SHOW`, `SET`, and `RESET` use that same
+contract in simple and extended queries. ParameterStatus reports the effective
+values, including IntervalStyle and extra_float_digits. Unsupported startup
+settings fail with SQLSTATE 0A000 and identify the parameter; `options`, `role`,
+and startup `search_path` remain rejected. Non-UTC clients, including JDBC JVMs,
+must select UTC explicitly until native session time zones are supported.
+
+Run `zig build pgwire-test` for framing, JDBC-style startup, settings, and
+rejection tests. Run `scripts/test_pgwire_drivers.py --binary <antfly>` using the
+uv command in its docstring for real SQLx 0.9, pgx, node-postgres, psycopg/libpq,
+and asyncpg clients against an isolated authenticated standalone process. Each
+client exercises pool/connection setup, SELECT 1, typed bound parameters, SHOW,
+and a transaction. Go also exercises database/sql and its comment-only ping.
+Portal arenas have stable addresses through registry growth and removal, so
+retained native results release before their allocator is destroyed. The Python client also verifies unsupported startup values
+through a real connection. Go, Node.js, and Rust (at least 1.94 for SQLx 0.9) toolchains are required.
+Both base and full E2E CI gates require the driver conformance job, which reuses
+the corresponding candidate binary. Use
+`--url` to target an existing node or `--drivers` to select individual clients.

@@ -2340,17 +2340,27 @@ const BitReader = struct {
         return .{ .bytes = bytes };
     }
 
-    fn readBits(self: *BitReader, count: u5) !u32 {
+    fn peekBits(self: *const BitReader, count: u5) !u32 {
+        if (count > self.bytes.len * 8 -| self.bit_pos) return error.WebpDecodeFailed;
         var value: u32 = 0;
+        var remaining: usize = count;
+        var position = self.bit_pos;
         var shift: u5 = 0;
-        while (shift < count) : (shift += 1) {
-            if (self.bit_pos >= self.bytes.len * 8) return error.WebpDecodeFailed;
-            const byte = self.bytes[self.bit_pos / 8];
-            const bit_index: u3 = @intCast(self.bit_pos & 7);
-            const bit = (byte >> bit_index) & 1;
-            value |= @as(u32, bit) << shift;
-            self.bit_pos += 1;
+        while (remaining != 0) {
+            const offset: u3 = @intCast(position & 7);
+            const take = @min(remaining, 8 - @as(usize, offset));
+            const mask = (@as(u32, 1) << @as(u5, @intCast(take))) - 1;
+            value |= ((@as(u32, self.bytes[position / 8]) >> offset) & mask) << shift;
+            position += take;
+            remaining -= take;
+            if (remaining != 0) shift += @intCast(take);
         }
+        return value;
+    }
+
+    fn readBits(self: *BitReader, count: u5) !u32 {
+        const value = try self.peekBits(count);
+        self.bit_pos += count;
         return value;
     }
 };
@@ -2382,13 +2392,13 @@ const vp8l_code_to_plane = [_]u8{
 };
 
 const PrefixCode = struct {
-    const Entry = struct {
-        code: u16,
-        bits: u4,
-        symbol: u16,
-    };
-
-    entries: [max_vp8l_symbol_count]Entry = undefined,
+    // Symbols in canonical length order, with an LSB-first short-code lookup.
+    // Borrow this table in symbol loops instead of copying it for each pixel.
+    symbols: [max_vp8l_symbol_count]u16 = undefined,
+    counts: [vp8l_max_code_bits + 1]u16 = @splat(0),
+    first_code: [vp8l_max_code_bits + 1]u16 = @splat(0),
+    first_symbol: [vp8l_max_code_bits + 1]u16 = @splat(0),
+    short_codes: [256]u32 = @splat(0),
     entry_count: usize = 0,
     max_bits: u4 = 0,
 
@@ -2500,32 +2510,46 @@ const PrefixCode = struct {
             next_code[bits] = code;
         }
 
-        var out = PrefixCode{ .max_bits = max_bits };
+        var out = PrefixCode{ .max_bits = max_bits, .counts = counts, .first_code = next_code, .entry_count = nonzero_count };
+        var offset: u16 = 0;
+        for (1..vp8l_max_code_bits + 1) |bits| {
+            out.first_symbol[bits] = offset;
+            offset += counts[bits];
+        }
         for (lengths, 0..) |raw_len, symbol| {
             if (raw_len == 0) continue;
             const bits: u4 = @intCast(raw_len);
             const canonical = next_code[bits];
             next_code[bits] += 1;
-            out.entries[out.entry_count] = .{
-                .code = reverseBits(canonical, bits),
-                .bits = bits,
-                .symbol = @intCast(symbol),
-            };
-            out.entry_count += 1;
+            out.symbols[out.first_symbol[bits] + canonical - out.first_code[bits]] = @intCast(symbol);
+            if (bits <= 8) {
+                var prefix: usize = reverseBits(canonical, bits);
+                const step = @as(usize, 1) << bits;
+                const entry = (@as(u32, bits) << 16) | @as(u32, @intCast(symbol));
+                while (prefix < out.short_codes.len) : (prefix += step) out.short_codes[prefix] = entry;
+            }
         }
         return out;
     }
 
-    fn readSymbol(self: PrefixCode, reader: *BitReader) !u16 {
-        if (self.entry_count == 1) return self.entries[0].symbol;
-
+    fn readSymbol(self: *const PrefixCode, reader: *BitReader) !u16 {
+        if (self.entry_count == 1) return self.symbols[0];
+        if (reader.bytes.len * 8 -| reader.bit_pos >= 8) {
+            const entry = self.short_codes[try reader.peekBits(8)];
+            const bits: u4 = @intCast(entry >> 16);
+            if (bits != 0) {
+                reader.bit_pos += bits;
+                return @truncate(entry);
+            }
+        }
+        // Convert the wire's LSB-first sequence back into canonical order.
+        // Length ranges avoid scanning the whole alphabet for long codes/tails.
         var code: u16 = 0;
-        var bits: u4 = 1;
-        while (bits <= self.max_bits) : (bits += 1) {
-            const bit = try reader.readBits(1);
-            code |= @as(u16, @intCast(bit)) << (bits - 1);
-            for (self.entries[0..self.entry_count]) |entry| {
-                if (entry.bits == bits and entry.code == code) return entry.symbol;
+        for (1..@as(usize, self.max_bits) + 1) |bits| {
+            code = (code << 1) | @as(u16, @intCast(try reader.readBits(1)));
+            const first = self.first_code[bits];
+            if (code >= first and code - first < self.counts[bits]) {
+                return self.symbols[self.first_symbol[bits] + code - first];
             }
         }
         return error.WebpDecodeFailed;
@@ -5986,5 +6010,82 @@ fn vp8VideoPredict(p: *Vp8FramePlanes, ref: Vp8FramePlanes, motion: Vp8VideoMoti
         };
         vp8VideoPredictBlock(p.u, p.uv_stride, ref.u, ref.uv_padded_height, x * 8 + i % 2 * 4, y * 8 + i / 2 * 4, mv, version);
         vp8VideoPredictBlock(p.v, p.uv_stride, ref.v, ref.uv_padded_height, x * 8 + i % 2 * 4, y * 8 + i / 2 * 4, mv, version);
+    }
+}
+
+test "vp8l prefix lookup matches linear decoding for every sixteen-bit prefix" {
+    // A complete tree with codes at every length through 15 bits. Permute
+    // symbols so wire order differs from symbol order.
+    var lengths: [16]u8 = @splat(0);
+    for (0..14) |i| lengths[(i * 7) % 16] = @intCast(i + 1);
+    lengths[(14 * 7) % 16] = 15;
+    lengths[(15 * 7) % 16] = 15;
+    const table = try PrefixCode.build(&lengths);
+    var codes: [16]u16 = undefined;
+    var next: u16 = 0;
+    for (1..16) |width| {
+        for (lengths, 0..) |length, symbol| {
+            if (length == width) {
+                codes[symbol] = reverseBits(next, @intCast(width));
+                next += 1;
+            }
+        }
+        if (width != 15) next <<= 1;
+    }
+    for (0..65536) |raw| {
+        const bytes = [_]u8{ @truncate(raw), @truncate(raw >> 8) };
+        var fast = BitReader.init(&bytes);
+        var expected_symbol: ?u16 = null;
+        var expected_bits: usize = 0;
+        for (lengths, 0..) |length, symbol| {
+            const mask = (@as(usize, 1) << @as(u4, @intCast(length))) - 1;
+            if (raw & mask == codes[symbol]) {
+                expected_symbol = @intCast(symbol);
+                expected_bits = length;
+                break;
+            }
+        }
+        try std.testing.expectEqual(expected_symbol.?, try table.readSymbol(&fast));
+        try std.testing.expectEqual(expected_bits, fast.bit_pos);
+    }
+}
+
+test "vp8l prefix lookup accepts short tails and zero-bit single-symbol trees" {
+    const pair = try PrefixCode.build(&.{ 1, 1 });
+    for (0..8) |offset| {
+        var reader = BitReader{ .bytes = &.{0xa5}, .bit_pos = offset };
+        for (offset..8) |bit| {
+            try std.testing.expectEqual(@as(u16, (@as(u8, 0xa5) >> @as(u3, @intCast(bit))) & 1), try pair.readSymbol(&reader));
+        }
+        try std.testing.expectError(error.WebpDecodeFailed, pair.readSymbol(&reader));
+    }
+    const single = try PrefixCode.build(&.{ 0, 7, 0 });
+    var empty = BitReader.init(&.{});
+    try std.testing.expectEqual(@as(u16, 1), try single.readSymbol(&empty));
+    try std.testing.expectEqual(@as(usize, 0), empty.bit_pos);
+    const long = try PrefixCode.build(&.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 15 });
+    var truncated = BitReader.init(&.{0xff});
+    try std.testing.expectError(error.WebpDecodeFailed, long.readSymbol(&truncated));
+}
+
+test "vp8l bulk bit reader matches scalar bits at every byte offset and count" {
+    const bytes = [_]u8{ 0xb5, 0x43, 0xff, 0x00, 0x69, 0xde };
+    for (0..49) |position| {
+        for (0..32) |count| {
+            var reader = BitReader{ .bytes = &bytes, .bit_pos = position };
+            if (position + count > bytes.len * 8) {
+                try std.testing.expectError(error.WebpDecodeFailed, reader.readBits(@intCast(count)));
+                continue;
+            }
+            var expected: u32 = 0;
+            for (0..count) |bit| {
+                const at = position + bit;
+                expected |= @as(u32, (bytes[at / 8] >> @as(u3, @intCast(at % 8))) & 1) << @as(u5, @intCast(bit));
+            }
+            try std.testing.expectEqual(expected, try reader.peekBits(@intCast(count)));
+            try std.testing.expectEqual(position, reader.bit_pos);
+            try std.testing.expectEqual(expected, try reader.readBits(@intCast(count)));
+            try std.testing.expectEqual(position + count, reader.bit_pos);
+        }
     }
 }

@@ -51,7 +51,7 @@ pub const Cursor = struct {
         pruned: bool = false,
         chunk: external.ColumnChunk,
         offset: u64,
-        decoded: ?parquet.OwnedBatch = null,
+        decoded: ?parquet.OwnedColumns = null,
         cached: ?@import("lake_decoded_cache.zig").Lease = null,
         dictionary: ?page.Dictionary = null,
         dictionary_lease: ?@import("lake_decoded_cache.zig").Lease = null,
@@ -189,7 +189,10 @@ pub const Cursor = struct {
                     }
                 }
             }
-            const parsed = try self.header(column);
+            const probe = try self.headerRead(column);
+            var probe_held = true;
+            defer if (probe_held) probe.lease.release();
+            const parsed = probe.parsed;
             const len = std.math.add(usize, parsed.header_len, parsed.header.compressed_page_size) catch return error.ParquetPageTooLarge;
             if (len > end - column.offset) return error.InvalidParquetPage;
             // Skip payloads whose row ordinals precede the next survivor.
@@ -218,7 +221,7 @@ pub const Cursor = struct {
                     var admission = self.limits;
                     admission.max_rows = @max(admission.max_rows, parsed.header.value_count);
                     admission.max_struct_allocation_bytes /= share;
-                    _ = try parquet.admitMaterialization(parsed.header.value_count, 1, admission);
+                    _ = try parquet.admitColumnMaterialization(parsed.header.value_count, 1, admission);
                     column.cached = lease;
                     column.offset += len;
                     column.count = parsed.header.value_count;
@@ -226,9 +229,18 @@ pub const Cursor = struct {
                     return;
                 }
             };
-            const encoded_lease = try self.read(column.offset, len);
-            defer encoded_lease.release();
-            const encoded = encoded_lease.bytes;
+            // Small pages are often already complete in the header probe.
+            // Borrow it instead of issuing a second overlapping provider GET
+            // (exact range cache keys deliberately do not alias subranges).
+            const reuse_probe = len <= probe.lease.bytes.len;
+            if (!reuse_probe) {
+                // Do not raise peak range residency for larger pages.
+                probe.lease.release();
+                probe_held = false;
+            }
+            const encoded_lease = if (reuse_probe) null else try self.read(column.offset, len);
+            defer if (encoded_lease) |lease| lease.release();
+            const encoded = if (encoded_lease) |lease| lease.bytes else probe.lease.bytes[0..len];
             column.offset += len;
             switch (parsed.header.page_type) {
                 .dictionary_page => {
@@ -285,7 +297,7 @@ pub const Cursor = struct {
                     fn load(raw: *anyopaque, item: *@import("lake_decoded_cache.zig").Item) !void {
                         const value: *@This() = @ptrCast(@alignCast(raw));
                         const cursor = value.cursor;
-                        const decoded = try parquet.buildSupportedI64RowGroupBatchAllocWithLimits(item.arena.allocator(), cursor.inventory, cursor.file.file_id, cursor.group.ordinal, value.input, value.limits);
+                        const decoded = try parquet.buildSupportedColumnsAllocWithLimits(item.arena.allocator(), cursor.inventory, cursor.file.file_id, cursor.group.ordinal, value.input, value.limits);
                         item.payload = .{ .columns = decoded.columns };
                         if (value.dictionary) |dictionary| dictionary.cache.depend(.{ .cache = dictionary.cache, .item = item }, dictionary);
                     }
@@ -296,7 +308,7 @@ pub const Cursor = struct {
                 // Cursor-owned dictionaries outlive every uncached page. Only
                 // cache publication needs an independently retained dependency.
                 limits.borrow_dictionary = true;
-                column.decoded = try parquet.buildSupportedI64RowGroupBatchAllocWithLimits(self.a, self.inventory, self.file.file_id, self.group.ordinal, &input, limits);
+                column.decoded = try parquet.buildSupportedColumnsAllocWithLimits(self.a, self.inventory, self.file.file_id, self.group.ordinal, &input, limits);
             }
             column.count = count;
             column.consumed = @intCast(self.position - column.first);
@@ -307,21 +319,28 @@ pub const Cursor = struct {
         return error.ParquetRowGroupRowCountMismatch;
     }
     fn header(self: *Cursor, column: *const Column) !page.ParsedHeader {
+        const probe = try self.headerRead(column);
+        defer probe.lease.release();
+        return probe.parsed;
+    }
+    const HeaderRead = struct { parsed: page.ParsedHeader, lease: ranges.RangeLease };
+    fn headerRead(self: *Cursor, column: *const Column) !HeaderRead {
         const end = std.math.add(u64, column.chunk.file_offset, column.chunk.compressed_len) catch return error.InvalidParquetPage;
         if (column.offset >= end) return error.InvalidParquetPage;
         var probe_size: usize = @intCast(@min(end - column.offset, 512));
         while (true) {
             const probe_lease = try self.read(column.offset, probe_size);
-            defer probe_lease.release();
+            errdefer probe_lease.release();
             const probe = probe_lease.bytes;
             const parsed = page.parsePageHeader(probe) catch |err| {
                 const next_size = @min(end - column.offset, @min(probe_size * 2, 64 * 1024));
                 if (next_size == probe_size) return err;
+                probe_lease.release();
                 probe_size = @intCast(next_size);
                 continue;
             };
             try parsed.header.validateResourceLimits();
-            return parsed;
+            return .{ .parsed = parsed, .lease = probe_lease };
         }
     }
     fn decodeDictionaryAlloc(a: A, chunk: external.ColumnChunk, header_value: page.Header, encoded: []const u8) !page.Dictionary {
@@ -340,7 +359,7 @@ pub const Cursor = struct {
     }
     /// Inspect the next headers while this page is being consumed, then warm
     /// the exact versioned ranges used by advance. Parallelism is bounded by
-    /// the shared reader's four workers and 32 MiB lookahead quota.
+    /// the shared reader's eight jobs and 32 MiB lookahead quota.
     fn prefetchPages(self: *Cursor) !void {
         const reader = self.shared_reader orelse return;
         if (reader.context.io == null or self.position == self.group.row_count) return;
@@ -360,14 +379,12 @@ pub const Cursor = struct {
             if (self.filter != null and !column.required) continue;
             if (count == reads.len) break;
             if (column.consumed != column.count) continue;
-            const parsed = try self.header(column);
-            const len = std.math.add(usize, parsed.header_len, parsed.header.compressed_page_size) catch return error.ParquetPageTooLarge;
             const end = std.math.add(u64, column.chunk.file_offset, column.chunk.compressed_len) catch return error.InvalidParquetPage;
-            if (len > end - column.offset or len > self.limits.max_input_bytes / @max(@as(usize, 1), self.columns.len)) return error.ParquetPageTooLarge;
-            reads[count] = .{ .object = try ranges.objectRefForExternalFileUri(self.file), .range = .{ .offset = column.offset, .len = len }, .purpose = .parquet_column_chunk };
+            if (column.offset >= end) continue;
+            reads[count] = .{ .object = try ranges.objectRefForExternalFileUri(self.file), .range = .{ .offset = column.offset, .len = @min(end - column.offset, 512) }, .purpose = .parquet_column_chunk };
+            try reader.prefetchPage(reads[count], end, self.limits.max_input_bytes / @max(@as(usize, 1), self.columns.len));
             count += 1;
         }
-        if (count != 0) try reader.prefetch(reads[0..count]);
     }
     const DecodeStats = struct { pages: usize, dictionaries: usize };
     const DecodeAllocator = @import("../../sql/parallel_scheduler.zig").LockedAllocator;

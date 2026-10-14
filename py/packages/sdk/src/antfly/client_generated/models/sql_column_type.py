@@ -2,6 +2,7 @@ from enum import StrEnum
 
 
 class SQLColumnType(StrEnum):
+    ARRAY = "array"
     BOOLEAN = "boolean"
     DATETIME = "datetime"
     INTEGER = "integer"

@@ -34,6 +34,7 @@ const enrichment_runtime_mod = @import("enrichment/enrichment_runtime.zig");
 const enrichment_state = @import("enrichment/enrichment_state.zig");
 const enrichment_worker = @import("enrichment/enrichment_worker.zig");
 const execution_resources = @import("execution_resources.zig");
+const graph_mod = @import("../../graph/graph.zig");
 const graph_edge_contender = @import("graph_edge_contender.zig");
 const graph_edge_ttl_tombstone = @import("graph_edge_ttl_tombstone.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
@@ -266,7 +267,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
             }
 
-            try self.executor.failIfUnhealthy();
+            try self.executor.checkSyncLevelHealth(req.sync_level);
 
             var foreground_write = resource_manager_mod.ResourceManager.ForegroundWriteLease{};
             defer foreground_write.release();
@@ -1787,6 +1788,21 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const existing = try collectGraphArtifactsForDocIndex(self.alloc, self.core.store, clear.doc_key, clear.index_name);
                 defer docstore_mod.DocStore.freeResults(self.alloc, existing);
                 for (existing) |entry| {
+                    // Field replacement owns the direct contributor only.
+                    // An unchanged asset assertion must retain its primary edge.
+                    const graph_entry = self.core.index_manager.graphIndex(clear.index_name) orelse return error.IndexNotFound;
+                    if (graph_entry.artifact_sources.len > 0) {
+                        const state = try internal_keys.graphDirectStateKeyAlloc(self.alloc, clear.doc_key, clear.index_name);
+                        defer self.alloc.free(state);
+                        const contender = try internal_keys.graphGlobalEdgeContenderKeyAlloc(self.alloc, clear.index_name, graph_entry.config.coverage_generation, entry.key, @intCast(graph_mod.direct_source_priority), state);
+                        defer self.alloc.free(contender);
+                        const direct = self.core.store.get(self.alloc, contender) catch |err| switch (err) {
+                            error.NotFound => null,
+                            else => return err,
+                        };
+                        defer if (direct) |raw| self.alloc.free(raw);
+                        if (direct == null) continue;
+                    }
                     if (explicit_graph_write_key_set.contains(entry.key)) continue;
                     if (graph_delete_key_set.contains(entry.key)) continue;
                     const owned_key = try self.alloc.dupe(u8, entry.key);
@@ -2239,7 +2255,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (!used_trusted_identity_path) self.clearBulkIngestIdentityAllNewLocked();
             }
             if (!used_trusted_identity_path) {
-                try doc_identity.appendBatchIdentityMetadataForNamespaceWithVisibilityDeletesAlloc(
+                try doc_identity.appendBatchIdentityMetadataForNamespaceWithDeletesAlloc(
                     self.alloc,
                     self.core.store,
                     self.core.identity_namespace,
@@ -4871,6 +4887,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     min_applied = @min(min_applied, stats.applied_sequence);
                 }
             }
+            min_applied = try ctx.index_manager.clampReplayForGraphReplacementBuilds(ctx.store, min_applied);
             min_applied = try clampReplayTruncationForRepairPins(ctx.alloc, ctx.index_repair_checkpoint, min_applied);
             if (min_applied == 0 or min_applied == std.math.maxInt(u64)) return;
             try truncateReplayLogs(ctx, min_applied);

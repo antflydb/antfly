@@ -278,6 +278,9 @@ class ImportGraphTest(unittest.TestCase):
 
         self.assertTrue(analyzer.check_ha_seed_failure_registry(self.root))
 
+    def test_repository_ha_seed_registry_resolves_relocated_owner(self):
+        self.assertTrue(analyzer.check_ha_seed_failure_registry())
+
     def test_ha_seed_failure_registry_rejects_unmapped_domain_error(self):
         self.write_ha_seed_failure_fixture(
             "",
@@ -298,6 +301,71 @@ class ImportGraphTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "escapes"):
             graph.resolve_source("../outside.zig")
+
+    def test_relocated_package_follows_selected_members_without_catalog_expansion(self):
+        embedded = self.root / "embedded"
+        physical = self.write(
+            "embedded/storage/db/db.zig", "pub const DB = struct {};\n"
+        )
+        unused = self.write(
+            "embedded/storage/lite/mod.zig", "pub const Lite = struct {};\n"
+        )
+        self.write(
+            "embedded/source_catalog_control.zig",
+            'pub const storage_db_db = @import("storage/db/db.zig");\n'
+            'pub const storage_lite_mod = @import("storage/lite/mod.zig");\n',
+        )
+        other = self.write(
+            "embedded/storage/new_plan.zig", "pub const Plan = struct {};\n"
+        )
+        self.write(
+            "embedded/source_catalog.zig",
+            'pub const storage_new_plan = @import("storage/new_plan.zig");\n',
+        )
+        direct = self.write(
+            "server/direct.zig",
+            'const db = @import("antfly_local_sources").storage_db_db;\n',
+        )
+        aliased = self.write(
+            "server/alias.zig",
+            'const local = @import("antfly_local_sources");\nconst db = local.storage_db_db;\n',
+        )
+        graph = analyzer.ImportGraph(
+            self.root / "server", {"antfly-embedded": embedded}
+        )
+        self.assertEqual(graph.resolve_source("storage/db/db.zig"), physical)
+        self.assertEqual(graph.relative_edges(direct), (physical,))
+        self.assertEqual(graph.relative_edges(aliased), (physical,))
+        selected = self.write(
+            "server/physical.zig",
+            'const plan = @import("antfly_local_sources").storage_new_plan;\n',
+        )
+        self.assertEqual(graph.relative_edges(selected), (other,))
+        self.assertNotIn(unused, graph.closure([direct]))
+        self.assertEqual(
+            graph.relative_name(physical), "@antfly-embedded/storage/db/db.zig"
+        )
+        with self.assertRaisesRegex(ValueError, "escapes"):
+            graph.resolve_source("../embedded/storage/db/db.zig")
+
+    def test_repository_relocated_roots_and_boundary_gates(self):
+        graph = analyzer.ImportGraph(analyzer.DEFAULT_SOURCE_ROOT)
+        analyzer.analyze(graph, analyzer.DEFAULT_ROOTS)
+        self.assertTrue(analyzer.check_runtime_boundary(graph))
+        self.assertTrue(analyzer.check_codegen_boundary(graph))
+        self.assertTrue(analyzer.check_api_kernel_boundary(graph))
+        physical = graph.resolve_source("storage/db/db.zig")
+        report = analyzer.TimeReport(
+            name="distributed",
+            path=Path("report.json"),
+            raw={},
+            repo_files=frozenset({physical}),
+            has_file_list=True,
+        )
+        with redirect_stderr(io.StringIO()):
+            self.assertFalse(
+                analyzer.check_compiled_storage_boundary({"distributed": report})
+            )
 
     def test_codegen_boundary_accepts_focused_cli(self):
         self.write("cli_runtime.zig", 'const client = @import("client.zig");\n')

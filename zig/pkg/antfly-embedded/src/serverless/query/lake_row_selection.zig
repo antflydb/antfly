@@ -21,7 +21,22 @@ const A = std.mem.Allocator;
 pub const max_candidates = 65536;
 pub const Coordinate = struct { file: usize, group: u32, row: u64 };
 pub const Selection = struct {
-    coordinates: []const Coordinate,
+    pub const Block = struct { file: usize, group: u32, high: u32, rows: *const @import("../../encoding/roaring.zig").RoaringBitmap };
+    coordinates: []const Coordinate = &.{},
+    /// Borrowed sorted blocks; retained by the caller for the scan lifetime.
+    blocks: []const Block = &.{},
+    pub fn blockLess(_: void, l: Block, r: Block) bool {
+        return less({}, .{ .file = l.file, .group = l.group, .row = @as(u64, l.high) << 32 }, .{ .file = r.file, .group = r.group, .row = @as(u64, r.high) << 32 });
+    }
+    fn blockLower(self: Selection, file: usize, group: u32, high: u32) usize {
+        var begin: usize = 0;
+        var end = self.blocks.len;
+        while (begin < end) {
+            const mid = begin + (end - begin) / 2;
+            if (blockLess({}, self.blocks[mid], .{ .file = file, .group = group, .high = high, .rows = self.blocks[mid].rows })) begin = mid + 1 else end = mid;
+        }
+        return begin;
+    }
 
     /// Allocations belong to the caller's request arena. Strings need not be
     /// retained: validated references become inventory ordinals exactly once.
@@ -65,6 +80,16 @@ pub const Selection = struct {
         return .{ .coordinates = coordinates[0..unique] };
     }
     pub fn validateFile(self: Selection, index: usize, file: external.FileEntry) !void {
+        var block_index = self.blockLower(index, 0, 0);
+        while (block_index < self.blocks.len and self.blocks[block_index].file == index) : (block_index += 1) {
+            const block = self.blocks[block_index];
+            const group = for (file.row_groups) |group| {
+                if (group.ordinal == block.group) break group;
+            } else return error.InvalidLakeCandidateReference;
+            const base = @as(u64, block.high) << 32;
+            const available = group.row_count -| base;
+            if (available < (1 << 32) and block.rows.rangeCardinality(@intCast(available), 1 << 32) != 0) return error.InvalidLakeCandidateReference;
+        }
         var position = self.lower(.{ .file = index, .group = 0, .row = 0 });
         while (position < self.coordinates.len and self.coordinates[position].file == index) : (position += 1)
             try validateGroup(file, self.coordinates[position]);
@@ -90,11 +115,23 @@ pub const Selection = struct {
         return begin;
     }
     pub fn fileMayMatch(self: Selection, file: usize) bool {
+        const block = self.blockLower(file, 0, 0);
+        if (block < self.blocks.len and self.blocks[block].file == file) return true;
         const index = self.lower(.{ .file = file, .group = 0, .row = 0 });
         return index < self.coordinates.len and self.coordinates[index].file == file;
     }
     pub fn rangeMayMatch(self: Selection, file: usize, group: u32, first: u64, count: u64) bool {
         if (count == 0) return false;
+        const end = @as(u128, first) + count;
+        var block_index = self.blockLower(file, group, @intCast(first >> 32));
+        while (block_index < self.blocks.len) : (block_index += 1) {
+            const block = self.blocks[block_index];
+            const base = @as(u64, block.high) << 32;
+            if (block.file != file or block.group != group or base >= end) break;
+            const low_row: u32 = @intCast(first -| base);
+            const upper: u64 = @intCast(@min(end - base, 1 << 32));
+            if (block.rows.rangeCardinality(low_row, upper) != 0) return true;
+        }
         const index = self.lower(.{ .file = file, .group = group, .row = first });
         if (index == self.coordinates.len) return false;
         const found = self.coordinates[index];
@@ -114,4 +151,20 @@ test "external lake physical candidates deduplicate and seek without losing exac
     try std.testing.expect(!selection.contains(0, 1, 9007199254740992));
     try std.testing.expect(!selection.rangeMayMatch(0, 1, 3, 5));
     try std.testing.expect(selection.rangeMayMatch(0, 1, 0, 3));
+}
+
+test "external lake compressed selections seek across block and u32 boundaries" {
+    const Bitmap = @import("../../encoding/roaring.zig").RoaringBitmap;
+    var selected_rows = Bitmap.init(std.testing.allocator);
+    defer selected_rows.deinit();
+    try selected_rows.add(0);
+    try selected_rows.add(7);
+    const blocks = [_]Selection.Block{ .{ .file = 0, .group = 1, .high = 0, .rows = &selected_rows }, .{ .file = 0, .group = 1, .high = 1, .rows = &selected_rows }, .{ .file = 3, .group = 0, .high = 0, .rows = &selected_rows } };
+    const selection: Selection = .{ .blocks = &blocks };
+    try std.testing.expect(selection.fileMayMatch(0));
+    try std.testing.expect(!selection.fileMayMatch(1));
+    try std.testing.expect(selection.contains(0, 1, (1 << 32) + 7));
+    try std.testing.expect(!selection.rangeMayMatch(0, 1, 8, 8));
+    try std.testing.expect(selection.rangeMayMatch(0, 1, std.math.maxInt(u32), 2));
+    try std.testing.expect(!selection.rangeMayMatch(0, 1, 8, (1 << 32) - 8));
 }

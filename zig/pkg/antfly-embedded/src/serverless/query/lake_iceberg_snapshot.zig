@@ -810,7 +810,6 @@ fn planInventoryFromDecodedDataManifestsAllowingDeletesAlloc(
         try validateDataManifestSummary(manifest_entry, decoded.manifest);
         total_entries += decoded.manifest.entries.len;
     }
-    if (total_entries == 0) return error.EmptyIcebergInventory;
 
     const data_files = try alloc.alloc(iceberg_avro.DataFileEntry, total_entries);
     defer alloc.free(data_files);

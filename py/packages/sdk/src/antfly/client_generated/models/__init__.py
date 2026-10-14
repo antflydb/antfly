@@ -143,6 +143,9 @@ from .cohere_reranker_config import CohereRerankerConfig
 from .cohere_reranker_config_provider import CohereRerankerConfigProvider
 from .committed_mutation_outcome import CommittedMutationOutcome
 from .committed_mutation_outcome_status import CommittedMutationOutcomeStatus
+from .composed_query_source import ComposedQuerySource
+from .composed_source_overlay import ComposedSourceOverlay
+from .composed_table_source import ComposedTableSource
 from .confidence_step_config import ConfidenceStepConfig
 from .configure_extension_request import ConfigureExtensionRequest
 from .conjunction_query import ConjunctionQuery
@@ -166,6 +169,7 @@ from .create_full_text_index_request_type import CreateFullTextIndexRequestType
 from .create_graph_index_request import CreateGraphIndexRequest
 from .create_graph_index_request_type import CreateGraphIndexRequestType
 from .create_index_common import CreateIndexCommon
+from .create_query_source_body import CreateQuerySourceBody
 from .create_relational_index_request import CreateRelationalIndexRequest
 from .create_relational_index_request_type import CreateRelationalIndexRequestType
 from .create_table_request import CreateTableRequest
@@ -515,6 +519,7 @@ from .get_current_user_response_200_metadata_type_0 import GetCurrentUserRespons
 from .get_document_artifact_manifest_detail import GetDocumentArtifactManifestDetail
 from .get_table_storage_migration_response_200 import GetTableStorageMigrationResponse200
 from .global_stateful_query_request import GlobalStatefulQueryRequest
+from .global_stateful_query_request_source_ranking import GlobalStatefulQueryRequestSourceRanking
 from .google_embedder_config import GoogleEmbedderConfig
 from .google_embedder_config_provider import GoogleEmbedderConfigProvider
 from .google_generator_config import GoogleGeneratorConfig
@@ -668,6 +673,7 @@ from .graph_relationship_property_predicate import GraphRelationshipPropertyPred
 from .graph_relationship_property_predicate_op import GraphRelationshipPropertyPredicateOp
 from .graph_relationship_property_predicate_value_type import GraphRelationshipPropertyPredicateValueType
 from .graph_resolver_config import GraphResolverConfig
+from .graph_resolver_config_aliases_item import GraphResolverConfigAliasesItem
 from .graph_resolver_config_candidate_search import GraphResolverConfigCandidateSearch
 from .graph_resolver_config_fusion_combine import GraphResolverConfigFusionCombine
 from .graph_resolver_config_source_artifact_kind import GraphResolverConfigSourceArtifactKind
@@ -779,6 +785,8 @@ from .inference_connection import InferenceConnection
 from .inference_connection_models import InferenceConnectionModels
 from .inference_content_security_config import InferenceContentSecurityConfig
 from .inference_credentials import InferenceCredentials
+from .inference_decide_long_document import InferenceDecideLongDocument
+from .inference_decide_long_document_mode import InferenceDecideLongDocumentMode
 from .inference_decide_request import InferenceDecideRequest
 from .inference_decide_response import InferenceDecideResponse
 from .inference_dictate_request import InferenceDictateRequest
@@ -849,9 +857,11 @@ from .inference_media_content_part_type import InferenceMediaContentPartType
 from .inference_model_backend import InferenceModelBackend
 from .inference_model_format import InferenceModelFormat
 from .inference_model_info import InferenceModelInfo
+from .inference_model_info_qualified_limits import InferenceModelInfoQualifiedLimits
 from .inference_model_kind import InferenceModelKind
 from .inference_model_quantization import InferenceModelQuantization
 from .inference_model_ref import InferenceModelRef
+from .inference_model_ref_cuda_precision import InferenceModelRefCudaPrecision
 from .inference_models_response import InferenceModelsResponse
 from .inference_models_response_chunkers import InferenceModelsResponseChunkers
 from .inference_models_response_data_item import InferenceModelsResponseDataItem
@@ -936,6 +946,11 @@ from .inference_transient_capacity_error import InferenceTransientCapacityError
 from .inference_transient_capacity_error_reason import InferenceTransientCapacityErrorReason
 from .inference_vad_config import InferenceVadConfig
 from .inferenceschemas_config import InferenceschemasConfig
+from .ingest_lake_changes_body import IngestLakeChangesBody
+from .ingest_lake_changes_body_changes_item import IngestLakeChangesBodyChangesItem
+from .ingest_lake_changes_body_changes_item_op import IngestLakeChangesBodyChangesItemOp
+from .ingest_lake_changes_body_changes_item_row import IngestLakeChangesBodyChangesItemRow
+from .ingest_lake_changes_response_202 import IngestLakeChangesResponse202
 from .install_extension_request import InstallExtensionRequest
 from .install_manifest import InstallManifest
 from .installed_extension import InstalledExtension
@@ -951,6 +966,22 @@ from .join_profile import JoinProfile
 from .join_strategy import JoinStrategy
 from .join_type import JoinType
 from .key_range import KeyRange
+from .lake_catalog_commit_request import LakeCatalogCommitRequest
+from .lake_catalog_commit_request_requirements_item import LakeCatalogCommitRequestRequirementsItem
+from .lake_catalog_commit_request_updates_item import LakeCatalogCommitRequestUpdatesItem
+from .lake_catalog_config import LakeCatalogConfig
+from .lake_catalog_config_type import LakeCatalogConfigType
+from .lake_catalog_create_request import LakeCatalogCreateRequest
+from .lake_catalog_create_request_partition_spec import LakeCatalogCreateRequestPartitionSpec
+from .lake_catalog_create_request_properties import LakeCatalogCreateRequestProperties
+from .lake_catalog_create_request_schema import LakeCatalogCreateRequestSchema
+from .lake_catalog_create_request_write_order import LakeCatalogCreateRequestWriteOrder
+from .lake_catalog_response import LakeCatalogResponse
+from .lake_catalog_response_metadata import LakeCatalogResponseMetadata
+from .lake_catalog_response_state import LakeCatalogResponseState
+from .lake_read_receipt import LakeReadReceipt
+from .lake_read_requirement import LakeReadRequirement
+from .lake_read_requirement_visibility import LakeReadRequirementVisibility
 from .legacy_graph_document_query import LegacyGraphDocumentQuery
 from .legacy_graph_node_selector import LegacyGraphNodeSelector
 from .legacy_graph_query import LegacyGraphQuery
@@ -980,6 +1011,9 @@ from .lookup_key_response_200 import LookupKeyResponse200
 from .lookup_namespace_table_document_consistency import LookupNamespaceTableDocumentConsistency
 from .lookup_namespace_table_document_response_200 import LookupNamespaceTableDocumentResponse200
 from .lsm_storage_status import LsmStorageStatus
+from .maintain_lake_table_body import MaintainLakeTableBody
+from .maintain_lake_table_body_action import MaintainLakeTableBodyAction
+from .maintain_lake_table_response_200 import MaintainLakeTableResponse200
 from .match_all_query import MatchAllQuery
 from .match_all_query_match_all import MatchAllQueryMatchAll
 from .match_none_query import MatchNoneQuery
@@ -1111,12 +1145,16 @@ from .query_result_base_aggregations import QueryResultBaseAggregations
 from .query_result_base_analyses import QueryResultBaseAnalyses
 from .query_result_base_evaluation import QueryResultBaseEvaluation
 from .query_result_base_graph_metric_results import QueryResultBaseGraphMetricResults
+from .query_result_base_source_ranking import QueryResultBaseSourceRanking
 from .query_score_details import QueryScoreDetails
 from .query_strategy import QueryStrategy
 from .query_string_query import QueryStringQuery
 from .query_temporarily_unavailable_error import QueryTemporarilyUnavailableError
 from .query_temporarily_unavailable_error_code import QueryTemporarilyUnavailableErrorCode
 from .rate_limit_config import RateLimitConfig
+from .read_receipt import ReadReceipt
+from .read_requirements import ReadRequirements
+from .read_requirements_visibility import ReadRequirementsVisibility
 from .reauthorize_table_destinations_response_200 import ReauthorizeTableDestinationsResponse200
 from .reauthorize_table_destinations_response_200_status import ReauthorizeTableDestinationsResponse200Status
 from .regexp_query import RegexpQuery
@@ -1160,6 +1198,7 @@ from .relational_row_query_request import RelationalRowQueryRequest
 from .relational_row_row import RelationalRowRow
 from .relational_scalar_expression import RelationalScalarExpression
 from .relational_unique_constraint import RelationalUniqueConstraint
+from .relational_unique_constraint_origin import RelationalUniqueConstraintOrigin
 from .rename_catalog_resource_request import RenameCatalogResourceRequest
 from .repair_issue_list_request import RepairIssueListRequest
 from .repair_run_request import RepairRunRequest
@@ -1236,6 +1275,7 @@ from .row_filter_entry_filter import RowFilterEntryFilter
 from .runtime_config_status import RuntimeConfigStatus
 from .runtime_decl import RuntimeDecl
 from .runtime_decl_mode import RuntimeDeclMode
+from .saved_query_source import SavedQuerySource
 from .scan_keys_request import ScanKeysRequest
 from .scoped_row_filter import ScopedRowFilter
 from .scoped_row_filter_filter import ScopedRowFilterFilter
@@ -1260,16 +1300,25 @@ from .sort_field import SortField
 from .sort_profile import SortProfile
 from .sort_profile_candidate_source import SortProfileCandidateSource
 from .sort_profile_sort_lifecycle_state import SortProfileSortLifecycleState
+from .sql_array_column_schema import SQLArrayColumnSchema
+from .sql_array_column_schema_type import SQLArrayColumnSchemaType
+from .sql_array_dimension import SQLArrayDimension
+from .sql_array_element_type import SQLArrayElementType
+from .sql_array_value import SQLArrayValue
+from .sql_builtin_type import SQLBuiltinType
 from .sql_column import SQLColumn
 from .sql_column_type import SQLColumnType
 from .sql_connection_open_request import SQLConnectionOpenRequest
 from .sql_connection_response import SQLConnectionResponse
 from .sql_diagnostic import SQLDiagnostic
 from .sql_mutation_outcome import SQLMutationOutcome
+from .sql_numeric_modifier import SQLNumericModifier
+from .sql_parameter_descriptor import SQLParameterDescriptor
 from .sql_prepare_request import SQLPrepareRequest
 from .sql_prepared_execution_request import SQLPreparedExecutionRequest
 from .sql_prepared_response import SQLPreparedResponse
 from .sql_request import SQLRequest
+from .sql_request_lake_visibility import SQLRequestLakeVisibility
 from .sql_response import SQLResponse
 from .sql_setting_database_default import SqlSettingDatabaseDefault
 from .sql_setting_mutation_drop import SqlSettingMutationDrop
@@ -1604,6 +1653,9 @@ __all__ = (
     "CohereRerankerConfigProvider",
     "CommittedMutationOutcome",
     "CommittedMutationOutcomeStatus",
+    "ComposedQuerySource",
+    "ComposedSourceOverlay",
+    "ComposedTableSource",
     "ConfidenceStepConfig",
     "ConfigureExtensionRequest",
     "ConjunctionQuery",
@@ -1648,6 +1700,7 @@ __all__ = (
     "CreateGraphIndexRequest",
     "CreateGraphIndexRequestType",
     "CreateIndexCommon",
+    "CreateQuerySourceBody",
     "CreateRelationalIndexRequest",
     "CreateRelationalIndexRequestType",
     "CreateTableRequest",
@@ -1968,6 +2021,7 @@ __all__ = (
     "GetDocumentArtifactManifestDetail",
     "GetTableStorageMigrationResponse200",
     "GlobalStatefulQueryRequest",
+    "GlobalStatefulQueryRequestSourceRanking",
     "GoogleEmbedderConfig",
     "GoogleEmbedderConfigProvider",
     "GoogleGeneratorConfig",
@@ -2121,6 +2175,7 @@ __all__ = (
     "GraphRelationshipPropertyPredicateOp",
     "GraphRelationshipPropertyPredicateValueType",
     "GraphResolverConfig",
+    "GraphResolverConfigAliasesItem",
     "GraphResolverConfigCandidateSearch",
     "GraphResolverConfigFusionCombine",
     "GraphResolverConfigSourceArtifactKind",
@@ -2232,6 +2287,8 @@ __all__ = (
     "InferenceConnectionModels",
     "InferenceContentSecurityConfig",
     "InferenceCredentials",
+    "InferenceDecideLongDocument",
+    "InferenceDecideLongDocumentMode",
     "InferenceDecideRequest",
     "InferenceDecideResponse",
     "InferenceDictateRequest",
@@ -2302,9 +2359,11 @@ __all__ = (
     "InferenceModelBackend",
     "InferenceModelFormat",
     "InferenceModelInfo",
+    "InferenceModelInfoQualifiedLimits",
     "InferenceModelKind",
     "InferenceModelQuantization",
     "InferenceModelRef",
+    "InferenceModelRefCudaPrecision",
     "InferenceModelsResponse",
     "InferenceModelsResponseChunkers",
     "InferenceModelsResponseDataItem",
@@ -2387,6 +2446,11 @@ __all__ = (
     "InferenceTransientCapacityError",
     "InferenceTransientCapacityErrorReason",
     "InferenceVadConfig",
+    "IngestLakeChangesBody",
+    "IngestLakeChangesBodyChangesItem",
+    "IngestLakeChangesBodyChangesItemOp",
+    "IngestLakeChangesBodyChangesItemRow",
+    "IngestLakeChangesResponse202",
     "InstalledExtension",
     "InstalledExtensionStatus",
     "InstallExtensionRequest",
@@ -2402,6 +2466,22 @@ __all__ = (
     "JoinStrategy",
     "JoinType",
     "KeyRange",
+    "LakeCatalogCommitRequest",
+    "LakeCatalogCommitRequestRequirementsItem",
+    "LakeCatalogCommitRequestUpdatesItem",
+    "LakeCatalogConfig",
+    "LakeCatalogConfigType",
+    "LakeCatalogCreateRequest",
+    "LakeCatalogCreateRequestPartitionSpec",
+    "LakeCatalogCreateRequestProperties",
+    "LakeCatalogCreateRequestSchema",
+    "LakeCatalogCreateRequestWriteOrder",
+    "LakeCatalogResponse",
+    "LakeCatalogResponseMetadata",
+    "LakeCatalogResponseState",
+    "LakeReadReceipt",
+    "LakeReadRequirement",
+    "LakeReadRequirementVisibility",
     "LegacyGraphDocumentQuery",
     "LegacyGraphNodeSelector",
     "LegacyGraphQuery",
@@ -2431,6 +2511,9 @@ __all__ = (
     "LookupNamespaceTableDocumentConsistency",
     "LookupNamespaceTableDocumentResponse200",
     "LsmStorageStatus",
+    "MaintainLakeTableBody",
+    "MaintainLakeTableBodyAction",
+    "MaintainLakeTableResponse200",
     "MatchAllQuery",
     "MatchAllQueryMatchAll",
     "MatchNoneQuery",
@@ -2558,12 +2641,16 @@ __all__ = (
     "QueryResultBaseAnalyses",
     "QueryResultBaseEvaluation",
     "QueryResultBaseGraphMetricResults",
+    "QueryResultBaseSourceRanking",
     "QueryScoreDetails",
     "QueryStrategy",
     "QueryStringQuery",
     "QueryTemporarilyUnavailableError",
     "QueryTemporarilyUnavailableErrorCode",
     "RateLimitConfig",
+    "ReadReceipt",
+    "ReadRequirements",
+    "ReadRequirementsVisibility",
     "ReauthorizeTableDestinationsResponse200",
     "ReauthorizeTableDestinationsResponse200Status",
     "RegexpQuery",
@@ -2607,6 +2694,7 @@ __all__ = (
     "RelationalRowRow",
     "RelationalScalarExpression",
     "RelationalUniqueConstraint",
+    "RelationalUniqueConstraintOrigin",
     "RenameCatalogResourceRequest",
     "RepairIssueListRequest",
     "RepairRunRequest",
@@ -2683,6 +2771,7 @@ __all__ = (
     "RuntimeConfigStatus",
     "RuntimeDecl",
     "RuntimeDeclMode",
+    "SavedQuerySource",
     "ScanKeysRequest",
     "ScopedRowFilter",
     "ScopedRowFilterFilter",
@@ -2707,6 +2796,12 @@ __all__ = (
     "SortProfile",
     "SortProfileCandidateSource",
     "SortProfileSortLifecycleState",
+    "SQLArrayColumnSchema",
+    "SQLArrayColumnSchemaType",
+    "SQLArrayDimension",
+    "SQLArrayElementType",
+    "SQLArrayValue",
+    "SQLBuiltinType",
     "SQLColumn",
     "SQLColumnType",
     "SQLConnectionOpenRequest",
@@ -2715,10 +2810,13 @@ __all__ = (
     "SQLDDLReceiptState",
     "SQLDiagnostic",
     "SQLMutationOutcome",
+    "SQLNumericModifier",
+    "SQLParameterDescriptor",
     "SQLPreparedExecutionRequest",
     "SQLPreparedResponse",
     "SQLPrepareRequest",
     "SQLRequest",
+    "SQLRequestLakeVisibility",
     "SQLResponse",
     "SqlSettingDatabaseDefault",
     "SqlSettingMutationDrop",

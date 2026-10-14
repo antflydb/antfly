@@ -11,7 +11,12 @@ statement before any mutation.
   `COUNT(*)`; typed comparisons, `IS [NOT] NULL`, `AND`/`OR`/`NOT`, IN/BETWEEN,
   arithmetic, casts, CASE, registered scalar functions and JSON extraction.
   Ordering supports source columns, aliases, ordinal positions, expressions,
-  ASC/DESC and NULLS FIRST/LAST; LIMIT/OFFSET accept nonnegative integers/parameters.
+  ASC/DESC and NULLS FIRST/LAST. LIMIT/OFFSET accept integer literals, parameters
+  and NULL; negative bounds fail at execution with PostgreSQL diagnostics.
+  LIMIT ALL is unbounded; OFFSET ROW/ROWS and FETCH FIRST/NEXT ROW/ROWS ONLY
+  normalize to the same bounded execution plan, with an omitted FETCH count
+  defaulting to one. FETCH WITH TIES and arbitrary bound expressions remain
+  unsupported.
 - Inner/outer joins with source aliases, derived tables and nonrecursive CTEs;
   grouping, aggregate FILTER/DISTINCT, HAVING, and bounded aggregate ordering.
 - Linear recursive CTEs with seed-typed outputs, delta worklists, UNION ALL or
@@ -208,11 +213,24 @@ field provenance into native validation and row preparation, so a JSON null
 value does not become SQL NULL. SQL `NULL` and nested JSON nulls remain supported. JSON literal nesting is admitted before tree allocation and bounded
 to 64 container levels.
 
-The default quotas are 1 MiB statement bytes, 16,384 tokens, 8,192 AST nodes,
+The default quotas are 64 MiB statement bytes, 16,384 tokens, 8,192 AST nodes,
 64 levels of nesting/tree depth, 1,024 positional parameter slots, and 1,000
 insert rows. Token admission happens before decoding/allocating the excess
 token. Associative boolean chains are balanced so a long flat clause cannot
 create a linear-depth binding/evaluation stack.
+
+Embedded SQL JSON requests (SQL text plus parameters) are capped at 64 MiB.
+An oversized request returns a SQL diagnostic with SQLSTATE `54000` and the
+67108864-byte limit, including through the C API. Preparation and execution
+have separate 64 MiB memory budgets; exceeding either still returns `54000`.
+These budgets include retained allocations, so the request ceiling is not a
+promise that every request of that size can execute. The default transaction
+intent budget is 128 MiB, charged by retained row/key data and bookkeeping,
+rather than a multiplier that imposed an effective 2 MiB payload ceiling.
+Native callers may configure runtime retained-memory and transaction budgets;
+the embedded JSON admission policy is centralized in `resource_limits.zig`.
+Individual relational rows remain bounded at 16 MiB and stored index keys at
+1 MiB. Temporary predicate keys and sort runs use their own execution budgets.
 
 Run compiler tests from `zig/`:
 
@@ -364,3 +382,29 @@ elapsed time. Three window layouts over 256 rows with 16 KiB payloads write
 4,255,232 bytes through shared payloads versus 29,524,992 through payload
 rewrites, with compression disabled. These fixtures validate equal results and
 alternate execution order; they do not measure total production query latency.
+
+Embedded backends additionally support the `antfly_search('table', request
+[, candidate_limit])` relation with schema-derived columns, `_id`, `score`
+and `_highlights`. Request/limit parameters are typed as text/integer. The
+backend must explicitly advertise search-relation support; other providers
+reject the relation before opening any scans. Embedded catalog index DDL uses
+the shared schema translator and a native schema version CAS.
+
+
+## TEXT and JSONB character domain
+
+SQL `TEXT` and `JSONB` reject NUL (`U+0000`), including nested JSONB strings
+and object keys, with SQLSTATE `22P05` (`untranslatable_character`). Invalid
+UTF-8 has SQLSTATE `22021`. Sanitize captured command output and binary content
+before binding, for example by replacing NUL with `U+FFFD`, or store binary
+content outside these SQL character types. A rejected write leaves the row
+unchanged; an explicit transaction enters its normal failed state.
+
+Native diagnostics identify a failing bound value with a one-based
+`parameter_index` and `parameter $N` in the message. The C ABI copies that
+diagnostic into `antfly_last_error_detail()` on the calling thread; read it
+immediately after failure. Rust SQL and sqlx errors retain the SQLSTATE and
+include up to 512 UTF-8 bytes of the submitted statement (plus an ellipsis
+when truncated). `SqlError.body` also retains `error.statement`. Cursor fetch
+errors in sqlx carry the original SELECT. Bound parameter values are not added
+by statement diagnostics; SQL literals remain part of the submitted statement.

@@ -52,7 +52,7 @@ const Vector = struct {
         };
     }
     pub fn set(self: Vector, row: usize, value: Datum) !void {
-        if (value.patterns != null) return error.UnsupportedTypedKernel;
+        if (value.patterns != null or value.array != null or value.numeric != null) return error.UnsupportedTypedKernel;
         self.states[row] = if (value.sql_null) .sql_null else if (value.value == .null) .json_null else .value;
         if (self.states[row] != .value) return;
         switch (self.kind) {
@@ -75,6 +75,7 @@ const Vector = struct {
     }
 };
 fn kind(type_: scalar.Type) ?Kind {
+    if (type_.element_type == .float32 or type_.element_type == .numeric) return null; // Exact scalar fallback preserves float4 rounding and decimal limbs.
     return if (type_.kind) |k| switch (k) {
         .integer => .integer,
         .number => .number,
@@ -148,6 +149,37 @@ pub fn evaluate(a: A, programs: []const *const scalar.Program, input: anytype, p
         else => return err,
     };
 }
+
+test "SQL typed kernels preserve int4 overflow and decline float4 execution" {
+    const Input = struct {
+        count: usize = 2,
+        pub fn cell(_: @This(), _: A, _: usize, _: u32) !Datum {
+            return error.UnexpectedColumnAccess;
+        }
+    };
+    for ([_][]const u8{ "2147483646 + 1", "2147483647 + 1" }, 0..) |sql, index| {
+        var compiled = try @import("compiler.zig").compileScalar(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        var program = try scalar.bind(std.testing.allocator, compiled.expression, &.{}, &.{}, .{});
+        defer program.deinit();
+        try std.testing.expect(supported(&program));
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        if (index == 1) {
+            try std.testing.expectError(error.SqlNumericOutOfRange, evaluate(arena.allocator(), &.{&program}, Input{}, &.{}));
+            try std.testing.expectError(error.SqlNumericOutOfRange, program.evaluate(arena.allocator(), &.{}, &.{}, .{}));
+        } else {
+            const result = (try evaluate(arena.allocator(), &.{&program}, Input{}, &.{})).?;
+            for (result[0]) |value| try std.testing.expectEqual(@as(i64, 2147483647), value.value.integer);
+        }
+    }
+    var compiled = try @import("compiler.zig").compileScalar(std.testing.allocator, "x + x", .{});
+    defer compiled.deinit();
+    var program = try scalar.bind(std.testing.allocator, compiled.expression, &.{.{ .name = "x", .type = .number, .element_type = .float32 }}, &.{}, .{});
+    defer program.deinit();
+    try std.testing.expect(!supported(&program));
+}
+
 fn evaluateImpl(a: A, programs: []const *const scalar.Program, input: anytype, parameters: []const std.json.Value) !?[]const []const Datum {
     if (input.count > 4096 or programs.len > 256) return null;
     var instructions: [512]scalar.Instruction = undefined;
@@ -257,6 +289,11 @@ fn evaluateImpl(a: A, programs: []const *const scalar.Program, input: anytype, p
             .binary => |b| try binary(target, b.op, vectors[b.left], vectors[b.right]),
             else => unreachable,
         }
+        if (target.kind == .integer and instruction.operation != .literal) if (instruction.type.element_type) |element| {
+            if (element == .int16 or element == .int32) for (target.integers(), target.states) |value, state| {
+                if (state == .value) _ = try @import("builtin_cast.zig").checkedInteger(value, element);
+            };
+        };
         // Materialize roots when ready, so delivery vectors do not pin live
         // kernel slots while later expressions reuse the shared DAG.
         for (roots[0..programs.len], outputs) |root, output| if (root == i) {

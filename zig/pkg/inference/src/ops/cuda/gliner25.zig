@@ -247,7 +247,7 @@ fn kernelInto(self: *Compute, request: boundary.Kernel, output: CT) !void {
         if (t.elem_count != layout.input_elements[i]) return error.InvalidBoundaryDeviceShape;
         inputs[i] = t.buffer;
     }
-    try self.kernels.launchGliner25Boundary(&self.ctx, inputs, out.buffer, request.params(), layout.work_items);
+    try self.launchGlinerBoundaryKernel(inputs, out.buffer, request.params(), layout.work_items);
     self.stats.launch_other += 1;
     self.boundary_scope.stats.dispatches +|= 1;
 }
@@ -2648,4 +2648,72 @@ test "CUDA resident validation rejects malformed input capture and cancellation 
     try std.testing.expect(device.backend.stats.launch_other > before.launch_other);
     const summary = try cb.residentTrainingValidate(&batch, .{});
     try std.testing.expect(summary.finite and !summary.all_zero);
+}
+
+test "GLiNER CUDA boundary inference attention preserves masked FP32 semantics" {
+    const a = std.testing.allocator;
+    var device = try @import("../../graph/resident_training_fixture.zig").CudaDevice.init(a);
+    defer device.deinit();
+    try std.testing.expect(device.backend.kernels.gliner_boundary_attention_f32 != null);
+    const cb = device.backend.computeBackend();
+    for ([_][2]u32{ .{ 1, 3 }, .{ 31, 64 }, .{ 65, 128 }, .{ 129, 64 }, .{ 513, 64 }, .{ 2049, 64 }, .{ 2050, 64 }, .{ 2051, 64 }, .{ 1025, 64 } }) |shape| {
+        const sequence = shape[0];
+        const hidden = 2 * shape[1];
+        const count = 2 * sequence * hidden;
+        const relative_count = 17 * hidden;
+        const qkv = try a.alloc(f32, 3 * count);
+        defer a.free(qkv);
+        const relative = try a.alloc(f32, 2 * relative_count);
+        defer a.free(relative);
+        const mask = try a.alloc(i32, 2 * sequence);
+        defer a.free(mask);
+        const buckets = try a.alloc(i32, 2 * sequence - 1);
+        defer a.free(buckets);
+        for (qkv, 0..) |*value, i| value.* = @sin(@as(f32, @floatFromInt(i)) * 0.13) * 0.3;
+        for (relative, 0..) |*value, i| value.* = @cos(@as(f32, @floatFromInt(i)) * 0.17) * 0.2;
+        // Exercise a completely masked first tile, a partial final tile,
+        // independent padding, and an entirely masked second document.
+        for (mask, 0..) |*value, i| value.* = @intFromBool(i < sequence and i % 7 != 3 and (sequence < 65 or i >= 64));
+        for (buckets, 0..) |*value, i| value.* = @intCast(if (sequence == 2050) (i / 47) % 17 else if (sequence == 2051) 8 else i % 17);
+        var request = boundary.Kernel{ .kind = .deberta_attention };
+        request.dims[0..5].* = .{ 2, sequence, 2, shape[1], 17 };
+        var inputs: [7]?CT = @splat(null);
+        defer for (inputs) |input| if (input) |t| cb.free(t);
+        for (0..3) |i| inputs[i] = try upload(device.backend, f32, qkv[i * count ..][0..count], &.{@intCast(count)}, .{});
+        for (0..2) |i| inputs[i + 3] = try upload(device.backend, f32, relative[i * relative_count ..][0..relative_count], &.{@intCast(relative_count)}, .{});
+        inputs[5] = try upload(device.backend, i32, buckets, &.{@intCast(buckets.len)}, .{});
+        inputs[6] = try upload(device.backend, i32, mask, &.{@intCast(mask.len)}, .{});
+        @memcpy(request.inputs[0..7], &inputs);
+        // The previous serial online-softmax kernel is an independent oracle.
+        device.backend.gliner_boundary_inference = false;
+        const reference = try kernel(device.backend, request);
+        defer cb.free(reference);
+        device.backend.gliner_boundary_inference = true;
+        const output = try kernel(device.backend, request);
+        defer cb.free(output);
+        const actual = try a.alloc(f32, count);
+        defer a.free(actual);
+        const expected = try a.alloc(f32, count);
+        defer a.free(expected);
+        try cb.glinerBoundaryDownload(output, actual);
+        try cb.glinerBoundaryDownload(reference, expected);
+        for (actual, expected, 0..) |got, want, i| {
+            try std.testing.expectApproxEqAbs(want, got, 3e-5);
+            if (mask[i / hidden] == 0) try std.testing.expectEqual(@as(f32, 0), got);
+        }
+        if (shape[1] == 64) {
+            try std.testing.expect(device.backend.kernels.gliner_boundary_attention_tc_f16 != null);
+            device.backend.gliner_mixed_attention = true;
+            defer device.backend.gliner_mixed_attention = false;
+            const mixed = try kernel(device.backend, request);
+            defer cb.free(mixed);
+            try cb.glinerBoundaryDownload(mixed, actual);
+            if (sequence >= 512) try std.testing.expect(device.backend.stats.gliner_boundary_wide_attention_launches > 0);
+            if (sequence >= 2048) try std.testing.expect(device.backend.stats.gliner_boundary_compact_attention_launches > 0);
+            for (actual, expected, 0..) |got, want, i| {
+                try std.testing.expectApproxEqAbs(want, got, 5e-4);
+                if (mask[i / hidden] == 0) try std.testing.expectEqual(@as(f32, 0), got);
+            }
+        }
+    }
 }

@@ -11,6 +11,11 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
       "require": "./dist/index.cjs"
+    },
+    "./kysely": {
+      "types": "./dist/kysely.d.ts",
+      "import": "./dist/kysely.js",
+      "require": "./dist/kysely.cjs"
     }
   },
   "files": [
@@ -52,6 +57,7 @@
   "homepage": "https://github.com/antflydb/antfly/tree/main/ts/packages/embedded#readme",
   "devDependencies": {
     "@types/node": "^25.9.3",
+    "kysely": "^0.29.6",
     "tsup": "^8.5.1",
     "typescript": "~5.9.3",
     "vitest": "^4.1.9"
@@ -71,5 +77,13 @@
     "@antfly/embedded-darwin-arm64": "workspace:*",
     "@antfly/embedded-linux-arm64": "workspace:*",
     "@antfly/embedded-linux-x64": "workspace:*"
+  },
+  "peerDependencies": {
+    "kysely": "^0.29.6"
+  },
+  "peerDependenciesMeta": {
+    "kysely": {
+      "optional": true
+    }
   }
 }

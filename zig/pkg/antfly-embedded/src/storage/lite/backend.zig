@@ -70,6 +70,7 @@ pub const EngineSelection = enum {
 };
 
 pub const OpenOptions = struct {
+    externally_locked: bool = false,
     reclamation: docstore.reclamation.Options = .{},
     engine: EngineSelection = .auto,
     read_only: bool = false,
@@ -81,6 +82,7 @@ pub const OpenOptions = struct {
 };
 
 pub const CreateOptions = struct {
+    externally_locked: bool = false,
     reclamation: docstore.reclamation.Options = .{},
     exclusive: bool = false,
     no_sync: bool = false,
@@ -682,6 +684,7 @@ fn openNativeSingleFile(allocator: Allocator, path: []const u8, opts: OpenOption
     };
 
     const initial_store = try docstore.Store.openWithOptions(allocator, path, .{
+        .externally_locked = opts.externally_locked,
         .reclamation = opts.reclamation,
         .read_only = opts.read_only,
         .no_sync = opts.no_sync,
@@ -705,6 +708,7 @@ fn createNativeSingleFile(allocator: Allocator, path: []const u8, opts: CreateOp
     };
 
     const initial_store = try docstore.Store.createWithOptions(allocator, path, .{
+        .externally_locked = opts.externally_locked,
         .reclamation = opts.reclamation,
         .exclusive = opts.exclusive,
         .no_sync = opts.no_sync,
@@ -933,6 +937,9 @@ test "lite backend capabilities contract is stable" {
     const expected_fields = [_][]const u8{
         "freestanding_build",
         "threading",
+        "minimum_reader_version",
+        "resolver_identity_management",
+        "atomic_graph_index_replacement",
         "hosted_profile",
         "manual_maintenance",
         "background_enrichment_runtime",
@@ -970,7 +977,7 @@ test "lite backend capabilities contract is stable" {
 
     const field_names = @typeInfo(Capabilities).@"struct".field_names;
     try std.testing.expectEqual(expected_fields.len, field_names.len);
-    inline for (field_names, 0..) |reflected_name, i| {
+    for (field_names, 0..) |reflected_name, i| {
         try std.testing.expectEqualStrings(expected_fields[i], reflected_name);
     }
 
@@ -987,7 +994,7 @@ test "lite backend capabilities contract is stable" {
             "[\"caller_supplied_artifacts\",\"remote_provider\",\"disabled_deferred\"]";
     const supported_modes_json = "[\"caller_supplied_artifacts\",\"remote_provider\",\"local_embedded\",\"manual_maintenance\",\"disabled_deferred\"]";
     const native_local_runtime_available = capabilitiesForProfile(.native).local_inference_runtime;
-    const expected_native = try std.fmt.allocPrint(allocator, "{{\"freestanding_build\":{},\"threading\":\"serialized\",\"hosted_profile\":false,\"manual_maintenance\":false,\"background_enrichment_runtime\":{},\"ttl_cleanup_runtime\":{},\"transaction_recovery_runtime\":{},\"local_template_rendering\":true,\"remote_template_rendering\":{},\"remote_template_host_callbacks\":{},\"inference_mode\":\"caller_supplied_or_disabled\",\"supported_inference_modes\":{s},\"available_inference_modes\":{s},\"inference_required\":false,\"no_inference_configured_ok\":true,\"caller_supplied_artifacts\":true,\"caller_supplied_embeddings\":true,\"remote_inference_providers\":{},\"local_inference_runtime\":{},\"generated_enrichment_planning\":true,\"text_search\":true,\"dense_vector_search\":true,\"sparse_vector_search\":true,\"hybrid_search\":true,\"graph_search\":true,\"distributed_shard_ownership\":false,\"raft_replication\":false,\"cluster_placement\":false,\"cross_node_joins\":false,\"remote_shard_fanout\":false,\"distributed_transaction_coordination\":false,\"cluster_heartbeat_status_aggregation\":false,\"server_side_autoscaling\":false,\"kubernetes_operator\":false,\"object_storage_primary\":false}}", .{
+    const expected_native = try std.fmt.allocPrint(allocator, "{{\"freestanding_build\":{},\"threading\":\"serialized\",\"minimum_reader_version\":1,\"resolver_identity_management\":true,\"atomic_graph_index_replacement\":true,\"hosted_profile\":false,\"manual_maintenance\":false,\"background_enrichment_runtime\":{},\"ttl_cleanup_runtime\":{},\"transaction_recovery_runtime\":{},\"local_template_rendering\":true,\"remote_template_rendering\":{},\"remote_template_host_callbacks\":{},\"inference_mode\":\"caller_supplied_or_disabled\",\"supported_inference_modes\":{s},\"available_inference_modes\":{s},\"inference_required\":false,\"no_inference_configured_ok\":true,\"caller_supplied_artifacts\":true,\"caller_supplied_embeddings\":true,\"remote_inference_providers\":{},\"local_inference_runtime\":{},\"generated_enrichment_planning\":true,\"text_search\":true,\"dense_vector_search\":true,\"sparse_vector_search\":true,\"hybrid_search\":true,\"graph_search\":true,\"distributed_shard_ownership\":false,\"raft_replication\":false,\"cluster_placement\":false,\"cross_node_joins\":false,\"remote_shard_fanout\":false,\"distributed_transaction_coordination\":false,\"cluster_heartbeat_status_aggregation\":false,\"server_side_autoscaling\":false,\"kubernetes_operator\":false,\"object_storage_primary\":false}}", .{
         freestanding,
         !freestanding,
         !freestanding,
@@ -1012,7 +1019,7 @@ test "lite backend capabilities contract is stable" {
         else
             "[\"caller_supplied_artifacts\",\"remote_provider\",\"manual_maintenance\",\"disabled_deferred\"]";
     const hosted_local_runtime_available = capabilitiesForProfile(.hosted).local_inference_runtime;
-    const expected_hosted = try std.fmt.allocPrint(allocator, "{{\"freestanding_build\":{},\"threading\":\"serialized\",\"hosted_profile\":true,\"manual_maintenance\":true,\"background_enrichment_runtime\":false,\"ttl_cleanup_runtime\":false,\"transaction_recovery_runtime\":false,\"local_template_rendering\":true,\"remote_template_rendering\":{},\"remote_template_host_callbacks\":{},\"inference_mode\":\"caller_supplied_or_disabled\",\"supported_inference_modes\":{s},\"available_inference_modes\":{s},\"inference_required\":false,\"no_inference_configured_ok\":true,\"caller_supplied_artifacts\":true,\"caller_supplied_embeddings\":true,\"remote_inference_providers\":{},\"local_inference_runtime\":{},\"generated_enrichment_planning\":true,\"text_search\":true,\"dense_vector_search\":true,\"sparse_vector_search\":true,\"hybrid_search\":true,\"graph_search\":true,\"distributed_shard_ownership\":false,\"raft_replication\":false,\"cluster_placement\":false,\"cross_node_joins\":false,\"remote_shard_fanout\":false,\"distributed_transaction_coordination\":false,\"cluster_heartbeat_status_aggregation\":false,\"server_side_autoscaling\":false,\"kubernetes_operator\":false,\"object_storage_primary\":false}}", .{
+    const expected_hosted = try std.fmt.allocPrint(allocator, "{{\"freestanding_build\":{},\"threading\":\"serialized\",\"minimum_reader_version\":1,\"resolver_identity_management\":true,\"atomic_graph_index_replacement\":true,\"hosted_profile\":true,\"manual_maintenance\":true,\"background_enrichment_runtime\":false,\"ttl_cleanup_runtime\":false,\"transaction_recovery_runtime\":false,\"local_template_rendering\":true,\"remote_template_rendering\":{},\"remote_template_host_callbacks\":{},\"inference_mode\":\"caller_supplied_or_disabled\",\"supported_inference_modes\":{s},\"available_inference_modes\":{s},\"inference_required\":false,\"no_inference_configured_ok\":true,\"caller_supplied_artifacts\":true,\"caller_supplied_embeddings\":true,\"remote_inference_providers\":{},\"local_inference_runtime\":{},\"generated_enrichment_planning\":true,\"text_search\":true,\"dense_vector_search\":true,\"sparse_vector_search\":true,\"hybrid_search\":true,\"graph_search\":true,\"distributed_shard_ownership\":false,\"raft_replication\":false,\"cluster_placement\":false,\"cross_node_joins\":false,\"remote_shard_fanout\":false,\"distributed_transaction_coordination\":false,\"cluster_heartbeat_status_aggregation\":false,\"server_side_autoscaling\":false,\"kubernetes_operator\":false,\"object_storage_primary\":false}}", .{
         freestanding,
         !freestanding,
         freestanding,
@@ -1047,7 +1054,7 @@ test "lite backend inference status reports disabled as clean state" {
 
     const field_names = @typeInfo(InferenceStatus).@"struct".field_names;
     try std.testing.expectEqual(expected_fields.len, field_names.len);
-    inline for (field_names, 0..) |reflected_name, i| {
+    for (field_names, 0..) |reflected_name, i| {
         try std.testing.expectEqualStrings(expected_fields[i], reflected_name);
     }
 

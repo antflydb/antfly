@@ -105,7 +105,7 @@ const ConfiguredExternalSourceObjectStoreResolver = struct {
     fn resolver(self: *@This()) build_mod.ExternalSourceOpenedObjectStoreResolver {
         return .{
             .ptr = self,
-            .vtable = &.{ .open = open },
+            .vtable = &.{ .open = open, .load_catalog = loadCatalog },
         };
     }
 
@@ -121,6 +121,12 @@ const ConfiguredExternalSourceObjectStoreResolver = struct {
             .node_config = self.node_config,
             .secret_store = self.secret_store,
         });
+    }
+
+    fn loadCatalog(raw: *const anyopaque, alloc: Allocator, binding: external_binding.Binding, context: @import("antfly_local_sources").serverless_external_source_mod.lake_catalog.types.Context) anyerror!@import("antfly_local_sources").serverless_external_source_mod.lake_catalog.types.Table {
+        const self: *const @This() = @ptrCast(@alignCast(raw));
+        const result = try configured_object_store_support.executeLakeCatalogAlloc(alloc, binding, .{ .node_config = self.node_config, .secret_store = self.secret_store }, context, .load);
+        return result.table;
     }
 };
 

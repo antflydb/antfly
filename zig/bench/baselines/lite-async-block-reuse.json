@@ -1,0 +1,539 @@
+{
+  "base_commit": "755cb12a68f8ed079dd8968814b8be48bb2850a3",
+  "comparison_review_commit": "b72700955e1e7eb1a8b051649f0f3b6842cbce8b",
+  "environment": {
+    "platform": "aarch64-macos",
+    "optimization": "Debug",
+    "storage": "MemoryStorage",
+    "zig": "0.17.0"
+  },
+  "raw_snappy_hot_points": {
+    "lookups": 10000,
+    "entries": 192,
+    "value_bytes": 16,
+    "before": {
+      "decoder_scratch_allocations": 10000,
+      "decoded_block_cached": false,
+      "elapsed_ns_samples": [
+        633358000,
+        424416000,
+        448309000
+      ]
+    },
+    "after": {
+      "decoder_scratch_allocations": 8,
+      "decoded_block_cached": true,
+      "elapsed_ns_samples": [
+        43279000,
+        44174000,
+        45023000,
+        44408000
+      ],
+      "warm_decoder_scratch_allocations": 0,
+      "warm_elapsed_ns_samples": [
+        41648000,
+        41536000,
+        44469000,
+        54464000
+      ]
+    },
+    "policy": "Existing eight-hit/256-hit retry, 64 KiB and 1/16 cache limits; already decoded raw rows copied once into cache storage with atomic construction-credit handoff."
+  },
+  "warm_sparse_snapshot_batches": {
+    "batches": 600,
+    "keys_per_batch": 16,
+    "hits": 9600,
+    "plan": "point (asserted by production planner)",
+    "before": {
+      "result_allocations": 9600,
+      "index_cache_hits": 9600,
+      "elapsed_ns_samples": [
+        92320000,
+        76731000,
+        95887000
+      ]
+    },
+    "after": {
+      "result_allocations": 0,
+      "index_cache_hits": 600,
+      "elapsed_ns_samples": [
+        43334000,
+        41426000,
+        43644000,
+        43480000
+      ]
+    },
+    "scope": "Warm shared decoded block; owner retains cache pins, results survive invalidation; output arrays and pin metadata warmed before counters."
+  },
+  "bounds": {
+    "result_pins_per_owner": 64,
+    "result_pin_bytes_per_owner": 1048576,
+    "index_owners_per_batch": 16,
+    "fallbacks": [
+      "owned-result callers",
+      "transient handles",
+      "pin metadata OOM",
+      "pin-count cap",
+      "pinned-byte cap"
+    ],
+    "codec_eligibility": "Borrow warm raw rows or values inside retained none/plain-prefix physical payloads. Temporary Snappy and prefix key storage never becomes a result owner."
+  },
+  "scope": "Isolated native Debug production helper fixtures with C result/scratch allocators. Deterministic allocation/admission counts; timing samples are indicative and do not establish end-to-end QPS or a 2 GiB soak.",
+  "followup": {
+    "comparison_head": "a933fb09c0b51dbbfaf7cad954e4eb7f2a02278e",
+    "environment": "Same native Debug MemoryStorage/C-allocator scope as original fixtures",
+    "batches": 600,
+    "keys_per_batch": 16,
+    "directory_overlap_runs": 64,
+    "modes": {
+      "1": "legacy synchronous snapshot",
+      "16": "async snapshot with prebuilt topology",
+      "2": "direct directory async snapshot",
+      "3": "snapshot under simulated cache pressure",
+      "4": "copy-only async results",
+      "5": "previous directory selection/sort/topology then async"
+    },
+    "measurements": {
+      "1": {
+        "elapsed_ns": 55437000,
+        "result_allocation_requests": 0,
+        "index_cache_acquisitions": 600,
+        "planning_allocation_requests": 0
+      },
+      "16": {
+        "elapsed_ns": 45041000,
+        "result_allocation_requests": 0,
+        "index_cache_acquisitions": 600,
+        "planning_allocation_requests": 0
+      },
+      "2": {
+        "elapsed_ns": 58449000,
+        "result_allocation_requests": 0,
+        "index_cache_acquisitions": 600,
+        "planning_allocation_requests": 0
+      },
+      "3": {
+        "elapsed_ns": 42578000,
+        "result_allocation_requests": 600,
+        "index_cache_acquisitions": 600,
+        "planning_allocation_requests": 0
+      },
+      "4": {
+        "elapsed_ns": 44917000,
+        "result_allocation_requests": 600,
+        "index_cache_acquisitions": 600,
+        "planning_allocation_requests": 0
+      },
+      "5": {
+        "elapsed_ns": 150586000,
+        "result_allocation_requests": 0,
+        "index_cache_acquisitions": 600,
+        "planning_allocation_requests": 3000
+      }
+    },
+    "owned_results_before": {
+      "allocation_requests": 9600,
+      "elapsed_ns": 45734000
+    },
+    "pressure_selection": {
+      "selected_bytes_per_batch": 16,
+      "before_pinned_payload_cost_bytes": 12683,
+      "after_owned_bytes_per_batch": 16,
+      "after_block_pins": 0
+    },
+    "bounds": {
+      "owned_copy_buffer_bytes": 16384,
+      "values_per_buffer_growth_estimate_max": 64,
+      "direct_directory_l0_runs_max": 64,
+      "additional_tree_summary_bytes_per_node_64_bit": 24,
+      "cursor_path_entries_per_slot": 128,
+      "fallbacks": [
+        "large unordered L0 backlogs",
+        "directories containing non-path or in-memory runs",
+        "sorted-by-run plans",
+        "async-disabled reads"
+      ],
+      "max_packed_value_bytes": 1024
+    },
+    "coverage": [
+      "Warm result lifetime after releasing independent cache handle",
+      "Existing result pin reuse under pressure",
+      "Dense results borrow under pressure within owner caps",
+      "Packed result growth and allocation failure cleanup",
+      "Direct directory ordering matches overlap-and-sort across namespaces and forked roots",
+      "L0 backlog falls back before processing any results",
+      "Mixed-size batches preserve the small buffer and allocate large results at their exact size"
+    ],
+    "limitations": [
+      "Timing samples do not establish end-to-end QPS or 2 GiB soak behavior",
+      "Production arenas may amortize allocator-call savings",
+      "Sorted-by-run and large-L0 directory planning retain the existing path",
+      "Fixed cursor stack storage and 24 bytes per read-order tree node trade against per-batch heap work"
+    ],
+    "measurement_commit": "4f8427650256e997629f2f3540f18691142a9ac9",
+    "packing_measurements_note": "Historical per-batch packing measurements. The owner_packing_and_single_point_followup section records the replacement design."
+  },
+  "owner_packing_and_single_point_followup": {
+    "merged_main_commit": "ebff19444d",
+    "comparison_commit": "4f8427650256e997629f2f3540f18691142a9ac9",
+    "sparse_owned_batches": {
+      "batches": 1000,
+      "requested_keys_per_batch": 16,
+      "hits_per_batch": 1,
+      "value_bytes": 1024,
+      "before": {
+        "retained_payload_bytes": 16384000,
+        "result_allocations": 1000,
+        "payload_budget_2048": "OutOfMemory"
+      },
+      "after": {
+        "retained_payload_bytes": 1031168,
+        "result_allocations": 66,
+        "payload_budget_2048": "success"
+      },
+      "metadata": "held allocation metadata prewarmed; payload remains alive across every batch",
+      "design": "Packing state belongs to the result owner; small slabs grow geometrically from actual copied demand. Optional spare capacity falls back to exact-size storage. Published values never move."
+    },
+    "warm_single_directory_points": {
+      "lookups": 9600,
+      "overlapping_l0_runs": 64,
+      "entries_per_run": 192,
+      "before": {
+        "elapsed_ns_samples": [
+          20142192000
+        ],
+        "planning_allocations": 28800
+      },
+      "after": {
+        "elapsed_ns_samples": [
+          108727000
+        ],
+        "planning_allocations": 0
+      },
+      "design": "Single-run lookups retain the established block loader and direct large-value lease adoption. With multiple overlapping runs, warm deciding candidates stop read-order traversal immediately; cold candidates prepare bounded asynchronous windows, consume results in visibility order and cancel remaining speculative reads after a deciding result. Preserve the bounds-index planner for unsupported directories or L0 counts greater than 64.",
+      "limitations": "Synthetic maximum supported L0 overlap, latest-run hits, warm MemoryStorage, Debug. This does not establish end-to-end speedup."
+    },
+    "bounds": {
+      "initial_small_slab_bytes": 256,
+      "max_slab_bytes": 16384,
+      "max_packed_value_bytes": 1024
+    },
+    "coverage": [
+      "Sparse misses with one copied result per batch",
+      "Live values across slab growth and repeated batches",
+      "Optional capacity fallback with tight result budgets",
+      "Allocation failure cleanup and stale cursor reset",
+      "Direct versus planned single reads across namespaces, tombstones, empty values and a 65-run backlog",
+      "Cold overlapping candidates still issue concurrent reads and cancel superseded reads",
+      "Result allocation ownership transfer resets source packing state",
+      "Single-run reads retain cache allocator ownership and direct large-value lease adoption"
+    ],
+    "measurement_commit": "69ea9adfe1057aa73ee3ff2217070f6581140965"
+  },
+  "ordinary_probe_ownership_followup": {
+    "merged_main_commit": "2964fe531a",
+    "review_comparison": {
+      "fixture": "Two overlapping L0 runs, 192 80-byte keys, one ordinary current-probe lookup returning one byte, warm uncompressed blocks; invalidate every run path while the probe is alive.",
+      "previous_commit": "4f8427650256e997629f2f3540f18691142a9ac9",
+      "reviewed_commit": "69ea9adfe1057aa73ee3ff2217070f6581140965",
+      "previous": {
+        "block_pins": 0,
+        "owned_payload_bytes": 82,
+        "cache_bytes_after_invalidation": 0
+      },
+      "reviewed": {
+        "block_pins": 1,
+        "owned_payload_bytes": 1,
+        "cache_bytes_after_invalidation": 18083
+      }
+    },
+    "fixed_production_fixture": {
+      "test": "lsm async reuse ordinary probes own one copy without retaining blocks",
+      "lookups_per_probe": 4,
+      "small_value_bytes": [
+        1,
+        1,
+        1
+      ],
+      "large_value_bytes": 8192,
+      "cases": [
+        "stable warm",
+        "stable cold",
+        "stable pressure",
+        "current warm",
+        "current cold",
+        "current pressure"
+      ],
+      "block_pins": 0,
+      "owned_payload_buffers": 2,
+      "owned_payload_bytes": 8448,
+      "cache_bytes_after_invalidation": 0,
+      "lease_control": "getLeased still borrows a retained cache block, owns no copied result buffer, and survives path invalidation."
+    },
+    "design": [
+      "Propagate explicit transaction-owned versus snapshot-pinned lifetime to single-key directory reads.",
+      "Use temporary block pins for ordinary probe fallback loaders and clear their borrowed legacy hints before releasing those pins.",
+      "Adopt decoder-owned results and recognize the active packed buffer in constant time, including reuse across lookups; inspect only new allocations for other interior slices.",
+      "Reuse one async directory cursor after lookahead by preserving its first two handles in a fixed-size leading window."
+    ],
+    "limitations": "Payload buffer counts exclude metadata and storage/cache construction. No standalone speedup is claimed for cursor reuse; timing samples vary and do not establish end-to-end throughput or soak behavior.",
+    "measurement_commit": "217995fdbe9d2da3c087cf6e886283410b4607be"
+  },
+  "owned_fallback_policy_followup": {
+    "merged_main_commit": "e8a1bfcabc33a3596b8e7ea3b2040e433c5cd8d1",
+    "comparison_commit": "217995fdbe9d2da3c087cf6e886283410b4607be",
+    "fixture": "Warm MemoryStorage, one or two uncompressed L0 runs, stable and current ordinary probes; 1000 one-byte lookups after a warm-up lookup, result ownership metadata prewarmed. Mutable-only probes covered too.",
+    "before": {
+      "single_run_backend_pin_allocations": 1000,
+      "single_run_owned_payload_buffers": 1001,
+      "current_two_run_reported_copies": 0,
+      "single_run_lookup_with_16_spare_backend_bytes": "OutOfMemory"
+    },
+    "after": {
+      "single_run_backend_pin_allocations": 0,
+      "single_run_owned_payload_buffers": 3,
+      "current_two_run_reported_copies": 1000,
+      "single_run_lookup_with_16_spare_backend_bytes": "success",
+      "persistent_cache_pins": 0
+    },
+    "coverage": [
+      "Stable and current ordinary probes with one or two runs",
+      "Mutable-only ordinary probes",
+      "Compressed and uncompressed warm, cold, pressure and invalidation cases",
+      "Small packing plus exact-size large copies",
+      "Snapshot and short-lease borrowing remains valid",
+      "Allocation-failure and tight-result-budget packing checks"
+    ],
+    "design": [
+      "Null pin ownership expresses transaction-owned results throughout synchronous and planned point loaders; copy into result storage before releasing the cache handle.",
+      "Prefix decoders retain only the selected value for owned callers, preserving checksum and optional promotion checks.",
+      "Use the owner packing cursor for small mutable, immutable, local and cached owned-copy fallbacks; adopt already-owned decoded buffers.",
+      "Count actual async copies at their copy site, and avoid counting adoption again."
+    ],
+    "limitations": "Backend allocation counts exclude the result scratch allocator. Payload buffer counts exclude metadata and storage/cache construction. Small packing trades bounded spare capacity for fewer buffers; these Debug fixtures do not establish end-to-end QPS or 2 GiB soak behavior."
+  },
+  "dense_prefix_scratch_followup": {
+    "comparison_commit": "257d6f683d97cac7432bfa7b8d3db6903880444c",
+    "merged_main_commit": "e8a1bfcabc33a3596b8e7ea3b2040e433c5cd8d1",
+    "fixtures": {
+      "local_prefix": {
+        "lookups": 1000,
+        "intermediate_backend_allocations_before": 1000,
+        "intermediate_backend_allocations_after": 0,
+        "owned_payload_buffers_after": 3,
+        "scope": "MemoryStorage, prefix-compressed block, local/global decoded caches disabled, 128 distinct 80-byte keys, one-byte values. Backend allocation counter excludes result allocator. Compare legacy owned-entry decoder with direct-to-result output; metadata/workspace prewarmed."
+      },
+      "dense_indexed_points": {
+        "keys": 512,
+        "parsed_rows_binary_seek_each_key": 5122,
+        "parsed_rows_adaptive": 522,
+        "scope": "One uncompressed indexed block, sorted distinct keys. Test-only row-parse counter; baseline clears cursor per key. Backward, duplicate, sparse, missing and namespace probes checked against the existing binary-search oracle."
+      },
+      "shared_decoded_scratch": {
+        "batches_after_warmup": 100,
+        "decoded_bytes_per_batch": 16384,
+        "unpooled_backend_allocations": 100,
+        "pooled_backend_allocations": 0,
+        "retained_bytes": 24638,
+        "scope": "Synthetic valid Snappy payload; counts decode-buffer allocation requests with and without workspace reuse, excluding payload generation and result copying."
+      },
+      "shared_prefix_scratch": {
+        "batches_after_warmup": 100,
+        "keys_per_batch": 64,
+        "pooled_backend_allocations": 0,
+        "retained_bytes": 2420,
+        "scope": "Prefix-compressed table payload, 80-byte keys; shared decompression and reconstructed-key storage. Allocation-failure inventory uses no-resize allocator."
+      }
+    },
+    "design": [
+      "Emit local prefix point values directly into result-owner packing while preserving existing warm local leases and promotion.",
+      "Bind adaptive row readers to immutable shared block owners. Forward probes walk at most eight rows before binary search; backward probes seek and duplicate probes reuse the current row.",
+      "Acquire shared scratch workspace lazily from an independent four-slot pool. Physical arena capacity is bounded at 768 KiB per active batch; retain at most 64 KiB per idle slot plus arena headers.",
+      "Optional decode and small-key workspace exhaustion falls back to separately admitted mandatory scratch. Large keys retain existing scratch handling. Release shared block readers before resetting workspace.",
+      "Rebind idle workspace backing/manager by releasing old buffers and admission credit outside the coordination lock."
+    ],
+    "limitations": "Debug helper measurements do not establish end-to-end throughput or 2 GiB soak behavior. A batch may wait for one of four workspace slots. Arena non-LIFO churn can exhaust optional pooled capacity and use mandatory scratch; oversized batches may discard/reallocate excess capacity. Retained workspaces remain resource-accounted.",
+    "measurement_commit": "3467aac50b6c0fff0076a197037224fb1011a012"
+  },
+  "recycled_scratch_followup": {
+    "comparison_commit": "3467aac50b6c0fff0076a197037224fb1011a012",
+    "merged_main_commit": "4710eb5cdde61ee5466815624573f0aa80ebbb87",
+    "fixtures": {
+      "non_lifo_decoded_churn": {
+        "blocks": 512,
+        "block_bytes": 16384,
+        "live_slots": 16,
+        "maximum_live_decoded_bytes": 262144,
+        "optional_fallbacks_before": 470,
+        "optional_fallbacks_after": 0,
+        "pooled_physical_charge_after": 263168
+      },
+      "tight_host_budget": {
+        "hard_limit_bytes": 409600,
+        "mandatory_decode_denials_before": 489,
+        "mandatory_decode_denials_after": 0,
+        "optional_fallbacks_after": 0
+      },
+      "oversized_mandatory_decode": {
+        "hard_limit_bytes": 131072,
+        "prior_idle_decoded_bytes": 16384,
+        "mandatory_decoded_bytes": 131072,
+        "idle_workspace_charge_before_mandatory_decode": 0,
+        "result": "success"
+      },
+      "sparse_indexed_points": {
+        "block_entries": 512,
+        "strides": [
+          16,
+          32,
+          64,
+          128,
+          256
+        ],
+        "keys": [
+          32,
+          16,
+          8,
+          4,
+          2
+        ],
+        "parsed_rows_binary_each_key": [
+          321,
+          161,
+          81,
+          41,
+          21
+        ],
+        "parsed_rows_previous_cursor": [
+          535,
+          265,
+          132,
+          null,
+          null
+        ],
+        "parsed_rows_adaptive_after": [
+          290,
+          149,
+          77,
+          41,
+          22
+        ]
+      },
+      "shared_decoded_scratch": {
+        "batches_after_warmup": 100,
+        "decoded_bytes_per_batch": 16384,
+        "unpooled_backend_allocations": 100,
+        "pooled_backend_allocations": 0,
+        "retained_bytes_before": 24638,
+        "retained_bytes_after": 16448
+      },
+      "shared_prefix_scratch": {
+        "batches_after_warmup": 100,
+        "keys_per_batch": 64,
+        "pooled_backend_allocations": 0,
+        "retained_bytes_before": 2420,
+        "retained_bytes_after": 2176
+      }
+    },
+    "design": [
+      "Use an exclusively leased recycling allocator for shared decoded blocks and prefix keys. Intrusive size-class free lists reuse arbitrary-order frees without a backing allocation; local decoders retain their existing arena.",
+      "Charge all physical buffers including ownership headers. Four classes per power-of-two octave bound rounding; exact-size retry preserves admission when optional spare capacity does not fit.",
+      "Trim idle buffers and return unused host admission credit on allocation pressure and before separately admitted mandatory decoding or key reconstruction. Live buffers never move or lose admission.",
+      "Retain at most 64 KiB physical memory per idle slot, including ownership headers; active per-workspace capacity remains bounded at 768 KiB.",
+      "Probe one row at unknown density, gallop at most eight rows after nearby hits, and disable forward probing after wide jumps. Retain binary lower-bound semantics and reuse the captured upper row."
+    ],
+    "coverage": [
+      "512 non-LIFO slot rotations with and without a 400 KiB aggregate host budget",
+      "Mandatory 128 KiB decoding after a smaller shared allocation becomes idle",
+      "Aligned buffer reuse, resize, exact-size admission, arbitrary free order and allocation-failure inventory",
+      "Dense, sparse, missing, backward, repeated and namespace lookup oracle comparisons, including 2048 randomized probes",
+      "Shared prefix key reconstruction and existing cache promotion/admission checks"
+    ],
+    "limitations": "Native Debug isolated production-helper fixtures; allocation/admission counts and parsed-row counts do not establish end-to-end QPS or 2 GiB soak behavior. The initial density probe can add one row for a two-key sparse workload. Size classes and ownership headers consume accounted memory. A batch may wait for one of four workspace slots."
+  },
+  "integrated_pr_1013": {
+    "head_commit": "2b3311ee32146e16ee74d9e2eaecd1e942ca8707",
+    "url": "https://github.com/antflydb/antfly/pull/1013",
+    "design": [
+      "Filter deleted postings before positional materialization and skip fully deleted framed chunks while preserving malformed-ID and framing validation.",
+      "Combine frozen bitmap membership and rank with an ordered container hint.",
+      "Reuse at most 512 bytes of mapping scratch per iterator; retain point reads for sparse file mappings.",
+      "Batch stored-document metadata within the existing 129-row bound using the known first row and predicted block length."
+    ],
+    "historical_measurement_artifacts": [
+      "zig/bench/baselines/lite-filter-metadata-followup.json",
+      "zig/bench/baselines/lite-mapping-batches-followup.json"
+    ],
+    "scope": "PR #1013 measurements remain historical ReleaseSafe helper fixtures. Combined branch reruns reader, artifact, Roaring, LSM and WASM validation; no new end-to-end throughput or soak result is claimed."
+  },
+  "identity_rank_and_admission_followup": {
+    "comparison_commit": "174f0c7fc03492cf49245641809d63394bdbebea",
+    "merged_main_commit": "a202a18842315cd5ae1f59d76a93dbddac0e72e4",
+    "fixtures": {
+      "inactive_decoded_owner_admission": {
+        "host_budget_bytes": 131072,
+        "inactive_decoded_payload_bytes": 16384,
+        "before_retained_charge_bytes": 16448,
+        "after_retained_charge_bytes": 0,
+        "mandatory_decode_bytes": 131072,
+        "before": "OutOfMemory",
+        "after": "success",
+        "inactive_physical_and_index_owner_preserved": true
+      },
+      "active_decoded_owner_preservation": {
+        "host_budget_bytes": 131072,
+        "inactive_decoded_payload_bytes": 16384,
+        "active_decoded_payload_bytes": 16384,
+        "after_active_charge_bytes": 16448,
+        "mandatory_decode_bytes": 98304,
+        "after": "success",
+        "active_bytes_preserved": true
+      },
+      "sparse_file_mapping": {
+        "postings": 128,
+        "document_stride": 5,
+        "lookahead_iterations_before": 2872,
+        "lookahead_iterations_after": 127,
+        "logical_reads_before": 125,
+        "logical_reads_after": 125,
+        "mapping_window_refills": 1
+      },
+      "stored_identity_streaming": {
+        "documents": 384,
+        "identity_bytes": 2578,
+        "warm_cache_probes_before": 768,
+        "warm_cache_probes_after": 6,
+        "scope": "Production identity output helper, metadata validation included. Whole merge also performs other metadata/body passes."
+      },
+      "live_count": {
+        "source_documents": 500000,
+        "deleted_documents": 100000,
+        "live_documents": 400000,
+        "before": "500000 bitmap membership calls",
+        "after": "One frozen rank lookup; preparation shared by all merge passes",
+        "overflow": "error.Overflow"
+      }
+    },
+    "design": [
+      "Before mandatory admission, clear optional decoded/prefix buffers on completed zero-user block owners while preserving physical and index pins. Active owners keep their decoded storage.",
+      "Track the mapping lookahead right edge across rejected density windows; reset on chunk changes and backward/repeated positions.",
+      "Stream contiguous identity spans in append and sorted merges through a 64 KiB stack copy buffer with up to 128 validated metadata rows per batch.",
+      "Prepare and validate deletion rank navigation before any merge output pass, then reuse it for live counts and stored-block deletion interval checks."
+    ],
+    "bounds": {
+      "identity_copy_buffer_bytes": 65536,
+      "identity_metadata_buffer_bytes": 3072,
+      "sorted_identity_run_documents_max": 128,
+      "mapping_window_bytes_max": 512
+    },
+    "coverage": [
+      "Inactive optional storage yields admission to a 128 KiB mandatory decode under a 128 KiB budget.",
+      "An active decoded owner survives reclamation while a separate 96 KiB mandatory decode succeeds.",
+      "Sparse mapping matches point-read results with linear lookahead.",
+      "Batched ID output matches individual reads, including sparse deletions.",
+      "IDs of 192 KiB plus 17 bytes stream without allocating decoder scratch; fully deleted ranges skip missing stored metadata.",
+      "Live counts use rank and reject aggregate u32 overflow."
+    ],
+    "limitations": "Native Debug production-helper fixtures. Counts do not establish end-to-end throughput or 2 GiB soak behavior. ID batching adds fixed stack storage; arbitrary sorted permutations may retain single-row runs. Frozen deletion navigation has allocation cost and is shared across merge passes."
+  }
+}

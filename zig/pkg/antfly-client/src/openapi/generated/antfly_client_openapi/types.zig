@@ -4921,6 +4921,90 @@ pub const CommittedMutationOutcome = struct {
     status: []const u8,
 };
 
+/// Specify exactly one of saved, union or overlay. Union preserves duplicates and table provenance. Overlay suppresses replaced base keys and tombstones before ranking using indexed unfiltered change lookups. Inputs are streamed in bounded pages; result pages allow at most 4096 hits. Large overlay totals are lower bounds unless count is explicitly requested; exact count streams the full visible relation within the request deadline.
+pub const ComposedQuerySource = struct {
+    /// Immutable source name from the Antfly catalog. Saved definitions contain literal table leaves, preventing recursive expansion.
+    saved: ?[]const u8 = null,
+    @"union": ?[]const ComposedTableSource = null,
+    overlay: ?ComposedSourceOverlay = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "saved", "saved", true },
+        .{ "union", "union", true },
+        .{ "overlay", "overlay", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.saved) |value| {
+            try jw.objectField("saved");
+            try jw.write(value);
+        }
+        if (self.@"union") |value| {
+            try jw.objectField("union");
+            try jw.write(value);
+        }
+        if (self.overlay) |value| {
+            try jw.objectField("overlay");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ComposedSourceOverlay = struct {
+    base: ComposedTableSource,
+    changes: ComposedTableSource,
+    key: []const []const u8,
+    /// Boolean field on change rows; true hides the base row. Changes must retain one latest row/tombstone per stable key. Row-policy identities are currently unsupported for keyed composition.
+    tombstone_field: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "base", "base", false },
+        .{ "changes", "changes", false },
+        .{ "key", "key", false },
+        .{ "tombstone_field", "tombstone_field", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("base");
+        try jw.write(self.base);
+        try jw.objectField("changes");
+        try jw.write(self.changes);
+        try jw.objectField("key");
+        try jw.write(self.key);
+        if (self.tombstone_field) |value| {
+            try jw.objectField("tombstone_field");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ComposedTableSource = struct {
+    /// Literal native table name. Each source is independently authorized.
+    table: []const u8,
+};
+
 /// Configuration for confidence assessment. Evaluates answer quality and resource relevance. Can use a model calibrated for scoring tasks.
 pub const ConfidenceStepConfig = struct {
     /// Compatibility switch. The step is enabled when this object is present; omit the step to disable it.
@@ -5638,6 +5722,8 @@ pub const CreateFullTextIndexRequest = struct {
     version: ?i64 = null,
     /// Inline managed enrichment definitions required by this index.
     enrichments: ?[]const EnrichmentConfig = null,
+    /// Opt in to retaining the indexed source projection in serverless full-text sidecars for cold highlighting. With field set, only that field is retained; otherwise the index source projection is retained. Increases index storage and build work. Omit or set false to hydrate highlights from the source table. Provisioned indexes already retain source independently.
+    store_source: ?bool = null,
     /// Chunk or textual asset streams indexed together; every artifact record is an independent full-text member. A source-local field overrides the shared index-level field for that stream. Artifact names must be unique. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     sources: ?[]const FullTextArtifactIndexSource = null,
     /// Whether to use memory-only storage
@@ -5654,6 +5740,7 @@ pub const CreateFullTextIndexRequest = struct {
         .{ "description", "description", true },
         .{ "version", "version", true },
         .{ "enrichments", "enrichments", true },
+        .{ "store_source", "store_source", true },
         .{ "sources", "sources", true },
         .{ "mem_only", "mem_only", true },
         .{ "field", "field", true },
@@ -5682,6 +5769,10 @@ pub const CreateFullTextIndexRequest = struct {
         }
         if (self.enrichments) |value| {
             try jw.objectField("enrichments");
+            try jw.write(value);
+        }
+        if (self.store_source) |value| {
+            try jw.objectField("store_source");
             try jw.write(value);
         }
         if (self.sources) |value| {
@@ -6666,6 +6757,7 @@ pub const CreatedFullTextIndex = struct {
     sources: ?[]const FullTextArtifactIndexSource = null,
     mem_only: ?bool = null,
     field: ?[]const u8 = null,
+    store_source: ?bool = null,
     analysis_config: ?TextAnalysisConfig = null,
     type: []const u8,
 
@@ -6678,6 +6770,7 @@ pub const CreatedFullTextIndex = struct {
         .{ "sources", "sources", true },
         .{ "mem_only", "mem_only", true },
         .{ "field", "field", true },
+        .{ "store_source", "store_source", true },
         .{ "analysis_config", "analysis_config", true },
         .{ "type", "type", false },
     };
@@ -6718,6 +6811,10 @@ pub const CreatedFullTextIndex = struct {
             try jw.objectField("field");
             try jw.write(value);
         }
+        if (self.store_source) |value| {
+            try jw.objectField("store_source");
+            try jw.write(value);
+        }
         if (self.analysis_config) |value| {
             try jw.objectField("analysis_config");
             try jw.write(value);
@@ -6733,6 +6830,7 @@ pub const CreatedFullTextIndexConfig = struct {
     sources: ?[]const FullTextArtifactIndexSource = null,
     mem_only: ?bool = null,
     field: ?[]const u8 = null,
+    store_source: ?bool = null,
     analysis_config: ?TextAnalysisConfig = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -6740,6 +6838,7 @@ pub const CreatedFullTextIndexConfig = struct {
         .{ "sources", "sources", true },
         .{ "mem_only", "mem_only", true },
         .{ "field", "field", true },
+        .{ "store_source", "store_source", true },
         .{ "analysis_config", "analysis_config", true },
     };
 
@@ -6763,6 +6862,10 @@ pub const CreatedFullTextIndexConfig = struct {
         }
         if (self.field) |value| {
             try jw.objectField("field");
+            try jw.write(value);
+        }
+        if (self.store_source) |value| {
+            try jw.objectField("store_source");
             try jw.write(value);
         }
         if (self.analysis_config) |value| {
@@ -12090,18 +12193,20 @@ pub const ExternalLakeSnapshotSelector = struct {
     }
 };
 
-/// Read-only authoritative Parquet or Iceberg source. A serving statement pins its inventory and object versions before returning rows.
+/// Authoritative Parquet or Iceberg source. A serving statement pins its inventory and object versions before returning rows. Iceberg catalog commits require an explicit writable catalog binding; ordinary row mutations remain unsupported.
 pub const ExternalLakeTableSource = struct {
     kind: []const u8,
     table_id: []const u8,
     format: []const u8,
     uri: []const u8,
     schema_fingerprint: ?[]const u8 = null,
+    /// iceberg_writer authorizes explicit Iceberg catalog commits and requires catalog plus a current snapshot selector. It does not enable ordinary row batch writes.
     write_policy: ?[]const u8 = null,
     /// Set immutable only when data files are never replaced at an existing URI. Allows authenticated provider-version proofs from retained index generations to be reused for unchanged data files. Metadata and delete files are still verified.
     object_mutability: ?[]const u8 = null,
     credentials: ?ExternalLakeCredentialRef = null,
     snapshot: ?ExternalLakeSnapshotSelector = null,
+    catalog: ?LakeCatalogConfig = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -12114,6 +12219,7 @@ pub const ExternalLakeTableSource = struct {
         .{ "object_mutability", "object_mutability", true },
         .{ "credentials", "credentials", true },
         .{ "snapshot", "snapshot", true },
+        .{ "catalog", "catalog", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -12152,6 +12258,10 @@ pub const ExternalLakeTableSource = struct {
         }
         if (self.snapshot) |value| {
             try jw.objectField("snapshot");
+            try jw.write(value);
+        }
+        if (self.catalog) |value| {
+            try jw.objectField("catalog");
             try jw.write(value);
         }
         try jw.endObject();
@@ -14756,6 +14866,8 @@ pub const FullTextArtifactIndexSource = struct {
 };
 
 pub const FullTextIndexConfig = struct {
+    /// Opt in to retaining the indexed source projection in serverless full-text sidecars for cold highlighting. With field set, only that field is retained; otherwise the index source projection is retained. Increases index storage and build work. Omit or set false to hydrate highlights from the source table. Provisioned indexes already retain source independently.
+    store_source: ?bool = null,
     /// Chunk or textual asset streams indexed together; every artifact record is an independent full-text member. A source-local field overrides the shared index-level field for that stream. Artifact names must be unique. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     sources: ?[]const FullTextArtifactIndexSource = null,
     /// Whether to use memory-only storage
@@ -14768,6 +14880,7 @@ pub const FullTextIndexConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "store_source", "store_source", true },
         .{ "sources", "sources", true },
         .{ "mem_only", "mem_only", true },
         .{ "field", "field", true },
@@ -14785,6 +14898,10 @@ pub const FullTextIndexConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.store_source) |value| {
+            try jw.objectField("store_source");
+            try jw.write(value);
+        }
         if (self.sources) |value| {
             try jw.objectField("sources");
             try jw.write(value);
@@ -15703,9 +15820,11 @@ pub const GeoShapeQuery = struct {
     }
 };
 
-/// A stateful global query. The target table is required on this route.
+/// A stateful global query. Specify a table target or a composed source.
 pub const GlobalStatefulQueryRequest = struct {
-    /// Opaque remote index snapshot token returned by a previous query. Required when replaying search_after or search_before against an external table; a changed publication returns 409.
+    read_requirements: ?ReadRequirements = null,
+    lake_read: ?LakeReadRequirement = null,
+    /// Opaque retained snapshot token returned by an ordered native or external-table query. Echo with search_after or search_before. Native and lake cuts expire within the configured retention period (default five minutes; maximum one hour); missing, expired or incompatible generations return 409.
     remote_snapshot: ?[]const u8 = null,
     evaluate: ?QueryEvaluation = null,
     table_target: ?CatalogTableTarget = null,
@@ -15782,13 +15901,20 @@ pub const GlobalStatefulQueryRequest = struct {
     graph_searches: ?std.json.ArrayHashMap(LegacyGraphQuery) = null,
     /// Deprecated compatibility behavior for `graph_searches`. Canonical `graph_queries` return independently typed, potentially table-qualified identities and cannot be combined with this field. Strategy for merging legacy graph results with search results: - union: Include nodes from both search and graph results - intersection: Only include nodes appearing in both
     expand_strategy: ?[]const u8 = null,
+    source: ?ComposedQuerySource = null,
+    /// Explicit reciprocal rank scoring across source lists after visibility resolution. Required for score ordering; shared corpus BM25 is not implemented. Constant 60, equal source weights.
+    source_ranking: ?[]const u8 = null,
+    /// Opaque composed continuation retaining per-leaf native generations or archive publications and accepted WAL cuts for the configured retention period from their creation (default five minutes; maximum one hour). Publication and restart preserve the cut. Authorization, policy, recipe, source and table incarnation changes invalidate it. Leaf search_after/search_before tuples are unsupported.
+    source_cursor: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "read_requirements", "read_requirements", true },
+        .{ "lake_read", "lake_read", true },
         .{ "remote_snapshot", "remote_snapshot", true },
         .{ "evaluate", "evaluate", true },
         .{ "table_target", "table_target", true },
-        .{ "table", "table", false },
+        .{ "table", "table", true },
         .{ "query", "query", true },
         .{ "full_text_search", "full_text_search", true },
         .{ "full_text_index", "full_text_index", true },
@@ -15826,6 +15952,9 @@ pub const GlobalStatefulQueryRequest = struct {
         .{ "foreign_sources", "foreign_sources", true },
         .{ "graph_searches", "graph_searches", true },
         .{ "expand_strategy", "expand_strategy", true },
+        .{ "source", "source", true },
+        .{ "source_ranking", "source_ranking", true },
+        .{ "source_cursor", "source_cursor", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -15838,6 +15967,14 @@ pub const GlobalStatefulQueryRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.read_requirements) |value| {
+            try jw.objectField("read_requirements");
+            try jw.write(value);
+        }
+        if (self.lake_read) |value| {
+            try jw.objectField("lake_read");
+            try jw.write(value);
+        }
         if (self.remote_snapshot) |value| {
             try jw.objectField("remote_snapshot");
             try jw.write(value);
@@ -15850,8 +15987,10 @@ pub const GlobalStatefulQueryRequest = struct {
             try jw.objectField("table_target");
             try jw.write(value);
         }
-        try jw.objectField("table");
-        try jw.write(self.table);
+        if (self.table) |value| {
+            try jw.objectField("table");
+            try jw.write(value);
+        }
         if (self.query) |value| {
             try jw.objectField("query");
             try jw.write(value);
@@ -15998,6 +16137,18 @@ pub const GlobalStatefulQueryRequest = struct {
         }
         if (self.expand_strategy) |value| {
             try jw.objectField("expand_strategy");
+            try jw.write(value);
+        }
+        if (self.source) |value| {
+            try jw.objectField("source");
+            try jw.write(value);
+        }
+        if (self.source_ranking) |value| {
+            try jw.objectField("source_ranking");
+            try jw.write(value);
+        }
+        if (self.source_cursor) |value| {
+            try jw.objectField("source_cursor");
             try jw.write(value);
         }
         try jw.endObject();
@@ -18279,6 +18430,8 @@ pub const GraphMetricProfile = struct {
 
 /// Reads a published graph metric. Score-bearing graph metric queries on multi-shard tables require a globally coordinated metric snapshot and otherwise return graph_metric_global_materialization_required instead of merging mathematically incompatible shard-local scores.
 pub const GraphMetricQuery = struct {
+    /// Direction of query-time personalized PageRank; defaults to out. Requires seed_nodes and metric_freshness=fresh. Both treats every selected relationship as undirected, allowing entity seeds to reach documents through incoming mention edges.
+    direction: ?EdgeDirection = null,
     /// Optional result key. Defaults to the metric name.
     name: ?[]const u8 = null,
     /// Graph index that owns the published metric.
@@ -18296,6 +18449,7 @@ pub const GraphMetricQuery = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "direction", "direction", true },
         .{ "name", "name", true },
         .{ "index", "index", false },
         .{ "metric", "metric", false },
@@ -18315,6 +18469,10 @@ pub const GraphMetricQuery = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.direction) |value| {
+            try jw.objectField("direction");
+            try jw.write(value);
+        }
         if (self.name) |value| {
             try jw.objectField("name");
             try jw.write(value);
@@ -18345,6 +18503,8 @@ pub const GraphMetricQuery = struct {
 
 /// Blends a published graph metric into hit scores. Multi-shard tables require a globally coordinated metric snapshot and otherwise return graph_metric_global_materialization_required.
 pub const GraphMetricRerank = struct {
+    /// Direction of query-time personalized PageRank; defaults to out. Requires seed_nodes and metric_freshness=fresh. Both treats every selected relationship as undirected, allowing entity seeds to reach documents through incoming mention edges.
+    direction: ?EdgeDirection = null,
     /// Graph index that owns the published metric.
     index: []const u8,
     /// Graph metric name to blend into the search hit score.
@@ -18368,6 +18528,7 @@ pub const GraphMetricRerank = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "direction", "direction", true },
         .{ "index", "index", false },
         .{ "metric", "metric", false },
         .{ "candidate_count", "candidate_count", true },
@@ -18390,6 +18551,10 @@ pub const GraphMetricRerank = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.direction) |value| {
+            try jw.objectField("direction");
+            try jw.write(value);
+        }
         try jw.objectField("index");
         try jw.write(self.index);
         try jw.objectField("metric");
@@ -19802,6 +19967,10 @@ pub const GraphResolverConfig = struct {
     source_artifact_kind: ?[]const u8 = null,
     resolution_artifact: []const u8,
     key_template: []const u8,
+    /// Materialize canonical entity documents. False resolves graph keys without promotion.
+    promote: ?bool = null,
+    /// Explicit redirects between fully rendered keys in this resolver's table; no entity documents required. Changes trigger corpus re-resolution.
+    aliases: ?[]const std.json.Value = null,
     /// Mention labels this resolver consumes; empty consumes every label (catch-all). Labeled resolvers sharing a source artifact must claim disjoint label sets, and every catch-all on that artifact skips the labels claimed by labeled siblings, so extraction labels stay open-vocabulary while each mention routes to exactly one labeled resolver (label-routed tables, e.g. event mentions to an events table).
     labels: ?[]const []const u8 = null,
     type_must_match: ?bool = null,
@@ -19829,6 +19998,8 @@ pub const GraphResolverConfig = struct {
         .{ "source_artifact_kind", "source_artifact_kind", true },
         .{ "resolution_artifact", "resolution_artifact", false },
         .{ "key_template", "key_template", false },
+        .{ "promote", "promote", true },
+        .{ "aliases", "aliases", true },
         .{ "labels", "labels", true },
         .{ "type_must_match", "type_must_match", true },
         .{ "scorer", "scorer", true },
@@ -19870,6 +20041,14 @@ pub const GraphResolverConfig = struct {
         try jw.write(self.resolution_artifact);
         try jw.objectField("key_template");
         try jw.write(self.key_template);
+        if (self.promote) |value| {
+            try jw.objectField("promote");
+            try jw.write(value);
+        }
+        if (self.aliases) |value| {
+            try jw.objectField("aliases");
+            try jw.write(value);
+        }
         if (self.labels) |value| {
             try jw.objectField("labels");
             try jw.write(value);
@@ -20413,6 +20592,8 @@ pub const GraphTraversal = struct {
     max_depth: ?i64 = null,
     edge_weight: ?GraphEdgeWeightRange = null,
     limit: ?i64 = null,
+    /// Return each node once across all starts. Set false with include_paths to return each reaching path, including its start node. Depth, result, and work limits still bound path enumeration.
+    deduplicate_nodes: ?bool = null,
     include_paths: ?bool = null,
     /// Include each result node's stored document when it exists at the pinned snapshot. A dangling graph identity omits document. When false, document is always omitted.
     include_documents: ?bool = null,
@@ -20440,6 +20621,7 @@ pub const GraphTraversal = struct {
         .{ "max_depth", "max_depth", true },
         .{ "edge_weight", "edge_weight", true },
         .{ "limit", "limit", true },
+        .{ "deduplicate_nodes", "deduplicate_nodes", true },
         .{ "include_paths", "include_paths", true },
         .{ "include_documents", "include_documents", true },
         .{ "fields", "fields", true },
@@ -20485,6 +20667,10 @@ pub const GraphTraversal = struct {
         }
         if (self.limit) |value| {
             try jw.objectField("limit");
+            try jw.write(value);
+        }
+        if (self.deduplicate_nodes) |value| {
+            try jw.objectField("deduplicate_nodes");
             try jw.write(value);
         }
         if (self.include_paths) |value| {
@@ -21234,6 +21420,8 @@ pub const IndexConfig = struct {
     version: ?i64 = null,
     /// Inline managed enrichment definitions required by this index. Enrichments are table-level generated artifacts such as chunks, asset-derived document units, or embeddings over an artifact stream.
     enrichments: ?[]const EnrichmentConfig = null,
+    /// Opt in to retaining the indexed source projection in serverless full-text sidecars for cold highlighting. With field set, only that field is retained; otherwise the index source projection is retained. Increases index storage and build work. Omit or set false to hydrate highlights from the source table. Provisioned indexes already retain source independently.
+    store_source: ?bool = null,
     /// Chunk or textual asset streams indexed together; every artifact record is an independent full-text member. A source-local field overrides the shared index-level field for that stream. Artifact names must be unique. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     sources: ?[]const FullTextArtifactIndexSource = null,
     /// Whether to use memory-only storage
@@ -21306,6 +21494,7 @@ pub const IndexConfig = struct {
         .{ "type", "type", false },
         .{ "version", "version", true },
         .{ "enrichments", "enrichments", true },
+        .{ "store_source", "store_source", true },
         .{ "sources", "sources", true },
         .{ "mem_only", "mem_only", true },
         .{ "field", "field", true },
@@ -21367,6 +21556,10 @@ pub const IndexConfig = struct {
         }
         if (self.enrichments) |value| {
             try jw.objectField("enrichments");
+            try jw.write(value);
+        }
+        if (self.store_source) |value| {
+            try jw.objectField("store_source");
             try jw.write(value);
         }
         if (self.sources) |value| {
@@ -22244,15 +22437,13 @@ pub const InferenceAudioContext = enum {
     }
 };
 
-/// Backend priority entry for model loading. Use `backend` or `backend:device`, where device defaults to `auto`. Backends: - `native` - Native CPU backend - `onnx` - ONNX Runtime backend - `metal` - Apple Metal backend - `cuda` - NVIDIA CUDA backend - `xla` - PJRT/XLA compiled backend - `webgpu` or `wasm` - Wasm/WebGPU backend in Wasm builds Devices: - `auto` - Auto-detect best available (default) - `cuda` - NVIDIA CUDA GPU - `tpu` - Google TPU (used by XLA) - `cpu` - Force CPU only
+/// Backend priority entry for model loading. Use `backend` or `backend:device`, where device defaults to `auto`. Backends: - `native` - Native CPU backend - `metal` - Apple Metal backend - `cuda` - NVIDIA CUDA backend - `xla` - PJRT/XLA compiled backend - `webgpu` or `wasm` - Wasm/WebGPU backend in Wasm builds Devices: - `auto` - Auto-detect best available (default) - `cuda` - NVIDIA CUDA GPU - `tpu` - Google TPU (used by XLA) - `cpu` - Force CPU only
 pub const InferenceBackendPriorityEntry = []const u8;
 
 /// Runtime backends compiled into this inference server.
 pub const InferenceBackendRuntimes = struct {
     /// Whether the native CPU backend is built into this runtime
     native: ?bool = null,
-    /// Whether the ONNX Runtime backend is built into this runtime
-    onnx: ?bool = null,
     /// Whether the Metal backend is built into this runtime
     metal: ?bool = null,
     /// Whether the CUDA backend is built into this runtime
@@ -22265,7 +22456,6 @@ pub const InferenceBackendRuntimes = struct {
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "native", "native", true },
-        .{ "onnx", "onnx", true },
         .{ "metal", "metal", true },
         .{ "cuda", "cuda", true },
         .{ "xla", "xla", true },
@@ -22284,10 +22474,6 @@ pub const InferenceBackendRuntimes = struct {
         try jw.beginObject();
         if (self.native) |value| {
             try jw.objectField("native");
-            try jw.write(value);
-        }
-        if (self.onnx) |value| {
-            try jw.objectField("onnx");
             try jw.write(value);
         }
         if (self.metal) |value| {
@@ -23325,6 +23511,52 @@ pub const InferenceDecideAnswer = union(enum) {
     }
 };
 
+/// Explicit windowing for qualified boundary decision models. Span and embedding decision models reject window mode. Omission preserves rejection of over-limit text.
+pub const InferenceDecideLongDocument = struct {
+    mode: ?[]const u8 = null,
+    window_words: ?i64 = null,
+    /// Must be smaller than window_words. Only valid in window mode.
+    overlap_words: ?i64 = null,
+    max_windows: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "mode", "mode", true },
+        .{ "window_words", "window_words", true },
+        .{ "overlap_words", "overlap_words", true },
+        .{ "max_windows", "max_windows", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.mode) |value| {
+            try jw.objectField("mode");
+            try jw.write(value);
+        }
+        if (self.window_words) |value| {
+            try jw.objectField("window_words");
+            try jw.write(value);
+        }
+        if (self.overlap_words) |value| {
+            try jw.objectField("overlap_words");
+            try jw.write(value);
+        }
+        if (self.max_windows) |value| {
+            try jw.objectField("max_windows");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 pub const InferenceDecideQuestion = union(enum) {
     multi_choice_decision_question: *MultiChoiceDecisionQuestion,
     choice_decision_question: *ChoiceDecisionQuestion,
@@ -23431,6 +23663,7 @@ pub const InferenceDecideRequest = struct {
     model_identity: ?[]const u8 = null,
     input: ?[]const u8 = null,
     inputs: ?[]const DecisionInput = null,
+    long_document: ?InferenceDecideLongDocument = null,
     questions: []const InferenceDecideQuestion,
     embedding_options: ?EmbeddingDecisionOptions = null,
 
@@ -23440,6 +23673,7 @@ pub const InferenceDecideRequest = struct {
         .{ "model_identity", "model_identity", true },
         .{ "input", "input", true },
         .{ "inputs", "inputs", true },
+        .{ "long_document", "long_document", true },
         .{ "questions", "questions", false },
         .{ "embedding_options", "embedding_options", true },
     };
@@ -23466,6 +23700,10 @@ pub const InferenceDecideRequest = struct {
         }
         if (self.inputs) |value| {
             try jw.objectField("inputs");
+            try jw.write(value);
+        }
+        if (self.long_document) |value| {
+            try jw.objectField("long_document");
             try jw.write(value);
         }
         try jw.objectField("questions");
@@ -24826,7 +25064,7 @@ pub const InferenceGenerateRequest = struct {
     frequency_penalty: ?f32 = null,
     /// Additive penalty for tokens that appeared at all in context (logit -= presence_penalty if count > 0)
     presence_penalty: ?f32 = null,
-    /// Structured output control. OpenAI-compatible entry point for requesting JSON output. `{"type":"json_object"}` is supported directly. `{"type":"json_schema"}` is compiled into a native constrained-decoding grammar on the native backend and is rejected on ONNX backends.
+    /// Structured output control. OpenAI-compatible entry point for requesting JSON output. `{"type":"json_object"}` is supported directly. `{"type":"json_schema"}` is compiled into a native constrained-decoding grammar on the native backend.
     response_format: ?InferenceGenerateResponseFormat = null,
     /// inference-native grammar override. When set, this takes precedence over `response_format`. Grammar-constrained decoding is currently native-backend only.
     grammar: ?[]const u8 = null,
@@ -25231,7 +25469,6 @@ pub const InferenceMediaContentPart = MediaContentPart;
 pub const InferenceModelBackend = enum {
     auto,
     native,
-    onnx,
     metal,
     cuda,
     xla,
@@ -25242,7 +25479,6 @@ pub const InferenceModelBackend = enum {
         const s = switch (self) {
             .auto => "auto",
             .native => "native",
-            .onnx => "onnx",
             .metal => "metal",
             .cuda => "cuda",
             .xla => "xla",
@@ -25260,7 +25496,6 @@ pub const InferenceModelBackend = enum {
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "auto", .auto },
             .{ "native", .native },
-            .{ "onnx", .onnx },
             .{ "metal", .metal },
             .{ "cuda", .cuda },
             .{ "xla", .xla },
@@ -25305,6 +25540,8 @@ pub const InferenceModelFormat = enum {
 
 /// Information about a model including its capabilities
 pub const InferenceModelInfo = struct {
+    /// Pull-time qualified request profiles for this exact artifact, including backend, supported features and min/max geometry. Runtime admission revalidates artifact identity and resource limits. Omitted for artifacts without a qualification receipt.
+    qualified_limits: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// List of capabilities this model supports (omitted when empty). For rerankers, `late_interaction` or `colbert` selects native MaxSim token scoring.
     capabilities: ?[]const []const u8 = null,
     /// List of input modalities this model accepts, such as `text`, `image`, or `audio`
@@ -25312,6 +25549,7 @@ pub const InferenceModelInfo = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "qualified_limits", "qualified_limits", true },
         .{ "capabilities", "capabilities", true },
         .{ "inputs", "inputs", true },
     };
@@ -25326,6 +25564,10 @@ pub const InferenceModelInfo = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.qualified_limits) |value| {
+            try jw.objectField("qualified_limits");
+            try jw.write(value);
+        }
         if (self.capabilities) |value| {
             try jw.objectField("capabilities");
             try jw.write(value);
@@ -25420,6 +25662,8 @@ pub const InferenceModelRef = struct {
     /// Model name to resolve within the registry for the selected kind, usually in `<owner>/<repo>` format.
     name: []const u8,
     backend: ?InferenceModelBackend = null,
+    /// Per-model GLiNER CUDA inference precision for extractor preloads. Requires CUDA; omitted or auto currently selects FP32. FP16 and BF16 requests fail closed until the exact model/profile has release qualification. Precision is part of the loaded-session cache identity.
+    cuda_precision: ?[]const u8 = null,
     format: ?InferenceModelFormat = null,
     quantization: ?InferenceModelQuantization = null,
     /// Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal or CUDA runtime. On qualified SM89 CUDA, auto resolves to resident and fails closed unless its envelope fits. Other model geometries reject this field.
@@ -25432,6 +25676,7 @@ pub const InferenceModelRef = struct {
         .{ "kind", "kind", false },
         .{ "name", "name", false },
         .{ "backend", "backend", true },
+        .{ "cuda_precision", "cuda_precision", true },
         .{ "format", "format", true },
         .{ "quantization", "quantization", true },
         .{ "residency_mode", "residency_mode", true },
@@ -25454,6 +25699,10 @@ pub const InferenceModelRef = struct {
         try jw.write(self.name);
         if (self.backend) |value| {
             try jw.objectField("backend");
+            try jw.write(value);
+        }
+        if (self.cuda_precision) |value| {
+            try jw.objectField("cuda_precision");
             try jw.write(value);
         }
         if (self.format) |value| {
@@ -27455,6 +27704,232 @@ pub const KeyRange = struct {
         }
         if (self.to) |value| {
             try jw.objectField("to");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const LakeCatalogCommitRequest = struct {
+    commit_id: []const u8,
+    expected_metadata_location: []const u8,
+    /// Standard Iceberg REST table requirements, validated against the authoritative state.
+    requirements: []const std.json.ArrayHashMap(std.json.Value),
+    /// Standard Iceberg REST metadata updates. Upload data/delete/manifest files before committing. A lake commit does not establish Antfly index visibility.
+    updates: []const std.json.ArrayHashMap(std.json.Value),
+};
+
+/// Catalog authority is independent of S3/GCS storage and deployment. managed uses a conditional durable head under the table root. rest uses a named HTTP connection; raw secrets are forbidden. Omit to retain explicit metadata URI/version-hint discovery.
+pub const LakeCatalogConfig = struct {
+    type: []const u8,
+    /// Required for rest. Named external_io/http connection with lake_catalog_read and, for commits, lake_catalog_write capabilities.
+    connection: ?[]const u8 = null,
+    /// Required for rest; catalog base URI whose origin must be allowed by the named connection.
+    uri: ?[]const u8 = null,
+    /// Required nonempty namespace components for rest.
+    namespace: ?[]const []const u8 = null,
+    /// Required table name for rest, distinct from Antfly's logical table name.
+    name: ?[]const u8 = null,
+    /// Optional REST config warehouse selector. Other fields must be omitted for managed.
+    warehouse: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "connection", "connection", true },
+        .{ "uri", "uri", true },
+        .{ "namespace", "namespace", true },
+        .{ "name", "name", true },
+        .{ "warehouse", "warehouse", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.connection) |value| {
+            try jw.objectField("connection");
+            try jw.write(value);
+        }
+        if (self.uri) |value| {
+            try jw.objectField("uri");
+            try jw.write(value);
+        }
+        if (self.namespace) |value| {
+            try jw.objectField("namespace");
+            try jw.write(value);
+        }
+        if (self.name) |value| {
+            try jw.objectField("name");
+            try jw.write(value);
+        }
+        if (self.warehouse) |value| {
+            try jw.objectField("warehouse");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const LakeCatalogCreateRequest = struct {
+    /// Stable identifier reused with exactly the same request after timeout or restart.
+    commit_id: []const u8,
+    /// Iceberg schema including schema-id and persistent field IDs.
+    schema: std.json.ArrayHashMap(std.json.Value),
+    partition_spec: ?std.json.ArrayHashMap(std.json.Value) = null,
+    write_order: ?std.json.ArrayHashMap(std.json.Value) = null,
+    properties: ?std.json.ArrayHashMap([]const u8) = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "commit_id", "commit_id", false },
+        .{ "schema", "schema", false },
+        .{ "partition-spec", "partition_spec", true },
+        .{ "write-order", "write_order", true },
+        .{ "properties", "properties", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("commit_id");
+        try jw.write(self.commit_id);
+        try jw.objectField("schema");
+        try jw.write(self.schema);
+        if (self.partition_spec) |value| {
+            try jw.objectField("partition-spec");
+            try jw.write(value);
+        }
+        if (self.write_order) |value| {
+            try jw.objectField("write-order");
+            try jw.write(value);
+        }
+        if (self.properties) |value| {
+            try jw.objectField("properties");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const LakeCatalogResponse = struct {
+    state: []const u8,
+    commit_id: ?[]const u8 = null,
+    /// Opaque request digest for outcome resolution.
+    request_hash: ?[]const u8 = null,
+    metadata_location: ?[]const u8 = null,
+    metadata: ?std.json.ArrayHashMap(std.json.Value) = null,
+    /// False if lake creation committed but native schema binding still needs the same initialization request replayed.
+    binding_ready: ?bool = null,
+    /// A catalog commit alone does not make a matching index publication searchable.
+    searchable: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "state", "state", false },
+        .{ "commit_id", "commit_id", true },
+        .{ "request_hash", "request_hash", true },
+        .{ "metadata_location", "metadata_location", true },
+        .{ "metadata", "metadata", true },
+        .{ "binding_ready", "binding_ready", true },
+        .{ "searchable", "searchable", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("state");
+        try jw.write(self.state);
+        if (self.commit_id) |value| {
+            try jw.objectField("commit_id");
+            try jw.write(value);
+        }
+        if (self.request_hash) |value| {
+            try jw.objectField("request_hash");
+            try jw.write(value);
+        }
+        if (self.metadata_location) |value| {
+            try jw.objectField("metadata_location");
+            try jw.write(value);
+        }
+        if (self.metadata) |value| {
+            try jw.objectField("metadata");
+            try jw.write(value);
+        }
+        if (self.binding_ready) |value| {
+            try jw.objectField("binding_ready");
+            try jw.write(value);
+        }
+        if (self.searchable) |value| {
+            try jw.objectField("searchable");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const LakeReadReceipt = struct {
+    table_id: u64,
+    object_generation: u64,
+    wal_lsn: u64,
+};
+
+pub const LakeReadRequirement = struct {
+    /// Accepted requires current WAL visibility; vector/hybrid reads wait for matching publication. Published explicitly permits the retained archive generation. Applies to native writable Iceberg reads.
+    visibility: ?[]const u8 = null,
+    through: ?LakeReadReceipt = null,
+    /// Bounded readiness wait, default 5000 ms when lake_read is supplied; also bounded by query timeout and cancellation.
+    wait_ms: ?u32 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "visibility", "visibility", true },
+        .{ "through", "through", true },
+        .{ "wait_ms", "wait_ms", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.visibility) |value| {
+            try jw.objectField("visibility");
+            try jw.write(value);
+        }
+        if (self.through) |value| {
+            try jw.objectField("through");
+            try jw.write(value);
+        }
+        if (self.wait_ms) |value| {
+            try jw.objectField("wait_ms");
             try jw.write(value);
         }
         try jw.endObject();
@@ -31408,6 +31883,8 @@ pub const QueryHighlight = struct {
 
 /// A single query result hit
 pub const QueryHit = struct {
+    /// Source table provenance for composed query hits; equal IDs from union inputs remain distinct.
+    _table: ?[]const u8 = null,
     /// Named query-time computed values, separate from stored source.
     _computed: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// ID of the record.
@@ -31430,6 +31907,7 @@ pub const QueryHit = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "_table", "_table", true },
         .{ "_computed", "_computed", true },
         .{ "_id", "_id", false },
         .{ "_score", "_score", false },
@@ -31452,6 +31930,10 @@ pub const QueryHit = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self._table) |value| {
+            try jw.objectField("_table");
+            try jw.write(value);
+        }
         if (self._computed) |value| {
             try jw.objectField("_computed");
             try jw.write(value);
@@ -31766,7 +32248,9 @@ pub const QueryProfile = struct {
 };
 
 pub const QueryRequest = struct {
-    /// Opaque remote index snapshot token returned by a previous query. Required when replaying search_after or search_before against an external table; a changed publication returns 409.
+    read_requirements: ?ReadRequirements = null,
+    lake_read: ?LakeReadRequirement = null,
+    /// Opaque retained snapshot token returned by an ordered native or external-table query. Echo with search_after or search_before. Native and lake cuts expire within the configured retention period (default five minutes; maximum one hour); missing, expired or incompatible generations return 409.
     remote_snapshot: ?[]const u8 = null,
     evaluate: ?QueryEvaluation = null,
     table_target: ?CatalogTableTarget = null,
@@ -31842,6 +32326,8 @@ pub const QueryRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "read_requirements", "read_requirements", true },
+        .{ "lake_read", "lake_read", true },
         .{ "remote_snapshot", "remote_snapshot", true },
         .{ "evaluate", "evaluate", true },
         .{ "table_target", "table_target", true },
@@ -31893,6 +32379,14 @@ pub const QueryRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.read_requirements) |value| {
+            try jw.objectField("read_requirements");
+            try jw.write(value);
+        }
+        if (self.lake_read) |value| {
+            try jw.objectField("lake_read");
+            try jw.write(value);
+        }
         if (self.remote_snapshot) |value| {
             try jw.objectField("remote_snapshot");
             try jw.write(value);
@@ -32082,7 +32576,11 @@ pub const QueryResponses = struct {
 
 /// Result of a canonical query operation.
 pub const QueryResult = struct {
-    /// Opaque remote publication and schema fence to echo with ordered pagination. This token does not grant access or retain the publication.
+    /// Ranking contract for a composed result.
+    source_ranking: ?[]const u8 = null,
+    /// Opaque continuation for composed queries. Pass as source_cursor with the same query; valid until the earliest retained leaf cut expires (default five minutes; maximum one hour). Publication and restart preserve it; authorization and incarnation fences remain enforced.
+    next_source_cursor: ?[]const u8 = null,
+    /// Opaque snapshot to echo with ordered pagination. Native tokens retain the complete physical generation; lake tokens retain the archive publication, metadata and accepted WAL cut, for the configured retention period (default five minutes; maximum one hour). Every use rechecks access, incarnation and recipe. Unavailable retained generations return 409.
     remote_snapshot: ?[]const u8 = null,
     /// Function evaluation scope, population, usage, and scoped aggregations.
     evaluation: ?std.json.ArrayHashMap(std.json.Value) = null,
@@ -32107,6 +32605,8 @@ pub const QueryResult = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "source_ranking", "source_ranking", true },
+        .{ "next_source_cursor", "next_source_cursor", true },
         .{ "remote_snapshot", "remote_snapshot", true },
         .{ "evaluation", "evaluation", true },
         .{ "hits", "hits", true },
@@ -32131,6 +32631,14 @@ pub const QueryResult = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.source_ranking) |value| {
+            try jw.objectField("source_ranking");
+            try jw.write(value);
+        }
+        if (self.next_source_cursor) |value| {
+            try jw.objectField("next_source_cursor");
+            try jw.write(value);
+        }
         if (self.remote_snapshot) |value| {
             try jw.objectField("remote_snapshot");
             try jw.write(value);
@@ -32181,7 +32689,11 @@ pub const QueryResult = struct {
 
 /// Fields shared by canonical and stateful query result envelopes.
 pub const QueryResultBase = struct {
-    /// Opaque remote publication and schema fence to echo with ordered pagination. This token does not grant access or retain the publication.
+    /// Ranking contract for a composed result.
+    source_ranking: ?[]const u8 = null,
+    /// Opaque continuation for composed queries. Pass as source_cursor with the same query; valid until the earliest retained leaf cut expires (default five minutes; maximum one hour). Publication and restart preserve it; authorization and incarnation fences remain enforced.
+    next_source_cursor: ?[]const u8 = null,
+    /// Opaque snapshot to echo with ordered pagination. Native tokens retain the complete physical generation; lake tokens retain the archive publication, metadata and accepted WAL cut, for the configured retention period (default five minutes; maximum one hour). Every use rechecks access, incarnation and recipe. Unavailable retained generations return 409.
     remote_snapshot: ?[]const u8 = null,
     /// Function evaluation scope, population, usage, and scoped aggregations.
     evaluation: ?std.json.ArrayHashMap(std.json.Value) = null,
@@ -32205,6 +32717,8 @@ pub const QueryResultBase = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "source_ranking", "source_ranking", true },
+        .{ "next_source_cursor", "next_source_cursor", true },
         .{ "remote_snapshot", "remote_snapshot", true },
         .{ "evaluation", "evaluation", true },
         .{ "hits", "hits", true },
@@ -32228,6 +32742,14 @@ pub const QueryResultBase = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.source_ranking) |value| {
+            try jw.objectField("source_ranking");
+            try jw.write(value);
+        }
+        if (self.next_source_cursor) |value| {
+            try jw.objectField("next_source_cursor");
+            try jw.write(value);
+        }
         if (self.remote_snapshot) |value| {
             try jw.objectField("remote_snapshot");
             try jw.write(value);
@@ -32646,6 +33168,54 @@ pub const RateLimitConfig = struct {
 
 /// An Antfly query expression retained as syntactically validated JSON and compiled by the query engine.
 pub const RawQuery = @import("antfly-json").RawValue;
+
+/// Opaque write receipt returned by ingestion. Pass it back unchanged to require a read including that write; it is a minimum freshness frontier, not an exact snapshot.
+pub const ReadReceipt = struct {
+    table_id: u64,
+    object_generation: u64,
+    wal_lsn: u64,
+};
+
+/// Freshness requirements for writable Iceberg reads. Search supports accepted and published (default accepted); SQL supports accepted and committed (default committed). Unsupported visibility modes fail explicitly. Cannot be combined with legacy lake_read or lake_visibility. A pinned transaction snapshot never advances to satisfy a newer receipt.
+pub const ReadRequirements = struct {
+    /// Accepted includes durable WAL writes; committed reads an Iceberg commit; published reads the search index generation. These are distinct visibility stages.
+    visibility: ?[]const u8 = null,
+    after_write: ?ReadReceipt = null,
+    /// Readiness wait budget within the query or statement timeout. Defaults to 5000 ms when requirements are supplied; zero fails immediately if coverage is unavailable.
+    wait_ms: ?u32 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "visibility", "visibility", true },
+        .{ "after_write", "after_write", true },
+        .{ "wait_ms", "wait_ms", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.visibility) |value| {
+            try jw.objectField("visibility");
+            try jw.write(value);
+        }
+        if (self.after_write) |value| {
+            try jw.objectField("after_write");
+            try jw.write(value);
+        }
+        if (self.wait_ms) |value| {
+            try jw.objectField("wait_ms");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
 
 pub const RegexpQuery = struct {
     regexp: []const u8,
@@ -33097,6 +33667,12 @@ pub const RelationalExpressionOp = enum {
     @"and",
     @"or",
     not,
+    cast,
+    case_when,
+    modulo,
+    in_list,
+    not_in_list,
+    array,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -33124,6 +33700,12 @@ pub const RelationalExpressionOp = enum {
             .@"and" => "and",
             .@"or" => "or",
             .not => "not",
+            .cast => "cast",
+            .case_when => "case_when",
+            .modulo => "modulo",
+            .in_list => "in_list",
+            .not_in_list => "not_in_list",
+            .array => "array",
         };
         try jw.write(s);
     }
@@ -33158,6 +33740,12 @@ pub const RelationalExpressionOp = enum {
             .{ "and", .@"and" },
             .{ "or", .@"or" },
             .{ "not", .not },
+            .{ "cast", .cast },
+            .{ "case_when", .case_when },
+            .{ "modulo", .modulo },
+            .{ "in_list", .in_list },
+            .{ "not_in_list", .not_in_list },
+            .{ "array", .array },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -33170,6 +33758,8 @@ pub const RelationalExpressionType = enum {
     datetime,
     integer,
     number,
+    numeric,
+    sql_array,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -33179,6 +33769,8 @@ pub const RelationalExpressionType = enum {
             .datetime => "datetime",
             .integer => "integer",
             .number => "number",
+            .numeric => "numeric",
+            .sql_array => "sql_array",
         };
         try jw.write(s);
     }
@@ -33195,6 +33787,8 @@ pub const RelationalExpressionType = enum {
             .{ "datetime", .datetime },
             .{ "integer", .integer },
             .{ "number", .number },
+            .{ "numeric", .numeric },
+            .{ "sql_array", .sql_array },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -33967,14 +34561,18 @@ pub const RelationalRowQueryRequest = struct {
     }
 };
 
-/// Immutable typed scalar expression, limited to 128 nodes and 16 levels. A literal requires type; omitted value means typed null. A column requires column; other operations require args. Unknown or irrelevant fields are rejected. Arithmetic operands have the same integer or number type. Integer division truncates toward zero. Overflow and division by zero reject the write. Arithmetic and string operations propagate null. ASCII case operations leave non-ASCII bytes unchanged. No volatile functions are accepted. Allocated results are bounded to 1 MiB each. Allocations and byte-comparison operand work share a 4 MiB evaluation budget per row and expression set. An integer literal may use a decimal string for exact int64 transport; blob uses base64 and datetime uses the normal relational datetime representation. Comparisons require operands of the same type and return boolean or SQL UNKNOWN (null); is_distinct and is_not_distinct always return a boolean. Unary is_null and is_not_null test presence/null. AND and OR evaluate left to right with SQL three-valued short-circuit semantics; NOT preserves UNKNOWN. CHECK accepts TRUE and UNKNOWN, rejecting FALSE.
+/// Immutable typed scalar expression, limited to 128 nodes and 16 levels. A literal requires type; omitted value means typed null. A column requires column; other operations require args. Unknown or irrelevant fields are rejected. Arithmetic operands have the same integer or number type. Integer division truncates toward zero. Overflow and division by zero reject the write. Arithmetic and string operations propagate null. ASCII case operations leave non-ASCII bytes unchanged. No volatile functions are accepted. Allocated results are bounded to 1 MiB each. Allocations and byte-comparison operand work share a 4 MiB evaluation budget per row and expression set. An integer literal may use a decimal string for exact int64 transport; blob uses base64 and datetime uses the normal relational datetime representation. Comparisons require operands of compatible types (integer and number may mix) and return boolean or SQL UNKNOWN (null); is_distinct and is_not_distinct always return a boolean. Unary is_null and is_not_null test presence/null. AND and OR evaluate left to right with SQL three-valued short-circuit semantics; NOT preserves UNKNOWN. CHECK accepts TRUE and UNKNOWN, rejecting FALSE. Numeric literals and arithmetic operations may specify sql_type to retain PostgreSQL builtin overflow and float4 rounding semantics. Without it, integer and number operations retain int64 and float64 semantics. Numeric cast requires type and sql_type, takes one numeric argument, and performs a checked conversion when evaluated (not when the schema is compiled). Floating-to-integer casts round ties to even. The numeric expression type uses exact PostgreSQL NUMERIC values and may specify sql_type numeric. Its literals accept decimal strings or exact JSON numeric lexemes, including string-valued special values. Exact NUMERIC programs require reader capability version 21 even when their result is boolean or integer. Float/integer assignment casts keep their declared PostgreSQL rounding and overflow semantics. A cast to numeric may specify numeric_modifier for PostgreSQL precision and signed-scale coercion. Overflow is checked when the selected cast executes; unselected lazy branches do not fail. Modifier-bearing programs require reader capability version 23 even with integer/boolean output. The sql_array expression type requires sql_type on literals, including typed NULL, to declare the element builtin. Non-null literals use the ordinal SQL array envelope (dimensions with length/lower_bound, values, and sql_nulls), retaining shape and lower bounds. Array columns derive their exact element identity from the immutable schema. Comparisons, IN, COALESCE and CASE require matching array element identities; no element type is inferred from values. Array-dependent programs require reader capability version 24 even with scalar output. Assignment to a NUMERIC array column applies its precision/signed-scale modifier to each element. Array casts require type sql_array and an explicit matching sql_type; identity casts borrow the immutable input. Casts of numeric arrays may additionally specify numeric_modifier, coercing each non-NULL element with PostgreSQL precision and signed-scale semantics while preserving dimensions, lower bounds and NULL slots. Coercion is lazy and shares invocation admission with the surrounding expression. Array-valued ordered index keys and element-changing array casts are not supported by this expression contract. The array constructor requires sql_type and zero to 32 arguments. Constructor programs additionally require reader capability version 25, including constructors hidden inside scalar/boolean expressions. Scalar arguments must have the declared element domain, with explicit width-preserving numeric casts where needed. SQL NULL arguments become NULL elements. Array arguments must all have matching element types, dimensions and lower bounds; one leading dimension with lower bound 1 is added. All empty/NULL subarrays produce an empty array; mixing an empty/NULL subarray with a nonempty one is a dimension mismatch. Child expressions execute once, with shared work/cancellation and byte limits. case_when takes alternating boolean conditions and result expressions, followed by a mandatory fallback result (3 to 31 arguments, at most 15 branches). Conditions are evaluated in order; only the selected result is evaluated, and a NULL condition is not TRUE. All result expressions must have the same physical type. Numeric SQL lowering records builtin result-domain promotions as explicit casts. This operation requires schema capability version 18. modulo takes two same-domain integer or NUMERIC operands and returns the signed remainder (minInt modulo -1 is zero); a zero divisor rejects the write. in_list and not_in_list take one probe followed by 1 to 127 same-domain candidates. The probe is evaluated once; NULL probes return UNKNOWN. A matching candidate wins over NULL candidates; otherwise a NULL candidate makes the result UNKNOWN. These operations require schema capability version 19.
 pub const RelationalScalarExpression = struct {
     op: RelationalExpressionOp,
     type: ?RelationalExpressionType = null,
+    /// Numeric builtin result identity on numeric literals, arithmetic, negate, and cast (capability version 18), or required array element identity on sql_array literals including typed NULL (capability version 24).
+    sql_type: ?SQLBuiltinType = null,
+    /// Optional precision/signed-scale coercion; accepted only on cast with type numeric and sql_type numeric. Requires reader capability version 23.
+    numeric_modifier: ?SQLNumericModifier = null,
     /// Typed literal value, including null.
-    value: ?std.json.Value = null,
+    value: OpenApiOptionalNullable(std.json.Value) = .absent,
     column: ?[]const u8 = null,
-    /// Optional binary or ASCII case-insensitive collation for binary string comparison operations only; aliases match ordered indexes.
+    /// Optional binary or ASCII case-insensitive collation for string comparisons and in_list; aliases match ordered indexes.
     collation: ?[]const u8 = null,
     args: ?[]const RelationalScalarExpression = null,
 
@@ -33982,7 +34580,9 @@ pub const RelationalScalarExpression = struct {
     pub const openApiFieldMetadata = .{
         .{ "op", "op", false },
         .{ "type", "type", true },
-        .{ "value", "value", true },
+        .{ "sql_type", "sql_type", true },
+        .{ "numeric_modifier", "numeric_modifier", true },
+        .{ "value", "value", false },
         .{ "column", "column", true },
         .{ "collation", "collation", true },
         .{ "args", "args", true },
@@ -34004,9 +34604,24 @@ pub const RelationalScalarExpression = struct {
             try jw.objectField("type");
             try jw.write(value);
         }
-        if (self.value) |value| {
-            try jw.objectField("value");
+        if (self.sql_type) |value| {
+            try jw.objectField("sql_type");
             try jw.write(value);
+        }
+        if (self.numeric_modifier) |value| {
+            try jw.objectField("numeric_modifier");
+            try jw.write(value);
+        }
+        switch (self.value) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("value");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("value");
+                try jw.write(value);
+            },
         }
         if (self.column) |value| {
             try jw.objectField("column");
@@ -34027,6 +34642,7 @@ pub const RelationalScalarExpression = struct {
 /// A named, ordered composite unique key. Validation status is maintained by the server. TTL expiry uses the distributed integrity coordinator. Referenced unique keys are nondeferrable.
 pub const RelationalUniqueConstraint = struct {
     name: []const u8,
+    origin: ?RelationalUniqueConstraintOrigin = null,
     /// SQL primary-key identity. At most one per relational table; all key columns must be required and nonnullable.
     primary: ?bool = null,
     columns: ?[]const []const u8 = null,
@@ -34043,6 +34659,7 @@ pub const RelationalUniqueConstraint = struct {
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "name", "name", false },
+        .{ "origin", "origin", true },
         .{ "primary", "primary", true },
         .{ "columns", "columns", true },
         .{ "keys", "keys", true },
@@ -34064,6 +34681,10 @@ pub const RelationalUniqueConstraint = struct {
         try jw.beginObject();
         try jw.objectField("name");
         try jw.write(self.name);
+        if (self.origin) |value| {
+            try jw.objectField("origin");
+            try jw.write(value);
+        }
         if (self.primary) |value| {
             try jw.objectField("primary");
             try jw.write(value);
@@ -34093,6 +34714,32 @@ pub const RelationalUniqueConstraint = struct {
             try jw.write(value);
         }
         try jw.endObject();
+    }
+};
+
+/// Durable ownership kind. Index-owned uniqueness participates in ON CONFLICT inference but is not a named SQL constraint. Human-readable index descriptions never determine ownership.
+pub const RelationalUniqueConstraintOrigin = enum {
+    constraint,
+    index,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .constraint => "constraint",
+            .index => "index",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "constraint", .constraint },
+            .{ "index", .index },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
     }
 };
 
@@ -37460,13 +38107,211 @@ pub const RuntimeDecl = struct {
     }
 };
 
+/// JSON Schema property declaration for one typed SQL-array column in a relational table. Use it as a root property of DocumentSchema.schema. The element identity is mandatory; a JSON Schema `array` remains a JSON column and is never inferred to be a SQL array. Column values use the lossless SQLArrayValue envelope: dimensions with lower bounds, flat row-major values and explicit SQL NULL flags. Integer elements are decimal strings, even when small. JSONB null and SQL NULL are distinct. Float elements acquire their declared width before validation and storage. Outer null represents a SQL NULL array when nullable is true. Additional JSON Schema constraints apply to this envelope, not to PostgreSQL array subscripts. SQL array index keys and SQL DDL activation are not implied by accepting this storage schema.
+pub const SQLArrayColumnSchema = struct {
+    type: []const u8,
+    x_antfly_sql_type: SQLArrayElementType,
+    /// Accepted only with numeric element identity. Applies assignment coercion to each non-NULL element while preserving dimensions and lower bounds. Requires reader capability version 23.
+    x_antfly_sql_numeric_modifier: ?SQLNumericModifier = null,
+    nullable: ?bool = null,
+    description: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "x-antfly-sql-type", "x_antfly_sql_type", false },
+        .{ "x-antfly-sql-numeric-modifier", "x_antfly_sql_numeric_modifier", true },
+        .{ "nullable", "nullable", true },
+        .{ "description", "description", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("x-antfly-sql-type");
+        try jw.write(self.x_antfly_sql_type);
+        if (self.x_antfly_sql_numeric_modifier) |value| {
+            try jw.objectField("x-antfly-sql-numeric-modifier");
+            try jw.write(value);
+        }
+        if (self.nullable) |value| {
+            try jw.objectField("nullable");
+            try jw.write(value);
+        }
+        if (self.description) |value| {
+            try jw.objectField("description");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const SQLArrayDimension = struct {
+    length: i64,
+    lower_bound: i64,
+};
+
+/// Bound SQL scalar or array-element identity, including numeric widths and exact NUMERIC. Never inferred from JSON value shape.
+pub const SQLArrayElementType = enum {
+    text,
+    int16,
+    int32,
+    int64,
+    float32,
+    float64,
+    boolean,
+    uuid,
+    jsonb,
+    numeric,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .text => "text",
+            .int16 => "int16",
+            .int32 => "int32",
+            .int64 => "int64",
+            .float32 => "float32",
+            .float64 => "float64",
+            .boolean => "boolean",
+            .uuid => "uuid",
+            .jsonb => "jsonb",
+            .numeric => "numeric",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "text", .text },
+            .{ "int16", .int16 },
+            .{ "int32", .int32 },
+            .{ "int64", .int64 },
+            .{ "float32", .float32 },
+            .{ "float64", .float64 },
+            .{ "boolean", .boolean },
+            .{ "uuid", .uuid },
+            .{ "jsonb", .jsonb },
+            .{ "numeric", .numeric },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Non-NULL SQL array result. Elements are flat, row-major values using the column's element_type. Their count equals the product of dimension lengths. Empty arrays have no dimensions and no elements. Integer elements are canonical decimal strings. Exact numeric elements are decimal strings preserving display scale, or NaN, Infinity and -Infinity. Floating elements are JSON numbers, or the strings NaN, Infinity and -Infinity. Element null flags distinguish SQL NULL from the JSON literal null in jsonb arrays. A NULL array is an outer null result cell, not an empty array or this envelope.
+pub const SQLArrayValue = struct {
+    dimensions: []const SQLArrayDimension,
+    values: []const std.json.Value,
+    /// Exactly one flag per value. True requires a null value; false permits a JSON null only for jsonb elements.
+    sql_nulls: []const bool,
+};
+
+/// Exact PostgreSQL builtin identity for a relational root scalar column. SQL array columns use SQLArrayElementType for their element identity. Set the JSON Schema property's `x-antfly-sql-type` annotation to one of these values. The underlying property type must match. SQL array storage is not implied by this annotation. Existing unannotated schemas retain their original domains. The numeric identity uses an underlying number property and exact PostgreSQL NUMERIC semantics, never binary float. Submit finite values as JSON numeric lexemes or decimal strings; special values use strings NaN, Infinity and -Infinity. Const/enum finite numeric members must be JSON numbers, not strings. Bounds and multipleOf are exact decimals. Public scalar NUMERIC schemas require reader capability version 22. To constrain a NUMERIC scalar or SQL-array column, set the root property's `x-antfly-sql-numeric-modifier` annotation to an object with precision (1..1000) and signed scale (-1000..1000). The annotation requires numeric identity and reader capability version 23. Assignment rounds before constraints, indexes and generated dependents; overflow rejects the write. Restore verifies stored values without rounding.
+pub const SQLBuiltinType = enum {
+    text,
+    int16,
+    int32,
+    int64,
+    float32,
+    float64,
+    boolean,
+    uuid,
+    jsonb,
+    numeric,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .text => "text",
+            .int16 => "int16",
+            .int32 => "int32",
+            .int64 => "int64",
+            .float32 => "float32",
+            .float64 => "float64",
+            .boolean => "boolean",
+            .uuid => "uuid",
+            .jsonb => "jsonb",
+            .numeric => "numeric",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "text", .text },
+            .{ "int16", .int16 },
+            .{ "int32", .int32 },
+            .{ "int64", .int64 },
+            .{ "float32", .float32 },
+            .{ "float64", .float64 },
+            .{ "boolean", .boolean },
+            .{ "uuid", .uuid },
+            .{ "jsonb", .jsonb },
+            .{ "numeric", .numeric },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const SQLColumn = struct {
     /// Display label. Labels need not be unique; rows use matching ordinal positions.
     name: []const u8,
     type: SQLColumnType,
+    /// Required for array columns and exact NUMERIC number columns. Identifies scalar widths when supplied. The descriptor applies even to NULL or empty arrays.
+    element_type: ?SQLArrayElementType = null,
+    /// Present only for constrained NUMERIC scalar or array results. Prepared result metadata is stable before execution-time constant folding.
+    numeric_modifier: ?SQLNumericModifier = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "name", "name", false },
+        .{ "type", "type", false },
+        .{ "element_type", "element_type", true },
+        .{ "numeric_modifier", "numeric_modifier", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.element_type) |value| {
+            try jw.objectField("element_type");
+            try jw.write(value);
+        }
+        if (self.numeric_modifier) |value| {
+            try jw.objectField("numeric_modifier");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
-/// Logical SQL result type. Integer values are decimal strings to preserve exact precision in every client.
+/// Logical SQL result type. Integer values and numbers with element_type numeric are decimal strings to preserve exact precision in every client.
 pub const SQLColumnType = enum {
     string,
     uuid,
@@ -37475,6 +38320,7 @@ pub const SQLColumnType = enum {
     boolean,
     datetime,
     json,
+    array,
     unknown,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -37486,6 +38332,7 @@ pub const SQLColumnType = enum {
             .boolean => "boolean",
             .datetime => "datetime",
             .json => "json",
+            .array => "array",
             .unknown => "unknown",
         };
         try jw.write(s);
@@ -37504,6 +38351,7 @@ pub const SQLColumnType = enum {
             .{ "boolean", .boolean },
             .{ "datetime", .datetime },
             .{ "json", .json },
+            .{ "array", .array },
             .{ "unknown", .unknown },
         });
         return map.get(s) orelse error.UnexpectedToken;
@@ -37653,6 +38501,8 @@ pub const SQLDiagnostic = struct {
     code: []const u8,
     /// Human-readable diagnostic with no sensitive parameter values.
     message: []const u8,
+    /// Public column identifier for a column constraint violation; no row values are included.
+    column_name: ?[]const u8 = null,
     /// Optional one-based character position in the submitted SQL statement.
     position: ?i64 = null,
     /// Native transaction receipt for reconciliation when a mutation outcome is unknown.
@@ -37665,6 +38515,7 @@ pub const SQLDiagnostic = struct {
     pub const openApiFieldMetadata = .{
         .{ "code", "code", false },
         .{ "message", "message", false },
+        .{ "column_name", "column_name", true },
         .{ "position", "position", true },
         .{ "transaction_id", "transaction_id", true },
         .{ "retryable", "retryable", true },
@@ -37685,6 +38536,10 @@ pub const SQLDiagnostic = struct {
         try jw.write(self.code);
         try jw.objectField("message");
         try jw.write(self.message);
+        if (self.column_name) |value| {
+            try jw.objectField("column_name");
+            try jw.write(value);
+        }
         if (self.position) |value| {
             try jw.objectField("position");
             try jw.write(value);
@@ -37734,6 +38589,47 @@ pub const SQLMutationOutcome = enum {
             .{ "committed_graph_metric_materialization_rejected", .committed_graph_metric_materialization_rejected },
         });
         return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// PostgreSQL NUMERIC precision and signed scale. For arrays this describes every element, not dimensions. Absent means unconstrained NUMERIC.
+pub const SQLNumericModifier = struct {
+    precision: i64,
+    scale: i64,
+};
+
+/// Immutable positional input contract. Element identity also preserves primitive widths; array inputs require it. Unknown slots have no SQL constraint.
+pub const SQLParameterDescriptor = struct {
+    type: SQLColumnType,
+    element_type: ?SQLArrayElementType = null,
+    nullable: bool,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "element_type", "element_type", true },
+        .{ "nullable", "nullable", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.element_type) |value| {
+            try jw.objectField("element_type");
+            try jw.write(value);
+        }
+        try jw.objectField("nullable");
+        try jw.write(self.nullable);
+        try jw.endObject();
     }
 };
 
@@ -37788,6 +38684,7 @@ pub const SQLPrepareRequest = struct {
 };
 
 pub const SQLPreparedExecutionRequest = struct {
+    read_requirements: ?ReadRequirements = null,
     parameters: ?[]const std.json.Value = null,
     limit: ?i64 = null,
     /// Optional durable transaction session. Required when the resource was prepared against a session; otherwise independent of the prepared resource lifetime.
@@ -37797,6 +38694,7 @@ pub const SQLPreparedExecutionRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "read_requirements", "read_requirements", true },
         .{ "parameters", "parameters", true },
         .{ "limit", "limit", true },
         .{ "session_id", "session_id", true },
@@ -37813,6 +38711,10 @@ pub const SQLPreparedExecutionRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.read_requirements) |value| {
+            try jw.objectField("read_requirements");
+            try jw.write(value);
+        }
         if (self.parameters) |value| {
             try jw.objectField("parameters");
             try jw.write(value);
@@ -37839,11 +38741,16 @@ pub const SQLPreparedResponse = struct {
     /// Exact decimal API owner identifier, preserved by JavaScript clients.
     owner_node_id: []const u8,
     parameter_types: []const SQLColumnType,
+    /// Precise positional contracts, aligned with parameter_types. Array arguments use the lossless SQLArrayValue envelope or PostgreSQL array text; plain JSON arrays are not SQL arrays.
+    parameter_descriptors: []const SQLParameterDescriptor,
     columns: []const SQLColumn,
 };
 
 /// Execute one SQL statement. Parameters are positional (`$1`, `$2`, ...), never interpolated into SQL text. To preserve integer precision in JavaScript clients, supply integers outside the exact JSON number range as decimal strings; binding coerces parameters to the expected type. The result limit is an admission bound, not an implicit SQL LIMIT: statements whose results exceed it fail instead of silently truncating. Request bodies are limited to 4 MiB, preparation to 8 MiB of allocated memory, and encoded results to a 16 MiB allocation budget.
 pub const SQLRequest = struct {
+    read_requirements: ?ReadRequirements = null,
+    /// Read visibility for writable Iceberg sources. Accepted pins typed WAL changes over the committed snapshot; unavailable coverage fails closed. HTTP sessions and prepared executions inside a transaction retain the first accepted read cut for each table, including across savepoint rollback. Cuts expire after one hour. Serializable write transactions over external sources are not supported. Prefer read_requirements.visibility; this field is a deprecated alias.
+    lake_visibility: ?[]const u8 = null,
     /// A single SQL statement.
     statement: []const u8,
     /// Positional JSON parameter values, including null.
@@ -37861,6 +38768,8 @@ pub const SQLRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "read_requirements", "read_requirements", true },
+        .{ "lake_visibility", "lake_visibility", true },
         .{ "statement", "statement", false },
         .{ "parameters", "parameters", true },
         .{ "database", "database", true },
@@ -37880,6 +38789,14 @@ pub const SQLRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.read_requirements) |value| {
+            try jw.objectField("read_requirements");
+            try jw.write(value);
+        }
+        if (self.lake_visibility) |value| {
+            try jw.objectField("lake_visibility");
+            try jw.write(value);
+        }
         try jw.objectField("statement");
         try jw.write(self.statement);
         if (self.parameters) |value| {
@@ -37910,7 +38827,7 @@ pub const SQLRequest = struct {
     }
 };
 
-/// Ordinal result rows with corresponding logical column metadata. SQL NULL is JSON null; sql_nulls distinguishes it from a JSON column containing the JSON literal null. Integer-typed values are exact decimal strings; datetime values are strings. Objects and arrays in JSON columns remain JSON.
+/// Ordinal result rows with corresponding logical column metadata. SQL NULL is JSON null; sql_nulls distinguishes it from a JSON column containing the JSON literal null. Integer-typed values are exact decimal strings; datetime values are strings. Objects and arrays in JSON columns remain JSON. Array-typed columns contain SQLArrayValue envelopes, with their element descriptor in the corresponding SQLColumn. They are not JSON columns.
 pub const SQLResponse = struct {
     columns: []const SQLColumn,
     rows: []const []const std.json.Value,
@@ -38239,6 +39156,12 @@ pub const STTProvider = enum {
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
+};
+
+pub const SavedQuerySource = struct {
+    source_id: u64,
+    name: []const u8,
+    source: ComposedQuerySource,
 };
 
 /// Request to scan keys in a table within a key range. If no range is specified, scans all keys in the table.
@@ -38839,6 +39762,8 @@ pub const SortProfile = struct {
     index_sort_coverage: ?[]const u8 = null,
     /// Candidate documents considered by sort execution.
     candidate_count: ?i64 = null,
+    /// Ordered lake entries traversed before native membership filtering.
+    ordered_scanned_count: ?i64 = null,
     /// Candidates rejected by cursor comparison.
     cursor_rejected_count: ?i64 = null,
     /// Hits selected for the returned page.
@@ -38872,6 +39797,7 @@ pub const SortProfile = struct {
         .{ "sort_lifecycle_state", "sort_lifecycle_state", true },
         .{ "index_sort_coverage", "index_sort_coverage", true },
         .{ "candidate_count", "candidate_count", true },
+        .{ "ordered_scanned_count", "ordered_scanned_count", true },
         .{ "cursor_rejected_count", "cursor_rejected_count", true },
         .{ "selected_count", "selected_count", true },
         .{ "total_us", "total_us", true },
@@ -38946,6 +39872,10 @@ pub const SortProfile = struct {
         }
         if (self.candidate_count) |value| {
             try jw.objectField("candidate_count");
+            try jw.write(value);
+        }
+        if (self.ordered_scanned_count) |value| {
+            try jw.objectField("ordered_scanned_count");
             try jw.write(value);
         }
         if (self.cursor_rejected_count) |value| {
@@ -39225,7 +40155,9 @@ pub const StatefulGraphResult = union(enum) {
 
 /// Stateful Antfly query request. Canonical clients use graph_queries; deprecated graph_searches is retained only at the stateful public transport boundary for the v0.2 transition window.
 pub const StatefulQueryRequest = struct {
-    /// Opaque remote index snapshot token returned by a previous query. Required when replaying search_after or search_before against an external table; a changed publication returns 409.
+    read_requirements: ?ReadRequirements = null,
+    lake_read: ?LakeReadRequirement = null,
+    /// Opaque retained snapshot token returned by an ordered native or external-table query. Echo with search_after or search_before. Native and lake cuts expire within the configured retention period (default five minutes; maximum one hour); missing, expired or incompatible generations return 409.
     remote_snapshot: ?[]const u8 = null,
     evaluate: ?QueryEvaluation = null,
     table_target: ?CatalogTableTarget = null,
@@ -39305,6 +40237,8 @@ pub const StatefulQueryRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "read_requirements", "read_requirements", true },
+        .{ "lake_read", "lake_read", true },
         .{ "remote_snapshot", "remote_snapshot", true },
         .{ "evaluate", "evaluate", true },
         .{ "table_target", "table_target", true },
@@ -39358,6 +40292,14 @@ pub const StatefulQueryRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.read_requirements) |value| {
+            try jw.objectField("read_requirements");
+            try jw.write(value);
+        }
+        if (self.lake_read) |value| {
+            try jw.objectField("lake_read");
+            try jw.write(value);
+        }
         if (self.remote_snapshot) |value| {
             try jw.objectField("remote_snapshot");
             try jw.write(value);
@@ -39555,7 +40497,11 @@ pub const StatefulQueryResponses = struct {
 
 /// Result emitted by the stateful compatibility transport.
 pub const StatefulQueryResult = struct {
-    /// Opaque remote publication and schema fence to echo with ordered pagination. This token does not grant access or retain the publication.
+    /// Ranking contract for a composed result.
+    source_ranking: ?[]const u8 = null,
+    /// Opaque continuation for composed queries. Pass as source_cursor with the same query; valid until the earliest retained leaf cut expires (default five minutes; maximum one hour). Publication and restart preserve it; authorization and incarnation fences remain enforced.
+    next_source_cursor: ?[]const u8 = null,
+    /// Opaque snapshot to echo with ordered pagination. Native tokens retain the complete physical generation; lake tokens retain the archive publication, metadata and accepted WAL cut, for the configured retention period (default five minutes; maximum one hour). Every use rechecks access, incarnation and recipe. Unavailable retained generations return 409.
     remote_snapshot: ?[]const u8 = null,
     /// Function evaluation scope, population, usage, and scoped aggregations.
     evaluation: ?std.json.ArrayHashMap(std.json.Value) = null,
@@ -39580,6 +40526,8 @@ pub const StatefulQueryResult = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "source_ranking", "source_ranking", true },
+        .{ "next_source_cursor", "next_source_cursor", true },
         .{ "remote_snapshot", "remote_snapshot", true },
         .{ "evaluation", "evaluation", true },
         .{ "hits", "hits", true },
@@ -39604,6 +40552,14 @@ pub const StatefulQueryResult = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.source_ranking) |value| {
+            try jw.objectField("source_ranking");
+            try jw.write(value);
+        }
+        if (self.next_source_cursor) |value| {
+            try jw.objectField("next_source_cursor");
+            try jw.write(value);
+        }
         if (self.remote_snapshot) |value| {
             try jw.objectField("remote_snapshot");
             try jw.write(value);
@@ -40663,7 +41619,7 @@ pub const TableSchema = struct {
     /// Backend-managed schema generation used for migrations. Omit it from create and update requests.
     version: ?u32 = null,
     storage_mode: ?TableStorageMode = null,
-    /// External tables require relational storage mode and are read-only. Omit for native tables.
+    /// External tables require relational storage mode. Ordinary row writes are read-only; an explicit iceberg_writer catalog binding permits Iceberg file commits. Omit for native tables.
     base_source: ?ExternalLakeTableSource = null,
     /// Immutable typed expressions applied only to absent columns on new writes, never explicit null. Defaults cannot reference columns. A column cannot have both a default and a generated expression. Omission or [] declares none. Relational tables only.
     column_defaults: ?[]const RelationalColumnExpression = null,

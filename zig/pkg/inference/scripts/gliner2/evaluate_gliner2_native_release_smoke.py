@@ -180,7 +180,6 @@ def build_command(
     command = [
         "zig",
         "build",
-        "-Donnx=false",
         "-Dmetal=false",
         "eval-gliner2-autodiff-adapter-dataset",
         "--",

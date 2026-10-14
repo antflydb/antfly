@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from ..models.graph_queries import GraphQueries
     from ..models.ip_range_query import IPRangeQuery
     from ..models.join_clause import JoinClause
+    from ..models.lake_read_requirement import LakeReadRequirement
     from ..models.match_all_query import MatchAllQuery
     from ..models.match_none_query import MatchNoneQuery
     from ..models.match_phrase_query import MatchPhraseQuery
@@ -47,6 +48,7 @@ if TYPE_CHECKING:
     from ..models.query_request_foreign_sources import QueryRequestForeignSources
     from ..models.query_request_query import QueryRequestQuery
     from ..models.query_string_query import QueryStringQuery
+    from ..models.read_requirements import ReadRequirements
     from ..models.regexp_query import RegexpQuery
     from ..models.reranker_config import RerankerConfig
     from ..models.sort_field import SortField
@@ -65,8 +67,14 @@ class StatefulQueryRequest:
     the stateful public transport boundary for the v0.2 transition window.
 
         Attributes:
-            remote_snapshot (str | Unset): Opaque remote index snapshot token returned by a previous query. Required when
-                replaying search_after or search_before against an external table; a changed publication returns 409.
+            read_requirements (ReadRequirements | Unset): Freshness requirements for writable Iceberg reads. Search supports
+                accepted and published (default accepted); SQL supports accepted and committed (default committed). Unsupported
+                visibility modes fail explicitly. Cannot be combined with legacy lake_read or lake_visibility. A pinned
+                transaction snapshot never advances to satisfy a newer receipt.
+            lake_read (LakeReadRequirement | Unset):
+            remote_snapshot (str | Unset): Opaque retained snapshot token returned by an ordered native or external-table
+                query. Echo with search_after or search_before. Native and lake cuts expire within the configured retention
+                period (default five minutes; maximum one hour); missing, expired or incompatible generations return 409.
             evaluate (QueryEvaluation | Unset): Evaluate expressions after global retrieval merging, before final
                 offset/limit. Candidates require candidate_count; matches require
                 max_rows and fail if the full qualifying population exceeds that budget.
@@ -388,6 +396,8 @@ class StatefulQueryRequest:
                 - intersection: Only include nodes appearing in both
     """
 
+    read_requirements: ReadRequirements | Unset = UNSET
+    lake_read: LakeReadRequirement | Unset = UNSET
     remote_snapshot: str | Unset = UNSET
     evaluate: QueryEvaluation | Unset = UNSET
     table_target: CatalogTableTarget | Unset = UNSET
@@ -541,6 +551,14 @@ class StatefulQueryRequest:
         from ..models.term_query import TermQuery
         from ..models.term_range_query import TermRangeQuery
         from ..models.wildcard_query import WildcardQuery
+
+        read_requirements: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.read_requirements, Unset):
+            read_requirements = self.read_requirements.to_dict()
+
+        lake_read: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.lake_read, Unset):
+            lake_read = self.lake_read.to_dict()
 
         remote_snapshot = self.remote_snapshot
 
@@ -838,6 +856,10 @@ class StatefulQueryRequest:
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
+        if read_requirements is not UNSET:
+            field_dict["read_requirements"] = read_requirements
+        if lake_read is not UNSET:
+            field_dict["lake_read"] = lake_read
         if remote_snapshot is not UNSET:
             field_dict["remote_snapshot"] = remote_snapshot
         if evaluate is not UNSET:
@@ -943,6 +965,7 @@ class StatefulQueryRequest:
         from ..models.graph_queries import GraphQueries
         from ..models.ip_range_query import IPRangeQuery
         from ..models.join_clause import JoinClause
+        from ..models.lake_read_requirement import LakeReadRequirement
         from ..models.match_all_query import MatchAllQuery
         from ..models.match_none_query import MatchNoneQuery
         from ..models.match_phrase_query import MatchPhraseQuery
@@ -962,6 +985,7 @@ class StatefulQueryRequest:
         from ..models.query_request_foreign_sources import QueryRequestForeignSources
         from ..models.query_request_query import QueryRequestQuery
         from ..models.query_string_query import QueryStringQuery
+        from ..models.read_requirements import ReadRequirements
         from ..models.regexp_query import RegexpQuery
         from ..models.reranker_config import RerankerConfig
         from ..models.sort_field import SortField
@@ -971,6 +995,20 @@ class StatefulQueryRequest:
         from ..models.wildcard_query import WildcardQuery
 
         d = dict(src_dict)
+        _read_requirements = d.pop("read_requirements", UNSET)
+        read_requirements: ReadRequirements | Unset
+        if isinstance(_read_requirements, Unset):
+            read_requirements = UNSET
+        else:
+            read_requirements = ReadRequirements.from_dict(_read_requirements)
+
+        _lake_read = d.pop("lake_read", UNSET)
+        lake_read: LakeReadRequirement | Unset
+        if isinstance(_lake_read, Unset):
+            lake_read = UNSET
+        else:
+            lake_read = LakeReadRequirement.from_dict(_lake_read)
+
         remote_snapshot = d.pop("remote_snapshot", UNSET)
 
         _evaluate = d.pop("evaluate", UNSET)
@@ -1868,6 +1906,8 @@ class StatefulQueryRequest:
             expand_strategy = StatefulQueryRequestExpandStrategy(_expand_strategy)
 
         stateful_query_request = cls(
+            read_requirements=read_requirements,
+            lake_read=lake_read,
             remote_snapshot=remote_snapshot,
             evaluate=evaluate,
             table_target=table_target,

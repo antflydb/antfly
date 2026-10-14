@@ -85,7 +85,7 @@ pub const Grouped = struct {
         const orders = try backing.alloc(operators.Order, key_count);
         @memset(orders, .{});
         return .{ .a = backing, .sort = spill.Sort.init(backing, manager, orders, bytes / 4), .specs = specs, .state_arena = std.heap.ArenaAllocator.init(backing), .read_arena = std.heap.ArenaAllocator.init(backing), .bytes = bytes, .partitioned = bytes >= 64 * 1024 and for (specs) |spec| {
-            if (spec.distinct or !(spec.kind == .count or spec.kind == .bool_and or spec.kind == .bool_or or (spec.kind == .sum and spec.input_type == .integer))) break false;
+            if (!operators.exactMergeable(spec)) break false;
         } else true };
     }
     pub fn deinit(self: *Grouped) void {
@@ -113,7 +113,7 @@ pub const Grouped = struct {
         values[0] = Datum.json(.{ .bool = true });
         for (states, values[1..]) |state, *value| {
             if (state.distinct) {
-                var base = try operators.Aggregate.init(a, state.kind, state.input_type);
+                var base = try operators.Aggregate.initTyped(a, state.kind, state.input_type, state.input_element);
                 defer base.deinit();
                 base.distinct = true;
                 value.* = try @import("aggregate_partial.zig").cell(a, base);
@@ -146,7 +146,7 @@ pub const Grouped = struct {
         if (!self.partitioned) return self.sort.add(row);
         var hash = std.hash.Wyhash.init(0);
         for (row.keys) |key| {
-            const value = if (key.sql_null) 0 else try scalar.semanticHash(key.value);
+            const value = if (key.sql_null) 0 else try scalar.semanticHashDatum(key);
             var bytes: [9]u8 = undefined;
             bytes[0] = @intFromBool(key.sql_null);
             std.mem.writeInt(u64, bytes[1..9], value, .little);
@@ -163,6 +163,10 @@ pub const Grouped = struct {
         if (values.len != self.specs.len) return false;
         for (values, self.specs) |value, spec| {
             if (value.sql_null or spec.kind == .count) continue;
+            if (spec.input_element == .numeric and (spec.kind == .sum or spec.kind == .avg)) {
+                if (value.numeric == null) return false;
+                continue;
+            }
             if (spec.kind == .sum and value.value != .integer) return false;
             if ((spec.kind == .bool_and or spec.kind == .bool_or) and value.value != .bool) return false;
         }
@@ -279,7 +283,11 @@ pub const Grouped = struct {
                     const row: operators.Row = .{ .values = values, .keys = keys, .ordinal = block.ordinal(lane) };
                     if (row.values.len == 0 or row.values[0].value != .bool) return error.InvalidSqlSpill;
                     const partial_state = row.values[0].value.bool;
-                    if (self.fallback == null and ((!partial_state and !self.nativeInputs(row.values[1..])) or !try self.local.?.canRetain(row.keys, if (partial_state) &.{} else row.values[1..]))) {
+                    const fits = if (self.fallback != null) false else if (partial_state)
+                        try self.local.?.tryImportPartial(row.keys, row.values[1..], row.ordinal)
+                    else
+                        self.nativeInputs(row.values[1..]) and try self.local.?.canRetain(row.keys, row.values[1..]);
+                    if (self.fallback == null and !fits) {
                         const fallback = try self.a.create(Grouped);
                         errdefer self.a.destroy(fallback);
                         fallback.* = try Grouped.init(self.a, self.sort.manager, self.specs, self.sort.orders.len, self.bytes);
@@ -293,9 +301,7 @@ pub const Grouped = struct {
                     }
                     if (self.fallback) |fallback| {
                         try fallback.append(row);
-                    } else if (partial_state) {
-                        try self.local.?.importPartial(row.keys, row.values[1..], row.ordinal);
-                    } else {
+                    } else if (!partial_state) {
                         try self.local.?.addOrdered(row.keys, row.values[1..], row.ordinal);
                     }
                 }
@@ -371,7 +377,7 @@ pub const Grouped = struct {
     }
     fn same(left: []const Datum, right: []const Datum) !bool {
         if (left.len != right.len) return error.InvalidSqlSpill;
-        for (left, right) |a, b| if (a.sql_null != b.sql_null or (!a.sql_null and (try scalar.compare(a.value, b.value)) != .eq)) return false;
+        for (left, right) |a, b| if (a.sql_null != b.sql_null or (!a.sql_null and (try scalar.compareDatums(a, b)) != .eq)) return false;
         return true;
     }
     pub fn next(self: *Grouped, out: Allocator) !?operators.GroupResult {
@@ -393,7 +399,7 @@ pub const Grouped = struct {
         var initialized: usize = 0;
         defer for (states[0..initialized]) |*state| state.deinit();
         for (states, self.specs) |*state, spec| {
-            state.* = try operators.Aggregate.init(self.a, spec.kind, spec.input_type);
+            state.* = try operators.Aggregate.initTyped(self.a, spec.kind, spec.input_type, spec.input_element);
             state.distinct = exact and spec.distinct;
             initialized += 1;
         }
@@ -413,10 +419,24 @@ pub const Grouped = struct {
                 distinct_ordinal += 1;
             } else if (row.values[0].value != .bool) return error.InvalidSqlSpill else if (row.values[0].value.bool) {
                 if (row.values.len != 1 + states.len) return error.InvalidSqlSpill;
-                for (states, row.values[1..], self.specs) |*state, value, spec| {
+                for (states, row.values[1..], self.specs, 0..) |*state, value, spec, slot| {
                     var incoming = try @import("aggregate_partial.zig").decode(a, value, spec);
                     defer incoming.deinit();
-                    try @import("aggregate_partial.zig").merge(state, incoming);
+                    if (spec.distinct and !exact) {
+                        // Final reducers deduplicate externally, not in the
+                        // in-memory membership table of a decoded partial.
+                        // This also accepts complete worker partials without
+                        // merging their already-reduced totals a second time.
+                        for (incoming.distinct_values.items) |entry| {
+                            const member = entry.row.row.values[0];
+                            try distinct.add(.{ .keys = &.{ Datum.json(.{ .integer = @intCast(slot) }), member }, .values = &.{member}, .ordinal = distinct_ordinal });
+                            distinct_ordinal += 1;
+                        }
+                        if (incoming.patterns) |patterns| if (patterns.has_null) {
+                            try distinct.add(.{ .keys = &.{ Datum.json(.{ .integer = @intCast(slot) }), .{} }, .values = &.{.{}}, .ordinal = distinct_ordinal });
+                            distinct_ordinal += 1;
+                        };
+                    } else try @import("aggregate_partial.zig").merge(state, incoming);
                 }
             } else {
                 if (row.values.len != states.len + 1) return error.InvalidSqlSpill;

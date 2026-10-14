@@ -1806,3 +1806,49 @@ def test_forced_promotion_receipt_records_lossy_runtime_evidence(ha_cluster: HAC
     assert promoted["promotion"]["switch_lsn"] == required_lsn
     assert promoted["promotion"]["forced"] is True
     assert promoted["promotion"]["data_loss_possible"] is True
+
+
+def test_ha_sql_automatic_constraint_names_use_durable_catalog(tmp_path: Path):
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    if not Path(binary).exists():
+        pytest.skip(f"Antfly binary not found: {binary}")
+    node = HAStandaloneNode(
+        binary=binary,
+        root=tmp_path.resolve(),
+        role="primary",
+        node_id="primary-a",
+        cluster_id=100,
+        timeline_id=1,
+        epoch=1,
+    )
+    try:
+        node.start()
+
+        def sql(statement):
+            response = requests.post(
+                node.url + DB_API_ROOT + "/sql",
+                json={"statement": statement},
+                timeout=30,
+            )
+            assert response.status_code == 200, response.text
+            return response.json()
+
+        sql("CREATE TABLE holder(id TEXT CONSTRAINT automatic_pkey PRIMARY KEY)")
+        sql("CREATE TABLE automatic(id TEXT PRIMARY KEY)")
+        sql("INSERT INTO automatic(id) VALUES ('first')")
+        assert sql("SELECT id FROM automatic")["rows"] == [["first"]]
+        sql("CREATE TABLE IF NOT EXISTS automatic(id TEXT PRIMARY KEY)")
+        # Existing-table rejection must not combine this target with 256
+        # backing-index names in a catalog request limited to 256 identities.
+        sql(
+            "CREATE TABLE IF NOT EXISTS automatic("
+            + ",".join(f"c{i} BIGINT UNIQUE" for i in range(256))
+            + ")"
+        )
+        # Names and source epochs survive restart without a standalone
+        # relation-publication coordinator running on this HA owner.
+        node.restart()
+        sql("CREATE TABLE another(id TEXT PRIMARY KEY)")
+        assert sql("SELECT id FROM automatic")["rows"] == [["first"]]
+    finally:
+        node.close()

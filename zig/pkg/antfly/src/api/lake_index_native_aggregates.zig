@@ -24,7 +24,7 @@ const stores = @import("../serverless/artifacts/store.zig");
 const Declared = local.serverless_segment_sidecar_manifest.DeclaredArtifact;
 const A = std.mem.Allocator;
 
-fn field(table: local.sql_catalog.Table, config: std.json.Value, name: []const u8, group: bool) !recipes.Key {
+fn field(table: local.sql_catalog.Table, config: std.json.Value, name: []const u8, group: bool) !local.sql_catalog.Column {
     var path = name;
     if (config.object.get(if (group) "group_fields" else "measure_fields")) |fields| {
         if (fields != .array) return error.InvalidAlgebraicConfig;
@@ -39,7 +39,7 @@ fn field(table: local.sql_catalog.Table, config: std.json.Value, name: []const u
             }
         }
     }
-    for (table.columns) |column| if (std.mem.eql(u8, column.path, path)) return .{ .path = column.path, .type = column.type, .nullable = column.nullable };
+    for (table.columns) |column| if (std.mem.eql(u8, column.path, path)) return column;
     return error.UndefinedColumn;
 }
 /// One persisted materialization is one reducer; output aliases are irrelevant.
@@ -55,13 +55,13 @@ pub fn recipeFor(a: A, table: local.sql_catalog.Table, config: std.json.Value, m
     const kind = std.meta.stringToEnum(operators.Aggregate.Kind, operation.string) orelse return null;
     if (kind == .pattern_set) return null;
     const measure = mat.object.get("measure") orelse mat.object.get("value_field");
-    const input: ?recipes.Key = if (measure) |value| key: {
+    const input: ?local.sql_catalog.Column = if (measure) |value| key: {
         if (value == .null) break :key null;
         if (value != .string or value.string.len == 0) return error.InvalidAlgebraicConfig;
         break :key try field(table, config, value.string, false);
     } else null;
     if (input == null and kind != .count) return error.InvalidAlgebraicConfig;
-    const spec: operators.AggregateSpec = .{ .kind = kind, .input_type = if (input) |column| column.type else null };
+    const spec: operators.AggregateSpec = .{ .kind = kind, .input_type = if (input) |column| column.type else null, .input_element = if (input) |column| local.sql_scalar.columnType(column).element_type else null };
     try operators.Aggregate.validate(spec.kind, spec.input_type);
     const groups = mat.object.get("group_by");
     const keys = try a.alloc(recipes.Key, if (groups) |value| count: {
@@ -70,15 +70,16 @@ pub fn recipeFor(a: A, table: local.sql_catalog.Table, config: std.json.Value, m
     } else 0);
     if (groups) |value| for (keys, value.array.items) |*key, name| {
         if (name != .string) return error.InvalidAlgebraicConfig;
-        key.* = try field(table, config, name.string, true);
+        const column = try field(table, config, name.string, true);
+        key.* = recipes.Key.fromColumn(column);
     };
     const inputs = try a.alloc(recipes.Input, 1);
-    inputs[0] = .{ .spec = spec, .column = input };
+    inputs[0] = .{ .spec = spec, .column = if (input) |column| recipes.Key.fromColumn(column) else null };
     return .{ .keys = keys, .inputs = inputs };
 }
 
 pub fn recipeIdentity(a: A, recipe: recipes.Recipe) ![]const u8 {
-    return std.fmt.allocPrint(a, "native-sql-aggregate-v1:{s}", .{std.fmt.bytesToHex(&recipe.fingerprint(), .lower)});
+    return std.fmt.allocPrint(a, "native-sql-aggregate-v2:{s}", .{std.fmt.bytesToHex(&recipe.fingerprint(), .lower)});
 }
 
 /// The publication arena owns declarations; each reducer and output chunk
@@ -111,14 +112,14 @@ pub fn buildIndexed(a: A, out: A, table: local.common_topology_records.TableReco
     defer schemas.deinit();
     const sql_table = try schemas.resolve(io, ca, table.schema_json, table.table_id, table.name);
     const contract = try ca.alloc(local.serverless_query_lake_schema.Column, sql_table.columns.len);
-    for (contract, sql_table.columns) |*column, definition| column.* = .{ .name = definition.path, .kind = @tagName(definition.type), .required = !definition.nullable };
+    for (contract, sql_table.columns) |*column, definition| column.* = .{ .name = definition.path, .kind = if (definition.element_type == .numeric) "numeric" else @tagName(definition.type), .required = !definition.nullable };
     var native_provider = provider.*;
     native_provider.schema_contract = if (source.iceberg_schema) |selected| selected.columns else contract;
     if (source.iceberg_schema) |selected| for (contract) |expected| {
         const actual = for (selected.columns) |column| {
             if (std.mem.eql(u8, column.name, expected.name)) break column;
         } else return error.ExternalLakeSchemaMismatch;
-        if (!std.mem.eql(u8, actual.kind, expected.kind) or (expected.required and !actual.required)) return error.ExternalLakeSchemaMismatch;
+        if (!expected.accepts(actual.kind) or (expected.required and !actual.required)) return error.ExternalLakeSchemaMismatch;
     };
     var old: ContributionIndex = .{};
     defer old.deinit(a);
@@ -720,9 +721,9 @@ fn consumeCohort(a: A, provider: *@import("lake_index_row_source.zig").Provider,
         const selection = try pa.alloc(usize, batch.rowCount());
         for (selection, 0..) |*selected, i| selected.* = i;
         const keys = try pa.alloc(local.sql_execution_batch.Batch, recipe.keys.len);
-        for (keys, recipe.keys) |*key, definition| key.* = .{ .columns = .{ .page = .{ .batch = batch, .selection = selection }, .definitions = try pa.dupe(local.sql_scalar.Column, &.{.{ .name = definition.path, .type = definition.type, .nullable = definition.nullable }}) } };
+        for (keys, recipe.keys) |*key, definition| key.* = .{ .columns = .{ .page = .{ .batch = batch, .selection = selection }, .definitions = try pa.dupe(local.sql_scalar.Column, &.{definition.definition()}) } };
         const input_batches = try pa.alloc(local.sql_execution_batch.Batch, recipe.inputs.len);
-        for (input_batches, recipe.inputs) |*input, definition| input.* = if (definition.column) |column| .{ .columns = .{ .page = .{ .batch = batch, .selection = selection }, .definitions = try pa.dupe(local.sql_scalar.Column, &.{.{ .name = column.path, .type = column.type, .nullable = column.nullable }}) } } else constant: {
+        for (input_batches, recipe.inputs) |*input, definition| input.* = if (definition.column) |column| .{ .columns = .{ .page = .{ .batch = batch, .selection = selection }, .definitions = try pa.dupe(local.sql_scalar.Column, &.{column.definition()}) } } else constant: {
             const ids = try pa.alloc(u32, batch.rowCount());
             @memset(ids, 0);
             break :constant .{ .dictionary = .{ .values = &.{local.sql_scalar.Datum.fromJson(.{ .integer = 1 })}, .indices = ids } };
@@ -747,11 +748,55 @@ test "external lake native algebraic recipes preserve aliases and SQL NULL ident
     try std.testing.expectEqualStrings("key", recipe.keys[0].path);
     try std.testing.expectEqualStrings("amount", recipe.inputs[0].column.?.path);
     try std.testing.expectEqual(local.sql_ast.ColumnType.integer, recipe.inputs[0].spec.input_type.?);
+    try std.testing.expectEqual(.int64, recipe.inputs[0].spec.input_element.?);
+    // Exact SQL width is part of recipe identity, including explicit widths
+    // whose reducer behavior differs from the default (REAL and NUMERIC).
+    for ([_]local.sql_catalog.Column{
+        .{ .name = "amount", .path = "amount", .type = .integer, .element_type = .int16 },
+        .{ .name = "amount", .path = "amount", .type = .number, .element_type = .float32 },
+        .{ .name = "amount", .path = "amount", .type = .number, .element_type = .numeric },
+        .{ .name = "amount", .path = "amount", .type = .number },
+    }) |typed_column| {
+        const typed_table: local.sql_catalog.Table = .{ .id = 1, .physical_name = "lake", .schema_version = 1, .columns = &.{ table.columns[0], typed_column } };
+        const typed = (try recipeFor(a, typed_table, config, mat)).?;
+        var expression: local.sql_ast.Scalar = .{ .column = "amount" };
+        var program = try local.sql_scalar.bind(a, &expression, &.{.{ .name = "amount", .type = typed_column.type, .element_type = typed_column.element_type }}, &.{}, .{});
+        defer program.deinit();
+        try std.testing.expectEqual(program.output_type.element_type, typed.inputs[0].spec.input_element);
+        try std.testing.expect(!recipe.eql(typed));
+    }
     const star = (try recipeFor(a, table, config, try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"name\":\"rows\",\"op\":\"count\"}", .{}))).?;
     const column = (try recipeFor(a, table, config, try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"name\":\"values\",\"op\":\"count\",\"measure\":\"value\"}", .{}))).?;
     try std.testing.expect(!star.eql(column));
     const unsupported = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"name\":\"joined\",\"op\":\"sum\",\"measure\":\"value\",\"join\":\"lookup\"}", .{});
     try std.testing.expect((try recipeFor(a, table, config, unsupported)) == null);
+}
+
+test "external lake native algebraic recipes match bound SQL scalar identities" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const config = try std.json.parseFromSliceLeaky(std.json.Value, a, "{}", .{});
+    const mat = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"name\":\"total\",\"op\":\"sum\",\"measure\":\"amount\"}", .{});
+    var compiled = try local.sql_compiler.compile(a, "SELECT SUM(amount) FROM lake", .{});
+    defer compiled.deinit();
+    for ([_]local.sql_catalog.Column{
+        .{ .name = "amount", .path = "amount", .type = .integer },
+        .{ .name = "amount", .path = "amount", .type = .integer, .element_type = .int16 },
+        .{ .name = "amount", .path = "amount", .type = .integer, .element_type = .int32 },
+        .{ .name = "amount", .path = "amount", .type = .integer, .element_type = .int64 },
+        .{ .name = "amount", .path = "amount", .type = .number },
+        .{ .name = "amount", .path = "amount", .type = .number, .element_type = .float32 },
+        .{ .name = "amount", .path = "amount", .type = .number, .element_type = .float64 },
+        .{ .name = "amount", .path = "amount", .type = .number, .element_type = .numeric },
+    }) |column| {
+        const table: local.sql_catalog.Table = .{ .id = 1, .physical_name = "lake", .schema_version = 1, .columns = &.{column} };
+        const bound = try local.sql_aggregate_binding.bind(a, table, compiled.statement.select, &.{});
+        const sql_recipe = (try recipes.fromBound(a, table, bound)).?;
+        const published_recipe = (try recipeFor(a, table, config, mat)).?;
+        try std.testing.expect(published_recipe.eql(sql_recipe));
+        try std.testing.expectEqualSlices(u8, &sql_recipe.fingerprint(), &published_recipe.fingerprint());
+    }
 }
 
 test "external lake native algebraic publication reads real Parquet into exact SQL partials" {
@@ -785,9 +830,14 @@ test "external lake native algebraic publication reads real Parquet into exact S
     const declarations = built.declarations;
     try std.testing.expectEqual(@as(usize, 2), built.contributions.len);
     try std.testing.expectEqual(@as(usize, 2), declarations.len);
-    const spec: operators.AggregateSpec = .{ .kind = .sum, .input_type = .integer };
-    const recipe: recipes.Recipe = .{ .keys = &.{}, .inputs = &.{.{ .spec = spec, .column = .{ .path = "amount", .type = .integer, .nullable = true } }} };
-    const sum_reader = try artifacts.Reader.open(a, store, declarations[0].artifact, recipe, .none);
+    const spec: operators.AggregateSpec = .{ .kind = .sum, .input_type = .integer, .input_element = .int64 };
+    const recipe: recipes.Recipe = .{ .keys = &.{}, .inputs = &.{.{ .spec = spec, .column = .{ .path = "amount", .type = .integer, .nullable = true, .element_type = .int64 } }} };
+    const sum_identity = try recipeIdentity(a, recipe);
+    defer a.free(sum_identity);
+    const sum_declaration = for (declarations) |declaration| {
+        if (std.mem.eql(u8, declaration.binding.index_config_hash, sum_identity)) break declaration;
+    } else return error.InvalidNativeAggregateArtifact;
+    const sum_reader = try artifacts.Reader.open(a, store, sum_declaration.artifact, recipe, .none);
     const cursor = sum_reader.cursor();
     defer cursor.close(cursor.ptr);
     var page = std.heap.ArenaAllocator.init(a);
@@ -800,7 +850,12 @@ test "external lake native algebraic publication reads real Parquet into exact S
     try std.testing.expectEqual(@as(i64, 18014398509481985), result.aggregates[0].value.integer);
     try std.testing.expect((try cursor.next(cursor.ptr, page.allocator(), 32)) == null);
     const count_recipe: recipes.Recipe = .{ .keys = &.{}, .inputs = &.{.{ .spec = .{ .kind = .count }, .column = null }} };
-    const count_reader = try artifacts.Reader.open(a, store, declarations[1].artifact, count_recipe, .none);
+    const count_identity = try recipeIdentity(a, count_recipe);
+    defer a.free(count_identity);
+    const count_declaration = for (declarations) |declaration| {
+        if (std.mem.eql(u8, declaration.binding.index_config_hash, count_identity)) break declaration;
+    } else return error.InvalidNativeAggregateArtifact;
+    const count_reader = try artifacts.Reader.open(a, store, count_declaration.artifact, count_recipe, .none);
     const count_cursor = count_reader.cursor();
     defer count_cursor.close(count_cursor.ptr);
     try std.testing.expect(sum_reader.root.state_slot != count_reader.root.state_slot);

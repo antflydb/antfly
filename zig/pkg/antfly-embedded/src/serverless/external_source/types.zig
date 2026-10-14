@@ -38,6 +38,8 @@ pub const ColumnChunk = struct {
     decimal_precision: i32 = 0,
     decimal_scale: i32 = 0,
     field_id: ?i32 = null,
+    bloom_filter_offset: ?u64 = null,
+    bloom_filter_length: ?u32 = null,
     offset_index_offset: ?u64 = null,
     offset_index_length: ?u32 = null,
     column_index_offset: ?u64 = null,
@@ -71,6 +73,10 @@ pub const ColumnChunk = struct {
             if ((index.offset == null) != (index.len == null)) return error.InvalidExternalSourceInventory;
             if (index.offset) |offset| if (offset > file_len or index.len.? == 0 or index.len.? > file_len - offset) return error.InvalidExternalSourceInventory;
         }
+        if (self.bloom_filter_offset) |offset| {
+            if (offset >= file_len) return error.InvalidExternalSourceInventory;
+            if (self.bloom_filter_length) |len| if (len == 0 or len > file_len - offset) return error.InvalidExternalSourceInventory;
+        } else if (self.bloom_filter_length != null) return error.InvalidExternalSourceInventory;
         if (self.column_id.len == 0) return error.InvalidExternalSourceInventory;
         if (self.compressed_len == 0) return error.InvalidExternalSourceInventory;
         if (self.file_offset > file_len) return error.InvalidExternalSourceInventory;

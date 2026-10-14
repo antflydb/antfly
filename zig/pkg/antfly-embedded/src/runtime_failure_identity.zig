@@ -121,6 +121,8 @@ const mappings = [_]Mapping{
     .{ .status = .ha_seed_capture_already_in_progress, .err = error.HASeedCaptureAlreadyInProgress },
 
     .{ .status = .relational_expression_overflow, .err = error.RelationalExpressionOverflow },
+    .{ .status = .sql_feature_not_supported, .err = error.SqlFeatureNotSupported },
+    .{ .status = .catalog_publication_proof_pending, .err = error.CatalogPublicationProofPending },
     .{ .status = .relational_expression_division_by_zero, .err = error.RelationalExpressionDivisionByZero },
     .{ .status = .relational_expression_budget_exceeded, .err = error.RelationalExpressionBudgetExceeded },
     .{ .status = .relational_index_key_too_large, .err = error.RelationalIndexKeyTooLarge },
@@ -519,6 +521,7 @@ const mappings = [_]Mapping{
     .{ .status = .seed_range_table_missing, .err = error.SeedRangeTableMissing },
     .{ .status = .seed_receipt_digest_mismatch, .err = error.SeedReceiptDigestMismatch },
     .{ .status = .seed_replica_identity_mismatch, .err = error.SeedReplicaIdentityMismatch },
+    .{ .status = .seed_replica_policy_mismatch, .err = error.SeedReplicaPolicyMismatch },
     .{ .status = .seed_replica_range_missing, .err = error.SeedReplicaRangeMissing },
     .{ .status = .seed_replica_table_missing, .err = error.SeedReplicaTableMissing },
     .{ .status = .seed_target_generation_conflict, .err = error.SeedTargetGenerationConflict },
@@ -976,6 +979,11 @@ pub fn validateForTest() !void {
     _ = relay.capture(error.LaterCallbackFailure);
     try std.testing.expectError(error.CallbackReadOnly, relay.finish(.storage_kernel_callback_failed));
     try std.testing.expectError(error.CallbackReadOnly, relay.finish(.ha_read_only_standby));
+}
+
+test "seed replica policy mismatch survives compiled runtime boundaries" {
+    try std.testing.expectEqual(abi.Status.seed_replica_policy_mismatch, statusFromError(error.SeedReplicaPolicyMismatch));
+    try std.testing.expectError(error.SeedReplicaPolicyMismatch, statusToError(.seed_replica_policy_mismatch));
 }
 
 test "registered storage-kernel errors are unique and round trip without losing identity" {

@@ -42,6 +42,40 @@ pub fn openWithCache(alloc: Allocator, table: catalog.Table, request: catalog.Sc
     return cursor;
 }
 
+/// Derive a conservative integer-domain bound without floating conversion.
+/// Fractional equality uses an inclusive superset; the typed residual remains
+/// authoritative. Non-finite/out-of-range operands decline optional pruning.
+fn numericPruning(a: std.mem.Allocator, column: []const u8, op: catalog.Condition.Op, datum: scalar.Datum) !?@import("../serverless/query/lake_stream.zig").Predicate {
+    const numeric = @import("numeric_value.zig");
+    const Predicate = @import("../serverless/query/lake_stream.zig").Predicate;
+    var operator = std.meta.stringToEnum(Predicate.Op, @tagName(op)) orelse return null;
+    var integer: i64 = undefined;
+    if (datum.numeric) |value| {
+        if (value.kind != .finite) return null;
+        var context: numeric.Context = .{ .alloc = a };
+        var truncated = try numeric.quantize(&context, value.*, 0, .truncate);
+        defer truncated.deinit();
+        integer = numeric.toInteger(i64, &context, truncated.value) catch |err| switch (err) {
+            error.InvalidSqlNumber, error.SqlFeatureNotSupported => return null,
+            else => return err,
+        };
+        const order = try numeric.order(&context, value.*, truncated.value);
+        if (order != .eq) switch (operator) {
+            .neq => return null,
+            .eq => {}, // Matching raw integers are a safe (empty-result) superset.
+            .lt, .lte => {
+                if (order == .lt) integer = std.math.sub(i64, integer, 1) catch return null;
+                operator = .lte;
+            },
+            .gt, .gte => {
+                if (order == .gt) integer = std.math.add(i64, integer, 1) catch return null;
+                operator = .gte;
+            },
+        };
+    } else if (datum.value == .integer) integer = datum.value.integer else return null;
+    return .{ .column = column, .op = operator, .value = .{ .integer = integer } };
+}
+
 pub fn openPinned(alloc: Allocator, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *serving.ServingSource) !catalog.Cursor {
     if (request.include_primary_digest or request.include_document or request.index_equality != null) return error.UnsupportedSqlExecution;
     try context.ensureActive();
@@ -74,13 +108,22 @@ pub fn openPinned(alloc: Allocator, table: catalog.Table, request: catalog.Scan,
     for (request.conditions, conditions) |condition, *out| {
         out.* = condition;
         out.column = try owned.dupe(u8, condition.column);
+        if (condition.operand) |operand| out.operand = try @import("operators.zig").cloneDatum(owned, operand);
         const bytes = try std.json.Stringify.valueAlloc(owned, condition.value, .{});
         out.value = try std.json.parseFromSliceLeaky(std.json.Value, owned, bytes, .{ .allocate = .alloc_always, .parse_numbers = false });
         if (condition.value == .integer or condition.value == .float) out.value = condition.value;
         if (condition.op == .is_null or condition.op == .is_not_null or std.mem.eql(u8, condition.column, "_id")) continue;
         const column = try table.column(condition.column);
-        out.value = try @import("lake_values.zig").comparisonValue(owned, out.value, column.type);
+        out.value = try @import("lake_values.zig").conditionValue(owned, out.value, column);
         const Predicate = @import("../serverless/query/lake_stream.zig").Predicate;
+        if (column.element_type == .numeric) {
+            // Raw integer metadata can prune exact NUMERIC comparisons. A
+            // negative typmod scale rounds physical integers, so it cannot use
+            // their uncoerced bounds. Text-backed decimals remain residual.
+            if (column.numeric_modifier) |modifier| if (modifier.scale < 0) continue;
+            if (try numericPruning(owned, column.path, condition.op, out.datum())) |predicate| try pruning.append(owned, predicate);
+            continue;
+        }
         const value: @FieldType(Predicate, "value") = switch (out.value) {
             .integer => |v| if (column.type == .integer or column.type == .datetime) .{ .integer = v } else continue,
             .string => |v| if (column.type == .string) .{ .bytes = v } else continue,
@@ -93,12 +136,16 @@ pub fn openPinned(alloc: Allocator, table: catalog.Table, request: catalog.Scan,
     var stream = try @import("../serverless/query/lake_stream.zig").Stream.init(alloc, source, columns.items, pruning.items, .{ .deadline_ns = normalized.deadline_ns, .cancellation = @import("../storage/object_storage.zig").CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) }, .{});
     errdefer stream.deinit();
     stream.identity_only = identity_only;
+    if (request.physical_selection) |selection| {
+        if (request.row_refs != null) return error.InvalidLakeCandidateReference;
+        try stream.selectRows(selection);
+    }
     if (request.row_refs) |refs| try stream.selectRows(try @import("../serverless/query/lake_row_selection.zig").Selection.initWithMap(owned, source.inventory, refs, source.fileMap()));
     if (source.iceberg_schema != null or std.mem.startsWith(u8, binding.binding.schema_fingerprint, "parquet-schema:") or std.mem.indexOf(u8, binding.binding.schema_fingerprint, ":hash=") != null) {
         var contract: std.ArrayList(@import("../serverless/query/lake_schema.zig").Column) = .empty;
         for (table.columns) |column| {
             if (std.mem.eql(u8, column.name, "_id")) continue;
-            try contract.append(owned, .{ .name = column.path, .kind = @tagName(column.type), .required = !column.nullable });
+            try contract.append(owned, .{ .name = column.path, .kind = if (column.element_type == .numeric) "numeric" else @tagName(column.type), .required = !column.nullable });
         }
         stream.schema_contract = contract.items;
     }
@@ -107,7 +154,7 @@ pub fn openPinned(alloc: Allocator, table: catalog.Table, request: catalog.Scan,
             const actual = for (selected.columns) |column| {
                 if (std.mem.eql(u8, column.name, expected.name)) break column;
             } else return error.ExternalLakeSchemaMismatch;
-            if (!std.mem.eql(u8, actual.kind, expected.kind) or (expected.required and !actual.required)) return error.ExternalLakeSchemaMismatch;
+            if (!expected.accepts(actual.kind) or (expected.required and !actual.required)) return error.ExternalLakeSchemaMismatch;
         }
         stream.schema_contract = selected.columns;
     }
@@ -558,9 +605,10 @@ pub fn matchesColumns(page: catalog.ColumnPage, alloc: Allocator, table: catalog
             continue;
         }
         if (cell.sql_null or condition.value == .null) return false;
-        const kind = (try table.column(condition.column)).type;
-        const stored = try @import("lake_values.zig").comparisonValue(alloc, cell.value, kind);
-        const order = try scalar.compare(stored, condition.value);
+        const column = try table.column(condition.column);
+        const stored = try @import("lake_values.zig").comparisonDatum(alloc, cell, column);
+        const literal = try @import("lake_values.zig").comparisonDatum(alloc, condition.datum(), column);
+        const order = try scalar.compareDatums(stored, literal);
         const match = switch (condition.op) {
             .eq => order == .eq,
             .neq => order != .eq,
@@ -1237,7 +1285,7 @@ test "lake SQL shared row group tasks and exact parallel reducers match serial g
             const self: *@This() = @ptrCast(@alignCast(raw));
             return try openPinned(alloc, table, request, .{}, &self.lake.source);
         }
-        fn mutate(_: *anyopaque, _: Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
+        fn mutate(_: *anyopaque, _: Allocator, _: std.mem.Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
             return error.UnexpectedMutation;
         }
         fn checkpoint(_: *anyopaque) !void {}
@@ -1251,6 +1299,8 @@ test "lake SQL shared row group tasks and exact parallel reducers match serial g
     for ([_][]const u8{
         "SELECT amount % 7 AS bucket, SUM(amount) AS total, COUNT(*) AS n FROM events GROUP BY amount % 7 ORDER BY bucket",
         "SELECT SUM(amount), COUNT(*) FROM events",
+        "SELECT amount % 7 AS bucket, SUM(amount::NUMERIC + '0.10'::NUMERIC), AVG(amount::NUMERIC + '0.10'::NUMERIC) FROM events GROUP BY amount % 7 ORDER BY bucket",
+        "SELECT SUM(amount::NUMERIC), AVG(amount::NUMERIC), COUNT(*) FROM events",
         "SELECT amount % 7 AS bucket, COUNT(*) AS n FROM events GROUP BY amount % 7 LIMIT 3",
     }) |sql| {
         var compiled = try compiler.compile(a, sql, .{});
@@ -1594,4 +1644,29 @@ test "lake SQL candidate windows share owned projected reader plans after cursor
         }
         previous = plan;
     }
+}
+
+test "external lake exact NUMERIC integer pruning retains signed fractional and large boundaries" {
+    const a = std.testing.allocator;
+    var work: @import("array_value.zig").Budget = .{};
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const cases = [_]struct { text: []const u8, op: catalog.Condition.Op, result_op: @import("../serverless/query/lake_stream.zig").Predicate.Op, integer: i64 }{
+        .{ .text = "9007199254740993", .op = .eq, .result_op = .eq, .integer = 9007199254740993 },
+        .{ .text = "9007199254740993.125", .op = .gt, .result_op = .gte, .integer = 9007199254740994 },
+        .{ .text = "9007199254740993.125", .op = .lte, .result_op = .lte, .integer = 9007199254740993 },
+        .{ .text = "-2.125", .op = .lt, .result_op = .lte, .integer = -3 },
+        .{ .text = "-2.125", .op = .gte, .result_op = .gte, .integer = -2 },
+        .{ .text = "-9223372036854775808", .op = .eq, .result_op = .eq, .integer = std.math.minInt(i64) },
+    };
+    for (cases) |case| {
+        const datum = try scalar.numericTextLeaky(arena.allocator(), case.text, &work);
+        const predicate = (try numericPruning(a, "n", case.op, datum)).?;
+        try std.testing.expectEqual(case.result_op, predicate.op);
+        try std.testing.expectEqual(case.integer, predicate.value.integer);
+    }
+    const fractional = try scalar.numericTextLeaky(arena.allocator(), "2.125", &work);
+    try std.testing.expect(try numericPruning(a, "n", .neq, fractional) == null);
+    const huge = try scalar.numericTextLeaky(arena.allocator(), "9223372036854775808", &work);
+    try std.testing.expect(try numericPruning(a, "n", .eq, huge) == null);
 }

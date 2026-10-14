@@ -35,8 +35,10 @@ class TestRunnerSelection(unittest.TestCase):
         cls.temp = tempfile.TemporaryDirectory()
         root = Path(cls.temp.name)
         source = root / "selection.zig"
+        (root / "retirement_selection.zig").write_text('test "borrowed anchor" {}\n')
         source.write_text(
             'const std = @import("std");\n'
+            'comptime { _ = @import("retirement_selection.zig"); }\n'
             'test "enrichment split" {}\ntest "enrichment merge" {}\ntest "unrelated anchor" {}\n'
             'test "enrichment logging" { std.log.debug("quiet debug", .{}); '
             'std.log.info("quiet info", .{}); std.log.warn("visible warning", .{}); }\n'
@@ -46,6 +48,16 @@ class TestRunnerSelection(unittest.TestCase):
             'test "progress body" { try std.testing.io.sleep(.fromSeconds(2), .awake); }\n'
             'test "error logging" { std.log.err("visible error", .{}); }\n'
             'test "environment unavailable" { return error.SkipZigTest; }\n'
+            'test "debug allocator policy" { '
+            "const actual = std.debug.getDebugInfoAllocator(); "
+            "try std.testing.expectEqual(std.heap.c_allocator.ptr, actual.ptr); "
+            "try std.testing.expectEqual(std.heap.c_allocator.vtable, actual.vtable); "
+            "var frames: [8]usize = undefined; "
+            "for (0..2000) |_| { "
+            "const trace = std.debug.captureCurrentStackTrace(.{}, &frames); "
+            "try std.testing.expect(trace.return_addresses.len != 0); } }\n"
+            'test "diagnostic assertion failure" { try std.testing.expect(false); }\n'
+            'test "diagnostic memory leak" { _ = try std.testing.allocator.alloc(u8, 8); }\n'
         )
         cls.binary = root / "tests"
         subprocess.run(
@@ -67,7 +79,7 @@ class TestRunnerSelection(unittest.TestCase):
                 "--cache-dir",
                 str(root / "cache"),
                 "--global-cache-dir",
-                "/tmp/zig-global-cache",
+                os.environ.get("ZIG_GLOBAL_CACHE_DIR", str(root / "global-cache")),
             ],
             check=True,
         )
@@ -82,6 +94,29 @@ class TestRunnerSelection(unittest.TestCase):
             text=True,
             capture_output=True,
         )
+
+    def test_debug_allocator_reclaims_without_disabling_diagnostics(self):
+        result = subprocess.run(
+            [str(self.binary), "--test-filter", "debug allocator policy"],
+            text=True,
+            capture_output=True,
+            timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("1 passed", result.stderr)
+        for name, diagnostic in (
+            ("diagnostic assertion failure", "FAIL"),
+            ("diagnostic memory leak", "1 leaked"),
+        ):
+            result = subprocess.run(
+                [str(self.binary), "--test-filter", name],
+                text=True,
+                capture_output=True,
+                timeout=15,
+            )
+            self.assertNotEqual(result.returncode, 0, result.stderr)
+            self.assertIn(diagnostic, result.stderr)
+            self.assertIn("selection.zig", result.stderr)
 
     def test_required_execution_rejects_skips_but_inventory_still_lists(self):
         for required, owner, expected in (
@@ -217,6 +252,23 @@ class TestRunnerSelection(unittest.TestCase):
         self.assertEqual(result.stderr.count("TEST\t"), 1)
         self.assertIn("enrichment split", result.stderr)
 
+    def test_namespace_prefix_does_not_exclude_suffix_module(self):
+        result = subprocess.run(
+            [
+                str(self.binary),
+                "--list-tests",
+                "--suite-filter",
+                "anchor",
+                "--skip-test-filter",
+                "^selection.",
+            ],
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr.count("TEST\t"), 1)
+        self.assertIn("retirement_selection.test.borrowed anchor", result.stderr)
+
     def test_anchor_cannot_satisfy_caller_filter(self):
         result = self.run_selection("--test-filter", "anchor")
         self.assertNotEqual(result.returncode, 0)
@@ -259,6 +311,27 @@ class InferenceRunnerProgress(unittest.TestCase):
     test_progress_survives_captured_output_before_exit = (
         TestRunnerSelection.test_progress_survives_captured_output_before_exit
     )
+
+    def test_namespace_prefix_does_not_exclude_suffix_module(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "inventory.txt"
+            result = subprocess.run(
+                [
+                    str(self.binary),
+                    "--test-filter",
+                    "anchor",
+                    "--skip-test-filter",
+                    "^selection.",
+                ],
+                capture_output=True,
+                timeout=5,
+                env={**os.environ, "ANTFLY_INFERENCE_TEST_LIST_FILE": str(output)},
+            )
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+            self.assertEqual(
+                output.read_text().splitlines(),
+                ["retirement_selection.test.borrowed anchor"],
+            )
 
     def test_inventory_preserves_selection_without_running_tests(self):
         with tempfile.TemporaryDirectory() as directory:

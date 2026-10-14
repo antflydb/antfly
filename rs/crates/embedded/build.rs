@@ -32,11 +32,11 @@ fn main() {
         return;
     }
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    if target_os == "macos" || target_os == "linux" {
-        if let Some(paths) = env::var_os("DEP_ANTFLY_LIB_DIRS") {
-            for directory in env::split_paths(&paths) {
-                println!("cargo:rustc-link-arg=-Wl,-rpath,{}", directory.display());
-            }
+    if (target_os == "macos" || target_os == "linux")
+        && let Some(paths) = env::var_os("DEP_ANTFLY_LIB_DIRS")
+    {
+        for directory in env::split_paths(&paths) {
+            println!("cargo:rustc-link-arg=-Wl,-rpath,{}", directory.display());
         }
     }
 }

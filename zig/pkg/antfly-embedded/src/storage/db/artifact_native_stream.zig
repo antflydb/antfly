@@ -409,7 +409,7 @@ test "ordered artifact inventory native census resumes authored inventory and re
                 try std.testing.expectEqual(@as(usize, 1), step.page.visits);
             }
         };
-        try std.testing.checkAllAllocationFailures(alloc, Check.run, .{ &read, db.root_incarnation, pin.plan() });
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Check.run, .{ &read, db.root_incarnation, pin.plan() });
     }
     {
         var txn = try db.core.store.beginWriteTxn();

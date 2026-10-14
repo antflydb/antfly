@@ -52,23 +52,6 @@ pub const View = struct {
         return .{ .start = if (group == 0) 0 else self.ends[group - 1], .end = self.ends[group] };
     }
 
-    /// Exact representative scoring; this does NOT certify excluded members.
-    /// Stable group order resolves ties. Caller supplies fixed-size scratch.
-    pub fn rank(self: View, query: []const f32, order: []u8, scores: []f64) !void {
-        if (query.len != self.dims or order.len < self.ends.len or scores.len < self.ends.len)
-            return error.InvalidSubgroupPlan;
-        for (query) |value| if (!std.math.isFinite(value)) return error.InvalidSubgroupPlan;
-        for (0..self.ends.len) |group| {
-            var dot: f64 = 0;
-            for (query, self.centers[group * self.dims ..][0..self.dims]) |q, c| dot += @as(f64, q) * c;
-            scores[group] = -dot;
-            var position = group;
-            while (position > 0 and scores[order[position - 1]] > scores[group]) : (position -= 1)
-                order[position] = order[position - 1];
-            order[position] = @intCast(group);
-        }
-    }
-
     pub fn validate(self: View) !void {
         if (self.dims == 0 or self.dims > max_dims or self.rows.len == 0 or self.rows.len > max_rows or
             self.ends.len == 0 or self.ends.len > max_groups or
@@ -440,9 +423,6 @@ fn allocationExercise(alloc: Allocator) !void {
     try std.testing.expectEqualSlices(f32, plan.view.centers, restored.view.centers);
     const borrowed = try decodeBorrowed(bytes);
     try std.testing.expectEqualSlices(u32, plan.view.rows, borrowed.rows);
-    var order: [max_groups]u8 = undefined;
-    var scores: [max_groups]f64 = undefined;
-    try borrowed.rank(&.{ 1, 0 }, &order, &scores);
     try std.testing.expectEqual(@as(u32, 2), borrowed.ends[0]);
 }
 

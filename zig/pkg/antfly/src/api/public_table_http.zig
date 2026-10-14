@@ -123,6 +123,7 @@ pub const TableApi = struct {
         DenseRepairBackpressure,
         Unavailable,
         WriteUnavailable,
+        WritePrecommitReadUnavailable,
         ConstraintActivationUnavailable,
         WriteDefinitelyAbortedUnavailable,
         HAWriteDurabilityPending,
@@ -1752,6 +1753,12 @@ fn executeOwnedTableBatch(alloc: std.mem.Allocator, table_name: []const u8, batc
         },
         error.Unavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "maintenance routes unavailable on query-only runtime") },
         error.WriteUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "write unavailable") },
+        error.WritePrecommitReadUnavailable => return .{
+            .status = 503,
+            .body = try alloc.dupe(u8, "{\"code\":\"transaction_precommit_read_unavailable\",\"message\":\"a required integrity read is unavailable; no mutation was admitted\",\"retryable\":true,\"retry_after_ms\":1000}"),
+            .json = true,
+            .retry_after_seconds = 1,
+        },
         error.ConstraintActivationUnavailable => return .{
             .status = 503,
             .body = try alloc.dupe(u8, "{\"code\":\"constraint_activation_pending\",\"message\":\"constraint activation is not ready; no mutation was admitted\",\"retryable\":true,\"retry_after_ms\":1000}"),
@@ -1860,6 +1867,7 @@ pub fn handleTableQueryRequest(
             std.log.warn("public table query invalid exact sort table={s} err={}", .{ table_name, err });
             return .{ .status = 422, .body = try unsupportedExactSortBody(alloc), .json = true };
         },
+        error.OutOfMemory => return error.OutOfMemory,
     };
     const response_body = api.executeTableQueryRequest(alloc, table_name, body, row_filter_json) catch |err| {
         switch (err) {
@@ -3765,6 +3773,7 @@ test "public table batch handler maps write unavailable errors" {
         retry_after_seconds: ?u32 = null,
     }{
         .{ .err = error.WriteUnavailable, .status = 503, .body = "write unavailable" },
+        .{ .err = error.WritePrecommitReadUnavailable, .status = 503, .body = "{\"code\":\"transaction_precommit_read_unavailable\",\"message\":\"a required integrity read is unavailable; no mutation was admitted\",\"retryable\":true,\"retry_after_ms\":1000}", .json = true, .retry_after_seconds = 1 },
         .{ .err = error.ConstraintActivationUnavailable, .status = 503, .body = "{\"code\":\"constraint_activation_pending\",\"message\":\"constraint activation is not ready; no mutation was admitted\",\"retryable\":true,\"retry_after_ms\":1000}", .json = true, .retry_after_seconds = 1 },
         .{ .err = error.WriteDefinitelyAbortedUnavailable, .status = 503, .body = "{\"code\":\"transaction_precommit_aborted\",\"message\":\"the transaction was durably aborted before commit; retrying the batch is safe\",\"retryable\":true,\"retry_after_ms\":1000}", .json = true, .retry_after_seconds = 1 },
         .{ .err = error.IntegrityTopologyBusy, .status = 409, .body = "{\"code\":\"integrity_topology_busy\",\"message\":\"table integrity topology is changing; retry this batch after publication\",\"retryable\":true,\"retry_after_ms\":1000}", .json = true, .retry_after_seconds = 1 },

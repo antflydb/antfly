@@ -14,9 +14,8 @@
 // limitations under the License.
 
 //! Concurrency behavior over a single shared handle: writes queue rather
-//! than fail with `Busy`, reads run alongside writes and admin calls, close
-//! waits for in-flight calls, and the busy-timeout retry policy behaves like
-//! `sqlite3_busy_timeout`. Mirrors
+//! than fail with `Busy`, close waits for in-flight calls, and independent
+//! writable Lite connections observe each other's publications. Mirrors
 //! `go/pkg/embedded/concurrency_cgo_test.go`. Requires linking against the real
 //! library (`--features libantfly`).
 
@@ -241,41 +240,26 @@ fn close_races_in_flight_calls_inner() {
 }
 
 #[test]
-fn busy_timeout_waits_for_writer_lock() {
-    run_with_stack(busy_timeout_waits_for_writer_lock_inner);
-}
-
-fn busy_timeout_waits_for_writer_lock_inner() {
-    let dir = tmp_dir("busy-timeout");
-    let path = dir.join("busy-timeout.aflite");
-    let first = Database::create(&path, &no_sync_opts()).expect("create");
-
-    // Without a timeout the second writer fails immediately.
-    match Database::open(&path, &no_sync_opts()) {
-        Err(Error::Busy) => {}
-        other => panic!("second writer without timeout = {other:?}, want Busy"),
-    }
-
-    // With a short timeout it fails with Busy only after waiting.
-    let start = Instant::now();
-    let short_timeout = no_sync_opts().busy_timeout(Duration::from_millis(150));
-    match Database::open(&path, &short_timeout) {
-        Err(Error::Busy) => {}
-        other => panic!("second writer with short timeout = {other:?}, want Busy"),
-    }
-    let waited = start.elapsed();
-    assert!(
-        waited >= Duration::from_millis(140),
-        "busy timeout returned after {waited:?}, want about 150ms"
-    );
-
-    // With a longer timeout it succeeds once the first writer closes.
-    let closer = spawn_with_stack(move || {
-        std::thread::sleep(Duration::from_millis(100));
-        first.close().expect("close first writer");
+fn independent_writable_connections_observe_commits_and_close_independently() {
+    run_with_stack(|| {
+        let dir = tmp_dir("connections");
+        let path = dir.join("connections.aflite");
+        let first = Database::create(&path, &no_sync_opts()).unwrap();
+        let second =
+            Database::open(&path, &no_sync_opts().busy_timeout(Duration::from_secs(1))).unwrap();
+        first
+            .batch_json(r#"{"inserts":{"first":{"body":"first"}}}"#)
+            .unwrap();
+        assert!(second.lookup_json("first").is_ok());
+        second
+            .batch_json(r#"{"inserts":{"second":{"body":"second"}}}"#)
+            .unwrap();
+        assert!(first.lookup_json("second").is_ok());
+        first.close().unwrap();
+        second
+            .batch_json(r#"{"inserts":{"after":{"body":"still open"}}}"#)
+            .unwrap();
+        assert!(second.lookup_json("first").is_ok());
+        second.close().unwrap();
     });
-    let long_timeout = no_sync_opts().busy_timeout(Duration::from_secs(10));
-    let second = Database::open(&path, &long_timeout).expect("second writer after first closed");
-    second.close().expect("close second writer");
-    closer.join().expect("closer thread panicked");
 }

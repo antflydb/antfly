@@ -72,13 +72,29 @@ def ids_for(tok, r):
     )
 
 
+def snapshot(cache):
+    """Each layer's keys and values, trimmed to the filled length. mlx-lm 0.32
+    states are the full-capacity buffers plus an offset, and extending a
+    cache writes into its buffers in place; trimmed copies make every fork
+    allocate its own buffer on its first token, so the snapshot stays intact."""
+    saved = []
+    for c in cache:
+        state = c.state
+        keys, values = state[0], state[1]
+        filled = state[2] if len(state) > 2 else keys.shape[2]
+        saved.append((keys[..., :filled, :], values[..., :filled, :]))
+    return saved
+
+
 def fork(saved):
-    out = []
-    for k, v in saved:
+    """A fresh KV cache per layer holding a snapshot from `snapshot`, so
+    one prefix can branch many continuations."""
+    fresh = []
+    for keys, values in saved:
         c = cache_mod.KVCache()
-        c.state = (k, v)
-        out.append(c)
-    return out
+        c.keys, c.values, c.offset = keys, values, keys.shape[2]
+        fresh.append(c)
+    return fresh
 
 
 def labels_from(model, tok, saved, last, r):
@@ -101,9 +117,9 @@ def per_question(model, tok, r):
     c = cache_mod.make_prompt_cache(model)
     lg = model(mx.array([ids]), cache=c)
     mx.eval(lg)
-    return labels_from(
-        model, tok, [x.state for x in c], lg[0, -1].astype(mx.float32), r
-    ), len(ids)
+    return labels_from(model, tok, snapshot(c), lg[0, -1].astype(mx.float32), r), len(
+        ids
+    )
 
 
 def shared(model, tok, case):
@@ -114,7 +130,7 @@ def shared(model, tok, case):
         p += 1
     c = cache_mod.make_prompt_cache(model)
     mx.eval(model(mx.array([all_ids[0][:p]]), cache=c))
-    base = [x.state for x in c]
+    base = snapshot(c)
     out, tokens = [], p
     for r, ids in zip(case, all_ids):
         branch = fork(base)
@@ -122,9 +138,7 @@ def shared(model, tok, case):
         mx.eval(lg)
         tokens += len(ids) - p
         out.append(
-            labels_from(
-                model, tok, [x.state for x in branch], lg[0, -1].astype(mx.float32), r
-            )
+            labels_from(model, tok, snapshot(branch), lg[0, -1].astype(mx.float32), r)
         )
     return out, tokens, p
 
@@ -195,9 +209,7 @@ def main():
             lg = model(mx.array([ids[p:]]), cache=c)
             mx.eval(lg)
             split.append(
-                labels_from(
-                    model, tok, [x.state for x in c], lg[0, -1].astype(mx.float32), r
-                )
+                labels_from(model, tok, snapshot(c), lg[0, -1].astype(mx.float32), r)
             )
 
     def sm(v):

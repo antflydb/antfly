@@ -60,6 +60,15 @@ pub const SearchDiagnostics = struct {
     wand_chunks_skipped: u64 = 0,
     boolean_candidates_scored: u64 = 0,
     boolean_chunks_skipped: u64 = 0,
+    boolean_parallel_tasks: u64 = 0,
+    boolean_range_tasks: u64 = 0,
+    boolean_cutoff_publications: u64 = 0,
+    boolean_workspace_retries: u64 = 0,
+    boolean_segment_preparations: u64 = 0,
+    boolean_prepared_reuses: u64 = 0,
+    boolean_plan_tasks: u64 = 0,
+    boolean_summary_loads: u64 = 0,
+    boolean_summary_hits: u64 = 0,
     phrase_candidates_verified: u64 = 0,
     phrase_position_records_decoded: u64 = 0,
     phrase_matches_scored: u64 = 0,
@@ -91,7 +100,7 @@ fn scoredHitWorseThan(a: ScoredHit, b: ScoredHit) bool {
     return a.score < b.score;
 }
 
-fn scoredHitBetterThan(a: ScoredHit, b: ScoredHit) bool {
+pub fn scoredHitBetterThan(a: ScoredHit, b: ScoredHit) bool {
     if (a.score == b.score) return a.doc_id < b.doc_id;
     return a.score > b.score;
 }
@@ -128,13 +137,37 @@ pub fn insertTopK(
     }
 }
 
+/// Worst-first bounded heap shared by filtered and unfiltered native ranking.
+pub fn offerTopK(alloc: Allocator, hits: *std.ArrayListUnmanaged(ScoredHit), k: u32, hit: ScoredHit) !void {
+    if (k == 0) return;
+    if (hits.items.len < k) {
+        try hits.append(alloc, hit);
+        var child = hits.items.len - 1;
+        while (child > 0) {
+            const parent = (child - 1) / 2;
+            if (!scoredHitWorseThan(hits.items[child], hits.items[parent])) break;
+            std.mem.swap(ScoredHit, &hits.items[child], &hits.items[parent]);
+            child = parent;
+        }
+    } else if (scoredHitBetterThan(hit, hits.items[0])) {
+        hits.items[0] = hit;
+        var parent: usize = 0;
+        while (parent < hits.items.len / 2) {
+            var child = parent * 2 + 1;
+            if (child + 1 < hits.items.len and scoredHitWorseThan(hits.items[child + 1], hits.items[child])) child += 1;
+            if (!scoredHitWorseThan(hits.items[child], hits.items[parent])) break;
+            std.mem.swap(ScoredHit, &hits.items[child], &hits.items[parent]);
+            parent = child;
+        }
+    }
+}
+
 pub const TopKCollector = struct {
     alloc: Allocator,
     k: u32,
     hits: std.ArrayListUnmanaged(ScoredHit) = .empty,
     total_count: u32 = 0,
     total_relation: TotalHitsRelation = .exact,
-    worst_index: usize = 0,
 
     pub fn init(alloc: Allocator, k: u32) TopKCollector {
         return .{ .alloc = alloc, .k = k };
@@ -150,12 +183,12 @@ pub const TopKCollector = struct {
 
     pub fn minCompetitiveScore(self: *const TopKCollector) f32 {
         if (self.k == 0 or self.hits.items.len < self.k) return 0;
-        return self.hits.items[self.worst_index].score;
+        return self.hits.items[0].score;
     }
 
     pub fn worstCompetitiveDocId(self: *const TopKCollector) ?u32 {
         if (self.k == 0 or self.hits.items.len < self.k) return null;
-        return self.hits.items[self.worst_index].doc_id;
+        return self.hits.items[0].doc_id;
     }
 
     pub fn markLowerBound(self: *TopKCollector) void {
@@ -164,23 +197,7 @@ pub const TopKCollector = struct {
 
     pub fn collect(self: *TopKCollector, hit: ScoredHit) !void {
         self.total_count += 1;
-        if (self.k == 0) return;
-        if (self.hits.items.len < self.k) {
-            try self.hits.append(self.alloc, hit);
-            if (self.hits.items.len == self.k) self.refreshWorst();
-            return;
-        }
-        if (scoredHitBetterThan(hit, self.hits.items[self.worst_index])) {
-            self.hits.items[self.worst_index] = hit;
-            self.refreshWorst();
-        }
-    }
-
-    fn refreshWorst(self: *TopKCollector) void {
-        self.worst_index = 0;
-        for (self.hits.items[1..], 1..) |candidate, i| {
-            if (scoredHitWorseThan(candidate, self.hits.items[self.worst_index])) self.worst_index = i;
-        }
+        try offerTopK(self.alloc, &self.hits, self.k, hit);
     }
 
     pub fn finishOwned(self: *TopKCollector) !SearchResults {
@@ -301,6 +318,7 @@ pub const WANDScorer = struct {
         const idf = @log(1.0 + (n - df + 0.5) / (df + 0.5));
 
         var iter_owned = iter;
+        errdefer iter_owned.deinit();
         // BM25 scoring doesn't read positions; flip the iterator into the
         // fast path so `next()` skips the per-doc varint walk over positions.
         // Saves real wall time on phrase-aware indexes when the query is
@@ -364,6 +382,28 @@ pub const WANDScorer = struct {
         }
     }
 
+    /// Exact membership can jump over rejected ordinal runs before scoring.
+    /// The collector's lower bound is monotone; absence is represented by 2^32.
+    fn seekCandidate(self: *WANDScorer, collector: anytype, doc: u32) !bool {
+        if (comptime @hasDecl(@typeInfo(@TypeOf(collector)).pointer.child, "nextCandidate")) {
+            const target = collector.nextCandidate(doc);
+            if (target > std.math.maxInt(u32)) {
+                for (self.terms.items) |*term| {
+                    term.current = null;
+                    term.exhausted = true;
+                }
+                return true;
+            }
+            if (target > doc) {
+                for (self.terms.items) |*term| if (!term.exhausted and term.current.?.doc_id < target) {
+                    try self.advancePast(term, @intCast(target));
+                };
+                return true;
+            }
+        }
+        return false;
+    }
+
     /// Single-term Block-Max top-k does not need pivot ordering, cumulative
     /// bounds, or the generic multi-term front-interval sweep. Score the
     /// current posting directly and feed the raised threshold into the same
@@ -376,6 +416,7 @@ pub const WANDScorer = struct {
 
         while (!term.exhausted) {
             const hit = term.current orelse break;
+            if (try self.seekCandidate(collector, hit.doc_id)) continue;
             self.pivots_scored += 1;
             self.next_in_score += 1;
             try collector.collect(.{
@@ -438,6 +479,7 @@ pub const WANDScorer = struct {
                 }
             }
             if (min_doc == null) break;
+            if (try self.seekCandidate(collector, min_doc.?)) continue;
 
             // Score this document across all terms that contain it
             var score: f32 = 0;
@@ -495,6 +537,7 @@ pub const WANDScorer = struct {
                 sorted[insert_pos] = moving;
             }
 
+            if (try self.seekCandidate(collector, self.terms.items[sorted[0]].current.?.doc_id)) continue;
             if (try self.skipNonCompetitiveFrontBlock(collector, sorted)) {
                 collector.markLowerBound();
                 continue;
@@ -1239,5 +1282,122 @@ test "block-max scorer proves sparse matches complete below top-k" {
         defer alloc.free(boundary.hits);
         try std.testing.expectEqual(@as(usize, k), boundary.hits.len);
         try std.testing.expectEqual(if (k == 4) TotalHitsRelation.exact else .gte, boundary.total_relation);
+    }
+}
+
+test "WAND membership seeks preserve selective single multi and unbounded scoring" {
+    const a = std.testing.allocator;
+    var builder = inverted.InvertedIndexBuilder.init(a, .{ .chunk_size = 128 });
+    defer builder.deinit();
+    for (0..8192) |i| try builder.addDocument(@intCast(i), &.{
+        .{ .term = "first", .freq = 1, .norm = 10 },
+        .{ .term = "second", .freq = 2, .norm = 10 },
+    });
+    const bytes = try builder.build();
+    defer a.free(bytes);
+    var reader = try inverted.InvertedIndexReader.init(a, bytes);
+    const Collector = struct {
+        base: TopKCollector,
+        calls: usize = 0,
+        pub fn nextCandidate(self: *@This(), first: u32) u64 {
+            self.calls += 1;
+            return if (first <= 7001) 7001 else 4294967296;
+        }
+        pub fn topKLimit(self: *@This()) u32 {
+            return self.base.topKLimit();
+        }
+        pub fn minCompetitiveScore(self: *@This()) f32 {
+            return self.base.minCompetitiveScore();
+        }
+        pub fn worstCompetitiveDocId(self: *@This()) ?u32 {
+            return self.base.worstCompetitiveDocId();
+        }
+        pub fn markLowerBound(self: *@This()) void {
+            self.base.markLowerBound();
+        }
+        pub fn collect(self: *@This(), hit: ScoredHit) !void {
+            if (hit.doc_id != 7001) return error.UnexpectedRejectedScore;
+            try self.base.collect(hit);
+        }
+    };
+    for ([_]usize{ 1, 2 }) |count| for ([_]bool{ false, true }) |bounded| {
+        var scorer = WANDScorer.init(a, 1, 8192, reader.avgDocLen(), .{});
+        defer scorer.deinit();
+        for (([_][]const u8{ "first", "second" })[0..count]) |term| {
+            const lookup = reader.lookup(term) orelse return error.TestUnexpectedResult;
+            try scorer.addTerm(try lookup.iterator(a), lookup.docFreq(), if (bounded) switch (lookup) {
+                .postings => |p| p.block_max,
+                .one_hit => null,
+            } else null, 128, 0);
+        }
+        var collector: Collector = .{ .base = .init(a, 1) };
+        defer collector.base.deinit();
+        try scorer.executeInto(&collector);
+        try std.testing.expectEqual(@as(u32, 1), collector.base.total_count);
+        try std.testing.expectEqual(@as(u32, 7001), collector.base.hits.items[0].doc_id);
+        try std.testing.expect(collector.calls <= 4);
+    };
+}
+
+test "WAND failed term admission releases owned metadata" {
+    const Owner = struct {
+        refs: usize = 1,
+        fn retain(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.refs += 1;
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.refs -= 1;
+        }
+    };
+    var owner: Owner = .{};
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var wand = WANDScorer.init(failing.allocator(), 1, 1, 1, .{});
+    defer wand.deinit();
+    const iterator: inverted.PostingsIterator = .{ .alloc = std.testing.allocator, .is_one_hit = true, .metadata_owner = .{ .ptr = &owner, .retain = Owner.retain, .release = Owner.release } };
+    try std.testing.expectError(error.OutOfMemory, wand.addTerm(iterator, 1, null, 1024, 0));
+    try std.testing.expectEqual(@as(usize, 0), owner.refs);
+}
+
+test "shared heap top k matches full ordering across windows and arrivals" {
+    const a = std.testing.allocator;
+    var input: [4096]ScoredHit = undefined;
+    for (&input, 0..) |*hit, i| hit.* = .{ .doc_id = @intCast(i), .score = @floatFromInt((i * 701) % 113) };
+    for ([_]u32{ 0, 1, 10, 100, 1000, 4096, 5000 }) |k| for ([_]bool{ false, true }) |reverse| {
+        var collector = TopKCollector.init(a, k);
+        defer collector.deinit();
+        for (0..input.len) |i| {
+            try collector.collect(input[if (reverse) input.len - 1 - i else i]);
+            if (k != 0 and collector.hits.items.len == k) {
+                for (collector.hits.items) |hit| try std.testing.expect(!scoredHitWorseThan(hit, collector.hits.items[0]));
+            } else try std.testing.expectEqual(@as(f32, 0), collector.minCompetitiveScore());
+        }
+        var expected = input;
+        sortScoredHits(&expected);
+        const result = try collector.finishOwned();
+        defer a.free(result.hits);
+        try std.testing.expectEqual(@as(u32, input.len), result.total_count);
+        try std.testing.expectEqualSlices(ScoredHit, expected[0..@min(k, input.len)], result.hits);
+    };
+}
+
+test "shared heap top k replacement benchmark" {
+    if (@import("builtin").mode != .fast) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    for ([_]u32{ 10, 100, 1000, 10000 }) |k| {
+        var linear: std.ArrayListUnmanaged(ScoredHit) = .empty;
+        defer linear.deinit(a);
+        var heap: std.ArrayListUnmanaged(ScoredHit) = .empty;
+        defer heap.deinit(a);
+        const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+        for (0..40000) |i| try insertTopK(a, &linear, k, .{ .doc_id = @intCast(i), .score = @floatFromInt(i) });
+        const middle = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+        for (0..40000) |i| try offerTopK(a, &heap, k, .{ .doc_id = @intCast(i), .score = @floatFromInt(i) });
+        const finish = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+        sortScoredHits(linear.items);
+        sortScoredHits(heap.items);
+        try std.testing.expectEqualSlices(ScoredHit, linear.items, heap.items);
+        std.debug.print("heap_topk k={d} candidates=40000 linear_ns={d} heap_ns={d}\n", .{ k, middle - start, finish - middle });
     }
 }

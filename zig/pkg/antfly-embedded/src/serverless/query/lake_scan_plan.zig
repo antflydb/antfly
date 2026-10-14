@@ -89,7 +89,7 @@ pub fn validateBindingInventory(
 /// Compare an already validated immutable inventory with current authority.
 /// Decoders and serving plan owners perform structural validation once.
 pub fn validateBindingInventoryIdentity(binding: external_binding.Binding, inventory: external_source.Inventory) !void {
-    try binding.validateReadOnlyMvp();
+    try binding.validateSupported();
     if (binding.format != inventory.format) return error.ExternalLakeSnapshotMismatch;
     if (!std.mem.eql(u8, binding.table_id, inventory.source_id)) return error.ExternalLakeSnapshotMismatch;
     if (!std.mem.eql(u8, binding.source_uri, inventory.source_uri)) return error.ExternalLakeSnapshotMismatch;

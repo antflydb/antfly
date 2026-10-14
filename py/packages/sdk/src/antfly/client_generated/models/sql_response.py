@@ -23,6 +23,8 @@ class SQLResponse:
     is JSON null; sql_nulls distinguishes it from a JSON column containing
     the JSON literal null. Integer-typed values are exact decimal strings; datetime
     values are strings. Objects and arrays in JSON columns remain JSON.
+    Array-typed columns contain SQLArrayValue envelopes, with their element
+    descriptor in the corresponding SQLColumn. They are not JSON columns.
 
         Attributes:
             columns (list[SQLColumn]):

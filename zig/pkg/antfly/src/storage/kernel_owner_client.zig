@@ -79,6 +79,10 @@ pub const Context = struct {
         try self.ensure();
         try statusToError(abi.antfly_storage_context_configure_secrets(self.handle, store));
     }
+    pub fn configureNativeQueries(self: *Context, setup: []const u8) !void {
+        try self.ensure();
+        try statusToError(abi.antfly_storage_context_configure_native_queries(self.handle, .fromSlice(setup)));
+    }
 
     pub fn configureRemoteContentSecurity(self: *Context, security_json: []const u8) !void {
         try self.ensure();
@@ -688,6 +692,7 @@ pub const Owner = struct {
             return error.InvalidBoundaryFailureIdentity;
         }
         statusToError(status) catch |err| {
+            std.log.debug("storage-owner query rejected provider_error={s} boundary={s} operation={d}", .{ failure.errorName(), @tagName(failure.boundary), failure.operation });
             if (status == .internal) {
                 std.log.err("storage-owner query failed provider_error={s} hash={x} operation={d}", .{
                     failure.errorName(),

@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
@@ -31,6 +32,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestBundledCABIHeaderMatchesSourceTree(t *testing.T) {
@@ -65,6 +67,9 @@ func TestErrorCodeMetadataMatchesCABI(t *testing.T) {
 		Unsupported,
 		Stalled,
 		Cancelled,
+		ReplacementFailed,
+		ReplacementPending,
+		ReplacementConfigurationMismatch,
 		Internal,
 		ErrorCode(127),
 	}
@@ -96,7 +101,7 @@ func TestLiteOpenReadOnlyMissingDoesNotCreate(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), name+".aflite")
 			db, err := open(path)
-			if err != NotFound {
+			if !errors.Is(err, NotFound) {
 				if db != nil {
 					db.Close()
 				}
@@ -122,9 +127,11 @@ func TestLiteOpenModeConcurrency(t *testing.T) {
 	}
 	defer writer.Close()
 
-	if _, err := Open(path); err != Busy {
-		t.Fatalf("second writer error = %v, want %v", err, Busy)
+	second, err := Open(path)
+	if err != nil {
+		t.Fatalf("open independent writer: %v", err)
 	}
+	defer second.Close()
 
 	readonly, err := OpenReadonly(path)
 	if err != nil {
@@ -137,7 +144,7 @@ func TestLiteOpenModeConcurrency(t *testing.T) {
 	if err := readonly.Batch([]WriteIntent{{
 		Key:   "doc:readonly-write",
 		Value: []byte(`{"title":"readonly write"}`),
-	}}, 2); err != InvalidArgument {
+	}}, 2); !errors.Is(err, InvalidArgument) {
 		readonly.Close()
 		t.Fatalf("readonly batch error = %v, want %v", err, InvalidArgument)
 	}
@@ -156,7 +163,7 @@ func TestLiteOpenModeConcurrency(t *testing.T) {
 	if err := statusOnly.Batch([]WriteIntent{{
 		Key:   "doc:status-only-write",
 		Value: []byte(`{"title":"status only write"}`),
-	}}, 3); err != InvalidArgument {
+	}}, 3); !errors.Is(err, InvalidArgument) {
 		statusOnly.Close()
 		t.Fatalf("status-only batch error = %v, want %v", err, InvalidArgument)
 	}
@@ -745,8 +752,8 @@ func TestLiteCAPI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("copy pinned reader snapshot: %v", err)
 	}
-	if pinnedSnapshotReport.TailBytes == 0 {
-		t.Fatalf("pinned snapshot report did not observe writer tail: %#v", pinnedSnapshotReport)
+	if pinnedSnapshotReport.CheckpointSequence == 0 || pinnedSnapshotReport.PageCount == 0 {
+		t.Fatalf("snapshot report lacks a committed checkpoint: %#v", pinnedSnapshotReport)
 	}
 	pinnedSnapshotCheck, err := CheckFile(pinnedSnapshotPath)
 	if err != nil {
@@ -766,8 +773,8 @@ func TestLiteCAPI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("lookup pinned snapshot: %v", err)
 	}
-	if !bytes.Contains(pinnedSnapshotLookup, []byte("pinned-before")) || bytes.Contains(pinnedSnapshotLookup, []byte("pinned-after")) {
-		t.Fatalf("pinned snapshot lookup JSON %q did not preserve reader checkpoint", pinnedSnapshotLookup)
+	if !bytes.Contains(pinnedSnapshotLookup, []byte("pinned-after-b")) {
+		t.Fatalf("snapshot lookup JSON %q did not observe the latest committed checkpoint", pinnedSnapshotLookup)
 	}
 	pinnedWriterLookup, err := db.LookupJSON("doc:go-pinned")
 	if err != nil {
@@ -788,7 +795,7 @@ func TestLiteCAPI(t *testing.T) {
 	if _, err := os.Stat(snapshotPath); err != nil {
 		t.Fatalf("snapshot file: %v", err)
 	}
-	if _, err := db.CopyStableSnapshot(filepath.Join(t.TempDir(), "go-snapshot.afb"), false); err != InvalidArgument {
+	if _, err := db.CopyStableSnapshot(filepath.Join(t.TempDir(), "go-snapshot.afb"), false); !errors.Is(err, InvalidArgument) {
 		t.Fatalf("handle snapshot to .afb error = %v, want %v", err, InvalidArgument)
 	}
 
@@ -817,7 +824,7 @@ func TestLiteCAPI(t *testing.T) {
 	if _, err := CopyStableSnapshotFile(path, snapshotFilePath, false); err == nil {
 		t.Fatalf("snapshot file without replace unexpectedly overwrote target")
 	}
-	if _, err := CopyStableSnapshotFile(path, filepath.Join(t.TempDir(), "go-snapshot-file.afb"), false); err != InvalidArgument {
+	if _, err := CopyStableSnapshotFile(path, filepath.Join(t.TempDir(), "go-snapshot-file.afb"), false); !errors.Is(err, InvalidArgument) {
 		t.Fatalf("snapshot file to .afb error = %v, want %v", err, InvalidArgument)
 	}
 
@@ -865,7 +872,7 @@ func TestLiteCAPI(t *testing.T) {
 		t.Fatalf("open-transaction snapshot lookup JSON %q did not contain committed document", openTxnSnapshotCommittedLookup)
 	}
 	openTxnSnapshotPendingLookup, snapshotPendingErr := openTxnSnapshot.LookupJSON("doc:go-pending-backup")
-	if snapshotPendingErr != nil && snapshotPendingErr != NotFound {
+	if snapshotPendingErr != nil && !errors.Is(snapshotPendingErr, NotFound) {
 		openTxnSnapshot.Close()
 		t.Fatalf("lookup pending doc from open-transaction snapshot: %v", snapshotPendingErr)
 	}
@@ -897,7 +904,7 @@ func TestLiteCAPI(t *testing.T) {
 		t.Fatalf("open-transaction backup lookup JSON %q did not contain committed document", openTxnCommittedLookup)
 	}
 	openTxnPendingLookup, pendingErr := openTxnRestored.LookupJSON("doc:go-pending-backup")
-	if pendingErr != nil && pendingErr != NotFound {
+	if pendingErr != nil && !errors.Is(pendingErr, NotFound) {
 		openTxnRestored.Close()
 		t.Fatalf("lookup pending doc from open-transaction backup: %v", pendingErr)
 	}
@@ -981,32 +988,60 @@ func TestLiteCAPI(t *testing.T) {
 		t.Fatalf("close restored directory database: %v", err)
 	}
 
-	lockedRestorePath := filepath.Join(t.TempDir(), "go-locked-restore.aflite")
-	lockedRestore, err := Create(lockedRestorePath)
+	// Open connections reserve the writer only during operations. Replacement
+	// between calls must refresh this connection instead of retaining old pages.
+	openRestorePath := filepath.Join(t.TempDir(), "go-open-restore.aflite")
+	openRestore, err := Create(openRestorePath)
 	if err != nil {
-		t.Fatalf("open locked restore target: %v", err)
+		t.Fatalf("open restore target: %v", err)
 	}
-	if err := lockedRestore.Batch([]WriteIntent{{
-		Key:   "doc:locked-restore-target",
-		Value: []byte(`{"title":"locked restore target survives"}`),
+	t.Cleanup(func() { openRestore.Close() })
+	if err := openRestore.Batch([]WriteIntent{{
+		Key:   "doc:pre-restore-target",
+		Value: []byte(`{"title":"old restore target"}`),
 	}}, 7); err != nil {
-		t.Fatalf("write locked restore target: %v", err)
+		t.Fatalf("write restore target: %v", err)
 	}
-	if err := Restore(lockedRestorePath, backupBytes, RestoreOptions{Replace: true}); err != Busy {
-		t.Fatalf("restore into active writer = %v, want %v", err, Busy)
+	// Native idle maintenance can briefly own the actual writer lease.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		err := Restore(openRestorePath, backupBytes, RestoreOptions{Replace: true})
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, Busy) || time.Now().After(deadline) {
+			t.Fatalf("restore between connection calls: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	lockedLookup, err := lockedRestore.LookupJSON("doc:locked-restore-target")
+	if _, err := openRestore.LookupJSON("doc:pre-restore-target"); !errors.Is(err, NotFound) {
+		t.Fatalf("old document after replacement = %v, want %v", err, NotFound)
+	}
+	assertSearchContains(openRestore, "open connection restored full-text", fullTextQuery, "go binding full text search")
+	assertSearchContains(openRestore, "open connection restored dense", denseQuery, "doc:go-search")
+	if err := openRestore.Batch([]WriteIntent{{
+		Key:   "doc:post-restore-target",
+		Value: []byte(`{"title":"new restore target"}`),
+	}}, 8); err != nil {
+		t.Fatalf("write through refreshed connection: %v", err)
+	}
+	if _, err := os.Stat(openRestorePath + ".restore-tmp.aflite"); !os.IsNotExist(err) {
+		t.Fatalf("restore left temp file behind: %v", err)
+	}
+	if err := openRestore.Close(); err != nil {
+		t.Fatalf("close refreshed restore target: %v", err)
+	}
+	refreshed, err := OpenReadonly(openRestorePath)
 	if err != nil {
-		t.Fatalf("lookup locked restore target: %v", err)
+		t.Fatalf("reopen refreshed restore target: %v", err)
 	}
-	if !bytes.Contains(lockedLookup, []byte("locked restore target survives")) {
-		t.Fatalf("locked restore target lookup JSON %q did not contain original document", lockedLookup)
+	refreshedLookup, lookupErr := refreshed.LookupJSON("doc:post-restore-target")
+	closeErr := refreshed.Close()
+	if lookupErr != nil || !bytes.Contains(refreshedLookup, []byte("new restore target")) {
+		t.Fatalf("post-restore write did not survive reopen: %q, %v", refreshedLookup, lookupErr)
 	}
-	if _, err := os.Stat(lockedRestorePath + ".restore-tmp.aflite"); !os.IsNotExist(err) {
-		t.Fatalf("locked restore left temp file behind: %v", err)
-	}
-	if err := lockedRestore.Close(); err != nil {
-		t.Fatalf("close locked restore target: %v", err)
+	if closeErr != nil {
+		t.Fatalf("close reopened restore target: %v", closeErr)
 	}
 
 	importedPath := filepath.Join(t.TempDir(), "go-imported.aflite")
@@ -1129,7 +1164,7 @@ func TestLiteCAPI(t *testing.T) {
 		defer hostedWithTTL.Close()
 		t.Fatalf("hosted Lite database unexpectedly accepted TTL cleanup options")
 	}
-	if err != InvalidArgument {
+	if !errors.Is(err, InvalidArgument) {
 		t.Fatalf("hosted TTL open error = %v, want %v", err, InvalidArgument)
 	}
 }
@@ -2507,5 +2542,291 @@ func TestLiteNativeStandaloneAssetEnrichmentDrainsWithoutOwningIndex(t *testing.
 	if enrichmentStats.ErrorCount != 0 || enrichmentStats.FatalErrorCount != 0 || enrichmentStats.Stalled ||
 		enrichmentStats.TargetSequence == 0 || enrichmentStats.TargetSequence != enrichmentStats.AppliedSequence {
 		t.Fatalf("standalone asset enrichment did not drain cleanly: %#v", enrichmentStats)
+	}
+}
+
+func TestNamedTableReopensManagedEmbeddingProviders(t *testing.T) {
+	for _, restore := range []bool{false, true} {
+		t.Run(fmt.Sprintf("restore=%v", restore), func(t *testing.T) {
+			const dims = 4
+			server, calls := newFakeAntflyEmbedServer(t, dims)
+			options := OpenOptions{Mode: OpenModeWriter, Profile: ProfileNative, RemoteProviderConfigured: true, NoSync: true}
+			path := filepath.Join(t.TempDir(), "source.aflite")
+			db, err := CreateWithOptions(path, options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				if db != nil {
+					_ = db.Close()
+				}
+			}()
+			if err = db.CreateTableJSON("named", []byte(`{}`)); err != nil {
+				t.Fatal(err)
+			}
+			table, err := db.OpenTable("named")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				if table != nil {
+					_ = table.Close()
+				}
+			}()
+			config, err := json.Marshal(map[string]any{"field": "body", "dims": dims, "metric": "l2_squared", "embedder": map[string]any{"provider": "antfly", "model": "fake-embedder", "api_url": server.URL}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			index, err := json.Marshal(map[string]any{"name": "automatic", "kind": "dense_vector", "config_json": string(config)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = table.AddIndexJSON(index); err != nil {
+				t.Fatal(err)
+			}
+			if err = table.Batch([]WriteIntent{{Key: "before", Value: []byte(`{"body":"before reopen"}`)}}, 1); err != nil {
+				t.Fatal(err)
+			}
+			if _, err = table.RunUntilIdleStatus(); err != nil {
+				t.Fatal(err)
+			}
+			before := atomic.LoadInt32(calls)
+			if before == 0 {
+				t.Fatal("initial embedding provider was not configured")
+			}
+			if err = table.Close(); err != nil {
+				t.Fatal(err)
+			}
+			table = nil
+			backup, err := db.Backup()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			db = nil
+			if restore {
+				path = filepath.Join(t.TempDir(), "restored.aflite")
+				if err = Restore(path, backup, RestoreOptions{Storage: StorageLite}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			db, err = OpenWithOptions(path, options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			table, err = db.OpenTable("named")
+			if err != nil {
+				t.Fatal(err)
+			}
+			const text = "generated after reopen"
+			if err = table.Batch([]WriteIntent{{Key: "after", Value: []byte(fmt.Sprintf(`{"body":%q}`, text))}}, 2); err != nil {
+				t.Fatal(err)
+			}
+			if _, err = table.RunUntilIdleStatus(); err != nil {
+				t.Fatal(err)
+			}
+			if atomic.LoadInt32(calls) <= before {
+				t.Fatal("reopened table did not call its embedding provider")
+			}
+			query, err := json.Marshal(map[string]any{"embeddings": map[string]any{"automatic": fakeRemoteEmbeddingVector(text, dims)}, "indexes": []string{"automatic"}, "limit": 1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := table.SearchJSON(query)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Contains(result, []byte(`"_id":"after"`)) {
+				t.Fatalf("new document has no searchable generated vector: %s", result)
+			}
+		})
+	}
+}
+
+func TestNativeDiagnosticsOwnDetailsAndResetForSQL(t *testing.T) {
+	db, err := CreateHosted(filepath.Join(t.TempDir(), "db.aflite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.CreateTableJSON("entities", []byte(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	table, err := db.OpenTable("entities")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer table.Close()
+	indexErr := db.AddIndexJSON([]byte(`{"name":"invalid"}`))
+	if !errors.Is(indexErr, InvalidArgument) || !strings.Contains(indexErr.Error(), "MissingIndexType") {
+		t.Fatalf("index diagnostic: %v", indexErr)
+	}
+	_, sqlErr := table.NewSQLSession()
+	if !errors.Is(sqlErr, InvalidArgument) || strings.Contains(sqlErr.Error(), "MissingIndexType") || !strings.Contains(sqlErr.Error(), "root database handle") {
+		t.Fatalf("SQL diagnostic: %v", sqlErr)
+	}
+	if !strings.Contains(indexErr.Error(), "MissingIndexType") {
+		t.Fatal("earlier error detail changed")
+	}
+}
+
+func TestLiteLocalResolverEmbedsMentionsAndMatchesStoredCanonicalEntity(t *testing.T) {
+	modelsDir := os.Getenv("ANTFLY_LITE_EMBEDDING_MODELS_DIR")
+	if modelsDir == "" {
+		t.Skip("set ANTFLY_LITE_EMBEDDING_MODELS_DIR to run the real embedding regression")
+	}
+	db, err := CreateWithOptions(filepath.Join(t.TempDir(), "resolver.aflite"), OpenOptions{Profile: ProfileNative, LocalRuntimeConfigured: true, ModelsDir: modelsDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	caps, err := db.Capabilities()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !caps.LocalInferenceRuntime {
+		t.Skip("local inference runtime is unavailable")
+	}
+	if err := db.CreateTableJSON("entities", []byte(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	entities, err := db.OpenTable("entities")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer entities.Close()
+	if err := entities.AddIndexJSON([]byte(`{"name":"names","type":"embeddings","dims":1024,"field":"canonical_name","metric":"cosine","embedder":{"provider":"antfly","model":"Qwen/Qwen3-Embedding-0.6B-GGUF"}}`)); err != nil {
+		t.Fatal(err)
+	}
+	scorer := `{"comparisons":[{"name":"embedding","left":"name_embedding","right":"name_embedding","levels":[{"when":"cosine > 0.5","weight":8.0},{"else":true,"weight":-6.0}]}],"combine":{"bias":-3.0},"decision":{"match":0.9}}`
+	config := map[string]any{"name": "knowledge", "type": "graph",
+		"source":     map[string]any{"artifact": "kg", "format": "extraction_graph", "mention_edge_type": "mentions"},
+		"artifact":   map[string]any{"name": "kg", "kind": "asset", "source": map[string]any{"type": "field", "value": "kg"}, "content_type": "application/json"},
+		"edge_types": []any{map[string]any{"name": "mentions"}},
+		"resolvers":  []any{map[string]any{"name": "concepts", "table": "entities", "source_artifact": "kg", "resolution_artifact": "resolved", "key_template": "concept/{{ uslug _entity.text }}", "candidate_search": "ann", "candidate_ann_index": "names", "candidate_limit": 1, "name_embedding": "names", "name_embedding_dims": 1024, "scorer_json": scorer, "config_generation": 1}},
+	}
+	raw, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AddIndexJSON(raw); err != nil {
+		t.Fatal(err)
+	}
+	// Seed the ANN candidate through extraction promotion, never a direct
+	// entity-table write. A root drain must make its generated vector visible.
+	if _, err := db.BatchJSON([]byte(`{"inserts":{"claim:seed":{"kg":{"entities":[{"id":"e0","label":"concept","text":"The approval reviewer"}]} }},"sync_level":"write"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.RunUntilIdleStatus(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := entities.LookupJSON("concept/the_approval_reviewer"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.BatchJSON([]byte(`{"inserts":{"claim:reviewer":{"kg":{"entities":[{"id":"e0","label":"concept","text":"Approval reviewer"}]} }},"sync_level":"write"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.RunUntilIdleStatus(); err != nil {
+		t.Fatal(err)
+	}
+	edges, err := db.EdgesJSON("knowledge", "claim:reviewer", "mentions", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parsed []struct {
+		Target string `json:"target_b64"`
+	}
+	if err := json.Unmarshal(edges, &parsed); err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed) != 1 {
+		t.Fatalf("mention edges = %s", edges)
+	}
+	key, err := base64.StdEncoding.DecodeString(parsed[0].Target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(key) != "concept/the_approval_reviewer" {
+		t.Fatalf("generated embeddings failed to merge the mention: %s", key)
+	}
+	query, err := db.ResolveQueryJSON("concepts", []byte(`{"extraction":{"entities":[{"id":"q0","label":"concept","text":"Approval reviewer"}]}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result struct {
+		Resolution struct {
+			Entities []struct {
+				DocRef struct {
+					Key   string `json:"key"`
+					Table string `json:"table"`
+				} `json:"doc_ref"`
+				Decision string `json:"decision"`
+			} `json:"entities"`
+		} `json:"resolution"`
+	}
+	if err := json.Unmarshal(query, &result); err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Resolution.Entities) != 1 || result.Resolution.Entities[0].DocRef.Key != "concept/the_approval_reviewer" || result.Resolution.Entities[0].DocRef.Table != "entities" || result.Resolution.Entities[0].Decision != "match" {
+		t.Fatalf("query embedding/ANN resolution = %s", query)
+	}
+}
+
+func TestResolverIdentityManagement(t *testing.T) {
+	db, err := CreateWithOptions(filepath.Join(t.TempDir(), "identities.aflite"), OpenOptions{Profile: ProfileNative, NoSync: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if cancelled, err := db.CancelReplacement("missing"); err != nil || cancelled {
+		t.Fatalf("cancel missing: %v %v", cancelled, err)
+	}
+	if archive, err := db.BackupJSON([]byte(`{"tables":["default"]}`)); err != nil || len(archive) == 0 {
+		t.Fatalf("scoped backup: %v", err)
+	}
+
+	config := []byte(`{"name":"knowledge","type":"graph","source":{"artifact":"kg","format":"extraction_graph","mention_edge_type":"mentions"},"artifact":{"name":"kg","kind":"asset","source":{"type":"field","value":"kg"},"content_type":"application/json"},"edge_types":[{"name":"mentions"}],"resolvers":[{"name":"concepts","table":"default","source_artifact":"kg","resolution_artifact":"resolved","key_template":"entity/{{ uslug _entity.text }}","promote":false}]}`)
+	if err := db.AddIndexJSON(config); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := db.ResolverIdentitiesJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var active []struct {
+		Config struct {
+			Name    string `json:"name"`
+			Retired bool   `json:"retired"`
+		} `json:"config"`
+	}
+	if err := json.Unmarshal(raw, &active); err != nil {
+		t.Fatal(err)
+	}
+	if len(active) != 1 || active[0].Config.Name != "concepts" || active[0].Config.Retired {
+		t.Fatalf("identities: %s", raw)
+	}
+	if _, err := db.DropResolverIdentity("concepts"); err == nil {
+		t.Fatal("active identity drop succeeded")
+	}
+	if deleted, err := db.DeleteIndex("knowledge"); err != nil || !deleted {
+		t.Fatalf("delete: %v %v", deleted, err)
+	}
+	raw, err = db.ResolverIdentitiesJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(raw, &active); err != nil {
+		t.Fatal(err)
+	}
+	if len(active) != 1 || !active[0].Config.Retired {
+		t.Fatalf("retired identities: %s", raw)
+	}
+	if deleted, err := db.DropResolverIdentity("concepts"); err != nil || !deleted {
+		t.Fatalf("drop: %v %v", deleted, err)
+	}
+	if deleted, err := db.DropResolverIdentity("concepts"); err != nil || deleted {
+		t.Fatalf("repeat drop: %v %v", deleted, err)
 	}
 }

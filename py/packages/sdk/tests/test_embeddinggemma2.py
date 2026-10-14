@@ -22,7 +22,10 @@ def test_abstained_choice_round_trips_without_probabilities():
     }
     raw = {"model": "embeddinggemma2", "answers": [answer], "usage": {"input_tokens": 2, "output_tokens": 0}}
     parsed = InferenceDecideResponse.from_dict(raw)
-    assert isinstance(parsed.answers[0], EmbeddingChoiceAnswer)
+    answers = parsed.answers
+    assert isinstance(answers, list)
+    assert len(answers) == 1
+    assert isinstance(answers[0], EmbeddingChoiceAnswer)
     assert parsed.to_dict() == raw
 
 
@@ -45,7 +48,13 @@ def test_batch_empty_multi_choice_is_distinct_from_abstention():
         "usage": {"input_tokens": 2, "output_tokens": 0},
     }
     parsed = InferenceDecideResponse.from_dict(raw)
-    assert isinstance(parsed.data[0].answers[0], EmbeddingMultiChoiceAnswer)
+    data = parsed.data
+    assert isinstance(data, list)
+    assert len(data) == 1
+    answers = data[0].answers
+    assert isinstance(answers, list)
+    assert len(answers) == 1
+    assert isinstance(answers[0], EmbeddingMultiChoiceAnswer)
     assert parsed.to_dict() == raw
 
 

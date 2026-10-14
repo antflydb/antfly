@@ -41,6 +41,10 @@ pub const Route = struct {
 pub fn parseAlloc(alloc: std.mem.Allocator, path: []const u8) !?Route {
     var parts = std.mem.splitScalar(u8, std.mem.trimStart(u8, path, "/"), '/');
     const first = parts.next() orelse return null;
+    if (std.mem.eql(u8, first, "sources")) {
+        const raw = parts.next() orelse return .{ .kind = .query_source };
+        return .{ .kind = .query_source, .name = try nameAlloc(alloc, raw), .suffix = parts.rest() };
+    }
     if (std.mem.eql(u8, first, "tablespaces")) {
         const raw = parts.next() orelse return .{ .kind = .tablespace };
         return .{ .kind = .tablespace, .name = try nameAlloc(alloc, raw), .suffix = parts.rest() };
@@ -79,7 +83,7 @@ fn tableNameAlloc(alloc: std.mem.Allocator, raw: []const u8) ![]u8 {
 pub fn resourceNameAlloc(alloc: std.mem.Allocator, route: Route) ![]u8 {
     const name = route.name orelse "*";
     return switch (route.kind) {
-        .database, .tablespace => alloc.dupe(u8, name),
+        .database, .tablespace, .query_source => alloc.dupe(u8, name),
         .namespace => std.fmt.allocPrint(alloc, "{s}.{s}", .{ route.database, name }),
         .table => (domain.TableScope{ .database = route.database, .namespace = route.namespace, .table = route.name }).keyAlloc(alloc),
     };

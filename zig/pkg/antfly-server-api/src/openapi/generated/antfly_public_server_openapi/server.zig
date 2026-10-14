@@ -867,6 +867,26 @@ pub fn parseAdministerSqlSettingsBody(allocator: std.mem.Allocator, body: []cons
     return std.json.parseFromSlice(types.SqlSettingMutationRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Get saved query source
+pub const GetQuerySourcePathParams = struct {
+    source_name: []const u8,
+};
+
+/// Create saved query source
+pub const CreateQuerySourcePathParams = struct {
+    source_name: []const u8,
+};
+
+/// Parse the JSON request body for createQuerySource.
+pub fn parseCreateQuerySourceBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(std.json.Value) {
+    return std.json.parseFromSlice(std.json.Value, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Drop saved query source
+pub const DropQuerySourcePathParams = struct {
+    source_name: []const u8,
+};
+
 /// Parse the JSON request body for executeSQL.
 pub fn parseExecuteSQLBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.SQLRequest) {
     return std.json.parseFromSlice(types.SQLRequest, allocator, body, .{ .ignore_unknown_fields = true });
@@ -1223,6 +1243,61 @@ pub const RetryIndexPathParams = struct {
 /// Parse the JSON request body for retryIndex.
 pub fn parseRetryIndexBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_indexes_openapi.IndexMaintenanceRequest) {
     return std.json.parseFromSlice(antfly_indexes_openapi.IndexMaintenanceRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// getLakeCatalog
+pub const GetLakeCatalogPathParams = struct {
+    table_name: []const u8,
+};
+
+/// initializeLakeCatalog
+pub const InitializeLakeCatalogPathParams = struct {
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for initializeLakeCatalog.
+pub fn parseInitializeLakeCatalogBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.LakeCatalogCreateRequest) {
+    return std.json.parseFromSlice(types.LakeCatalogCreateRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// ingestLakeChanges
+pub const IngestLakeChangesPathParams = struct {
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for ingestLakeChanges.
+pub fn parseIngestLakeChangesBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(std.json.Value) {
+    return std.json.parseFromSlice(std.json.Value, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// commitLakeCatalog
+pub const CommitLakeCatalogPathParams = struct {
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for commitLakeCatalog.
+pub fn parseCommitLakeCatalogBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.LakeCatalogCommitRequest) {
+    return std.json.parseFromSlice(types.LakeCatalogCommitRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// getLakeCommitOutcome
+pub const GetLakeCommitOutcomePathParams = struct {
+    table_name: []const u8,
+    commit_id: []const u8,
+};
+
+pub const GetLakeCommitOutcomeParams = struct {
+    request_hash: []const u8,
+};
+
+/// Maintain a writable Iceberg table
+pub const MaintainLakeTablePathParams = struct {
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for maintainLakeTable.
+pub fn parseMaintainLakeTableBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(std.json.Value) {
+    return std.json.parseFromSlice(std.json.Value, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
 /// Synchronize data from external sources (Shopify, Postgres, S3) using a linear merge
@@ -1627,6 +1702,10 @@ pub const routes = [_]Route{
     .{ .method = "PUT", .path = "/secrets/{key}", .operation_id = "putSecret", .request_body = .buffered, .streaming_response = false },
     .{ .method = "DELETE", .path = "/secrets/{key}", .operation_id = "deleteSecret", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/settings", .operation_id = "administerSqlSettings", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/sources", .operation_id = "listQuerySources", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/sources/{sourceName}", .operation_id = "getQuerySource", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/sources/{sourceName}", .operation_id = "createQuerySource", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "DELETE", .path = "/sources/{sourceName}", .operation_id = "dropQuerySource", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/sql", .operation_id = "executeSQL", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/sql/connections", .operation_id = "openSQLConnection", .request_body = .buffered, .streaming_response = false },
     .{ .method = "DELETE", .path = "/sql/connections/{connection_id}", .operation_id = "closeSQLConnection", .request_body = .none, .streaming_response = false },
@@ -1667,6 +1746,12 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}:{action}", .operation_id = "executeGraphMetricAction", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}/repair", .operation_id = "repairIndex", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}/retry", .operation_id = "retryIndex", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/tables/{tableName}/lake/catalog", .operation_id = "getLakeCatalog", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/lake/catalog", .operation_id = "initializeLakeCatalog", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/lake/changes", .operation_id = "ingestLakeChanges", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/lake/commits", .operation_id = "commitLakeCatalog", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/tables/{tableName}/lake/commits/{commitId}", .operation_id = "getLakeCommitOutcome", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/lake/maintenance", .operation_id = "maintainLakeTable", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/merge", .operation_id = "linearMerge", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/query", .operation_id = "queryTable", .request_body = .buffered, .streaming_response = true },
     .{ .method = "POST", .path = "/tables/{tableName}/repair/control-jobs", .operation_id = "startTableRepairControlJob", .request_body = .buffered, .streaming_response = false },
@@ -1798,6 +1883,10 @@ pub const routes = [_]Route{
 //   fn putSecret(self: *Impl, ctx: *httpx.Context, key: []const u8) !httpx.Response
 //   fn deleteSecret(self: *Impl, ctx: *httpx.Context, key: []const u8) !httpx.Response
 //   fn administerSqlSettings(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn listQuerySources(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn getQuerySource(self: *Impl, ctx: *httpx.Context, source_name: []const u8) !httpx.Response
+//   fn createQuerySource(self: *Impl, ctx: *httpx.Context, source_name: []const u8) !httpx.Response
+//   fn dropQuerySource(self: *Impl, ctx: *httpx.Context, source_name: []const u8) !httpx.Response
 //   fn executeSQL(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn openSQLConnection(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn closeSQLConnection(self: *Impl, ctx: *httpx.Context, connection_id: []const u8) !httpx.Response
@@ -1838,6 +1927,12 @@ pub const routes = [_]Route{
 //   fn executeGraphMetricAction(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8, metric_name: []const u8, action: []const u8) !httpx.Response
 //   fn repairIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn retryIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
+//   fn getLakeCatalog(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn initializeLakeCatalog(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn ingestLakeChanges(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn commitLakeCatalog(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn getLakeCommitOutcome(self: *Impl, ctx: *httpx.Context, table_name: []const u8, commit_id: []const u8, params: GetLakeCommitOutcomeParams) !httpx.Response
+//   fn maintainLakeTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn linearMerge(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn queryTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn startTableRepairControlJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response

@@ -27,6 +27,10 @@ const Cancellation = @import("antfly_cancellation").CancellationToken;
 const A = std.mem.Allocator;
 pub const Provider = struct {
     source: *serving.ServingSource,
+    enrichment_columns: bool = false,
+    vector_memo: ?@import("lake_vector_enrichment.zig").Memo = null,
+    progress: ?BuildProgress = null,
+    embedding_options: ?local.inference_managed_embedder.InitOptions = null,
     context: Context,
     limits: stream_api.Limits = .{},
     expected_delete_objects: ?[32]u8 = null,
@@ -34,6 +38,26 @@ pub const Provider = struct {
     only_files: ?[]const bool = null,
     replay: ?*@import("lake_index_build_replay.zig").Replay = null,
     schema_contract: []const local.serverless_query_lake_schema.Column = &.{},
+    pub const BuildProgress = struct {
+        ptr: *anyopaque,
+        save: *const fn (*anyopaque, local.serverless_segment_sidecar_manifest.DeclaredArtifact) anyerror!void,
+        save_batch: ?*const fn (*anyopaque, []const local.serverless_segment_sidecar_manifest.DeclaredArtifact) anyerror!void = null,
+    };
+    pub fn checkpoint(self: *Provider, declaration: local.serverless_segment_sidecar_manifest.DeclaredArtifact) !void {
+        try self.context.ensureActive();
+        if (self.progress) |progress| try progress.save(progress.ptr, declaration);
+    }
+    /// Builders that complete a declaration set together checkpoint it once.
+    /// Per-file builders keep their individual resumable boundaries.
+    pub fn checkpointBatch(self: *Provider, declarations: []const local.serverless_segment_sidecar_manifest.DeclaredArtifact) !void {
+        try self.context.ensureActive();
+        const progress = self.progress orelse return;
+        if (progress.save_batch) |save_batch| {
+            try save_batch(progress.ptr, declarations);
+        } else {
+            for (declarations) |declaration| try self.checkpoint(declaration);
+        }
+    }
     pub fn provider(self: *Provider) @import("../serverless/build/lake_rebuild.zig").RowSourceProvider {
         return .{ .ptr = self, .open_fn = open, .open_with_cancellation_fn = openCanceled };
     }
@@ -61,10 +85,14 @@ pub const Provider = struct {
             cursor.* = .{ .provider = self.*, .binding = binding, .cancellation = cancellation };
             return .{ .kind = kind, .ctx = cursor, .next_batch = FileCursor.next, .deinit_fn = FileCursor.deinit };
         }
-        if (self.replay) |replay| if (try replay.open(a, binding, self.only_file, cancellation)) |source| return source;
+        if (!self.enrichment_columns) if (self.replay) |replay| if (try replay.open(a, binding, self.only_file, cancellation)) |source| return source;
         var names: std.ArrayList([]const u8) = .empty;
         defer names.deinit(a);
-        try names.appendSlice(a, binding.column_bindings);
+        if (self.enrichment_columns) {
+            const schema = if (self.source.iceberg_schema) |selected| selected.columns else self.schema_contract;
+            for (schema) |column| try names.append(a, column.name);
+            if (names.items.len == 0) return error.InvalidLakeEnrichmentSchema;
+        } else try names.appendSlice(a, binding.column_bindings);
         if (self.source.scanner.iceberg_delete_plan) |plan| for (plan.files) |file| for (file.equality_columns) |column| {
             const present = for (names.items) |name| {
                 if (std.mem.eql(u8, name, column)) break true;

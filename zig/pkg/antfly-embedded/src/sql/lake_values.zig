@@ -23,7 +23,7 @@ pub fn comparisonValue(a: std.mem.Allocator, raw: Json, kind: @import("ast.zig")
     const ns: i128 = switch (raw) {
         .integer => |value| value,
         .number_string => |text| std.fmt.parseInt(i128, text, 10) catch return error.InvalidSqlDateTime,
-        .string => |text| @import("../datetime.zig").parseDateTimeToSignedNs(text) orelse return error.InvalidSqlDateTime,
+        .string => |text| @import("../datetime.zig").rangeNanoseconds(raw) orelse @import("../datetime.zig").parseDateTimeToSignedNs(text) orelse return error.InvalidSqlDateTime,
         else => return error.SqlTypeMismatch,
     };
     return if (std.math.cast(i64, ns)) |value| .{ .integer = value } else .{ .number_string = try std.fmt.allocPrint(a, "{d}", .{ns}) };
@@ -41,4 +41,30 @@ test "lake SQL timestamp comparisons normalize signed values offsets and distant
     try std.testing.expectEqual(std.math.Order.gt, try @import("scalar.zig").compare(far, .{ .integer = std.math.maxInt(i64) }));
     try std.testing.expectError(error.InvalidSqlDateTime, comparisonValue(a, .{ .string = "not-a-date" }, .datetime));
     try std.testing.expectEqual(Json.null, try comparisonValue(a, .null, .datetime));
+}
+
+/// Preserve exact NUMERIC lexemes in untyped condition envelopes; ordinary
+/// columns retain their existing normalization and signed timestamp contract.
+pub fn conditionValue(a: std.mem.Allocator, raw: Json, column: @import("catalog.zig").Column) !Json {
+    if (column.element_type == .numeric) return raw;
+    return comparisonValue(a, raw, column.type);
+}
+pub fn comparisonDatum(a: std.mem.Allocator, raw: @import("scalar.zig").Datum, column: @import("catalog.zig").Column) !@import("scalar.zig").Datum {
+    if (column.element_type == .numeric) return @import("describe.zig").coerceDatum(a, raw, column.type, column.element_type);
+    return .{ .value = try comparisonValue(a, raw.value, column.type), .sql_null = raw.sql_null };
+}
+
+test "external lake NUMERIC predicates preserve exact conditions and native cells" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const column: @import("catalog.zig").Column = .{ .name = "k", .path = "k", .type = .number, .element_type = .numeric };
+    const scalar = @import("scalar.zig");
+    const large = try comparisonDatum(a, scalar.Datum.json(try conditionValue(a, .{ .string = "9007199254740993.125" }, column)), column);
+    const adjacent = try comparisonDatum(a, scalar.Datum.json(.{ .string = "9007199254740993.124" }), column);
+    try std.testing.expectEqual(std.math.Order.gt, try scalar.compareDatums(large, adjacent));
+    try std.testing.expect((try comparisonDatum(a, large, column)).numeric == large.numeric);
+    const integer = try comparisonDatum(a, scalar.Datum.json(.{ .integer = 9007199254740993 }), column);
+    const before = try comparisonDatum(a, scalar.Datum.json(.{ .integer = 9007199254740992 }), column);
+    try std.testing.expectEqual(std.math.Order.gt, try scalar.compareDatums(integer, before));
 }

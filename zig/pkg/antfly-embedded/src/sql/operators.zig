@@ -17,6 +17,15 @@
 //! Inputs may borrow a scan page. Competitive top-K rows and aggregate extrema
 //! take ownership before that page closes; discarded rows allocate nothing.
 const std = @import("std");
+pub const TupleMembership = @import("tuple_membership.zig").Index;
+test {
+    _ = @import("tuple_membership.zig");
+}
+pub const OrderedAggregate = @import("ordered_aggregate.zig").State;
+test {
+    _ = @import("ordered_aggregate.zig");
+    _ = @import("ordered_grouped.zig");
+}
 const scalar = @import("scalar.zig");
 const ast = @import("ast.zig");
 const Allocator = std.mem.Allocator;
@@ -36,7 +45,7 @@ pub fn compareRows(left: Row, right: Row, orders: []const Order) !std.math.Order
             const nulls_first = order.nulls_first orelse order.descending;
             return if (a.sql_null == nulls_first) .lt else .gt;
         }
-        const comparison = try scalar.compare(a.value, b.value);
+        const comparison = try scalar.compareDatums(a, b);
         if (comparison != .eq) return if (order.descending) comparison.invert() else comparison;
     }
     return std.math.order(left.ordinal, right.ordinal);
@@ -101,25 +110,40 @@ pub const TopK = struct {
     scratch: ?std.heap.ArenaAllocator = null,
 
     pub fn init(alloc: Allocator, k: usize, orders: []const Order, max_bytes: usize) !TopK {
-        const bytes = std.math.add(usize, std.math.mul(usize, k, @sizeOf(OwnedRow)) catch return error.SqlProgramLimitExceeded, std.math.mul(usize, orders.len, @sizeOf(Order)) catch return error.SqlProgramLimitExceeded) catch return error.SqlProgramLimitExceeded;
+        const bytes = std.math.mul(usize, orders.len, @sizeOf(Order)) catch return error.SqlProgramLimitExceeded;
         if (bytes > max_bytes or orders.len > 256) return error.SqlProgramLimitExceeded;
-        const entries = try alloc.alloc(OwnedRow, k);
-        errdefer alloc.free(entries);
         const owned_orders = try alloc.dupe(Order, orders);
-        return .{ .alloc = alloc, .entries = entries, .orders = owned_orders, .max_bytes = max_bytes, .retained_bytes = bytes, .capacity = k };
+        return .{ .alloc = alloc, .entries = &.{}, .orders = owned_orders, .max_bytes = max_bytes, .retained_bytes = bytes, .capacity = k };
     }
 
     pub fn initWithSpill(alloc: Allocator, k: usize, orders: []const Order, max_bytes: usize, manager: ?*@import("spill.zig").Manager) !TopK {
-        if (manager != null and k > (max_bytes / 4) / @sizeOf(OwnedRow)) {
-            if (orders.len > 256) return error.SqlProgramLimitExceeded;
-            var top: TopK = .{ .alloc = alloc, .entries = &.{}, .orders = try alloc.dupe(Order, orders), .max_bytes = max_bytes, .retained_bytes = 0, .capacity = k, .spill_manager = manager };
-            errdefer alloc.free(top.orders);
-            try top.startSpill();
-            return top;
-        }
         var top = try init(alloc, k, orders, if (manager != null) max_bytes - max_bytes / 4 else max_bytes);
         top.spill_manager = manager;
+        errdefer top.deinit();
+        // Reserve the bounded external-sort path before a large nested sort
+        // competes with its parent for the shared statement allocator.
+        if (manager != null and k > (max_bytes / 4) / @sizeOf(OwnedRow)) try top.startSpill();
         return top;
+    }
+
+    // LIMIT/scan bounds describe maximum retained rows, not actual cardinality.
+    // Grow only for rows observed, charging both live arrays during a copy.
+    fn growEntries(self: *TopK) !void {
+        if (self.count < self.entries.len or self.count == self.capacity) return;
+        const old_len = self.entries.len;
+        var wanted = @min(self.capacity, @max(@as(usize, 8), old_len *| 2));
+        const available = (self.max_bytes -| self.retained_bytes) / @sizeOf(OwnedRow);
+        wanted = @min(wanted, old_len +| available);
+        if (wanted <= old_len) return error.SqlProgramLimitExceeded;
+        if (!self.alloc.resize(self.entries, wanted)) {
+            wanted = @min(wanted, available);
+            if (wanted <= old_len) return error.SqlProgramLimitExceeded;
+            const entries = try self.alloc.alloc(OwnedRow, wanted);
+            @memcpy(entries[0..self.count], self.entries[0..self.count]);
+            self.alloc.free(self.entries);
+            self.entries = entries;
+        } else self.entries.len = wanted;
+        self.retained_bytes += (wanted - old_len) * @sizeOf(OwnedRow);
     }
     fn startSpill(self: *TopK) !void {
         const manager = self.spill_manager orelse return error.SqlProgramLimitExceeded;
@@ -222,13 +246,14 @@ pub const TopK = struct {
     fn addInMemory(self: *TopK, row: Row) !void {
         if (self.finished) return error.InvalidSqlBackendResponse;
         if (row.keys.len != self.orders.len) return error.InvalidSqlBackendResponse;
-        if (self.entries.len == 0) return;
+        if (self.capacity == 0) return;
         // Validate values before mutation, including when there is no prior
         // row to compare; malformed input cannot poison a partly sorted heap.
         for (row.keys) |key| if (!key.sql_null) {
-            _ = try scalar.compare(key.value, key.value);
+            _ = try scalar.compareDatums(key, key);
         };
-        if (self.count == self.entries.len and (try self.compare(row, self.entries[0].row)) != .lt) return;
+        if (self.count == self.capacity and (try self.compare(row, self.entries[0].row)) != .lt) return;
+        try self.growEntries();
         var estimate: usize = 0;
         for (row.values) |value| estimate = std.math.add(usize, estimate, try datumBytes(value)) catch return error.SqlProgramLimitExceeded;
         for (row.keys) |value| estimate = std.math.add(usize, estimate, try datumBytes(value)) catch return error.SqlProgramLimitExceeded;
@@ -335,6 +360,8 @@ pub const Aggregate = struct {
     alloc: Allocator,
     kind: Kind,
     input_type: ?ast.ColumnType,
+    input_element: ?@import("array_value.zig").ElementType = null,
+    numeric: ?*@import("numeric_aggregate.zig").Reducer = null,
     count: u64 = 0,
     integer_sum: i128 = 0,
     number_sum: f64 = 0,
@@ -355,8 +382,18 @@ pub const Aggregate = struct {
     }
 
     pub fn init(alloc: Allocator, kind: Kind, input_type: ?ast.ColumnType) !Aggregate {
+        return initTyped(alloc, kind, input_type, null);
+    }
+
+    pub fn initTyped(alloc: Allocator, kind: Kind, input_type: ?ast.ColumnType, input_element: ?@import("array_value.zig").ElementType) !Aggregate {
         try validate(kind, input_type);
-        var result: Aggregate = .{ .alloc = alloc, .kind = kind, .input_type = input_type, .boolean = kind == .bool_and };
+        var result: Aggregate = .{ .alloc = alloc, .kind = kind, .input_type = input_type, .input_element = input_element, .boolean = kind == .bool_and };
+        if (input_element == .numeric and (kind == .sum or kind == .avg)) {
+            if (input_type != .number) return error.SqlTypeMismatch;
+            const reducer = try alloc.create(@import("numeric_aggregate.zig").Reducer);
+            reducer.* = .{ .alloc = alloc };
+            result.numeric = reducer;
+        }
         if (kind == .pattern_set) {
             const state = try alloc.create(PatternState);
             state.* = .{ .values = .init(alloc) };
@@ -366,6 +403,10 @@ pub const Aggregate = struct {
     }
 
     pub fn deinit(self: *Aggregate) void {
+        if (self.numeric) |reducer| {
+            reducer.deinit();
+            self.alloc.destroy(reducer);
+        }
         if (self.selected) |*value| value.deinit();
         if (self.patterns) |state| {
             state.values.deinit();
@@ -389,11 +430,11 @@ pub const Aggregate = struct {
         }
         if (self.kind == .pattern_set and value.value != .string) return error.SqlTypeMismatch;
         if (self.distinct) {
-            const hash = try scalar.semanticHash(value.value);
+            const hash = try scalar.semanticHashDatum(value);
             var slot = self.distinct_heads.get(hash);
             while (slot) |index| {
                 const entry = self.distinct_values.items[index];
-                if ((try scalar.compare(value.value, entry.row.row.values[0].value)) == .eq) return;
+                if ((try scalar.compareDatums(value, entry.row.row.values[0])) == .eq) return;
                 slot = entry.next;
             }
             try self.distinct_values.ensureUnusedCapacity(self.alloc, 1);
@@ -406,28 +447,32 @@ pub const Aggregate = struct {
         if (self.count == std.math.maxInt(i64)) return error.SqlNumericOutOfRange;
         switch (self.kind) {
             .count => {},
-            .sum, .avg => {
+            .sum, .avg => if (self.numeric) |reducer| {
+                try reducer.add((value.numeric orelse return error.SqlTypeMismatch).*);
+            } else {
                 const number: f64 = switch (value.value) {
                     .integer => |v| @floatFromInt(v),
-                    .float => |v| if (std.math.isFinite(v)) v else return error.SqlNumericOutOfRange,
+                    .float => |v| v,
                     else => return error.SqlTypeMismatch,
                 };
                 if (self.kind == .sum) {
                     if (self.input_type == .integer) {
                         if (value.value != .integer) return error.SqlTypeMismatch;
                         self.integer_sum = std.math.add(i128, self.integer_sum, value.value.integer) catch return error.SqlNumericOutOfRange;
+                    } else if (self.input_element == .float32) {
+                        self.number_sum = try addRealSum(self.number_sum, number);
                     } else {
-                        const adjusted = number - self.compensation;
-                        const total = self.number_sum + adjusted;
-                        if (!std.math.isFinite(total)) return error.SqlNumericOutOfRange;
-                        self.compensation = (total - self.number_sum) - adjusted;
-                        self.number_sum = total;
+                        try addFloatSum(&self.number_sum, &self.compensation, number);
                     }
                 } else {
                     const n: f64 = @floatFromInt(self.count + 1);
                     const delta = number - self.mean;
-                    self.mean = if (std.math.isFinite(delta)) self.mean + delta / n else self.mean * ((n - 1) / n) + number / n;
-                    if (!std.math.isFinite(self.mean)) return error.SqlNumericOutOfRange;
+                    if (!std.math.isFinite(self.mean) or !std.math.isFinite(number)) {
+                        self.mean += number;
+                    } else {
+                        self.mean = if (std.math.isFinite(delta)) self.mean + delta / n else self.mean * ((n - 1) / n) + number / n;
+                        if (!std.math.isFinite(self.mean)) return error.SqlNumericOutOfRange;
+                    }
                 }
             },
             .bool_and, .bool_or => {
@@ -436,7 +481,7 @@ pub const Aggregate = struct {
             },
             .min, .max => {
                 if (self.selected) |current| {
-                    const order = try scalar.compare(value.value, current.row.values[0].value);
+                    const order = try scalar.compareDatums(value, current.row.values[0]);
                     if (order != (if (self.kind == .min) std.math.Order.lt else .gt)) {
                         self.count += 1;
                         return;
@@ -456,10 +501,39 @@ pub const Aggregate = struct {
         self.count += 1;
     }
 
+    /// PostgreSQL float4 SUM rounds each transition and partial combination.
+    /// Finite inputs must not overflow the float4 transition state.
+    pub fn addRealSum(left: f64, right: f64) !f64 {
+        const a: f32 = @floatCast(left);
+        const b: f32 = @floatCast(right);
+        const sum: f32 = a + b;
+        if (std.math.isFinite(left) and std.math.isFinite(right) and !std.math.isFinite(sum)) return error.SqlNumericOutOfRange;
+        return sum;
+    }
+
+    /// Compensation applies only to finite transitions. Special inputs retain
+    /// IEEE sums; finite inputs that overflow still raise a range error.
+    pub fn addFloatSum(sum: *f64, compensation: *f64, value: f64) !void {
+        if (!std.math.isFinite(sum.*) or !std.math.isFinite(value)) {
+            sum.* += value;
+            compensation.* = 0;
+            return;
+        }
+        const adjusted = value - compensation.*;
+        const total = sum.* + adjusted;
+        if (!std.math.isFinite(total)) return error.SqlNumericOutOfRange;
+        compensation.* = (total - sum.*) - adjusted;
+        sum.* = total;
+    }
+
     pub fn finish(self: *const Aggregate) !Datum {
         if (self.kind == .count) return Datum.json(.{ .integer = std.math.cast(i64, self.count) orelse return error.SqlNumericOutOfRange });
         if (self.kind == .pattern_set) return Datum.json(.{ .array = self.patterns.?.values });
         if (self.count == 0) return .{};
+        if (self.numeric) |reducer| {
+            if (reducer.state.count != self.count) return error.InvalidSqlBackendResponse;
+            return Datum.typedNumeric((try reducer.finish(self.kind == .avg)) orelse return error.InvalidSqlBackendResponse);
+        }
         return switch (self.kind) {
             .count => unreachable,
             .sum => Datum.json(if (self.input_type == .integer) .{ .integer = std.math.cast(i64, self.integer_sum) orelse return error.SqlNumericOutOfRange } else .{ .float = self.number_sum }),
@@ -471,13 +545,34 @@ pub const Aggregate = struct {
     }
 };
 
-pub const AggregateSpec = struct { kind: Aggregate.Kind, input_type: ?ast.ColumnType = null, distinct: bool = false };
+pub const AggregateSpec = struct { kind: Aggregate.Kind, input_type: ?ast.ColumnType = null, input_element: ?@import("array_value.zig").ElementType = null, distinct: bool = false };
+
+/// Associative exact states may use worker and hash-partition reduction.
+/// This is not primitive SIMD eligibility: NUMERIC has its own flat lane.
+pub fn exactMergeable(spec: AggregateSpec) bool {
+    if (spec.distinct) return false;
+    return spec.kind == .count or spec.kind == .bool_and or spec.kind == .bool_or or
+        (spec.kind == .sum and spec.input_type == .integer) or
+        ((spec.kind == .sum or spec.kind == .avg) and spec.input_type == .number and spec.input_element == .numeric);
+}
 pub const GroupBatch = struct {
     keys: @import("execution_batch.zig").Batch,
     aggregates: @import("execution_batch.zig").Batch,
     ordinals: []const u64,
 };
 pub const GroupResult = struct {
+    /// Compact in-process partials materialize one reducer at a time. The
+    /// reader and its packed inputs live until the provider's next page;
+    /// allocations made by read belong to the consumer's per-partial scratch.
+    pub const StateReader = struct {
+        ptr: *const anyopaque,
+        count: usize,
+        read: *const fn (*const anyopaque, Allocator, usize) anyerror!Aggregate,
+    };
+    /// In-process partials borrow typed reducers from the page arena. Durable
+    /// and backend interchange continues to use versioned aggregate cells.
+    typed_states: ?[]const Aggregate = null,
+    state_reader: ?StateReader = null,
     keys: []const Datum,
     aggregates: []const Datum,
     ordinal: u64,
@@ -530,7 +625,7 @@ pub const HashJoin = struct {
                 self.owner.probes += 1;
                 if (decoded.row.keys.len != self.keys.len) return error.InvalidSqlSpill;
                 var equal = true;
-                for (decoded.row.keys, self.keys) |left, right| if (left.sql_null or right.sql_null or (try scalar.compare(left.value, right.value)) != .eq) {
+                for (decoded.row.keys, self.keys) |left, right| if (left.sql_null or right.sql_null or (try scalar.compareDatums(left, right)) != .eq) {
                     equal = false;
                     break;
                 };
@@ -624,7 +719,7 @@ pub const HashJoin = struct {
         for (keys) |key| {
             if (key.sql_null) return null;
             var bytes: [8]u8 = undefined;
-            std.mem.writeInt(u64, &bytes, try scalar.semanticHash(key.value), .little);
+            std.mem.writeInt(u64, &bytes, try scalar.semanticHashDatum(key), .little);
             hasher.update(&bytes);
         }
         return hasher.final();
@@ -662,6 +757,8 @@ pub const HashJoin = struct {
             if (row.len > 256 or (self.key_count != null and row.len != self.key_count.?)) return error.InvalidSqlBackendResponse;
             for (row) |value| needed +|= (try datumBytes(value)) *| 4;
         }
+        needed +|= self.value_columns.dictionaryGrowthBytes(batch.len()) *| 2;
+        needed +|= self.key_columns.dictionaryGrowthBytes(keys.len) *| 2;
         if (needed > self.budget.limit / 2 -| self.budget.live) return false;
         const hashes = try @import("batch_hash.zig").rows(a, keys, false);
         defer a.free(hashes);
@@ -818,6 +915,7 @@ pub const Grouped = struct {
     results: std.heap.ArenaAllocator,
     heads: std.AutoHashMapUnmanaged(u64, usize) = .empty,
     rows_seen: u64 = 0,
+    source_ordinal: ?u64 = null,
     hash_probes: u64 = 0,
     last_group: ?usize = null,
     failed: bool = false,
@@ -905,6 +1003,21 @@ pub const Grouped = struct {
         self.result_cursor += 1;
         return result;
     }
+    pub fn nextTypedPartialResult(self: *Grouped, a: Allocator) !?GroupResult {
+        if (self.external) |external| {
+            // Decode once at the spill boundary, before any compact join pair.
+            const result = try external.nextPartial(a) orelse return null;
+            const states = try a.alloc(Aggregate, result.aggregates.len);
+            for (states, result.aggregates, self.specs) |*state, cell, spec| state.* = try @import("aggregate_partial.zig").decode(a, cell, spec);
+            return .{ .keys = result.keys, .aggregates = &.{}, .typed_states = states, .ordinal = result.ordinal };
+        }
+        if (self.result_cursor == self.groups.items.len) return null;
+        const index = self.result_cursor;
+        self.result_cursor += 1;
+        const states = try a.alloc(Aggregate, self.specs.len);
+        for (self.state_columns, states) |column, *state| state.* = try column.snapshot(a, index);
+        return .{ .keys = try self.key_columns.row(a, index), .aggregates = &.{}, .typed_states = states, .ordinal = self.groups.items[index].ordinal };
+    }
     pub fn nextPartialResult(self: *Grouped, a: Allocator) !?GroupResult {
         if (self.external) |external| return external.nextPartial(a);
         if (self.result_cursor == self.groups.items.len) return null;
@@ -953,13 +1066,10 @@ pub const Grouped = struct {
             if (disk_patterns) try self.startSpill();
         }
         if (self.external == null and self.limits.spill != null) {
-            var needed: usize = 4096 + self.specs.len * @sizeOf(Aggregate) * 2;
-            for (keys) |key| needed +|= (try datumBytes(key)) *| 4;
-            for (inputs) |input| needed +|= (try datumBytes(input)) *| 4;
-            if (self.budget.live > self.budget.limit / 2 or needed > self.budget.limit -| self.budget.live) try self.startSpill();
+            if (!try self.canRetain(keys, inputs)) try self.startSpill();
         }
         if (self.external) |external| {
-            try external.add(keys, inputs, self.rows_seen);
+            try external.add(keys, inputs, self.source_ordinal orelse self.rows_seen);
             self.rows_seen = std.math.add(u64, self.rows_seen, 1) catch return error.SqlNumericOutOfRange;
             return;
         }
@@ -990,7 +1100,7 @@ pub const Grouped = struct {
             for (column) |value| needed +|= (try datumBytes(value)) *| 4;
         };
         var fast = self.external == null and needed <= self.budget.limit -| self.budget.live and self.budget.live <= self.budget.limit / 2;
-        for (self.specs) |spec| if (spec.distinct or spec.kind == .pattern_set) {
+        for (self.specs) |spec| if (spec.distinct or spec.kind == .pattern_set or spec.input_element == .numeric) {
             fast = false;
         };
         if (!fast) {
@@ -1019,6 +1129,18 @@ pub const Grouped = struct {
     /// Admission precedes mutation; disk, DISTINCT and pattern reducers use
     /// the same ordered fallback as row input.
     pub fn addEncodedColumns(self: *Grouped, keys: []const @import("execution_batch.zig").Batch, inputs: []const @import("execution_batch.zig").Batch, count: usize) !void {
+        return self.addEncodedColumnsIdentified(keys, inputs, count, null);
+    }
+    /// Source identity lets disjoint key partitions retain columnar state
+    /// without rehashing or losing first-occurrence ordinals after selection.
+    pub const InputIdentity = struct { ordinals: []const u64, hashes: []const ?u64 };
+    pub fn addEncodedColumnsIdentified(self: *Grouped, keys: []const @import("execution_batch.zig").Batch, inputs: []const @import("execution_batch.zig").Batch, count: usize, identity: ?InputIdentity) !void {
+        const previous_ordinal = self.source_ordinal;
+        defer self.source_ordinal = previous_ordinal;
+        if (identity) |ids| {
+            if (ids.ordinals.len != count or ids.hashes.len != count) return error.InvalidSqlBackendResponse;
+            for (ids.hashes) |hash| if (hash == null) return error.InvalidSqlBackendResponse;
+        }
         if (self.failed or self.finished or inputs.len != self.specs.len or keys.len > 256 or (self.key_count != null and self.key_count.? != keys.len)) return error.InvalidSqlBackendResponse;
         for (keys) |column| if (column.len() != count or column.width() != 1) return error.InvalidSqlBackendResponse;
         for (inputs) |column| if (column.len() != count or column.width() != 1) return error.InvalidSqlBackendResponse;
@@ -1036,13 +1158,14 @@ pub const Grouped = struct {
             for (0..count) |index| needed +|= (try datumBytes(try column.cell(a, index, 0))) *| 4;
         };
         var fast = self.external == null and needed <= self.budget.limit -| self.budget.live and self.budget.live <= self.budget.limit / 2;
-        for (self.specs) |spec| if (spec.distinct or spec.kind == .pattern_set) {
+        for (self.specs) |spec| if (spec.distinct or spec.kind == .pattern_set or spec.input_element == .numeric) {
             fast = false;
         };
         if (!fast) {
             for (0..count) |index| {
                 for (keys, row_keys) |column, *cell| cell.* = try column.cell(a, index, 0);
                 for (inputs, row_inputs) |column, *cell| cell.* = try column.cell(a, index, 0);
+                if (identity) |ids| self.source_ordinal = ids.ordinals[index];
                 try self.add(row_keys, row_inputs);
             }
             return;
@@ -1050,9 +1173,10 @@ pub const Grouped = struct {
         const ids = try a.alloc(usize, count);
         self.key_count = keys.len;
         errdefer self.failed = true;
-        const hashes = try @import("batch_hash.zig").encodedColumns(a, keys, count, true);
+        const hashes = if (identity) |ids_| ids_.hashes else try @import("batch_hash.zig").encodedColumns(a, keys, count, true);
         for (ids, 0..) |*id, index| {
             for (keys, row_keys) |column, *cell| cell.* = try column.cell(a, index, 0);
+            if (identity) |identity_| self.source_ordinal = identity_.ordinals[index];
             id.* = try self.resolveGroupHashed(row_keys, hashes[index].?);
             self.rows_seen = std.math.add(u64, self.rows_seen, 1) catch return error.SqlNumericOutOfRange;
         }
@@ -1063,10 +1187,42 @@ pub const Grouped = struct {
     /// probe per row. Validate the batch before changing state; unsupported
     /// kinds, DISTINCT, mixed values and disk groups retain ordered updates.
     pub fn canRetain(self: *const Grouped, keys: []const Datum, inputs: []const Datum) !bool {
-        var needed: usize = 4096 + self.specs.len * @sizeOf(Aggregate) * 2;
+        return self.canRetainAdditional(keys, inputs, 0);
+    }
+    fn canRetainAdditional(self: *const Grouped, keys: []const Datum, inputs: []const Datum, extra: usize) !bool {
+        var needed: usize = extra +| (4096 + self.specs.len * @sizeOf(Aggregate) * 2);
         needed +|= (try self.key_columns.appendBytes(keys)) *| 4;
         for (inputs) |input| needed +|= (try datumBytes(input)) *| 4;
+        needed +|= try self.numericGrowth(keys, inputs);
         return self.budget.live <= self.budget.limit / 2 and needed <= self.budget.limit -| self.budget.live;
+    }
+    fn numericGrowth(self: *const Grouped, keys: []const Datum, inputs: []const Datum) !usize {
+        if (inputs.len == 0) return 0;
+        const present = for (self.specs) |spec| {
+            if (spec.input_element == .numeric and (spec.kind == .sum or spec.kind == .avg)) break true;
+        } else false;
+        if (!present) return 0;
+        const slot = try self.findGroup(keys);
+        var bytes: usize = 0;
+        for (self.specs, self.state_columns, inputs) |spec, column, input| {
+            if (input.sql_null or spec.input_element != .numeric or (spec.kind != .sum and spec.kind != .avg)) continue;
+            const value = input.numeric orelse return error.SqlTypeMismatch;
+            if (value.kind == .finite) bytes +|= column.numericGrowth(slot, value.weight, value.digits.len);
+        }
+        return bytes;
+    }
+    fn numericStateGrowth(self: *const Grouped, keys: []const Datum, states: []const Aggregate, slots: ?[]const u16) !usize {
+        const present = for (states) |state| {
+            if (state.numeric != null) break true;
+        } else false;
+        if (!present) return 0;
+        const slot = try self.findGroup(keys);
+        var bytes: usize = 0;
+        for (states, 0..) |state, index| if (state.numeric) |reducer| {
+            const column = if (slots) |mapping| mapping[index] else index;
+            bytes +|= self.state_columns[column].numericGrowth(slot, reducer.state.weight, reducer.state.buckets.items.len);
+        };
+        return bytes;
     }
     pub fn addOrdered(self: *Grouped, keys: []const Datum, inputs: []const Datum, ordinal: u64) !void {
         const prior_groups = self.groups.items.len;
@@ -1102,7 +1258,10 @@ pub const Grouped = struct {
             const ordinal = std.math.add(u64, ordinal_base, group.ordinal) catch return error.SqlNumericOutOfRange;
             for (source.state_columns, states) |*column, *state| state.* = try column.snapshot(arena.allocator(), index);
             self.key_count = keys.len;
-            if (self.external == null and self.limits.spill != null and !try self.canRetain(keys, empty)) try self.startSpill();
+            if (self.external == null and self.limits.spill != null) {
+                const bytes = try self.numericStateGrowth(keys, states, null);
+                if (!try self.canRetainAdditional(keys, empty, bytes)) try self.startSpill();
+            }
             if (self.external) |external| {
                 try external.partial(keys, states, ordinal);
             } else {
@@ -1118,6 +1277,18 @@ pub const Grouped = struct {
         return self.importPartialMapped(keys, cells, null, ordinal);
     }
     pub fn importPartialMapped(self: *Grouped, keys: []const Datum, cells: []const Datum, slots: ?[]const u16, ordinal: u64) !void {
+        return self.importPartialMappedAdmitted(keys, cells, slots, ordinal, false);
+    }
+    /// Decode once and prove the entire merge allocation before changing any
+    /// group. Partition reducers may spill a declined checkpoint unchanged.
+    pub fn tryImportPartial(self: *Grouped, keys: []const Datum, cells: []const Datum, ordinal: u64) !bool {
+        self.importPartialMappedAdmitted(keys, cells, null, ordinal, true) catch |err| return switch (err) {
+            error.SqlAggregateAdmissionExceeded => false,
+            else => err,
+        };
+        return true;
+    }
+    fn importPartialMappedAdmitted(self: *Grouped, keys: []const Datum, cells: []const Datum, slots: ?[]const u16, ordinal: u64, require_fit: bool) !void {
         if (slots) |mapping| {
             if (mapping.len == 0 or mapping.len != cells.len or mapping.len > self.specs.len) return error.InvalidSqlSpill;
             for (mapping, 0..) |slot, i| {
@@ -1137,16 +1308,40 @@ pub const Grouped = struct {
             state.* = try @import("aggregate_partial.zig").decode(a, value, self.specs[slot]);
             initialized += 1;
         }
+        return self.importTypedPartialMappedAdmitted(keys, states, slots, ordinal, require_fit);
+    }
+    pub fn importTypedPartialMapped(self: *Grouped, keys: []const Datum, states: []const Aggregate, slots: ?[]const u16, ordinal: u64) !void {
+        return self.importTypedPartialMappedAdmitted(keys, states, slots, ordinal, false);
+    }
+    fn importTypedPartialMappedAdmitted(self: *Grouped, keys: []const Datum, states: []const Aggregate, slots: ?[]const u16, ordinal: u64, require_fit: bool) !void {
+        if (slots) |mapping| {
+            if (mapping.len == 0 or mapping.len != states.len or mapping.len > self.specs.len) return error.InvalidSqlSpill;
+            for (mapping, 0..) |slot, i| {
+                if (slot >= self.specs.len) return error.InvalidSqlSpill;
+                for (mapping[0..i]) |prior| if (prior == slot) return error.InvalidSqlSpill;
+            }
+        } else if (states.len != self.specs.len) return error.InvalidSqlSpill;
+        for (states, 0..) |state, i| {
+            const spec = self.specs[if (slots) |mapping| mapping[i] else i];
+            if (state.kind != spec.kind or state.input_type != spec.input_type or state.input_element != spec.input_element or state.distinct != spec.distinct) return error.InvalidSqlSpill;
+        }
+        var arena = std.heap.ArenaAllocator.init(self.backing);
+        defer arena.deinit();
+        const a = arena.allocator();
         var input_storage: [256]Datum = undefined;
         const inputs = input_storage[0..self.specs.len];
         @memset(inputs, .{});
         self.key_count = keys.len;
         var state_bytes: usize = 0;
         for (states) |state| {
+            if (state.numeric) |reducer| state_bytes +|= (reducer.state.buckets.items.len *| @sizeOf(i128) +| @sizeOf(@import("numeric_aggregate.zig").Reducer)) *| 4;
             if (state.selected) |selected| state_bytes +|= (try datumBytes(selected.row.values[0])) *| 4;
             for (state.distinct_values.items) |entry| state_bytes +|= (try datumBytes(entry.row.row.values[0]) +| @sizeOf(Aggregate)) *| 4;
         }
-        if (self.external == null and self.limits.spill != null and (state_bytes > self.budget.limit -| self.budget.live or !try self.canRetain(keys, inputs))) try self.startSpill();
+        state_bytes +|= try self.numericStateGrowth(keys, states, slots);
+        if (self.external == null and !try self.canRetainAdditional(keys, inputs, state_bytes)) {
+            if (self.limits.spill != null) try self.startSpill() else if (require_fit) return error.SqlAggregateAdmissionExceeded;
+        }
         if (self.external) |external| {
             if (slots) |mapping| {
                 // Existing spill frames are dense. Expand only at this durable
@@ -1155,14 +1350,14 @@ pub const Grouped = struct {
                 var initialized_dense: usize = 0;
                 defer for (dense[0..initialized_dense]) |*state| state.deinit();
                 for (dense, self.specs) |*state, spec| {
-                    state.* = try Aggregate.init(a, spec.kind, spec.input_type);
+                    state.* = try Aggregate.initTyped(a, spec.kind, spec.input_type, spec.input_element);
                     state.distinct = spec.distinct;
                     initialized_dense += 1;
                 }
-                for (mapping, cells) |slot, value| {
+                for (mapping, states) |slot, value| {
                     // A separate decode gives the dense frame its own payload
                     // ownership and keeps failure cleanup independent.
-                    const replacement = try @import("aggregate_partial.zig").decode(a, value, self.specs[slot]);
+                    const replacement = try @import("aggregate_partial.zig").decode(a, try @import("aggregate_partial.zig").cell(a, value), self.specs[slot]);
                     dense[slot].deinit();
                     dense[slot] = replacement;
                 }
@@ -1344,15 +1539,26 @@ pub const Grouped = struct {
         self.rows_seen = std.math.add(u64, self.rows_seen, 1) catch return error.SqlNumericOutOfRange;
     }
 
-    fn resolveGroup(self: *Grouped, keys: []const Datum) !usize {
+    fn groupHash(keys: []const Datum) !u64 {
         var hasher = std.hash.Wyhash.init(0);
         for (keys) |key| {
             var bytes: [9]u8 = undefined;
             bytes[0] = @intFromBool(key.sql_null);
-            std.mem.writeInt(u64, bytes[1..9], if (key.sql_null) 0 else try scalar.semanticHash(key.value), .little);
+            std.mem.writeInt(u64, bytes[1..9], if (key.sql_null) 0 else try scalar.semanticHashDatum(key), .little);
             hasher.update(&bytes);
         }
-        return self.resolveGroupHashed(keys, hasher.final());
+        return hasher.final();
+    }
+    fn findGroup(self: *const Grouped, keys: []const Datum) !?usize {
+        var slot = self.heads.get(try groupHash(keys));
+        while (slot) |index| {
+            if (try self.key_columns.equal(self.backing, index, keys, true)) return index;
+            slot = self.groups.items[index].next;
+        }
+        return null;
+    }
+    fn resolveGroup(self: *Grouped, keys: []const Datum) !usize {
+        return self.resolveGroupHashed(keys, try groupHash(keys));
     }
     fn resolveGroupHashed(self: *Grouped, keys: []const Datum, hash: u64) !usize {
         var slot = self.heads.get(hash);
@@ -1375,7 +1581,7 @@ pub const Grouped = struct {
         _ = try self.key_columns.append(keys);
         for (self.state_columns) |*column| try column.append(alloc);
         const index = self.groups.items.len;
-        self.groups.appendAssumeCapacity(.{ .next = self.heads.get(hash), .ordinal = self.rows_seen });
+        self.groups.appendAssumeCapacity(.{ .next = self.heads.get(hash), .ordinal = self.source_ordinal orelse self.rows_seen });
         self.heads.putAssumeCapacity(hash, index);
         return index;
     }
@@ -1399,7 +1605,30 @@ pub const Grouped = struct {
     }
 };
 
-pub fn cloneDatum(alloc: Allocator, value: Datum) !Datum {
+pub fn cloneDatum(alloc: Allocator, value: Datum) anyerror!Datum {
+    if (value.numeric) |number| {
+        if (value.sql_null or value.array != null or value.patterns != null or value.value != .null) return error.SqlTypeMismatch;
+        const exact = @import("numeric_value.zig");
+        var ctx: exact.Context = .{ .alloc = alloc };
+        try exact.validateCanonical(&ctx, number.*);
+        const owned = try alloc.create(exact.Value);
+        errdefer alloc.destroy(owned);
+        owned.* = number.*;
+        owned.digits = try alloc.dupe(u16, number.digits);
+        return Datum.typedNumeric(owned);
+    }
+    if (value.array) |array| {
+        if (value.sql_null or value.patterns != null or value.value != .null) return error.SqlTypeMismatch;
+        const owned = try alloc.create(@import("array_value.zig").Value);
+        const dimensions = try alloc.dupe(@import("array_value.zig").Dimension, array.dimensions);
+        const elements = try alloc.alloc(Datum, array.elements.len);
+        for (array.elements, elements) |element, *out| {
+            if (element.array != null) return error.SqlTypeMismatch;
+            out.* = try cloneDatum(alloc, element);
+        }
+        owned.* = .{ .element_type = array.element_type, .dimensions = dimensions, .elements = elements };
+        return Datum.typedArray(owned);
+    }
     return .{ .value = try cloneJson(alloc, value.value, 0), .sql_null = value.sql_null, .patterns = value.patterns };
 }
 
@@ -1423,7 +1652,16 @@ fn cloneJson(alloc: Allocator, value: Json, depth: usize) error{ OutOfMemory, Sq
         else => value,
     };
 }
-pub fn datumBytes(value: Datum) !usize {
+pub fn datumBytes(value: Datum) anyerror!usize {
+    if (value.numeric) |number| return @sizeOf(Datum) + @sizeOf(@import("numeric_value.zig").Value) + number.digits.len * 2;
+    if (value.array) |array| {
+        var bytes: usize = @sizeOf(Datum) + @sizeOf(@import("array_value.zig").Value) + array.dimensions.len * @sizeOf(@import("array_value.zig").Dimension);
+        for (array.elements) |element| {
+            if (element.array != null) return error.SqlTypeMismatch;
+            bytes +|= try datumBytes(element);
+        }
+        return bytes;
+    }
     return jsonBytes(value.value, 0);
 }
 fn jsonBytes(value: Json, depth: usize) error{SqlProgramLimitExceeded}!usize {
@@ -1440,6 +1678,38 @@ fn jsonBytes(value: Json, depth: usize) error{SqlProgramLimitExceeded}!usize {
         else => {},
     }
     return size;
+}
+
+test "SQL typed array physical keys preserve ordering hashes join equality and copied ownership" {
+    const arrays = @import("array_value.zig");
+    const a = std.testing.allocator;
+    const elements = &.{ Datum.json(.{ .integer = 1 }), Datum.json(.{ .integer = 2 }) };
+    const first = try arrays.Value.init(.int32, &.{.{ .length = 2, .lower = 0 }}, elements, .{});
+    const second = try arrays.Value.init(.int32, &.{.{ .length = 2, .lower = 1 }}, elements, .{});
+    const first_cell = Datum.typedArray(&first);
+    const second_cell = Datum.typedArray(&second);
+    try std.testing.expectEqual(std.math.Order.lt, try scalar.compareDatums(first_cell, second_cell));
+    try std.testing.expect(try scalar.semanticHashDatum(first_cell) != try scalar.semanticHashDatum(second_cell));
+    try std.testing.expect(@import("sort_key.zig").encode(&.{first_cell}, &[_]Order{.{}}) == null);
+    var top = try TopK.init(a, 2, &.{.{}}, 128 * 1024);
+    defer top.deinit();
+    try top.add(.{ .values = &.{second_cell}, .keys = &.{second_cell}, .ordinal = 0 });
+    try top.add(.{ .values = &.{first_cell}, .keys = &.{first_cell}, .ordinal = 1 });
+    const ordered = try top.finish(a);
+    defer a.free(ordered);
+    try std.testing.expectEqual(@as(u64, 1), ordered[0].ordinal);
+    try std.testing.expect(ordered[0].values[0].array.? != &first);
+    const join = try HashJoin.create(a, .{});
+    defer join.deinit();
+    try join.add(&.{first_cell}, &.{first_cell});
+    try join.add(&.{second_cell}, &.{second_cell});
+    var probe = try join.probe(&.{first_cell});
+    const matched = (try probe.next()).?;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const values = try matched.materializeValues(arena.allocator());
+    try std.testing.expectEqual(@as(i32, 0), values[0].array.?.dimensions[0].lower);
+    try std.testing.expect((try probe.next()) == null);
 }
 
 test "SQL top K retains bounded competitive rows with stable null ordering" {
@@ -1464,6 +1734,62 @@ test "SQL top K retains bounded competitive rows with stable null ordering" {
     try std.testing.expectEqual(@as(u64, 3), descending[0].ordinal);
     try std.testing.expectEqual(@as(u64, 1), descending[1].ordinal);
     try std.testing.expectEqual(@as(u64, 2), descending[2].ordinal);
+}
+
+test "SQL top K sparse logical ceilings reserve only admitted heap capacity" {
+    var top = try TopK.init(std.testing.allocator, 10_000_000, &.{.{}}, 64 * 1024);
+    defer top.deinit();
+    try std.testing.expectEqual(@as(usize, 0), top.entries.len);
+    for ([_]i64{ 2, 1 }, 0..) |number, ordinal| {
+        const value = Datum.json(.{ .integer = number });
+        try top.add(.{ .values = &.{value}, .keys = &.{value}, .ordinal = ordinal });
+    }
+    const rows = try top.finish(std.testing.allocator);
+    defer std.testing.allocator.free(rows);
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    try std.testing.expectEqual(@as(i64, 1), rows[0].values[0].value.integer);
+    try std.testing.expectEqual(@as(i64, 2), rows[1].values[0].value.integer);
+    try std.testing.expect(top.retained_bytes < 16 * 1024);
+    std.debug.print("SQL sparse topK: logical_k=10000000 rows=2 heap_slots={d} retained_bytes={d}\n", .{ top.entries.len, top.retained_bytes });
+}
+
+test "SQL top K growing heaps preserve the logical limit under allocation faults" {
+    const Harness = struct {
+        fn run(alloc: Allocator) !void {
+            var top = try TopK.init(alloc, 33, &.{.{}}, 256 * 1024);
+            defer top.deinit();
+            for (0..70) |ordinal| {
+                const value = Datum.json(.{ .integer = @intCast(69 - ordinal) });
+                try top.add(.{ .values = &.{value}, .keys = &.{value}, .ordinal = ordinal });
+            }
+            const rows = try top.finish(alloc);
+            defer alloc.free(rows);
+            try std.testing.expectEqual(@as(usize, 33), rows.len);
+            for (rows, 0..) |row, ordinal| try std.testing.expectEqual(@as(i64, @intCast(ordinal)), row.values[0].value.integer);
+            try std.testing.expectEqual(@as(usize, 33), top.entries.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
+test "SQL top K growing heaps retain an intact prefix when the byte budget is exhausted" {
+    var top = try TopK.init(std.testing.allocator, 10_000_000, &.{.{}}, 8 * 1024);
+    defer top.deinit();
+    var admitted: usize = 0;
+    for (0..100) |ordinal| {
+        const value = Datum.json(.{ .integer = @intCast(ordinal) });
+        top.add(.{ .values = &.{value}, .keys = &.{value}, .ordinal = ordinal }) catch |err| {
+            try std.testing.expectEqual(error.SqlProgramLimitExceeded, err);
+            break;
+        };
+        admitted += 1;
+    }
+    try std.testing.expect(admitted > 0 and admitted < 100);
+    try std.testing.expect(top.retained_bytes <= top.max_bytes);
+    const rows = try top.finish(std.testing.allocator);
+    defer std.testing.allocator.free(rows);
+    try std.testing.expectEqual(admitted, rows.len);
+    for (rows, 0..) |row, ordinal| try std.testing.expectEqual(@as(i64, @intCast(ordinal)), row.values[0].value.integer);
 }
 
 test "SQL top K encoding releases retained rows incrementally" {
@@ -1602,6 +1928,22 @@ test "SQL pattern aggregate retains distinct nullable patterns within quota" {
         };
     }
     try std.testing.expect(exhausted);
+}
+
+test "SQL top K admits sparse input under a large logical row limit" {
+    var quota: MemoryBudget = .{ .backing = std.testing.allocator, .limit = 8192 };
+    var top = try TopK.init(quota.allocator(), 10_000_000, &.{.{}}, 8192);
+    defer top.deinit();
+    try std.testing.expectEqual(@as(usize, 0), top.entries.len);
+    for (0..20) |i| {
+        const value = Datum.json(.{ .integer = @intCast(20 - i) });
+        try top.add(.{ .values = &.{value}, .keys = &.{value}, .ordinal = i });
+    }
+    const result = try top.finish(std.testing.allocator);
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqual(@as(usize, 20), result.len);
+    for (result, 0..) |row, i| try std.testing.expectEqual(@as(i64, @intCast(i + 1)), row.values[0].value.integer);
+    try std.testing.expect(quota.peak <= quota.limit);
 }
 
 test "SQL top K replacement churn stays bounded by actual allocation quota" {
@@ -1803,6 +2145,59 @@ test "SQL spilled aggregate partials merge averages extrema booleans and high ca
     try std.testing.expectEqual(@as(i64, 500), result.aggregates[7].value.integer);
     try std.testing.expectEqual(@as(i64, 124750), result.aggregates[8].value.integer);
     try std.testing.expect((try group.nextResult(arena.allocator())) == null);
+}
+
+test "SQL NUMERIC aggregate exponent gaps spill before row worker and checkpoint mutation" {
+    const numeric = @import("numeric_value.zig");
+    const a = std.testing.allocator;
+    var context: numeric.Context = .{ .alloc = a };
+    var high = try numeric.parse(&context, "1e10000");
+    defer high.deinit();
+    var low = try numeric.parse(&context, "1e-1000");
+    defer low.deinit();
+    var expected = try numeric.add(&context, high.value, low.value);
+    defer expected.deinit();
+    const Check = struct {
+        fn call(_: *anyopaque) anyerror!void {}
+    };
+    const spec: AggregateSpec = .{ .kind = .sum, .input_type = .number, .input_element = .numeric };
+    var token: u8 = 0;
+    for (0..3) |path| {
+        var quota: MemoryBudget = .{ .backing = std.heap.page_allocator, .limit = 512 * 1024 };
+        defer std.debug.assert(quota.live == 0);
+        const alloc = quota.allocator();
+        var manager: @import("spill.zig").Manager = .{ .alloc = alloc, .io = std.testing.io, .context = &token, .checkpoint = Check.call };
+        defer manager.deinit();
+        const group = try Grouped.create(alloc, &.{spec}, .{ .bytes = 64 * 1024, .spill = &manager });
+        defer group.deinit();
+        try group.add(&.{}, &.{Datum.typedNumeric(&low.value)});
+        try std.testing.expect(group.external == null);
+        switch (path) {
+            0 => try group.add(&.{}, &.{Datum.typedNumeric(&high.value)}),
+            1 => {
+                const worker = try Grouped.create(alloc, &.{spec}, .{});
+                defer worker.deinit();
+                try worker.add(&.{}, &.{Datum.typedNumeric(&high.value)});
+                try group.mergeExact(worker, 1);
+            },
+            else => {
+                var partial = try Aggregate.initTyped(alloc, .sum, .number, .numeric);
+                defer partial.deinit();
+                try partial.update(Datum.typedNumeric(&high.value));
+                const encoded = try @import("aggregate_partial.zig").cell(alloc, partial);
+                defer alloc.free(encoded.value.string);
+                try group.importPartial(&.{}, &.{encoded}, 1);
+            },
+        }
+        try std.testing.expect(group.external != null);
+        try std.testing.expect(!group.budget.exhausted);
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const result = (try group.nextResult(arena.allocator())).?;
+        try std.testing.expectEqual(std.math.Order.eq, try numeric.order(&context, expected.value, result.aggregates[0].numeric.?.*));
+        try std.testing.expect((try group.nextResult(arena.allocator())) == null);
+        try std.testing.expect(quota.peak <= quota.limit);
+    }
 }
 
 test "SQL pattern sets spill distinct state and preserve reusable quantified null semantics" {
@@ -2202,5 +2597,41 @@ test "SQL variable extrema batch admission spills before retaining payloads" {
             count += 1;
         }
         try std.testing.expectEqual(keys.len, count);
+    }
+}
+
+test "external lake SQL identified group columns separate source ordinals from input cardinality" {
+    const a = std.testing.allocator;
+    const Batch = @import("execution_batch.zig").Batch;
+    const values = [_]Datum{ Datum.json(.{ .integer = 11 }), Datum.json(.{ .integer = 22 }) };
+    const indices = [_]u32{ 1, 0, 1 };
+    const columns = [_]Batch{.{ .dictionary = .{ .values = &values, .indices = &indices } }};
+    const hashes = try @import("batch_hash.zig").encodedColumns(a, &columns, indices.len, true);
+    defer a.free(hashes);
+    var context: u8 = 0;
+    for ([_]bool{ false, true }) |disk| {
+        var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &context, .checkpoint = struct {
+            fn check(_: *anyopaque) !void {}
+        }.check };
+        defer manager.deinit();
+        const grouped = try Grouped.create(a, &.{.{ .kind = .count }}, .{ .bytes = 1024 * 1024, .spill = &manager });
+        defer grouped.deinit();
+        if (disk) {
+            grouped.key_count = columns.len;
+            try grouped.startSpill();
+        }
+        try grouped.addEncodedColumnsIdentified(&columns, &columns, indices.len, .{ .ordinals = &.{ 100, 900, 5000 }, .hashes = hashes });
+        try std.testing.expectEqual(@as(u64, 3), grouped.rows_seen);
+        try std.testing.expect(grouped.source_ordinal == null);
+        var count: usize = 0;
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        while (try grouped.nextTypedPartialResult(scratch.allocator())) |group| {
+            const is_eleven = group.keys[0].value.integer == 11;
+            try std.testing.expectEqual(@as(u64, if (is_eleven) 900 else 100), group.ordinal);
+            try std.testing.expectEqual(@as(u64, if (is_eleven) 1 else 2), group.typed_states.?[0].count);
+            count += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 2), count);
     }
 }

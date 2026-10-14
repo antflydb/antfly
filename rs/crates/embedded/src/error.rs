@@ -28,8 +28,10 @@ use std::fmt;
 ///
 /// `ANTFLY_OK` (0) is success and is never represented by `Error`; every
 /// fallible call in this crate returns `Result<T, Error> = Result<T>`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 pub enum Error {
+    /// Owned diagnostic from a native call. Use `code()`/`kind()` to classify.
+    Native { code: i32, detail: String },
     /// An argument, request, path, or open mode is invalid.
     InvalidArgument,
     /// The requested database object was not found.
@@ -49,13 +51,19 @@ pub enum Error {
     /// The operation requires a capability that is not supported by this
     /// platform or filesystem. Retrying unchanged will not succeed.
     Unsupported,
-    /// A bounded drain (e.g. `run_until_idle`) made no forward progress for
-    /// its configured stall window and gave up.
+    /// Derived work stalled or a derived worker failed. Inspect pending-work
+    /// diagnostics and repair or reopen the database.
     Stalled,
-    /// The caller cancelled the call by returning `false` from its progress
-    /// or stream callback (e.g. [`crate::Inference::pull`]'s progress
-    /// callback or [`crate::Inference::generate_stream`]'s chunk callback).
+    /// The operation was cancelled, including a pending replacement or a
+    /// progress/stream callback returning `false`, or an IO interruption.
     Cancelled,
+    /// A replacement exhausted its consecutive or lifetime retry budget,
+    /// or encountered a permanent error. Inspect its pending-work diagnostics.
+    ReplacementFailed,
+    /// The requested operation conflicts with a pending replacement.
+    ReplacementPending,
+    /// The requested configuration differs from the pending replacement.
+    ReplacementConfigurationMismatch,
     /// An internal error occurred.
     Internal,
     /// A C ABI error code this binding does not recognize, carrying the raw
@@ -64,6 +72,27 @@ pub enum Error {
 }
 
 impl Error {
+    /// Stable category, independent of the owned diagnostic.
+    pub fn kind(&self) -> Error {
+        Error::from_code(self.code())
+    }
+    pub fn detail(&self) -> Option<&str> {
+        match self {
+            Error::Native { detail, .. } => Some(detail),
+            _ => None,
+        }
+    }
+    pub(crate) fn from_native(code: i32) -> Error {
+        #[cfg(feature = "libantfly")]
+        if unsafe { antfly_embedded_sys::antfly_last_error_code() } == code {
+            let detail = last_error_detail();
+            if !detail.is_empty() {
+                return Error::Native { code, detail };
+            }
+        }
+        Error::from_code(code)
+    }
+
     /// Maps a raw `antfly_error_code` to a typed `Error`. Callers should
     /// treat `ANTFLY_OK` (0) as success, not as an `Error`; this function
     /// will happily map it to `Error::Unknown(0)` if asked.
@@ -78,6 +107,9 @@ impl Error {
             7 => Error::OutcomeUnknown,
             8 => Error::Unsupported,
             9 => Error::Stalled,
+            11 => Error::ReplacementFailed,
+            12 => Error::ReplacementPending,
+            13 => Error::ReplacementConfigurationMismatch,
             10 => Error::Cancelled,
             255 => Error::Internal,
             other => Error::Unknown(other),
@@ -87,6 +119,7 @@ impl Error {
     /// The raw numeric `antfly_error_code` this value represents.
     pub fn code(&self) -> i32 {
         match self {
+            Error::Native { code, .. } => *code,
             Error::InvalidArgument => 1,
             Error::NotFound => 2,
             Error::VersionConflict => 3,
@@ -96,6 +129,9 @@ impl Error {
             Error::OutcomeUnknown => 7,
             Error::Unsupported => 8,
             Error::Stalled => 9,
+            Error::ReplacementFailed => 11,
+            Error::ReplacementPending => 12,
+            Error::ReplacementConfigurationMismatch => 13,
             Error::Cancelled => 10,
             Error::Internal => 255,
             Error::Unknown(code) => *code,
@@ -114,9 +150,13 @@ impl Error {
             Error::OutcomeUnknown => "ANTFLY_OUTCOME_UNKNOWN",
             Error::Unsupported => "ANTFLY_UNSUPPORTED",
             Error::Stalled => "ANTFLY_STALLED",
+            Error::ReplacementFailed => "ANTFLY_REPLACEMENT_FAILED",
+            Error::ReplacementPending => "ANTFLY_REPLACEMENT_PENDING",
+            Error::ReplacementConfigurationMismatch => "ANTFLY_REPLACEMENT_CONFIGURATION_MISMATCH",
             Error::Cancelled => "ANTFLY_CANCELLED",
             Error::Internal => "ANTFLY_INTERNAL",
             Error::Unknown(_) => "ANTFLY_UNKNOWN_ERROR",
+            Error::Native { code, .. } => Error::from_code(*code).name(),
         }
     }
 
@@ -143,19 +183,44 @@ impl Error {
                  or filesystem"
             }
             Error::Stalled => {
-                "a bounded drain made no forward progress for its configured stall window and \
-                 gave up"
+                "derived work stalled or failed; inspect pending-work diagnostics and \
+                 repair or reopen the database"
+            }
+            Error::ReplacementFailed => {
+                "replacement failed after its retry budget; inspect diagnostics and cancel before retrying"
+            }
+            Error::ReplacementPending => "index name is reserved by a pending replacement",
+            Error::ReplacementConfigurationMismatch => {
+                "replacement configuration differs from the reserved request"
             }
             Error::Cancelled => "the caller cancelled the operation",
             Error::Internal => "an internal error occurred",
             Error::Unknown(_) => "unknown Antfly error code",
+            Error::Native { code, .. } => Error::from_code(*code).description(),
         }
     }
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}", self.name(), self.description())
+        write!(f, "{}: {}", self.name(), self.description())?;
+        if let Some(detail) = self.detail() {
+            write!(f, ": {detail}")?;
+        }
+        Ok(())
+    }
+}
+
+// Preserve stable-code comparisons when native diagnostics are present.
+impl PartialEq for Error {
+    fn eq(&self, other: &Self) -> bool {
+        self.code() == other.code()
+    }
+}
+impl Eq for Error {}
+impl std::hash::Hash for Error {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&self.code(), state);
     }
 }
 
@@ -163,3 +228,14 @@ impl std::error::Error for Error {}
 
 /// A `Result` whose error type is [`Error`].
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Copy the most recent native failure detail on the current thread.
+/// Call immediately after a failed operation; later failures replace it.
+#[cfg(feature = "libantfly")]
+pub fn last_error_detail() -> String {
+    unsafe {
+        std::ffi::CStr::from_ptr(antfly_embedded_sys::antfly_last_error_detail())
+            .to_string_lossy()
+            .into_owned()
+    }
+}

@@ -51,6 +51,16 @@ pub fn prepare(a: A, input: []const u8, options: @import("../serverless/configur
             break :blk try schema.parquetSchema(a, inventory, reader.parquetReader());
         },
         .iceberg => blk: {
+            if (binding.binding.catalog != null) {
+                var result = @import("../serverless/configured_object_store_support.zig").executeLakeCatalogAlloc(a, binding.binding, options, context, .load) catch |err| {
+                    // A declared writable table can be bound before its initial
+                    // catalog commit. Initialization persists the inferred fingerprint.
+                    if (err == error.LakeTableNotFound and !infer and binding.binding.write_policy == .iceberg_writer) return null;
+                    return err;
+                };
+                defer result.deinit(a);
+                break :blk try schema.icebergSchema(a, result.table.metadata_json, binding.binding.snapshot_mode.pinnedSnapshotId());
+            }
             const uri = try @import("antfly_local_sources").serverless_query_lake_serving.ServingSource.icebergMetadataUriForOpenedStoreAlloc(a, client, store.bucket, store.prefix, binding.binding.source_uri, base);
             defer a.free(uri);
             var reader_client = client;
@@ -241,7 +251,7 @@ test "lake SQL inferred decimal128 and signed timestamps execute through Parquet
         fn scan(_: *anyopaque, _: A, _: catalog.Table, _: catalog.Scan) !catalog.Page {
             return error.UnexpectedStatelessScan;
         }
-        fn mutate(_: *anyopaque, _: A, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
+        fn mutate(_: *anyopaque, _: A, _: A, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
             return error.UnexpectedMutation;
         }
         fn checkpoint(_: *anyopaque) !void {}

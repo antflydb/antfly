@@ -1,0 +1,49 @@
+{
+  "provider": "polaris",
+  "catalog_uri": "https://lake.example.com/catalog",
+  "upstream_uri": "http://polaris:8181/api/catalog",
+  "nessie_uri": "http://nessie:19120/api/v2",
+  "warehouse": "qualification",
+  "warehouse_uri": "s3://warehouse/polaris/",
+  "authority_uri": "s3://warehouse/controllers/polaris/",
+  "artifact_uri": "s3://warehouse/artifacts/",
+  "artifact_connection": "qualification",
+  "gateway_enforced": true,
+  "upstream_headers": {
+    "Polaris-Realm": "POLARIS"
+  },
+  "io_properties": {
+    "s3.endpoint": "http://s3:9000",
+    "s3.region": "us-west-2",
+    "s3.access-key-id": {
+      "env": "S3_ACCESS_KEY"
+    },
+    "s3.secret-access-key": {
+      "env": "S3_SECRET_KEY"
+    }
+  },
+  "tokens": {
+    "admin": {
+      "env": "ANTFLY_ADMIN_TOKEN"
+    },
+    "writer": {
+      "env": "ANTFLY_WRITER_TOKEN"
+    },
+    "native": {
+      "env": "ANTFLY_NATIVE_TOKEN"
+    }
+  },
+  "oauth": {
+    "uri": "http://polaris:8181/api/catalog/v1/oauth/tokens",
+    "client_id": {
+      "env": "POLARIS_CLIENT_ID"
+    },
+    "client_secret": {
+      "env": "POLARIS_CLIENT_SECRET"
+    },
+    "scope": "PRINCIPAL_ROLE:ALL"
+  },
+  "oauth_headers": {
+    "Polaris-Realm": "POLARIS"
+  }
+}

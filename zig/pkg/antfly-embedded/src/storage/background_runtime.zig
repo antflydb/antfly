@@ -957,6 +957,8 @@ const OwnerRegistry = struct {
 };
 
 pub const BackendRuntime = struct {
+    /// Borrowed until every physical owner and retained reader has closed.
+    query_cut_repository: ?@import("db/native_query_cut_repository.zig").Port = null,
     alloc: Allocator,
     backend: Backend,
     lane_limits: threaded_io_limits.BackendRuntimeLaneLimits,
@@ -1854,6 +1856,20 @@ pub const BackendRuntimeHandle = struct {
             .alloc = alloc,
             .runtime = runtime,
         };
+    }
+
+    /// Manual storage scheduling with host I/O for request-local inference.
+    /// The caller drives publication; this runtime starts no durable worker.
+    pub fn initManualWithOwnedIo(alloc: Allocator) !BackendRuntimeHandle {
+        if (comptime is_hostless) return error.UnsupportedPlatform;
+        const io_impl = try initIoLane(alloc, threaded_io_limits.backend_runtime_inference);
+        errdefer deinitIoLane(alloc, io_impl);
+        var handle = try init(alloc, .{
+            .backend = .manual,
+            .borrowed_io = .{ .general = io_impl.io() },
+        });
+        handle.owned_filesystem_io = io_impl;
+        return handle;
     }
 
     pub fn initManualWithOwnedFilesystemIo(alloc: Allocator) !BackendRuntimeHandle {

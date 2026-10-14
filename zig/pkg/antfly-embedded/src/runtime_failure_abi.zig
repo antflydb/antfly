@@ -733,6 +733,9 @@ pub const Status = enum(u32) {
     commit_visibility_not_satisfied = 773,
     commit_propagation_incomplete = 774,
     invalid_generated_tool_arguments = 775,
+    sql_feature_not_supported = 776,
+    catalog_publication_proof_pending = 777,
+    seed_replica_policy_mismatch = 778,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

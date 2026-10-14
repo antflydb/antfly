@@ -1257,6 +1257,15 @@ pub const Store = struct {
 
     fn configureDirectory(self: *Store) !void {
         self.preparation_alloc = self.alloc;
+        if (self.read_only) {
+            // Read-only cuts need immutable catalog leases, not writer GC
+            // inventories, liveness scans or location-directory construction.
+            self.positional_batch_reads = true;
+            self.shared_catalog = true;
+            try self.prepareReadCatalog(&self.opened);
+            self.publishReadView(try self.prepareReadPublication(&self.opened));
+            return;
+        }
         self.unlocked_checkpoint = experimentEnabled("ANTFLY_SOURCE_VECTOR_UNLOCKED_CHECKPOINT");
         self.background_checkpoint = experimentEnabled("ANTFLY_SOURCE_VECTOR_BACKGROUND_CHECKPOINT");
         self.positional_batch_reads = @import("dense_perf_experiments.zig").enabledDefault("ANTFLY_SOURCE_VECTOR_POSITIONAL_BATCH_READS", true);
@@ -1331,6 +1340,7 @@ pub const Store = struct {
 
     pub const OpenPolicy = struct {
         checkpoint_receipts: bool = false,
+        inventory_read_only: bool = true,
         pub fn fromEnvironment() OpenPolicy {
             return .{ .checkpoint_receipts = experimentEnabled("ANTFLY_SOURCE_VECTOR_GC_RECEIPTS") };
         }
@@ -1380,7 +1390,7 @@ pub const Store = struct {
         if (read_only) {
             var result: Store = .{ .alloc = alloc, .opened = try native.Store.openReadOnlyWithBlocks(alloc, storage, root), .read_only = true, .segment_sizing = sizing, .snapshot_reads = snapshot_reads, .checkpoint_receipts = policy.checkpoint_receipts };
             errdefer result.deinit();
-            if (!try result.loadCheckpointReceipt() and !experimentEnabled("ANTFLY_SOURCE_VECTOR_INCREMENTAL_INVENTORY")) try result.inventoryRetainedPayloads();
+            if (policy.inventory_read_only and !try result.loadCheckpointReceipt() and !experimentEnabled("ANTFLY_SOURCE_VECTOR_INCREMENTAL_INVENTORY")) try result.inventoryRetainedPayloads();
             try result.configureLocationCache();
             try result.configureDirectory();
             return result;
@@ -1482,6 +1492,62 @@ pub const Store = struct {
             budget.deinit();
             backing.destroy(budget);
         }
+    }
+
+    /// Query retention seals the current vector authority alongside primary
+    /// and ANN checkpoints. Immutable blocks/extents are linked; only the
+    /// active committed WAL is copied, within the caller's remaining budget.
+    pub fn sealQuerySnapshot(self: *Store, io: std.Io, target: []const u8, remaining_wal: *u64, cancellation: @import("antfly_cancellation").CancellationToken) !u64 {
+        while (!self.mutex.tryLock()) {
+            try cancellation.check();
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        defer self.mutex.unlock();
+        if (self.poisoned) return error.VectorPayloadStorePoisoned;
+        try cancellation.check();
+        const store = &self.opened.store;
+        var manifest = store.manifest orelse return error.MissingVectorPayloadStore;
+        const sealed_bytes = try manifest.sealed_wals.bytes();
+        const active_bytes = store.wal_committed_bytes - sealed_bytes;
+        remaining_wal.* = std.math.sub(u64, remaining_wal.*, active_bytes) catch return error.QueryCandidateBudgetExceeded;
+        const paths = @import("antfly_runtime_fs").fs_paths;
+        const backup = @import("db/native_backup.zig");
+        try paths.createDirPathPortable(io, target);
+        var total: u64 = 0;
+        for (manifest.segments) |segment| {
+            try cancellation.check();
+            const source_path = try native.checkpointBlockPathAlloc(self.alloc, store.root_dir, segment.generation, segment.shard_id);
+            defer self.alloc.free(source_path);
+            const target_path = try native.checkpointBlockPathAlloc(self.alloc, target, segment.generation, segment.shard_id);
+            defer self.alloc.free(target_path);
+            try std.Io.Dir.hardLink(.cwd(), source_path, .cwd(), target_path, io, .{});
+            total = std.math.add(u64, total, (try backup.statRegularFile(io, target_path)).size) catch return error.FileTooBig;
+        }
+        for (manifest.sealed_wals.items[0..manifest.sealed_wals.count]) |extent| {
+            try cancellation.check();
+            const source_path = try native.checkpointWalPathAlloc(self.alloc, store.root_dir, extent.generation);
+            defer self.alloc.free(source_path);
+            const target_path = try native.checkpointWalPathAlloc(self.alloc, target, extent.generation);
+            defer self.alloc.free(target_path);
+            try std.Io.Dir.hardLink(.cwd(), source_path, .cwd(), target_path, io, .{});
+            if ((try backup.statRegularFile(io, target_path)).size != extent.committed_bytes) return error.SourceFileChanged;
+            total = std.math.add(u64, total, extent.committed_bytes) catch return error.FileTooBig;
+        }
+        const source_wal = try native.checkpointWalPathAlloc(self.alloc, store.root_dir, store.wal_generation);
+        defer self.alloc.free(source_wal);
+        const target_wal = try native.checkpointWalPathAlloc(self.alloc, target, store.wal_generation);
+        defer self.alloc.free(target_wal);
+        if ((try backup.statRegularFile(io, source_wal)).size != active_bytes) return error.SourceFileChanged;
+        total = std.math.add(u64, total, try backup.copyFileDurableCancellableWithSink(io, source_wal, target_wal, cancellation, null)) catch return error.FileTooBig;
+        manifest.wal_generation = store.wal_generation;
+        manifest.wal_committed_bytes = store.wal_committed_bytes;
+        const bytes = try manifest.encodeAlloc(self.alloc);
+        defer self.alloc.free(bytes);
+        const current = try std.fs.path.join(self.alloc, &.{ target, "CURRENT" });
+        defer self.alloc.free(current);
+        total = std.math.add(u64, total, try backup.writeFileDurable(io, current, bytes)) catch return error.FileTooBig;
+        try paths.syncDirPortable(io, target);
+        return total;
     }
 
     /// Immutable ANN leases share native blocks and persistent WAL nodes.
@@ -2474,6 +2540,24 @@ pub const Store = struct {
         // Seal the cut before selecting segments; later preparations remain
         // in the WAL suffix preserved by publication.
         if (self.selective_gc) try self.checkpointLocked();
+        if (!self.selective_gc and self.opened.store.wal_committed_bytes > try self.opened.store.manifest.?.sealed_wals.bytes()) {
+            // Finish any checkpoint that can release SourceLock BEFORE
+            // selecting the primary snapshot. Otherwise a writer can commit
+            // in that gap and its payload lands inside the source cut but
+            // outside both the primary mark and the protected WAL suffix.
+            var successor = try self.opened.clone(self.alloc);
+            var successor_owned = true;
+            defer if (successor_owned) successor.deinit();
+            const sealed = successor.store.sealWal() catch |err| {
+                self.setPoisoned(successor.store.poisoned);
+                return err;
+            };
+            if (sealed) {
+                self.opened.deinit();
+                self.opened = successor;
+                successor_owned = false;
+            } else try self.checkpointLocked();
+        }
         if (@import("builtin").is_test) if (self.mark_snapshot_test_hook) |hook| try hook.call(hook.ctx);
         // This is a one-pass ownership scan, not foreground working-set data.
         // Keep the same read snapshot while bypassing ordinary cache admission.
@@ -2540,22 +2624,6 @@ pub const Store = struct {
         else
             null;
         defer if (mark_scratch) |reservation| reservation.release();
-        if (!self.selective_gc and self.opened.store.wal_committed_bytes != 0) {
-            // Retain the cut as a sealed extent so full GC can share its
-            // post-cut WAL view too, without rereading or copying that WAL.
-            var successor = try self.opened.clone(self.alloc);
-            var successor_owned = true;
-            defer if (successor_owned) successor.deinit();
-            const sealed = successor.store.sealWal() catch |err| {
-                self.setPoisoned(successor.store.poisoned);
-                return err;
-            };
-            if (sealed) {
-                self.opened.deinit();
-                self.opened = successor;
-                successor_owned = false;
-            } else try self.checkpointLocked();
-        }
         var source_snapshot = try self.opened.clone(self.alloc);
         errdefer source_snapshot.deinit();
         const scopes = if (self.ann_scopes) |scopes| try self.alloc.dupe(u64, scopes) else null;
@@ -4062,6 +4130,69 @@ test "source vector payloads incremental collection retains updates retries dele
         defer alloc.free(restored);
         try std.testing.expectEqualSlices(u8, second, restored);
     }
+}
+
+test "source vector payloads GC checkpoints before selecting the primary cut" {
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
+    const docs = @import("docstore.zig");
+    const mem = @import("mem_backend.zig");
+    const keys = @import("internal_keys.zig");
+    var memory = lsm.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var source = try Store.open(alloc, memory.storage(), "/gc-checkpoint-cut", false);
+    defer source.deinit();
+    source.selective_gc = false;
+    source.positional_batch_reads = true;
+    var backend = mem.Backend.init(alloc, .{});
+    defer backend.close();
+    var raw = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer raw.deinit();
+    var store = try docs.DocStore.openRuntime(alloc, &raw);
+    defer store.close();
+    store.payload_store = source.interface();
+    const key = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "model");
+    defer alloc.free(key);
+    // Exhaust the sealed-extent slots so mark setup must fall back to the
+    // checkpoint path that releases SourceLock during file construction.
+    const max_extents = @import("antfly_vectorindex").vector_block_manifest.wal_extents.max_extents;
+    for (0..max_extents + 1) |sequence| {
+        const artifact = try codec.encodeDenseEmbeddingAlloc(alloc, sequence, &.{ 1, 2, 3 });
+        defer alloc.free(artifact);
+        try store.put(key, artifact);
+        if (sequence < max_extents) try std.testing.expect(try source.opened.store.sealWal());
+    }
+    const latest = try codec.encodeDenseEmbeddingAlloc(alloc, 99, &.{ 4, 5, 6 });
+    defer alloc.free(latest);
+    const Hook = struct {
+        var primary: *docs.DocStore = undefined;
+        var artifact_key: []const u8 = undefined;
+        var artifact: []const u8 = undefined;
+        var called: bool = false;
+        fn run(_: *Store, phase: Store.CheckpointPhase) !void {
+            if (phase != .stage or called) return;
+            called = true;
+            try primary.put(artifact_key, artifact);
+        }
+    };
+    Hook.primary = &store;
+    Hook.artifact_key = key;
+    Hook.artifact = latest;
+    Hook.called = false;
+    source.checkpoint_test_hook = Hook.run;
+    defer source.checkpoint_test_hook = null;
+    try std.testing.expect(!try source.collect(&raw));
+    try std.testing.expect(Hook.called);
+    try std.testing.expect(!source.collectionPending());
+    source.checkpoint_test_hook = null;
+    while (!try source.collect(&raw)) {}
+    const ref = try payload.Reference.forArtifact(key, latest);
+    var reopened = try Store.open(alloc, memory.storage(), "/gc-checkpoint-cut", false);
+    defer reopened.deinit();
+    const resolved = try Store.resolve(&reopened, alloc, key, ref);
+    defer alloc.free(resolved);
+    try std.testing.expectEqualSlices(u8, latest, resolved);
 }
 
 test "source vector payloads lock-free session admission invalidates a racing GC cut" {

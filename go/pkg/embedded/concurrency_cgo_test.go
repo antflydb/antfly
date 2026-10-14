@@ -19,6 +19,7 @@ package embedded
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"runtime"
@@ -100,7 +101,7 @@ func TestConcurrentCallsOnOneHandle(t *testing.T) {
 					errs <- fmt.Errorf("scan: %w", err)
 					return
 				}
-				if _, err := db.LookupJSON("doc:w0:0"); err != nil && err != NotFound {
+				if _, err := db.LookupJSON("doc:w0:0"); err != nil && !errors.Is(err, NotFound) {
 					errs <- fmt.Errorf("lookup: %w", err)
 					return
 				}
@@ -198,42 +199,39 @@ func TestCloseRacesInFlightCalls(t *testing.T) {
 	if closedSeen.Load() != 8 {
 		t.Fatalf("%d of 8 readers observed the closed handle", closedSeen.Load())
 	}
-	if _, err := db.StatsJSON(); err != InvalidArgument {
+	if _, err := db.StatsJSON(); !errors.Is(err, InvalidArgument) {
 		t.Fatalf("call after close = %v, want %v", err, InvalidArgument)
 	}
 }
 
-func TestBusyTimeoutWaitsForWriterLock(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "busy-timeout.aflite")
+func TestIndependentWritableConnections(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "connections.aflite")
 	first, err := CreateWithOptions(path, OpenOptions{NoSync: true})
 	if err != nil {
-		t.Fatalf("create: %v", err)
+		t.Fatal(err)
 	}
-
-	// Without a timeout the second writer fails immediately.
-	if _, err := OpenWithOptions(path, OpenOptions{NoSync: true}); err != Busy {
-		t.Fatalf("second writer without timeout = %v, want %v", err, Busy)
-	}
-
-	// With a short timeout it fails with Busy only after waiting.
-	start := time.Now()
-	if _, err := OpenWithOptions(path, OpenOptions{NoSync: true, BusyTimeout: 150 * time.Millisecond}); err != Busy {
-		t.Fatalf("second writer with short timeout = %v, want %v", err, Busy)
-	}
-	if waited := time.Since(start); waited < 140*time.Millisecond {
-		t.Fatalf("busy timeout returned after %v, want about 150ms", waited)
-	}
-
-	// With a longer timeout it succeeds once the first writer closes.
-	go func() {
-		time.Sleep(100 * time.Millisecond)
-		first.Close()
-	}()
-	second, err := OpenWithOptions(path, OpenOptions{NoSync: true, BusyTimeout: 10 * time.Second})
+	defer first.Close()
+	second, err := OpenWithOptions(path, OpenOptions{NoSync: true, BusyTimeout: time.Second})
 	if err != nil {
-		t.Fatalf("second writer after first closed: %v", err)
+		t.Fatal(err)
 	}
-	second.Close()
+	defer second.Close()
+	if err := first.Batch([]WriteIntent{{Key: "first", Value: []byte(`{"title":"first"}`)}}, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := second.LookupJSON("first"); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.Batch([]WriteIntent{{Key: "second", Value: []byte(`{"title":"second"}`)}}, 2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.LookupJSON("second"); err != nil {
+		t.Fatal(err)
+	}
+	first.Close()
+	if err := second.Batch([]WriteIntent{{Key: "after", Value: []byte(`{"title":"still open"}`)}}, 3); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // Handle values are opaque ids that the Go binding keeps in an

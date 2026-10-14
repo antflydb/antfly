@@ -106,7 +106,8 @@ pub const AddRuntimeOptions = struct {
     production_antfly_imports: AntflyRootImports,
     antfly_client_pkg_mod: *std.Build.Module,
     capi_mod: *std.Build.Module,
-    libantfly_link_mod: *std.Build.Module,
+    native_enrichment: *std.Build.Step.Compile,
+    native_inference: *std.Build.Step.Compile,
 };
 pub const AddRuntimeResult = struct {
     antfly_main_tests: *std.Build.Step.Compile,
@@ -128,7 +129,6 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
     const production_antfly_imports = options.production_antfly_imports;
     const antfly_client_pkg_mod = options.antfly_client_pkg_mod;
     const capi_mod = options.capi_mod;
-    const libantfly_link_mod = options.libantfly_link_mod;
     const main_module_options: std.Build.Module.CreateOptions = .{
         .root_source_file = b.path("pkg/antfly/src/main.zig"),
         .target = target,
@@ -153,7 +153,6 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
     });
     addMacosSdkPaths(b, antfly_main_tests.root_module, target);
     production_antfly_imports.build_info.link(antfly_main_mod);
-    production_antfly_imports.build_info.link(libantfly_link_mod);
     addMacosSdkPaths(b, antfly_main_mod, target);
 
     const antfly_main = b.addExecutable(.{
@@ -204,8 +203,8 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
             capi_options.addOption(bool, "linked_storage", true);
             // This archive is shared by the default `libantfly` and by the
             // `antfly` executable. Both link the inference runtime archive
-            // in-process (see `link_anchor.zig` and the `.inference` unit
-            // linked into `libantfly_link_mod` below), so the
+            // in-process (see `link_anchor.zig` and the embedded library
+            // composition), so the
             // embedded-inference construction path is always available.
             capi_options.addOption(bool, "inference_enabled", true);
             role_mod.addOptions("capi_build_options", capi_options);
@@ -224,22 +223,34 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
             role_mod.addImport("usermgr_storage", role_usermgr_storage_mod);
         }
 
-        const role_artifact = b.addLibrary(.{
+        // Both products consume the same three coarse compute exports. The
+        // Apache owner is already PIC and storage-free. Sanitized server
+        // profiles retain their separately instrumented owner.
+        const compile_max_rss = if (unit == .inference and production_antfly_imports.shared_inference_core) 4 * 1024 * 1024 * 1024 else runtimeCompileMaxRss(unit, .{
+            .host = b.graph.host.result,
+            .target = target.result,
+            .optimize = optimize,
+            .strip = strip,
+            .cpu_inference = options.cpu_inference,
+            .sanitize_thread = sanitize_thread,
+            .macos_metal_blas_release = production_antfly_imports.darwin_release_memory,
+        });
+        const role_artifact = if (unit == .enrichment_compute and !sanitize_thread) blk: {
+            // Reuse the implementation without replacing the runtime's
+            // measured profile reservation with the embedded default.
+            options.native_enrichment.step.max_rss = compile_max_rss;
+            break :blk options.native_enrichment;
+        } else b.addLibrary(.{
             .name = if (unit == .storage_kernel)
                 "antfly-storage-kernel"
             else
                 b.fmt("antfly-runtime-{s}", .{@tagName(unit)}),
             .root_module = role_mod,
             .linkage = .static,
-            .max_rss = runtimeCompileMaxRss(unit, .{
-                .host = b.graph.host.result,
-                .target = target.result,
-                .optimize = optimize,
-                .strip = strip,
-                .cpu_inference = options.cpu_inference,
-                .sanitize_thread = sanitize_thread,
-            }),
+            .max_rss = compile_max_rss,
         });
+        if (unit == .inference and production_antfly_imports.shared_inference_core)
+            role_artifact.root_module.linkLibrary(options.native_inference);
         const runtime_unit_step = b.step(
             b.fmt("runtime-unit-{s}", .{@tagName(unit)}),
             b.fmt("Build only the {s} runtime library unit", .{@tagName(unit)}),

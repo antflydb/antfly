@@ -192,7 +192,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const replay_allocation_tests = b.addTest(.{
         .root_module = replay_allocation_mod,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
-        .filters = &.{ "storage.db.derived.", "storage.db.artifact_ids.", "lookup scratch", "document read scratch", "ordinal batch lookup", "replay batcher", "dense replay preserves", "sparse replay preserves" },
+        .filters = &.{ "storage.db.derived.", "storage.db.artifact_ids.", "lookup scratch", "document read scratch", "ordinal batch lookup", "replay batcher", "dense replay preserves", "sparse replay preserves", "graph replay" },
     });
     b.step("replay-allocation-test", "Run replay ownership, scratch retention and window contracts")
         .dependOn(&b.addRunArtifact(replay_allocation_tests).step);
@@ -291,9 +291,23 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = metadata_unit_baseline_mods[8],
         .filters = &.{ "system catalog", "catalog rename", "catalog names", "metadata raft apply store projects backup restore bootstrap source in placement intents" },
     });
+    const relation_namespace_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[8],
+        .filters = &.{ "system catalog relation namespace transaction", "relation mutation ownership" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("system-catalog-relation-store-test", "Verify namespace and schema transaction rollback and restart")
+        .dependOn(&addFilteredTestRunArtifact(b, relation_namespace_tests).step);
+    const relation_coordinator_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[1],
+        .filters = &.{ "relational topology admission rejects lifecycle proposals before encoding", "relation reconciliation worker", "relation mutation admission", "table definition stamp distinguishes rejection", "system catalog relation replacement" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-relation-coordinator-test", "Verify relation control and tracked-writer decoder admission")
+        .dependOn(&addFilteredTestRunArtifact(b, relation_coordinator_tests).step);
     const system_catalog_store_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[8],
-        .filters = &.{ "metadata raft apply store", "metadata replay", "system catalog", "row-policy publication", "metadata.table storage extension", "relational integrity restore staging", "FK generation publication", "policy definition command serializes" },
+        .filters = &.{ "metadata raft apply store", "metadata replay", "system catalog", "row-policy publication", "metadata.table storage extension", "relational integrity restore staging", "FK generation publication", "policy definition command serializes", "standalone metadata" },
     });
     const system_catalog_store_step = b.step("antfly-system-catalog-store-test", "Run catalog report persistence, snapshot, drain, and migration regressions");
     system_catalog_store_step.dependOn(&b.addRunArtifact(system_catalog_store_tests).step);
@@ -343,6 +357,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const system_catalog_api_step = b.step("antfly-system-catalog-api-test", "Run qualified catalog HTTP authorization and protocol tests");
     system_catalog_api_step.dependOn(&b.addRunArtifact(system_catalog_api_tests).step);
+    const sql_index_ddl_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = &.{ "SQL catalog", "SQL index DDL", "SQL pgwire" } });
+    b.step("antfly-sql-index-ddl-test", "Verify qualified SQL index ownership, authorization and guarded schema admission")
+        .dependOn(&b.addRunArtifact(sql_index_ddl_tests).step);
     const system_catalog_test_step = b.step("antfly-system-catalog-test", "Run system catalog durability, identity, and routing tests");
     system_catalog_test_step.dependOn(&b.addRunArtifact(system_catalog_tests).step);
     const system_catalog_transport_tests = b.addTest(.{ .root_module = metadata_unit_baseline_mods[1], .filters = &.{"system catalog"} });
@@ -410,6 +427,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         auth.addImport("antfly_platform", platform_mod);
         module.addImport("usermgr_storage", auth);
     }
+    const sql_expression_apply_tests = b.addTest(.{
+        .root_module = data_implementation_module,
+        .filters = &.{"SQL expression apply failures preserve exact semantic rejections"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-sql-expression-apply-contract-test", "Run deterministic SQL expression rejection classification")
+        .dependOn(&addFilteredTestRunArtifact(b, sql_expression_apply_tests).step);
+
     const raft_runtime_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/raft_runtime_test_root.zig"),
         .target = target,
@@ -762,7 +787,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const lib_common_config_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{ "common config", "external lake native artifact collection config validates bounded operator controls" },
+        .filters = &.{"common.config.test."},
         .test_runner = .{
             .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
@@ -1132,7 +1157,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "metadata.runtime_status_protocol.test.runtime status exposes only released compatibility profiles",
         "metadata.table_topology_mutations.test.restore preserves implicit source document identity across a new physical incarnation",
 
-        "boundary dispatcher preserves local calls and maps cross-unit calls",
         "bedrock provider request helpers",
         "embedding provider request helpers",
         "restore job store is idempotent and fenced",
@@ -1411,6 +1435,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "native doc values plan rejects runtime value kind mismatch",
         "required native sort fails on absent physical doc value section",
         "required native sort fails on sparse doc value entry miss",
+        "pattern native pointer scalar filters",
         "pattern typed structured filters accept explicit path alias",
         "pattern typed structured filters reject ambiguous field and path aliases",
         "pattern typed structured filters reject malformed and unbounded ranges",
@@ -1628,7 +1653,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "distributed graph target refs are table exact while raw keys remain wildcard",
         "distributed graph MATCH binding refs preserve table identity and deduplicate",
         "distributed graph executes result dependencies before declaration order",
-        "distributed graph path materialization preserves table provenance",
         "distributed canonical path weight is the checked raw edge sum",
         "distributed K path identity preserves parallel typed edges",
         "distributed Yen edge exclusions preserve table-qualified path identity",
@@ -1711,6 +1735,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     lib_bedrock_test_step.dependOn(&run_lib_bedrock_tests.step);
 
     const api_http_runtime_default_filters = [_][]const u8{
+        "httpx internal control routes call typed operations directly",
         "caller cancellation does not interrupt protected child work",
         "httpx SQL dispatch preserves imported executor authority including unavailable views",
         "SQL pgwire dispatch preserves imported executor authority including unavailable views",
@@ -1836,6 +1861,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "httpx inference connection requires inference write permission",
         "httpx inference connection propagates failures after stream commit",
         "httpx retrieval SSE",
+        "httpx retrieval read failures preserve retryable JSON and conflict status",
         "retrieval agent sse",
         "retrieval agent streaming emits go-shaped tree",
         "inference connection invocation forwards streaming and deadline through stable target ABI",
@@ -1860,7 +1886,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "api http client preserves group doc identity conflicts",
         "typed internal group reads preserve retryable resident storage failures",
         "typed routed batch preserves forwarding cancellation and identity conflicts",
-        "boundary dispatcher preserves local calls and maps cross-unit calls",
         "db graph search filters result nodes and hidden traversal intermediates",
         "internal transaction HTTP responses prove not-proposed only before decision",
         "internal transaction ingress establishes and validates pre-decision deadline",
@@ -1885,11 +1910,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const api_http_runtime_filters = selectTestFilters(b, &api_http_runtime_default_filters);
     const api_http_runtime_tests = b.addTest(.{
         .root_module = api_http_runtime_test_mod,
-        .filters = @import("../../../build_support/antfly/test_support.zig").compileFiltersWithAnchors(b, &.{"api module compiles"}, api_http_runtime_filters),
-        // The native-generation merge raised this linked API/DB harness to
-        // 16.01 GB in macOS ReleaseFast codegen. Reserve measured usage plus
+        .filters = @import("../../../build_support/antfly/test_support.zig").compileFiltersWithAnchors(b, &.{ "api module compiles", "api HTTP runtime discovery" }, api_http_runtime_filters),
+        // Native lake kernels peak at 18.50 GB in macOS ReleaseFast codegen.
+        // Reserve measured usage plus
         // headroom; the shared runner still caps aggregate compilation.
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 17 else 7) * 1024 * 1024 * 1024,
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 19 else 7) * 1024 * 1024 * 1024,
         .test_runner = .{
             .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
@@ -1907,7 +1932,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .name = "lake-api-tests",
         .root_module = api_http_runtime_test_mod,
         .filters = @import("../../../build_support/antfly/test_support.zig").compileFiltersWithAnchors(b, &.{"api module compiles"}, lake_api_filters),
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 17 else 7) * 1024 * 1024 * 1024,
+        // The native ordering and sparse integration suite peaks at 27.89 GB
+        // in macOS ReleaseFast codegen. Reserve 28 GiB, including headroom,
+        // so the shared scheduler admits only one large API compiler at a time.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 28 else 7) * 1024 * 1024 * 1024,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("lake-api-test", "Run mounted API lake and SQL integration tests").dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, lake_api_tests, lake_api_filters).step);
@@ -1925,7 +1953,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_public_limits_tests = b.addRunArtifact(public_limits_tests);
     b.step("public-limits-test", "Run shared public transport limits contract").dependOn(&run_public_limits_tests.step);
     api_http_runtime_test_step.dependOn(&run_public_limits_tests.step);
-    const runtime_contract_tests = b.addTest(.{ .root_module = antfly_imports.runtime_abi });
+    const runtime_contract_tests = b.addTest(.{
+        .root_module = antfly_imports.runtime_abi,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
     const run_runtime_contract_tests = b.addRunArtifact(runtime_contract_tests);
     b.step("runtime-contract-test", "Run shared runtime ABI and transport contracts").dependOn(&run_runtime_contract_tests.step);
     api_http_runtime_test_step.dependOn(&run_runtime_contract_tests.step);
@@ -1984,6 +2015,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         },
     });
     const run_introducer_tests = addFilteredTestRunArtifact(b, introducer_tests);
+    // The aggregate owns unit work; corpus-scale storage benchmarks retain
+    // their release-scale owner. Keep focused introducer coverage unchanged.
+    const run_unit_introducer_tests = addFilteredTestRunArtifact(b, introducer_tests);
+    addRuntimeSkipTestFilters(run_unit_introducer_tests, &release_scale_test_filters);
     const introducer_test_step = b.step("introducer-test", "Run segment introducer unit tests");
     introducer_test_step.dependOn(&run_introducer_tests.step);
 
@@ -2036,7 +2071,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     test_imports.configure(b, lite_reader_test_mod, true, true);
     const lite_reader_tests = b.addTest(.{
         .root_module = lite_reader_test_mod,
-        .filters = &.{ "search.search.", "search.query.", "index.", "merger.", "segment.", "section.inverted.", "section.typed_doc_values.", "section.doc_values.", "section.vector_section." },
+        .filters = &.{ "search.search.", "search.query.", "search.scorer.", "search.aggregation.", "datetime.", "index.", "merger.", "segment.", "section.inverted.", "section.typed_doc_values.", "section.doc_values.", "section.vector_section." },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("lite-bounded-reader-test", "Verify segment scratch reuse and stored search result ownership")
@@ -2540,6 +2575,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const graph_test_step = b.step("antfly-graph-test", "Run graph algorithms, topology, pages, query and recovery tests");
+    b.step("antfly-graph-pages-test", "Run immutable page publication and upload admission contracts")
+        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, graph_page_tests, selectTestFilters(b, &.{ "serverless.graph_segment.", "serverless.artifacts.fs_store.", "serverless.build.lake_build_limits." })).step);
 
     const serverless_manifest_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/serverless_manifest_test_root.zig"),
@@ -2590,14 +2627,17 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     test_imports.configure(b, lake_scaffold_test_mod, true, true);
     lake_scaffold_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const lake_scaffold_tests = b.addTest(.{
+        // Measured macOS ReleaseSafe partition peak: 15.67 GB. Reserve headroom
+        // for native lake API codegen rather than failing scheduler admission.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 18 else 10) * 1024 * 1024 * 1024,
         .root_module = lake_scaffold_test_mod,
         .filters = &.{ "lake", "parquet", "iceberg", "external source", "row fragment", "sidecar" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const run_lake_scaffold_tests = addFilteredTestRunArtifact(b, lake_scaffold_tests);
-    // The query engine owner runs the shared bitmap kernels. Lake-named
-    // regressions must not acquire a second owner through this broad filter.
-    addRuntimeSkipTestFilters(run_lake_scaffold_tests, &.{"encoding.roaring.test."});
+    // Query-engine and SQL owners run their shared kernels and lake-named
+    // regressions. Broad scaffold filters must not select those tests again.
+    addRuntimeSkipTestFilters(run_lake_scaffold_tests, &.{ "encoding.roaring.test.", "sql." });
     const lake_integration_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/lake_integration_test_root.zig"),
         .target = target,
@@ -2611,6 +2651,20 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("lake-integration-test", "Run public lake binding and SQL cursor integration tests").dependOn(&addFilteredTestRunArtifact(b, lake_integration_tests).step);
+    const filtered_topk_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/lake_filtered_topk_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, filtered_topk_mod, true, true);
+    const filtered_topk_tests = b.addTest(.{
+        .root_module = filtered_topk_mod,
+        .filters = &.{ "producer top k", "deferred membership refines", "streaming boolean", "search.scorer.", "sparse exclusion masks", "public ordering seeks complete ties", "warm tie pagination", "sparse predicate planning", "text statistics", "necessary term routing", "retained closure", "dynamic exact keys", "rank cursors" },
+        .max_rss = 8 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("lake-filtered-topk-test", "Verify bounded native membership, exclusion masks and cached public ties")
+        .dependOn(&addFilteredTestRunArtifact(b, filtered_topk_tests).step);
     const lake_refinement_bench_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/lake_refinement_bench_root.zig"),
         .target = target,
@@ -2620,6 +2674,19 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     lake_refinement_bench_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const lake_refinement_bench = b.addTest(.{ .root_module = lake_refinement_bench_mod, .filters = &.{"native dictionary refinement benchmark"} });
     b.step("lake-native-refinement-bench", "Compare repeated and reused native Parquet dictionary decoding").dependOn(&b.addRunArtifact(lake_refinement_bench).step);
+    const bitmap_seek_bench_mod = b.createModule(.{
+        .root_source_file = b.path("bench/bitmap_seek_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    bitmap_seek_bench_mod.addImport("roaring", b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/encoding/roaring.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
+    const bitmap_seek_bench = b.addTest(.{ .root_module = bitmap_seek_bench_mod, .filters = &.{"native bitmap lower-bound seek benchmark"} });
+    b.step("lake-bitmap-seek-bench", "Measure fresh bitmap lower-bound probes across 50 million ordinals").dependOn(&b.addRunArtifact(bitmap_seek_bench).step);
+
     const lake_test_step = b.step("lake-test", "Run Antfly lake-native tests");
     lake_test_step.dependOn(&run_lake_scaffold_tests.step);
     unit_test_step.dependOn(&run_lake_scaffold_tests.step);
@@ -3622,7 +3689,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const production_cluster_managed_index_vopr_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{"full cluster production managed index publication recovery exact replay"},
+        .filters = &.{"full cluster production managed index publication bounded lifecycle exact replay"},
         .max_rss = full_cluster_vopr_max_rss,
     });
     const run_production_cluster_managed_index_vopr_tests = b.addRunArtifact(production_cluster_managed_index_vopr_tests);
@@ -4629,12 +4696,36 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     usermgr_storage_standalone_runtime_test_mod.addImport("antfly_root", standalone_runtime_test_mod);
     usermgr_storage_standalone_runtime_test_mod.addImport("antfly_platform", platform_mod);
     standalone_runtime_test_mod.addImport("usermgr_storage", usermgr_storage_standalone_runtime_test_mod);
+    // Catalog point reads reach the durable storage-owner ABI, including its
+    // handle cleanup. Isolate this root so linking the production provider
+    // does not change unrelated standalone/restore test compositions.
+    const system_catalog_standalone_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/standalone_runtime_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    standalone_runtime_imports.configure(b, system_catalog_standalone_test_mod, true, true);
+    system_catalog_standalone_test_mod.addImport("antfly_openapi_specs", standalone_runtime_imports.runtime.embedded_openapi);
+    const catalog_usermgr_storage_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    catalog_usermgr_storage_mod.addImport("antfly_root", system_catalog_standalone_test_mod);
+    catalog_usermgr_storage_mod.addImport("antfly_platform", platform_mod);
+    system_catalog_standalone_test_mod.addImport("usermgr_storage", catalog_usermgr_storage_mod);
     const system_catalog_standalone_tests = b.addTest(.{
-        .root_module = standalone_runtime_test_mod,
+        .root_module = system_catalog_standalone_test_mod,
         .filters = &.{"system catalog"},
     });
     const system_catalog_standalone_step = b.step("antfly-system-catalog-standalone-test", "Run standalone catalog checkpoint and rollback tests");
     system_catalog_standalone_step.dependOn(&b.addRunArtifact(system_catalog_standalone_tests).step);
+    const standalone_ddl_tests = b.addTest(.{
+        .root_module = system_catalog_standalone_test_mod,
+        .filters = &.{"system catalog standalone relation coordinator"},
+    });
+    b.step("antfly-standalone-pgwire-ddl-test", "Run standalone relation publication and guarded DDL tests").dependOn(&addFilteredTestRunArtifact(b, standalone_ddl_tests).step);
+
     // This filter set boots the real CLI/standalone and Lite server paths
     // (HA, hot-standby, Lite adoption, ...), which reach the real
     // storage-kernel owner through api/kernel_owner_source.zig the same way
@@ -4642,7 +4733,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     // Clone standalone_runtime_test_mod instead of reusing it directly so
     // only this one compile carries the storage owner archive; root
     // composition links it below rather than every standalone runtime
-    // consumer (system_catalog_standalone_tests, standalone_restore_tests).
+    // consumer (standalone_restore_tests and the separately linked catalog root).
     const lib_standalone_runtime_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/standalone_runtime_test_root.zig"),
         .target = target,
@@ -4851,7 +4942,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         },
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
     });
-    lib_standalone_runtime_test_step.dependOn(&b.addRunArtifact(inference_host_tests).step);
+    const run_inference_host_tests = b.addRunArtifact(inference_host_tests);
+    lib_standalone_runtime_test_step.dependOn(&run_inference_host_tests.step);
+    b.step("antfly-inference-host-test", "Run inference host ABI and preload conversion regressions")
+        .dependOn(&run_inference_host_tests.step);
     // Keep the complete API worker fixture out of the inference-heavy runtime
     // object. Compile this narrow integration slice independently so adding
     // restore coverage does not inflate every standalone runtime test build.
@@ -4971,7 +5065,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     // The storage engine artifact owns Lite native tests; keep lite-native-test focused.
     unit_test_step.dependOn(&run_cmd_tests.step);
     unit_test_step.dependOn(&run_lite_cmd_tests.step);
-    unit_test_step.dependOn(&run_introducer_tests.step);
+    unit_test_step.dependOn(&run_unit_introducer_tests.step);
     unit_test_step.dependOn(&run_serverless_tests.step);
     unit_test_step.dependOn(&run_lib_data_runtime_tests.step);
     // Data storage has its own root module, so the root-module `storage.` union
@@ -5109,6 +5203,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("vector-payload-bench", "Build real-file source payload and hash benchmarks").dependOn(&install_vector_payload_bench.step);
 
     const vector_payload_test_mod = makeLmdbModule(b, "pkg/antfly/src/vector_payload_store_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
+    vector_payload_test_mod.addImport("antfly_test_error_logs", b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/test_error_logs.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
     antfly_imports.configureRuntimeContracts(vector_payload_test_mod);
     vector_payload_test_mod.addImport("bloom", bloom_mod);
     vector_payload_test_mod.addImport("antfly_vectorindex", vectorindex_mod);
@@ -5612,6 +5711,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "distributed graph expand request bounds deferred worker metric candidates",
         "distributed graph metric status merge validates metadata compatibility",
         "distributed graph metric post processing applies max results after filter and order",
+        "distributed graph supports cross-range traverse target selectors",
+        "distributed graph traverse target nodes filter returned nodes without pruning frontier",
+        "distributed graph traverse routes cross-table frontier by table generation",
+        "distributed graph path materialization preserves table provenance",
+        "public graph metric borrowed wire",
         "public index contract exposes runtime status metadata",
         "indexes openapi parses graph metric runtime summary",
         "client openapi parses graph metric runtime summary",
@@ -5637,7 +5741,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const run_graph_metric_fan_in_tests = @import("../../../build_support/antfly/test_support.zig").addCuratedTestRunArtifact(b, graph_metric_fan_in_tests, &graph_metric_fan_in_filters);
     unit_test_step.dependOn(&run_graph_metric_fan_in_tests.step);
-    b.step("antfly-graph-metric-contract-test", "Run graph metric request and response contract tests").dependOn(&run_graph_metric_fan_in_tests.step);
+    const graph_metric_contract_step = b.step("antfly-graph-metric-contract-test", "Run graph metric request and response contract tests");
+    graph_metric_contract_step.dependOn(&run_graph_metric_fan_in_tests.step);
+    // Native response adoption belongs to graph.query in the graph owner.
+    // Reuse that run so the standalone contract gate retains this coverage.
+    graph_metric_contract_step.dependOn(&run_graph_metric_unit_tests.step);
 
     const graph_metric_remote_wire_filters = [_][]const u8{
         "api http client authenticates only the internal API namespace",
@@ -5728,11 +5836,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     graph_metric_default_step.dependOn(&addFilteredTestRunArtifact(b, graph_metric_default_tests).step);
     graph_metric_default_step.dependOn(&addFilteredTestRunArtifact(b, graph_metric_default_http_tests).step);
     const graph_metric_boundary_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly-embedded/src/runtime_callback_abi.zig"),
+        .root_source_file = b.path("lib/runtime/src/runtime_callback_abi.zig"),
         .target = target,
         .optimize = optimize,
     });
-    graph_metric_boundary_mod.addImport("antfly_runtime_abi", antfly_imports.runtime_abi);
     const graph_metric_boundary_tests = b.addTest(.{
         .root_module = graph_metric_boundary_mod,
         .filters = &.{"boundary dispatcher preserves graph metric readiness across runtime units"},
@@ -5839,7 +5946,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const lite_merge_publication_runtime_tests = b.addTest(.{
         .root_module = db_test_mod,
-        .filters = &.{ "db text merge descriptor admission failures retry without quarantine", "db text merge shutdown cancels a worker blocked on descriptor admission" },
+        .filters = &.{ "db text merge descriptor admission failures retry without quarantine", "db text merge shutdown cancels a worker blocked on descriptor admission", "db text merge backpressure drains sustained segment debt to low watermark", "db text merge producer admission isolates quarantined dimensions" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("lite-merge-publication-runtime-test", "Verify incremental merge publication handoff and shutdown")
@@ -5861,6 +5968,21 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lake_storage_tests = b.addTest(.{ .root_module = db_test_mod, .filters = &.{"db external lake"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     b.step("lake-storage-test", "Run native owner lake read-only and restart contracts").dependOn(&addFilteredTestRunArtifact(b, lake_storage_tests).step);
     const db_test_step = b.step("antfly-storage-db-test", "Run storage/db owner tests using the shared unit artifacts");
+    const v02_upgrade_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &.{ "schema v02", "schema format-only", "schema epochs", "portable backup", "portable AFB2", "native v02", "native generation manifest", "db v02", "same-version publication", "db restore repair does not complete before regenerated chunk embeddings" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const v02_marker_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{"ensureCompatible"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const v02_upgrade_step = b.step("antfly-v02-upgrade-test", "Verify released v0.2.1+ schema/backup fixtures and directory admission");
+    v02_upgrade_step.dependOn(&addFilteredTestRunArtifact(b, v02_upgrade_tests).step);
+    v02_upgrade_step.dependOn(&addFilteredTestRunArtifact(b, v02_marker_tests).step);
+    lib_storage_test_step.dependOn(v02_upgrade_step);
+
     const relational_index_lifecycle_tests = b.addTest(.{
         .root_module = db_test_mod,
         .filters = &.{ "storage.db.relational_index_catalog.", "storage.db.relational_index_gc.", "storage.db.relational_index_jobs.", "storage.db.relational_index_records." },
@@ -6329,6 +6451,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.graph_restore_materialization.",
             "storage.db.status_projection.",
             "storage.db.document_collectors.",
+            "storage.db.graph_endpoint_resolutions.",
             "storage.db.graph_field_plan.",
             "storage.db.owned_keys.",
             "storage.db.read_projection.",
@@ -6413,11 +6536,17 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.relational_rewrite_staging_test.",
             "storage.db.relational_rewrite_program.",
             "storage.db.relational_row_transform_test.",
+            "storage.db.relational_row_transform.",
+            "storage.db.relational_index_cover.",
             "storage.db.source_pin.",
             "storage.db.source_pin_gc.",
             "storage.db.source_publication_job.",
             "storage.db.mod.",
             "storage.db.native_backup.",
+            "storage.db.native_query_cut.",
+            "storage.db.native_query_cut_contract.",
+            "storage.db.native_query_remote_storage.",
+            "storage.db.native_query_warming.",
             "storage.db.snapshot_staging.",
             "storage.db.ownership.",
             "storage.db.planning_stats.",
@@ -6488,6 +6617,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.artifact_footprint.",
             "storage.artifact_input_capture.",
             "storage.artifact_publication_dispatch.",
+            "storage.prepared_score_plan.",
             "storage.projection_seal.",
             "storage.retained_frame.",
             "storage.admission_waiter.",
@@ -6500,6 +6630,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.retained_read_registry.",
             "storage.row_identity.",
             "storage.statement_read_fence.",
+            "storage.prepared_score_request.",
             "storage.document_mutation_revision.",
             "storage.source_authority.",
             "storage.typed_json.",
@@ -7214,7 +7345,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .storage_test_step = lib_storage_test_step,
         // Runtime/restore and VOPR CLI/meta/registry slices each share a root.
         // Register both roots once to link their production ABI providers.
-        .linked_consumer_tests = std.mem.concat(b.allocator, *std.Build.Step.Compile, &.{ api_tests_addTests_result.linked_consumer_tests, data_tests_addTests_result.linked_consumer_tests, &.{ lite_cmd_tests, provisioned_query_visibility_tests.consumer.executable, graph_metric_remote_wire_tests.consumer.executable, lib_standalone_runtime_tests, vopr_cli } }) catch @panic("OOM"),
+        .linked_consumer_tests = std.mem.concat(b.allocator, *std.Build.Step.Compile, &.{ api_tests_addTests_result.linked_consumer_tests, data_tests_addTests_result.linked_consumer_tests, &.{ lite_cmd_tests, provisioned_query_visibility_tests.consumer.executable, graph_metric_remote_wire_tests.consumer.executable, lib_standalone_runtime_tests, system_catalog_standalone_tests, vopr_cli } }) catch @panic("OOM"),
     };
 }
 

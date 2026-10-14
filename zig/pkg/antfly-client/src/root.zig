@@ -165,7 +165,25 @@ test "SQL prepared client forbids replay and preserves exact owner identity" {
         const path = if (comptime std.mem.eql(u8, operation, "prepare")) "/db/v1/sql/prepared" else if (comptime std.mem.eql(u8, operation, "execute")) "/db/v1/sql/prepared/" ++ id ++ "/execute" else "/db/v1/sql/prepared/" ++ id;
         const method: httpx.Method = if (comptime std.mem.eql(u8, operation, "close")) .DELETE else .POST;
         for ([_]u16{ 200, 503 }) |status| {
-            const success = if (comptime std.mem.eql(u8, operation, "prepare")) "{\"prepared_id\":\"" ++ id ++ "\",\"owner_node_id\":\"9007199254740993\",\"expires_at_ms\":123,\"columns\":[],\"parameter_types\":[]}" else if (comptime std.mem.eql(u8, operation, "execute")) "{\"columns\":[],\"rows\":[],\"rows_affected\":0,\"command_tag\":\"SELECT 0\"}" else "{}";
+            const success = if (comptime std.mem.eql(u8, operation, "prepare"))
+                try std.json.Stringify.valueAlloc(alloc, types.SQLPreparedResponse{
+                    .prepared_id = id,
+                    .owner_node_id = "9007199254740993",
+                    .expires_at_ms = 123,
+                    .columns = &.{},
+                    .parameter_types = &.{},
+                    .parameter_descriptors = &.{},
+                }, .{})
+            else if (comptime std.mem.eql(u8, operation, "execute"))
+                try std.json.Stringify.valueAlloc(alloc, types.SQLResponse{
+                    .columns = &.{},
+                    .rows = &.{},
+                    .rows_affected = 0,
+                    .command_tag = "SELECT 0",
+                }, .{})
+            else
+                try alloc.dupe(u8, "{}");
+            defer alloc.free(success);
             const body = if (status == 200) success else "{\"code\":\"40003\",\"message\":\"do not replay\",\"retryable\":false}";
             var server = try httpx.TestServer.start(alloc, io, &.{.{ .method = method, .path = path, .respond = .{ .status = status, .body = body } }});
             defer server.deinit();
@@ -179,7 +197,10 @@ test "SQL prepared client forbids replay and preserves exact owner identity" {
             defer response.deinit();
             try std.testing.expectEqual(status, response.status_code);
             if (comptime std.mem.eql(u8, operation, "prepare")) {
-                if (status == 200) try std.testing.expectEqualStrings("9007199254740993", response.data.?.value.owner_node_id);
+                if (status == 200) {
+                    try std.testing.expectEqualStrings("9007199254740993", response.data.?.value.owner_node_id);
+                    try std.testing.expectEqual(@as(usize, 0), response.data.?.value.parameter_descriptors.len);
+                }
             }
             try serving.await(io);
             try std.testing.expectEqual(@as(usize, 1), server.route_hits[0]);
@@ -285,10 +306,15 @@ test "personal connections polling accommodates slow status and explicit deadlin
             defer response.deinit();
             try std.testing.expectEqualStrings("connected", response.data.?.value.status);
             try serving.await(io);
+            try std.testing.expectEqual(@as(usize, 1), server.route_hits[0]);
         } else {
             try std.testing.expectError(error.Timeout, client.getChatGPTAttemptWithTimeout("attempt-1", 50));
+            // The deadline may expire before the server accepts the request.
+            // Join the worker before reading its counters; neither outcome
+            // may replay the attempt after the caller's budget expires.
+            serving.cancel(io) catch {};
+            try std.testing.expect(server.route_hits[0] <= 1);
         }
-        try std.testing.expectEqual(@as(usize, 1), server.route_hits[0]);
     }
 }
 

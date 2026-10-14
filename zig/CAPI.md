@@ -70,7 +70,7 @@ primitive.
 
 Portable `.afb` backups are storage-neutral:
 
-- `antfly_db_backup` writes a backup of any handle.
+- `antfly_db_backup` writes a backup of the entire embedded database.
 - `antfly_db_import_backup` imports one into an empty database of either kind.
 - `antfly_restore_backup_json` and `antfly_restore_backup_file_json` create a
   new database at a path, of the storage kind in the passed
@@ -79,8 +79,8 @@ Portable `.afb` backups are storage-neutral:
   swaps out an existing one. A failed or interrupted restore leaves the
   destination holding either the complete old or the complete new database,
   never a partial or missing one. Replacing a directory database that any
-  process has open (through libantfly or otherwise), or a Lite file that has
-  an open writer, fails with `ANTFLY_BUSY`; so does opening a directory
+  process has open (through libantfly or otherwise), or a Lite file whose
+  writer lease is held, fails with `ANTFLY_BUSY`; so does opening a directory
   database while a restore publishes it. `ANTFLY_OUTCOME_UNKNOWN` means the
   new database was published but its crash durability could not be confirmed.
 
@@ -197,9 +197,10 @@ concurrently. `antfly_threading_mode()` reports it as
 `ANTFLY_THREADING_SERIALIZED`, like `sqlite3_threadsafe()`, and the Lite
 capabilities JSON carries `"threading": "serialized"`.
 
-Unlike a single SQLite connection, one handle is not a single serial queue.
-Every export that takes a handle enters through a per-handle guard, and each
-export has one of four access classes:
+Embedded database and table handles share one serialized API fence so
+local multi-table decisions and catalog changes cannot interleave with other
+API calls. Cursor snapshots remain pinned between fetches while other
+sessions execute. Managed owner handles retain four access classes:
 
 | Class | Exports | Runs concurrently with |
 |---|---|---|
@@ -208,9 +209,9 @@ export has one of four access classes:
 | maintain | run-until-idle, generated-enrichment replay, backup, stable snapshot copy | reads and writes; one maintenance call at a time per handle |
 | exclusive | set schema, add/delete index or enrichment, import a backup into a handle, range and split changes, shadow index managers, readable lease hook | nothing; waits for in-flight calls |
 
-Concurrent writes on one handle queue behind each other instead of failing
-with `ANTFLY_BUSY`. Reads run against pinned storage snapshots while a write
-commits. A search stamps the current document identity generation; if a write
+Concurrent calls on an embedded database queue behind each other instead
+of failing with `ANTFLY_BUSY`. Managed owner reads run against pinned
+storage snapshots while a write commits. A search stamps the current document identity generation; if a write
 commits before the search re-checks it, the search restamps and retries, and
 its final attempt briefly holds off writers so it always completes. A read
 with a caller-pinned `identity_read_generation` that has gone stale is
@@ -242,13 +243,43 @@ This is stronger than `sqlite3_close`, where using a closed connection is
 undefined. Bindings may still track their own handle state to report a
 closed handle before crossing the ABI.
 
-Across handles and processes the Lite model matches SQLite in WAL mode: one
-writer and any number of readers per file. The writer lock is taken when a
-writer handle opens and held until it closes. A second writer open fails
-with `ANTFLY_BUSY` immediately, or, when `busy_timeout_ms` is set in
-`antfly_open_options`, retries with capped
-exponential backoff until the timeout elapses, like `sqlite3_busy_timeout`.
-Read-only and status-only opens never contend for the writer lock.
+Lite embedded handles are independent connections. Any number of writable,
+read-only, and status-only connections may remain open to the same file.
+Compatible connections share one process storage owner, catalog/index caches,
+and, when enabled, a maintenance worker per canonical path. SQL sessions, cursor
+IDs, and child handle ownership remain connection-local; closing one connection preserves the
+others. Busy timeouts remain per connection. Distinct storage settings use
+separate owners under the same file gate.
+Opening an existing file does not reserve its writer. Complete native operations
+queue on a canonical file gate within a process, and a kernel path lease
+coordinates operations between processes. A writable operation owns the lease
+through its durable publication; SQL COMMIT retains it through the complete
+coordinator/participant recovery boundary. A competing process returns
+`ANTFLY_BUSY`, or waits up to `busy_timeout_ms`. Read-only calls use a shared
+lease. Calls on writable connections currently use an exclusive lease even
+for reads, a conservative policy that serializes those calls across processes.
+Read-only snapshots without a lock sidecar also open from read-only directories
+or media. Their calls use a shared inode fence when sidecar creation is denied;
+every sidecar creator takes the exclusive inode fence before installing it.
+Reopened native writers discover pending generated enrichment in the durable
+journals of all tables and resume it under their connection lease.
+
+After an external commit or atomic file replacement, the shared owner reopens
+its cached runtime before the next operation. An in-process handoff between
+compatible connections reuses the live runtime. Streaming SQL cursors retain the
+runtime and immutable pages they originally pinned; retiring that runtime
+releases caches without flushing them over a newer generation. Read-only
+connections observe new commits at operation boundaries. Automatic enrichment,
+TTL, and reclamation maintenance run under the same file gate and kernel lease.
+Foreground refresh defers reclamation to that owner. Lease-scoped publication
+fences new read pins until page reuse and checkpoint publication finish; temporary
+lock contention reports `ANTFLY_BUSY` and SQLSTATE `55P03`.
+
+This follows SQLite's separation of connection lifetime from writer ownership;
+it does not claim SQLite WAL concurrency or change Antfly SQL's existing
+READ COMMITTED transaction semantics. Low-level storage owners used by the
+standalone CLI/server retain their exclusive owner contract; a connection waits
+for an active owner at operation time, not at open time.
 
 Every thread that calls into `libantfly` needs at least
 `ANTFLY_MIN_THREAD_STACK_SIZE` (8 MiB) of native stack. The storage engine
@@ -304,3 +335,251 @@ C ABI changes should have coverage for:
 - Every new export that takes a handle must enter through `enterHandle` with
   the right access class, and a binding test should run it concurrently with
   writes (see `go/pkg/embedded/concurrency_cgo_test.go`).
+
+## Database SQL
+
+ABI 3 makes SQL database-scoped: `antfly_db_sql_json(db, request, out)` resolves
+tables from a durable catalog. `antfly_db_create_table_json`, `drop_table`,
+`list_tables_json`, and SQL CREATE/DROP TABLE manage independent table
+namespaces. Tables own their schemas, indexes, enrichment configuration, and
+document identities. Dropped IDs are never reused. The root document API
+addresses the catalog's `default` table; quote it as `"default"` in SQL.
+
+`antfly_db_open_table` returns a handle accepted by the document, schema,
+index, enrichment, graph, and search APIs. Table handles share the owning
+database's API fence and never own the file runtime. Close them with
+`antfly_db_close` before dropping their table. Closing the database drains
+entered calls, invalidates its table handles, and releases all sessions and
+cursors. Database SQL/catalog/session operations require the database handle.
+
+Portable `.afb` archives contain the complete embedded database: its live
+table catalog, schemas, documents, index and enrichment definitions, stored
+artifacts, and UNIQUE/FK constraint state. Export and import require the
+database handle. Import requires an empty database without open table handles,
+SQL sessions, or cursors. Restore builds every table in an unpublished
+file or directory generation before atomically publishing the whole database.
+Table IDs and the next-ID counter survive restoration; dropped namespaces
+are excluded. A SHA-256 digest covers the complete database archive.
+
+Embedded SQL catalog DDL uses the shared schema translator and native schema
+publication. `CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (...)`
+supports expression keys, direction/null ordering, INCLUDE columns and partial
+WHERE predicates. `DROP INDEX [IF EXISTS] name [ON table]` removes the index
+and its paired SQL uniqueness constraint. Without ON, the name must identify
+one table; ambiguity returns SQLSTATE 42725. DDL runs outside explicit
+transactions. Declaration changes increment the schema version through a
+compare-and-swap and return a receipt with the native build/validation state.
+`ALTER TABLE ... VALIDATE CONSTRAINT ...` retries failed coverage through the
+native guarded retry protocol without changing the schema version. Constraint
+activation uses the same bounded, guarded worker as the server. UNIQUE removal
+fences and drains the native claims with durable retirement checkpoints;
+interrupted retirement resumes before the next embedded operation. Foreign keys
+that own a retiring UNIQUE generation prevent admission; another equivalent
+UNIQUE can be dropped if it is not the selected foreign-key target. A pending
+receipt means the operation was durably admitted; inspect the schema and native
+status rather than replaying it.
+
+CHECK expressions also accept typed `IN` and `NOT IN` membership lists,
+including NULL items and other supported scalar expressions. Membership uses
+SQL three-valued logic and stops at the first match. SQL queries support
+`strpos(text, substring)`, returning the first one-based Unicode character
+position, zero for no match, and NULL when either argument is NULL.
+`LIKE` and `ILIKE`, including their negations, accept `ESCAPE` with a single
+Unicode character or an empty string to disable escaping. The default escape
+is backslash. Escape expressions can be parameters; NULL produces UNKNOWN.
+
+Partial-index predicates accept boolean columns, `NOT`, `IS [NOT] TRUE/FALSE`,
+and conjunctions of typed column/literal comparisons and NULL tests. Boolean
+shorthand shares the native equality predicates used by explicit comparisons.
+Negated truth tests retain NULL rows through native null-safe distinctness;
+`NOT flag` excludes NULL rows, while `flag IS NOT TRUE` includes them. Predicates
+that require a disjunction remain unsupported by the native conjunction format.
+
+Index creation advances bounded native build pages before reporting readiness.
+Large builds can return pending and resume through Lite maintenance or an
+explicit `run_until_idle`, which drains relational indexes as well as search
+indexes. MATCH PARTIAL FK publication requires ready parent support indexes;
+a readiness deadline expires before any FK publication decision is admitted.
+Admission builds only the selected witness indexes; unrelated builds and
+reclamation do not consume its deadline. Lite background maintenance advances
+one relational index page per table and releases the writer lease between
+turns, retaining pending work for subsequent turns.
+
+Failed UNIQUE coverage admits constraint-checked UPDATE/DELETE repairs under
+the exact native activation checkpoint, including SQL transactions with cascades and multiple repair targets.
+Repair admission follows the complete mutation closure, including failed tables
+first reached by CASCADE or SET NULL. Read-only FK parents retain their coverage
+requirements, and every cascaded postimage still obeys its declared constraints.
+Every repair target retains its failed native checkpoint guard; other participants
+still require completed UNIQUE coverage. After repairing the rows, VALIDATE
+CONSTRAINT resumes historical coverage. FK activation waits for parent UNIQUE
+coverage without blocking reads or parent repairs.
+FK-bearing CREATE TABLE and ALTER TABLE ADD/DROP CONSTRAINT publish accepted
+child generations at each parent before installing the child schema. DROP TABLE
+retires its outgoing FK generations before removing the namespace. These native
+owner transitions share a durable root publication plan; reopen or the next API
+call completes an interrupted plan before admitting more work. Recreating a
+table registers its fresh identity and FK generations rather than reusing old
+references or parent admission state.
+
+`antfly_search('table', request [, candidate_limit])` is a SQL relation. The
+table name is a literal so preparation can derive its columns; request is text
+or a text parameter containing the same public query JSON used by search_json.
+Plain query text uses the full-text query-string parser. JSON supports named
+indexes, filters, highlights, explicit dense/sparse embeddings, configured
+semantic embedders and hybrid fusion. The optional candidate limit overrides
+the JSON limit (1–10000), and may be written as `limit => 50`. SQL LIMIT applies
+after joins and filters; it does not expand the search candidate window.
+
+The relation exposes the declared table columns plus `_id`, nullable `score`
+and nullable JSON `_highlights`. `score` and `_highlights` are reserved in a
+search relation; conflicting declarations are rejected. All participating
+native tables are fenced together while search hits are ranked/hydrated and
+other scans capture snapshots. Cursors retain this statement view across
+fetches. Embedding resolution happens before capture. SQL search rejects
+uncommitted writes to the searched table because native indexes cannot rank
+staged rows; commit those writes first. Other session postimages remain
+available to ordinary table scans.
+Relational hits are hydrated from the retained native typed-row snapshot,
+preserving SQL NULL separately from JSON null. Document hydration preserves
+JSON number tokens, including decimals and integers beyond float precision.
+
+```sql
+SELECT t.id, s._id, s.score
+FROM antfly_search('history_items', $1, 50) s
+JOIN threads t ON t.id = s.thread_id
+WHERE t.project_id = $2 AND NOT t.archived
+ORDER BY s.score DESC, s._id
+LIMIT 20;
+```
+
+SQL requests contain `statement`, positional `parameters`, a materialized
+result `limit` (default 128, maximum 4096), and optional `session_id`.
+Sessions are independent connection contexts created by `sql_session_open`.
+BEGIN defaults to READ COMMITTED. COMMIT, ROLLBACK, SAVEPOINT, ROLLBACK TO,
+and RELEASE are supported; stronger isolation and transactional DDL are
+rejected. Statements read a pinned native snapshot plus their session's staged
+postimages. Session writes remain private until COMMIT, which prepares native
+version predicates and relational integrity commands across all affected
+tables. Cross-table joins and foreign keys use the same native catalog.
+Closing a session abandons staged writes. Failed transactions reject further
+data statements until ROLLBACK or ROLLBACK TO an existing savepoint.
+
+The root namespace persists the native transaction's durable decision.
+Interrupted preparation is aborted on recovery; decided commits finish
+participant intent resolution without replaying SQL. A committed-pending
+outcome remains committed. An unknown decision returns SQLSTATE 40003 and a
+transaction receipt; do not replay it. Close and reopen the database to
+recover/reconcile that receipt. Commit responses reserve a fallback buffer
+before mutation, so response allocation cannot erase a committed outcome.
+
+`sql_open_cursor_json` pins a read statement without a total row limit.
+`sql_fetch_cursor_json` returns `{result, exhausted}` in pages of 1–4096
+rows. Close cursors explicitly, including after early termination. Unsupported
+streaming plans return 0A000 and may use the bounded materialized API;
+materialized result overflow returns an error. Session close releases its
+cursors. `sql_describe_json` binds column and parameter types without executing.
+SQL buffers include structured diagnostics on failure and must always be
+freed. Integer cells are decimal strings, preserving exact signed 64-bit
+values; `sql_nulls` distinguishes SQL NULL from a JSON null value.
+
+The bindings provide Go `database/sql` (`antfly`, `file:/path/app.aflite`),
+Python `antfly_embedded.dbapi`, Rust's optional `sqlx` feature, and TypeScript
+`Connection` / `@antfly/embedded/kysely`. Their shared SQL conformance inputs
+are in `pkg/antfly-embedded/capi-conformance/sql/cases.json`.
+
+SQL JSON requests admit at most 64 MiB (67,108,864 bytes), including source
+text and parameter data. Larger requests return a structured SQLSTATE `54000`
+diagnostic naming that limit, including when a SQL session is active.
+Preparation and execution each default to 256 MiB (268,435,456 bytes) of
+working memory; decoding, staged rows and storage representations can coexist.
+Requests below the wire limit can still exhaust working memory. Token, node
+and nesting limits independently bound syntax. Embedded SQL sessions admit
+4,096 staged mutations and 256 MiB of staging memory; native transaction
+intent admission additionally counts retained payload and metadata, with its
+configured transaction-byte limit (128 MiB by default). Nested OFFSET queries and derived-table
+window functions grow retained storage with observed rows and may spill to disk.
+
+## Native SDK validation
+
+The Zig validation workflow installs `libantfly` alongside the E2E binary and
+shares its complete `lib/` and `include/` installation with the Go, Rust, Python,
+and TypeScript native SDK jobs. SDK source changes also admit this build. The
+E2E aggregate gates require those jobs to pass; the fast SDK checks remain
+available independently. Native jobs require the installed library and cannot
+pass by skipping tests when it is missing.
+
+Run the same checks locally with:
+
+```sh
+scripts/ci/test-embedded-sdk-native.sh /path/to/libantfly-install all
+```
+
+The optional final argument selects `go`, `rust`, `python`, or `typescript`.
+The runner includes Rust's embedded SQLx integration. Model-dependent inference
+suites are excluded by default; set `ANTFLY_SDK_NATIVE_INFERENCE=1` to include
+them after installing their required models. This is separate from the remote
+PostgreSQL driver matrix in `scripts/test_pgwire_drivers.py`.
+
+
+### Replacement retry and publication boundaries
+
+Replacement `retry_count` counts consecutive transient failures since the last
+acknowledged source/replay checkpoint. A durable forward step resets the count
+and backoff; volatile progress does not. `total_retry_count` never resets and
+bounds each accepted job to 64 lifetime retries; status exposes that count and
+`max_total_retries`. Persisted deadlines more than 3.2 seconds ahead of the
+scheduler's wall clock are clamped and saved once, including after reopen. Explicit resource exhaustion, full-disk
+and temporary remote failures retry up to four times. Unclassified
+`Unexpected`, `InputOutput`, `ReadFailed` and `WriteFailed` errors fail immediately
+rather than assuming storage corruption is transient. A failure after a newer
+checkpoint uses that checkpoint for both retry accounting and recovery.
+
+Replacement ownership uses an IO mutex. Blocking cancellation and deletion park
+on it; backoff sleeps occur after releasing it. Regular activation catch-up has
+a 100 ms cooperative budget. After eight attempts its budget rises to at most
+one second, still limited by an explicit wait deadline. The durable journal
+sequence and intra-entry cursor survive each yield. These are cooperative work
+budgets: a storage operation already underway, including fsync, may overrun one.
+There is no unlimited escalated drain. Sustained producers can require further
+bounded rounds; the old graph remains available until activation commits.
+
+A successful replacement wait observes the catalog under the publication read
+lease. The write lease spans the atomic catalog transaction and old-index
+retirement, so an entry appended provisionally during installation cannot make
+wait return success before commit. If a missing job races publication, wait
+checks the committed catalog again before returning cancellation.
+`ANTFLY_CANCELLED` describes the operation: it covers replacement cancellation,
+progress/stream callbacks returning false, and IO/mutex interruption. Interrupting
+an owner preserves accepted work and its durable checkpoint rather than marking
+the job failed. Completion may have raced interruption; inspect current state.
+
+
+Pending replacements temporarily require reader version 2, because an older
+writer's journal cleanup does not honor shadow retention. Registration publishes
+this fence and a versioned resolver envelope with the build marker. Libraries
+that predate the epoch key reject that envelope through their strict parser;
+already-open Lite writers encounter it when refreshing their connection. Failed
+jobs release replay retention but keep their reservation fence until cancellation.
+Swap and cancellation remove the temporary fence in their catalog transaction
+once no reservations remain. Cancellation rejects a foreign serving generation
+with `ANTFLY_REPLACEMENT_CONFIGURATION_MISMATCH`, leaving the catalog and job intact.
+A separate baseline preserves any permanent reader requirement from resolver
+features; a plain completed replacement returns to version 1. Named tables
+aggregate permanent requirements into the root baseline; temporary child fences
+never become permanent root requirements. This also excludes
+older read-only handles during the build, since older libraries do not distinguish
+reader and writer compatibility epochs.
+
+In-process writers block on the apply lock during replacement activation: the
+ordinary work budget is 100 ms, escalating to about 1 s after eight attempts.
+The current batch and durability checkpoint may overrun that cooperative budget.
+Clock-backoff correction leaves queued jobs unchanged on replicas, write-gated
+handles and databases requiring ordered maintenance; it never chooses a local
+write merely to shorten a retry deadline.
+
+Optional replacement waits capture the admitted generation before releasing
+registration admission and retain it across all wait quanta. Cancelling that
+reservation returns `ANTFLY_CANCELLED`, even if another index or replacement
+subsequently reuses the same name and configuration. Identical requests joining
+an existing reservation wait for that reservation's generation.

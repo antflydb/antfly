@@ -1068,7 +1068,7 @@ fn optionsForSample(common: Options, item: Options) Options {
 /// Scores a heterogeneous batch once, then applies each complete item option
 /// replacement. Empty per_sample selects the common options for every item.
 pub fn runNativePerSample(cb: *const compute.ComputeBackend, allocator: Allocator, config: *const model.Config, prepared: *const processor.PreparedBatch, schemas: []const *const schema_mod.CompiledSchema, core: CoreView, options: Options, per_sample: []const Options) !Result {
-    if (cb.kind() != .native) return error.UnsupportedGlinerBoundaryBackend;
+    if (cb.kind() != .native and cb.kind() != .wasm) return error.UnsupportedGlinerBoundaryBackend;
     try cb.checkExecutionControl();
     if (options.control) |control| try control.check();
     try validateOptions(options);
@@ -1276,7 +1276,9 @@ pub const fp16_encoder_confidence_tolerance: f32 = 7.5e-4;
 /// larger, but still bounded and deterministic, cross-window delta. Measured
 /// via the real long executor (session_factory + Node.extractDirect, not a
 /// diagnostic) over VOPR.md's "Completion-Claim Audit" (37KB, multi-window),
-/// PDF.md's corpus-maximum section (~99KB), and both corpus-minimum
+/// PDF.md's corpus-maximum section (~99KB) -- both now frozen snapshots of
+/// those sections at commit 3ce5aff4ea, under
+/// testdata/gliner25/long_document_probe/ -- and both corpus-minimum
 /// documents, order-independent identity matching (label+text+span) so a
 /// harmless near-tie reordering of the final entities array is never
 /// conflated with a decision difference: every one of 445 matched

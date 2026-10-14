@@ -1329,6 +1329,8 @@ const RaftTableApplyStateMachine = struct {
         InvalidRelationalGeneratedValue,
         GeneratedColumnRewriteRequired,
         InitialChildProvisionAlreadyCommitted,
+        SqlFeatureNotSupported,
+        SqlArraySubscriptError,
 
         fn fromError(err: anyerror) ?ExpectedApplyFailure {
             inline for (@typeInfo(@import("antfly_local_sources").storage_db_online_source_contract.Rejection).error_set.error_names.?) |field| {
@@ -1935,8 +1937,22 @@ const RaftTableApplyStateMachine = struct {
         if (comptime linked_storage) {
             const owner_source = self.kernel_owner_source orelse
                 return error.StorageKernelOwnerUnavailable;
-            const descriptor = storage_owner_descriptor orelse
-                return error.MissingStorageKernelOwnerDescriptor;
+            const descriptor = storage_owner_descriptor orelse {
+                // Released v0.2.1+ Raft commands did not pin owner descriptors.
+                // Use the already-prepared resident owner, as those writers
+                // did. This never resolves metadata on the progress thread;
+                // startup/control must open it first, or apply yields. The
+                // original atomic term/index receipt still prevents replay.
+                _ = try self.write_source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(
+                    self.alloc,
+                    group_id,
+                    table_name,
+                    req,
+                    entry,
+                );
+                if (@import("builtin").is_test) self.test_faults.document_apply_successes += 1;
+                return;
+            };
             try owner_source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(
                 self.alloc,
                 group_id,
@@ -2554,6 +2570,7 @@ pub const HealthSource = struct {
             try health_metrics.appendPromMetric(writer, "antfly_http_hard_disconnect_cancellations_total", "counter", "Public requests cancelled after a hard transport failure", http.peer_disconnects_total);
             try health_metrics.appendPromMetric(writer, "antfly_http_active_peer_observers", "gauge", "Public request sockets registered for hard-disconnect observation", http.active_peer_observers);
         }
+        try antfly.common.prometheus.appendLakeCacheMetrics(writer, api_request_stats.lake_range_cache, api_request_stats.lake_disk_cache);
         try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_hits_total", "counter", "Query embedding cache hits", api_request_stats.query_embedding_cache.hits);
         try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_misses_total", "counter", "Query embedding cache producer misses", api_request_stats.query_embedding_cache.misses);
         try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_coalesced_waiters_total", "counter", "Query embedding requests coalesced behind an in-flight producer", api_request_stats.query_embedding_cache.coalesced_waiters);
@@ -2569,6 +2586,10 @@ pub const HealthSource = struct {
         try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_rejected_admissions_total", "counter", "Query embedding results rejected by cache admission control", api_request_stats.query_embedding_cache.rejected_admissions);
         try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_entries", "gauge", "Live query embedding cache entries", api_request_stats.query_embedding_cache.entries);
         try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_live_bytes", "gauge", "Accounted live query embedding cache bytes", api_request_stats.query_embedding_cache.live_bytes);
+        try @import("../api/lake_query_metrics.zig").append(writer, api_request_stats.lake_range_cache, api_request_stats.lake_disk_cache, api_request_stats.lake_query);
+        inline for (.{ "attempts", "failures", "pages", "nanoseconds" }) |field| {
+            try health_metrics.appendPromMetric(writer, "antfly_lake_navigation_warming_" ++ field ++ "_total", "counter", "Bounded lake navigation warming " ++ field, @field(api_request_stats.lake_navigation_warming, field));
+        }
         try health_metrics.appendPromMetric(writer, "antfly_incoming_graph_route_directory_hits_total", "counter", "Durable incoming-graph route directory hits", api_request_stats.incoming_graph_routes.durable_hits);
         try health_metrics.appendPromMetric(writer, "antfly_incoming_graph_route_directory_misses_total", "counter", "Durable incoming-graph route directory misses, including stale fences", api_request_stats.incoming_graph_routes.durable_misses);
         try health_metrics.appendPromMetric(writer, "antfly_incoming_graph_route_directory_read_failures_total", "counter", "Durable incoming-graph route directory read or decode failures", api_request_stats.incoming_graph_routes.durable_read_failures);
@@ -4827,6 +4848,13 @@ fn isSupersededHotStandbyStandbyReplicationRound(err: anyerror) bool {
         err == error.HAStandbyStateChanged;
 }
 
+fn isCooperativeHotStandbyStandbyReplicationRound(err: anyerror) bool {
+    // A bounded local publication proof yields with the durable received tail
+    // intact. It is neither transport degradation nor an acknowledged apply.
+    return err == error.CatalogPublicationProofPending or
+        isSupersededHotStandbyStandbyReplicationRound(err);
+}
+
 fn isRetryableMetadataBootstrapError(err: anyerror) bool {
     if (isRetryableControlPlaneTransportError(err)) return true;
     // Preserve the metadata layer's shared linearizable-authority contract.
@@ -5801,6 +5829,7 @@ pub const DataServer = struct {
     backend_runtime_mutex: std.atomic.Mutex = .unlocked,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     owned_backend_runtime: ?backend_runtime_mod.BackendRuntimeHandle = null,
+    native_query_repository: ?*@import("../api/native_query_repository.zig").Repository = null,
     /// Process-role HTTP transport services are distinct from storage/API
     /// executor lanes and may be shared by every httpx listener in this role.
     http_observer_lease: ?backend_runtime_mod.BackendRuntime.WorkerLease = null,
@@ -7493,7 +7522,7 @@ pub const DataServer = struct {
             received_count += result.received_count;
             applied_count += result.applied_count;
 
-            if (result.end_of_wal) {
+            if (try antfly.hot_standby.http_replication_client.catchUpComplete(result)) {
                 return .{
                     .iterations = iterations,
                     .received_count = received_count,
@@ -7503,9 +7532,6 @@ pub const DataServer = struct {
                     .last_sent_lsn = result.last_sent_lsn,
                     .next_lsn = result.next_lsn,
                 };
-            }
-            if (result.received_count == 0 and result.applied_count == 0) {
-                return error.InternalReplicationDidNotAdvance;
             }
         }
     }
@@ -9220,7 +9246,7 @@ pub const DataServer = struct {
                 self.clearHotStandbyStandbyReplicationRetry();
                 self.clearHotStandbyStandbyReplicationError();
             } else |err| {
-                if (isSupersededHotStandbyStandbyReplicationRound(err)) {
+                if (isCooperativeHotStandbyStandbyReplicationRound(err)) {
                     self.clearHotStandbyStandbyReplicationRetry();
                     self.clearHotStandbyStandbyReplicationError();
                 } else {
@@ -9561,6 +9587,11 @@ pub const DataServer = struct {
         self.graph_cleanup_sweep.deinit();
         self.initial_fk_retirement_recovery_cursor.deinit();
         self.initial_fk_retirement_gc_cursor.deinit();
+        if (self.native_query_repository) |repository| {
+            if (self.backend_runtime) |runtime| runtime.query_cut_repository = null;
+            repository.deinit();
+            self.alloc.destroy(repository);
+        }
         if (self.owned_backend_runtime) |*runtime| runtime.deinit();
         if (self.query_io_impl) |*io_impl| io_impl.deinit();
         self.hot_standby_admin_server = null;
@@ -9618,6 +9649,14 @@ pub const DataServer = struct {
             self.backend_runtime = self.owned_backend_runtime.?.ptr();
         }
         if (self.backend_runtime) |ptr| {
+            if (comptime !linked_storage) if (ptr.query_cut_repository == null and self.api_server_cfg.node_config != null and self.api_server_cfg.node_config.?.storage.artifacts.connection != null) {
+                const Repository = @import("../api/native_query_repository.zig").Repository;
+                const repository = try self.alloc.create(Repository);
+                errdefer self.alloc.destroy(repository);
+                repository.* = try Repository.init(self.alloc, self.api_server_cfg.node_config, self.api_server_cfg.secret_store, self.api_server_cfg.deployment_mode, self.api_server_cfg.native_lake_artifact_base_dir);
+                self.native_query_repository = repository;
+                ptr.query_cut_repository = repository.capability();
+            };
             self.provisioned_storage.attachBackendRuntime(ptr, &self.read_source, &self.write_source);
             if (self.data_raft_apply) |apply_sm| {
                 apply_sm.write_source.backend_runtime = ptr;
@@ -22915,7 +22954,10 @@ pub const DataServer = struct {
         table_filter: ?[]const []const u8,
     ) !RuntimeStatusRefreshCollection {
         const registration = self.store_registration orelse return error.UnsupportedOperation;
-        var snapshot = (try self.status_source.adminSnapshot()) orelse return error.UnsupportedOperation;
+        // Local status is collected below; fetching every store's diagnostic
+        // payload here creates a polling feedback loop and can monopolize the
+        // bounded diagnostic transfer lane. Use the fenced control authority.
+        var snapshot = (try self.adminSnapshotForMaintenance()) orelse return error.UnsupportedOperation;
         defer self.status_source.freeAdminSnapshot(&snapshot);
 
         var filter_map = std.StringHashMapUnmanaged(void).empty;
@@ -23930,6 +23972,11 @@ pub const DataServer = struct {
                 defer alloc.free(security_json);
                 try storage_kernel_context.?.configureRemoteContentSecurity(security_json);
                 try storage_kernel_context.?.configureSecrets(cfg.api_server_cfg.secret_store);
+                if (cfg.api_server_cfg.node_config != null and cfg.api_server_cfg.node_config.?.storage.artifacts.connection != null) {
+                    const retained_setup = try @import("../api/native_query_repository.zig").Repository.setupJsonAlloc(alloc, cfg.api_server_cfg.node_config, cfg.api_server_cfg.deployment_mode, cfg.api_server_cfg.native_lake_artifact_base_dir);
+                    defer alloc.free(retained_setup);
+                    try storage_kernel_context.?.configureNativeQueries(retained_setup);
+                }
             }
         }
 
@@ -24046,7 +24093,7 @@ pub const DataServer = struct {
                                 },
                             },
                         },
-                        .data_apply_storage_context = if (storage_kernel_context) |context| context.handle else null,
+                        .data_apply_storage_context = cfg.storage_kernel_context_handle orelse if (storage_kernel_context) |context| context.handle else null,
                         .native_snapshot_delegate = data_raft_apply.?.nativeSnapshotDelegate(),
                     }, .{}, .{
                         .transition_runtime = null,
@@ -24079,6 +24126,7 @@ pub const DataServer = struct {
             .local_transition_runtime = if (data_raft) |raft| raft.local_transition_runtime else null,
             .provisioned_storage = provisioned_storage,
             .storage_kernel_context = storage_kernel_context,
+            .borrowed_storage_kernel_context = cfg.storage_kernel_context_handle,
             .read_source = antfly.public_api.ProvisionedTableReadSource.init(
                 cfg.replica_root_dir,
                 remote_metadata.catalogSource(),
@@ -24114,6 +24162,17 @@ pub const DataServer = struct {
 // These tests inspect private apply/admission state and belong to the physical
 // implementation partition, not to both linked test inventories.
 const activation_admission_tests = if (@import("builtin").is_test and implementation_tests_only) struct {
+    test "SQL expression apply failures preserve exact semantic rejections" {
+        const Failure = RaftTableApplyStateMachine.ExpectedApplyFailure;
+        inline for (@typeInfo(@import("antfly_local_sources").schema_relational_expression_errors.Error).error_set.error_names.?) |field| {
+            const reason = @field(@import("antfly_local_sources").schema_relational_expression_errors.Error, field);
+            const classified = Failure.fromError(reason) orelse return error.TestExpectedSemanticRejection;
+            try std.testing.expectEqual(reason, classified.toError());
+        }
+        inline for (.{ error.OutOfMemory, error.ResourceBudgetExceeded, error.Corrupted }) |reason|
+            try std.testing.expectEqual(@as(?Failure, null), Failure.fromError(reason));
+    }
+
     test "ordinary unpublished placement does not require a private initial FK owner snapshot" {
         const snapshot: antfly.metadata_api.AdminSnapshot = .{
             .status = undefined,
@@ -25953,6 +26012,7 @@ const RemoteMetadataSource = struct {
                 .supports_query_definitions = true,
                 .status = remoteStatus,
                 .admin_snapshot = remoteAdminSnapshot,
+                .control_snapshot = remoteControlSnapshot,
                 .acquire_join_planning = remoteAcquireJoinPlanning,
                 .cached_admin_snapshot = remoteCachedAdminSnapshot,
                 .linearizable_snapshot = remoteLinearizableSnapshot,
@@ -26786,6 +26846,11 @@ const RemoteMetadataSource = struct {
         return null;
     }
 
+    fn remoteControlSnapshot(ptr: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        return try self.fetchSnapshotForHead(try self.fetchHead());
+    }
+
     fn remoteAdminSnapshot(ptr: *anyopaque) !antfly.metadata_api.AdminSnapshot {
         const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
         if (try self.cachedDiagnosticSnapshot()) |snapshot| return snapshot;
@@ -27596,7 +27661,7 @@ const RemoteMetadataSource = struct {
                 ));
                 const read = client.readSystemCatalog(self.base_uris[index], input, attempt_ms, &cancellation) catch |err| {
                     switch (err) {
-                        error.InvalidCatalogName, error.CatalogNotFound, error.CatalogGenerationChanged, error.GenerationPublicationNotFound, error.GenerationPublicationChanged, error.InvalidGenerationPublication, error.CatalogCommandTooLarge, error.OutOfMemory, error.Cancelled, error.Canceled => return err,
+                        error.InvalidCatalogName, error.CatalogNotFound, error.CatalogGenerationChanged, error.GenerationPublicationNotFound, error.GenerationPublicationChanged, error.InvalidGenerationPublication, error.CatalogPublicationProofPending, error.CatalogCommandTooLarge, error.OutOfMemory, error.Cancelled, error.Canceled => return err,
                         else => {
                             if (!antfly.metadata.authority.isRetryableError(err) and
                                 !isRetryableControlPlaneTransportError(err) and err != error.RemoteUnavailable)
@@ -30867,6 +30932,11 @@ pub fn runFromIterator(
         defer alloc.free(security_json);
         try process_storage_kernel_context.?.configureRemoteContentSecurity(security_json);
         try process_storage_kernel_context.?.configureSecrets(if (secret_store_initialized) &secret_store else null);
+        if (loaded_config) |*cfg| if (cfg.storage.artifacts.connection != null) {
+            const retained_setup = try @import("../api/native_query_repository.zig").Repository.setupJsonAlloc(alloc, cfg, .distributed, null);
+            defer alloc.free(retained_setup);
+            try process_storage_kernel_context.?.configureNativeQueries(retained_setup);
+        };
     }
 
     var auth_backend: ?LegacyAuthBackend = null;
@@ -33967,7 +34037,7 @@ fn consumerTests() type {
                 .read_source = antfly.public_api.ProvisionedTableReadSource.init("/tmp/unused-report-worker", antfly.public_api.table_catalog.emptyCatalogSource(), antfly.raft.read_gate.alreadyReadSafeBarrier()),
                 .write_source = antfly.public_api.ProvisionedTableWriteSource.init("/tmp/unused-report-worker", antfly.public_api.table_catalog.emptyCatalogSource()),
                 .status_source = undefined,
-                .api_server_cfg = undefined,
+                .api_server_cfg = .{},
                 .query_async_limit = .nothing,
                 .listener_cfg = undefined,
             };
@@ -34090,7 +34160,7 @@ fn consumerTests() type {
                 .read_source = antfly.public_api.ProvisionedTableReadSource.init("/tmp/unused-report-worker", antfly.public_api.table_catalog.emptyCatalogSource(), antfly.raft.read_gate.alreadyReadSafeBarrier()),
                 .write_source = antfly.public_api.ProvisionedTableWriteSource.init("/tmp/unused-report-worker", antfly.public_api.table_catalog.emptyCatalogSource()),
                 .status_source = undefined,
-                .api_server_cfg = undefined,
+                .api_server_cfg = .{},
                 .query_async_limit = .nothing,
                 .listener_cfg = undefined,
             };
@@ -34144,7 +34214,7 @@ fn consumerTests() type {
                 .read_source = antfly.public_api.ProvisionedTableReadSource.init("/tmp/unused-report-worker", antfly.public_api.table_catalog.emptyCatalogSource(), antfly.raft.read_gate.alreadyReadSafeBarrier()),
                 .write_source = antfly.public_api.ProvisionedTableWriteSource.init("/tmp/unused-report-worker", antfly.public_api.table_catalog.emptyCatalogSource()),
                 .status_source = undefined,
-                .api_server_cfg = undefined,
+                .api_server_cfg = .{},
                 .query_async_limit = .nothing,
                 .listener_cfg = undefined,
             };
@@ -34210,7 +34280,7 @@ fn consumerTests() type {
                     .read_source = antfly.public_api.ProvisionedTableReadSource.init("/tmp/unused-report-worker", antfly.public_api.table_catalog.emptyCatalogSource(), antfly.raft.read_gate.alreadyReadSafeBarrier()),
                     .write_source = antfly.public_api.ProvisionedTableWriteSource.init("/tmp/unused-report-worker", antfly.public_api.table_catalog.emptyCatalogSource()),
                     .status_source = undefined,
-                    .api_server_cfg = undefined,
+                    .api_server_cfg = .{},
                     .query_async_limit = .nothing,
                     .listener_cfg = undefined,
                 };
@@ -34703,7 +34773,7 @@ fn consumerTests() type {
                     antfly.public_api.table_catalog.emptyCatalogSource(),
                 ),
                 .status_source = undefined,
-                .api_server_cfg = undefined,
+                .api_server_cfg = .{},
                 .query_async_limit = .nothing,
                 .listener_cfg = undefined,
             };
@@ -34918,7 +34988,7 @@ fn consumerTests() type {
                     antfly.public_api.table_catalog.emptyCatalogSource(),
                 ),
                 .status_source = undefined,
-                .api_server_cfg = undefined,
+                .api_server_cfg = .{},
                 .query_async_limit = .limited(8),
                 .listener_cfg = undefined,
                 .backend_runtime = backend_runtime.ptr(),
@@ -35788,7 +35858,7 @@ fn consumerTests() type {
                 .read_source = antfly.public_api.ProvisionedTableReadSource.init(".", catalog, antfly.raft.read_gate.alreadyReadSafeBarrier()),
                 .write_source = antfly.public_api.ProvisionedTableWriteSource.init(".", catalog),
                 .status_source = undefined,
-                .api_server_cfg = undefined,
+                .api_server_cfg = .{},
                 .query_async_limit = .limited(1),
                 .backend_runtime = runtime.ptr(),
                 .listener_cfg = undefined,
@@ -37427,13 +37497,25 @@ fn consumerTests() type {
 
             // A durable size rejection must not wedge the shard behind the rejected
             // entry (or prevent the coordinator's later abort from applying).
+            // Admission is durable table policy, independent of the worker's
+            // preparation-memory budget. Keep each value within the wire limit,
+            // while exceeding the logical cap with distinct prepared intents.
             const payload = try alloc.alloc(u8, 3 * 1024 * 1024);
             defer alloc.free(payload);
             @memset(payload, 'x');
             const oversized_json = try std.json.Stringify.valueAlloc(alloc, .{ .title = payload }, .{});
             defer alloc.free(oversized_json);
+            var oversized_arena = std.heap.ArenaAllocator.init(alloc);
+            defer oversized_arena.deinit();
+            const fixture_alloc = oversized_arena.allocator();
+            const admission_bytes = @import("antfly_local_sources").storage_db_table_catalog.default_transaction_admission_bytes;
+            const oversized_writes = try fixture_alloc.alloc(std.meta.Child(@FieldType(antfly.db.types.BatchRequest, "writes")), @intCast(admission_bytes / payload.len + 1));
+            for (oversized_writes, 0..) |*write, i| write.* = .{
+                .key = try std.fmt.allocPrint(fixture_alloc, "doc:oversized:{d}", .{i}),
+                .value = oversized_json,
+            };
             const oversized = try data_raft_batch.encodeWithStorageOwnerDescriptor(alloc, "docs", .{
-                .writes = &.{.{ .key = "doc:oversized", .value = oversized_json }},
+                .writes = oversized_writes,
                 .transaction = .{ .prepare = .{ .txn_id = txn_version, .topology_epoch = 1 } },
             }, if (descriptor) |*value| value.view() else null);
             defer alloc.free(oversized);
@@ -37450,6 +37532,7 @@ fn consumerTests() type {
             try RaftTableApplyStateMachine.applyReady(&apply_sm, group_id, null, &after_limit, &.{});
             try std.testing.expectEqual(@as(u64, 12), apply_sm.appliedIndex(group_id));
             const rejected = apply_sm.takeApplyOutcome(group_id, 10).?;
+            try std.testing.expectEqual(.failed, std.meta.activeTag(rejected));
             try std.testing.expectEqual(error.TransactionTooLarge, rejected.failed.toError());
             try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 11).?);
             try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 12).?);
@@ -39174,7 +39257,7 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(u64, 12), groups[0].doc_count);
         }
 
-        test "data runtime status refresh publishes synthetic missing status for absent local group db" {
+        test "data runtime status refresh uses control metadata to publish synthetic missing status" {
             const alloc = std.testing.allocator;
 
             var tmp = std.testing.tmpDir(.{});
@@ -39190,13 +39273,22 @@ fn consumerTests() type {
                         .ptr = undefined,
                         .vtable = &.{
                             .status = status,
-                            .admin_snapshot = adminSnapshot,
+                            .admin_snapshot = rejectDiagnosticSnapshot,
+                            .cached_admin_snapshot = cachedControlSnapshot,
                             .free_admin_snapshot = freeAdminSnapshot,
                             .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
                             .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
                             .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
                         },
                     };
+                }
+
+                fn rejectDiagnosticSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+                    return error.UnexpectedDiagnosticSnapshot;
+                }
+
+                fn cachedControlSnapshot(ptr: *anyopaque) !?antfly.metadata_api.AdminSnapshot {
+                    return try adminSnapshot(ptr);
                 }
 
                 fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
@@ -39941,7 +40033,7 @@ fn consumerTests() type {
                 .read_source = undefined,
                 .write_source = undefined,
                 .status_source = undefined,
-                .api_server_cfg = undefined,
+                .api_server_cfg = .{},
                 .query_async_limit = .limited(8),
                 .listener_cfg = undefined,
             };
@@ -41386,6 +41478,8 @@ fn consumerTests() type {
             try std.testing.expect(std.mem.indexOf(u8, output, "antfly_data_raft_writer_unavailable_logs_suppressed_total 7") != null);
             try std.testing.expect(std.mem.indexOf(u8, output, "antfly_data_api_first_request_elapsed_ms") != null);
             try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_hits_total 0") != null);
+            try std.testing.expect(std.mem.indexOf(u8, output, "antfly_lake_cache_disk_ready 0") != null);
+            try std.testing.expect(std.mem.indexOf(u8, output, "antfly_lake_query_hydration_calls_total 0") != null);
             try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_coalesced_waiters_total 0") != null);
             try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_uncached_computations_total 0") != null);
             try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_producer_compute_ns_total 0") != null);
@@ -43946,6 +44040,15 @@ fn consumerTests() type {
             try std.testing.expect(DataServer.hot_standby_replication_default_apply_window_ns <= std.time.ns_per_s);
         }
 
+        test "data runtime publication proof yields without transport failure backoff" {
+            try std.testing.expect(isCooperativeHotStandbyStandbyReplicationRound(error.CatalogPublicationProofPending));
+            try std.testing.expect(isCooperativeHotStandbyStandbyReplicationRound(error.HAStandbyStateChanged));
+            try std.testing.expect(isCooperativeHotStandbyStandbyReplicationRound(error.HAStandbyNotConfigured));
+            try std.testing.expect(!isCooperativeHotStandbyStandbyReplicationRound(error.InvalidCatalogRecord));
+            try std.testing.expect(!isCooperativeHotStandbyStandbyReplicationRound(error.ConnectionResetByPeer));
+            try std.testing.expect(!isCooperativeHotStandbyStandbyReplicationRound(error.InternalReplicationDidNotAdvance));
+        }
+
         test "data runtime HA apply window does not report caught up with pending or deferred WAL" {
             const caught_up = antfly.hot_standby.standby.Progress{
                 .received_lsn = 10,
@@ -46420,7 +46523,7 @@ fn consumerTests() type {
                     antfly.public_api.table_catalog.emptyCatalogSource(),
                 ),
                 .status_source = undefined,
-                .api_server_cfg = undefined,
+                .api_server_cfg = .{},
                 .query_async_limit = .nothing,
                 .listener_cfg = undefined,
             };
@@ -46771,7 +46874,7 @@ fn implementationTests() type {
                     FakeCatalog.iface(),
                 ),
                 .status_source = FakeStatus.iface(),
-                .api_server_cfg = undefined,
+                .api_server_cfg = .{},
                 .query_async_limit = .limited(8),
                 .listener_cfg = undefined,
             };
@@ -47576,7 +47679,7 @@ fn implementationTests() type {
                 .read_source = antfly.public_api.ProvisionedTableReadSource.init("/tmp/unused-upload-handoff", antfly.public_api.table_catalog.emptyCatalogSource(), antfly.raft.read_gate.alreadyReadSafeBarrier()),
                 .write_source = antfly.public_api.ProvisionedTableWriteSource.init("/tmp/unused-upload-handoff", antfly.public_api.table_catalog.emptyCatalogSource()),
                 .status_source = undefined,
-                .api_server_cfg = undefined,
+                .api_server_cfg = .{},
                 .query_async_limit = .nothing,
                 .listener_cfg = undefined,
             };
@@ -47682,7 +47785,7 @@ fn implementationTests() type {
                 .read_source = antfly.public_api.ProvisionedTableReadSource.init("/tmp/unused-ttl-admission", antfly.public_api.table_catalog.emptyCatalogSource(), antfly.raft.read_gate.alreadyReadSafeBarrier()),
                 .write_source = antfly.public_api.ProvisionedTableWriteSource.init("/tmp/unused-ttl-admission", antfly.public_api.table_catalog.emptyCatalogSource()),
                 .status_source = undefined,
-                .api_server_cfg = undefined,
+                .api_server_cfg = .{},
                 .query_async_limit = .nothing,
                 .listener_cfg = undefined,
             };
@@ -48018,7 +48121,7 @@ fn implementationTests() type {
                         antfly.public_api.table_catalog.emptyCatalogSource(),
                     ),
                     .status_source = undefined,
-                    .api_server_cfg = undefined,
+                    .api_server_cfg = .{},
                     .query_async_limit = .limited(8),
                     .work_cost_port = .{ .ptr = &attempts, .charge_fn = Attempts.charge },
                     .listener_cfg = undefined,
@@ -48245,7 +48348,7 @@ fn implementationTests() type {
                     antfly.public_api.table_catalog.emptyCatalogSource(),
                 ),
                 .status_source = remote_metadata.statusSource(),
-                .api_server_cfg = undefined,
+                .api_server_cfg = .{},
                 .query_async_limit = .limited(8),
                 .backend_runtime = backend_runtime.ptr(),
                 .listener_cfg = undefined,
@@ -48975,7 +49078,7 @@ fn implementationTests() type {
                     antfly.public_api.table_catalog.emptyCatalogSource(),
                 ),
                 .status_source = undefined,
-                .api_server_cfg = undefined,
+                .api_server_cfg = .{},
                 .query_async_limit = .limited(8),
                 .work_cost_port = adapter.iface(),
                 .listener_cfg = undefined,
@@ -56153,7 +56256,7 @@ fn implementationTests() type {
                     FakeCatalog.iface(),
                 ),
                 .status_source = FakeStatus.iface(),
-                .api_server_cfg = undefined,
+                .api_server_cfg = .{},
                 .query_async_limit = .limited(8),
                 .listener_cfg = undefined,
             };

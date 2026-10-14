@@ -16,7 +16,7 @@
 //! Opt-in public service qualification for the exact GLiNER2.5-Decide-1B
 //! artifact after the pinned capture and shared loaded-identity gate passed
 //! native and physical Metal parity. Both direct and HTTP presentation paths
-//! use an explicit 10 GiB process envelope with a 10 GiB generation budget.
+//! use an explicit 12 GiB process envelope with a 12 GiB generation budget.
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
@@ -42,8 +42,8 @@ const BackendType = @import("../backends/backends.zig").BackendType;
 const Allocator = std.mem.Allocator;
 
 const pins = decide_parity.files;
-const service_process_memory_bytes = 10 * 1024 * 1024 * 1024;
-const service_generation_memory_bytes = 10 * 1024 * 1024 * 1024;
+const service_process_memory_bytes = 12 * 1024 * 1024 * 1024;
+const service_generation_memory_bytes = 12 * 1024 * 1024 * 1024;
 
 const OwnershipSnapshot = struct {
     model: memory.AdmissionAmounts = .{},
@@ -210,9 +210,23 @@ fn linkedModel(a: Allocator, temporary: *std.testing.TmpDir, source: []const u8,
     if (synthesize_manifest) {
         const manifest_json = try registry.synthesizePulledModelManifestJson(a, model_dir, null, null);
         defer a.free(manifest_json);
+        try expectSpanPublication(a, manifest_json);
         try temporary.dir.writeFile(io, .{ .sub_path = "model/model_manifest.json", .data = manifest_json });
     }
     return root;
+}
+
+fn expectSpanPublication(a: Allocator, manifest_json: []const u8) !void {
+    const publication = try std.json.parseFromSlice(std.json.Value, a, manifest_json, .{});
+    defer publication.deinit();
+    const capabilities = publication.value.object.get("capabilities").?.array.items;
+    for (capabilities) |capability| {
+        try std.testing.expect(!std.mem.eql(u8, capability.string, "named_entity_recognition"));
+        try std.testing.expect(!std.mem.eql(u8, capability.string, "relations"));
+        try std.testing.expect(!std.mem.eql(u8, capability.string, "extraction"));
+    }
+    const limits = publication.value.object.get("qualified_limits").?.object;
+    try std.testing.expectEqualStrings("parity_only_no_nonempty_eval", limits.get("span_extraction_status").?.string);
 }
 
 fn requestJson(a: Allocator, captured: []const u8) ![]u8 {
@@ -680,8 +694,8 @@ fn explicitV1ClassificationRegression(
     const fallback_score = (try expectClassificationCount(a, high_v2.json, 1)) orelse return error.InvalidFamilyReference;
     try std.testing.expect(fallback_score < 0.999999);
 
-    // Qualification covers one request item and one prepared sequence through
-    // 198 tokens. Legacy adapters must reject before executing outside it.
+    // Qualification covers one request item and a 1024-token complete prompt.
+    // Legacy adapters must reject before executing outside it.
     try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, node.extractDirect(a, "model", .{
         .schema_version = 1,
         .inputs = &.{
@@ -705,7 +719,7 @@ fn explicitV1ClassificationRegression(
 
     var long_text = std.ArrayListUnmanaged(u8).empty;
     defer long_text.deinit(a);
-    for (0..256) |_| try long_text.appendSlice(a, "token ");
+    for (0..1100) |_| try long_text.appendSlice(a, "token ");
     const long_content_json = try std.json.Stringify.valueAlloc(a, long_text.items, .{});
     defer a.free(long_content_json);
     try std.testing.expectError(error.BoundarySequenceLimitExceeded, node.extractDirect(a, "model", .{
@@ -725,6 +739,48 @@ fn explicitV1ClassificationRegression(
     defer long_http.deinit();
     try std.testing.expectEqual(@as(u16, 413), long_http.status.code);
     try std.testing.expect(std.mem.indexOf(u8, long_http.body orelse return error.MissingResponseBody, "EXTRACTION_LIMIT_EXCEEDED") != null);
+    _ = try expectIdle(node);
+}
+
+fn expandedKnowledgeGraphParity(a: Allocator, node: *Node) !void {
+    const fixtures = @import("../extractors/gliner_graph_qualification_fixtures.zig");
+    const Case = struct { id: []const u8, text: []const u8, native_schema_json: []const u8 };
+    const capture = try std.json.parseFromSlice(struct { cases: []const Case }, a, fixtures.decide_1b_spans, .{ .ignore_unknown_fields = true });
+    defer capture.deinit();
+    for (capture.value.cases) |case| {
+        if (!std.mem.eql(u8, case.id, "entities_relations") and !std.mem.eql(u8, case.id, "decision_1024")) continue;
+        const schema = try std.json.parseFromSlice(std.json.Value, a, case.native_schema_json, .{});
+        defer schema.deinit();
+        const request = try std.json.Stringify.valueAlloc(a, .{ .schema_version = @as(u32, 2), .model = "model", .schema = schema.value, .inputs = .{.{ .content = case.text }}, .options = .{ .include_confidence = true, .include_spans = true, .offset_unit = "unicode_codepoints" } }, .{});
+        defer a.free(request);
+        var direct = try node.extractV2DirectJsonWithControl(a, request, null);
+        defer direct.deinit();
+        var http = try dispatchExtraction(a, node, request);
+        defer http.deinit();
+        try std.testing.expectEqual(@as(u16, 200), http.status.code);
+        const left = try std.json.parseFromSlice(std.json.Value, a, direct.json, .{});
+        defer left.deinit();
+        const right = try std.json.parseFromSlice(std.json.Value, a, http.body.?, .{});
+        defer right.deinit();
+        try expectJsonApprox(left.value, right.value, 5e-4);
+        const result = left.value.object.get("data").?.array.items[0].object;
+        if (result.get("entities")) |entities|
+            try std.testing.expectEqual(@as(usize, 0), entities.array.items.len);
+        if (std.mem.eql(u8, case.id, "decision_1024")) {
+            const task = result.get("classifications").?.array.items[0].object;
+            try std.testing.expectEqualStrings("refund", task.get("label").?.string);
+            try std.testing.expectApproxEqAbs(@as(f64, 0.9999940395355225), task.get("score").?.float, 5e-4);
+            // The public decisions adapter shares this ceiling. Its realistic
+            // 700+ token state must succeed with the full question prompt.
+            const decision = try std.json.Stringify.valueAlloc(a, .{ .model = "model", .input = case.text[0..3600], .questions = .{.{ .name = "intent", .type = "choice", .instructions = "Classify the customer intent.", .choices = .{ .{ .value = "refund", .description = "refund" }, .{ .value = "support", .description = "support" }, .{ .value = "cancel", .description = "cancel" } } }} }, .{});
+            defer a.free(decision);
+            const answer = try node.decideDirectJsonWithControl(a, decision, null);
+            defer a.free(answer);
+            var response = try dispatch(a, node, decision);
+            defer response.deinit();
+            try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        }
+    }
     _ = try expectIdle(node);
 }
 
@@ -1144,19 +1200,19 @@ fn serviceParity(comptime backend: BackendType) !void {
     try std.testing.expectEqual(manifest_mod.GlinerSpanEncoderFamily.modern_bert, raw_listing.gliner_span_encoder_family);
     try std.testing.expectEqual(@as(usize, 0), raw_listing.tasks.len);
     try std.testing.expectEqual(@as(usize, 0), raw_listing.capabilities.len);
+    const publication = try registry.synthesizePulledModelManifestJson(a, directory, null, null);
+    defer a.free(publication);
+    try expectSpanPublication(a, publication);
     var node = try Node.init(a, .{
         .models_dir = models_dir,
         .max_loaded_models = 1,
         .max_concurrent_requests = 1,
         .keep_alive_ms = 30 * 60 * 1000,
         .process_termination_available = true,
-        // The measured cold Metal load plus partial lazy F32 host-cache growth
-        // already exceeds 7 GiB. The complete pinned mapping, bounded request
-        // scratch, tokenizer ownership, default 512 MiB request heap and the
-        // mandatory emergency reserve have a 9.46 GiB conservative upper
-        // bound. The explicit 10 GiB worker envelope constrains the available
-        // memory signal and keeps that ownership contract plus the mandatory
-        // 512 MiB emergency reserve within the same process limit.
+        // The 1024-token qualification reserves more span-head scratch than
+        // the earlier 198-token profile. Include resident weights, lazy host
+        // caches, request scratch and the mandatory emergency reserve in an
+        // explicit 12 GiB worker envelope; keep production admission enabled.
         .process_memory_limit_bytes = service_process_memory_bytes,
         .process_memory_limit_provenance = .explicit,
         .generation_budget_overrides = .{ .host_limit_bytes = service_generation_memory_bytes, .backend_limit_bytes = service_generation_memory_bytes, .scratch_limit_bytes = service_generation_memory_bytes, .combined_limit_bytes = service_generation_memory_bytes, .kv_limit_bytes = 4 * 1024 * 1024 * 1024 },
@@ -1279,6 +1335,7 @@ fn serviceParity(comptime backend: BackendType) !void {
     // timing scope. These compatibility regressions run only in qualification.
     if (!run_perf) {
         try explicitV1ClassificationRegression(a, &node, directory, capture.value);
+        try expandedKnowledgeGraphParity(a, &node);
         try std.testing.expectEqual(cached.?, try expectCached(&node, directory, backend));
         try expectSameModelWeights(resident_model.?, try modelOwned(&node));
     }

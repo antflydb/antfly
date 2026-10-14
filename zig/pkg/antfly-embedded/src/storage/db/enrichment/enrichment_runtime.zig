@@ -2966,6 +2966,7 @@ fn noteTransientEmbedRetry(runtime: *EnrichmentRuntime, err: anyerror) void {
 
 fn runtimeStatusSnapshot(runtime: *EnrichmentRuntime) enrichment_state.RuntimeStatus {
     return .{
+        .last_error_code = runtime.last_error_code,
         .target_sequence = runtime.target_sequence,
         .error_count = runtime.error_count,
         .retryable_error_count = runtime.retryable_error_count,
@@ -2989,6 +2990,7 @@ fn runtimeProjectionStatus(retrying: bool, worker_failed: bool) enrichment_state
 }
 
 fn restorePersistedRuntimeStatus(runtime: anytype, persisted_status: enrichment_state.RuntimeStatus) void {
+    if (@hasField(@TypeOf(runtime.*), "last_error_code")) runtime.last_error_code = persisted_status.last_error_code;
     runtime.error_count = persisted_status.error_count;
     runtime.retryable_error_count = persisted_status.retryable_error_count;
     runtime.fatal_error_count = persisted_status.fatal_error_count;
@@ -4319,6 +4321,7 @@ fn getOrCreateRequestChunks(
 fn inheritProcessTelemetryUnlocked(runtime: anytype, previous: types.EnrichmentStats) void {
     runtime.processed_requests = @max(runtime.processed_requests, previous.processed_requests);
     runtime.error_count = @max(runtime.error_count, previous.error_count);
+    if (@hasField(@TypeOf(runtime.*), "last_error_code") and previous.last_error_code.len > 0) runtime.last_error_code = previous.last_error_code;
     runtime.retryable_error_count = @max(runtime.retryable_error_count, previous.retryable_error_count);
     runtime.fatal_error_count = @max(runtime.fatal_error_count, previous.fatal_error_count);
     runtime.skip_by_hash_count = @max(runtime.skip_by_hash_count, previous.skip_by_hash_count);
@@ -4375,6 +4378,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     target_sequence: u64 = 0,
     activity_epoch: u64 = 0,
     processed_requests: u64 = 0,
+    last_error_code: types.RuntimeErrorName = .{},
     error_count: u64 = 0,
     retryable_error_count: u64 = 0,
     fatal_error_count: u64 = 0,
@@ -4774,6 +4778,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .projection_checkpoint_config_hash = config_hash,
             .checkpoint_replay_tail_sequence_count = self.target_sequence -| self.applied_sequence,
             .processed_requests = self.processed_requests,
+            .last_error_code = if (@hasField(@TypeOf(self.*), "last_error_code")) self.last_error_code else .{},
             .error_count = self.error_count,
             .retryable_error_count = self.retryable_error_count,
             .fatal_error_count = self.fatal_error_count,
@@ -4961,6 +4966,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     sparse_artifact_bytes_written: u64 = 0,
     chunk_artifact_bytes_written: u64 = 0,
     index_embedding_activity: std.StringHashMapUnmanaged(types.EmbeddingActivityStats) = .empty,
+    last_error_code: types.RuntimeErrorName = .{},
     last_error_name: ?[]const u8 = null,
     /// Guards the three string sets below. They are read and written from
     /// the scanner thread and from both concurrently running execution
@@ -5129,8 +5135,14 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         return self.future != null;
     }
 
-    pub fn start(self: *EnrichmentRuntime) !void {
-        if (self.future != null) return;
+    /// Resume provider admission after a joined stop while the caller owns
+    /// synchronous replay. Restore drains must not launch a competing worker.
+    pub fn resumeInlineAfterStop(self: *EnrichmentRuntime) !void {
+        if (self.future != null) return error.EnrichmentWorkerAlreadyRunning;
+        try self.prepareExecution();
+    }
+
+    fn prepareExecution(self: *EnrichmentRuntime) !void {
         const io_impl = self.io_impl orelse return error.MissingBackendRuntimeIo;
         self.shutdown_event.reset();
         self.shutdown_requested.store(false, .release);
@@ -5146,6 +5158,11 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             provider.execution.cancellation = cancellation;
             provider.execution.io = io;
         }
+    }
+
+    pub fn start(self: *EnrichmentRuntime) !void {
+        if (self.future != null) return;
+        try self.prepareExecution();
         self.future = try (try self.backend_runtime.?.maintenanceScheduler()).registerClass(.producer, self, workerStep);
     }
 
@@ -5553,6 +5570,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .projection_checkpoint_config_hash = config_hash,
             .checkpoint_replay_tail_sequence_count = self.target_sequence -| self.applied_sequence,
             .processed_requests = self.processed_requests,
+            .last_error_code = if (@hasField(@TypeOf(self.*), "last_error_code")) self.last_error_code else .{},
             .error_count = self.error_count,
             .retryable_error_count = self.retryable_error_count,
             .fatal_error_count = self.fatal_error_count,
@@ -5636,6 +5654,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         std.log.err("enrichment worker failed: {s}", .{@errorName(err)});
         var status: enrichment_state.RuntimeStatus = .{};
         self.mutex.lockUncancelable(io);
+        self.last_error_code = types.RuntimeErrorName.init(@errorName(err));
         self.error_count += 1;
         self.fatal_error_count += 1;
         self.retrying = false;
@@ -5663,6 +5682,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         var status: enrichment_state.RuntimeStatus = .{};
         self.mutex.lockUncancelable(io);
         if (!awaiting_publication) {
+            self.last_error_code = types.RuntimeErrorName.init(@errorName(err));
             self.error_count += 1;
             self.retryable_error_count += 1;
             if (scope == .pipeline) self.consecutive_retry_count +|= 1;
@@ -5698,6 +5718,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         std.log.warn("enrichment provider transient failure, retrying inline: {s}", .{@errorName(err)});
         var status: enrichment_state.RuntimeStatus = .{};
         self.mutex.lockUncancelable(io);
+        self.last_error_code = types.RuntimeErrorName.init(@errorName(err));
         self.error_count += 1;
         self.retryable_error_count += 1;
         status = runtimeStatusSnapshot(self);
@@ -6419,6 +6440,7 @@ fn noteTerminalRequestFailure(
     indexes: []const []const u8,
     artifact_name: []const u8,
     completed_failure_fingerprint: u64,
+    failure: anyerror,
 ) !void {
     const maybe_io = lockRuntime(runtime);
     const interval = mergedTerminalFailureInterval(
@@ -6440,6 +6462,7 @@ fn noteTerminalRequestFailure(
         runtime.retry_failure_fingerprint = 0;
         runtime.retry_failure_count = 0;
     }
+    runtime.last_error_code = types.RuntimeErrorName.init(@errorName(failure));
     runtime.error_count += 1;
     runtime.fatal_error_count += 1;
     runtime.retrying = false;
@@ -6573,6 +6596,7 @@ fn recordIsolatedRequestErrorFor(runtime: *EnrichmentRuntime, window: ?*Generate
             .asset, .chunk_text => requestArtifactName(request),
         },
         requestFailureFingerprint(request),
+        err,
     );
     runtime.notifyStatusHook();
 }
@@ -7189,7 +7213,19 @@ fn runForegroundCatchUpPassOwned(
     runtime.mutex.unlock(io);
     if (already_failed) return;
     try scavengeSharedPdfConsumerAttempts(runtime);
-    const pending = try enrichment_worker.collectPendingDocumentGroups(runtime.alloc, runtime.replay_source, runtime.applied_sequence);
+    // A worker pass checkpoints a complete bounded prefix. Rebuilding and
+    // sorting the full remaining corpus on every retry makes discovery cost
+    // grow with ingestion backlog instead of the work this pass can publish.
+    // Cap distinct work at 128 documents while letting repeated updates
+    // coalesce across up to 4096 records before paying for another checkpoint.
+    // The byte limit also bounds discovery of large repeated-update records;
+    // one complete record may exceed either soft limit.
+    const replay_window = try runtime.replay_source.collectEnrichmentDocumentGroupsWindow(runtime.alloc, runtime.applied_sequence, .{
+        .max_records = 4096,
+        .max_document_groups = 128,
+        .max_input_bytes = 4 * 1024 * 1024,
+    });
+    const pending = replay_window.groups;
     defer enrichment_worker.freePendingDocumentGroups(runtime.alloc, pending);
     var replay_cursor_assets = try loadReplayCursorForPass(runtime, runtime.applied_sequence, .assets);
     defer if (replay_cursor_assets) |*cursor| cursor.deinit(runtime.alloc);
@@ -7213,9 +7249,10 @@ fn runForegroundCatchUpPassOwned(
     };
     try drain_result;
     try replay_lease_guard.check();
-    if (pending.len == 0) {
-        max_seen = target_sequence;
-    }
+    // Empty records still consume a bounded window. Advance only through the
+    // scanned prefix; an empty group list does not prove the tail is empty.
+    max_seen = @max(max_seen, replay_window.last_sequence);
+    if (pending.len == 0 and replay_window.last_sequence == 0) max_seen = target_sequence;
 
     if (max_seen > runtime.applied_sequence) {
         setActiveFailureFingerprint(runtime, 0);
@@ -11492,6 +11529,13 @@ pub fn servicePendingArtifactUnitJobs(runtime: *EnrichmentRuntime, document: []c
     const store = runtime.artifact_store orelse return;
     if (runtime.config.root_incarnation == 0) return;
     const unit_jobs = @import("../artifact_unit_jobs.zig");
+    {
+        // Most documents have no unit outbox. Check absence with point reads
+        // before acquiring a cursor-capable primary snapshot.
+        var probe = try store.beginProbeTxnWithBlockCacheAdmission(.transient);
+        defer probe.abort();
+        if (!try unit_jobs.documentMayHaveJobs(&probe, runtime.config.root_incarnation, document)) return;
+    }
     var budget = if (runtime.config.resource_manager orelse runtime.index_manager.resource_manager) |manager|
         resource_manager_mod.BudgetedAllocator.init(manager, .document_extraction_working_set, runtime.alloc, 1)
     else
@@ -21793,6 +21837,10 @@ fn prepareGraphAssetForRuntime(
     defer if (comptime @hasDecl(@typeInfo(@TypeOf(runtime.index_manager)).pointer.child, "beginGraphPrimaryMutation")) graph_publication.release();
     const artifact_name = requestArtifactName(request);
 
+    // Cached artifacts retain the landed canonical endpoint mapping.
+    const endpoint_resolutions = try runtimeGraphEndpointResolutionsAlloc(runtime, request.doc_key, artifact_name);
+    defer if (endpoint_resolutions) |raw| runtime.alloc.free(raw);
+
     for (runtime.index_manager.graphIndexes()) |graph_entry| {
         if (comptime @hasDecl(@typeInfo(@TypeOf(runtime)).pointer.child, "accepted")) {
             if (try runtime.accepted(graph_entry)) continue;
@@ -21800,7 +21848,7 @@ fn prepareGraphAssetForRuntime(
         const source = runtime.index_manager.graphArtifactSourceForArtifact(graph_entry.config.name, artifact_name) orelse continue;
 
         const edge_limit = graph_asset_state.effectiveEdgeLimit(graph_entry.max_edges_per_document);
-        const graph_writes = try runtimeGraphWritesFromArtifactValueAlloc(runtime.alloc, graph_entry.config.name, request.doc_key, value, source, request.content_type, raw_doc, graph_asset_state.hard_max_relation_items_per_artifact);
+        const graph_writes = try runtimeGraphWritesWithResolutionsAlloc(runtime.alloc, graph_entry.config.name, request.doc_key, value, source, request.content_type, raw_doc, endpoint_resolutions, graph_asset_state.hard_max_relation_items_per_artifact);
         defer runtimeFreeGraphWrites(runtime.alloc, graph_writes);
 
         var writes = std.ArrayListUnmanaged(KVPair).empty;
@@ -22644,6 +22692,28 @@ fn borrowedRuntimeKeySet(
     return set;
 }
 
+fn runtimeGraphEndpointResolutionsAlloc(runtime: anytype, doc_key: []const u8, artifact_name: []const u8) !?[]u8 {
+    if (comptime !@hasField(@typeInfo(@TypeOf(runtime.index_manager)).pointer.child, "resolvers")) return null;
+    var arena = std.heap.ArenaAllocator.init(runtime.alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var map: std.json.ObjectMap = .empty;
+    var targeted = false;
+    for (runtime.index_manager.resolvers.items) |cfg| {
+        if (!std.mem.eql(u8, cfg.source_artifact, artifact_name)) continue;
+        targeted = true;
+        const key = try internal_keys.resolutionArtifactKeyAlloc(a, doc_key, cfg.resolution_artifact);
+        const raw = if (comptime @hasDecl(@typeInfo(@TypeOf(runtime)).pointer.child, "getResolutionAlloc"))
+            try runtime.getResolutionAlloc(key)
+        else
+            try storeGetOptionalAllocWithRetry(runtime, key);
+        defer if (raw) |bytes| runtime.alloc.free(bytes);
+        try @import("../graph_endpoint_resolutions.zig").append(a, &map, raw orelse continue);
+    }
+    if (!targeted) return null;
+    return try std.json.Stringify.valueAlloc(runtime.alloc, std.json.Value{ .object = map }, .{});
+}
+
 fn runtimeGraphWritesFromArtifactValueAlloc(
     alloc: Allocator,
     index_name: []const u8,
@@ -22654,8 +22724,29 @@ fn runtimeGraphWritesFromArtifactValueAlloc(
     raw_doc: ?[]const u8,
     edge_limit: usize,
 ) ![]types.GraphEdgeWrite {
+    return runtimeGraphWritesWithResolutionsAlloc(alloc, index_name, doc_key, raw, source, artifact_content_type, raw_doc, null, edge_limit);
+}
+
+fn runtimeGraphWritesWithResolutionsAlloc(
+    alloc: Allocator,
+    index_name: []const u8,
+    doc_key: []const u8,
+    raw: []const u8,
+    source: index_manager_mod.GraphArtifactSource,
+    artifact_content_type: []const u8,
+    raw_doc: ?[]const u8,
+    endpoint_resolutions: ?[]const u8,
+    edge_limit: usize,
+) ![]types.GraphEdgeWrite {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{ .parse_numbers = false });
     defer parsed.deinit();
+    if (endpoint_resolutions) |res_raw| {
+        if (parsed.value == .object) {
+            const a = parsed.arena.allocator();
+            const resolutions = try @import("../graph_endpoint_resolutions.zig").references(a, res_raw);
+            try parsed.value.object.put(a, "_entities", resolutions);
+        }
+    }
     var parsed_doc = if (raw_doc) |doc| try std.json.parseFromSlice(std.json.Value, alloc, doc, .{ .parse_numbers = false }) else null;
     defer if (parsed_doc) |*doc| doc.deinit();
     const doc_value: ?std.json.Value = if (parsed_doc) |doc| doc.value else null;
@@ -30509,14 +30600,14 @@ test "durable enrichment retry progress preserves unrelated request debt across 
     runtime.consecutive_retry_count = 6;
     runtime.retry_failure_fingerprint = 91;
     runtime.retry_failure_count = 4;
-    try noteTerminalRequestFailure(&runtime, 7, &.{}, "", 92);
+    try noteTerminalRequestFailure(&runtime, 7, &.{}, "", 92, error.TestFailure);
     persisted = try enrichment_state.loadRuntimeStatus(alloc, runtime.store, scope_name);
     try std.testing.expectEqual(@as(u32, 0), persisted.consecutive_retry_count);
     try std.testing.expectEqual(@as(u64, 91), persisted.retry_failure_fingerprint);
     try std.testing.expectEqual(@as(u32, 4), persisted.retry_failure_count);
 
     // Parking the request which owns the budget retires that debt.
-    try noteTerminalRequestFailure(&runtime, 8, &.{}, "", 91);
+    try noteTerminalRequestFailure(&runtime, 8, &.{}, "", 91, error.TestFailure);
     persisted = try enrichment_state.loadRuntimeStatus(alloc, runtime.store, scope_name);
     try std.testing.expectEqual(@as(u64, 0), persisted.retry_failure_fingerprint);
     try std.testing.expectEqual(@as(u32, 0), persisted.retry_failure_count);
@@ -30774,9 +30865,14 @@ const AllocatedStoreReader = struct {
     alloc: Allocator,
 
     pub fn read(self: *@This(), key: []const u8) ![]u8 {
-        var txn = try self.runtime.store.beginRead();
+        // This read returns one owned value and needs no transaction-wide
+        // snapshot. A short point lease avoids retaining a full read view
+        // while copying the source value for the caller.
+        var txn = try self.runtime.store.beginProbe();
         defer txn.abort();
-        return self.alloc.dupe(u8, try txn.get(key));
+        // The lease ends after the owned copy. Ordinary probe gets already
+        // copy values, which would duplicate large source documents twice.
+        return self.alloc.dupe(u8, try txn.getLeased(key));
     }
 
     fn readDocument(self: *@This(), key: []const u8) ![]u8 {
@@ -30786,6 +30882,66 @@ const AllocatedStoreReader = struct {
         return try self.runtime.index_manager.materializeStoredValueAlloc(self.alloc, key, raw);
     }
 };
+
+test "enrichment point reads avoid mutable backlog snapshots and return owned current values" {
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
+    const lsm = @import("../../lsm_backend.zig");
+    var backend = lsm.Backend.init(alloc, .{ .read_snapshot_rotate_mutable_bytes = std.math.maxInt(usize) });
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer store.deinit();
+    var document_store = try @import("../../docstore.zig").DocStore.openRuntime(alloc, &store);
+    defer document_store.close();
+    {
+        var write = try store.beginWrite();
+        for (0..512) |i| {
+            var key_buf: [32]u8 = undefined;
+            const key = try std.fmt.bufPrint(&key_buf, "doc:{d}", .{i});
+            try write.put(key, "original");
+        }
+        try write.commit();
+    }
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .store = store,
+        .artifact_store = &document_store,
+        .io_impl = null,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .root_incarnation = 1 },
+        .ownership = undefined,
+    };
+    var reader = AllocatedStoreReader{ .runtime = &runtime, .alloc = alloc };
+    const before = backend.snapshotMaintenanceStats().mutable_snapshot_clone_calls;
+    const before_read = backend.snapshotReadStats();
+    const owned = try reader.read("doc:0");
+    defer alloc.free(owned);
+    const after_read = backend.snapshotReadStats();
+    try std.testing.expectEqual(before_read.point_value_copies, after_read.point_value_copies);
+    try std.testing.expectEqual(before_read.point_value_borrows + 1, after_read.point_value_borrows);
+    {
+        var write = try store.beginWrite();
+        try write.put("doc:0", "updated");
+        try write.commit();
+    }
+    for (0..32) |_| {
+        try servicePendingArtifactUnitJobs(&runtime, "doc:0", .{});
+        const current = try reader.read("doc:0");
+        defer alloc.free(current);
+        try std.testing.expectEqualStrings("updated", current);
+    }
+    try std.testing.expectEqualStrings("original", owned);
+    try std.testing.expectError(error.NotFound, reader.read("missing"));
+    try std.testing.expectEqual(before, backend.snapshotMaintenanceStats().mutable_snapshot_clone_calls);
+}
 
 fn storeGetAlloc(runtime: anytype, key: []const u8) ![]u8 {
     if (comptime @hasDecl(@typeInfo(@TypeOf(runtime)).pointer.child, "getAlloc")) return runtime.getAlloc(key);
@@ -32368,7 +32524,7 @@ test "ordered artifact inventory chunk callback waits for acceptance and atomica
                         defer closure.deinit();
                     }
                 };
-                try std.testing.checkAllAllocationFailures(alloc, Check.run, .{ &read, db.root_incarnation, request, plan.plan() });
+                try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Check.run, .{ &read, db.root_incarnation, request, plan.plan() });
             }
         }
         try std.testing.expectEqual(@as(usize, 0), window.documents.items.len);
@@ -34557,7 +34713,13 @@ fn isAppleGeneratedTextProvider(alloc: Allocator, config_json: []const u8) !bool
 
 test "document extraction accepts validated reader no-text results without hiding invalid output" {
     const Runner = struct {
-        fn run(alloc: Allocator) !void {
+        fn run(backing: Allocator) !void {
+            // In-place growth depends on OS mapping state. Enumerate every
+            // allocation failure through the deterministic allocate/copy path.
+            var vtable = backing.vtable.*;
+            vtable.resize = Allocator.noResize;
+            vtable.remap = Allocator.noRemap;
+            const alloc: Allocator = .{ .ptr = backing.ptr, .vtable = &vtable };
             for ([_][]const u8{ "", "EFTA02731411" }) |embedded| {
                 var unit = try cloneDocumentExtractionUnit(alloc, .{
                     .unit_id = @constCast("page-1"),
@@ -34579,4 +34741,19 @@ test "document extraction accepts validated reader no-text results without hidin
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "capi graph replay injects canonical endpoints and isolates malformed resolution JSON" {
+    const a = std.testing.allocator;
+    const raw = "{\"entities\":[{\"id\":\"e0\",\"label\":\"concept\",\"text\":\"Alias\"},{\"id\":\"e1\",\"label\":\"concept\",\"text\":\"Parent\"}],\"relations\":[{\"type\":\"is_a\",\"source\":\"e0\",\"target\":\"e1\"}]}";
+    const source = index_manager_mod.GraphArtifactSource{ .artifact_name = @constCast("kg"), .format = .extraction_graph, .mention_edge_type = @constCast("mentions") };
+    const writes = try runtimeGraphWritesWithResolutionsAlloc(a, "knowledge", "claim", raw, source, "application/json", null, "{\"e0\":{\"key\":\"concept/canonical\",\"table\":\"entities\"},\"e1\":{\"key\":\"concept/parent\",\"table\":\"entities\"}}", 10);
+    defer runtimeFreeGraphWrites(a, writes);
+    try std.testing.expectEqual(@as(usize, 1), writes.len);
+    try std.testing.expectEqualStrings("concept/canonical", writes[0].source);
+    try std.testing.expectEqualStrings("concept/parent", writes[0].target);
+    const malformed = try runtimeGraphWritesWithResolutionsAlloc(a, "knowledge", "claim", raw, source, "application/json", null, "{", 10);
+    defer runtimeFreeGraphWrites(a, malformed);
+    // No inferred/fallback edge may be substituted for missing canonical refs.
+    try std.testing.expectEqual(@as(usize, 0), malformed.len);
 }

@@ -20,6 +20,10 @@ T = TypeVar("T", bound="FullTextIndexConfig")
 class FullTextIndexConfig:
     """
     Attributes:
+        store_source (bool | Unset): Opt in to retaining the indexed source projection in serverless full-text sidecars
+            for cold highlighting. With field set, only that field is retained; otherwise the index source projection is
+            retained. Increases index storage and build work. Omit or set false to hydrate highlights from the source table.
+            Provisioned indexes already retain source independently. Default: False.
         sources (list[FullTextArtifactIndexSource] | Unset): Chunk or textual asset streams indexed together; every
             artifact record is an independent full-text member. A source-local field overrides the shared index-level field
             for that stream. Artifact names must be unique. Requires index_capabilities.artifact_sources=true and is
@@ -61,6 +65,7 @@ class FullTextIndexConfig:
             ```
     """
 
+    store_source: bool | Unset = False
     sources: list[FullTextArtifactIndexSource] | Unset = UNSET
     mem_only: bool | Unset = UNSET
     field: str | Unset = UNSET
@@ -69,6 +74,8 @@ class FullTextIndexConfig:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        store_source = self.store_source
+
         sources: list[dict[str, Any]] | Unset = UNSET
         if not isinstance(self.sources, Unset):
             sources = []
@@ -89,6 +96,8 @@ class FullTextIndexConfig:
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
+        if store_source is not UNSET:
+            field_dict["store_source"] = store_source
         if sources is not UNSET:
             field_dict["sources"] = sources
         if mem_only is not UNSET:
@@ -108,6 +117,8 @@ class FullTextIndexConfig:
         from ..models.text_analysis_config import TextAnalysisConfig
 
         d = dict(src_dict)
+        store_source = d.pop("store_source", UNSET)
+
         _sources = d.pop("sources", UNSET)
         sources: list[FullTextArtifactIndexSource] | Unset = UNSET
         if _sources is not UNSET:
@@ -131,6 +142,7 @@ class FullTextIndexConfig:
             analysis_config = TextAnalysisConfig.from_dict(_analysis_config)
 
         full_text_index_config = cls(
+            store_source=store_source,
             sources=sources,
             mem_only=mem_only,
             field=field,

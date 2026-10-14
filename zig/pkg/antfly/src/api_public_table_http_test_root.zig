@@ -15,8 +15,9 @@
 
 const public_table_http = @import("api/public_table_http.zig");
 
-test "public table HTTP module compiles" {
-    _ = public_table_http;
+// Filtered contract targets must discover their fixtures even when the named
+// module smoke test is excluded by the compiler's test filter.
+test {
     _ = @import("api/relational_rows.zig");
     _ = @import("api/tables.zig");
     _ = @import("api/fk_generation_publication_coordinator.zig");
@@ -36,6 +37,10 @@ test "public table HTTP module compiles" {
     _ = @import("api/relational_index_status.zig");
     _ = @import("storage/hot_standby/mutation_inventory.zig");
     _ = @import("serverless/catalog/storage_capabilities.zig");
+}
+
+test "public table HTTP module compiles" {
+    _ = public_table_http;
 }
 
 /// Implementation source choices for this compilation root.
