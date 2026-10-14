@@ -122,12 +122,20 @@ class BoundedZigBuildTest(unittest.TestCase):
             "zig-base-tests": "arc-antfly-heavy",
             "zig-full-tests": "arc-antfly-heavy",
             "zig-build-cache-tests": "arc-antfly-heavy",
-            "e2e-base-build": "arc-antfly-heavy-runtime",
-            "e2e-full-build": "arc-antfly-heavy-runtime",
+            "e2e-base-build": "arc-antfly-heavy",
+            "e2e-full-build": "arc-antfly-heavy",
         }
         for job, runner in expected_runners.items():
             with self.subTest(job=job):
                 self.assertIn(f"    runs-on: {runner}\n", jobs[job])
+                if job in ("e2e-base-build", "e2e-full-build"):
+                    # Compilation needs job-owned scratch on the heavy PVC,
+                    # not the runtime runner's 10 GiB ephemeral filesystem.
+                    self.assertIn("mountpoint -q /mnt/cache", jobs[job])
+                    self.assertIn("$cache_root/zig-local", jobs[job])
+                    self.assertIn("$cache_root/zig-global", jobs[job])
+                    self.assertIn("$cache_root/tmp", jobs[job])
+                    self.assertIn("Release completed E2E build scratch", jobs[job])
                 budget = re.search(
                     r'^      ANTFLY_ZIG_MAX_RSS: "(\d+)"$',
                     jobs[job],
