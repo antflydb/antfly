@@ -3636,6 +3636,30 @@ pub const ProvisionedKernelOwnerSource = struct {
         }
     };
 
+    pub const RootedNativeIndexOwnerBuild = struct {
+        root_generation: u64,
+        outcome: std.json.Parsed(native_index_control.BuildResponse),
+    };
+
+    pub fn stepNativeIndexOwnerBuildAtRoot(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: native_index_control.BuildRequest, context: request_operation.RequestContext) !RootedNativeIndexOwnerBuild {
+        try context.ensureActive();
+        try request.validate();
+        var lease = try self.acquireNativeIndexOwner(group_id, table_name, request.identity, context);
+        defer lease.deinit();
+        const encoded = try std.json.Stringify.valueAlloc(alloc, request, .{});
+        defer alloc.free(encoded);
+        if (encoded.len > 32 * 1024) return error.TransactionTooLarge;
+        const native_context = try platformDeadlineContext(context);
+        var cancellation = native_context.cancellation;
+        try context.ensureActive();
+        var response = try lease.owner().nativeIndexOwnerBuildJson(table_name, encoded, .{ .execution_deadline_ns = native_context.deadline_ns, .cancellation_ctx = &cancellation, .cancellation_fn = cancellationTokenRequested });
+        defer response.deinit();
+        var result = try std.json.parseFromSlice(native_index_control.BuildResponse, alloc, response.bytes(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
+        errdefer result.deinit();
+        try result.value.validateFor(request);
+        return .{ .root_generation = lease.entry.generation, .outcome = result };
+    }
+
     pub fn applyNativeIndexOwnerClaimsAtRoot(
         self: *ProvisionedKernelOwnerSource,
         alloc: std.mem.Allocator,

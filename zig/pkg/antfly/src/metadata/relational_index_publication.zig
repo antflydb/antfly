@@ -357,6 +357,14 @@ pub const OwnerDecision = struct {
         return command;
     }
 
+    /// Build dispatch binds actual reserved state to freshly observed metadata
+    /// permission. No physical allocation or schema manifest enters the body.
+    pub fn nativeBuild(self: OwnerDecision, request: OwnerRequest, observed: local.storage_db_relational_index_owner_job.Binding, budget: local.storage_db_relational_index_jobs.Budget) !native_control.BuildRequest {
+        if (request.operation != .build) return error.InvalidGenerationPublication;
+        try self.requireNativeBinding(request, observed);
+        return native_control.BuildRequest.init(try self.nativeExecutionIdentity(request), observed, budget);
+    }
+
     fn requireNativeBinding(self: OwnerDecision, request: OwnerRequest, observed: local.storage_db_relational_index_owner_job.Binding) !void {
         const identity = try self.nativeExecutionIdentity(request);
         const dispatch = self.dispatch orelse return error.InvalidGenerationPublication;
@@ -1552,6 +1560,29 @@ test "relational index publication native dispatch binds exact admitted fence an
     try std.testing.expectEqual(.fencing, reserve_control.binding.phase);
     try std.testing.expectEqual(.reserved, already_reserved.phase);
     try std.testing.expectEqualSlices(u8, &try binding.encode(), &try reserve_control.binding.encode());
+    const reserved = try progress.acknowledge(reserving.head, reserving.owner, reserving.head.revision, .{
+        .owner = reserving.owner.owner,
+        .action = .reserved,
+        .position = .{ .native = .{ .namespace = binding.fence.namespace, .sequence = 2 } },
+        .candidate_digest = reserving.head.candidate_digest,
+        .reservation_digest = reserving.head.reservation_digest,
+        .evidence_digest = @splat(10),
+    });
+    var building = permission;
+    building.head = reserved.head;
+    building.owner = reserved.owner;
+    var build_request = request;
+    build_request.operation = .build;
+    const build = try building.nativeBuild(build_request, already_reserved, .{ .records = 7 });
+    try build.requireBinding(already_reserved);
+    try std.testing.expectEqual(@as(usize, 7), build.budget.records);
+    try std.testing.expectError(error.PrivateIndexOwnerJobChanged, building.nativeBuild(build_request, binding, .{}));
+    try std.testing.expectError(error.GenerationPublicationChanged, permission.nativeBuild(build_request, already_reserved, .{}));
+    try std.testing.expectError(error.InvalidGenerationPublication, building.nativeBuild(reserve_request, already_reserved, .{}));
+    var replaced = already_reserved;
+    replaced.inputs_digest[0] ^= 1;
+    try std.testing.expectError(error.PrivateIndexOwnerJobChanged, build.requireBinding(replaced));
+    try std.testing.expectError(error.InvalidRelationalIndexBudget, building.nativeBuild(build_request, already_reserved, .{ .records = 0 }));
     try std.testing.expectError(error.GenerationPublicationChanged, permission.nativeControl(reserve_request, binding));
     var changed_binding = binding;
     changed_binding.owner_digest[0] ^= 1;

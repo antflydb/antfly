@@ -2972,6 +2972,7 @@ pub const DB = struct {
     rewrite_program_cache: @import("../rewrite_program_cache.zig").Cache = .{},
     rewrite_tail_cache: @import("../rewrite_tail_spool.zig").Cache = .{},
     restore_decoder_cache: @import("../restore_decoder_cache.zig").Cache = .{},
+    native_index_build_cache: native_index_control.BuildCache = .{},
     source_vector_storage: ?*lsm_backend_mod.NativeStorage = null,
     closed: bool = false,
     stable_address: bool = false,
@@ -5050,6 +5051,7 @@ pub const DB = struct {
     pub fn close(self: *DB) void {
         if (self.closed) return;
         self.closed = true;
+        self.native_index_build_cache.deinit(self.backend_runtime.io() orelse std.Options.debug_io);
         self.restore_decoder_cache.deinit(self.backend_runtime.filesystemIo() orelse std.Options.debug_io);
         self.rewrite_program_cache.deinit(self.backend_runtime.io() orelse std.Options.debug_io);
         self.rewrite_tail_cache.deinit(self.backend_runtime.io() orelse std.Options.debug_io);
@@ -8102,6 +8104,57 @@ pub const DB = struct {
     const NativeIndexReplay = struct { position: @import("receipt_position.zig").Native, lsn: u64 };
 
     pub const PreparedNativeIndexOwnerBuild = native_index_control.PreparedBuild;
+    pub const NativeIndexOwnerBuildRequest = native_index_control.BuildRequest;
+    pub const NativeIndexOwnerBuildResponse = native_index_control.BuildResponse;
+
+    /// Exactly one bounded physical page, or an observation of durable terminal
+    /// progress. The receiving server must independently obtain live metadata
+    /// permission. The disposable compilation cache cannot grant that permission.
+    pub fn stepNativeIndexOwnerBuild(self: *DB, request: NativeIndexOwnerBuildRequest, context: @import("../../api/operation.zig").RequestContext) !NativeIndexOwnerBuildResponse {
+        try context.ensureActive();
+        try request.validate();
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        try self.enforceReplicationWriteGate();
+        const binding = (try self.nativeIndexOwnerState(request.identity)) orelse return error.PrivateIndexRootRecoveryRequired;
+        try request.requireBinding(binding);
+        const io = self.backend_runtime.io() orelse return error.UnsupportedPlatform;
+        var lease = try self.native_index_build_cache.acquire(io, self.alloc, self.core.index_manager.resource_manager, self.core, request, binding, context);
+        defer lease.deinit();
+        var budget = if (self.core.index_manager.resource_manager) |manager| resource_manager_mod.BudgetedAllocator.initReclaiming(manager, .relational_preparation_working_set, self.alloc, 1) else null;
+        defer if (budget) |*value| value.deinit();
+        const alloc = if (budget) |*value| value.allocator() else self.alloc;
+        var prepared = PreparedNativeIndexOwnerBuild.prepareControlled(alloc, io, self.core, lease.reservation(), request.budget, context) catch |err| {
+            if (budget) |value| if (value.denied()) return error.ResourceBudgetExceeded;
+            return err;
+        };
+        defer if (prepared) |*value| value.deinit();
+        const response: NativeIndexOwnerBuildResponse = if (prepared) |*value| blk: {
+            const outcome = self.applyPreparedNativeIndexOwnerBuild(value, null) catch |err| {
+                if (budget) |working| if (working.denied()) return error.ResourceBudgetExceeded;
+                return err;
+            };
+            break :blk .{ .advanced = outcome };
+        } else blk: {
+            try context.ensureActive();
+            try self.enforceReplicationWriteGate();
+            var needs_recovery = false;
+            defer if (needs_recovery) self.scheduleDurableReplicationOutboxRecovery();
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            var complete = try PreparedNativeIndexOwnerBuild.completion(&read, lease.reservation());
+            if (try durable_outbox_store.hasPendingTxn(&read)) {
+                complete.replication_pending = true;
+                complete.error_name = "ReplicationOutboxPending";
+                self.local_execution.durable_replication_outbox_maybe.store(true, .release);
+                needs_recovery = true;
+            }
+            break :blk .{ .complete = complete };
+        };
+        // Do not turn a committed page into an apparent rollback if the request
+        // was canceled while its mirror was acknowledging the durable outbox.
+        try response.validateFor(request);
+        return response;
+    }
 
     /// Reservation retains its compiled candidate across bounded page prepares.
     /// Receiving workers must still independently authorize each metadata cut.
@@ -8175,11 +8228,15 @@ pub const DB = struct {
     }
 
     pub fn applyPreparedNativeIndexOwnerCleanup(self: *DB, prepared: *PreparedNativeIndexOwnerCleanup, replay: ?NativeIndexReplay) !NativeIndexOwnerCleanupOutcome {
-        return self.applyPreparedNativeIndexEffect(prepared, replay);
+        const result = try self.applyPreparedNativeIndexEffect(prepared, replay);
+        self.native_index_build_cache.evict(self.backend_runtime.io() orelse std.Options.debug_io);
+        return result;
     }
 
     pub fn applyPreparedNativeIndexOwnerCancellation(self: *DB, prepared: *PreparedNativeIndexOwnerCancellation, replay: ?NativeIndexReplay) !NativeIndexOwnerCancellationOutcome {
-        return self.applyPreparedNativeIndexEffect(prepared, replay);
+        const result = try self.applyPreparedNativeIndexEffect(prepared, replay);
+        self.native_index_build_cache.evict(self.backend_runtime.io() orelse std.Options.debug_io);
+        return result;
     }
 
     /// Private owner execution. Metadata authorization belongs to the receiving

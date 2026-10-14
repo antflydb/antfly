@@ -4015,7 +4015,25 @@ pub fn storageOwnerNativeIndexControlJson(
     }
     // Headers/bindings contain only fixed-size identities. Large schema inputs
     // remain raw borrowed bytes rather than another JSON/base64 representation.
-    if (request.request_json.len == 0 or request.request_json.len > 32 * 1024) return .invalid_argument;
+    if (request.request_json.len == 0 or request.request_json.ptr == null or request.request_json.len > 32 * 1024) return .invalid_argument;
+    if (request.operation == .build) {
+        if (request.manifest.len != 0 or request.control.version != kernel_owner_abi.abi_version or request.control.has_execution_deadline > 1 or
+            request.control.table_name.len != 0 or request.control.request_json.len != 0) return .invalid_argument;
+        var parsed = std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerBuildRequest, handle.alloc, request.request_json.slice(), .{ .ignore_unknown_fields = false, .allocate = .alloc_always }) catch |err| return switch (err) {
+            error.OutOfMemory => .out_of_memory,
+            else => .invalid_argument,
+        };
+        defer parsed.deinit();
+        if (parsed.value.identity.owner_group_id != handle.storage_owner_group_id) return .invalid_argument;
+        var response = NativeIndexResponse.init() catch |err| return storageOwnerStatusFromError(err);
+        defer response.deinit();
+        const context: @import("antfly_local_sources").api_operation.RequestContext = .{
+            .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null,
+            .cancellation = ownerQueryCancellation(&request.control),
+        };
+        const result = handle.db.stepNativeIndexOwnerBuild(parsed.value, context) catch |err| return storageOwnerStatusFromError(err);
+        return response.finish(result, out_response);
+    }
     if (request.operation == .receipt) {
         if (request.manifest.len != 0) return .invalid_argument;
         var parsed = std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerReceiptRequest, handle.alloc, request.request_json.slice(), .{}) catch |err|

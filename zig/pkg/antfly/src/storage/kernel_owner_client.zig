@@ -554,6 +554,17 @@ pub const Owner = struct {
         return response;
     }
 
+    pub fn nativeIndexOwnerBuildJson(self: *Owner, table_name: []const u8, request_json: []const u8, options: QueryOptions) !Response {
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_native_index_control_json(self.handle, &.{
+            .operation = .build,
+            .table_name = .fromSlice(table_name),
+            .request_json = .fromSlice(request_json),
+            .control = controlledRequest("", "", options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn),
+        }, &response.buffer));
+        return response;
+    }
+
     pub fn nativeIndexOwnerStateJson(self: *Owner, table_name: []const u8, identity_json: []const u8) !Response {
         var response: Response = .{};
         try statusToError(abi.antfly_storage_owner_native_index_control_json(self.handle, &.{

@@ -760,6 +760,8 @@ pub const Detail = enum(c_int) {
     invalid_index_owner_receipt,
     sql_invalid_power_argument,
     invalid_schema_reader_requirements,
+    private_index_root_recovery_required,
+    invalid_relational_index_budget,
 };
 
 test "schema reader requirement validation preserves exact callback error identity" {
@@ -776,6 +778,8 @@ test "native index claim failures preserve typed callback boundary identities" {
         .{ error.PrivateIndexOwnerJobChanged, Code.conflict },
         .{ error.PrivateIndexPublicationCanceled, Code.conflict },
         .{ error.PrivateIndexJobRequired, Code.retryable },
+        .{ error.PrivateIndexRootRecoveryRequired, Code.retryable },
+        .{ error.InvalidRelationalIndexBudget, Code.invalid_argument },
         .{ error.PrivateIndexPublicationRequired, Code.retryable },
         .{ error.InvalidPrivateIndexOwnerJob, Code.corrupt },
         .{ error.InvalidPrivateIndexInputs, Code.corrupt },
@@ -1064,6 +1068,8 @@ pub fn statusFromError(err: anyerror) Status {
         error.PrivateIndexOwnerJobChanged => status(.conflict, .private_index_owner_job_changed),
         error.PrivateIndexPublicationCanceled => status(.conflict, .private_index_publication_canceled),
         error.PrivateIndexJobRequired => status(.retryable, .private_index_job_required),
+        error.PrivateIndexRootRecoveryRequired => status(.retryable, .private_index_root_recovery_required),
+        error.InvalidRelationalIndexBudget => status(.invalid_argument, .invalid_relational_index_budget),
         error.PrivateIndexPublicationRequired => status(.retryable, .private_index_publication_required),
         error.InvalidPrivateIndexOwnerJob => status(.corrupt, .invalid_private_index_owner_job),
         error.InvalidPrivateIndexInputs => status(.corrupt, .invalid_private_index_inputs),
@@ -1794,6 +1800,8 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .private_index_owner_job_changed => "PrivateIndexOwnerJobChanged",
         .private_index_publication_canceled => "PrivateIndexPublicationCanceled",
         .private_index_job_required => "PrivateIndexJobRequired",
+        .private_index_root_recovery_required => "PrivateIndexRootRecoveryRequired",
+        .invalid_relational_index_budget => "InvalidRelationalIndexBudget",
         .private_index_publication_required => "PrivateIndexPublicationRequired",
         .invalid_private_index_owner_job => "InvalidPrivateIndexOwnerJob",
         .invalid_private_index_inputs => "InvalidPrivateIndexInputs",

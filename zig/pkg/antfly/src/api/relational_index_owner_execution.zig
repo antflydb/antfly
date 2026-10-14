@@ -38,10 +38,13 @@ pub const Request = struct {
     table_id: u64,
     group_id: u64,
     id: [16]u8,
-    operation: enum { fence, reserve },
+    operation: enum { fence, reserve, build },
+    build_budget: ?local.storage_db_relational_index_jobs.Budget = null,
 
     pub fn validate(self: Request, group_id: u64) !void {
         if (self.group_id != group_id) return error.GenerationPublicationChanged;
+        if (self.operation != .build and self.build_budget != null) return error.InvalidGenerationPublication;
+        if (self.build_budget) |budget| try budget.validate();
         try self.lookup(.permission).validate();
     }
 
@@ -53,6 +56,7 @@ pub const Request = struct {
             .operation = switch (self.operation) {
                 .fence => .fence,
                 .reserve => .reserve,
+                .build => .build,
             },
             .projection = projection,
         };
@@ -76,6 +80,7 @@ pub const Result = union(enum) {
     },
     applied: std.json.Parsed(native.Outcome),
     controlled: struct { root_generation: u64, outcome: std.json.Parsed(native.Outcome), signing: SigningState = .{} },
+    building: struct { root_generation: u64, outcome: std.json.Parsed(native.BuildResponse) },
 
     pub fn deinit(self: *Result) void {
         switch (self.*) {
@@ -83,6 +88,7 @@ pub const Result = union(enum) {
             .recovered => |value| value.deinit(),
             .applied => |value| value.deinit(),
             .controlled => |value| value.outcome.deinit(),
+            .building => |value| value.outcome.deinit(),
         }
         self.* = undefined;
     }
@@ -90,7 +96,7 @@ pub const Result = union(enum) {
     /// Borrowed until deinit; copying an outcome does not own error_name.
     pub fn outcome(self: *const Result) ?native.Outcome {
         return switch (self.*) {
-            .acknowledged => null,
+            .acknowledged, .building => null,
             .recovered => |value| value.outcome.value,
             .applied => |value| value.value,
             .controlled => |value| value.outcome.value,
@@ -103,6 +109,7 @@ pub const Result = union(enum) {
         return switch (self.*) {
             .recovered => |value| value.root_generation,
             .controlled => |value| value.root_generation,
+            .building => |value| value.root_generation,
             .acknowledged, .applied => null,
         };
     }
@@ -111,7 +118,7 @@ pub const Result = union(enum) {
         return switch (self.*) {
             .controlled => |*value| &value.signing,
             .recovered => |*value| &value.signing,
-            .acknowledged, .applied => null,
+            .acknowledged, .applied, .building => null,
         };
     }
 
@@ -157,6 +164,7 @@ pub const Result = union(enum) {
             .applied => |value| .{ .admitted = value.value },
             .controlled => |value| .{ .controlled = .{ .root_generation = value.root_generation, .outcome = value.outcome.value, .signed_ack = value.signing.ack, .signing_failure = value.signing.failure } },
             .recovered => |value| .{ .recovered = .{ .root_generation = value.root_generation, .outcome = value.outcome.value orelse return error.InvalidPrivateIndexNativeReceipt, .signed_ack = value.signing.ack, .signing_failure = value.signing.failure } },
+            .building => |value| .{ .building = .{ .root_generation = value.root_generation, .outcome = value.outcome.value } },
         };
     }
 };
@@ -171,6 +179,7 @@ pub const ControlResponse = union(enum) {
     admitted: native.Outcome,
     controlled: RootedOutcome,
     recovered: RootedOutcome,
+    building: struct { root_generation: u64, outcome: native.BuildResponse },
 
     pub const RootedOutcome = struct {
         root_generation: u64,
@@ -183,6 +192,17 @@ pub const ControlResponse = union(enum) {
         try request.validate(request.group_id);
         const outcome: native.Outcome = switch (self) {
             .acknowledged => return,
+            .building => |value| {
+                if (request.operation != .build or value.root_generation == 0) return error.InvalidPrivateIndexNativeReceipt;
+                const binding = switch (value.outcome) {
+                    .advanced => |item| item.binding,
+                    .complete => |item| item.binding,
+                };
+                if (binding.fence.namespace.table_id != request.table_id) return error.InvalidPrivateIndexNativeReceipt;
+                const build = try native.BuildRequest.init(.{ .id = request.id, .plan_digest = binding.plan_digest, .owner_digest = binding.owner_digest, .ordinal = binding.ordinal, .namespace = binding.fence.namespace, .owner_group_id = request.group_id }, binding, request.build_budget orelse .{});
+                try value.outcome.validateFor(build);
+                return;
+            },
             .admitted => |value| blk: {
                 if (request.operation != .fence or value.receipt != null or value.binding.phase != .fencing)
                     return error.InvalidPrivateIndexNativeReceipt;
@@ -208,6 +228,7 @@ pub const ControlResponse = union(enum) {
             .effect = switch (request.operation) {
                 .fence => .fenced,
                 .reserve => .reserved,
+                .build => return error.InvalidPrivateIndexNativeReceipt,
             },
         });
         if (binding.fence.namespace.table_id != request.table_id) return error.InvalidPrivateIndexNativeReceipt;
@@ -247,7 +268,7 @@ pub fn claimHttpFailure(status: u16, body: []const u8) ?anyerror {
         408 => inline for (.{ error.Canceled, error.Cancelled, error.DeadlineExceeded }) |err| {
             if (std.mem.eql(u8, body, @errorName(err))) return err;
         },
-        503 => inline for (.{ error.InvalidPrivateIndexClaimReceipt, error.InvalidPrivateIndexClaimInventory, error.InvalidPrivateIndexOwnerJob, error.InvalidPrivateIndexInputs, error.InvalidPrivateIndexNativeReceipt, error.PrivateIndexJobRequired, error.PrivateIndexRootRecoveryRequired, error.PrivateIndexPublicationRequired, error.PrivateIndexCancellationPending, error.PrivateIndexCancellationRequired, error.ImmutableRelationalIndexDefinitionConflict, error.InvalidIndexPublicationCandidate, error.InvalidRelationalIndexProgress, error.MissingRelationalIndexDefinitions, error.RelationalIndexCatalogSchemaMismatch, error.InvalidPrivateIndexCancellation }) |err| {
+        503 => inline for (.{ error.InvalidPrivateIndexClaimReceipt, error.InvalidPrivateIndexClaimInventory, error.InvalidPrivateIndexOwnerJob, error.InvalidPrivateIndexInputs, error.InvalidPrivateIndexNativeReceipt, error.PrivateIndexJobRequired, error.PrivateIndexRootRecoveryRequired, error.PrivateIndexPublicationRequired, error.PrivateIndexCancellationPending, error.PrivateIndexCancellationRequired, error.ImmutableRelationalIndexDefinitionConflict, error.InvalidIndexPublicationCandidate, error.InvalidRelationalIndexProgress, error.MissingRelationalIndexDefinitions, error.RelationalIndexCatalogSchemaMismatch, error.InvalidPrivateIndexCancellation, error.ResourceBudgetExceeded }) |err| {
             if (std.mem.eql(u8, body, @errorName(err))) return err;
         },
         else => {},
@@ -512,6 +533,7 @@ fn requireTable(value: publication.OwnerDecision, table_name: []const u8) !void 
 /// cancellation still requires a durable late-admission tombstone protocol.
 pub fn step(alloc: std.mem.Allocator, source: anytype, metadata: anytype, table_name: []const u8, request: Request, context: operation.RequestContext) !Result {
     try context.ensureActive();
+    try request.validate(request.group_id);
     const hot_request = request.lookup(.permission);
     try hot_request.validate();
     if (table_name.len == 0) return error.InvalidGenerationPublication;
@@ -524,6 +546,7 @@ pub fn step(alloc: std.mem.Allocator, source: anytype, metadata: anytype, table_
         const receipt_request: native.ReceiptRequest = .{ .identity = grant.identity, .effect = switch (request.operation) {
             .fence => .fenced,
             .reserve => .reserved,
+            .build => return error.InvalidGenerationPublication,
         } };
         var recovered = try source.nativeIndexOwnerReceiptAtRoot(alloc, request.group_id, table_name, receipt_request, context);
         errdefer recovered.deinit();
@@ -541,10 +564,19 @@ pub fn step(alloc: std.mem.Allocator, source: anytype, metadata: anytype, table_
     const signing: SigningState = .{ .context = if (permission.value.native_signing) |view| .{ .view = view, .expected_revision = permission.value.head.revision, .request = request } else null };
     var state = try source.nativeIndexOwnerState(alloc, request.group_id, table_name, identity, context);
     defer state.deinit();
+    if (request.operation == .build) {
+        const build = try permission.value.nativeBuild(hot_request, state.value orelse return error.PrivateIndexRootRecoveryRequired, request.build_budget orelse .{});
+        const rooted = try source.stepNativeIndexOwnerBuildAtRoot(alloc, request.group_id, table_name, build, context);
+        errdefer rooted.outcome.deinit();
+        try rooted.outcome.value.validateFor(build);
+        if (rooted.root_generation == 0) return error.InvalidPrivateIndexNativeReceipt;
+        return .{ .building = .{ .root_generation = rooted.root_generation, .outcome = rooted.outcome } };
+    }
     if (state.value) |binding| {
         const effect: @FieldType(native.ReceiptRequest, "effect") = switch (request.operation) {
             .fence => .fenced,
             .reserve => .reserved,
+            .build => return error.InvalidGenerationPublication,
         };
         var recovered = try source.nativeIndexOwnerReceiptAtRoot(alloc, request.group_id, table_name, native.ReceiptRequest{ .identity = identity, .effect = effect }, context);
         if (recovered.outcome.value) |value| {
@@ -601,6 +633,7 @@ const TestDriver = struct {
     fail_control: bool = false,
     produce_receipt: bool = false,
     pending: bool = false,
+    build_pages: usize = 0,
     cancel_after_commit: ?*std.atomic.Value(bool) = null,
 
     pub fn systemCatalog(self: *TestDriver, alloc: std.mem.Allocator, context: operation.RequestContext, call: calls.Call) ![]u8 {
@@ -658,6 +691,15 @@ const TestDriver = struct {
             .replication_pending = self.pending,
             .error_name = if (self.pending) "ReplicationOutboxPending" else null,
         }) };
+    }
+
+    pub fn stepNativeIndexOwnerBuildAtRoot(self: *TestDriver, alloc: std.mem.Allocator, _: u64, _: []const u8, request: native.BuildRequest, context: operation.RequestContext) !@FieldType(Result, "building") {
+        try context.ensureActive();
+        const binding = self.binding orelse return error.PrivateIndexRootRecoveryRequired;
+        try request.requireBinding(binding);
+        self.build_pages += 1;
+        if (self.cancel_after_commit) |signal| signal.store(true, .release);
+        return .{ .root_generation = self.root_generation, .outcome = try parsed(native.BuildResponse, alloc, .{ .advanced = .{ .binding = binding, .page_digest = @splat(9), .position = .{ .namespace = binding.fence.namespace, .sequence = 4 }, .duplicate = false, .replication_pending = self.pending, .error_name = if (self.pending) "ReplicationOutboxPending" else null } }) };
     }
 
     pub fn admitNativeIndexOwner(self: *TestDriver, alloc: std.mem.Allocator, _: u64, _: []const u8, header: native.Admission, manifest: []const u8, _: operation.RequestContext) !std.json.Parsed(native.Outcome) {
@@ -942,7 +984,7 @@ test "relational index publication native cancellation receiver uses fixed permi
 }
 
 test "relational index publication claim HTTP errors preserve conflicts corruption and cancellation" {
-    inline for (.{ .{ 409, error.UniqueConstraintViolation }, .{ 409, error.PrivateIndexOwnerJobChanged }, .{ 409, error.PrivateIndexPublicationCanceled }, .{ 503, error.InvalidPrivateIndexClaimReceipt }, .{ 503, error.PrivateIndexJobRequired }, .{ 408, error.DeadlineExceeded } }) |entry| {
+    inline for (.{ .{ 409, error.UniqueConstraintViolation }, .{ 409, error.PrivateIndexOwnerJobChanged }, .{ 409, error.PrivateIndexPublicationCanceled }, .{ 503, error.InvalidPrivateIndexClaimReceipt }, .{ 503, error.PrivateIndexJobRequired }, .{ 503, error.ResourceBudgetExceeded }, .{ 408, error.DeadlineExceeded } }) |entry| {
         try std.testing.expectEqual(entry[1], claimHttpFailure(entry[0], @errorName(entry[1])).?);
     }
     try std.testing.expect(claimHttpFailure(200, "PrivateIndexOwnerJobChanged") == null);
@@ -1031,6 +1073,48 @@ test "relational index publication claim receiver binds fresh build permission w
     try std.testing.expect(signal.load(.acquire));
     try std.testing.expect(pending.applied.outcome.value.replication_pending);
     try std.testing.expectEqualStrings("ReplicationOutboxPending", pending.applied.outcome.value.error_name.?);
+
+    const build_control: Request = .{ .table_id = request.table_id, .group_id = request.group_id, .id = request.id, .operation = .build, .build_budget = .{ .records = 7 } };
+    driver = .{ .value = permission, .binding = binding };
+    {
+        var built = try step(alloc, &driver, &driver, plan.before.name, build_control, .{});
+        defer built.deinit();
+        try std.testing.expect(built == .building);
+        try std.testing.expectEqual(@as(usize, 1), driver.build_pages);
+        try std.testing.expectEqual(@as(usize, 1), driver.permission_reads);
+        try std.testing.expectEqual(@as(usize, 0), driver.admission_reads);
+        try std.testing.expectEqual(@as(usize, 0), driver.admissions);
+        try std.testing.expect(!built.needsSigning());
+        try (try built.response()).validate(build_control);
+        driver.root_generation += 1;
+        try std.testing.expectEqual(@as(?u64, 9), built.rootGeneration());
+        var wrong_control = build_control;
+        wrong_control.operation = .reserve;
+        wrong_control.build_budget = null;
+        try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, (try built.response()).validate(wrong_control));
+    }
+    driver = .{ .value = permission, .binding = binding };
+    try std.testing.expectError(error.GenerationPublicationChanged, step(alloc, &driver, &driver, "wrong table", build_control, .{}));
+    try std.testing.expectEqual(@as(usize, 0), driver.inspections);
+    driver = .{ .value = permission };
+    try std.testing.expectError(error.PrivateIndexRootRecoveryRequired, step(alloc, &driver, &driver, plan.before.name, build_control, .{}));
+    try std.testing.expectEqual(@as(usize, 0), driver.admissions);
+    driver = .{ .value = permission, .binding = binding };
+    driver.binding.?.owner_digest[0] ^= 1;
+    try std.testing.expectError(error.PrivateIndexOwnerJobChanged, step(alloc, &driver, &driver, plan.before.name, build_control, .{}));
+    try std.testing.expectEqual(@as(usize, 0), driver.build_pages);
+    signal.store(true, .release);
+    driver = .{ .value = permission, .binding = binding };
+    try std.testing.expectError(error.Canceled, step(alloc, &driver, &driver, plan.before.name, build_control, context));
+    try std.testing.expectEqual(@as(usize, 0), driver.permission_reads);
+    signal.store(false, .release);
+    driver.pending = true;
+    driver.cancel_after_commit = &signal;
+    var pending_build = try step(alloc, &driver, &driver, plan.before.name, build_control, context);
+    defer pending_build.deinit();
+    try std.testing.expect(signal.load(.acquire));
+    try std.testing.expect(pending_build.building.outcome.value.advanced.replication_pending);
+    try (try pending_build.response()).validate(build_control);
 }
 
 test "relational index publication native receiver signs pinned authority and preserves progress on signing failure" {

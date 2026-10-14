@@ -490,6 +490,11 @@ pub const Page = struct {
     /// validation receipt or publication decision. The owner retains its DB
     /// lifetime lease; use stage, not the local commit convenience, to apply.
     pub fn preparePrivate(alloc: Allocator, io: ?std.Io, core: anytype, binding: owner_job.Binding, addition: *const catalog.PrivateAddition, budget: Budget) !?Page {
+        return preparePrivateControlled(alloc, io, core, binding, addition, budget, .{});
+    }
+
+    pub fn preparePrivateControlled(alloc: Allocator, io: ?std.Io, core: anytype, binding: owner_job.Binding, addition: *const catalog.PrivateAddition, budget: Budget, context: @import("../../api/operation.zig").RequestContext) !?Page {
+        try context.ensureActive();
         try budget.validate();
         if (io) |runtime_io| try runtime_io.checkCancel();
         if (!core.identity_namespace.eql(binding.fence.namespace) or
@@ -499,10 +504,14 @@ pub const Page = struct {
         const name = for (addition.plan.boundIndexes()) |index| {
             if (index.id().mapKey() == binding.index.mapKey()) break index.name;
         } else return error.IndexNotFound;
-        return preparePinned(alloc, io, core, name, budget, .{ .head = addition.candidate.head, .plan = addition.plan.clone() }, binding);
+        return preparePinnedControlled(alloc, io, core, name, budget, .{ .head = addition.candidate.head, .plan = addition.plan.clone() }, binding, context);
     }
 
     fn preparePinned(alloc: Allocator, io: ?std.Io, core: anytype, name: []const u8, budget: Budget, snapshot: catalog.WriteSnapshot, private_job: ?owner_job.Binding) !?Page {
+        return preparePinnedControlled(alloc, io, core, name, budget, snapshot, private_job, .{});
+    }
+
+    fn preparePinnedControlled(alloc: Allocator, io: ?std.Io, core: anytype, name: []const u8, budget: Budget, snapshot: catalog.WriteSnapshot, private_job: ?owner_job.Binding, context: @import("../../api/operation.zig").RequestContext) !?Page {
         const namespace_generation = core.schemaNamespaceGeneration();
         var pinned = snapshot;
         var transferred = false;
@@ -552,6 +561,7 @@ pub const Page = struct {
         var failed_source: ?FailedSource = null;
         var entry = try cursor.seekAtOrAfter(if (after.len == 0) lower else after);
         while (entry) |kv| : (entry = try cursor.seekAtOrAfter(after)) {
+            try context.ensureActive();
             if (io) |runtime_io| try runtime_io.checkCancel();
             if (std.mem.order(u8, kv.key, upper) != .lt) break;
             if (kv.key.len > max_cursor_bytes) return error.InvalidRelationalIndexProgress;

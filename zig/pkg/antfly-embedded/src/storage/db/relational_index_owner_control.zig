@@ -29,6 +29,9 @@ const private_claims = @import("relational_index_private_claims.zig");
 const integrity = @import("relational_integrity_contract.zig");
 const Allocator = std.mem.Allocator;
 const pages = @import("relational_index_jobs.zig");
+const resources = @import("../resource_manager.zig");
+const RequestContext = @import("../../api/operation.zig").RequestContext;
+const Waiters = @import("../admission_waiter.zig").Fifo(void);
 pub const envelope_version = 22;
 pub const max_cancellation_wire_bytes = 32 * 1024;
 pub const max_encoded_inputs = std.base64.standard.Encoder.calcSize(inputs.max_bytes);
@@ -366,6 +369,79 @@ pub const BuildOutcome = struct {
     }
 };
 
+/// A receiving worker supplies identity plus an observed binding commitment,
+/// never physical allocation choices, schema inputs or a replay position.
+/// This is a CAS precondition, not metadata authorization.
+pub const BuildRequest = struct {
+    identity: Identity,
+    binding_digest: [32]u8,
+    budget: pages.Budget = .{},
+
+    pub fn init(identity: Identity, binding: jobs.Binding, budget: pages.Budget) !BuildRequest {
+        const result: BuildRequest = .{ .identity = identity, .binding_digest = try bindingDigest(binding), .budget = budget };
+        try result.requireBinding(binding);
+        return result;
+    }
+    pub fn validate(self: BuildRequest) !void {
+        try self.identity.validate();
+        try self.budget.validate();
+        if (std.mem.allEqual(u8, &self.binding_digest, 0)) return error.InvalidPrivateIndexOwnerJob;
+    }
+    pub fn requireBinding(self: BuildRequest, binding: jobs.Binding) !void {
+        try self.validate();
+        const identity = self.identity;
+        if (binding.phase != .reserved or binding.authority != .native or
+            !std.mem.eql(u8, &binding.id, &identity.id) or !std.mem.eql(u8, &binding.plan_digest, &identity.plan_digest) or
+            !std.mem.eql(u8, &binding.owner_digest, &identity.owner_digest) or binding.ordinal != identity.ordinal or
+            !binding.fence.namespace.eql(identity.namespace) or binding.fence.owner_group_id != identity.owner_group_id or
+            !std.mem.eql(u8, &try bindingDigest(binding), &self.binding_digest)) return error.PrivateIndexOwnerJobChanged;
+    }
+    fn bindingDigest(binding: jobs.Binding) ![32]u8 {
+        var result: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(&try binding.encode(), &result, .{});
+        return result;
+    }
+};
+
+/// Physical terminal progress only. Complete claims and publication still
+/// require their independent protocols; this cannot carry a publication ACK.
+pub const BuildCompletion = struct {
+    binding: jobs.Binding,
+    state: enum { ready, failed },
+    failure: pages.Failure,
+    rows_scanned: u64,
+    progress_digest: [32]u8,
+    position: Native,
+    replication_pending: bool = false,
+    error_name: ?[]const u8 = null,
+
+    pub fn validateFor(self: BuildCompletion, request: BuildRequest) !void {
+        try request.requireBinding(self.binding);
+        try self.position.validate();
+        if (!self.position.namespace.eql(request.identity.namespace) or
+            std.mem.allEqual(u8, &self.progress_digest, 0) or
+            (self.state == .failed) != (self.failure != .none) or
+            self.replication_pending != (self.error_name != null)) return error.InvalidRelationalIndexProgress;
+    }
+};
+
+pub const BuildResponse = union(enum) {
+    advanced: BuildOutcome,
+    complete: BuildCompletion,
+
+    pub fn validateFor(self: BuildResponse, request: BuildRequest) !void {
+        switch (self) {
+            .complete => |value| try value.validateFor(request),
+            .advanced => |value| {
+                try request.requireBinding(value.binding);
+                try value.position.validate();
+                if (!value.position.namespace.eql(request.identity.namespace) or std.mem.allEqual(u8, &value.page_digest, 0) or
+                    value.replication_pending != (value.error_name != null)) return error.InvalidPrivateIndexNativeReceipt;
+            },
+        }
+    }
+};
+
 pub const PreparedBuild = struct {
     pub const ApplyOutcome = BuildOutcome;
     pub const checkpoint_key = jobs.key ++ ":build-page";
@@ -375,6 +451,7 @@ pub const PreparedBuild = struct {
     command: pages.Page.PrivateCommand,
     command_digest: [32]u8,
     progress_digest: [32]u8,
+    context: RequestContext = .{},
     payload: ?[]u8 = null,
     prefix_len: usize = 0,
 
@@ -386,13 +463,19 @@ pub const PreparedBuild = struct {
     /// Reuse the compiled reservation across pages. Only the page's source
     /// snapshot and scratch arena are renewed; no per-page schema compilation.
     pub fn prepare(alloc: Allocator, io: ?std.Io, core: anytype, reservation: *const Prepared, budget: pages.Budget) !?PreparedBuild {
+        return prepareControlled(alloc, io, core, reservation, budget, .{});
+    }
+    pub fn prepareControlled(alloc: Allocator, io: ?std.Io, core: anytype, reservation: *const Prepared, budget: pages.Budget, context: RequestContext) !?PreparedBuild {
+        try context.ensureActive();
         if (reservation.command.effect != .reserved) return error.PrivateIndexOwnerJobChanged;
         const artifacts = if (reservation.artifacts) |*value| value else return error.InvalidPrivateIndexOwnerJob;
         var binding = reservation.command.binding;
         binding.phase = .reserved;
-        var page = (try pages.Page.preparePrivate(alloc, io, core, binding, &artifacts.addition, budget)) orelse return null;
+        var page = (try pages.Page.preparePrivateControlled(alloc, io, core, binding, &artifacts.addition, budget, context)) orelse return null;
         errdefer page.deinit();
-        return try init(alloc, page);
+        var result = try init(alloc, page);
+        result.context = context;
+        return result;
     }
     pub fn replayPrepared(alloc: Allocator, core: anytype, command: pages.Page.PrivateCommand) !PreparedBuild {
         try command.validate();
@@ -415,6 +498,7 @@ pub const PreparedBuild = struct {
         self.* = undefined;
     }
     pub fn validate(self: *const PreparedBuild) !void {
+        try self.context.ensureActive();
         try self.command.validate();
     }
     pub fn namespace(self: *const PreparedBuild) @FieldType(Native, "namespace") {
@@ -453,7 +537,23 @@ pub const PreparedBuild = struct {
     pub fn verifyRecovery(txn: anytype, binding: jobs.Binding) !void {
         _ = try checkpoint(txn, binding);
     }
+    pub fn completion(txn: anytype, reservation: *const Prepared) !BuildCompletion {
+        const artifacts = if (reservation.artifacts) |*value| value else return error.InvalidPrivateIndexOwnerJob;
+        var binding = reservation.command.binding;
+        binding.phase = .reserved;
+        try jobs.requireReserved(txn, binding);
+        const bytes = (try checkpoint(txn, binding)) orelse return error.InvalidRelationalIndexProgress;
+        const index = for (artifacts.addition.plan.boundIndexes()) |value| {
+            if (value.id().mapKey() == binding.index.mapKey()) break value;
+        } else return error.PrivateIndexOwnerJobChanged;
+        const owner = try pages.ownership(txn);
+        const progress = try pages.Progress.decode(try txn.get(&pages.progressKey(binding.index)));
+        if (!progress.matches(index, owner) or progress.phase != .primary or progress.state == .building)
+            return error.InvalidRelationalIndexProgress;
+        return .{ .binding = binding, .state = if (progress.state == .ready) .ready else .failed, .failure = progress.failure, .rows_scanned = progress.rows_scanned, .progress_digest = bytes[72..104].*, .position = (try @import("receipt_position.zig").Position.decode(bytes[104..137])).native };
+    }
     pub fn stage(self: *PreparedBuild, core: anytype, txn: anytype, replay: ?Native) !BuildOutcome {
+        try self.context.ensureActive();
         const binding = self.command.binding;
         try jobs.requireReserved(txn, binding);
         if (try checkpoint(txn, binding)) |bytes| {
@@ -487,6 +587,193 @@ pub const PreparedBuild = struct {
     }
     pub fn finalizePayload(self: *PreparedBuild, position: Native) ![]const u8 {
         return finalizeNativePayload(self, position);
+    }
+};
+
+/// One resource-accounted immutable candidate per resident owner. Single-flight
+/// compilation runs outside apply exclusion; leases pin the allocator through
+/// page deinit, including concurrent eviction. The cache grants no authority.
+pub const BuildCache = struct {
+    mutex: std.Io.Mutex = .init,
+    io: ?std.Io = null,
+    manager: ?*resources.ResourceManager = null,
+    reclaimer: u64 = 0,
+    entry: ?*Entry = null,
+    compiling: bool = false,
+    epoch: u64 = 0,
+    waiters: Waiters = .{},
+    compilations: u64 = 0,
+    hits: u64 = 0,
+
+    const Entry = struct {
+        backing: Allocator,
+        header: ?resources.Reservation,
+        budget: ?resources.BudgetedAllocator,
+        refs: std.atomic.Value(usize) = .init(1),
+        digest: [32]u8,
+        prepared: ?Prepared = null,
+
+        fn create(backing: Allocator, manager: ?*resources.ResourceManager, binding_digest: [32]u8) !*Entry {
+            var header = if (manager) |value| try value.reserve(.relational_preparation_working_set, @sizeOf(Entry)) else null;
+            errdefer if (header) |*reservation| reservation.release();
+            const entry = try backing.create(Entry);
+            entry.* = .{ .backing = backing, .header = header, .budget = if (manager) |value| resources.BudgetedAllocator.initReclaiming(value, .relational_preparation_working_set, backing, 1) else null, .digest = binding_digest };
+            return entry;
+        }
+        fn retain(self: *Entry) void {
+            const old = self.refs.fetchAdd(1, .monotonic);
+            std.debug.assert(old > 0 and old < std.math.maxInt(usize));
+        }
+        fn release(self: *Entry) void {
+            if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+            if (self.prepared) |*value| value.deinit();
+            if (self.budget) |*value| value.deinit();
+            const backing = self.backing;
+            var header = self.header;
+            backing.destroy(self);
+            if (header) |*value| value.release();
+        }
+        fn bytes(self: *const Entry) u64 {
+            return (if (self.header) |value| value.bytes else @as(u64, 0)) +
+                (if (self.budget) |value| value.reservation.bytes else @as(u64, 0));
+        }
+    };
+
+    pub const Lease = struct {
+        entry: *Entry,
+        pub fn reservation(self: Lease) *const Prepared {
+            return &self.entry.prepared.?;
+        }
+        pub fn deinit(self: *Lease) void {
+            self.entry.release();
+            self.* = undefined;
+        }
+    };
+
+    pub fn evict(self: *BuildCache, io: std.Io) void {
+        self.mutex.lockUncancelable(io);
+        const entry = self.entry;
+        self.entry = null;
+        self.epoch +%= 1;
+        self.mutex.unlock(io);
+        if (entry) |value| value.release();
+    }
+    pub fn deinit(self: *BuildCache, io: std.Io) void {
+        // Resident-owner leases drain before DB close, just like schema views.
+        std.debug.assert(!self.compiling and self.waiters.head == null);
+        if (self.manager) |value| value.unregisterReclaimer(self.reclaimer);
+        self.evict(io);
+        self.reclaimer = 0;
+        self.manager = null;
+        self.io = null;
+    }
+    fn reclaim(ptr: *anyopaque, _: u64) u64 {
+        const self: *BuildCache = @ptrCast(@alignCast(ptr));
+        if (!self.mutex.tryLock()) return 0;
+        const entry = self.entry orelse {
+            self.mutex.unlock(self.io.?);
+            return 0;
+        };
+        if (entry.refs.load(.acquire) != 1) {
+            self.mutex.unlock(self.io.?);
+            return 0;
+        }
+        const bytes = entry.bytes();
+        self.entry = null;
+        self.mutex.unlock(self.io.?);
+        entry.release();
+        return bytes;
+    }
+    fn finish(self: *BuildCache) void {
+        self.compiling = false;
+        while (self.waiters.pop()) |waiter| waiter.handoff.publish();
+    }
+    fn wait(self: *BuildCache, io: std.Io, waiter: *Waiters.Waiter, context: RequestContext) !void {
+        defer {
+            self.mutex.lockUncancelable(io);
+            _ = self.waiters.remove(waiter);
+            self.mutex.unlock(io);
+        }
+        while (!waiter.handoff.isAdmitted()) {
+            try context.ensureActive();
+            waiter.handoff.ready.waitTimeout(io, .{ .duration = .{ .raw = std.Io.Duration.fromMilliseconds(5), .clock = .awake } }) catch |err| switch (err) {
+                error.Timeout => {},
+                error.Canceled => return err,
+            };
+        }
+        try context.ensureActive();
+    }
+
+    /// Caller observes the actual durable reserved binding before acquisition;
+    /// page preparation and commit must independently recheck it afterwards.
+    pub fn acquire(self: *BuildCache, io: std.Io, backing: Allocator, manager: ?*resources.ResourceManager, core: anytype, request: BuildRequest, binding: jobs.Binding, context: RequestContext) !Lease {
+        try context.ensureActive();
+        try request.requireBinding(binding);
+        const epoch = while (true) {
+            try self.mutex.lock(io);
+            var locked = true;
+            errdefer if (locked) self.mutex.unlock(io);
+            try context.ensureActive();
+            if (self.io != null and self.manager != manager) return error.PrivateIndexOwnerJobChanged;
+            self.io = io;
+            self.manager = manager;
+            if (manager) |value| if (self.reclaimer == 0) {
+                self.reclaimer = try value.registerReclaimer(.relational_preparation_working_set, self, reclaim);
+            };
+            if (self.entry) |entry| if (std.mem.eql(u8, &entry.digest, &request.binding_digest)) {
+                entry.retain();
+                self.hits +|= 1;
+                self.mutex.unlock(io);
+                return .{ .entry = entry };
+            };
+            if (self.compiling) {
+                var waiter: Waiters.Waiter = .{ .handoff = .{ .io = io }, .payload = {} };
+                self.waiters.enqueue(&waiter);
+                self.mutex.unlock(io);
+                locked = false;
+                try self.wait(io, &waiter, context);
+                continue;
+            }
+            self.compiling = true;
+            const generation = self.epoch;
+            const old = self.entry;
+            self.entry = null;
+            self.mutex.unlock(io);
+            if (old) |value| value.release();
+            break generation;
+        };
+        errdefer {
+            self.mutex.lockUncancelable(io);
+            self.finish();
+            self.mutex.unlock(io);
+        }
+        const entry = try Entry.create(backing, manager, request.binding_digest);
+        errdefer entry.release();
+        const alloc = if (entry.budget) |*value| value.allocator() else backing;
+        var view = core.acquireSchemaView() orelse return error.RelationalTableRequired;
+        defer view.release();
+        {
+            var read = try core.store.beginReadTxn();
+            defer read.abort();
+            try jobs.requireReserved(&read, binding);
+            var command: Command = .{ .effect = .reserved, .binding = binding };
+            command.binding.phase = .fencing;
+            entry.prepared = Prepared.control(alloc, view, &read, command) catch |err| {
+                if (entry.budget) |value| if (value.denied()) return error.ResourceBudgetExceeded;
+                return err;
+            };
+        }
+        try context.ensureActive();
+        if (entry.budget) |*value| _ = value.releaseUnusedCredit();
+        self.mutex.lockUncancelable(io);
+        if (self.epoch == epoch) {
+            entry.retain();
+            self.entry = entry;
+        }
+        self.compilations +|= 1;
+        self.finish();
+        self.mutex.unlock(io);
+        return .{ .entry = entry };
     }
 };
 

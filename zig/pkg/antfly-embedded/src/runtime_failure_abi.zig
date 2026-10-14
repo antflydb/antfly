@@ -756,6 +756,8 @@ pub const Status = enum(u32) {
     relational_index_catalog_schema_mismatch = 796,
     sql_invalid_power_argument = 797,
     invalid_schema_reader_requirements = 798,
+    private_index_root_recovery_required = 799,
+    invalid_relational_index_budget = 800,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

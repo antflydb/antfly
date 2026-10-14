@@ -6051,3 +6051,68 @@ distributed UNIQUE validation, native validated/installed/released receipt
 production, and the atomic current-proof/reader-floor/catalog/schema decision.
 Qualify the original public index/ALTER cohorts only after these boundaries and
 their distributed recovery faults are complete.
+
+### Native build receiver and resource-accounted candidate reuse
+
+The existing internal owner-control operation now accepts bounded build work.
+The receiving server obtains fresh metadata permission and inspects the actual
+native job before constructing an identity/binding-commitment/budget request.
+Metadata checks the plan, owner, exact fence, candidate/reservation identities
+and schema versions. Request bodies supply neither schema-sized inputs nor
+physical allocation choices or replay positions. The compiled owner rechecks
+the durable reserved job and cancellation; missing state is
+`PrivateIndexRootRecoveryRequired`, not permission to re-admit or mint a cut.
+The physical root generation comes from the lease that executed the request.
+
+One resident, immutable candidate cache avoids per-page schema compilation.
+Compilation is single-flight outside apply exclusion, uses the shared Resource-
+Manager preparation budget, and is reclaimable only when unpinned. A lease
+keeps its stable-address allocator alive through page destruction, even after
+eviction. Epoch invalidation prevents an in-flight compiler from repopulating
+an evicted cache. Queue waits use `std.Io` events and observe semantic request
+cancellation/deadlines without OS-thread spin loops. Cancellation intent and
+cleanup retire cached preparation outside the commit lock. Cache data never
+grants metadata permission or replaces the durable job/fence/progress checks.
+
+The kernel step prepares/applies at most one page or returns terminal physical
+progress. Per-row preparation and serialized staging check request activity;
+committed/pending outcomes survive cancellation after commit. Completion is
+receipt-free, checks the actual index/owner/progress/cut and exposes persisted
+outbox debt even when the in-memory pending hint is stale. It does not certify
+distributed UNIQUE claims or publish a schema. C-ABI response ownership is
+reserved before mutation. Execution controls cross that ABI only as borrowed
+synchronous callbacks, never as request-selected authorization.
+
+Focused Debug qualification passed 87/87 steps, including six native page tests,
+14 private-candidate prerequisites, six C-ABI tests, 32 publication tests and
+46 shared runtime contracts. The native work-count test builds 32 rows in nine
+four-record/EOF pages with one candidate compilation. It covers invalid binding,
+budget denial and backing-allocation failures, cancellation during preparation,
+pinned eviction, reopen with the original cut, canceled jobs, independent queued
+cancellation/deadlines and eight contending callers sharing one compilation.
+Receiver checks cover fresh permission, no admission on missing state, wrong
+table/binding, pinned applying-root identity and committed pending progress after
+cancellation. These are component/native tests, not a live distributed SQL
+producer or original-case qualification.
+
+Review subsequently preserved root-recovery and invalid-budget errors through
+both typed failure registries, retained resource-pressure identity over HTTP,
+and advanced the storage-owner ABI from 77 to 78 for the changed request layout.
+A regression rejects version 77 before dereferencing any request fields. Final
+combined Debug qualification of this source revision passed 206/206 steps and
+278/278 standard tests, plus linked native page, candidate, C-ABI, shared runtime,
+metadata, service, control, runtime, reader, FK, restore and publication runners.
+Two optional live PostgreSQL CDC tests skipped prerequisites; no failures or
+leaks remained. Counts overlap and are not original SQL cases. The final log is
+`/private/tmp/antfly-native-build-receiver-abi78-debug.log`; the pre-bump broad run
+was stopped and is not final qualification. Inventory,
+Apache boundary, licensing and control-catalog freshness checks passed. No
+throughput improvement, full SQL release pass, public activation, push or
+original-case disposition change is claimed: 483 implemented / 862 unresolved.
+
+Next: provenance-backed missing-root repair, durable source-to-claim production
+and complete distributed UNIQUE validation, native validated/installed/released
+receipt production and the atomic current-proof/reader-floor/catalog/schema
+decision. Data-Raft execution is not substituted with native authority. Enable
+and qualify the original public index/ALTER cohorts only when these remaining
+boundaries and their distributed recovery faults are complete.
