@@ -1298,6 +1298,8 @@ typedef struct termite_metal_decode_runtime {
     id<MTLComputePipelineState> multiply_add2_pipeline;
     id<MTLComputePipelineState> training_accumulate_pipeline;
     id<MTLComputePipelineState> training_adamw_pipeline;
+    id<MTLComputePipelineState> training_accumulate_into_pipeline;
+    id<MTLComputePipelineState> training_adamw_into_pipeline;
     id<MTLComputePipelineState> training_sumsq_pipeline;
     id<MTLComputePipelineState> subtract_pipeline;
     id<MTLComputePipelineState> divide_pipeline;
@@ -5805,6 +5807,18 @@ typedef struct termite_metal_training_accumulate_params {
     uint32_t reserved;
 } termite_metal_training_accumulate_params;
 
+typedef struct termite_metal_training_accumulate_into_params {
+    uint32_t elem_count;
+    float divisor;
+    float renormalize;
+    uint32_t flags;
+} termite_metal_training_accumulate_into_params;
+
+typedef struct termite_metal_training_ref {
+    const void *handle;
+    size_t offset;
+} termite_metal_training_ref;
+
 typedef struct termite_metal_training_adamw_params {
     uint32_t elem_count;
     float lr;
@@ -6627,6 +6641,7 @@ static NSString *termite_metal_shader_source(void) {
            "struct termite_metal_gemma4_audio_channel_norm_params { uint channels; uint positions; float eps; uint reserved; };\n"
            "struct termite_metal_gemma4_audio_attention_params { uint rows; uint hidden; uint heads; uint head_dim; uint chunk; uint context_left; uint context; uint reserved; float k_scale; float logit_cap; float invalid_value; float reserved_f; };\n"
            "struct termite_metal_training_accumulate_params { uint elem_count; float scale; uint first; uint reserved; };\n"
+           "struct termite_metal_training_accumulate_into_params { uint elem_count; float divisor; float renormalize; uint flags; };\n"
            "struct termite_metal_training_adamw_params { uint elem_count; float lr; float beta1; float beta2; float eps; float weight_decay; float bias_correction1; float bias_correction2; float grad_scale; uint reserved0; uint reserved1; uint reserved2; };\n"
            "struct termite_metal_training_sumsq_params { uint elem_count; uint reserved0; uint reserved1; uint reserved2; };\n"
            "struct termite_metal_apply_softmax_params { uint rows; uint dim; uint log_softmax; uint reserved; };\n"
@@ -10293,6 +10308,32 @@ static NSString *termite_metal_shader_source(void) {
            "    float vh = vv / p.bias_correction2;\n"
            "    float update = mh / (sqrt(vh) + p.eps) + p.weight_decay * weight[gid];\n"
            "    weight[gid] -= p.lr * update;\n"
+           "    grad[gid] = 0.0f;\n"
+           "}\n"
+           // Out of place: the result is (previous + gradient / divisor) *
+           // renormalize, each term only when its flag is set, in the same
+           // operation order as separate divide, add and multiply passes.
+           "kernel void termite_training_accumulate_into_f32(device const float *previous [[buffer(0)]], device const float *grad [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_training_accumulate_into_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
+           "    if (gid >= p.elem_count) return;\n"
+           "    float value = (p.flags & 1u) != 0u ? previous[gid] : 0.0f;\n"
+           "    if ((p.flags & 2u) != 0u) value = value + grad[gid] / p.divisor;\n"
+           "    if ((p.flags & 4u) != 0u) value = value * p.renormalize;\n"
+           "    output[gid] = value;\n"
+           "}\n"
+           // termite_training_adamw_f32 with weight and moments written to new
+           // buffers, so the inputs stay intact until the caller publishes.
+           "kernel void termite_training_adamw_into_f32(device const float *weight [[buffer(0)]], device float *grad [[buffer(1)]], device const float *m [[buffer(2)]], device const float *v [[buffer(3)]], device float *weight_out [[buffer(4)]], device float *m_out [[buffer(5)]], device float *v_out [[buffer(6)]], constant termite_metal_training_adamw_params &p [[buffer(7)]], uint gid [[thread_position_in_grid]]) {\n"
+           "    if (gid >= p.elem_count) return;\n"
+           "    float g = grad[gid] * p.grad_scale;\n"
+           "    float mv = p.beta1 * m[gid] + (1.0f - p.beta1) * g;\n"
+           "    float vv = p.beta2 * v[gid] + (1.0f - p.beta2) * g * g;\n"
+           "    m_out[gid] = mv;\n"
+           "    v_out[gid] = vv;\n"
+           "    float mh = mv / p.bias_correction1;\n"
+           "    float vh = vv / p.bias_correction2;\n"
+           "    float w = weight[gid];\n"
+           "    float update = mh / (sqrt(vh) + p.eps) + p.weight_decay * w;\n"
+           "    weight_out[gid] = w - p.lr * update;\n"
            "    grad[gid] = 0.0f;\n"
            "}\n"
            "kernel void termite_training_sumsq_f32(device const float *input [[buffer(0)]], device float *output [[buffer(1)]], constant termite_metal_training_sumsq_params &p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {\n"
@@ -27935,6 +27976,8 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         runtime->multiply_add2_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_multiply_add2_1x");
         runtime->training_accumulate_pipeline = termite_metal_make_pipeline(device, library, @"termite_training_accumulate_f32");
         runtime->training_adamw_pipeline = termite_metal_make_pipeline(device, library, @"termite_training_adamw_f32");
+        runtime->training_accumulate_into_pipeline = termite_metal_make_pipeline(device, library, @"termite_training_accumulate_into_f32");
+        runtime->training_adamw_into_pipeline = termite_metal_make_pipeline(device, library, @"termite_training_adamw_into_f32");
         runtime->training_sumsq_pipeline = termite_metal_make_pipeline(device, library, @"termite_training_sumsq_f32");
         runtime->layer_norm_bwd_dx_pipeline = termite_metal_make_pipeline(device, library, @"termite_layer_norm_bwd_dx");
         runtime->layer_norm_bwd_dgdb_pipeline = termite_metal_make_pipeline(device, library, @"termite_layer_norm_bwd_dgdb");
@@ -28872,6 +28915,8 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->multiply_add2_pipeline = nil;
     runtime->training_accumulate_pipeline = nil;
     runtime->training_adamw_pipeline = nil;
+    runtime->training_accumulate_into_pipeline = nil;
+    runtime->training_adamw_into_pipeline = nil;
     runtime->training_sumsq_pipeline = nil;
     runtime->layer_norm_bwd_dx_pipeline = nil;
     runtime->layer_norm_bwd_dgdb_pipeline = nil;
@@ -51007,6 +51052,144 @@ int termite_metal_decode_runtime_training_adamw_many_f32(
             [encoder setBytes:&params length:sizeof(params) atIndex:4];
             [encoder dispatchThreads:MTLSizeMake(elem_count, 1, 1)
                threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->training_adamw_pipeline, elem_count), 1, 1)];
+        }
+        [encoder endEncoding];
+        return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -10);
+    }
+}
+
+static bool termite_metal_training_ref_fits(termite_metal_training_ref ref, size_t bytes) {
+    if (ref.handle == NULL) return false;
+    id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)ref.handle;
+    return ref.offset <= buffer.length && bytes <= buffer.length - ref.offset;
+}
+
+// One encoder, one dispatch per tensor: output = (previous + grad / divisor)
+// * renormalize. A null previous or grad handle omits that term.
+int termite_metal_decode_runtime_training_accumulate_into_many_f32(
+    termite_metal_decode_runtime *runtime,
+    const termite_metal_training_ref *previous,
+    const termite_metal_training_ref *grad,
+    const termite_metal_training_ref *output,
+    const size_t *elem_counts,
+    size_t input_count,
+    float divisor,
+    float renormalize
+) {
+    if (runtime == NULL || previous == NULL || grad == NULL || output == NULL || elem_counts == NULL) return -1;
+    if (runtime->training_accumulate_into_pipeline == nil) return -2;
+    if (input_count == 0 || input_count > UINT32_MAX || divisor == 0.0f) return -3;
+    @autoreleasepool {
+        bool frame_owned = true;
+        id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
+        if (command_buffer == nil) return -5;
+        id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
+        if (encoder == nil) return -6;
+        [encoder setComputePipelineState:runtime->training_accumulate_into_pipeline];
+        for (size_t idx = 0; idx < input_count; idx += 1) {
+            const size_t elem_count = elem_counts[idx];
+            const size_t bytes = elem_count * sizeof(float);
+            const bool has_previous = previous[idx].handle != NULL;
+            const bool has_grad = grad[idx].handle != NULL;
+            if (elem_count == 0 || elem_count > UINT32_MAX || !termite_metal_training_ref_fits(output[idx], bytes) ||
+                (has_previous && !termite_metal_training_ref_fits(previous[idx], bytes)) ||
+                (has_grad && !termite_metal_training_ref_fits(grad[idx], bytes)))
+            {
+                [encoder endEncoding];
+                return -7;
+            }
+            termite_metal_training_accumulate_into_params params = {
+                .elem_count = (uint32_t)elem_count,
+                .divisor = divisor,
+                .renormalize = renormalize,
+                .flags = (has_previous ? 1u : 0u) | (has_grad ? 2u : 0u) | (renormalize != 1.0f ? 4u : 0u),
+            };
+            id<MTLBuffer> output_buffer = (__bridge id<MTLBuffer>)output[idx].handle;
+            // An absent term binds the output buffer; the kernel never reads it.
+            [encoder setBuffer:has_previous ? (__bridge id<MTLBuffer>)previous[idx].handle : output_buffer
+                        offset:has_previous ? previous[idx].offset : output[idx].offset
+                       atIndex:0];
+            [encoder setBuffer:has_grad ? (__bridge id<MTLBuffer>)grad[idx].handle : output_buffer
+                        offset:has_grad ? grad[idx].offset : output[idx].offset
+                       atIndex:1];
+            [encoder setBuffer:output_buffer offset:output[idx].offset atIndex:2];
+            [encoder setBytes:&params length:sizeof(params) atIndex:3];
+            [encoder dispatchThreads:MTLSizeMake(elem_count, 1, 1)
+               threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->training_accumulate_into_pipeline, elem_count), 1, 1)];
+        }
+        [encoder endEncoding];
+        return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -10);
+    }
+}
+
+// termite_metal_decode_runtime_training_adamw_many_f32 writing new weight and
+// moment buffers; the inputs are only read, and grad is cleared.
+int termite_metal_decode_runtime_training_adamw_into_many_f32(
+    termite_metal_decode_runtime *runtime,
+    const termite_metal_training_ref *weight,
+    const termite_metal_training_ref *grad,
+    const termite_metal_training_ref *m,
+    const termite_metal_training_ref *v,
+    const termite_metal_training_ref *weight_out,
+    const termite_metal_training_ref *m_out,
+    const termite_metal_training_ref *v_out,
+    const size_t *elem_counts,
+    const float *bias_correction1s,
+    const float *bias_correction2s,
+    size_t input_count,
+    float lr,
+    float beta1,
+    float beta2,
+    float eps,
+    float weight_decay,
+    float grad_scale
+) {
+    if (runtime == NULL || weight == NULL || grad == NULL || m == NULL || v == NULL || weight_out == NULL ||
+        m_out == NULL || v_out == NULL || elem_counts == NULL || bias_correction1s == NULL || bias_correction2s == NULL)
+        return -1;
+    if (runtime->training_adamw_into_pipeline == nil) return -2;
+    if (input_count == 0 || input_count > UINT32_MAX) return -3;
+    @autoreleasepool {
+        bool frame_owned = true;
+        id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
+        if (command_buffer == nil) return -5;
+        id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
+        if (encoder == nil) return -6;
+        [encoder setComputePipelineState:runtime->training_adamw_into_pipeline];
+        for (size_t idx = 0; idx < input_count; idx += 1) {
+            const size_t elem_count = elem_counts[idx];
+            const size_t bytes = elem_count * sizeof(float);
+            const termite_metal_training_ref refs[7] = { weight[idx], grad[idx], m[idx], v[idx], weight_out[idx], m_out[idx], v_out[idx] };
+            bool fits = elem_count != 0 && elem_count <= UINT32_MAX;
+            for (size_t r = 0; fits && r < 7; ++r) fits = termite_metal_training_ref_fits(refs[r], bytes);
+            if (!fits) {
+                [encoder endEncoding];
+                return -7;
+            }
+            if (bias_correction1s[idx] == 0.0f || bias_correction2s[idx] == 0.0f) {
+                [encoder endEncoding];
+                return -4;
+            }
+            termite_metal_training_adamw_params params = {
+                .elem_count = (uint32_t)elem_count,
+                .lr = lr,
+                .beta1 = beta1,
+                .beta2 = beta2,
+                .eps = eps,
+                .weight_decay = weight_decay,
+                .bias_correction1 = bias_correction1s[idx],
+                .bias_correction2 = bias_correction2s[idx],
+                .grad_scale = grad_scale,
+                .reserved0 = 0u,
+                .reserved1 = 0u,
+                .reserved2 = 0u,
+            };
+            for (size_t r = 0; r < 7; ++r) {
+                [encoder setBuffer:(__bridge id<MTLBuffer>)refs[r].handle offset:refs[r].offset atIndex:r];
+            }
+            [encoder setBytes:&params length:sizeof(params) atIndex:7];
+            [encoder dispatchThreads:MTLSizeMake(elem_count, 1, 1)
+               threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->training_adamw_into_pipeline, elem_count), 1, 1)];
         }
         [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -10);

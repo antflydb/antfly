@@ -260,6 +260,18 @@ pub const TrainingAdamWBatchInput = struct {
     adam_step: u32 = 0,
 };
 
+/// Out-of-place accumulation: output = (previous + grad / divisor) *
+/// renormalize. A null previous or grad omits that term.
+pub const TrainingAccumulateIntoInput = struct {
+    previous: ?CT,
+    grad: ?CT,
+    shape: []const i32,
+    elem_count: usize,
+};
+
+/// New weight and moment buffers produced by an out-of-place AdamW update.
+pub const TrainingAdamWOutputs = struct { weight: CT, m: CT, v: CT };
+
 pub const TrainingAdamWBatchOptions = struct {
     lr: f32,
     beta1: f32,
@@ -2615,6 +2627,11 @@ pub const ComputeBackend = struct {
         trainingZeroF32: ?*const fn (ctx: *anyopaque, elem_count: usize, shape: []const i32) anyerror!CT = null,
         trainingAccumulateF32: ?*const fn (ctx: *anyopaque, accum: CT, grad: CT, elem_count: usize, scale: f32, first: bool) anyerror!void = null,
         trainingAdamWManyF32: ?*const fn (ctx: *anyopaque, inputs: []const TrainingAdamWBatchInput, opts: TrainingAdamWBatchOptions) anyerror!void = null,
+        /// Allocates one fresh output per input. On error no output is returned.
+        trainingAccumulateIntoManyF32: ?*const fn (ctx: *anyopaque, inputs: []const TrainingAccumulateIntoInput, divisor: f32, renormalize: f32, outputs: []CT) anyerror!void = null,
+        /// AdamW that only reads weight/m/v, writing fresh outputs (grad is
+        /// still cleared). On error no output is returned.
+        trainingAdamWIntoManyF32: ?*const fn (ctx: *anyopaque, inputs: []const TrainingAdamWBatchInput, shapes: []const []const i32, opts: TrainingAdamWBatchOptions, outputs: []TrainingAdamWOutputs) anyerror!void = null,
         trainingSumSquaresManyF32: ?*const fn (ctx: *anyopaque, inputs: []const TrainingSumSquaresInput) anyerror!f32 = null,
         trainingSynchronize: ?*const fn (ctx: *anyopaque) anyerror!void = null,
 
@@ -4632,6 +4649,20 @@ pub const ComputeBackend = struct {
     pub fn trainingAccumulateF32(self: *const ComputeBackend, accum: CT, grad: CT, elem_count: usize, scale: f32, first: bool) !void {
         const op = self.vtable.trainingAccumulateF32 orelse return error.DeviceTrainingUnavailable;
         return op(self.ptr, accum, grad, elem_count, scale, first);
+    }
+
+    pub fn trainingAccumulateIntoManyF32(self: *const ComputeBackend, inputs: []const TrainingAccumulateIntoInput, divisor: f32, renormalize: f32, outputs: []CT) !void {
+        const op = self.vtable.trainingAccumulateIntoManyF32 orelse return error.DeviceTrainingUnavailable;
+        if (outputs.len != inputs.len) return error.InvalidTrainingGradient;
+        try self.checkExecutionControl();
+        return op(self.ptr, inputs, divisor, renormalize, outputs);
+    }
+
+    pub fn trainingAdamWIntoManyF32(self: *const ComputeBackend, inputs: []const TrainingAdamWBatchInput, shapes: []const []const i32, opts: TrainingAdamWBatchOptions, outputs: []TrainingAdamWOutputs) !void {
+        const op = self.vtable.trainingAdamWIntoManyF32 orelse return error.DeviceTrainingUnavailable;
+        if (outputs.len != inputs.len or shapes.len != inputs.len) return error.InvalidTrainingGradient;
+        try self.checkExecutionControl();
+        return op(self.ptr, inputs, shapes, opts, outputs);
     }
 
     pub fn trainingAdamWManyF32(self: *const ComputeBackend, inputs: []const TrainingAdamWBatchInput, opts: TrainingAdamWBatchOptions) !void {
