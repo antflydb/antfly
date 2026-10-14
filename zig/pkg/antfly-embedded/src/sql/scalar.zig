@@ -3805,6 +3805,7 @@ const Evaluator = struct {
                 try self.charge(value.string.len);
                 var work = self.workBudget();
                 const parsed = try json_order.parseTextLeaky(self.alloc, value.string, &work);
+                try json_order.validateTextDomain(parsed, &work, 0);
                 break :blk parsed;
             } else value,
         };
