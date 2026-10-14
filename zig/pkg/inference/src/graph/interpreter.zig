@@ -212,6 +212,25 @@ pub const ExecuteOptions = struct {
     /// aligned with the direct interpreter, where labels, masks, and borrowed
     /// weights stay in the representation supplied by the caller.
     preserve_runtime_input_residency: bool = false,
+
+    /// One runtime input supplied only once execution reaches node `at`,
+    /// computed from an earlier value. Training uses it to run a gradient
+    /// graph once: its forward nodes produce the loss input, the callback
+    /// returns the loss cotangent, and the backward nodes reuse every forward
+    /// value instead of a second forward pass recomputing them.
+    deferred_input: ?DeferredInput = null,
+};
+
+pub const DeferredInput = struct {
+    /// A parameter node that no node before `at` consumes.
+    node_id: NodeId,
+    at: NodeId,
+    /// A graph output computed before `at`, passed to `resolve`.
+    observe: NodeId,
+    context: *anyopaque,
+    /// Returns the parameter's value. The interpreter takes ownership and
+    /// frees it after its last use.
+    resolve: *const fn (context: *anyopaque, observed: CT) anyerror!CT,
 };
 
 /// Result of graph execution. Caller owns the output tensors and must
@@ -745,9 +764,27 @@ pub fn execute(
     };
     defer exec_state.freeMoeState();
 
+    if (options.deferred_input) |deferred| {
+        if (deferred.node_id >= deferred.at or deferred.observe >= deferred.at or deferred.at > count or
+            graph.node(deferred.node_id).op != .parameter or rt_values[deferred.node_id] != null or
+            std.mem.indexOfScalar(NodeId, graph.outputs.items, deferred.observe) == null)
+            return error.InvalidDeferredInput;
+        for (0..deferred.at) |i| for (graph.node(@intCast(i)).getInputs()) |input|
+            if (input == deferred.node_id) return error.InvalidDeferredInput;
+    }
     for (0..count) |i| {
+        if (options.deferred_input) |deferred| if (i == deferred.at) {
+            const observed = values[deferred.observe] orelse return error.InvalidDeferredInput;
+            if (options.execution_control) |control| try control.check();
+            const value = try deferred.resolve(deferred.context, observed);
+            rt_values[deferred.node_id] = value;
+            values[deferred.node_id] = value;
+            donated_values[deferred.node_id] = true;
+        };
         if (!reachable[i]) continue;
         if (options.execution_control) |control| try control.check();
+        // Resolved at `at`; no earlier node consumes it.
+        if (options.deferred_input) |deferred| if (i == deferred.node_id and i < deferred.at) continue;
 
         const node_id: NodeId = @intCast(i);
 
