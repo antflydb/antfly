@@ -1,0 +1,6 @@
+Build Summary: 4/4 steps succeeded; 16/16 tests passed
+test-video success
++- run test 16 pass (16 total) 35s MaxRSS:59M
+   +- compile test debug native success 7s MaxRSS:728M
+      +- WriteFile video_prepare_shader.h cached
+

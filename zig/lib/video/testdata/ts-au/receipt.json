@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "date": "2026-10-14",
+  "basis_commit": "987912340f23b6b2441256ae43a08c4419520f5b",
+  "status": "focused normalization passed on macOS/Linux; broader device regression running",
+  "scope": "Incremental PES-to-owned-AVC normalization; acknowledged HTTP/Reader/model integration remains open",
+  "compiler": "Zig 0.17.0",
+  "optimization": "Debug",
+  "source_sha256": {
+    "zig/lib/video/src/transport_avc.zig": "db2e64bb3dd8ef0c87610ce50dc519e9135100abfd6ebcf734e7173a23d98571"
+  },
+  "binary_sha256": {
+    "zig/.zig-cache/o/3f5063aeff211484fab2a4d9c045a928/test": "52f32b7f1e70baf283a5e936bd6cbff03b7b8ad72e922186127918eae8fc6a78",
+    "zig/zig-out/bin/video-tests": "b8ea02f6be55974fb9accf79d4657f12ffd5fa8f5359d46e931928294b63f400"
+  },
+  "results": {
+    "macos_arm64": {
+      "TS_tests_passed": 16
+    },
+    "linux_arm64": {
+      "status": "passed",
+      "image_id": "sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1",
+      "runtime": "native ARM64 Linux VM",
+      "network": "none",
+      "TS_tests_passed": 16
+    }
+  },
+  "contracts": [
+    "Four ordinary/B-frame/split-PES fixtures match buffered normalized payload, DTS/PTS/duration/sync/AVCC",
+    "One-byte TS input and snapshots retained after producer destruction",
+    "Timed PES may begin in the preceding AU",
+    "Legacy PES-aligned no-AUD input preserves the buffered timing contract",
+    "Multiple AU clocks and untimed starts reject; missing final duration rejects",
+    "Consumer failure and every allocation failure clean owned normalized snapshots"
+  ],
+  "log_sha256": {
+    "macos.log": "34d8f16f79ff04e03a7d2477f0abdfdfa50ad051d3b251d503e06f2ec3ebd493",
+    "linux-build.log": "a037c8798510c40c4bb6196279975ba1a6f31b718aa3d4d2c8a534e960328010",
+    "linux.log": "3b6cd2b92dcd90944fae889eb3ef625645aa71ffd293dd98e45fa05b2fa910ff"
+  },
+  "remaining": [
+    "Acknowledged HTTP/Reader replay/cursors",
+    "Direct TS model coordinator delivery and pretrained preservation gate"
+  ],
+  "broader_device_regression": {
+    "status": "running",
+    "scope": "Build began before the final deterministic allocation-harness and no-AUD test changes; no pass claim yet."
+  },
+  "commands": {
+    "macos": "zig build --build-file zig/lib/video/build.zig test-video -Dvideo-test-filter=\"native TS\" -Doptimize=Debug --summary all",
+    "linux_build": "zig build --build-file zig/lib/video/build.zig install-video-tests -Dvideo-test-filter=\"native TS\" -Dtarget=aarch64-linux-musl -Doptimize=Debug --prefix zig/zig-out --summary all",
+    "linux_run": "docker run --rm --network=none --read-only --workdir=/tmp --tmpfs /tmp:size=128m -v <recorded binary>:/qualify/test:ro --entrypoint /qualify/test <pinned image>"
+  }
+}

@@ -3015,3 +3015,35 @@ and direct model coordinator delivery remain to be connected. The existing TS
 Reader/model route remains buffered. See [PES extraction qualification](../media/testdata/ts-stream/README.md)
 for source/binary scope: 218 media and 18 authenticated HTTP tests pass on
 macOS and actual Linux ARM64.
+
+
+### Incremental TS AVC access-unit normalization
+
+`transport_avc.Stream` consumes borrowed PES deliveries and emits independently
+owned `normalized_transport` segments using the existing MP4 packet-reader ABI.
+It joins NALs split across PES, retains AUD-to-PES clock anchors, and waits for
+the next AU's DTS to determine duration. A timed PES may start in the preceding
+AU; its later AUD receives that PES clock. Multiple AUs sharing one timestamp
+and untimed AU starts reject as ambiguous. PES-aligned input without AUD retains
+the existing legacy contract. Final duration uses explicit metadata or the prior
+measured DTS delta, matching buffered normalization policy.
+
+Only the active AU/lookahead bytes and timestamp anchors are retained. Dynamic
+allocation and moving-growth overlap participate in shared admission; copied
+configuration and identities have separate owners. Each output snapshot survives
+both producers. Consumer/cancellation/allocation errors terminalize the normalizer;
+explicit acknowledgement survives a later consumer failure. The final AU reports
+body completion only during successful upstream EOF finalization.
+
+The gate compares ordinary, B-frame and split-PES streams with buffered native
+normalization, including payload bytes, DTS/PTS, duration, sync and AVCC. It tests
+one-byte TS delivery, cross-PES AUD timing, timestamp ambiguity, missing duration,
+consumer failure, independent retained snapshots and every allocation failure.
+See [AU normalization qualification](testdata/ts-au/README.md) for exact terminal
+platform results and source/binary scope: the focused 16-test gate passes on
+macOS and actual Linux ARM64.
+
+Acknowledged HTTP/Reader replay and direct TS model coordinator delivery remain
+open. Existing TS inference remains buffered; this stage connects incremental
+PES extraction to the native video representation without claiming those later
+integrations or new pretrained parity.

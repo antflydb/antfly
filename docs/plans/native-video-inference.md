@@ -2296,3 +2296,11 @@ qualified independently of the buffered oracle, including a real withheld-tail
 HTTP gate. AVC normalization/lookahead, acknowledged Reader replay and model
 coordinator integration remain open; the current TS model path stays buffered.
 Qualification: `zig/lib/media/testdata/ts-stream/README.md`.
+
+
+Incremental TS AVC normalization now joins split PES/NAL data and maps AUDs to
+their PES clock anchors, including timed PES beginning within a previous AU.
+Next-AU DTS lookahead determines duration; ambiguity rejects rather than inventing
+clocks. Owned normalized snapshots and actual-allocation admission are qualified
+against buffered packet readers. Acknowledged HTTP/Reader replay and direct TS
+model integration remain open. Evidence: `zig/lib/video/testdata/ts-au/README.md`.

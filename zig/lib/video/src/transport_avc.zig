@@ -228,6 +228,262 @@ pub fn fromDemux(a: std.mem.Allocator, identity: []const u8, demux: media.transp
     return .{ .snapshot = snapshot, .reader = .{ .allocator = a, .input = &snapshot.input, .metadata = metadata, .index_reservation = reservation, .track = track, .packets = packets, .limits = options.index }, .next_state = demux.next_state };
 }
 
+pub const StreamOptions = struct {
+    video: Options = .{},
+    epoch: usize = 0,
+    first_ordinal: usize = 0,
+    max_identity_bytes: usize = 4096,
+};
+/// Incremental Annex B AU normalization. Borrowed PES payloads are copied only
+/// into the active AU/lookahead buffer. Output segments own their packet data.
+/// One consumer; entered failures are terminal, with caller-managed replay.
+pub const Stream = struct {
+    const Anchor = struct { offset: usize, packet: media.transport_stream.Packet, ordinal: usize };
+    allocator: std.mem.Allocator,
+    options: StreamOptions,
+    identity: []u8,
+    identity_reservation: media.admission.Token = .{},
+    configuration: ?[]u8 = null,
+    configuration_reservation: media.admission.Token = .{},
+    fixed_reservation: media.admission.Token = .{},
+    workspace: media.admission.TrackedAllocator,
+    bytes: std.ArrayList(u8) = .empty,
+    anchors: std.ArrayList(Anchor) = .empty,
+    scan_cursor: usize = 0,
+    mode: enum { unknown, aud, pes } = .unknown,
+    clock: ?Anchor = null,
+    next_pes: usize = 0,
+    payload_bytes: usize = 0,
+    published: usize = 0,
+    last_duration: ?u32 = null,
+    ended: bool = false,
+    active: bool = false,
+    context: *anyopaque,
+    accept: *const fn (*anyopaque, *media.http_stream.FragmentDelivery) anyerror!void,
+    pub fn init(a: std.mem.Allocator, identity: []const u8, options: StreamOptions, context: *anyopaque, accept: *const fn (*anyopaque, *media.http_stream.FragmentDelivery) anyerror!void) !Stream {
+        try options.video.stream.control.check();
+        if (identity.len > options.max_identity_bytes or options.video.index.max_packet_bytes == 0) return error.ResourceLimitExceeded;
+        const au_limit = @min(options.video.index.max_packet_bytes, options.video.stream.max_bytes);
+        // Active AU plus incoming lookahead PES and moving allocation overlap.
+        const bytes_bound = try std.math.mul(usize, try std.math.add(usize, au_limit, options.video.transport.max_pes_bytes), 3);
+        const anchors_bound = try std.math.mul(usize, options.video.transport.max_packets, 3 * @sizeOf(Anchor));
+        const bound = try std.math.add(usize, try std.math.add(usize, bytes_bound, anchors_bound), 4096);
+        const pool = options.video.stream.admission_pool;
+        var fixed = if (pool) |value| try value.acquire(.{ .host_bytes = @sizeOf(Stream) }) else media.admission.Token{};
+        errdefer fixed.deinit();
+        var id_token = if (pool) |value| try value.acquire(.{ .host_bytes = identity.len }) else media.admission.Token{};
+        errdefer id_token.deinit();
+        const owned = try a.dupe(u8, identity);
+        errdefer a.free(owned);
+        var cfg_token = media.admission.Token{};
+        errdefer cfg_token.deinit();
+        var cfg: ?[]u8 = null;
+        errdefer if (cfg) |value| a.free(value);
+        if (options.video.configuration) |value| {
+            if (value.len > options.video.stream.max_bytes) return error.ResourceLimitExceeded;
+            if (pool) |shared| cfg_token = try shared.acquire(.{ .host_bytes = value.len });
+            cfg = try a.dupe(u8, value);
+        }
+        const token = if (pool) |value| try value.acquire(.{}) else media.admission.Token{};
+        var saved = options;
+        saved.video.configuration = null;
+        return .{ .allocator = a, .options = saved, .identity = owned, .identity_reservation = id_token, .configuration = cfg, .configuration_reservation = cfg_token, .fixed_reservation = fixed, .workspace = .{ .backing = a, .limit = bound, .reservation = token }, .context = context, .accept = accept };
+    }
+    pub fn deinit(self: *Stream) void {
+        self.bytes.deinit(self.workspace.allocator());
+        self.bytes = .empty;
+        self.anchors.deinit(self.workspace.allocator());
+        self.anchors = .empty;
+        std.debug.assert(self.workspace.live == 0);
+        self.workspace.reservation.deinit();
+        self.allocator.free(self.identity);
+        self.identity = &.{};
+        if (self.configuration) |value| self.allocator.free(value);
+        self.configuration = null;
+        self.configuration_reservation.deinit();
+        self.identity_reservation.deinit();
+        self.fixed_reservation.deinit();
+        self.ended = true;
+    }
+    fn failure(self: *Stream, err: anyerror) anyerror {
+        const result = if (err == error.OutOfMemory and self.workspace.denied != null) self.workspace.denied.? else err;
+        self.deinit();
+        return result;
+    }
+    pub fn consumer(self: *Stream) media.transport_stream.Consumer {
+        return .{ .context = self, .accept = acceptPes };
+    }
+    fn acceptPes(raw: *anyopaque, pes: media.transport_stream.Pes) !void {
+        try @as(*Stream, @ptrCast(@alignCast(raw))).push(pes);
+    }
+    pub fn push(self: *Stream, pes: media.transport_stream.Pes) !void {
+        if (self.ended or self.active) return error.InvalidTransportState;
+        self.active = true;
+        defer self.active = false;
+        self.pushEntered(pes) catch |err| return self.failure(err);
+    }
+    fn pushEntered(self: *Stream, pes: media.transport_stream.Pes) !void {
+        try self.options.video.stream.control.check();
+        if (pes.ordinal != self.next_pes or pes.packet.offset != self.payload_bytes or pes.packet.size != pes.bytes.len) return error.InvalidTransportState;
+        if (pes.bytes.len > self.options.video.transport.max_pes_bytes or pes.bytes.len > self.options.video.transport.max_bytes -| self.payload_bytes or self.next_pes >= self.options.video.transport.max_packets) return error.ResourceLimitExceeded;
+        if (self.mode == .pes and self.bytes.items.len != 0) {
+            if (!pes.packet.has_timestamp) return error.AmbiguousTransportPictureTiming;
+            const duration = try durationBetween(self.clock.?.packet.dts, pes.packet.dts);
+            try self.publish(self.bytes.items.len, duration, false);
+            self.drop(self.bytes.items.len);
+            self.clock = null;
+        }
+        const active_limit = @min(self.options.video.index.max_packet_bytes, self.options.video.stream.max_bytes);
+        const bound = try std.math.add(usize, active_limit, self.options.video.transport.max_pes_bytes);
+        if (pes.bytes.len > bound -| self.bytes.items.len) return error.ResourceLimitExceeded;
+        const anchor = Anchor{ .offset = self.bytes.items.len, .packet = pes.packet, .ordinal = pes.ordinal };
+        try self.anchors.append(self.workspace.allocator(), anchor);
+        try self.bytes.appendSlice(self.workspace.allocator(), pes.bytes);
+        self.next_pes += 1;
+        self.payload_bytes += pes.bytes.len;
+        try self.scan();
+    }
+    fn durationBetween(first: i64, second: i64) !u32 {
+        const value = std.math.cast(u32, @as(i128, second) - first) orelse return error.InvalidSamplingMetadata;
+        if (value == 0) return error.InvalidSamplingMetadata;
+        return value;
+    }
+    fn clockAt(self: *Stream, offset: usize) !Anchor {
+        var selected: ?Anchor = null;
+        for (self.anchors.items) |anchor| {
+            if (anchor.offset > offset) break;
+            selected = anchor;
+        }
+        const value = selected orelse return error.AmbiguousTransportPictureTiming;
+        if (!value.packet.has_timestamp) return error.AmbiguousTransportPictureTiming;
+        return value;
+    }
+    fn scan(self: *Stream) !void {
+        while (try Nals.start(self.bytes.items, self.scan_cursor, self.options.video.stream.control)) |nal| {
+            if (nal.payload >= self.bytes.items.len) {
+                self.scan_cursor = nal.at;
+                return;
+            }
+            const kind = self.bytes.items[nal.payload] & 31;
+            if (kind == 9 and self.bytes.items.len - nal.payload < 2) {
+                self.scan_cursor = nal.at;
+                return;
+            }
+            if (self.mode == .unknown) self.mode = if (kind == 9) .aud else .pes;
+            if (self.clock == null) self.clock = try self.clockAt(0);
+            if (kind == 9) {
+                if (self.mode != .aud) return error.AmbiguousTransportPictureTiming;
+                if (self.bytes.items[nal.payload] & 0x60 != 0 or self.bytes.items[nal.payload + 1] & 31 != 16) return error.MalformedVideoPacket;
+                if (nal.at != 0) {
+                    // A first AUD may have leading_zero_8bits, but preceding
+                    // nonzero payload belongs to an already timed AU.
+                    var only_zero = true;
+                    for (self.bytes.items[0..nal.at]) |byte| if (byte != 0) {
+                        only_zero = false;
+                        break;
+                    };
+                    if (!only_zero) {
+                        const next = try self.clockAt(nal.at);
+                        if (next.ordinal == self.clock.?.ordinal) return error.AmbiguousTransportPictureTiming;
+                        const duration = try durationBetween(self.clock.?.packet.dts, next.packet.dts);
+                        try self.publish(nal.at, duration, false);
+                        const payload = nal.payload - nal.at;
+                        self.drop(nal.at);
+                        self.clock = next;
+                        self.scan_cursor = payload;
+                        continue;
+                    }
+                }
+            }
+            self.scan_cursor = nal.payload;
+        }
+        self.scan_cursor = @max(self.scan_cursor, self.bytes.items.len -| 3);
+    }
+    fn drop(self: *Stream, count: usize) void {
+        std.mem.copyForwards(u8, self.bytes.items, self.bytes.items[count..]);
+        self.bytes.items.len -= count;
+        var keep: usize = 0;
+        for (self.anchors.items, 0..) |anchor, index| {
+            if (anchor.offset > count) break;
+            keep = index;
+        }
+        std.mem.copyForwards(Anchor, self.anchors.items, self.anchors.items[keep..]);
+        self.anchors.items.len -= keep;
+        for (self.anchors.items) |*anchor| anchor.offset -|= count;
+        self.scan_cursor = 0;
+        if (self.bytes.items.len == 0) self.anchors.clearRetainingCapacity();
+    }
+    fn publish(self: *Stream, count: usize, duration: u32, complete: bool) !void {
+        if (self.published >= self.options.video.transport.max_packets or count > self.options.video.index.max_packet_bytes) return error.ResourceLimitExceeded;
+        const ordinal = try std.math.add(usize, self.options.first_ordinal, self.published);
+        const length = std.fmt.count("{s}/au/{d}", .{ self.identity, ordinal });
+        if (length > self.options.max_identity_bytes) return error.ResourceLimitExceeded;
+        var id_token = if (self.options.video.stream.admission_pool) |pool| try pool.acquire(.{ .host_bytes = length }) else media.admission.Token{};
+        var owners_live = true;
+        errdefer if (owners_live) id_token.deinit();
+        const identity = try self.allocator.alloc(u8, length);
+        errdefer if (owners_live) self.allocator.free(identity);
+        _ = try std.fmt.bufPrint(identity, "{s}/au/{d}", .{ self.identity, ordinal });
+        const clock = self.clock orelse return error.AmbiguousTransportPictureTiming;
+        var packet = clock.packet;
+        packet.offset = 0;
+        packet.size = count;
+        var records = [_]media.transport_stream.Packet{packet};
+        const demux = media.transport_stream.Demux{ .allocator = self.allocator, .bytes = self.bytes.items[0..count], .packets = &records, .next_state = .{} };
+        var options = self.options.video;
+        options.configuration = self.configuration;
+        options.single_access_unit_duration_ticks = duration;
+        options.last_duration_ticks = duration;
+        var source = try fromDemux(self.allocator, identity, demux, options);
+        errdefer if (owners_live) source.deinit();
+        if (self.configuration) |config| if (!std.mem.eql(u8, config, source.reader.track.avcc)) return error.SourceVersionChanged;
+        var cfg: ?[]u8 = null;
+        var cfg_token = media.admission.Token{};
+        defer {
+            if (cfg) |value| self.allocator.free(value);
+            cfg_token.deinit();
+        }
+        if (self.configuration == null) {
+            if (options.stream.admission_pool) |pool| cfg_token = try pool.acquire(.{ .host_bytes = source.reader.track.avcc.len });
+            cfg = try self.allocator.dupe(u8, source.reader.track.avcc);
+        }
+        // Transfer all owners into callback-scoped delivery before invoking it.
+        var delivery = media.http_stream.FragmentDelivery{ .body_complete = complete, .segment = .{ .origin = .normalized_transport, .backing = source.snapshot, .reader = source.reader, .ordinal = ordinal, .epoch = self.options.epoch, .identity = identity, .identity_reservation = id_token } };
+        // Ownership has moved; no errdefer may free these owners again.
+        owners_live = false;
+        try self.deliver(&delivery);
+        if (cfg) |value| {
+            self.configuration = value;
+            cfg = null;
+            self.configuration_reservation = cfg_token;
+            cfg_token = .{};
+        }
+        self.last_duration = duration;
+    }
+    fn deliver(self: *Stream, delivery: *media.http_stream.FragmentDelivery) !void {
+        defer if (delivery.segment) |*owner| owner.deinit();
+        self.accept(self.context, delivery) catch |err| {
+            if (delivery.acknowledged) self.published += 1;
+            return err;
+        };
+        self.published += 1;
+    }
+    pub fn finish(self: *Stream, final_duration_ticks: ?u32) !void {
+        if (self.ended or self.active) return error.InvalidTransportState;
+        self.active = true;
+        defer self.active = false;
+        self.finishEntered(final_duration_ticks) catch |err| return self.failure(err);
+        self.deinit();
+    }
+    fn finishEntered(self: *Stream, final_duration_ticks: ?u32) !void {
+        try self.options.video.stream.control.check();
+        if (self.bytes.items.len == 0 or self.clock == null) return error.EmptyVideo;
+        const duration = final_duration_ticks orelse self.options.video.last_duration_ticks orelse self.last_duration orelse self.options.video.single_access_unit_duration_ticks orelse return error.MissingTransportDuration;
+        if (duration == 0) return error.InvalidSamplingMetadata;
+        try self.publish(self.bytes.items.len, duration, true);
+    }
+};
+
 /// Request-local state for HLS TS video. Media controls the transport and AES;
 /// this adapter supplies codec configuration and the existing packet-reader ABI.
 pub const Hls = struct {
@@ -513,4 +769,178 @@ test "native TS AVC access units preserve Annex B leading zero bytes" {
     var reader = try fromDemux(a, "leading-zero", demux, .{});
     defer reader.deinit();
     try std.testing.expectEqual(demux.packets.len, reader.reader.packets.len);
+}
+
+const AuCapture = struct {
+    held: [128]?media.live_mp4.Segment = @splat(null),
+    count: usize = 0,
+    fail: bool = false,
+    fn deinit(self: *@This()) void {
+        for (&self.held) |*unit| if (unit.*) |*value| value.deinit();
+    }
+    fn accept(raw: *anyopaque, delivery: *media.http_stream.FragmentDelivery) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.fail) return error.ConsumerFailure;
+        try std.testing.expectEqual(self.count, delivery.segment.?.ordinal);
+        try std.testing.expectEqual(@as(usize, 1), delivery.segment.?.reader.packets.len);
+        self.held[self.count] = try delivery.take();
+        self.count += 1;
+    }
+    fn parity(self: *@This(), expected: *Reader) !void {
+        try std.testing.expectEqual(expected.reader.packets.len, self.count);
+        for (self.held[0..self.count], 0..) |entry, i| {
+            var unit = entry.?;
+            const packet = unit.reader.packets[0];
+            const reference = expected.reader.packets[i];
+            try std.testing.expectEqual(reference.media_dts, packet.media_dts);
+            try std.testing.expectEqual(reference.media_pts, packet.media_pts);
+            try std.testing.expectEqual(reference.duration, packet.duration);
+            try std.testing.expectEqual(reference.sync, packet.sync);
+            var left = try expected.reader.readPacket(i);
+            defer left.deinit();
+            var right = try unit.reader.readPacket(0);
+            defer right.deinit();
+            try std.testing.expectEqualSlices(u8, left.bytes, right.bytes);
+            try std.testing.expectEqualSlices(u8, expected.reader.track.avcc, unit.reader.track.avcc);
+        }
+    }
+};
+test "native TS incremental AVC normalization joins split PES and preserves buffered packet clocks durations and payloads" {
+    const a = std.testing.allocator;
+    inline for (.{ "closed", "bframes", "closed-split", "bframes-split" }) |name| {
+        const bytes = @embedFile("../testdata/transport/" ++ name ++ ".ts");
+        var expected = try Reader.init(a, "au-stream-oracle", bytes, .{}, .{});
+        defer expected.deinit();
+        for ([_]usize{ 1, 188, 8192, bytes.len }) |chunk| {
+            var pool = media.admission.Pool{ .limits = .{ .host_bytes = 64 * 1024 * 1024 } };
+            var capture = AuCapture{};
+            defer capture.deinit();
+            var normal = try Stream.init(a, "au-stream", .{ .video = .{ .stream = .{ .admission_pool = &pool } } }, &capture, AuCapture.accept);
+            defer normal.deinit();
+            var demux = try media.transport_stream.Stream.init(a, .{}, .{}, .{}, &pool, normal.consumer());
+            defer demux.deinit();
+            var offset: usize = 0;
+            while (offset < bytes.len) {
+                const end = @min(bytes.len, offset + chunk);
+                try demux.push(bytes[offset..end]);
+                offset = end;
+            }
+            try std.testing.expect(capture.count > 0);
+            _ = try demux.finish();
+            try normal.finish(null);
+            try capture.parity(&expected);
+            normal.deinit();
+            // Snapshots remain valid after both incremental producers are gone.
+            try capture.parity(&expected);
+            capture.deinit();
+            capture = .{};
+            try std.testing.expectEqual(media.admission.Resources{}, pool.snapshot());
+        }
+    }
+}
+fn auStreamAllocations(backing: std.mem.Allocator) !void {
+    // Moving-growth failure counts must not depend on heap placement.
+    var no_resize = std.testing.FailingAllocator.init(backing, .{ .resize_fail_index = 0 });
+    const a = no_resize.allocator();
+    var capture = AuCapture{};
+    defer capture.deinit();
+    var normal = try Stream.init(a, "au-allocation", .{}, &capture, AuCapture.accept);
+    defer normal.deinit();
+    var demux = try media.transport_stream.Stream.init(a, .{}, .{}, .{}, null, normal.consumer());
+    defer demux.deinit();
+    try demux.push(@embedFile("../testdata/transport/closed-split.ts"));
+    _ = try demux.finish();
+    try normal.finish(null);
+}
+test "native TS incremental AVC allocation failures release normalization configuration and retained snapshots" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, auStreamAllocations, .{});
+}
+test "native TS incremental AVC consumer failure terminalizes without double-freeing transferred owners" {
+    var capture = AuCapture{ .fail = true };
+    defer capture.deinit();
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 64 * 1024 * 1024 } };
+    var normal = try Stream.init(std.testing.allocator, "au-fail", .{ .video = .{ .stream = .{ .admission_pool = &pool } } }, &capture, AuCapture.accept);
+    defer normal.deinit();
+    var demux = try media.transport_stream.Stream.init(std.testing.allocator, .{}, .{}, .{}, &pool, normal.consumer());
+    defer demux.deinit();
+    try std.testing.expectError(error.ConsumerFailure, demux.push(@embedFile("../testdata/transport/closed.ts")));
+    try std.testing.expect(normal.ended and demux.ended);
+    try std.testing.expectEqual(media.admission.Resources{}, pool.snapshot());
+}
+
+test "native TS incremental AVC timed PES may begin in the previous AU and clocks belong to its later AUD" {
+    const a = std.testing.allocator;
+    var demux = try media.transport_stream.demux(a, @embedFile("../testdata/transport/closed.ts"), .{}, .{}, .{}, null);
+    defer demux.deinit();
+    const first = demux.packets[0];
+    const second = demux.packets[1];
+    const stop = second.offset + second.size;
+    const split = first.size - 7;
+    var records = [_]media.transport_stream.Packet{ first, second };
+    records[0].size = split;
+    records[1].offset = split;
+    records[1].size = stop - split;
+    const joined = media.transport_stream.Demux{ .allocator = a, .bytes = demux.bytes[0..stop], .packets = &records, .next_state = demux.next_state };
+    var expected = try fromDemux(a, "cross-PES-oracle", joined, .{});
+    defer expected.deinit();
+    var capture = AuCapture{};
+    defer capture.deinit();
+    var normal = try Stream.init(a, "cross-PES", .{}, &capture, AuCapture.accept);
+    defer normal.deinit();
+    try normal.push(.{ .bytes = joined.bytes[0..split], .packet = records[0], .ordinal = 0 });
+    try normal.push(.{ .bytes = joined.bytes[split..], .packet = records[1], .ordinal = 1 });
+    try normal.finish(null);
+    try capture.parity(&expected);
+}
+test "native TS incremental AVC rejects multiple AUD clocks missing duration and untimed first AU" {
+    const a = std.testing.allocator;
+    var demux = try media.transport_stream.demux(a, @embedFile("../testdata/transport/closed.ts"), .{}, .{}, .{}, null);
+    defer demux.deinit();
+    var capture = AuCapture{};
+    defer capture.deinit();
+    var normal = try Stream.init(a, "ambiguous", .{}, &capture, AuCapture.accept);
+    defer normal.deinit();
+    var packet = demux.packets[0];
+    packet.size += demux.packets[1].size;
+    try std.testing.expectError(error.AmbiguousTransportPictureTiming, normal.push(.{ .bytes = demux.bytes[0..packet.size], .packet = packet, .ordinal = 0 }));
+    try std.testing.expect(normal.ended);
+    normal = try Stream.init(a, "duration", .{}, &capture, AuCapture.accept);
+    packet = demux.packets[0];
+    try normal.push(.{ .bytes = demux.bytes[0..packet.size], .packet = packet, .ordinal = 0 });
+    try std.testing.expectError(error.MissingTransportDuration, normal.finish(null));
+    normal = try Stream.init(a, "untimed", .{}, &capture, AuCapture.accept);
+    packet.has_timestamp = false;
+    try std.testing.expectError(error.AmbiguousTransportPictureTiming, normal.push(.{ .bytes = demux.bytes[0..packet.size], .packet = packet, .ordinal = 0 }));
+    try std.testing.expectEqual(@as(usize, 0), capture.count);
+}
+
+test "native TS incremental AVC PES aligned input without AUD retains the legacy timing contract" {
+    const a = std.testing.allocator;
+    var input = try media.transport_stream.demux(a, @embedFile("../testdata/transport/closed.ts"), .{}, .{}, .{}, null);
+    defer input.deinit();
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(a);
+    var records: std.ArrayList(media.transport_stream.Packet) = .empty;
+    defer records.deinit(a);
+    for (input.packets) |packet| {
+        const payload = input.bytes[packet.offset..][0..packet.size];
+        const aud = (try Nals.start(payload, 0, .{})).?;
+        try std.testing.expectEqual(@as(u8, 9), payload[aud.payload] & 31);
+        const next = (try Nals.start(payload, aud.payload, .{})).?;
+        var record = packet;
+        record.offset = bytes.items.len;
+        record.size -= next.at;
+        try records.append(a, record);
+        try bytes.appendSlice(a, payload[next.at..]);
+    }
+    const demux = media.transport_stream.Demux{ .allocator = a, .bytes = bytes.items, .packets = records.items, .next_state = input.next_state };
+    var expected = try fromDemux(a, "pes-aligned-oracle", demux, .{});
+    defer expected.deinit();
+    var capture = AuCapture{};
+    defer capture.deinit();
+    var normal = try Stream.init(a, "pes-aligned", .{}, &capture, AuCapture.accept);
+    defer normal.deinit();
+    for (records.items, 0..) |packet, ordinal| try normal.push(.{ .bytes = bytes.items[packet.offset..][0..packet.size], .packet = packet, .ordinal = ordinal });
+    try normal.finish(null);
+    try capture.parity(&expected);
 }
