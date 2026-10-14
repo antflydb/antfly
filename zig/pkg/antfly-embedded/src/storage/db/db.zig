@@ -8595,6 +8595,26 @@ pub const DB = struct {
             return true;
         }
 
+        fn acquireCatalogBarrierWithCancellation(self: *@This(), io: std.Io, cancellation: types.CancellationToken) !void {
+            std.debug.assert(self.active and !self.catalog_barrier_held);
+            const admission = &self.db.core.index_manager.published_dense_admission;
+            const previous = admission.fetchOr(published_dense_catalog_closed, .acq_rel);
+            if (previous & published_dense_catalog_closed != 0) return error.IndexRebuilding;
+            // A canceled acquisition has not changed catalog pointers. Reopen
+            // admission while retaining every reader pin; the successful
+            // mutation release still requires a completely drained barrier.
+            errdefer {
+                const aborted = admission.fetchAnd(published_dense_reader_mask, .release);
+                std.debug.assert(aborted & published_dense_catalog_closed != 0);
+            }
+            while (admission.load(.acquire) & published_dense_reader_mask != 0) {
+                try cancellation.check();
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
+            try cancellation.check();
+            self.catalog_barrier_held = true;
+        }
+
         fn releaseCatalogBarrier(self: *@This()) void {
             if (!self.catalog_barrier_held) return;
             self.db.endIndexCatalogBarrier();
@@ -19391,6 +19411,74 @@ pub const DB = struct {
     pub fn captureQueryCut(self: *DB, request: @import("native_query_cut.zig").Request, cancellation: types.CancellationToken) !void {
         return self.captureQueryCutInternal(request, cancellation, true);
     }
+    /// Called under source/replay admission and apply fences. A sequence alone
+    /// misses catalog and generated-publication changes at the same watermark.
+    fn nativeQueryReuseDigestLocked(self: *DB, a: Allocator) !?[32]u8 {
+        // Local revision counters cannot be compared across owner lifetimes.
+        // Query-pin serialization owns this nonce and every hint using it.
+        if (!self.local_execution.native_query_reuse_epoch_ready) {
+            const io = self.backend_runtime.filesystemIo() orelse return null;
+            try io.randomSecure(&self.local_execution.native_query_reuse_epoch);
+            self.local_execution.native_query_reuse_epoch_ready = true;
+        }
+        const sequence = self.core.nextDerivedSequence();
+        if (self.currentMaintenanceTargetSequence() != sequence) return null;
+        const configs = try self.core.listIndexes(a);
+        defer types.freeIndexConfigs(a, configs);
+        const Entry = struct { name: []const u8, kind: []const u8, config_hash: u64, coverage_generation: u64, checkpoint: @import("derived/apply_state.zig").ProjectionCheckpoint };
+        const entries = try a.alloc(Entry, configs.len);
+        defer a.free(entries);
+        for (configs, entries) |cfg, *entry| {
+            const checkpoint = try self.core.loadProjectionCheckpoint(a, cfg.name);
+            if (checkpoint.status != .clean or checkpoint.config_hash != types.indexConfigHash(cfg) or checkpoint.applied_sequence != sequence) return null;
+            entry.* = .{ .name = cfg.name, .kind = @tagName(cfg.kind), .config_hash = types.indexConfigHash(cfg), .coverage_generation = cfg.coverage_generation, .checkpoint = checkpoint };
+        }
+        std.mem.sort(Entry, entries, {}, struct {
+            fn less(_: void, left: Entry, right: Entry) bool {
+                return std.mem.lessThan(u8, left.name, right.name);
+            }
+        }.less);
+        if (self.loadIndexRepairState(a)) |value| {
+            var repair = value;
+            defer repair.deinit(a);
+            if (repair.entries.items.len != 0) return null;
+        } else |err| switch (err) {
+            error.FileNotFound, error.DurableIndexRepairStateUnavailable => {},
+            else => return err,
+        }
+        const bytes = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u16, 1), .owner_epoch = self.local_execution.native_query_reuse_epoch, .namespace = self.core.identity_namespace, .range = self.core.byteRange(), .sequence = sequence, .primary_revision = self.core.store.query_generation_revision.load(.acquire), .catalog_epoch = self.core.index_manager.writePlanGeneration(), .projections = entries }, .{});
+        defer a.free(bytes);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(bytes, &digest, .{});
+        return digest;
+    }
+    /// Query-pin guard is held. Validate unchanged state at a short read point,
+    /// release mutation fences before repository I/O, then rebind exact extents.
+    fn tryReuseNativeQueryCut(self: *DB, io: std.Io, request: @import("native_query_cut.zig").Request, cancellation: types.CancellationToken) !bool {
+        const repository = self.backend_runtime.query_cut_repository orelse return false;
+        if (repository.vtable.reuse == null) return false;
+        const basis = self.local_execution.native_query_reuse orelse return false;
+        if (std.mem.eql(u8, &basis.id, request.id)) return false;
+        const digest = checked: {
+            var capture = self.core.snapshot_admission.tryAcquireCapture() orelse return false;
+            defer capture.release();
+            var replay = self.core.snapshot_replay_admission.tryAcquireCapture() orelse return false;
+            defer replay.release();
+            if (!self.core.tryLockApplyExclusive()) return false;
+            defer self.core.unlockApply();
+            try cancellation.check();
+            try self.requireQueryCutStorage();
+            var arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer arena.deinit();
+            break :checked (try self.nativeQueryReuseDigestLocked(arena.allocator())) orelse return false;
+        };
+        if (!basis.matches(digest, @import("native_query_cut.zig").nowMs())) return false;
+        const proof = (try repository.reuse(io, basis.asRequest(), request, self.core.identity_namespace, basis.proof(), cancellation)) orelse return false;
+        // Rotate the logical authority, so expiry of the original manifest does
+        // not force capture while the authenticated extents still cover readers.
+        self.local_execution.native_query_reuse = try @import("native_query_reuse.zig").State.init(request, proof);
+        return true;
+    }
     fn captureQueryCutInternal(self: *DB, request: @import("native_query_cut.zig").Request, cancellation: types.CancellationToken, publish: bool) !void {
         try request.validate(@import("native_query_cut.zig").nowMs());
         _ = try request.namespace(self.core.identity_namespace);
@@ -19407,6 +19495,7 @@ pub const DB = struct {
         };
         var guard = try @import("native_query_cut.zig").lock(self.alloc, io, self.core.path, token);
         defer guard.deinit();
+        if (publish and try self.tryReuseNativeQueryCut(io, request, token)) return;
         try self.admitQueryCut(io, request.id, token);
         const root = try @import("native_query_cut.zig").pathAlloc(self.alloc, self.core.path, request.id);
         defer self.alloc.free(root);
@@ -19425,7 +19514,9 @@ pub const DB = struct {
         };
         try self.admitQueryCut(io, request.id, token);
         if (publish) if (self.backend_runtime.query_cut_repository) |repository| {
-            try repository.publish(io, root, request, self.core.identity_namespace, token);
+            if (try repository.publishReusable(io, root, request, self.core.identity_namespace, token)) |proof| {
+                self.local_execution.native_query_reuse = try @import("native_query_reuse.zig").State.init(request, proof);
+            }
         };
     }
     fn warmNativeCheckpoint(raw: *anyopaque, cancellation: types.CancellationToken) !bool {
@@ -19439,13 +19530,8 @@ pub const DB = struct {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
-        const State = struct { request: cut.Request, sequence: u64, complete: bool = false, next_ms: u64 = 0 };
-        var state: ?State = if (@import("native_backup.zig").readFileAlloc(a, io, state_path, 4096)) |bytes|
-            try std.json.parseFromSliceLeaky(State, a, bytes, .{})
-        else |err| switch (err) {
-            error.FileNotFound => null,
-            else => return err,
-        };
+        const warming = @import("native_query_warming.zig");
+        var state = try warming.readState(a, io, state_path);
         const sequence = self.core.nextDerivedSequence();
         if (state) |value| if (value.request.table_id != self.core.identity_namespace.table_id or (!value.complete and !try snapshotPathExists(io, try cut.pathAlloc(a, self.core.path, value.request.id)))) {
             state = null;
@@ -19466,17 +19552,19 @@ pub const DB = struct {
             // The parent directory is created by capture; persist only once
             // the coherent local generation is sealed.
             try self.captureQueryCutInternal(state.?.request, cancellation, false);
-            _ = try @import("native_backup.zig").writeFileDurable(io, state_path, try std.json.Stringify.valueAlloc(a, state.?, .{}));
+            try warming.writeState(a, io, state_path, state.?);
         }
         const root = try cut.pathAlloc(a, self.core.path, state.?.request.id);
         const control: cut.Control = .{ .parent = cancellation, .deadline_ns = monotonicTimeNs() +| 10 * std.time.ns_per_s };
-        const completed = try repository.warm(io, root, state.?.request, self.core.identity_namespace, control.token(), 8 * 1024 * 1024);
+        const warmed = try repository.warmReusable(io, root, state.?.request, self.core.identity_namespace, control.token(), 8 * 1024 * 1024);
+        const completed = warmed.complete;
         if (completed) {
             state.?.complete = true;
             state.?.next_ms = now +| 60000;
-            _ = try @import("native_backup.zig").writeFileDurable(io, state_path, try std.json.Stringify.valueAlloc(a, state.?, .{}));
+            try warming.writeState(a, io, state_path, state.?);
             var guard = try cut.lock(self.alloc, io, self.core.path, cancellation);
             defer guard.deinit();
+            if (warmed.proof) |proof| self.local_execution.native_query_reuse = try @import("native_query_reuse.zig").State.init(state.?.request, proof);
             try std.Io.Dir.cwd().deleteTree(io, root);
         }
         return completed;
@@ -19758,13 +19846,7 @@ pub const DB = struct {
                     .restart_text_merge = self.quiesceTextMergeForStructuralMutation(),
                     .restart_sparse_compaction = self.quiesceSparseCompactionForStructuralMutation(),
                 };
-                const previous = self.core.index_manager.published_dense_admission.fetchOr(published_dense_catalog_closed, .acq_rel);
-                if (previous & published_dense_catalog_closed != 0) return error.IndexRebuilding;
-                structural.?.catalog_barrier_held = true;
-                while (self.core.index_manager.published_dense_admission.load(.acquire) & published_dense_reader_mask != 0) {
-                    try cancellation.check();
-                    try io.sleep(.fromMilliseconds(1), .awake);
-                }
+                try structural.?.acquireCatalogBarrierWithCancellation(io, cancellation);
             } else {
                 structural = self.beginDrainedIndexStructuralMutationWithLease("native snapshot", "*", capture.borrowMutation());
                 if (!structural.?.acquireCatalogBarrierUntil(std.math.maxInt(u64))) unreachable;
@@ -19824,6 +19906,7 @@ pub const DB = struct {
         // Pin the primary MVCC/read-snapshot while the selected revision is
         // fenced. Its corpus-sized serialization happens only after writers
         // resume and therefore does not extend write unavailability.
+        const query_reuse_digest = if (query_cut != null) try self.nativeQueryReuseDigestLocked(self.alloc) else null;
         var primary_snapshot = try self.core.pinNativeSnapshot();
         defer primary_snapshot.deinit();
         if (comptime builtin.os.tag == .freestanding) {
@@ -19948,7 +20031,9 @@ pub const DB = struct {
             try std.Io.Dir.cwd().deleteTree(io, generated_native_pin_root);
             try std.Io.Dir.cwd().deleteTree(io, generated_metadata_pin_root);
             if (query_cut) |request| {
-                try @import("native_query_cut.zig").finish(self.alloc, io, staging_root, request, self.core.identity_namespace, capture_target_sequence, cancellation);
+                const final_digest = try self.nativeQueryReuseDigestLocked(self.alloc);
+                const reuse_digest = if (query_reuse_digest != null and final_digest != null and std.mem.eql(u8, &query_reuse_digest.?, &final_digest.?)) query_reuse_digest else null;
+                try @import("native_query_cut.zig").finishWithReuseDigest(self.alloc, io, staging_root, request, self.core.identity_namespace, capture_target_sequence, reuse_digest, cancellation);
             } else _ = try seal.finish(self.alloc, io, staging_root, expected_topology_fence.?, capture_target_sequence, .{
                 .artifact_format = primary_snapshot.artifactFormat(),
                 .artifact_version = primary_snapshot.artifactVersion(),
@@ -69320,6 +69405,116 @@ test "db index catalog barrier and apply acquisition honor activation deadline" 
     db.core.lockApplyExclusive();
     defer db.core.unlockApplyExclusive();
     try std.testing.expect(!db.lockApplyUntil(monotonicTimeNs() + std.time.ns_per_ms));
+}
+
+test "db index catalog barrier canceled acquisition preserves reader pins and releases structural ownership" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    const Cancel = struct {
+        db: *DB,
+        failure: anyerror,
+        checks: usize = 0,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            try std.testing.expect(self.db.indexCatalogBarrierActive());
+            try std.testing.expectEqual(@as(u32, 1), self.db.publishedDenseSearchCount());
+            self.checks += 1;
+            return self.failure;
+        }
+    };
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded }) |failure| {
+        try std.testing.expect(db.beginPublishedDenseSearch());
+        var cancellation = Cancel{ .db = &db, .failure = failure };
+        var guard = db.beginDrainedIndexStructuralMutation("canceled query cut", "*");
+        try std.testing.expectError(failure, guard.acquireCatalogBarrierWithCancellation(
+            db.backend_runtime.filesystemIo().?,
+            .{ .ptr = &cancellation, .check_fn = Cancel.check },
+        ));
+        try std.testing.expectEqual(@as(usize, 1), cancellation.checks);
+        try std.testing.expect(!guard.catalog_barrier_held);
+        guard.release();
+        try std.testing.expect(!db.indexCatalogBarrierActive());
+        try std.testing.expectEqual(@as(u32, 1), db.publishedDenseSearchCount());
+        // New readers can enter and the canceled writer did not retire an old
+        // reader's pin. Its structural serialization is available to retry.
+        try std.testing.expect(db.beginPublishedDenseSearch());
+        db.endPublishedDenseSearch();
+        db.endPublishedDenseSearch();
+        var retry = db.beginDrainedIndexStructuralMutation("retry query cut", "*");
+        try retry.acquireCatalogBarrierWithCancellation(db.backend_runtime.filesystemIo().?, .{});
+        try std.testing.expect(retry.catalog_barrier_held);
+        try std.testing.expect(!db.beginPublishedDenseSearch());
+        retry.release();
+        try std.testing.expect(!db.indexCatalogBarrierActive());
+    }
+}
+
+test "db index catalog barrier canceled query capture unwinds staging and permits retry" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    const pins = try std.fmt.allocPrint(alloc, "{s}.query-pins", .{std.mem.span(path)});
+    defer alloc.free(pins);
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, pins) catch {};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 },
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    const Cancel = struct {
+        db: *DB,
+        failure: anyerror,
+        canceled: bool = false,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            // Let maintenance and capture admission finish, then cancel at
+            // exactly the catalog-reader drain which crashed the CI server.
+            self.canceled = self.canceled or self.db.indexCatalogBarrierActive();
+            if (self.canceled) return self.failure;
+        }
+    };
+    const id: [64]u8 = @splat('a');
+    const request: @import("native_query_cut.zig").Request = .{
+        .id = &id,
+        .table_id = 7,
+        .expires_ms = @import("native_query_cut.zig").nowMs() + 300_000,
+        .create = true,
+    };
+    const root = try @import("native_query_cut.zig").pathAlloc(alloc, std.mem.span(path), &id);
+    defer alloc.free(root);
+    const staging = try std.fmt.allocPrint(alloc, "{s}.staging", .{root});
+    defer alloc.free(staging);
+    const io = db.backend_runtime.filesystemIo().?;
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded }) |failure| {
+        try std.testing.expect(db.beginPublishedDenseSearch());
+        var cancellation = Cancel{ .db = &db, .failure = failure };
+        try std.testing.expectError(failure, db.captureQueryCut(request, .{ .ptr = &cancellation, .check_fn = Cancel.check }));
+        try std.testing.expect(cancellation.canceled);
+        try std.testing.expect(!db.indexCatalogBarrierActive());
+        try std.testing.expectEqual(@as(u32, 1), db.publishedDenseSearchCount());
+        try std.testing.expect(!try snapshotPathExists(io, root));
+        try std.testing.expect(!try snapshotPathExists(io, staging));
+        db.endPublishedDenseSearch();
+    }
+    // Exercise the full retry: structural, snapshot, replay, and file leases
+    // from both aborted attempts must have been released.
+    try db.captureQueryCut(request, .{});
+    try @import("native_query_cut.zig").validate(alloc, io, root, request, db.core.identity_namespace, .{});
+    try std.testing.expect(!db.indexCatalogBarrierActive());
 }
 
 test "db published dense admission cannot overflow into catalog closure" {

@@ -682,6 +682,10 @@ const PersistentObjectRangeCacheState = struct {
                 }
                 continue;
             }
+            const protected = persistentCachedKeyProtected(io, self.alloc, dir, entry.name, self.policy.max_cache_key_bytes) catch |err| switch (err) {
+                error.Canceled => return err,
+                else => false,
+            };
             const owned = try self.alloc.create(PersistentObjectRangeCacheEntry);
             const filename = self.alloc.dupe(u8, entry.name) catch |err| {
                 self.alloc.destroy(owned);
@@ -691,7 +695,7 @@ const PersistentObjectRangeCacheState = struct {
                 .filename = filename,
                 .disk_bytes = disk_bytes,
                 .modified_ns = stat.mtime.toNanoseconds(),
-                .protected = persistentCachedKeyProtected(io, self.alloc, dir, filename, self.policy.max_cache_key_bytes) catch false,
+                .protected = protected,
             };
             discovered.push(self.alloc, owned) catch |err| {
                 self.freeEntry(owned);
