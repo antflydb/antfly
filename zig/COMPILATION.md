@@ -1062,3 +1062,9 @@ qualification remain pending. Raw JSON, logs and linker maps stay outside the re
 The cold measurement snapshot predates relocating the ordinal sources into the
 embedded package; both implementations passed their 48 tests after relocation.
 Later rebases must be validated separately and do not change these historical figures.
+
+An initial alternating release-library batch probe (three runs per variant,
+40 batches of 64 rows) had median document-write time 23.99 → 26.02 ms and SQL
+insert time 179.55 → 181.95 ms. These short, model-free runs do not establish
+throughput parity; the apparent regressions (8.47% and 1.34%) require longer
+workloads and attribution before promotion.
