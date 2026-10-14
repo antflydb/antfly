@@ -58,14 +58,28 @@ pub const Source = union(enum) {
 pub const Output = union(enum) {
     borrowed: Source,
     object: Object,
+    overlay: *Overlay,
     array: std.ArrayListUnmanaged(Output),
     pub const Object = std.StringArrayHashMapUnmanaged(Output);
+    // Keep this behind a pointer: ordinary fanout entries must not pay for a
+    // base source plus an override map when no copy-on-write is needed.
+    const Overlay = struct { base: Source, changed: Object = .empty };
+    const Target = struct { map: *Object, base: ?Source = null };
 
-    fn makeObject(self: *Output, a: Allocator) !void {
-        if (self.* == .object) return;
-        var object: Object = .empty;
-        if (self.* == .borrowed and self.borrowed.kind() == '{') try copyObject(a, &object, self.borrowed);
-        self.* = .{ .object = object };
+    fn objectTarget(self: *Output, a: Allocator) !Target {
+        switch (self.*) {
+            .object => |*object| return .{ .map = object },
+            .overlay => |overlay| return .{ .map = &overlay.changed, .base = overlay.base },
+            .borrowed => |source| if (source.kind() == '{') {
+                const overlay = try a.create(Overlay);
+                overlay.* = .{ .base = source };
+                self.* = .{ .overlay = overlay };
+                return .{ .map = &overlay.changed, .base = source };
+            },
+            else => {},
+        }
+        self.* = .{ .object = .empty };
+        return .{ .map = &self.object };
     }
 
     fn put(a: Allocator, object: *Object, name: []const u8, value: Output) !void {
@@ -98,17 +112,23 @@ pub const Output = union(enum) {
     /// Apply includes in caller order. Object selections merge; every array
     /// selection builds a fresh compact array, preserving legacy replacement.
     pub fn include(a: Allocator, dst: *Object, name: []const u8, source: Source, path: []const []const u8) anyerror!void {
+        return includeWithBase(a, .{ .map = dst }, name, source, path);
+    }
+    fn includeWithBase(a: Allocator, target: Target, name: []const u8, source: Source, path: []const []const u8) anyerror!void {
+        const dst = target.map;
         if (path.len == 0) return put(a, dst, name, .{ .borrowed = source });
         switch (source.kind()) {
             '{' => {
-                if (!dst.contains(name)) try put(a, dst, name, .{ .object = .empty });
-                const value = dst.getPtr(name).?;
-                try value.makeObject(a);
+                if (!dst.contains(name)) {
+                    const previous = if (target.base) |base| try base.field(name) else null;
+                    try put(a, dst, name, if (previous) |child| .{ .borrowed = child } else .{ .object = .empty });
+                }
+                const nested = try dst.getPtr(name).?.objectTarget(a);
                 if (std.mem.eql(u8, path[0], "*")) {
                     var all: Object = .empty;
                     try copyObject(a, &all, source);
-                    for (all.keys(), all.values()) |key, child| try include(a, &value.object, key, child.borrowed, path[1..]);
-                } else if (try source.field(path[0])) |child| try include(a, &value.object, path[0], child, path[1..]);
+                    for (all.keys(), all.values()) |key, child| try includeWithBase(a, nested, key, child.borrowed, path[1..]);
+                } else if (try source.field(path[0])) |child| try includeWithBase(a, nested, path[0], child, path[1..]);
             },
             '[' => {
                 var result: std.ArrayListUnmanaged(Output) = .empty;
@@ -186,6 +206,7 @@ pub const Output = union(enum) {
                 .span => |s| try writeSpan(scratch, writer, s.node.raw, s.view.parse_numbers),
                 .logical => |v| try std.json.Stringify.value(v.*, .{}, writer),
             },
+            .overlay => |overlay| try writeOverlay(scratch, writer, overlay),
             .object => |object| {
                 try writer.writeByte('{');
                 for (object.keys(), object.values(), 0..) |name, child, i| {
@@ -206,7 +227,78 @@ pub const Output = union(enum) {
             },
         }
     }
+
+    fn writeMember(scratch: Allocator, writer: *std.Io.Writer, count: *usize, name: []const u8, value: Output) !void {
+        if (count.* != 0) try writer.writeByte(',');
+        try std.json.Stringify.value(name, .{}, writer);
+        try writer.writeByte(':');
+        try value.write(scratch, writer);
+        count.* += 1;
+    }
+    fn writeBaseMember(scratch: Allocator, writer: *std.Io.Writer, overlay: *const Overlay, emitted: []bool, count: *usize, name: []const u8, source: Source) !void {
+        if (overlay.changed.getIndex(name)) |index| {
+            try writeMember(scratch, writer, count, name, overlay.changed.values()[index]);
+            emitted[index] = true;
+        } else try writeMember(scratch, writer, count, name, .{ .borrowed = source });
+    }
+    fn writeOverlay(scratch: Allocator, writer: *std.Io.Writer, overlay: *const Overlay) anyerror!void {
+        const work = @import("antfly_platform").allocator.reclaimingScratch(scratch);
+        const emitted = try work.alloc(bool, overlay.changed.count());
+        defer work.free(emitted);
+        @memset(emitted, false);
+        var count: usize = 0;
+        try writer.writeByte('{');
+        switch (overlay.base) {
+            .logical => |value| for (value.object.keys(), value.object.values()) |name, *child| {
+                try writeBaseMember(scratch, writer, overlay, emitted, &count, name, .{ .logical = child });
+            },
+            .span => |span| {
+                var scanner = std.json.Scanner.initCompleteInput(work, span.node.raw);
+                defer scanner.deinit();
+                var keys = std.heap.ArenaAllocator.init(work);
+                defer keys.deinit();
+                var names: std.StringHashMapUnmanaged(void) = .empty;
+                var token_arena = std.heap.ArenaAllocator.init(work);
+                defer token_arena.deinit();
+                if (try scanner.next() != .object_begin) return error.SyntaxError;
+                while (try scanner.peekNextTokenType() != .object_end) {
+                    try resetScratch(&token_arena);
+                    const token = try scanner.nextAllocMax(token_arena.allocator(), .alloc_if_needed, span.node.raw.len);
+                    const name = switch (token) {
+                        .string, .allocated_string => |name| name,
+                        else => return error.SyntaxError,
+                    };
+                    const owned_name = if (token == .allocated_string) try keys.allocator().dupe(u8, name) else name;
+                    if ((try names.getOrPut(keys.allocator(), owned_name)).found_existing) return error.DuplicateField;
+                    switch (try scanner.peekNextTokenType()) {
+                        .object_end, .array_end, .end_of_document => return error.SyntaxError,
+                        else => {},
+                    }
+                    const start = scanner.cursor;
+                    try scanner.skipValue();
+                    // This temporary node is consumed synchronously by write;
+                    // none of its navigation can enter a retained native view.
+                    var node: View.Node = .{ .raw = span.node.raw[start..scanner.cursor] };
+                    try writeBaseMember(scratch, writer, overlay, emitted, &count, name, .{ .span = .{ .view = span.view, .node = &node } });
+                }
+                _ = try scanner.next();
+                if (try scanner.next() != .end_of_document) return error.SyntaxError;
+            },
+        }
+        for (overlay.changed.keys(), overlay.changed.values(), emitted) |name, child, seen| {
+            if (!seen) try writeMember(scratch, writer, &count, name, child);
+        }
+        try writer.writeByte('}');
+    }
 };
+
+/// Retire large buffers without allocating a replacement just to shrink one.
+/// Small arenas consolidate once and then reset in place across siblings.
+fn resetScratch(arena: *std.heap.ArenaAllocator) Allocator.Error!void {
+    if (arena.queryCapacity() > 16 * 1024) {
+        _ = arena.reset(.free_all);
+    } else if (!arena.reset(.retain_capacity)) return error.OutOfMemory;
+}
 
 /// Transcode a validated terminal without constructing its DOM. Decode one
 /// string/number at a time; container state scales only with nesting depth.
@@ -223,25 +315,31 @@ fn writeSpan(scratch: Allocator, writer: *std.Io.Writer, raw: []const u8, parse_
         stack.deinit(work);
     }
     var root_seen = false;
+    // Reuse arenas across siblings, but keep each live ancestor's duplicate
+    // keys until its object ends. Retention is capped at every reuse.
+    var depth: usize = 0;
     while (true) {
-        _ = token_arena.reset(.{ .retain_with_limit = 16 * 1024 });
+        try resetScratch(&token_arena);
         const token = try scanner.nextAllocMax(token_arena.allocator(), .alloc_if_needed, raw.len);
         if (token == .end_of_document) {
-            if (!root_seen or stack.items.len != 0) return error.SyntaxError;
+            if (!root_seen or depth != 0) return error.SyntaxError;
             break;
         }
         if (token == .object_end or token == .array_end) {
             try writer.writeByte(if (token == .object_end) '}' else ']');
-            var frame = stack.pop().?;
-            frame.arena.deinit();
+            if (depth == 0) return error.SyntaxError;
+            depth -= 1;
+            const closed = &stack.items[depth];
+            try resetScratch(&closed.arena);
+            closed.names = .empty;
             continue;
         }
-        if (stack.items.len == 0) {
+        if (depth == 0) {
             if (root_seen) return error.SyntaxError;
             root_seen = true;
         }
-        if (stack.items.len != 0) {
-            const frame = &stack.items[stack.items.len - 1];
+        if (depth != 0) {
+            const frame = &stack.items[depth - 1];
             if (frame.object and frame.key) {
                 const name = switch (token) {
                     .string, .allocated_string => |s| s,
@@ -266,7 +364,10 @@ fn writeSpan(scratch: Allocator, writer: *std.Io.Writer, raw: []const u8, parse_
         switch (token) {
             .object_begin, .array_begin => {
                 try writer.writeByte(if (token == .object_begin) '{' else '[');
-                try stack.append(work, .{ .object = token == .object_begin, .arena = .init(work) });
+                if (depth == stack.items.len) try stack.append(work, .{ .object = token == .object_begin, .arena = .init(work) });
+                const frame = &stack.items[depth];
+                frame.* = .{ .object = token == .object_begin, .arena = frame.arena };
+                depth += 1;
             },
             .string, .allocated_string => |s| try std.json.Stringify.value(s, .{}, writer),
             .number, .allocated_number => |s| try std.json.Stringify.value(if (parse_numbers) Value.parseFromNumberSlice(s) else Value{ .number_string = s }, .{}, writer),
@@ -287,6 +388,20 @@ fn differentialScenario(a: Allocator) !void {
         &.{ "items.x.m", "items" }, &.{ "items.0.x", "items.1.x.n", "items.0.x.m" }, &.{ "a", "a", "-omit" },
         &.{"-omit"},                &.{"*"},
     };
+    const overlay_selections = [_][]const []const u8{
+        &.{ "a", "a.numbers.0", "a.numbers.1" },
+        &.{ "a.numbers.0", "a", "a.numbers.1" },
+        &.{ "a", "a.missing.value" },
+        &.{ "items.0.x", "items", "items.1.x.m" },
+    };
+    for (overlay_selections) |fields| {
+        const opts: @import("../types.zig").LookupOptions = .{ .fields = fields, .include_all_fields = false };
+        var expected = try query.lookupJson(a, raw, opts);
+        defer expected.deinit(a);
+        var actual = try query.lookupJsonWithOutput(a, a, raw, opts);
+        defer actual.deinit(a);
+        try std.testing.expectEqualStrings(expected.json, actual.json);
+    }
     for (selections) |fields| {
         const opts: @import("../types.zig").LookupOptions = .{ .fields = fields, .include_all_fields = false };
         var expected = try query.lookupJson(a, raw, opts);
@@ -346,4 +461,120 @@ test "public graph metric borrowed wire streaming whole terminal has bounded scr
     try std.testing.expectEqualSlices(u8, input.written()[0 .. input.written().len - 13], result.json[0 .. result.json.len - 1]);
     try std.testing.expectEqual(@as(usize, 0), budget.live);
     std.debug.print("STREAMING_TERMINAL output_bytes={d} scratch_peak={d}\n", .{ result.json.len, budget.peak });
+}
+
+fn overlayAppendScenario(a: Allocator) !void {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var base = View.init(scratch, "{\"a\":[1,2],\"b\":{\"x\":1,\"y\":2}}");
+    base.parse_numbers = true;
+    const selected = try @import("json_projection_plan.zig").compile(scratch, &.{.{ .parts = &.{ "a", "1" } }});
+    try base.prepareProjection(selected, .visited, .any_container);
+    var replacement = View.init(scratch, "{\"x\":9,\"z\":3}");
+    replacement.parse_numbers = true;
+    const extra: Value = .{ .integer = 7 };
+    var root: Output.Object = .empty;
+    try Output.include(scratch, &root, "v", .{ .span = .{ .view = &base, .node = &base.root } }, &.{});
+    // Select from a different source into a borrowed base. Existing members
+    // retain base order; new members append in first insertion order.
+    try Output.include(scratch, &root, "v", .{ .span = .{ .view = &replacement, .node = &replacement.root } }, &.{"z"});
+    try Output.include(scratch, &root, "v", .{ .span = .{ .view = &replacement, .node = &replacement.root } }, &.{"x"});
+    try Output.include(scratch, &root, "v", .{ .span = .{ .view = &base, .node = &base.root } }, &.{ "a", "1" });
+    var extra_source: Value = .{ .object = .empty };
+    try extra_source.object.put(scratch, "last", extra);
+    try Output.include(scratch, &root, "v", .{ .logical = &extra_source }, &.{"last"});
+    const bytes = try (Output{ .object = root }).serialize(scratch, a);
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("{\"v\":{\"a\":[2],\"b\":{\"x\":1,\"y\":2},\"z\":3,\"x\":9,\"last\":7}}", bytes);
+    try std.testing.expectEqual(@as(usize, 1), base.root.children.?.len);
+}
+
+test "public graph metric borrowed wire streaming sparse overlays preserve base order and appended members" {
+    try overlayAppendScenario(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, overlayAppendScenario, .{});
+}
+
+test "public graph metric borrowed wire streaming sparse wide object stays within bounded scratch" {
+    const a = std.testing.allocator;
+    const query = @import("../document_query.zig");
+    const Counter = @import("../../lite/test_allocator.zig").BudgetAllocator;
+    var input = std.Io.Writer.Allocating.init(a);
+    defer input.deinit();
+    try input.writer.writeAll("{\"wide\":{");
+    for (0..20000) |i| {
+        if (i != 0) try input.writer.writeByte(',');
+        try input.writer.print("\"k{d}\":{d}", .{ i, i });
+    }
+    try input.writer.writeAll("}}");
+    var plan = (try query.SpanProjectionPlan.init(a, .{ .fields = &.{ "wide", "wide.k0" }, .include_all_fields = false })).?;
+    defer plan.deinit();
+    var budget: Counter = .{ .backing = a, .limit = 6 * 1024 * 1024 };
+    var body = try query.lookupJsonWithPlan(budget.allocator(), a, input.written(), &plan);
+    defer body.deinit(a);
+    try std.testing.expectEqualStrings(input.written(), body.json);
+    try std.testing.expectEqual(@as(usize, 0), budget.live);
+    std.debug.print("SPARSE_WIDE fields=20000 output_bytes={d} peak={d}\n", .{ body.json.len, budget.peak });
+}
+
+test "public graph metric borrowed wire streaming siblings reuse bounded key arenas" {
+    const a = std.testing.allocator;
+    const query = @import("../document_query.zig");
+    const counters = @import("../../lite/test_allocator.zig");
+    var input = std.Io.Writer.Allocating.init(a);
+    defer input.deinit();
+    try input.writer.writeAll("{\"items\":[");
+    for (0..8000) |i| {
+        if (i != 0) try input.writer.writeByte(',');
+        try input.writer.writeAll(if (i % 2 == 0) "{\"x\":1,\"y\":2}" else "{\"x\\u0061\":1,\"y\":2}");
+    }
+    try input.writer.writeAll("]}");
+    var plan = (try query.SpanProjectionPlan.init(a, .{ .fields = &.{"items"}, .include_all_fields = false })).?;
+    defer plan.deinit();
+    var no_resize: counters.NoResizeAllocator = .{ .backing = a };
+    var budget: counters.BudgetAllocator = .{ .backing = no_resize.allocator(), .limit = 2 * 1024 * 1024 };
+    var body = try query.lookupJsonWithPlan(budget.allocator(), a, input.written(), &plan);
+    defer body.deinit(a);
+    const expected = try query.lookupJson(a, input.written(), .{ .fields = &.{"items"}, .include_all_fields = false });
+    defer a.free(expected.json);
+    try std.testing.expectEqualStrings(expected.json, body.json);
+    try std.testing.expectEqual(@as(usize, 0), budget.live);
+    try std.testing.expect(budget.alloc_calls < 128);
+    std.debug.print("STREAMING_SIBLINGS count=8000 backing_allocations={d} peak={d}\n", .{ budget.alloc_calls, budget.peak });
+}
+
+test "public graph metric borrowed wire streaming sparse overlays validate discarded base members" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var replacement: Value = .{ .object = .empty };
+    try replacement.object.put(arena.allocator(), "dup", .{ .integer = 7 });
+    for ([_][]const u8{ "{\"dup\":1,\"d\\u0075p\":2}", "{\"dup\":[1,]}", "{\"dup\":}" }) |raw| {
+        var base = View.init(arena.allocator(), raw);
+        var root: Output.Object = .empty;
+        try Output.include(arena.allocator(), &root, "v", .{ .span = .{ .view = &base, .node = &base.root } }, &.{});
+        try Output.include(arena.allocator(), &root, "v", .{ .logical = &replacement }, &.{"dup"});
+        if ((Output{ .object = root }).serialize(arena.allocator(), a)) |bytes| {
+            a.free(bytes);
+            return error.TestExpectedError;
+        } else |_| {}
+    }
+}
+
+test "public graph metric borrowed wire streaming scratch retires oversized buffers without replacement allocation" {
+    const counters = @import("../../lite/test_allocator.zig");
+    var no_resize: counters.NoResizeAllocator = .{ .backing = std.testing.allocator };
+    var budget: counters.BudgetAllocator = .{ .backing = no_resize.allocator() };
+    var arena = std.heap.ArenaAllocator.init(budget.allocator());
+    defer arena.deinit();
+    _ = try arena.allocator().alloc(u8, 64 * 1024);
+    const allocated = budget.alloc_calls;
+    try resetScratch(&arena);
+    try std.testing.expectEqual(@as(usize, 0), budget.live);
+    try std.testing.expectEqual(allocated, budget.alloc_calls);
+    _ = try arena.allocator().alloc(u8, 128);
+    const small_allocated = budget.alloc_calls;
+    try resetScratch(&arena);
+    _ = try arena.allocator().alloc(u8, 128);
+    try std.testing.expectEqual(small_allocated, budget.alloc_calls);
 }
