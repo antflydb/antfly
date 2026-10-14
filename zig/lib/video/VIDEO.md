@@ -3069,3 +3069,54 @@ See [TS HTTP qualification](testdata/ts-http/README.md) for exact platform resul
 and source/binary scope. This is reference preservation for the pinned fixture;
 end-user retrieval relevance is outside this gate. TS LL-HLS parts remain
 unsupported.
+
+### Runtime Metal buffer lifetime telemetry
+
+The inference bridge's `metal_kernels.m` now observes all 712 `newBufferWithLength`,
+`newBufferWithBytes` and `newBufferWithBytesNoCopy` expressions, including direct
+kernel convenience paths and temporary staging. Observation preserves retained
+ARC ownership. A token associated with the Metal object records its release;
+views and GPU commands therefore keep its memory live until the last object
+reference disappears. Recording neither fences the GPU nor changes admission.
+
+Owned resources use `MTLResource.allocatedSize`. Private and host-visible live
+bytes/peaks are separate gauges, alongside their owned total and object counts.
+No-copy buffers contribute logical mapped bytes/counts to separate alias gauges;
+overlapping mappings may name the same host pages. They are never added to owned
+bytes. Allocation/release byte and object counters are monotone. Successful
+`newBufferWithBytes` initialization has its own byte/call counters, separate from
+existing explicit upload/download/copy API counts.
+
+Metrics are worker-process observations. Live gauges may decrease; peak gauges
+are lifetime high watermarks. Independent reads can straddle concurrent changes.
+These are allocated buffer resources, not physical residency, a per-request peak
+or all GPU memory: video preparation buffers/textures, VideoToolbox surfaces,
+driver/pipeline internals, the optional MTP-head extension and allocations in
+other libraries remain separate.
+The maintained comparison tool retains gauges and signed net changes and rejects
+counter/peak regressions. Existing numerical, cancellation, admission and load
+gates remain mandatory. See [buffer telemetry qualification](testdata/metal-buffer-validation/README.md).
+
+The same full-clip gate exposed a reference regression after the latest main
+merge: the Gemma4 vision Flash route converts Q/K/V and softmax probabilities to
+half precision. EmbeddingGemma 2 now requests a separate full-F32 tiled route.
+Its 32-query kernel retains float inputs/probabilities and reuses Q scratch for
+the final tail, using 25.25 KiB of threadgroup storage. Other Gemma4 callers keep
+their existing route. Unsupported shapes retain resident generic F32 attention;
+the full-F32 contract never selects a half-precision Flash fallback. A dedicated
+dispatch counter proves the new route executes during qualification.
+
+The production F32 gate passes without a disabling override: the 52-second
+clip's maximum vector error is 8.7964e-7, with 256 full-F32 tiled dispatches.
+Four requests at concurrency two return exact repeat vectors and release
+admission, with matched completion accounting and no net live-buffer growth.
+The refreshed five-video WebM corpus also passes all eight vectors and three
+rankings/top-k sets (maximum vector error 6.2213e-7). Exact measured source and
+binary scopes are retained in `metal-buffer-validation`; these diagnostic
+shared-host timings do not establish production capacity.
+
+The [independent real-content corpus](testdata/real-content/README.md) adds
+three Big Buck Bunny scenes encoded as VP8/VP9/AV1. macOS ARM64 and actual
+offline Linux ARM64 match all 324 complete normalized pictures. A fresh
+generation reproduces all nine streams and picture hashes exactly; attribution,
+commands, binary/source hashes and raw outcomes are retained with the fixtures.

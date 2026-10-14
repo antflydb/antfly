@@ -2323,3 +2323,44 @@ with buffered TS inference. Platform and source/binary evidence is recorded in
 
 Latest `origin/main` was merged without conflicts at `a2a1aca1d8`, including
 `0cba59bceb`; ongoing video edits were preserved separately from that merge.
+
+### Observe runtime Metal buffer allocation and lifetime
+
+The bridge now wraps all 712 maintained buffer creation expressions, including
+direct kernel convenience paths. ARC retains the original new-buffer ownership
+contract. Associated tokens account for actual MTLBuffer destruction, preserving
+live bytes while views or submitted commands still retain a resource. Owned
+allocatedSize and logical alias length have separate live/peak gauges; private
+and host-visible owned resources are distinct. Monotone allocation/release and
+initialization-copy counters complement the existing explicit-transfer counters.
+
+The real device gate checks exact allocation/release deltas, independent retained
+views, no-copy aliases and concurrent destruction. Disabled-Metal rendering runs
+without platform linkage on actual Linux. The full-request comparison tool
+accepts decreasing live gauges, preserves unsigned precision and rejects counter
+or peak regressions. It records signed gauge changes without presenting lifetime
+peaks as per-request or physical residency. Numerical/load gates are unchanged.
+Evidence: `zig/lib/video/testdata/metal-buffer-validation/README.md`.
+
+These observations close the missing runtime-buffer lifetime measurement; they
+do not include separate preparation textures/buffers, VideoToolbox surfaces or
+opaque driver/pipeline allocations. The full non-CUDA objective remains active.
+
+The full-clip rerun also found a new main-merge regression: default Gemma4-shaped
+vision Flash attention rounds Q/K/V/probabilities to half. On the same measured
+binary, disabling only that route restores the pinned reference gate; the failing
+and passing control reports are retained. EmbeddingGemma 2 now has an explicit
+full-F32 vision operation and a 32-query tiled Metal kernel. Q storage doubles
+as output-tail scratch after its last use, keeping static threadgroup storage at
+25.25 KiB. Generic device F32 remains the capability/shape fallback, and other
+Gemma4 callers retain their previous policy. New batched-tail GPU tests compare
+generic F32 and independent F64 outputs; a counter verifies tiled dispatch.
+
+The production F32 gate passes without a disabling override: the 52-second
+clip's maximum vector error is 8.7964e-7, with 256 full-F32 tiled dispatches.
+Four requests at concurrency two return exact repeat vectors and release
+admission, with matched completion accounting and no net live-buffer growth.
+The refreshed five-video WebM corpus also passes all eight vectors and three
+rankings/top-k sets (maximum vector error 6.2213e-7). Exact measured source and
+binary scopes are retained in `metal-buffer-validation`; these diagnostic
+shared-host timings do not establish production capacity.

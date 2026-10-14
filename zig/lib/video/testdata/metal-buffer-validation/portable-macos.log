@@ -1,0 +1,4 @@
+1/3 metal_telemetry.test.disabled Metal telemetry is zero without platform linkage...OK
+2/3 metal_telemetry.test.Metal telemetry renders unsigned counters without losing integer precision...OK
+3/3 metal_telemetry.test.Metal buffer memory renders unsigned live and peak gauges without counter suffixes...OK
+All 3 tests passed.

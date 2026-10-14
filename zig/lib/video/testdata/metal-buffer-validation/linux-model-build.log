@@ -1,0 +1,14 @@
+Build Summary: 10/10 steps succeeded
+install-video-model-tests success
++- install test success
+   +- compile test debug aarch64-linux-musl success 3m MaxRSS:2G
+      +- options success
+      +- WriteFile tokenizer.json success
+      +- run exe patch_sentencepiece_proto (sentencepiece_proto) success 108ms
+         +- compile exe patch_sentencepiece_proto safe native success 25s MaxRSS:285M
+         |  +- WriteFile macos-sdk-libc.txt success
+         +- run exe protoc-zig (sentencepiece_proto_raw) success 149ms
+         |  +- compile exe protoc-zig safe native success 34s MaxRSS:362M
+         |     +- WriteFile macos-sdk-libc.txt (reused)
+         +- run exe protoc-zig (sentencepiece_proto_raw) (+1 more reused dependencies)
+

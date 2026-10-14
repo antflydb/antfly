@@ -592,7 +592,7 @@ def post_capacity_retry(url, body, timeout=30, max_attempts=16):
             ) from error
 
 
-METAL_TELEMETRY_NAMES = (
+METAL_COUNTER_NAMES = (
     "buffer_upload_bytes",
     "buffer_upload_calls",
     "buffer_download_bytes",
@@ -603,14 +603,42 @@ METAL_TELEMETRY_NAMES = (
     "commands_failed",
     "completed_gpu_nanoseconds",
     "gpu_timestamps_missing",
+    "buffer_allocations",
+    "buffer_releases",
+    "buffer_owned_bytes_allocated",
+    "buffer_owned_bytes_released",
+    "buffer_aliases_created",
+    "buffer_aliases_released",
+    "buffer_alias_bytes_registered",
+    "buffer_alias_bytes_released",
+    "buffer_initialization_bytes",
+    "buffer_initialization_calls",
+    "vision_full_f32_flash_dispatches",
 )
+METAL_MEMORY_GAUGES = (
+    "owned_buffer_live_bytes",
+    "owned_buffer_peak_bytes",
+    "private_buffer_live_bytes",
+    "private_buffer_peak_bytes",
+    "host_visible_buffer_live_bytes",
+    "host_visible_buffer_peak_bytes",
+    "alias_buffer_live_bytes",
+    "alias_buffer_peak_bytes",
+    "owned_buffer_live_count",
+    "owned_buffer_peak_count",
+    "alias_buffer_live_count",
+    "alias_buffer_peak_count",
+)
+METAL_TELEMETRY_NAMES = METAL_COUNTER_NAMES + METAL_MEMORY_GAUGES
+
+
+def metal_metric_name(name):
+    suffix = "" if name in METAL_MEMORY_GAUGES else "_total"
+    return "antfly_inference_metal_" + name + suffix
 
 
 def metal_telemetry_snapshot(url, timeout=5):
-    names = {
-        "antfly_inference_metal_" + name + "_total": name
-        for name in METAL_TELEMETRY_NAMES
-    }
+    names = {metal_metric_name(name): name for name in METAL_TELEMETRY_NAMES}
     with urllib.request.urlopen(url + "/ml/v1/metrics", timeout=timeout) as response:
         data = response.read(4 * 1024 * 1024 + 1)
     if len(data) > 4 * 1024 * 1024:
@@ -638,14 +666,18 @@ def metal_telemetry_delta(before, after):
             for value in values.values()
         ):
             raise ValueError("invalid Metal telemetry snapshot")
-    if any(after[key] < before[key] for key in before):
+    monotone = METAL_COUNTER_NAMES + tuple(
+        key for key in METAL_MEMORY_GAUGES if "_peak_" in key
+    )
+    if any(after[key] < before[key] for key in monotone):
         raise ValueError("Metal telemetry worker counters reset during measurement")
     return {
         "before": before,
         "after": after,
         "delta": {key: after[key] - before[key] for key in before},
-        "saturated": [key for key in after if after[key] == 2**64 - 1],
-        "scope": "worker-process interval; concurrent requests and setup may contribute; explicit logical buffer copies, not bus traffic; completed runtime-factory GPU command time, not wall time or preparation GPU time; independent atomic scrapes may straddle operations",
+        "saturated": [key for key in METAL_COUNTER_NAMES if after[key] == 2**64 - 1],
+        "gauge_names": list(METAL_MEMORY_GAUGES),
+        "scope": "worker-process interval; concurrent requests and setup may contribute; explicit logical copies and initialized-buffer bytes, not bus traffic; runtime MTLBuffer owned allocatedSize and logical aliases are separate, not physical residency; gauge deltas are signed net changes, peaks are worker-lifetime high watermarks; completed runtime-factory GPU command time, not wall time or preparation GPU time; independent atomic scrapes may straddle operations",
     }
 
 

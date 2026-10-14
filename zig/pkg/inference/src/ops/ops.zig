@@ -2334,6 +2334,7 @@ pub const ComputeBackend = struct {
         /// but lets a backend select a model-scoped kernel without changing
         /// unrelated vision encoders that happen to share a tensor shape.
         scaledDotProductAttentionGemma4Vision: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT = null,
+        scaledDotProductAttentionEmbeddingGemma2Vision: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT = null,
         scaledDotProductAttentionQwen3VlVision: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT = null,
 
         /// Optional bidirectional attention with no mask. This is equivalent
@@ -4184,6 +4185,15 @@ pub const ComputeBackend = struct {
     /// qualified model-specific kernel retain portable unmasked attention.
     pub fn scaledDotProductAttentionGemma4Vision(self: *const ComputeBackend, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) !CT {
         if (self.vtable.scaledDotProductAttentionGemma4Vision) |f| {
+            return f(self.ptr, Q, K, V, batch, seq_len, num_heads, head_dim);
+        }
+        return self.scaledDotProductAttention(Q, K, V, &.{}, null, batch, seq_len, num_heads, head_dim);
+    }
+
+    /// EmbeddingGemma 2's Gemma4-shaped vision tower requires F32 inputs and
+    /// probabilities throughout attention to preserve pretrained retrieval.
+    pub fn scaledDotProductAttentionEmbeddingGemma2Vision(self: *const ComputeBackend, Q: CT, K: CT, V: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) !CT {
+        if (self.vtable.scaledDotProductAttentionEmbeddingGemma2Vision) |f| {
             return f(self.ptr, Q, K, V, batch, seq_len, num_heads, head_dim);
         }
         return self.scaledDotProductAttention(Q, K, V, &.{}, null, batch, seq_len, num_heads, head_dim);

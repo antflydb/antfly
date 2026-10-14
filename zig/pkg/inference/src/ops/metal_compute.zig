@@ -13235,7 +13235,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         seq_len: usize,
         num_heads: usize,
         head_dim: usize,
-        vision_policy: enum { generic, qwen3vl, gemma4 },
+        vision_policy: enum { generic, qwen3vl, gemma4, embedding_gemma2 },
     ) anyerror!?CT {
         if (batch == 0 or seq_len == 0 or num_heads == 0 or head_dim == 0) return null;
         const q_buf = toBuf(q_ct);
@@ -13301,6 +13301,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .bias_mode = bias_mode,
             .qwen3vl_vision_flash = vision_policy == .qwen3vl,
             .gemma4_vision_flash = vision_policy == .gemma4,
+            .embedding_gemma2_vision_f32 = vision_policy == .embedding_gemma2,
         })) orelse return null;
         return self.ctFromOwnedMetalTensor(tensor);
     }
@@ -13522,6 +13523,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (try self.tryScaledDotProductAttentionResident(q_ct, k_ct, v_ct, null, null, batch, seq_len, num_heads, head_dim, .gemma4)) |output| return output;
         return self.hostFallbackSdpa(q_ct, k_ct, v_ct, &.{}, null, batch, seq_len, num_heads, head_dim);
+    }
+
+    fn scaledDotProductAttentionEmbeddingGemma2VisionOp(ctx: *anyopaque, q: CT, k: CT, v: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (try self.tryScaledDotProductAttentionResident(q, k, v, null, null, batch, seq_len, num_heads, head_dim, .embedding_gemma2)) |output| return output;
+        return self.hostFallbackSdpa(q, k, v, &.{}, null, batch, seq_len, num_heads, head_dim);
     }
 
     fn scaledDotProductAttentionQwen3VlVisionOp(
@@ -32465,6 +32472,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.maskedMeanNormalizedRows = maskedMeanNormalizedRowsOp;
         vt.scaledDotProductAttentionQwen3VlVision = scaledDotProductAttentionQwen3VlVisionOp;
         vt.scaledDotProductAttentionGemma4Vision = scaledDotProductAttentionGemma4VisionOp;
+        vt.scaledDotProductAttentionEmbeddingGemma2Vision = scaledDotProductAttentionEmbeddingGemma2VisionOp;
         vt.scaledDotProductAttentionFull = scaledDotProductAttentionFullOp;
         vt.maskedBceWithLogitsLoss = maskedBceWithLogitsLossOp;
         vt.maskedBceWithLogitsBackward = maskedBceWithLogitsBackwardOp;

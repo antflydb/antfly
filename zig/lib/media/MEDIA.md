@@ -2256,3 +2256,34 @@ windows to complete before HTTP EOF. Its retained output is retried before the
 next HTTP request. See [TS streaming qualification](../video/testdata/ts-http/README.md)
 for platform results, checkpoint scope and the independent buffered comparison.
 TS LL-HLS parts remain unsupported; this does not change that declared policy.
+
+### Observe inference Metal buffer ownership
+
+The inference metrics route now includes allocated runtime MTLBuffer live/peak
+bytes and object counts, split into private, host-visible and logical no-copy
+aliases. Associated lifetime tokens follow retained buffers through views and
+GPU command ownership. Direct kernel/staging allocations and initialized-buffer
+copies participate, alongside the existing explicit-transfer and completed-GPU
+command counters. Metric reads add no command fence or model lock.
+
+The comparison harness retains live gauges as signed interval changes and peak
+gauges as worker-lifetime observations. It continues to require completed correct
+requests, released admission and numerical/lifecycle gates. Buffer allocatedSize
+is distinct from physical residency; preparation buffers/textures, decoder
+surfaces and opaque driver allocations are outside these runtime-only gauges.
+See [runtime buffer qualification](../video/testdata/metal-buffer-validation/README.md)
+for device lifetime tests and completed full-clip/load measurements.
+
+The production F32 gate passes without a disabling override: the 52-second
+clip's maximum vector error is 8.7964e-7, with 256 full-F32 tiled dispatches.
+Four requests at concurrency two return exact repeat vectors and release
+admission, with matched completion accounting and no net live-buffer growth.
+The refreshed five-video WebM corpus also passes all eight vectors and three
+rankings/top-k sets (maximum vector error 6.2213e-7). Exact measured source and
+binary scopes are retained in `metal-buffer-validation`; these diagnostic
+shared-host timings do not establish production capacity.
+
+The [independent WebM corpus](../video/testdata/real-content/README.md) qualifies
+container-to-native-picture delivery for nine Big Buck Bunny streams. Both
+macOS and actual Linux match all 324 complete normalized pictures; the source,
+encoding commands and exact reproduction evidence are pinned separately.

@@ -1,0 +1,149 @@
+{
+  "version": 1,
+  "recorded_at": "2026-10-14T23:58:48.885429+00:00",
+  "status": "pass",
+  "scope": "EmbeddingGemma 2 full-F32 vision and observed primary-bridge Metal buffer lifetime; preserves failed precision regression and same-binary control",
+  "zig": "0.17.0",
+  "tests": {
+    "postmerge_macos_metal": {
+      "passed": 60,
+      "skipped": 0
+    },
+    "earlier_macos_metal": {
+      "passed": 59,
+      "scope": "before additional portable native fallback test declaration"
+    },
+    "linux_arm64_model": {
+      "passed": 52,
+      "skipped": 5,
+      "failed": 0,
+      "execution": "actual offline Linux ARM64"
+    },
+    "portable_telemetry_each_macos_linux": 3,
+    "python_contracts": 46
+  },
+  "source_scope": {
+    "production_binary_base": "bf65d36f26cf04d33e8ab58e3fdc83884826857b",
+    "postmerge_tests_base": "b23cf4b73e30cfd8dbf5fbb7b5a1e6135ac23c5e",
+    "merged_main": "7cf87a418f49cb960045b518a7fc512b8035ac62",
+    "overrides": "Delivered source digests below identify the local implementation added to the base. The production binary and earlier GPU59 build began before the extra native fallback test declaration; runtime executable statements were frozen. The later GLiNER-only main merge is compiled/executed by the post-merge 60-case suite, not by the production binary. Reports retain that measured binary identity rather than claiming a rebuilt latest-main binary. Linux52 executes the native fallback and predates the later GLiNER main merge.",
+    "delivered_sources_sha256": {
+      "zig/pkg/inference/src/backends/metal_buffer_observation.h": "6873d32642e0b9bd3f8acfdbf33306798b11e6a3a1a0b8c6571026f1c36b8ef7",
+      "zig/pkg/inference/src/backends/metal_kernels.m": "9ffa45e6cc5c7d4449d00f3c25df63521c13306c78cd05fc63230b38c0a7b2c5",
+      "zig/pkg/inference/src/backends/metal_runtime.zig": "6183fb5b2eb0d9844bee148c07dc09f7fd8993aad504ead15e016c3284a06b46",
+      "zig/pkg/inference/src/backends/metal_telemetry.zig": "55661e56ea9b0536a8b4f55dff4fb53d34c68e71d32244c9077d8714a526f9d5",
+      "zig/pkg/inference/src/ops/ops.zig": "8a7c185ea4f3651bded457729117f4c0c5e9184df19ae761ccbd948cadacc382",
+      "zig/pkg/inference/src/ops/metal_compute.zig": "6ef4e181729f5aca0f95cefedd85215d9c8d65e6b76f5e0aaf3bcb7400042c9f",
+      "zig/pkg/inference/src/ops/native_compute.zig": "12c00c6c548b2f1abb4f1da59b76e4ae9c2367e4251d6a955d2b51a3f2c90cb6",
+      "zig/pkg/inference/src/architectures/gemma4_projector.zig": "10d0205f754f76b552c0930c492af5386084ec648bc5067db282dcc451bdf00a",
+      "zig/pkg/inference/src/server/server.zig": "0ff099b0d3f27176c0440f32441e2e0c6d3e5fb6052806e4051dd0cdccf818f4",
+      "tools/embeddinggemma2/video_compare.py": "e6e895bc39fd36f99cbba190fe4f695d9bc2ee4e9116c753361fa16e1ecd2bf2",
+      "tools/embeddinggemma2/test_video_compare.py": "c02770a41b5232eb308af24035471af54622d3098dfbe8028b9b2dfb6b0fa42a",
+      "zig/pkg/inference/build.zig": "13168033ea9af536e1bfb0269223663b0f29b664af546a2366b2ab93924ce047",
+      "zig/pkg/inference/build/context.zig": "5eafea9d39a19e5c83c27bd3a68f77e34f22e5a1d0f7c2b455eefa8ec66c355c",
+      "zig/pkg/inference/build/commands.zig": "7547398bd2e29ab118a4341f49f286f906ce0bd8f5057a59546d70aeff3e0435"
+    }
+  },
+  "pretrained": {
+    "full-clip": {
+      "status": "pass",
+      "vectors": 5,
+      "max_abs": 8.796341717243195e-07,
+      "rankings_and_top_k": "pass",
+      "lifecycle": "reset/retry and half-close pass",
+      "load": {
+        "status": "pass",
+        "concurrency": 2,
+        "requests": 4,
+        "cleanup": true,
+        "completion_accounting": true
+      },
+      "binary_sha256": "bbcc731551b2a9f2c85663049d4fbe70c697fe72c701b787de5d5667fc7a02b4",
+      "reference_sha256": "a71da18bd0b809af773128b0cad46c34e60e33792de65da9f001e594602260cf"
+    },
+    "webm": {
+      "status": "pass",
+      "vectors": 8,
+      "max_abs": 6.221234798431396e-07,
+      "rankings_and_top_k": "pass",
+      "lifecycle": "reset/retry and half-close pass",
+      "load": {
+        "status": "pass",
+        "concurrency": 2,
+        "requests": 10,
+        "cleanup": true,
+        "completion_accounting": true
+      },
+      "binary_sha256": "bbcc731551b2a9f2c85663049d4fbe70c697fe72c701b787de5d5667fc7a02b4",
+      "reference_sha256": "c6c487d5a19f363f885c59d215e392c7b60dc3daa14f8b3d792dec461ec8ddd0"
+    },
+    "formats": {
+      "status": "pass",
+      "vectors": 14,
+      "max_abs": 3.762543201446533e-07,
+      "rankings_and_top_k": "pass",
+      "lifecycle": "reset/retry and half-close pass",
+      "load": {
+        "status": "pass",
+        "concurrency": 2,
+        "requests": 24,
+        "cleanup": true,
+        "completion_accounting": true
+      },
+      "binary_sha256": "bbcc731551b2a9f2c85663049d4fbe70c697fe72c701b787de5d5667fc7a02b4",
+      "reference_sha256": "f12b2f62a6dfb388bd45aace12c83932398e17ebcea0492e626889ded103319f"
+    }
+  },
+  "full_clip_observations": {
+    "full_f32_tiled_dispatches": 256,
+    "initialized_buffer_bytes": 9758012520,
+    "initialized_buffer_calls": 1869,
+    "owned_buffer_process_peak_bytes": 3183421188,
+    "warmed_load_net_live_bytes_and_objects": 0,
+    "cold_clip_http_seconds": 20.309360209,
+    "four_request_wall_seconds": 73.86837683299999,
+    "timing_scope": "shared-host diagnostics, completed HTTP response; no speedup or capacity claim"
+  },
+  "counter_abi": {
+    "counters": 21,
+    "gauges": 12
+  },
+  "measurement_scope": "Observed primary metal_kernels.m owned allocatedSize and logical no-copy aliases; excludes preparation textures/buffers, VideoToolbox surfaces, optional MTP extension, opaque driver storage and other libraries. Constructor/copy bytes are logical operations, not bus traffic or physical residency. Peaks are process-lifetime high watermarks, not per-request peaks.",
+  "initial_regression": {
+    "initial_status": "failed",
+    "control_status": "pass",
+    "same_binary_sha256": "544b71fa8d7052921ffd18677f2465c44dd95d420044f1327467659b844115c8",
+    "tool_snapshot_sha256": "2c722e57e2c455064a1351aef15be91cde99c7c1754520fedf1e13591ff0135e",
+    "control_only_environment": "TERMITE_METAL_DISABLE_GEMMA4_VISION_FLASH=1",
+    "initial_video_max_abs": 0.00022155046463012695,
+    "control_video_max_abs": 1.1790543794631958e-06
+  },
+  "commands": {
+    "production_build": "zig build --build-file zig/pkg/inference/build.zig bench-server -Doptimize=ReleaseFast -Dmetal=true -Dstrip=true --prefix zig/zig-out --summary all",
+    "postmerge_device": "zig build --build-file zig/pkg/inference/build.zig test-video-model -Dmetal=true --prefix zig/zig-out --summary all",
+    "full_clip": "python3 tools/embeddinggemma2/video_compare.py --backend metal --binary zig/zig-out/bin/antfly-inference-bench-server --model-dir .benchmark-assets/native-video/model --corpus tools/embeddinggemma2/testdata/retrieval-long/corpus.json --reference zig/lib/video/testdata/retrieval-validation/long-pytorch-cpu.json --warmups 0 --iterations 1 --concurrency 2 --sustained-rounds 4 --request-timeout 600 --sustained-request-timeout 180 --collect-metal-telemetry --output REPORT.json",
+    "webm_and_formats": "Same maintained tool/binary and unchanged pinned references; corpus/reference hashes and all controls are retained in each raw report."
+  },
+  "artifacts_sha256": {
+    "README.md": "f86ea3bc644ebdbba3c4f8fbf8836e101bf546d826f71d2cfc5d81ea524b2e4a",
+    "canonical-control.json": "3d5e6e2f7cbde4697fbedc5f13828b7e1497449249e4b47fa77e3e59dc5a2a25",
+    "canonical-control.log": "c18b91712e0a2d91cc28134a1527f53f2ed6eb84ab79920c609ec58a9d7cd9c1",
+    "device.log": "377969071619055ca6ed7acc8114680dfd1cf6224495dd80befa920de5a668d1",
+    "f32-formats.json": "f758b737c381fcd049acfa1fd58f7cd71259171916b640f4ce352fea0be6d452",
+    "f32-formats.log": "ec3960e95bbc9fc5fd6ab412fd00ed3ed9b40af6403816e341fb574e8dea5fa0",
+    "f32-full-clip.json": "661ef6b11994cee581cf022f10c78817066cad35d78d519fe3da779012bbb8c3",
+    "f32-full-clip.log": "5d3e3857335fd60462358a8cd4035220671fbfdcf9a4e5144613a1994398f0eb",
+    "f32-webm.json": "e18bf2effb4d7be26fd515ab8e4c08f148a07c6d0a7084246bdbc2f0c7a95b42",
+    "f32-webm.log": "5d1fc3cff6e1421f5b2756eaada2d3b4932994dc17dd53cde3d84647b59a0dd5",
+    "initial-failed.json": "ea58c8555f51a974938f8996db9167fcfecf94899a9e6392295a11f46cf057b3",
+    "initial-failed.log": "5b027d2811bd95a65d3b75fa2ab1fdf32b6418b2bdfe7a2723da26ce5f4da6db",
+    "linux-model-build.log": "b5a3a3075779091531b448dd3d072163a849d87d3725e5896810dd207984c509",
+    "linux-model.log": "8fadc2212fbe4146d9976f866291fea531fa036ea9c5c50d6bbee129d78c9345",
+    "portable-linux.log": "cf43aefcde1823baedf9047dbd804c32bf21f86bead01da8270e6a5e20c59822",
+    "portable-macos.log": "cf43aefcde1823baedf9047dbd804c32bf21f86bead01da8270e6a5e20c59822",
+    "postmerge-device.log": "7ebdfc5c4876839d655eb5a971cc1e571cb40ffb9b8fb67e3f459f1968cc764f",
+    "python.log": "b9026500c8372b7b3ae39def0107a725e9e90e77d4c17e881eaa8ee64894a72e",
+    "server-build.log": "d2d0088e1f1e5378cb2304d299cafa250cf5ad7301c09bb856fd9dbf8f3942a6",
+    "video_compare.initial-measurement.py": "2c722e57e2c455064a1351aef15be91cde99c7c1754520fedf1e13591ff0135e"
+  }
+}

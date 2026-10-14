@@ -7434,7 +7434,7 @@ pub fn decoderRuntimeSdpaF32Device(self: anytype, request: anytype) !?MetalTenso
     const mask_tensor: ?MetalTensor = if (@hasField(@TypeOf(request), "mask")) request.mask else null;
     const bias_mode: u32 = if (@hasField(@TypeOf(request), "bias_mode")) request.bias_mode else 0;
     // Stable C ABI policy value: 0 generic, 1 Qwen3 VL, 2 Gemma4.
-    const qwen3vl_vision_flash: u32 = if (@hasField(@TypeOf(request), "gemma4_vision_flash") and request.gemma4_vision_flash) 2 else if (@hasField(@TypeOf(request), "qwen3vl_vision_flash") and request.qwen3vl_vision_flash) 1 else 0;
+    const qwen3vl_vision_flash: u32 = if (@hasField(@TypeOf(request), "embedding_gemma2_vision_f32") and request.embedding_gemma2_vision_f32) 3 else if (@hasField(@TypeOf(request), "gemma4_vision_flash") and request.gemma4_vision_flash) 2 else if (@hasField(@TypeOf(request), "qwen3vl_vision_flash") and request.qwen3vl_vision_flash) 1 else 0;
     if (bias_mode > 3) return null;
     if (bias_mode != 0 and (bias_tensor == null or !bias_tensor.?.isDevice())) return null;
     if (mask_tensor) |mask| {
@@ -48616,6 +48616,77 @@ test "embeddinggemma2 Metal video transfer telemetry counts real shared/private 
     try std.testing.expect(after[6] > before[6]);
     try std.testing.expectEqual(before[7], after[7]);
     try std.testing.expect(after[8] > before[8]);
+}
+
+extern fn termite_metal_buffer_observation_check() c_int;
+test "embeddinggemma2 Metal video buffer telemetry measures retained private shared and aliased allocations" {
+    if (!build_options.enable_metal or !metalDeviceAvailable()) return error.SkipZigTest;
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_buffer_observation_check());
+}
+
+test "embeddinggemma2 Metal video full F32 tiled attention preserves batched tails and independent F64 scores" {
+    if (!build_options.enable_metal or !metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var provider = try @import("metal_native_provider.zig").MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.UnexpectedNull;
+    const batch = 2;
+    const seq = 300;
+    const heads = 2;
+    const dim = 64;
+    const hidden = heads * dim;
+    const count = batch * seq * hidden;
+    const q_values = try a.alloc(f32, count);
+    defer a.free(q_values);
+    const k_values = try a.alloc(f32, count);
+    defer a.free(k_values);
+    const v_values = try a.alloc(f32, count);
+    defer a.free(v_values);
+    for (q_values, k_values, v_values, 0..) |*q, *k, *v, i| {
+        const x: f32 = @floatFromInt(i);
+        q.* = @sin(x * 0.273) * 1.71341 + @cos(x * 0.031) * 0.21317;
+        k.* = @cos(x * 0.193) * 1.29721 + @sin(x * 0.071) * 0.39133;
+        v.* = @sin(x * 0.097) * 0.91731 + @as(f32, @floatFromInt(i / (seq * hidden))) * 0.19317;
+    }
+    const shape = [_]i32{ batch * seq, hidden };
+    var q = try testDeviceTensorFromSlice(runtime, q_values, &shape);
+    defer q.deinit();
+    var k = try testDeviceTensorFromSlice(runtime, k_values, &shape);
+    defer k.deinit();
+    var v = try testDeviceTensorFromSlice(runtime, v_values, &shape);
+    defer v.deinit();
+    var generic = (try decoderRuntimeSdpaF32Device(&provider, .{ .q = q, .k = k, .v = v, .batch = batch, .seq_len = seq, .num_heads = heads, .head_dim = dim })) orelse return error.UnexpectedNull;
+    defer generic.deinit();
+    const expected = try generic.toHostSlice();
+    const telemetry = @import("metal_telemetry.zig");
+    const before = telemetry.snapshot(true);
+    var tiled = (try decoderRuntimeSdpaF32Device(&provider, .{ .q = q, .k = k, .v = v, .batch = batch, .seq_len = seq, .num_heads = heads, .head_dim = dim, .embedding_gemma2_vision_f32 = true })) orelse return error.UnexpectedNull;
+    defer tiled.deinit();
+    const actual = try tiled.toHostSlice();
+    try std.testing.expectEqual(before[20] + 1, telemetry.snapshot(true)[20]);
+    for (expected, actual) |left, right| try std.testing.expectApproxEqAbs(left, right, 5e-6);
+    // Independent double precision softmax for both cohorts, both heads and
+    // first/middle/final query rows, including the partial final query tile.
+    for (0..batch) |b| for (0..heads) |h| for ([_]usize{ 0, 137, 299 }) |row| {
+        var scores: [seq]f64 = undefined;
+        var maximum: f64 = -std.math.inf(f64);
+        for (&scores, 0..) |*score, key| {
+            var dot: f64 = 0;
+            for (0..dim) |d| dot += @as(f64, q_values[(b * seq + row) * hidden + h * dim + d]) * @as(f64, k_values[(b * seq + key) * hidden + h * dim + d]);
+            score.* = dot * 0.125;
+            maximum = @max(maximum, score.*);
+        }
+        var denominator: f64 = 0;
+        for (&scores) |*score| {
+            score.* = @exp(score.* - maximum);
+            denominator += score.*;
+        }
+        for ([_]usize{ 0, 17, 63 }) |d| {
+            var sum: f64 = 0;
+            for (scores, 0..) |score, key| sum += score * @as(f64, v_values[(b * seq + key) * hidden + h * dim + d]);
+            try std.testing.expectApproxEqAbs(sum / denominator, @as(f64, actual[(b * seq + row) * hidden + h * dim + d]), 5e-6);
+        }
+    };
 }
 
 test "metal paged suffix seed stays on frame across page growth" {

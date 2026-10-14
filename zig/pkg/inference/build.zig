@@ -248,6 +248,7 @@ pub fn build(b: *std.Build) void {
         .b = b,
         .target = target,
         .optimize = optimize,
+        .strip = strip,
         .paths = runtime_config.paths,
         .backend = runtime_config.backend,
         .graph = runtime_graph,

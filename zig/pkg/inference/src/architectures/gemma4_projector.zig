@@ -87,6 +87,7 @@ const Config = struct {
     block_count: usize,
     head_count: usize,
     direct_unified: bool = false,
+    embedding_gemma2_f32_attention: bool = false,
     image_size: usize,
     patch_size: usize,
     layer_norm_eps: f32,
@@ -478,6 +479,7 @@ pub fn embeddingGemma2RasterSequenceLength(raster: antfly_image.BorrowedRasterAt
 
 fn embeddingGemma2ImageConfig() Config {
     return .{
+        .embedding_gemma2_f32_attention = true,
         .text_hidden = 512,
         .vision_hidden = 768,
         .intermediate_size = 3072,
@@ -3627,7 +3629,10 @@ fn selfAttentionBatch(
     try profile.phase(cb, "v_projection_norm");
     // Cohorts have equal grids and no padded patch rows. An all-valid mask
     // unnecessarily prevents Metal's model-scoped Flash dispatch.
-    const attn = try cb.scaledDotProductAttentionGemma4Vision(q, k, v, batch, sequence, cfg.head_count, head_dim);
+    const attn = if (cfg.embedding_gemma2_f32_attention)
+        try cb.scaledDotProductAttentionEmbeddingGemma2Vision(q, k, v, batch, sequence, cfg.head_count, head_dim)
+    else
+        try cb.scaledDotProductAttentionGemma4Vision(q, k, v, batch, sequence, cfg.head_count, head_dim);
     defer cb.free(attn);
     try profile.phase(cb, "attention");
 

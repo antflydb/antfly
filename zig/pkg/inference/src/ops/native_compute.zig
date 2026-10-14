@@ -51117,6 +51117,23 @@ test "Qwen3-VL vision attention portable fallback treats an empty mask as unmask
     try std.testing.expectEqualSlices(f32, &.{ 3.0, 3.0 }, getData(output));
 }
 
+test "embeddinggemma2 video full F32 vision fallback preserves independent unmasked native cohorts" {
+    const allocator = std.testing.allocator;
+    var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
+    const cb = ComputeBackend{ .ptr = &compute, .vtable = &vtable_impl };
+    var zeros = [_]f32{ 0, 0, 0, 0 };
+    var values = [_]f32{ 2, 4, 10, 14 };
+    const qk = try compute.makeBuf(&zeros, false);
+    defer freeTensor(&compute, qk);
+    const v = try compute.makeBuf(&values, false);
+    defer freeTensor(&compute, v);
+    const output = try cb.scaledDotProductAttentionEmbeddingGemma2Vision(qk, qk, v, 2, 2, 1, 1);
+    defer freeTensor(&compute, output);
+    try std.testing.expectEqualSlices(f32, &.{ 3, 3, 12, 12 }, getData(output));
+}
+
 test "ComputeBackend causalSelfAttention call site matches naive reference" {
     const allocator = std.testing.allocator;
     var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };

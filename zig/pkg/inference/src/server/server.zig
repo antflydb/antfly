@@ -20732,6 +20732,7 @@ pub const Node = struct {
         try appendMetalExactJitMetrics(&writer.writer, aggregateMetalExactJitStats(loaded_snapshot.handles));
         const metal_telemetry = @import("../backends/metal_telemetry.zig");
         try metal_telemetry.render(&writer.writer, metal_telemetry.snapshot(build_options.enable_metal));
+        try metal_telemetry.renderMemory(&writer.writer, metal_telemetry.memorySnapshot(build_options.enable_metal));
 
         try ctx.setHeader("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
         return ctx.text(writer.writer.buffered());

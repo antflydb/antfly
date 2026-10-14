@@ -585,8 +585,7 @@ class MetalTelemetryContracts(unittest.TestCase):
 
     def text(self, values):
         return "".join(
-            f"antfly_inference_metal_{key}_total {value}\n"
-            for key, value in values.items()
+            f"{video.metal_metric_name(key)} {value}\n" for key, value in values.items()
         )
 
     def test_integer_precision_and_zero_platform_metrics(self):
@@ -628,6 +627,21 @@ class MetalTelemetryContracts(unittest.TestCase):
             video.metal_telemetry_delta(before, after)["delta"],
             dict.fromkeys(before, 3),
         )
+
+    def test_memory_gauges_decrease_without_resetting_lifetime_peaks(self):
+        before = dict.fromkeys(video.METAL_TELEMETRY_NAMES, 32)
+        after = dict(before, owned_buffer_live_bytes=8, alias_buffer_live_count=0)
+        result = video.metal_telemetry_delta(before, after)
+        self.assertEqual(result["delta"]["owned_buffer_live_bytes"], -24)
+        self.assertEqual(result["delta"]["alias_buffer_live_count"], -32)
+        self.assertEqual(result["after"]["owned_buffer_peak_bytes"], 32)
+        self.assertEqual(result["gauge_names"], list(video.METAL_MEMORY_GAUGES))
+        text = self.text(after)
+        self.assertIn("antfly_inference_metal_owned_buffer_live_bytes 8\n", text)
+        self.assertNotIn("owned_buffer_live_bytes_total", text)
+        self.assertEqual(self.metrics(text), after)
+        with self.assertRaisesRegex(ValueError, "reset"):
+            video.metal_telemetry_delta(before, dict(after, owned_buffer_peak_bytes=31))
 
 
 if __name__ == "__main__":

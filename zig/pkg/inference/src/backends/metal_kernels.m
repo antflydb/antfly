@@ -44,6 +44,12 @@ enum { TERMITE_METAL_UPLOAD_BYTES, TERMITE_METAL_UPLOAD_CALLS,
     TERMITE_METAL_COPY_BYTES, TERMITE_METAL_COPY_CALLS,
     TERMITE_METAL_COMMAND_COMPLETED, TERMITE_METAL_COMMAND_FAILED,
     TERMITE_METAL_GPU_NANOS, TERMITE_METAL_GPU_TIMESTAMP_MISSING,
+    TERMITE_METAL_BUFFER_ALLOCATIONS, TERMITE_METAL_BUFFER_RELEASES,
+    TERMITE_METAL_BUFFER_BYTES_ALLOCATED, TERMITE_METAL_BUFFER_BYTES_RELEASED,
+    TERMITE_METAL_ALIAS_CREATES, TERMITE_METAL_ALIAS_RELEASES,
+    TERMITE_METAL_ALIAS_BYTES_REGISTERED, TERMITE_METAL_ALIAS_BYTES_RELEASED,
+    TERMITE_METAL_BUFFER_INITIALIZATION_BYTES, TERMITE_METAL_BUFFER_INITIALIZATION_CALLS,
+    TERMITE_METAL_VISION_F32_FLASH_DISPATCHES,
     TERMITE_METAL_TELEMETRY_COUNT };
 static _Atomic uint64_t termite_metal_telemetry[TERMITE_METAL_TELEMETRY_COUNT];
 static void termite_metal_telemetry_add(size_t index, uint64_t amount) {
@@ -63,6 +69,7 @@ static void termite_metal_telemetry_copy(size_t bytes_index, size_t calls_index,
     termite_metal_telemetry_add(bytes_index, (uint64_t)length);
     termite_metal_telemetry_add(calls_index, 1);
 }
+#include "metal_buffer_observation.h"
 // Managed-buffer synchronization is still needed on older discrete Macs.
 // New Apple Silicon SDKs deprecate it; keep the compatibility path localized.
 #pragma clang diagnostic push
@@ -1117,6 +1124,7 @@ typedef struct termite_metal_decode_runtime {
     id<MTLComputePipelineState> sdpa_f32_vision_hd64_q32_pipeline;
     id<MTLComputePipelineState> sdpa_f32_vision_hd64_flash_q16_pipeline;
     id<MTLComputePipelineState> sdpa_f32_vision_hd64_flash_q32_pipeline;
+    id<MTLComputePipelineState> sdpa_f32_vision_hd64_flash_q32_full_pipeline;
     id<MTLComputePipelineState> sdpa_f32_nomic_q8_pipeline;
     id<MTLComputePipelineState> sdpa_f32_tg_pipeline;
     id<MTLComputePipelineState> sdpa_f32_segments_pipeline;
@@ -3039,7 +3047,7 @@ static int termite_metal_decode_runtime_encode_sample_nucleus_from_logits_buffer
         termite_metal_decode_runtime_ensure_sample_topk_buffers(runtime, partial_values_bytes > partial_ids_bytes ? partial_values_bytes : partial_ids_bytes) != 0) return -4;
     if (runtime->scratch_buffer == nil || runtime->sample_topk_values_buffer == nil || runtime->sample_topk_ids_buffer == nil) return -4;
     if (runtime->token_capacity < sizeof(uint32_t) || runtime->token_buffer == nil || runtime->token_buffer.storageMode != MTLStorageModeShared) {
-        id<MTLBuffer> token = [runtime->device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> token = antfly_observe_metal_buffer([runtime->device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
         if (token == nil) return -4;
         runtime->token_buffer = token;
         runtime->token_capacity = sizeof(uint32_t);
@@ -3288,7 +3296,7 @@ static id<MTLBuffer> termite_metal_workspace_buffer(
         }
         runtime->embedding_workspace_remaining -= charge;
     }
-    return [runtime->device newBufferWithLength:bytes options:options];
+    return antfly_observe_metal_buffer([runtime->device newBufferWithLength:bytes options:options], ANTFLY_BUFFER_OWNED);
 }
 
 int termite_metal_decode_runtime_begin_embedding_workspace(termite_metal_decode_runtime *runtime, size_t bytes) {
@@ -3572,7 +3580,7 @@ static void termite_metal_debug_dump_buffer_finite(
     if (buffer.storageMode == MTLStorageModeShared) {
         values = (const float *)((const uint8_t *)buffer.contents + offset);
     } else {
-        staging = [runtime->device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+        staging = antfly_observe_metal_buffer([runtime->device newBufferWithLength:bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
         if (staging == nil) {
             fprintf(stderr, "metal-quant-block-finite label=%s layer=%zu elems=%zu staging_failed=1\n", label, layer_index, elems);
             return;
@@ -4594,10 +4602,10 @@ int termite_metal_run_generated_quant_kernel_check(
 
         id<MTLCommandQueue> queue = [device newCommandQueue];
         if (queue == nil) return -11;
-        id<MTLBuffer> input_buffer = [device newBufferWithBytes:input length:input_count * sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> weight_buffer = [device newBufferWithBytes:weight length:weight_count options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bias_buffer = has_bias ? [device newBufferWithBytes:bias length:bias_count * sizeof(float) options:MTLResourceStorageModeShared] : nil;
-        id<MTLBuffer> output_buffer = [device newBufferWithLength:output_count * sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([device newBufferWithBytes:input length:input_count * sizeof(float) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> weight_buffer = antfly_observe_metal_buffer([device newBufferWithBytes:weight length:weight_count options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> bias_buffer = has_bias ? antfly_observe_metal_buffer([device newBufferWithBytes:bias length:bias_count * sizeof(float) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED) : nil;
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([device newBufferWithLength:output_count * sizeof(float) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
         if (input_buffer == nil || weight_buffer == nil || output_buffer == nil || (has_bias && bias_buffer == nil)) return -12;
         memset(output_buffer.contents, 0, output_count * sizeof(float));
 
@@ -4698,9 +4706,9 @@ int termite_metal_run_generated_microkernel_check(
 
         id<MTLCommandQueue> queue = [device newCommandQueue];
         if (queue == nil) return -11;
-        id<MTLBuffer> input_buffer = [device newBufferWithBytes:input length:input_count * sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> weight_buffer = [device newBufferWithBytes:weight length:weight_count * sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> output_buffer = [device newBufferWithLength:output_count * sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([device newBufferWithBytes:input length:input_count * sizeof(float) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> weight_buffer = antfly_observe_metal_buffer([device newBufferWithBytes:weight length:weight_count * sizeof(float) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([device newBufferWithLength:output_count * sizeof(float) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
         if (input_buffer == nil || weight_buffer == nil || output_buffer == nil) return -12;
         memset(output_buffer.contents, 0, output_count * sizeof(float));
 
@@ -5074,9 +5082,9 @@ int termite_metal_run_jit_quant_route_check(
     if (runtime->device == nil || runtime->queue == nil || runtime->device != provider->device || generated->device != runtime->device) return -8;
 
     @autoreleasepool {
-        id<MTLBuffer> input_buffer = [runtime->device newBufferWithBytes:input length:input_count * sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> weight_buffer = [runtime->device newBufferWithBytes:weight length:weight_count options:MTLResourceStorageModeShared];
-        id<MTLBuffer> output_buffer = [runtime->device newBufferWithLength:output_count * sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:input length:input_count * sizeof(float) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> weight_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:weight length:weight_count options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:output_count * sizeof(float) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
         if (input_buffer == nil || weight_buffer == nil || output_buffer == nil) return -9;
         memset(output_buffer.contents, 0, output_count * sizeof(float));
 
@@ -5208,10 +5216,10 @@ int termite_metal_run_jit_quant_route_paired_measure(
     if (runtime->device == nil || runtime->queue == nil || runtime->device != provider->device || generated->device != runtime->device) return -8;
 
     @autoreleasepool {
-        id<MTLBuffer> input_buffer = [runtime->device newBufferWithBytes:input length:input_count * sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> weight_buffer = [runtime->device newBufferWithBytes:weight length:weight_count options:MTLResourceStorageModeShared];
-        id<MTLBuffer> baseline_output_buffer = [runtime->device newBufferWithLength:output_count * sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> candidate_output_buffer = [runtime->device newBufferWithLength:output_count * sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:input length:input_count * sizeof(float) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> weight_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:weight length:weight_count options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> baseline_output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:output_count * sizeof(float) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> candidate_output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:output_count * sizeof(float) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
         if (input_buffer == nil || weight_buffer == nil || baseline_output_buffer == nil || candidate_output_buffer == nil) return -9;
         memset(baseline_output_buffer.contents, 0, output_count * sizeof(float));
         memset(candidate_output_buffer.contents, 0, output_count * sizeof(float));
@@ -5889,12 +5897,12 @@ int termite_metal_run_generated_attention_check(
         if (queue == nil) return -12;
 
         const float zero_sink = 0.0f;
-        id<MTLBuffer> q_buffer = [device newBufferWithBytes:q length:q_count * sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> key_buffer = [device newBufferWithBytes:encoded_key length:encoded_key_count * sizeof(uint16_t) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> v_buffer = [device newBufferWithBytes:v_bytes length:v_bytes_count * sizeof(uint16_t) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> block_table_buffer = [device newBufferWithBytes:block_table length:block_count * sizeof(uint32_t) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> sinks_buffer = [device newBufferWithBytes:&zero_sink length:sizeof(zero_sink) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> output_buffer = [device newBufferWithLength:output_count * sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> q_buffer = antfly_observe_metal_buffer([device newBufferWithBytes:q length:q_count * sizeof(float) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> key_buffer = antfly_observe_metal_buffer([device newBufferWithBytes:encoded_key length:encoded_key_count * sizeof(uint16_t) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> v_buffer = antfly_observe_metal_buffer([device newBufferWithBytes:v_bytes length:v_bytes_count * sizeof(uint16_t) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> block_table_buffer = antfly_observe_metal_buffer([device newBufferWithBytes:block_table length:block_count * sizeof(uint32_t) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> sinks_buffer = antfly_observe_metal_buffer([device newBufferWithBytes:&zero_sink length:sizeof(zero_sink) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([device newBufferWithLength:output_count * sizeof(float) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
         if (q_buffer == nil || key_buffer == nil || v_buffer == nil || block_table_buffer == nil || sinks_buffer == nil || output_buffer == nil) return -13;
         memset(output_buffer.contents, 0, output_count * sizeof(float));
 
@@ -6049,12 +6057,12 @@ int termite_metal_run_generated_flash_prefill_check(
         if (queue == nil) return -12;
 
         const float zero_sink = 0.0f;
-        id<MTLBuffer> q_buffer = [device newBufferWithBytes:q length:q_count * sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> key_buffer = [device newBufferWithBytes:encoded_key length:encoded_key_count * sizeof(uint16_t) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> v_buffer = [device newBufferWithBytes:v_bytes length:v_bytes_count * sizeof(uint16_t) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> block_table_buffer = [device newBufferWithBytes:block_table length:block_count * sizeof(uint32_t) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> sinks_buffer = [device newBufferWithBytes:&zero_sink length:sizeof(zero_sink) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> output_buffer = [device newBufferWithLength:output_count * sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> q_buffer = antfly_observe_metal_buffer([device newBufferWithBytes:q length:q_count * sizeof(float) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> key_buffer = antfly_observe_metal_buffer([device newBufferWithBytes:encoded_key length:encoded_key_count * sizeof(uint16_t) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> v_buffer = antfly_observe_metal_buffer([device newBufferWithBytes:v_bytes length:v_bytes_count * sizeof(uint16_t) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> block_table_buffer = antfly_observe_metal_buffer([device newBufferWithBytes:block_table length:block_count * sizeof(uint32_t) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> sinks_buffer = antfly_observe_metal_buffer([device newBufferWithBytes:&zero_sink length:sizeof(zero_sink) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([device newBufferWithLength:output_count * sizeof(float) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
         if (q_buffer == nil || key_buffer == nil || v_buffer == nil || block_table_buffer == nil || sinks_buffer == nil || output_buffer == nil) return -13;
         memset(output_buffer.contents, 0, output_count * sizeof(float));
 
@@ -12144,6 +12152,35 @@ static NSString *termite_metal_shader_source(void) {
            "    if (q0 + 32u <= p.seq_len) { for (uint qp = 0u; qp < 2u; ++qp) { const uint qgroup = qgroup_base + qp * 2u; const uint output_base = (b * p.seq_len + q0 + qgroup * 8u) * hidden + h * 64u + dslice; for (uint dt = 0u; dt < 2u; ++dt) simdgroup_store(mo[qp][dt], output + output_base + dt * 8u, hidden); } return; }\n"
            "    for (uint qp = 0u; qp < 2u; ++qp) for (uint dt = 0u; dt < 2u; ++dt) simdgroup_store(mo[qp][dt], so + (uint(sgitg) + qp * 8u) * 128u + dt * 8u, 16u); threadgroup_barrier(mem_flags::mem_threadgroup); const uint valid_rows = p.seq_len - q0; for (uint i = uint(tid); i < valid_rows * 64u; i += 256u) { const uint qr = i >> 6u; const uint d = i & 63u; const uint owner = (qr >> 3u) * 4u + (d >> 4u); const uint local_r = qr & 7u; const uint local_d = d & 15u; output[(b * p.seq_len + q0 + qr) * hidden + h * 64u + d] = so[owner * 128u + local_r * 16u + local_d]; }\n"
            "}\n"
+           // Full F32 variant for retrieval-sensitive vision. Reuse Q storage
+           // for the output tail after the final attention barrier: 25.25 KiB
+           // of threadgroup memory rather than 33.25 KiB with a separate tail.
+           "kernel void termite_sdpa_f32_vision_hd64_flash_q32_full(device const float *q [[buffer(0)]], device const float *k [[buffer(1)]], device const float *v [[buffer(2)]], device const float *bias [[buffer(3)]], device const float *mask [[buffer(4)]], device float *output [[buffer(5)]], constant termite_metal_sdpa_f32_params &p [[buffer(6)]], ushort tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
+           "    (void)bias; (void)mask; if (p.seq_len == 0u || p.head_dim != 64u || p.bias_mode != 0u || p.has_mask != 0u || p.layout != 1u || sgitg >= 8u) return;\n"
+           "    const uint query_tile_count = (p.seq_len + 31u) / 32u; const uint query_tile = tg.x % query_tile_count; const uint tmp = tg.x / query_tile_count; const uint h = tmp % p.num_heads; const uint b = tmp / p.num_heads; if (b >= p.batch) return;\n"
+           "    const uint q0 = query_tile * 32u; const uint hidden = p.num_heads * 64u; const uint qgroup_base = uint(sgitg) >> 2u; const uint subgroup = uint(sgitg) & 3u; const uint dslice = subgroup * 16u; const float neg_inf = -3.402823466e+38f;\n"
+           "    threadgroup float sq[2048]; threadgroup float skv[2048]; threadgroup float ss[1024]; threadgroup float sp[1024]; threadgroup float sM[32]; threadgroup float sS[32]; threadgroup float sdiag[256]; \n"
+           "    for (uint i = uint(tid); i < 2048u; i += 256u) { const uint qr = i >> 6u; const uint d = i & 63u; const uint qi = q0 + qr; sq[i] = qi < p.seq_len ? float(q[(b * p.seq_len + qi) * hidden + h * 64u + d] * 0.125f) : float(0.0f); }\n"
+           "    if (tid < 32u) { sM[tid] = neg_inf; sS[tid] = 0.0f; } if (tid < 256u) sdiag[tid] = 0.0f; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    simdgroup_float8x8 mo[2][2]; for (uint qp = 0u; qp < 2u; ++qp) for (uint dt = 0u; dt < 2u; ++dt) mo[qp][dt] = make_filled_simdgroup_matrix<float, 8>(0.0f);\n"
+           "    for (uint key_start = 0u; key_start < p.seq_len; key_start += 32u) {\n"
+           "        for (uint i = uint(tid); i < 2048u; i += 256u) { const uint kr = i >> 6u; const uint d = i & 63u; const uint ki = key_start + kr; skv[i] = ki < p.seq_len ? float(k[(b * p.seq_len + ki) * hidden + h * 64u + d]) : float(0.0f); }\n"
+           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "        for (uint qp = 0u; qp < 2u; ++qp) { const uint qgroup = qgroup_base + qp * 2u; simdgroup_float8x8 ms = make_filled_simdgroup_matrix<float, 8>(0.0f); for (uint d = 0u; d < 64u; d += 8u) { simdgroup_float8x8 mq; simdgroup_float8x8 mk; simdgroup_load(mq, sq + qgroup * 512u + d, 64u); simdgroup_load(mk, skv + subgroup * 512u + d, 64u, 0, true); simdgroup_multiply_accumulate(ms, mq, mk, ms); } simdgroup_store(ms, ss + qgroup * 256u + subgroup * 8u, 32u); }\n"
+           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "        for (uint pass = 0u; pass < 4u; ++pass) { const uint j = uint(sgitg) + pass * 8u; const uint qi = q0 + j; const uint kk = uint(lane); const uint ki = key_start + kk; float sc = qi < p.seq_len && ki < p.seq_len ? ss[j * 32u + kk] : neg_inf; if (!isfinite(sc)) sc = neg_inf; const float row_max = simd_max(sc); const float m_old = sM[j]; const float m_new = max(m_old, row_max); float corr = 0.0f; float e = 0.0f; if (m_new > -3.0e+38f) { corr = m_old > -3.0e+38f ? exp(m_old - m_new) : 0.0f; e = sc > -3.0e+38f ? exp(sc - m_new) : 0.0f; } sp[j * 32u + kk] = float(e); const float row_sum = simd_sum(e); if (lane == 0u) { sS[j] = sS[j] * corr + row_sum; sM[j] = m_new; const uint local_j = j & 7u; sdiag[(j >> 3u) * 64u + local_j * 8u + local_j] = corr; } }\n"
+           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "        for (uint qp = 0u; qp < 2u; ++qp) { const uint qgroup = qgroup_base + qp * 2u; simdgroup_float8x8 mcorr; simdgroup_load(mcorr, sdiag + qgroup * 64u, 8u); for (uint dt = 0u; dt < 2u; ++dt) { simdgroup_float8x8 scaled; simdgroup_multiply(scaled, mcorr, mo[qp][dt]); mo[qp][dt] = scaled; } }\n"
+           "        for (uint i = uint(tid); i < 2048u; i += 256u) { const uint kr = i >> 6u; const uint d = i & 63u; const uint ki = key_start + kr; skv[i] = ki < p.seq_len ? float(v[(b * p.seq_len + ki) * hidden + h * 64u + d]) : float(0.0f); }\n"
+           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "        for (uint qp = 0u; qp < 2u; ++qp) { const uint qgroup = qgroup_base + qp * 2u; for (uint kk8 = 0u; kk8 < 4u; ++kk8) { simdgroup_float8x8 mp; simdgroup_load(mp, sp + qgroup * 256u + kk8 * 8u, 32u); for (uint dt = 0u; dt < 2u; ++dt) { simdgroup_float8x8 mv; simdgroup_load(mv, skv + kk8 * 512u + dslice + dt * 8u, 64u); simdgroup_multiply_accumulate(mo[qp][dt], mp, mv, mo[qp][dt]); } } }\n"
+           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    }\n"
+           "    if (tid < 32u) { const uint local_j = uint(tid) & 7u; const float denom = sS[tid]; sdiag[(uint(tid) >> 3u) * 64u + local_j * 8u + local_j] = denom > 0.0f ? 1.0f / denom : 0.0f; } threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    for (uint qp = 0u; qp < 2u; ++qp) { const uint qgroup = qgroup_base + qp * 2u; simdgroup_float8x8 minv; simdgroup_load(minv, sdiag + qgroup * 64u, 8u); for (uint dt = 0u; dt < 2u; ++dt) { simdgroup_float8x8 scaled; simdgroup_multiply(scaled, minv, mo[qp][dt]); mo[qp][dt] = scaled; } }\n"
+           "    if (q0 + 32u <= p.seq_len) { for (uint qp = 0u; qp < 2u; ++qp) { const uint qgroup = qgroup_base + qp * 2u; const uint output_base = (b * p.seq_len + q0 + qgroup * 8u) * hidden + h * 64u + dslice; for (uint dt = 0u; dt < 2u; ++dt) simdgroup_store(mo[qp][dt], output + output_base + dt * 8u, hidden); } return; }\n"
+           "    for (uint qp = 0u; qp < 2u; ++qp) for (uint dt = 0u; dt < 2u; ++dt) simdgroup_store(mo[qp][dt], sq + (uint(sgitg) + qp * 8u) * 128u + dt * 8u, 16u); threadgroup_barrier(mem_flags::mem_threadgroup); const uint valid_rows = p.seq_len - q0; for (uint i = uint(tid); i < valid_rows * 64u; i += 256u) { const uint qr = i >> 6u; const uint d = i & 63u; const uint owner = (qr >> 3u) * 4u + (d >> 4u); const uint local_r = qr & 7u; const uint local_d = d & 15u; output[(b * p.seq_len + q0 + qr) * hidden + h * 64u + d] = sq[owner * 128u + local_r * 16u + local_d]; }\n"
+           "}\n"
            "kernel void termite_sdpa_f32_florence_window_hd32(device const float *q [[buffer(0)]], device const float *k [[buffer(1)]], device const float *v [[buffer(2)]], device const float *bias [[buffer(3)]], device const float *mask [[buffer(4)]], device float *output [[buffer(5)]], constant termite_metal_sdpa_f32_params &p [[buffer(6)]], threadgroup float *scores [[threadgroup(0)]], ushort lane [[thread_index_in_simdgroup]], uint tg [[threadgroup_position_in_grid]]) {\n"
            "    (void)bias; (void)mask; if (p.seq_len == 0u || p.seq_len > 256u || p.head_dim != 32u || p.bias_mode != 0u || p.has_mask != 0u) return;\n"
            "    const uint qi = tg % p.seq_len; const uint tmp = tg / p.seq_len; const uint h = tmp % p.num_heads; const uint b = tmp / p.num_heads; if (b >= p.batch) return;\n"
@@ -13539,9 +13576,9 @@ static id<MTLBuffer> termite_metal_make_private_buffer_with_bytes(
 ) {
     if (device == nil || queue == nil || bytes == NULL || length == 0) return nil;
     @autoreleasepool {
-        id<MTLBuffer> staging = [device newBufferWithBytes:bytes length:length options:MTLResourceStorageModeShared];
+        id<MTLBuffer> staging = antfly_observe_metal_buffer([device newBufferWithBytes:bytes length:length options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (staging == nil) return nil;
-        id<MTLBuffer> dst = [device newBufferWithLength:length options:MTLResourceStorageModePrivate];
+        id<MTLBuffer> dst = antfly_observe_metal_buffer([device newBufferWithLength:length options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
         if (dst == nil) return nil;
         id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(queue, __func__);
         if (command_buffer == nil) return nil;
@@ -13659,7 +13696,7 @@ static int termite_metal_upload_private_buffer(
     if (device == nil || queue == nil || dst == nil || bytes == NULL || length == 0) return -1;
     @autoreleasepool {
         if (dst.length < length) return -2;
-        id<MTLBuffer> staging = [device newBufferWithBytes:bytes length:length options:MTLResourceStorageModeShared];
+        id<MTLBuffer> staging = antfly_observe_metal_buffer([device newBufferWithBytes:bytes length:length options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (staging == nil) return -3;
         id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(queue, __func__);
         if (command_buffer == nil) return -4;
@@ -16920,8 +16957,8 @@ static int termite_metal_decode_runtime_ensure_dense_qkv_packed_weight(
     if (!termite_metal_size_add(packed_bytes, packed_bias_bytes, &requested_bytes) ||
         !termite_metal_size_add(cached_bytes, requested_bytes, &projected_cache_bytes) ||
         projected_cache_bytes > termite_metal_dense_qkv_pack_cache_max_bytes()) return -4;
-    id<MTLBuffer> packed = [runtime->device newBufferWithLength:packed_bytes options:MTLResourceStorageModePrivate];
-    id<MTLBuffer> packed_bias = [runtime->device newBufferWithLength:packed_bias_bytes options:MTLResourceStorageModePrivate];
+    id<MTLBuffer> packed = antfly_observe_metal_buffer([runtime->device newBufferWithLength:packed_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+    id<MTLBuffer> packed_bias = antfly_observe_metal_buffer([runtime->device newBufferWithLength:packed_bias_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
     if (packed == nil || packed_bias == nil) return -2;
     id<MTLBlitCommandEncoder> blit = termite_metal_tracked_blit_command_encoder(command_buffer);
     if (blit == nil) return -3;
@@ -17007,8 +17044,8 @@ static int termite_metal_decode_runtime_ensure_dense_pair_packed_weight(
     {
         return 0;
     }
-    id<MTLBuffer> packed = [runtime->device newBufferWithLength:packed_bytes options:MTLResourceStorageModePrivate];
-    id<MTLBuffer> packed_bias = [runtime->device newBufferWithLength:packed_bias_bytes options:MTLResourceStorageModePrivate];
+    id<MTLBuffer> packed = antfly_observe_metal_buffer([runtime->device newBufferWithLength:packed_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+    id<MTLBuffer> packed_bias = antfly_observe_metal_buffer([runtime->device newBufferWithLength:packed_bias_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
     if (packed == nil || packed_bias == nil) return -2;
     id<MTLBlitCommandEncoder> blit = termite_metal_tracked_blit_command_encoder(command_buffer);
     if (blit == nil) return -3;
@@ -17411,7 +17448,7 @@ static int termite_metal_decode_runtime_ensure_q8_qkv_packed_weight(
         return 0;
     }
 
-    id<MTLBuffer> packed = [runtime->device newBufferWithLength:packed_bytes options:MTLResourceStorageModePrivate];
+    id<MTLBuffer> packed = antfly_observe_metal_buffer([runtime->device newBufferWithLength:packed_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
     if (packed == nil) return -3;
     id<MTLBlitCommandEncoder> blit = termite_metal_tracked_blit_command_encoder(command_buffer);
     if (blit == nil) return -4;
@@ -19468,10 +19505,10 @@ int termite_metal_decode_runtime_apply_quantized_linear_slot_host(
     @autoreleasepool {
         const size_t input_bytes = rows * in_dim * sizeof(float);
         const size_t output_bytes = rows * out_dim * sizeof(float);
-        id<MTLBuffer> input_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)input length:input_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (input_buffer == nil) input_buffer = [runtime->device newBufferWithBytes:input length:input_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> output_buffer = [runtime->device newBufferWithBytesNoCopy:output length:output_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (output_buffer == nil) output_buffer = [runtime->device newBufferWithBytes:output length:output_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)input length:input_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:input length:input_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:output length:output_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (output_buffer == nil) output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:output length:output_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (input_buffer == nil || output_buffer == nil) return -7;
         if (format == TERMITE_METAL_QUANT_FORMAT_TL1 || format == TERMITE_METAL_QUANT_FORMAT_TL2) {
             return termite_metal_decode_runtime_apply_quantized_linear_slot_device(
@@ -21781,9 +21818,9 @@ int termite_metal_calibrate_quant_signature(
     if ((rows != 0 && output_count / rows != out_dim) || output_count > SIZE_MAX / sizeof(float)) return -8;
 
     @autoreleasepool {
-        id<MTLBuffer> input_buffer = [runtime->device newBufferWithBytes:input length:input_count * sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> weight_buffer = [runtime->device newBufferWithBytes:weight length:weight_count options:MTLResourceStorageModeShared];
-        id<MTLBuffer> output_buffer = [runtime->device newBufferWithLength:output_count * sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:input length:input_count * sizeof(float) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> weight_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:weight length:weight_count options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:output_count * sizeof(float) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
         if (input_buffer == nil || weight_buffer == nil || output_buffer == nil) return -9;
 
         termite_metal_quant_matmul_descriptor descriptor = {
@@ -24245,7 +24282,7 @@ static int termite_metal_encode_paged_attention_slot_on_encoder(
     if (block_table_bytes <= 4096u) {
         [encoder setBytes:block_table length:block_table_bytes atIndex:3];
     } else {
-        block_table_buffer = [runtime->device newBufferWithBytes:block_table length:block_table_bytes options:MTLResourceStorageModeShared];
+        block_table_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:block_table length:block_table_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (block_table_buffer == nil) return failure_code;
         [encoder setBuffer:block_table_buffer offset:0 atIndex:3];
     }
@@ -24254,7 +24291,7 @@ static int termite_metal_encode_paged_attention_slot_on_encoder(
     } else if (sinks_bytes <= 4096u) {
         [encoder setBytes:sinks length:sinks_bytes atIndex:4];
     } else {
-        sinks_buffer = [runtime->device newBufferWithBytes:sinks length:sinks_bytes options:MTLResourceStorageModeShared];
+        sinks_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:sinks length:sinks_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (sinks_buffer == nil) return failure_code;
         [encoder setBuffer:sinks_buffer offset:0 atIndex:4];
     }
@@ -24930,7 +24967,7 @@ static int termite_metal_encode_rms_norm_add_scale_on_encoder(
         .scale = scale,
         .reserved = 0,
     };
-    id<MTLBuffer> params_buffer = [runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
     if (params_buffer == nil) return failure_code;
     [encoder setComputePipelineState:runtime->rms_norm_add_scale_pipeline];
     [encoder setBuffer:input_buffer offset:input_offset atIndex:0];
@@ -26395,7 +26432,7 @@ static int termite_metal_encode_rms_norm_add_scale_for(
         if (!planned_encoder) [encoder endEncoding];
         return 0;
     }
-    id<MTLBuffer> params_buffer = [runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
     if (params_buffer == nil) return failure_code;
     if (runtime->active_frame_cb == command_buffer && termite_metal_decode_runtime_retain_frame_resource(runtime, params_buffer) != 0) return failure_code;
     [encoder setComputePipelineState:runtime->rms_norm_add_scale_pipeline];
@@ -26475,7 +26512,7 @@ static int termite_metal_encode_rms_norm_add_scale_rows_for(
         if (!planned_encoder) [encoder endEncoding];
         return 0;
     }
-    id<MTLBuffer> params_buffer = [runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
     if (params_buffer == nil) return failure_code;
     if (runtime->active_frame_cb == command_buffer && termite_metal_decode_runtime_retain_frame_resource(runtime, params_buffer) != 0) return failure_code;
     [encoder setComputePipelineState:runtime->rms_norm_add_scale_rows_pipeline];
@@ -27374,7 +27411,7 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         runtime->concurrent_planned_dispatch_force_disabled =
             termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_CONCURRENT_PLANNED_DISPATCH"));
         termite_metal_refresh_concurrent_planned_dispatch_policy(runtime);
-        runtime->optional_dummy_buffer = [device newBufferWithLength:sizeof(float) options:MTLResourceStorageModeShared];
+        runtime->optional_dummy_buffer = antfly_observe_metal_buffer([device newBufferWithLength:sizeof(float) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
         if (runtime->optional_dummy_buffer == nil) {
             free(runtime);
             return NULL;
@@ -27512,12 +27549,12 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
             size_t split_scratch_capacity = 0;
             if (termite_metal_decode_gqa_split_runtime_scratch_capacity(runtime, &split_scratch_capacity)) {
                 runtime->attention_decode_gqa_split_scratch_buffer =
-                    [device newBufferWithLength:split_scratch_capacity options:MTLResourceStorageModePrivate];
+                    antfly_observe_metal_buffer([device newBufferWithLength:split_scratch_capacity options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
                 if (runtime->attention_decode_gqa_split_scratch_buffer != nil) {
                     runtime->attention_decode_gqa_split_scratch_capacity = split_scratch_capacity;
                     if (runtime->decode_gqa_split_frame_scratch_enabled) {
                         runtime->attention_decode_gqa_split_scratch_buffer_alt =
-                            [device newBufferWithLength:split_scratch_capacity options:MTLResourceStorageModePrivate];
+                            antfly_observe_metal_buffer([device newBufferWithLength:split_scratch_capacity options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
                     }
                 }
             }
@@ -27585,6 +27622,7 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         runtime->sdpa_f32_vision_hd64_q32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_sdpa_f32_vision_hd64_q32");
         runtime->sdpa_f32_vision_hd64_flash_q16_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_sdpa_f32_vision_hd64_flash_q16");
         runtime->sdpa_f32_vision_hd64_flash_q32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_sdpa_f32_vision_hd64_flash_q32");
+        runtime->sdpa_f32_vision_hd64_flash_q32_full_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_sdpa_f32_vision_hd64_flash_q32_full");
         runtime->sdpa_f32_nomic_q8_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_sdpa_f32_nomic_q8");
         runtime->sdpa_f32_tg_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_sdpa_f32_tg");
         runtime->sdpa_f32_segments_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_sdpa_f32_segments");
@@ -28531,6 +28569,7 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->sdpa_f32_vision_hd64_q32_pipeline = nil;
     runtime->sdpa_f32_vision_hd64_flash_q16_pipeline = nil;
     runtime->sdpa_f32_vision_hd64_flash_q32_pipeline = nil;
+    runtime->sdpa_f32_vision_hd64_flash_q32_full_pipeline = nil;
     runtime->sdpa_f32_nomic_q8_pipeline = nil;
     runtime->sdpa_f32_tg_pipeline = nil;
     runtime->sdpa_f32_segments_pipeline = nil;
@@ -29269,7 +29308,7 @@ int termite_metal_decode_runtime_borrow_nomic_encoder_hidden_scratch_device(
         if (runtime->nomic_encoder_hidden_buffers[index] == nil ||
             runtime->nomic_encoder_hidden_capacities[index] < bytes)
         {
-            id<MTLBuffer> buffer = [runtime->device newBufferWithLength:bytes options:MTLResourceStorageModePrivate];
+            id<MTLBuffer> buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
             if (buffer == nil) return -3;
             runtime->nomic_encoder_hidden_buffers[index] = buffer;
             runtime->nomic_encoder_hidden_capacities[index] = bytes;
@@ -29632,8 +29671,8 @@ int termite_metal_decode_runtime_embed_absolute_position(
     if (hidden_size != runtime->resident_hidden_size) return -6;
     if (token_id >= runtime->resident_vocab_size || position_id >= runtime->resident_max_position_embeddings) return -7;
     @autoreleasepool {
-        id<MTLBuffer> output_buffer = [runtime->device newBufferWithBytesNoCopy:output length:hidden_size * sizeof(float) options:MTLResourceStorageModeShared deallocator:nil];
-        if (output_buffer == nil) output_buffer = [runtime->device newBufferWithBytes:output length:hidden_size * sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:output length:hidden_size * sizeof(float) options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (output_buffer == nil) output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:output length:hidden_size * sizeof(float) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (output_buffer == nil) return -8;
         termite_metal_embed_absolute_position_params params = {
             .token_id = (uint32_t)token_id,
@@ -29889,11 +29928,11 @@ int termite_metal_decode_runtime_prepare_embedding_table_bf16_no_copy_region(
     const uintptr_t source_id = (uintptr_t)mapped_raw;
     if (termite_metal_decode_runtime_select_embedding_cache(runtime, source_id, weight_offset, rows, dim, expected_bytes)) return 0;
     @autoreleasepool {
-        id<MTLBuffer> buffer = [runtime->device
+        id<MTLBuffer> buffer = antfly_observe_metal_buffer([runtime->device
             newBufferWithBytesNoCopy:(void *)mapped_raw
                               length:mapped_bytes
                              options:MTLResourceStorageModeShared
-                         deallocator:nil];
+                         deallocator:nil], ANTFLY_BUFFER_ALIAS);
         if (buffer == nil) return -7;
         termite_metal_decode_runtime_store_embedding_cache(runtime, buffer, weight_offset, source_id, weight_offset, rows, dim, expected_bytes);
         return 0;
@@ -29978,11 +30017,11 @@ int termite_metal_decode_runtime_prepare_quant_embedding_table_no_copy_region(
     const uintptr_t source_id = (uintptr_t)mapped_raw;
     if (termite_metal_decode_runtime_select_embedding_cache(runtime, source_id, weight_offset, rows, dim, expected_bytes)) return 0;
     @autoreleasepool {
-        id<MTLBuffer> buffer = [runtime->device
+        id<MTLBuffer> buffer = antfly_observe_metal_buffer([runtime->device
             newBufferWithBytesNoCopy:(void *)mapped_raw
                               length:mapped_bytes
                              options:MTLResourceStorageModeShared
-                         deallocator:nil];
+                         deallocator:nil], ANTFLY_BUFFER_ALIAS);
         if (buffer == nil) return -9;
         termite_metal_decode_runtime_store_embedding_cache(runtime, buffer, weight_offset, source_id, weight_offset, rows, dim, expected_bytes);
         return 0;
@@ -30007,8 +30046,8 @@ int termite_metal_decode_runtime_embedding_lookup_prepared(
         if (termite_metal_decode_runtime_host_io_sync(runtime) != 0) return -5;
         termite_metal_host_staging_slice ids_slice = { nil, 0 };
         if (termite_metal_decode_runtime_stage_host_bytes(runtime, ids, ids_bytes, frame_owned, &ids_slice) != 0) return -5;
-        id<MTLBuffer> output_buffer = [runtime->device newBufferWithBytesNoCopy:output length:output_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (output_buffer == nil) output_buffer = [runtime->device newBufferWithBytes:output length:output_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:output length:output_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (output_buffer == nil) output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:output length:output_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (ids_slice.buffer == nil || output_buffer == nil) return -5;
         termite_metal_embedding_lookup_params params = {
             .total = (uint32_t)total,
@@ -30190,7 +30229,7 @@ static bool termite_metal_stage_standalone_deberta_embedding_metadata(
     const size_t mask_offset = termite_metal_align_forward_size(ids_bytes, 256);
     size_t metadata_bytes = 0;
     if (mask_offset == SIZE_MAX || !termite_metal_size_add(mask_offset, ids_bytes, &metadata_bytes)) return false;
-    id<MTLBuffer> metadata = [runtime->device newBufferWithLength:metadata_bytes options:MTLResourceStorageModeShared];
+    id<MTLBuffer> metadata = antfly_observe_metal_buffer([runtime->device newBufferWithLength:metadata_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
     if (metadata == nil || metadata.contents == NULL) return false;
     memcpy(metadata.contents, ids, ids_bytes);
     memcpy((uint8_t *)metadata.contents + mask_offset, mask, ids_bytes);
@@ -30320,8 +30359,8 @@ int termite_metal_decode_runtime_deberta_embeddings_f32(
         const size_t weight_offset = runtime->generic_embedding_buffer_offset;
         if (weight_offset > weight_buffer.length || weight_bytes > weight_buffer.length - weight_offset) return -5;
         if (output_offset > output_buffer.length || output_bytes > output_buffer.length - output_offset) return -6;
-        id<MTLBuffer> gamma_buffer = [runtime->device newBufferWithBytes:gamma length:scale_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> beta_buffer = [runtime->device newBufferWithBytes:beta length:scale_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> gamma_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:gamma length:scale_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> beta_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:beta length:scale_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (gamma_buffer == nil || beta_buffer == nil) return -7;
         const bool frame_owned = (runtime->active_frame_cb == nil);
         if (!frame_owned) {
@@ -30536,7 +30575,7 @@ int termite_metal_decode_runtime_embedding_lookup_bf16_staged_rows_device(
     if (staged_bytes == 0) return -8;
 
     @autoreleasepool {
-        id<MTLBuffer> row_buffer = [runtime->device newBufferWithLength:staged_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> row_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:staged_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
         if (row_buffer == nil || row_buffer.contents == NULL) return -9;
         uint8_t *dst = (uint8_t *)row_buffer.contents;
         for (size_t i = 0; i < total; ++i) {
@@ -31143,14 +31182,14 @@ int termite_metal_decode_runtime_apply_rope(
         bool frame_owned = (runtime->active_frame_cb == nil);
         const size_t input_bytes = total_chunks * head_dim * sizeof(float);
         const size_t positions_bytes = total_chunks * sizeof(uint32_t);
-        id<MTLBuffer> input_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)input length:input_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (input_buffer == nil) input_buffer = [runtime->device newBufferWithBytes:input length:input_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)input length:input_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:input length:input_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         id<MTLBuffer> positions_buffer = frame_owned
-            ? [runtime->device newBufferWithBytesNoCopy:(void *)positions length:positions_bytes options:MTLResourceStorageModeShared deallocator:nil]
-            : [runtime->device newBufferWithBytes:positions length:positions_bytes options:MTLResourceStorageModeShared];
-        if (positions_buffer == nil) positions_buffer = [runtime->device newBufferWithBytes:positions length:positions_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> output_buffer = [runtime->device newBufferWithBytesNoCopy:output length:input_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (output_buffer == nil) output_buffer = [runtime->device newBufferWithBytes:output length:input_bytes options:MTLResourceStorageModeShared];
+            ? antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)positions length:positions_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS)
+            : antfly_observe_metal_buffer([runtime->device newBufferWithBytes:positions length:positions_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        if (positions_buffer == nil) positions_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:positions length:positions_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:output length:input_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (output_buffer == nil) output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:output length:input_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (input_buffer == nil || positions_buffer == nil || output_buffer == nil) return -5;
         termite_metal_rope_params params = {
             .total_chunks = (uint32_t)total_chunks,
@@ -31212,9 +31251,9 @@ int termite_metal_decode_runtime_apply_rope_device(
         if (input_offset + input_bytes > input_buffer.length || output_offset + input_bytes > output_buffer.length) return -5;
         const size_t positions_bytes = total_chunks * sizeof(uint32_t);
         id<MTLBuffer> positions_buffer = frame_owned
-            ? [runtime->device newBufferWithBytesNoCopy:(void *)positions length:positions_bytes options:MTLResourceStorageModeShared deallocator:nil]
-            : [runtime->device newBufferWithBytes:positions length:positions_bytes options:MTLResourceStorageModeShared];
-        if (positions_buffer == nil) positions_buffer = [runtime->device newBufferWithBytes:positions length:positions_bytes options:MTLResourceStorageModeShared];
+            ? antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)positions length:positions_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS)
+            : antfly_observe_metal_buffer([runtime->device newBufferWithBytes:positions length:positions_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        if (positions_buffer == nil) positions_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:positions length:positions_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (positions_buffer == nil) return -6;
         termite_metal_rope_params params = {
             .total_chunks = (uint32_t)total_chunks,
@@ -31450,7 +31489,7 @@ int termite_metal_decode_runtime_apply_rope_pair_scratch_device(
             termite_metal_decode_runtime_ensure_active_layer_projection_buffer(runtime, 5, tensor_bytes) != 0) return -6;
         id<MTLBuffer> first_output_buffer = runtime->active_layer_projection_buffers[4];
         id<MTLBuffer> second_output_buffer = runtime->active_layer_projection_buffers[5];
-        id<MTLBuffer> positions_buffer = [runtime->device newBufferWithBytes:positions length:positions_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> positions_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:positions length:positions_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (first_output_buffer == nil || second_output_buffer == nil || positions_buffer == nil) return -7;
         if (termite_metal_decode_runtime_retain_frame_resource(runtime, positions_buffer) != 0) return -7;
 
@@ -31659,23 +31698,23 @@ int termite_metal_decode_runtime_apply_attention_f32(
         const size_t q_bytes = q_len * num_heads * head_dim * sizeof(float);
         const size_t kv_bytes = kv_len * num_kv_heads * head_dim * sizeof(float);
         const bool frame_owned_expected = (runtime->active_frame_cb == nil);
-        id<MTLBuffer> q_buffer = [runtime->device newBufferWithBytes:q length:q_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> k_buffer = [runtime->device newBufferWithBytes:k length:kv_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> v_buffer = [runtime->device newBufferWithBytes:v length:kv_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> q_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:q length:q_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> k_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:k length:kv_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> v_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:v length:kv_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         id<MTLBuffer> output_buffer = frame_owned_expected
-            ? [runtime->device newBufferWithLength:q_bytes options:MTLResourceStorageModeShared]
-            : [runtime->device newBufferWithBytesNoCopy:output length:q_bytes options:MTLResourceStorageModeShared deallocator:nil];
+            ? antfly_observe_metal_buffer([runtime->device newBufferWithLength:q_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED)
+            : antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:output length:q_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
         if (q_buffer == nil || k_buffer == nil || v_buffer == nil || output_buffer == nil) return -6;
         id<MTLBuffer> bias_buffer = nil;
         if (bias != NULL) {
             const size_t bias_bytes = num_heads * q_len * kv_len * sizeof(float);
-            bias_buffer = [runtime->device newBufferWithBytes:bias length:bias_bytes options:MTLResourceStorageModeShared];
+            bias_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:bias length:bias_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
             if (bias_buffer == nil) return -7;
         }
         id<MTLBuffer> mask_buffer = nil;
         if (mask != NULL) {
             const size_t mask_bytes = total_sequence_len * total_sequence_len * sizeof(uint8_t);
-            mask_buffer = [runtime->device newBufferWithBytes:mask length:mask_bytes options:MTLResourceStorageModeShared];
+            mask_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:mask length:mask_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
             if (mask_buffer == nil) return -8;
         }
         const float zero_bias = 0.0f;
@@ -31789,9 +31828,9 @@ int termite_metal_decode_runtime_apply_attention_f32_device(
         } else if (bias_host != NULL) {
             const size_t bias_bytes = num_heads * q_len * kv_len * sizeof(float);
             bias_buffer = wrap_host_nocopy
-                ? [runtime->device newBufferWithBytesNoCopy:(void *)bias_host length:bias_bytes options:MTLResourceStorageModeShared deallocator:nil]
+                ? antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)bias_host length:bias_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS)
                 : nil;
-            if (bias_buffer == nil) bias_buffer = [runtime->device newBufferWithBytes:bias_host length:bias_bytes options:MTLResourceStorageModeShared];
+            if (bias_buffer == nil) bias_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:bias_host length:bias_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
             if (bias_buffer == nil) return -8;
             bias_buffer_transient = true;
         }
@@ -31800,9 +31839,9 @@ int termite_metal_decode_runtime_apply_attention_f32_device(
         if (mask != NULL) {
             const size_t mask_bytes = total_sequence_len * total_sequence_len * sizeof(uint8_t);
             mask_buffer = wrap_host_nocopy
-                ? [runtime->device newBufferWithBytesNoCopy:(void *)mask length:mask_bytes options:MTLResourceStorageModeShared deallocator:nil]
+                ? antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)mask length:mask_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS)
                 : nil;
-            if (mask_buffer == nil) mask_buffer = [runtime->device newBufferWithBytes:mask length:mask_bytes options:MTLResourceStorageModeShared];
+            if (mask_buffer == nil) mask_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:mask length:mask_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
             if (mask_buffer == nil) return -9;
             mask_buffer_transient = true;
         }
@@ -32066,7 +32105,7 @@ int termite_metal_decode_runtime_apply_attention_f32_device_batched(
         if (use_split) {
             const size_t partial_bytes = batch * num_heads * split_count * 72u * sizeof(float);
             if (runtime->attention_split_partials_buffer == nil || runtime->attention_split_partials_capacity < partial_bytes) {
-                id<MTLBuffer> partials = [runtime->device newBufferWithLength:partial_bytes options:MTLResourceStorageModePrivate];
+                id<MTLBuffer> partials = antfly_observe_metal_buffer([runtime->device newBufferWithLength:partial_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
                 if (partials != nil) {
                     runtime->attention_split_partials_buffer = partials;
                     runtime->attention_split_partials_capacity = partial_bytes;
@@ -32088,7 +32127,7 @@ int termite_metal_decode_runtime_apply_attention_f32_device_batched(
             const size_t per_query_bytes = num_heads * split_count * 72u * sizeof(float);
             const size_t partial_bytes = per_query_bytes * q_len;
             if (runtime->attention_split_partials_buffer == nil || runtime->attention_split_partials_capacity < partial_bytes) {
-                id<MTLBuffer> partials = [runtime->device newBufferWithLength:partial_bytes options:MTLResourceStorageModePrivate];
+                id<MTLBuffer> partials = antfly_observe_metal_buffer([runtime->device newBufferWithLength:partial_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
                 if (partials == nil) return -10;
                 runtime->attention_split_partials_buffer = partials;
                 runtime->attention_split_partials_capacity = partial_bytes;
@@ -32374,7 +32413,7 @@ int termite_metal_decode_runtime_florence_channel_attention_f32_device(
         if (score_elems > SIZE_MAX - score_rows) return -9;
         const size_t score_bytes = (score_elems + score_rows) * sizeof(float);
         if (qkv_offset + qkv_bytes > qkv_buffer.length || output_offset + output_bytes > output_buffer.length) return -10;
-        id<MTLBuffer> scores_buffer = [runtime->device newBufferWithLength:score_bytes options:MTLResourceStorageModePrivate];
+        id<MTLBuffer> scores_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:score_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
         if (scores_buffer == nil) return -11;
         termite_metal_florence_channel_params params = {
             .batch = (uint32_t)batch,
@@ -32761,11 +32800,11 @@ static int termite_metal_decode_runtime_prepare_layer_norm_storage(
     @autoreleasepool {
         const bool use_shared = owned_shared_if_unified && runtime->device.hasUnifiedMemory;
         id<MTLBuffer> weight_buffer = use_shared
-            ? [runtime->device newBufferWithBytes:weight length:bytes options:MTLResourceStorageModeShared]
+            ? antfly_observe_metal_buffer([runtime->device newBufferWithBytes:weight length:bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED)
             : termite_metal_make_private_buffer_with_bytes(runtime->device, runtime->queue, weight, bytes);
         if (weight_buffer == nil) return -4;
         id<MTLBuffer> bias_buffer = use_shared
-            ? [runtime->device newBufferWithBytes:bias length:bytes options:MTLResourceStorageModeShared]
+            ? antfly_observe_metal_buffer([runtime->device newBufferWithBytes:bias length:bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED)
             : termite_metal_make_private_buffer_with_bytes(runtime->device, runtime->queue, bias, bytes);
         if (bias_buffer == nil) return -4;
         // Both owned copies must exist before replacing a live slot.
@@ -32814,13 +32853,13 @@ int termite_metal_decode_runtime_apply_layer_norm(
     if (rows > UINT32_MAX || hidden_size > UINT32_MAX) return -6;
     @autoreleasepool {
         const size_t bytes = rows * hidden_size * sizeof(float);
-        id<MTLBuffer> input_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)input length:bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (input_buffer == nil) input_buffer = [runtime->device newBufferWithBytes:input length:bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)input length:bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:input length:bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         BOOL output_borrowed = YES;
-        id<MTLBuffer> output_buffer = [runtime->device newBufferWithBytesNoCopy:output length:bytes options:MTLResourceStorageModeShared deallocator:nil];
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:output length:bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
         if (output_buffer == nil) {
             output_borrowed = NO;
-            output_buffer = [runtime->device newBufferWithBytes:output length:bytes options:MTLResourceStorageModeShared];
+            output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:output length:bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         }
         if (input_buffer == nil || output_buffer == nil) return -7;
         termite_metal_apply_layer_norm_params params = {
@@ -32874,7 +32913,7 @@ static int termite_metal_decode_runtime_prepare_rms_norm_storage(
         // Always take an owned snapshot. Shared storage avoids a synchronous
         // upload for small encoder constants without borrowing caller memory.
         id<MTLBuffer> weight_buffer = use_shared
-            ? [runtime->device newBufferWithBytes:weight length:bytes options:MTLResourceStorageModeShared]
+            ? antfly_observe_metal_buffer([runtime->device newBufferWithBytes:weight length:bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED)
             : termite_metal_make_private_buffer_with_bytes(runtime->device, runtime->queue, weight, bytes);
         if (weight_buffer == nil) return -4;
         runtime->rms_norm_weight_buffers[slot] = weight_buffer;
@@ -32916,7 +32955,7 @@ int termite_metal_decode_runtime_prepare_rms_norm_from_buffer(
         const size_t bytes = hidden_size * sizeof(float);
         id<MTLBuffer> source_buffer = (__bridge id<MTLBuffer>)weight_handle;
         if (source_buffer == nil || weight_offset > source_buffer.length || bytes > source_buffer.length - weight_offset) return -4;
-        id<MTLBuffer> weight_buffer = [runtime->device newBufferWithLength:bytes options:MTLResourceStorageModePrivate];
+        id<MTLBuffer> weight_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
         if (weight_buffer == nil) return -5;
 
         bool frame_owned = true;
@@ -33039,7 +33078,7 @@ static int termite_metal_decode_runtime_ensure_i2s_quantize_buffers(
     @autoreleasepool {
         if (qinput_bytes > 0) {
             if (qinput_bytes > runtime->i2s_qinput_capacity || runtime->i2s_qinput_buffer == nil) {
-                id<MTLBuffer> buffer = [runtime->device newBufferWithLength:qinput_bytes options:MTLResourceStorageModePrivate];
+                id<MTLBuffer> buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:qinput_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
                 if (buffer == nil) return -2;
                 runtime->i2s_qinput_buffer = buffer;
                 runtime->i2s_qinput_capacity = qinput_bytes;
@@ -33047,7 +33086,7 @@ static int termite_metal_decode_runtime_ensure_i2s_quantize_buffers(
         }
         if (scale_bytes > 0) {
             if (scale_bytes > runtime->i2s_scale_capacity || runtime->i2s_scale_buffer == nil) {
-                id<MTLBuffer> buffer = [runtime->device newBufferWithLength:scale_bytes options:MTLResourceStorageModePrivate];
+                id<MTLBuffer> buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:scale_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
                 if (buffer == nil) return -3;
                 runtime->i2s_scale_buffer = buffer;
                 runtime->i2s_scale_capacity = scale_bytes;
@@ -33300,7 +33339,7 @@ static int termite_metal_decode_runtime_ensure_sample_logits_buffer(
     if (runtime->active_frame_cb != nil) return -2;
     @autoreleasepool {
         if (logits_bytes > runtime->sample_logits_capacity || runtime->sample_logits_buffer == nil) {
-            id<MTLBuffer> logits_buffer = [runtime->device newBufferWithLength:logits_bytes options:MTLResourceStorageModePrivate];
+            id<MTLBuffer> logits_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:logits_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
             if (logits_buffer == nil) return -2;
             runtime->sample_logits_buffer = logits_buffer;
             runtime->sample_logits_capacity = logits_bytes;
@@ -33323,7 +33362,7 @@ static int termite_metal_decode_runtime_ensure_sample_probs_buffer(
     if (runtime->active_frame_cb != nil) return -2;
     @autoreleasepool {
         if (probs_bytes > runtime->scratch_capacity || runtime->scratch_buffer == nil) {
-            id<MTLBuffer> scratch = [runtime->device newBufferWithLength:probs_bytes options:MTLResourceStorageModePrivate];
+            id<MTLBuffer> scratch = antfly_observe_metal_buffer([runtime->device newBufferWithLength:probs_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
             if (scratch == nil) return -3;
             runtime->scratch_buffer = scratch;
             runtime->scratch_capacity = probs_bytes;
@@ -33349,8 +33388,8 @@ static int termite_metal_decode_runtime_ensure_sample_topk_buffers(
     if (runtime->active_frame_cb != nil) return -2;
     @autoreleasepool {
         if (partial_bytes > runtime->sample_topk_capacity || runtime->sample_topk_values_buffer == nil || runtime->sample_topk_ids_buffer == nil) {
-            id<MTLBuffer> values = [runtime->device newBufferWithLength:partial_bytes options:MTLResourceStorageModePrivate];
-            id<MTLBuffer> ids = [runtime->device newBufferWithLength:partial_bytes options:MTLResourceStorageModePrivate];
+            id<MTLBuffer> values = antfly_observe_metal_buffer([runtime->device newBufferWithLength:partial_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+            id<MTLBuffer> ids = antfly_observe_metal_buffer([runtime->device newBufferWithLength:partial_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
             if (values == nil || ids == nil) return -2;
             runtime->sample_topk_values_buffer = values;
             runtime->sample_topk_ids_buffer = ids;
@@ -33425,7 +33464,7 @@ static int termite_metal_encode_argmax_logits_on_encoder_at(
     if (!termite_metal_size_mul(out_dim, sizeof(float), &logits_bytes)) return failure_code;
     if (token_offset == 0) {
         if (runtime->token_capacity < sizeof(uint32_t) || runtime->token_buffer == nil || runtime->token_buffer.storageMode != MTLStorageModeShared) {
-            id<MTLBuffer> token = [runtime->device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+            id<MTLBuffer> token = antfly_observe_metal_buffer([runtime->device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
             if (token == nil) return failure_code;
             runtime->token_buffer = token;
             runtime->token_capacity = sizeof(uint32_t);
@@ -33543,7 +33582,7 @@ static int termite_metal_encode_argmax_logits_suppress_on_encoder_at(
     if (!termite_metal_size_mul(suppress_count, sizeof(int32_t), &suppress_bytes)) return failure_code;
     if (token_offset == 0) {
         if (runtime->token_capacity < sizeof(uint32_t) || runtime->token_buffer == nil || runtime->token_buffer.storageMode != MTLStorageModeShared) {
-            id<MTLBuffer> token = [runtime->device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+            id<MTLBuffer> token = antfly_observe_metal_buffer([runtime->device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
             if (token == nil) return failure_code;
             runtime->token_buffer = token;
             runtime->token_capacity = sizeof(uint32_t);
@@ -33668,7 +33707,7 @@ static int termite_metal_encode_lm_head_q4_q6_refined_argmax_on_encoder(
         runtime->sample_topk_values_buffer == nil || runtime->sample_topk_ids_buffer == nil) return failure_code;
     const size_t token_bytes = sizeof(uint32_t);
     if (runtime->token_capacity < token_bytes || runtime->token_buffer == nil || runtime->token_buffer.storageMode != MTLStorageModeShared) {
-        id<MTLBuffer> token = [runtime->device newBufferWithLength:token_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> token = antfly_observe_metal_buffer([runtime->device newBufferWithLength:token_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
         if (token == nil) return failure_code;
         runtime->token_buffer = token;
         runtime->token_capacity = token_bytes;
@@ -33773,7 +33812,7 @@ int termite_metal_decode_runtime_reserve_argmax_rows(
     if (rows > SIZE_MAX / sizeof(uint32_t)) return -2;
     const size_t token_bytes = rows * sizeof(uint32_t);
     if (runtime->token_capacity < token_bytes || runtime->token_buffer == nil || runtime->token_buffer.storageMode != MTLStorageModeShared) {
-        id<MTLBuffer> token = [runtime->device newBufferWithLength:token_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> token = antfly_observe_metal_buffer([runtime->device newBufferWithLength:token_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
         if (token == nil) return -3;
         runtime->token_buffer = token;
         runtime->token_capacity = token_bytes;
@@ -33816,7 +33855,7 @@ int termite_metal_decode_runtime_argmax_from_logits_rows_suppress_device(
         if (suppress_count > 0) {
             size_t suppress_bytes = 0;
             if (!termite_metal_size_mul(suppress_count, sizeof(int32_t), &suppress_bytes)) return -8;
-            suppress_buffer = [runtime->device newBufferWithBytes:suppress_token_ids length:suppress_bytes options:MTLResourceStorageModeShared];
+            suppress_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:suppress_token_ids length:suppress_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
             if (suppress_buffer == nil) return -8;
         }
 
@@ -33958,7 +33997,7 @@ static int termite_metal_decode_runtime_ensure_attention_span_slot_buffers(
         {
             id<MTLBuffer> old_buffer = runtime->attention_span_encoded_key_buffers[slot];
             const size_t old_capacity = runtime->attention_span_encoded_key_capacities[slot];
-            id<MTLBuffer> buffer = [runtime->device newBufferWithLength:encoded_bytes options:MTLResourceStorageModePrivate];
+            id<MTLBuffer> buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:encoded_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
             if (buffer == nil) return -5;
             if (old_buffer != nil && old_capacity > 0) {
                 if (termite_metal_decode_runtime_copy_grown_buffer(runtime, old_buffer, buffer, old_capacity, -10) != 0) return -10;
@@ -33971,7 +34010,7 @@ static int termite_metal_decode_runtime_ensure_attention_span_slot_buffers(
         {
             id<MTLBuffer> old_buffer = runtime->attention_span_v_buffers[slot];
             const size_t old_capacity = runtime->attention_span_v_capacities[slot];
-            id<MTLBuffer> buffer = [runtime->device newBufferWithLength:v_bytes options:MTLResourceStorageModePrivate];
+            id<MTLBuffer> buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:v_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
             if (buffer == nil) return -6;
             if (old_buffer != nil && old_capacity > 0) {
                 if (termite_metal_decode_runtime_copy_grown_buffer(runtime, old_buffer, buffer, old_capacity, -14) != 0) return -14;
@@ -34019,10 +34058,10 @@ int termite_metal_decode_runtime_apply_rms_norm(
     if (hidden_size > UINT32_MAX) return -6;
     @autoreleasepool {
         const size_t bytes = hidden_size * sizeof(float);
-        id<MTLBuffer> input_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)input length:bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (input_buffer == nil) input_buffer = [runtime->device newBufferWithBytes:input length:bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> output_buffer = [runtime->device newBufferWithBytesNoCopy:output length:bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (output_buffer == nil) output_buffer = [runtime->device newBufferWithBytes:output length:bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)input length:bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:input length:bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:output length:bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (output_buffer == nil) output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:output length:bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (input_buffer == nil || output_buffer == nil) return -7;
         termite_metal_apply_layer_norm_params params = {
             .hidden_size = (uint32_t)hidden_size,
@@ -34837,7 +34876,7 @@ static int termite_metal_decode_runtime_prepare_linear_storage(
         // storage avoids two upload command buffers for short-lived slots on
         // unified-memory devices; no source pointer escapes preparation.
         id<MTLBuffer> weight_buffer = use_shared
-            ? [runtime->device newBufferWithBytes:weight length:weight_bytes options:MTLResourceStorageModeShared]
+            ? antfly_observe_metal_buffer([runtime->device newBufferWithBytes:weight length:weight_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED)
             : termite_metal_make_private_buffer_with_bytes(runtime->device, runtime->queue, weight, weight_bytes);
         if (weight_buffer == nil) return -4;
         bool zero_bias = true;
@@ -34845,7 +34884,7 @@ static int termite_metal_decode_runtime_prepare_linear_storage(
         id<MTLBuffer> bias_buffer = zero_bias
             ? termite_metal_decode_runtime_zero_bias_buffer(runtime, out_dim)
             : use_shared
-            ? [runtime->device newBufferWithBytes:bias length:bias_bytes options:MTLResourceStorageModeShared]
+            ? antfly_observe_metal_buffer([runtime->device newBufferWithBytes:bias length:bias_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED)
             : termite_metal_make_private_buffer_with_bytes(runtime->device, runtime->queue, bias, bias_bytes);
         if (bias_buffer == nil) return -4;
         // Publish only after both allocations succeed. Failed replacement
@@ -34989,11 +35028,11 @@ int termite_metal_decode_runtime_prepare_linear_bf16_no_copy(
     if (weight_bytes < expected_weight_bytes) return -4;
     @autoreleasepool {
         const size_t bias_bytes = out_dim * sizeof(float);
-        id<MTLBuffer> weight_buffer = [runtime->device
+        id<MTLBuffer> weight_buffer = antfly_observe_metal_buffer([runtime->device
             newBufferWithBytesNoCopy:(void *)weight
                               length:expected_weight_bytes
                              options:MTLResourceStorageModeShared
-                         deallocator:nil];
+                         deallocator:nil], ANTFLY_BUFFER_ALIAS);
         if (weight_buffer == nil) return -5;
         id<MTLBuffer> bias_buffer = termite_metal_make_private_buffer_with_bytes(runtime->device, runtime->queue, bias, bias_bytes);
         if (bias_buffer == nil) return -6;
@@ -35230,11 +35269,11 @@ int termite_metal_decode_runtime_prepare_model_mapped_buffer(
         return 0;
     }
     @autoreleasepool {
-        id<MTLBuffer> buffer = [runtime->device
+        id<MTLBuffer> buffer = antfly_observe_metal_buffer([runtime->device
             newBufferWithBytesNoCopy:(void *)allocation_raw
                               length:allocated_bytes
                              options:MTLResourceStorageModeShared
-                         deallocator:nil];
+                         deallocator:nil], ANTFLY_BUFFER_ALIAS);
         if (buffer == nil) {
             runtime->mapped_model_prepare_failures = termite_metal_u64_saturating_add(
                 runtime->mapped_model_prepare_failures, 1);
@@ -35393,11 +35432,11 @@ int termite_metal_decode_runtime_prepare_quantized_linear_slot_no_copy_region(
     }
     if (!termite_metal_can_make_no_copy_buffer(mapped_raw, mapped_bytes)) return -8;
     @autoreleasepool {
-        id<MTLBuffer> weight_buffer = [runtime->device
+        id<MTLBuffer> weight_buffer = antfly_observe_metal_buffer([runtime->device
             newBufferWithBytesNoCopy:(void *)mapped_raw
                               length:mapped_bytes
                              options:MTLResourceStorageModeShared
-                         deallocator:nil];
+                         deallocator:nil], ANTFLY_BUFFER_ALIAS);
         if (weight_buffer == nil) return -6;
         termite_metal_decode_runtime_prepare_quantized_linear_slot_from_buffer(
             runtime, format, slot, weight_buffer, weight_offset, in_dim, out_dim, values_per_block, bytes_per_block);
@@ -35421,11 +35460,11 @@ int termite_metal_decode_runtime_prepare_quantized_linear_slot_no_copy(
     if (validation_rc != 0) return validation_rc;
     if (!termite_metal_can_make_no_copy_buffer(weight_raw, weight_bytes)) return -8;
     @autoreleasepool {
-        id<MTLBuffer> weight_buffer = [runtime->device
+        id<MTLBuffer> weight_buffer = antfly_observe_metal_buffer([runtime->device
             newBufferWithBytesNoCopy:(void *)weight_raw
                               length:weight_bytes
                              options:MTLResourceStorageModeShared
-                         deallocator:nil];
+                         deallocator:nil], ANTFLY_BUFFER_ALIAS);
         if (weight_buffer == nil) return -6;
         termite_metal_decode_runtime_prepare_quantized_linear_slot_from_buffer(
             runtime, format, slot, weight_buffer, 0, in_dim, out_dim, values_per_block, bytes_per_block);
@@ -35531,10 +35570,10 @@ int termite_metal_decode_runtime_apply_linear(
     @autoreleasepool {
         const size_t input_bytes = in_dim * sizeof(float);
         const size_t output_bytes = out_dim * sizeof(float);
-        id<MTLBuffer> input_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)input length:input_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (input_buffer == nil) input_buffer = [runtime->device newBufferWithBytes:input length:input_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> output_buffer = [runtime->device newBufferWithBytesNoCopy:output length:output_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (output_buffer == nil) output_buffer = [runtime->device newBufferWithBytes:output length:output_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)input length:input_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:input length:input_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:output length:output_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (output_buffer == nil) output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:output length:output_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (input_buffer == nil || output_buffer == nil) return -7;
         termite_metal_apply_linear_params params = {
             .in_dim = (uint32_t)in_dim,
@@ -35811,10 +35850,10 @@ int termite_metal_decode_runtime_apply_linear_multi_row(
     @autoreleasepool {
         const size_t input_bytes = rows * in_dim * sizeof(float);
         const size_t output_bytes = rows * out_dim * sizeof(float);
-        id<MTLBuffer> input_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)input length:input_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (input_buffer == nil) input_buffer = [runtime->device newBufferWithBytes:input length:input_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> output_buffer = [runtime->device newBufferWithBytesNoCopy:output length:output_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (output_buffer == nil) output_buffer = [runtime->device newBufferWithBytes:output length:output_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)input length:input_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:input length:input_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:output length:output_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (output_buffer == nil) output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:output length:output_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (input_buffer == nil || output_buffer == nil) return -7;
         termite_metal_linear_params params = {
             .rows = (uint32_t)rows,
@@ -36150,8 +36189,8 @@ int termite_metal_decode_runtime_apply_dense_mlp2_device(
             first_output_buffer = runtime->hot_intermediate_buffers[0];
             activated_buffer = runtime->hot_intermediate_buffers[1];
         } else {
-            first_output_buffer = [runtime->device newBufferWithLength:hidden_bytes options:MTLResourceStorageModePrivate];
-            activated_buffer = [runtime->device newBufferWithLength:hidden_bytes options:MTLResourceStorageModePrivate];
+            first_output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:hidden_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+            activated_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:hidden_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
         }
         if (first_output_buffer == nil || activated_buffer == nil) return -12;
 
@@ -36403,9 +36442,9 @@ int termite_metal_decode_runtime_apply_dense_ffn_layer_norm_device(
             activated_buffer = runtime->hot_intermediate_buffers[1];
             projected_buffer = runtime->hot_hidden_buffers[0];
         } else {
-            first_output_buffer = [runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate];
-            activated_buffer = [runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate];
-            projected_buffer = [runtime->device newBufferWithLength:output_bytes options:MTLResourceStorageModePrivate];
+            first_output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+            activated_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+            projected_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:output_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
         }
         if (first_output_buffer == nil || activated_buffer == nil || projected_buffer == nil) {
             runtime->deberta_ffn_fused_fallbacks += 1;
@@ -36817,7 +36856,7 @@ int termite_metal_decode_runtime_apply_dense_linear_layer_norm_device(
         if (termite_metal_decode_runtime_ensure_hot_buffers(runtime, output_bytes, 0) == 0) {
             projected_buffer = runtime->hot_hidden_buffers[3];
         } else {
-            projected_buffer = [runtime->device newBufferWithLength:output_bytes options:MTLResourceStorageModePrivate];
+            projected_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:output_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
         }
         if (projected_buffer == nil) return -9;
 
@@ -37112,7 +37151,7 @@ int termite_metal_decode_runtime_apply_quantized_linear_layer_norm_device(
         if (termite_metal_decode_runtime_ensure_hot_buffers(runtime, output_bytes, 0) == 0) {
             projected_buffer = runtime->hot_hidden_buffers[3];
         } else {
-            projected_buffer = [runtime->device newBufferWithLength:output_bytes options:MTLResourceStorageModePrivate];
+            projected_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:output_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
         }
         if (projected_buffer == nil) return -7;
 
@@ -37237,9 +37276,9 @@ int termite_metal_decode_runtime_apply_quantized_ffn_layer_norm_device(
             activated_buffer = runtime->hot_intermediate_buffers[1];
             projected_buffer = runtime->hot_hidden_buffers[0];
         } else {
-            first_output_buffer = [runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate];
-            activated_buffer = [runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate];
-            projected_buffer = [runtime->device newBufferWithLength:output_bytes options:MTLResourceStorageModePrivate];
+            first_output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+            activated_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+            projected_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:output_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
         }
         if (first_output_buffer == nil || activated_buffer == nil || projected_buffer == nil) {
             runtime->deberta_ffn_fused_fallbacks += 1;
@@ -37378,13 +37417,13 @@ int termite_metal_decode_runtime_apply_i2_s_linear_slot(
         const size_t output_bytes = rows * out_dim * sizeof(float);
         const size_t qinput_bytes = rows * in_dim * sizeof(int8_t);
         const size_t scale_bytes = rows * sizeof(float);
-        id<MTLBuffer> input_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)input length:input_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (input_buffer == nil) input_buffer = [runtime->device newBufferWithBytes:input length:input_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)input length:input_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:input length:input_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (termite_metal_decode_runtime_ensure_i2s_quantize_buffers(runtime, qinput_bytes, scale_bytes) != 0) return -7;
         id<MTLBuffer> qinput_buffer = runtime->i2s_qinput_buffer;
         id<MTLBuffer> scale_buffer = runtime->i2s_scale_buffer;
-        id<MTLBuffer> output_buffer = [runtime->device newBufferWithBytesNoCopy:output length:output_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (output_buffer == nil) output_buffer = [runtime->device newBufferWithBytes:output length:output_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:output length:output_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (output_buffer == nil) output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:output length:output_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (input_buffer == nil || qinput_buffer == nil || scale_buffer == nil || output_buffer == nil) return -7;
         termite_metal_quantize_rows_params quantize_params = {
             .rows = (uint32_t)rows,
@@ -37542,11 +37581,11 @@ static id<MTLBuffer> termite_metal_cached_shared_subbuffer(
                 runtime->expert_subbuffer_cache_hits += 1;
                 return runtime->expert_subbuffer_cache_buffers[at];
             }
-            id<MTLBuffer> replacement = [runtime->device
+            id<MTLBuffer> replacement = antfly_observe_metal_buffer([runtime->device
                 newBufferWithBytesNoCopy:(void *)base
                                   length:length
                                  options:MTLResourceStorageModeShared
-                             deallocator:nil];
+                             deallocator:nil], ANTFLY_BUFFER_ALIAS);
             if (replacement == nil) return nil;
             runtime->expert_subbuffer_cache_lens[at] = length;
             runtime->expert_subbuffer_cache_buffers[at] = replacement;
@@ -37554,11 +37593,11 @@ static id<MTLBuffer> termite_metal_cached_shared_subbuffer(
             return replacement;
         }
         if (entry_ptr == NULL) {
-            id<MTLBuffer> created = [runtime->device
+            id<MTLBuffer> created = antfly_observe_metal_buffer([runtime->device
                 newBufferWithBytesNoCopy:(void *)base
                                   length:length
                                  options:MTLResourceStorageModeShared
-                             deallocator:nil];
+                             deallocator:nil], ANTFLY_BUFFER_ALIAS);
             if (created == nil) return nil;
             runtime->expert_subbuffer_cache_ptrs[at] = base;
             runtime->expert_subbuffer_cache_lens[at] = length;
@@ -37568,11 +37607,11 @@ static id<MTLBuffer> termite_metal_cached_shared_subbuffer(
         }
     }
     runtime->expert_subbuffer_cache_misses += 1;
-    return [runtime->device
+    return antfly_observe_metal_buffer([runtime->device
         newBufferWithBytesNoCopy:(void *)base
                           length:length
                          options:MTLResourceStorageModeShared
-                     deallocator:nil];
+                     deallocator:nil], ANTFLY_BUFFER_ALIAS);
 }
 
 static id<MTLBuffer> termite_metal_make_shared_subbuffer(
@@ -37698,9 +37737,9 @@ int termite_metal_decode_runtime_prewarm_mapped_moe_layer0(
             page_touches += (uint64_t)pages;
         }
         if (max_pages > SIZE_MAX / sizeof(uint32_t)) return -10;
-        id<MTLBuffer> scratch = [runtime->device
+        id<MTLBuffer> scratch = antfly_observe_metal_buffer([runtime->device
             newBufferWithLength:max_pages * sizeof(uint32_t)
-                         options:MTLResourceStorageModePrivate];
+                         options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
         if (scratch == nil) return -11;
         id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(runtime->queue, __func__);
         if (command_buffer == nil) return -12;
@@ -37780,9 +37819,9 @@ int termite_metal_decode_runtime_apply_quantized_linear_id_slot_device(
             const size_t row_stride = runtime->quant_linear_row_stride_bytes[slot];
             if (row_stride == 0 || source_out_dim > SIZE_MAX / row_stride) return -12;
             const size_t expert_bytes = source_out_dim * row_stride;
-            id<MTLBuffer> zero_id_buffer = [runtime->device
+            id<MTLBuffer> zero_id_buffer = antfly_observe_metal_buffer([runtime->device
                 newBufferWithLength:rows * sizeof(uint32_t)
-                          options:MTLResourceStorageModeShared];
+                          options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
             if (zero_id_buffer == nil || zero_id_buffer.contents == NULL) return -12;
             memset(zero_id_buffer.contents, 0, rows * sizeof(uint32_t));
             bool frame_owned = true;
@@ -37843,10 +37882,10 @@ int termite_metal_decode_runtime_apply_quantized_linear_id_slot_device(
             return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -16);
         }
 
-        id<MTLBuffer> expert_id_buffer = [runtime->device
+        id<MTLBuffer> expert_id_buffer = antfly_observe_metal_buffer([runtime->device
             newBufferWithBytes:expert_ids
                        length:rows * sizeof(uint32_t)
-                      options:MTLResourceStorageModeShared];
+                      options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (expert_id_buffer == nil) return -12;
 
         termite_metal_linear_id_params params = {
@@ -37956,9 +37995,9 @@ int termite_metal_decode_runtime_apply_quantized_linear_pair_id_slots_device(
                 source_out_dim_b > SIZE_MAX / row_stride_b) return -12;
             const size_t expert_bytes_a = source_out_dim_a * row_stride_a;
             const size_t expert_bytes_b = source_out_dim_b * row_stride_b;
-            id<MTLBuffer> zero_id_buffer = [runtime->device
+            id<MTLBuffer> zero_id_buffer = antfly_observe_metal_buffer([runtime->device
                 newBufferWithLength:rows * sizeof(uint32_t)
-                          options:MTLResourceStorageModeShared];
+                          options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
             if (zero_id_buffer == nil || zero_id_buffer.contents == NULL) return -12;
             memset(zero_id_buffer.contents, 0, rows * sizeof(uint32_t));
             bool frame_owned = true;
@@ -38032,10 +38071,10 @@ int termite_metal_decode_runtime_apply_quantized_linear_pair_id_slots_device(
             return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -16);
         }
 
-        id<MTLBuffer> expert_id_buffer = [runtime->device
+        id<MTLBuffer> expert_id_buffer = antfly_observe_metal_buffer([runtime->device
             newBufferWithBytes:expert_ids
                        length:rows * sizeof(uint32_t)
-                      options:MTLResourceStorageModeShared];
+                      options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (expert_id_buffer == nil) return -12;
 
         termite_metal_linear_pair_id_params params = {
@@ -38118,8 +38157,8 @@ int termite_metal_decode_runtime_moe_scatter_add_device(
         if (base_offset > base_buffer.length || base_bytes > base_buffer.length - base_offset ||
             updates_offset > updates_buffer.length || updates_bytes > updates_buffer.length - updates_offset ||
             output_offset > output_buffer.length || base_bytes > output_buffer.length - output_offset) return -5;
-        id<MTLBuffer> row_id_buffer = [runtime->device newBufferWithBytes:row_ids length:route_rows * sizeof(uint32_t) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> route_weight_buffer = [runtime->device newBufferWithBytes:route_weights length:route_rows * sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> row_id_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:row_ids length:route_rows * sizeof(uint32_t) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> route_weight_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:route_weights length:route_rows * sizeof(float) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (row_id_buffer == nil || route_weight_buffer == nil) return -6;
         termite_metal_moe_scatter_params params = {
             .base_rows = (uint32_t)base_rows,
@@ -38193,7 +38232,7 @@ static int termite_metal_decode_runtime_apply_quantized_linear_k_bias_activation
         if (input_offset + input_bytes > input_buffer.length) return -10;
         if (bias_offset + bias_bytes > bias_buffer.length) return -11;
         if (output_offset + output_bytes > output_buffer.length) return -12;
-        id<MTLBuffer> intermediate_buffer = [runtime->device newBufferWithLength:output_bytes options:MTLResourceStorageModePrivate];
+        id<MTLBuffer> intermediate_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:output_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
         if (intermediate_buffer == nil) return -13;
         bool frame_owned = true;
         id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
@@ -40053,12 +40092,12 @@ int termite_metal_decode_runtime_apply_quantized_linear_pair_slots(
     @autoreleasepool {
         const size_t input_bytes = rows * in_dim * sizeof(float);
         const size_t output_bytes = rows * out_dim * sizeof(float);
-        id<MTLBuffer> input_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)input length:input_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (input_buffer == nil) input_buffer = [runtime->device newBufferWithBytes:input length:input_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> output_a_buffer = [runtime->device newBufferWithBytesNoCopy:output_a length:output_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (output_a_buffer == nil) output_a_buffer = [runtime->device newBufferWithBytes:output_a length:output_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> output_b_buffer = [runtime->device newBufferWithBytesNoCopy:output_b length:output_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (output_b_buffer == nil) output_b_buffer = [runtime->device newBufferWithBytes:output_b length:output_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)input length:input_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:input length:input_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> output_a_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:output_a length:output_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (output_a_buffer == nil) output_a_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:output_a length:output_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> output_b_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:output_b length:output_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (output_b_buffer == nil) output_b_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:output_b length:output_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (input_buffer == nil || output_a_buffer == nil || output_b_buffer == nil) return -8;
         id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(runtime->queue, __func__);
         if (command_buffer == nil) return -9;
@@ -40232,12 +40271,12 @@ int termite_metal_decode_runtime_apply_linear_pair_slots(
     @autoreleasepool {
         const size_t input_bytes = rows * in_dim * sizeof(float);
         const size_t output_bytes = rows * out_dim * sizeof(float);
-        id<MTLBuffer> input_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)input length:input_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (input_buffer == nil) input_buffer = [runtime->device newBufferWithBytes:input length:input_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> output_a_buffer = [runtime->device newBufferWithBytesNoCopy:output_a length:output_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (output_a_buffer == nil) output_a_buffer = [runtime->device newBufferWithBytes:output_a length:output_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> output_b_buffer = [runtime->device newBufferWithBytesNoCopy:output_b length:output_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (output_b_buffer == nil) output_b_buffer = [runtime->device newBufferWithBytes:output_b length:output_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)input length:input_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:input length:input_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> output_a_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:output_a length:output_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (output_a_buffer == nil) output_a_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:output_a length:output_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> output_b_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:output_b length:output_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (output_b_buffer == nil) output_b_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:output_b length:output_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (input_buffer == nil || output_a_buffer == nil || output_b_buffer == nil) return -9;
 
         termite_metal_apply_linear_params params = {
@@ -40415,14 +40454,14 @@ int termite_metal_decode_runtime_apply_linear_qkv_slots(
         const size_t input_bytes = in_dim * sizeof(float);
         const size_t q_output_bytes = q_out_dim * sizeof(float);
         const size_t kv_output_bytes = kv_out_dim * sizeof(float);
-        id<MTLBuffer> input_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)input length:input_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (input_buffer == nil) input_buffer = [runtime->device newBufferWithBytes:input length:input_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> q_output_buffer = [runtime->device newBufferWithBytesNoCopy:q_output length:q_output_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (q_output_buffer == nil) q_output_buffer = [runtime->device newBufferWithBytes:q_output length:q_output_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> k_output_buffer = [runtime->device newBufferWithBytesNoCopy:k_output length:kv_output_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (k_output_buffer == nil) k_output_buffer = [runtime->device newBufferWithBytes:k_output length:kv_output_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> v_output_buffer = [runtime->device newBufferWithBytesNoCopy:v_output length:kv_output_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (v_output_buffer == nil) v_output_buffer = [runtime->device newBufferWithBytes:v_output length:kv_output_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)input length:input_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:input length:input_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> q_output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:q_output length:q_output_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (q_output_buffer == nil) q_output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:q_output length:q_output_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> k_output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:k_output length:kv_output_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (k_output_buffer == nil) k_output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:k_output length:kv_output_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> v_output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:v_output length:kv_output_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (v_output_buffer == nil) v_output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:v_output length:kv_output_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (input_buffer == nil || q_output_buffer == nil || k_output_buffer == nil || v_output_buffer == nil) return -9;
 
         termite_metal_apply_linear_params q_params = {
@@ -41250,14 +41289,14 @@ int termite_metal_decode_runtime_apply_quantized_q_kv_pair_linear_qkv_slots(
         const size_t input_bytes = rows * in_dim * sizeof(float);
         const size_t q_output_bytes = rows * q_out_dim * sizeof(float);
         const size_t kv_output_bytes = rows * kv_out_dim * sizeof(float);
-        id<MTLBuffer> input_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)input length:input_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (input_buffer == nil) input_buffer = [runtime->device newBufferWithBytes:input length:input_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> q_output_buffer = [runtime->device newBufferWithBytesNoCopy:q_output length:q_output_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (q_output_buffer == nil) q_output_buffer = [runtime->device newBufferWithBytes:q_output length:q_output_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> k_output_buffer = [runtime->device newBufferWithBytesNoCopy:k_output length:kv_output_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (k_output_buffer == nil) k_output_buffer = [runtime->device newBufferWithBytes:k_output length:kv_output_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> v_output_buffer = [runtime->device newBufferWithBytesNoCopy:v_output length:kv_output_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (v_output_buffer == nil) v_output_buffer = [runtime->device newBufferWithBytes:v_output length:kv_output_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)input length:input_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:input length:input_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> q_output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:q_output length:q_output_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (q_output_buffer == nil) q_output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:q_output length:q_output_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> k_output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:k_output length:kv_output_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (k_output_buffer == nil) k_output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:k_output length:kv_output_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> v_output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:v_output length:kv_output_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (v_output_buffer == nil) v_output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:v_output length:kv_output_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (input_buffer == nil || q_output_buffer == nil || k_output_buffer == nil || v_output_buffer == nil) return -9;
         id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(runtime->queue, __func__);
         if (command_buffer == nil) return -10;
@@ -41457,8 +41496,8 @@ int termite_metal_decode_runtime_apply_linear_argmax(
     @autoreleasepool {
         const size_t input_bytes = in_dim * sizeof(float);
         const size_t logits_bytes = out_dim * sizeof(float);
-        id<MTLBuffer> input_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)input length:input_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (input_buffer == nil) input_buffer = [runtime->device newBufferWithBytes:input length:input_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)input length:input_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:input length:input_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (input_buffer == nil) return -7;
         if (termite_metal_decode_runtime_ensure_sample_logits_buffer(runtime, logits_bytes) != 0) return -8;
         id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(runtime->queue, __func__);
@@ -41556,7 +41595,7 @@ int termite_metal_decode_runtime_apply_linear_argmax_device_frame_encode(
         if (input_offset + input_bytes > input_buffer.length) return -7;
         if (termite_metal_decode_runtime_ensure_sample_logits_buffer(runtime, logits_bytes) != 0) return -8;
         if (runtime->token_capacity < sizeof(uint32_t) || runtime->token_buffer == nil || runtime->token_buffer.storageMode != MTLStorageModeShared) {
-            id<MTLBuffer> token = [runtime->device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+            id<MTLBuffer> token = antfly_observe_metal_buffer([runtime->device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
             if (token == nil) return -10;
             runtime->token_buffer = token;
             runtime->token_capacity = sizeof(uint32_t);
@@ -41592,7 +41631,7 @@ int termite_metal_decode_runtime_argmax_from_logits_device(
         const size_t logits_bytes = out_dim * sizeof(float);
         if (logits_offset + logits_bytes > logits_buffer.length) return -4;
         if (runtime->token_capacity < sizeof(uint32_t) || runtime->token_buffer == nil || runtime->token_buffer.storageMode != MTLStorageModeShared) {
-            id<MTLBuffer> token = [runtime->device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+            id<MTLBuffer> token = antfly_observe_metal_buffer([runtime->device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
             if (token == nil) return -5;
             runtime->token_buffer = token;
             runtime->token_capacity = sizeof(uint32_t);
@@ -41663,7 +41702,7 @@ int termite_metal_decode_runtime_argmax_from_logits_suppress_device(
         if (logits_offset + logits_bytes > logits_buffer.length) return -5;
         size_t suppress_bytes = 0;
         if (!termite_metal_size_mul(suppress_count, sizeof(int32_t), &suppress_bytes)) return -6;
-        id<MTLBuffer> suppress_buffer = [runtime->device newBufferWithBytes:suppress_token_ids length:suppress_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> suppress_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:suppress_token_ids length:suppress_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (suppress_buffer == nil) return -7;
 
         const bool restore_active_frame = (runtime->active_frame_cb != nil);
@@ -41728,7 +41767,7 @@ int termite_metal_decode_runtime_encode_argmax_from_logits_device(
         const size_t logits_bytes = out_dim * sizeof(float);
         if (logits_offset + logits_bytes > logits_buffer.length) return -4;
         if (runtime->token_capacity < sizeof(uint32_t) || runtime->token_buffer == nil || runtime->token_buffer.storageMode != MTLStorageModeShared) {
-            id<MTLBuffer> token = [runtime->device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+            id<MTLBuffer> token = antfly_observe_metal_buffer([runtime->device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
             if (token == nil) return -5;
             runtime->token_buffer = token;
             runtime->token_capacity = sizeof(uint32_t);
@@ -41771,15 +41810,15 @@ int termite_metal_decode_runtime_apply_layer_norm_linear_argmax(
         const size_t input_bytes = hidden_size * sizeof(float);
         const size_t hidden_bytes = hidden_size * sizeof(float);
         const size_t logits_bytes = out_dim * sizeof(float);
-        id<MTLBuffer> input_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)input length:input_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (input_buffer == nil) input_buffer = [runtime->device newBufferWithBytes:input length:input_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> hidden_buffer = [runtime->device newBufferWithLength:hidden_bytes options:MTLResourceStorageModePrivate];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)input length:input_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:input length:input_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> hidden_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:hidden_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
         if (input_buffer == nil || hidden_buffer == nil) return -9;
         termite_metal_apply_layer_norm_params norm_params = {
             .hidden_size = (uint32_t)hidden_size,
             .eps = eps,
         };
-        id<MTLBuffer> norm_params_buffer = [runtime->device newBufferWithBytes:&norm_params length:sizeof(norm_params) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> norm_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&norm_params length:sizeof(norm_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (norm_params_buffer == nil) return -10;
         if (termite_metal_decode_runtime_ensure_sample_logits_buffer(runtime, logits_bytes) != 0) return -10;
         id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(runtime->queue, __func__);
@@ -41837,10 +41876,10 @@ int termite_metal_decode_runtime_apply_layer_norm_linear(
         const size_t input_bytes = hidden_size * sizeof(float);
         const size_t hidden_bytes = hidden_size * sizeof(float);
         const size_t output_bytes = out_dim * sizeof(float);
-        id<MTLBuffer> input_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)input length:input_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (input_buffer == nil) input_buffer = [runtime->device newBufferWithBytes:input length:input_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> hidden_buffer = [runtime->device newBufferWithLength:hidden_bytes options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> output_buffer = [runtime->device newBufferWithLength:output_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)input length:input_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:input length:input_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> hidden_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:hidden_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:output_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
         if (input_buffer == nil || hidden_buffer == nil || output_buffer == nil) return -9;
         termite_metal_apply_layer_norm_params norm_params = {
             .hidden_size = (uint32_t)hidden_size,
@@ -41850,8 +41889,8 @@ int termite_metal_decode_runtime_apply_layer_norm_linear(
             .in_dim = (uint32_t)hidden_size,
             .out_dim = (uint32_t)out_dim,
         };
-        id<MTLBuffer> norm_params_buffer = [runtime->device newBufferWithBytes:&norm_params length:sizeof(norm_params) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> linear_params_buffer = [runtime->device newBufferWithBytes:&linear_params length:sizeof(linear_params) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> norm_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&norm_params length:sizeof(norm_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> linear_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&linear_params length:sizeof(linear_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (norm_params_buffer == nil || linear_params_buffer == nil) return -10;
         id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(runtime->queue, __func__);
         if (command_buffer == nil) return -11;
@@ -41918,9 +41957,9 @@ int termite_metal_decode_runtime_apply_rms_norm_linear_argmax(
         const size_t input_bytes = hidden_size * sizeof(float);
         const size_t hidden_bytes = hidden_size * sizeof(float);
         const size_t logits_bytes = out_dim * sizeof(float);
-        id<MTLBuffer> input_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)input length:input_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (input_buffer == nil) input_buffer = [runtime->device newBufferWithBytes:input length:input_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> hidden_buffer = [runtime->device newBufferWithLength:hidden_bytes options:MTLResourceStorageModePrivate];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)input length:input_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:input length:input_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> hidden_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:hidden_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
         if (input_buffer == nil || hidden_buffer == nil) return -9;
         if (termite_metal_decode_runtime_ensure_sample_logits_buffer(runtime, logits_bytes) != 0) return -10;
         id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(runtime->queue, __func__);
@@ -41985,7 +42024,7 @@ int termite_metal_decode_runtime_encode_rms_norm_linear_argmax_device(
         const size_t logits_bytes = out_dim * sizeof(float);
         if (input_offset + input_bytes > input_buffer.length) return -9;
         if (runtime->token_capacity < sizeof(uint32_t) || runtime->token_buffer == nil || runtime->token_buffer.storageMode != MTLStorageModeShared) {
-            id<MTLBuffer> token = [runtime->device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+            id<MTLBuffer> token = antfly_observe_metal_buffer([runtime->device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
             if (token == nil) return -10;
             runtime->token_buffer = token;
             runtime->token_capacity = sizeof(uint32_t);
@@ -41999,7 +42038,7 @@ int termite_metal_decode_runtime_encode_rms_norm_linear_argmax_device(
         if (suppress_count != 0) {
             size_t suppress_bytes = 0;
             if (!termite_metal_size_mul(suppress_count, sizeof(int32_t), &suppress_bytes)) return -18;
-            suppress_buffer = [runtime->device newBufferWithBytes:suppress_token_ids length:suppress_bytes options:MTLResourceStorageModeShared];
+            suppress_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:suppress_token_ids length:suppress_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
             if (suppress_buffer == nil) return -18;
             if (!frame_owned && termite_metal_decode_runtime_retain_frame_resource(runtime, suppress_buffer) != 0) return -18;
         }
@@ -42199,7 +42238,7 @@ int termite_metal_decode_runtime_encode_rms_norm_quantized_linear_argmax_device(
         const size_t logits_bytes = out_dim * sizeof(float);
         if (input_offset + input_bytes > input_buffer.length) return -9;
         if (runtime->token_capacity < sizeof(uint32_t) || runtime->token_buffer == nil || runtime->token_buffer.storageMode != MTLStorageModeShared) {
-            id<MTLBuffer> token = [runtime->device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+            id<MTLBuffer> token = antfly_observe_metal_buffer([runtime->device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
             if (token == nil) return -10;
             runtime->token_buffer = token;
             runtime->token_capacity = sizeof(uint32_t);
@@ -42213,7 +42252,7 @@ int termite_metal_decode_runtime_encode_rms_norm_quantized_linear_argmax_device(
         if (suppress_count != 0) {
             size_t suppress_bytes = 0;
             if (!termite_metal_size_mul(suppress_count, sizeof(int32_t), &suppress_bytes)) return -18;
-            suppress_buffer = [runtime->device newBufferWithBytes:suppress_token_ids length:suppress_bytes options:MTLResourceStorageModeShared];
+            suppress_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:suppress_token_ids length:suppress_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
             if (suppress_buffer == nil) return -18;
             if (!frame_owned && termite_metal_decode_runtime_retain_frame_resource(runtime, suppress_buffer) != 0) return -18;
         }
@@ -43138,7 +43177,7 @@ typedef struct termite_metal_whisper_logits_params_host {
 
 static int termite_metal_decode_runtime_ensure_whisper_grammar_buffer(termite_metal_decode_runtime *runtime) {
     if (runtime->whisper_grammar_buffer != nil) return 0;
-    id<MTLBuffer> grammar = [runtime->device newBufferWithLength:TERMITE_METAL_WHISPER_GRAMMAR_WORDS * sizeof(uint32_t) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> grammar = antfly_observe_metal_buffer([runtime->device newBufferWithLength:TERMITE_METAL_WHISPER_GRAMMAR_WORDS * sizeof(uint32_t) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
     if (grammar == nil) return -1;
     memset(grammar.contents, 0, TERMITE_METAL_WHISPER_GRAMMAR_WORDS * sizeof(uint32_t));
     runtime->whisper_grammar_buffer = grammar;
@@ -43151,7 +43190,7 @@ static int termite_metal_decode_runtime_ensure_whisper_grammar_buffer(termite_me
 static int termite_metal_decode_runtime_ensure_whisper_token_buffer(termite_metal_decode_runtime *runtime, size_t slots) {
     const size_t bytes = slots * sizeof(uint32_t);
     if (runtime->token_buffer != nil && runtime->token_capacity >= bytes && runtime->token_buffer.storageMode == MTLStorageModeShared) return 0;
-    id<MTLBuffer> token = [runtime->device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+    id<MTLBuffer> token = antfly_observe_metal_buffer([runtime->device newBufferWithLength:bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
     if (token == nil) return -1;
     memset(token.contents, 0, bytes);
     runtime->token_buffer = token;
@@ -43188,13 +43227,13 @@ int termite_metal_decode_runtime_whisper_logits_stats_device(
         if (block_count == 0 || block_count > UINT32_MAX) return -4;
         const size_t partial_bytes = block_count * 16u * sizeof(float);
         if (runtime->whisper_stats_partials_buffer == nil || runtime->whisper_stats_partials_capacity < partial_bytes) {
-            id<MTLBuffer> partials = [runtime->device newBufferWithLength:partial_bytes options:MTLResourceStorageModePrivate];
+            id<MTLBuffer> partials = antfly_observe_metal_buffer([runtime->device newBufferWithLength:partial_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
             if (partials == nil) return -5;
             runtime->whisper_stats_partials_buffer = partials;
             runtime->whisper_stats_partials_capacity = partial_bytes;
         }
         if (runtime->whisper_stats_buffer == nil) {
-            id<MTLBuffer> stats = [runtime->device newBufferWithLength:TERMITE_METAL_WHISPER_STATS_SLOTS * 16u * sizeof(float) options:MTLResourceStorageModeShared];
+            id<MTLBuffer> stats = antfly_observe_metal_buffer([runtime->device newBufferWithLength:TERMITE_METAL_WHISPER_STATS_SLOTS * 16u * sizeof(float) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
             if (stats == nil) return -5;
             runtime->whisper_stats_buffer = stats;
         }
@@ -43205,7 +43244,7 @@ int termite_metal_decode_runtime_whisper_logits_stats_device(
         if (suppress_count > 0) {
             size_t suppress_bytes = 0;
             if (!termite_metal_size_mul(suppress_count, sizeof(int32_t), &suppress_bytes)) return -6;
-            suppress_buffer = [runtime->device newBufferWithBytes:suppress_ids length:suppress_bytes options:MTLResourceStorageModeShared];
+            suppress_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:suppress_ids length:suppress_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
             if (suppress_buffer == nil) return -6;
         }
         const bool frame_owned = (runtime->active_frame_cb == nil);
@@ -43382,10 +43421,10 @@ int termite_metal_decode_runtime_apply_rms_norm_linear(
         const size_t input_bytes = hidden_size * sizeof(float);
         const size_t hidden_bytes = hidden_size * sizeof(float);
         const size_t output_bytes = out_dim * sizeof(float);
-        id<MTLBuffer> input_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)input length:input_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (input_buffer == nil) input_buffer = [runtime->device newBufferWithBytes:input length:input_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> hidden_buffer = [runtime->device newBufferWithLength:hidden_bytes options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> output_buffer = [runtime->device newBufferWithLength:output_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)input length:input_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:input length:input_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> hidden_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:hidden_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:output_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
         if (input_buffer == nil || hidden_buffer == nil || output_buffer == nil) return -9;
         termite_metal_apply_layer_norm_params norm_params = {
             .hidden_size = (uint32_t)hidden_size,
@@ -43395,8 +43434,8 @@ int termite_metal_decode_runtime_apply_rms_norm_linear(
             .in_dim = (uint32_t)hidden_size,
             .out_dim = (uint32_t)out_dim,
         };
-        id<MTLBuffer> norm_params_buffer = [runtime->device newBufferWithBytes:&norm_params length:sizeof(norm_params) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> linear_params_buffer = [runtime->device newBufferWithBytes:&linear_params length:sizeof(linear_params) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> norm_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&norm_params length:sizeof(norm_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> linear_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&linear_params length:sizeof(linear_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (norm_params_buffer == nil || linear_params_buffer == nil) return -10;
         id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(runtime->queue, __func__);
         if (command_buffer == nil) return -11;
@@ -43462,8 +43501,8 @@ static int termite_metal_decode_runtime_sample_from_logits(
     if (out_dim == 0 || out_dim > UINT32_MAX) return -3;
     @autoreleasepool {
         const size_t logits_bytes = out_dim * sizeof(float);
-        id<MTLBuffer> logits_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)logits length:logits_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (logits_buffer == nil) logits_buffer = [runtime->device newBufferWithBytes:logits length:logits_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> logits_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)logits length:logits_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (logits_buffer == nil) logits_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:logits length:logits_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (logits_buffer == nil) return -4;
         id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(runtime->queue, __func__);
         if (command_buffer == nil) return -6;
@@ -43619,7 +43658,7 @@ static int termite_metal_bind_sampling_penalties(
         [encoder setBytes:entries length:penalty_bytes atIndex:index];
         return 0;
     }
-    id<MTLBuffer> penalty_buffer = [runtime->device newBufferWithBytes:entries length:penalty_bytes options:MTLResourceStorageModeShared];
+    id<MTLBuffer> penalty_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:entries length:penalty_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
     if (penalty_buffer == nil) return -10;
     [encoder setBuffer:penalty_buffer offset:0 atIndex:index];
     return 0;
@@ -43656,7 +43695,7 @@ static int termite_metal_decode_runtime_encode_sample_topk_from_logits_buffer(
     const size_t probs_bytes = actual_top_k * sizeof(float);
     if (termite_metal_decode_runtime_ensure_sample_probs_buffer(runtime, probs_bytes) != 0) return -4;
     if (runtime->token_capacity < sizeof(uint32_t) || runtime->token_buffer == nil || runtime->token_buffer.storageMode != MTLStorageModeShared) {
-        id<MTLBuffer> token = [runtime->device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> token = antfly_observe_metal_buffer([runtime->device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
         if (token == nil) return -4;
         runtime->token_buffer = token;
         runtime->token_capacity = sizeof(uint32_t);
@@ -43804,7 +43843,7 @@ static int termite_metal_decode_runtime_encode_sample_from_logits_buffer(
         if (termite_metal_decode_runtime_ensure_sample_topk_buffers(runtime, partial_bytes) != 0) return -4;
         if (runtime->sample_topk_values_buffer == nil || runtime->sample_topk_ids_buffer == nil) return -4;
         if (runtime->token_capacity < sizeof(uint32_t) || runtime->token_buffer == nil || runtime->token_buffer.storageMode != MTLStorageModeShared) {
-            id<MTLBuffer> token = [runtime->device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+            id<MTLBuffer> token = antfly_observe_metal_buffer([runtime->device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
             if (token == nil) return -4;
             runtime->token_buffer = token;
             runtime->token_capacity = sizeof(uint32_t);
@@ -43870,7 +43909,7 @@ static int termite_metal_decode_runtime_encode_sample_from_logits_buffer(
     const size_t logits_bytes = out_dim * sizeof(float);
     if (termite_metal_decode_runtime_ensure_sample_probs_buffer(runtime, logits_bytes) != 0) return -4;
     if (runtime->token_capacity < sizeof(uint32_t) || runtime->token_buffer == nil || runtime->token_buffer.storageMode != MTLStorageModeShared) {
-        id<MTLBuffer> token = [runtime->device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> token = antfly_observe_metal_buffer([runtime->device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
         if (token == nil) return -4;
         runtime->token_buffer = token;
         runtime->token_capacity = sizeof(uint32_t);
@@ -44046,9 +44085,9 @@ int termite_metal_decode_runtime_apply_layer_norm_linear_sample_device(
         const size_t input_bytes = hidden_size * sizeof(float);
         const size_t hidden_bytes = hidden_size * sizeof(float);
         const size_t logits_bytes = out_dim * sizeof(float);
-        id<MTLBuffer> input_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)input length:input_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (input_buffer == nil) input_buffer = [runtime->device newBufferWithBytes:input length:input_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> hidden_buffer = [runtime->device newBufferWithLength:hidden_bytes options:MTLResourceStorageModePrivate];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)input length:input_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:input length:input_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> hidden_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:hidden_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
         if (termite_metal_decode_runtime_ensure_sample_logits_buffer(runtime, logits_bytes) != 0) return -9;
         if (input_buffer == nil || hidden_buffer == nil || runtime->sample_logits_buffer == nil) return -9;
         termite_metal_apply_layer_norm_params norm_params = {
@@ -44059,8 +44098,8 @@ int termite_metal_decode_runtime_apply_layer_norm_linear_sample_device(
             .in_dim = (uint32_t)hidden_size,
             .out_dim = (uint32_t)out_dim,
         };
-        id<MTLBuffer> norm_params_buffer = [runtime->device newBufferWithBytes:&norm_params length:sizeof(norm_params) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> linear_params_buffer = [runtime->device newBufferWithBytes:&linear_params length:sizeof(linear_params) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> norm_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&norm_params length:sizeof(norm_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> linear_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&linear_params length:sizeof(linear_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (norm_params_buffer == nil || linear_params_buffer == nil) return -10;
         id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(runtime->queue, __func__);
         if (command_buffer == nil) return -11;
@@ -44157,9 +44196,9 @@ int termite_metal_decode_runtime_apply_rms_norm_linear_sample_device(
         const size_t input_bytes = hidden_size * sizeof(float);
         const size_t hidden_bytes = hidden_size * sizeof(float);
         const size_t logits_bytes = out_dim * sizeof(float);
-        id<MTLBuffer> input_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)input length:input_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (input_buffer == nil) input_buffer = [runtime->device newBufferWithBytes:input length:input_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> hidden_buffer = [runtime->device newBufferWithLength:hidden_bytes options:MTLResourceStorageModePrivate];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)input length:input_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:input length:input_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> hidden_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:hidden_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
         if (termite_metal_decode_runtime_ensure_sample_logits_buffer(runtime, logits_bytes) != 0) return -9;
         if (input_buffer == nil || hidden_buffer == nil || runtime->sample_logits_buffer == nil) return -9;
         termite_metal_apply_layer_norm_params norm_params = {
@@ -44170,8 +44209,8 @@ int termite_metal_decode_runtime_apply_rms_norm_linear_sample_device(
             .in_dim = (uint32_t)hidden_size,
             .out_dim = (uint32_t)out_dim,
         };
-        id<MTLBuffer> norm_params_buffer = [runtime->device newBufferWithBytes:&norm_params length:sizeof(norm_params) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> linear_params_buffer = [runtime->device newBufferWithBytes:&linear_params length:sizeof(linear_params) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> norm_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&norm_params length:sizeof(norm_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> linear_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&linear_params length:sizeof(linear_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (norm_params_buffer == nil || linear_params_buffer == nil) return -10;
         id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(runtime->queue, __func__);
         if (command_buffer == nil) return -11;
@@ -44246,17 +44285,17 @@ int termite_metal_decode_runtime_apply_activation(
     if (dim == 0 || dim > UINT32_MAX) return -3;
     @autoreleasepool {
         const size_t bytes = dim * sizeof(float);
-        id<MTLBuffer> input_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)input length:bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (input_buffer == nil) input_buffer = [runtime->device newBufferWithBytes:input length:bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> output_buffer = [runtime->device newBufferWithBytesNoCopy:output length:bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (output_buffer == nil) output_buffer = [runtime->device newBufferWithBytes:output length:bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)input length:bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:input length:bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:output length:bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (output_buffer == nil) output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:output length:bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (input_buffer == nil || output_buffer == nil) return -4;
         termite_metal_apply_activation_params params = {
             .activation_kind = activation_kind,
             .rows = 1,
             .dim = (uint32_t)dim,
         };
-        id<MTLBuffer> params_buffer = [runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (params_buffer == nil) return -5;
         id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(runtime->queue, __func__);
         if (command_buffer == nil) return -6;
@@ -44410,7 +44449,7 @@ int termite_metal_decode_runtime_publish_moe_expert_slot_map(
         const size_t bytes = expert_count * sizeof(uint32_t);
         id<MTLBuffer> buffer = runtime->moe_expert_slot_map_buffers[layer_index];
         if (buffer == nil || buffer.length < bytes) {
-            buffer = [runtime->device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+            buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
             if (buffer == nil) return -5;
             runtime->moe_expert_slot_map_buffers[layer_index] = buffer;
         }
@@ -44470,7 +44509,7 @@ int termite_metal_decode_runtime_prepare_moe_q4_0_slot_arena(
     if (runtime->submitted_frame_cb != nil ||
         (runtime->active_frame_cb != nil && !termite_metal_decode_runtime_active_frame_empty(runtime))) return -6;
     @autoreleasepool {
-        id<MTLBuffer> arena = [runtime->device newBufferWithLength:arena_bytes options:MTLResourceStorageModePrivate];
+        id<MTLBuffer> arena = antfly_observe_metal_buffer([runtime->device newBufferWithLength:arena_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
         if (arena == nil) return -7;
         runtime->moe_slot_layer_prepared[layer_index] = 0;
         runtime->moe_slot_layer_arena_buffers[layer_index] = arena;
@@ -44510,7 +44549,7 @@ int termite_metal_decode_runtime_upload_moe_q4_0_slots(
     }
     @autoreleasepool {
         id<MTLBuffer> arena = runtime->moe_slot_layer_arena_buffers[layer_index];
-        id<MTLBuffer> staging = [runtime->device newBufferWithBytes:slot_bytes length:upload_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> staging = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:slot_bytes length:upload_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (arena == nil || staging == nil) return -6;
         bool frame_owned = true;
         id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
@@ -44591,14 +44630,14 @@ int termite_metal_decode_runtime_moe_forward_q4_0_slots_device(
         runtime->moe_route_capacity < route_bytes) return -6;
     @autoreleasepool {
         if (runtime->moe_route_slot_capacity < route_bytes || runtime->moe_route_slots_buffer == nil) {
-            id<MTLBuffer> slots = [runtime->device newBufferWithLength:route_bytes options:MTLResourceStorageModeShared];
+            id<MTLBuffer> slots = antfly_observe_metal_buffer([runtime->device newBufferWithLength:route_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
             if (slots == nil) return -7;
             runtime->moe_route_slots_buffer = slots;
             runtime->moe_route_slot_capacity = route_bytes;
         }
         const size_t miss_rows_bytes = rows * sizeof(uint32_t);
         if (runtime->moe_route_miss_rows_capacity < miss_rows_bytes || runtime->moe_route_miss_rows_buffer == nil) {
-            id<MTLBuffer> misses = [runtime->device newBufferWithLength:miss_rows_bytes options:MTLResourceStorageModeShared];
+            id<MTLBuffer> misses = antfly_observe_metal_buffer([runtime->device newBufferWithLength:miss_rows_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
             if (misses == nil) return -7;
             runtime->moe_route_miss_rows_buffer = misses;
             runtime->moe_route_miss_rows_capacity = miss_rows_bytes;
@@ -44606,15 +44645,15 @@ int termite_metal_decode_runtime_moe_forward_q4_0_slots_device(
         if (runtime->moe_slot_intermediate_capacity < intermediate_bytes ||
             runtime->moe_slot_gate_buffer == nil || runtime->moe_slot_up_buffer == nil)
         {
-            id<MTLBuffer> gate = [runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate];
-            id<MTLBuffer> up = [runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate];
+            id<MTLBuffer> gate = antfly_observe_metal_buffer([runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+            id<MTLBuffer> up = antfly_observe_metal_buffer([runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
             if (gate == nil || up == nil) return -7;
             runtime->moe_slot_gate_buffer = gate;
             runtime->moe_slot_up_buffer = up;
             runtime->moe_slot_intermediate_capacity = intermediate_bytes;
         }
         if (runtime->moe_slot_route_output_capacity < route_output_bytes || runtime->moe_slot_route_output_buffer == nil) {
-            id<MTLBuffer> route_output = [runtime->device newBufferWithLength:route_output_bytes options:MTLResourceStorageModePrivate];
+            id<MTLBuffer> route_output = antfly_observe_metal_buffer([runtime->device newBufferWithLength:route_output_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
             if (route_output == nil) return -7;
             runtime->moe_slot_route_output_buffer = route_output;
             runtime->moe_slot_route_output_capacity = route_output_bytes;
@@ -44786,11 +44825,11 @@ static id<MTLBuffer> termite_metal_make_selected_expert_page_buffer(
     if (logical_bytes > SIZE_MAX - 2u * page_size ||
         mapped_bytes > logical_bytes + 2u * page_size ||
         !termite_metal_can_make_no_copy_buffer((const void *)aligned_start, mapped_bytes)) return nil;
-    id<MTLBuffer> buffer = [runtime->device
+    id<MTLBuffer> buffer = antfly_observe_metal_buffer([runtime->device
         newBufferWithBytesNoCopy:(void *)aligned_start
                           length:mapped_bytes
                          options:MTLResourceStorageModeShared
-                     deallocator:nil];
+                     deallocator:nil], ANTFLY_BUFFER_ALIAS);
     if (buffer == nil) return nil;
     buffer.label = @"antfly A4B selected expert pages";
     *buffer_offset_out = (size_t)(logical_start - aligned_start);
@@ -44891,8 +44930,8 @@ int termite_metal_decode_runtime_moe_forward_q4_0_selected_pages_device(
         if (runtime->moe_slot_intermediate_capacity < gate_intermediate_bytes ||
             runtime->moe_slot_gate_buffer == nil || runtime->moe_slot_up_buffer == nil)
         {
-            id<MTLBuffer> gate_buffer = [runtime->device newBufferWithLength:gate_intermediate_bytes options:MTLResourceStorageModePrivate];
-            id<MTLBuffer> up_buffer = [runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate];
+            id<MTLBuffer> gate_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:gate_intermediate_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+            id<MTLBuffer> up_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
             if (gate_buffer == nil || up_buffer == nil) return -11;
             runtime->moe_slot_gate_buffer = gate_buffer;
             runtime->moe_slot_up_buffer = up_buffer;
@@ -44901,7 +44940,7 @@ int termite_metal_decode_runtime_moe_forward_q4_0_selected_pages_device(
         if (runtime->moe_slot_route_output_capacity < route_output_bytes ||
             runtime->moe_slot_route_output_buffer == nil)
         {
-            id<MTLBuffer> route_output = [runtime->device newBufferWithLength:route_output_bytes options:MTLResourceStorageModePrivate];
+            id<MTLBuffer> route_output = antfly_observe_metal_buffer([runtime->device newBufferWithLength:route_output_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
             if (route_output == nil) return -11;
             runtime->moe_slot_route_output_buffer = route_output;
             runtime->moe_slot_route_output_capacity = route_output_bytes;
@@ -44959,10 +44998,10 @@ int termite_metal_decode_runtime_moe_forward_q4_0_selected_pages_device(
         if (mapped_page_bytes > 64ull * 1024ull * 1024ull) return -14;
 
         uint32_t zero_id = 0;
-        id<MTLBuffer> zero_id_buffer = [runtime->device
+        id<MTLBuffer> zero_id_buffer = antfly_observe_metal_buffer([runtime->device
             newBufferWithBytes:&zero_id
                        length:sizeof(zero_id)
-                      options:MTLResourceStorageModeShared];
+                      options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (zero_id_buffer == nil ||
             termite_metal_decode_runtime_retain_frame_resource(runtime, zero_id_buffer) != 0) return -15;
 
@@ -45312,8 +45351,8 @@ int termite_metal_decode_runtime_moe_forward_q4_0_mapped_device(
             runtime->moe_slot_gate_buffer == nil ||
             runtime->moe_slot_up_buffer == nil)
         {
-            id<MTLBuffer> gate = [runtime->device newBufferWithLength:gate_intermediate_bytes options:MTLResourceStorageModePrivate];
-            id<MTLBuffer> up = [runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate];
+            id<MTLBuffer> gate = antfly_observe_metal_buffer([runtime->device newBufferWithLength:gate_intermediate_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+            id<MTLBuffer> up = antfly_observe_metal_buffer([runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
             if (gate == nil || up == nil) return -11;
             runtime->moe_slot_gate_buffer = gate;
             runtime->moe_slot_up_buffer = up;
@@ -45322,7 +45361,7 @@ int termite_metal_decode_runtime_moe_forward_q4_0_mapped_device(
         if (runtime->moe_slot_route_output_capacity < route_output_bytes ||
             runtime->moe_slot_route_output_buffer == nil)
         {
-            id<MTLBuffer> route_output = [runtime->device newBufferWithLength:route_output_bytes options:MTLResourceStorageModePrivate];
+            id<MTLBuffer> route_output = antfly_observe_metal_buffer([runtime->device newBufferWithLength:route_output_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
             if (route_output == nil) return -11;
             runtime->moe_slot_route_output_buffer = route_output;
             runtime->moe_slot_route_output_capacity = route_output_bytes;
@@ -45385,7 +45424,7 @@ int termite_metal_decode_runtime_moe_forward_q4_0_mapped_device(
             if (runtime->moe_selected_expert_prefetch_scratch_buffer == nil ||
                 runtime->moe_selected_expert_prefetch_scratch_capacity < prefetch_scratch_bytes)
             {
-                id<MTLBuffer> scratch = [runtime->device newBufferWithLength:prefetch_scratch_bytes options:MTLResourceStorageModePrivate];
+                id<MTLBuffer> scratch = antfly_observe_metal_buffer([runtime->device newBufferWithLength:prefetch_scratch_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
                 if (scratch == nil) return -11;
                 runtime->moe_selected_expert_prefetch_scratch_buffer = scratch;
                 runtime->moe_selected_expert_prefetch_scratch_capacity = prefetch_scratch_bytes;
@@ -45901,7 +45940,7 @@ int termite_metal_decode_runtime_begin_moe_checkpoint(
         if (runtime->moe_checkpoint_layer_miss_buffer == nil ||
             runtime->moe_checkpoint_layer_miss_buffer.length < bytes)
         {
-            id<MTLBuffer> ledger = [runtime->device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+            id<MTLBuffer> ledger = antfly_observe_metal_buffer([runtime->device newBufferWithLength:bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
             if (ledger == nil) return -4;
             runtime->moe_checkpoint_layer_miss_buffer = ledger;
         }
@@ -46031,8 +46070,8 @@ static int termite_metal_decode_runtime_select_moe_routes_device_impl(
             runtime->moe_route_ids_buffer == nil ||
             runtime->moe_route_weights_buffer == nil)
         {
-            id<MTLBuffer> ids = [runtime->device newBufferWithLength:route_bytes options:MTLResourceStorageModeShared];
-            id<MTLBuffer> weights = [runtime->device newBufferWithLength:route_bytes options:MTLResourceStorageModeShared];
+            id<MTLBuffer> ids = antfly_observe_metal_buffer([runtime->device newBufferWithLength:route_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
+            id<MTLBuffer> weights = antfly_observe_metal_buffer([runtime->device newBufferWithLength:route_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
             if (ids == nil || weights == nil) return -7;
             runtime->moe_route_ids_buffer = ids;
             runtime->moe_route_weights_buffer = weights;
@@ -46052,7 +46091,7 @@ static int termite_metal_decode_runtime_select_moe_routes_device_impl(
         if ((slot_map_available || fold_route_map) &&
             (runtime->moe_route_slot_capacity < route_bytes || runtime->moe_route_slots_buffer == nil))
         {
-            id<MTLBuffer> slots = [runtime->device newBufferWithLength:route_bytes options:MTLResourceStorageModeShared];
+            id<MTLBuffer> slots = antfly_observe_metal_buffer([runtime->device newBufferWithLength:route_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
             if (slots == nil) return -7;
             runtime->moe_route_slots_buffer = slots;
             runtime->moe_route_slot_capacity = route_bytes;
@@ -46060,7 +46099,7 @@ static int termite_metal_decode_runtime_select_moe_routes_device_impl(
         if ((slot_map_available || fold_route_map) &&
             (runtime->moe_route_miss_rows_capacity < miss_rows_bytes || runtime->moe_route_miss_rows_buffer == nil))
         {
-            id<MTLBuffer> misses = [runtime->device newBufferWithLength:miss_rows_bytes options:MTLResourceStorageModeShared];
+            id<MTLBuffer> misses = antfly_observe_metal_buffer([runtime->device newBufferWithLength:miss_rows_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
             if (misses == nil) return -7;
             runtime->moe_route_miss_rows_buffer = misses;
             runtime->moe_route_miss_rows_capacity = miss_rows_bytes;
@@ -47369,7 +47408,7 @@ int termite_metal_decode_runtime_sdpa_f32_device(
 ) {
     if (runtime == NULL || q_handle == NULL || k_handle == NULL || v_handle == NULL || output_handle == NULL) return -1;
     if (runtime->sdpa_f32_pipeline == nil) return -2;
-    if (batch == 0 || seq_len == 0 || num_heads == 0 || head_dim == 0 || bias_mode > 3u || has_mask > 1u || layout > 1u || qwen3vl_vision_flash > 2u || nomic_mode > 1u) return -3;
+    if (batch == 0 || seq_len == 0 || num_heads == 0 || head_dim == 0 || bias_mode > 3u || has_mask > 1u || layout > 1u || qwen3vl_vision_flash > 3u || nomic_mode > 1u) return -3;
     if (bias_mode != 0u && bias_handle == NULL) return -4;
     if (has_mask != 0u && mask_handle == NULL) return -5;
     if (batch > UINT32_MAX || seq_len > UINT32_MAX || num_heads > UINT32_MAX || head_dim > UINT32_MAX) return -6;
@@ -47435,19 +47474,22 @@ int termite_metal_decode_runtime_sdpa_f32_device(
             runtime->sdpa_f32_vision_hd64_q32_pipeline.threadExecutionWidth == 32u &&
             runtime->sdpa_f32_vision_hd64_q32_pipeline.maxTotalThreadsPerThreadgroup >= 256u &&
             termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_VISION_SDPA_HD64_Q32"));
-        const BOOL use_vision_hd64_flash_q16 = bias_mode == 0u && has_mask == 0u && layout == 1u &&
+        const BOOL use_vision_hd64_flash_q16 = qwen3vl_vision_flash != 3u && bias_mode == 0u && has_mask == 0u && layout == 1u &&
             head_dim == 64u && seq_len > 256u && seq_len <= 4096u &&
             runtime->sdpa_f32_vision_hd64_flash_q16_pipeline != nil &&
             runtime->sdpa_f32_vision_hd64_flash_q16_pipeline.threadExecutionWidth == 32u &&
             runtime->sdpa_f32_vision_hd64_flash_q16_pipeline.maxTotalThreadsPerThreadgroup >= 256u &&
             termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_VISION_SDPA_HD64_FLASH_Q16"));
+        id<MTLComputePipelineState> vision_flash_q32 = qwen3vl_vision_flash == 3u
+            ? runtime->sdpa_f32_vision_hd64_flash_q32_full_pipeline
+            : runtime->sdpa_f32_vision_hd64_flash_q32_pipeline;
         const BOOL use_vision_hd64_flash_q32 = bias_mode == 0u && has_mask == 0u && layout == 1u &&
             head_dim == 64u && seq_len > 256u && seq_len <= 4096u &&
-            runtime->sdpa_f32_vision_hd64_flash_q32_pipeline != nil &&
-            runtime->sdpa_f32_vision_hd64_flash_q32_pipeline.threadExecutionWidth == 32u &&
-            runtime->sdpa_f32_vision_hd64_flash_q32_pipeline.maxTotalThreadsPerThreadgroup >= 256u &&
+            vision_flash_q32 != nil &&
+            vision_flash_q32.threadExecutionWidth == 32u &&
+            vision_flash_q32.maxTotalThreadsPerThreadgroup >= 256u &&
             ((qwen3vl_vision_flash == 1u ||
-              (qwen3vl_vision_flash == 2u && !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_GEMMA4_VISION_FLASH")))) ||
+              ((qwen3vl_vision_flash == 2u || qwen3vl_vision_flash == 3u) && !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_GEMMA4_VISION_FLASH")))) ||
              termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_VISION_SDPA_HD64_FLASH_Q32"))) &&
             !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_VISION_SDPA_HD64_FLASH_Q32"));
         const BOOL use_nomic_q8 = nomic_mode != 0u && bias_mode == 0u && layout == 1u &&
@@ -47464,7 +47506,7 @@ int termite_metal_decode_runtime_sdpa_f32_device(
             : (use_bert_prefill_q8
             ? runtime->sdpa_f32_bert_prefill_s256_hd64_q8_pipeline
             : (use_vision_hd64_flash_q32
-            ? runtime->sdpa_f32_vision_hd64_flash_q32_pipeline
+            ? vision_flash_q32
             : (use_vision_hd64_flash_q16
             ? runtime->sdpa_f32_vision_hd64_flash_q16_pipeline
             : (use_vision_hd64_q32
@@ -47476,6 +47518,7 @@ int termite_metal_decode_runtime_sdpa_f32_device(
             : (use_tg ? runtime->sdpa_f32_tg_pipeline : runtime->sdpa_f32_pipeline)))))));
         if (use_florence_window_hd32) runtime->florence_window_sdpa_dispatches += 1;
         if (use_vision_hd64_flash_q32 && qwen3vl_vision_flash == 1u) runtime->qwen3vl_vision_flash_q32_dispatches += 1;
+        if (use_vision_hd64_flash_q32 && qwen3vl_vision_flash == 3u) termite_metal_telemetry_add(TERMITE_METAL_VISION_F32_FLASH_DISPATCHES, 1);
         bool frame_owned = true;
         id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
         if (command_buffer == nil) return -14;
@@ -48969,16 +49012,16 @@ int termite_metal_decode_runtime_disentangled_relative_attention_backward_f32_de
         id<MTLBuffer> dk_r_buffer = (__bridge id<MTLBuffer>)dk_r_handle;
         id<MTLBuffer> mask_buffer = mask_handle == NULL ? nil : (__bridge id<MTLBuffer>)mask_handle;
         if (mask_buffer == nil) {
-            mask_buffer = [runtime->device newBufferWithLength:sizeof(float) options:MTLResourceStorageModeShared];
+            mask_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:sizeof(float) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
             if (mask_buffer == nil) return -18;
         }
         const size_t scratch_bytes_needed = score_count * sizeof(float);
         if (runtime->attn_bwd_p_scratch == nil || runtime->attn_bwd_p_scratch_capacity < scratch_bytes_needed) {
-            runtime->attn_bwd_p_scratch = [runtime->device newBufferWithLength:scratch_bytes_needed options:MTLResourceStorageModePrivate];
+            runtime->attn_bwd_p_scratch = antfly_observe_metal_buffer([runtime->device newBufferWithLength:scratch_bytes_needed options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
             runtime->attn_bwd_p_scratch_capacity = runtime->attn_bwd_p_scratch == nil ? 0 : scratch_bytes_needed;
         }
         if (runtime->attn_bwd_dscore_scratch == nil || runtime->attn_bwd_dscore_scratch_capacity < scratch_bytes_needed) {
-            runtime->attn_bwd_dscore_scratch = [runtime->device newBufferWithLength:scratch_bytes_needed options:MTLResourceStorageModePrivate];
+            runtime->attn_bwd_dscore_scratch = antfly_observe_metal_buffer([runtime->device newBufferWithLength:scratch_bytes_needed options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
             runtime->attn_bwd_dscore_scratch_capacity = runtime->attn_bwd_dscore_scratch == nil ? 0 : scratch_bytes_needed;
         }
         id<MTLBuffer> p_scratch = runtime->attn_bwd_p_scratch;
@@ -50635,18 +50678,18 @@ int termite_metal_decode_runtime_apply_add(
     if (dim == 0 || dim > UINT32_MAX) return -3;
     @autoreleasepool {
         const size_t bytes = dim * sizeof(float);
-        id<MTLBuffer> lhs_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)lhs length:bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (lhs_buffer == nil) lhs_buffer = [runtime->device newBufferWithBytes:lhs length:bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> rhs_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)rhs length:bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (rhs_buffer == nil) rhs_buffer = [runtime->device newBufferWithBytes:rhs length:bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> output_buffer = [runtime->device newBufferWithBytesNoCopy:output length:bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (output_buffer == nil) output_buffer = [runtime->device newBufferWithBytes:output length:bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> lhs_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)lhs length:bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (lhs_buffer == nil) lhs_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:lhs length:bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> rhs_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)rhs length:bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (rhs_buffer == nil) rhs_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:rhs length:bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:output length:bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (output_buffer == nil) output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:output length:bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (lhs_buffer == nil || rhs_buffer == nil || output_buffer == nil) return -4;
         termite_metal_apply_add_params params = {
             .rows = 1,
             .dim = (uint32_t)dim,
         };
-        id<MTLBuffer> params_buffer = [runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (params_buffer == nil) return -5;
         id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(runtime->queue, __func__);
         if (command_buffer == nil) return -6;
@@ -50997,7 +51040,7 @@ int termite_metal_decode_runtime_layer_norm_backward_f32(
         id<MTLBuffer> gamma_buffer = (__bridge id<MTLBuffer>)gamma_handle;
         id<MTLBuffer> dy_buffer = (__bridge id<MTLBuffer>)dy_handle;
         id<MTLBuffer> output_buffer = (__bridge id<MTLBuffer>)output_handle;
-        id<MTLBuffer> stats = [runtime->device newBufferWithLength:rows * 2u * sizeof(float) options:MTLResourceStorageModePrivate];
+        id<MTLBuffer> stats = antfly_observe_metal_buffer([runtime->device newBufferWithLength:rows * 2u * sizeof(float) options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
         if (stats == nil) return -4;
 
         termite_metal_layer_norm_bwd_params params = {
@@ -51378,7 +51421,7 @@ int termite_metal_decode_runtime_ffn_gelu_backward_output_f32_device(
 
         id<MTLBuffer> second_output_buffer = nil;
         if (second_k != 1) {
-            second_output_buffer = [runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate];
+            second_output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
             if (second_output_buffer == nil) return -15;
         }
 
@@ -52371,18 +52414,18 @@ int termite_metal_decode_runtime_apply_multiply(
     if (dim == 0 || dim > UINT32_MAX) return -3;
     @autoreleasepool {
         const size_t bytes = dim * sizeof(float);
-        id<MTLBuffer> lhs_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)lhs length:bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (lhs_buffer == nil) lhs_buffer = [runtime->device newBufferWithBytes:lhs length:bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> rhs_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)rhs length:bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (rhs_buffer == nil) rhs_buffer = [runtime->device newBufferWithBytes:rhs length:bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> output_buffer = [runtime->device newBufferWithBytesNoCopy:output length:bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (output_buffer == nil) output_buffer = [runtime->device newBufferWithBytes:output length:bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> lhs_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)lhs length:bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (lhs_buffer == nil) lhs_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:lhs length:bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> rhs_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)rhs length:bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (rhs_buffer == nil) rhs_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:rhs length:bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:output length:bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (output_buffer == nil) output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:output length:bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (lhs_buffer == nil || rhs_buffer == nil || output_buffer == nil) return -4;
         termite_metal_apply_add_params params = {
             .rows = 1,
             .dim = (uint32_t)dim,
         };
-        id<MTLBuffer> params_buffer = [runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (params_buffer == nil) return -5;
         id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(runtime->queue, __func__);
         if (command_buffer == nil) return -6;
@@ -52840,17 +52883,17 @@ static int termite_metal_decode_runtime_encode_attention_quantized_residual_tl1(
     @autoreleasepool {
         const size_t attention_input_bytes = attention_input_size * sizeof(float);
         const size_t hidden_bytes = hidden_size * sizeof(float);
-        id<MTLBuffer> weight_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)weight_raw length:weight_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (weight_buffer == nil) weight_buffer = [runtime->device newBufferWithBytes:weight_raw length:weight_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> tmp_a = [runtime->device newBufferWithLength:attention_input_bytes options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> tmp_b = [runtime->device newBufferWithLength:hidden_bytes options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> projected_buffer = [runtime->device newBufferWithLength:hidden_bytes options:MTLResourceStorageModePrivate];
+        id<MTLBuffer> weight_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)weight_raw length:weight_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (weight_buffer == nil) weight_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:weight_raw length:weight_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> tmp_a = antfly_observe_metal_buffer([runtime->device newBufferWithLength:attention_input_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> tmp_b = antfly_observe_metal_buffer([runtime->device newBufferWithLength:hidden_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> projected_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:hidden_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
         if (weight_buffer == nil || tmp_a == nil || tmp_b == nil || projected_buffer == nil) return -8;
 
         id<MTLBuffer> current_buffer = input_buffer;
         if (attention_pre_linear_rms_norm_slot != SIZE_MAX) {
             termite_metal_apply_layer_norm_params params = { .hidden_size = (uint32_t)attention_input_size, .eps = eps };
-            id<MTLBuffer> params_buffer = [runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared];
+            id<MTLBuffer> params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
             if (params_buffer == nil) return -9;
             id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder_for(command_buffer, TERMITE_METAL_COMPUTE_SOURCE_TAIL);
             if (encoder == nil) return -10;
@@ -52874,7 +52917,7 @@ static int termite_metal_decode_runtime_encode_attention_quantized_residual_tl1(
                 .cfg_by = cfg_by,
                 .bmm = bmm,
             };
-            id<MTLBuffer> params_buffer = [runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared];
+            id<MTLBuffer> params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
             if (params_buffer == nil) return -11;
             id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
             if (encoder == nil) return -12;
@@ -52890,7 +52933,7 @@ static int termite_metal_decode_runtime_encode_attention_quantized_residual_tl1(
 
         if (attention_post_linear_rms_norm_slot != SIZE_MAX) {
             termite_metal_apply_layer_norm_params params = { .hidden_size = (uint32_t)hidden_size, .eps = eps };
-            id<MTLBuffer> params_buffer = [runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared];
+            id<MTLBuffer> params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
             if (params_buffer == nil) return -13;
             id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
             if (encoder == nil) return -14;
@@ -52906,7 +52949,7 @@ static int termite_metal_decode_runtime_encode_attention_quantized_residual_tl1(
 
         {
             termite_metal_apply_add_params params = { .rows = 1, .dim = (uint32_t)hidden_size };
-            id<MTLBuffer> params_buffer = [runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared];
+            id<MTLBuffer> params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
             if (params_buffer == nil) return -15;
             id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
             if (encoder == nil) return -16;
@@ -52958,17 +53001,17 @@ static int termite_metal_decode_runtime_encode_attention_quantized_residual_tl2(
     @autoreleasepool {
         const size_t attention_input_bytes = attention_input_size * sizeof(float);
         const size_t hidden_bytes = hidden_size * sizeof(float);
-        id<MTLBuffer> weight_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)weight_raw length:weight_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (weight_buffer == nil) weight_buffer = [runtime->device newBufferWithBytes:weight_raw length:weight_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> tmp_a = [runtime->device newBufferWithLength:attention_input_bytes options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> tmp_b = [runtime->device newBufferWithLength:hidden_bytes options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> projected_buffer = [runtime->device newBufferWithLength:hidden_bytes options:MTLResourceStorageModePrivate];
+        id<MTLBuffer> weight_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)weight_raw length:weight_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (weight_buffer == nil) weight_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:weight_raw length:weight_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> tmp_a = antfly_observe_metal_buffer([runtime->device newBufferWithLength:attention_input_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> tmp_b = antfly_observe_metal_buffer([runtime->device newBufferWithLength:hidden_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> projected_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:hidden_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
         if (weight_buffer == nil || tmp_a == nil || tmp_b == nil || projected_buffer == nil) return -8;
 
         id<MTLBuffer> current_buffer = input_buffer;
         if (attention_pre_linear_rms_norm_slot != SIZE_MAX) {
             termite_metal_apply_layer_norm_params params = { .hidden_size = (uint32_t)attention_input_size, .eps = eps };
-            id<MTLBuffer> params_buffer = [runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared];
+            id<MTLBuffer> params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
             if (params_buffer == nil) return -9;
             id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
             if (encoder == nil) return -10;
@@ -52996,7 +53039,7 @@ static int termite_metal_decode_runtime_encode_attention_quantized_residual_tl2(
                 .three_cols = three_cols,
                 .two_cols = two_cols,
             };
-            id<MTLBuffer> params_buffer = [runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared];
+            id<MTLBuffer> params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
             if (params_buffer == nil) return -11;
             id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
             if (encoder == nil) return -12;
@@ -53012,7 +53055,7 @@ static int termite_metal_decode_runtime_encode_attention_quantized_residual_tl2(
 
         if (attention_post_linear_rms_norm_slot != SIZE_MAX) {
             termite_metal_apply_layer_norm_params params = { .hidden_size = (uint32_t)hidden_size, .eps = eps };
-            id<MTLBuffer> params_buffer = [runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared];
+            id<MTLBuffer> params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
             if (params_buffer == nil) return -13;
             id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
             if (encoder == nil) return -14;
@@ -53028,7 +53071,7 @@ static int termite_metal_decode_runtime_encode_attention_quantized_residual_tl2(
 
         {
             termite_metal_apply_add_params params = { .rows = 1, .dim = (uint32_t)hidden_size };
-            id<MTLBuffer> params_buffer = [runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared];
+            id<MTLBuffer> params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
             if (params_buffer == nil) return -15;
             id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
             if (encoder == nil) return -16;
@@ -53751,15 +53794,15 @@ int termite_metal_decode_runtime_apply_attention_residual_tl1(
     @autoreleasepool {
         const size_t attention_input_bytes = attention_input_size * sizeof(float);
         const size_t hidden_bytes = hidden_size * sizeof(float);
-        id<MTLBuffer> input_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)attention_input length:attention_input_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (input_buffer == nil) input_buffer = [runtime->device newBufferWithBytes:attention_input length:attention_input_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> residual_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (residual_buffer == nil) residual_buffer = [runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)attention_input length:attention_input_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:attention_input length:attention_input_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (residual_buffer == nil) residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         BOOL output_borrowed = YES;
-        id<MTLBuffer> output_buffer = [runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
         if (output_buffer == nil) {
             output_borrowed = NO;
-            output_buffer = [runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared];
+            output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         }
         if (input_buffer == nil || residual_buffer == nil || output_buffer == nil) return -2;
         id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(runtime->queue, __func__);
@@ -53799,15 +53842,15 @@ int termite_metal_decode_runtime_apply_attention_residual_tl2(
     @autoreleasepool {
         const size_t attention_input_bytes = attention_input_size * sizeof(float);
         const size_t hidden_bytes = hidden_size * sizeof(float);
-        id<MTLBuffer> input_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)attention_input length:attention_input_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (input_buffer == nil) input_buffer = [runtime->device newBufferWithBytes:attention_input length:attention_input_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> residual_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (residual_buffer == nil) residual_buffer = [runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)attention_input length:attention_input_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:attention_input length:attention_input_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (residual_buffer == nil) residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         BOOL output_borrowed = YES;
-        id<MTLBuffer> output_buffer = [runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
         if (output_buffer == nil) {
             output_borrowed = NO;
-            output_buffer = [runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared];
+            output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         }
         if (input_buffer == nil || residual_buffer == nil || output_buffer == nil) return -2;
         id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(runtime->queue, __func__);
@@ -53838,12 +53881,12 @@ int termite_metal_decode_runtime_apply_attention_residual_i2_s_slot(
     @autoreleasepool {
         const size_t attention_input_bytes = attention_input_size * sizeof(float);
         const size_t hidden_bytes = hidden_size * sizeof(float);
-        id<MTLBuffer> input_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)attention_input length:attention_input_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (input_buffer == nil) input_buffer = [runtime->device newBufferWithBytes:attention_input length:attention_input_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> residual_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (residual_buffer == nil) residual_buffer = [runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> output_buffer = [runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (output_buffer == nil) output_buffer = [runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)attention_input length:attention_input_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:attention_input length:attention_input_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (residual_buffer == nil) residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (output_buffer == nil) output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (input_buffer == nil || residual_buffer == nil || output_buffer == nil) return -2;
         id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(runtime->queue, __func__);
         if (command_buffer == nil) return -3;
@@ -53877,12 +53920,12 @@ int termite_metal_decode_runtime_apply_attention_residual_q4_k_slot(
     @autoreleasepool {
         const size_t attention_input_bytes = attention_input_size * sizeof(float);
         const size_t hidden_bytes = hidden_size * sizeof(float);
-        id<MTLBuffer> input_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)attention_input length:attention_input_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (input_buffer == nil) input_buffer = [runtime->device newBufferWithBytes:attention_input length:attention_input_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> residual_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (residual_buffer == nil) residual_buffer = [runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> output_buffer = [runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (output_buffer == nil) output_buffer = [runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)attention_input length:attention_input_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:attention_input length:attention_input_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (residual_buffer == nil) residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (output_buffer == nil) output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (input_buffer == nil || residual_buffer == nil || output_buffer == nil) return -2;
         id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(runtime->queue, __func__);
         if (command_buffer == nil) return -3;
@@ -53916,12 +53959,12 @@ int termite_metal_decode_runtime_apply_attention_residual_q5_k_slot(
     @autoreleasepool {
         const size_t attention_input_bytes = attention_input_size * sizeof(float);
         const size_t hidden_bytes = hidden_size * sizeof(float);
-        id<MTLBuffer> input_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)attention_input length:attention_input_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (input_buffer == nil) input_buffer = [runtime->device newBufferWithBytes:attention_input length:attention_input_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> residual_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (residual_buffer == nil) residual_buffer = [runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> output_buffer = [runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (output_buffer == nil) output_buffer = [runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)attention_input length:attention_input_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:attention_input length:attention_input_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (residual_buffer == nil) residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (output_buffer == nil) output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (input_buffer == nil || residual_buffer == nil || output_buffer == nil) return -2;
         id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(runtime->queue, __func__);
         if (command_buffer == nil) return -3;
@@ -53955,12 +53998,12 @@ int termite_metal_decode_runtime_apply_attention_residual_q8_0_slot(
     @autoreleasepool {
         const size_t attention_input_bytes = attention_input_size * sizeof(float);
         const size_t hidden_bytes = hidden_size * sizeof(float);
-        id<MTLBuffer> input_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)attention_input length:attention_input_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (input_buffer == nil) input_buffer = [runtime->device newBufferWithBytes:attention_input length:attention_input_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> residual_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (residual_buffer == nil) residual_buffer = [runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> output_buffer = [runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (output_buffer == nil) output_buffer = [runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)attention_input length:attention_input_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:attention_input length:attention_input_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (residual_buffer == nil) residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (output_buffer == nil) output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (input_buffer == nil || residual_buffer == nil || output_buffer == nil) return -2;
         id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(runtime->queue, __func__);
         if (command_buffer == nil) return -3;
@@ -54175,15 +54218,15 @@ int termite_metal_decode_runtime_apply_attention_span_residual_tl1(
         const size_t q_bytes = num_heads * head_dim * sizeof(float);
         const size_t attention_input_bytes = attention_input_size * sizeof(float);
         const size_t hidden_bytes = hidden_size * sizeof(float);
-        id<MTLBuffer> q_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)q length:q_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (q_buffer == nil) q_buffer = [runtime->device newBufferWithBytes:q length:q_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> residual_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (residual_buffer == nil) residual_buffer = [runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> q_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)q length:q_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (q_buffer == nil) q_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:q length:q_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (residual_buffer == nil) residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         const size_t max_hidden_bytes = attention_input_bytes > hidden_bytes ? attention_input_bytes : hidden_bytes;
         if (termite_metal_decode_runtime_ensure_hot_buffers(runtime, max_hidden_bytes, 0) != 0) return -2;
         id<MTLBuffer> attention_output_buffer = runtime->hot_hidden_buffers[0];
-        id<MTLBuffer> output_buffer = [runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (output_buffer == nil) output_buffer = [runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (output_buffer == nil) output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (q_buffer == nil || residual_buffer == nil || attention_output_buffer == nil || output_buffer == nil) return -2;
         id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(runtime->queue, __func__);
         if (command_buffer == nil) return -3;
@@ -54251,13 +54294,13 @@ int termite_metal_decode_runtime_apply_attention_span_residual_tl2(
         const size_t q_bytes = num_heads * head_dim * sizeof(float);
         const size_t attention_input_bytes = attention_input_size * sizeof(float);
         const size_t hidden_bytes = hidden_size * sizeof(float);
-        id<MTLBuffer> q_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)q length:q_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (q_buffer == nil) q_buffer = [runtime->device newBufferWithBytes:q length:q_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> residual_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (residual_buffer == nil) residual_buffer = [runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> attention_output_buffer = [runtime->device newBufferWithLength:attention_input_bytes options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> output_buffer = [runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (output_buffer == nil) output_buffer = [runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> q_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)q length:q_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (q_buffer == nil) q_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:q length:q_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (residual_buffer == nil) residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> attention_output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:attention_input_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (output_buffer == nil) output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (q_buffer == nil || residual_buffer == nil || attention_output_buffer == nil || output_buffer == nil) return -2;
         id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(runtime->queue, __func__);
         if (command_buffer == nil) return -3;
@@ -54316,15 +54359,15 @@ int termite_metal_decode_runtime_apply_attention_span_residual_i2_s_slot(
         const size_t q_bytes = num_heads * head_dim * sizeof(float);
         const size_t attention_input_bytes = attention_input_size * sizeof(float);
         const size_t hidden_bytes = hidden_size * sizeof(float);
-        id<MTLBuffer> q_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)q length:q_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (q_buffer == nil) q_buffer = [runtime->device newBufferWithBytes:q length:q_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> residual_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (residual_buffer == nil) residual_buffer = [runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> q_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)q length:q_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (q_buffer == nil) q_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:q length:q_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (residual_buffer == nil) residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         const size_t max_hidden_bytes = attention_input_bytes > hidden_bytes ? attention_input_bytes : hidden_bytes;
         if (termite_metal_decode_runtime_ensure_hot_buffers(runtime, max_hidden_bytes, 0) != 0) return -2;
         id<MTLBuffer> attention_output_buffer = runtime->hot_hidden_buffers[0];
-        id<MTLBuffer> output_buffer = [runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (output_buffer == nil) output_buffer = [runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (output_buffer == nil) output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (q_buffer == nil || residual_buffer == nil || attention_output_buffer == nil || output_buffer == nil) return -2;
         id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(runtime->queue, __func__);
         if (command_buffer == nil) return -3;
@@ -54385,15 +54428,15 @@ int termite_metal_decode_runtime_apply_attention_f32_span_residual_q8_0_slot(
         const size_t q_bytes = num_heads * head_dim * sizeof(float);
         const size_t attention_input_bytes = attention_input_size * sizeof(float);
         const size_t hidden_bytes = hidden_size * sizeof(float);
-        id<MTLBuffer> q_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)q length:q_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (q_buffer == nil) q_buffer = [runtime->device newBufferWithBytes:q length:q_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> residual_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (residual_buffer == nil) residual_buffer = [runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> q_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)q length:q_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (q_buffer == nil) q_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:q length:q_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (residual_buffer == nil) residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         const size_t max_hidden_bytes = attention_input_bytes > hidden_bytes ? attention_input_bytes : hidden_bytes;
         if (termite_metal_decode_runtime_ensure_hot_buffers(runtime, max_hidden_bytes, 0) != 0) return -3;
         id<MTLBuffer> attention_output_buffer = runtime->hot_hidden_buffers[0];
-        id<MTLBuffer> output_buffer = [runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (output_buffer == nil) output_buffer = [runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (output_buffer == nil) output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (q_buffer == nil || residual_buffer == nil || attention_output_buffer == nil || output_buffer == nil) return -3;
         id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(runtime->queue, __func__);
         if (command_buffer == nil) return -4;
@@ -54501,24 +54544,24 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_tl1(
     @autoreleasepool {
         const size_t hidden_bytes = hidden_size * sizeof(float);
         const size_t intermediate_bytes = intermediate_size * sizeof(float);
-        id<MTLBuffer> input_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)input length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (input_buffer == nil) input_buffer = [runtime->device newBufferWithBytes:input length:hidden_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> residual_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (residual_buffer == nil) residual_buffer = [runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> gate_weight_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)gate_weight_raw length:gate_weight_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (gate_weight_buffer == nil) gate_weight_buffer = [runtime->device newBufferWithBytes:gate_weight_raw length:gate_weight_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> up_weight_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)up_weight_raw length:up_weight_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (up_weight_buffer == nil) up_weight_buffer = [runtime->device newBufferWithBytes:up_weight_raw length:up_weight_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> down_weight_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)down_weight_raw length:down_weight_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (down_weight_buffer == nil) down_weight_buffer = [runtime->device newBufferWithBytes:down_weight_raw length:down_weight_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> gate_output_buffer = [runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> up_output_buffer = [runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> activated_buffer = [runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> gated_buffer = [runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> normed_gated_buffer = post_gate_rms_norm_slot != SIZE_MAX ? [runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate] : nil;
-        id<MTLBuffer> projected_buffer = [runtime->device newBufferWithLength:hidden_bytes options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> output_buffer = [runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (output_buffer == nil) output_buffer = [runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)input length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:input length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (residual_buffer == nil) residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> gate_weight_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)gate_weight_raw length:gate_weight_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (gate_weight_buffer == nil) gate_weight_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:gate_weight_raw length:gate_weight_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> up_weight_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)up_weight_raw length:up_weight_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (up_weight_buffer == nil) up_weight_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:up_weight_raw length:up_weight_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> down_weight_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)down_weight_raw length:down_weight_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (down_weight_buffer == nil) down_weight_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:down_weight_raw length:down_weight_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> gate_output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> up_output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> activated_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> gated_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> normed_gated_buffer = post_gate_rms_norm_slot != SIZE_MAX ? antfly_observe_metal_buffer([runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED) : nil;
+        id<MTLBuffer> projected_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:hidden_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (output_buffer == nil) output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (input_buffer == nil || residual_buffer == nil || gate_weight_buffer == nil || up_weight_buffer == nil || down_weight_buffer == nil || gate_output_buffer == nil || up_output_buffer == nil || activated_buffer == nil || gated_buffer == nil || projected_buffer == nil || output_buffer == nil || (post_gate_rms_norm_slot != SIZE_MAX && normed_gated_buffer == nil)) return -6;
 
         termite_metal_tl1_params gate_params = { .rows = 1, .in_dim = (uint32_t)hidden_size, .out_dim = (uint32_t)intermediate_size, .packed_len = gate_packed_len, .bm = gate_bm, .cfg_by = gate_cfg_by, .bmm = gate_bmm };
@@ -54528,13 +54571,13 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_tl1(
         termite_metal_apply_add_params multiply_params = { .rows = 1, .dim = (uint32_t)intermediate_size };
         termite_metal_apply_layer_norm_params rms_params = { .hidden_size = (uint32_t)intermediate_size, .eps = 0.0f };
         termite_metal_apply_add_params add_params = { .rows = 1, .dim = (uint32_t)hidden_size };
-        id<MTLBuffer> gate_params_buffer = [runtime->device newBufferWithBytes:&gate_params length:sizeof(gate_params) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> up_params_buffer = [runtime->device newBufferWithBytes:&up_params length:sizeof(up_params) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> down_params_buffer = [runtime->device newBufferWithBytes:&down_params length:sizeof(down_params) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> activation_params_buffer = [runtime->device newBufferWithBytes:&activation_params length:sizeof(activation_params) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> multiply_params_buffer = [runtime->device newBufferWithBytes:&multiply_params length:sizeof(multiply_params) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> rms_params_buffer = post_gate_rms_norm_slot != SIZE_MAX ? [runtime->device newBufferWithBytes:&rms_params length:sizeof(rms_params) options:MTLResourceStorageModeShared] : nil;
-        id<MTLBuffer> add_params_buffer = [runtime->device newBufferWithBytes:&add_params length:sizeof(add_params) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> gate_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&gate_params length:sizeof(gate_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> up_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&up_params length:sizeof(up_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> down_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&down_params length:sizeof(down_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> activation_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&activation_params length:sizeof(activation_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> multiply_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&multiply_params length:sizeof(multiply_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> rms_params_buffer = post_gate_rms_norm_slot != SIZE_MAX ? antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&rms_params length:sizeof(rms_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED) : nil;
+        id<MTLBuffer> add_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&add_params length:sizeof(add_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (gate_params_buffer == nil || up_params_buffer == nil || down_params_buffer == nil || activation_params_buffer == nil || multiply_params_buffer == nil || add_params_buffer == nil || (post_gate_rms_norm_slot != SIZE_MAX && rms_params_buffer == nil)) return -7;
 
         id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(runtime->queue, __func__);
@@ -54653,24 +54696,24 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_i2_s(
     @autoreleasepool {
         const size_t hidden_bytes = hidden_size * sizeof(float);
         const size_t intermediate_bytes = intermediate_size * sizeof(float);
-        id<MTLBuffer> input_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)input length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (input_buffer == nil) input_buffer = [runtime->device newBufferWithBytes:input length:hidden_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> residual_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (residual_buffer == nil) residual_buffer = [runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> gate_weight_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)gate_weight_raw length:gate_weight_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (gate_weight_buffer == nil) gate_weight_buffer = [runtime->device newBufferWithBytes:gate_weight_raw length:gate_weight_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> up_weight_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)up_weight_raw length:up_weight_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (up_weight_buffer == nil) up_weight_buffer = [runtime->device newBufferWithBytes:up_weight_raw length:up_weight_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> down_weight_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)down_weight_raw length:down_weight_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (down_weight_buffer == nil) down_weight_buffer = [runtime->device newBufferWithBytes:down_weight_raw length:down_weight_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> gate_output_buffer = [runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> up_output_buffer = [runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> activated_buffer = [runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> gated_buffer = [runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> normed_gated_buffer = post_gate_rms_norm_slot != SIZE_MAX ? [runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate] : nil;
-        id<MTLBuffer> projected_buffer = [runtime->device newBufferWithLength:hidden_bytes options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> output_buffer = [runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (output_buffer == nil) output_buffer = [runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)input length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:input length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (residual_buffer == nil) residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> gate_weight_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)gate_weight_raw length:gate_weight_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (gate_weight_buffer == nil) gate_weight_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:gate_weight_raw length:gate_weight_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> up_weight_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)up_weight_raw length:up_weight_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (up_weight_buffer == nil) up_weight_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:up_weight_raw length:up_weight_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> down_weight_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)down_weight_raw length:down_weight_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (down_weight_buffer == nil) down_weight_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:down_weight_raw length:down_weight_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> gate_output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> up_output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> activated_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> gated_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> normed_gated_buffer = post_gate_rms_norm_slot != SIZE_MAX ? antfly_observe_metal_buffer([runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED) : nil;
+        id<MTLBuffer> projected_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:hidden_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (output_buffer == nil) output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (input_buffer == nil || residual_buffer == nil || gate_weight_buffer == nil || up_weight_buffer == nil || down_weight_buffer == nil || gate_output_buffer == nil || up_output_buffer == nil || activated_buffer == nil || gated_buffer == nil || projected_buffer == nil || output_buffer == nil || (post_gate_rms_norm_slot != SIZE_MAX && normed_gated_buffer == nil)) return -8;
 
         termite_metal_linear_params pair_params = { .rows = 1, .in_dim = (uint32_t)hidden_size, .out_dim = (uint32_t)intermediate_size, .row_blocks = (uint32_t)gate_row_blocks };
@@ -54679,12 +54722,12 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_i2_s(
         termite_metal_apply_add_params multiply_params = { .rows = 1, .dim = (uint32_t)intermediate_size };
         termite_metal_apply_layer_norm_params rms_params = { .hidden_size = (uint32_t)intermediate_size, .eps = 0.0f };
         termite_metal_apply_add_params add_params = { .rows = 1, .dim = (uint32_t)hidden_size };
-        id<MTLBuffer> pair_params_buffer = [runtime->device newBufferWithBytes:&pair_params length:sizeof(pair_params) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> down_params_buffer = [runtime->device newBufferWithBytes:&down_params length:sizeof(down_params) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> activation_params_buffer = [runtime->device newBufferWithBytes:&activation_params length:sizeof(activation_params) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> multiply_params_buffer = [runtime->device newBufferWithBytes:&multiply_params length:sizeof(multiply_params) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> rms_params_buffer = post_gate_rms_norm_slot != SIZE_MAX ? [runtime->device newBufferWithBytes:&rms_params length:sizeof(rms_params) options:MTLResourceStorageModeShared] : nil;
-        id<MTLBuffer> add_params_buffer = [runtime->device newBufferWithBytes:&add_params length:sizeof(add_params) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> pair_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&pair_params length:sizeof(pair_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> down_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&down_params length:sizeof(down_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> activation_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&activation_params length:sizeof(activation_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> multiply_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&multiply_params length:sizeof(multiply_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> rms_params_buffer = post_gate_rms_norm_slot != SIZE_MAX ? antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&rms_params length:sizeof(rms_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED) : nil;
+        id<MTLBuffer> add_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&add_params length:sizeof(add_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (pair_params_buffer == nil || down_params_buffer == nil || activation_params_buffer == nil || multiply_params_buffer == nil || add_params_buffer == nil || (post_gate_rms_norm_slot != SIZE_MAX && rms_params_buffer == nil)) return -9;
 
         id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(runtime->queue, __func__);
@@ -54798,10 +54841,10 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_i2_s_slots(
     @autoreleasepool {
         const size_t hidden_bytes = rows * hidden_size * sizeof(float);
         const size_t intermediate_bytes = rows * intermediate_size * sizeof(float);
-        id<MTLBuffer> input_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)input length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (input_buffer == nil) input_buffer = [runtime->device newBufferWithBytes:input length:hidden_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> residual_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (residual_buffer == nil) residual_buffer = [runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)input length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:input length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (residual_buffer == nil) residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (termite_metal_decode_runtime_ensure_hot_buffers(runtime, hidden_bytes, intermediate_bytes) != 0) return -11;
         id<MTLBuffer> gate_output_buffer = runtime->hot_intermediate_buffers[0];
         id<MTLBuffer> up_output_buffer = runtime->hot_intermediate_buffers[1];
@@ -54809,8 +54852,8 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_i2_s_slots(
         id<MTLBuffer> gated_buffer = runtime->hot_intermediate_buffers[3];
         id<MTLBuffer> normed_gated_buffer = post_gate_rms_norm_slot != SIZE_MAX ? runtime->hot_intermediate_buffers[4] : nil;
         id<MTLBuffer> projected_buffer = runtime->hot_hidden_buffers[0];
-        id<MTLBuffer> output_buffer = [runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (output_buffer == nil) output_buffer = [runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (output_buffer == nil) output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (input_buffer == nil || residual_buffer == nil || gate_output_buffer == nil || up_output_buffer == nil || activated_buffer == nil || gated_buffer == nil || projected_buffer == nil || output_buffer == nil || (post_gate_rms_norm_slot != SIZE_MAX && normed_gated_buffer == nil)) return -11;
 
         termite_metal_linear_params pair_params = { .rows = (uint32_t)rows, .in_dim = (uint32_t)hidden_size, .out_dim = (uint32_t)intermediate_size, .row_blocks = (uint32_t)(hidden_size / 128u) };
@@ -54936,10 +54979,10 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q4_k_slots(
     @autoreleasepool {
         const size_t hidden_bytes = rows * hidden_size * sizeof(float);
         const size_t intermediate_bytes = rows * intermediate_size * sizeof(float);
-        id<MTLBuffer> input_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)input length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (input_buffer == nil) input_buffer = [runtime->device newBufferWithBytes:input length:hidden_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> residual_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (residual_buffer == nil) residual_buffer = [runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)input length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:input length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (residual_buffer == nil) residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (termite_metal_decode_runtime_ensure_hot_buffers(runtime, hidden_bytes, intermediate_bytes) != 0) return -13;
         id<MTLBuffer> gate_output_buffer = runtime->hot_intermediate_buffers[0];
         id<MTLBuffer> up_output_buffer = runtime->hot_intermediate_buffers[1];
@@ -54949,10 +54992,10 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q4_k_slots(
         id<MTLBuffer> projected_buffer = runtime->hot_hidden_buffers[0];
         id<MTLBuffer> post_down_buffer = post_down_rms_norm_slot != SIZE_MAX ? runtime->hot_hidden_buffers[1] : nil;
         BOOL output_borrowed = YES;
-        id<MTLBuffer> output_buffer = [runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
         if (output_buffer == nil) {
             output_borrowed = NO;
-            output_buffer = [runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared];
+            output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         }
         if (input_buffer == nil || residual_buffer == nil || gate_output_buffer == nil || up_output_buffer == nil || activated_buffer == nil || gated_buffer == nil || projected_buffer == nil || output_buffer == nil || (post_gate_rms_norm_slot != SIZE_MAX && normed_gated_buffer == nil) || (post_down_rms_norm_slot != SIZE_MAX && post_down_buffer == nil)) return -13;
 
@@ -55103,24 +55146,24 @@ int termite_metal_decode_runtime_apply_rms_norm_i2_s_linear_residual(
     @autoreleasepool {
         const size_t hidden_bytes = hidden_size * sizeof(float);
         const size_t intermediate_bytes = intermediate_size * sizeof(float);
-        id<MTLBuffer> input_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)input length:intermediate_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (input_buffer == nil) input_buffer = [runtime->device newBufferWithBytes:input length:intermediate_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> residual_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (residual_buffer == nil) residual_buffer = [runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> down_weight_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)down_weight_raw length:down_weight_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (down_weight_buffer == nil) down_weight_buffer = [runtime->device newBufferWithBytes:down_weight_raw length:down_weight_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> normed_input_buffer = [runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> projected_buffer = [runtime->device newBufferWithLength:hidden_bytes options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> output_buffer = [runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (output_buffer == nil) output_buffer = [runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)input length:intermediate_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:input length:intermediate_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (residual_buffer == nil) residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> down_weight_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)down_weight_raw length:down_weight_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (down_weight_buffer == nil) down_weight_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:down_weight_raw length:down_weight_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> normed_input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> projected_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:hidden_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (output_buffer == nil) output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (input_buffer == nil || residual_buffer == nil || down_weight_buffer == nil || normed_input_buffer == nil || projected_buffer == nil || output_buffer == nil) return -8;
 
         termite_metal_apply_layer_norm_params rms_params = { .hidden_size = (uint32_t)intermediate_size, .eps = 0.0f };
         termite_metal_linear_params down_params = { .rows = 1, .in_dim = (uint32_t)intermediate_size, .out_dim = (uint32_t)hidden_size, .row_blocks = (uint32_t)down_row_blocks };
         termite_metal_apply_add_params add_params = { .rows = 1, .dim = (uint32_t)hidden_size };
-        id<MTLBuffer> rms_params_buffer = [runtime->device newBufferWithBytes:&rms_params length:sizeof(rms_params) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> down_params_buffer = [runtime->device newBufferWithBytes:&down_params length:sizeof(down_params) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> add_params_buffer = [runtime->device newBufferWithBytes:&add_params length:sizeof(add_params) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> rms_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&rms_params length:sizeof(rms_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> down_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&down_params length:sizeof(down_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> add_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&add_params length:sizeof(add_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (rms_params_buffer == nil || down_params_buffer == nil || add_params_buffer == nil) return -9;
 
         id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(runtime->queue, __func__);
@@ -55187,22 +55230,22 @@ int termite_metal_decode_runtime_apply_rms_norm_i2_s_linear_residual_slot(
     @autoreleasepool {
         const size_t hidden_bytes = hidden_size * sizeof(float);
         const size_t intermediate_bytes = intermediate_size * sizeof(float);
-        id<MTLBuffer> input_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)input length:intermediate_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (input_buffer == nil) input_buffer = [runtime->device newBufferWithBytes:input length:intermediate_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> residual_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (residual_buffer == nil) residual_buffer = [runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> normed_input_buffer = [runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> projected_buffer = [runtime->device newBufferWithLength:hidden_bytes options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> output_buffer = [runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (output_buffer == nil) output_buffer = [runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)input length:intermediate_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:input length:intermediate_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (residual_buffer == nil) residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> normed_input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> projected_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:hidden_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (output_buffer == nil) output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (input_buffer == nil || residual_buffer == nil || normed_input_buffer == nil || projected_buffer == nil || output_buffer == nil) return -9;
 
         termite_metal_apply_layer_norm_params rms_params = { .hidden_size = (uint32_t)intermediate_size, .eps = 0.0f };
         termite_metal_linear_params down_params = { .rows = 1, .in_dim = (uint32_t)intermediate_size, .out_dim = (uint32_t)hidden_size, .row_blocks = (uint32_t)(intermediate_size / 128u) };
         termite_metal_apply_add_params add_params = { .rows = 1, .dim = (uint32_t)hidden_size };
-        id<MTLBuffer> rms_params_buffer = [runtime->device newBufferWithBytes:&rms_params length:sizeof(rms_params) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> down_params_buffer = [runtime->device newBufferWithBytes:&down_params length:sizeof(down_params) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> add_params_buffer = [runtime->device newBufferWithBytes:&add_params length:sizeof(add_params) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> rms_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&rms_params length:sizeof(rms_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> down_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&down_params length:sizeof(down_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> add_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&add_params length:sizeof(add_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (rms_params_buffer == nil || down_params_buffer == nil || add_params_buffer == nil) return -10;
 
         id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(runtime->queue, __func__);
@@ -55298,24 +55341,24 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_tl2(
     @autoreleasepool {
         const size_t hidden_bytes = hidden_size * sizeof(float);
         const size_t intermediate_bytes = intermediate_size * sizeof(float);
-        id<MTLBuffer> input_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)input length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (input_buffer == nil) input_buffer = [runtime->device newBufferWithBytes:input length:hidden_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> residual_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (residual_buffer == nil) residual_buffer = [runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> gate_weight_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)gate_weight_raw length:gate_weight_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (gate_weight_buffer == nil) gate_weight_buffer = [runtime->device newBufferWithBytes:gate_weight_raw length:gate_weight_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> up_weight_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)up_weight_raw length:up_weight_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (up_weight_buffer == nil) up_weight_buffer = [runtime->device newBufferWithBytes:up_weight_raw length:up_weight_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> down_weight_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)down_weight_raw length:down_weight_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (down_weight_buffer == nil) down_weight_buffer = [runtime->device newBufferWithBytes:down_weight_raw length:down_weight_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> gate_output_buffer = [runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> up_output_buffer = [runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> activated_buffer = [runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> gated_buffer = [runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> normed_gated_buffer = post_gate_rms_norm_slot != SIZE_MAX ? [runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate] : nil;
-        id<MTLBuffer> projected_buffer = [runtime->device newBufferWithLength:hidden_bytes options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> output_buffer = [runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (output_buffer == nil) output_buffer = [runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)input length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:input length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (residual_buffer == nil) residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> gate_weight_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)gate_weight_raw length:gate_weight_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (gate_weight_buffer == nil) gate_weight_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:gate_weight_raw length:gate_weight_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> up_weight_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)up_weight_raw length:up_weight_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (up_weight_buffer == nil) up_weight_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:up_weight_raw length:up_weight_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> down_weight_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)down_weight_raw length:down_weight_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (down_weight_buffer == nil) down_weight_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:down_weight_raw length:down_weight_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> gate_output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> up_output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> activated_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> gated_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> normed_gated_buffer = post_gate_rms_norm_slot != SIZE_MAX ? antfly_observe_metal_buffer([runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED) : nil;
+        id<MTLBuffer> projected_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:hidden_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (output_buffer == nil) output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (input_buffer == nil || residual_buffer == nil || gate_weight_buffer == nil || up_weight_buffer == nil || down_weight_buffer == nil || gate_output_buffer == nil || up_output_buffer == nil || activated_buffer == nil || gated_buffer == nil || projected_buffer == nil || output_buffer == nil || (post_gate_rms_norm_slot != SIZE_MAX && normed_gated_buffer == nil)) return -6;
 
         termite_metal_tl2_params gate_params = { .rows = 1, .in_dim = (uint32_t)hidden_size, .out_dim = (uint32_t)intermediate_size, .scale_off = gate_scale_off, .three_value_len = gate_three_value_len, .three_sign_len = gate_three_sign_len, .bm = gate_bm, .cfg_by = gate_cfg_by, .bmm = gate_bmm, .three_cols = gate_three_cols, .two_cols = gate_two_cols };
@@ -55325,13 +55368,13 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_tl2(
         termite_metal_apply_add_params multiply_params = { .rows = 1, .dim = (uint32_t)intermediate_size };
         termite_metal_apply_layer_norm_params rms_params = { .hidden_size = (uint32_t)intermediate_size, .eps = 0.0f };
         termite_metal_apply_add_params add_params = { .rows = 1, .dim = (uint32_t)hidden_size };
-        id<MTLBuffer> gate_params_buffer = [runtime->device newBufferWithBytes:&gate_params length:sizeof(gate_params) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> up_params_buffer = [runtime->device newBufferWithBytes:&up_params length:sizeof(up_params) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> down_params_buffer = [runtime->device newBufferWithBytes:&down_params length:sizeof(down_params) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> activation_params_buffer = [runtime->device newBufferWithBytes:&activation_params length:sizeof(activation_params) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> multiply_params_buffer = [runtime->device newBufferWithBytes:&multiply_params length:sizeof(multiply_params) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> rms_params_buffer = post_gate_rms_norm_slot != SIZE_MAX ? [runtime->device newBufferWithBytes:&rms_params length:sizeof(rms_params) options:MTLResourceStorageModeShared] : nil;
-        id<MTLBuffer> add_params_buffer = [runtime->device newBufferWithBytes:&add_params length:sizeof(add_params) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> gate_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&gate_params length:sizeof(gate_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> up_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&up_params length:sizeof(up_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> down_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&down_params length:sizeof(down_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> activation_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&activation_params length:sizeof(activation_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> multiply_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&multiply_params length:sizeof(multiply_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> rms_params_buffer = post_gate_rms_norm_slot != SIZE_MAX ? antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&rms_params length:sizeof(rms_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED) : nil;
+        id<MTLBuffer> add_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&add_params length:sizeof(add_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (gate_params_buffer == nil || up_params_buffer == nil || down_params_buffer == nil || activation_params_buffer == nil || multiply_params_buffer == nil || add_params_buffer == nil || (post_gate_rms_norm_slot != SIZE_MAX && rms_params_buffer == nil)) return -7;
 
         id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(runtime->queue, __func__);
@@ -55442,17 +55485,17 @@ int termite_metal_decode_runtime_apply_linear_activation_linear_residual(
     @autoreleasepool {
         const size_t hidden_bytes = hidden_size * sizeof(float);
         const size_t intermediate_bytes = intermediate_size * sizeof(float);
-        id<MTLBuffer> input_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)input length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (input_buffer == nil) input_buffer = [runtime->device newBufferWithBytes:input length:hidden_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> residual_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (residual_buffer == nil) residual_buffer = [runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> first_output_buffer = [runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> activated_buffer = [runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> second_output_buffer = [runtime->device newBufferWithLength:hidden_bytes options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> output_buffer = [runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)input length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:input length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (residual_buffer == nil) residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> first_output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> activated_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> second_output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:hidden_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
         bool output_needs_copyback = false;
         if (output_buffer == nil) {
-            output_buffer = [runtime->device newBufferWithLength:hidden_bytes options:MTLResourceStorageModeShared];
+            output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
             output_needs_copyback = output_buffer != nil;
         }
         if (input_buffer == nil || residual_buffer == nil || first_output_buffer == nil || activated_buffer == nil || second_output_buffer == nil || output_buffer == nil) return -9;
@@ -55474,10 +55517,10 @@ int termite_metal_decode_runtime_apply_linear_activation_linear_residual(
             .rows = 1,
             .dim = (uint32_t)hidden_size,
         };
-        id<MTLBuffer> first_linear_params_buffer = [runtime->device newBufferWithBytes:&first_linear_params length:sizeof(first_linear_params) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> activation_params_buffer = [runtime->device newBufferWithBytes:&activation_params length:sizeof(activation_params) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> second_linear_params_buffer = [runtime->device newBufferWithBytes:&second_linear_params length:sizeof(second_linear_params) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> add_params_buffer = [runtime->device newBufferWithBytes:&add_params length:sizeof(add_params) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> first_linear_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&first_linear_params length:sizeof(first_linear_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> activation_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&activation_params length:sizeof(activation_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> second_linear_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&second_linear_params length:sizeof(second_linear_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> add_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&add_params length:sizeof(add_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (first_linear_params_buffer == nil || activation_params_buffer == nil || second_linear_params_buffer == nil || add_params_buffer == nil) return -10;
 
         id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(runtime->queue, __func__);
@@ -55577,18 +55620,18 @@ int termite_metal_decode_runtime_apply_linear_pair_activation_multiply_linear_re
     @autoreleasepool {
         const size_t hidden_bytes = hidden_size * sizeof(float);
         const size_t intermediate_bytes = intermediate_size * sizeof(float);
-        id<MTLBuffer> input_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)input length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (input_buffer == nil) input_buffer = [runtime->device newBufferWithBytes:input length:hidden_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> residual_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (residual_buffer == nil) residual_buffer = [runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> gate_output_buffer = [runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> up_output_buffer = [runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> activated_buffer = [runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> gated_buffer = [runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> projected_buffer = [runtime->device newBufferWithLength:hidden_bytes options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> normed_projected_buffer = post_down_rms_norm_slot != SIZE_MAX ? [runtime->device newBufferWithLength:hidden_bytes options:MTLResourceStorageModePrivate] : nil;
-        id<MTLBuffer> output_buffer = [runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (output_buffer == nil) output_buffer = [runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)input length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:input length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (residual_buffer == nil) residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> gate_output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> up_output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> activated_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> gated_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> projected_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:hidden_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> normed_projected_buffer = post_down_rms_norm_slot != SIZE_MAX ? antfly_observe_metal_buffer([runtime->device newBufferWithLength:hidden_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED) : nil;
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (output_buffer == nil) output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (input_buffer == nil || residual_buffer == nil || gate_output_buffer == nil || up_output_buffer == nil || activated_buffer == nil || gated_buffer == nil || projected_buffer == nil || output_buffer == nil || (post_down_rms_norm_slot != SIZE_MAX && normed_projected_buffer == nil)) return -14;
 
         termite_metal_apply_linear_params up_linear_params = {
@@ -55616,12 +55659,12 @@ int termite_metal_decode_runtime_apply_linear_pair_activation_multiply_linear_re
             .rows = 1,
             .dim = (uint32_t)hidden_size,
         };
-        id<MTLBuffer> pair_linear_params_buffer = [runtime->device newBufferWithBytes:&up_linear_params length:sizeof(up_linear_params) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> activation_params_buffer = [runtime->device newBufferWithBytes:&activation_params length:sizeof(activation_params) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> multiply_params_buffer = [runtime->device newBufferWithBytes:&multiply_params length:sizeof(multiply_params) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> down_linear_params_buffer = [runtime->device newBufferWithBytes:&down_linear_params length:sizeof(down_linear_params) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> post_down_rms_params_buffer = post_down_rms_norm_slot != SIZE_MAX ? [runtime->device newBufferWithBytes:&post_down_rms_params length:sizeof(post_down_rms_params) options:MTLResourceStorageModeShared] : nil;
-        id<MTLBuffer> add_params_buffer = [runtime->device newBufferWithBytes:&add_params length:sizeof(add_params) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> pair_linear_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&up_linear_params length:sizeof(up_linear_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> activation_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&activation_params length:sizeof(activation_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> multiply_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&multiply_params length:sizeof(multiply_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> down_linear_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&down_linear_params length:sizeof(down_linear_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> post_down_rms_params_buffer = post_down_rms_norm_slot != SIZE_MAX ? antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&post_down_rms_params length:sizeof(post_down_rms_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED) : nil;
+        id<MTLBuffer> add_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&add_params length:sizeof(add_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (pair_linear_params_buffer == nil || activation_params_buffer == nil || multiply_params_buffer == nil || down_linear_params_buffer == nil || add_params_buffer == nil || (post_down_rms_norm_slot != SIZE_MAX && post_down_rms_params_buffer == nil)) return -15;
 
         id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(runtime->queue, __func__);
@@ -55768,10 +55811,10 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q4_k_pair_q5_k_down_sl
     @autoreleasepool {
         const size_t hidden_bytes = rows * hidden_size * sizeof(float);
         const size_t intermediate_bytes = rows * intermediate_size * sizeof(float);
-        id<MTLBuffer> input_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)input length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (input_buffer == nil) input_buffer = [runtime->device newBufferWithBytes:input length:hidden_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> residual_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (residual_buffer == nil) residual_buffer = [runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)input length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:input length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (residual_buffer == nil) residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (termite_metal_decode_runtime_ensure_hot_buffers(runtime, hidden_bytes, intermediate_bytes) != 0) return -13;
         id<MTLBuffer> gate_output_buffer = runtime->hot_intermediate_buffers[0];
         id<MTLBuffer> up_output_buffer = runtime->hot_intermediate_buffers[1];
@@ -55781,10 +55824,10 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q4_k_pair_q5_k_down_sl
         id<MTLBuffer> projected_buffer = runtime->hot_hidden_buffers[0];
         id<MTLBuffer> post_down_buffer = post_down_rms_norm_slot != SIZE_MAX ? runtime->hot_hidden_buffers[1] : nil;
         BOOL output_borrowed = YES;
-        id<MTLBuffer> output_buffer = [runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
         if (output_buffer == nil) {
             output_borrowed = NO;
-            output_buffer = [runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared];
+            output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         }
         if (input_buffer == nil || residual_buffer == nil || gate_output_buffer == nil || up_output_buffer == nil || activated_buffer == nil || gated_buffer == nil || projected_buffer == nil || output_buffer == nil || (post_gate_rms_norm_slot != SIZE_MAX && normed_gated_buffer == nil) || (post_down_rms_norm_slot != SIZE_MAX && post_down_buffer == nil)) return -13;
 
@@ -55937,10 +55980,10 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q4_k_pair_q6_k_down_sl
     @autoreleasepool {
         const size_t hidden_bytes = rows * hidden_size * sizeof(float);
         const size_t intermediate_bytes = rows * intermediate_size * sizeof(float);
-        id<MTLBuffer> input_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)input length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (input_buffer == nil) input_buffer = [runtime->device newBufferWithBytes:input length:hidden_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> residual_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (residual_buffer == nil) residual_buffer = [runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)input length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:input length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (residual_buffer == nil) residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (termite_metal_decode_runtime_ensure_hot_buffers(runtime, hidden_bytes, intermediate_bytes) != 0) return -13;
         id<MTLBuffer> gate_output_buffer = runtime->hot_intermediate_buffers[0];
         id<MTLBuffer> up_output_buffer = runtime->hot_intermediate_buffers[1];
@@ -55949,8 +55992,8 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q4_k_pair_q6_k_down_sl
         id<MTLBuffer> normed_gated_buffer = post_gate_rms_norm_slot != SIZE_MAX ? runtime->hot_intermediate_buffers[4] : nil;
         id<MTLBuffer> projected_buffer = runtime->hot_hidden_buffers[0];
         id<MTLBuffer> post_down_buffer = post_down_rms_norm_slot != SIZE_MAX ? runtime->hot_hidden_buffers[1] : nil;
-        id<MTLBuffer> output_buffer = [runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (output_buffer == nil) output_buffer = [runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (output_buffer == nil) output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (input_buffer == nil || residual_buffer == nil || gate_output_buffer == nil || up_output_buffer == nil || activated_buffer == nil || gated_buffer == nil || projected_buffer == nil || output_buffer == nil || (post_gate_rms_norm_slot != SIZE_MAX && normed_gated_buffer == nil) || (post_down_rms_norm_slot != SIZE_MAX && post_down_buffer == nil)) return -13;
 
         termite_metal_linear_params down_params = { .rows = (uint32_t)rows, .in_dim = (uint32_t)intermediate_size, .out_dim = (uint32_t)hidden_size, .row_blocks = (uint32_t)(intermediate_size / 256u) };
@@ -56113,10 +56156,10 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q6_k_slots(
     @autoreleasepool {
         const size_t hidden_bytes = rows * hidden_size * sizeof(float);
         const size_t intermediate_bytes = rows * intermediate_size * sizeof(float);
-        id<MTLBuffer> input_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)input length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (input_buffer == nil) input_buffer = [runtime->device newBufferWithBytes:input length:hidden_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> residual_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (residual_buffer == nil) residual_buffer = [runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)input length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:input length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (residual_buffer == nil) residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (termite_metal_decode_runtime_ensure_hot_buffers(runtime, hidden_bytes, intermediate_bytes) != 0) return -13;
         id<MTLBuffer> gate_output_buffer = runtime->hot_intermediate_buffers[0];
         id<MTLBuffer> up_output_buffer = runtime->hot_intermediate_buffers[1];
@@ -56125,8 +56168,8 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q6_k_slots(
         id<MTLBuffer> normed_gated_buffer = post_gate_rms_norm_slot != SIZE_MAX ? runtime->hot_intermediate_buffers[4] : nil;
         id<MTLBuffer> projected_buffer = runtime->hot_hidden_buffers[0];
         id<MTLBuffer> post_down_buffer = post_down_rms_norm_slot != SIZE_MAX ? runtime->hot_hidden_buffers[1] : nil;
-        id<MTLBuffer> output_buffer = [runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (output_buffer == nil) output_buffer = [runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (output_buffer == nil) output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (input_buffer == nil || residual_buffer == nil || gate_output_buffer == nil || up_output_buffer == nil || activated_buffer == nil || gated_buffer == nil || projected_buffer == nil || output_buffer == nil || (post_gate_rms_norm_slot != SIZE_MAX && normed_gated_buffer == nil) || (post_down_rms_norm_slot != SIZE_MAX && post_down_buffer == nil)) return -13;
 
         termite_metal_linear_params down_params = { .rows = (uint32_t)rows, .in_dim = (uint32_t)intermediate_size, .out_dim = (uint32_t)hidden_size, .row_blocks = (uint32_t)(intermediate_size / 256u) };
@@ -56277,10 +56320,10 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q4_0_pair_q8_0_down_sl
     @autoreleasepool {
         const size_t hidden_bytes = rows * hidden_size * sizeof(float);
         const size_t intermediate_bytes = rows * intermediate_size * sizeof(float);
-        id<MTLBuffer> input_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)input length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (input_buffer == nil) input_buffer = [runtime->device newBufferWithBytes:input length:hidden_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> residual_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (residual_buffer == nil) residual_buffer = [runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)input length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:input length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (residual_buffer == nil) residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (termite_metal_decode_runtime_ensure_hot_buffers(runtime, hidden_bytes, intermediate_bytes) != 0) return -13;
         id<MTLBuffer> gate_output_buffer = runtime->hot_intermediate_buffers[0];
         id<MTLBuffer> up_output_buffer = runtime->hot_intermediate_buffers[1];
@@ -56290,8 +56333,8 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q4_0_pair_q8_0_down_sl
         id<MTLBuffer> projected_buffer = runtime->hot_hidden_buffers[0];
         id<MTLBuffer> ffn_scalar_or_post_down_buffer = runtime->hot_hidden_buffers[1];
         id<MTLBuffer> post_down_buffer = post_down_rms_norm_slot != SIZE_MAX ? ffn_scalar_or_post_down_buffer : nil;
-        id<MTLBuffer> output_buffer = [runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (output_buffer == nil) output_buffer = [runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (output_buffer == nil) output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (input_buffer == nil || residual_buffer == nil || gate_output_buffer == nil || up_output_buffer == nil || activated_buffer == nil || gated_buffer == nil || projected_buffer == nil || output_buffer == nil || (post_gate_rms_norm_slot != SIZE_MAX && normed_gated_buffer == nil) || (post_down_rms_norm_slot != SIZE_MAX && post_down_buffer == nil)) return -13;
 
         termite_metal_apply_activation_params activation_params = { .activation_kind = activation_kind, .rows = (uint32_t)rows, .dim = (uint32_t)intermediate_size };
@@ -56478,10 +56521,10 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q8_0_slots(
     @autoreleasepool {
         const size_t hidden_bytes = rows * hidden_size * sizeof(float);
         const size_t intermediate_bytes = rows * intermediate_size * sizeof(float);
-        id<MTLBuffer> input_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)input length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (input_buffer == nil) input_buffer = [runtime->device newBufferWithBytes:input length:hidden_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> residual_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (residual_buffer == nil) residual_buffer = [runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)input length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:input length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (residual_buffer == nil) residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (termite_metal_decode_runtime_ensure_hot_buffers(runtime, hidden_bytes, intermediate_bytes) != 0) return -13;
         id<MTLBuffer> gate_output_buffer = runtime->hot_intermediate_buffers[0];
         id<MTLBuffer> up_output_buffer = runtime->hot_intermediate_buffers[1];
@@ -56492,10 +56535,10 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q8_0_slots(
         id<MTLBuffer> ffn_scalar_or_post_down_buffer = runtime->hot_hidden_buffers[1];
         id<MTLBuffer> post_down_buffer = post_down_rms_norm_slot != SIZE_MAX ? ffn_scalar_or_post_down_buffer : nil;
         BOOL output_borrowed = YES;
-        id<MTLBuffer> output_buffer = [runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
         if (output_buffer == nil) {
             output_borrowed = NO;
-            output_buffer = [runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared];
+            output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         }
         if (input_buffer == nil || residual_buffer == nil || gate_output_buffer == nil || up_output_buffer == nil || activated_buffer == nil || gated_buffer == nil || projected_buffer == nil || output_buffer == nil || (post_gate_rms_norm_slot != SIZE_MAX && normed_gated_buffer == nil) || (post_down_rms_norm_slot != SIZE_MAX && post_down_buffer == nil)) return -14;
 
@@ -58014,16 +58057,16 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q8_0(
     @autoreleasepool {
         const size_t hidden_bytes = rows * hidden_size * sizeof(float);
         const size_t intermediate_bytes = rows * intermediate_size * sizeof(float);
-        id<MTLBuffer> input_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)input length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (input_buffer == nil) input_buffer = [runtime->device newBufferWithBytes:input length:hidden_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> residual_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (residual_buffer == nil) residual_buffer = [runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> gate_weight_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)gate_weight_raw length:gate_weight_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (gate_weight_buffer == nil) gate_weight_buffer = [runtime->device newBufferWithBytes:gate_weight_raw length:gate_weight_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> up_weight_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)up_weight_raw length:up_weight_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (up_weight_buffer == nil) up_weight_buffer = [runtime->device newBufferWithBytes:up_weight_raw length:up_weight_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> down_weight_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)down_weight_raw length:down_weight_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (down_weight_buffer == nil) down_weight_buffer = [runtime->device newBufferWithBytes:down_weight_raw length:down_weight_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)input length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:input length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (residual_buffer == nil) residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> gate_weight_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)gate_weight_raw length:gate_weight_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (gate_weight_buffer == nil) gate_weight_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:gate_weight_raw length:gate_weight_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> up_weight_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)up_weight_raw length:up_weight_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (up_weight_buffer == nil) up_weight_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:up_weight_raw length:up_weight_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> down_weight_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)down_weight_raw length:down_weight_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (down_weight_buffer == nil) down_weight_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:down_weight_raw length:down_weight_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (termite_metal_decode_runtime_ensure_hot_buffers(runtime, hidden_bytes, intermediate_bytes) != 0) return -12;
         id<MTLBuffer> gate_output_buffer = runtime->hot_intermediate_buffers[0];
         id<MTLBuffer> up_output_buffer = runtime->hot_intermediate_buffers[1];
@@ -58032,8 +58075,8 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q8_0(
         id<MTLBuffer> normed_gated_buffer = post_gate_rms_norm_slot != SIZE_MAX ? runtime->hot_intermediate_buffers[4] : nil;
         id<MTLBuffer> projected_buffer = runtime->hot_hidden_buffers[0];
         id<MTLBuffer> post_down_buffer = post_down_rms_norm_slot != SIZE_MAX ? runtime->hot_hidden_buffers[1] : nil;
-        id<MTLBuffer> output_buffer = [runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (output_buffer == nil) output_buffer = [runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:output length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (output_buffer == nil) output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:output length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (input_buffer == nil || residual_buffer == nil || gate_weight_buffer == nil || up_weight_buffer == nil || down_weight_buffer == nil || gate_output_buffer == nil || up_output_buffer == nil || activated_buffer == nil || gated_buffer == nil || projected_buffer == nil || output_buffer == nil || (post_gate_rms_norm_slot != SIZE_MAX && normed_gated_buffer == nil) || (post_down_rms_norm_slot != SIZE_MAX && post_down_buffer == nil)) return -13;
 
         termite_metal_apply_activation_params activation_params = { .activation_kind = activation_kind, .rows = (uint32_t)rows, .dim = (uint32_t)intermediate_size };
@@ -58445,7 +58488,7 @@ static int termite_metal_decode_runtime_encode_attention_paged_update_from_f32_k
                 .key_row_bytes = (uint32_t)key_row_bytes,
                 .base_key_row_bytes = (uint32_t)base_key_row_bytes,
             };
-            id<MTLBuffer> params_buffer = [runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared];
+            id<MTLBuffer> params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
             if (params_buffer == nil) return -21;
             size_t int8_tg_size = 1u;
             while (int8_tg_size < head_dim && int8_tg_size < 256u) int8_tg_size <<= 1u;
@@ -58607,7 +58650,7 @@ static int termite_metal_encode_paged_quantized_kv_seed_on_encoder(
         if (block_table_bytes <= 4096u) {
             [encoder setBytes:block_table length:block_table_bytes atIndex:4];
         } else {
-            block_table_buffer = [runtime->device newBufferWithBytes:block_table length:block_table_bytes options:MTLResourceStorageModeShared];
+            block_table_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:block_table length:block_table_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
             if (block_table_buffer == nil) return failure_code;
             if (runtime->active_frame_cb != nil && termite_metal_decode_runtime_retain_frame_resource(runtime, block_table_buffer) != 0) return failure_code;
             [encoder setBuffer:block_table_buffer offset:0 atIndex:4];
@@ -58663,7 +58706,7 @@ static int termite_metal_encode_paged_quantized_kv_seed_on_encoder(
         if (block_table_bytes <= 4096u) {
             [encoder setBytes:block_table length:block_table_bytes atIndex:2];
         } else {
-            block_table_buffer = [runtime->device newBufferWithBytes:block_table length:block_table_bytes options:MTLResourceStorageModeShared];
+            block_table_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:block_table length:block_table_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
             if (block_table_buffer == nil) return failure_code;
             if (runtime->active_frame_cb != nil && termite_metal_decode_runtime_retain_frame_resource(runtime, block_table_buffer) != 0) return failure_code;
             [encoder setBuffer:block_table_buffer offset:0 atIndex:2];
@@ -58775,7 +58818,7 @@ static int termite_metal_encode_paged_f32_kv_seed_on_encoder(
     if (block_table_bytes <= 4096u) {
         [encoder setBytes:block_table length:block_table_bytes atIndex:4];
     } else {
-        block_table_buffer = [runtime->device newBufferWithBytes:block_table length:block_table_bytes options:MTLResourceStorageModeShared];
+        block_table_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:block_table length:block_table_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (block_table_buffer == nil) return failure_code;
         if (runtime->active_frame_cb != nil && termite_metal_decode_runtime_retain_frame_resource(runtime, block_table_buffer) != 0) return failure_code;
         [encoder setBuffer:block_table_buffer offset:0 atIndex:4];
@@ -59087,8 +59130,8 @@ static int termite_metal_decode_runtime_encode_replace_attention_span_slot(
     const size_t encoded_bytes = kv_tokens * key_row_bytes;
     const size_t v_bytes = kv_tokens * v_row_stride * sizeof(float);
     if (termite_metal_decode_runtime_ensure_attention_span_slot_buffers(runtime, slot, encoded_bytes, v_bytes) != 0) return -4;
-    id<MTLBuffer> encoded_staging = [runtime->device newBufferWithBytes:encoded_key length:encoded_bytes options:MTLResourceStorageModeShared];
-    id<MTLBuffer> v_staging = [runtime->device newBufferWithBytes:v length:v_bytes options:MTLResourceStorageModeShared];
+    id<MTLBuffer> encoded_staging = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:encoded_key length:encoded_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+    id<MTLBuffer> v_staging = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:v length:v_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
     if (encoded_staging == nil || v_staging == nil) return -6;
     termite_metal_record_active_frame_blit_source(command_buffer, TERMITE_METAL_BLIT_SOURCE_ATTENTION_SPAN);
     id<MTLBlitCommandEncoder> blit = termite_metal_tracked_blit_command_encoder(command_buffer);
@@ -59207,9 +59250,9 @@ static int termite_metal_decode_runtime_encode_replace_attention_span_from_f32_k
 
     const float *k_suffix = k + suffix_start * num_kv_heads * head_dim;
     const float *v_suffix = v + suffix_start * v_row_stride;
-    id<MTLBuffer> k_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)k_suffix length:k_bytes options:MTLResourceStorageModeShared deallocator:nil];
-    if (k_buffer == nil) k_buffer = [runtime->device newBufferWithBytes:k_suffix length:k_bytes options:MTLResourceStorageModeShared];
-    id<MTLBuffer> v_staging = [runtime->device newBufferWithBytes:v_suffix length:suffix_v_bytes options:MTLResourceStorageModeShared];
+    id<MTLBuffer> k_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)k_suffix length:k_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+    if (k_buffer == nil) k_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:k_suffix length:k_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+    id<MTLBuffer> v_staging = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:v_suffix length:suffix_v_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
     if (k_buffer == nil || v_staging == nil) return -9;
 
     termite_metal_encode_key_params params = {
@@ -59219,7 +59262,7 @@ static int termite_metal_decode_runtime_encode_replace_attention_span_from_f32_k
         .key_row_bytes = (uint32_t)key_row_bytes,
         .base_key_row_bytes = (uint32_t)base_key_row_bytes,
     };
-    id<MTLBuffer> params_buffer = [runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
     if (params_buffer == nil) return -10;
 
     id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
@@ -59342,7 +59385,7 @@ static int termite_metal_decode_runtime_encode_replace_attention_span_from_f32_k
             .key_row_bytes = (uint32_t)key_row_bytes,
             .base_key_row_bytes = (uint32_t)base_key_row_bytes,
         };
-        id<MTLBuffer> params_buffer = [runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (params_buffer == nil) return -10;
 
         id<MTLComputeCommandEncoder> k_encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
@@ -59380,7 +59423,7 @@ static int termite_metal_decode_runtime_encode_replace_attention_span_from_f32_k
             .key_row_bytes = (uint32_t)key_row_bytes,
             .base_key_row_bytes = (uint32_t)base_key_row_bytes,
         };
-        id<MTLBuffer> params_buffer = [runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (params_buffer == nil) return -10;
         const size_t work_items = suffix_tokens * values_per_row;
         const size_t tg_width = termite_metal_thread_width(pipeline, work_items);
@@ -59420,7 +59463,7 @@ static int termite_metal_decode_runtime_encode_replace_attention_span_from_f32_k
             .key_row_bytes = (uint32_t)key_row_bytes,
             .base_key_row_bytes = (uint32_t)base_key_row_bytes,
         };
-        id<MTLBuffer> params_buffer = [runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (params_buffer == nil) return -10;
 
         id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
@@ -59489,10 +59532,10 @@ int termite_metal_decode_runtime_attention_span(
     @autoreleasepool {
         const size_t q_bytes = num_heads * head_dim * sizeof(float);
         const size_t output_bytes = num_heads * head_dim * sizeof(float);
-        id<MTLBuffer> q_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)q length:q_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (q_buffer == nil) q_buffer = [runtime->device newBufferWithBytes:q length:q_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> output_buffer = [runtime->device newBufferWithBytesNoCopy:output length:output_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (output_buffer == nil) output_buffer = [runtime->device newBufferWithBytes:output length:output_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> q_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)q length:q_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (q_buffer == nil) q_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:q length:q_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:output length:output_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (output_buffer == nil) output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:output length:output_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (q_buffer == nil || output_buffer == nil) return -9;
         termite_metal_attention_span_params params = {
             .kv_tokens = (uint32_t)kv_tokens,
@@ -59506,7 +59549,7 @@ int termite_metal_decode_runtime_attention_span(
             .sliding_window = (uint32_t)sliding_window,
             .v_row_stride = (uint32_t)runtime->attention_span_v_row_stride,
         };
-        id<MTLBuffer> params_buffer = [runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (params_buffer == nil) return -10;
         id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(runtime->queue, __func__);
         if (command_buffer == nil) return -11;
@@ -59579,7 +59622,7 @@ int termite_metal_decode_runtime_attention_span_device(
             .sliding_window = (uint32_t)sliding_window,
             .v_row_stride = (uint32_t)runtime->attention_span_v_row_stride,
         };
-        id<MTLBuffer> params_buffer = [runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (params_buffer == nil) return -10;
         id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(runtime->queue, __func__);
         if (command_buffer == nil) return -11;
@@ -59726,10 +59769,10 @@ static int termite_metal_decode_runtime_encode_paged_attention_slot_ex(
     const size_t block_table_bytes = needed_blocks * sizeof(uint32_t);
     const size_t sinks_bytes = sinks != NULL ? num_heads * sizeof(float) : sizeof(zero_sink);
     id<MTLBuffer> block_table_buffer = block_table_bytes > 4096u
-        ? [runtime->device newBufferWithBytes:block_table length:block_table_bytes options:MTLResourceStorageModeShared]
+        ? antfly_observe_metal_buffer([runtime->device newBufferWithBytes:block_table length:block_table_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED)
         : nil;
     id<MTLBuffer> sinks_buffer = sinks != NULL && sinks_bytes > 4096u
-        ? [runtime->device newBufferWithBytes:sinks length:sinks_bytes options:MTLResourceStorageModeShared]
+        ? antfly_observe_metal_buffer([runtime->device newBufferWithBytes:sinks length:sinks_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED)
         : nil;
     if ((block_table_bytes > 4096u && block_table_buffer == nil) ||
         (sinks != NULL && sinks_bytes > 4096u && sinks_buffer == nil)) return -14;
@@ -60077,10 +60120,10 @@ static int termite_metal_decode_runtime_encode_rms_norm_quantized_linear_slot(
     @autoreleasepool {
         const size_t input_bytes = hidden_size * sizeof(float);
         const size_t output_bytes = out_dim * sizeof(float);
-        id<MTLBuffer> input_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)input length:input_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (input_buffer == nil) input_buffer = [runtime->device newBufferWithBytes:input length:input_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> output_buffer = [runtime->device newBufferWithBytesNoCopy:output length:output_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (output_buffer == nil) output_buffer = [runtime->device newBufferWithBytes:output length:output_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)input length:input_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:input length:input_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:output length:output_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (output_buffer == nil) output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:output length:output_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         id<MTLBuffer> normed_buffer = runtime->hot_hidden_buffers[0];
         if (input_buffer == nil || output_buffer == nil || normed_buffer == nil) return -5;
         // Deferred encode: the caller commits/waits this command buffer, so a
@@ -60290,7 +60333,7 @@ static int termite_metal_decode_runtime_encode_attention_span_slot(
         .sliding_window = (uint32_t)sliding_window,
         .v_row_stride = (uint32_t)runtime->attention_span_slot_v_row_stride[slot],
     };
-    id<MTLBuffer> params_buffer = [runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
     if (params_buffer == nil) return -10;
     id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
     if (encoder == nil) return -11;
@@ -60396,15 +60439,15 @@ static int termite_metal_decode_runtime_encode_attention_block_prefix(
         const size_t hidden_bytes = hidden_size * sizeof(float);
         const size_t attention_input_bytes = attention_input_size * sizeof(float);
         const size_t scratch_bytes = attention_input_bytes > hidden_bytes ? attention_input_bytes : hidden_bytes;
-        id<MTLBuffer> tmp_a = [runtime->device newBufferWithLength:scratch_bytes options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> tmp_b = [runtime->device newBufferWithLength:scratch_bytes options:MTLResourceStorageModePrivate];
+        id<MTLBuffer> tmp_a = antfly_observe_metal_buffer([runtime->device newBufferWithLength:scratch_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> tmp_b = antfly_observe_metal_buffer([runtime->device newBufferWithLength:scratch_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
         if (tmp_a == nil || tmp_b == nil) return -6;
 
         id<MTLBuffer> current_buffer = attention_input_buffer;
         NSUInteger current_offset = attention_input_offset;
         if (attention_pre_linear_rms_norm_slot != SIZE_MAX) {
             termite_metal_apply_layer_norm_params params = { .hidden_size = (uint32_t)attention_input_size, .eps = eps };
-            id<MTLBuffer> params_buffer = [runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared];
+            id<MTLBuffer> params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
             if (params_buffer == nil) return -7;
             id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder_for(command_buffer, TERMITE_METAL_COMPUTE_SOURCE_ATTENTION);
             if (encoder == nil) return -8;
@@ -60421,7 +60464,7 @@ static int termite_metal_decode_runtime_encode_attention_block_prefix(
 
         {
             termite_metal_apply_linear_params params = { .in_dim = (uint32_t)attention_input_size, .out_dim = (uint32_t)hidden_size };
-            id<MTLBuffer> params_buffer = [runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared];
+            id<MTLBuffer> params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
             if (params_buffer == nil) return -9;
             id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
             if (encoder == nil) return -10;
@@ -60444,7 +60487,7 @@ static int termite_metal_decode_runtime_encode_attention_block_prefix(
 
         if (attention_post_linear_rms_norm_slot != SIZE_MAX) {
             termite_metal_apply_layer_norm_params params = { .hidden_size = (uint32_t)hidden_size, .eps = eps };
-            id<MTLBuffer> params_buffer = [runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared];
+            id<MTLBuffer> params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
             if (params_buffer == nil) return -11;
             id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
             if (encoder == nil) return -12;
@@ -60461,7 +60504,7 @@ static int termite_metal_decode_runtime_encode_attention_block_prefix(
 
         {
             termite_metal_apply_add_params params = { .rows = 1, .dim = (uint32_t)hidden_size };
-            id<MTLBuffer> params_buffer = [runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared];
+            id<MTLBuffer> params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
             if (params_buffer == nil) return -13;
             id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
             if (encoder == nil) return -14;
@@ -60476,7 +60519,7 @@ static int termite_metal_decode_runtime_encode_attention_block_prefix(
 
         if (ffn_layer_norm_slot != SIZE_MAX) {
             termite_metal_apply_layer_norm_params params = { .hidden_size = (uint32_t)hidden_size, .eps = eps };
-            id<MTLBuffer> params_buffer = [runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared];
+            id<MTLBuffer> params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
             if (params_buffer == nil) return -15;
             id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
             if (encoder == nil) return -16;
@@ -60490,7 +60533,7 @@ static int termite_metal_decode_runtime_encode_attention_block_prefix(
             [encoder endEncoding];
         } else if (ffn_rms_norm_slot != SIZE_MAX) {
             termite_metal_apply_layer_norm_params params = { .hidden_size = (uint32_t)hidden_size, .eps = eps };
-            id<MTLBuffer> params_buffer = [runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared];
+            id<MTLBuffer> params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
             if (params_buffer == nil) return -17;
             id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
             if (encoder == nil) return -18;
@@ -60532,14 +60575,14 @@ int termite_metal_decode_runtime_apply_attention_block_prefix(
     @autoreleasepool {
         const size_t attention_input_bytes = attention_input_size * sizeof(float);
         const size_t hidden_bytes = hidden_size * sizeof(float);
-        id<MTLBuffer> attention_input_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)attention_input length:attention_input_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (attention_input_buffer == nil) attention_input_buffer = [runtime->device newBufferWithBytes:attention_input length:attention_input_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> residual_buffer = [runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (residual_buffer == nil) residual_buffer = [runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> attn_added_buffer = [runtime->device newBufferWithBytesNoCopy:attn_added length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (attn_added_buffer == nil) attn_added_buffer = [runtime->device newBufferWithBytes:attn_added length:hidden_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> ffn_input_buffer = [runtime->device newBufferWithBytesNoCopy:ffn_input length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (ffn_input_buffer == nil) ffn_input_buffer = [runtime->device newBufferWithBytes:ffn_input length:hidden_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> attention_input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)attention_input length:attention_input_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (attention_input_buffer == nil) attention_input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:attention_input length:attention_input_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:(void *)residual length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (residual_buffer == nil) residual_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:residual length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> attn_added_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:attn_added length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (attn_added_buffer == nil) attn_added_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:attn_added length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> ffn_input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytesNoCopy:ffn_input length:hidden_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (ffn_input_buffer == nil) ffn_input_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:ffn_input length:hidden_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (attention_input_buffer == nil || residual_buffer == nil || attn_added_buffer == nil || ffn_input_buffer == nil) return -3;
 
         id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(runtime->queue, __func__);
@@ -60596,18 +60639,18 @@ static int termite_metal_decode_runtime_encode_dense_ffn_residual(
     @autoreleasepool {
         const size_t hidden_bytes = hidden_size * sizeof(float);
         const size_t intermediate_bytes = intermediate_size * sizeof(float);
-        id<MTLBuffer> first_output_buffer = [runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> activated_buffer = [runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> second_output_buffer = [runtime->device newBufferWithLength:hidden_bytes options:MTLResourceStorageModePrivate];
+        id<MTLBuffer> first_output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> activated_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> second_output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:hidden_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
         if (first_output_buffer == nil || activated_buffer == nil || second_output_buffer == nil) return -9;
         termite_metal_apply_linear_params first_linear_params = { .in_dim = (uint32_t)hidden_size, .out_dim = (uint32_t)intermediate_size };
         termite_metal_apply_activation_params activation_params = { .activation_kind = activation_kind, .rows = 1, .dim = (uint32_t)intermediate_size };
         termite_metal_apply_linear_params second_linear_params = { .in_dim = (uint32_t)intermediate_size, .out_dim = (uint32_t)hidden_size };
         termite_metal_apply_add_params add_params = { .rows = 1, .dim = (uint32_t)hidden_size };
-        id<MTLBuffer> first_linear_params_buffer = [runtime->device newBufferWithBytes:&first_linear_params length:sizeof(first_linear_params) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> activation_params_buffer = [runtime->device newBufferWithBytes:&activation_params length:sizeof(activation_params) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> second_linear_params_buffer = [runtime->device newBufferWithBytes:&second_linear_params length:sizeof(second_linear_params) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> add_params_buffer = [runtime->device newBufferWithBytes:&add_params length:sizeof(add_params) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> first_linear_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&first_linear_params length:sizeof(first_linear_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> activation_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&activation_params length:sizeof(activation_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> second_linear_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&second_linear_params length:sizeof(second_linear_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> add_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&add_params length:sizeof(add_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (first_linear_params_buffer == nil || activation_params_buffer == nil || second_linear_params_buffer == nil || add_params_buffer == nil) return -10;
 
         id<MTLComputeCommandEncoder> first_linear_encoder = termite_metal_tracked_compute_command_encoder(command_buffer);
@@ -60688,12 +60731,12 @@ static int termite_metal_decode_runtime_encode_gated_ffn_residual(
     @autoreleasepool {
         const size_t hidden_bytes = hidden_size * sizeof(float);
         const size_t intermediate_bytes = intermediate_size * sizeof(float);
-        id<MTLBuffer> gate_output_buffer = [runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> up_output_buffer = [runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> activated_buffer = [runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> gated_buffer = [runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> normed_gated_buffer = post_gate_rms_norm_slot != SIZE_MAX ? [runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate] : nil;
-        id<MTLBuffer> projected_buffer = [runtime->device newBufferWithLength:hidden_bytes options:MTLResourceStorageModePrivate];
+        id<MTLBuffer> gate_output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> up_output_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> activated_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> gated_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> normed_gated_buffer = post_gate_rms_norm_slot != SIZE_MAX ? antfly_observe_metal_buffer([runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED) : nil;
+        id<MTLBuffer> projected_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:hidden_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
         if (gate_output_buffer == nil || up_output_buffer == nil || activated_buffer == nil || gated_buffer == nil || projected_buffer == nil || (post_gate_rms_norm_slot != SIZE_MAX && normed_gated_buffer == nil)) return -12;
         termite_metal_apply_linear_params pair_linear_params = { .in_dim = (uint32_t)hidden_size, .out_dim = (uint32_t)intermediate_size };
         termite_metal_apply_activation_params activation_params = { .activation_kind = activation_kind, .rows = 1, .dim = (uint32_t)intermediate_size };
@@ -60701,12 +60744,12 @@ static int termite_metal_decode_runtime_encode_gated_ffn_residual(
         termite_metal_apply_layer_norm_params gated_rms_norm_params = { .hidden_size = (uint32_t)intermediate_size, .eps = 0.0f };
         termite_metal_apply_linear_params down_linear_params = { .in_dim = (uint32_t)intermediate_size, .out_dim = (uint32_t)hidden_size };
         termite_metal_apply_add_params add_params = { .rows = 1, .dim = (uint32_t)hidden_size };
-        id<MTLBuffer> pair_linear_params_buffer = [runtime->device newBufferWithBytes:&pair_linear_params length:sizeof(pair_linear_params) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> activation_params_buffer = [runtime->device newBufferWithBytes:&activation_params length:sizeof(activation_params) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> multiply_params_buffer = [runtime->device newBufferWithBytes:&multiply_params length:sizeof(multiply_params) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> gated_rms_norm_params_buffer = post_gate_rms_norm_slot != SIZE_MAX ? [runtime->device newBufferWithBytes:&gated_rms_norm_params length:sizeof(gated_rms_norm_params) options:MTLResourceStorageModeShared] : nil;
-        id<MTLBuffer> down_linear_params_buffer = [runtime->device newBufferWithBytes:&down_linear_params length:sizeof(down_linear_params) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> add_params_buffer = [runtime->device newBufferWithBytes:&add_params length:sizeof(add_params) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> pair_linear_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&pair_linear_params length:sizeof(pair_linear_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> activation_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&activation_params length:sizeof(activation_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> multiply_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&multiply_params length:sizeof(multiply_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> gated_rms_norm_params_buffer = post_gate_rms_norm_slot != SIZE_MAX ? antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&gated_rms_norm_params length:sizeof(gated_rms_norm_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED) : nil;
+        id<MTLBuffer> down_linear_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&down_linear_params length:sizeof(down_linear_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> add_params_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:&add_params length:sizeof(add_params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (pair_linear_params_buffer == nil || activation_params_buffer == nil || multiply_params_buffer == nil || down_linear_params_buffer == nil || add_params_buffer == nil || (post_gate_rms_norm_slot != SIZE_MAX && gated_rms_norm_params_buffer == nil)) return -13;
 
         const BOOL use_gate_reduce = intermediate_size >= 128;
@@ -65085,7 +65128,7 @@ int termite_metal_buffer_upload(
             return 0;
         }
         if (runtime == NULL || runtime->device == nil || runtime->queue == nil) return -3;
-        id<MTLBuffer> staging = [runtime->device newBufferWithBytes:src length:length options:MTLResourceStorageModeShared];
+        id<MTLBuffer> staging = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:src length:length options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (staging == nil) return -4;
         bool frame_owned = true;
         id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
@@ -65130,7 +65173,7 @@ int termite_metal_buffer_download(
             fprintf(stderr, "metal_frame_lifecycle: buffer_download storage=private length=%zu offset=%zu\n", length, offset);
         }
         if (termite_metal_decode_runtime_flush_active_frame(runtime) != 0) return -8;
-        id<MTLBuffer> staging = [runtime->device newBufferWithLength:length options:MTLResourceStorageModeShared];
+        id<MTLBuffer> staging = antfly_observe_metal_buffer([runtime->device newBufferWithLength:length options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
         if (staging == nil) return -4;
         id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(runtime->queue, __func__);
         if (command_buffer == nil) return -5;
@@ -65474,18 +65517,18 @@ static int termite_metal_dispatch(termite_metal_provider *provider, id<MTLComput
     @autoreleasepool {
         const size_t input_bytes = rows * in_dim * sizeof(float);
         const size_t output_bytes = rows * out_dim * sizeof(float);
-        id<MTLBuffer> input_buffer = [provider->device newBufferWithBytesNoCopy:(void *)input length:input_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (input_buffer == nil) input_buffer = [provider->device newBufferWithBytes:input length:input_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> weight_buffer = [provider->device newBufferWithBytesNoCopy:(void *)weight_raw length:weight_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (weight_buffer == nil) weight_buffer = [provider->device newBufferWithBytes:weight_raw length:weight_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> output_buffer = [provider->device newBufferWithBytesNoCopy:output length:output_bytes options:MTLResourceStorageModeShared deallocator:nil];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytesNoCopy:(void *)input length:input_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytes:input length:input_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> weight_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytesNoCopy:(void *)weight_raw length:weight_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (weight_buffer == nil) weight_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytes:weight_raw length:weight_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytesNoCopy:output length:output_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
         // The output is write-only. When the caller allocation cannot be
         // wrapped directly, avoid snapshotting its uninitialized bytes into
         // Metal only to overwrite them before the required copy-back below.
-        if (output_buffer == nil) output_buffer = [provider->device newBufferWithLength:output_bytes options:MTLResourceStorageModeShared];
+        if (output_buffer == nil) output_buffer = antfly_observe_metal_buffer([provider->device newBufferWithLength:output_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
         if (input_buffer == nil || weight_buffer == nil || output_buffer == nil) return -3;
         termite_metal_linear_params params = { .rows = (uint32_t)rows, .in_dim = (uint32_t)in_dim, .out_dim = (uint32_t)out_dim, .row_blocks = (uint32_t)row_blocks };
-        id<MTLBuffer> params_buffer = [provider->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> params_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (params_buffer == nil) return -4;
         id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(provider->queue, __func__);
         if (command_buffer == nil) return -5;
@@ -65574,12 +65617,12 @@ static int termite_metal_dispatch_quant_matmul_none(termite_metal_provider *prov
     @autoreleasepool {
         const size_t input_bytes = rows * in_dim * sizeof(float);
         const size_t output_bytes = rows * out_dim * sizeof(float);
-        id<MTLBuffer> input_buffer = [provider->device newBufferWithBytesNoCopy:(void *)input length:input_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (input_buffer == nil) input_buffer = [provider->device newBufferWithBytes:input length:input_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> weight_buffer = [provider->device newBufferWithBytesNoCopy:(void *)weight_raw length:weight_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (weight_buffer == nil) weight_buffer = [provider->device newBufferWithBytes:weight_raw length:weight_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> output_buffer = [provider->device newBufferWithBytesNoCopy:output length:output_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (output_buffer == nil) output_buffer = [provider->device newBufferWithBytes:output length:output_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytesNoCopy:(void *)input length:input_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytes:input length:input_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> weight_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytesNoCopy:(void *)weight_raw length:weight_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (weight_buffer == nil) weight_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytes:weight_raw length:weight_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytesNoCopy:output length:output_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (output_buffer == nil) output_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytes:output length:output_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (input_buffer == nil || weight_buffer == nil || output_buffer == nil) return -3;
         id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(provider->queue, __func__);
         if (command_buffer == nil) return -5;
@@ -65838,14 +65881,14 @@ static int termite_metal_dispatch_generated_quant_bias(termite_metal_provider *p
         const size_t input_bytes = rows * in_dim * sizeof(float);
         const size_t output_bytes = rows * out_dim * sizeof(float);
         const size_t bias_bytes = out_dim * sizeof(float);
-        id<MTLBuffer> input_buffer = [provider->device newBufferWithBytesNoCopy:(void *)input length:input_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (input_buffer == nil) input_buffer = [provider->device newBufferWithBytes:input length:input_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> weight_buffer = [provider->device newBufferWithBytesNoCopy:(void *)weight_raw length:weight_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (weight_buffer == nil) weight_buffer = [provider->device newBufferWithBytes:weight_raw length:weight_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bias_buffer = [provider->device newBufferWithBytesNoCopy:(void *)bias length:bias_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (bias_buffer == nil) bias_buffer = [provider->device newBufferWithBytes:bias length:bias_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> output_buffer = [provider->device newBufferWithBytesNoCopy:output length:output_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (output_buffer == nil) output_buffer = [provider->device newBufferWithBytes:output length:output_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytesNoCopy:(void *)input length:input_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytes:input length:input_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> weight_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytesNoCopy:(void *)weight_raw length:weight_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (weight_buffer == nil) weight_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytes:weight_raw length:weight_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> bias_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytesNoCopy:(void *)bias length:bias_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (bias_buffer == nil) bias_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytes:bias length:bias_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytesNoCopy:output length:output_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (output_buffer == nil) output_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytes:output length:output_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (input_buffer == nil || weight_buffer == nil || bias_buffer == nil || output_buffer == nil) return -4;
         id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(provider->queue, __func__);
         if (command_buffer == nil) return -5;
@@ -65887,12 +65930,12 @@ static int termite_metal_dispatch_generated_quant_relu(termite_metal_provider *p
     @autoreleasepool {
         const size_t input_bytes = rows * in_dim * sizeof(float);
         const size_t output_bytes = rows * out_dim * sizeof(float);
-        id<MTLBuffer> input_buffer = [provider->device newBufferWithBytesNoCopy:(void *)input length:input_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (input_buffer == nil) input_buffer = [provider->device newBufferWithBytes:input length:input_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> weight_buffer = [provider->device newBufferWithBytesNoCopy:(void *)weight_raw length:weight_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (weight_buffer == nil) weight_buffer = [provider->device newBufferWithBytes:weight_raw length:weight_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> output_buffer = [provider->device newBufferWithBytesNoCopy:output length:output_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (output_buffer == nil) output_buffer = [provider->device newBufferWithBytes:output length:output_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytesNoCopy:(void *)input length:input_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytes:input length:input_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> weight_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytesNoCopy:(void *)weight_raw length:weight_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (weight_buffer == nil) weight_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytes:weight_raw length:weight_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytesNoCopy:output length:output_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (output_buffer == nil) output_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytes:output length:output_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (input_buffer == nil || weight_buffer == nil || output_buffer == nil) return -4;
         id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(provider->queue, __func__);
         if (command_buffer == nil) return -5;
@@ -65928,16 +65971,16 @@ static int termite_metal_dispatch_pair(termite_metal_provider *provider, id<MTLC
     @autoreleasepool {
         const size_t input_bytes = rows * in_dim * sizeof(float);
         const size_t output_bytes = rows * out_dim * sizeof(float);
-        id<MTLBuffer> input_buffer = [provider->device newBufferWithBytesNoCopy:(void *)input length:input_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (input_buffer == nil) input_buffer = [provider->device newBufferWithBytes:input length:input_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> weight_a_buffer = [provider->device newBufferWithBytesNoCopy:(void *)weight_a_raw length:weight_a_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (weight_a_buffer == nil) weight_a_buffer = [provider->device newBufferWithBytes:weight_a_raw length:weight_a_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> weight_b_buffer = [provider->device newBufferWithBytesNoCopy:(void *)weight_b_raw length:weight_b_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (weight_b_buffer == nil) weight_b_buffer = [provider->device newBufferWithBytes:weight_b_raw length:weight_b_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> output_a_buffer = [provider->device newBufferWithBytesNoCopy:output_a length:output_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (output_a_buffer == nil) output_a_buffer = [provider->device newBufferWithBytes:output_a length:output_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> output_b_buffer = [provider->device newBufferWithBytesNoCopy:output_b length:output_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (output_b_buffer == nil) output_b_buffer = [provider->device newBufferWithBytes:output_b length:output_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytesNoCopy:(void *)input length:input_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytes:input length:input_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> weight_a_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytesNoCopy:(void *)weight_a_raw length:weight_a_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (weight_a_buffer == nil) weight_a_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytes:weight_a_raw length:weight_a_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> weight_b_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytesNoCopy:(void *)weight_b_raw length:weight_b_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (weight_b_buffer == nil) weight_b_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytes:weight_b_raw length:weight_b_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> output_a_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytesNoCopy:output_a length:output_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (output_a_buffer == nil) output_a_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytes:output_a length:output_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> output_b_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytesNoCopy:output_b length:output_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (output_b_buffer == nil) output_b_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytes:output_b length:output_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (input_buffer == nil || weight_a_buffer == nil || weight_b_buffer == nil || output_a_buffer == nil || output_b_buffer == nil) return -3;
         termite_metal_linear_params params = {
             .rows = (uint32_t)rows,
@@ -65945,7 +65988,7 @@ static int termite_metal_dispatch_pair(termite_metal_provider *provider, id<MTLC
             .out_dim = (uint32_t)out_dim,
             .row_blocks = (uint32_t)row_blocks,
         };
-        id<MTLBuffer> params_buffer = [provider->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> params_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (params_buffer == nil) return -4;
         id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(provider->queue, __func__);
         if (command_buffer == nil) return -5;
@@ -65982,12 +66025,12 @@ static int termite_metal_dispatch_key_scores(termite_metal_provider *provider, i
         const size_t q_bytes = q_len * num_heads * head_dim * sizeof(float);
         const size_t output_len = q_len * num_heads * block_tokens;
         const size_t output_bytes = output_len * sizeof(float);
-        id<MTLBuffer> q_buffer = [provider->device newBufferWithBytesNoCopy:(void *)q length:q_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (q_buffer == nil) q_buffer = [provider->device newBufferWithBytes:q length:q_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> key_buffer = [provider->device newBufferWithBytesNoCopy:(void *)encoded_key length:encoded_key_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (key_buffer == nil) key_buffer = [provider->device newBufferWithBytes:encoded_key length:encoded_key_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> output_buffer = [provider->device newBufferWithBytesNoCopy:output length:output_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (output_buffer == nil) output_buffer = [provider->device newBufferWithBytes:output length:output_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> q_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytesNoCopy:(void *)q length:q_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (q_buffer == nil) q_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytes:q length:q_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> key_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytesNoCopy:(void *)encoded_key length:encoded_key_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (key_buffer == nil) key_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytes:encoded_key length:encoded_key_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytesNoCopy:output length:output_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (output_buffer == nil) output_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytes:output length:output_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (q_buffer == nil || key_buffer == nil || output_buffer == nil) return -3;
         termite_metal_key_scores_params params = {
             .q_len = (uint32_t)q_len,
@@ -65997,7 +66040,7 @@ static int termite_metal_dispatch_key_scores(termite_metal_provider *provider, i
             .head_dim = (uint32_t)head_dim,
             .key_row_bytes = (uint32_t)key_row_bytes,
         };
-        id<MTLBuffer> params_buffer = [provider->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> params_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (params_buffer == nil) return -4;
         id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(provider->queue, __func__);
         if (command_buffer == nil) return -5;
@@ -66030,15 +66073,15 @@ static int termite_metal_dispatch_tl1(termite_metal_provider *provider, const fl
     @autoreleasepool {
         const size_t input_bytes = rows * in_dim * sizeof(float);
         const size_t output_bytes = rows * out_dim * sizeof(float);
-        id<MTLBuffer> input_buffer = [provider->device newBufferWithBytesNoCopy:(void *)input length:input_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (input_buffer == nil) input_buffer = [provider->device newBufferWithBytes:input length:input_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> weight_buffer = [provider->device newBufferWithBytesNoCopy:(void *)weight_raw length:weight_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (weight_buffer == nil) weight_buffer = [provider->device newBufferWithBytes:weight_raw length:weight_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> output_buffer = [provider->device newBufferWithBytesNoCopy:output length:output_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (output_buffer == nil) output_buffer = [provider->device newBufferWithBytes:output length:output_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytesNoCopy:(void *)input length:input_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytes:input length:input_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> weight_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytesNoCopy:(void *)weight_raw length:weight_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (weight_buffer == nil) weight_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytes:weight_raw length:weight_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytesNoCopy:output length:output_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (output_buffer == nil) output_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytes:output length:output_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (input_buffer == nil || weight_buffer == nil || output_buffer == nil) return -3;
         termite_metal_tl1_params params = { .rows = (uint32_t)rows, .in_dim = (uint32_t)in_dim, .out_dim = (uint32_t)out_dim, .packed_len = packed_len, .bm = bm, .cfg_by = cfg_by, .bmm = bmm };
-        id<MTLBuffer> params_buffer = [provider->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> params_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (params_buffer == nil) return -4;
         id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(provider->queue, __func__);
         if (command_buffer == nil) return -5;
@@ -66071,15 +66114,15 @@ static int termite_metal_dispatch_tl2(termite_metal_provider *provider, const fl
     @autoreleasepool {
         const size_t input_bytes = rows * in_dim * sizeof(float);
         const size_t output_bytes = rows * out_dim * sizeof(float);
-        id<MTLBuffer> input_buffer = [provider->device newBufferWithBytesNoCopy:(void *)input length:input_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (input_buffer == nil) input_buffer = [provider->device newBufferWithBytes:input length:input_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> weight_buffer = [provider->device newBufferWithBytesNoCopy:(void *)weight_raw length:weight_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (weight_buffer == nil) weight_buffer = [provider->device newBufferWithBytes:weight_raw length:weight_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> output_buffer = [provider->device newBufferWithBytesNoCopy:output length:output_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (output_buffer == nil) output_buffer = [provider->device newBufferWithBytes:output length:output_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytesNoCopy:(void *)input length:input_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytes:input length:input_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> weight_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytesNoCopy:(void *)weight_raw length:weight_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (weight_buffer == nil) weight_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytes:weight_raw length:weight_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytesNoCopy:output length:output_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (output_buffer == nil) output_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytes:output length:output_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (input_buffer == nil || weight_buffer == nil || output_buffer == nil) return -3;
         termite_metal_tl2_params params = { .rows = (uint32_t)rows, .in_dim = (uint32_t)in_dim, .out_dim = (uint32_t)out_dim, .scale_off = scale_off, .three_value_len = three_value_len, .three_sign_len = three_sign_len, .bm = bm, .cfg_by = cfg_by, .bmm = bmm, .three_cols = three_cols, .two_cols = two_cols };
-        id<MTLBuffer> params_buffer = [provider->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> params_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytes:&params length:sizeof(params) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (params_buffer == nil) return -4;
         id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(provider->queue, __func__);
         if (command_buffer == nil) return -5;
@@ -66144,12 +66187,12 @@ int termite_metal_provider_linear_q8_0_planned(termite_metal_provider *provider,
         const size_t input_bytes = rows * in_dim * sizeof(float);
         const size_t weight_bytes = out_dim * (in_dim / 32u) * 34u;
         const size_t output_bytes = rows * out_dim * sizeof(float);
-        id<MTLBuffer> input_buffer = [provider->device newBufferWithBytesNoCopy:(void *)input length:input_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (input_buffer == nil) input_buffer = [provider->device newBufferWithBytes:input length:input_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> weight_buffer = [provider->device newBufferWithBytesNoCopy:(void *)weight_raw length:weight_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (weight_buffer == nil) weight_buffer = [provider->device newBufferWithBytes:weight_raw length:weight_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> output_buffer = [provider->device newBufferWithBytesNoCopy:output length:output_bytes options:MTLResourceStorageModeShared deallocator:nil];
-        if (output_buffer == nil) output_buffer = [provider->device newBufferWithBytes:output length:output_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytesNoCopy:(void *)input length:input_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (input_buffer == nil) input_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytes:input length:input_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> weight_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytesNoCopy:(void *)weight_raw length:weight_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (weight_buffer == nil) weight_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytes:weight_raw length:weight_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        id<MTLBuffer> output_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytesNoCopy:output length:output_bytes options:MTLResourceStorageModeShared deallocator:nil], ANTFLY_BUFFER_ALIAS);
+        if (output_buffer == nil) output_buffer = antfly_observe_metal_buffer([provider->device newBufferWithBytes:output length:output_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (input_buffer == nil || weight_buffer == nil || output_buffer == nil) return -3;
         id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(provider->queue, __func__);
         if (command_buffer == nil) return -4;
@@ -66470,11 +66513,11 @@ int termite_metal_a4b_route_select_replay(
         if (baseline == nil || candidate == nil || queue == nil ||
             candidate.threadExecutionWidth != 32u || candidate.maxTotalThreadsPerThreadgroup < 32u) return -4;
 
-        id<MTLBuffer> logits = [device newBufferWithLength:128u * sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> baseline_ids = [device newBufferWithLength:8u * sizeof(uint32_t) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> baseline_weights = [device newBufferWithLength:8u * sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> candidate_ids = [device newBufferWithLength:8u * sizeof(uint32_t) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> candidate_weights = [device newBufferWithLength:8u * sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> logits = antfly_observe_metal_buffer([device newBufferWithLength:128u * sizeof(float) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> baseline_ids = antfly_observe_metal_buffer([device newBufferWithLength:8u * sizeof(uint32_t) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> baseline_weights = antfly_observe_metal_buffer([device newBufferWithLength:8u * sizeof(float) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> candidate_ids = antfly_observe_metal_buffer([device newBufferWithLength:8u * sizeof(uint32_t) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> candidate_weights = antfly_observe_metal_buffer([device newBufferWithLength:8u * sizeof(float) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
         if (logits == nil || baseline_ids == nil || baseline_weights == nil ||
             candidate_ids == nil || candidate_weights == nil) return -5;
         const termite_metal_moe_route_select_params params = {
@@ -66604,11 +66647,11 @@ int termite_metal_a4b_router_projection_replay(
         const size_t in_dim = 2816u, out_dim = 128u;
         const size_t weight_count = in_dim * out_dim;
         result->weight_bytes = weight_count * sizeof(float);
-        id<MTLBuffer> input = [device newBufferWithLength:in_dim * sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> weight = [device newBufferWithLength:result->weight_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bias = [device newBufferWithLength:out_dim * sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> baseline_output = [device newBufferWithLength:out_dim * sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> candidate_output = [device newBufferWithLength:out_dim * sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input = antfly_observe_metal_buffer([device newBufferWithLength:in_dim * sizeof(float) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> weight = antfly_observe_metal_buffer([device newBufferWithLength:result->weight_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> bias = antfly_observe_metal_buffer([device newBufferWithLength:out_dim * sizeof(float) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> baseline_output = antfly_observe_metal_buffer([device newBufferWithLength:out_dim * sizeof(float) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> candidate_output = antfly_observe_metal_buffer([device newBufferWithLength:out_dim * sizeof(float) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
         if (input == nil || weight == nil || bias == nil || baseline_output == nil || candidate_output == nil) return -5;
         float *input_values = (float *)input.contents;
         float *weight_values = (float *)weight.contents;
@@ -66745,10 +66788,10 @@ static int termite_metal_a4b_argmax_replay_validate(
     if (device == nil || queue == nil || library == nil) return -1;
     id<MTLComputePipelineState> baseline = termite_metal_make_pipeline(device, library, @"termite_argmax_logits_reduce");
     id<MTLComputePipelineState> candidate = termite_metal_make_pipeline(device, library, @"termite_argmax_logits_reduce_tg");
-    id<MTLBuffer> values = [device newBufferWithLength:256u * sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> ids = [device newBufferWithLength:256u * sizeof(uint32_t) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> baseline_output = [device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
-    id<MTLBuffer> candidate_output = [device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> values = antfly_observe_metal_buffer([device newBufferWithLength:256u * sizeof(float) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
+    id<MTLBuffer> ids = antfly_observe_metal_buffer([device newBufferWithLength:256u * sizeof(uint32_t) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
+    id<MTLBuffer> baseline_output = antfly_observe_metal_buffer([device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
+    id<MTLBuffer> candidate_output = antfly_observe_metal_buffer([device newBufferWithLength:sizeof(uint32_t) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
     if (baseline == nil || candidate == nil || values == nil || ids == nil ||
         baseline_output == nil || candidate_output == nil) return -2;
     float *value_data = (float *)values.contents;
@@ -66804,10 +66847,10 @@ int termite_metal_a4b_lm_head_replay(
         const size_t in_dim = 2816u, out_dim = 65536u, row_blocks = 11u;
         const size_t row_bytes = row_blocks * 210u;
         result->weight_bytes = out_dim * row_bytes;
-        id<MTLBuffer> input = [device newBufferWithLength:in_dim * sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> weight = [device newBufferWithLength:result->weight_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> baseline_output = [device newBufferWithLength:out_dim * sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> candidate_output = [device newBufferWithLength:out_dim * sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input = antfly_observe_metal_buffer([device newBufferWithLength:in_dim * sizeof(float) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> weight = antfly_observe_metal_buffer([device newBufferWithLength:result->weight_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> baseline_output = antfly_observe_metal_buffer([device newBufferWithLength:out_dim * sizeof(float) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> candidate_output = antfly_observe_metal_buffer([device newBufferWithLength:out_dim * sizeof(float) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
         if (input == nil || weight == nil || baseline_output == nil || candidate_output == nil) return -5;
 
         float *input_values = (float *)input.contents;
@@ -67173,22 +67216,22 @@ int termite_metal_a4b_q4_0_id_replay(
         const size_t down_weight_bytes = experts * down_out * down_blocks * 18u;
         result->gate_weight_bytes = gate_weight_bytes;
         result->down_weight_bytes = down_weight_bytes;
-        id<MTLBuffer> gate_input = [device newBufferWithLength:gate_in * sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> down_input = [device newBufferWithLength:routes * down_in * sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> gate_weight = [device newBufferWithLength:gate_weight_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> down_weight = [device newBufferWithLength:down_weight_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> expert_ids = [device newBufferWithLength:routes * sizeof(uint32_t) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> route_weights = [device newBufferWithLength:routes * sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> expert_scale = [device newBufferWithLength:experts * sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> gate_generic_output = [device newBufferWithLength:routes * gate_out * sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> gate_specialized_output = [device newBufferWithLength:routes * gate_out * sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> gate_activation_baseline_output = [device newBufferWithLength:routes * 704u * sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> gate_activation_fused_output = [device newBufferWithLength:routes * 704u * sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> down_generic_output = [device newBufferWithLength:routes * down_out * sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> down_specialized_output = [device newBufferWithLength:routes * down_out * sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> down_nq8_output = [device newBufferWithLength:routes * down_out * sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> down_reduce_baseline_output = [device newBufferWithLength:down_out * sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> down_reduce_fused_output = [device newBufferWithLength:down_out * sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> gate_input = antfly_observe_metal_buffer([device newBufferWithLength:gate_in * sizeof(float) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> down_input = antfly_observe_metal_buffer([device newBufferWithLength:routes * down_in * sizeof(float) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> gate_weight = antfly_observe_metal_buffer([device newBufferWithLength:gate_weight_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> down_weight = antfly_observe_metal_buffer([device newBufferWithLength:down_weight_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> expert_ids = antfly_observe_metal_buffer([device newBufferWithLength:routes * sizeof(uint32_t) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> route_weights = antfly_observe_metal_buffer([device newBufferWithLength:routes * sizeof(float) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> expert_scale = antfly_observe_metal_buffer([device newBufferWithLength:experts * sizeof(float) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> gate_generic_output = antfly_observe_metal_buffer([device newBufferWithLength:routes * gate_out * sizeof(float) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> gate_specialized_output = antfly_observe_metal_buffer([device newBufferWithLength:routes * gate_out * sizeof(float) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> gate_activation_baseline_output = antfly_observe_metal_buffer([device newBufferWithLength:routes * 704u * sizeof(float) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> gate_activation_fused_output = antfly_observe_metal_buffer([device newBufferWithLength:routes * 704u * sizeof(float) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> down_generic_output = antfly_observe_metal_buffer([device newBufferWithLength:routes * down_out * sizeof(float) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> down_specialized_output = antfly_observe_metal_buffer([device newBufferWithLength:routes * down_out * sizeof(float) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> down_nq8_output = antfly_observe_metal_buffer([device newBufferWithLength:routes * down_out * sizeof(float) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> down_reduce_baseline_output = antfly_observe_metal_buffer([device newBufferWithLength:down_out * sizeof(float) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> down_reduce_fused_output = antfly_observe_metal_buffer([device newBufferWithLength:down_out * sizeof(float) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
         if (gate_input == nil || down_input == nil || gate_weight == nil || down_weight == nil ||
             expert_ids == nil || route_weights == nil || expert_scale == nil ||
             gate_generic_output == nil || gate_specialized_output == nil ||
@@ -67514,18 +67557,18 @@ int termite_metal_a4b_common_q4_replay(
         result->gate_up_weight_bytes = one_gate_weight_bytes * 2u;
         result->down_weight_bytes = down_weight_bytes;
 
-        id<MTLBuffer> gate_input = [device newBufferWithLength:hidden * sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> down_input = [device newBufferWithLength:intermediate * sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> gate_weight = [device newBufferWithLength:one_gate_weight_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> up_weight = [device newBufferWithLength:one_gate_weight_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> down_weight = [device newBufferWithLength:down_weight_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> gate_weight_packed = [device newBufferWithLength:one_gate_weight_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> up_weight_packed = [device newBufferWithLength:one_gate_weight_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> down_weight_packed = [device newBufferWithLength:down_weight_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> gate_up_baseline_output = [device newBufferWithLength:intermediate * sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> gate_up_packed_output = [device newBufferWithLength:intermediate * sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> down_baseline_output = [device newBufferWithLength:hidden * sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> down_packed_output = [device newBufferWithLength:hidden * sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> gate_input = antfly_observe_metal_buffer([device newBufferWithLength:hidden * sizeof(float) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> down_input = antfly_observe_metal_buffer([device newBufferWithLength:intermediate * sizeof(float) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> gate_weight = antfly_observe_metal_buffer([device newBufferWithLength:one_gate_weight_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> up_weight = antfly_observe_metal_buffer([device newBufferWithLength:one_gate_weight_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> down_weight = antfly_observe_metal_buffer([device newBufferWithLength:down_weight_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> gate_weight_packed = antfly_observe_metal_buffer([device newBufferWithLength:one_gate_weight_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> up_weight_packed = antfly_observe_metal_buffer([device newBufferWithLength:one_gate_weight_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> down_weight_packed = antfly_observe_metal_buffer([device newBufferWithLength:down_weight_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> gate_up_baseline_output = antfly_observe_metal_buffer([device newBufferWithLength:intermediate * sizeof(float) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> gate_up_packed_output = antfly_observe_metal_buffer([device newBufferWithLength:intermediate * sizeof(float) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> down_baseline_output = antfly_observe_metal_buffer([device newBufferWithLength:hidden * sizeof(float) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
+        id<MTLBuffer> down_packed_output = antfly_observe_metal_buffer([device newBufferWithLength:hidden * sizeof(float) options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
         if (gate_input == nil || down_input == nil || gate_weight == nil || up_weight == nil ||
             down_weight == nil || gate_weight_packed == nil || up_weight_packed == nil ||
             down_weight_packed == nil || gate_up_baseline_output == nil ||
