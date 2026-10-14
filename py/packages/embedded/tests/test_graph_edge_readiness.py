@@ -1010,6 +1010,7 @@ lib.antfly_db_close(handle)
     try:
         import select
 
+        assert writer.stdout is not None
         ready, _, _ = select.select([writer.stdout], [], [], 30)
         assert ready and writer.stdout.readline().strip() == "ready"
         with antfly_embedded.open_hosted(live) as db:
@@ -1205,6 +1206,9 @@ while True:
         text=True,
     ) as child:
         try:
+            assert child.stdin is not None
+            assert child.stdout is not None
+            assert child.stderr is not None
             assert select.select([child.stdout], [], [], 60)[0], "child did not initialize"
             assert child.stdout.readline().strip() == "ready"
             child.stdin.write("build\n")
