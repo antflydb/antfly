@@ -23278,6 +23278,7 @@ pub const IndexManager = struct {
                 error.Unsupported => source_map.reset(),
                 else => {
                     if (task.deletion_state.budget.denied()) return error.ResourceBudgetExceeded;
+                    if (err == error.EnrichmentWaitCanceled or err == error.Canceled) return err;
                     std.log.err("scheduled text merge file-backed build failed index={s}: {s}", .{ task.index_name, @errorName(err) });
                     return err;
                 },
