@@ -19,6 +19,7 @@ const compiler = @import("compiler.zig");
 const catalog = @import("catalog.zig");
 const v = @import("value.zig");
 const backend_mod = @import("backend.zig");
+const unicode_string = @import("unicode_string.zig");
 const Budget = @import("budget.zig");
 const A = std.mem.Allocator;
 pub const Row = []const v.Entry;
@@ -1054,8 +1055,7 @@ const Engine = struct {
         }
         if (std.ascii.eqlIgnoreCase(name, "trim") or std.ascii.eqlIgnoreCase(name, "ltrim") or std.ascii.eqlIgnoreCase(name, "rtrim")) {
             if (value != .string) return error.CypherTypeMismatch;
-            const whitespace = " \t\r\n\x0b\x0c";
-            return .{ .string = if (std.ascii.eqlIgnoreCase(name, "ltrim")) std.mem.trimStart(u8, value.string, whitespace) else if (std.ascii.eqlIgnoreCase(name, "rtrim")) std.mem.trimEnd(u8, value.string, whitespace) else std.mem.trim(u8, value.string, whitespace) };
+            return .{ .string = try unicode_string.trim(value.string, !std.ascii.eqlIgnoreCase(name, "rtrim"), !std.ascii.eqlIgnoreCase(name, "ltrim")) };
         }
         if (std.ascii.eqlIgnoreCase(name, "toString")) return switch (value) {
             .string => value,
@@ -1135,11 +1135,11 @@ const Engine = struct {
         }
         if (std.ascii.eqlIgnoreCase(name, "toLower")) {
             if (value != .string) return error.CypherTypeMismatch;
-            return .{ .string = try std.ascii.allocLowerString(self.a, value.string) };
+            return .{ .string = try unicode_string.caseConvert(self.a, value.string, false) };
         }
         if (std.ascii.eqlIgnoreCase(name, "toUpper")) {
             if (value != .string) return error.CypherTypeMismatch;
-            return .{ .string = try std.ascii.allocUpperString(self.a, value.string) };
+            return .{ .string = try unicode_string.caseConvert(self.a, value.string, true) };
         }
         if (std.ascii.eqlIgnoreCase(name, "abs")) return if (value == .integer) .{ .integer = std.math.cast(i64, @abs(value.integer)) orelse return error.CypherNumericOverflow } else .{ .number = @abs(try value.numeric()) };
         return error.UnknownCypherFunction;

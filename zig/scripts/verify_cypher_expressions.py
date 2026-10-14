@@ -150,6 +150,43 @@ def main():
         )
         assert sql["rows"] == [["a"]], sql
         checks += 1
+        assert strings(
+            query(
+                "RETURN toLower($text),toUpper($text),trim($space),ltrim($space),rtrim($space),trim($nbsp)",
+                parameters={
+                    "text": "ÉCOLE Straße ΟΣ 𐐀",
+                    "space": "\u2003hi\u3000",
+                    "nbsp": "\u00a0hi\u202f",
+                },
+            )
+        ) == [
+            [
+                "école straße ος 𐐨",
+                "ÉCOLE STRASSE ΟΣ 𐐀",
+                "hi",
+                "hi\u3000",
+                "\u2003hi",
+                "\u00a0hi\u202f",
+            ]
+        ]
+        checks += 1
+        written = query(
+            "CREATE (n:Document {id:'unicode',title:'ÉCOLE'}) WITH n WHERE toLower(n.title)='école' SET n.note=toUpper(trim($note)) RETURN n.note",
+            parameters={"note": "\u2003Straße\u3000"},
+        )
+        assert strings(written) == [["STRASSE"]], written
+        assert strings(
+            query("MATCH (n:Document) WHERE toLower(n.title)='école' RETURN n.note")
+        ) == [["STRASSE"]]
+        checks += 1
+        sql = call(
+            "/sql",
+            {
+                "statement": f"SELECT g.title FROM GRAPH_TABLE({graph} MATCH (n IS Document) WHERE lower(n.title)='école' COLUMNS(upper(n.title) AS title)) g"
+            },
+        )
+        assert sql["rows"] == [["ÉCOLE"]], sql
+        checks += 1
         print(f"{checks} native Cypher/SQL expression checks passed")
     finally:
         if created_graph:

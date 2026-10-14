@@ -457,3 +457,9 @@ test "transaction overlay reads staged entities and rolls back before durable co
     try std.testing.expectEqual(@as(usize, 0), overlay.mutations.items.len);
     try std.testing.expectEqual(@as(usize, 2), host.committed);
 }
+
+test "Unicode casing and trimming preserve Cypher scalar semantics" {
+    try check("RETURN toLower('ÉCOLE'),toUpper('Straße'),trim('　hi '),ltrim(' hi '),rtrim(' hi ')", "[[\"école\",\"STRASSE\",\"hi\",\"hi \",\" hi\"]]");
+    try check("RETURN toLower(null),toUpper(null),trim(null),ltrim(null),rtrim(null)", "[[null,null,null,null,null]]");
+    try check("UNWIND ['ÉCOLE','école','Else'] AS title WITH title WHERE toLower(title)='école' RETURN count(*)", "[[2]]");
+}

@@ -35,6 +35,7 @@ test {
     _ = @import("compiler_test.zig");
     _ = @import("catalog_test.zig");
     _ = @import("runtime_test.zig");
+    _ = @import("unicode_string.zig");
     _ = @import("mutation_test.zig");
     _ = @import("native_test.zig");
     _ = @import("postimage_policy_test.zig");

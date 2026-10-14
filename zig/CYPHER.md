@@ -175,6 +175,14 @@ deprecated [`id()` returns an integer](https://neo4j.com/docs/cypher-manual/5/fu
 this implementation rejects it with `CypherLegacyIdUnavailable` until a
 qualified integer identity provider exists. `length()` accepts paths; `size()`
 accepts lists and Unicode strings. These functions keep their Cypher types.
+`toLower()` and `toUpper()` use pinned Unicode 16.0.0 default full case mappings,
+including expanding mappings and contextual Greek final sigma. They are locale
+independent across native and portable execution; server locale does not select
+Turkish or Lithuanian tailoring. `trim()`, `ltrim()`, and `rtrim()` follow Neo4j's
+Java `Character.isWhitespace` boundaries, preserving nonbreaking spaces.
+The tables are reproduced with `lib/cypher/tools/generate_unicode_case.py` from
+hash-checked official Unicode inputs; their Unicode license is embedded in the
+generated source.
 
 ## Product direction
 

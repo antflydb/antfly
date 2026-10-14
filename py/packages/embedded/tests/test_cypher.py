@@ -318,3 +318,43 @@ def test_document_derived_aliases_resolve_replacements_and_deleted_contents(requ
             "rows"
         ][0]
         assert row == [{"type": "number", "value": 1}]
+
+
+def test_unicode_strings_filter_write_and_graph_table_survive_reopen(require_native, aflite_path):
+    with af.create_hosted(aflite_path) as database:
+        database.sql("CREATE TABLE docs (name TEXT)")
+        database.graph_catalog_json(
+            {"action": "put", "name": "knowledge", "definition": {"labels": [{"name": "Document", "table": "docs"}]}}
+        )
+        result = database.cypher_json(
+            "knowledge",
+            {
+                "query": "RETURN toLower($text),toUpper($text),trim($space),ltrim($space),rtrim($space),trim($nbsp)",
+                "parameters": {"text": "ÉCOLE Straße ΟΣ 𐐀", "space": "\u2003hi\u3000", "nbsp": "\u00a0hi\u202f"},
+            },
+        )
+        assert [cell["value"] for cell in result["rows"][0]] == [
+            "école straße ος 𐐨",
+            "ÉCOLE STRASSE ΟΣ 𐐀",
+            "hi",
+            "hi\u3000",
+            "\u2003hi",
+            "\u00a0hi\u202f",
+        ]
+        result = database.cypher_json(
+            "knowledge",
+            {
+                "query": "CREATE (n:Document {name:'ÉCOLE'}) WITH n WHERE toLower(n.name)='école' SET n.name=toUpper(trim($name)) RETURN n.name",
+                "parameters": {"name": "\u2003Straße\u3000"},
+            },
+        )
+        assert result["rows"] == [[{"type": "string", "value": "STRASSE"}]]
+        database.cypher_json("knowledge", {"query": "CREATE (:Document {name:'ÉCOLE'})"})
+    with af.open_hosted(aflite_path) as database:
+        result = database.cypher_json(
+            "knowledge", {"query": "MATCH (n:Document) WHERE toLower(n.name)='école' RETURN n.name"}
+        )
+        assert result["rows"] == [[{"type": "string", "value": "ÉCOLE"}]]
+        assert database.sql(
+            "SELECT g.name FROM GRAPH_TABLE(knowledge MATCH (n IS Document) WHERE lower(n.name)='école' COLUMNS (upper(n.name) AS name)) g"
+        )["rows"] == [["ÉCOLE"]]
