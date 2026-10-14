@@ -1141,7 +1141,11 @@ are excluded from the source scan and journal artifact pass. Resolution batches
 also deduplicate owning extraction artifacts, rendering canonical relation
 endpoints once after all mention resolutions are applied.
 
-Identical in-progress requests are no-ops. `replaces` and optional
+Identical in-progress requests join the existing reservation generation. A wait
+captures that generation under registration admission and retains it across
+quanta. Cancellation or target-name reuse returns `ANTFLY_CANCELLED`; a new
+serving index or reservation with the same name (even the same configuration)
+cannot complete the original wait. `replaces` and optional
 `"wait":{"timeout_ms":10000}` are command fields, excluded from stored config.
 Waiting cooperatively advances the same work, releasing handle/path locks between
 quanta so another caller can cancel or write. A missing job record triggers a
