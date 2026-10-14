@@ -32,7 +32,10 @@ const model = @import("gliner_boundary.zig");
 const artifact = @import("gliner_boundary_artifact.zig");
 
 pub const policy_version: u32 = 1;
-pub const max_entries: usize = 64;
+// The original table nearly filled 64 bits; exact wrapper profiles require
+// more entries. Geometry remains u64 and each row still matches independently.
+const CandidateMask = u128;
+pub const max_entries: usize = @bitSizeOf(CandidateMask);
 pub const Backend = enum { native, metal, cuda };
 
 /// Required features come from the complete compiled request, never from
@@ -185,11 +188,11 @@ fn fieldLimitError(comptime field_name: []const u8) LengthLimitError {
 /// together, that is a cross-row combination rather than one measured bound;
 /// blame the first field as a conservative default (still a genuine
 /// bounded-length rejection, not an unreviewed request shape).
-fn blamedLengthDimension(entries: []const Entry, previous: u64, observed: LengthContract) LengthLimitError {
+fn blamedLengthDimension(entries: []const Entry, previous: CandidateMask, observed: LengthContract) LengthLimitError {
     inline for (comptime std.meta.fieldNames(LengthContract)) |reflected_name| {
         var covered = false;
         for (entries, 0..) |entry, index| {
-            const bit = @as(u64, 1) << @intCast(index);
+            const bit = @as(CandidateMask, 1) << @intCast(index);
             if (previous & bit != 0 and @field(entry.lengths, reflected_name).contains(@field(observed, reflected_name))) covered = true;
         }
         if (!covered) return fieldLimitError(reflected_name);
@@ -249,6 +252,17 @@ pub const fastino_gliner25_base_v1 = bundle.Identity{
         .{ .size_bytes = 8341713, .sha256 = "cbc8ae6037812709c9c26f2a160f8dc48b0440bcb79c8141804259ae2d6adac3".* },
         .{ .size_bytes = 645, .sha256 = "0bf3ea0873234bd9bfdd3853c440395009ac6365a925b91654daed5396d655e1".* },
     },
+};
+
+// Transformers wrapper revision 54785d51df8d86a0d8f2eb212fec15871aad2c4d.
+// Only config.json changed: model_type, architectures, and an inline copy of
+// the encoder sidecar. The checked-in wrapper fixture parses to exactly the
+// same Config; the four other file identities are unchanged. Qualification
+// retains the original backends, features, and bounds (GLINER25.md).
+pub const fastino_gliner25_base_v1_transformers = blk: {
+    var identity = fastino_gliner25_base_v1;
+    identity.sidecars[0] = .{ .size_bytes = 4103, .sha256 = "d6b515c21ae2100c12267fb42a3f02c1e99ad87580366aebedb161efd74441c7".* };
+    break :blk identity;
 };
 
 // Every feature actually exercised, end to end, against the real weights by
@@ -705,7 +719,19 @@ const base_production_entries = [_]Entry{
     .{ .identity = fastino_gliner25_base_v1_fp16_encoder, .backend = .native, .features = fastino_gliner25_base_v1_long_document_features, .lengths = fastino_gliner25_base_v1_long_document_lengths },
     .{ .identity = fastino_gliner25_base_v1_fp16_encoder, .backend = .metal, .features = fastino_gliner25_base_v1_long_document_features, .lengths = fastino_gliner25_base_v1_long_document_lengths },
 };
-const production_entries: []const Entry = &(base_production_entries ++ multilingualEntries() ++ composed_window_entries);
+fn transformersWrapperEntries() [6]Entry {
+    var entries: [6]Entry = undefined;
+    for (base_production_entries[0..4], 0..) |entry, index| {
+        entries[index] = entry;
+        entries[index].identity = fastino_gliner25_base_v1_transformers;
+    }
+    for (composed_window_entries[0..2], 4..) |entry, index| {
+        entries[index] = entry;
+        entries[index].identity = fastino_gliner25_base_v1_transformers;
+    }
+    return entries;
+}
+const production_entries: []const Entry = &(base_production_entries ++ multilingualEntries() ++ composed_window_entries ++ transformersWrapperEntries());
 
 comptime {
     // Each entry's five digests are hex-validated one character at a time
@@ -768,7 +794,7 @@ pub fn hasQualifiedBackbonePrecision(backbone: model.Backbone, precision: artifa
 /// A bounded selection of private production rows. Treat its representation as
 /// opaque; callers obtain it only from start(). No row data or operation for
 /// widening a selection is exposed. Reuse the SAME value for the whole request.
-pub const Candidates = enum(u64) {
+pub const Candidates = enum(CandidateMask) {
     rejected = 0,
     _,
 
@@ -839,10 +865,10 @@ fn validEntries(entries: []const Entry) bool {
 
 fn startEntries(entries: []const Entry, consumed: bundle.Identity, backend: Backend, required: Features) error{UnsupportedGlinerBoundaryRuntime}!Candidates {
     if (!validEntries(entries)) return error.UnsupportedGlinerBoundaryRuntime;
-    var remaining: u64 = 0;
+    var remaining: CandidateMask = 0;
     for (entries, 0..) |entry, index| {
         if (!equalIdentity(entry.identity, consumed) or entry.backend != backend or !containsFeatures(entry.features, required)) continue;
-        remaining |= @as(u64, 1) << @intCast(index);
+        remaining |= @as(CandidateMask, 1) << @intCast(index);
     }
     if (remaining == 0) return error.UnsupportedGlinerBoundaryRuntime;
     return @fromBackingInt(remaining);
@@ -852,14 +878,14 @@ fn narrowEntries(entries: []const Entry, candidates: *Candidates, observed: Leng
     const previous = @backingInt(candidates.*);
     candidates.* = .rejected;
     if (!validEntries(entries) or !observed.valid()) return error.UnsupportedGlinerBoundaryRuntime;
-    const valid_mask = if (entries.len == max_entries) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(entries.len)) - 1;
+    const valid_mask = if (entries.len == max_entries) std.math.maxInt(CandidateMask) else (@as(CandidateMask, 1) << @intCast(entries.len)) - 1;
     if (previous & ~valid_mask != 0) return error.UnsupportedGlinerBoundaryRuntime;
     // Nothing matched identity/backend/features to begin with: that is an
     // unreviewed request shape, not a bounded-length rejection.
     if (previous == 0) return error.UnsupportedGlinerBoundaryRuntime;
-    var remaining: u64 = 0;
+    var remaining: CandidateMask = 0;
     for (entries, 0..) |entry, index| {
-        const bit = @as(u64, 1) << @intCast(index);
+        const bit = @as(CandidateMask, 1) << @intCast(index);
         if (previous & bit != 0 and entry.lengths.contains(observed)) remaining |= bit;
     }
     candidates.* = @fromBackingInt(remaining);
@@ -1178,7 +1204,7 @@ test "boundary qualification rejects malformed or oversized tables before matchi
     const rows: [max_entries + 1]Entry = @splat(row);
     try matchEntries(rows[0..max_entries], row.identity, .native, row.features, row.lengths);
     try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, matchEntries(&rows, row.identity, .native, row.features, row.lengths));
-    var invalid_selection: Candidates = @fromBackingInt(@as(u64, 1) << 63);
+    var invalid_selection: Candidates = @fromBackingInt(@as(CandidateMask, 1) << (max_entries - 1));
     try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, narrowEntries(&.{row}, &invalid_selection, row.lengths));
     // Even test-supplied synthetic selections cannot access a production row:
     // the public narrow() always checks against the real production table, so
@@ -1198,4 +1224,34 @@ test "boundary qualification range matching has no saturating or overflow accept
     try matchEntries(&.{row}, row.identity, .native, row.features, observed);
     row.lengths.document_bytes.max -= 1;
     try std.testing.expectError(error.GlinerBoundaryDocumentBytesLimitExceeded, matchEntries(&.{row}, row.identity, .native, row.features, observed));
+}
+
+test "boundary qualification Transformers wrapper has exactly the original fp32 profiles" {
+    const identity = fastino_gliner25_base_v1_transformers;
+    const bytes = try @import("../architectures/gliner/boundary_parity_test.zig").fixtureBytes(std.testing.allocator, "models/base/config_transformers.json");
+    defer std.testing.allocator.free(bytes);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    try std.testing.expectEqual(identity.sidecars[0].sha256, std.fmt.bytesToHex(digest, .lower));
+    try std.testing.expectEqual(identity.sidecars[0].size_bytes, bytes.len);
+    try std.testing.expect(hasQualifiedIdentity(identity));
+    var count: usize = 0;
+    for (publishedProfiles()) |entry| {
+        if (!equalIdentity(entry.identity, fastino_gliner25_base_v1)) continue;
+        try require(identity, entry.backend, entry.features, entry.lengths);
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 6), count);
+    for (0..4) |index| {
+        var changed = identity;
+        changed.sidecars[index].sha256[0] = 'f';
+        try std.testing.expect(!hasQualifiedIdentity(changed));
+        changed = identity;
+        changed.sidecars[index].size_bytes += 1;
+        try std.testing.expect(!hasQualifiedIdentity(changed));
+    }
+    var changed = identity;
+    changed.weight.sha256[0] = 'f';
+    try std.testing.expect(!hasQualifiedIdentity(changed));
+    try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, require(identity, .cuda, fastino_gliner25_base_v1_features, fastino_gliner25_base_v1_lengths));
 }
