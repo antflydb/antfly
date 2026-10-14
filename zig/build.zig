@@ -896,6 +896,8 @@ pub fn create(b: *std.Build) ?Artifacts {
         .production_antfly_imports = production_antfly_imports,
         .antfly_client_pkg_mod = antfly_client_pkg_mod,
         .capi_mod = capi_mod,
+        .native_enrichment = embedded.native_enrichment,
+        .native_inference = embedded.native_inference,
     });
     b.step("linked-inference-abi-integration-test", "Run the production-linked inference function-table and binary-payload ABI probe").dependOn(&runtime.run_linked_inference_abi_integration.step);
     owner_tests.standalone_runtime_test_step.dependOn(&runtime.run_linked_inference_abi_integration.step);

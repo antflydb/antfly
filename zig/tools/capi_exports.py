@@ -140,6 +140,8 @@ def link_macho(args: argparse.Namespace) -> None:
     ]
     # Each declared API is a link root, including APIs owned by a provider
     # archive that otherwise has no undefined reference from the C API object.
+    if getattr(args, "map", None) is not None:
+        command.extend(["-map", str(args.map)])
     for name in args.exports.read_text().splitlines():
         command.extend(["-u", name])
     if link_map := getattr(args, "map", None):

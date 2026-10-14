@@ -21,6 +21,9 @@ const preload_model_spec = @import("../common/preload_model_spec.zig");
 const process_memory_budget = @import("antfly_local_sources").common_process_memory_budget;
 const runtime_lifecycle = @import("../common/runtime_lifecycle.zig");
 const inference = @import("inference_server");
+const engine = @import("antfly_inference_engine");
+const InferenceNode = if (engine.enabled) engine.Node else inference.server.Node;
+const ModelRegistry = if (engine.enabled) engine.ModelRegistry else inference.registry.ModelRegistry;
 const httpx = @import("httpx");
 
 pub const ServerBudgetOverrides = inference.server.BudgetOverrides;
@@ -260,7 +263,7 @@ pub fn runFromIterator(
     const command = args.next() orelse "run";
 
     if (std.mem.eql(u8, command, "_worker")) {
-        return @import("antfly_inference_host").worker_module.runChild(alloc, io);
+        return if (engine.enabled) engine.runCommand(.worker, init, &.{}, "") else @import("antfly_inference_host").worker_module.runChild(alloc, io);
     }
 
     if (std.mem.eql(u8, command, "run")) {
@@ -270,11 +273,11 @@ pub fn runFromIterator(
         }
         return try runServer(alloc, io, args);
     } else if (std.mem.eql(u8, command, "embed")) {
-        return try inference.native_embed.main(alloc, io, try collectArgs(alloc, args));
+        return try (if (engine.enabled) engine.runCommand(.embed, init, try collectArgs(alloc, args), "") else inference.native_embed.main(alloc, io, try collectArgs(alloc, args)));
     } else if (std.mem.eql(u8, command, "classify")) {
-        return try inference.native_classify.main(alloc, io, try collectArgs(alloc, args));
+        return try (if (engine.enabled) engine.runCommand(.classify, init, try collectArgs(alloc, args), "") else inference.native_classify.main(alloc, io, try collectArgs(alloc, args)));
     } else if (std.mem.eql(u8, command, "generate")) {
-        inference.native_generate.main(alloc, io, try collectArgs(alloc, args)) catch |err| switch (err) {
+        (if (engine.enabled) engine.runCommand(.generate, init, try collectArgs(alloc, args), "") else inference.native_generate.main(alloc, io, try collectArgs(alloc, args))) catch |err| switch (err) {
             error.WarmInferenceServerUnavailable => {
                 std.debug.print(
                     "warm inference server unavailable; start one with `antfly inference run --preload-model generator:<model>` and pass --server\n",
@@ -290,35 +293,35 @@ pub fn runFromIterator(
         };
         return;
     } else if (std.mem.eql(u8, command, "chat")) {
-        return try inference.native_chat.main(alloc, io, try collectArgs(alloc, args));
+        return try (if (engine.enabled) engine.runCommand(.chat, init, try collectArgs(alloc, args), "") else inference.native_chat.main(alloc, io, try collectArgs(alloc, args)));
     } else if (std.mem.eql(u8, command, "compile-artifact")) {
-        return try inference.native_compile.main(alloc, io, try collectArgs(alloc, args));
+        return try (if (engine.enabled) engine.runCommand(.compile_artifact, init, try collectArgs(alloc, args), "") else inference.native_compile.main(alloc, io, try collectArgs(alloc, args)));
     } else if (std.mem.eql(u8, command, "export")) {
-        return try inference.native_export.main(alloc, io, try collectArgs(alloc, args));
+        return try (if (engine.enabled) engine.runCommand(.export_model, init, try collectArgs(alloc, args), "") else inference.native_export.main(alloc, io, try collectArgs(alloc, args)));
     } else if (std.mem.eql(u8, command, "quantize")) {
-        return try inference.native_quantize.main(alloc, io, try collectArgs(alloc, args));
+        return try (if (engine.enabled) engine.runCommand(.quantize, init, try collectArgs(alloc, args), "") else inference.native_quantize.main(alloc, io, try collectArgs(alloc, args)));
     } else if (std.mem.eql(u8, command, "run-artifact")) {
-        return try inference.native_run_artifact.main(alloc, io, try collectArgs(alloc, args));
+        return try (if (engine.enabled) engine.runCommand(.run_artifact, init, try collectArgs(alloc, args), "") else inference.native_run_artifact.main(alloc, io, try collectArgs(alloc, args)));
     } else if (std.mem.eql(u8, command, "transcribe")) {
-        return try inference.native_transcribe.main(alloc, io, try collectArgs(alloc, args));
+        return try (if (engine.enabled) engine.runCommand(.transcribe, init, try collectArgs(alloc, args), "") else inference.native_transcribe.main(alloc, io, try collectArgs(alloc, args)));
     } else if (std.mem.eql(u8, command, "read")) {
-        return try inference.native_read.main(alloc, io, try collectArgs(alloc, args));
+        return try (if (engine.enabled) engine.runCommand(.read, init, try collectArgs(alloc, args), "") else inference.native_read.main(alloc, io, try collectArgs(alloc, args)));
     } else if (std.mem.eql(u8, command, "extract")) {
-        return try inference.native_extract.main(alloc, io, try collectArgs(alloc, args));
+        return try (if (engine.enabled) engine.runCommand(.extract, init, try collectArgs(alloc, args), "") else inference.native_extract.main(alloc, io, try collectArgs(alloc, args)));
     } else if (std.mem.eql(u8, command, "compare")) {
-        return try inference.compare_generate.main(alloc, io, try collectArgs(alloc, args));
+        return try (if (engine.enabled) engine.runCommand(.compare, init, try collectArgs(alloc, args), "") else inference.compare_generate.main(alloc, io, try collectArgs(alloc, args)));
     } else if (std.mem.eql(u8, command, "finetune")) {
-        return try inference.finetune_cli.main(init, try collectArgs(alloc, args));
+        return try (if (engine.enabled) engine.runCommand(.finetune, init, try collectArgs(alloc, args), "") else inference.finetune_cli.main(init, try collectArgs(alloc, args)));
     } else if (std.mem.eql(u8, command, "cuda-info")) {
-        return try inference.cuda_info.main(alloc, io, try collectArgs(alloc, args));
+        return try (if (engine.enabled) engine.runCommand(.cuda_info, init, try collectArgs(alloc, args), "") else inference.cuda_info.main(alloc, io, try collectArgs(alloc, args)));
     } else if (std.mem.eql(u8, command, "smoke")) {
-        return try inference.native_smoke.main(alloc, io, try collectArgs(alloc, args));
+        return try (if (engine.enabled) engine.runCommand(.smoke, init, try collectArgs(alloc, args), "") else inference.native_smoke.main(alloc, io, try collectArgs(alloc, args)));
     } else if (std.mem.eql(u8, command, "list")) {
         return try listModels(alloc, io, args);
     } else if (std.mem.eql(u8, command, "pull")) {
         return try pullModel(alloc, io, args);
     } else if (std.mem.eql(u8, command, "convert")) {
-        return try inference.tabular.cli.convertMain(alloc, io, try collectArgs(alloc, args));
+        return try (if (engine.enabled) engine.runCommand(.convert, init, try collectArgs(alloc, args), "") else inference.tabular.cli.convertMain(alloc, io, try collectArgs(alloc, args)));
     } else if (std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h") or std.mem.eql(u8, command, "help")) {
         printUsage();
     } else {
@@ -685,7 +688,7 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
         },
     );
 
-    var node = try inference.server.Node.init(alloc, .{
+    var node = try InferenceNode.init(alloc, .{
         .models_dir = models_dir,
         .ml_dir = ml_dir,
         .max_loaded_models = model_settings.max_loaded_models,
@@ -721,35 +724,68 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
         );
         return err;
     };
-    var server = httpx.Server.initWithConfig(alloc, io, node.httpServerConfig(host, port));
-    defer server.deinit();
-    try node.registerHttpRoutes(&server);
-
-    var termination_signals = runtime_lifecycle.ProcessSignalScope.install();
-    defer termination_signals.deinit();
-    var supervisor = runtime_lifecycle.RuntimeSupervisor.init(30_000);
-    defer supervisor.markStopped();
-
-    var listener_task = httpx.ListenerTask.init(&server);
-    try listener_task.start();
-    defer {
-        listener_task.shutdown(supervisor.deadline().remainingMilliseconds());
-        listener_task.join() catch |err| {
-            std.log.err("inference listener failed during shutdown err={s}", .{@errorName(err)});
+    if (comptime engine.enabled) {
+        var signals = runtime_lifecycle.ProcessSignalScope.install();
+        defer signals.deinit();
+        var supervisor = runtime_lifecycle.RuntimeSupervisor.init(30_000);
+        defer supervisor.markStopped();
+        const Lifetime = struct {
+            signals: *runtime_lifecycle.ProcessSignalScope,
+            supervisor: *runtime_lifecycle.RuntimeSupervisor,
+            fn get(raw: *anyopaque) *@This() {
+                return @ptrCast(@alignCast(raw));
+            }
+            fn poll(raw: *anyopaque) callconv(.c) u8 {
+                const self = get(raw);
+                return @intFromBool(self.supervisor.shouldStop(self.signals.cancellationRequested()));
+            }
+            fn ready(raw: *anyopaque) callconv(.c) @import("antfly_runtime_abi").error_abi.Status {
+                get(raw).supervisor.publishReady() catch |err| return @import("antfly_runtime_abi").error_abi.statusFromError(err);
+                return .ok;
+            }
+            fn fail(raw: *anyopaque, status: @import("antfly_runtime_abi").error_abi.Status) callconv(.c) void {
+                _ = @intFromError(get(raw).supervisor.fail("inference", "public-http", @import("antfly_runtime_abi").error_abi.errorFromStatus(status)));
+            }
+            fn cancel(raw: *anyopaque) callconv(.c) void {
+                get(raw).supervisor.requestShutdown();
+            }
+            fn remaining(raw: *anyopaque) callconv(.c) u64 {
+                return get(raw).supervisor.deadline().remainingMilliseconds();
+            }
         };
-    }
+        var lifetime = Lifetime{ .signals = &signals, .supervisor = &supervisor };
+        return node.serve(host, port, .{ .context = &lifetime, .poll = Lifetime.poll, .ready = Lifetime.ready, .fail = Lifetime.fail, .cancel = Lifetime.cancel, .remaining_ms = Lifetime.remaining });
+    } else {
+        var server = httpx.Server.initWithConfig(alloc, io, node.httpServerConfig(host, port));
+        defer server.deinit();
+        try node.registerHttpRoutes(&server);
 
-    if (server.boundAddress()) |address|
-        std.debug.print("listening on http://{f}\n", .{address})
-    else
-        return error.MissingInferenceListener;
-    try supervisor.publishReady();
-    while (!supervisor.shouldStop(termination_signals.cancellationRequested())) {
-        if (listener_task.runtimeFailure()) |err|
-            return supervisor.fail("inference", "public-http", err);
-        io.sleep(std.Io.Duration.fromMilliseconds(10), .awake) catch |err| switch (err) {
-            error.Canceled => supervisor.requestShutdown(),
-        };
+        var termination_signals = runtime_lifecycle.ProcessSignalScope.install();
+        defer termination_signals.deinit();
+        var supervisor = runtime_lifecycle.RuntimeSupervisor.init(30_000);
+        defer supervisor.markStopped();
+
+        var listener_task = httpx.ListenerTask.init(&server);
+        try listener_task.start();
+        defer {
+            listener_task.shutdown(supervisor.deadline().remainingMilliseconds());
+            listener_task.join() catch |err| {
+                std.log.err("inference listener failed during shutdown err={s}", .{@errorName(err)});
+            };
+        }
+
+        if (server.boundAddress()) |address|
+            std.debug.print("listening on http://{f}\n", .{address})
+        else
+            return error.MissingInferenceListener;
+        try supervisor.publishReady();
+        while (!supervisor.shouldStop(termination_signals.cancellationRequested())) {
+            if (listener_task.runtimeFailure()) |err|
+                return supervisor.fail("inference", "public-http", err);
+            io.sleep(std.Io.Duration.fromMilliseconds(10), .awake) catch |err| switch (err) {
+                error.Canceled => supervisor.requestShutdown(),
+            };
+        }
     }
 }
 
@@ -815,8 +851,10 @@ pub fn listModels(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.
     const configured_models_dir = try parseListModelsDir(args);
     const models_dir: []const u8 = configured_models_dir orelse defaultModelsDir(alloc);
 
-    var reg = inference.registry.ModelRegistry.init(alloc, models_dir);
+    var reg = if (engine.enabled) try ModelRegistry.init(alloc, models_dir) else ModelRegistry.init(alloc, models_dir);
     defer reg.deinit();
+
+    if (comptime engine.enabled) return reg.list(io);
 
     const models = try reg.discover(io);
     defer alloc.free(models);
@@ -944,7 +982,7 @@ fn pullModel(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
         defer normalized.deinit(alloc);
         try normalized.append(alloc, refs.items[0]);
         try normalized.appendSlice(alloc, passthrough.items);
-        return try inference.tabular.cli.pullMain(alloc, io, normalized.items, defaultMlDir(alloc));
+        return try (if (engine.enabled) engine.pullPredictor(alloc, io, normalized.items, defaultMlDir(alloc)) else inference.tabular.cli.pullMain(alloc, io, normalized.items, defaultMlDir(alloc)));
     }
 
     // Also check HF_TOKEN env var
@@ -952,7 +990,7 @@ fn pullModel(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
         token = platform.env.getenv("HF_TOKEN");
     }
 
-    var reg = inference.registry.ModelRegistry.init(alloc, models_dir);
+    var reg = if (engine.enabled) try ModelRegistry.init(alloc, models_dir) else ModelRegistry.init(alloc, models_dir);
     defer reg.deinit();
     const hub_config = inference.registry.download.HubConfig{
         .token = token,
@@ -979,7 +1017,7 @@ fn pullModel(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
 }
 
 fn pullOneModel(
-    registry: *inference.registry.ModelRegistry,
+    registry: *ModelRegistry,
     io: std.Io,
     ref: []const u8,
     hub_config: inference.registry.download.HubConfig,
