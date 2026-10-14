@@ -1,6 +1,6 @@
 # Antfly Zig compilation architecture
 
-Last updated: 2026-10-12
+Last updated: 2026-10-14
 
 This is the living design and operating guide for Antfly's Zig compilation
 architecture. The complete chronological investigation, including rejected
@@ -9,9 +9,11 @@ probes and superseded measurements, is preserved in the
 
 ## Status at a glance
 
-Production builds seven static runtime archives and links them into one Antfly
-executable. The executable compiles its storage archive from the embedded source owner.
-`libantfly` compiles the local C API independently, without server coordination.
+Production builds seven runtime archives plus shared Apache storage and inference
+owners and links them into one Antfly executable. The executable and `libantfly`
+use the same compiled physical engine and inference implementations. The C API
+links the Apache owners without server coordination. Native owner sharing is the
+standard topology; there are no shared-core build switches.
 The source roots are explicit: selecting one archive does not declare the other
 archives' entry files through inactive imports.
 
@@ -80,11 +82,13 @@ libraries and links them into one executable:
 
 ```text
 thin linked antfly executable
-├── antfly-storage-kernel
+├── antfly-storage-engine (Apache; also linked into libantfly)
 │   ├── physical DB, LSM, indexes, DocStore and local query
-│   ├── writes, transaction participation, WAL and Raft apply
+│   ├── writes, transaction participation, WAL and local Raft apply
 │   ├── snapshots, restore, maintenance and Lite
-│   └── private server C API and storage-owner adapters
+│   └── public C API and handle registry
+├── antfly-storage-kernel (ELv2)
+│   └── server/Raft adapters over the compiled physical engine
 ├── antfly-runtime-distributed
 │   ├── data, metadata and hot-standby control
 │   └── standalone lifecycle and product composition
@@ -94,9 +98,10 @@ thin linked antfly executable
 │   └── serverless orchestration over published artifacts
 ├── antfly-runtime-cli
 │   └── remote/client CLI commands
+├── antfly-inference-core (Apache; also linked into libantfly)
+│   └── model lifecycle, inference execution and provider implementations
 ├── antfly-runtime-inference
-│   ├── model lifecycle and inference execution
-│   └── linked standalone inference host
+│   └── server inference adaptation and standalone inference host
 └── antfly-runtime-enrichment_compute
     └── bounded document and media extraction compute
 ```
@@ -974,9 +979,10 @@ then storage alongside distributed (826–1522 s and 826–1121 s respectively).
 The shared core took about 340 s, Zig MaxRSS 8G; its server adapter took about
 20 s/901M. Baseline server/embedded inference took about 346 s/8G and 233 s/6G.
 The shared core retains a conservative 20 GiB Darwin admission reservation.
-Reduced reservations require the explicit option and matching compiler, SDK,
-host/target, baseline CPU, optimization, strip, sanitizer and backend settings.
-Other profiles retain their existing claims.
+That snapshot required an explicit reservation option. Current builds select
+qualified claims automatically only for the matching compiler, SDK, host/target,
+baseline CPU, optimization, strip, sanitizer and backend settings. Other profiles
+retain conservative claims.
 
 The Apache inference owner contains HTTP serving, model ownership and CLI work.
 Its checked private boundary borrows IO/allocator callbacks and transports error
@@ -989,23 +995,23 @@ concrete worker. Broader storage reuse and size reduction remain open.
 The measured release passed twelve inference CLI help paths, model-free HTTP
 health/readiness/model inventory, and graceful worker shutdown. No downloaded
 model or throughput comparison was performed. Raw measurement files are retained
-outside the repository. Use separate fresh local/global caches and install
-prefixes for each run:
+outside the repository. For current builds, use the worktree's caches and one
+install prefix. Isolated qualification caches must also live in the worktree
+and be removed when qualification finishes:
 
 ```sh
-export ZIG_GLOBAL_CACHE_DIR=/absolute/path/to/fresh-global-cache
+export ZIG_LOCAL_CACHE_DIR="$PWD/.zig-cache"
+export ZIG_GLOBAL_CACHE_DIR="$PWD/.zig-global-cache"
 python3 tools/run_bounded_zig_build.py --zig /path/to/zig-0.17.0 -- \
   build antfly capi -Dtarget=aarch64-macos -Dcpu=baseline \
   -Doptimize=fast -Dstrip=true -Dmetal=true -Dsystem-blas=true \
   -Dcuda=false -Dpjrt=false -Dantfly-version=build-study \
-  -Dshared-inference-core=true -Dmeasured-darwin-compile-memory=true \
-  --cache-dir /absolute/path/to/fresh-local-cache \
-  --prefix /absolute/path/to/new-install --summary all
+  --cache-dir .zig-cache --prefix zig-out --summary all
 ```
 
 On the measured older source also pass `-Donnx=false`; main no longer has that
-backend option. Release packaging forwards these options for `--product server`
-as `--shared-inference-core true --measured-darwin-compile-memory true`.
+backend option. Current release packaging selects native shared owners and
+qualified admission automatically; the former shared-core switches are retired.
 Regenerate error names with
 `python3 zig/tools/generate_engine_errors.py --zig /path/to/pinned/zig`;
 `--check` verifies freshness. Run the model-free release check with
@@ -1051,8 +1057,9 @@ The follow-up changes are:
   remain inline; union remains inline because the native union probe regressed.
   Unsupported targets and thread-sanitized builds retain the inline implementation.
 
-The storage option is disabled by default. Release packaging forwards it with
-`--shared-storage-core true`. Qualification includes 48 ordinal/document-set tests
+That historical snapshot disabled the storage option by default and forwarded
+it through release packaging. Current native builds use the full shared storage
+owner automatically. Qualification of that ordinal snapshot includes 48 ordinal/document-set tests
 in each inline/shared mode, runtime contracts, mutation preparation/replay/SQL
 transform tests, native foreign-key and relational-index suites, the Apache source
 boundary audit, release C consumer linkage, and model-free inference CLI/HTTP
@@ -1071,8 +1078,9 @@ workloads and attribution before promotion.
 
 ### Shared physical engine follow-up (qualification in progress)
 
-`-Dshared-storage-core=true` now selects a complete Apache native storage owner,
-not only ordinal workers. `antfly-storage-engine` compiles the public C API once
+Native macOS/Linux aarch64/x86_64 products use the complete Apache compiled
+storage owner, including ordinal workers. Shared inference and storage are
+mandatory on these targets; source-only targets retain their target implementation. `antfly-storage-engine` compiles the public C API once
 and owns coarse DB lifecycle, batch, query (including leased reads), snapshot,
 schema/index and maintenance operations. The executable's ELv2 storage archive
 retains server/Raft adapters and calls this same compiled owner. The installed
@@ -1085,7 +1093,7 @@ borrowed native state. Conditional runtime implementations have authored names
 so independent compilation units calculate identical type identities. The
 existing error-domain dispatcher transports named failures without copying
 compiler-local numeric error codes. Both products access one handle registry
-and one C API TLS error state. The private v4 descriptor additionally checks
+and one C API TLS error state. The private native descriptor additionally checks
 backend-runtime and resource-manager layouts. Named callback dispatch preserves
 project error identities for server-provided mutation, query, replication, TTL,
 repair/capacity and background-job hooks. Query proxies are synchronous and
@@ -1099,15 +1107,20 @@ final links can discard unused operations. Lookup, scan, statistics and relation
 constraint/index maintenance also route to the owner. Enrichment reconfiguration
 and recovery/resolver runtime construction belong to this same owner, preventing
 server-side construction from retaining a second prepared-mutation engine.
-Stateful relational readers
-retain their existing implementation until their full reader lifetime and callback
-contract can be moved together.
+Stateful relational readers and document/relational sessions cross complete
+open, paging, normalization and destruction operations. Their native layouts
+are checked, and retained row filters carry their originating named-error
+dispatch for the entire reader lifetime. Statement snapshots, capture fences
+and query leases release through the same owner. The caller keeps borrowed
+filter context alive until reader destruction; owned request bytes and storage
+pins remain under the original reader lifetime rules.
 
 Static server adapters compile without waiting for the shared engine. Provider
 archives are attached to final consumers; `runtime-unit-storage-adapter` compiles
 the adapter alone for memory/time qualification. Reservations remain conservative
 until the new unit is measured. Unsupported and thread-sanitized profiles keep
-the existing independent implementations. The option remains disabled by default.
+the independent implementations in that historical snapshot. Current native
+products use the shared topology without a build option.
 
 Both embedded and production-profile executable probes pass real cross-archive
 lifecycle, batch/query, named-error, incompatible-layout, registry and TLS checks.
@@ -1182,7 +1195,8 @@ Repeat on the final revision with a quiet host. Counts and read-backs passed.
 
 Final release and overlap measurements remain pending. SDK 27.0 results are
 separate from wolfspider's SDK 26.4 pair; earlier figures describe their frozen
-snapshots. Shared storage and measured memory remain opt-in.
+snapshots. At that point shared storage and measured memory were opt-in;
+the October 14 default-topology work below removes those switches.
 
 
 Native Debug probes now emit entry objects and use the same system Mach-O linker
@@ -1255,8 +1269,9 @@ preceding shared snapshot. Exact bundled font bytes occur once per font in both
 final artifacts, versus five copies per font in the baseline executable and two
 in its library. Nevertheless, additional physical/query helper instantiations in
 the server adapter keep the executable 16.53 MB larger than current main. **The
-executable-size goal is not achieved.** Keep shared storage and measured admission
-opt-in and the PR in draft until that tradeoff is resolved or explicitly accepted.
+executable-size goal is not achieved.** This historical snapshot kept shared storage and measured admission opt-in.
+The subsequent default-topology work removes these switches at the user's
+request; executable-size qualification remains an independent acceptance gate.
 
 Final library throughput used isolated processes, alternating order, 64 warmup
 batches and verified insert/count/read-back checks. Six pairs of 1,200 batches of
@@ -1283,3 +1298,95 @@ renewed Tailscale authentication and is not qualified by these SDK 27.0 results.
 The exact final stripped CLI help smoke and ordinary executable/shared-library C
 consumer linkage both passed after cold qualification. Isolated measurement caches
 were removed after preserving raw evidence; the installed release artifacts remain.
+
+### Default shared-owner boundary completion (2026-10-14)
+
+The build and release packaging no longer expose shared-inference-core,
+shared-storage-core or measured-darwin-compile-memory switches. Native owner
+sharing is automatic, including instrumented native storage/inference owners.
+Compiler admission uses measured claims only for the exact pinned Zig, SDK,
+CPU, optimization, strip, sanitizer and provider profile; other configurations
+retain conservative reservations. SDK 26.4 does not inherit SDK 27.0 qualification.
+
+The server call-site audit now routes physical transaction, restore/staging,
+replication, index/graph/vector maintenance, statistics and read-session work
+through the engine. Thin batch profiling wrappers call the already shared batch
+entry. Progress callbacks use synchronous named-error receivers, and incoming
+graph-build failures cross as names rather than compiler-local error integers.
+The private v20 descriptor keeps all method and borrowed-state layout guards,
+including reader/session, index-manager, algebraic-index, DocStore, rewrite
+program, enrichment-set and backup-snapshot layouts. Shared contract helpers
+invoke the engine through their selected source-owner capability, keeping
+literal physical DB imports out of control catalogs and consumer cache inputs.
+Collision checking hashes
+each method once before comparing IDs, preserving detection while avoiding
+repeated compile-time hashing. Anonymous restore-finish and graph-notification
+payloads now have authored names shared by independently compiled profiles.
+Per-record and per-candidate loops stay inside complete engine operations.
+API coordinators use an aggregation-only native contract that does not import
+physical DB sources. It shares the engine's compiled aggregation implementation
+and validates borrowed physical state when an aggregation context carries it.
+Physical query/aggregation helpers, managed DB/provider factories, schema
+reconciliation and backup execution also use that owner. Disposable portable
+restore decoders execute a bounded burst of at most 16 pages or 100 ms inside
+one open/import/close operation. Explicit I/O arguments use named-error borrows;
+prepared backups own their receiving I/O until snapshot destruction, including
+copy calls made after preparation returns. Source-pin publication/reclamation,
+resolution and promotion runtimes, and pinned snapshot materialization and
+destruction also execute in the engine. Offline Lite portable exports and
+static native-restore materialization/publication entry points use the same
+owner. Staged generations, their manager and native manifests have explicit
+layout guards; a native fixture materializes, restores and reads back a snapshot.
+Artifact receipt callbacks preserve caller error names across independent
+compilation units. Writer callbacks execute through their originating unit,
+with named error transport and a local receiving writer; optional spool I/O
+uses a receiving executor. Receiver completion delivers pending bytes without
+prematurely flushing the caller’s writer. Native tests compare complete bytes
+and exercise caller-side WriteFailed and spool-backed export. Sanitizer settings
+propagate to the shared ordinal, storage, inference and enrichment owners; the
+server reuses the same enrichment archive for instrumented configurations.
+Release metadata attaches only to
+final executable/library consumers; the provider archives stay independent of
+release version objects and unit-test metadata.
+
+Implementation `a9e704da59` passes 84/84 default Debug native/restore/runtime
+steps, including both actual shared-owner profiles, portable writer/spool
+transport, snapshot restore/readback, 44 runtime tests and 13 restore tests.
+The earlier expanded implementation `9b6b19d94e` also passed the complete
+100/100 Debug composition, including 73 C API implementation tests (2 skips)
+and 48 production C API tests, with no failures, leaks or unexpected error logs.
+The current source audit verifies 880 embedded production files without server
+coordination imports; its 20 checker regression tests and all six memory-profile
+policy tests pass. The generated control catalog and default build help are
+consistent; no retired build switches remain. The real ordinal kernel compiles
+with TSAN read/write/function hooks, but full native TSAN execution remains
+unqualified. The focused CPU cache fixture passed; the full 29-fixture suite is
+not qualified.
+
+The clean-cache SDK 27.0 release at `9b6b19d94e` completed 88/88 steps in
+1,024.735 seconds (17m05s), with sampled aggregate descendant RSS of 11.49 GiB.
+This predates the final offline export, static restore and writer/sanitizer
+review corrections. The earlier 43m54s to 21m56s cold pair above belongs to its
+own frozen source. Neither timing establishes a matched speedup for the final
+reviewed source. SDK 26.4, current Linux execution and full TSAN execution need
+separate qualification.
+
+The pre-review final boundary `087425d46d` passed 88/88 stripped release steps,
+including ordinary C consumers and exactly 118 public C functions with no
+internal exports. Its executable was 184,158,664 bytes (5.57% smaller than the
+initial PR artifact, 3.18% larger than the recorded main baseline); its library
+was 68,606,944 bytes (4.13% smaller than that baseline). The exact executable
+link map placed the large prepared mutation worker, portable exporter, snapshot
+materializer and resolution/promotion execution only in the Apache engine.
+The adapter contribution fell from 24.11 MiB at the prior boundary to 22.52 MiB.
+The executable size goal remains incomplete relative to main.
+
+Four alternating model-free throughput pairs at `087425d46d`, each using
+1,200 batches of 64 rows after 64 warmup batches, preserved counts and readback.
+Document elapsed time increased 8.46% by independent medians and 3.49% by the
+median paired change. Relational elapsed time decreased 23.86% and 24.55%,
+respectively. Per-round variability and the shared host limit interpretation;
+this does not establish broad production throughput parity.
+
+Reviewed release artifact and link-map qualification is in progress. Raw logs,
+JSON, command provenance and maps remain outside the repository.
