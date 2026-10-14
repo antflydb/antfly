@@ -29,6 +29,20 @@ pub const Span = struct {
     pack_lower: u32,
     count: u32,
 };
+/// Encoded metadata estimate available without loading any span page.
+pub fn metadataBytes(spans: []const Span, pages: []const artifacts.ChunkRef) u64 {
+    var bytes: u64 = 0;
+    if (pages.len != 0) {
+        for (pages) |page| bytes +|= page.byte_len;
+    } else {
+        for (spans) |span| bytes +|= span.file.id.len + 512;
+    }
+    return bytes;
+}
+pub fn planningBytes(payload: u64, metadata: u64) u64 {
+    // Include copied span/rank maps and decoded strings, not just wire bytes.
+    return payload +| (metadata *| 4);
+}
 pub fn validate(spans: []const Span, count: u32, domain: [32]u8) !void {
     if (spans.len == 0 or spans.len > max_spans) return error.InvalidNativeLakeTextCorpus;
     var lower: u32 = 0;

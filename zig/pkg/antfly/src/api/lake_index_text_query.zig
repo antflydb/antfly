@@ -1329,7 +1329,11 @@ const Execution = struct {
                 }
             }
         }
-        if (root.segment_count <= window_config.admission_window_segments and root.serving_bytes <= window_config.admission_window_bytes) return null;
+        const planning_bytes = if (root.serving_metadata_bytes) |bytes|
+            corpus.source_spans.planningBytes(root.serving_bytes, bytes)
+        else
+            std.math.maxInt(u64);
+        if (root.segment_count == 0 or (root.segment_count <= window_config.admission_window_segments and planning_bytes <= window_config.admission_window_bytes)) return null;
         var ordering: ?local.storage_db_query_search_exec.SearchHitOrder = if (req.order_by.len != 0 or req.search_after.len != 0 or req.search_before.len != 0)
             try .init(a, req, runtime)
         else

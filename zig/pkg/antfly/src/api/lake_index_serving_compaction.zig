@@ -53,6 +53,7 @@ const Builder = struct {
     metadata_bytes: [4]usize = @splat(0),
     pack_count: u32 = 0,
     serving_bytes: u64 = 0,
+    serving_metadata_bytes: ?u64 = 0,
     fn check(self: *@This()) !void {
         try self.context.ensureActive();
         try self.token.check();
@@ -181,6 +182,7 @@ const Builder = struct {
         try self.contribution(group, 1);
         self.pack_count = try std.math.add(u32, self.pack_count, 1);
         self.serving_bytes = try std.math.add(u64, self.serving_bytes, group.admissions[0].bytes);
+        if (self.serving_metadata_bytes) |bytes| self.serving_metadata_bytes = try std.math.add(u64, bytes, metadataBytes(group, manifest));
     }
     fn merge(self: *@This(), a: A, inputs: []const Input) ![]u8 {
         var data: [8]local.index.SegmentData = undefined;
@@ -214,6 +216,11 @@ const Builder = struct {
         return local.segment.mergeSegmentInputs(a, merged[0..inputs.len]);
     }
 };
+fn metadataBytes(group: corpus.FileGroup, manifest: Chunk) u64 {
+    var bytes = corpus.source_spans.metadataBytes(group.sources, group.source_pages) +| manifest.byte_len;
+    for (group.descriptors) |descriptor| bytes +|= descriptor.byte_len;
+    return bytes;
+}
 fn put(a: A, out: A, store: *stores.ArtifactStore, value: anytype, token: Cancellation) !Chunk {
     var wire = value;
     if (@TypeOf(value) == corpus.FileGroup) if (wire.source_pages.len != 0) {
@@ -287,6 +294,7 @@ pub fn publishDelta(a: A, out: A, store: *stores.ArtifactStore, current: corpus.
         }
         builder.pack_count = old.segment_count;
         builder.serving_bytes = old.serving_bytes;
+        builder.serving_metadata_bytes = old.serving_metadata_bytes;
         // Paged ownership lookup touches only changed/removed source prefixes.
         var affected: std.StringHashMapUnmanaged(Chunk) = .empty;
         defer affected.deinit(a);
@@ -320,6 +328,7 @@ pub fn publishDelta(a: A, out: A, store: *stores.ArtifactStore, current: corpus.
             try builder.owner(group, ref.*, true);
             builder.pack_count = try std.math.sub(u32, builder.pack_count, 1);
             builder.serving_bytes = try std.math.sub(u64, builder.serving_bytes, group.admissions[0].bytes);
+            if (builder.serving_metadata_bytes) |bytes| builder.serving_metadata_bytes = try std.math.sub(u64, bytes, metadataBytes(group, ref.*));
             if (sources.items.len != 0) try builder.add(.{ .ref = group.segments[0], .admission = group.admissions[0], .sources = sources.items, .original_docs = group.admissions[0].doc_count, .summary = group.summaries[0] });
         }
     }
@@ -351,6 +360,7 @@ pub fn publishDelta(a: A, out: A, store: *stores.ArtifactStore, current: corpus.
     root.file_count = builder.pack_count;
     root.segment_count = builder.pack_count;
     root.serving_bytes = builder.serving_bytes;
+    root.serving_metadata_bytes = builder.serving_metadata_bytes;
     try root.validate();
     return put(a, out, store, root, token);
 }
@@ -399,6 +409,12 @@ test "external lake global frontier cross file packs preserve coordinates ties r
             return corpus.loadServing(a_, store_.*, .{ .kind = .text_segment, .metadata_version = corpus.metadata_version, .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, .none, null);
         }
         fn verify(a_: A, store_: stores.ArtifactStore, root_: corpus.Root, expected: usize) !void {
+            var metadata_bytes: u64 = 0;
+            for (try corpus.text_directory.fileRecords(a_, root_, store_, null, .none)) |pack| {
+                const group = try corpus.loadFileManifest(a_, store_, pack.manifest, root_.domain, .none, null);
+                metadata_bytes += metadataBytes(group, pack.manifest);
+            }
+            try std.testing.expectEqual(metadata_bytes, root_.serving_metadata_bytes.?);
             var writer = try corpus.loadWriter(a_, store_, root_, .none, null, null);
             defer writer.deinit();
             const snapshot = writer.snapshot();
@@ -451,6 +467,21 @@ test "external lake global frontier cross file packs preserve coordinates ties r
         const group = try corpus.loadFileManifest(ca, store, pack.manifest, current.domain, .none, null);
         try std.testing.expectEqual(@as(usize, 128), group.sources.len);
         try std.testing.expectEqual(@as(usize, 2), group.source_pages.len);
+        const metadata_bytes = metadataBytes(group, pack.manifest);
+        try std.testing.expect(metadata_bytes > 0);
+        try std.testing.expectEqual(metadata_bytes, first.serving_metadata_bytes.?);
+        const segment_id = corpus.term_directory.identity(group.segments[0].artifact_id);
+        const selected = try corpus.text_directory.SelectedCursor.create(a, first, store, null, .none, &.{ segment_id, segment_id });
+        defer selected.deinit();
+        const planning_bytes = try corpus.text_directory.segmentBytes(ca, selected.reader.pages.store(), first, segment_id);
+        try std.testing.expectEqual(corpus.source_spans.planningBytes(first.serving_bytes, metadata_bytes), planning_bytes);
+        try std.testing.expect(planning_bytes > first.serving_bytes);
+        // Metadata alone must prevent two native-small packs sharing a window.
+        const target = @max(planning_bytes, first.serving_bytes * 2);
+        var window: [2][32]u8 = undefined;
+        try std.testing.expectEqual(@as(usize, 1), (try selected.nextBounded(&window, target)).?.identities.len);
+        try std.testing.expectEqual(@as(usize, 1), (try selected.nextBounded(&window, target)).?.identities.len);
+        try std.testing.expect((try selected.nextBounded(&window, target)) == null);
     }
     try Helper.verify(ca, store, try Helper.reopen(ca, &store, current), 256);
     // A serving publication retains canonical maintenance metadata, without

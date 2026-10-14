@@ -219,6 +219,7 @@ pub const Root = struct {
     checkpoint_removed_files: ?statistics.Ref = null,
     checkpoint_removed_count: u32 = 0,
     serving_bytes: u64 = 0,
+    serving_metadata_bytes: ?u64 = null,
     pack_ownership: ?statistics.Ref = null,
     source_layout_version: u8 = 0,
     source_routes_version: u8 = 0,

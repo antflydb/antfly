@@ -455,6 +455,11 @@ fn get(a: A, storage: tree.Store, root: ?tree.Ref, id: Id) ![]const u8 {
     if (bytes.items.len == 0) return error.InvalidNativeLakeTextCorpus;
     return bytes.toOwnedSlice(a);
 }
+fn segmentPlanningBytes(record: SegmentRecord) u64 {
+    var metadata = corpus.source_spans.metadataBytes(record.sources, record.source_pages) +| record.manifest.byte_len;
+    if (record.route.descriptor) |descriptor| metadata +|= descriptor.byte_len;
+    return corpus.source_spans.planningBytes(record.route.bytes, metadata);
+}
 /// Authenticate a selected leaf's size without admitting its inventory.
 pub fn segmentBytes(a: A, storage: tree.Store, root: corpus.Root, id: Id) !u64 {
     const bytes = try get(a, storage, root.directories.segments, id);
@@ -462,7 +467,7 @@ pub fn segmentBytes(a: A, storage: tree.Store, root: corpus.Root, id: Id) !u64 {
     const record = try parseSegment(a, bytes, .{ .allocate = .alloc_always });
     if (!std.mem.eql(u8, &id, &corpus.term_directory.identity(record.route.ref.artifact_id))) return error.InvalidNativeLakeTextCorpus;
     try validateRouting(record, root.domain);
-    return record.route.bytes;
+    return segmentPlanningBytes(record);
 }
 
 pub fn decodeFileRecord(a: A, id: Id, bytes: []const u8, domain: Id) !FileRecord {
@@ -1084,7 +1089,7 @@ pub const RoutingCursor = struct {
         self.last_physical = physical_id;
         self.last_ordinal = record.ordinal;
         self.last_upper = try std.math.add(u32, record.interval.lower, record.interval.count);
-        self.last_segment_bytes = record.route.bytes;
+        self.last_segment_bytes = segmentPlanningBytes(record);
         self.last_segment_docs = record.route.doc_count;
         self.emitted = std.math.add(u32, self.emitted, 1) catch return error.InvalidNativeLakeTextCorpus;
         self.documents = std.math.add(u64, self.documents, record.route.doc_count) catch return error.InvalidNativeLakeTextCorpus;

@@ -3844,3 +3844,10 @@ fixtures use 131 independent files and a one-segment admission window, exercisin
 both paged spans and multiple actual serving windows after compaction. Archive-scale
 latency/RSS benchmarking and live-provider retention qualification remain deferred;
 no measured archive speedup is claimed by these bounded-work regressions.
+
+Admission planning counts span pages, descriptors and manifests as well as native
+posting bytes, with a conservative fourfold allowance for decoded metadata and
+coordinate maps. This cost is available from authenticated navigation alone;
+planning never fetches source-span pages. New serving roots maintain the aggregate
+cost incrementally. Older roots without that counter use bounded windows instead
+of the small-corpus shortcut until a fresh serving layout is published.
