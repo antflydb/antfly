@@ -96,6 +96,84 @@ pub fn freeRef(a: A, ref: Ref) void {
     a.free(ref.checksum);
     a.free(ref.generation);
 }
+/// Data-only navigation shared across operation-local generation bindings.
+/// Neither clients, roots, deadlines nor reader leases enter this pool.
+const Navigation = struct {
+    mu: std.atomic.Mutex = .unlocked,
+    cache: [128]?Reader.Cached = @splat(null),
+    cache_bytes: usize = 0,
+    clock: u64 = 0,
+    cache_allocator: A = std.heap.page_allocator,
+    cache_limit: usize = 8 * 1024 * 1024,
+    fn freeCached(self: *Navigation, value: Reader.Cached) void {
+        value.arena.deinit();
+        self.cache_allocator.destroy(value.arena);
+        freeRef(self.cache_allocator, value.ref);
+        self.cache_allocator.free(value.bytes);
+    }
+    fn deinit(self: *Navigation) void {
+        for (self.cache) |entry| if (entry) |value| self.freeCached(value);
+        self.cache = @splat(null);
+        self.cache_bytes = 0;
+    }
+};
+pub const NavigationOwner = struct {
+    refs: std.atomic.Value(usize) = .init(1),
+    budget: local.sql_memory_budget,
+    navigation: Navigation = .{},
+    pub fn release(self: *NavigationOwner) void {
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+        self.navigation.deinit();
+        std.debug.assert(self.budget.live == 0);
+        self.budget.backing.destroy(self);
+    }
+};
+pub const NavigationPool = struct {
+    const Entry = struct { scope: [32]u8, owner: *NavigationOwner, used: u64 };
+    entries: [8]?Entry = @splat(null),
+    mu: std.atomic.Mutex = .unlocked,
+    clock: u64 = 0,
+    budget: local.sql_memory_budget = .{ .backing = @import("antfly_platform").allocator.processAllocator(std.heap.smp_allocator), .limit = 64 * 1024 * 1024 },
+    pub fn acquire(self: *NavigationPool, scope: [32]u8) !*NavigationOwner {
+        lock(&self.mu);
+        defer self.mu.unlock();
+        self.clock +|= 1;
+        var target: usize = 0;
+        for (self.entries, 0..) |entry, i| {
+            if (entry) |held| {
+                if (std.mem.eql(u8, &scope, &held.scope)) {
+                    self.entries[i].?.used = self.clock;
+                    _ = held.owner.refs.fetchAdd(1, .monotonic);
+                    return held.owner;
+                }
+                if (self.entries[target] != null and held.used < self.entries[target].?.used) target = i;
+            } else target = i;
+        }
+        if (self.entries[target]) |retired| {
+            self.entries[target] = null;
+            retired.owner.release();
+        }
+        const owner = try self.budget.allocator().create(NavigationOwner);
+        owner.* = .{ .budget = .{ .backing = self.budget.allocator(), .limit = 64 * 1024 * 1024 } };
+        owner.navigation.cache_limit = 64 * 1024 * 1024;
+        owner.navigation.cache_allocator = owner.budget.allocator();
+        self.entries[target] = .{ .scope = scope, .owner = owner, .used = self.clock };
+        _ = owner.refs.fetchAdd(1, .monotonic);
+        return owner;
+    }
+    pub fn deinit(self: *NavigationPool) void {
+        for (&self.entries) |*entry| if (entry.*) |held| {
+            held.owner.release();
+            entry.* = null;
+        };
+        std.debug.assert(self.budget.live == 0);
+    }
+};
+var process_navigation: NavigationPool = .{};
+pub fn sharedNavigation(scope: [32]u8) ?*NavigationOwner {
+    if (std.mem.allEqual(u8, &scope, 0)) return null;
+    return process_navigation.acquire(scope) catch null;
+}
 pub const Reader = struct {
     client: objectstore.Client,
     bucket: []const u8,
@@ -108,17 +186,45 @@ pub const Reader = struct {
     /// Operation-local, serialized read allowance. Independent read views own
     /// independent counters; no publication-sized cache is required.
     remaining_bytes: u64 = 256 * 1024 * 1024,
-    mu: std.atomic.Mutex = .unlocked,
-    cache: [16]?Cached = @splat(null),
-    cache_bytes: usize = 0,
-    clock: u64 = 0,
+    shared: ?*NavigationOwner = null,
+    local_navigation: Navigation = .{},
     decoded_hits: u64 = 0,
     const Cached = struct { ref: Ref, bytes: []u8, arena: *std.heap.ArenaAllocator, node: Node, cost: usize, used: u64 };
+    fn navigation(self: *Reader) *Navigation {
+        if (self.shared) |owner| return &owner.navigation;
+        return &self.local_navigation;
+    }
+    fn cacheLimit(self: *Reader) usize {
+        return if (self.shared) |owner| owner.navigation.cache_limit else self.cache_limit;
+    }
+    fn cacheAllocator(self: *Reader) A {
+        return if (self.shared) |owner| owner.navigation.cache_allocator else self.cache_allocator;
+    }
     fn freeCached(self: *Reader, value: Cached) void {
+        const a = self.cacheAllocator();
         value.arena.deinit();
-        self.cache_allocator.destroy(value.arena);
-        freeRef(self.cache_allocator, value.ref);
-        self.cache_allocator.free(value.bytes);
+        a.destroy(value.arena);
+        freeRef(a, value.ref);
+        a.free(value.bytes);
+    }
+    fn evictOne(self: *Reader) bool {
+        const nav = self.navigation();
+        var oldest: ?usize = null;
+        for (nav.cache, 0..) |entry, i| if (entry) |value| {
+            if (oldest == null or value.used < nav.cache[oldest.?].?.used) oldest = i;
+        };
+        const index = oldest orelse return false;
+        const value = nav.cache[index].?;
+        nav.cache_bytes -= value.cost;
+        nav.cache[index] = null;
+        self.freeCached(value);
+        return true;
+    }
+    pub fn cachedBytes(self: *Reader) usize {
+        const nav = self.navigation();
+        lock(&nav.mu);
+        defer nav.mu.unlock();
+        return nav.cache_bytes;
     }
     fn cloneNode(a: A, node: Node) !Node {
         const records = try a.alloc(Record, node.records.len);
@@ -128,16 +234,17 @@ pub const Reader = struct {
         return .{ .version = node.version, .depth = node.depth, .leaf = node.leaf, .records = records, .children = children };
     }
     pub fn resetBudget(self: *Reader) void {
-        lock(&self.mu);
-        defer self.mu.unlock();
+        lock(&self.navigation().mu);
+        defer self.navigation().mu.unlock();
         self.remaining_bytes = 256 * 1024 * 1024;
     }
     pub fn deinit(self: *Reader) void {
-        for (self.cache) |entry| if (entry) |value| {
-            self.freeCached(value);
-        };
-        self.cache = @splat(null);
-        self.cache_bytes = 0;
+        if (self.shared) |owner| {
+            owner.release();
+            self.shared = null;
+        }
+        self.local_navigation.cache_allocator = self.cache_allocator;
+        self.local_navigation.deinit();
     }
     fn validateDomain(_: *Reader, node: Node, ref: Ref) !void {
         const root_scope = (try api.uploadScopeFromArtifactId(ref.artifact_id)) orelse return error.InvalidCloudGenerationMap;
@@ -157,13 +264,13 @@ pub const Reader = struct {
         try token.check();
         if (ref.byte_len > max_page_bytes) return error.InvalidCloudGenerationMap;
         {
-            lock(&self.mu);
-            defer self.mu.unlock();
-            self.clock +|= 1;
-            for (&self.cache) |*entry| if (entry.*) |*cached| {
+            lock(&self.navigation().mu);
+            defer self.navigation().mu.unlock();
+            self.navigation().clock +|= 1;
+            for (&self.navigation().cache) |*entry| if (entry.*) |*cached| {
                 if (std.mem.eql(u8, cached.ref.artifact_id, ref.artifact_id) and std.mem.eql(u8, cached.ref.generation, ref.generation)) {
                     if (cached.ref.byte_len != ref.byte_len or !std.mem.eql(u8, cached.ref.checksum, ref.checksum)) return error.ArtifactIntegrityMismatch;
-                    cached.used = self.clock;
+                    cached.used = self.navigation().clock;
                     if (cached.node.depth != depth) return error.InvalidCloudGenerationMap;
                     self.decoded_hits += 1;
                     return cloneNode(a, cached.node);
@@ -185,25 +292,31 @@ pub const Reader = struct {
         const node = try std.json.parseFromSliceLeaky(Node, a, result.body, .{ .allocate = .alloc_always });
         try node.validate(depth);
         try self.validateDomain(node, ref);
-        if (result.body.len > self.cache_limit) return node;
+        if (result.body.len > self.cacheLimit()) return node;
         // Distinct cold leaves can use the shared I/O scheduler concurrently.
         // Cache bookkeeping stays serialized; no network request holds its lock.
-        lock(&self.mu);
-        defer self.mu.unlock();
-        self.clock +|= 1;
-        for (self.cache) |entry| if (entry) |cached| {
+        lock(&self.navigation().mu);
+        defer self.navigation().mu.unlock();
+        self.navigation().clock +|= 1;
+        for (self.navigation().cache) |entry| if (entry) |cached| {
             if (std.mem.eql(u8, cached.ref.artifact_id, ref.artifact_id) and std.mem.eql(u8, cached.ref.generation, ref.generation)) return node;
         };
-        const ca = self.cache_allocator;
-        const owned = try ca.dupe(u8, result.body);
-        const owned_ref = cloneRef(ca, ref) catch |err| {
+        const ca = self.cacheAllocator();
+        // Make room before optional decoding, including shared-parent pressure.
+        // Otherwise a full byte budget would prevent reaching LRU eviction.
+        const staging = @min(self.cacheLimit(), result.body.len * 4 + 16 * 1024);
+        while ((local.sql_memory_budget.headroom(ca) orelse std.math.maxInt(usize)) < staging) {
+            if (!self.evictOne()) break;
+        }
+        const owned = ca.dupe(u8, result.body) catch return node;
+        const owned_ref = cloneRef(ca, ref) catch {
             ca.free(owned);
-            return err;
+            return node;
         };
-        const parsed = ca.create(std.heap.ArenaAllocator) catch |err| {
+        const parsed = ca.create(std.heap.ArenaAllocator) catch {
             freeRef(ca, owned_ref);
             ca.free(owned);
-            return err;
+            return node;
         };
         parsed.* = .init(ca);
         var retained = false;
@@ -213,30 +326,30 @@ pub const Reader = struct {
             freeRef(ca, owned_ref);
             ca.free(owned);
         };
-        const decoded = try std.json.parseFromSliceLeaky(Node, parsed.allocator(), owned, .{ .allocate = .alloc_if_needed });
+        const decoded = std.json.parseFromSliceLeaky(Node, parsed.allocator(), owned, .{ .allocate = .alloc_if_needed }) catch return node;
         const cost = owned.len + parsed.queryCapacity() + @sizeOf(std.heap.ArenaAllocator) + @sizeOf(Cached) + owned_ref.artifact_id.len + owned_ref.checksum.len + owned_ref.generation.len;
-        if (cost > self.cache_limit) return node;
+        if (cost > self.cacheLimit()) return node;
         var index: usize = 0;
         while (true) {
             var free: ?usize = null;
             var oldest: ?usize = null;
-            for (self.cache, 0..) |entry, i| {
+            for (self.navigation().cache, 0..) |entry, i| {
                 if (entry) |value| {
-                    if (oldest == null or value.used < self.cache[oldest.?].?.used) oldest = i;
+                    if (oldest == null or value.used < self.navigation().cache[oldest.?].?.used) oldest = i;
                 } else free = i;
             }
-            if (free != null and cost <= self.cache_limit - self.cache_bytes) {
+            if (free != null and cost <= self.cacheLimit() - self.navigation().cache_bytes) {
                 index = free.?;
                 break;
             }
             const victim = oldest orelse return error.InvalidCloudGenerationMap;
-            const old = self.cache[victim].?;
-            self.cache_bytes -= old.cost;
+            const old = self.navigation().cache[victim].?;
+            self.navigation().cache_bytes -= old.cost;
             self.freeCached(old);
-            self.cache[victim] = null;
+            self.navigation().cache[victim] = null;
         }
-        self.cache[index] = .{ .ref = owned_ref, .bytes = owned, .arena = parsed, .node = decoded, .cost = cost, .used = self.clock };
-        self.cache_bytes += cost;
+        self.navigation().cache[index] = .{ .ref = owned_ref, .bytes = owned, .arena = parsed, .node = decoded, .cost = cost, .used = self.navigation().clock };
+        self.navigation().cache_bytes += cost;
         retained = true;
         return node;
     }
@@ -256,13 +369,13 @@ pub const Reader = struct {
         return .{ .found = null };
     }
     fn cachedStep(self: *Reader, a: A, ref: Ref, id: []const u8, digest: [32]u8, depth: u8) !?Step {
-        lock(&self.mu);
-        defer self.mu.unlock();
-        self.clock +|= 1;
-        for (&self.cache) |*entry| if (entry.*) |*value| {
+        lock(&self.navigation().mu);
+        defer self.navigation().mu.unlock();
+        self.navigation().clock +|= 1;
+        for (&self.navigation().cache) |*entry| if (entry.*) |*value| {
             if (!std.mem.eql(u8, value.ref.artifact_id, ref.artifact_id) or !std.mem.eql(u8, value.ref.generation, ref.generation)) continue;
             if (value.ref.byte_len != ref.byte_len or !std.mem.eql(u8, value.ref.checksum, ref.checksum)) return error.ArtifactIntegrityMismatch;
-            value.used = self.clock;
+            value.used = self.navigation().clock;
             self.decoded_hits += 1;
             return try select(value.node, a, id, digest, depth);
         };
@@ -578,9 +691,9 @@ pub const Writer = struct {
         defer arena.deinit();
         const a = arena.allocator();
         // Construction reads one bounded page, not a cumulative archive quota.
-        lock(&self.reader.mu);
+        lock(&self.reader.navigation().mu);
         self.reader.remaining_bytes = std.math.maxInt(u64);
-        self.reader.mu.unlock();
+        self.reader.navigation().mu.unlock();
         const node: Node = if (old) |ref| try self.reader.read(a, ref, depth, token) else .{ .depth = depth, .leaf = true };
         if (node.leaf) {
             var entries: std.StringHashMapUnmanaged(Record) = .empty;
@@ -822,7 +935,7 @@ test "external lake global frontier generation maps pin restart reads and rewrit
     }
     try std.testing.expectEqual(charged, reopened.remaining_bytes);
     try std.testing.expect(reopened.decoded_hits >= hits + 100);
-    try std.testing.expect(reopened.cache_bytes <= reopened.cache_limit);
+    try std.testing.expect(reopened.cachedBytes() <= reopened.cache_limit);
     // Replacing the live map name cannot redirect an authenticated edge.
     const path = try key(a, "maps", first.artifact_id);
     defer a.free(path);
@@ -1021,4 +1134,68 @@ test "external lake global frontier cloud map siblings overlap before root publi
     try std.testing.expectEqual(@as(u32, 0), gate.active.load(.acquire));
     try std.testing.expect(!writer.complete and writer.disabled);
     try std.testing.expectEqualStrings(root.generation, writer.reader.root.?.generation);
+}
+
+test "external lake global frontier shared generation navigation survives request release and pinned eviction" {
+    const a = std.testing.allocator;
+    const Provider = @import("cloud_generations_test_provider.zig").Provider;
+    var provider = Provider.init(a);
+    defer provider.deinit();
+    var client = provider.client();
+    try client.makeBucket("bucket");
+    const scope: api.UploadScope = .{ .domain = @splat(1), .attempt = @splat(2) };
+    var writer: Writer = .{ .a = a, .reader = .{ .client = client, .bucket = "bucket", .prefix = "native" }, .scope = scope };
+    defer writer.deinit();
+    const id = try scope.artifactId(&(@as([64]u8, @splat('a'))));
+    try writer.capture(&id, 10, "v1", .none);
+    const root = (try writer.finish(.none)).?;
+    defer freeRef(a, root);
+    var pool: NavigationPool = .{};
+    defer pool.deinit();
+    var one: Reader = .{ .client = client, .bucket = "bucket", .prefix = "native", .root = root, .shared = try pool.acquire(@splat(7)) };
+    const record = (try one.lookup(a, &id, .none)).?;
+    defer {
+        var owned = record;
+        owned.deinit(a);
+    }
+    one.deinit();
+    var two: Reader = .{ .client = client, .bucket = "bucket", .prefix = "native", .root = root, .shared = try pool.acquire(@splat(7)) };
+    defer two.deinit();
+    const before = provider.gets;
+    const again = (try two.lookup(a, &id, .none)).?;
+    defer {
+        var owned = again;
+        owned.deinit(a);
+    }
+    try std.testing.expectEqual(before, provider.gets);
+    try std.testing.expectEqualStrings("v1", again.generation);
+    for (0..9) |i| (try pool.acquire(@splat(@intCast(i + 20)))).release();
+    const pinned = (try two.lookup(a, &id, .none)).?;
+    defer {
+        var owned = pinned;
+        owned.deinit(a);
+    }
+    try std.testing.expectEqual(before, provider.gets);
+    try std.testing.expect(two.cachedBytes() <= 8 * 1024 * 1024);
+    var pressure: NavigationPool = .{};
+    defer pressure.deinit();
+    pressure.budget.limit = @sizeOf(NavigationOwner) + 1;
+    var private: Reader = .{ .client = client, .bucket = "bucket", .prefix = "native", .root = root, .shared = try pressure.acquire(@splat(7)) };
+    defer private.deinit();
+    const uncached = (try private.lookup(a, &id, .none)).?;
+    defer {
+        var owned = uncached;
+        owned.deinit(a);
+    }
+    try std.testing.expectEqualStrings("v1", uncached.generation);
+    try std.testing.expectEqual(@as(usize, 0), private.cachedBytes());
+    var isolated: Reader = .{ .client = client, .bucket = "bucket", .prefix = "native", .root = root, .shared = try pool.acquire(@splat(99)) };
+    defer isolated.deinit();
+    const before_other = provider.gets;
+    const other = (try isolated.lookup(a, &id, .none)).?;
+    defer {
+        var owned = other;
+        owned.deinit(a);
+    }
+    try std.testing.expectEqual(before_other + 1, provider.gets);
 }

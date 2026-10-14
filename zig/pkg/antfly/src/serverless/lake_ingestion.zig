@@ -198,7 +198,7 @@ pub fn watermark(a: A, binding: Binding, options: Options, context: Context) !u6
     return store.watermark(a);
 }
 
-pub const Pending = struct { base_lsn: u64 = 0, lsn: u64, key_fields: []const []const u8, changes: []const Batch.Change };
+pub const Pending = struct { cut_identity: ?[32]u8 = null, base_lsn: u64 = 0, lsn: u64, key_fields: []const []const u8, changes: []const Batch.Change };
 /// Caller arena owns the immutable WAL cut and its normalized final images.
 pub fn pending(a: A, binding: Binding, options: Options, context: Context, cut: u64) !Pending {
     var opened = try openQueue(a, binding, options);

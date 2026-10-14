@@ -208,7 +208,9 @@ pub const Cache = struct {
             _ = previous.?.references.fetchAdd(1, .monotonic);
         }
         owner.head = if (head) |tail| .{ .lsn = tail.lsn, .key = try a.dupe(u8, tail.key) } else null;
-        owner.overlay = try Overlay.init(a, try ingestion.normalizePendingWithBase(a, cut, suffix.lsn, if (extension != null) previous.?.overlay.pending else null, suffix.records));
+        var pending = try ingestion.normalizePendingWithBase(a, cut, suffix.lsn, if (extension != null) previous.?.overlay.pending else null, suffix.records);
+        pending.cut_identity = key(@splat(0), cut, head);
+        owner.overlay = try Overlay.init(a, pending);
     }
 };
 

@@ -1055,7 +1055,9 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
             ),
         ),
     )
-    for part in range(67):
+    file_count = 131
+    row_count = file_count * 3
+    for part in range(file_count):
         table.append(
             pa.table(
                 {
@@ -1225,10 +1227,10 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
                     "/tables/wal_windows/query",
                     {
                         "full_text_search": {"match": "quasar", "field": "body"},
-                        "limit": 201,
+                        "limit": row_count,
                     },
                 )
-                if len(probe["hits"]["hits"]) == 201:
+                if len(probe["hits"]["hits"]) == row_count:
                     break
             assert time.monotonic() < deadline, index
             time.sleep(0.1)
@@ -1264,7 +1266,7 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
         query = {
             "full_text_search": {"match": "quasar", "field": "body"},
             "fields": ["id", "body"],
-            "limit": 201,
+            "limit": row_count,
             "profile": True,
             "lake_read": {
                 "visibility": "accepted",
@@ -1278,7 +1280,7 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
         assert first["profile"]["sort"]["selection_reason"] == (
             "bounded_global_text_frontier"
         ), first
-        assert len(hits) == 201, first
+        assert len(hits) == row_count, first
         rows = {h["_source"]["id"]: h["_source"]["body"] for h in hits}
         assert 1 not in rows and rows[0] == "quasar replacement"
         assert rows[1000] == "quasar recent recent"
@@ -1311,7 +1313,7 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
                     response.text + server.debug_logs()
                 )
                 time.sleep(0.1)
-            assert len(hybrid_first["hits"]["hits"]) == 201, hybrid_first
+            assert len(hybrid_first["hits"]["hits"]) == row_count, hybrid_first
             assert {h["_source"]["id"] for h in hybrid_first["hits"]["hits"]} == set(
                 rows
             )
@@ -1397,7 +1399,7 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
             )
             assert [h["_source"] for h in recent_only["hits"]["hits"]] == [{"id": 1000}]
             counted = call("POST", "/tables/wal_windows/query", dict(pinned, limit=0))
-            assert counted["hits"]["total"] == {"value": 201, "relation": "exact"}
+            assert counted["hits"]["total"] == {"value": row_count, "relation": "exact"}
         failed = False
     finally:
         server.stop(test_failed=failed)

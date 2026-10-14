@@ -49,7 +49,7 @@ pub const Binding = struct {
         errdefer a.destroy(reader);
         const root = try maps.cloneRef(a, cloud.root);
         errdefer maps.freeRef(a, root);
-        reader.* = .{ .client = object.client, .bucket = object.bucket, .prefix = object.prefix, .root = root, .complete = cloud.complete };
+        reader.* = .{ .client = object.client, .bucket = object.bucket, .prefix = object.prefix, .root = root, .complete = cloud.complete, .shared = maps.sharedNavigation(object.cloud_cache_scope) };
         const result: Binding = .{ .a = a, .object = object, .reader = reader, .previous_reader = object.cloud_reader, .previous_roots = object.cloud_certified_roots, .previous_until = object.cloud_certificate_until_ms };
         object.cloud_reader = reader;
         object.cloud_certified_roots = &.{};
@@ -186,7 +186,7 @@ pub const UnionBinding = struct {
         const pointers = try a.alloc(*maps.Reader, readers.len);
         errdefer a.free(pointers);
         for (readers, pointers, selected.items, 0..) |*reader, *pointer, cloud, i| {
-            reader.* = .{ .client = object.client, .bucket = object.bucket, .prefix = object.prefix, .root = cloud.root, .cache_limit = if (i < 4) 2 * 1024 * 1024 else 0 };
+            reader.* = .{ .client = object.client, .bucket = object.bucket, .prefix = object.prefix, .root = cloud.root, .shared = maps.sharedNavigation(object.cloud_cache_scope), .cache_limit = if (i < 4) 2 * 1024 * 1024 else 0 };
             pointer.* = reader;
         }
         const union_reader = try a.create(maps.Reader);

@@ -28,6 +28,27 @@ pub const Overlay = struct {
     rows: std.StringHashMapUnmanaged(V) = .empty,
     key_filter: []const u8,
     physical: ?@import("lake_index_physical_set.zig").Set = null,
+    pub fn valueDigest(value: anytype) [32]u8 {
+        var buffer: [4096]u8 = undefined;
+        var writer: std.Io.Writer.Hashing(std.crypto.hash.Blake3) = .init(&buffer);
+        std.json.Stringify.value(value, .{}, &writer.writer) catch unreachable;
+        writer.writer.flush() catch unreachable;
+        var digest: [32]u8 = undefined;
+        writer.hasher.final(&digest);
+        return digest;
+    }
+    pub fn contentIdentity(self: *const Overlay) [32]u8 {
+        if (self.pending.cut_identity) |digest| return digest;
+        // Legacy descriptors and hand-built overlays have no immutable head.
+        // Hash row images without allocating a second encoded suffix.
+        var combined: [32]u8 = @splat(0);
+        var rows = self.rows.iterator();
+        while (rows.next()) |entry| {
+            const digest = valueDigest(.{ entry.key_ptr.*, entry.value_ptr.* });
+            for (&combined, digest) |*out, byte| out.* ^= byte;
+        }
+        return valueDigest(.{ self.pending, self.rows.count(), combined });
+    }
     pub fn init(a: A, pending: ingestion.Pending) !Overlay {
         var result: Overlay = .{ .pending = pending, .key_filter = "" };
         var disjunction: std.ArrayList(V) = .empty;
@@ -48,6 +69,7 @@ pub const Overlay = struct {
             }
         }
         result.key_filter = try std.json.Stringify.valueAlloc(a, .{ .disjuncts = disjunction.items }, .{});
+        if (result.pending.cut_identity == null) result.pending.cut_identity = result.contentIdentity();
         return result;
     }
     pub fn row(self: *const Overlay, key: []const u8) ?V {
@@ -59,32 +81,142 @@ pub const Overlay = struct {
     pub fn recent(self: *const Overlay, a: A, name: []const u8, analysis: local.introducer.TextAnalysisConfig, schema: ?local.storage_schema.TableSchema, field: ?[]const u8, context: local.serverless_query_lake_read_context.Context) !search.PinnedTextSource {
         return self.recentBounded(a, name, analysis, schema, field, context, 64 * 1024 * 1024);
     }
+    pub const RecentPartition = struct { prefix: u16, digest: [32]u8, first: usize, count: usize, run: *RecentRun };
+    pub const RecentMetadata = struct { partitions: []const RecentPartition = &.{}, rebuilt_rows: usize = 0, reused_segments: usize = 0 };
+    const RecentRun = struct {
+        refs: std.atomic.Value(usize) = .init(1),
+        budget: local.sql_memory_budget,
+        locked: local.sql_parallel_scheduler.LockedAllocator = undefined,
+        snapshot: ?*local.index.IndexSnapshot = null,
+        fn retainedBytes(self: *RecentRun) usize {
+            @import("antfly_platform").sync.lockYielding(&self.budget.mutex);
+            defer self.budget.mutex.unlock();
+            return self.budget.live;
+        }
+        fn release(self: *RecentRun) void {
+            if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+            if (self.snapshot) |snapshot| snapshot.release();
+            std.debug.assert(self.budget.live == 0);
+            self.budget.backing.destroy(self);
+        }
+    };
     const RecentOwner = struct {
         a: A,
         budget: local.sql_memory_budget,
         locked: local.sql_parallel_scheduler.LockedAllocator = undefined,
+        metadata_arena: std.heap.ArenaAllocator = undefined,
+        metadata: RecentMetadata = .{},
+        runs: std.ArrayList(*RecentRun) = .empty,
         fn release(raw: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            for (self.runs.items) |run| run.release();
+            self.runs.deinit(self.locked.allocator());
+            self.metadata_arena.deinit();
             std.debug.assert(self.budget.live == 0);
             self.a.destroy(self);
         }
     };
     fn recentBounded(self: *const Overlay, a: A, name: []const u8, analysis: local.introducer.TextAnalysisConfig, schema: ?local.storage_schema.TableSchema, field: ?[]const u8, context: local.serverless_query_lake_read_context.Context, limit: usize) !search.PinnedTextSource {
         const owner = try a.create(RecentOwner);
-        errdefer a.destroy(owner);
         owner.* = .{ .a = a, .budget = .{ .backing = a, .limit = limit } };
         owner.locked = .{ .backing = owner.budget.allocator() };
-        return self.buildRecent(owner, name, analysis, schema, field, context) catch |err| {
-            if (owner.budget.exhausted) return error.LakeOverlayTooLarge;
+        owner.metadata_arena = .init(owner.locked.allocator());
+        return self.buildRecent(owner, name, analysis, schema, field, context, null) catch |err| {
+            const exhausted = owner.budget.isExhausted();
+            RecentOwner.release(owner);
+            if (exhausted) return error.LakeOverlayTooLarge;
             return err;
         };
     }
-    fn buildRecent(self: *const Overlay, owner: *RecentOwner, name: []const u8, analysis: local.introducer.TextAnalysisConfig, schema: ?local.storage_schema.TableSchema, field: ?[]const u8, context: local.serverless_query_lake_read_context.Context) !search.PinnedTextSource {
+    fn buildRecent(self: *const Overlay, owner: *RecentOwner, name: []const u8, analysis: local.introducer.TextAnalysisConfig, schema: ?local.storage_schema.TableSchema, field: ?[]const u8, context: local.serverless_query_lake_read_context.Context, previous: ?search.PinnedTextSource) !search.PinnedTextSource {
         const a = owner.locked.allocator();
         var writer = try local.index.IndexWriter.init(a);
         defer writer.deinit();
-        try self.appendRecent(a, &writer, analysis, schema, field, context);
-        return .{ .snapshot = writer.acquireSnapshot(), .name = name, .text_analysis = analysis, .runtime_schema = schema, .selected_field = field, .owner = owner, .release_owner = RecentOwner.release };
+        try self.appendPartitions(a, owner, &writer, previous, analysis, schema, field, context);
+        return .{ .snapshot = writer.acquireSnapshot(), .name = name, .text_analysis = analysis, .runtime_schema = schema, .selected_field = field, .provider_metadata = &owner.metadata, .owner = owner, .release_owner = RecentOwner.release };
+    }
+    pub fn recentIncremental(self: *const Overlay, a: A, name: []const u8, analysis: local.introducer.TextAnalysisConfig, schema: ?local.storage_schema.TableSchema, field: ?[]const u8, context: local.serverless_query_lake_read_context.Context, previous: ?search.PinnedTextSource) !search.PinnedTextSource {
+        const owner = try a.create(RecentOwner);
+        owner.* = .{ .a = a, .budget = .{ .backing = a, .limit = 64 * 1024 * 1024 } };
+        owner.locked = .{ .backing = owner.budget.allocator() };
+        owner.metadata_arena = .init(owner.locked.allocator());
+        // buildRecent releases its writer before this owner on failure.
+        return self.buildRecent(owner, name, analysis, schema, field, context, previous) catch |err| {
+            const exhausted = owner.budget.isExhausted();
+            RecentOwner.release(owner);
+            if (exhausted) return error.LakeOverlayTooLarge;
+            return err;
+        };
+    }
+    fn prefix(id: []const u8) u16 {
+        const tail = if (std.mem.startsWith(u8, id, "wal1:")) id[5..] else id;
+        return (@as(u16, if (tail.len != 0) tail[0] else 0) << 8) | (if (tail.len > 1) @as(u16, tail[1]) else 0);
+    }
+    fn appendPartitions(self: *const Overlay, a: A, owner: *RecentOwner, writer: *local.index.IndexWriter, previous: ?search.PinnedTextSource, analysis: local.introducer.TextAnalysisConfig, schema: ?local.storage_schema.TableSchema, field: ?[]const u8, context: local.serverless_query_lake_read_context.Context) !void {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const ids = try scratch.alloc([]const u8, self.rows.count());
+        var it = self.rows.keyIterator();
+        for (ids) |*id| id.* = it.next().?.*;
+        std.mem.sort([]const u8, ids, {}, struct {
+            fn less(_: void, l: []const u8, r: []const u8) bool {
+                return std.mem.lessThan(u8, l, r);
+            }
+        }.less);
+        const prior: ?*const RecentMetadata = if (previous) |pin| if (pin.provider_metadata) |raw| @ptrCast(@alignCast(raw)) else null else null;
+        var parts: std.ArrayList(RecentPartition) = .empty;
+        var sources: std.ArrayList(local.index.IndexWriter.ImmutableSegment) = .empty;
+        var retained_bytes: usize = 0;
+        var start: usize = 0;
+        while (start < ids.len) {
+            try context.ensureActive();
+            var end = start + 1;
+            const p = prefix(ids[start]);
+            while (end < ids.len and prefix(ids[end]) == p) : (end += 1) {}
+            var hash = std.crypto.hash.Blake3.init(.{});
+            for (ids[start..end]) |id| hash.update(&valueDigest(.{ id, self.rows.get(id).? }));
+            var digest: [32]u8 = undefined;
+            hash.final(&digest);
+            const matching: ?RecentPartition = if (prior != null) blk: {
+                for (prior.?.partitions) |part| if (part.prefix == p and std.mem.eql(u8, &part.digest, &digest)) break :blk part;
+                break :blk null;
+            } else null;
+            const first = sources.items.len;
+            const run: *RecentRun = if (matching) |part| reused: {
+                _ = part.run.refs.fetchAdd(1, .monotonic);
+                owner.metadata.reused_segments += part.count;
+                break :reused part.run;
+            } else fresh: {
+                const built = try owner.a.create(RecentRun);
+                built.* = .{ .budget = .{ .backing = owner.a, .limit = 64 * 1024 * 1024 } };
+                built.locked = .{ .backing = built.budget.allocator() };
+                errdefer built.release();
+                var subset: Overlay = .{ .pending = self.pending, .key_filter = "" };
+                for (ids[start..end]) |id| try subset.rows.put(scratch, id, self.rows.get(id).?);
+                var build = try local.index.IndexWriter.init(built.locked.allocator());
+                defer build.deinit();
+                subset.appendRecent(built.locked.allocator(), &build, analysis, schema, field, context) catch |err| {
+                    if (built.budget.isExhausted()) return error.LakeOverlayTooLarge;
+                    return err;
+                };
+                built.snapshot = build.acquireSnapshot();
+                owner.metadata.rebuilt_rows += end - start;
+                break :fresh built;
+            };
+            owner.runs.append(a, run) catch |err| {
+                run.release();
+                return err;
+            };
+            retained_bytes = std.math.add(usize, retained_bytes, run.retainedBytes()) catch return error.LakeOverlayTooLarge;
+            if (retained_bytes > 64 * 1024 * 1024) return error.LakeOverlayTooLarge;
+            const snapshot = run.snapshot.?;
+            for (snapshot.segments, 0..) |_, ordinal| try sources.append(scratch, .{ .snapshot = snapshot, .ordinal = ordinal, .target_id = sources.items.len + 1 });
+            try parts.append(scratch, .{ .prefix = p, .digest = digest, .first = first, .count = sources.items.len - first, .run = run });
+            start = end;
+        }
+        owner.metadata.partitions = try owner.metadata_arena.allocator().dupe(RecentPartition, parts.items);
+        try writer.shareImmutableSegments(sources.items);
     }
     fn appendRecent(self: *const Overlay, a: A, writer: *local.index.IndexWriter, analysis: local.introducer.TextAnalysisConfig, schema: ?local.storage_schema.TableSchema, field: ?[]const u8, context: local.serverless_query_lake_read_context.Context) !void {
         var arena = std.heap.ArenaAllocator.init(a);

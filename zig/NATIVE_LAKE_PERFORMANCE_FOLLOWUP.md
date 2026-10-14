@@ -3775,3 +3775,72 @@ qualification remains deferred and certificate enablement defaults off.
 Archive-scale latency/RSS measurements remain outstanding; these regressions
 establish correct results, bounded admission and reduced repeated work, not a
 measured speedup for a production archive.
+
+## Shared run owners and byte-targeted packs (protocol 42)
+
+Cloud GC asks the backend whether version operations are available, independently
+of whether bucket versioning is currently enabled. Known R2 endpoints use ordinary
+name enumeration and deletion. Other S3-compatible endpoints prove API support;
+explicit unsupported responses permit the unversioned path, while authorization,
+transport and malformed-response errors do not downgrade it. A GC operation caches
+that decision. S3 versioned collection still requires permission to list versions.
+No bucket versioning or retention policy is changed by this capability check.
+
+Normalized pending cuts now carry an immutable identity derived from their pinned
+WAL head and base coverage. Retained descriptors preserve that identity. Legacy
+images derive a streamed content digest without allocating another encoded suffix.
+Recent-text keys and fresh search snapshot hashes include the cut identity, so a
+same-generation restored queue cannot alias an earlier cut merely by reusing LSNs.
+
+Recent text is partitioned by ordered stable-key prefix. Each immutable run owns
+its allocator and native snapshot; a new cut retains matching runs directly and
+rebuilds changed prefixes. This preserves the original logical key order, complete
+BM25 statistics and private accepted-row visibility. Run references do not retain
+ancestor cuts, so repeated updates need no periodic full rebuild to truncate an
+ownership chain. The existing 256 MiB process-accounted cache budget covers run
+owners, payloads and cut metadata. Cut construction and retained-run admission are
+bounded separately; saturation retains the bounded private-build fallback. The
+regression checks twenty successive one-prefix replacements, old-cut results and
+active-reader survival after cache eviction.
+
+Cloud generation bindings share authenticated encoded and decoded navigation
+through a data-only process pool. Eight backend/credential scopes share 64 MiB,
+including owner allocations; an active scope has 128 LRU page slots and may use
+available capacity up to that shared ceiling. Exact artifact and provider-generation
+selectors identify each page. Clients, roots, permissions, request deadlines and
+reader leases remain operation-owned. Cache hits never widen a complete binding.
+Pinned owners survive eviction, and pressure evicts before optional decoding or
+returns an uncached authenticated result. Query, builder, recent-vector and GC
+bindings can reuse these pages. Scripted-provider tests prove reuse across reader
+release, isolation between scopes, pinned eviction and the pressure fallback.
+
+One lookahead task now prepares an admitted native window as well as compact
+navigation. It transfers a pinned archive source to the consuming window, where
+normal WAL masks, global statistics and query authority still apply. The shared
+scheduler reserves 16 MiB of planning work; actual inventory, segment and resource
+admission retain their existing limits. At most one future window is prepared.
+Saturation executes the required pull inline. Successful transfer, cancellation
+and query exit join the task and release every unconsumed pin before publication
+and source leases end. This extends the existing parallel opening inside a window
+by overlapping the next window's preparation with current-window scoring.
+
+Serving compaction now has four bounded eight-way tiers. Tiny files can share a
+pack until its byte/metadata target or 4,096-source safety bound is reached, while
+no merge opens more than eight posting inputs. Packs target at most 16 MiB of
+input admission and 1 MiB of estimated source metadata; indivisible prior inputs
+retain their established admission contract. Only small tails with less than
+512 KiB of source metadata remain open for future packing. Source spans beyond the small inline
+case live in authenticated pages of at most 64 spans and 64 KiB. Compact routing
+stores page edges; only admitted packs expand their spans. Physical inverse seeks,
+logical ties, hidden highlights, incremental ownership and stored source mapping
+use the same validated coordinates. GC and reuse audits retain the span pages and
+physical dependencies, with page reads charged to the operation's budget.
+
+Reader protocol 42 fences the paged layout; a layout marker upgrades older serving
+roots while retained earlier roots remain readable. The 128-file native regression
+now produces one paged pack and verifies reclamation, restart, inverse routing,
+append/removal/replacement and preserved prior pack bytes. Real Parquet and Iceberg
+fixtures use 131 independent files and a one-segment admission window, exercising
+both paged spans and multiple actual serving windows after compaction. Archive-scale
+latency/RSS benchmarking and live-provider retention qualification remain deferred;
+no measured archive speedup is claimed by these bounded-work regressions.

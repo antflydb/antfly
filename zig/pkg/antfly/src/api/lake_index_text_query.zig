@@ -178,6 +178,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
         std.mem.writeInt(u64, &lsn_bytes, value.pending.lsn, .little);
         snapshot_hash.update("accepted-wal-overlay-v1");
         snapshot_hash.update(&lsn_bytes);
+        snapshot_hash.update(&value.contentIdentity());
     }
     snapshot_hash.update(table.schema_json);
     var snapshot_digest: [32]u8 = undefined;
@@ -312,6 +313,7 @@ const Execution = struct {
     server: *server_api.ApiHttpServer,
     overlay: ?*overlay_api.Overlay = null,
     wal_cut: ?*const @import("lake_wal_cut_cache.zig").Pin = null,
+    prefetched_archive: ?*const search.PinnedTextSource = null,
     forced_pin: ?*search.PinnedTextSource = null,
     candidate_rows: ?[]const local.storage_rowsource_types.RowRef = null,
     table: local.sql_catalog.Table,
@@ -718,7 +720,7 @@ const Execution = struct {
                 else => return err,
             };
         };
-        var pin = self.server.lake_text_corpora.acquireSelected(self.server.embedding_provider_runtime.io, self.store.artifactStore(), selected.artifact, root, self.schema_json, cached, self.context, cancellation, selection) catch |err| switch (err) {
+        var pin = if (self.prefetched_archive) |held| try held.clone() else self.server.lake_text_corpora.acquireSelected(self.server.embedding_provider_runtime.io, self.store.artifactStore(), selected.artifact, root, self.schema_json, cached, self.context, cancellation, selection) catch |err| switch (err) {
             // Exact segment routing is an optional admission optimization. Its
             // detailed metadata can cost more than compact full-inventory
             // routes; retry full admission when that optional budget is tight.
@@ -739,7 +741,7 @@ const Execution = struct {
                 try self.resolveOverlayPhysical();
                 var excluded = try identities.bitmapForPhysical(self.arena, &overlay.physical.?, self.store.artifactStore(), cached);
                 defer excluded.deinit();
-                var recent_pin = try self.server.lake_recent_text.acquire(@import("lake_recent_text_cache.zig").Cache.key(self.store.identity, self.table.id, if (self.table.external_indexes) |indexes_| indexes_.object_generation else 0, self.source.inventory.source_id, self.source.inventory.snapshot_id, self.schema_json, root.config_json, selected.name, overlay), overlay, pin.name, pin.text_analysis, pin.runtime_schema, pin.selected_field, self.context);
+                var recent_pin = try self.server.lake_recent_text.acquireFamily(@import("lake_recent_text_cache.zig").Cache.key(self.store.identity, self.table.id, if (self.table.external_indexes) |indexes_| indexes_.object_generation else 0, self.source.inventory.source_id, self.source.inventory.snapshot_id, self.schema_json, root.config_json, selected.name, overlay), @import("lake_recent_text_cache.zig").Cache.family(self.store.identity, self.table.id, if (self.table.external_indexes) |indexes_| indexes_.object_generation else 0, self.source.inventory.source_id, self.source.inventory.snapshot_id, self.schema_json, root.config_json, selected.name), overlay, pin.name, pin.text_analysis, pin.runtime_schema, pin.selected_field, self.context);
                 defer recent_pin.deinit();
                 // Saturation can return a private pin; sharing gives the composed
                 // owner the same lifetime contract as a cache hit.
@@ -1371,7 +1373,7 @@ const Execution = struct {
             const config = try std.json.parseFromSliceLeaky(std.json.Value, self.arena, root.config_json, .{});
             const field: ?[]const u8 = if (config == .object) if (config.object.get("field")) |value| if (value == .string) value.string else null else null else null;
             const analysis = try local.storage_db_catalog_index_manager.parseTextAnalysisForIndexConfig(self.arena, root.config_json, runtime);
-            var pin = try self.server.lake_recent_text.acquire(@import("lake_recent_text_cache.zig").Cache.key(self.store.identity, self.table.id, if (self.table.external_indexes) |indexes_| indexes_.object_generation else 0, self.source.inventory.source_id, self.source.inventory.snapshot_id, self.schema_json, root.config_json, selected.name, overlay), overlay, selected.name, analysis, runtime, field, self.context);
+            var pin = try self.server.lake_recent_text.acquireFamily(@import("lake_recent_text_cache.zig").Cache.key(self.store.identity, self.table.id, if (self.table.external_indexes) |indexes_| indexes_.object_generation else 0, self.source.inventory.source_id, self.source.inventory.snapshot_id, self.schema_json, root.config_json, selected.name, overlay), @import("lake_recent_text_cache.zig").Cache.family(self.store.identity, self.table.id, if (self.table.external_indexes) |indexes_| indexes_.object_generation else 0, self.source.inventory.source_id, self.source.inventory.snapshot_id, self.schema_json, root.config_json, selected.name), overlay, selected.name, analysis, runtime, field, self.context);
             errdefer pin.deinit();
             recent = try pin.share(std.heap.page_allocator);
         }
@@ -1443,6 +1445,17 @@ const Execution = struct {
             reader: ?*@import("lake_index_text_directory.zig").RoutingCursor,
             selected: ?*@import("lake_index_text_directory.zig").SelectedCursor,
             max_bytes: u64,
+            execution: *Execution,
+            root: corpus.Root,
+            declaration: local.serverless_segment_sidecar_manifest.DeclaredArtifact,
+            cached: @import("lake_index_aggregate_artifact.zig").CachedRead,
+            token: @import("antfly_cancellation").CancellationToken,
+            fn prepare(raw: *anyopaque, selected_ids: []const [32]u8) !?search.PinnedTextSource {
+                const self_: *@This() = @ptrCast(@alignCast(raw));
+                const owner = self_.execution;
+                try owner.context.ensureActive();
+                return try owner.server.lake_text_corpora.acquireSelected(owner.server.embedding_provider_runtime.io, owner.store.artifactStore(), self_.declaration.artifact, self_.root, owner.schema_json, self_.cached, owner.context, self_.token, selected_ids);
+            }
             fn next(raw: *anyopaque, output: [][32]u8, cutoff: ?f32) !?@import("lake_index_text_directory.zig").RoutingCursor.Window {
                 const self_: *@This() = @ptrCast(@alignCast(raw));
                 if (self_.frontier) |value| {
@@ -1453,8 +1466,8 @@ const Execution = struct {
                 return self_.reader.?.nextBounded(output, self_.max_bytes);
             }
         };
-        var navigation: Navigation = .{ .frontier = frontier, .reader = reader, .selected = selected_reader, .max_bytes = window_config.admission_window_bytes };
-        var ahead = @import("lake_text_window_ahead.zig").init(.{ .ptr = &navigation, .next = Navigation.next }, self.context.io);
+        var navigation: Navigation = .{ .frontier = frontier, .reader = reader, .selected = selected_reader, .max_bytes = window_config.admission_window_bytes, .execution = self, .root = root, .declaration = selected, .cached = cached, .token = cancellation };
+        var ahead = @import("lake_text_window_ahead.zig").init(.{ .ptr = &navigation, .next = Navigation.next, .prepare = Navigation.prepare }, self.context.io);
         defer ahead.deinit();
         // Reuse the region even when the caller is itself an arena: freeing a
         // fresh child region per window would retain every window in its parent.
@@ -1473,6 +1486,8 @@ const Execution = struct {
             const recent_window = recent != null and !recent_scored;
             const pulled = if (recent_window) null else try ahead.next(if (frontier != null) batch_limit else window_config.admission_window_segments, competitive_cutoff);
             if (pulled == null and !recent_window) break;
+            var prepared = if (!recent_window) ahead.takePrepared() else null;
+            defer if (prepared) |*pin| pin.deinit();
             var window: @import("lake_index_text_directory.zig").RoutingCursor.Window = .{ .identities = &.{}, .doc_offset = root.collection.?.documents };
             if (pulled) |value| {
                 // Copy worker-owned output before the single lookahead reuses it.
@@ -1483,7 +1498,7 @@ const Execution = struct {
                 recent_scored = true;
                 ahead.prefetch(if (frontier != null) batch_limit else window_config.admission_window_segments, competitive_cutoff);
             }
-            var child: Execution = .{ .server = self.server, .table = self.table, .source = self.source, .store = self.store, .domain = self.domain, .declarations = self.declarations, .context = self.context, .request = self.request, .schema_json = self.schema_json, .arena = wa, .result_allocator = wa, .files = self.files, .private_files = self.private_files, .private_digests = self.private_digests, .typed_delivery = true, .forced_selection = window.identities, .overlay = self.overlay, .overlay_preparation = if (self.overlay != null) frontier orelse preparation else null, .recent_text_source = if (recent != null) &recent.? else null, .recent_text_window = recent_window };
+            var child: Execution = .{ .server = self.server, .table = self.table, .source = self.source, .store = self.store, .domain = self.domain, .declarations = self.declarations, .context = self.context, .request = self.request, .schema_json = self.schema_json, .arena = wa, .result_allocator = wa, .files = self.files, .private_files = self.private_files, .private_digests = self.private_digests, .typed_delivery = true, .forced_selection = window.identities, .prefetched_archive = if (prepared != null) &prepared.? else null, .overlay = self.overlay, .overlay_preparation = if (self.overlay != null) frontier orelse preparation else null, .recent_text_source = if (recent != null) &recent.? else null, .recent_text_window = recent_window };
             defer child.deinit();
             var request = retrievalRequest(req);
             request.offset = 0;

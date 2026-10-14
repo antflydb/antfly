@@ -42,6 +42,8 @@ pub const Interval = struct { lower: u32, count: u32 };
 pub const FileRecord = struct { file: state.File, manifest: Chunk };
 pub const SegmentRecord = struct {
     sources: []const corpus.source_spans.Span = &.{},
+    source_pages: []const Chunk = &.{},
+    source_count: u32 = 0,
     members: []const corpus.Member = &.{},
     file: state.File,
     manifest: Chunk,
@@ -89,10 +91,14 @@ fn put(a: A, store: *stores.ArtifactStore, value: anytype, token: Cancellation) 
 /// Descriptor payloads contain one segment's admission, and physical metadata
 /// contains no admissions. Neither hydration nor binding decodes a whole file.
 pub fn prepare(a: A, store: *stores.ArtifactStore, group: *corpus.FileGroup, token: Cancellation) !void {
+    if (group.sources.len > corpus.source_spans.page_spans and group.source_pages.len == 0) {
+        group.source_pages = try corpus.source_spans.publish(a, store, group.sources, token);
+        group.source_count = @intCast(group.sources.len);
+    }
     const descriptors = try a.alloc(Chunk, group.segments.len);
     for (descriptors, group.segments, group.admissions, group.summaries) |*ref, segment, admission, summary| {
         try token.check();
-        ref.* = try put(a, store, corpus.FileGroup{ .file = fileState(group.file), .sources = group.sources, .segments = &.{segment}, .admissions = &.{admission}, .summaries = &.{summary} }, token);
+        ref.* = try put(a, store, corpus.FileGroup{ .file = fileState(group.file), .sources = if (group.source_pages.len == 0) group.sources else &.{}, .source_pages = group.source_pages, .source_count = group.source_count, .segments = &.{segment}, .admissions = &.{admission}, .summaries = &.{summary} }, token);
     }
     group.descriptors = descriptors;
     if (group.sources.len != 0) return;
@@ -154,7 +160,7 @@ const Segments = struct {
         }
         var end = self.first_block;
         while (end < self.group.rows.len and self.group.rows[end].base < upper) : (end += 1) self.blocks_examined += 1;
-        const result: SegmentRecord = .{ .sources = self.group.sources, .file = fileState(self.group.file), .manifest = self.manifest, .physical = self.group.physical_manifest, .ordinal = @intCast(self.ordinal), .interval = .{ .lower = self.lower, .count = route.doc_count }, .route = route, .rows = self.group.rows[self.first_block..end] };
+        const result: SegmentRecord = .{ .sources = if (self.group.source_pages.len == 0) self.group.sources else &.{}, .source_pages = self.group.source_pages, .source_count = self.group.source_count, .file = fileState(self.group.file), .manifest = self.manifest, .physical = self.group.physical_manifest, .ordinal = @intCast(self.ordinal), .interval = .{ .lower = self.lower, .count = route.doc_count }, .route = route, .rows = self.group.rows[self.first_block..end] };
         self.lower = upper;
         self.ordinal += 1;
         return result;
@@ -540,6 +546,12 @@ fn validateRouting(record: SegmentRecord, domain: Id) !void {
     }
 }
 fn validatePhysical(record: SegmentRecord, domain: Id, upper: u32) !void {
+    if (record.source_pages.len != 0) {
+        if (record.source_count == 0 or record.source_count > corpus.source_spans.max_spans or record.source_pages.len > record.source_count or record.ordinal != 0 or record.interval.lower != 0 or record.rows.len != 0 or record.physical != null) return error.InvalidNativeLakeTextCorpus;
+        for (record.source_pages) |page| try validateRef(page, domain);
+        if (record.sources.len == 0) return;
+        if (record.sources.len != record.source_count) return error.InvalidNativeLakeTextCorpus;
+    }
     if (record.sources.len != 0) {
         if (record.ordinal != 0 or record.interval.lower != 0 or record.rows.len != 0 or record.physical != null) return error.InvalidNativeLakeTextCorpus;
         return corpus.source_spans.validate(record.sources, record.interval.count, domain);
@@ -573,6 +585,7 @@ pub fn loadSelected(a: A, scratch: A, root: corpus.Root, store: stores.ArtifactS
         if (!std.mem.eql(u8, &id, &corpus.term_directory.identity(record.route.ref.artifact_id))) return error.InvalidNativeLakeTextCorpus;
         try validateSegment(record.*, root.domain);
     }
+    try hydrateSources(a, root, store, cached, token, records, &read.reads);
     return assemble(a, root, records, true);
 }
 /// Compact routing is already in immutable file/segment order. Decode pages
@@ -602,13 +615,14 @@ fn loadRouting(a: A, scratch: A, root: corpus.Root, store: stores.ArtifactStore,
     }
     if (previous) |last| try appendRouting(a, &records, root.domain, last, bytes.items);
     if (root.segment_count != 0 and records.items.len != root.segment_count) return error.InvalidNativeLakeTextCorpus;
+    try hydrateSources(a, root, store, cached, token, records.items, &read.reads);
     return assembleOrdered(a, root, records.items, false);
 }
 fn appendRouting(a: A, records: *std.ArrayList(SegmentRecord), domain: Id, expected: [36]u8, bytes: []const u8) !void {
     if (records.items.len >= corpus.max_segments) return error.InvalidNativeLakeTextCorpus;
     const record = try parseSegment(a, bytes, .{ .allocate = .alloc_always });
     const file_id = corpus.term_directory.identity(record.file.id);
-    if (!std.mem.eql(u8, expected[0..32], &file_id) or std.mem.readInt(u32, expected[32..36], .big) != record.ordinal or record.rows.len != 0 or (record.physical == null and record.sources.len == 0)) return error.InvalidNativeLakeTextCorpus;
+    if (!std.mem.eql(u8, expected[0..32], &file_id) or std.mem.readInt(u32, expected[32..36], .big) != record.ordinal or record.rows.len != 0 or (record.physical == null and record.sources.len == 0 and record.source_pages.len == 0)) return error.InvalidNativeLakeTextCorpus;
     try validateRouting(record, domain);
     try records.append(a, record);
 }
@@ -650,6 +664,7 @@ pub fn loadAll(a: A, scratch: A, root: corpus.Root, store: stores.ArtifactStore,
         try bytes.appendSlice(scratch, record.value);
     }
     if (id) |last| try appendSegment(a, &records, root.domain, last, bytes.items);
+    try hydrateSources(a, root, store, cached, token, records.items, &read.reads);
     return assemble(a, root, records.items, false);
 }
 /// Stream the authenticated retained serving closure with one record decoded.
@@ -689,6 +704,12 @@ fn appendSegment(a: A, records: *std.ArrayList(SegmentRecord), domain: Id, id: I
     if (!std.mem.eql(u8, &id, &corpus.term_directory.identity(record.route.ref.artifact_id))) return error.InvalidNativeLakeTextCorpus;
     try validateSegment(record, domain);
     try records.append(a, record);
+}
+fn hydrateSources(a: A, root: corpus.Root, store: stores.ArtifactStore, cached: artifacts.CachedRead, token: Cancellation, records: []SegmentRecord, reads: *u64) !void {
+    for (records) |*record| if (record.source_pages.len != 0) {
+        record.sources = try corpus.source_spans.load(a, store, record.source_pages, record.source_count, root.domain, token, cached, reads);
+        try validateSegment(record.*, root.domain);
+    };
 }
 fn assemble(a: A, root: corpus.Root, records: []SegmentRecord, partial: bool) !corpus.Root {
     std.mem.sort(SegmentRecord, records, {}, struct {
@@ -732,7 +753,7 @@ fn assembleOrdered(a: A, root: corpus.Root, records: []const SegmentRecord, part
                 try blocks.append(a, block);
             }
         }
-        try groups.append(a, .{ .sources = selected[0].sources, .file = selected[0].file, .segments = refs, .summaries = summaries, .rows = blocks.items, .physical_manifest = selected[0].physical, .selected = if (partial or blocks.items.len != 0) intervals else &.{} });
+        try groups.append(a, .{ .sources = selected[0].sources, .source_pages = selected[0].source_pages, .source_count = selected[0].source_count, .file = selected[0].file, .segments = refs, .summaries = summaries, .rows = blocks.items, .physical_manifest = selected[0].physical, .selected = if (partial or blocks.items.len != 0) intervals else &.{} });
         try manifests.append(a, selected[0].manifest);
         try routes.append(a, routing);
         try segments.appendSlice(a, refs);
@@ -1048,7 +1069,7 @@ pub const RoutingCursor = struct {
         const record = try parseSegment(self.scratch.allocator(), self.bytes.items, .{ .allocate = .alloc_always });
         const file = corpus.term_directory.identity(record.file.id);
         if (!std.mem.eql(u8, key_[0..32], &file) or std.mem.readInt(u32, key_[32..36], .big) != record.ordinal) return error.InvalidNativeLakeTextCorpus;
-        if (record.rows.len != 0 or (record.physical == null and record.sources.len == 0)) return error.InvalidNativeLakeTextCorpus;
+        if (record.rows.len != 0 or (record.physical == null and record.sources.len == 0 and record.source_pages.len == 0)) return error.InvalidNativeLakeTextCorpus;
         try validateRouting(record, self.root.domain);
         const manifest_id = corpus.term_directory.identity(record.manifest.artifact_id);
         const physical_id = corpus.term_directory.identity((record.physical orelse record.manifest).artifact_id);

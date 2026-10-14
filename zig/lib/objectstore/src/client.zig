@@ -35,6 +35,7 @@ pub const Client = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
+        supports_object_versions: ?*const fn (*anyopaque, Allocator, []const u8, ?types.CancellationToken) anyerror!bool = null,
         /// Optional provider-enforced protection of current object names against
         /// deletion AND replacement. Version retention alone is insufficient.
         immutable_prefix_until: ?*const fn (*anyopaque, []const u8, []const u8, ?types.CancellationToken) anyerror!?u64 = null,
@@ -59,6 +60,14 @@ pub const Client = struct {
         list_object_versions: ?*const fn (*anyopaque, Allocator, []const u8, types.ListObjectVersionsOptions) anyerror!types.ListObjectVersionsResult = null,
     };
 
+    /// Availability of version operations, independently of bucket versioning
+    /// state. Permission/transport errors never authorize name-only deletion.
+    pub fn supportsObjectVersions(self: Client, bucket: []const u8, token: ?types.CancellationToken) !bool {
+        if (token) |value| try value.check();
+        const supported = if (self.vtable.supports_object_versions) |call| try call(self.ptr, self.allocator, bucket, token) else self.vtable.list_object_versions != null;
+        if (token) |value| try value.check();
+        return supported;
+    }
     pub fn immutablePrefixUntil(self: *Client, bucket: []const u8, prefix: []const u8, token: ?types.CancellationToken) !?u64 {
         if (token) |value| try value.check();
         const call = self.vtable.immutable_prefix_until orelse return null;

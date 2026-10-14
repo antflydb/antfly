@@ -42,14 +42,15 @@ const Builder = struct {
     open_packs: std.ArrayList(Chunk) = .empty,
     added: std.ArrayList(Chunk) = .empty,
     removed: std.ArrayList(Chunk) = .empty,
-    // Eight-way merges at each of two source-span tiers produce up to 64
-    // tiny-file spans per historical pack, without opening 64 inputs at once.
-    pending: [2][8]Input = undefined,
-    count: [2]usize = @splat(0),
-    bytes: [2]u64 = @splat(0),
-    spans: [2]usize = @splat(0),
-    open_counts: [2]usize = @splat(0),
-    pending_arena: [2]std.heap.ArenaAllocator,
+    // Four eight-way tiers fill tiny-file packs by bytes. Source spans live in
+    // independent pages; no merge opens more than eight posting inputs.
+    pending: [4][8]Input = undefined,
+    count: [4]usize = @splat(0),
+    bytes: [4]u64 = @splat(0),
+    spans: [4]usize = @splat(0),
+    open_counts: [4]usize = @splat(0),
+    pending_arena: [4]std.heap.ArenaAllocator,
+    metadata_bytes: [4]usize = @splat(0),
     pack_count: u32 = 0,
     serving_bytes: u64 = 0,
     fn check(self: *@This()) !void {
@@ -72,18 +73,24 @@ const Builder = struct {
         }
     }
     fn add(self: *@This(), input: Input) !void {
-        return self.addAt(if (input.sources.len < 8) 0 else 1, input);
+        var level: usize = 0;
+        var threshold: usize = 8;
+        while (level < 3 and input.sources.len >= threshold) : (level += 1) threshold *= 8;
+        return self.addAt(level, input);
     }
     fn addAt(self: *@This(), level: usize, input: Input) !void {
         try self.check();
-        if (self.count[level] != 0 and (self.bytes[level] + input.admission.bytes > 16 * 1024 * 1024 or self.spans[level] + input.sources.len > 64)) try self.flush(level);
+        var metadata: usize = 0;
+        for (input.sources) |span| metadata += span.file.id.len + 512;
+        if (self.count[level] != 0 and (self.bytes[level] + input.admission.bytes > 16 * 1024 * 1024 or self.spans[level] + input.sources.len > corpus.source_spans.max_spans or self.metadata_bytes[level] + metadata > 1024 * 1024)) try self.flush(level);
         const a = self.pending_arena[level].allocator();
         const bytes = try std.json.Stringify.valueAlloc(a, input, .{});
         self.pending[level][self.count[level]] = try std.json.parseFromSliceLeaky(Input, a, bytes, .{ .allocate = .alloc_always });
         self.count[level] += 1;
         self.bytes[level] += input.admission.bytes;
         self.spans[level] += input.sources.len;
-        if (self.count[level] == 8 or self.spans[level] == 64) try self.flush(level);
+        self.metadata_bytes[level] += metadata;
+        if (self.count[level] == 8 or self.spans[level] == corpus.source_spans.max_spans) try self.flush(level);
     }
     fn flush(self: *@This(), level: usize) anyerror!void {
         if (self.count[level] == 0) return;
@@ -91,6 +98,7 @@ const Builder = struct {
         self.count[level] = 0;
         self.bytes[level] = 0;
         self.spans[level] = 0;
+        self.metadata_bytes[level] = 0;
         _ = self.pending_arena[level].reset(.free_all);
     }
     fn emit(self: *@This(), inputs: []const Input, level: usize) anyerror!void {
@@ -141,7 +149,7 @@ const Builder = struct {
             if (admission.doc_count != count) return error.InvalidNativeLakeTextCorpus;
             group = .{ .file = undefined, .sources = sources.items, .segments = try out.dupe(Chunk, &.{ref}), .admissions = try out.dupe(local.segment.SegmentReader.Admission, &.{admission}), .summaries = try out.dupe(?corpus.statistics.Ref, &.{try corpus.statistics.publishSegmentWithIo(a, self.store, encoded, self.token, self.context.io)}) };
         }
-        if (level == 0 and group.sources.len >= 8 and group.sources.len < 64 and group.admissions[0].bytes < 2 * 1024 * 1024) {
+        if (level < 3 and group.sources.len >= std.math.pow(usize, 8, level + 1) and group.sources.len < corpus.source_spans.max_spans and group.admissions[0].bytes < 2 * 1024 * 1024) {
             // Only final packs own directory/ownership/statistics entries.
             // Intermediate immutable segments remain ordinary attempt orphans.
             var carry = std.heap.ArenaAllocator.init(self.a);
@@ -151,7 +159,7 @@ const Builder = struct {
             // A second-tier flush must not overlap the first merge workspace.
             arena.deinit();
             arena_live = false;
-            try self.addAt(1, input);
+            try self.addAt(level + 1, input);
             return;
         }
         const digest = corpus.term_directory.identity(group.segments[0].artifact_id);
@@ -161,8 +169,12 @@ const Builder = struct {
         const manifest = try put(out, self.out, self.store, group, self.token);
         try self.added.append(self.out, manifest);
         try self.owner(group, manifest, false);
-        const tier: usize = if (group.sources.len < 8) 0 else 1;
-        if (group.sources.len < 64 and group.admissions[0].bytes < 2 * 1024 * 1024 and self.open_counts[tier] < 7) {
+        var tier: usize = 0;
+        var threshold: usize = 8;
+        while (tier < 3 and group.sources.len >= threshold) : (tier += 1) threshold *= 8;
+        var source_metadata: usize = 0;
+        for (group.sources) |span| source_metadata += span.file.id.len + 512;
+        if (group.sources.len < corpus.source_spans.max_spans and source_metadata < 512 * 1024 and group.admissions[0].bytes < 2 * 1024 * 1024 and self.open_counts[tier] < 7) {
             try self.open_packs.append(self.out, manifest);
             self.open_counts[tier] += 1;
         }
@@ -203,7 +215,11 @@ const Builder = struct {
     }
 };
 fn put(a: A, out: A, store: *stores.ArtifactStore, value: anytype, token: Cancellation) !Chunk {
-    const bytes = try std.json.Stringify.valueAlloc(a, value, .{});
+    var wire = value;
+    if (@TypeOf(value) == corpus.FileGroup) if (wire.source_pages.len != 0) {
+        wire.sources = &.{};
+    };
+    const bytes = try std.json.Stringify.valueAlloc(a, wire, .{});
     defer a.free(bytes);
     if (bytes.len > corpus.max_root_bytes) return error.NativeLakeTextCorpusTooLarge;
     var writer = store.*;
@@ -253,7 +269,7 @@ pub fn publishDelta(a: A, out: A, store: *stores.ArtifactStore, current: corpus.
     defer ownership.deinit();
     var source_routes = corpus.text_directory.Mutations.init(a, &manager, pages.store());
     defer source_routes.deinit();
-    var builder: Builder = .{ .a = a, .out = ca, .store = store, .context = context, .token = token, .pages = &pages, .terms = &terms, .ownership = &ownership, .source_routes = &source_routes, .pending_arena = .{ .init(a), .init(a) } };
+    var builder: Builder = .{ .a = a, .out = ca, .store = store, .context = context, .token = token, .pages = &pages, .terms = &terms, .ownership = &ownership, .source_routes = &source_routes, .pending_arena = .{ .init(a), .init(a), .init(a), .init(a) } };
     defer for (&builder.pending_arena) |*pending| pending.deinit();
     var prior: ?corpus.Root = null;
     if (previous) |old| if (old.serving != null) {
@@ -322,12 +338,12 @@ pub fn publishDelta(a: A, out: A, store: *stores.ArtifactStore, current: corpus.
         }
         if (lower != rows) return error.InvalidNativeLakeTextCorpus;
     }
-    try builder.flush(0);
-    try builder.flush(1);
+    for (0..4) |level| try builder.flush(level);
     var root = current;
     root.serving = null;
     root.directories = try corpus.text_directory.publishManifests(a, store, builder.added.items, builder.removed.items, if (prior) |old| old.directories else .{}, current.domain, token, context.io.?);
     root.term_directory = try terms.finish(pages.store(), if (prior) |old| old.term_directory else .{});
+    root.source_layout_version = 1;
     root.source_routes_version = 1;
     root.source_routes = try source_routes.finish(if (prior) |old| old.source_routes else null);
     root.pack_ownership = try ownership.finish(if (prior) |old| old.pack_ownership else null);
@@ -428,12 +444,13 @@ test "external lake global frontier cross file packs preserve coordinates ties r
     defer first_plan.deinit();
     current.serving = try publish(a, ca, &store, current, null, &first_plan, .{ .io = std.testing.io }, .none);
     const first = try corpus.servingRoot(ca, store, current, .none, null);
-    try std.testing.expectEqual(@as(u32, 2), first.segment_count);
-    try std.testing.expectEqual(@as(usize, 0), first.open_packs.len);
+    try std.testing.expectEqual(@as(u32, 1), first.segment_count);
+    try std.testing.expectEqual(@as(usize, 1), first.open_packs.len);
     const first_packs = try corpus.text_directory.fileRecords(ca, first, store, null, .none);
     for (first_packs) |pack| {
         const group = try corpus.loadFileManifest(ca, store, pack.manifest, current.domain, .none, null);
-        try std.testing.expectEqual(@as(usize, 64), group.sources.len);
+        try std.testing.expectEqual(@as(usize, 128), group.sources.len);
+        try std.testing.expectEqual(@as(usize, 2), group.source_pages.len);
     }
     try Helper.verify(ca, store, try Helper.reopen(ca, &store, current), 256);
     // A serving publication retains canonical maintenance metadata, without
@@ -446,6 +463,10 @@ test "external lake global frontier cross file packs preserve coordinates ties r
         collector.marked.deinit(a);
     }
     try collector.markArtifact(ca, .{ .kind = .text_segment, .metadata_version = corpus.metadata_version, .artifact_id = root_ref.artifact_id, .checksum = root_ref.checksum, .byte_len = root_ref.byte_len });
+    for (first_packs) |pack| {
+        const retained_pack = try corpus.loadFileManifest(ca, store, pack.manifest, current.domain, .none, null);
+        for (retained_pack.source_pages) |page| try std.testing.expect(collector.marked.contains(page.artifact_id));
+    }
     for (refs[0..128]) |ref| {
         const group = try corpus.loadFileManifest(ca, store, ref, current.domain, .none, null);
         try std.testing.expect(collector.marked.contains(group.physical_manifest.?.artifact_id));
@@ -476,7 +497,7 @@ test "external lake global frontier cross file packs preserve coordinates ties r
     const added: corpus.text_directory.FileRecord = .{ .file = append_plan.files[128], .manifest = refs[128] };
     appended.serving = try publishDelta(a, ca, &store, delta_current, delta_base, .{ .removed = &.{}, .added = &.{added} }, &append_plan, .{ .io = std.testing.io }, .none);
     const appended_root = try corpus.servingRoot(ca, store, appended, .none, null);
-    try std.testing.expectEqual(@as(u32, 3), appended_root.segment_count);
+    try std.testing.expectEqual(@as(u32, 2), appended_root.segment_count);
     const appended_packs = try corpus.text_directory.fileRecords(ca, appended_root, store, null, .none);
     for (first_packs) |pack| {
         var found = false;

@@ -60,7 +60,9 @@ pub const ObjectStore = struct {
     /// Borrowed, immutable operation-local publication binding. A build writer
     /// owns the separate bounded upload journal and never escapes its lease.
     cloud_retention_qualified: bool = false,
+    cloud_cache_scope: [32]u8 = @splat(0),
     cloud_reader: ?*@import("cloud_generations.zig").Reader = null,
+    version_operations: std.atomic.Value(u8) = .init(0),
     cloud_writer: ?*@import("cloud_generations.zig").Writer = null,
     cloud_vacuum: ?@import("cloud_generations.zig").VacuumCut = null,
     cloud_certified_roots: []const [32]u8 = &.{},
@@ -252,6 +254,15 @@ pub const ObjectStore = struct {
         self.* = undefined;
     }
 
+    pub fn usesObjectVersions(self: *ObjectStore, token: CancellationToken) !bool {
+        try token.check();
+        if (self.fs_client != null) return false;
+        const held = self.version_operations.load(.acquire);
+        if (held != 0) return held == 2;
+        const supported = try self.client.supportsObjectVersions(self.bucket, objectstore.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn));
+        self.version_operations.store(if (supported) 2 else 1, .release);
+        return supported;
+    }
     fn generation(self: *ObjectStore, id: []const u8, token: CancellationToken) !?[]u8 {
         // Range reads may borrow an arena-owned store. Reclaim selectors after
         // every request rather than retaining one parse per posting block.
@@ -628,7 +639,7 @@ pub const ObjectStore = struct {
         if (self.local_inventory) |*fs| if (try artifact_store.uploadScopeFromArtifactId(artifact_id)) |scope| try @import("retained_closure.zig").invalidate(fs, scope, .none);
         const key = try keyForArtifactIdAlloc(self.alloc, self.prefix, artifact_id);
         defer self.alloc.free(key);
-        if (self.fs_client == null and self.client.vtable.list_object_versions != null) {
+        if (try self.usesObjectVersions(token)) {
             try self.deleteVersions(key, token);
         } else try self.client.deleteObject(self.bucket, key, .{ .cancellation = objectstore.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) });
         if (self.local_inventory) |*fs| try @import("retained_closure.zig").forget(fs, artifact_id);
@@ -741,7 +752,7 @@ pub const ObjectStore = struct {
         else
             try std.fmt.allocPrint(self.alloc, "{s}/graph/{s}/", .{ self.prefix, std.fmt.bytesToHex(&domain, .lower) });
         defer self.alloc.free(prefix);
-        if (self.fs_client == null and self.client.vtable.list_object_versions != null) return self.visitVersionedScopes(domain, prefix, visitor, cancellation);
+        if (try self.usesObjectVersions(cancellation)) return self.visitVersionedScopes(domain, prefix, visitor, cancellation);
         const start = if (visitor.after_suffix) |after| try std.mem.concat(self.alloc, u8, &.{ prefix, after }) else null;
         defer if (start) |key| self.alloc.free(key);
         var visited: usize = 0;
@@ -1497,4 +1508,42 @@ test "external lake remote retained closure certificates survive reopen inherit 
     defer mutable.deinit();
     var mutable_store = mutable.artifactStore();
     try std.testing.expect(!try mutable_store.retainedClosure(root.artifact_id, .none));
+}
+
+test "external lake global frontier unversioned S3-compatible GC uses names throughout enumeration and deletion" {
+    const a = std.testing.allocator;
+    const State = struct {
+        lists: usize = 0,
+        deletes: usize = 0,
+        fn request(raw: ?*anyopaque, alloc: std.mem.Allocator, method: objectstore.S3.HttpMethod, url: []const u8, _: []const objectstore.S3.HeaderPair, _: ?[]const u8, _: ?[]const u8, _: ?usize, _: ?objectstore.CancellationToken) !objectstore.S3.TransportResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(std.mem.indexOf(u8, url, "versions=") == null);
+            try std.testing.expect(std.mem.indexOf(u8, url, "versionId=") == null);
+            if (method == .HEAD) return .{ .status = 200, .body = try alloc.alloc(u8, 0) };
+            if (method == .GET) {
+                self.lists += 1;
+                return .{ .status = 200, .body = try alloc.dupe(u8, "<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>") };
+            }
+            try std.testing.expectEqual(objectstore.S3.HttpMethod.DELETE, method);
+            self.deletes += 1;
+            return .{ .status = 204, .body = try alloc.alloc(u8, 0) };
+        }
+        fn visit(_: *anyopaque, _: artifact_store.UploadScope, _: []const u8) !void {
+            return error.TestUnexpectedResult;
+        }
+    };
+    const cfg: objectstore.S3.Config = .{ .credentials = .{ .endpoint = try a.dupe(u8, "account.r2.cloudflarestorage.com"), .use_ssl = true, .access_key_id = try a.dupe(u8, "key"), .secret_access_key = try a.dupe(u8, "secret"), .region = try a.dupe(u8, "auto") }, .addressing_style = .path };
+    var state: State = .{};
+    var provider = objectstore.S3.Client.initWithRequestFn(a, cfg, &state, State.request);
+    var client = provider.client();
+    defer client.deinit();
+    var object = try ObjectStore.initWithClientOptions(a, client, "bucket", "native", .{});
+    defer object.deinit();
+    var store = object.artifactStore();
+    const scope: artifact_store.UploadScope = .{ .domain = @splat(1), .attempt = @splat(2) };
+    try store.visitScopedUploads(scope.domain, .{ .ptr = &state, .visit = State.visit }, .none);
+    const id = try scope.artifactId(&(@as([64]u8, @splat('a'))));
+    try store.delete(&id);
+    try std.testing.expectEqual(@as(usize, 1), state.lists);
+    try std.testing.expectEqual(@as(usize, 1), state.deletes);
 }

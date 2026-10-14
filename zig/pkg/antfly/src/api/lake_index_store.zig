@@ -71,6 +71,7 @@ pub const Store = struct {
         defer a.free(encoded);
         var identity: local.metadata_lake_index_catalog.Digest = undefined;
         std.crypto.hash.sha2.Sha256.hash(encoded, &identity, .{});
+        implementation.cloud_cache_scope = identity;
         const locator: local.metadata_lake_index_catalog.StoreLocator = .{
             .protocol = if (opened.fs_client != null) .filesystem else if (opened.s3_client != null) .s3 else .gcs,
             .connection = storage.artifacts.connection,

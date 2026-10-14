@@ -383,7 +383,7 @@ pub fn run(collector: *gc.Collector, state: lifecycle.State) !gc.Result {
         try collector.authority.apply(collector.table, .{ .checkpoint_collection = .{ .token = collector.token, .previous = progress.previous, .progress = next, .now_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms } });
         return collector.result;
     }
-    const cloud_checkpoints = if (collector.store.providerStore()) |object| object.fs_client == null and object.client.vtable.list_object_versions != null else false;
+    const cloud_checkpoints = if (collector.store.providerStore()) |object| try object.usesObjectVersions(collector.cancellation()) else false;
     try collector.authority.apply(collector.table, .{ .finish_collection = .{ .token = collector.token, .now_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, .retain_store = progress.value.deferred_retention or cloud_checkpoints, .vacuum = if (cloud_checkpoints) .{ .domain = domain, .floor = progress.value.floor, .cutoff = progress.value.cutoff, .marks = progress.value.marks } else null } });
     // Legacy nonce staging predates journal-discoverable pending-v2 files.
     // Its advisory migration cleanup must never gate collection completion.

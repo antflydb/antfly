@@ -32,7 +32,7 @@ pub const term_directory = @import("lake_index_term_directory.zig");
 // Includes v8 ordered producer identities and stored projection coverage.
 // Never reuse a v8 source-free segment as a covered stored-text sidecar.
 // V11 authenticates independent serving packs and original-source spans.
-// Protocol 37 fences older workers before admitting the new publication.
+// Protocol 42 fences paged source spans and larger byte-targeted serving packs.
 pub const metadata_version: u16 = 11;
 pub fn supportsBuildMetadata(version: u16) bool {
     return version == 9 or version == 10 or version == metadata_version;
@@ -103,6 +103,8 @@ pub fn validateMembers(members: []const Member, domain: [32]u8, lower: u32, coun
 pub const FileGroup = struct {
     file: state.File,
     sources: []const source_spans.Span = &.{},
+    source_pages: []const artifacts.ChunkRef = &.{},
+    source_count: u32 = 0,
     /// Historical v10 compaction coordinates, normalized before serving.
     members: []const Member = &.{},
     segments: []const artifacts.ChunkRef,
@@ -115,6 +117,10 @@ pub const FileGroup = struct {
     /// Query-only intervals map selected segment ordinals to original file ranks.
     selected: []const text_directory.Interval = &.{},
     pub fn validate(self: FileGroup, domain: [32]u8) !void {
+        if (self.source_pages.len != 0) {
+            if (self.source_count == 0 or self.source_count > source_spans.max_spans or self.sources.len != self.source_count) return error.InvalidNativeLakeTextCorpus;
+            for (self.source_pages) |page| try text_directory.validateRef(page, domain);
+        }
         if (self.sources.len != 0) {
             if (self.segments.len != 1) return error.InvalidNativeLakeTextCorpus;
             const last = self.sources[self.sources.len - 1];
@@ -214,6 +220,7 @@ pub const Root = struct {
     checkpoint_removed_count: u32 = 0,
     serving_bytes: u64 = 0,
     pack_ownership: ?statistics.Ref = null,
+    source_layout_version: u8 = 0,
     source_routes_version: u8 = 0,
     source_routes: ?statistics.Ref = null,
     open_packs: []const artifacts.ChunkRef = &.{},
@@ -284,9 +291,10 @@ pub const Root = struct {
         if (self.serving != null and self.compacted != null) return error.InvalidNativeLakeTextCorpus;
         if (self.checkpoint_removed.len > 16384 or (self.checkpoint_removed.len != 0 and self.checkpoint_base == null)) return error.InvalidNativeLakeTextCorpus;
         if (self.pack_ownership) |ref| try ref.validate();
+        if (self.source_layout_version > 1) return error.InvalidNativeLakeTextCorpus;
         if (self.source_routes_version > 1 or (self.source_routes != null and self.source_routes_version != 1)) return error.InvalidNativeLakeTextCorpus;
         if (self.source_routes) |ref| try ref.validate();
-        if (self.open_packs.len > 14) return error.InvalidNativeLakeTextCorpus;
+        if (self.open_packs.len > 28) return error.InvalidNativeLakeTextCorpus;
         for (self.open_packs) |ref| try text_directory.validateRef(ref, self.domain);
         if (self.admission_version > 1) return error.InvalidNativeLakeTextCorpus;
         if (self.term_directory.version < 1 or self.term_directory.version > 2) return error.InvalidNativeLakeTextCorpus;
@@ -380,6 +388,10 @@ pub fn servingRoot(a: A, store: stores.ArtifactStore, outer: Root, token: Cancel
 /// serving while allowing GC to checkpoint between file jobs.
 pub fn loadFileManifest(a: A, store: stores.ArtifactStore, ref: artifacts.ChunkRef, domain: [32]u8, cancellation: Cancellation, cache: ?artifacts.CachedRead) !FileGroup {
     if (ref.byte_len == 0 or ref.byte_len > max_root_bytes) return error.InvalidNativeLakeTextCorpus;
+    return loadFileManifestBudget(a, store, ref, domain, cancellation, cache, null);
+}
+pub fn loadFileManifestBudget(a: A, store: stores.ArtifactStore, ref: artifacts.ChunkRef, domain: [32]u8, cancellation: Cancellation, cache: ?artifacts.CachedRead, remaining: ?*u64) !FileGroup {
+    if (ref.byte_len == 0 or ref.byte_len > max_root_bytes) return error.InvalidNativeLakeTextCorpus;
     const scope = (try stores.uploadScopeFromArtifactId(ref.artifact_id)) orelse return error.InvalidNativeLakeTextCorpus;
     if (!std.mem.eql(u8, &scope.domain, &domain)) return error.InvalidNativeLakeTextCorpus;
     const bytes = try artifacts.readArtifact(a, store, ref, cancellation, cache);
@@ -390,6 +402,10 @@ pub fn loadFileManifest(a: A, store: stores.ArtifactStore, ref: artifacts.ChunkR
         if (group.sources.len != 0 or group.segments.len != 1) return error.InvalidNativeLakeTextCorpus;
         group.sources = try source_spans.fromMembers(a, group.members, domain);
         group.physical_manifest = null;
+    }
+    if (group.source_pages.len != 0) {
+        if (group.sources.len != 0) return error.InvalidNativeLakeTextCorpus;
+        group.sources = try source_spans.load(a, store, group.source_pages, group.source_count, domain, cancellation, cache, remaining);
     }
     try group.validate(domain);
     return group;
@@ -747,7 +763,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         if (prior) |declaration| {
             const directory_root = try loadRootDirectory(ca, store.*, declaration.artifact, cancellation, null);
             const root = if ((directory_root.inventory_version == 3 and directory_root.serving_routes == null) or directory_root.manifests.len != 0 or directory_root.checkpoint_files != null) directory_root else try loadRoot(ca, store.*, declaration.artifact, cancellation, null);
-            if (root.source_routes_version == 1 and root.serving != null and root.inventory_version == 3 and root.admission_version == 1 and root.statistics_version == 2 and root.term_directory.version == 2 and root.collection != null and root.serving_inventory == null and root.serving_routes == null and root.segment_files == null and std.mem.eql(u8, &root.recipe, &recipe)) {
+            if (root.source_layout_version == 1 and root.source_routes_version == 1 and root.serving != null and root.inventory_version == 3 and root.admission_version == 1 and root.statistics_version == 2 and root.term_directory.version == 2 and root.collection != null and root.serving_inventory == null and root.serving_routes == null and root.segment_files == null and std.mem.eql(u8, &root.recipe, &recipe)) {
                 try validateReuse(a, store.*, root, declaration.artifact.artifact_id, provider.context, cancellation);
                 try declarations.append(out, declaration);
                 continue;
@@ -1075,6 +1091,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         const directory = try directory_builder.finish(stats_pages.store(), prior_directory);
         const directories = try text_directory.publishManifests(a, store, current_refs.items, removed_refs.items, if (baseline) |old| old.directories else .{}, store.upload_scope.?.domain, cancellation, provider.context.io orelse return error.UnsupportedSqlExecution);
         var root: Root = .{ .admission_version = 1, .statistics_version = 2, .term_statistics = global_statistics, .term_directory = directory, .seekable = true, .stored_projection = store_source, .domain = store.upload_scope.?.domain, .binding = binding, .config_json = spec.config_json, .recipe = recipe, .directories = directories, .inventory_version = 3, .file_count = @intCast(plan.files.len), .segment_count = totals.segments, .collection = try totals.finish(ca) };
+        root.source_layout_version = 1;
         root.source_routes_version = 1;
         root.serving = try @import("lake_index_serving_compaction.zig").publishDelta(a, ca, store, root, baseline, .{ .removed = removed_files.items, .added = added_files.items }, &plan, provider.context, cancellation);
         try root.validate();
@@ -1239,7 +1256,9 @@ fn validateReuse(backing_a: A, backend: stores.ArtifactStore, root: Root, root_i
             if (entry.physical) |physical_ref| try v.leaf(physical_ref);
             try v.pages(entry.route.summary);
             if (v.maintenance_only) return;
-            for (entry.sources) |span| try v.leaf(span.physical);
+            for (entry.source_pages) |page| try v.leaf(page);
+            const spans = if (entry.source_pages.len != 0 and entry.sources.len == 0) try source_spans.load(v.a, v.store, entry.source_pages, entry.source_count, v.domain, v.cancellation, null, null) else entry.sources;
+            for (spans) |span| try v.leaf(span.physical);
             try v.leaf(entry.route.descriptor orelse return error.InvalidNativeLakeTextCorpus);
             try v.pages(entry.route.summary);
             try v.segment(entry.route.ref, true);
@@ -1380,7 +1399,9 @@ fn presentManifests(a: A, slots: []const ?artifacts.ChunkRef) ![]const artifacts
     return refs.toOwnedSlice(a);
 }
 pub fn publishFileManifest(a: A, out: A, store: *stores.ArtifactStore, group: FileGroup, cancellation: Cancellation) !artifacts.ChunkRef {
-    const bytes = try std.json.Stringify.valueAlloc(a, group, .{});
+    var wire = group;
+    if (wire.source_pages.len != 0) wire.sources = &.{};
+    const bytes = try std.json.Stringify.valueAlloc(a, wire, .{});
     defer a.free(bytes);
     if (bytes.len > max_root_bytes) return error.NativeLakeTextCorpusTooLarge;
     var upload = store.*;

@@ -20,10 +20,12 @@ const std = @import("std");
 const scheduler = @import("antfly_local_sources").sql_parallel_scheduler;
 const Window = @import("lake_index_text_directory.zig").RoutingCursor.Window;
 const Id = [32]u8;
+const Pin = @import("antfly_local_sources").storage_db_query_search_exec.PinnedTextSource;
 const Self = @This();
 pub const Source = struct {
     ptr: *anyopaque,
     next: *const fn (*anyopaque, []Id, ?f32) anyerror!?Window,
+    prepare: ?*const fn (*anyopaque, []const Id) anyerror!?Pin = null,
 };
 source: Source,
 io: ?std.Io,
@@ -32,11 +34,14 @@ ids: [64]Id = undefined,
 limit: usize = 1,
 cutoff: ?f32 = null,
 task: ?scheduler.Task(anyerror!?Window) = null,
+prepared: ?Pin = null,
 pub fn init(source: Source, io: ?std.Io) Self {
     return .{ .source = source, .io = io, .scheduling = scheduler.global() };
 }
 fn run(self: *Self) anyerror!?Window {
-    return self.source.next(self.source.ptr, self.ids[0..self.limit], self.cutoff);
+    const window = (try self.source.next(self.source.ptr, self.ids[0..self.limit], self.cutoff)) orelse return null;
+    if (self.source.prepare) |prepare| self.prepared = prepare(self.source.ptr, window.identities) catch null;
+    return window;
 }
 pub fn next(self: *Self, limit: usize, cutoff: ?f32) !?Window {
     if (self.task) |task| {
@@ -48,11 +53,16 @@ pub fn next(self: *Self, limit: usize, cutoff: ?f32) !?Window {
     self.cutoff = cutoff;
     return self.run();
 }
+pub fn takePrepared(self: *Self) ?Pin {
+    const pin = self.prepared;
+    self.prepared = null;
+    return pin;
+}
 pub fn prefetch(self: *Self, limit: usize, cutoff: ?f32) void {
-    std.debug.assert(self.task == null);
+    std.debug.assert(self.task == null and self.prepared == null);
     self.limit = @min(self.ids.len, @max(1, limit));
     self.cutoff = cutoff;
-    if (self.io) |io| self.task = self.scheduling.submitIoTransient(io, 8 * 1024 * 1024, run, .{self});
+    if (self.io) |io| self.task = self.scheduling.submitIoTransient(io, 16 * 1024 * 1024, run, .{self});
 }
 pub fn deinit(self: *Self) void {
     if (self.task) |task| {
@@ -60,6 +70,8 @@ pub fn deinit(self: *Self) void {
         self.task = null;
         _ = pending.cancel(self.io.?) catch {};
     }
+    if (self.prepared) |*pin| pin.deinit();
+    self.prepared = null;
 }
 
 test "external lake bounded window lookahead joins cancellation and yields under saturation" {
@@ -68,6 +80,17 @@ test "external lake bounded window lookahead joins cancellation and yields under
         started: std.Io.Event = .unset,
         gate: std.Io.Event = .unset,
         joined: std.atomic.Value(bool) = .init(false),
+        released: std.atomic.Value(usize) = .init(0),
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.released.fetchAdd(1, .monotonic);
+        }
+        fn prepare(raw: *anyopaque, _: []const Id) !?Pin {
+            var writer = try @import("antfly_local_sources").index.IndexWriter.init(std.testing.allocator);
+            defer writer.deinit();
+            const pin: Pin = .{ .snapshot = writer.acquireSnapshot(), .name = "prepared", .text_analysis = .{}, .runtime_schema = null, .owner = raw, .release_owner = release };
+            return try pin.share(std.testing.allocator);
+        }
         fn next(raw: *anyopaque, ids: []Id, _: ?f32) !?Window {
             const self: *@This() = @ptrCast(@alignCast(raw));
             defer self.joined.store(true, .release);
@@ -81,7 +104,7 @@ test "external lake bounded window lookahead joins cancellation and yields under
     for ([_]bool{ false, true }) |cancel| {
         var state: State = .{ .io = io };
         var scheduling: scheduler.Scheduler = .{};
-        var ahead = Self.init(.{ .ptr = &state, .next = State.next }, io);
+        var ahead = Self.init(.{ .ptr = &state, .next = State.next, .prepare = State.prepare }, io);
         ahead.scheduling = &scheduling;
         defer ahead.deinit();
         ahead.prefetch(64, null);
@@ -94,6 +117,12 @@ test "external lake bounded window lookahead joins cancellation and yields under
             const window = (try ahead.next(64, null)).?;
             try std.testing.expectEqual(@as(u64, 9), window.doc_offset);
             try std.testing.expectEqual(@as(Id, @splat(7)), window.identities[0]);
+            var pin = ahead.takePrepared().?;
+            try std.testing.expectEqualStrings("prepared", pin.name);
+            ahead.deinit();
+            try std.testing.expectEqual(@as(usize, 0), state.released.load(.acquire));
+            pin.deinit();
+            try std.testing.expectEqual(@as(usize, 1), state.released.load(.acquire));
         }
         try std.testing.expect(state.joined.load(.acquire));
         try std.testing.expectEqual(@as(usize, 0), scheduling.io_workers);
@@ -102,7 +131,7 @@ test "external lake bounded window lookahead joins cancellation and yields under
     var state: State = .{ .io = io };
     state.gate.set(io);
     var scheduling: scheduler.Scheduler = .{ .max_io_workers = 0 };
-    var ahead = Self.init(.{ .ptr = &state, .next = State.next }, io);
+    var ahead = Self.init(.{ .ptr = &state, .next = State.next, .prepare = State.prepare }, io);
     ahead.scheduling = &scheduling;
     defer ahead.deinit();
     ahead.prefetch(1000, 1);

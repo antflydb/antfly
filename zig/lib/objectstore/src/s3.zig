@@ -1230,6 +1230,19 @@ pub const Client = struct {
         }
     }
 
+    fn supportsObjectVersions(raw: *anyopaque, a: Allocator, bucket: []const u8, token: ?types.CancellationToken) !bool {
+        const self: *Client = @ptrCast(@alignCast(raw));
+        // R2's API is explicitly unversioned. Other compatible endpoints must
+        // prove support; HTTP failures cannot silently discard historical versions.
+        if (std.mem.endsWith(u8, self.cfg.credentials.endpoint, ".r2.cloudflarestorage.com")) return false;
+        var page = self.listObjectVersions(a, bucket, .{ .max_keys = 1, .cancellation = token }) catch |err| switch (err) {
+            error.ObjectVersionListingUnsupported => return false,
+            else => return err,
+        };
+        defer page.deinit(a);
+        return true;
+    }
+
     fn listObjectVersions(self: *Client, alloc: Allocator, bucket: []const u8, opts: types.ListObjectVersionsOptions) !types.ListObjectVersionsResult {
         if (opts.continuation_token != null) return error.InvalidVersionPagination;
         const query = try buildListObjectVersionsQueryAlloc(alloc, opts);
@@ -1244,6 +1257,11 @@ pub const Client = struct {
             404 => return .{
                 .entries = try alloc.alloc(types.ObjectVersionEntry, 0),
                 .is_truncated = false,
+            },
+            501 => return error.ObjectVersionListingUnsupported,
+            400 => {
+                if (std.mem.indexOf(u8, response.body, "<Code>NotImplemented</Code>") != null or std.mem.indexOf(u8, response.body, "<Code>UnsupportedOperation</Code>") != null) return error.ObjectVersionListingUnsupported;
+                return unexpectedStatusError(response.status);
             },
             else => return unexpectedStatusError(response.status),
         }
@@ -1390,6 +1408,7 @@ pub const Client = struct {
     }
 
     const vtable: client_mod.Client.VTable = .{
+        .supports_object_versions = supportsObjectVersions,
         .version_retention = erasedVersionRetention,
         .provider_time = erasedProviderTime,
         .deinit = erasedDeinit,
@@ -2274,6 +2293,7 @@ fn parseListResponse(alloc: Allocator, xml: []const u8) !types.ListResult {
 }
 
 fn parseListObjectVersionsResponse(alloc: Allocator, xml: []const u8) !types.ListObjectVersionsResult {
+    if (std.mem.indexOf(u8, xml, "<ListVersionsResult") == null or std.mem.indexOf(u8, xml, "</ListVersionsResult>") == null) return error.InvalidListVersionsResponse;
     var entries = std.ArrayListUnmanaged(types.ObjectVersionEntry).empty;
     errdefer {
         for (entries.items) |*entry| entry.deinit(alloc);
@@ -3530,5 +3550,37 @@ test "s3 exact reads reject contradictory response versions and retain qualified
         defer result.deinit(a);
         try std.testing.expectEqualStrings("v1", result.metadata.version_id.?);
         try std.testing.expectEqualStrings("x", result.body);
+    }
+}
+
+test "s3 version capabilities preserve unversioned compatible endpoints and permission failures" {
+    const a = std.testing.allocator;
+    const State = struct {
+        status: u16 = 200,
+        calls: usize = 0,
+        fn request(raw: ?*anyopaque, alloc: Allocator, _: HttpMethod, url: []const u8, _: []const HeaderPair, _: ?[]const u8, _: ?[]const u8, _: ?usize, _: ?types.CancellationToken) !TransportResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            try std.testing.expect(std.mem.indexOf(u8, url, "versions=") != null);
+            return .{ .status = self.status, .body = try alloc.dupe(u8, "<ListVersionsResult><IsTruncated>false</IsTruncated></ListVersionsResult>") };
+        }
+    };
+    var state: State = .{};
+    for ([_][]const u8{ "example.com", "account.r2.cloudflarestorage.com" }, 0..) |endpoint, index| {
+        const cfg: Config = .{ .credentials = .{ .endpoint = try a.dupe(u8, endpoint), .use_ssl = true, .access_key_id = try a.dupe(u8, "key"), .secret_access_key = try a.dupe(u8, "secret"), .region = try a.dupe(u8, "us-east-1") }, .addressing_style = .path };
+        var provider = Client.initWithRequestFn(a, cfg, &state, State.request);
+        var client = provider.client();
+        defer client.deinit();
+        if (index == 1) {
+            const before = state.calls;
+            try std.testing.expect(!try client.supportsObjectVersions("bucket", null));
+            try std.testing.expectEqual(before, state.calls);
+        } else {
+            try std.testing.expect(try client.supportsObjectVersions("bucket", null));
+            state.status = 501;
+            try std.testing.expect(!try client.supportsObjectVersions("bucket", null));
+            state.status = 403;
+            try std.testing.expectError(error.AccessDenied, client.supportsObjectVersions("bucket", null));
+        }
     }
 }

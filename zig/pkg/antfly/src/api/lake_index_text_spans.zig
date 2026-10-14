@@ -18,6 +18,9 @@ const std = @import("std");
 const state = @import("lake_index_native_state.zig");
 const artifacts = @import("lake_index_aggregate_artifact.zig");
 const stores = @import("../serverless/artifacts/store.zig");
+pub const max_spans = 4096;
+pub const page_spans = 64;
+pub const max_page_bytes = 64 * 1024;
 pub const Span = struct {
     file: state.File,
     physical: artifacts.ChunkRef,
@@ -27,7 +30,7 @@ pub const Span = struct {
     count: u32,
 };
 pub fn validate(spans: []const Span, count: u32, domain: [32]u8) !void {
-    if (spans.len == 0 or spans.len > 64) return error.InvalidNativeLakeTextCorpus;
+    if (spans.len == 0 or spans.len > max_spans) return error.InvalidNativeLakeTextCorpus;
     var lower: u32 = 0;
     for (spans) |span| {
         try state.validate(&.{span.file}, domain);
@@ -50,5 +53,53 @@ pub fn fromMembers(a: std.mem.Allocator, members: anytype, domain: [32]u8) ![]co
         count = try std.math.add(u32, count, member.count);
     }
     try validate(result, count, domain);
+    return result;
+}
+
+const Page = struct { version: u8 = 1, spans: []const Span };
+pub fn publish(a: std.mem.Allocator, store: *stores.ArtifactStore, spans: []const Span, token: @import("antfly_cancellation").CancellationToken) ![]const artifacts.ChunkRef {
+    var refs: std.ArrayList(artifacts.ChunkRef) = .empty;
+    var offset: usize = 0;
+    while (offset < spans.len) {
+        try token.check();
+        var count = @min(page_spans, spans.len - offset);
+        while (true) {
+            const bytes = try std.json.Stringify.valueAlloc(a, Page{ .spans = spans[offset..][0..count] }, .{});
+            defer a.free(bytes);
+            if (bytes.len > max_page_bytes) {
+                if (count == 1) return error.NativeLakeTextCorpusTooLarge;
+                count /= 2;
+                continue;
+            }
+            var writer = store.*;
+            writer.allocator = a;
+            const ref = try writer.putWithCancellation(bytes, token);
+            defer if (ref.provider_version) |version| a.free(version);
+            try refs.append(a, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len });
+            offset += count;
+            break;
+        }
+    }
+    return refs.toOwnedSlice(a);
+}
+pub fn load(a: std.mem.Allocator, store: stores.ArtifactStore, pages: []const artifacts.ChunkRef, count: u32, domain: [32]u8, token: @import("antfly_cancellation").CancellationToken, cached: ?artifacts.CachedRead, remaining: ?*u64) ![]const Span {
+    if (count == 0 or count > max_spans or pages.len == 0 or pages.len > count) return error.InvalidNativeLakeTextCorpus;
+    const result = try a.alloc(Span, count);
+    var offset: usize = 0;
+    var allowance: u64 = 4 * 1024 * 1024;
+    for (pages) |ref| {
+        try token.check();
+        try @import("lake_index_text_directory.zig").validateRef(ref, domain);
+        if (ref.byte_len > max_page_bytes) return error.InvalidNativeLakeTextCorpus;
+        try stores.chargeReadBudget(&allowance, ref.byte_len);
+        if (remaining) |budget| try stores.chargeReadBudget(budget, ref.byte_len);
+        const bytes = try artifacts.readArtifact(a, store, ref, token, cached);
+        defer a.free(bytes);
+        const page = try std.json.parseFromSliceLeaky(Page, a, bytes, .{ .allocate = .alloc_always });
+        if (page.version != 1 or page.spans.len == 0 or page.spans.len > page_spans or page.spans.len > count - offset) return error.InvalidNativeLakeTextCorpus;
+        @memcpy(result[offset..][0..page.spans.len], page.spans);
+        offset += page.spans.len;
+    }
+    if (offset != count) return error.InvalidNativeLakeTextCorpus;
     return result;
 }

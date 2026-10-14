@@ -4574,7 +4574,7 @@ def test_numeric_algebraic_materializations_keep_exact_groups_and_inputs(
 def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(
     tmp_path, inference_reranker, monkeypatch
 ):
-    """Packed runs from 67 independent Parquet files match the full corpus exactly."""
+    """Paged source spans from 131 independent Parquet files match the full corpus exactly."""
     import conftest
 
     original_config = conftest._write_remote_content_e2e_config
@@ -4594,7 +4594,9 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(
     root = tmp_path / "lake"
     objects = root / "buckets" / "antfly" / "objects"
     objects.mkdir(parents=True)
-    for part in range(67):
+    file_count = 131
+    row_count = file_count * 3
+    for part in range(file_count):
         path = tmp_path / "part.parquet"
         rows = [
             {
@@ -4744,7 +4746,7 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(
             "full_text_search": {"match": "quasar", "field": "body"},
             "full_text_index": "body_text",
             "fields": ["amount"],
-            "limit": 201,
+            "limit": row_count,
         }
 
         def full_admission(query):
@@ -4767,7 +4769,7 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(
             (h["_id"], h["_score"], h["_source"]["amount"])
             for h in oracle["hits"]["hits"]
         ]
-        assert len(expected) == 201
+        assert len(expected) == row_count
 
         def check():
             result = call(
@@ -4802,7 +4804,7 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(
                 "POST", "/tables/profile_text/query", dict(direct, limit=0, offset=0)
             )
             assert metadata_count["hits"]["total"] == {
-                "value": 201,
+                "value": row_count,
                 "relation": "exact",
             }
             assert metadata_count["profile"]["sort"]["selection_reason"] == (
@@ -4816,7 +4818,7 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(
                 "bounded_ordered_lake_index"
             ), json.dumps(ordered["profile"], sort_keys=True)
             assert [h["_source"]["amount"] for h in ordered["hits"]["hits"]] == list(
-                range(200, 193, -1)
+                range(row_count - 1, row_count - 8, -1)
             )
             forward = call(
                 "POST",
@@ -4828,7 +4830,7 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(
                 ),
             )
             assert [h["_source"]["amount"] for h in forward["hits"]["hits"]] == list(
-                range(193, 186, -1)
+                range(row_count - 8, row_count - 15, -1)
             )
             backward = call(
                 "POST",
@@ -4842,11 +4844,11 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(
             assert backward["hits"]["hits"] == ordered["hits"]["hits"]
             total = result["hits"]["total"]
             assert total["relation"] in ("exact", "gte")
-            assert total["value"] <= 201
+            assert total["value"] <= row_count
             if total["relation"] == "exact":
-                assert total["value"] == 201
+                assert total["value"] == row_count
             counted = call("POST", "/tables/paged_text/query", dict(request, limit=0))
-            assert counted["hits"]["total"] == {"value": 201, "relation": "exact"}
+            assert counted["hits"]["total"] == {"value": row_count, "relation": "exact"}
             assert counted["hits"]["hits"] == []
             shapes = [
                 {
@@ -4867,7 +4869,7 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(
                 {
                     "evaluate": {
                         "scope": "matches",
-                        "max_rows": 201,
+                        "max_rows": row_count,
                         "compute": {"hidden_body": {"field": "body"}},
                         "order_by": [
                             {"expression": {"field": "amount"}, "descending": True}

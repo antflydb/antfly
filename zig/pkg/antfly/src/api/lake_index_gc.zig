@@ -267,10 +267,11 @@ pub const Collector = struct {
         // Charge before I/O, independently from the serving metadata budget.
         try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
         const domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(self.table, self.identity, self.namespace);
-        const group = try @import("lake_index_native_text.zig").loadFileManifest(a, self.store, ref, domain, self.cancellation(), null);
+        const group = try @import("lake_index_native_text.zig").loadFileManifestBudget(a, self.store, ref, domain, self.cancellation(), null, &self.remaining_reads);
         if (!maintenance_only) for (group.opening_packs) |pack| {
             _ = try self.mark(pack.artifact);
         };
+        for (group.source_pages) |page| _ = try self.mark(page);
         for (group.sources) |span| {
             if (self.progress) |progress| try progress.enqueue(.{ .text_manifest = .{ .ref = span.physical, .seekable = false, .maintenance_only = true } }) else try self.markTextManifestMode(a, span.physical, false, true);
         }
