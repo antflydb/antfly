@@ -636,3 +636,57 @@ def test_shared_storage_cursor_survives_other_connection_close(require_native, a
             assert second.sql("SELECT n FROM numbers ORDER BY n")["rows"] == [["7"], ["8"]]
     finally:
         first.close()
+
+
+@pytest.mark.parametrize(
+    "kind,value",
+    [
+        ("TEXT", "prefix\x00suffix"),
+        ("JSONB", {"output": ["prefix\x00suffix"]}),
+        ("JSONB", {"prefix\x00suffix": "value"}),
+    ],
+)
+def test_sql_nul_diagnostic_and_atomicity(require_native, aflite_path, kind, value):
+    with af.create(aflite_path, no_sync=True) as database:
+        database.sql(f"CREATE TABLE items (id BIGINT PRIMARY KEY, item {kind})")
+        statement = "INSERT INTO items (id,item) VALUES ($1,$2) ON CONFLICT (id) DO UPDATE SET item=excluded.item"
+        with pytest.raises(SQLStateError) as raised:
+            database.sql(statement, [1, value])
+        assert raised.value.sqlstate == "22P05"
+        assert raised.value.diagnostic["parameter_index"] == 2
+        assert "parameter $2" in str(raised.value)
+        assert "NUL" in str(raised.value)
+        detail = json.loads(database._lib.antfly_last_error_detail())
+        assert detail["error"]["parameter_index"] == 2
+        assert "parameter $2" in detail["error"]["message"]
+        assert database.sql("SELECT id FROM items")["rows"] == []
+        database.sql(statement, [1, "clean" if kind == "TEXT" else {"output": "clean"}])
+        with pytest.raises(SQLStateError) as update:
+            database.sql("UPDATE items SET item=$1 WHERE id=1", [value])
+        assert update.value.sqlstate == "22P05"
+        assert update.value.diagnostic["parameter_index"] == 1
+        # Cursor preparation uses the same parameter validation and diagnostics.
+        with pytest.raises(SQLStateError) as cursor:
+            database.sql_cursor(f"SELECT $1::{kind}", [value])
+        assert cursor.value.sqlstate == "22P05"
+        assert cursor.value.diagnostic["parameter_index"] == 1
+
+
+@pytest.mark.parametrize("payload", ['{"v":"\\u0000"}', '{"\\u0000":"v"}'])
+@pytest.mark.parametrize("bound", [False, True])
+def test_sql_jsonb_cast_rejects_nul(require_native, aflite_path, payload, bound):
+    expression = "$1::text::jsonb" if bound else f"'{payload}'::jsonb"
+    parameters = [payload] if bound else []
+    with af.create(aflite_path, no_sync=True) as database:
+        database.sql("CREATE TABLE items (id BIGINT PRIMARY KEY, item JSONB)")
+        for statement in [f"SELECT {expression}", f"INSERT INTO items (id,item) VALUES (1,{expression})"]:
+            with pytest.raises(SQLStateError) as raised:
+                database.sql(statement, parameters)
+            assert raised.value.sqlstate == "22P05"
+            assert "NUL" in str(raised.value)
+        assert database.sql("SELECT id FROM items")["rows"] == []
+        database.sql("INSERT INTO items (id,item) VALUES (1,'{}'::jsonb)")
+        with pytest.raises(SQLStateError) as raised:
+            with closing(database.sql_cursor(f"SELECT {expression} FROM items", parameters)) as cursor:
+                cursor.fetch()
+        assert raised.value.sqlstate == "22P05"

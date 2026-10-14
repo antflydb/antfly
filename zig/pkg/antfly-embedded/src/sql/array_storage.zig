@@ -667,7 +667,7 @@ test "SQL flat array strict JSONB restore rejects equivalent noncanonical bytes 
     }
     const invalid_text = try rawJsonbFrame(a, "{\"nested\":[\"a\\u0000b\"]}");
     defer a.free(invalid_text);
-    try std.testing.expectError(error.SqlTypeMismatch, validateCanonical(a, .jsonb, invalid_text, .{}));
+    try std.testing.expectError(error.SqlUntranslatableCharacter, validateCanonical(a, .jsonb, invalid_text, .{}));
     const syntax = try rawJsonbFrame(a, "invalid");
     defer a.free(syntax);
     try std.testing.expectError(error.SqlInvalidTextRepresentation, validateCanonical(a, .jsonb, syntax, .{}));
