@@ -27,6 +27,7 @@ pub const Plan = struct {
     base: codec.OrdinalProjectionPlan,
     arena: std.heap.ArenaAllocator,
     paths: []const []const []const u8 = &.{},
+    selectors: ?*const @import("json_projection_plan.zig").Selector = null,
 
     /// Positive selections share one contract across row and column readers.
     /// A hyphen inside a name is literal; only a leading hyphen is exclusion.
@@ -57,7 +58,11 @@ pub const Plan = struct {
             paths[i] = try parts.toOwnedSlice(scratch);
             roots[i] = if (paths[i].len > 0) paths[i][0] else "";
         }
+        const compiled = try scratch.alloc(@import("json_projection_plan.zig").Path, paths.len);
+        for (paths, compiled) |parts, *path| path.* = .{ .parts = parts };
+        const selectors = try @import("json_projection_plan.zig").compile(scratch, compiled);
         return .{
+            .selectors = selectors,
             .base = try codec.OrdinalProjectionPlan.init(alloc, table, layout, roots),
             .arena = arena,
             .paths = paths,
@@ -119,16 +124,23 @@ pub const Plan = struct {
             }
             output.writer.writeByte('}') catch return error.OutOfMemory;
             return alloc.dupe(u8, output.written());
-        } else for (self.paths) |parts| {
-            if (parts.len == 0) continue;
-            const value = source.get(parts[0]) orelse continue;
-            switch (value) {
-                .json => |view| try view.include(scratch, &result, parts[0], parts[1..]),
-                .logical => |logical| {
-                    var object = std.json.ObjectMap.empty;
-                    try object.put(scratch, parts[0], logical);
-                    try document_query.applyIncludePath(scratch, object, &result, parts);
-                },
+        } else {
+            if (self.selectors) |selectors| for (source.keys(), source.values()) |name, value| {
+                if (value == .json) if (selectors.fields.get(name)) |selected| {
+                    if (selected.fields.count() != 0) try value.json.prepareProjection(selected, .visited, .any_container);
+                };
+            };
+            for (self.paths) |parts| {
+                if (parts.len == 0) continue;
+                const value = source.get(parts[0]) orelse continue;
+                switch (value) {
+                    .json => |view| try view.include(scratch, &result, parts[0], parts[1..]),
+                    .logical => |logical| {
+                        var object = std.json.ObjectMap.empty;
+                        try object.put(scratch, parts[0], logical);
+                        try document_query.applyIncludePath(scratch, object, &result, parts);
+                    },
+                }
             }
         }
         return document_query.serializeWithOutput(scratch, alloc, std.json.Value{ .object = result });
@@ -184,4 +196,50 @@ test "relational nested projection preserves document semantics with bounded scr
         }
     };
     try std.testing.checkAllAllocationFailures(alloc, Check.run, .{ table, &layout, row });
+}
+
+test "public graph metric borrowed wire native JSON sparse selectors reuse immutable plans" {
+    const a = std.testing.allocator;
+    const Counter = @import("../../lite/test_allocator.zig").BudgetAllocator;
+    const columns = [_]schema.RelationalColumn{.{ .name = "payload", .path = "payload", .column_type = .json, .is_json = true, .json_kind = .any }};
+    const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &columns };
+    var layout = try codec.PhysicalLayout.init(a, table);
+    defer layout.deinit();
+    var input = std.Io.Writer.Allocating.init(a);
+    defer input.deinit();
+    try input.writer.writeAll("{\"arr\":[");
+    for (0..20000) |i| {
+        if (i != 0) try input.writer.writeByte(',');
+        try input.writer.print("{d}", .{i});
+    }
+    try input.writer.writeAll("]}");
+    const cells = [_]codec.Cell{.{ .ordinal = 0, .path = "payload", .is_json = true, .value_type = .bytes_val, .value = .{ .bytes_val = input.written() } }};
+    const encoded = try codec.serializeOrdinal(a, 1, &columns, &cells, @splat(0));
+    defer a.free(encoded);
+    const row = try codec.ordinalRowViewTrusted(encoded, table, &layout);
+    const fields = [_][]const u8{ "payload.arr.19999", "payload.arr.19998", "payload.arr.19997", "payload.arr.19996", "payload.arr.19995", "payload.arr.19994", "payload.arr.19993", "payload.arr.19992", "payload.arr.19991", "payload.arr.19990", "payload.arr.19989", "payload.arr.19988", "payload.arr.19987", "payload.arr.19986", "payload.arr.19985", "payload.arr.19984" };
+    var plan = try Plan.init(a, table, &layout, &fields);
+    defer plan.deinit();
+    const selector = plan.selectors.?;
+    const capacity = plan.arena.queryCapacity();
+    for (0..16) |_| {
+        var budget: Counter = .{ .backing = a, .limit = 64 * 1024 };
+        const result = try plan.projectWithOutput(budget.allocator(), a, row);
+        defer a.free(result);
+        try std.testing.expectEqualStrings("{\"payload\":{\"arr\":[19984]}}", result);
+        try std.testing.expectEqual(@as(usize, 0), budget.live);
+        try std.testing.expectEqual(selector, plan.selectors.?);
+        try std.testing.expectEqual(capacity, plan.arena.queryCapacity());
+    }
+    // Preserve native number lexemes and ignored duplicate-key behavior.
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var view = JsonView.init(arena.allocator(), "{\"arr\":[1e2],\"skip\":{\"x\":1,\"x\":2}}");
+    var sources: Plan.Sources = .empty;
+    try sources.put(arena.allocator(), "payload", .{ .json = &view });
+    var lexical = try Plan.init(a, table, &layout, &.{"payload.arr.0"});
+    defer lexical.deinit();
+    const result = try lexical.projectSources(a, arena.allocator(), sources);
+    defer a.free(result);
+    try std.testing.expectEqualStrings("{\"payload\":{\"arr\":[1e2]}}", result);
 }

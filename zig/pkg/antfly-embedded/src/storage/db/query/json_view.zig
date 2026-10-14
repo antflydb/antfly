@@ -16,6 +16,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Value = std.json.Value;
+const plan_mod = @import("json_projection_plan.zig");
+pub const Selector = plan_mod.Selector;
 
 /// Arena-owned, lazy navigation over pinned JSON bytes. Only visited containers
 /// acquire an index; unselected subtrees remain raw spans. Scanner.skipValue
@@ -116,7 +118,7 @@ pub const View = struct {
         return null;
     }
 
-    pub const ProjectionPath = struct { parts: []const []const u8 };
+    pub const ProjectionPath = plan_mod.Path;
     pub fn projectionPaths(self: *View, fields: []const []const u8) ![]const ProjectionPath {
         var paths: std.ArrayListUnmanaged(ProjectionPath) = .empty;
         for (fields) |field_name| {
@@ -129,8 +131,138 @@ pub const View = struct {
         return paths.items;
     }
     pub fn projectionIndex(part: []const u8) ?usize {
-        if (part.len == 0 or std.mem.indexOfNone(u8, part, "0123456789") != null) return null;
-        return std.fmt.parseInt(usize, part, 10) catch null;
+        return plan_mod.index(part);
+    }
+
+    pub const DuplicatePolicy = enum { all, visited };
+    pub const RootMode = enum { object_only, any_container };
+    pub fn prepareProjection(view: *View, selector: *const Selector, policy: DuplicatePolicy, root_mode: RootMode) !void {
+        const alloc = view.alloc;
+        const raw = view.root.raw;
+        const scratch = @import("antfly_platform").allocator.reclaimingScratch(alloc);
+        const Frame = struct {
+            object: bool = false,
+            key: bool = true,
+            arena: std.heap.ArenaAllocator,
+            names: std.StringHashMapUnmanaged(void) = .empty,
+            node: ?*View.Node = null,
+            children: std.ArrayListUnmanaged(View.Child) = .empty,
+            selected: ?*const Selector = null,
+            name: []const u8 = "",
+            ordinal: usize = 0,
+            start: usize = 0,
+            pending_node: ?*View.Node = null,
+            pending_selector: ?*const Selector = null,
+
+            fn plan(self: *@This(), a: Allocator) !void {
+                if (self.node == null or self.object) return;
+                const selected = self.selected orelse return;
+                var indices = selected.indices.iterator();
+                while (indices.next()) |entry| try self.node.?.array_index.put(a, entry.key_ptr.*, null);
+            }
+            fn beginValue(self: *@This(), a: Allocator, start: usize, object_value: bool) !void {
+                self.start = start;
+                self.pending_node = null;
+                self.pending_selector = null;
+                if (self.node == null) return;
+                const selected = self.selected.?;
+                if (self.object) {
+                    if (selected.fields.get(self.name)) |child| {
+                        if (child.fields.count() != 0) {
+                            self.pending_selector = child;
+                            self.pending_node = try a.create(View.Node);
+                        }
+                    }
+                } else {
+                    const item = selected.array_items.get(self.ordinal);
+                    if (item == null and selected.fanout == null) return;
+                    self.pending_node = try a.create(View.Node);
+                    if (object_value) {
+                        const child = item orelse selected.fanout.?;
+                        if (child.fields.count() != 0) self.pending_selector = child;
+                    }
+                }
+                if (self.pending_node) |node| node.* = .{ .raw = &.{} };
+            }
+            fn finishValue(self: *@This(), a: Allocator, source: []const u8, end: usize) !void {
+                if (self.node) |parent| {
+                    const span = source[self.start..end];
+                    if (self.pending_node) |node| node.raw = span;
+                    if (self.object) {
+                        try parent.object_index.put(a, self.name, self.children.items.len);
+                        try self.children.append(a, .{ .node = if (self.pending_node) |node| node.* else .{ .raw = span } });
+                    } else if (self.pending_node) |node| {
+                        if (self.selected.?.fanout != null) try self.children.append(a, .{ .node = node.* }) else try parent.array_index.put(a, self.ordinal, node);
+                    }
+                }
+                self.ordinal += 1;
+            }
+            fn finishContainer(self: *@This(), a: Allocator) !void {
+                if (self.node) |node| {
+                    if (self.object or self.selected.?.fanout != null) node.children = try self.children.toOwnedSlice(a);
+                }
+            }
+        };
+        var frames: std.ArrayListUnmanaged(Frame) = .empty;
+        defer {
+            for (frames.items) |*frame| frame.arena.deinit();
+            frames.deinit(scratch);
+        }
+        var scanner = std.json.Scanner.initCompleteInput(scratch, raw);
+        defer scanner.deinit();
+        var depth: usize = 0;
+        var root_seen = false;
+        while (!root_seen or depth != 0) {
+            const token = try scanner.peekNextTokenType();
+            if (depth != 0) {
+                const frame = &frames.items[depth - 1];
+                if ((frame.object and frame.key and token == .object_end) or (!frame.object and token == .array_end)) {
+                    _ = try scanner.next();
+                    try frame.finishContainer(alloc);
+                    depth -= 1;
+                    if (depth != 0) try frames.items[depth - 1].finishValue(alloc, raw, scanner.cursor);
+                    continue;
+                }
+                if (frame.object and frame.key) {
+                    if (policy == .visited and frame.node == null) {
+                        // Unvisited native keys need syntax checks, not decoded
+                        // names or duplicate-key tables. Keep them allocation-free.
+                        if (token != .string) return error.SyntaxError;
+                        try scanner.skipValue();
+                        frame.key = false;
+                        continue;
+                    }
+                    const name = switch (try scanner.nextAllocMax(frame.arena.allocator(), .alloc_if_needed, raw.len)) {
+                        .string, .allocated_string => |key_name| key_name,
+                        else => return error.SyntaxError,
+                    };
+                    if (policy == .all or frame.node != null) if ((try frame.names.getOrPut(frame.arena.allocator(), name)).found_existing) return error.DuplicateField;
+                    frame.name = if (frame.node != null) try alloc.dupe(u8, name) else name;
+                    frame.key = false;
+                    continue;
+                }
+                frame.key = true;
+                try frame.beginValue(alloc, scanner.cursor, token == .object_begin);
+            }
+            root_seen = true;
+            if (token == .object_begin or token == .array_begin) {
+                const selected_node: ?*View.Node = if (depth == 0) (if (token == .object_begin or root_mode == .any_container) &view.root else null) else if (frames.items[depth - 1].pending_selector != null) frames.items[depth - 1].pending_node else null;
+                const selected_plan = if (depth == 0) selector else frames.items[depth - 1].pending_selector;
+                _ = try scanner.next();
+                if (depth == frames.items.len) try frames.append(scratch, .{ .arena = .init(scratch) });
+                const frame = &frames.items[depth];
+                var key_arena = frame.arena;
+                _ = key_arena.reset(.{ .retain_with_limit = 16 * 1024 });
+                frame.* = .{ .arena = key_arena, .object = token == .object_begin, .node = selected_node, .selected = selected_plan };
+                try frame.plan(alloc);
+                depth += 1;
+            } else {
+                if (token == .object_end or token == .array_end or token == .end_of_document) return error.SyntaxError;
+                try scanner.skipValue();
+                if (depth != 0) try frames.items[depth - 1].finishValue(alloc, raw, scanner.cursor);
+            }
+        }
+        if (try scanner.next() != .end_of_document) return error.SyntaxError;
     }
 
     pub fn materialize(self: *View, node: *Node) !Value {

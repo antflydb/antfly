@@ -2961,6 +2961,50 @@ test "db optional row policy authority preserves scoped secret denial and outage
 /// Scope pins belong to a byte window, never to the long-lived metadata txn.
 /// Cached lengths preflight the next row. Uncached/oversized rows are isolated
 /// and retired immediately, preserving formerly valid large-document reads.
+/// One hydration request owns its immutable projections. Historical row
+/// schemas use a bounded LRU; plans own only ordinals and selector names.
+const LookupProjectionPlans = struct {
+    const Entry = struct { plan: RelationalProjectionPlan, used: usize };
+    alloc: Allocator,
+    opts: types.LookupOptions,
+    plain: ?@import("document_query.zig").SpanProjectionPlan = null,
+    plain_initialized: bool = false,
+    native: [4]?Entry = @splat(null),
+    clock: usize = 0,
+    fn init(alloc: Allocator, opts: types.LookupOptions) !@This() {
+        const a = @import("antfly_platform").allocator.reclaimingScratch(alloc);
+        return .{ .alloc = a, .opts = opts };
+    }
+    fn deinit(self: *@This()) void {
+        if (self.plain) |*plan| plan.deinit();
+        for (&self.native) |*entry| if (entry.*) |*value| value.plan.deinit();
+    }
+    fn getPlain(self: *@This()) !?*const @import("document_query.zig").SpanProjectionPlan {
+        if (!self.plain_initialized) {
+            self.plain = try @import("document_query.zig").SpanProjectionPlan.init(self.alloc, self.opts);
+            self.plain_initialized = true;
+        }
+        return if (self.plain) |*plan| plan else null;
+    }
+    fn forRow(self: *@This(), row: relational_row_codec.OrdinalRowView, fields: []const []const u8) !*RelationalProjectionPlan {
+        self.clock +|= 1;
+        var victim: usize = 0;
+        for (&self.native, 0..) |*entry, i| if (entry.*) |*value| {
+            if (value.plan.base.schema_version == row.table_schema.version) {
+                value.used = self.clock;
+                return &value.plan;
+            }
+            if (self.native[victim] != null and value.used < self.native[victim].?.used) victim = i;
+        } else {
+            victim = i;
+        };
+        if (self.native[victim]) |*old| old.plan.deinit();
+        self.native[victim] = null;
+        self.native[victim] = .{ .plan = try RelationalProjectionPlan.init(self.alloc, row.table_schema, row.layout, fields), .used = self.clock };
+        return &self.native[victim].?.plan;
+    }
+};
+
 const DocumentPrimaryReadWindow = struct {
     const max_bytes: usize = 8 * 1024 * 1024;
     arena: std.heap.ArenaAllocator,
@@ -18274,6 +18318,9 @@ pub const DB = struct {
         return self.lookupPrimarySnapshotWithSchemaAndOutput(alloc, alloc, key, opts, probe, schema_view, null, null);
     }
     fn lookupPrimarySnapshotWithSchemaAndOutput(self: *DB, alloc: Allocator, output: Allocator, key: []const u8, opts: types.LookupOptions, probe: *docstore_mod.DocStore.Txn, schema_view: ?schema_registry_mod.SchemaView, primary: ?[]const u8, primary_timestamp: ?u64) !?types.LookupResult {
+        return self.lookupPrimarySnapshotWithPreparedProjection(alloc, output, key, opts, probe, schema_view, primary, primary_timestamp, null);
+    }
+    fn lookupPrimarySnapshotWithPreparedProjection(self: *DB, alloc: Allocator, output: Allocator, key: []const u8, opts: types.LookupOptions, probe: *docstore_mod.DocStore.Txn, schema_view: ?schema_registry_mod.SchemaView, primary: ?[]const u8, primary_timestamp: ?u64, prepared: ?*LookupProjectionPlans) !?types.LookupResult {
         var verified_principal: ?std.json.Parsed(row_policy_authority_mod.Payload) = null;
         defer if (verified_principal) |*principal| principal.deinit();
         var row_policy_lease = if (opts.row_policy_principal_proof.len != 0) bound: {
@@ -18344,6 +18391,7 @@ pub const DB = struct {
             null;
         const stored = if (direct_fields) |fields| blk: {
             const row = ordinal_row.?;
+            if (prepared) |plans| break :blk try (try plans.forRow(row, fields)).projectWithOutput(alloc, output, row);
             var projection = try RelationalProjectionPlan.init(
                 alloc,
                 row.table_schema,
@@ -18363,12 +18411,12 @@ pub const DB = struct {
             }
             const materialized = if (ordinal_row) |row| try row.reconstructValueAlloc(alloc) else null;
             defer if (materialized) |bytes| alloc.free(bytes);
-            break :blk try db_query_projection.projectLookupStoredBytesWithOutput(alloc, output, key, materialized orelse raw, opts, .{
+            break :blk try db_query_projection.projectLookupStoredBytesWithPlanAndOutput(alloc, output, key, materialized orelse raw, opts, .{
                 .ctx = self,
                 .load_chunks = loadChunkFieldValueCallback,
                 .load_embeddings = loadEmbeddingFieldValueCallback,
                 .load_artifacts = loadArtifactFieldValueCallback,
-            });
+            }, if (prepared) |plans| try plans.getPlain() else null);
         };
         errdefer output.free(stored);
         try checkLookupOptionsActive(opts);
@@ -39435,6 +39483,9 @@ pub const DB = struct {
     fn attachDistributedDocumentAuthorityAtSnapshot(self: *DB, alloc: Allocator, req: types.SearchRequest, result: *types.SearchResult, pinned: ?*docstore_mod.DocStore.Txn, schema_view: ?schema_registry_mod.SchemaView) !void {
         if (req.document_authority_mode == .none) return;
         if (req.document_output_allocator != null and req.document_authority_mode != .hydrate) return error.InvalidQueryRequest;
+        const lookup_opts: types.LookupOptions = .{ .fields = if (req.defer_stored_projection) &.{} else req.fields, .include_all_fields = req.defer_stored_projection or req.include_all_fields };
+        var plans = try LookupProjectionPlans.init(alloc, lookup_opts);
+        defer plans.deinit();
         var read: ?docstore_mod.DocStore.Txn = if (pinned) |captured_read| try captured_read.forkRead() else try self.core.store.beginReadTxn();
         defer if (read) |*owned| owned.abort();
         var metadata_scratch = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
@@ -39529,7 +39580,7 @@ pub const DB = struct {
             }
             if (!projection_scratch.reset(.{ .retain_with_limit = 64 * 1024 })) _ = projection_scratch.reset(.free_all);
             var projected: ?types.LookupResult = if (req.document_authority_mode == .hydrate or eager)
-                try self.lookupPrimarySnapshotWithSchemaAndOutput(projection_scratch.allocator(), body_allocator, hit.id, .{ .fields = if (req.defer_stored_projection) &.{} else req.fields, .include_all_fields = req.defer_stored_projection or req.include_all_fields }, &read.?, schema_view, raw_primary, version)
+                try self.lookupPrimarySnapshotWithPreparedProjection(projection_scratch.allocator(), body_allocator, hit.id, lookup_opts, &read.?, schema_view, raw_primary, version, &plans)
             else
                 null;
             if (req.document_authority_mode == .candidates) if (projected) |*document| {
@@ -137022,4 +137073,34 @@ test "capi resolver replacement wait rechecks generation in the publication gap"
     try std.testing.expectError(error.Cancelled, db.waitGraphReplacement("new", generation, 0));
     try std.testing.expect(db.indexGeneration("old") != null);
     try std.testing.expect(db.indexGeneration("new").? != generation);
+}
+
+test "public graph metric borrowed wire hydration projection cache reuses and bounds schema plans" {
+    const a = std.testing.allocator;
+    var plans = try LookupProjectionPlans.init(a, .{ .fields = &.{"payload.arr.0"}, .include_all_fields = false });
+    defer plans.deinit();
+    try std.testing.expect(!plans.plain_initialized);
+    const plain = (try plans.getPlain()).?;
+    try std.testing.expectEqual(plain, (try plans.getPlain()).?);
+    const columns = [_]schema_mod.RelationalColumn{.{ .name = "payload", .path = "payload", .column_type = .json, .is_json = true, .json_kind = .any }};
+    for (1..6) |version| {
+        const table: schema_mod.TableSchema = .{ .version = @intCast(version), .storage_mode = .relational, .relational_columns = &columns };
+        var layout = try relational_row_codec.PhysicalLayout.init(a, table);
+        defer layout.deinit();
+        const cells = [_]relational_row_codec.Cell{.{ .ordinal = 0, .path = "payload", .is_json = true, .value_type = .bytes_val, .value = .{ .bytes_val = "{\"arr\":[7]}" } }};
+        const encoded = try relational_row_codec.serializeOrdinal(a, @intCast(version), &columns, &cells, @splat(0));
+        defer a.free(encoded);
+        const row = try relational_row_codec.ordinalRowViewTrusted(encoded, table, &layout);
+        const native = try plans.forRow(row, &.{"payload.arr.0"});
+        try std.testing.expectEqual(native, try plans.forRow(row, &.{"payload.arr.0"}));
+        const result = try native.projectWithOutput(a, a, row);
+        defer a.free(result);
+        try std.testing.expectEqualStrings("{\"payload\":{\"arr\":[7]}}", result);
+    }
+    var resident: usize = 0;
+    for (plans.native) |entry| if (entry) |value| {
+        resident += 1;
+        try std.testing.expect(value.plan.base.schema_version != 1);
+    };
+    try std.testing.expectEqual(@as(usize, 4), resident);
 }
