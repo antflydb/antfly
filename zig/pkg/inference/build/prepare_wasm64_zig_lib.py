@@ -25,6 +25,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 
@@ -82,11 +83,18 @@ def prepare(zig: str, destination: Path, comparison_source: Path) -> None:
         staged = Path(staging) / "lib"
         shutil.copytree(source, staged, copy_function=clone_file)
         comparison = staged / "compiler_rt/comparef.zig"
+        # copytree preserves read-only Nix directory modes. Directories are
+        # cache-owned copies, so grant write access to the patch parent;
+        # chmod on a hard-linked file would alter the installed toolchain.
+        comparison.parent.chmod(comparison.parent.stat().st_mode | stat.S_IWUSR)
         # Break the hard link BEFORE writing: the installed library is immutable.
         comparison.unlink()
         comparison.write_text(corrected)
         if destination.exists():
             destination.rmdir()
+        # macOS also requires a writable directory when moving it between
+        # parents. This changes only the copied library root.
+        staged.chmod(staged.stat().st_mode | stat.S_IWUSR)
         staged.rename(destination)
 
 

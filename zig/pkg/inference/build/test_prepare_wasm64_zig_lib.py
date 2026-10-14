@@ -19,6 +19,7 @@ from __future__ import annotations
 import errno
 import json
 from pathlib import Path
+import stat
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -33,6 +34,62 @@ from pkg.inference.build.prepare_wasm64_zig_lib import (
 
 
 class Wasm64ZigLibTest(unittest.TestCase):
+    def test_read_only_toolchain_preserves_contents_and_permissions(self):
+        for cross_volume in (False, True):
+            with (
+                self.subTest(cross_volume=cross_volume),
+                tempfile.TemporaryDirectory() as root,
+            ):
+                source = Path(root) / "installed"
+                runtime = source / "compiler_rt"
+                runtime.mkdir(parents=True)
+                comparison = runtime / "comparef.zig"
+                comparison.write_text(OLD)
+                neighbor = source / "std.zig"
+                neighbor.write_text("unchanged")
+                comparison.chmod(0o444)
+                neighbor.chmod(0o444)
+                runtime.chmod(0o555)
+                source.chmod(0o555)
+                output = Path(root) / "cache/overlay"
+                try:
+                    with patch(
+                        "subprocess.check_output",
+                        side_effect=[
+                            "0.17.0\n",
+                            f".lib_dir = {json.dumps(str(source))},\n",
+                        ],
+                    ):
+                        if cross_volume:
+                            with patch(
+                                "os.link",
+                                side_effect=OSError(errno.EXDEV, "cross volume"),
+                            ):
+                                prepare("zig", output, comparison)
+                        else:
+                            prepare("zig", output, comparison)
+                    self.assertEqual(comparison.read_text(), OLD)
+                    self.assertEqual(neighbor.read_text(), "unchanged")
+                    self.assertEqual(
+                        (output / "compiler_rt/comparef.zig").read_text(), NEW
+                    )
+                    self.assertEqual((output / "std.zig").read_text(), "unchanged")
+                    for path, mode in (
+                        (source, 0o555),
+                        (runtime, 0o555),
+                        (comparison, 0o444),
+                        (neighbor, 0o444),
+                    ):
+                        self.assertEqual(stat.S_IMODE(path.stat().st_mode), mode)
+                    self.assertNotEqual(
+                        comparison.stat().st_ino,
+                        (output / "compiler_rt/comparef.zig").stat().st_ino,
+                    )
+                    self.assertEqual(list(output.parent.glob("wasm64-lib-*")), [])
+                finally:
+                    source.chmod(0o755)
+                    runtime.chmod(0o755)
+
     def test_unknown_runtime_is_rejected(self):
         for source in ("different compiler runtime", OLD + OLD):
             with self.assertRaisesRegex(RuntimeError, "unrecognized"):
