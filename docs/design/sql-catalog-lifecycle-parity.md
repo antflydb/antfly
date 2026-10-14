@@ -5225,6 +5225,84 @@ DDL tests plus its linked parser test. Formatting, license/product boundary,
 control-catalog freshness and original inventory integrity passed. Cache GC
 was previewed only; nothing was deleted. No original disposition changed.
 
+### Durable reader-floor substrate and downgrade enforcement
+
+ReaderFloor now joins semantic and physical requirements independently and
+monotonically. An inactive zero/zero floor remains distinct from a schema
+identity; incomplete, unknown and future requirements are invalid. Metadata
+incarnation extension version 4 preserves this pair alongside the prior runtime,
+dense-native and relational-topology floors. Decoder profile 38 advertises this
+record interpretation and store enforcement, not a complete publication workflow.
+Predecessor incarnation frames retain their exact interpretation.
+
+The internal transactional raise primitive verifies compact active store headers
+before advancing the floor. It fails closed without metadata initialization,
+eligible readers or complete capability coverage. A publication caller must
+validate its mutation and decoder/membership proof first, then raise the floor
+and install the schema in the same transaction. No standalone activation API or
+automatic producer is added. Already covered requirements use a fixed-size
+incarnation lookup without scanning stores: a 10,000-call failing-allocation
+contract detects any header re-decoding or escaping allocation on that path.
+
+Registration and ordinary report replacement enforce the floor in service
+admission and again in replicated apply. Sparse/baseline HTTP admission reports
+a reader upgrade requirement before append; baseline root activation checks the
+current floor again, so an upload prepared before an advance cannot expose a
+weaker reader afterward. The fault contract also repairs such an upload with a
+new qualified cursor rather than changing an immutable pending generation.
+
+Reference heartbeats preserve the registered capability instead of treating
+liveness as permission to replace implementation support. Their capability-bearing
+wire records now participate in the version-37 final decoder classifier; that
+arm was missing in the preceding transport checkpoint. A reference producer
+must match the committed reader descriptor and capture the corresponding
+decoder readiness before its catalog lane.
+
+Metadata snapshot verification reuses its existing borrowed-row index to check
+the incarnation floor against active store headers before installation. Weaker
+unpublished baseline roots remain resumable/collectable but cannot become active
+without the current admission check. Tests reject incompatible active readers,
+partial/future/corrupt floor frames and stale store registrations/reports.
+Transaction tests cover denied activation, abort of floor plus actual catalog
+mutation, committed publication, snapshot installation and reopen. Restored
+name lookups use normal derived-catalog bootstrap; the guard is not bypassed.
+
+The substrate is not yet connected to all schema publication producers.
+Server-derived schema/manifest identity binding, an explicit publication decoder
+profile and term/membership preflight, automatic capability advertisement,
+same-root owner acknowledgements and document/relational restore publication
+are still required before activation can be called complete. This does not
+change original SQL dispositions or qualify the distributed sql-0671 declaration.
+
+Raising a new floor additionally requires durable metadata decoder activation
+version 38 for the same metadata incarnation. Snapshot verification rejects a
+floor without that activation, or with a predecessor activation. The final
+append guard applies an active reader floor to every metadata command, not only
+relation-source mutations, and rechecks an advance after off-lock admission.
+Tests cover an ordinary non-relation command through mixed version-37/38 members
+and activation between preparation and append. Publication integration must
+capture fresh term/membership readiness before its lane; ordinary metadata
+mutator preflights must also be audited before enabling automatic activation.
+The strict ceiling profiles are paired with ASCH/semantic support 31; increasing
+native ceilings requires reviewing and advancing metadata transport/floor
+decoder admission too, not merely changing a serializer constant.
+
+Qualification passed the combined 105-step Debug SQL/pgwire/native/transaction/
+DDL/catalog gate. After the additional global decoder and activation-binding
+checks, a clean in-place cache rebuild passed the final 70-step metadata gate,
+398 tests. An intervening run failed because its generated Zig object cache
+disappeared; no source error was reported, no external cache cleaner was live
+at inspection, and this work used no destructive cache operation.
+
+Zig/Go/Python formatting phases, the pinned Biome 2.5.0 native checker (641 files),
+Cargo formatting, license/product-boundary checks, control-catalog freshness and
+original inventory integrity passed. The full make fmt-check wrapper stalled
+in its PNPM launcher before Biome. The installed pinned Biome and Cargo checks
+passed directly; after verifying its process group, only that task-owned stalled
+wrapper was stopped. The wrapper itself is not recorded as a completed check.
+Original dispositions remain 479 implemented / 136 rejected / 73 superseded /
+898 unresolved. The floor/transport tests earn no original-case credit.
+
 The unchanged sql-0671 declaration now also has an independently captured
 PostgreSQL fixture and native/mounted contracts. The complete declaration binds
 its UUID PRIMARY KEY, text replacement/lower, exact NUMERIC rounding and JSONB

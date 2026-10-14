@@ -365,6 +365,43 @@ pub const ReaderCapabilities = struct {
     }
 };
 
+/// A monotonic cluster floor over all admitted schema identities, including
+/// historical layouts. Zero/zero means inactive, not a schema requirement.
+pub const ReaderFloor = struct {
+    semantic_version: u32 = 0,
+    encoding_version: u32 = 0,
+
+    pub fn active(self: ReaderFloor) bool {
+        return self.semantic_version != 0 or self.encoding_version != 0;
+    }
+
+    pub fn valid(self: ReaderFloor) bool {
+        if (!self.active()) return true;
+        return self.semantic_version >= 11 and self.semantic_version <= storage_format_version and
+            self.encoding_version != 0 and self.encoding_version <= storage_format_version;
+    }
+
+    pub fn include(self: ReaderFloor, requirement: ReaderRequirements) !ReaderFloor {
+        const incoming: ReaderFloor = .{ .semantic_version = requirement.semantic_version, .encoding_version = requirement.encoding_version };
+        if (!self.valid() or !incoming.active() or !incoming.valid()) return error.InvalidSchemaReaderRequirements;
+        return .{
+            .semantic_version = @max(self.semantic_version, incoming.semantic_version),
+            .encoding_version = @max(self.encoding_version, incoming.encoding_version),
+        };
+    }
+
+    pub fn covers(self: ReaderFloor, requirement: ReaderRequirements) bool {
+        const incoming: ReaderFloor = .{ .semantic_version = requirement.semantic_version, .encoding_version = requirement.encoding_version };
+        return self.valid() and incoming.active() and incoming.valid() and
+            self.semantic_version >= requirement.semantic_version and self.encoding_version >= requirement.encoding_version;
+    }
+
+    pub fn admits(self: ReaderFloor, reader: ReaderCapabilities, reporter_incarnation: u64) bool {
+        if (!self.valid() or !reader.validForReporter(reporter_incarnation)) return false;
+        return !self.active() or reader.supports(.{ .semantic_version = self.semantic_version, .encoding_version = self.encoding_version });
+    }
+};
+
 /// Requirements attached to one immutable schema identity. Semantic feature
 /// support and physical frame decoding are separate admission decisions.
 pub const ReaderRequirements = struct {
@@ -383,6 +420,38 @@ pub const ReaderRequirements = struct {
         return self.encoding_version != 0 and self.encoding_version <= decoder_ceiling and self.canInterpret(capability_ceiling);
     }
 };
+
+test "relational index system schema reader floor joins independent dimensions without regression" {
+    const inactive: ReaderFloor = .{};
+    try std.testing.expect(inactive.valid());
+    try std.testing.expect(!inactive.active());
+    try std.testing.expect(inactive.admits(.{}, 0));
+    const first = try inactive.include(.{ .semantic_version = 30, .encoding_version = 17 });
+    const joined = try first.include(.{ .semantic_version = 13, .encoding_version = 31 });
+    try std.testing.expectEqualDeep(@as(ReaderFloor, .{ .semantic_version = 30, .encoding_version = 31 }), joined);
+    try std.testing.expectEqualDeep(joined, try joined.include(.{ .semantic_version = 13, .encoding_version = 11 }));
+    try std.testing.expect(joined.covers(.{ .semantic_version = 30, .encoding_version = 31 }));
+    try std.testing.expect(!joined.covers(.{ .semantic_version = 31, .encoding_version = 31 }));
+    try std.testing.expect(!joined.admits(.{}, 7));
+    try std.testing.expect(!joined.admits(ReaderCapabilities.current, 0));
+    try std.testing.expect(joined.admits(ReaderCapabilities.current, 7));
+    try std.testing.expect(!joined.admits(.{ .semantic_ceiling = 29, .encoding_ceiling = 31 }, 7));
+    try std.testing.expect(!joined.admits(.{ .semantic_ceiling = 31, .encoding_ceiling = 30 }, 7));
+    for ([_]ReaderRequirements{
+        .{ .semantic_version = 0, .encoding_version = 0 },
+        .{ .semantic_version = 30, .encoding_version = 0 },
+        .{ .semantic_version = 0, .encoding_version = 31 },
+        .{ .semantic_version = 10, .encoding_version = 31 },
+        .{ .semantic_version = 32, .encoding_version = 31 },
+        .{ .semantic_version = 30, .encoding_version = 32 },
+    }) |bad| {
+        try std.testing.expectError(error.InvalidSchemaReaderRequirements, joined.include(bad));
+        try std.testing.expect(!joined.covers(bad));
+    }
+    const corrupt: ReaderFloor = .{ .semantic_version = 30 };
+    try std.testing.expect(!corrupt.valid());
+    try std.testing.expect(!corrupt.admits(ReaderCapabilities.current, 7));
+}
 
 test "relational index system schema reader capabilities distinguish semantics frames and unknown reporters" {
     const current = ReaderCapabilities.current;

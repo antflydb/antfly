@@ -71,7 +71,11 @@ const std = @import("std");
 /// Version 37 decodes dedicated schema-reader store capabilities and their
 /// versioned sparse/baseline envelopes. This is decoder support, not an ACK
 /// that any particular schema has been installed on a data owner.
-pub const current_version: u16 = 37;
+/// Version 38 decodes the durable independent semantic/ASCH reader floor and
+/// enforces it on store registration and report-root publication. A schema
+/// publication producer must separately bind this floor to its mutation.
+pub const current_version: u16 = 38;
+pub const schema_reader_floor_version: u16 = 38;
 pub const schema_reader_capability_version: u16 = 37;
 pub const index_publication_admission_version: u16 = 36;
 pub const checks_catalog_identity_version: u16 = 35;

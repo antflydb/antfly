@@ -8486,9 +8486,9 @@ test "relational integrity metadata topology admission persists rollout floor an
     try std.testing.expectEqual(.distributed_quiescent_v1, transition.table_contract.integrity_protocol);
     var legacy = capable;
     legacy.relational_topology_protocol_version = 0;
-    try std.testing.expect(!try admitRelationalTopologyStoreTxn(&txn, group_id, legacy));
+    try std.testing.expect(!try admitSchemaAndTopologyStoreTxn(&txn, group_id, legacy));
     legacy.role = "metadata";
-    try std.testing.expect(try admitRelationalTopologyStoreTxn(&txn, group_id, legacy));
+    try std.testing.expect(try admitSchemaAndTopologyStoreTxn(&txn, group_id, legacy));
     try txn.commit();
     open = false;
     try std.testing.expectEqual(capable.relational_topology_protocol_version, try store.getRelationalTopologyProtocolActivationVersion(group_id));
@@ -13560,6 +13560,16 @@ pub const RaftApplyStore = struct {
         };
         defer self.alloc.free(encoded);
         return (try decodeMetadataIncarnationRecord(encoded)).relational_topology_protocol_activated_version;
+    }
+
+    pub fn getSchemaReaderFloor(self: *RaftApplyStore, group_id: u64) !metadata_table_manager.SchemaReaderFloor {
+        var key_buf: [160]u8 = undefined;
+        const encoded = self.store.get(self.alloc, try metadataIncarnationKeyForGroup(&key_buf, group_id)) catch |err| switch (err) {
+            error.NotFound => return .{},
+            else => return err,
+        };
+        defer self.alloc.free(encoded);
+        return (try decodeMetadataIncarnationRecord(encoded)).schema_reader_floor;
     }
 
     pub fn listSplitTransitions(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]metadata.SplitTransitionRecord {
@@ -18747,7 +18757,7 @@ pub const RaftApplyStore = struct {
                         var replacement = metadata_store_observer.applyObservation(header, replacement_report);
                         replacement = try self.normalizeStoreUpsertDrainIntentTxn(txn, group_id, replacement);
                         if (!try admitDenseNativeStoreTxn(self, txn, group_id, replacement)) return;
-                        if (!try admitRelationalTopologyStoreTxn(txn, group_id, replacement)) return;
+                        if (!try admitSchemaAndTopologyStoreTxn(txn, group_id, replacement)) return;
                         if (storeRuntimeStatusRecordVersion(replacement)) |version| try activateRuntimeStatusProtocolTxn(txn, group_id, version);
                         _ = try self.writeStoreGenerationTxn(txn, group_id, header.store_id, replacement, false, if (upload.last_group_id == 0) null else &.{}, null, request.generation());
                         // Keep the prefix retryable until every admission check
@@ -18773,7 +18783,7 @@ pub const RaftApplyStore = struct {
                     // Revalidate at publication, not only while staging them.
                     const staged = try decodeStoredHeader(a, staged_header);
                     if (!try admitDenseNativeStoreTxn(self, txn, group_id, staged)) return;
-                    if (!try admitRelationalTopologyStoreTxn(txn, group_id, staged)) return;
+                    if (!try admitSchemaAndTopologyStoreTxn(txn, group_id, staged)) return;
                     var store_key: [160]u8 = undefined;
                     const header_key = try storeKeyForGroup(&store_key, group_id, header.store_id);
                     try txn.put(header_key, staged_header);
@@ -18828,7 +18838,7 @@ pub const RaftApplyStore = struct {
         var replacement = metadata_store_observer.applyObservation(header, update.report);
         replacement = try self.normalizeStoreUpsertDrainIntentTxn(txn, group_id, replacement);
         if (!try admitDenseNativeStoreTxn(self, txn, group_id, replacement)) return;
-        if (!try admitRelationalTopologyStoreTxn(txn, group_id, replacement)) return;
+        if (!try admitSchemaAndTopologyStoreTxn(txn, group_id, replacement)) return;
         if (storeRuntimeStatusRecordVersion(replacement)) |version| try activateRuntimeStatusProtocolTxn(txn, group_id, version);
         var runtime_changed = false;
         const changed = try self.writeStoreComponentsTxn(txn, group_id, header.store_id, replacement, false, if (update.base != null) update.removed_groups else null, &runtime_changed);
@@ -22538,8 +22548,11 @@ pub const RaftApplyStore = struct {
                 var applied = try self.normalizeStoreUpsertDrainIntentTxn(txn, group_id, record);
                 applied.replica_root_incarnation = header.replica_root_incarnation;
                 applied.replica_root_public_key = header.replica_root_public_key;
+                // A reference refresh cannot replace implementation support;
+                // changing capabilities requires a full, fenced report.
+                applied.schema_reader = header.schema_reader;
                 if (!try admitDenseNativeStoreTxn(self, txn, group_id, applied)) return;
-                if (!try admitRelationalTopologyStoreTxn(txn, group_id, applied)) return;
+                if (!try admitSchemaAndTopologyStoreTxn(txn, group_id, applied)) return;
                 const reports_changed = self.updateStoreComponentsTxn(txn, group_id, record.store_id, applied, true) catch |err| switch (err) {
                     // A full report can supersede the inventory after admission.
                     error.StoreReportBaseMismatch => return,
@@ -22554,7 +22567,7 @@ pub const RaftApplyStore = struct {
                 var key_buf: [160]u8 = undefined;
                 const key = try storeKeyForGroup(&key_buf, group_id, record.store_id);
                 const applied = try self.normalizeStoreUpsertDrainIntentTxn(txn, group_id, record);
-                if (!try admitRelationalTopologyStoreTxn(txn, group_id, applied)) return;
+                if (!try admitSchemaAndTopologyStoreTxn(txn, group_id, applied)) return;
                 if (!try admitDenseNativeStoreTxn(self, txn, group_id, applied)) return;
                 if (storeRuntimeStatusRecordVersion(applied)) |version| {
                     try activateRuntimeStatusProtocolTxn(txn, group_id, version);
@@ -22575,7 +22588,7 @@ pub const RaftApplyStore = struct {
                 var key_buf: [160]u8 = undefined;
                 const key = try storeKeyForGroup(&key_buf, group_id, record.store_id);
                 const applied = try self.normalizeStoreDrainIntentTxn(txn, group_id, record);
-                if (!try admitRelationalTopologyStoreTxn(txn, group_id, applied)) return;
+                if (!try admitSchemaAndTopologyStoreTxn(txn, group_id, applied)) return;
                 if (!try admitDenseNativeStoreTxn(self, txn, group_id, applied)) return;
                 if (storeRuntimeStatusRecordVersion(applied)) |version| {
                     try activateRuntimeStatusProtocolTxn(txn, group_id, version);
@@ -25769,6 +25782,50 @@ pub const RaftApplyStore = struct {
         return true;
     }
 
+    /// Publication must first validate its mutation/decoder admission, then
+    /// raise this floor in that SAME transaction before installing the schema.
+    /// This is not a standalone activation producer or a data-owner ACK.
+    fn raiseSchemaReaderFloorTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, requirement: @import("antfly_local_sources").storage_schema.ReaderRequirements) !bool {
+        var key_buf: [160]u8 = undefined;
+        const key = try metadataIncarnationKeyForGroup(&key_buf, group_id);
+        const raw = txn.get(key) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        };
+        var incarnation = try decodeMetadataIncarnationRecord(raw);
+        const next = try incarnation.schema_reader_floor.include(requirement);
+        // Registration and every durable status replacement enforce an active
+        // floor. Re-admitting an already covered layout therefore needs no
+        // store inventory scan or allocation.
+        if (incarnation.schema_reader_floor.covers(requirement)) return true;
+        var activation_buf: [160]u8 = undefined;
+        const activation_bytes = (try stagingGet(txn, try topologyActivationKeyForGroup(&activation_buf, group_id))) orelse return false;
+        if (!try schemaReaderDecoderActivationValid(self.alloc, activation_bytes, incarnation.incarnation)) return false;
+        var prefix_buf: [128]u8 = undefined;
+        const prefix = try storePrefixForGroup(&prefix_buf, group_id);
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var entry = try cursor.seekAtOrAfter(prefix);
+        var count: usize = 0;
+        var found = false;
+        while (entry) |kv| : (entry = try cursor.next()) {
+            if (!std.mem.startsWith(u8, kv.key, prefix)) break;
+            count += 1;
+            if (count > 4096) return false;
+            const record = try decodeStoredHeader(self.alloc, kv.value);
+            defer metadata_table_manager.freeStore(self.alloc, record);
+            if (!metadata_table_manager.storeServesTableData(record.role)) continue;
+            found = true;
+            if (!next.admits(record.schema_reader, record.reporter_incarnation)) return false;
+        }
+        if (!found) return false;
+        incarnation.schema_reader_floor = next;
+        try writeMetadataIncarnationRecordTxn(txn, group_id, incarnation);
+        self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+        self.notifyProjectionListeners(.{ .kind = .metadata_incarnation, .metadata_group_id = group_id });
+        return true;
+    }
+
     fn mergeTransitionAdmissionMatchesTxn(
         self: *RaftApplyStore,
         txn: *docstore.DocStore.Txn,
@@ -26953,6 +27010,7 @@ const metadata_incarnation_extension_magic = "afmi1";
 const metadata_incarnation_extension_runtime_status_version: u16 = 1;
 const metadata_incarnation_extension_version: u16 = 2;
 const metadata_incarnation_extension_relational_topology_version: u16 = 3;
+const metadata_incarnation_extension_schema_reader_version: u16 = 4;
 // Store records predate framing and are read by mixed-version metadata
 // replicas. Keep the existing prefix byte-for-byte compatible. Extensions are
 // self-identifying for current readers, but legacy readers do not ignore them;
@@ -27084,7 +27142,277 @@ const MetadataIncarnationRecord = struct {
     runtime_status_record_version: u16 = 0,
     dense_native_storage_protocol_activated_version: u16 = 0,
     relational_topology_protocol_activated_version: u16 = 0,
+    schema_reader_floor: metadata_table_manager.SchemaReaderFloor = .{},
 };
+
+test "metadata raft apply store schema reader floor codec preserves predecessor floors and rejects corrupt frames" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/reader-floor-codec", .{tmp.sub_path});
+    defer a.free(root);
+    var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer store.deinit();
+    var txn = try store.store.beginWriteTxn();
+    defer txn.abort();
+    var record: MetadataIncarnationRecord = .{ .incarnation = "0123456789abcdef0123456789abcdef".* };
+    var buf: [160]u8 = undefined;
+    const key = try metadataIncarnationKeyForGroup(&buf, 21);
+    try writeMetadataIncarnationRecordTxn(&txn, 21, record);
+    const legacy = try a.dupe(u8, try txn.get(key));
+    defer a.free(legacy);
+    const version_offset = @sizeOf(metadata_incarnation.MetadataClusterIncarnation) + metadata_incarnation_extension_magic.len;
+    try std.testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, legacy[version_offset..][0..2], .little));
+    try std.testing.expect(!(try decodeMetadataIncarnationRecord(legacy)).schema_reader_floor.active());
+    record.runtime_status_record_version = runtime_status_protocol.framed_index_record_version;
+    record.dense_native_storage_protocol_activated_version = 1;
+    record.relational_topology_protocol_activated_version = 2;
+    record.schema_reader_floor = .{ .semantic_version = 30, .encoding_version = 31 };
+    try writeMetadataIncarnationRecordTxn(&txn, 21, record);
+    const encoded = try a.dupe(u8, try txn.get(key));
+    defer a.free(encoded);
+    try std.testing.expectEqual(@as(u16, 4), std.mem.readInt(u16, encoded[version_offset..][0..2], .little));
+    try std.testing.expectEqualDeep(record, try decodeMetadataIncarnationRecord(encoded));
+    for (0..encoded.len) |cut| {
+        if (cut == @sizeOf(metadata_incarnation.MetadataClusterIncarnation)) continue; // Exact legacy incarnation remains valid.
+        try std.testing.expectError(error.InvalidMetadataIncarnation, decodeMetadataIncarnationRecord(encoded[0..cut]));
+    }
+    encoded[version_offset] = 3;
+    try std.testing.expectError(error.InvalidMetadataIncarnation, decodeMetadataIncarnationRecord(encoded));
+    encoded[version_offset] = 5;
+    try std.testing.expectError(error.InvalidMetadataIncarnation, decodeMetadataIncarnationRecord(encoded));
+    encoded[version_offset] = 4;
+    const floor_offset = version_offset + 4 * @sizeOf(u16);
+    for ([_]metadata_table_manager.SchemaReaderFloor{
+        .{},                                                 .{ .semantic_version = 30 },                         .{ .encoding_version = 31 },
+        .{ .semantic_version = 32, .encoding_version = 31 }, .{ .semantic_version = 30, .encoding_version = 32 },
+    }) |bad| {
+        std.mem.writeInt(u32, encoded[floor_offset..][0..4], bad.semantic_version, .little);
+        std.mem.writeInt(u32, encoded[floor_offset + 4 ..][0..4], bad.encoding_version, .little);
+        try std.testing.expectError(error.InvalidMetadataIncarnation, decodeMetadataIncarnationRecord(encoded));
+    }
+    record.schema_reader_floor = .{ .semantic_version = 30 };
+    try std.testing.expectError(error.InvalidMetadataIncarnation, writeMetadataIncarnationRecordTxn(&txn, 21, record));
+}
+
+test "metadata raft apply store schema reader floor is transactional monotonic and rejects later downgrade" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/reader-floor", .{tmp.sub_path});
+    defer a.free(root);
+    const restored_root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/reader-floor-restored", .{tmp.sub_path});
+    defer a.free(restored_root);
+    const requirement: @import("antfly_local_sources").storage_schema.ReaderRequirements = .{ .semantic_version = 30, .encoding_version = 31 };
+    const activation = try readerFloorActivationForTest(a);
+    defer a.free(activation);
+    const capable: metadata.StoreRecord = .{ .store_id = 1, .node_id = 1, .reporter_incarnation = 11, .schema_reader = metadata_table_manager.SchemaReaderCapabilities.current };
+    var other = capable;
+    other.store_id = 2;
+    other.node_id = 2;
+    other.reporter_incarnation = 22;
+    other.schema_reader.semantic_ceiling = 29;
+    const table: metadata.TableRecord = .{ .table_id = 7, .name = "reader_floor_rows", .schema_json = "{}" };
+    const snapshot = snapshot: {
+        var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+        defer store.deinit();
+        {
+            var txn = try store.store.beginWriteTxn();
+            errdefer txn.abort();
+            try store.applyTransitionCommandTxn(&txn, 21, .{ .initialize_metadata_incarnation = "0123456789abcdef0123456789abcdef".* });
+            _ = try store.ensureDerivedCatalogIndexesTxn(&txn, 21);
+            try store.applyTransitionCommandTxn(&txn, 21, .{ .register_store = capable });
+            try store.applyTransitionCommandTxn(&txn, 21, .{ .register_store = other });
+            try store.applyTransitionCommandTxn(&txn, 21, .{ .activate_topology_protocol = activation });
+            try std.testing.expect(!try store.raiseSchemaReaderFloorTxn(&txn, 21, requirement));
+            try txn.commit();
+        }
+        try std.testing.expect(!(try store.getSchemaReaderFloor(21)).active());
+        other.schema_reader = metadata_table_manager.SchemaReaderCapabilities.current;
+        {
+            var txn = try store.store.beginWriteTxn();
+            errdefer txn.abort();
+            try store.applyTransitionCommandTxn(&txn, 21, .{ .register_store = other });
+            try txn.commit();
+        }
+        // An aborted publication exposes neither the floor nor catalog row.
+        {
+            var txn = try store.store.beginWriteTxn();
+            defer txn.abort();
+            try std.testing.expect(try store.raiseSchemaReaderFloorTxn(&txn, 21, requirement));
+            try store.applyTransitionCommandTxn(&txn, 21, .{ .upsert_table = table });
+        }
+        try std.testing.expect(!(try store.getSchemaReaderFloor(21)).active());
+        {
+            var txn = try store.store.beginReadTxn();
+            defer txn.abort();
+            try std.testing.expect((try store.getTableByNameTxn(a, &txn, 21, table.name)) == null);
+        }
+        {
+            var txn = try store.store.beginWriteTxn();
+            errdefer txn.abort();
+            try std.testing.expect(try store.raiseSchemaReaderFloorTxn(&txn, 21, requirement));
+            try store.applyTransitionCommandTxn(&txn, 21, .{ .upsert_table = table });
+            try txn.commit();
+        }
+        const admitted = try store.getSchemaReaderFloor(21);
+        try std.testing.expectEqual(@as(u32, 30), admitted.semantic_version);
+        try std.testing.expectEqual(@as(u32, 31), admitted.encoding_version);
+        // This deliberately fails every header allocation: already covered
+        // identities must not rescan/decode the registered store inventory.
+        {
+            var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0, .resize_fail_index = 0 });
+            const saved = store.alloc;
+            store.alloc = failing.allocator();
+            defer store.alloc = saved;
+            var txn = try store.store.beginWriteTxn();
+            defer txn.abort();
+            for (0..10_000) |_| try std.testing.expect(try store.raiseSchemaReaderFloorTxn(&txn, 21, .{ .semantic_version = 13, .encoding_version = 17 }));
+            try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
+        }
+        var downgrade = capable;
+        downgrade.schema_reader = .{};
+        var newcomer = downgrade;
+        newcomer.store_id = 3;
+        newcomer.node_id = 3;
+        newcomer.reporter_incarnation = 33;
+        {
+            var txn = try store.store.beginWriteTxn();
+            errdefer txn.abort();
+            try store.applyTransitionCommandTxn(&txn, 21, .{ .upsert_store = downgrade });
+            try store.applyTransitionCommandTxn(&txn, 21, .{ .register_store = newcomer });
+            // References retain the registered capability, not an omitted or
+            // forged implementation claim in a liveness-only refresh.
+            downgrade.capacity_bytes = 123;
+            try store.applyTransitionCommandTxn(&txn, 21, .{ .upsert_store_heartbeat = downgrade });
+            try txn.commit();
+        }
+        try std.testing.expect((try store.readStore(a, 21, 3, false)) == null);
+        const unchanged = (try store.readStore(a, 21, 1, false)).?;
+        defer metadata_table_manager.freeStore(a, unchanged);
+        try std.testing.expectEqualDeep(capable.schema_reader, unchanged.schema_reader);
+        try std.testing.expectEqual(@as(u64, 123), unchanged.capacity_bytes);
+        try std.testing.expectError(error.SchemaReaderUpgradeRequired, metadata_table_manager.requireSchemaReaderAtFloor(admitted, newcomer));
+        newcomer.role = "metadata";
+        try metadata_table_manager.requireSchemaReaderAtFloor(admitted, newcomer);
+        const sparse = try encodeTestReportUpdate(&store, a, .{ .sequence = 1, .report = store_report_update.asReport(downgrade) });
+        defer a.free(sparse);
+        try applyTestReportUpdate(&store, sparse);
+        try std.testing.expect((try store.reportCursor(21, 1)) == null);
+        try std.testing.expectEqualDeep(admitted, try store.getSchemaReaderFloor(21));
+        break :snapshot try store.snapshotBuilder().buildSnapshot(a, 21);
+    };
+    defer a.free(snapshot);
+    {
+        var restored = try RaftApplyStore.init(a, .{ .root_dir = restored_root });
+        defer restored.deinit();
+        try RaftApplyStore.installSnapshotFromRaft(&restored, a, 21, 10, snapshot);
+    }
+    var reopened = try RaftApplyStore.init(a, .{ .root_dir = restored_root });
+    defer reopened.deinit();
+    const retained = try reopened.getSchemaReaderFloor(21);
+    try std.testing.expectEqual(@as(u32, 30), retained.semantic_version);
+    try std.testing.expectEqual(@as(u32, 31), retained.encoding_version);
+    // Snapshot installation deliberately retires derived lookup indexes.
+    // Bootstrap them through the normal catalog path before a name lookup.
+    {
+        var bootstrap = try reopened.store.beginWriteTxn();
+        errdefer bootstrap.abort();
+        _ = try reopened.ensureDerivedCatalogIndexesTxn(&bootstrap, 21);
+        try bootstrap.commit();
+    }
+    var txn = try reopened.store.beginReadTxn();
+    defer txn.abort();
+    const visible = (try reopened.getTableByNameTxn(a, &txn, 21, table.name)).?;
+    defer metadata_table_manager.freeTable(a, visible);
+    try std.testing.expectEqual(table.table_id, visible.table_id);
+}
+
+test "system catalog schema reader floor advancement fences an uploaded baseline before activation" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/reader-floor-baseline", .{tmp.sub_path});
+    defer a.free(root);
+    var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer store.deinit();
+    const capable: metadata.StoreRecord = .{ .store_id = 1, .node_id = 1, .reporter_incarnation = 11, .schema_reader = metadata_table_manager.SchemaReaderCapabilities.current };
+    const activation = try readerFloorActivationForTest(a);
+    defer a.free(activation);
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        try store.applyTransitionCommandTxn(&txn, 21, .{ .initialize_metadata_incarnation = "0123456789abcdef0123456789abcdef".* });
+        try store.applyTransitionCommandTxn(&txn, 21, .{ .register_store = capable });
+        try std.testing.expect(!try store.raiseSchemaReaderFloorTxn(&txn, 21, .{ .semantic_version = 30, .encoding_version = 31 }));
+        try store.applyTransitionCommandTxn(&txn, 21, .{ .activate_topology_protocol = activation });
+        try txn.commit();
+    }
+    var publisher: store_report_update.Publisher = .{};
+    defer publisher.deinit(a);
+    var groups = [_]metadata.GroupStatusReport{.{ .group_id = 100 }};
+    var report = store_report_update.asReport(capable);
+    report.group_statuses = &groups;
+    report.schema_reader.semantic_ceiling = 29;
+    var prepared = try publisher.prepare(a, report, true, false);
+    defer prepared.deinit(a);
+    var plan = try store_report_baseline.Plan.init(a, &prepared);
+    defer plan.deinit();
+    try applyTestBaseline(&store, a, plan.request);
+    var chunk = plan.request;
+    chunk.action = .chunk;
+    chunk.report = plan.chunks[0];
+    try applyTestBaseline(&store, a, chunk);
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        try std.testing.expect(try store.raiseSchemaReaderFloorTxn(&txn, 21, .{ .semantic_version = 30, .encoding_version = 31 }));
+        try txn.commit();
+    }
+    var activate = plan.request;
+    activate.action = .activate;
+    try applyTestBaseline(&store, a, activate);
+    try std.testing.expect(!(try store.reportBaselineProgress(21, plan.request)).activated);
+    try std.testing.expect((try store.reportCursor(21, 1)) == null);
+    const retained = (try store.readStore(a, 21, 1, false)).?;
+    defer metadata_table_manager.freeStore(a, retained);
+    try std.testing.expectEqualDeep(capable.schema_reader, retained.schema_reader);
+    report.schema_reader = capable.schema_reader;
+    var repaired = try publisher.prepare(a, report, true, false);
+    defer repaired.deinit(a);
+    var repaired_plan = try store_report_baseline.Plan.init(a, &repaired);
+    defer repaired_plan.deinit();
+    try std.testing.expect(repaired_plan.request.cursor.sequence > plan.request.cursor.sequence);
+    try applyTestBaseline(&store, a, repaired_plan.request);
+    chunk = repaired_plan.request;
+    chunk.action = .chunk;
+    chunk.report = repaired_plan.chunks[0];
+    try applyTestBaseline(&store, a, chunk);
+    activate = repaired_plan.request;
+    activate.action = .activate;
+    try applyTestBaseline(&store, a, activate);
+    try std.testing.expect((try store.reportBaselineProgress(21, repaired_plan.request)).activated);
+    try std.testing.expectEqual(repaired_plan.request.cursor, (try store.reportCursor(21, 1)).?);
+}
+
+fn schemaReaderDecoderActivationValid(a: std.mem.Allocator, bytes: []const u8, incarnation: metadata_incarnation.MetadataClusterIncarnation) !bool {
+    if (bytes.len > 1024) return error.InvalidCatalogRecord;
+    var parsed = try std.json.parseFromSlice(topology_protocol.Activation, a, bytes, .{});
+    defer parsed.deinit();
+    const activation = parsed.value;
+    return activation.version >= topology_protocol.schema_reader_floor_version and activation.version <= topology_protocol.current_version and
+        activation.member_count != 0 and !std.mem.allEqual(u8, &activation.membership_fingerprint, 0) and
+        std.meta.eql(activation.incarnation, incarnation);
+}
+
+fn readerFloorActivationForTest(a: std.mem.Allocator) ![]u8 {
+    return std.json.Stringify.valueAlloc(a, topology_protocol.Activation{
+        .version = topology_protocol.schema_reader_floor_version,
+        .incarnation = "0123456789abcdef0123456789abcdef".*,
+        .member_count = 2,
+        .membership_fingerprint = @splat(7),
+    }, .{});
+}
 
 fn decodeMetadataIncarnationRecord(encoded: []const u8) !MetadataIncarnationRecord {
     const incarnation_len = @sizeOf(metadata_incarnation.MetadataClusterIncarnation);
@@ -27110,8 +27438,11 @@ fn decodeMetadataIncarnationRecord(encoded: []const u8) !MetadataIncarnationReco
     pos += @sizeOf(u16);
     if (extension_version != metadata_incarnation_extension_runtime_status_version and
         extension_version != metadata_incarnation_extension_version and
-        extension_version != metadata_incarnation_extension_relational_topology_version) return error.InvalidMetadataIncarnation;
-    const trailing_len: usize = if (extension_version >= metadata_incarnation_extension_relational_topology_version)
+        extension_version != metadata_incarnation_extension_relational_topology_version and
+        extension_version != metadata_incarnation_extension_schema_reader_version) return error.InvalidMetadataIncarnation;
+    const trailing_len: usize = if (extension_version >= metadata_incarnation_extension_schema_reader_version)
+        2 * @sizeOf(u16) + 2 * @sizeOf(u32)
+    else if (extension_version >= metadata_incarnation_extension_relational_topology_version)
         2 * @sizeOf(u16)
     else if (extension_version >= metadata_incarnation_extension_version)
         @sizeOf(u16)
@@ -27137,11 +27468,20 @@ fn decodeMetadataIncarnationRecord(encoded: []const u8) !MetadataIncarnationReco
     else
         0;
     if (relational_topology_protocol_activated_version > metadata_table_manager.relational_topology_protocol_version) return error.InvalidMetadataIncarnation;
+    const schema_reader_floor: metadata_table_manager.SchemaReaderFloor = if (extension_version >= metadata_incarnation_extension_schema_reader_version)
+        .{
+            .semantic_version = std.mem.readInt(u32, encoded[pos + 2 * @sizeOf(u16) ..][0..4], .little),
+            .encoding_version = std.mem.readInt(u32, encoded[pos + 2 * @sizeOf(u16) + 4 ..][0..4], .little),
+        }
+    else
+        .{};
+    if (!schema_reader_floor.valid() or (extension_version == metadata_incarnation_extension_schema_reader_version and !schema_reader_floor.active())) return error.InvalidMetadataIncarnation;
     return .{
         .incarnation = incarnation,
         .runtime_status_record_version = runtime_status_record_version,
         .dense_native_storage_protocol_activated_version = dense_native_storage_protocol_activated_version,
         .relational_topology_protocol_activated_version = relational_topology_protocol_activated_version,
+        .schema_reader_floor = schema_reader_floor,
     };
 }
 
@@ -27150,18 +27490,20 @@ fn writeMetadataIncarnationRecordTxn(
     group_id: u64,
     record: MetadataIncarnationRecord,
 ) !void {
+    if (!record.schema_reader_floor.valid()) return error.InvalidMetadataIncarnation;
     var key_buf: [160]u8 = undefined;
     const key = try metadataIncarnationKeyForGroup(&key_buf, group_id);
     const incarnation_len = @sizeOf(metadata_incarnation.MetadataClusterIncarnation);
     const encoded_len = incarnation_len + metadata_incarnation_extension_magic.len +
-        @sizeOf(u16) + @sizeOf(u16) + @sizeOf(u16) + @sizeOf(u16);
+        @sizeOf(u16) + @sizeOf(u16) + @sizeOf(u16) + @sizeOf(u16) + 2 * @sizeOf(u32);
     var encoded: [encoded_len]u8 = undefined;
     @memcpy(encoded[0..incarnation_len], &record.incarnation);
     var pos: usize = incarnation_len;
     @memcpy(encoded[pos..][0..metadata_incarnation_extension_magic.len], metadata_incarnation_extension_magic);
     pos += metadata_incarnation_extension_magic.len;
     const has_topology_floor = record.relational_topology_protocol_activated_version != 0;
-    std.mem.writeInt(u16, encoded[pos..][0..@sizeOf(u16)], if (has_topology_floor) metadata_incarnation_extension_relational_topology_version else metadata_incarnation_extension_version, .little);
+    const has_reader_floor = record.schema_reader_floor.active();
+    std.mem.writeInt(u16, encoded[pos..][0..@sizeOf(u16)], if (has_reader_floor) metadata_incarnation_extension_schema_reader_version else if (has_topology_floor) metadata_incarnation_extension_relational_topology_version else metadata_incarnation_extension_version, .little);
     pos += @sizeOf(u16);
     std.mem.writeInt(u16, encoded[pos..][0..@sizeOf(u16)], record.runtime_status_record_version, .little);
     pos += @sizeOf(u16);
@@ -27172,9 +27514,15 @@ fn writeMetadataIncarnationRecordTxn(
         .little,
     );
     pos += @sizeOf(u16);
-    if (has_topology_floor) {
+    if (has_topology_floor or has_reader_floor) {
         std.mem.writeInt(u16, encoded[pos..][0..@sizeOf(u16)], record.relational_topology_protocol_activated_version, .little);
         pos += @sizeOf(u16);
+    }
+    if (has_reader_floor) {
+        std.mem.writeInt(u32, encoded[pos..][0..4], record.schema_reader_floor.semantic_version, .little);
+        pos += 4;
+        std.mem.writeInt(u32, encoded[pos..][0..4], record.schema_reader_floor.encoding_version, .little);
+        pos += 4;
     }
     try txn.put(key, encoded[0..pos]);
 }
@@ -27287,7 +27635,9 @@ fn admitDenseNativeStoreTxn(
     return true;
 }
 
-fn admitRelationalTopologyStoreTxn(txn: *docstore.DocStore.Txn, group_id: u64, incoming: metadata.StoreRecord) !bool {
+/// Independent schema-reader and topology floors share one fixed-size
+/// incarnation read; neither capability implies the other.
+fn admitSchemaAndTopologyStoreTxn(txn: *docstore.DocStore.Txn, group_id: u64, incoming: metadata.StoreRecord) !bool {
     if (!incoming.schema_reader.validForReporter(incoming.reporter_incarnation)) return false;
     if (incoming.relational_topology_protocol_version > metadata_table_manager.relational_topology_protocol_version or
         (incoming.relational_topology_protocol_version != 0 and incoming.reporter_incarnation == 0)) return false;
@@ -27297,7 +27647,9 @@ fn admitRelationalTopologyStoreTxn(txn: *docstore.DocStore.Txn, group_id: u64, i
         error.NotFound => return true,
         else => return err,
     };
-    const floor = (try decodeMetadataIncarnationRecord(raw)).relational_topology_protocol_activated_version;
+    const incarnation = try decodeMetadataIncarnationRecord(raw);
+    if (!incarnation.schema_reader_floor.admits(incoming.schema_reader, incoming.reporter_incarnation)) return false;
+    const floor = incarnation.relational_topology_protocol_activated_version;
     return floor == 0 or (incoming.reporter_incarnation != 0 and incoming.relational_topology_protocol_version >= floor);
 }
 
@@ -31896,10 +32248,89 @@ fn validateMetadataSnapshotRowsCancelable(alloc: std.mem.Allocator, group_id: u6
         if (result.found_existing) return error.InvalidMetadataSnapshot;
         result.value_ptr.* = row.value;
     }
+    validateSchemaReaderSnapshotCut(alloc, group_id, rows, &seen, cancelled) catch |err| switch (err) {
+        error.OutOfMemory, error.SnapshotBuildCancelled => return err,
+        else => return error.InvalidMetadataSnapshot,
+    };
     validateRelationSnapshotCut(alloc, group_id, rows, &seen, cancelled) catch |err| switch (err) {
         error.OutOfMemory, error.SnapshotBuildCancelled => return err,
         else => return error.InvalidMetadataSnapshot,
     };
+}
+
+/// Reuse the snapshot's existing borrowed-row index. Only active store headers
+/// participate: an incomplete baseline may retain a weaker unpublished root,
+/// but must revalidate the current floor before that root becomes visible.
+fn validateSchemaReaderSnapshotCut(alloc: std.mem.Allocator, group_id: u64, rows: []const docstore.OwnedKVPair, values: *const std.StringHashMapUnmanaged([]const u8), cancelled: ?*const std.atomic.Value(bool)) !void {
+    var buf: [160]u8 = undefined;
+    const encoded = values.get(try metadataIncarnationKeyForGroup(&buf, group_id)) orelse return;
+    const incarnation = try decodeMetadataIncarnationRecord(encoded);
+    const floor = incarnation.schema_reader_floor;
+    if (!floor.active()) return;
+    const activation = values.get(try RaftApplyStore.topologyActivationKeyForGroup(&buf, group_id)) orelse return error.InvalidMetadataSnapshot;
+    if (!try schemaReaderDecoderActivationValid(alloc, activation, incarnation.incarnation)) return error.InvalidMetadataSnapshot;
+    var prefix_buf: [128]u8 = undefined;
+    const prefix = try storePrefixForGroup(&prefix_buf, group_id);
+    for (rows) |row| {
+        if (cancelled) |flag| if (flag.load(.acquire)) return error.SnapshotBuildCancelled;
+        if (!std.mem.startsWith(u8, row.key, prefix)) continue;
+        const header = try RaftApplyStore.decodeStoredHeader(alloc, row.value);
+        defer metadata_table_manager.freeStore(alloc, header);
+        try metadata_table_manager.requireSchemaReaderAtFloor(floor, header);
+    }
+}
+
+test "metadata raft apply store schema reader snapshot rejects incompatible active store headers" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/reader-floor-snapshot", .{tmp.sub_path});
+    defer a.free(root);
+    var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer store.deinit();
+    var txn = try store.store.beginWriteTxn();
+    defer txn.abort();
+    const state: MetadataIncarnationRecord = .{ .incarnation = "0123456789abcdef0123456789abcdef".*, .schema_reader_floor = .{ .semantic_version = 30, .encoding_version = 31 } };
+    try writeMetadataIncarnationRecordTxn(&txn, 21, state);
+    var inc_buf: [160]u8 = undefined;
+    const incarnation_key = try metadataIncarnationKeyForGroup(&inc_buf, 21);
+    const incarnation_bytes = try a.dupe(u8, try txn.get(incarnation_key));
+    defer a.free(incarnation_bytes);
+    var activation_buf: [160]u8 = undefined;
+    const activation_key = try RaftApplyStore.topologyActivationKeyForGroup(&activation_buf, 21);
+    const activation = try readerFloorActivationForTest(a);
+    defer a.free(activation);
+    var store_buf: [160]u8 = undefined;
+    const store_key = try storeKeyForGroup(&store_buf, 21, 1);
+    var record: metadata.StoreRecord = .{ .store_id = 1, .node_id = 1, .reporter_incarnation = 11, .schema_reader = metadata_table_manager.SchemaReaderCapabilities.current };
+    const capable = try encodeStoreRecord(a, record);
+    defer a.free(capable);
+    var rows = [_]docstore.OwnedKVPair{
+        .{ .key = @constCast(incarnation_key), .value = incarnation_bytes },
+        .{ .key = @constCast(store_key), .value = capable },
+        .{ .key = @constCast(activation_key), .value = activation },
+    };
+    try std.testing.expectError(error.InvalidMetadataSnapshot, validateMetadataSnapshotRows(a, 21, rows[0..2]));
+    try validateMetadataSnapshotRows(a, 21, &rows);
+    const version_digit = (std.mem.indexOf(u8, activation, "\"version\":38") orelse return error.TestUnexpectedResult) + "\"version\":3".len;
+    activation[version_digit] = '7';
+    try std.testing.expectError(error.InvalidMetadataSnapshot, validateMetadataSnapshotRows(a, 21, &rows));
+    activation[version_digit] = '8';
+    for ([_]metadata_table_manager.SchemaReaderCapabilities{
+        .{}, .{ .semantic_ceiling = 29, .encoding_ceiling = 31 }, .{ .semantic_ceiling = 31, .encoding_ceiling = 30 },
+    }) |insufficient| {
+        record.schema_reader = insufficient;
+        const invalid = try encodeStoreRecord(a, record);
+        defer a.free(invalid);
+        rows[1].value = invalid;
+        try std.testing.expectError(error.InvalidMetadataSnapshot, validateMetadataSnapshotRows(a, 21, &rows));
+    }
+    record.schema_reader = .{};
+    record.role = "metadata";
+    const metadata_only = try encodeStoreRecord(a, record);
+    defer a.free(metadata_only);
+    rows[1].value = metadata_only;
+    try validateMetadataSnapshotRows(a, 21, &rows);
 }
 
 /// Validate outside the apply lock, using borrowed snapshot rows and one

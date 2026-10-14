@@ -26,6 +26,30 @@ const topology_records = @import("antfly_local_sources").common_topology_records
 const index_repair_status = @import("antfly_local_sources").common_index_repair_status;
 const dense_native_storage_phase = @import("antfly_local_sources").common_dense_native_storage_phase;
 pub const SchemaReaderCapabilities = @import("antfly_local_sources").storage_schema.ReaderCapabilities;
+pub const SchemaReaderFloor = @import("antfly_local_sources").storage_schema.ReaderFloor;
+
+pub fn requireSchemaReaderAtFloor(floor: SchemaReaderFloor, incoming: StoreRecord) !void {
+    if (!floor.valid()) return error.InvalidSchemaReaderRequirements;
+    if (!incoming.schema_reader.validForReporter(incoming.reporter_incarnation)) return error.InvalidStoreReporterFence;
+    if (storeServesTableData(incoming.role) and !floor.admits(incoming.schema_reader, incoming.reporter_incarnation))
+        return error.SchemaReaderUpgradeRequired;
+}
+
+test "system catalog schema reader admission covers custom data roles without conflating metadata roles" {
+    const floor: SchemaReaderFloor = .{ .semantic_version = 30, .encoding_version = 31 };
+    var record: StoreRecord = .{ .store_id = 1, .node_id = 1, .role = "ssd", .reporter_incarnation = 7 };
+    try requireSchemaReaderAtFloor(.{}, record);
+    try std.testing.expectError(error.SchemaReaderUpgradeRequired, requireSchemaReaderAtFloor(floor, record));
+    record.role = "metadata";
+    try requireSchemaReaderAtFloor(floor, record);
+    record.role = "ssd";
+    record.schema_reader = SchemaReaderCapabilities.current;
+    try requireSchemaReaderAtFloor(floor, record);
+    record.reporter_incarnation = 0;
+    try std.testing.expectError(error.InvalidStoreReporterFence, requireSchemaReaderAtFloor(floor, record));
+    record.role = "metadata";
+    try std.testing.expectError(error.InvalidSchemaReaderRequirements, requireSchemaReaderAtFloor(.{ .semantic_version = 30 }, record));
+}
 const transition_state = @import("transition_state.zig");
 
 pub const IndexRepairStatus = index_repair_status.IndexRepairStatus;
