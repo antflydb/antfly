@@ -1731,5 +1731,3207 @@
     "Shared development host with concurrent unrelated builds; no controlled before/after latency claim.",
     "Lake-cache cold means owned lake cache files are cleared, not an OS cache purge.",
     "Bounded native current fixture, not full-archive or Antfly Cloud qualification."
-  ]
+  ],
+  "merged_revision_validation": {
+    "code_revision": "c068b72af791e62bbc75b3d5b2084bb2466e3bb1",
+    "origin_main_revision": "4838edd961",
+    "binary_sha256": "f0109097be0be122fcc843d4974565cf950c755dd80fc6f16774d3d1b6ecff7e",
+    "optimized_executable_build": "passed",
+    "focused_native_tests": {
+      "passed": 7,
+      "skipped": 0,
+      "failed": 0,
+      "leaked": 0
+    },
+    "python_tests": {
+      "passed": 26,
+      "subtests": 9
+    },
+    "cold_probe": {
+      "method": "Twelve union-then-saved-overlay cycles, restart and clear only the owned lake disk cache before each cold query. Odd cycles issue the query immediately after readiness; even cycles wait six seconds. Then twenty warm queries verify exact table, ID, score, projected source and highlights. Metrics are sampled after a six-second refresh wait outside query timing. OS cache retained; shared host. Process resource counters include concurrent background work. Stack sampling triggers above 750 ms; stripped stacks cannot independently identify internal call sites.",
+      "summary": [
+        {
+          "kind": "union",
+          "ready_delay_seconds": 0,
+          "count": 6,
+          "min_ms": 199.192,
+          "max_ms": 1334.599,
+          "mean_ms": 469.865
+        },
+        {
+          "kind": "union",
+          "ready_delay_seconds": 6,
+          "count": 6,
+          "min_ms": 157.895,
+          "max_ms": 387.271,
+          "mean_ms": 284.303
+        },
+        {
+          "kind": "saved_overlay",
+          "ready_delay_seconds": 0,
+          "count": 6,
+          "min_ms": 171.296,
+          "max_ms": 508.899,
+          "mean_ms": 297.466
+        },
+        {
+          "kind": "saved_overlay",
+          "ready_delay_seconds": 6,
+          "count": 6,
+          "min_ms": 169.199,
+          "max_ms": 441.881,
+          "mean_ms": 294.953
+        }
+      ],
+      "warming_error_count": 0,
+      "warming_hint_recovered": true,
+      "max_composition_ms": 2.968,
+      "max_outside_composed_ms": 2.197,
+      "slowest_request_attribution": "First immediate union: 1,334.599 ms total; native leaf 998.381 ms; lake 324.854 ms. This is measured native execution, not proof of the historical saved-overlay stall cause.",
+      "records": [
+        {
+          "cycle": 1,
+          "kind": "union",
+          "ready_delay_seconds": 0,
+          "elapsed_ms": 1334.599,
+          "lake_phase_profile": {
+            "total_ms": 324.854,
+            "pre_search_ms": 199.355,
+            "search_ms": 117.56,
+            "post_search_ms": 7.939,
+            "hydration_ms": 4.821,
+            "outside_lake_ms": 1009.745,
+            "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+          },
+          "composed_phase_profile": {
+            "total_ms": 1333.867,
+            "definition_ms": 0.0,
+            "leaves_ms": 1328.829,
+            "native_leaves_ms": 998.381,
+            "cursor_storage_ms": 4.081,
+            "composition_ms": 0.957,
+            "outside_composed_ms": 0.732,
+            "scope": "Process counters for one serial composed query. Native leaves include durable snapshot capture/recovery and overlap leaves; lake totals also overlap leaves. Composition is the remainder after definition, leaves and cursor storage. Outside-composed time includes HTTP admission and transport."
+          },
+          "process_resource_delta": {
+            "user_time": 5221626,
+            "system_time": 42169347,
+            "pageins": 0,
+            "diskio_bytesread": 60469248,
+            "diskio_byteswritten": 31961088
+          },
+          "warming_state_after_ready": [
+            {
+              "bytes": 270,
+              "valid": true,
+              "complete": true,
+              "table_id": 12756602829812110719,
+              "sequence": 128
+            },
+            {
+              "bytes": 0,
+              "valid": false,
+              "error": "JSONDecodeError"
+            },
+            {
+              "bytes": 258,
+              "valid": true,
+              "complete": false,
+              "table_id": 12155029896106309663,
+              "sequence": 32
+            }
+          ],
+          "warming_state_after_query": [
+            {
+              "bytes": 270,
+              "valid": true,
+              "complete": true,
+              "table_id": 12756602829812110719,
+              "sequence": 128
+            },
+            {
+              "bytes": 267,
+              "valid": true,
+              "complete": true,
+              "table_id": 6834168243242581414,
+              "sequence": 0
+            },
+            {
+              "bytes": 269,
+              "valid": true,
+              "complete": true,
+              "table_id": 12155029896106309663,
+              "sequence": 32
+            }
+          ],
+          "warming_error_count": 0,
+          "sample_captured": true,
+          "selected_metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 505,
+            "antfly_lake_cache_provider_bytes_total": 28387222,
+            "antfly_lake_query_composed_total_calls_total": 1,
+            "antfly_lake_query_composed_total_nanoseconds_total": 1333867000,
+            "antfly_lake_query_composed_definition_calls_total": 0,
+            "antfly_lake_query_composed_definition_nanoseconds_total": 0,
+            "antfly_lake_query_composed_leaf_calls_total": 2,
+            "antfly_lake_query_composed_leaf_nanoseconds_total": 1328829000,
+            "antfly_lake_query_composed_native_leaf_calls_total": 1,
+            "antfly_lake_query_composed_native_leaf_nanoseconds_total": 998381000,
+            "antfly_lake_query_composed_cursor_calls_total": 1,
+            "antfly_lake_query_composed_cursor_nanoseconds_total": 4081000
+          }
+        },
+        {
+          "cycle": 1,
+          "kind": "saved_overlay",
+          "ready_delay_seconds": 0,
+          "elapsed_ms": 171.296,
+          "lake_phase_profile": {
+            "total_ms": 105.415,
+            "pre_search_ms": 53.65,
+            "search_ms": 47.374,
+            "post_search_ms": 4.391,
+            "hydration_ms": 2.891,
+            "outside_lake_ms": 65.881,
+            "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+          },
+          "composed_phase_profile": {
+            "total_ms": 170.733,
+            "definition_ms": 0.071,
+            "leaves_ms": 169.003,
+            "native_leaves_ms": 61.344,
+            "cursor_storage_ms": 1.484,
+            "composition_ms": 0.175,
+            "outside_composed_ms": 0.563,
+            "scope": "Process counters for one serial composed query. Native leaves include durable snapshot capture/recovery and overlap leaves; lake totals also overlap leaves. Composition is the remainder after definition, leaves and cursor storage. Outside-composed time includes HTTP admission and transport."
+          },
+          "process_resource_delta": {
+            "user_time": 2434231,
+            "system_time": 6491007,
+            "pageins": 0,
+            "diskio_bytesread": 81920,
+            "diskio_byteswritten": 24465408
+          },
+          "warming_state_after_ready": [
+            {
+              "bytes": 270,
+              "valid": true,
+              "complete": true,
+              "table_id": 12756602829812110719,
+              "sequence": 128
+            },
+            {
+              "bytes": 267,
+              "valid": true,
+              "complete": true,
+              "table_id": 6834168243242581414,
+              "sequence": 0
+            },
+            {
+              "bytes": 269,
+              "valid": true,
+              "complete": true,
+              "table_id": 12155029896106309663,
+              "sequence": 32
+            }
+          ],
+          "warming_state_after_query": [
+            {
+              "bytes": 270,
+              "valid": true,
+              "complete": true,
+              "table_id": 12756602829812110719,
+              "sequence": 128
+            },
+            {
+              "bytes": 267,
+              "valid": true,
+              "complete": true,
+              "table_id": 6834168243242581414,
+              "sequence": 0
+            },
+            {
+              "bytes": 269,
+              "valid": true,
+              "complete": true,
+              "table_id": 12155029896106309663,
+              "sequence": 32
+            }
+          ],
+          "warming_error_count": 0,
+          "sample_captured": false,
+          "selected_metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 505,
+            "antfly_lake_cache_provider_bytes_total": 28387222,
+            "antfly_lake_query_composed_total_calls_total": 1,
+            "antfly_lake_query_composed_total_nanoseconds_total": 170733000,
+            "antfly_lake_query_composed_definition_calls_total": 1,
+            "antfly_lake_query_composed_definition_nanoseconds_total": 71000,
+            "antfly_lake_query_composed_leaf_calls_total": 3,
+            "antfly_lake_query_composed_leaf_nanoseconds_total": 169003000,
+            "antfly_lake_query_composed_native_leaf_calls_total": 2,
+            "antfly_lake_query_composed_native_leaf_nanoseconds_total": 61344000,
+            "antfly_lake_query_composed_cursor_calls_total": 1,
+            "antfly_lake_query_composed_cursor_nanoseconds_total": 1484000
+          }
+        },
+        {
+          "cycle": 2,
+          "kind": "union",
+          "ready_delay_seconds": 6,
+          "elapsed_ms": 160.219,
+          "lake_phase_profile": {
+            "total_ms": 93.869,
+            "pre_search_ms": 39.805,
+            "search_ms": 49.121,
+            "post_search_ms": 4.943,
+            "hydration_ms": 3.292,
+            "outside_lake_ms": 66.35,
+            "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+          },
+          "composed_phase_profile": {
+            "total_ms": 159.667,
+            "definition_ms": 0.0,
+            "leaves_ms": 157.775,
+            "native_leaves_ms": 61.657,
+            "cursor_storage_ms": 1.753,
+            "composition_ms": 0.139,
+            "outside_composed_ms": 0.552,
+            "scope": "Process counters for one serial composed query. Native leaves include durable snapshot capture/recovery and overlap leaves; lake totals also overlap leaves. Composition is the remainder after definition, leaves and cursor storage. Outside-composed time includes HTTP admission and transport."
+          },
+          "process_resource_delta": {
+            "user_time": 2385618,
+            "system_time": 5430382,
+            "pageins": 0,
+            "diskio_bytesread": 16384,
+            "diskio_byteswritten": 25886720
+          },
+          "warming_state_after_ready": [
+            {
+              "bytes": 270,
+              "valid": true,
+              "complete": true,
+              "table_id": 12756602829812110719,
+              "sequence": 128
+            },
+            {
+              "bytes": 267,
+              "valid": true,
+              "complete": true,
+              "table_id": 6834168243242581414,
+              "sequence": 0
+            },
+            {
+              "bytes": 269,
+              "valid": true,
+              "complete": true,
+              "table_id": 12155029896106309663,
+              "sequence": 32
+            }
+          ],
+          "warming_state_after_query": [
+            {
+              "bytes": 270,
+              "valid": true,
+              "complete": true,
+              "table_id": 12756602829812110719,
+              "sequence": 128
+            },
+            {
+              "bytes": 267,
+              "valid": true,
+              "complete": true,
+              "table_id": 6834168243242581414,
+              "sequence": 0
+            },
+            {
+              "bytes": 269,
+              "valid": true,
+              "complete": true,
+              "table_id": 12155029896106309663,
+              "sequence": 32
+            }
+          ],
+          "warming_error_count": 0,
+          "sample_captured": false,
+          "selected_metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 455,
+            "antfly_lake_cache_provider_bytes_total": 26885788,
+            "antfly_lake_query_composed_total_calls_total": 1,
+            "antfly_lake_query_composed_total_nanoseconds_total": 159667000,
+            "antfly_lake_query_composed_definition_calls_total": 0,
+            "antfly_lake_query_composed_definition_nanoseconds_total": 0,
+            "antfly_lake_query_composed_leaf_calls_total": 2,
+            "antfly_lake_query_composed_leaf_nanoseconds_total": 157775000,
+            "antfly_lake_query_composed_native_leaf_calls_total": 1,
+            "antfly_lake_query_composed_native_leaf_nanoseconds_total": 61657000,
+            "antfly_lake_query_composed_cursor_calls_total": 1,
+            "antfly_lake_query_composed_cursor_nanoseconds_total": 1753000
+          }
+        },
+        {
+          "cycle": 2,
+          "kind": "saved_overlay",
+          "ready_delay_seconds": 6,
+          "elapsed_ms": 178.67,
+          "lake_phase_profile": {
+            "total_ms": 106.083,
+            "pre_search_ms": 48.41,
+            "search_ms": 51.729,
+            "post_search_ms": 5.944,
+            "hydration_ms": 3.636,
+            "outside_lake_ms": 72.587,
+            "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+          },
+          "composed_phase_profile": {
+            "total_ms": 177.926,
+            "definition_ms": 0.204,
+            "leaves_ms": 175.731,
+            "native_leaves_ms": 67.158,
+            "cursor_storage_ms": 1.813,
+            "composition_ms": 0.178,
+            "outside_composed_ms": 0.744,
+            "scope": "Process counters for one serial composed query. Native leaves include durable snapshot capture/recovery and overlap leaves; lake totals also overlap leaves. Composition is the remainder after definition, leaves and cursor storage. Outside-composed time includes HTTP admission and transport."
+          },
+          "process_resource_delta": {
+            "user_time": 2474304,
+            "system_time": 5809700,
+            "pageins": 0,
+            "diskio_bytesread": 20480,
+            "diskio_byteswritten": 24551424
+          },
+          "warming_state_after_ready": [
+            {
+              "bytes": 270,
+              "valid": true,
+              "complete": true,
+              "table_id": 12756602829812110719,
+              "sequence": 128
+            },
+            {
+              "bytes": 267,
+              "valid": true,
+              "complete": true,
+              "table_id": 6834168243242581414,
+              "sequence": 0
+            },
+            {
+              "bytes": 269,
+              "valid": true,
+              "complete": true,
+              "table_id": 12155029896106309663,
+              "sequence": 32
+            }
+          ],
+          "warming_state_after_query": [
+            {
+              "bytes": 270,
+              "valid": true,
+              "complete": true,
+              "table_id": 12756602829812110719,
+              "sequence": 128
+            },
+            {
+              "bytes": 267,
+              "valid": true,
+              "complete": true,
+              "table_id": 6834168243242581414,
+              "sequence": 0
+            },
+            {
+              "bytes": 269,
+              "valid": true,
+              "complete": true,
+              "table_id": 12155029896106309663,
+              "sequence": 32
+            }
+          ],
+          "warming_error_count": 0,
+          "sample_captured": false,
+          "selected_metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 455,
+            "antfly_lake_cache_provider_bytes_total": 26885788,
+            "antfly_lake_query_composed_total_calls_total": 1,
+            "antfly_lake_query_composed_total_nanoseconds_total": 177926000,
+            "antfly_lake_query_composed_definition_calls_total": 1,
+            "antfly_lake_query_composed_definition_nanoseconds_total": 204000,
+            "antfly_lake_query_composed_leaf_calls_total": 3,
+            "antfly_lake_query_composed_leaf_nanoseconds_total": 175731000,
+            "antfly_lake_query_composed_native_leaf_calls_total": 2,
+            "antfly_lake_query_composed_native_leaf_nanoseconds_total": 67158000,
+            "antfly_lake_query_composed_cursor_calls_total": 1,
+            "antfly_lake_query_composed_cursor_nanoseconds_total": 1813000
+          }
+        },
+        {
+          "cycle": 3,
+          "kind": "union",
+          "ready_delay_seconds": 0,
+          "elapsed_ms": 297.512,
+          "lake_phase_profile": {
+            "total_ms": 184.078,
+            "pre_search_ms": 84.643,
+            "search_ms": 71.979,
+            "post_search_ms": 27.456,
+            "hydration_ms": 20.841,
+            "outside_lake_ms": 113.434,
+            "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+          },
+          "composed_phase_profile": {
+            "total_ms": 296.822,
+            "definition_ms": 0.0,
+            "leaves_ms": 294.445,
+            "native_leaves_ms": 103.845,
+            "cursor_storage_ms": 2.201,
+            "composition_ms": 0.176,
+            "outside_composed_ms": 0.69,
+            "scope": "Process counters for one serial composed query. Native leaves include durable snapshot capture/recovery and overlap leaves; lake totals also overlap leaves. Composition is the remainder after definition, leaves and cursor storage. Outside-composed time includes HTTP admission and transport."
+          },
+          "process_resource_delta": {
+            "user_time": 2850999,
+            "system_time": 8976675,
+            "pageins": 0,
+            "diskio_bytesread": 356352,
+            "diskio_byteswritten": 22233088
+          },
+          "warming_state_after_ready": [
+            {
+              "bytes": 270,
+              "valid": true,
+              "complete": true,
+              "table_id": 12756602829812110719,
+              "sequence": 128
+            },
+            {
+              "bytes": 267,
+              "valid": true,
+              "complete": true,
+              "table_id": 6834168243242581414,
+              "sequence": 0
+            },
+            {
+              "bytes": 269,
+              "valid": true,
+              "complete": true,
+              "table_id": 12155029896106309663,
+              "sequence": 32
+            }
+          ],
+          "warming_state_after_query": [
+            {
+              "bytes": 270,
+              "valid": true,
+              "complete": true,
+              "table_id": 12756602829812110719,
+              "sequence": 128
+            },
+            {
+              "bytes": 267,
+              "valid": true,
+              "complete": true,
+              "table_id": 6834168243242581414,
+              "sequence": 0
+            },
+            {
+              "bytes": 269,
+              "valid": true,
+              "complete": true,
+              "table_id": 12155029896106309663,
+              "sequence": 32
+            }
+          ],
+          "warming_error_count": 0,
+          "sample_captured": false,
+          "selected_metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 505,
+            "antfly_lake_cache_provider_bytes_total": 28387222,
+            "antfly_lake_query_composed_total_calls_total": 1,
+            "antfly_lake_query_composed_total_nanoseconds_total": 296822000,
+            "antfly_lake_query_composed_definition_calls_total": 0,
+            "antfly_lake_query_composed_definition_nanoseconds_total": 0,
+            "antfly_lake_query_composed_leaf_calls_total": 2,
+            "antfly_lake_query_composed_leaf_nanoseconds_total": 294445000,
+            "antfly_lake_query_composed_native_leaf_calls_total": 1,
+            "antfly_lake_query_composed_native_leaf_nanoseconds_total": 103845000,
+            "antfly_lake_query_composed_cursor_calls_total": 1,
+            "antfly_lake_query_composed_cursor_nanoseconds_total": 2201000
+          }
+        },
+        {
+          "cycle": 3,
+          "kind": "saved_overlay",
+          "ready_delay_seconds": 0,
+          "elapsed_ms": 213.06,
+          "lake_phase_profile": {
+            "total_ms": 110.924,
+            "pre_search_ms": 56.405,
+            "search_ms": 48.988,
+            "post_search_ms": 5.531,
+            "hydration_ms": 3.685,
+            "outside_lake_ms": 102.136,
+            "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+          },
+          "composed_phase_profile": {
+            "total_ms": 212.508,
+            "definition_ms": 0.065,
+            "leaves_ms": 209.954,
+            "native_leaves_ms": 96.339,
+            "cursor_storage_ms": 2.229,
+            "composition_ms": 0.26,
+            "outside_composed_ms": 0.552,
+            "scope": "Process counters for one serial composed query. Native leaves include durable snapshot capture/recovery and overlap leaves; lake totals also overlap leaves. Composition is the remainder after definition, leaves and cursor storage. Outside-composed time includes HTTP admission and transport."
+          },
+          "process_resource_delta": {
+            "user_time": 2488937,
+            "system_time": 7045193,
+            "pageins": 0,
+            "diskio_bytesread": 102400,
+            "diskio_byteswritten": 15261696
+          },
+          "warming_state_after_ready": [
+            {
+              "bytes": 270,
+              "valid": true,
+              "complete": true,
+              "table_id": 12756602829812110719,
+              "sequence": 128
+            },
+            {
+              "bytes": 267,
+              "valid": true,
+              "complete": true,
+              "table_id": 6834168243242581414,
+              "sequence": 0
+            },
+            {
+              "bytes": 269,
+              "valid": true,
+              "complete": true,
+              "table_id": 12155029896106309663,
+              "sequence": 32
+            }
+          ],
+          "warming_state_after_query": [
+            {
+              "bytes": 270,
+              "valid": true,
+              "complete": true,
+              "table_id": 12756602829812110719,
+              "sequence": 128
+            },
+            {
+              "bytes": 267,
+              "valid": true,
+              "complete": true,
+              "table_id": 6834168243242581414,
+              "sequence": 0
+            },
+            {
+              "bytes": 269,
+              "valid": true,
+              "complete": true,
+              "table_id": 12155029896106309663,
+              "sequence": 32
+            }
+          ],
+          "warming_error_count": 0,
+          "sample_captured": false,
+          "selected_metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 505,
+            "antfly_lake_cache_provider_bytes_total": 28387222,
+            "antfly_lake_query_composed_total_calls_total": 1,
+            "antfly_lake_query_composed_total_nanoseconds_total": 212508000,
+            "antfly_lake_query_composed_definition_calls_total": 1,
+            "antfly_lake_query_composed_definition_nanoseconds_total": 65000,
+            "antfly_lake_query_composed_leaf_calls_total": 3,
+            "antfly_lake_query_composed_leaf_nanoseconds_total": 209954000,
+            "antfly_lake_query_composed_native_leaf_calls_total": 2,
+            "antfly_lake_query_composed_native_leaf_nanoseconds_total": 96339000,
+            "antfly_lake_query_composed_cursor_calls_total": 1,
+            "antfly_lake_query_composed_cursor_nanoseconds_total": 2229000
+          }
+        },
+        {
+          "cycle": 4,
+          "kind": "union",
+          "ready_delay_seconds": 6,
+          "elapsed_ms": 157.895,
+          "lake_phase_profile": {
+            "total_ms": 97.444,
+            "pre_search_ms": 44.901,
+            "search_ms": 47.408,
+            "post_search_ms": 5.135,
+            "hydration_ms": 3.033,
+            "outside_lake_ms": 60.451,
+            "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+          },
+          "composed_phase_profile": {
+            "total_ms": 157.35,
+            "definition_ms": 0.0,
+            "leaves_ms": 155.415,
+            "native_leaves_ms": 55.909,
+            "cursor_storage_ms": 1.794,
+            "composition_ms": 0.141,
+            "outside_composed_ms": 0.545,
+            "scope": "Process counters for one serial composed query. Native leaves include durable snapshot capture/recovery and overlap leaves; lake totals also overlap leaves. Composition is the remainder after definition, leaves and cursor storage. Outside-composed time includes HTTP admission and transport."
+          },
+          "process_resource_delta": {
+            "user_time": 2326108,
+            "system_time": 5332657,
+            "pageins": 0,
+            "diskio_bytesread": 45056,
+            "diskio_byteswritten": 23543808
+          },
+          "warming_state_after_ready": [
+            {
+              "bytes": 270,
+              "valid": true,
+              "complete": true,
+              "table_id": 12756602829812110719,
+              "sequence": 128
+            },
+            {
+              "bytes": 267,
+              "valid": true,
+              "complete": true,
+              "table_id": 6834168243242581414,
+              "sequence": 0
+            },
+            {
+              "bytes": 269,
+              "valid": true,
+              "complete": true,
+              "table_id": 12155029896106309663,
+              "sequence": 32
+            }
+          ],
+          "warming_state_after_query": [
+            {
+              "bytes": 270,
+              "valid": true,
+              "complete": true,
+              "table_id": 12756602829812110719,
+              "sequence": 128
+            },
+            {
+              "bytes": 267,
+              "valid": true,
+              "complete": true,
+              "table_id": 6834168243242581414,
+              "sequence": 0
+            },
+            {
+              "bytes": 269,
+              "valid": true,
+              "complete": true,
+              "table_id": 12155029896106309663,
+              "sequence": 32
+            }
+          ],
+          "warming_error_count": 0,
+          "sample_captured": false,
+          "selected_metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 455,
+            "antfly_lake_cache_provider_bytes_total": 26885788,
+            "antfly_lake_query_composed_total_calls_total": 1,
+            "antfly_lake_query_composed_total_nanoseconds_total": 157350000,
+            "antfly_lake_query_composed_definition_calls_total": 0,
+            "antfly_lake_query_composed_definition_nanoseconds_total": 0,
+            "antfly_lake_query_composed_leaf_calls_total": 2,
+            "antfly_lake_query_composed_leaf_nanoseconds_total": 155415000,
+            "antfly_lake_query_composed_native_leaf_calls_total": 1,
+            "antfly_lake_query_composed_native_leaf_nanoseconds_total": 55909000,
+            "antfly_lake_query_composed_cursor_calls_total": 1,
+            "antfly_lake_query_composed_cursor_nanoseconds_total": 1794000
+          }
+        },
+        {
+          "cycle": 4,
+          "kind": "saved_overlay",
+          "ready_delay_seconds": 6,
+          "elapsed_ms": 188.319,
+          "lake_phase_profile": {
+            "total_ms": 97.279,
+            "pre_search_ms": 45.608,
+            "search_ms": 46.697,
+            "post_search_ms": 4.974,
+            "hydration_ms": 3.392,
+            "outside_lake_ms": 91.04,
+            "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+          },
+          "composed_phase_profile": {
+            "total_ms": 187.927,
+            "definition_ms": 0.047,
+            "leaves_ms": 185.472,
+            "native_leaves_ms": 85.575,
+            "cursor_storage_ms": 2.22,
+            "composition_ms": 0.188,
+            "outside_composed_ms": 0.392,
+            "scope": "Process counters for one serial composed query. Native leaves include durable snapshot capture/recovery and overlap leaves; lake totals also overlap leaves. Composition is the remainder after definition, leaves and cursor storage. Outside-composed time includes HTTP admission and transport."
+          },
+          "process_resource_delta": {
+            "user_time": 2346002,
+            "system_time": 5973412,
+            "pageins": 0,
+            "diskio_bytesread": 77824,
+            "diskio_byteswritten": 21057536
+          },
+          "warming_state_after_ready": [
+            {
+              "bytes": 270,
+              "valid": true,
+              "complete": true,
+              "table_id": 12756602829812110719,
+              "sequence": 128
+            },
+            {
+              "bytes": 267,
+              "valid": true,
+              "complete": true,
+              "table_id": 6834168243242581414,
+              "sequence": 0
+            },
+            {
+              "bytes": 269,
+              "valid": true,
+              "complete": true,
+              "table_id": 12155029896106309663,
+              "sequence": 32
+            }
+          ],
+          "warming_state_after_query": [
+            {
+              "bytes": 270,
+              "valid": true,
+              "complete": true,
+              "table_id": 12756602829812110719,
+              "sequence": 128
+            },
+            {
+              "bytes": 267,
+              "valid": true,
+              "complete": true,
+              "table_id": 6834168243242581414,
+              "sequence": 0
+            },
+            {
+              "bytes": 269,
+              "valid": true,
+              "complete": true,
+              "table_id": 12155029896106309663,
+              "sequence": 32
+            }
+          ],
+          "warming_error_count": 0,
+          "sample_captured": false,
+          "selected_metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 455,
+            "antfly_lake_cache_provider_bytes_total": 26885788,
+            "antfly_lake_query_composed_total_calls_total": 1,
+            "antfly_lake_query_composed_total_nanoseconds_total": 187927000,
+            "antfly_lake_query_composed_definition_calls_total": 1,
+            "antfly_lake_query_composed_definition_nanoseconds_total": 47000,
+            "antfly_lake_query_composed_leaf_calls_total": 3,
+            "antfly_lake_query_composed_leaf_nanoseconds_total": 185472000,
+            "antfly_lake_query_composed_native_leaf_calls_total": 2,
+            "antfly_lake_query_composed_native_leaf_nanoseconds_total": 85575000,
+            "antfly_lake_query_composed_cursor_calls_total": 1,
+            "antfly_lake_query_composed_cursor_nanoseconds_total": 2220000
+          }
+        },
+        {
+          "cycle": 5,
+          "kind": "union",
+          "ready_delay_seconds": 0,
+          "elapsed_ms": 217.769,
+          "lake_phase_profile": {
+            "total_ms": 121.648,
+            "pre_search_ms": 62.88,
+            "search_ms": 52.444,
+            "post_search_ms": 6.324,
+            "hydration_ms": 3.83,
+            "outside_lake_ms": 96.121,
+            "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+          },
+          "composed_phase_profile": {
+            "total_ms": 217.033,
+            "definition_ms": 0.0,
+            "leaves_ms": 214.898,
+            "native_leaves_ms": 82.784,
+            "cursor_storage_ms": 1.993,
+            "composition_ms": 0.142,
+            "outside_composed_ms": 0.736,
+            "scope": "Process counters for one serial composed query. Native leaves include durable snapshot capture/recovery and overlap leaves; lake totals also overlap leaves. Composition is the remainder after definition, leaves and cursor storage. Outside-composed time includes HTTP admission and transport."
+          },
+          "process_resource_delta": {
+            "user_time": 2536833,
+            "system_time": 7834963,
+            "pageins": 0,
+            "diskio_bytesread": 36864,
+            "diskio_byteswritten": 23093248
+          },
+          "warming_state_after_ready": [
+            {
+              "bytes": 270,
+              "valid": true,
+              "complete": true,
+              "table_id": 12756602829812110719,
+              "sequence": 128
+            },
+            {
+              "bytes": 267,
+              "valid": true,
+              "complete": true,
+              "table_id": 6834168243242581414,
+              "sequence": 0
+            },
+            {
+              "bytes": 269,
+              "valid": true,
+              "complete": true,
+              "table_id": 12155029896106309663,
+              "sequence": 32
+            }
+          ],
+          "warming_state_after_query": [
+            {
+              "bytes": 270,
+              "valid": true,
+              "complete": true,
+              "table_id": 12756602829812110719,
+              "sequence": 128
+            },
+            {
+              "bytes": 267,
+              "valid": true,
+              "complete": true,
+              "table_id": 6834168243242581414,
+              "sequence": 0
+            },
+            {
+              "bytes": 269,
+              "valid": true,
+              "complete": true,
+              "table_id": 12155029896106309663,
+              "sequence": 32
+            }
+          ],
+          "warming_error_count": 0,
+          "sample_captured": false,
+          "selected_metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 505,
+            "antfly_lake_cache_provider_bytes_total": 28387222,
+            "antfly_lake_query_composed_total_calls_total": 1,
+            "antfly_lake_query_composed_total_nanoseconds_total": 217033000,
+            "antfly_lake_query_composed_definition_calls_total": 0,
+            "antfly_lake_query_composed_definition_nanoseconds_total": 0,
+            "antfly_lake_query_composed_leaf_calls_total": 2,
+            "antfly_lake_query_composed_leaf_nanoseconds_total": 214898000,
+            "antfly_lake_query_composed_native_leaf_calls_total": 1,
+            "antfly_lake_query_composed_native_leaf_nanoseconds_total": 82784000,
+            "antfly_lake_query_composed_cursor_calls_total": 1,
+            "antfly_lake_query_composed_cursor_nanoseconds_total": 1993000
+          }
+        },
+        {
+          "cycle": 5,
+          "kind": "saved_overlay",
+          "ready_delay_seconds": 0,
+          "elapsed_ms": 202.322,
+          "lake_phase_profile": {
+            "total_ms": 112.8,
+            "pre_search_ms": 56.968,
+            "search_ms": 50.232,
+            "post_search_ms": 5.6,
+            "hydration_ms": 3.533,
+            "outside_lake_ms": 89.522,
+            "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+          },
+          "composed_phase_profile": {
+            "total_ms": 201.793,
+            "definition_ms": 0.04,
+            "leaves_ms": 199.57,
+            "native_leaves_ms": 84.287,
+            "cursor_storage_ms": 2.007,
+            "composition_ms": 0.176,
+            "outside_composed_ms": 0.529,
+            "scope": "Process counters for one serial composed query. Native leaves include durable snapshot capture/recovery and overlap leaves; lake totals also overlap leaves. Composition is the remainder after definition, leaves and cursor storage. Outside-composed time includes HTTP admission and transport."
+          },
+          "process_resource_delta": {
+            "user_time": 2569688,
+            "system_time": 7299195,
+            "pageins": 0,
+            "diskio_bytesread": 278528,
+            "diskio_byteswritten": 24526848
+          },
+          "warming_state_after_ready": [
+            {
+              "bytes": 270,
+              "valid": true,
+              "complete": true,
+              "table_id": 12756602829812110719,
+              "sequence": 128
+            },
+            {
+              "bytes": 267,
+              "valid": true,
+              "complete": true,
+              "table_id": 6834168243242581414,
+              "sequence": 0
+            },
+            {
+              "bytes": 269,
+              "valid": true,
+              "complete": true,
+              "table_id": 12155029896106309663,
+              "sequence": 32
+            }
+          ],
+          "warming_state_after_query": [
+            {
+              "bytes": 270,
+              "valid": true,
+              "complete": true,
+              "table_id": 12756602829812110719,
+              "sequence": 128
+            },
+            {
+              "bytes": 267,
+              "valid": true,
+              "complete": true,
+              "table_id": 6834168243242581414,
+              "sequence": 0
+            },
+            {
+              "bytes": 269,
+              "valid": true,
+              "complete": true,
+              "table_id": 12155029896106309663,
+              "sequence": 32
+            }
+          ],
+          "warming_error_count": 0,
+          "sample_captured": false,
+          "selected_metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 505,
+            "antfly_lake_cache_provider_bytes_total": 28387222,
+            "antfly_lake_query_composed_total_calls_total": 1,
+            "antfly_lake_query_composed_total_nanoseconds_total": 201793000,
+            "antfly_lake_query_composed_definition_calls_total": 1,
+            "antfly_lake_query_composed_definition_nanoseconds_total": 40000,
+            "antfly_lake_query_composed_leaf_calls_total": 3,
+            "antfly_lake_query_composed_leaf_nanoseconds_total": 199570000,
+            "antfly_lake_query_composed_native_leaf_calls_total": 2,
+            "antfly_lake_query_composed_native_leaf_nanoseconds_total": 84287000,
+            "antfly_lake_query_composed_cursor_calls_total": 1,
+            "antfly_lake_query_composed_cursor_nanoseconds_total": 2007000
+          }
+        },
+        {
+          "cycle": 6,
+          "kind": "union",
+          "ready_delay_seconds": 6,
+          "elapsed_ms": 239.069,
+          "lake_phase_profile": {
+            "total_ms": 151.734,
+            "pre_search_ms": 90.562,
+            "search_ms": 54.244,
+            "post_search_ms": 6.928,
+            "hydration_ms": 4.732,
+            "outside_lake_ms": 87.335,
+            "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+          },
+          "composed_phase_profile": {
+            "total_ms": 236.872,
+            "definition_ms": 0.0,
+            "leaves_ms": 234.845,
+            "native_leaves_ms": 80.339,
+            "cursor_storage_ms": 1.825,
+            "composition_ms": 0.202,
+            "outside_composed_ms": 2.197,
+            "scope": "Process counters for one serial composed query. Native leaves include durable snapshot capture/recovery and overlap leaves; lake totals also overlap leaves. Composition is the remainder after definition, leaves and cursor storage. Outside-composed time includes HTTP admission and transport."
+          },
+          "process_resource_delta": {
+            "user_time": 2548629,
+            "system_time": 6902414,
+            "pageins": 0,
+            "diskio_bytesread": 241664,
+            "diskio_byteswritten": 23298048
+          },
+          "warming_state_after_ready": [
+            {
+              "bytes": 270,
+              "valid": true,
+              "complete": true,
+              "table_id": 12756602829812110719,
+              "sequence": 128
+            },
+            {
+              "bytes": 267,
+              "valid": true,
+              "complete": true,
+              "table_id": 6834168243242581414,
+              "sequence": 0
+            },
+            {
+              "bytes": 269,
+              "valid": true,
+              "complete": true,
+              "table_id": 12155029896106309663,
+              "sequence": 32
+            }
+          ],
+          "warming_state_after_query": [
+            {
+              "bytes": 270,
+              "valid": true,
+              "complete": true,
+              "table_id": 12756602829812110719,
+              "sequence": 128
+            },
+            {
+              "bytes": 267,
+              "valid": true,
+              "complete": true,
+              "table_id": 6834168243242581414,
+              "sequence": 0
+            },
+            {
+              "bytes": 269,
+              "valid": true,
+              "complete": true,
+              "table_id": 12155029896106309663,
+              "sequence": 32
+            }
+          ],
+          "warming_error_count": 0,
+          "sample_captured": false,
+          "selected_metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 455,
+            "antfly_lake_cache_provider_bytes_total": 26885788,
+            "antfly_lake_query_composed_total_calls_total": 1,
+            "antfly_lake_query_composed_total_nanoseconds_total": 236872000,
+            "antfly_lake_query_composed_definition_calls_total": 0,
+            "antfly_lake_query_composed_definition_nanoseconds_total": 0,
+            "antfly_lake_query_composed_leaf_calls_total": 2,
+            "antfly_lake_query_composed_leaf_nanoseconds_total": 234845000,
+            "antfly_lake_query_composed_native_leaf_calls_total": 1,
+            "antfly_lake_query_composed_native_leaf_nanoseconds_total": 80339000,
+            "antfly_lake_query_composed_cursor_calls_total": 1,
+            "antfly_lake_query_composed_cursor_nanoseconds_total": 1825000
+          }
+        },
+        {
+          "cycle": 6,
+          "kind": "saved_overlay",
+          "ready_delay_seconds": 6,
+          "elapsed_ms": 169.199,
+          "lake_phase_profile": {
+            "total_ms": 102.451,
+            "pre_search_ms": 45.469,
+            "search_ms": 52.222,
+            "post_search_ms": 4.76,
+            "hydration_ms": 3.067,
+            "outside_lake_ms": 66.748,
+            "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+          },
+          "composed_phase_profile": {
+            "total_ms": 168.79,
+            "definition_ms": 0.039,
+            "leaves_ms": 166.685,
+            "native_leaves_ms": 61.641,
+            "cursor_storage_ms": 1.913,
+            "composition_ms": 0.153,
+            "outside_composed_ms": 0.409,
+            "scope": "Process counters for one serial composed query. Native leaves include durable snapshot capture/recovery and overlap leaves; lake totals also overlap leaves. Composition is the remainder after definition, leaves and cursor storage. Outside-composed time includes HTTP admission and transport."
+          },
+          "process_resource_delta": {
+            "user_time": 2471057,
+            "system_time": 5673450,
+            "pageins": 0,
+            "diskio_bytesread": 24576,
+            "diskio_byteswritten": 23621632
+          },
+          "warming_state_after_ready": [
+            {
+              "bytes": 270,
+              "valid": true,
+              "complete": true,
+              "table_id": 12756602829812110719,
+              "sequence": 128
+            },
+            {
+              "bytes": 267,
+              "valid": true,
+              "complete": true,
+              "table_id": 6834168243242581414,
+              "sequence": 0
+            },
+            {
+              "bytes": 269,
+              "valid": true,
+              "complete": true,
+              "table_id": 12155029896106309663,
+              "sequence": 32
+            }
+          ],
+          "warming_state_after_query": [
+            {
+              "bytes": 270,
+              "valid": true,
+              "complete": true,
+              "table_id": 12756602829812110719,
+              "sequence": 128
+            },
+            {
+              "bytes": 267,
+              "valid": true,
+              "complete": true,
+              "table_id": 6834168243242581414,
+              "sequence": 0
+            },
+            {
+              "bytes": 269,
+              "valid": true,
+              "complete": true,
+              "table_id": 12155029896106309663,
+              "sequence": 32
+            }
+          ],
+          "warming_error_count": 0,
+          "sample_captured": false,
+          "selected_metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 455,
+            "antfly_lake_cache_provider_bytes_total": 26885788,
+            "antfly_lake_query_composed_total_calls_total": 1,
+            "antfly_lake_query_composed_total_nanoseconds_total": 168790000,
+            "antfly_lake_query_composed_definition_calls_total": 1,
+            "antfly_lake_query_composed_definition_nanoseconds_total": 39000,
+            "antfly_lake_query_composed_leaf_calls_total": 3,
+            "antfly_lake_query_composed_leaf_nanoseconds_total": 166685000,
+            "antfly_lake_query_composed_native_leaf_calls_total": 2,
+            "antfly_lake_query_composed_native_leaf_nanoseconds_total": 61641000,
+            "antfly_lake_query_composed_cursor_calls_total": 1,
+            "antfly_lake_query_composed_cursor_nanoseconds_total": 1913000
+          }
+        },
+        {
+          "cycle": 7,
+          "kind": "union",
+          "ready_delay_seconds": 0,
+          "elapsed_ms": 199.192,
+          "lake_phase_profile": {
+            "total_ms": 113.98,
+            "pre_search_ms": 58.99,
+            "search_ms": 49.561,
+            "post_search_ms": 5.429,
+            "hydration_ms": 3.485,
+            "outside_lake_ms": 85.212,
+            "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+          },
+          "composed_phase_profile": {
+            "total_ms": 198.811,
+            "definition_ms": 0.0,
+            "leaves_ms": 196.832,
+            "native_leaves_ms": 79.983,
+            "cursor_storage_ms": 1.836,
+            "composition_ms": 0.143,
+            "outside_composed_ms": 0.381,
+            "scope": "Process counters for one serial composed query. Native leaves include durable snapshot capture/recovery and overlap leaves; lake totals also overlap leaves. Composition is the remainder after definition, leaves and cursor storage. Outside-composed time includes HTTP admission and transport."
+          },
+          "process_resource_delta": {
+            "user_time": 2529847,
+            "system_time": 7194109,
+            "pageins": 0,
+            "diskio_bytesread": 57344,
+            "diskio_byteswritten": 26898432
+          },
+          "warming_state_after_ready": [
+            {
+              "bytes": 270,
+              "valid": true,
+              "complete": true,
+              "table_id": 12756602829812110719,
+              "sequence": 128
+            },
+            {
+              "bytes": 267,
+              "valid": true,
+              "complete": true,
+              "table_id": 6834168243242581414,
+              "sequence": 0
+            },
+            {
+              "bytes": 269,
+              "valid": true,
+              "complete": true,
+              "table_id": 12155029896106309663,
+              "sequence": 32
+            }
+          ],
+          "warming_state_after_query": [
+            {
+              "bytes": 270,
+              "valid": true,
+              "complete": true,
+              "table_id": 12756602829812110719,
+              "sequence": 128
+            },
+            {
+              "bytes": 267,
+              "valid": true,
+              "complete": true,
+              "table_id": 6834168243242581414,
+              "sequence": 0
+            },
+            {
+              "bytes": 269,
+              "valid": true,
+              "complete": true,
+              "table_id": 12155029896106309663,
+              "sequence": 32
+            }
+          ],
+          "warming_error_count": 0,
+          "sample_captured": false,
+          "selected_metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 505,
+            "antfly_lake_cache_provider_bytes_total": 28387222,
+            "antfly_lake_query_composed_total_calls_total": 1,
+            "antfly_lake_query_composed_total_nanoseconds_total": 198811000,
+            "antfly_lake_query_composed_definition_calls_total": 0,
+            "antfly_lake_query_composed_definition_nanoseconds_total": 0,
+            "antfly_lake_query_composed_leaf_calls_total": 2,
+            "antfly_lake_query_composed_leaf_nanoseconds_total": 196832000,
+            "antfly_lake_query_composed_native_leaf_calls_total": 1,
+            "antfly_lake_query_composed_native_leaf_nanoseconds_total": 79983000,
+            "antfly_lake_query_composed_cursor_calls_total": 1,
+            "antfly_lake_query_composed_cursor_nanoseconds_total": 1836000
+          }
+        },
+        {
+          "cycle": 7,
+          "kind": "saved_overlay",
+          "ready_delay_seconds": 0,
+          "elapsed_ms": 199.875,
+          "lake_phase_profile": {
+            "total_ms": 110.923,
+            "pre_search_ms": 57.905,
+            "search_ms": 47.987,
+            "post_search_ms": 5.031,
+            "hydration_ms": 3.16,
+            "outside_lake_ms": 88.952,
+            "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+          },
+          "composed_phase_profile": {
+            "total_ms": 199.316,
+            "definition_ms": 0.041,
+            "leaves_ms": 197.209,
+            "native_leaves_ms": 84.009,
+            "cursor_storage_ms": 1.91,
+            "composition_ms": 0.156,
+            "outside_composed_ms": 0.559,
+            "scope": "Process counters for one serial composed query. Native leaves include durable snapshot capture/recovery and overlap leaves; lake totals also overlap leaves. Composition is the remainder after definition, leaves and cursor storage. Outside-composed time includes HTTP admission and transport."
+          },
+          "process_resource_delta": {
+            "user_time": 2525579,
+            "system_time": 7521413,
+            "pageins": 0,
+            "diskio_bytesread": 258048,
+            "diskio_byteswritten": 25153536
+          },
+          "warming_state_after_ready": [
+            {
+              "bytes": 270,
+              "valid": true,
+              "complete": true,
+              "table_id": 12756602829812110719,
+              "sequence": 128
+            },
+            {
+              "bytes": 267,
+              "valid": true,
+              "complete": true,
+              "table_id": 6834168243242581414,
+              "sequence": 0
+            },
+            {
+              "bytes": 269,
+              "valid": true,
+              "complete": true,
+              "table_id": 12155029896106309663,
+              "sequence": 32
+            }
+          ],
+          "warming_state_after_query": [
+            {
+              "bytes": 270,
+              "valid": true,
+              "complete": true,
+              "table_id": 12756602829812110719,
+              "sequence": 128
+            },
+            {
+              "bytes": 267,
+              "valid": true,
+              "complete": true,
+              "table_id": 6834168243242581414,
+              "sequence": 0
+            },
+            {
+              "bytes": 269,
+              "valid": true,
+              "complete": true,
+              "table_id": 12155029896106309663,
+              "sequence": 32
+            }
+          ],
+          "warming_error_count": 0,
+          "sample_captured": false,
+          "selected_metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 505,
+            "antfly_lake_cache_provider_bytes_total": 28387222,
+            "antfly_lake_query_composed_total_calls_total": 1,
+            "antfly_lake_query_composed_total_nanoseconds_total": 199316000,
+            "antfly_lake_query_composed_definition_calls_total": 1,
+            "antfly_lake_query_composed_definition_nanoseconds_total": 41000,
+            "antfly_lake_query_composed_leaf_calls_total": 3,
+            "antfly_lake_query_composed_leaf_nanoseconds_total": 197209000,
+            "antfly_lake_query_composed_native_leaf_calls_total": 2,
+            "antfly_lake_query_composed_native_leaf_nanoseconds_total": 84009000,
+            "antfly_lake_query_composed_cursor_calls_total": 1,
+            "antfly_lake_query_composed_cursor_nanoseconds_total": 1910000
+          }
+        },
+        {
+          "cycle": 8,
+          "kind": "union",
+          "ready_delay_seconds": 6,
+          "elapsed_ms": 383.23,
+          "lake_phase_profile": {
+            "total_ms": 275.375,
+            "pre_search_ms": 88.505,
+            "search_ms": 173.548,
+            "post_search_ms": 13.322,
+            "hydration_ms": 10.533,
+            "outside_lake_ms": 107.855,
+            "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+          },
+          "composed_phase_profile": {
+            "total_ms": 382.509,
+            "definition_ms": 0.0,
+            "leaves_ms": 380.296,
+            "native_leaves_ms": 101.214,
+            "cursor_storage_ms": 2.011,
+            "composition_ms": 0.202,
+            "outside_composed_ms": 0.721,
+            "scope": "Process counters for one serial composed query. Native leaves include durable snapshot capture/recovery and overlap leaves; lake totals also overlap leaves. Composition is the remainder after definition, leaves and cursor storage. Outside-composed time includes HTTP admission and transport."
+          },
+          "process_resource_delta": {
+            "user_time": 2924243,
+            "system_time": 7870635,
+            "pageins": 0,
+            "diskio_bytesread": 29274112,
+            "diskio_byteswritten": 27992064
+          },
+          "warming_state_after_ready": [
+            {
+              "bytes": 270,
+              "valid": true,
+              "complete": true,
+              "table_id": 12756602829812110719,
+              "sequence": 128
+            },
+            {
+              "bytes": 267,
+              "valid": true,
+              "complete": true,
+              "table_id": 6834168243242581414,
+              "sequence": 0
+            },
+            {
+              "bytes": 269,
+              "valid": true,
+              "complete": true,
+              "table_id": 12155029896106309663,
+              "sequence": 32
+            }
+          ],
+          "warming_state_after_query": [
+            {
+              "bytes": 270,
+              "valid": true,
+              "complete": true,
+              "table_id": 12756602829812110719,
+              "sequence": 128
+            },
+            {
+              "bytes": 267,
+              "valid": true,
+              "complete": true,
+              "table_id": 6834168243242581414,
+              "sequence": 0
+            },
+            {
+              "bytes": 269,
+              "valid": true,
+              "complete": true,
+              "table_id": 12155029896106309663,
+              "sequence": 32
+            }
+          ],
+          "warming_error_count": 0,
+          "sample_captured": false,
+          "selected_metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 455,
+            "antfly_lake_cache_provider_bytes_total": 26885788,
+            "antfly_lake_query_composed_total_calls_total": 1,
+            "antfly_lake_query_composed_total_nanoseconds_total": 382509000,
+            "antfly_lake_query_composed_definition_calls_total": 0,
+            "antfly_lake_query_composed_definition_nanoseconds_total": 0,
+            "antfly_lake_query_composed_leaf_calls_total": 2,
+            "antfly_lake_query_composed_leaf_nanoseconds_total": 380296000,
+            "antfly_lake_query_composed_native_leaf_calls_total": 1,
+            "antfly_lake_query_composed_native_leaf_nanoseconds_total": 101214000,
+            "antfly_lake_query_composed_cursor_calls_total": 1,
+            "antfly_lake_query_composed_cursor_nanoseconds_total": 2011000
+          }
+        },
+        {
+          "cycle": 8,
+          "kind": "saved_overlay",
+          "ready_delay_seconds": 6,
+          "elapsed_ms": 427.02,
+          "lake_phase_profile": {
+            "total_ms": 306.333,
+            "pre_search_ms": 138.264,
+            "search_ms": 162.055,
+            "post_search_ms": 6.014,
+            "hydration_ms": 4.114,
+            "outside_lake_ms": 120.687,
+            "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+          },
+          "composed_phase_profile": {
+            "total_ms": 425.767,
+            "definition_ms": 0.064,
+            "leaves_ms": 419.02,
+            "native_leaves_ms": 110.06,
+            "cursor_storage_ms": 3.715,
+            "composition_ms": 2.968,
+            "outside_composed_ms": 1.253,
+            "scope": "Process counters for one serial composed query. Native leaves include durable snapshot capture/recovery and overlap leaves; lake totals also overlap leaves. Composition is the remainder after definition, leaves and cursor storage. Outside-composed time includes HTTP admission and transport."
+          },
+          "process_resource_delta": {
+            "user_time": 2795307,
+            "system_time": 7396110,
+            "pageins": 0,
+            "diskio_bytesread": 29294592,
+            "diskio_byteswritten": 28045312
+          },
+          "warming_state_after_ready": [
+            {
+              "bytes": 270,
+              "valid": true,
+              "complete": true,
+              "table_id": 12756602829812110719,
+              "sequence": 128
+            },
+            {
+              "bytes": 267,
+              "valid": true,
+              "complete": true,
+              "table_id": 6834168243242581414,
+              "sequence": 0
+            },
+            {
+              "bytes": 269,
+              "valid": true,
+              "complete": true,
+              "table_id": 12155029896106309663,
+              "sequence": 32
+            }
+          ],
+          "warming_state_after_query": [
+            {
+              "bytes": 270,
+              "valid": true,
+              "complete": true,
+              "table_id": 12756602829812110719,
+              "sequence": 128
+            },
+            {
+              "bytes": 267,
+              "valid": true,
+              "complete": true,
+              "table_id": 6834168243242581414,
+              "sequence": 0
+            },
+            {
+              "bytes": 269,
+              "valid": true,
+              "complete": true,
+              "table_id": 12155029896106309663,
+              "sequence": 32
+            }
+          ],
+          "warming_error_count": 0,
+          "sample_captured": false,
+          "selected_metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 455,
+            "antfly_lake_cache_provider_bytes_total": 26885788,
+            "antfly_lake_query_composed_total_calls_total": 1,
+            "antfly_lake_query_composed_total_nanoseconds_total": 425767000,
+            "antfly_lake_query_composed_definition_calls_total": 1,
+            "antfly_lake_query_composed_definition_nanoseconds_total": 64000,
+            "antfly_lake_query_composed_leaf_calls_total": 3,
+            "antfly_lake_query_composed_leaf_nanoseconds_total": 419020000,
+            "antfly_lake_query_composed_native_leaf_calls_total": 2,
+            "antfly_lake_query_composed_native_leaf_nanoseconds_total": 110060000,
+            "antfly_lake_query_composed_cursor_calls_total": 1,
+            "antfly_lake_query_composed_cursor_nanoseconds_total": 3715000
+          }
+        },
+        {
+          "cycle": 9,
+          "kind": "union",
+          "ready_delay_seconds": 0,
+          "elapsed_ms": 496.25,
+          "lake_phase_profile": {
+            "total_ms": 386.255,
+            "pre_search_ms": 101.282,
+            "search_ms": 254.695,
+            "post_search_ms": 30.278,
+            "hydration_ms": 27.761,
+            "outside_lake_ms": 109.995,
+            "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+          },
+          "composed_phase_profile": {
+            "total_ms": 495.315,
+            "definition_ms": 0.0,
+            "leaves_ms": 491.353,
+            "native_leaves_ms": 102.092,
+            "cursor_storage_ms": 2.883,
+            "composition_ms": 1.079,
+            "outside_composed_ms": 0.935,
+            "scope": "Process counters for one serial composed query. Native leaves include durable snapshot capture/recovery and overlap leaves; lake totals also overlap leaves. Composition is the remainder after definition, leaves and cursor storage. Outside-composed time includes HTTP admission and transport."
+          },
+          "process_resource_delta": {
+            "user_time": 3572359,
+            "system_time": 14905345,
+            "pageins": 0,
+            "diskio_bytesread": 30597120,
+            "diskio_byteswritten": 29564928
+          },
+          "warming_state_after_ready": [
+            {
+              "bytes": 270,
+              "valid": true,
+              "complete": true,
+              "table_id": 12756602829812110719,
+              "sequence": 128
+            },
+            {
+              "bytes": 267,
+              "valid": true,
+              "complete": true,
+              "table_id": 6834168243242581414,
+              "sequence": 0
+            },
+            {
+              "bytes": 269,
+              "valid": true,
+              "complete": true,
+              "table_id": 12155029896106309663,
+              "sequence": 32
+            }
+          ],
+          "warming_state_after_query": [
+            {
+              "bytes": 270,
+              "valid": true,
+              "complete": true,
+              "table_id": 12756602829812110719,
+              "sequence": 128
+            },
+            {
+              "bytes": 267,
+              "valid": true,
+              "complete": true,
+              "table_id": 6834168243242581414,
+              "sequence": 0
+            },
+            {
+              "bytes": 269,
+              "valid": true,
+              "complete": true,
+              "table_id": 12155029896106309663,
+              "sequence": 32
+            }
+          ],
+          "warming_error_count": 0,
+          "sample_captured": false,
+          "selected_metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 505,
+            "antfly_lake_cache_provider_bytes_total": 28387222,
+            "antfly_lake_query_composed_total_calls_total": 1,
+            "antfly_lake_query_composed_total_nanoseconds_total": 495315000,
+            "antfly_lake_query_composed_definition_calls_total": 0,
+            "antfly_lake_query_composed_definition_nanoseconds_total": 0,
+            "antfly_lake_query_composed_leaf_calls_total": 2,
+            "antfly_lake_query_composed_leaf_nanoseconds_total": 491353000,
+            "antfly_lake_query_composed_native_leaf_calls_total": 1,
+            "antfly_lake_query_composed_native_leaf_nanoseconds_total": 102092000,
+            "antfly_lake_query_composed_cursor_calls_total": 1,
+            "antfly_lake_query_composed_cursor_nanoseconds_total": 2883000
+          }
+        },
+        {
+          "cycle": 9,
+          "kind": "saved_overlay",
+          "ready_delay_seconds": 0,
+          "elapsed_ms": 508.899,
+          "lake_phase_profile": {
+            "total_ms": 379.055,
+            "pre_search_ms": 97.033,
+            "search_ms": 268.484,
+            "post_search_ms": 13.538,
+            "hydration_ms": 10.471,
+            "outside_lake_ms": 129.844,
+            "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+          },
+          "composed_phase_profile": {
+            "total_ms": 506.715,
+            "definition_ms": 0.049,
+            "leaves_ms": 502.049,
+            "native_leaves_ms": 120.003,
+            "cursor_storage_ms": 4.375,
+            "composition_ms": 0.242,
+            "outside_composed_ms": 2.184,
+            "scope": "Process counters for one serial composed query. Native leaves include durable snapshot capture/recovery and overlap leaves; lake totals also overlap leaves. Composition is the remainder after definition, leaves and cursor storage. Outside-composed time includes HTTP admission and transport."
+          },
+          "process_resource_delta": {
+            "user_time": 3431223,
+            "system_time": 11660124,
+            "pageins": 0,
+            "diskio_bytesread": 30625792,
+            "diskio_byteswritten": 27598848
+          },
+          "warming_state_after_ready": [
+            {
+              "bytes": 270,
+              "valid": true,
+              "complete": true,
+              "table_id": 12756602829812110719,
+              "sequence": 128
+            },
+            {
+              "bytes": 267,
+              "valid": true,
+              "complete": true,
+              "table_id": 6834168243242581414,
+              "sequence": 0
+            },
+            {
+              "bytes": 269,
+              "valid": true,
+              "complete": true,
+              "table_id": 12155029896106309663,
+              "sequence": 32
+            }
+          ],
+          "warming_state_after_query": [
+            {
+              "bytes": 270,
+              "valid": true,
+              "complete": true,
+              "table_id": 12756602829812110719,
+              "sequence": 128
+            },
+            {
+              "bytes": 267,
+              "valid": true,
+              "complete": true,
+              "table_id": 6834168243242581414,
+              "sequence": 0
+            },
+            {
+              "bytes": 269,
+              "valid": true,
+              "complete": true,
+              "table_id": 12155029896106309663,
+              "sequence": 32
+            }
+          ],
+          "warming_error_count": 0,
+          "sample_captured": false,
+          "selected_metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 505,
+            "antfly_lake_cache_provider_bytes_total": 28387222,
+            "antfly_lake_query_composed_total_calls_total": 1,
+            "antfly_lake_query_composed_total_nanoseconds_total": 506715000,
+            "antfly_lake_query_composed_definition_calls_total": 1,
+            "antfly_lake_query_composed_definition_nanoseconds_total": 49000,
+            "antfly_lake_query_composed_leaf_calls_total": 3,
+            "antfly_lake_query_composed_leaf_nanoseconds_total": 502049000,
+            "antfly_lake_query_composed_native_leaf_calls_total": 2,
+            "antfly_lake_query_composed_native_leaf_nanoseconds_total": 120003000,
+            "antfly_lake_query_composed_cursor_calls_total": 1,
+            "antfly_lake_query_composed_cursor_nanoseconds_total": 4375000
+          }
+        },
+        {
+          "cycle": 10,
+          "kind": "union",
+          "ready_delay_seconds": 6,
+          "elapsed_ms": 378.137,
+          "lake_phase_profile": {
+            "total_ms": 216.125,
+            "pre_search_ms": 83.621,
+            "search_ms": 126.074,
+            "post_search_ms": 6.43,
+            "hydration_ms": 4.582,
+            "outside_lake_ms": 162.012,
+            "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+          },
+          "composed_phase_profile": {
+            "total_ms": 376.188,
+            "definition_ms": 0.0,
+            "leaves_ms": 372.39,
+            "native_leaves_ms": 153.441,
+            "cursor_storage_ms": 3.492,
+            "composition_ms": 0.306,
+            "outside_composed_ms": 1.949,
+            "scope": "Process counters for one serial composed query. Native leaves include durable snapshot capture/recovery and overlap leaves; lake totals also overlap leaves. Composition is the remainder after definition, leaves and cursor storage. Outside-composed time includes HTTP admission and transport."
+          },
+          "process_resource_delta": {
+            "user_time": 2933410,
+            "system_time": 7617038,
+            "pageins": 0,
+            "diskio_bytesread": 29282304,
+            "diskio_byteswritten": 27267072
+          },
+          "warming_state_after_ready": [
+            {
+              "bytes": 270,
+              "valid": true,
+              "complete": true,
+              "table_id": 12756602829812110719,
+              "sequence": 128
+            },
+            {
+              "bytes": 267,
+              "valid": true,
+              "complete": true,
+              "table_id": 6834168243242581414,
+              "sequence": 0
+            },
+            {
+              "bytes": 269,
+              "valid": true,
+              "complete": true,
+              "table_id": 12155029896106309663,
+              "sequence": 32
+            }
+          ],
+          "warming_state_after_query": [
+            {
+              "bytes": 270,
+              "valid": true,
+              "complete": true,
+              "table_id": 12756602829812110719,
+              "sequence": 128
+            },
+            {
+              "bytes": 267,
+              "valid": true,
+              "complete": true,
+              "table_id": 6834168243242581414,
+              "sequence": 0
+            },
+            {
+              "bytes": 269,
+              "valid": true,
+              "complete": true,
+              "table_id": 12155029896106309663,
+              "sequence": 32
+            }
+          ],
+          "warming_error_count": 0,
+          "sample_captured": false,
+          "selected_metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 455,
+            "antfly_lake_cache_provider_bytes_total": 26885788,
+            "antfly_lake_query_composed_total_calls_total": 1,
+            "antfly_lake_query_composed_total_nanoseconds_total": 376188000,
+            "antfly_lake_query_composed_definition_calls_total": 0,
+            "antfly_lake_query_composed_definition_nanoseconds_total": 0,
+            "antfly_lake_query_composed_leaf_calls_total": 2,
+            "antfly_lake_query_composed_leaf_nanoseconds_total": 372390000,
+            "antfly_lake_query_composed_native_leaf_calls_total": 1,
+            "antfly_lake_query_composed_native_leaf_nanoseconds_total": 153441000,
+            "antfly_lake_query_composed_cursor_calls_total": 1,
+            "antfly_lake_query_composed_cursor_nanoseconds_total": 3492000
+          }
+        },
+        {
+          "cycle": 10,
+          "kind": "saved_overlay",
+          "ready_delay_seconds": 6,
+          "elapsed_ms": 441.881,
+          "lake_phase_profile": {
+            "total_ms": 283.542,
+            "pre_search_ms": 75.981,
+            "search_ms": 180.159,
+            "post_search_ms": 27.402,
+            "hydration_ms": 23.312,
+            "outside_lake_ms": 158.339,
+            "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+          },
+          "composed_phase_profile": {
+            "total_ms": 440.795,
+            "definition_ms": 0.082,
+            "leaves_ms": 438.38,
+            "native_leaves_ms": 151.592,
+            "cursor_storage_ms": 2.099,
+            "composition_ms": 0.234,
+            "outside_composed_ms": 1.086,
+            "scope": "Process counters for one serial composed query. Native leaves include durable snapshot capture/recovery and overlap leaves; lake totals also overlap leaves. Composition is the remainder after definition, leaves and cursor storage. Outside-composed time includes HTTP admission and transport."
+          },
+          "process_resource_delta": {
+            "user_time": 3090367,
+            "system_time": 8262597,
+            "pageins": 0,
+            "diskio_bytesread": 29347840,
+            "diskio_byteswritten": 28663808
+          },
+          "warming_state_after_ready": [
+            {
+              "bytes": 270,
+              "valid": true,
+              "complete": true,
+              "table_id": 12756602829812110719,
+              "sequence": 128
+            },
+            {
+              "bytes": 267,
+              "valid": true,
+              "complete": true,
+              "table_id": 6834168243242581414,
+              "sequence": 0
+            },
+            {
+              "bytes": 269,
+              "valid": true,
+              "complete": true,
+              "table_id": 12155029896106309663,
+              "sequence": 32
+            }
+          ],
+          "warming_state_after_query": [
+            {
+              "bytes": 270,
+              "valid": true,
+              "complete": true,
+              "table_id": 12756602829812110719,
+              "sequence": 128
+            },
+            {
+              "bytes": 267,
+              "valid": true,
+              "complete": true,
+              "table_id": 6834168243242581414,
+              "sequence": 0
+            },
+            {
+              "bytes": 269,
+              "valid": true,
+              "complete": true,
+              "table_id": 12155029896106309663,
+              "sequence": 32
+            }
+          ],
+          "warming_error_count": 0,
+          "sample_captured": false,
+          "selected_metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 455,
+            "antfly_lake_cache_provider_bytes_total": 26885788,
+            "antfly_lake_query_composed_total_calls_total": 1,
+            "antfly_lake_query_composed_total_nanoseconds_total": 440795000,
+            "antfly_lake_query_composed_definition_calls_total": 1,
+            "antfly_lake_query_composed_definition_nanoseconds_total": 82000,
+            "antfly_lake_query_composed_leaf_calls_total": 3,
+            "antfly_lake_query_composed_leaf_nanoseconds_total": 438380000,
+            "antfly_lake_query_composed_native_leaf_calls_total": 2,
+            "antfly_lake_query_composed_native_leaf_nanoseconds_total": 151592000,
+            "antfly_lake_query_composed_cursor_calls_total": 1,
+            "antfly_lake_query_composed_cursor_nanoseconds_total": 2099000
+          }
+        },
+        {
+          "cycle": 11,
+          "kind": "union",
+          "ready_delay_seconds": 0,
+          "elapsed_ms": 273.87,
+          "lake_phase_profile": {
+            "total_ms": 162.716,
+            "pre_search_ms": 85.017,
+            "search_ms": 60.661,
+            "post_search_ms": 17.038,
+            "hydration_ms": 10.01,
+            "outside_lake_ms": 111.154,
+            "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+          },
+          "composed_phase_profile": {
+            "total_ms": 271.922,
+            "definition_ms": 0.0,
+            "leaves_ms": 269.733,
+            "native_leaves_ms": 101.901,
+            "cursor_storage_ms": 1.935,
+            "composition_ms": 0.254,
+            "outside_composed_ms": 1.948,
+            "scope": "Process counters for one serial composed query. Native leaves include durable snapshot capture/recovery and overlap leaves; lake totals also overlap leaves. Composition is the remainder after definition, leaves and cursor storage. Outside-composed time includes HTTP admission and transport."
+          },
+          "process_resource_delta": {
+            "user_time": 2974451,
+            "system_time": 10216440,
+            "pageins": 0,
+            "diskio_bytesread": 1220608,
+            "diskio_byteswritten": 24580096
+          },
+          "warming_state_after_ready": [
+            {
+              "bytes": 270,
+              "valid": true,
+              "complete": true,
+              "table_id": 12756602829812110719,
+              "sequence": 128
+            },
+            {
+              "bytes": 267,
+              "valid": true,
+              "complete": true,
+              "table_id": 6834168243242581414,
+              "sequence": 0
+            },
+            {
+              "bytes": 269,
+              "valid": true,
+              "complete": true,
+              "table_id": 12155029896106309663,
+              "sequence": 32
+            }
+          ],
+          "warming_state_after_query": [
+            {
+              "bytes": 270,
+              "valid": true,
+              "complete": true,
+              "table_id": 12756602829812110719,
+              "sequence": 128
+            },
+            {
+              "bytes": 267,
+              "valid": true,
+              "complete": true,
+              "table_id": 6834168243242581414,
+              "sequence": 0
+            },
+            {
+              "bytes": 269,
+              "valid": true,
+              "complete": true,
+              "table_id": 12155029896106309663,
+              "sequence": 32
+            }
+          ],
+          "warming_error_count": 0,
+          "sample_captured": false,
+          "selected_metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 505,
+            "antfly_lake_cache_provider_bytes_total": 28387222,
+            "antfly_lake_query_composed_total_calls_total": 1,
+            "antfly_lake_query_composed_total_nanoseconds_total": 271922000,
+            "antfly_lake_query_composed_definition_calls_total": 0,
+            "antfly_lake_query_composed_definition_nanoseconds_total": 0,
+            "antfly_lake_query_composed_leaf_calls_total": 2,
+            "antfly_lake_query_composed_leaf_nanoseconds_total": 269733000,
+            "antfly_lake_query_composed_native_leaf_calls_total": 1,
+            "antfly_lake_query_composed_native_leaf_nanoseconds_total": 101901000,
+            "antfly_lake_query_composed_cursor_calls_total": 1,
+            "antfly_lake_query_composed_cursor_nanoseconds_total": 1935000
+          }
+        },
+        {
+          "cycle": 11,
+          "kind": "saved_overlay",
+          "ready_delay_seconds": 0,
+          "elapsed_ms": 489.342,
+          "lake_phase_profile": {
+            "total_ms": 297.38,
+            "pre_search_ms": 139.481,
+            "search_ms": 146.49,
+            "post_search_ms": 11.409,
+            "hydration_ms": 8.932,
+            "outside_lake_ms": 191.962,
+            "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+          },
+          "composed_phase_profile": {
+            "total_ms": 488.116,
+            "definition_ms": 0.064,
+            "leaves_ms": 485.503,
+            "native_leaves_ms": 183.997,
+            "cursor_storage_ms": 2.311,
+            "composition_ms": 0.238,
+            "outside_composed_ms": 1.226,
+            "scope": "Process counters for one serial composed query. Native leaves include durable snapshot capture/recovery and overlap leaves; lake totals also overlap leaves. Composition is the remainder after definition, leaves and cursor storage. Outside-composed time includes HTTP admission and transport."
+          },
+          "process_resource_delta": {
+            "user_time": 3461520,
+            "system_time": 16423378,
+            "pageins": 0,
+            "diskio_bytesread": 30670848,
+            "diskio_byteswritten": 29741056
+          },
+          "warming_state_after_ready": [
+            {
+              "bytes": 270,
+              "valid": true,
+              "complete": true,
+              "table_id": 12756602829812110719,
+              "sequence": 128
+            },
+            {
+              "bytes": 267,
+              "valid": true,
+              "complete": true,
+              "table_id": 6834168243242581414,
+              "sequence": 0
+            },
+            {
+              "bytes": 269,
+              "valid": true,
+              "complete": true,
+              "table_id": 12155029896106309663,
+              "sequence": 32
+            }
+          ],
+          "warming_state_after_query": [
+            {
+              "bytes": 270,
+              "valid": true,
+              "complete": true,
+              "table_id": 12756602829812110719,
+              "sequence": 128
+            },
+            {
+              "bytes": 267,
+              "valid": true,
+              "complete": true,
+              "table_id": 6834168243242581414,
+              "sequence": 0
+            },
+            {
+              "bytes": 269,
+              "valid": true,
+              "complete": true,
+              "table_id": 12155029896106309663,
+              "sequence": 32
+            }
+          ],
+          "warming_error_count": 0,
+          "sample_captured": false,
+          "selected_metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 505,
+            "antfly_lake_cache_provider_bytes_total": 28387222,
+            "antfly_lake_query_composed_total_calls_total": 1,
+            "antfly_lake_query_composed_total_nanoseconds_total": 488116000,
+            "antfly_lake_query_composed_definition_calls_total": 1,
+            "antfly_lake_query_composed_definition_nanoseconds_total": 64000,
+            "antfly_lake_query_composed_leaf_calls_total": 3,
+            "antfly_lake_query_composed_leaf_nanoseconds_total": 485503000,
+            "antfly_lake_query_composed_native_leaf_calls_total": 2,
+            "antfly_lake_query_composed_native_leaf_nanoseconds_total": 183997000,
+            "antfly_lake_query_composed_cursor_calls_total": 1,
+            "antfly_lake_query_composed_cursor_nanoseconds_total": 2311000
+          }
+        },
+        {
+          "cycle": 12,
+          "kind": "union",
+          "ready_delay_seconds": 6,
+          "elapsed_ms": 387.271,
+          "lake_phase_profile": {
+            "total_ms": 260.866,
+            "pre_search_ms": 69.083,
+            "search_ms": 164.76,
+            "post_search_ms": 27.023,
+            "hydration_ms": 23.287,
+            "outside_lake_ms": 126.405,
+            "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+          },
+          "composed_phase_profile": {
+            "total_ms": 386.345,
+            "definition_ms": 0.0,
+            "leaves_ms": 383.904,
+            "native_leaves_ms": 119.496,
+            "cursor_storage_ms": 2.208,
+            "composition_ms": 0.233,
+            "outside_composed_ms": 0.926,
+            "scope": "Process counters for one serial composed query. Native leaves include durable snapshot capture/recovery and overlap leaves; lake totals also overlap leaves. Composition is the remainder after definition, leaves and cursor storage. Outside-composed time includes HTTP admission and transport."
+          },
+          "process_resource_delta": {
+            "user_time": 2953785,
+            "system_time": 8354303,
+            "pageins": 0,
+            "diskio_bytesread": 29380608,
+            "diskio_byteswritten": 28676096
+          },
+          "warming_state_after_ready": [
+            {
+              "bytes": 270,
+              "valid": true,
+              "complete": true,
+              "table_id": 12756602829812110719,
+              "sequence": 128
+            },
+            {
+              "bytes": 267,
+              "valid": true,
+              "complete": true,
+              "table_id": 6834168243242581414,
+              "sequence": 0
+            },
+            {
+              "bytes": 269,
+              "valid": true,
+              "complete": true,
+              "table_id": 12155029896106309663,
+              "sequence": 32
+            }
+          ],
+          "warming_state_after_query": [
+            {
+              "bytes": 270,
+              "valid": true,
+              "complete": true,
+              "table_id": 12756602829812110719,
+              "sequence": 128
+            },
+            {
+              "bytes": 267,
+              "valid": true,
+              "complete": true,
+              "table_id": 6834168243242581414,
+              "sequence": 0
+            },
+            {
+              "bytes": 269,
+              "valid": true,
+              "complete": true,
+              "table_id": 12155029896106309663,
+              "sequence": 32
+            }
+          ],
+          "warming_error_count": 0,
+          "sample_captured": false,
+          "selected_metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 455,
+            "antfly_lake_cache_provider_bytes_total": 26885788,
+            "antfly_lake_query_composed_total_calls_total": 1,
+            "antfly_lake_query_composed_total_nanoseconds_total": 386345000,
+            "antfly_lake_query_composed_definition_calls_total": 0,
+            "antfly_lake_query_composed_definition_nanoseconds_total": 0,
+            "antfly_lake_query_composed_leaf_calls_total": 2,
+            "antfly_lake_query_composed_leaf_nanoseconds_total": 383904000,
+            "antfly_lake_query_composed_native_leaf_calls_total": 1,
+            "antfly_lake_query_composed_native_leaf_nanoseconds_total": 119496000,
+            "antfly_lake_query_composed_cursor_calls_total": 1,
+            "antfly_lake_query_composed_cursor_nanoseconds_total": 2208000
+          }
+        },
+        {
+          "cycle": 12,
+          "kind": "saved_overlay",
+          "ready_delay_seconds": 6,
+          "elapsed_ms": 364.627,
+          "lake_phase_profile": {
+            "total_ms": 234.497,
+            "pre_search_ms": 110.152,
+            "search_ms": 117.752,
+            "post_search_ms": 6.593,
+            "hydration_ms": 4.691,
+            "outside_lake_ms": 130.13,
+            "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+          },
+          "composed_phase_profile": {
+            "total_ms": 363.686,
+            "definition_ms": 0.229,
+            "leaves_ms": 360.29,
+            "native_leaves_ms": 122.522,
+            "cursor_storage_ms": 2.867,
+            "composition_ms": 0.3,
+            "outside_composed_ms": 0.941,
+            "scope": "Process counters for one serial composed query. Native leaves include durable snapshot capture/recovery and overlap leaves; lake totals also overlap leaves. Composition is the remainder after definition, leaves and cursor storage. Outside-composed time includes HTTP admission and transport."
+          },
+          "process_resource_delta": {
+            "user_time": 2857765,
+            "system_time": 8047051,
+            "pageins": 0,
+            "diskio_bytesread": 29310976,
+            "diskio_byteswritten": 28200960
+          },
+          "warming_state_after_ready": [
+            {
+              "bytes": 270,
+              "valid": true,
+              "complete": true,
+              "table_id": 12756602829812110719,
+              "sequence": 128
+            },
+            {
+              "bytes": 267,
+              "valid": true,
+              "complete": true,
+              "table_id": 6834168243242581414,
+              "sequence": 0
+            },
+            {
+              "bytes": 269,
+              "valid": true,
+              "complete": true,
+              "table_id": 12155029896106309663,
+              "sequence": 32
+            }
+          ],
+          "warming_state_after_query": [
+            {
+              "bytes": 270,
+              "valid": true,
+              "complete": true,
+              "table_id": 12756602829812110719,
+              "sequence": 128
+            },
+            {
+              "bytes": 267,
+              "valid": true,
+              "complete": true,
+              "table_id": 6834168243242581414,
+              "sequence": 0
+            },
+            {
+              "bytes": 269,
+              "valid": true,
+              "complete": true,
+              "table_id": 12155029896106309663,
+              "sequence": 32
+            }
+          ],
+          "warming_error_count": 0,
+          "sample_captured": false,
+          "selected_metrics_delta": {
+            "antfly_lake_cache_provider_reads_total": 455,
+            "antfly_lake_cache_provider_bytes_total": 26885788,
+            "antfly_lake_query_composed_total_calls_total": 1,
+            "antfly_lake_query_composed_total_nanoseconds_total": 363686000,
+            "antfly_lake_query_composed_definition_calls_total": 1,
+            "antfly_lake_query_composed_definition_nanoseconds_total": 229000,
+            "antfly_lake_query_composed_leaf_calls_total": 3,
+            "antfly_lake_query_composed_leaf_nanoseconds_total": 360290000,
+            "antfly_lake_query_composed_native_leaf_calls_total": 2,
+            "antfly_lake_query_composed_native_leaf_nanoseconds_total": 122522000,
+            "antfly_lake_query_composed_cursor_calls_total": 1,
+            "antfly_lake_query_composed_cursor_nanoseconds_total": 2867000
+          }
+        }
+      ]
+    },
+    "historical_outlier_cause": "unproven",
+    "full_hn_matrix": {
+      "row_count": 142577,
+      "first_search_ms": 357.39,
+      "after_restart_ms": 148.99,
+      "startup_samples_ms": [
+        558.17,
+        509.88,
+        513.65,
+        511.34,
+        511.49
+      ],
+      "cursor_depth": {
+        "hits": 1408,
+        "samples_ms": [
+          318.02,
+          301.21,
+          277.08,
+          199.45,
+          241.19,
+          216.61,
+          270.63,
+          261.1,
+          309.53,
+          398.33
+        ],
+        "term": "AI",
+        "initial_ms": 609.02,
+        "restart_ms": 343.33
+      },
+      "composed_sources": {
+        "verified": [
+          "union_history",
+          "overlay_nonmatching_suppression",
+          "saved_current_visibility",
+          "mutable_composed_cursor_restart"
+        ],
+        "error": null
+      },
+      "exact_filter_status": "passed",
+      "unordered_filter_ms": 117.67,
+      "verified": [
+        "remote_bm25",
+        "projected_highlights",
+        "snapshot_pagination",
+        "restart_scores",
+        "restart_pagination",
+        "metadata_filters_match_residual",
+        "metadata_filters_after_restart",
+        "empty_date_filter_before_and_after_restart",
+        "concurrent_search",
+        "exact_filter"
+      ],
+      "composed_benchmarks": {
+        "union": {
+          "first_search_ms": 279.55,
+          "warm_samples_ms": [
+            272.82,
+            193.8,
+            238.36,
+            227.64,
+            191.9,
+            176.07,
+            182.43,
+            236.89,
+            174.48,
+            178.79,
+            410.57,
+            317.74,
+            321.78,
+            1060.01,
+            253.85,
+            295.35,
+            300.85,
+            305.77,
+            320.47,
+            403.54
+          ],
+          "warm_p95_ms": 410.57,
+          "result_count": 5,
+          "top_hits": [
+            {
+              "table": "hn_archive_poc",
+              "id": "lake1:febfa7d451f621d1a2a8152643fd57c495ca0c5415345086a5c7d04ae31ca302:00000000:0000000000000059",
+              "score": 0.01639344262295082
+            },
+            {
+              "table": "hn_current_benchmark",
+              "id": "42129170",
+              "score": 0.01639344262295082
+            },
+            {
+              "table": "hn_archive_poc",
+              "id": "lake1:81dc2bd15b3d3db54128651e192d5631f33ed031f713eec030a67ecad14dea22:00000000:0000000000000015",
+              "score": 0.016129032258064516
+            },
+            {
+              "table": "hn_current_benchmark",
+              "id": "42129069",
+              "score": 0.016129032258064516
+            },
+            {
+              "table": "hn_archive_poc",
+              "id": "lake1:9903e146a825cf2d98c7370330b9580e6a3d931152dafc6ec5bf1ce6430716ae:00000000:000000000000002a",
+              "score": 0.015873015873015872
+            }
+          ],
+          "total": {
+            "value": 5,
+            "relation": "gte"
+          },
+          "current_fixture_rows": 1000,
+          "note": "Full sample history plus its most recent rows copied into a native current table; bounded diagnostic fixture, not production current-table scale."
+        },
+        "saved_overlay": {
+          "first_search_ms": 368.2,
+          "warm_samples_ms": [
+            847.08,
+            3324.86,
+            1073.53,
+            236.83,
+            325.02,
+            328.3,
+            281.88,
+            264.29,
+            299.28,
+            364.73,
+            169.52,
+            161.21,
+            151.88,
+            154.28,
+            155.02,
+            169.46,
+            158.26,
+            157.81,
+            158.96,
+            175.07
+          ],
+          "warm_p95_ms": 1073.53,
+          "result_count": 5,
+          "top_hits": [
+            {
+              "table": "hn_archive_poc",
+              "id": "lake1:febfa7d451f621d1a2a8152643fd57c495ca0c5415345086a5c7d04ae31ca302:00000000:0000000000000059",
+              "score": 0.01639344262295082
+            },
+            {
+              "table": "hn_current_benchmark",
+              "id": "42129170",
+              "score": 0.01639344262295082
+            },
+            {
+              "table": "hn_archive_poc",
+              "id": "lake1:81dc2bd15b3d3db54128651e192d5631f33ed031f713eec030a67ecad14dea22:00000000:0000000000000015",
+              "score": 0.016129032258064516
+            },
+            {
+              "table": "hn_current_benchmark",
+              "id": "42129069",
+              "score": 0.016129032258064516
+            },
+            {
+              "table": "hn_archive_poc",
+              "id": "lake1:9903e146a825cf2d98c7370330b9580e6a3d931152dafc6ec5bf1ce6430716ae:00000000:000000000000002a",
+              "score": 0.015873015873015872
+            }
+          ],
+          "total": {
+            "value": 5,
+            "relation": "gte"
+          },
+          "current_fixture_rows": 1000,
+          "note": "Full sample history plus its most recent rows copied into a native current table; bounded diagnostic fixture, not production current-table scale."
+        }
+      },
+      "sql_count": [
+        [
+          "142577"
+        ]
+      ],
+      "correctness": "passed",
+      "latency": "not qualified: saved-overlay warm p95 1073.53 ms exceeds the 750 ms warm gate; maximum 3324.86 ms. Warm requests were not individually phase-profiled; cause unproven.",
+      "cold_io_profiles": [
+        {
+          "phase": "cold",
+          "elapsed_ms": 357.39,
+          "lake_phase_profile": {
+            "total_ms": 346.455,
+            "pre_search_ms": 164.972,
+            "search_ms": 167.51,
+            "post_search_ms": 13.973,
+            "hydration_ms": 7.908,
+            "outside_lake_ms": 10.935,
+            "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+          },
+          "composed_phase_profile": null
+        },
+        {
+          "phase": "cursor_initial",
+          "elapsed_ms": 609.02,
+          "lake_phase_profile": {
+            "total_ms": 607.362,
+            "pre_search_ms": 64.201,
+            "search_ms": 273.892,
+            "post_search_ms": 269.269,
+            "hydration_ms": 261.943,
+            "outside_lake_ms": 1.658,
+            "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+          },
+          "composed_phase_profile": null
+        },
+        {
+          "phase": "restart",
+          "elapsed_ms": 148.99,
+          "lake_phase_profile": {
+            "total_ms": 148.205,
+            "pre_search_ms": 62.304,
+            "search_ms": 78.721,
+            "post_search_ms": 7.18,
+            "hydration_ms": 4.957,
+            "outside_lake_ms": 0.785,
+            "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+          },
+          "composed_phase_profile": null
+        },
+        {
+          "phase": "cursor_depth_restart",
+          "elapsed_ms": 343.33,
+          "lake_phase_profile": {
+            "total_ms": 341.636,
+            "pre_search_ms": 55.538,
+            "search_ms": 119.271,
+            "post_search_ms": 166.827,
+            "hydration_ms": 164.119,
+            "outside_lake_ms": 1.694,
+            "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+          },
+          "composed_phase_profile": null
+        },
+        {
+          "phase": "composed_cold.union",
+          "elapsed_ms": 279.55,
+          "lake_phase_profile": {
+            "total_ms": 204.932,
+            "pre_search_ms": 64.189,
+            "search_ms": 133.012,
+            "post_search_ms": 7.731,
+            "hydration_ms": 5.936,
+            "outside_lake_ms": 74.618,
+            "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+          },
+          "composed_phase_profile": {
+            "total_ms": 278.874,
+            "definition_ms": 0.0,
+            "leaves_ms": 277.12,
+            "native_leaves_ms": 69.666,
+            "cursor_storage_ms": 1.586,
+            "composition_ms": 0.168,
+            "outside_composed_ms": 0.676,
+            "scope": "Process counters for one serial composed query. Native leaves include durable snapshot capture/recovery and overlap leaves; lake totals also overlap leaves. Composition is the remainder after definition, leaves and cursor storage. Outside-composed time includes HTTP admission and transport."
+          }
+        },
+        {
+          "phase": "composed_cold.saved_overlay",
+          "elapsed_ms": 368.2,
+          "lake_phase_profile": {
+            "total_ms": 221.443,
+            "pre_search_ms": 143.678,
+            "search_ms": 63.86,
+            "post_search_ms": 13.905,
+            "hydration_ms": 10.851,
+            "outside_lake_ms": 146.757,
+            "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative."
+          },
+          "composed_phase_profile": {
+            "total_ms": 366.849,
+            "definition_ms": 0.051,
+            "leaves_ms": 364.323,
+            "native_leaves_ms": 139.055,
+            "cursor_storage_ms": 2.264,
+            "composition_ms": 0.211,
+            "outside_composed_ms": 1.351,
+            "scope": "Process counters for one serial composed query. Native leaves include durable snapshot capture/recovery and overlap leaves; lake totals also overlap leaves. Composition is the remainder after definition, leaves and cursor storage. Outside-composed time includes HTTP admission and transport."
+          }
+        }
+      ]
+    },
+    "warm_stall_followup": {
+      "method": "Ten saved-overlay restart/cache-clear cycles, wait six seconds before cold request and six seconds afterward, then twenty consecutive warm queries. Verify exact table, ID, score, source and highlights. Arm process sampling above 750 ms for every warm request. Collect process resource counters per request and phase counters per serial window; windows with multiple requests cannot attribute an individual request.",
+      "samples": 200,
+      "min_ms": 139.094,
+      "max_ms": 616.381,
+      "p95_ms": 309.514,
+      "sampled_stalls": 0,
+      "records": [
+        {
+          "cycle": 1,
+          "cold_ms": 560.029,
+          "warm_ms": [
+            359.156,
+            239.451,
+            188.488,
+            226.313,
+            234.601,
+            300.126,
+            309.514,
+            175.688,
+            294.267,
+            210.575,
+            232.189,
+            318.101,
+            385.204,
+            262.156,
+            265.569,
+            220.945,
+            239.641,
+            204.126,
+            275.892,
+            178.754
+          ],
+          "process_resource_delta_sum": {
+            "user_time": 15381122,
+            "system_time": 162281475,
+            "pageins": 0,
+            "diskio_bytesread": 5042176,
+            "diskio_byteswritten": 13627392
+          },
+          "samples_captured": 0,
+          "metric_windows": [
+            {
+              "first_index": 0,
+              "last_index": 19,
+              "query_elapsed_sum_ms": 5120.754,
+              "selected_metrics_delta": {
+                "antfly_lake_query_phase_nanoseconds_total{phase=\"total\"}": 2177645000,
+                "antfly_lake_query_phase_nanoseconds_total{phase=\"publication\"}": 1895074000,
+                "antfly_lake_query_phase_nanoseconds_total{phase=\"search\"}": 160563000,
+                "antfly_lake_query_phase_nanoseconds_total{phase=\"hydration\"}": 67185000,
+                "antfly_lake_query_phase_nanoseconds_total{phase=\"delivery\"}": 122008000,
+                "antfly_lake_query_composed_total_calls_total": 20,
+                "antfly_lake_query_composed_total_nanoseconds_total": 5089295000,
+                "antfly_lake_query_composed_definition_calls_total": 20,
+                "antfly_lake_query_composed_definition_nanoseconds_total": 2728000,
+                "antfly_lake_query_composed_leaf_calls_total": 60,
+                "antfly_lake_query_composed_leaf_nanoseconds_total": 4998917000,
+                "antfly_lake_query_composed_native_leaf_calls_total": 40,
+                "antfly_lake_query_composed_native_leaf_nanoseconds_total": 2696466000,
+                "antfly_lake_query_composed_cursor_calls_total": 20,
+                "antfly_lake_query_composed_cursor_nanoseconds_total": 84078000
+              },
+              "composed_phase_profile": null
+            }
+          ]
+        },
+        {
+          "cycle": 2,
+          "cold_ms": 348.733,
+          "warm_ms": [
+            251.775,
+            225.869,
+            265.857,
+            203.478,
+            217.706,
+            258.68,
+            201.134,
+            215.507,
+            201.992,
+            218.6,
+            283.174,
+            186.124,
+            224.865,
+            235.212,
+            193.224,
+            210.884,
+            180.477,
+            208.908,
+            243.237,
+            175.208
+          ],
+          "process_resource_delta_sum": {
+            "user_time": 12885831,
+            "system_time": 87851599,
+            "pageins": 1,
+            "diskio_bytesread": 974848,
+            "diskio_byteswritten": 9338880
+          },
+          "samples_captured": 0,
+          "metric_windows": [
+            {
+              "first_index": 0,
+              "last_index": 19,
+              "query_elapsed_sum_ms": 4401.911,
+              "selected_metrics_delta": {
+                "antfly_lake_query_phase_nanoseconds_total{phase=\"total\"}": 1948622000,
+                "antfly_lake_query_phase_nanoseconds_total{phase=\"publication\"}": 1708029000,
+                "antfly_lake_query_phase_nanoseconds_total{phase=\"search\"}": 137018000,
+                "antfly_lake_query_phase_nanoseconds_total{phase=\"hydration\"}": 50275000,
+                "antfly_lake_query_phase_nanoseconds_total{phase=\"delivery\"}": 103575000,
+                "antfly_lake_query_composed_total_calls_total": 20,
+                "antfly_lake_query_composed_total_nanoseconds_total": 4376370000,
+                "antfly_lake_query_composed_definition_calls_total": 20,
+                "antfly_lake_query_composed_definition_nanoseconds_total": 844000,
+                "antfly_lake_query_composed_leaf_calls_total": 60,
+                "antfly_lake_query_composed_leaf_nanoseconds_total": 4312725000,
+                "antfly_lake_query_composed_native_leaf_calls_total": 40,
+                "antfly_lake_query_composed_native_leaf_nanoseconds_total": 2296090000,
+                "antfly_lake_query_composed_cursor_calls_total": 20,
+                "antfly_lake_query_composed_cursor_nanoseconds_total": 57547000
+              },
+              "composed_phase_profile": null
+            }
+          ]
+        },
+        {
+          "cycle": 3,
+          "cold_ms": 522.762,
+          "warm_ms": [
+            211.237,
+            188.543,
+            190.418,
+            194.271,
+            240.025,
+            224.818,
+            202.763,
+            204.921,
+            207.99,
+            209.382,
+            258.868,
+            207.476,
+            178.599,
+            333.927,
+            201.054,
+            208.831,
+            244.392,
+            204.511,
+            197.261,
+            207.288
+          ],
+          "process_resource_delta_sum": {
+            "user_time": 12967839,
+            "system_time": 93250768,
+            "pageins": 0,
+            "diskio_bytesread": 929792,
+            "diskio_byteswritten": 9314304
+          },
+          "samples_captured": 0,
+          "metric_windows": [
+            {
+              "first_index": 0,
+              "last_index": 19,
+              "query_elapsed_sum_ms": 4316.573,
+              "selected_metrics_delta": {
+                "antfly_lake_query_phase_nanoseconds_total{phase=\"total\"}": 1903098000,
+                "antfly_lake_query_phase_nanoseconds_total{phase=\"publication\"}": 1662442000,
+                "antfly_lake_query_phase_nanoseconds_total{phase=\"search\"}": 133354000,
+                "antfly_lake_query_phase_nanoseconds_total{phase=\"hydration\"}": 39478000,
+                "antfly_lake_query_phase_nanoseconds_total{phase=\"delivery\"}": 107302000,
+                "antfly_lake_query_composed_total_calls_total": 20,
+                "antfly_lake_query_composed_total_nanoseconds_total": 4294846000,
+                "antfly_lake_query_composed_definition_calls_total": 20,
+                "antfly_lake_query_composed_definition_nanoseconds_total": 989000,
+                "antfly_lake_query_composed_leaf_calls_total": 60,
+                "antfly_lake_query_composed_leaf_nanoseconds_total": 4239601000,
+                "antfly_lake_query_composed_native_leaf_calls_total": 40,
+                "antfly_lake_query_composed_native_leaf_nanoseconds_total": 2271557000,
+                "antfly_lake_query_composed_cursor_calls_total": 20,
+                "antfly_lake_query_composed_cursor_nanoseconds_total": 50097000
+              },
+              "composed_phase_profile": null
+            }
+          ]
+        },
+        {
+          "cycle": 4,
+          "cold_ms": 620.308,
+          "warm_ms": [
+            264.382,
+            288.492,
+            255.675,
+            246.73,
+            278.217,
+            205.131,
+            202.706,
+            211.073,
+            187.159,
+            210.516,
+            227.816,
+            206.914,
+            307.808,
+            256.595,
+            310.832,
+            343.458,
+            320.432,
+            616.381,
+            311.226,
+            357.386
+          ],
+          "process_resource_delta_sum": {
+            "user_time": 13356098,
+            "system_time": 95286665,
+            "pageins": 0,
+            "diskio_bytesread": 872448,
+            "diskio_byteswritten": 9269248
+          },
+          "samples_captured": 0,
+          "metric_windows": [
+            {
+              "first_index": 0,
+              "last_index": 19,
+              "query_elapsed_sum_ms": 5608.929,
+              "selected_metrics_delta": {
+                "antfly_lake_query_phase_nanoseconds_total{phase=\"total\"}": 1826673000,
+                "antfly_lake_query_phase_nanoseconds_total{phase=\"publication\"}": 1605336000,
+                "antfly_lake_query_phase_nanoseconds_total{phase=\"search\"}": 118619000,
+                "antfly_lake_query_phase_nanoseconds_total{phase=\"hydration\"}": 26639000,
+                "antfly_lake_query_phase_nanoseconds_total{phase=\"delivery\"}": 102718000,
+                "antfly_lake_query_composed_total_calls_total": 20,
+                "antfly_lake_query_composed_total_nanoseconds_total": 5582658000,
+                "antfly_lake_query_composed_definition_calls_total": 20,
+                "antfly_lake_query_composed_definition_nanoseconds_total": 869000,
+                "antfly_lake_query_composed_leaf_calls_total": 60,
+                "antfly_lake_query_composed_leaf_nanoseconds_total": 5495410000,
+                "antfly_lake_query_composed_native_leaf_calls_total": 40,
+                "antfly_lake_query_composed_native_leaf_nanoseconds_total": 3572499000,
+                "antfly_lake_query_composed_cursor_calls_total": 20,
+                "antfly_lake_query_composed_cursor_nanoseconds_total": 82379000
+              },
+              "composed_phase_profile": null
+            }
+          ]
+        },
+        {
+          "cycle": 5,
+          "cold_ms": 327.79,
+          "warm_ms": [
+            178.124,
+            195.079,
+            198.751,
+            184.452,
+            214.945,
+            196.455,
+            191.241,
+            188.668,
+            187.961,
+            258.321,
+            208.722,
+            170.118,
+            178.29,
+            193.833,
+            190.469,
+            197.256,
+            218.697,
+            201.047,
+            212.078,
+            233.363
+          ],
+          "process_resource_delta_sum": {
+            "user_time": 13193204,
+            "system_time": 98655517,
+            "pageins": 0,
+            "diskio_bytesread": 925696,
+            "diskio_byteswritten": 9084928
+          },
+          "samples_captured": 0,
+          "metric_windows": [
+            {
+              "first_index": 0,
+              "last_index": 19,
+              "query_elapsed_sum_ms": 3997.869,
+              "selected_metrics_delta": {
+                "antfly_lake_query_phase_nanoseconds_total{phase=\"total\"}": 1628678000,
+                "antfly_lake_query_phase_nanoseconds_total{phase=\"publication\"}": 1439081000,
+                "antfly_lake_query_phase_nanoseconds_total{phase=\"search\"}": 111254000,
+                "antfly_lake_query_phase_nanoseconds_total{phase=\"hydration\"}": 21194000,
+                "antfly_lake_query_phase_nanoseconds_total{phase=\"delivery\"}": 78343000,
+                "antfly_lake_query_composed_total_calls_total": 20,
+                "antfly_lake_query_composed_total_nanoseconds_total": 3981548000,
+                "antfly_lake_query_composed_definition_calls_total": 20,
+                "antfly_lake_query_composed_definition_nanoseconds_total": 1057000,
+                "antfly_lake_query_composed_leaf_calls_total": 60,
+                "antfly_lake_query_composed_leaf_nanoseconds_total": 3924061000,
+                "antfly_lake_query_composed_native_leaf_calls_total": 40,
+                "antfly_lake_query_composed_native_leaf_nanoseconds_total": 2233126000,
+                "antfly_lake_query_composed_cursor_calls_total": 20,
+                "antfly_lake_query_composed_cursor_nanoseconds_total": 52885000
+              },
+              "composed_phase_profile": null
+            }
+          ]
+        },
+        {
+          "cycle": 6,
+          "cold_ms": 354.289,
+          "warm_ms": [
+            189.756,
+            252.612,
+            210.396,
+            226.798,
+            193.304,
+            199.963,
+            196.743,
+            219.362,
+            190.747,
+            184.085,
+            192.084,
+            210.356,
+            199.315,
+            220.359,
+            193.25,
+            157.794,
+            192.229,
+            186.476,
+            182.316,
+            211.376
+          ],
+          "process_resource_delta_sum": {
+            "user_time": 12562598,
+            "system_time": 92693448,
+            "pageins": 0,
+            "diskio_bytesread": 802816,
+            "diskio_byteswritten": 9269248
+          },
+          "samples_captured": 0,
+          "metric_windows": [
+            {
+              "first_index": 0,
+              "last_index": 19,
+              "query_elapsed_sum_ms": 4009.321,
+              "selected_metrics_delta": {
+                "antfly_lake_query_phase_nanoseconds_total{phase=\"total\"}": 1748131000,
+                "antfly_lake_query_phase_nanoseconds_total{phase=\"publication\"}": 1534656000,
+                "antfly_lake_query_phase_nanoseconds_total{phase=\"search\"}": 126123000,
+                "antfly_lake_query_phase_nanoseconds_total{phase=\"hydration\"}": 28791000,
+                "antfly_lake_query_phase_nanoseconds_total{phase=\"delivery\"}": 87352000,
+                "antfly_lake_query_composed_total_calls_total": 20,
+                "antfly_lake_query_composed_total_nanoseconds_total": 3993068000,
+                "antfly_lake_query_composed_definition_calls_total": 20,
+                "antfly_lake_query_composed_definition_nanoseconds_total": 1057000,
+                "antfly_lake_query_composed_leaf_calls_total": 60,
+                "antfly_lake_query_composed_leaf_nanoseconds_total": 3940667000,
+                "antfly_lake_query_composed_native_leaf_calls_total": 40,
+                "antfly_lake_query_composed_native_leaf_nanoseconds_total": 2124074000,
+                "antfly_lake_query_composed_cursor_calls_total": 20,
+                "antfly_lake_query_composed_cursor_nanoseconds_total": 47431000
+              },
+              "composed_phase_profile": null
+            }
+          ]
+        },
+        {
+          "cycle": 7,
+          "cold_ms": 666.918,
+          "warm_ms": [
+            192.158,
+            166.175,
+            169.205,
+            174.245,
+            172.68,
+            198.943,
+            182.626,
+            176.038,
+            202.032,
+            195.349,
+            176.128,
+            205.785,
+            203.233,
+            189.115,
+            171.748,
+            194.44,
+            165.919,
+            197.677,
+            189.126,
+            196.184
+          ],
+          "process_resource_delta_sum": {
+            "user_time": 12178388,
+            "system_time": 91334351,
+            "pageins": 0,
+            "diskio_bytesread": 823296,
+            "diskio_byteswritten": 9224192
+          },
+          "samples_captured": 0,
+          "metric_windows": [
+            {
+              "first_index": 0,
+              "last_index": 19,
+              "query_elapsed_sum_ms": 3718.806,
+              "selected_metrics_delta": {
+                "antfly_lake_query_phase_nanoseconds_total{phase=\"total\"}": 1560499000,
+                "antfly_lake_query_phase_nanoseconds_total{phase=\"publication\"}": 1380985000,
+                "antfly_lake_query_phase_nanoseconds_total{phase=\"search\"}": 106367000,
+                "antfly_lake_query_phase_nanoseconds_total{phase=\"hydration\"}": 25732000,
+                "antfly_lake_query_phase_nanoseconds_total{phase=\"delivery\"}": 73147000,
+                "antfly_lake_query_composed_total_calls_total": 20,
+                "antfly_lake_query_composed_total_nanoseconds_total": 3706039000,
+                "antfly_lake_query_composed_definition_calls_total": 20,
+                "antfly_lake_query_composed_definition_nanoseconds_total": 788000,
+                "antfly_lake_query_composed_leaf_calls_total": 60,
+                "antfly_lake_query_composed_leaf_nanoseconds_total": 3659123000,
+                "antfly_lake_query_composed_native_leaf_calls_total": 40,
+                "antfly_lake_query_composed_native_leaf_nanoseconds_total": 2035110000,
+                "antfly_lake_query_composed_cursor_calls_total": 20,
+                "antfly_lake_query_composed_cursor_nanoseconds_total": 42849000
+              },
+              "composed_phase_profile": null
+            }
+          ]
+        },
+        {
+          "cycle": 8,
+          "cold_ms": 290.302,
+          "warm_ms": [
+            149.834,
+            149.691,
+            183.15,
+            151.37,
+            145.701,
+            157.608,
+            161.419,
+            150.587,
+            171.271,
+            154.662,
+            156.188,
+            145.082,
+            159.938,
+            160.954,
+            171.598,
+            148.925,
+            148.284,
+            141.308,
+            149.142,
+            139.094
+          ],
+          "process_resource_delta_sum": {
+            "user_time": 11093517,
+            "system_time": 88641026,
+            "pageins": 0,
+            "diskio_bytesread": 790528,
+            "diskio_byteswritten": 9138176
+          },
+          "samples_captured": 0,
+          "metric_windows": [
+            {
+              "first_index": 0,
+              "last_index": 19,
+              "query_elapsed_sum_ms": 3095.805,
+              "selected_metrics_delta": {
+                "antfly_lake_query_phase_nanoseconds_total{phase=\"total\"}": 1219014000,
+                "antfly_lake_query_phase_nanoseconds_total{phase=\"publication\"}": 1079379000,
+                "antfly_lake_query_phase_nanoseconds_total{phase=\"search\"}": 84785000,
+                "antfly_lake_query_phase_nanoseconds_total{phase=\"hydration\"}": 15633000,
+                "antfly_lake_query_phase_nanoseconds_total{phase=\"delivery\"}": 54850000,
+                "antfly_lake_query_composed_total_calls_total": 20,
+                "antfly_lake_query_composed_total_nanoseconds_total": 3085528000,
+                "antfly_lake_query_composed_definition_calls_total": 20,
+                "antfly_lake_query_composed_definition_nanoseconds_total": 662000,
+                "antfly_lake_query_composed_leaf_calls_total": 60,
+                "antfly_lake_query_composed_leaf_nanoseconds_total": 3043641000,
+                "antfly_lake_query_composed_native_leaf_calls_total": 40,
+                "antfly_lake_query_composed_native_leaf_nanoseconds_total": 1771722000,
+                "antfly_lake_query_composed_cursor_calls_total": 20,
+                "antfly_lake_query_composed_cursor_nanoseconds_total": 38162000
+              },
+              "composed_phase_profile": null
+            }
+          ]
+        },
+        {
+          "cycle": 9,
+          "cold_ms": 202.035,
+          "warm_ms": [
+            145.552,
+            171.856,
+            153.816,
+            154.102,
+            160.303,
+            159.826,
+            165.589,
+            146.923,
+            155.331,
+            152.543,
+            156.588,
+            168.206,
+            194.89,
+            153.153,
+            163.898,
+            146.643,
+            147.047,
+            148.647,
+            154.865,
+            150.614
+          ],
+          "process_resource_delta_sum": {
+            "user_time": 11295940,
+            "system_time": 89072260,
+            "pageins": 0,
+            "diskio_bytesread": 790528,
+            "diskio_byteswritten": 9297920
+          },
+          "samples_captured": 0,
+          "metric_windows": [
+            {
+              "first_index": 0,
+              "last_index": 19,
+              "query_elapsed_sum_ms": 3150.39,
+              "selected_metrics_delta": {
+                "antfly_lake_query_phase_nanoseconds_total{phase=\"total\"}": 1222459000,
+                "antfly_lake_query_phase_nanoseconds_total{phase=\"publication\"}": 1081631000,
+                "antfly_lake_query_phase_nanoseconds_total{phase=\"search\"}": 84078000,
+                "antfly_lake_query_phase_nanoseconds_total{phase=\"hydration\"}": 15810000,
+                "antfly_lake_query_phase_nanoseconds_total{phase=\"delivery\"}": 56750000,
+                "antfly_lake_query_composed_total_calls_total": 20,
+                "antfly_lake_query_composed_total_nanoseconds_total": 3140778000,
+                "antfly_lake_query_composed_definition_calls_total": 20,
+                "antfly_lake_query_composed_definition_nanoseconds_total": 622000,
+                "antfly_lake_query_composed_leaf_calls_total": 60,
+                "antfly_lake_query_composed_leaf_nanoseconds_total": 3097317000,
+                "antfly_lake_query_composed_native_leaf_calls_total": 40,
+                "antfly_lake_query_composed_native_leaf_nanoseconds_total": 1827697000,
+                "antfly_lake_query_composed_cursor_calls_total": 20,
+                "antfly_lake_query_composed_cursor_nanoseconds_total": 40002000
+              },
+              "composed_phase_profile": null
+            }
+          ]
+        },
+        {
+          "cycle": 10,
+          "cold_ms": 263.972,
+          "warm_ms": [
+            164.393,
+            173.244,
+            162.496,
+            167.585,
+            196.288,
+            194.687,
+            179.111,
+            165.101,
+            149.004,
+            144.042,
+            149.54,
+            162.909,
+            176.066,
+            170.578,
+            168.776,
+            159.631,
+            178.032,
+            189.198,
+            183.238,
+            170.734
+          ],
+          "process_resource_delta_sum": {
+            "user_time": 11767493,
+            "system_time": 94452638,
+            "pageins": 0,
+            "diskio_bytesread": 806912,
+            "diskio_byteswritten": 9224192
+          },
+          "samples_captured": 0,
+          "metric_windows": [
+            {
+              "first_index": 0,
+              "last_index": 19,
+              "query_elapsed_sum_ms": 3404.652,
+              "selected_metrics_delta": {
+                "antfly_lake_query_phase_nanoseconds_total{phase=\"total\"}": 1404210000,
+                "antfly_lake_query_phase_nanoseconds_total{phase=\"publication\"}": 1246184000,
+                "antfly_lake_query_phase_nanoseconds_total{phase=\"search\"}": 93882000,
+                "antfly_lake_query_phase_nanoseconds_total{phase=\"hydration\"}": 19560000,
+                "antfly_lake_query_phase_nanoseconds_total{phase=\"delivery\"}": 64144000,
+                "antfly_lake_query_composed_total_calls_total": 20,
+                "antfly_lake_query_composed_total_nanoseconds_total": 3393672000,
+                "antfly_lake_query_composed_definition_calls_total": 20,
+                "antfly_lake_query_composed_definition_nanoseconds_total": 735000,
+                "antfly_lake_query_composed_leaf_calls_total": 60,
+                "antfly_lake_query_composed_leaf_nanoseconds_total": 3346097000,
+                "antfly_lake_query_composed_native_leaf_calls_total": 40,
+                "antfly_lake_query_composed_native_leaf_nanoseconds_total": 1889456000,
+                "antfly_lake_query_composed_cursor_calls_total": 20,
+                "antfly_lake_query_composed_cursor_nanoseconds_total": 43791000
+              },
+              "composed_phase_profile": null
+            }
+          ]
+        }
+      ],
+      "conclusion": "The 3324.86 ms full-matrix warm stall did not recur. This does not explain or erase its failed warm latency gate."
+    }
+  }
 }

@@ -889,8 +889,9 @@ Validation passes 47 embedded cache tests, three focused API tests, and 25 Pytho
 tests with nine subtests. Native tests have no skips, failures or leaks. The fresh
 native-source fixture verifies grouped highlight acquisition, reordered hits,
 identity mismatch rejection and cancellation independently of the HN timings.
-The complete optimized executable also requires the resolver import in the
-serverless object-runtime dependency set; the follow-up fixes that missing import.
+The complete optimized executable also requires the resolver import. After merging
+main through `4838edd961`, the shared database imports supply it to both API and
+serverless builds; the duplicate object-runtime import was removed.
 
 ### Cold overlay attribution and native warming recovery
 
@@ -905,7 +906,7 @@ outside the composed total. Nested counters must not be added to their parents.
 
 The retained fixture also contains an empty `.warming.json` progress hint,
 producing repeated `UnexpectedEndOfInput` warnings and preventing the affected
-native current table from warming. Local warming progress is optional; malformed
+native table from warming. Local warming progress is optional; malformed
 or oversized hints now trigger fresh warming. Writes use a synced temporary file
 and atomic replacement, preserving the last complete state if canceled. Validate
 request IDs before using a recovered hint to select a cleanup path. Published
@@ -918,3 +919,31 @@ results in 211–652 ms. A 923 ms union triggered stack sampling; no overlay cro
 the 750 ms sampling threshold. These shared-host runs do not explain the original
 2,366 ms sample or establish a controlled performance improvement. The warming
 fault is a separately reproduced startup bug, not proof of that sample's cause.
+
+The merged revision at `c068b72af7` builds the complete optimized executable and
+passes seven focused native tests with no skips, failures or leaks, plus 26 Python
+tests and nine subtests. Twenty-four instrumented cold requests preserve exact
+table identities, IDs, scores, projected source and highlights across twenty warm
+queries per request. Saved overlays take 169–509 ms; immediate unions take
+199–1,335 ms and unions delayed six seconds take 158–387 ms. The slowest immediate
+union spends 998 ms in native leaves and 325 ms in lake execution. Composed
+bookkeeping remains below 3 ms and time outside composed execution below 2.2 ms.
+The empty progress hint becomes valid and complete automatically, with no warming
+errors across these restarts. This verifies the recovery fix, while preserving the
+historical outlier's unproven attribution.
+
+The complete merged-revision HN matrix passes correctness, including SQL count
+142,577, exact metadata filters, 1,408 unique paginated hits and mutable composed
+cursor replay after restart. Cold search is 357 ms, search restart 149 ms, cursor
+restart 343 ms, union cold search 280 ms and saved-overlay cold search 368 ms.
+However, saved-overlay warm p95 is 1,074 ms, including a 3,325 ms request, and fails
+the 750 ms warm gate. Those warm requests lack individual phase profiles, so their
+cause remains unproven. Retain this failure and require controlled-host and
+full-archive qualification; passing cold samples do not establish the service SLO.
+
+Ten additional saved-overlay restart/cache-clear sequences arm stack sampling
+above 750 ms for every warm request and preserve exact results and highlights.
+Their 200 warm searches take 139–616 ms, with p95 310 ms, without reproducing the
+3,325 ms request. Serial-window counters cover multiple warm requests and cannot
+attribute one request within such a window. Keep the failed full-matrix sample;
+these follow-ups neither explain its cause nor replace controlled-host qualification.
