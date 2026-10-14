@@ -947,3 +947,89 @@ Their 200 warm searches take 139–616 ms, with p95 310 ms, without reproducing 
 3,325 ms request. Serial-window counters cover multiple warm requests and cannot
 attribute one request within such a window. Keep the failed full-matrix sample;
 these follow-ups neither explain its cause nor replace controlled-host qualification.
+
+### Preventing composed-query latency outliers
+
+Review of the startup, mapping-retirement, grouped-highlight and warming-progress
+changes found no additional correctness regression. The warm outlier still has no
+proven cause. Process counter deltas are insufficient for an individual warm
+request in a burst or under concurrency, so each composed request now accumulates
+its own timings through the serial leaf callbacks. The server retains the slowest
+request above 750 ms since startup and exports its total, definition, leaf, native
+leaf, cursor and composition durations as fixed-name gauges. Native time overlaps
+leaf time. Optional diagnostic retention uses a nonblocking lock, fixed-size
+copies and no request-path logging or allocation; contention increments a drop
+counter. A contended status read can omit the profile until a later refresh. The
+HN benchmark samples the profile and drop counter after each warm burst before
+stopping its dedicated process. The profile includes failed work and cannot by
+itself identify which public sample produced it or attribute transport overhead.
+
+The remaining native path can still perform expensive work on a nominally warm
+query. `captureQueryCutInternal` takes a query-pin guard and constructs a coherent
+snapshot; `snapshotInternal` drains required maintenance, pauses generated-index
+workers, syncs stores and indexes, and seals/publishes the snapshot. Cached chunks
+reduce transfer, but do not eliminate this capture for a live filesystem-backed
+table. An overlay's suppression lookup reuses the changes stream's retained token;
+it does not capture a second independent current-table snapshot, though it still
+opens and queries the retained generation again.
+
+The next prevention work should follow measured attribution:
+
+- If native capture dominates, reuse a sealed immutable generation for unchanged
+  state and coalesce concurrent captures of that generation. Its identity must
+  cover table/shard/range incarnation, source/WAL visibility and generated-index
+  publication state; a WAL sequence alone is insufficient. Acquire the read lease
+  and validate that identity atomically before reuse. Publish any required
+  retention extension before returning a cursor, and preserve existing authority,
+  expiry and split/merge recovery checks.
+- Build reusable generations after accepted changes through bounded background
+  work. A fresh query with a newer required watermark must wait for or capture
+  that exact state within its deadline, rather than silently using an older warm
+  checkpoint. Qualify ingestion, enrichment, index changes and maintenance as well
+  as a static HN fixture.
+- If retained-generation opening dominates, add a bounded cache of immutable read
+  owners keyed by the authenticated generation and retention horizon. Keep reader
+  leases alive through queries, evict only idle owners, and preserve cancellation
+  and topology validation. This can amortize metadata verification and duplicate
+  opens within an overlay without weakening cursor durability.
+- If lake I/O or host paging dominates, qualify foreground reads alongside cache
+  restoration, snapshot warming and vacuum under controlled CPU/memory/I/O limits.
+  Bound background batches and admission independently of foreground work. Existing
+  asynchronous cache restoration and unlocked mapping cleanup already remove two
+  demonstrated sources of shared-query blocking.
+
+Request deadlines bound cooperative work and admission; they do not guarantee a
+successful low-latency result during arbitrary filesystem stalls or host paging.
+Use the retained request profile and controlled-host measurements before attributing
+the historical failures or claiming that one of these designs eliminates them.
+
+Native generation reuse now implements the first prevention step. One optional
+hint belongs to the physical execution owner and is serialized by the existing
+query-pin guard. Its fingerprint covers an owner nonce, table/shard/range identity
+and key bounds, source and maintenance watermarks, the primary commit revision,
+catalog epoch, index configurations and complete projection checkpoints. The
+primary revision increments before transaction and batch commit attempts, covering
+metadata/graph/enrichment changes without a new source replay record and ambiguous
+commit failures. Owner nonces prevent comparison of process-local counters across
+restarts. The coherent full snapshot records its fingerprint only when the state
+matches before primary pinning and after sealing.
+
+The repository returns a reuse proof only after committing the exact manifest
+constructed from that snapshot. The proof binds the state fingerprint, sequence
+and manifest checksum. Fresh requests validate unchanged state under short source,
+replay and apply fences, release those fences before provider I/O, verify the
+previous committed manifest against that proof, and publish a new logical cursor
+manifest referencing its immutable chunks. Every chunk's authenticated retention
+horizon must cover the new cursor; insufficient coverage forces ordinary capture.
+Successful reuse rotates the hint to the new manifest. Completed background warming
+can seed the same hint. Missing capabilities, expired hints, changed state or a
+missing/mismatched manifest fall back to capture. The shared-store manifest format
+is unchanged, and no additional object is written for a reuse proof.
+
+This removes maintenance drain, worker pause, store/index sync and filesystem
+generation sealing from unchanged-state capture. New or changed state still uses
+the existing coherent capture path. A new owner must establish a fresh proof;
+existing remote checkpoint references and retained-cursor recovery remain valid.
+Caching immutable read owners and qualification under controlled host limits
+remain separate work. The historical outliers remain unproven until attributed by
+retained request-local timings.

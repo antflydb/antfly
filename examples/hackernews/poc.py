@@ -112,6 +112,24 @@ def composed_phase_profile(delta, elapsed_ms):
     }
 
 
+def slowest_composed_profile(metrics):
+    """Read one retained request, rather than subtracting process-wide gauges."""
+    phases = ("total", "definition", "leaf", "native_leaf", "cursor", "composition")
+    keys = {
+        phase: f"antfly_lake_query_slowest_composed_{phase}_nanoseconds"
+        for phase in phases
+    }
+    if not all(key in metrics for key in keys.values()):
+        return None
+    return {
+        **{phase + "_ms": metrics[key] / 1_000_000 for phase, key in keys.items()},
+        "diagnostic_drops": metrics.get(
+            "antfly_lake_query_slow_profile_drops_total", 0
+        ),
+        "scope": "Request-local phases of the slowest composed request above 750 ms since this process started; includes failed work. Native overlaps leaves. Optional diagnostic contention can skip retention; drops are counted. This is a gauge snapshot, not a process counter delta or identification of a particular warm sample.",
+    }
+
+
 def wait_for_index(
     read_status,
     deadline,
@@ -1254,10 +1272,16 @@ def main():
                         for h in result["hits"]["hits"]
                     ] == expected
                     samples.append(elapsed)
+                # Read after the burst and before stopping its dedicated process.
+                final_metrics = lake_metrics()
                 composed_benchmarks[name] = {
                     "first_search_ms": cold_ms,
                     "warm_samples_ms": samples,
                     "warm_p95_ms": sorted(samples)[math.ceil(len(samples) * 0.95) - 1],
+                    "slowest_request_profile": slowest_composed_profile(final_metrics),
+                    "slow_profile_drops": final_metrics.get(
+                        "antfly_lake_query_slow_profile_drops_total"
+                    ),
                     "result_count": len(expected),
                     "top_hits": [
                         {"table": table, "id": identity, "score": score}

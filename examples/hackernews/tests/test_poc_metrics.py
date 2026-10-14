@@ -25,6 +25,32 @@ spec.loader.exec_module(poc)
 
 
 class LakeMetricEvidenceTests(unittest.TestCase):
+    def test_slowest_profile_survives_a_multi_request_burst_as_absolute_gauges(self):
+        timings = dict(
+            total=3325,
+            definition=1,
+            leaf=3310,
+            native_leaf=3100,
+            cursor=10,
+            composition=4,
+        )
+        text = "antfly_lake_query_composed_total_calls_total 20\n" + "".join(
+            f"antfly_lake_query_slowest_composed_{phase}_nanoseconds {value * 1000000}\n"
+            for phase, value in timings.items()
+        )
+        metrics = poc.parse_lake_metrics(text)
+        self.assertIsNone(poc.composed_phase_profile(metrics, 3325))
+        profile = poc.slowest_composed_profile(metrics)
+        self.assertEqual(profile["total_ms"], 3325)
+        self.assertEqual(profile["native_leaf_ms"], 3100)
+        self.assertEqual(profile["composition_ms"], 4)
+        self.assertEqual(profile["diagnostic_drops"], 0)
+        metrics["antfly_lake_query_slow_profile_drops_total"] = 2
+        self.assertEqual(poc.slowest_composed_profile(metrics)["diagnostic_drops"], 2)
+        del metrics["antfly_lake_query_slowest_composed_leaf_nanoseconds"]
+        self.assertIsNone(poc.slowest_composed_profile(metrics))
+        self.assertIsNone(poc.slowest_composed_profile({}))
+
     def test_composed_profile_preserves_nested_native_work_without_double_counting(
         self,
     ):
