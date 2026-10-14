@@ -262,12 +262,34 @@ const Engine = struct {
                     }
                     break :blk try output.toOwnedSlice(self.a);
                 },
-                .create => |paths| try self.create(rows, paths, null),
+                .create => |paths| try self.create(rows, paths, false),
                 .merge => |m| blk: {
                     var output: std.ArrayList(Row) = .empty;
                     for (rows) |row| {
+                        // NULL cannot identify a MERGE pattern. Validate both
+                        // node and relationship keys before matching or creating.
+                        for (m.path.nodes) |node| for (node.properties) |property| {
+                            const key = self.eval(property.value, row, null) catch |err| {
+                                // Later pattern components can refer to a node
+                                // bound earlier in the same MERGE. Check them
+                                // again when CREATE evaluates that component.
+                                if (err == error.UnboundCypherVariable) continue;
+                                return err;
+                            };
+                            if (key == .null) return error.CypherInvalidPropertyValue;
+                        };
+                        for (m.path.edges) |edge| for (edge.properties) |property| {
+                            const key = self.eval(property.value, row, null) catch |err| {
+                                // Later pattern components can refer to a node
+                                // bound earlier in the same MERGE. Check them
+                                // again when CREATE evaluates that component.
+                                if (err == error.UnboundCypherVariable) continue;
+                                return err;
+                            };
+                            if (key == .null) return error.CypherInvalidPropertyValue;
+                        };
                         const matched = try self.match(&.{row}, .{ .paths = &.{m.path} });
-                        const selected = if (matched.len == 0) try self.create(&.{row}, &.{m.path}, null) else matched;
+                        const selected = if (matched.len == 0) try self.create(&.{row}, &.{m.path}, true) else matched;
                         const assigned = try self.assign(selected, if (matched.len == 0) m.on_create else m.on_match);
                         try output.appendSlice(self.a, assigned);
                     }
@@ -589,16 +611,21 @@ const Engine = struct {
     }
 
     fn readValue(self: *Engine, value: v.Value) anyerror!v.Value {
-        const project_node = self.backend.vtable.project_node orelse return value;
+        const project_node = self.backend.vtable.project_node;
+        if (project_node == null and self.backend.vtable.get_relationship == null) return value;
         return switch (value) {
-            .node => |node| if (try project_node(self.backend.ptr, self.a, node)) |visible| .{ .node = visible } else .null,
-            .relationship => |relationship| blk: {
-                for ([_]v.Identity{ relationship.source, relationship.target }) |identity| {
+            .node => |node| if (project_node) |project_read| if (try project_read(self.backend.ptr, self.a, node)) |visible| .{ .node = visible } else .null else value,
+            .relationship => |retained| blk: {
+                const relationship = if (self.backend.vtable.get_relationship) |get_relationship|
+                    (try get_relationship(self.backend.ptr, self.a, .{ .identity = retained.identity, .index = retained.index })) orelse retained
+                else
+                    retained;
+                if (project_node) |project_read| for ([_]v.Identity{ relationship.source, relationship.target }) |identity| {
                     if (try self.backend.vtable.get(self.backend.ptr, self.a, identity)) |node| {
-                        if (try project_node(self.backend.ptr, self.a, node) == null) break :blk .null;
+                        if (try project_read(self.backend.ptr, self.a, node) == null) break :blk .null;
                     }
-                }
-                break :blk value;
+                };
+                break :blk .{ .relationship = relationship };
             },
             .path => |path| blk: {
                 const nodes = try self.a.alloc(*const v.Node, path.nodes.len);
@@ -1293,7 +1320,14 @@ const Engine = struct {
         try mutate_fn(self.backend.ptr, self.a, mutation);
         self.stats.mutations += 1;
     }
-    fn create(self: *Engine, rows: []const Row, paths: []const ast.Path, _: ?void) anyerror![]const Row {
+    fn creationProperties(self: *Engine, items: []const ast.Entry, row: Row, merge: bool) ![]const v.Entry {
+        const properties = try self.entries(items, row);
+        if (merge) for (properties) |property| {
+            if (property.value == .null) return error.CypherInvalidPropertyValue;
+        };
+        return properties;
+    }
+    fn create(self: *Engine, rows: []const Row, paths: []const ast.Path, merge: bool) anyerror![]const Row {
         var output: std.ArrayList(Row) = .empty;
         for (rows) |input| {
             var row = input;
@@ -1303,6 +1337,7 @@ const Engine = struct {
                 for (path.nodes, nodes) |pattern, *node| {
                     if (pattern.alias) |alias| if (lookup(row, alias)) |bound| {
                         if (bound != .node) return error.CypherTypeMismatch;
+                        if (merge) _ = try self.creationProperties(pattern.properties, row, true);
                         node.* = bound.node;
                         continue;
                     };
@@ -1310,7 +1345,7 @@ const Engine = struct {
                     const label = self.graph.label(pattern.labels[0]) orelse return error.UnknownGraphLabel;
                     node.* = try self.a.create(v.Node);
                     const mutable: *v.Node = @constCast(node.*);
-                    mutable.* = .{ .identity = try self.backend.vtable.new_identity.?(self.backend.ptr, self.a, label.table, false), .labels = pattern.labels, .properties = try self.entries(pattern.properties, row) };
+                    mutable.* = .{ .identity = try self.backend.vtable.new_identity.?(self.backend.ptr, self.a, label.table, false), .labels = pattern.labels, .properties = try self.creationProperties(pattern.properties, row, merge) };
                     try self.mutate(.{ .create_node = mutable });
                     node.* = (try self.backend.vtable.get(self.backend.ptr, self.a, mutable.identity)) orelse return error.CypherDeletedEntity;
                     for (pattern.labels) |name| if (!self.graph.admits(node.*, name)) return error.CypherLabelPredicateViolation;
@@ -1323,10 +1358,13 @@ const Engine = struct {
                     const target = nodes[if (pattern.direction == .out) i + 1 else i];
                     if (!self.graph.admits(source, mapping.source_label) or !self.graph.admits(target, mapping.target_label)) return error.CypherRelationshipEndpointMismatch;
                     const rel = try self.a.create(v.Relationship);
-                    rel.* = .{ .identity = try self.backend.vtable.new_identity.?(self.backend.ptr, self.a, source.identity.table, true), .index = mapping.index, .type = mapping.name, .source = source.identity, .target = target.identity, .properties = try self.entries(pattern.properties, row) };
+                    rel.* = .{ .identity = try self.backend.vtable.new_identity.?(self.backend.ptr, self.a, source.identity.table, true), .index = mapping.index, .type = mapping.name, .source = source.identity, .target = target.identity, .properties = try v.entityProperties(self.a, try self.creationProperties(pattern.properties, row, merge)) };
                     try self.mutate(.{ .create_relationship = rel });
-                    relationship.* = rel;
-                    row = (try self.bind(row, pattern.alias, .{ .relationship = rel })) orelse return error.CypherVariableConflict;
+                    relationship.* = if (self.backend.vtable.get_relationship) |get_relationship|
+                        (try get_relationship(self.backend.ptr, self.a, .{ .identity = rel.identity, .index = rel.index })) orelse return error.CypherDeletedEntity
+                    else
+                        rel;
+                    row = (try self.bind(row, pattern.alias, .{ .relationship = relationship.* })) orelse return error.CypherVariableConflict;
                 }
                 row = (try self.bind(row, path.alias, .{ .path = .{ .nodes = nodes, .relationships = relationships } })) orelse return error.CypherVariableConflict;
             }

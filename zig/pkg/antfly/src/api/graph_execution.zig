@@ -24,13 +24,18 @@ const port = local.storage_statement_read_fence;
 
 pub const WriteOutcome = enum { not_started, aborted, committed, unknown };
 
+/// Shared operator ceilings for text queries and SQL GRAPH_TABLE execution.
+pub fn limits(server: *const server_mod.ApiHttpServer) cypher.runtime.Limits {
+    const ceilings = server.cfg.graph_execution_limits;
+    return .{ .memory_bytes = ceilings.max_retained_state_bytes, .scanned_anchors = ceilings.max_scanned_anchors, .explored_edges = ceilings.max_explored_edges, .intermediate_states = ceilings.max_intermediate_states };
+}
+
 pub fn execute(a: std.mem.Allocator, server: *server_mod.ApiHttpServer, identity: *?server_mod.AuthenticatedIdentity, context: operation.RequestContext, name: []const u8, body: []const u8, diagnostic: *cypher.compiler.Diagnostic, write_outcome: *WriteOutcome) ![]u8 {
     try context.ensureActive();
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const scratch = arena.allocator();
-    const ceilings = server.cfg.graph_execution_limits;
-    var request = try cypher.request.Request.parse(scratch, body, .{ .memory_bytes = ceilings.max_retained_state_bytes, .scanned_anchors = ceilings.max_scanned_anchors, .explored_edges = ceilings.max_explored_edges, .intermediate_states = ceilings.max_intermediate_states });
+    var request = try cypher.request.Request.parse(scratch, body, limits(server));
     defer request.deinit();
     var compiled = try cypher.compiler.compile(scratch, request.query, .{}, diagnostic);
     defer compiled.deinit();

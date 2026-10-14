@@ -61,7 +61,7 @@ def main():
                     code, content = response.status, response.read()
             except urllib.error.HTTPError as error:
                 code, content = error.code, error.read()
-            if code == 503 and attempt < 39 and (status is None or 200 <= status < 300):
+            if code == 503 and attempt < 39 and status != 503:
                 failure = json.loads(content)
                 if failure.get("write_outcome") == "not_started":
                     time.sleep(0.25)
@@ -634,6 +634,28 @@ def main():
                     },
                     status=None,
                 )
+                if result["commit"]["status"] == "unknown":
+                    deadline = time.monotonic() + 30
+                    while True:
+                        try:
+                            receipt = call("GET", f"/transactions/{request_id}")
+                        except AssertionError as error:
+                            failure = error.args[0]
+                            if not isinstance(failure, tuple) or failure[2] not in (
+                                404,
+                                503,
+                            ):
+                                raise
+                            receipt = {"disposition": "outcome_unknown"}
+                        if receipt["disposition"] in ("committed", "aborted"):
+                            assert receipt["durable"], receipt
+                            return (
+                                result["rows"][0][0]
+                                if receipt["disposition"] == "committed"
+                                else None
+                            )
+                        assert time.monotonic() < deadline, receipt
+                        time.sleep(0.25)
                 assert durable_commit(result), result
                 return result["rows"][0][0]
 

@@ -1778,8 +1778,9 @@ pub const Adapter = struct {
                 for (staged_effects.items) |effects| for (binding.graph.labels) |label| {
                     if (std.mem.eql(u8, label.table, effects.table)) changed = true;
                 };
-                var overlay: graph_overlay.View = .{ .client = &client, .rows = staged_rows.items, .effects = staged_effects.items, .limits = .{} };
-                break :blk try catalog.graph_relation.Cursor.open(a, binding.*, if (changed) overlay.backend() else client.backend(), parameters, request.request, .{});
+                const graph_limits = @import("graph_execution.zig").limits(self.server);
+                var overlay: graph_overlay.View = .{ .client = &client, .rows = staged_rows.items, .effects = staged_effects.items, .limits = graph_limits };
+                break :blk try catalog.graph_relation.Cursor.open(a, binding.*, if (changed) overlay.backend() else client.backend(), parameters, request.request, graph_limits);
             } else blk: {
                 var demanded = request.request;
                 demanded.primary_order = true;

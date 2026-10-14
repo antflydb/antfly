@@ -41,7 +41,7 @@ pub const Overlay = struct {
     captured: b.StartupWork = .{},
     const Node = struct { value: *v.Node, deleted: bool = false, dirty: bool = false, projection_cached: bool = false, projected: ?*const v.Node = null };
     const Relationship = struct { value: *v.Relationship, deleted: bool = false };
-    const plain_vtable: b.Backend.VTable = .{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .get = get, .expand = expand, .search = search, .begin = begin, .startup_work = startupWork, .mutate = mutate, .commit = commit, .rollback = rollback, .new_identity = newIdentity };
+    const plain_vtable: b.Backend.VTable = .{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .get = get, .get_relationship = getRelationship, .expand = expand, .search = search, .begin = begin, .startup_work = startupWork, .mutate = mutate, .commit = commit, .rollback = rollback, .new_identity = newIdentity };
     const projecting_vtable: b.Backend.VTable = projected: {
         var value = plain_vtable;
         value.project_node = projectNode;
@@ -157,6 +157,12 @@ pub const Overlay = struct {
         const node = self.findNode(identity) orelse return null;
         return if (node.deleted) null else node.value;
     }
+    fn getRelationship(ptr: *anyopaque, _: A, identity: v.RelationshipIdentity) !?*const v.Relationship {
+        const self = cast(ptr);
+        try checkpoint(ptr);
+        const relationship = self.findRelationship(identity) orelse return null;
+        return if (relationship.deleted) null else relationship.value;
+    }
     fn projectNode(ptr: *anyopaque, a: A, value: *const v.Node) !?*const v.Node {
         const self = cast(ptr);
         try checkpoint(ptr);
@@ -266,6 +272,7 @@ pub const Overlay = struct {
                 try self.capacity();
                 const copy = try a.create(v.Relationship);
                 copy.* = relationship.*;
+                copy.properties = try v.entityProperties(a, relationship.properties);
                 try self.relationships.append(a, .{ .value = copy });
             },
             .set_properties => |update| try self.set(a, update.target, update.properties, update.replace),

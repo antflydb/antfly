@@ -46,7 +46,7 @@ pub const View = struct {
     }
     fn bind(ptr: *anyopaque, a: A, graph: cypher.catalog.Graph) !void {
         const self = cast(ptr);
-        self.inner = .{ .base = self.client.backend(), .host = .{ .ptr = self, .new_identity = unavailableIdentity, .commit = unavailableCommit }, .max_entities = @min(65536, self.limits.intermediate_states), .max_anchors = self.limits.scanned_anchors, .max_edges = self.limits.explored_edges };
+        self.inner = .{ .base = self.client.backend(), .host = .{ .ptr = self, .new_identity = unavailableIdentity, .commit = unavailableCommit }, .max_entities = self.limits.intermediate_states, .max_anchors = self.limits.scanned_anchors, .max_edges = self.limits.explored_edges };
         const backend_inner = self.inner.backend();
         try backend_inner.vtable.bind(backend_inner.ptr, a, graph);
         try backend_inner.vtable.begin.?(backend_inner.ptr);
@@ -136,7 +136,7 @@ pub const View = struct {
                 var replaced = false;
                 for (self.inner.relationships.items) |*relationship| {
                     if (!std.mem.eql(u8, relationship.value.index, mapping.index) or !relationship.value.identity.eql(.{ .table = effects.table, .key = key })) continue;
-                    relationship.value.* = .{ .identity = .{ .table = effects.table, .key = key }, .index = mapping.index, .type = mapping.name, .source = source, .target = target, .properties = properties.items, .ownership = if (producer(edge).len == 0) .explicit else .document };
+                    relationship.value.* = .{ .identity = .{ .table = effects.table, .key = key }, .index = mapping.index, .type = mapping.name, .source = source, .target = target, .properties = try cypher.value.entityProperties(a, properties.items), .ownership = if (producer(edge).len == 0) .explicit else .document };
                     relationship.deleted = false;
                     replaced = true;
                     break;
@@ -144,7 +144,7 @@ pub const View = struct {
                 if (!replaced) {
                     try self.capacity();
                     const relationship = try a.create(cypher.value.Relationship);
-                    relationship.* = .{ .identity = .{ .table = effects.table, .key = key }, .index = mapping.index, .type = mapping.name, .source = source, .target = target, .properties = properties.items, .ownership = if (producer(edge).len == 0) .explicit else .document };
+                    relationship.* = .{ .identity = .{ .table = effects.table, .key = key }, .index = mapping.index, .type = mapping.name, .source = source, .target = target, .properties = try cypher.value.entityProperties(a, properties.items), .ownership = if (producer(edge).len == 0) .explicit else .document };
                     try self.inner.relationships.append(a, .{ .value = relationship });
                 }
                 self.inner.captured.explored_edges +|= 1;

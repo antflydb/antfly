@@ -45,6 +45,9 @@ pub const Backend = struct {
         checkpoint: *const fn (*anyopaque) anyerror!void,
         scan: *const fn (*anyopaque, std.mem.Allocator, []const u8, ?[]const u8, usize) anyerror!Page(*const v.Node),
         get: *const fn (*anyopaque, std.mem.Allocator, v.Identity) anyerror!?*const v.Node,
+        /// Resolve the current statement postimage of a retained relationship
+        /// alias. Mutable adapters provide this even without read projection.
+        get_relationship: ?*const fn (*anyopaque, std.mem.Allocator, v.RelationshipIdentity) anyerror!?*const v.Relationship = null,
         expand: *const fn (*anyopaque, std.mem.Allocator, catalog.Relationship, v.Identity, ast.Direction, ?[]const u8, usize) anyerror!Page(*const v.Relationship),
         search: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, SearchInput) anyerror!SearchPage = null,
         normalize_node: ?*const fn (*anyopaque, std.mem.Allocator, *const v.Node, bool) anyerror!*const v.Node = null,

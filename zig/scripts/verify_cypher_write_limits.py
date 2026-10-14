@@ -26,7 +26,7 @@ def main():
     name = "cypher_limits_" + uuid.uuid4().hex
     table_created = graph_created = False
 
-    def call(path, body=None, method="POST", expected_error=None):
+    def call(path, body=None, method="POST", expected_error=None, allowed_error=None):
         request = urllib.request.Request(
             args.url.rstrip("/") + "/db/v1" + path,
             data=None if body is None else json.dumps(body).encode(),
@@ -40,8 +40,9 @@ def main():
                 return json.loads(content) if content else None
         except urllib.error.HTTPError as error:
             content = error.read().decode()
-            assert expected_error and expected_error in content, (error.code, content)
-            return None
+            match = expected_error or allowed_error
+            assert match and match in content, (error.code, content)
+            return json.loads(content) if allowed_error else None
 
     def query(statement, states=100000, expected_error=None, parameters=None):
         return call(
@@ -94,8 +95,37 @@ def main():
         # A node created then deleted has no durable preimage to delete.
         query("CREATE (n:Document) DELETE n")
         count(65537)
+        # A staged SQL delete forces GRAPH_TABLE to retain an overlay. It must
+        # use the same operator ceiling rather than a separate 65,536-row cap.
+        session_id = call("/sql", {"statement": "BEGIN"})["session_id"]
+        try:
+            call(
+                "/sql",
+                {
+                    "statement": f"DELETE FROM {name} WHERE _id='k000000'",
+                    "session_id": session_id,
+                },
+            )
+            result = call(
+                "/sql",
+                {
+                    "statement": f"SELECT id FROM GRAPH_TABLE({name} MATCH (n IS Document) WHERE antfly.documentKey(n)='k000001' COLUMNS (antfly.documentKey(n) AS id)) g",
+                    "session_id": session_id,
+                },
+                allowed_error='"code":"54000"',
+            )
+            if "rows" in result:
+                assert result["rows"] == [["k000001"]], result
+            else:
+                # SQL's separate working-memory ceiling remains enforced even
+                # when the operator permits a larger graph materialization.
+                assert "working-memory limit" in result["message"], result
+                print("Large staged GRAPH_TABLE retained SQL working-memory protection")
+        finally:
+            call("/sql", {"statement": "ROLLBACK", "session_id": session_id})
+        count(65537)
         print(
-            "Production writes above 65,536 rows, preimage deletes, transient creates, and configured limits passed"
+            "Production writes above 65,536 rows, preimage deletes, transient creates, staged SQL memory protection, and configured limits passed"
         )
     finally:
         if graph_created:

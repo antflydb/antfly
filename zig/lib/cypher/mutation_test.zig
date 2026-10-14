@@ -46,6 +46,12 @@ const Fixture = struct {
         for (self(ptr).nodes) |node| if (node.identity.eql(id)) return node;
         return null;
     }
+    fn getRelationship(ptr: *anyopaque, _: A, relationship_id: v.RelationshipIdentity) !?*const v.Relationship {
+        for (self(ptr).relationships) |relationship| {
+            if (relationship.identity.eql(relationship_id.identity) and std.mem.eql(u8, relationship.index, relationship_id.index)) return relationship;
+        }
+        return null;
+    }
     fn expand(ptr: *anyopaque, a: A, _: root.catalog.Relationship, id: v.Identity, direction: root.ast.Direction, _: ?[]const u8, _: usize) !b.Page(*const v.Relationship) {
         var out: std.ArrayList(*const v.Relationship) = .empty;
         for (self(ptr).relationships) |r| if ((direction != .in and r.source.eql(id)) or (direction != .out and r.target.eql(id))) try out.append(a, r);
@@ -153,7 +159,7 @@ const Fixture = struct {
         }
     }
     fn backend(fixture: *Fixture) b.Backend {
-        return .{ .ptr = fixture, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .get = get, .expand = expand, .begin = begin, .commit = commit, .rollback = rollback, .new_identity = identity, .mutate = mutate } };
+        return .{ .ptr = fixture, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .get = get, .get_relationship = getRelationship, .expand = expand, .begin = begin, .commit = commit, .rollback = rollback, .new_identity = identity, .mutate = mutate } };
     }
     fn run(fixture: *Fixture, text: []const u8) !root.runtime.Result {
         var diagnostic: root.compiler.Diagnostic = .{};
@@ -254,4 +260,66 @@ test "unit write subqueries preserve the incoming outer row" {
     try std.testing.expectEqual(@as(usize, 2), result.rows.len);
     try std.testing.expectEqual(@as(usize, 2), fixture.nodes.len);
     try std.testing.expectEqual(@as(usize, 1), fixture.commits);
+}
+
+test "created relationship postimages survive unit subqueries and drive later writes" {
+    var fixture = Fixture.init();
+    defer fixture.arena.deinit();
+    var result = try fixture.run("CREATE p=(a:Person)-[r:KNOWS {x:1}]->(b:Person) WITH p,r,[r] AS list,{edge:r} AS map CALL { WITH r SET r.x=2 } SET r.y=r.x RETURN r.x,r.y,relationships(p)[0].x,list[0].x,map.edge.x");
+    defer result.deinit();
+    for (result.rows[0]) |cell| try std.testing.expectEqual(@as(i64, 2), cell.integer);
+    var stored = try fixture.run("MATCH ()-[r:KNOWS]->() RETURN r.x,r.y");
+    defer stored.deinit();
+    for (stored.rows[0]) |cell| try std.testing.expectEqual(@as(i64, 2), cell.integer);
+}
+
+test "MERGE rejects null node and relationship keys and rolls back earlier writes" {
+    var fixture = Fixture.init();
+    defer fixture.arena.deinit();
+    for ([_][]const u8{
+        "MERGE (n:Person {name:null}) RETURN n",
+        "CREATE (a:Person) MERGE (n:Person {name:a.missing}) RETURN n",
+        "MERGE (a:Person)-[r:KNOWS {since:null}]->(b:Person) RETURN r",
+    }) |query| {
+        try std.testing.expectError(error.CypherInvalidPropertyValue, fixture.run(query));
+        try std.testing.expectEqual(@as(usize, 0), fixture.nodes.len);
+        try std.testing.expectEqual(@as(usize, 0), fixture.relationships.len);
+        try std.testing.expectEqual(@as(usize, 0), fixture.commits);
+    }
+}
+
+test "relationship CREATE omits entity null properties while preserving nested null data" {
+    var fixture = Fixture.init();
+    defer fixture.arena.deinit();
+    var result = try fixture.run("CREATE (:Person)-[r:KNOWS {absent:null,data:{nested:null}}]->(:Person) RETURN keys(r),properties(r)");
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.rows[0][0].list.len);
+    try std.testing.expectEqualStrings("data", result.rows[0][0].list[0].string);
+    try std.testing.expect(result.rows[0][1].property("data").property("nested") == .null);
+    try std.testing.expectEqual(@as(usize, 1), fixture.relationships[0].properties.len);
+}
+
+test "MERGE checks relationship keys after their pattern node references are bound" {
+    var fixture = Fixture.init();
+    defer fixture.arena.deinit();
+    const query = "MERGE (a:Person {name:'Ada'})-[r:KNOWS {owner:a.name}]->(b:Person {name:'Bob'}) RETURN r.owner";
+    for (0..2) |_| {
+        var result = try fixture.run(query);
+        defer result.deinit();
+        try std.testing.expectEqualStrings("Ada", result.rows[0][0].string);
+    }
+    try std.testing.expectEqual(@as(usize, 2), fixture.nodes.len);
+    try std.testing.expectEqual(@as(usize, 1), fixture.relationships.len);
+    try std.testing.expectError(error.CypherInvalidPropertyValue, fixture.run("MERGE (a:Person {name:'Other'})-[r:KNOWS {owner:a.missing}]->(b:Person {name:'New'}) RETURN r"));
+    try std.testing.expectEqual(@as(usize, 2), fixture.nodes.len);
+    try std.testing.expectEqual(@as(usize, 1), fixture.relationships.len);
+}
+
+test "deleting a relationship preserves its row binding for aggregate counts" {
+    var fixture = Fixture.init();
+    defer fixture.arena.deinit();
+    var result = try fixture.run("CREATE (:Person)-[r:KNOWS]->(:Person) DELETE r RETURN count(r)");
+    defer result.deinit();
+    try std.testing.expectEqual(@as(i64, 1), result.rows[0][0].integer);
+    try std.testing.expectEqual(@as(usize, 0), fixture.relationships.len);
 }

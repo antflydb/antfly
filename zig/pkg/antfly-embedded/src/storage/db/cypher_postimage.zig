@@ -64,7 +64,7 @@ pub fn relationships(self: anytype, a: A, graph: cypher.catalog.Graph, node: *co
             .source = .{ .table = source_table, .key = edge.source },
             .target = .{ .table = target_table, .key = edge.target },
             .ownership = .document,
-            .properties = properties.items,
+            .properties = try cypher.value.entityProperties(temporary, properties.items),
         };
         try result.append(a, (try (cypher.value.Value{ .relationship = &relationship }).clone(a)).relationship);
     };

@@ -732,6 +732,20 @@ misrepresent the original query result.
   cut at prepare; production writes do not materialize a predicate per row.
   CREATE preserves explicit nulls through SQL default evaluation and validates
   requested labels after defaults and generated columns have been normalized.
+  MERGE rejects null node and relationship keys during pattern evaluation and
+  rolls back earlier writes in the same statement. Keys referencing nodes in
+  the same pattern are checked once those nodes are bound. Relationship aliases resolve
+  current overlay postimages through subqueries, paths, lists, and maps; CREATE
+  omits null entity properties while preserving nested null data. SQL GRAPH_TABLE
+  shares the operator memory, anchor, edge, and intermediate-state ceilings with
+  direct Cypher, including transaction overlays and pgwire; no separate 65,536
+  entity clamp applies to staged SQL graph reads. Graph budget rejections use
+  SQLSTATE 54000 through SQL HTTP and pgwire. SQL retains its separate 256 MiB
+  working-memory ceiling even when the graph ceiling is larger.
+  `scripts/verify_cypher_mutations.py` qualifies relationship postimages, nested
+  null data, MERGE rollback, and DELETE counts on authenticated owner cuts.
+  `e2e/antfly/test_cypher_limits.py` exercises all four operator ceilings through
+  direct Cypher, SQL HTTP, and pgwire, including staged reads and rollback.
   `scripts/verify_cypher_normalization.py` covers durable SQL parity, CREATE and
   MERGE predicate labels, and deletion of existing versus transient nodes.
   `scripts/verify_cypher_write_limits.py` qualifies production writes above

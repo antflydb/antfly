@@ -146,3 +146,48 @@ def test_normalized_create_defaults_nulls_and_label_predicates(require_native, a
                 database.cypher_json("filtered", {"query": f"CREATE (n:Document {{amount:{value}}}) RETURN n"})
             assert invalid.value.graph_code == "CypherLabelPredicateViolation"
             assert database.sql("SELECT amount,total FROM docs")["rows"] == []
+
+
+def test_relationship_postimages_nulls_and_merge_rollback(require_native, aflite_path):
+    definition = {
+        "labels": [{"name": "Document", "table": "docs"}],
+        "relationships": [
+            {
+                "name": "LINK",
+                "index": "links",
+                "source_label": "Document",
+                "target_label": "Document",
+                "stored_type": "link",
+            }
+        ],
+    }
+    with af.create_hosted(aflite_path) as database:
+        database.sql("CREATE TABLE docs (name TEXT)")
+        with database.open_table("docs") as table:
+            table.add_index({"name": "links", "kind": "graph", "config_json": "{}"})
+        database.graph_catalog_json({"action": "put", "name": "knowledge", "definition": definition})
+        for query in (
+            "MERGE (n:Document {name:$key}) RETURN n",
+            "UNWIND ['valid',null] AS key MERGE (n:Document {name:key}) RETURN n",
+            "MERGE (:Document)-[r:LINK {key:$key}]->(:Document) RETURN r",
+        ):
+            with pytest.raises(af.GraphError) as invalid:
+                database.cypher_json("knowledge", {"query": query, "parameters": {"key": None}})
+            assert invalid.value.graph_code == "CypherInvalidPropertyValue"
+            assert database.sql("SELECT count(*) FROM docs")["rows"] == [["0"]]
+        result = database.cypher_json(
+            "knowledge",
+            {
+                "query": "CREATE p=(:Document)-[r:LINK {x:1,absent:null,data:{nested:null}}]->(:Document) WITH p,r,[r] AS list,{edge:r} AS map CALL { WITH r SET r.x=2 } SET r.y=r.x RETURN r.x,r.y,relationships(p)[0].x,list[0].x,map.edge.x,keys(r),r.data",
+            },
+        )
+        assert [cell["value"] for cell in result["rows"][0][:5]] == ["2"] * 5
+        assert {cell["value"] for cell in result["rows"][0][5]["value"]} == {"x", "y", "data"}
+        assert result["rows"][0][6] == {"type": "map", "value": {"nested": {"type": "null", "value": None}}}
+    with af.open_hosted(aflite_path) as database:
+        row = database.cypher_json("knowledge", {"query": "MATCH ()-[r:LINK]->() RETURN r.x,r.y,keys(r),r.data"})[
+            "rows"
+        ][0]
+        assert [cell["value"] for cell in row[:2]] == ["2", "2"]
+        assert {cell["value"] for cell in row[2]["value"]} == {"x", "y", "data"}
+        assert row[3] == {"type": "map", "value": {"nested": {"type": "null", "value": None}}}
