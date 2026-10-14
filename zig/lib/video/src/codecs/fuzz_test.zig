@@ -133,3 +133,173 @@ test "codec fuzz seed packets reach reconstruction successfully" {
         for (batch.frames) |frame| try frame.host().validate();
     }
 }
+
+/// Packet tapes preserve all IVF packet headers/payloads without requiring an
+/// intact container header. Smith can mutate interframes and framing lengths.
+fn tapeSeed(comptime directory: []const u8, comptime name: []const u8) []const u8 {
+    return comptime blk: {
+        @setEvalBranchQuota(2_000_000);
+        const ivf = @embedFile("../../testdata/" ++ directory ++ "/" ++ name ++ ".ivf");
+        var encoded: [4 + ivf.len - 32]u8 = undefined;
+        std.mem.writeInt(u32, encoded[0..4], ivf.len - 32, .little);
+        @memcpy(encoded[4..], ivf[32..]);
+        const frozen = encoded;
+        break :blk &frozen;
+    };
+}
+const TapeResult = struct { packets: usize = 0, outputs: usize = 0, materialized: usize = 0, retained_checks: usize = 0 };
+fn batchHash(batch: decoder.Batch) [32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    for (batch.frames) |picture| hash.update(picture.bytes);
+    return hash.finalResult();
+}
+fn verifyHeld(held: *[4]?decoder.Batch, hashes: *const [4][32]u8, result: *TapeResult) !void {
+    for (held, hashes) |entry, expected| if (entry) |batch| {
+        for (batch.frames) |picture| try picture.host().validate();
+        try std.testing.expectEqual(expected, batchHash(batch));
+        result.retained_checks += 1;
+    };
+}
+fn runTape(codec: decoder.Codec, framing: decoder.Av1Framing, tape: []const u8, strict: bool) !TapeResult {
+    const SequenceGuard = struct {
+        calls: usize = 0,
+        // Textured 480p seeds exceed the tiny-fixture guard; still bound
+        // work independently of the packet/pixel/allocation limits.
+        limit: usize = 2_000_000,
+        fn check(raw: ?*const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw.?)));
+            self.calls += 1;
+            if (self.calls > self.limit) return error.Canceled;
+        }
+    };
+    var guard = SequenceGuard{};
+    var session: ?*decoder.Session = try decoder.Session.create(std.testing.allocator, codec, .{
+        .av1_framing = framing,
+        .max_pixels = 1024 * 1024,
+        .max_packet_bytes = 128 * 1024,
+        .max_decode_bytes = 32 * 1024 * 1024,
+        .max_output_bytes = 4 * 1024 * 1024,
+        .control = .{ .context = &guard, .check_fn = SequenceGuard.check },
+    });
+    defer if (session) |owner| owner.destroy();
+    var held: [4]?decoder.Batch = @splat(null);
+    defer for (&held) |*entry| if (entry.*) |*batch| batch.deinit();
+    var hashes: [4][32]u8 = @splat(@splat(0));
+    var result = TapeResult{};
+    var offset: usize = 0;
+    var rejected: usize = 0;
+    while (offset <= tape.len and tape.len - offset >= 12 and result.packets < 32) {
+        const length: usize = std.mem.readInt(u32, tape[offset..][0..4], .little);
+        const flags = tape[offset + 11];
+        offset += 12;
+        if (length == 0 or length > tape.len - offset or length > 128 * 1024) {
+            if (strict) return error.InvalidTape;
+            break;
+        }
+        const packet = tape[offset..][0..length];
+        offset += length;
+        if (!strict and flags & 0x80 != 0) guard.limit = guard.calls + 1;
+        try verifyHeld(&held, &hashes, &result);
+        const selection: decoder.OutputSelection = switch (flags & 3) {
+            1 => .none,
+            2 => .{ .indexes = &.{0} },
+            else => .all,
+        };
+        result.packets += 1;
+        var batch = session.?.decodeOutputs(packet, @intCast(result.packets), null, selection) catch |err| {
+            try verifyHeld(&held, &hashes, &result);
+            if (strict) return err;
+            rejected += 1;
+            // Never reenter a poisoned core. Pre-entry rejection may leave the
+            // session retryable, but control exhaustion remains terminal.
+            if (session.?.failed or guard.calls > guard.limit or rejected >= 4) break;
+            continue;
+        };
+        result.outputs += batch.output_count;
+        result.materialized += batch.frames.len;
+        try verifyHeld(&held, &hashes, &result);
+        for (batch.frames) |picture| try picture.host().validate();
+        if (batch.frames.len == 0) {
+            batch.deinit();
+        } else {
+            const slot = (result.packets - 1) % held.len;
+            if (held[slot]) |*old| old.deinit();
+            hashes[slot] = batchHash(batch);
+            held[slot] = batch;
+        }
+    }
+    // Retained output is independently owned, including on decoder failure.
+    session.?.destroy();
+    session = null;
+    try verifyHeld(&held, &hashes, &result);
+    return result;
+}
+
+test "video fuzz sequence VP9 interframes retained outputs and cleanup" {
+    const Harness = struct {
+        fn fuzz(_: void, smith: *std.testing.Smith) !void {
+            var bytes: [128 * 1024]u8 = undefined;
+            const length = smith.sliceWithHash(&bytes, 0xA17F9002);
+            _ = try runTape(.vp9, .low_overhead, bytes[0..length], false);
+        }
+    };
+    try std.testing.fuzz({}, Harness.fuzz, .{ .corpus = &.{ tapeSeed("vpx-av1", "vp9"), tapeSeed("vpx-av1", "vp9-yuv420p12le"), tapeSeed("vpx-av1", "vp9-yuv444p10le"), tapeSeed("vpx-av1", "vp9-yuv422p12le"), tapeSeed("sequence-fuzz", "sintel-vp9-detail") } });
+}
+test "video fuzz sequence AV1 interframes layers retained outputs and cleanup" {
+    const Harness = struct {
+        fn fuzz(_: void, smith: *std.testing.Smith) !void {
+            var bytes: [128 * 1024]u8 = undefined;
+            const length = smith.sliceWithHash(&bytes, 0xA17FA002);
+            _ = try runTape(.av1, .low_overhead, bytes[0..length], false);
+        }
+    };
+    try std.testing.fuzz({}, Harness.fuzz, .{ .corpus = &.{ tapeSeed("vpx-av1", "av1"), tapeSeed("vpx-av1", "av1-10"), tapeSeed("vpx-av1", "av1-grain"), tapeSeed("vpx-av1", "av1-odd"), tapeSeed("av1-extended", "av1-c0-12"), tapeSeed("av1-extended", "av1-c2-12"), tapeSeed("av1-extended", "av1-c3-12"), tapeSeed("av1-extended", "av1-svc"), tapeSeed("sequence-fuzz", "sintel-av1-detail") } });
+}
+test "video fuzz sequence Annex B retained outputs and cleanup" {
+    const Harness = struct {
+        fn fuzz(_: void, smith: *std.testing.Smith) !void {
+            var bytes: [128 * 1024]u8 = undefined;
+            const length = smith.sliceWithHash(&bytes, 0xA17FAB02);
+            _ = try runTape(.av1, .annex_b, bytes[0..length], false);
+        }
+    };
+    try std.testing.fuzz({}, Harness.fuzz, .{ .corpus = &.{tapeSeed("av1-extended", "av1-annex-b")} });
+}
+test "codec fuzz sequence seeds consume complete streams and retain independent pictures" {
+    inline for (.{ .{ "vpx-av1", "vp9", decoder.Codec.vp9, decoder.Av1Framing.low_overhead }, .{ "vpx-av1", "vp9-yuv420p12le", decoder.Codec.vp9, decoder.Av1Framing.low_overhead }, .{ "vpx-av1", "vp9-yuv444p10le", decoder.Codec.vp9, decoder.Av1Framing.low_overhead }, .{ "vpx-av1", "vp9-yuv422p12le", decoder.Codec.vp9, decoder.Av1Framing.low_overhead }, .{ "vpx-av1", "av1", decoder.Codec.av1, decoder.Av1Framing.low_overhead }, .{ "vpx-av1", "av1-10", decoder.Codec.av1, decoder.Av1Framing.low_overhead }, .{ "vpx-av1", "av1-grain", decoder.Codec.av1, decoder.Av1Framing.low_overhead }, .{ "vpx-av1", "av1-odd", decoder.Codec.av1, decoder.Av1Framing.low_overhead }, .{ "av1-extended", "av1-c0-12", decoder.Codec.av1, decoder.Av1Framing.low_overhead }, .{ "av1-extended", "av1-c2-12", decoder.Codec.av1, decoder.Av1Framing.low_overhead }, .{ "av1-extended", "av1-c3-12", decoder.Codec.av1, decoder.Av1Framing.low_overhead }, .{ "av1-extended", "av1-svc", decoder.Codec.av1, decoder.Av1Framing.low_overhead }, .{ "av1-extended", "av1-annex-b", decoder.Codec.av1, decoder.Av1Framing.annex_b }, .{ "sequence-fuzz", "sintel-vp9-detail", decoder.Codec.vp9, decoder.Av1Framing.low_overhead }, .{ "sequence-fuzz", "sintel-av1-detail", decoder.Codec.av1, decoder.Av1Framing.low_overhead } }) |case| {
+        const encoded = tapeSeed(case[0], case[1]);
+        const result = runTape(case[2], case[3], encoded[4..], true) catch |err| {
+            std.debug.print("sequence seed {s}: {s}\n", .{ case[1], @errorName(err) });
+            return err;
+        };
+        try std.testing.expectEqual(@as(usize, 12), result.packets);
+        try std.testing.expect(result.outputs >= 12);
+        try std.testing.expect(result.retained_checks > 4);
+    }
+}
+
+test "codec sequence selection and cancellation preserve retained pictures" {
+    inline for (.{ .{ "vp9", decoder.Codec.vp9 }, .{ "av1", decoder.Codec.av1 } }) |case| {
+        const encoded = comptime tapeSeed("vpx-av1", case[0]);
+        var tape: [encoded.len - 4]u8 = undefined;
+        @memcpy(&tape, encoded[4..]);
+        var offset: usize = 0;
+        var index: usize = 0;
+        while (offset < tape.len) : (index += 1) {
+            const length = std.mem.readInt(u32, tape[offset..][0..4], .little);
+            tape[offset + 11] = if (index % 2 == 1) 1 else 2;
+            offset += 12 + length;
+        }
+        const selected = try runTape(case[1], .low_overhead, &tape, true);
+        try std.testing.expectEqual(@as(usize, 12), selected.outputs);
+        try std.testing.expectEqual(@as(usize, 6), selected.materialized);
+        try std.testing.expect(selected.retained_checks > 4);
+        const first_length = std.mem.readInt(u32, tape[0..4], .little);
+        tape[12 + first_length + 11] = 0x80;
+        const canceled = try runTape(case[1], .low_overhead, &tape, false);
+        try std.testing.expectEqual(@as(usize, 2), canceled.packets);
+        try std.testing.expectEqual(@as(usize, 1), canceled.outputs);
+        try std.testing.expectEqual(@as(usize, 1), canceled.materialized);
+        try std.testing.expect(canceled.retained_checks >= 3);
+    }
+}

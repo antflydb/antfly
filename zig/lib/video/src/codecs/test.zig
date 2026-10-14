@@ -76,6 +76,48 @@ test "VP9 AV1 public sessions match independent per-picture hashes" {
         try std.testing.expectEqual(g.frame_sha256.len, displayed);
     }
 }
+test "VP9 AV1 real sequence pictures match independent decoder hashes" {
+    const a = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice([]Golden, a, @embedFile("../../testdata/sequence-fuzz/golden.json"), .{});
+    defer parsed.deinit();
+    inline for (.{ "sintel-vp9-detail", "sintel-av1-detail" }) |name| {
+        const coded = @embedFile("../../testdata/sequence-fuzz/" ++ name ++ ".ivf");
+        var golden: ?Golden = null;
+        for (parsed.value) |entry| if (std.mem.eql(u8, entry.name, name)) {
+            golden = entry;
+        };
+        const g = golden.?;
+        var expected_packet_hash: [32]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&expected_packet_hash, g.packet_sha256);
+        var packet_hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(coded, &packet_hash, .{});
+        try std.testing.expectEqual(expected_packet_hash, packet_hash);
+        const session = try decoder.Session.create(a, g.codec, .{});
+        defer session.destroy();
+        var offset: usize = 32;
+        var displayed: usize = 0;
+        while (offset < coded.len) {
+            const length = std.mem.readInt(u32, coded[offset..][0..4], .little);
+            offset += 12;
+            var batch = try session.decode(coded[offset..][0..length], @intCast(displayed), null);
+            defer batch.deinit();
+            offset += length;
+            for (batch.frames) |picture| {
+                try std.testing.expect(displayed < g.frame_sha256.len);
+                try std.testing.expectEqual(g.width, picture.width);
+                try std.testing.expectEqual(g.height, picture.height);
+                try std.testing.expectEqual(g.depth, picture.bit_depth);
+                try std.testing.expectEqual(g.chroma, picture.chroma_format);
+                var expected: [32]u8 = undefined;
+                _ = try std.fmt.hexToBytes(&expected, g.frame_sha256[displayed]);
+                try std.testing.expectEqual(expected, hashFrame(picture));
+                displayed += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 12), displayed);
+        try std.testing.expectEqual(g.frame_sha256.len, displayed);
+    }
+}
 test "VP9 AV1 output survives session destruction and releases admission" {
     const a = std.testing.allocator;
     inline for (.{ decoder.Codec.vp9, decoder.Codec.av1 }) |codec| {

@@ -1,0 +1,9 @@
+1/7 video_fuzz_root.test_0...OK
+2/7 src.codecs.fuzz_test.test.video fuzz sequence VP9 interframes retained outputs and cleanup...OK
+3/7 src.codecs.fuzz_test.test.video fuzz sequence AV1 interframes layers retained outputs and cleanup...OK
+4/7 src.codecs.fuzz_test.test.video fuzz sequence Annex B retained outputs and cleanup...OK
+5/7 src.codecs.fuzz_test.test.codec fuzz sequence seeds consume complete streams and retain independent pictures...OK
+6/7 src.webm_pictures.test_0...OK
+7/7 src.webm_pictures.test.WebM indexed replay ignores sync hints and bootstraps AV1 sequence headers...OK
+All 7 tests passed.
+3 fuzz tests found.

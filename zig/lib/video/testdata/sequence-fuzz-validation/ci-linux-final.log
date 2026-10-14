@@ -1,0 +1,12 @@
+1/10 video_test_root.test_0...OK
+2/10 src.mod.test_0...OK
+3/10 src.codecs.fuzz_test.test.video fuzz sequence VP9 interframes retained outputs and cleanup...OK
+4/10 src.codecs.fuzz_test.test.video fuzz sequence AV1 interframes layers retained outputs and cleanup...OK
+5/10 src.codecs.fuzz_test.test.video fuzz sequence Annex B retained outputs and cleanup...OK
+6/10 src.codecs.fuzz_test.test.codec fuzz sequence seeds consume complete streams and retain independent pictures...OK
+7/10 src.codecs.fuzz_test.test.codec sequence selection and cancellation preserve retained pictures...OK
+8/10 src.codecs.test.test_0...OK
+9/10 src.webm_pictures.test_0...OK
+10/10 src.webm_pictures.test.WebM indexed replay ignores sync hints and bootstraps AV1 sequence headers...OK
+All 10 tests passed.
+3 fuzz tests found.

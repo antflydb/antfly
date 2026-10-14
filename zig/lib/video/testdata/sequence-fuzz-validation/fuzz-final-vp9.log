@@ -1,0 +1,15 @@
+======= FUZZING REPORT =======
+Step: run test
+Fuzz test: "src.codecs.fuzz_test.test.video fuzz sequence VP9 interframes retained outputs and cleanup" (8119d520243870cc)
+Runs: 0 -> 20005
+Unique runs: 0 -> 15
+Coverage: 0/48143 -> 10982/48143 (22.81%)
+------------------------------
+Values are accumulated across multiple runs when preserving the cache.
+==============================
+Build Summary: 4/4 steps succeeded; 3/3 tests passed
+fuzz-video success
++- run test 3 pass (3 total) 11s MaxRSS:35M
+   +- compile test debug native success 15s MaxRSS:774M
+      +- WriteFile macos-sdk-libc.txt success
+

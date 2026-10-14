@@ -1885,3 +1885,25 @@ previously captured native Linux vectors; the latter is explicitly historical
 binary evidence. Current native Linux execution passes the expanded-format suite.
 No numerical gates were relaxed. Broader Linux formats/x86_64, codec/display/fuzz,
 GPU memory/transfer attribution and the full non-CUDA scope remain open.
+
+### Stateful decoder sequence qualification
+
+The ordinary video test root now replays VP9 and AV1 packet sequences in
+addition to individual reconstruction packets. Fifteen twelve-packet streams
+cover depth/chroma variants, grain, scalable layers, Annex B and textured 480p
+Sintel interframes. The harness retains four independently owned picture batches
+and checks their geometry and SHA-256 bytes across subsequent decoding, skipped
+output, cancellation, decoder failure and decoder destruction. Deterministic
+selection/cancellation checks also verify materialized-output counts. Mutated
+tapes have packet, pixel, allocation and control-check bounds; poisoned cores
+are never reentered. These ownership and accepted-sequence gates execute in
+ordinary CI on macOS and Linux, independently of instrumented fuzz campaigns.
+
+Fuzz reports are recorded per explicit target with the exact harness snapshot,
+fresh cache and actual run/coverage counts. The historical synthetic VP9 report
+does not qualify AV1 or the later textured-picture harness. Bounded campaigns
+add evidence; exhaustive codec conformance, broader independent sources and
+sustained production fuzz coverage remain open. See the
+[source-bound sequence receipts](../video/testdata/sequence-fuzz-validation/README.md) for platform results,
+independent picture oracles, seed attribution and reproduction. The complete
+non-CUDA objective remains active.

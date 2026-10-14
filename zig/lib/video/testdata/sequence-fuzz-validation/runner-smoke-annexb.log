@@ -1,0 +1,15 @@
+======= FUZZING REPORT =======
+Step: run test
+Fuzz test: "src.codecs.fuzz_test.test.video fuzz sequence Annex B retained outputs and cleanup" (932762292b6c33ce)
+Runs: 0 -> 119
+Unique runs: 0 -> 15
+Coverage: 0/48139 -> 4685/48139 (9.73%)
+------------------------------
+Values are accumulated across multiple runs when preserving the cache.
+==============================
+Build Summary: 4/4 steps succeeded; 3/3 tests passed
+fuzz-video success
++- run test 3 pass (3 total) 5s MaxRSS:9M
+   +- compile test debug native success 23s MaxRSS:401M
+      +- WriteFile macos-sdk-libc.txt success
+
