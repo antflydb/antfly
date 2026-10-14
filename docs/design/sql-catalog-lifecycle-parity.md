@@ -5999,3 +5999,55 @@ provenance-checked native root/journal recovery before re-driving control work,
 and add the remaining post-reservation native receipt production. Then revalidate
 current physical evidence in the atomic reader-floor/catalog/schema decision
 before enabling the original public index/ALTER cohorts.
+
+### Native ordered private build pages
+
+The existing private physical builder now participates in the shared native
+transaction, durable-outbox and standby replay pipeline. Its private `build`
+effect retains the prepared page, not a time/byte scheduling budget that could
+select different rows during replay. Primary preparation reuses the compiled
+reservation across pages. Replay owns normalized page data and independently
+reopens its immutable candidate; it does not rerun a timed source scan. The
+existing namespace/catalog/fence, progress CAS and exact physical source-hash
+checks remain mandatory. Command decoding bounds candidate count and data size.
+
+An allocation-free, length-framed page digest avoids hashing JSON byte-array
+expansion. One fixed 176-byte AIBP v1 checkpoint binds the reserved owner, page
+digest, encoded progress and actual native cut. Retry metadata stays bounded by
+one slot, replaced by the next page and retired with cancellation GC admission.
+Cold recovery verifies retained checkpoint framing, cut and progress consistency.
+The separate build outcome has no publication-receipt field: physical readiness
+does not certify distributed UNIQUE claims or authorize schema activation.
+
+The focused Debug page gate passed 53/53 steps, including 14 prerequisite and
+five native storage tests. Its regression builds three source rows in four
+one-record/EOF pages, recovers a pending mirror outbox after reopen, rejects
+clock gaps atomically and preserves exact primary/standby progress on duplicate
+replay without publishing schema version two. The fixture now seeds the standby
+with the primary's actual physical row records rather than independently
+generated row metadata; the failed independent-row fixture did not justify
+weakening the source-hash CAS. The subsequent combined metadata/service/reader/
+catalog/FK/restore/publication/progress Debug run passed 179/179 steps and
+278/278 standard tests, plus its linked runners. Two optional live PostgreSQL
+CDC tests skipped missing prerequisites. Inventory, Apache boundary, licensing
+and control-catalog freshness checks passed.
+
+Review then added a stricter duplicate check against the prepared encoded
+progress digest, including substitution of both well-formed stored values with
+matching checksums. This also computes the progress digest off-lock instead of
+rereading progress during commit. Final qualification of that hardening plus the
+page and combined gates passed 191/191 steps and 278/278 standard tests, with
+linked 14 private-candidate and five native page tests as well as the metadata,
+service, control, runtime, reader, FK, restore and publication runners. Counts
+overlap and are not original SQL cases. Two optional live PostgreSQL CDC tests
+skipped missing prerequisites; there were no failures or leaks. The final log is
+`/private/tmp/antfly-native-build-pages-final-debug.log`. No original-case disposition change,
+throughput improvement, public activation, full SQL release pass or push is
+claimed; the original counts remain 483 implemented / 862 unresolved.
+
+Still required: identity-only receiving-worker build dispatch and its live
+metadata authorization, provenance-backed missing-root repair, complete
+distributed UNIQUE validation, native validated/installed/released receipt
+production, and the atomic current-proof/reader-floor/catalog/schema decision.
+Qualify the original public index/ALTER cohorts only after these boundaries and
+their distributed recovery faults are complete.

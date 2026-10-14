@@ -122,6 +122,22 @@ test "relational index build pages native owner control preserves committed cuts
     for ([_]*db_mod.DB{ &primary, &standby }) |db| {
         try db.setSchemaJson(alloc, before);
         try db.core.store.putBatch(&.{.{ .key = catalog.key, .value = prior.value }}, &.{});
+        try db.batch(.{ .writes = &.{
+            .{ .key = "a", .value = "{\"id\":1,\"email\":\"a@example.com\"}" },
+            .{ .key = "b", .value = "{\"id\":2,\"email\":\"b@example.com\"}" },
+            .{ .key = "c", .value = "{\"id\":3,\"email\":\"c@example.com\"}" },
+        } });
+    }
+    // Standby starts from the same physical source snapshot, not independent
+    // mutations whose stored row metadata can differ despite equal JSON.
+    {
+        var read = try primary.core.store.beginReadTxn();
+        defer read.abort();
+        for ([_][]const u8{ "a", "b", "c" }) |document| {
+            const key = try internal.relationalRowKeyAlloc(alloc, document);
+            defer alloc.free(key);
+            try standby.core.store.putBatch(&.{.{ .key = key, .value = try read.get(key) }}, &.{});
+        }
     }
     var candidate = try candidates.Candidate.prepare(alloc, 101, before, after, prior.value, "email_idx");
     defer candidate.deinit();
@@ -315,6 +331,102 @@ test "relational index build pages native owner control preserves committed cuts
         try std.testing.expectEqual(outcome.position, (try jobs.nativeEffectPosition(&txn, binding, effect)).?);
         try std.testing.expectEqual(outcome.position.sequence, (try authority.load(&txn)).?.sequence);
         try std.testing.expectError(error.NotFound, txn.get(&internal.ordered_document_applied_entry_key));
+    }
+    // Every bounded page (including EOF) is ordered progress, not UNIQUE
+    // validation. Replay the prepared boundary, never another timed scan.
+    {
+        var reservation = try primary.prepareNativeIndexOwnerControl(.{ .effect = .reserved, .binding = binding });
+        defer reservation.deinit();
+        var page_count: u64 = 0;
+        var examined: usize = 0;
+        while (try primary.prepareNativeIndexOwnerBuild(&reservation, .{ .records = 1, .time_ns = std.time.ns_per_s })) |owned| {
+            var build = owned;
+            defer build.deinit();
+            examined += build.command.records_examined;
+            page_count += 1;
+            try std.testing.expect(page_count <= 4);
+            publisher.lsn = 3 + page_count;
+            publisher.fail = page_count == 1;
+            if (publisher.payload) |bytes| alloc.free(bytes);
+            publisher.payload = null;
+            primary.local_execution.replication_async_batch_mirror = publisher.asMirror();
+            const outcome = try primary.applyPreparedNativeIndexOwnerBuild(&build, null);
+            try std.testing.expectEqual(page_count == 1, outcome.replication_pending);
+            try outcome.validateFor(build.command);
+            try std.testing.expect(!@hasField(@TypeOf(outcome), "receipt"));
+            const payload = try build.finalizePayload(outcome.position);
+            try std.testing.expectEqualSlices(u8, payload, publisher.payload.?);
+            primary.local_execution.replication_async_batch_mirror = null;
+            if (page_count == 1) {
+                primary.close();
+                primary = try db_mod.DB.open(alloc, primary_dir.path(), options);
+                publisher.fail = false;
+                primary.local_execution.replication_async_batch_mirror = publisher.asMirror();
+                try primary.flushDurableReplicationOutboxes();
+                primary.local_execution.replication_async_batch_mirror = null;
+            }
+            const retry = try primary.applyPreparedNativeIndexOwnerBuild(&build, null);
+            try retry.validateFor(build.command);
+            try std.testing.expect(retry.duplicate);
+            try std.testing.expectEqual(outcome.position, retry.position);
+            if (page_count == 1) {
+                // Both values can be well formed with matching physical
+                // checksums yet disagree with this prepared page's next cut.
+                primary.core.lockApply();
+                defer primary.core.unlockApply();
+                var fault_txn = try primary.core.store.beginWriteTxn();
+                defer fault_txn.abort();
+                var bytes = (try fault_txn.get(db_mod.DB.PreparedNativeIndexOwnerBuild.checkpoint_key))[0..db_mod.DB.PreparedNativeIndexOwnerBuild.checkpoint_len].*;
+                var changed = build.command.next;
+                changed.rows_scanned += 1;
+                const encoded = try changed.encode(alloc);
+                defer alloc.free(encoded);
+                try fault_txn.put(&@import("relational_index_jobs.zig").progressKey(binding.index), encoded);
+                std.crypto.hash.Blake3.hash(encoded, bytes[72..104], .{});
+                std.crypto.hash.Blake3.hash(bytes[0..144], bytes[144..176], .{});
+                try fault_txn.put(db_mod.DB.PreparedNativeIndexOwnerBuild.checkpoint_key, &bytes);
+                try std.testing.expectError(error.InvalidRelationalIndexProgress, build.stage(primary.core, &fault_txn, null));
+            }
+            const record: @import("replication_record.zig").Record = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 3 + page_count, .previous_lsn = 2 + page_count, .payload = payload };
+            {
+                var decoded = try effects.decodeBatchMutationRequest(alloc, record);
+                defer decoded.deinit();
+                try std.testing.expectEqual(build.command_digest, try decoded.value.index_owner_control.?.effect.build.digest());
+                var gap = try replication_ingress.normalizeBatch(decoded.value);
+                gap.index_owner_control.?.position.sequence += 1;
+                gap.receipt = .{ .native = gap.index_owner_control.?.position };
+                try std.testing.expectError(error.OnlineSourceScopeChanged, standby.applyReplicatedBatch(gap, record.lsn));
+                try std.testing.expectEqual(record.previous_lsn, try standby.replicationAppliedSequence());
+            }
+            try replication_ingress.applyRecord(&standby, record);
+            try replication_ingress.applyRecord(&standby, record);
+            for ([_]*db_mod.DB{ &primary, &standby }) |db| {
+                var read = try db.core.store.beginReadTxn();
+                defer read.abort();
+                const progress = try @import("relational_index_jobs.zig").Progress.decode(try read.get(&@import("relational_index_jobs.zig").progressKey(binding.index)));
+                try std.testing.expectEqual(build.command.next.state, progress.state);
+                try std.testing.expectEqual(@min(page_count, 3), progress.rows_scanned);
+                var reserved = binding;
+                reserved.phase = .reserved;
+                try db_mod.DB.PreparedNativeIndexOwnerBuild.verifyRecovery(&read, reserved);
+                try std.testing.expectEqual(outcome.position.sequence, (try authority.load(&read)).?.sequence);
+                try std.testing.expectEqual(@as(u32, 1), db.core.schema.?.version);
+            }
+        }
+        try std.testing.expectEqual(@as(u64, 4), page_count);
+        try std.testing.expectEqual(@as(usize, 3), examined);
+        // A valid checksum cannot substitute a different durable progress cut.
+        {
+            var fault_txn = try primary.core.store.beginWriteTxn();
+            defer fault_txn.abort();
+            var bytes = (try fault_txn.get(db_mod.DB.PreparedNativeIndexOwnerBuild.checkpoint_key))[0..db_mod.DB.PreparedNativeIndexOwnerBuild.checkpoint_len].*;
+            bytes[72] ^= 1;
+            std.crypto.hash.Blake3.hash(bytes[0..144], bytes[144..176], .{});
+            try fault_txn.put(db_mod.DB.PreparedNativeIndexOwnerBuild.checkpoint_key, &bytes);
+            var reserved = binding;
+            reserved.phase = .reserved;
+            try std.testing.expectError(error.InvalidRelationalIndexProgress, db_mod.DB.PreparedNativeIndexOwnerBuild.verifyRecovery(&fault_txn, reserved));
+        }
     }
     // Prepare first, then let a newer ordinary transport receipt win. The
     // apply-lock recheck must suppress the old effect and retain the newer LSN.

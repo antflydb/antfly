@@ -1681,6 +1681,9 @@ fn testCancellationIntent(comptime Backend: type, comptime prior_phase: enum { a
             pub fn put(self: *@This(), key: []const u8, value: []const u8) !void {
                 try self.inner.put(key, value);
             }
+            pub fn delete(self: *@This(), key: []const u8) !void {
+                try self.inner.delete(key);
+            }
             pub fn openCursor(_: *@This()) !@import("../docstore.zig").DocStore.Txn.CursorAdapter {
                 return error.UnexpectedCancellationAdmissionScan;
             }

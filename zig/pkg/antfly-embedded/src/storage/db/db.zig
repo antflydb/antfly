@@ -7948,6 +7948,14 @@ pub const DB = struct {
             try replication_effects_mod.validateIndexOwnerPayload(.{ .schema_version = native_index_control.envelope_version, .request = mutation.request, .index_owner_control = frame });
             if (try self.replicationMutationAlreadyApplied(sequence)) return;
             switch (frame.effect) {
+                .build => |command| {
+                    var prepared = native_index_control.PreparedBuild.replayPrepared(self.alloc, self.core, command) catch |err| {
+                        if (try self.replicationMutationAlreadyApplied(sequence)) return;
+                        return err;
+                    };
+                    defer prepared.deinit();
+                    _ = try self.applyPreparedNativeIndexOwnerBuild(&prepared, .{ .position = frame.position, .lsn = sequence });
+                },
                 .claims => |command| {
                     var prepared = self.prepareNativeIndexOwnerClaims(command) catch |err| {
                         if (try self.replicationMutationAlreadyApplied(sequence)) return;
@@ -8092,6 +8100,18 @@ pub const DB = struct {
     }
 
     const NativeIndexReplay = struct { position: @import("receipt_position.zig").Native, lsn: u64 };
+
+    pub const PreparedNativeIndexOwnerBuild = native_index_control.PreparedBuild;
+
+    /// Reservation retains its compiled candidate across bounded page prepares.
+    /// Receiving workers must still independently authorize each metadata cut.
+    pub fn prepareNativeIndexOwnerBuild(self: *DB, reservation: *const PreparedNativeIndexOwnerControl, budget: RelationalIndexBuildBudget) !?PreparedNativeIndexOwnerBuild {
+        return PreparedNativeIndexOwnerBuild.prepare(self.alloc, self.backend_runtime.io(), self.core, reservation, budget);
+    }
+
+    pub fn applyPreparedNativeIndexOwnerBuild(self: *DB, prepared: *PreparedNativeIndexOwnerBuild, replay: ?NativeIndexReplay) !native_index_control.BuildOutcome {
+        return self.applyPreparedNativeIndexEffect(prepared, replay);
+    }
 
     pub const NativeIndexOwnerClaimCommand = native_index_control.ClaimCommand;
     pub const NativeIndexOwnerClaimOutcome = native_index_control.ClaimOutcome;

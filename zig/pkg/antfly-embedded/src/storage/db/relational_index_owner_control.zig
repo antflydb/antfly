@@ -28,12 +28,13 @@ const Native = @import("receipt_position.zig").Native;
 const private_claims = @import("relational_index_private_claims.zig");
 const integrity = @import("relational_integrity_contract.zig");
 const Allocator = std.mem.Allocator;
+const pages = @import("relational_index_jobs.zig");
 pub const envelope_version = 22;
 pub const max_cancellation_wire_bytes = 32 * 1024;
 pub const max_encoded_inputs = std.base64.standard.Encoder.calcSize(inputs.max_bytes);
 pub const max_claim_wire_bytes = 6 * private_claims.max_bytes + 128 * 1024;
 pub const max_control_wire_bytes = max_encoded_inputs + 32 * 1024;
-pub const max_wire_bytes = @max(max_control_wire_bytes, max_claim_wire_bytes);
+pub const max_wire_bytes = @max(max_control_wire_bytes, max_claim_wire_bytes, pages.Page.PrivateCommand.max_wire_bytes);
 pub const Manifest = inputs.Prepared;
 
 pub const Admission = @import("relational_index_cancellation_intent.zig").Intent;
@@ -147,11 +148,13 @@ pub const Effect = union(enum) {
     cancel_intent: Admission,
     cancel_cleanup: jobs.Binding,
     claims: ClaimCommand,
+    build: pages.Page.PrivateCommand,
 
     pub fn namespace(self: Effect) @FieldType(Native, "namespace") {
         return switch (self) {
             .control, .cancel_control => |value| value.binding.fence.namespace,
             .claims => |value| value.binding.fence.namespace,
+            .build => |value| value.binding.fence.namespace,
             .cancel_intent => |value| value.fence.namespace,
             .cancel_cleanup => |value| value.fence.namespace,
         };
@@ -161,6 +164,7 @@ pub const Effect = union(enum) {
         switch (self) {
             .control, .cancel_control => |value| try value.validate(),
             .claims => |value| try value.validate(),
+            .build => |value| try value.validate(),
             .cancel_intent => |value| try value.validate(),
             .cancel_cleanup => |value| {
                 _ = try value.encode();
@@ -173,6 +177,7 @@ pub const Effect = union(enum) {
         return switch (self) {
             .control, .cancel_control => max_control_wire_bytes,
             .claims => max_claim_wire_bytes,
+            .build => pages.Page.PrivateCommand.max_wire_bytes,
             else => max_cancellation_wire_bytes,
         };
     }
@@ -337,6 +342,150 @@ pub const PreparedClaims = struct {
         try prepareNativePayload(self, "claims", self.command, max_claim_wire_bytes);
     }
     pub fn finalizePayload(self: *PreparedClaims, position: Native) ![]const u8 {
+        return finalizeNativePayload(self, position);
+    }
+};
+
+/// A build page is durable progress, not a UNIQUE-validation receipt. One
+/// retained checkpoint bounds retry state regardless of table size or churn.
+pub const BuildOutcome = struct {
+    binding: jobs.Binding,
+    page_digest: [32]u8,
+    position: Native,
+    duplicate: bool,
+    replication_pending: bool = false,
+    error_name: ?[]const u8 = null,
+
+    pub fn validateFor(self: BuildOutcome, command: pages.Page.PrivateCommand) !void {
+        try command.validate();
+        try self.position.validate();
+        if (!std.mem.eql(u8, &try self.binding.encode(), &try command.binding.encode()) or
+            !std.mem.eql(u8, &self.page_digest, &try command.digest()) or
+            !self.position.namespace.eql(command.binding.fence.namespace) or
+            self.replication_pending != (self.error_name != null)) return error.InvalidPrivateIndexNativeReceipt;
+    }
+};
+
+pub const PreparedBuild = struct {
+    pub const ApplyOutcome = BuildOutcome;
+    pub const checkpoint_key = jobs.key ++ ":build-page";
+    pub const checkpoint_len = 176;
+    alloc: Allocator,
+    page: pages.Page,
+    command: pages.Page.PrivateCommand,
+    command_digest: [32]u8,
+    progress_digest: [32]u8,
+    payload: ?[]u8 = null,
+    prefix_len: usize = 0,
+
+    /// Takes page ownership only on success.
+    pub fn init(alloc: Allocator, page: pages.Page) !PreparedBuild {
+        const command = try page.privateCommand();
+        return .{ .alloc = alloc, .page = page, .command = command, .command_digest = try command.digest(), .progress_digest = try command.encodedProgressDigest() };
+    }
+    /// Reuse the compiled reservation across pages. Only the page's source
+    /// snapshot and scratch arena are renewed; no per-page schema compilation.
+    pub fn prepare(alloc: Allocator, io: ?std.Io, core: anytype, reservation: *const Prepared, budget: pages.Budget) !?PreparedBuild {
+        if (reservation.command.effect != .reserved) return error.PrivateIndexOwnerJobChanged;
+        const artifacts = if (reservation.artifacts) |*value| value else return error.InvalidPrivateIndexOwnerJob;
+        var binding = reservation.command.binding;
+        binding.phase = .reserved;
+        var page = (try pages.Page.preparePrivate(alloc, io, core, binding, &artifacts.addition, budget)) orelse return null;
+        errdefer page.deinit();
+        return try init(alloc, page);
+    }
+    pub fn replayPrepared(alloc: Allocator, core: anytype, command: pages.Page.PrivateCommand) !PreparedBuild {
+        try command.validate();
+        var view = core.acquireSchemaView() orelse return error.RelationalTableRequired;
+        defer view.release();
+        var read = try core.store.beginReadTxn();
+        defer read.abort();
+        try jobs.requireReserved(&read, command.binding);
+        var manifest = try inputs.Prepared.load(alloc, &read, command.binding.inputs_digest);
+        defer manifest.deinit();
+        var artifacts = try Artifacts.init(alloc, view, &read, manifest.bytes);
+        defer artifacts.deinit();
+        var page = try pages.Page.replayPrivate(alloc, core, &artifacts.addition, command);
+        errdefer page.deinit();
+        return try init(alloc, page);
+    }
+    pub fn deinit(self: *PreparedBuild) void {
+        if (self.payload) |bytes| self.alloc.free(bytes);
+        self.page.deinit();
+        self.* = undefined;
+    }
+    pub fn validate(self: *const PreparedBuild) !void {
+        try self.command.validate();
+    }
+    pub fn namespace(self: *const PreparedBuild) @FieldType(Native, "namespace") {
+        return self.command.binding.fence.namespace;
+    }
+    pub fn validateReplay(self: *const PreparedBuild, position: Native) !void {
+        try (Frame{ .effect = .{ .build = self.command }, .position = position }).validate();
+    }
+    pub fn replayDuplicateOutcome(self: *const PreparedBuild, position: Native) BuildOutcome {
+        return .{ .binding = self.command.binding, .page_digest = self.command_digest, .position = position, .duplicate = true };
+    }
+    fn hash(bytes: []const u8) [32]u8 {
+        var result: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(bytes, &result, .{});
+        return result;
+    }
+    fn checkpoint(txn: anytype, binding: jobs.Binding) !?[checkpoint_len]u8 {
+        const raw = txn.get(checkpoint_key) catch |err| {
+            if (err == error.NotFound) return null;
+            return err;
+        };
+        if (raw.len != checkpoint_len or !std.mem.eql(u8, raw[0..8], "AIBP\x01\x00\x00\x00") or
+            !std.mem.allEqual(u8, raw[137..144], 0) or !std.mem.eql(u8, raw[144..176], &hash(raw[0..144]))) return error.InvalidRelationalIndexProgress;
+        // Copy before another store lookup can invalidate the borrowed value.
+        const bytes = raw[0..checkpoint_len].*;
+        if (!std.mem.eql(u8, bytes[8..40], &hash(&try binding.encode()))) return null;
+        const position = try @import("receipt_position.zig").Position.decode(bytes[104..137]);
+        if (position != .native) return error.InvalidControlReceiptPosition;
+        try position.requireNamespace(binding.fence.namespace);
+        const state = try source_authority.require(txn, .native, @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace));
+        if (position.native.sequence > state.sequence) return error.InvalidControlReceiptPosition;
+        const progress = try txn.get(&pages.progressKey(binding.index));
+        if (!std.mem.eql(u8, bytes[72..104], &hash(progress))) return error.InvalidRelationalIndexProgress;
+        return bytes;
+    }
+    pub fn verifyRecovery(txn: anytype, binding: jobs.Binding) !void {
+        _ = try checkpoint(txn, binding);
+    }
+    pub fn stage(self: *PreparedBuild, core: anytype, txn: anytype, replay: ?Native) !BuildOutcome {
+        const binding = self.command.binding;
+        try jobs.requireReserved(txn, binding);
+        if (try checkpoint(txn, binding)) |bytes| {
+            if (std.mem.eql(u8, bytes[40..72], &self.command_digest)) {
+                if (!std.mem.eql(u8, bytes[72..104], &self.progress_digest)) return error.InvalidRelationalIndexProgress;
+                const position = (try @import("receipt_position.zig").Position.decode(bytes[104..137])).native;
+                if (replay) |expected| if (!std.meta.eql(position, expected)) return error.InvalidControlReceiptPosition;
+                return .{ .binding = binding, .page_digest = self.command_digest, .position = position, .duplicate = true };
+            }
+        }
+        var manager = try core.initTxnManager();
+        defer manager.deinit();
+        try self.page.stage(core, &manager, txn);
+        const position: Native = .{ .namespace = self.namespace(), .sequence = try source_authority.advance(txn, @import("online_source_contract.zig").namespaceBytes(self.namespace()), if (replay) |value| value.sequence else null) };
+        var bytes: [checkpoint_len]u8 = @splat(0);
+        @memcpy(bytes[0..8], "AIBP\x01\x00\x00\x00");
+        @memcpy(bytes[8..40], &hash(&try binding.encode()));
+        @memcpy(bytes[40..72], &self.command_digest);
+        @memcpy(bytes[72..104], &self.progress_digest);
+        @memcpy(bytes[104..137], &try (@import("receipt_position.zig").Position{ .native = position }).encode());
+        @memcpy(bytes[144..176], &hash(bytes[0..144]));
+        try txn.put(checkpoint_key, &bytes);
+        return .{ .binding = binding, .page_digest = self.command_digest, .position = position, .duplicate = false };
+    }
+    pub fn hasPublicationReceipt(_: *const PreparedBuild) bool {
+        return false;
+    }
+    pub fn populateReceipt(_: *const PreparedBuild, _: anytype, _: *BuildOutcome) !void {}
+    pub fn preparePayload(self: *PreparedBuild) !void {
+        try prepareNativePayload(self, "build", self.command, pages.Page.PrivateCommand.max_wire_bytes);
+    }
+    pub fn finalizePayload(self: *PreparedBuild, position: Native) ![]const u8 {
         return finalizeNativePayload(self, position);
     }
 };

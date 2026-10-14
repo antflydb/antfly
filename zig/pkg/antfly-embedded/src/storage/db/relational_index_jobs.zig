@@ -250,7 +250,7 @@ pub const Page = struct {
     /// Logical scan work, independent of payload size and unrelated indexes.
     records_examined: usize = 0,
 
-    const Candidate = struct {
+    pub const Candidate = struct {
         primary: ?[]const u8 = null,
         document: []const u8 = "",
         hash: ?Digest = null,
@@ -262,7 +262,185 @@ pub const Page = struct {
         delete_reverse: ?[]const u8 = null,
         nonmember: bool = false,
     };
-    const FailedSource = struct { primary: []const u8, hash: Digest };
+    pub const FailedSource = struct { primary: []const u8, hash: Digest };
+
+    /// The committed page, not its scheduling budget. Replaying a time-limited
+    /// scan would choose a different boundary on another machine.
+    pub const PrivateCommand = struct {
+        binding: owner_job.Binding,
+        expected: ?[]const u8,
+        control: maintenance.Control,
+        next: Progress,
+        candidates: []const Candidate,
+        failed_source: ?FailedSource,
+        records_examined: usize,
+
+        pub const max_bytes = 16 * 1024 * 1024;
+        pub const max_wire_bytes = 6 * max_bytes + 1024 * 1024;
+
+        pub fn jsonStringify(self: @This(), stream: anytype) @TypeOf(stream.*).Error!void {
+            try @import("relational_integrity_json.zig").write(self, stream);
+        }
+
+        pub fn jsonParse(alloc: Allocator, source: anytype, options: std.json.ParseOptions) !PrivateCommand {
+            const Bounded = struct {
+                items: []const Candidate,
+                pub fn jsonParse(a: Allocator, s: anytype, opts: std.json.ParseOptions) !@This() {
+                    if (try s.next() != .array_begin) return error.UnexpectedToken;
+                    var items: std.ArrayList(Candidate) = .empty;
+                    var size: usize = 0;
+                    while (try s.peekNextTokenType() != .array_end) {
+                        if (items.items.len >= 4096) return error.LengthMismatch;
+                        const value = try std.json.innerParse(Candidate, a, s, opts);
+                        size = std.math.add(usize, size, candidateBytes(value) catch return error.Overflow) catch return error.Overflow;
+                        if (size > max_bytes) return error.LengthMismatch;
+                        try items.append(a, value);
+                    }
+                    _ = try s.next();
+                    return .{ .items = try items.toOwnedSlice(a) };
+                }
+            };
+            const Wire = struct { binding: owner_job.Binding, expected: ?[]const u8, control: maintenance.Control, next: Progress, candidates: Bounded, failed_source: ?FailedSource, records_examined: usize };
+            var limited = options;
+            limited.max_value_len = @min(options.max_value_len.?, max_bytes);
+            const wire = try std.json.innerParse(Wire, alloc, source, limited);
+            const result: PrivateCommand = .{ .binding = wire.binding, .expected = wire.expected, .control = wire.control, .next = wire.next, .candidates = wire.candidates.items, .failed_source = wire.failed_source, .records_examined = wire.records_examined };
+            result.validate() catch return error.UnexpectedToken;
+            return result;
+        }
+
+        fn candidateBytes(candidate: Candidate) !usize {
+            var size: usize = 0;
+            inline for (.{ candidate.primary, candidate.tuple, candidate.observed_key, candidate.delete_reverse }) |field| if (field) |value| {
+                size = std.math.add(usize, size, value.len) catch return error.TransactionTooLarge;
+            };
+            size = std.math.add(usize, size, candidate.document.len) catch return error.TransactionTooLarge;
+            return std.math.add(usize, size, candidate.payload.len) catch return error.TransactionTooLarge;
+        }
+
+        pub fn validate(self: PrivateCommand) !void {
+            _ = try self.binding.encode();
+            if (self.binding.authority != .native or self.binding.phase != .reserved or
+                self.next.id.mapKey() != self.binding.index.mapKey() or self.next.phase != .primary or
+                self.candidates.len > 4096 or self.records_examined > 4096 or
+                self.candidates.len > self.records_examined or
+                self.next.attempt != self.control.epoch or
+                !std.mem.eql(u8, &self.next.last_maintenance, &self.control.last_request) or
+                (self.next.state == .failed) != (self.failed_source != null) or
+                (self.failed_source != null and self.candidates.len != 0)) return error.InvalidRelationalIndexProgress;
+            var storage: [header_len + max_cursor_bytes + 32]u8 = undefined;
+            var fixed = std.heap.FixedBufferAllocator.init(&storage);
+            _ = try self.next.encode(fixed.allocator());
+            var size: usize = self.next.cursor.len;
+            if (self.expected) |value| {
+                const old = try Progress.decode(value);
+                if (old.id.mapKey() != self.next.id.mapKey() or old.phase != .primary or old.state != .building or
+                    !std.mem.eql(u8, &old.owner, &self.next.owner) or !std.mem.eql(u8, &old.comparison, &self.next.comparison) or
+                    old.attempt != self.next.attempt or !std.mem.eql(u8, &old.last_maintenance, &self.next.last_maintenance) or
+                    old.rows_scanned > self.next.rows_scanned or
+                    (self.next.state == .building and std.mem.order(u8, old.cursor, self.next.cursor) != .lt)) return error.InvalidRelationalIndexProgress;
+                size += value.len;
+            }
+            for (self.candidates) |candidate| {
+                size = std.math.add(usize, size, try candidateBytes(candidate)) catch return error.TransactionTooLarge;
+            }
+            if (self.failed_source) |failed| size = std.math.add(usize, size, failed.primary.len) catch return error.TransactionTooLarge;
+            if (size > max_bytes) return error.TransactionTooLarge;
+        }
+
+        pub fn digest(self: PrivateCommand) !Digest {
+            try self.validate();
+            var state = std.crypto.hash.Blake3.init(.{});
+            state.update("antfly private index build page v1");
+            state.update(&try self.binding.encode());
+            hashOptional(&state, self.expected);
+            var storage: [header_len + max_cursor_bytes + 32]u8 = undefined;
+            var fixed = std.heap.FixedBufferAllocator.init(&storage);
+            hashBytes(&state, try self.next.encode(fixed.allocator()));
+            hashNumber(&state, self.control.epoch);
+            state.update(&self.control.last_request);
+            hashNumber(&state, self.records_examined);
+            hashNumber(&state, self.candidates.len);
+            for (self.candidates) |candidate| {
+                hashOptional(&state, candidate.primary);
+                hashBytes(&state, candidate.document);
+                hashOptional(&state, if (candidate.hash) |*value| value else null);
+                hashOptional(&state, candidate.tuple);
+                hashBytes(&state, candidate.payload);
+                hashOptional(&state, candidate.observed_key);
+                state.update(&candidate.observed_hash);
+                state.update(&.{ @intFromBool(candidate.delete_observed), @intFromBool(candidate.nonmember) });
+                hashOptional(&state, candidate.delete_reverse);
+            }
+            state.update(&.{@intFromBool(self.failed_source != null)});
+            if (self.failed_source) |failed| {
+                hashBytes(&state, failed.primary);
+                state.update(&failed.hash);
+            }
+            var result: Digest = undefined;
+            state.final(&result);
+            return result;
+        }
+
+        pub fn encodedProgressDigest(self: PrivateCommand) !Digest {
+            var storage: [header_len + max_cursor_bytes + 32]u8 = undefined;
+            var fixed = std.heap.FixedBufferAllocator.init(&storage);
+            var result: Digest = undefined;
+            std.crypto.hash.Blake3.hash(try self.next.encode(fixed.allocator()), &result, .{});
+            return result;
+        }
+
+        fn hashNumber(state: *std.crypto.hash.Blake3, value: u64) void {
+            var bytes: [8]u8 = undefined;
+            std.mem.writeInt(u64, &bytes, value, .little);
+            state.update(&bytes);
+        }
+        fn hashBytes(state: *std.crypto.hash.Blake3, value: []const u8) void {
+            hashNumber(state, value.len);
+            state.update(value);
+        }
+        fn hashOptional(state: *std.crypto.hash.Blake3, value: ?[]const u8) void {
+            state.update(&.{@intFromBool(value != null)});
+            if (value) |bytes| hashBytes(state, bytes);
+        }
+    };
+
+    pub fn privateCommand(self: *const Page) !PrivateCommand {
+        var result: PrivateCommand = .{ .binding = self.private_job orelse return error.PrivateIndexJobRequired, .expected = self.expected, .control = self.control, .next = self.next, .candidates = self.candidates, .failed_source = self.failed_source, .records_examined = self.records_examined };
+        result.binding.phase = .reserved;
+        try result.validate();
+        return result;
+    }
+
+    /// Own normalized replay data and rebind the actual local namespace epoch.
+    /// The caller independently reopens the immutable candidate at this root.
+    pub fn replayPrivate(alloc: Allocator, core: anytype, addition: *const catalog.PrivateAddition, command: PrivateCommand) !Page {
+        try command.validate();
+        if (!addition.candidate.head.eql(command.binding.physical_candidate) or
+            !addition.reservation.head.eql(command.binding.physical_reserved)) return error.PrivateIndexOwnerJobChanged;
+        const offset = for (addition.plan.boundIndexes(), 0..) |index, i| {
+            if (index.id().mapKey() == command.binding.index.mapKey()) {
+                if (!std.mem.eql(u8, &index.tuple.fingerprint, &command.next.comparison)) return error.InvalidRelationalIndexProgress;
+                break i;
+            }
+        } else return error.IndexNotFound;
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        const expected = if (command.expected) |value| try a.dupe(u8, value) else null;
+        var next = command.next;
+        next.cursor = try a.dupe(u8, next.cursor);
+        const candidates = try a.dupe(Candidate, command.candidates);
+        for (candidates) |*candidate| {
+            inline for (.{ "primary", "tuple", "observed_key", "delete_reverse" }) |field| if (@field(candidate, field)) |value| {
+                @field(candidate, field) = try a.dupe(u8, value);
+            };
+            candidate.document = try a.dupe(u8, candidate.document);
+            candidate.payload = try a.dupe(u8, candidate.payload);
+        }
+        const failed: ?FailedSource = if (command.failed_source) |value| .{ .primary = try a.dupe(u8, value.primary), .hash = value.hash } else null;
+        return .{ .arena = arena, .pinned = .{ .head = addition.candidate.head, .plan = addition.plan.clone() }, .private_job = command.binding, .index_offset = offset, .namespace_generation = core.schemaNamespaceGeneration(), .expected = expected, .control = command.control, .next = next, .candidates = candidates, .failed_source = failed, .records_examined = command.records_examined };
+    }
 
     fn prepareTuple(alloc: Allocator, payload_alloc: Allocator, core: anytype, pinned: catalog.WriteSnapshot, index: plans.BoundIndex, value: []const u8, document: []const u8, source: *?registry.SchemaView, projected: *?tuples.TuplePlan, projected_cover: *?@import("relational_index_cover.zig").Source, projected_predicate: *?@import("relational_index_predicate.zig").Source, encoded: *std.ArrayList(u8)) !?[]const u8 {
         const version = try row_store.rowSchemaVersion(value);
