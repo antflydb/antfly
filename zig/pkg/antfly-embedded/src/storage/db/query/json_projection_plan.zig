@@ -32,62 +32,132 @@ pub fn index(part: []const u8) ?usize {
     return std.fmt.parseInt(usize, part, 10) catch null;
 }
 
+// Bound both input size and synthetic union work. These limits apply before
+// materializing a document and fail as an invalid request, never a stack fault.
+pub const max_components = 65536;
+pub const max_path_depth = 1024;
+const max_nodes = 131072;
+const max_steps = 1024 * 1024;
+const Compiler = struct {
+    a: Allocator,
+    work: Allocator,
+    nodes: usize = 0,
+    steps: usize = 0,
+    const Task = union(enum) { prepare: *Selector, derive: *Selector, finish: *Selector };
+    fn step(self: *@This()) !void {
+        if (self.steps == max_steps) return error.InvalidQueryRequest;
+        self.steps += 1;
+    }
+    fn node(self: *@This()) !*Selector {
+        if (self.nodes == max_nodes) return error.InvalidQueryRequest;
+        self.nodes += 1;
+        const value = try self.a.create(Selector);
+        value.* = .{};
+        return value;
+    }
+    // Build only the union's fields. Preparation is scheduled separately so
+    // numeric aliases and nested fanout never recurse through native frames.
+    fn merge(self: *@This(), left: *Selector, right: *Selector) !*Selector {
+        const Pair = struct { left: *Selector, right: *Selector, result: *Selector };
+        if (left == right or right.fields.count() == 0) return left;
+        if (left.fields.count() == 0) return right;
+        const result = try self.node();
+        var pending: std.ArrayListUnmanaged(Pair) = .empty;
+        defer pending.deinit(self.work);
+        try pending.append(self.work, .{ .left = left, .right = right, .result = result });
+        while (pending.pop()) |pair| {
+            var it = pair.left.fields.iterator();
+            while (it.next()) |entry| {
+                try self.step();
+                try pair.result.fields.put(self.a, entry.key_ptr.*, entry.value_ptr.*);
+            }
+            it = pair.right.fields.iterator();
+            while (it.next()) |entry| {
+                try self.step();
+                const found = try pair.result.fields.getOrPut(self.a, entry.key_ptr.*);
+                const r = entry.value_ptr.*;
+                if (!found.found_existing) {
+                    found.value_ptr.* = r;
+                    continue;
+                }
+                const l = found.value_ptr.*;
+                if (l == r or r.fields.count() == 0) continue;
+                if (l.fields.count() == 0) {
+                    found.value_ptr.* = r;
+                    continue;
+                }
+                const child = try self.node();
+                found.value_ptr.* = child;
+                try pending.append(self.work, .{ .left = l, .right = r, .result = child });
+            }
+        }
+        return result;
+    }
+    fn prepare(self: *@This(), root: *Selector) !void {
+        var tasks: std.ArrayListUnmanaged(Task) = .empty;
+        defer tasks.deinit(self.work);
+        try tasks.append(self.work, .{ .prepare = root });
+        while (tasks.pop()) |task| {
+            try self.step();
+            switch (task) {
+                .finish => |value| value.prepared = true,
+                .prepare => |value| {
+                    if (value.prepared) continue;
+                    try tasks.append(self.work, .{ .derive = value });
+                    var it = value.fields.iterator();
+                    while (it.next()) |entry| try tasks.append(self.work, .{ .prepare = entry.value_ptr.* });
+                },
+                .derive => |value| {
+                    var it = value.fields.iterator();
+                    while (it.next()) |entry| {
+                        try self.step();
+                        const child = entry.value_ptr.*;
+                        if (index(entry.key_ptr.*)) |i| {
+                            const found = try value.indices.getOrPut(self.a, i);
+                            found.value_ptr.* = if (found.found_existing) try self.merge(found.value_ptr.*, child) else child;
+                        } else {
+                            if (value.fanout == null) value.fanout = try self.node();
+                            // Fanout is used only for object array items.
+                            try value.fanout.?.fields.put(self.a, entry.key_ptr.*, child);
+                        }
+                    }
+                    var indices = value.indices.iterator();
+                    while (indices.next()) |entry| {
+                        const child = if (value.fanout) |fanout| try self.merge(entry.value_ptr.*, fanout) else entry.value_ptr.*;
+                        try value.array_items.put(self.a, entry.key_ptr.*, child);
+                    }
+                    try tasks.append(self.work, .{ .finish = value });
+                    var items = value.array_items.iterator();
+                    while (items.next()) |entry| try tasks.append(self.work, .{ .prepare = entry.value_ptr.* });
+                },
+            }
+        }
+    }
+};
 pub fn compile(a: Allocator, paths: []const Path) !*Selector {
-    const root = try new(a);
+    var components: usize = 0;
+    var bytes: usize = 0;
+    for (paths) |path| {
+        if (path.parts.len > max_path_depth or path.parts.len > max_components -| components) return error.InvalidQueryRequest;
+        components += path.parts.len;
+        for (path.parts) |part| {
+            if (part.len > max_steps -| bytes) return error.InvalidQueryRequest;
+            bytes += part.len;
+        }
+    }
+    var compiler = Compiler{ .a = a, .work = @import("antfly_platform").allocator.reclaimingScratch(a) };
+    const root = try compiler.node();
     for (paths) |path| {
         var current = root;
         for (path.parts) |part| {
             const entry = try current.fields.getOrPut(a, part);
             if (!entry.found_existing) {
                 entry.key_ptr.* = try a.dupe(u8, part);
-                entry.value_ptr.* = try new(a);
+                entry.value_ptr.* = try compiler.node();
             }
             current = entry.value_ptr.*;
         }
     }
-    try prepare(a, root);
+    try compiler.prepare(root);
     return root;
-}
-fn new(a: Allocator) !*Selector {
-    const node = try a.create(Selector);
-    node.* = .{};
-    return node;
-}
-fn merge(a: Allocator, left: *Selector, right: *Selector) anyerror!*Selector {
-    if (left == right) return left;
-    if (left.fields.count() == 0) return right;
-    if (right.fields.count() == 0) return left;
-    const result = try new(a);
-    var it = left.fields.iterator();
-    while (it.next()) |entry| try result.fields.put(a, entry.key_ptr.*, entry.value_ptr.*);
-    it = right.fields.iterator();
-    while (it.next()) |entry| {
-        const found = try result.fields.getOrPut(a, entry.key_ptr.*);
-        if (found.found_existing) found.value_ptr.* = try merge(a, found.value_ptr.*, entry.value_ptr.*) else found.value_ptr.* = entry.value_ptr.*;
-    }
-    try prepare(a, result);
-    return result;
-}
-fn prepare(a: Allocator, node: *Selector) anyerror!void {
-    if (node.prepared) return;
-    var it = node.fields.iterator();
-    while (it.next()) |entry| {
-        const child = entry.value_ptr.*;
-        try prepare(a, child);
-        if (index(entry.key_ptr.*)) |i| {
-            const found = try node.indices.getOrPut(a, i);
-            if (found.found_existing) found.value_ptr.* = try merge(a, found.value_ptr.*, child) else found.value_ptr.* = child;
-        } else {
-            if (node.fanout == null) node.fanout = try new(a);
-            // Fanout is only applied to object array items, so these nodes do
-            // not require a recursively synthesized fanout of themselves.
-            try node.fanout.?.fields.put(a, entry.key_ptr.*, child);
-        }
-    }
-    var indices = node.indices.iterator();
-    while (indices.next()) |entry| {
-        const child = if (node.fanout) |fanout| try merge(a, entry.value_ptr.*, fanout) else entry.value_ptr.*;
-        try node.array_items.put(a, entry.key_ptr.*, child);
-    }
-    node.prepared = true;
 }

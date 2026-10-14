@@ -39470,7 +39470,16 @@ pub const DB = struct {
     }
 
     fn searchLockedWithExecutionContextImpl(self: *DB, alloc: Allocator, req: types.SearchRequest, exec_ctx: types.ExecutionContext, externalize_artifact_ids: bool, dense_profile_sink: ?*db_query_search.DenseSearchProfile) !types.SearchResult {
-        var result = try self.searchLockedWithExecutionContextRaw(alloc, req, exec_ctx, externalize_artifact_ids, dense_profile_sink);
+        var request = req;
+        var projection: ?@import("document_query.zig").SpanProjectionPlan = null;
+        defer if (projection) |*plan| plan.deinit();
+        const projection_opts: types.LookupOptions = .{ .fields = req.fields, .include_all_fields = req.include_all_fields };
+        const shared_matches = if (req.document_projection_plan) |shared| shared.matches(projection_opts) else false;
+        if (req.include_stored and !req.count_only and req.limit != 0 and !req.defer_stored_projection and db_query_projection.shouldProjectSearchStored(req) and !shared_matches) {
+            projection = try @import("document_query.zig").SpanProjectionPlan.init(alloc, projection_opts);
+            if (projection) |*plan| request.document_projection_plan = .{ .plan = plan, .fields = req.fields, .include_all_fields = req.include_all_fields };
+        }
+        var result = try self.searchLockedWithExecutionContextRaw(alloc, request, exec_ctx, externalize_artifact_ids, dense_profile_sink);
         errdefer result.deinit();
         try self.attachDistributedDocumentAuthority(alloc, req, &result);
         return result;

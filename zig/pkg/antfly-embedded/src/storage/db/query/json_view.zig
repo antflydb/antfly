@@ -28,13 +28,27 @@ pub const View = struct {
     root: Node,
     materialized_values: usize = 0,
     parse_numbers: bool = false,
+    root_sources: []const RootSource = &.{},
+    pub const RootSource = struct { name: []const u8, view: *View };
 
     pub const Node = struct {
         raw: []const u8,
         children: ?[]Child = null,
         object_index: std.StringHashMapUnmanaged(usize) = .empty,
         array_index: std.AutoHashMapUnmanaged(usize, ?*Node) = .empty,
-        logical: ?Value = null,
+        // Pack index completeness into the logical-cache tag; this has the
+        // same footprint as ?Value, avoiding another byte on every span node.
+        logical: union(enum) { empty, object_complete, value: Value, complete_value: Value } = .empty,
+
+        fn objectComplete(self: Node) bool {
+            return self.logical == .object_complete or self.logical == .complete_value;
+        }
+        fn markObjectComplete(self: *Node, complete: bool) void {
+            self.logical = switch (self.logical) {
+                .value, .complete_value => |value| if (complete) .{ .complete_value = value } else .{ .value = value },
+                .empty, .object_complete => if (complete) .object_complete else .empty,
+            };
+        }
 
         fn kind(self: Node) u8 {
             const raw = std.mem.trim(u8, self.raw, " \r\n\t");
@@ -48,8 +62,8 @@ pub const View = struct {
     }
 
     fn children(self: *View, node: *Node) ![]Child {
-        if (node.children) |cached| return cached;
         const object = node.kind() == '{';
+        if (node.children) |cached| if (!object or node.objectComplete()) return cached;
         if (!object and node.kind() != '[') return &.{};
         var scanner = std.json.Scanner.initCompleteInput(self.alloc, node.raw);
         defer scanner.deinit();
@@ -83,10 +97,19 @@ pub const View = struct {
         if (try scanner.next() != .end_of_document) return error.SyntaxError;
         node.children = try entries.toOwnedSlice(self.alloc);
         node.object_index = index;
+        node.markObjectComplete(object);
         return node.children.?;
     }
 
     fn field(self: *View, node: *Node, name: []const u8) !?*Node {
+        if (node.kind() != '{') return null;
+        if (node.object_index.get(name)) |i| {
+            if (i == std.math.maxInt(usize)) return null;
+            if (node.children) |entries| if (i < entries.len) return &entries[i].node;
+        }
+        if (node.objectComplete()) return null;
+        // An unplanned field still has the ordinary lazy behavior. A partial
+        // projection cache is never a complete index of the original object.
         const entries = try self.children(node);
         const i = node.object_index.get(name) orelse return null;
         return &entries[i].node;
@@ -137,6 +160,21 @@ pub const View = struct {
     pub const DuplicatePolicy = enum { all, visited };
     pub const RootMode = enum { object_only, any_container };
     pub fn prepareProjection(view: *View, selector: *const Selector, policy: DuplicatePolicy, root_mode: RootMode) !void {
+        return view.prepareProjectionWithOptions(selector, policy, root_mode, .{});
+    }
+    pub const PreparationOptions = struct {
+        retain_root_fields: bool = false,
+        root_excluded: []const []const u8 = &.{},
+    };
+    pub fn prepareProjectionWithOptions(view: *View, selector: *const Selector, policy: DuplicatePolicy, root_mode: RootMode, options: PreparationOptions) !void {
+        errdefer {
+            // A failed preparation cannot publish half-built caches to a
+            // later predicate or projection using this same source view.
+            view.root.children = null;
+            view.root.object_index.clearRetainingCapacity();
+            view.root.array_index.clearRetainingCapacity();
+            view.root.markObjectComplete(false);
+        }
         const alloc = view.alloc;
         const raw = view.root.raw;
         const scratch = @import("antfly_platform").allocator.reclaimingScratch(alloc);
@@ -149,13 +187,29 @@ pub const View = struct {
             children: std.ArrayListUnmanaged(View.Child) = .empty,
             selected: ?*const Selector = null,
             name: []const u8 = "",
+            retain: bool = false,
+            retain_all: bool = false,
+            omitted: bool = false,
+            excluded: []const []const u8 = &.{},
             ordinal: usize = 0,
             start: usize = 0,
             pending_node: ?*View.Node = null,
             pending_selector: ?*const Selector = null,
 
+            fn wants(self: *@This(), name: []const u8) bool {
+                if (self.node == null) return false;
+                for (self.excluded) |omit| if (std.mem.eql(u8, omit, "*") or std.mem.eql(u8, omit, name)) return false;
+                return self.retain_all or self.selected.?.fields.contains(name);
+            }
+
             fn plan(self: *@This(), a: Allocator) !void {
-                if (self.node == null or self.object) return;
+                const node = self.node orelse return;
+                if (self.object) {
+                    node.children = null;
+                    node.object_index.clearRetainingCapacity();
+                    node.markObjectComplete(false);
+                    return;
+                }
                 const selected = self.selected orelse return;
                 var indices = selected.indices.iterator();
                 while (indices.next()) |entry| try self.node.?.array_index.put(a, entry.key_ptr.*, null);
@@ -167,6 +221,7 @@ pub const View = struct {
                 if (self.node == null) return;
                 const selected = self.selected.?;
                 if (self.object) {
+                    if (!self.retain) return;
                     if (selected.fields.get(self.name)) |child| {
                         if (child.fields.count() != 0) {
                             self.pending_selector = child;
@@ -189,7 +244,16 @@ pub const View = struct {
                     const span = source[self.start..end];
                     if (self.pending_node) |node| node.raw = span;
                     if (self.object) {
+                        if (!self.retain) {
+                            self.omitted = true;
+                            self.ordinal += 1;
+                            return;
+                        }
                         try parent.object_index.put(a, self.name, self.children.items.len);
+                        // Tiny selectors should not reserve eight full nodes
+                        // per object. Allocate lazily and bound the first slab
+                        // by the known selector width, never the source width.
+                        if (self.children.capacity == 0 and !self.retain_all) try self.children.ensureTotalCapacityPrecise(a, @min(self.selected.?.fields.count(), 8));
                         try self.children.append(a, .{ .node = if (self.pending_node) |node| node.* else .{ .raw = span } });
                     } else if (self.pending_node) |node| {
                         if (self.selected.?.fanout != null) try self.children.append(a, .{ .node = node.* }) else try parent.array_index.put(a, self.ordinal, node);
@@ -200,6 +264,19 @@ pub const View = struct {
             fn finishContainer(self: *@This(), a: Allocator) !void {
                 if (self.node) |node| {
                     if (self.object or self.selected.?.fanout != null) node.children = try self.children.toOwnedSlice(a);
+                    if (self.object) {
+                        node.markObjectComplete(!self.omitted);
+                        if (!node.objectComplete()) {
+                            var it = self.selected.?.fields.iterator();
+                            while (it.next()) |entry| {
+                                if (node.object_index.contains(entry.key_ptr.*)) continue;
+                                // Missing-name cache keys belong to the view,
+                                // which can outlive its borrowed selector plan.
+                                const name = try a.dupe(u8, entry.key_ptr.*);
+                                try node.object_index.put(a, name, std.math.maxInt(usize));
+                            }
+                        }
+                    }
                 }
             }
         };
@@ -237,7 +314,8 @@ pub const View = struct {
                         else => return error.SyntaxError,
                     };
                     if (policy == .all or frame.node != null) if ((try frame.names.getOrPut(frame.arena.allocator(), name)).found_existing) return error.DuplicateField;
-                    frame.name = if (frame.node != null) try alloc.dupe(u8, name) else name;
+                    frame.retain = frame.wants(name);
+                    frame.name = if (frame.retain) try alloc.dupe(u8, name) else name;
                     frame.key = false;
                     continue;
                 }
@@ -253,7 +331,7 @@ pub const View = struct {
                 const frame = &frames.items[depth];
                 var key_arena = frame.arena;
                 _ = key_arena.reset(.{ .retain_with_limit = 16 * 1024 });
-                frame.* = .{ .arena = key_arena, .object = token == .object_begin, .node = selected_node, .selected = selected_plan };
+                frame.* = .{ .arena = key_arena, .object = token == .object_begin, .node = selected_node, .selected = selected_plan, .retain_all = depth == 0 and options.retain_root_fields, .excluded = if (depth == 0) options.root_excluded else &.{} };
                 try frame.plan(alloc);
                 depth += 1;
             } else {
@@ -266,11 +344,14 @@ pub const View = struct {
     }
 
     pub fn materialize(self: *View, node: *Node) !Value {
-        if (node.logical) |value| return value;
+        switch (node.logical) {
+            .value, .complete_value => |value| return value,
+            else => {},
+        }
         // Predicates share the document evaluator's numeric interpretation.
         // Projection below separately retains exact stored number lexemes.
         const value = try std.json.parseFromSliceLeaky(Value, self.alloc, node.raw, .{});
-        node.logical = value;
+        node.logical = if (node.objectComplete()) .{ .complete_value = value } else .{ .value = value };
         self.materialized_values += 1;
         return value;
     }
@@ -327,24 +408,49 @@ pub const View = struct {
 
     /// Ordinary document projections share the native row path/array rules.
     pub fn includeRoot(self: *View, alloc: Allocator, dst: *std.json.ObjectMap, path: []const []const u8) !void {
-        if (path.len == 0 or self.root.kind() != '{') return;
+        if (path.len == 0) return;
+        for (self.root_sources) |source| if (std.mem.eql(u8, source.name, path[0])) {
+            return source.view.includeNode(alloc, dst, path[0], &source.view.root, path[1..]);
+        };
+        if (self.root.kind() != '{') return;
         if (try self.field(&self.root, path[0])) |node|
             try self.includeNode(alloc, dst, path[0], node, path[1..]);
     }
 
     pub fn includeRootExcept(self: *View, alloc: Allocator, dst: *std.json.ObjectMap, excluded: []const []const u8) !void {
-        if (self.root.kind() != '{') return;
+        return self.includeRootExceptImpl(alloc, dst, excluded, false);
+    }
+    /// Use only after prepareProjectionWithOptions retained every nonexcluded
+    /// root member with these exclusions. Other callers use includeRootExcept.
+    pub fn includePreparedRootExcept(self: *View, alloc: Allocator, dst: *std.json.ObjectMap, excluded: []const []const u8) !void {
+        return self.includeRootExceptImpl(alloc, dst, excluded, true);
+    }
+    fn includeRootExceptImpl(self: *View, alloc: Allocator, dst: *std.json.ObjectMap, excluded: []const []const u8, prepared: bool) !void {
         for (excluded) |name| if (std.mem.eql(u8, name, "*")) return;
-        const children_in_order = try self.children(&self.root);
+        const children_in_order: []Child = if (self.root.kind() == '{') (if (prepared) self.root.children orelse try self.children(&self.root) else try self.children(&self.root)) else &.{};
         const names = try self.alloc.alloc([]const u8, children_in_order.len);
         // Preserve source order without adding a name to every array node.
         var entries = self.root.object_index.iterator();
-        while (entries.next()) |entry| names[entry.value_ptr.*] = entry.key_ptr.*;
+        while (entries.next()) |entry| if (entry.value_ptr.* < names.len) {
+            names[entry.value_ptr.*] = entry.key_ptr.*;
+        };
         for (children_in_order, names) |*child, field_name| {
             const omit = for (excluded) |name| {
                 if (std.mem.eql(u8, name, field_name)) break true;
             } else false;
-            if (!omit) try self.includeNode(alloc, dst, field_name, &child.node, &.{});
+            if (!omit) {
+                const replacement = for (self.root_sources) |source| {
+                    if (std.mem.eql(u8, source.name, field_name)) break source;
+                } else null;
+                if (replacement) |source| try source.view.includeNode(alloc, dst, field_name, &source.view.root, &.{}) else try self.includeNode(alloc, dst, field_name, &child.node, &.{});
+            }
+        }
+        for (self.root_sources) |source| {
+            if (self.root.object_index.contains(source.name)) continue;
+            const omit = for (excluded) |name| {
+                if (std.mem.eql(u8, name, source.name)) break true;
+            } else false;
+            if (!omit) try source.view.includeNode(alloc, dst, source.name, &source.view.root, &.{});
         }
     }
 
@@ -355,6 +461,15 @@ pub const View = struct {
             const value = try std.json.parseFromSliceLeaky(Value, alloc, node.raw, .{ .parse_numbers = self.parse_numbers });
             try dst.put(alloc, name, value);
             return;
+        }
+        // Synthetic-field wildcards need a DOM only of that selected source,
+        // never of the surrounding primary document. This also preserves the
+        // legacy object/array wildcard rules for stored special fields.
+        if (path.len == 1 and std.mem.eql(u8, path[0], "*")) {
+            const value = try std.json.parseFromSliceLeaky(Value, alloc, node.raw, .{ .parse_numbers = self.parse_numbers });
+            var source = std.json.ObjectMap.empty;
+            try source.put(alloc, name, value);
+            return @import("../document_query.zig").applyIncludePath(alloc, source, dst, &.{ name, "*" });
         }
         switch (node.kind()) {
             '{' => {
@@ -476,4 +591,38 @@ test "relational lazy JSON errors release all arenas and deep fanout is iterativ
     var values = std.ArrayListUnmanaged(Value).empty;
     try view.collect(&.{"n"}, false, &values);
     try std.testing.expectEqual(@as(usize, 1), values.items.len);
+}
+
+test "public graph metric borrowed wire partial JSON object caches survive predicate and plan reuse" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const s = arena.allocator();
+    var view = View.init(s, "{\"skip\":2,\"keep\":1,\"other\":{\"a\":3}}");
+    var values: std.ArrayListUnmanaged(Value) = .empty;
+    try view.collect(&.{"skip"}, false, &values);
+    try std.testing.expectEqual(@as(i64, 2), values.items[0].integer);
+    var plan_arena = std.heap.ArenaAllocator.init(a);
+    var live = true;
+    defer if (live) plan_arena.deinit();
+    const selector = try plan_mod.compile(plan_arena.allocator(), &.{ .{ .parts = &.{"keep"} }, .{ .parts = &.{"missing"} } });
+    try view.prepareProjection(selector, .visited, .object_only);
+    try std.testing.expectEqual(@as(usize, 1), view.root.children.?.len);
+    plan_arena.deinit();
+    live = false;
+    values.clearRetainingCapacity();
+    try view.collect(&.{"missing"}, false, &values);
+    try std.testing.expectEqual(@as(usize, 0), values.items.len);
+    try std.testing.expectEqual(@as(usize, 1), view.root.children.?.len);
+    try view.collect(&.{ "other", "a" }, false, &values);
+    try std.testing.expectEqual(@as(i64, 3), values.items[0].integer);
+    values.clearRetainingCapacity();
+    try view.collect(&.{"skip"}, false, &values);
+    try std.testing.expectEqual(@as(i64, 2), values.items[0].integer);
+    const keep = try plan_mod.compile(s, &.{.{ .parts = &.{"keep"} }});
+    try view.prepareProjection(keep, .visited, .object_only);
+    var all: std.json.ObjectMap = .empty;
+    try view.includeRootExcept(s, &all, &.{});
+    const body = try std.json.Stringify.valueAlloc(s, Value{ .object = all }, .{});
+    try std.testing.expectEqualStrings(view.root.raw, body);
 }
