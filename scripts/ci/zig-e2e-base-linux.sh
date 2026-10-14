@@ -76,7 +76,7 @@ if [[ "$#" -gt 0 ]]; then
   run_inference="${RUN_INFERENCE_E2E:-0}"
 else
   antfly_args=(
-    -m "not objectstore_integration and not standalone_integration and not real_model and not postgres_integration and not slow"
+    -m "$(python3 "$script_dir/zig_e2e_shard.py" base-marker)"
     e2e/antfly
   )
   run_inference="${RUN_INFERENCE_E2E:-1}"

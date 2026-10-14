@@ -22,6 +22,8 @@ pub const Spec = struct {
 };
 
 fn isBackend(value: []const u8) bool {
+    // `onnx` names the removed ONNX Runtime backend. It is still recognized
+    // here so the caller rejects it instead of reading it as part of the name.
     return std.mem.eql(u8, value, "native") or
         std.mem.eql(u8, value, "onnx") or
         std.mem.eql(u8, value, "metal") or

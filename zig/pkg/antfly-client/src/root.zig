@@ -306,10 +306,15 @@ test "personal connections polling accommodates slow status and explicit deadlin
             defer response.deinit();
             try std.testing.expectEqualStrings("connected", response.data.?.value.status);
             try serving.await(io);
+            try std.testing.expectEqual(@as(usize, 1), server.route_hits[0]);
         } else {
             try std.testing.expectError(error.Timeout, client.getChatGPTAttemptWithTimeout("attempt-1", 50));
+            // The deadline may expire before the server accepts the request.
+            // Join the worker before reading its counters; neither outcome
+            // may replay the attempt after the caller's budget expires.
+            serving.cancel(io) catch {};
+            try std.testing.expect(server.route_hits[0] <= 1);
         }
-        try std.testing.expectEqual(@as(usize, 1), server.route_hits[0]);
     }
 }
 

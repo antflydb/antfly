@@ -35,7 +35,6 @@ const print = std.debug.print;
 
 const BackendChoice = enum {
     auto,
-    onnx,
     native,
     metal,
     cuda,
@@ -558,7 +557,6 @@ fn jsonEncodeString(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocat
 
 fn parseBackendChoice(value: []const u8) ?BackendChoice {
     if (std.mem.eql(u8, value, "auto")) return .auto;
-    if (std.mem.eql(u8, value, "onnx")) return .onnx;
     if (std.mem.eql(u8, value, "native")) return .native;
     if (std.mem.eql(u8, value, "metal")) return .metal;
     if (std.mem.eql(u8, value, "cuda")) return .cuda;
@@ -573,7 +571,6 @@ fn configureBackendPreference(session_manager: *backends.SessionManager, choice:
             &.{ backends.BackendType.metal, backends.BackendType.native }
         else
             &.{backends.BackendType.native},
-        .onnx => &.{backends.BackendType.onnx},
         .native => &.{backends.BackendType.native},
         .metal => if (build_options.enable_metal) &.{backends.BackendType.metal} else &.{backends.BackendType.native},
         .cuda => if (build_options.enable_cuda) &.{backends.BackendType.cuda} else &.{backends.BackendType.native},
@@ -583,7 +580,6 @@ fn configureBackendPreference(session_manager: *backends.SessionManager, choice:
 fn ensureRequestedBackendAvailable(choice: BackendChoice) !void {
     switch (choice) {
         .auto, .native => return,
-        .onnx => return,
         .cuda => if (!build_options.enable_cuda) return error.BackendUnavailable,
         .metal => {
             if (native_backend_guard.checkMetal(build_options.enable_metal, metal_runtime.metalDeviceAvailable())) |failure| {
@@ -597,7 +593,7 @@ fn ensureRequestedBackendAvailable(choice: BackendChoice) !void {
 
 fn printUsage() void {
     print(
-        \\usage: antfly inference read <model-dir> <image-path> [--backend auto|onnx|native|metal|cuda] [--prompt <prompt>] [--max-tokens <n>] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--warmup-iters <n>] [--measure-iters <n>] [--json-timing <path>]
+        \\usage: antfly inference read <model-dir> <image-path> [--backend auto|native|metal|cuda] [--prompt <prompt>] [--max-tokens <n>] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--warmup-iters <n>] [--measure-iters <n>] [--json-timing <path>]
         \\  Runs local document/image reading and prints a JSON response to stdout.
         \\  With --measure-iters, keeps the model loaded and prints warm request latency JSON. --json-timing also writes that JSON to a file.
         \\
@@ -644,8 +640,8 @@ test "parseArgs rejects zero max tokens" {
     }));
 }
 
-test "parseBackendChoice accepts onnx" {
-    try std.testing.expectEqual(BackendChoice.onnx, parseBackendChoice("onnx").?);
+test "parseBackendChoice rejects the removed onnx backend" {
+    try std.testing.expect(parseBackendChoice("onnx") == null);
 }
 
 test "parseBackendChoice accepts cuda" {

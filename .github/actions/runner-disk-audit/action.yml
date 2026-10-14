@@ -1,5 +1,5 @@
 name: ARC runner disk audit
-description: Sample runner filesystems during the job and report peak usage at job completion
+description: Sample runner filesystems and memory during the job and report peaks at job completion
 runs:
   using: node24
   main: main.cjs

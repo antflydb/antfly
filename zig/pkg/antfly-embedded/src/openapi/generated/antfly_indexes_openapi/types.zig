@@ -6652,6 +6652,8 @@ pub const GraphMetricOrder = struct {
 
 /// Reads a published graph metric. Score-bearing graph metric queries on multi-shard tables require a globally coordinated metric snapshot and otherwise return graph_metric_global_materialization_required instead of merging mathematically incompatible shard-local scores.
 pub const GraphMetricQuery = struct {
+    /// Direction of query-time personalized PageRank; defaults to out. Requires seed_nodes and metric_freshness=fresh. Both treats every selected relationship as undirected, allowing entity seeds to reach documents through incoming mention edges.
+    direction: ?EdgeDirection = null,
     /// Optional result key. Defaults to the metric name.
     name: ?[]const u8 = null,
     /// Graph index that owns the published metric.
@@ -6669,6 +6671,7 @@ pub const GraphMetricQuery = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "direction", "direction", true },
         .{ "name", "name", true },
         .{ "index", "index", false },
         .{ "metric", "metric", false },
@@ -6688,6 +6691,10 @@ pub const GraphMetricQuery = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.direction) |value| {
+            try jw.objectField("direction");
+            try jw.write(value);
+        }
         if (self.name) |value| {
             try jw.objectField("name");
             try jw.write(value);
@@ -6718,6 +6725,8 @@ pub const GraphMetricQuery = struct {
 
 /// Blends a published graph metric into hit scores. Multi-shard tables require a globally coordinated metric snapshot and otherwise return graph_metric_global_materialization_required.
 pub const GraphMetricRerank = struct {
+    /// Direction of query-time personalized PageRank; defaults to out. Requires seed_nodes and metric_freshness=fresh. Both treats every selected relationship as undirected, allowing entity seeds to reach documents through incoming mention edges.
+    direction: ?EdgeDirection = null,
     /// Graph index that owns the published metric.
     index: []const u8,
     /// Graph metric name to blend into the search hit score.
@@ -6741,6 +6750,7 @@ pub const GraphMetricRerank = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "direction", "direction", true },
         .{ "index", "index", false },
         .{ "metric", "metric", false },
         .{ "candidate_count", "candidate_count", true },
@@ -6763,6 +6773,10 @@ pub const GraphMetricRerank = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.direction) |value| {
+            try jw.objectField("direction");
+            try jw.write(value);
+        }
         try jw.objectField("index");
         try jw.write(self.index);
         try jw.objectField("metric");
@@ -7996,6 +8010,10 @@ pub const GraphResolverConfig = struct {
     source_artifact_kind: ?[]const u8 = null,
     resolution_artifact: []const u8,
     key_template: []const u8,
+    /// Materialize canonical entity documents. False resolves graph keys without promotion.
+    promote: ?bool = null,
+    /// Explicit redirects between fully rendered keys in this resolver's table; no entity documents required. Changes trigger corpus re-resolution.
+    aliases: ?[]const std.json.Value = null,
     /// Mention labels this resolver consumes; empty consumes every label (catch-all). Labeled resolvers sharing a source artifact must claim disjoint label sets, and every catch-all on that artifact skips the labels claimed by labeled siblings, so extraction labels stay open-vocabulary while each mention routes to exactly one labeled resolver (label-routed tables, e.g. event mentions to an events table).
     labels: ?[]const []const u8 = null,
     type_must_match: ?bool = null,
@@ -8023,6 +8041,8 @@ pub const GraphResolverConfig = struct {
         .{ "source_artifact_kind", "source_artifact_kind", true },
         .{ "resolution_artifact", "resolution_artifact", false },
         .{ "key_template", "key_template", false },
+        .{ "promote", "promote", true },
+        .{ "aliases", "aliases", true },
         .{ "labels", "labels", true },
         .{ "type_must_match", "type_must_match", true },
         .{ "scorer", "scorer", true },
@@ -8064,6 +8084,14 @@ pub const GraphResolverConfig = struct {
         try jw.write(self.resolution_artifact);
         try jw.objectField("key_template");
         try jw.write(self.key_template);
+        if (self.promote) |value| {
+            try jw.objectField("promote");
+            try jw.write(value);
+        }
+        if (self.aliases) |value| {
+            try jw.objectField("aliases");
+            try jw.write(value);
+        }
         if (self.labels) |value| {
             try jw.objectField("labels");
             try jw.write(value);
@@ -8610,6 +8638,8 @@ pub const GraphTraversal = struct {
     max_depth: ?i64 = null,
     edge_weight: ?GraphEdgeWeightRange = null,
     limit: ?i64 = null,
+    /// Return each node once across all starts. Set false with include_paths to return each reaching path, including its start node. Depth, result, and work limits still bound path enumeration.
+    deduplicate_nodes: ?bool = null,
     include_paths: ?bool = null,
     /// Include each result node's stored document when it exists at the pinned snapshot. A dangling graph identity omits document. When false, document is always omitted.
     include_documents: ?bool = null,
@@ -8637,6 +8667,7 @@ pub const GraphTraversal = struct {
         .{ "max_depth", "max_depth", true },
         .{ "edge_weight", "edge_weight", true },
         .{ "limit", "limit", true },
+        .{ "deduplicate_nodes", "deduplicate_nodes", true },
         .{ "include_paths", "include_paths", true },
         .{ "include_documents", "include_documents", true },
         .{ "fields", "fields", true },
@@ -8682,6 +8713,10 @@ pub const GraphTraversal = struct {
         }
         if (self.limit) |value| {
             try jw.objectField("limit");
+            try jw.write(value);
+        }
+        if (self.deduplicate_nodes) |value| {
+            try jw.objectField("deduplicate_nodes");
             try jw.write(value);
         }
         if (self.include_paths) |value| {

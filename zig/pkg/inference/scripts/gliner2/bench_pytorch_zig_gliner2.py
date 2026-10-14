@@ -332,7 +332,6 @@ def run_zig(
         args.zig_cache_dir,
         "--global-cache-dir",
         args.zig_global_cache_dir,
-        "-Donnx=false",
         f"-Dmetal={'true' if backend == 'metal' else 'false'}",
         f"-Dcuda={'true' if backend == 'cuda' else 'false'}",
     ]

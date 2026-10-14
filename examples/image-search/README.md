@@ -4,7 +4,7 @@ Search your image collection using text descriptions or find visually similar im
 
 ## Prerequisites
 
-- Antfly running with Antfly inference and ONNX Runtime (CLIP requires ONNX)
+- Antfly running with Antfly inference
 - CLIP model: `antfly inference pull openai/clip-vit-base-patch32`
 
 ## Step 1: Create the Table
@@ -12,8 +12,6 @@ Search your image collection using text descriptions or find visually similar im
 Create a table with a CLIP embeddings index. The template combines the image URL and caption for multimodal embedding:
 
 <!-- include: main.go#create_table -->
-
-> **Note:** ONNX Runtime is experimental. If you encounter issues like "model not found" errors, empty results, or embeddings not being computed, try restarting Antfly. Check `antfly.log` for errors if problems persist.
 
 ## Step 2: Add a Sample Image
 

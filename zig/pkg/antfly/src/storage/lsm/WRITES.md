@@ -141,6 +141,8 @@ The durable write path should look closer to Lucene/Tantivy/Pebble:
 
 Global mutable-state memory is governed by `ResourceManager`, which admits an incoming mutable batch against a shared `lsm.in_memory_state` budget before WAL append (512 MiB soft / 768 MiB hard by default; adaptive provisioning can lower these, e.g. to a 576 MiB soft boundary under the same 768 MiB cap). The DB layer waits on the shared usage-change epoch before acquiring its apply lock, then repeats the projected admission check immediately before WAL append, so configured rejection happens before durability/apply. A backend drains local state at soft pressure but never blocks on aggregate state while its caller may hold a higher-level lock; hard pressure is a non-blocking `ResourceBudgetExceeded`. A writer behind an unlocked immutable build releases the backend mutex and waits on a completion condition instead, since that local flush can progress independently. See [LSM.md](LSM.md) for the immutable memtable lifecycle this admission contract sits on top of.
 
+Before the DB apply lock, a public write estimates its expanded LSM cost as two copies of its payload plus 512 bytes per operation and waits on the shared `lsm.in_memory_state` slice; a request larger than the hard slice is rejected immediately because waiting cannot make it fit. Budget rejection maps to HTTP 429 `Backpressured`, not HTTP 500. Each backend also has an aggregate immutable-byte limit in addition to its generation-count limit (primary 256 MiB, dense 512 MiB, text/sparse/graph 128 MiB) so one store cannot monopolize the global pool; these local caps are for per-backend fairness only, and `ResourceManager` remains the global authority ([history](../../../../../../docs/design/full-text/history/implementation-progress-2026-07.md)).
+
 ## Implementation Roadmap
 
 Current status:
@@ -207,6 +209,8 @@ Implementation task list:
   - Add explicit segment writer budgets for pending docs, token bytes, postings bytes, stored-doc bytes, and merge output bytes.
   - Use tiered segment merge policy by similar-sized segments, tombstone pressure, and max merge bytes.
   - Batch full-text manifest updates during replay/bulk windows.
+- Failure handling:
+  - `NoSpaceLeft` must propagate as a failed write/request and allow clean shutdown, not lead to a panic in `text_merge_runtime.deinit()` (open as of the 2026-04 log; text merge failures are now recorded and quarantine their source segments, but no `NoSpaceLeft`-specific shutdown test exists) ([history](../../../../../../docs/design/lsm-writes/history/follow-ups-2026-04.md)).
 
 Per-store LSM config split should come first. Add explicit store profiles for primary documents, derived log, text main/WAL metadata, HBC nodes, HBC metadata, HBC vectors, HBC vector mappings, and graph reverse indexes. The first implementation can thread per-store `lsm_backend.Options` through `IndexBackendOptions`, `PersistentIndex.open`, `HBCIndex.openWithLsmOptions`, and graph reverse store open. HBC should be the first consumer because node, metadata, vector, and mapping writes have very different sizes and rewrite behavior.
 

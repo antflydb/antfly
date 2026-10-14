@@ -43,15 +43,24 @@ must remain consistent between indexing and retrieval.
 
 Existing flat inputs return one vector per text or media part. A group returns
 one vector for all its ordered content. Each request must use one form throughout.
-Encoded rows/groups execute serially within the request workspace. Local PDF
+Ordered mixed groups execute serially within the request workspace. Flat encoded
+image rows use bounded vision and embedding-encoder cohorts. Local PDF
 page embeddings borrow the renderer's RGBA pixels, including padded row strides,
 without PNG encoding or decoding. They share the encoded-image resize and
-projector, then execute the encoder in cohorts of up to four pages. Cohorts
+projector, batching compatible patch grids before executing the embedding encoder
+in cohorts of up to four pages. Cohorts
 preserve page order, cap token padding at 25%, and occupy at most 2048 padded
 token slots. Masks isolate attention and mean pooling by page. Projections are
 released after each cohort, and observed execution reports native batching only
 when every cohort contains multiple pages. Model identity pins, reduced
 dimensions, deadlines and cancellation also apply to this raster path.
+On qualified Metal/CUDA row-operation paths, image-only cohorts retain visual
+soft tokens, prompt embeddings and encoder activations on the backend through
+masked pooling. Only final vectors are downloaded. CPU codec decoding and
+model-exact resizing still precede upload; Native keeps the host execution path.
+The [real-PDF benchmark](../../zig/pkg/inference/BATCHING.md#gemma4-pdf-measurement-and-resident-embedding-handoff) compares
+host/resident handoffs and an experimental GPU painter with the exact CPU renderer.
+Production PDF rendering uses the CPU renderer.
 For example, post this body to `/ai/v1/embed`:
 
 ```json

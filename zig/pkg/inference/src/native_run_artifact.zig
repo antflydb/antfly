@@ -35,9 +35,6 @@ const hf_tokenizer = @import("inference_hf_tokenizer");
 const sentencepiece = @import("inference_tokenizer").sentencepiece;
 const backends = @import("backends/backends.zig");
 const activations = @import("backends/activations.zig");
-const OnnxSessionOptions = if (build_options.enable_onnx) backends.onnx.SessionOptions else struct {
-    low_memory: bool = false,
-};
 const PjrtInputBinding = if (build_options.enable_pjrt)
     graph_mod.pjrt_compiler.InputBinding
 else
@@ -337,21 +334,6 @@ pub fn validateArtifact(
     io: std.Io,
     artifact_or_manifest_path: []const u8,
 ) !ValidationResult {
-    const session_manager = backends.SessionManager.init(allocator);
-    return validateArtifactWithSessionManager(
-        allocator,
-        io,
-        artifact_or_manifest_path,
-        &session_manager,
-    );
-}
-
-fn validateArtifactWithSessionManager(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    artifact_or_manifest_path: []const u8,
-    session_manager: *const backends.SessionManager,
-) !ValidationResult {
     if (compiled_artifact.isPackageManifestPath(artifact_or_manifest_path)) {
         var parsed = try compiled_artifact.readPackageManifest(allocator, io, artifact_or_manifest_path);
         defer parsed.deinit();
@@ -393,31 +375,6 @@ fn validateArtifactWithSessionManager(
     var parsed = try compiled_artifact.readManifest(allocator, io, manifest_path);
     defer parsed.deinit();
     const manifest = parsed.value;
-
-    if (std.mem.eql(u8, manifest.backend, "onnx")) {
-        try validateArtifactBackendPolicy(session_manager, manifest.backend);
-        if (!build_options.enable_onnx) return error.BackendUnavailable;
-        var session = try backends.onnx.createSession(allocator, manifest.artifact_path);
-        defer session.close();
-        const input_materialization = graph_mod.onnx_artifact_executor.detectInputMaterialization(
-            .host_assisted_explicit_kv,
-            session.inputInfo(),
-            session.outputInfo(),
-        );
-        return .{
-            .backend = try allocator.dupe(u8, manifest.backend),
-            .kind = try allocator.dupe(u8, manifest.kind),
-            .model_dir = try allocator.dupe(u8, manifest.model_dir),
-            .artifact_path = try allocator.dupe(u8, manifest.artifact_path),
-            .inputs = session.inputInfo().len,
-            .outputs = session.outputInfo().len,
-            .seq_len = manifest.seq_len,
-            .query_seq_len = manifest.query_seq_len,
-            .attention_mode = try allocator.dupe(u8, manifest.attention_mode),
-            .runtime_state_ownership = try allocator.dupe(u8, graph_mod.onnx_artifact_executor.stateOwnershipName(input_materialization)),
-            .supports_decode = input_materialization == .runtime_owned_host_cache or input_materialization == .backend_owned_kv,
-        };
-    }
 
     if (std.mem.eql(u8, manifest.backend, "xla")) {
         if (!build_options.enable_pjrt) return error.BackendUnavailable;
@@ -628,10 +585,6 @@ fn findMatchingFullModelPackageManifest(
             .{ .kind = "pjrt_hlo", .parameter_mode = compiled_artifact.pjrt_parameter_mode_embedded },
             .{ .kind = "pjrt_hlo", .parameter_mode = compiled_artifact.pjrt_parameter_mode_inputs },
         }
-    else if (std.mem.eql(u8, backend, "onnx"))
-        &.{
-            .{ .kind = "onnx_graph", .parameter_mode = null },
-        }
     else
         return null;
 
@@ -698,19 +651,7 @@ fn findMatchingFullModelArtifact(
         }
         return null;
     }
-
-    const kind = if (std.mem.eql(u8, backend, "onnx"))
-        "onnx_graph"
-    else
-        return null;
-    return compiled_artifact.findMatchingArtifactPath(allocator, io, search_dir, .{
-        .backend = backend,
-        .kind = kind,
-        .model_dir = model_dir,
-        .seq_len = seq_len,
-        .query_seq_len = query_seq_len,
-        .attention_mode = attention_mode,
-    });
+    return null;
 }
 
 fn resolvePackagePrefillManifestPath(
@@ -843,8 +784,7 @@ pub fn tryRunArtifactFromDir(
             allocator.free(manifest_path);
             continue;
         }
-        if (!(std.mem.eql(u8, manifest.kind, "onnx_graph") or
-            std.mem.eql(u8, manifest.kind, "pjrt_hlo") or
+        if (!(std.mem.eql(u8, manifest.kind, "pjrt_hlo") or
             std.mem.eql(u8, manifest.kind, "pjrt_executable") or
             std.mem.eql(u8, manifest.kind, "pjrt_partition_executable")))
         {
@@ -1025,11 +965,15 @@ test "run-artifact rejects a compiled backend outside the required policy" {
     session_manager.required_backend_invalid = false;
     try std.testing.expectError(
         error.RequiredBackendUnavailable,
+        validateArtifactBackendPolicy(&session_manager, "xla"),
+    );
+    try std.testing.expectError(
+        error.UnsupportedCompileBackend,
         validateArtifactBackendPolicy(&session_manager, "onnx"),
     );
 
     session_manager.required_backend = null;
-    try validateArtifactBackendPolicy(&session_manager, "onnx");
+    try validateArtifactBackendPolicy(&session_manager, "xla");
 }
 
 fn runPreparedArtifactPrompt(
@@ -1041,16 +985,10 @@ fn runPreparedArtifactPrompt(
     graph_input_ids: []const i32,
     compare_host: bool,
 ) !RunResult {
-    if (std.mem.eql(u8, artifact.kind, "onnx_graph") or
-        std.mem.eql(u8, artifact.kind, "pjrt_hlo") or
+    if (std.mem.eql(u8, artifact.kind, "pjrt_hlo") or
         std.mem.eql(u8, artifact.kind, "pjrt_executable"))
     {
-        const full_result = if (std.mem.eql(u8, artifact.backend, "onnx"))
-            if (compare_host)
-                try runOnnxArtifactFull(allocator, artifact, graph_input_ids, tokenizer.vocabSize(), true)
-            else
-                try runOnnxArtifactFullViaModelExecutor(allocator, io, manifest_path, artifact, graph_input_ids, tokenizer.vocabSize())
-        else if (std.mem.eql(u8, artifact.backend, "xla"))
+        const full_result = if (std.mem.eql(u8, artifact.backend, "xla"))
             try runPjrtHloArtifactFull(allocator, io, artifact, graph_input_ids, compare_host)
         else
             return error.UnsupportedCompileBackend;
@@ -1091,9 +1029,7 @@ fn runPreparedArtifactPrompt(
         if (pjrtExecDebugEnabled() and std.mem.eql(u8, artifact.backend, "xla")) {
             std.log.info("PJRT run-artifact full result deinit complete", .{});
         }
-        if (std.mem.eql(u8, artifact.backend, "onnx") and !compare_host) {
-            yieldAfterShortLivedOnnxSessionClose();
-        } else if (std.mem.eql(u8, artifact.backend, "xla")) {
+        if (std.mem.eql(u8, artifact.backend, "xla")) {
             if (pjrtExecDebugEnabled()) std.log.info("PJRT run-artifact post-run yield begin", .{});
             yieldAfterShortLivedPjrtSessionClose();
             if (pjrtExecDebugEnabled()) std.log.info("PJRT run-artifact post-run yield complete", .{});
@@ -1102,28 +1038,6 @@ fn runPreparedArtifactPrompt(
             std.log.info("PJRT run-artifact returning RunResult", .{});
         }
         return result;
-    }
-
-    if (std.mem.eql(u8, artifact.kind, "onnx_partition_graph")) {
-        var partition_result = try runOnnxPartitionArtifact(
-            allocator,
-            artifact,
-            graph_input_ids,
-            compare_host,
-        );
-        defer partition_result.deinit(allocator);
-        return .{
-            .backend = try allocator.dupe(u8, artifact.backend),
-            .kind = try allocator.dupe(u8, artifact.kind),
-            .manifest_path = try allocator.dupe(u8, manifest_path),
-            .artifact_path = try allocator.dupe(u8, artifact.artifact_path),
-            .token_text = &.{},
-            .output_count = partition_result.output_count,
-            .output_shapes_summary = try allocator.dupe(u8, partition_result.output_shapes_summary),
-            .compare_summary = try allocator.dupe(u8, partition_result.compare_summary),
-            .seq_len = artifact.seq_len,
-            .query_seq_len = artifact.query_seq_len,
-        };
     }
 
     if (std.mem.eql(u8, artifact.kind, "pjrt_partition_hlo") or
@@ -1168,51 +1082,6 @@ fn modelRuntimeAttentionModeFromArtifact(artifact: compiled_artifact.Manifest) !
     if (std.mem.eql(u8, artifact.attention_mode, "paged_prefill")) return .paged_prefill;
     if (std.mem.eql(u8, artifact.attention_mode, "paged_decode")) return .paged_decode;
     return error.UnsupportedArtifactKind;
-}
-
-fn runOnnxArtifactFullViaModelExecutor(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    manifest_path: []const u8,
-    artifact: compiled_artifact.Manifest,
-    graph_input_ids: []const i32,
-    fallback_vocab_size: usize,
-) !FullModelRunResult {
-    if (comptime !build_options.enable_onnx) return error.BackendUnavailable;
-
-    var executor_ctx = try graph_mod.onnx_artifact_executor.createModelExecutorFromManifestPath(
-        allocator,
-        io,
-        manifest_path,
-        fallback_vocab_size,
-    );
-    var executor = executor_ctx.modelExecutor();
-    defer executor.deinit();
-
-    var runtime_value = try executor.createRuntime(allocator);
-    defer runtime_value.deinit();
-    const runtime_caps = runtime_value.capabilities();
-    if (runtime_caps.supports_decode) {
-        return error.UnsupportedRuntimeCapabilities;
-    }
-
-    const input_ids = try allocator.alloc(i64, graph_input_ids.len);
-    defer allocator.free(input_ids);
-    for (graph_input_ids, 0..) |id, i| input_ids[i] = id;
-
-    var output = try runtime_value.prefill(allocator, .{
-        .input_ids = input_ids,
-        .seq_len = artifact.seq_len,
-        .query_seq_len = artifact.query_seq_len,
-        .attention_mode = try modelRuntimeAttentionModeFromArtifact(artifact),
-    });
-    defer output.deinit(allocator);
-    const token_id = activations.argmax(try output.hostLogits(allocator));
-
-    return .{
-        .token_id = token_id,
-        .compare_summary = &.{},
-    };
 }
 
 fn runPjrtHloArtifactFull(
@@ -1274,7 +1143,6 @@ fn runPjrtHloArtifactFull(
         .metal => .metal,
         .cuda => .cuda,
         .pjrt => return error.UnexpectedPjrtBackend,
-        .onnx => return error.UnexpectedOnnxBackend,
         .wasm => return error.UnexpectedWasmBackend,
     };
     const kv_dtype = session_factory.recommendedKvDTypeForSession(model.session, backend_kind);
@@ -1406,375 +1274,11 @@ const OwnedTensorInfoList = struct {
     }
 };
 
-fn cloneTensorInfoList(
-    allocator: std.mem.Allocator,
-    infos: []const backends.TensorInfo,
-) !OwnedTensorInfoList {
-    const out = try allocator.alloc(backends.TensorInfo, infos.len);
-    errdefer allocator.free(out);
-    var initialized: usize = 0;
-    errdefer {
-        for (out[0..initialized]) |info| {
-            allocator.free(info.name);
-            allocator.free(info.shape);
-        }
-    }
-    for (infos, 0..) |info, i| {
-        const owned_name = try allocator.dupe(u8, info.name);
-        const owned_shape = allocator.dupe(i64, info.shape) catch |err| {
-            allocator.free(owned_name);
-            return err;
-        };
-        out[i] = .{
-            .name = owned_name,
-            .dtype = info.dtype,
-            .shape = owned_shape,
-        };
-        initialized += 1;
-    }
-    return .{ .items = out };
-}
-
-fn deinitTensorSlice(allocator: std.mem.Allocator, tensors: []backends.Tensor) void {
-    for (tensors) |*tensor| tensor.deinit();
-    allocator.free(tensors);
-}
-
-fn onnxArtifactSessionOptions(
-    artifact: compiled_artifact.Manifest,
-    compare_host: bool,
-) OnnxSessionOptions {
-    const debug_outputs_enabled = artifact.onnx_output_node_ids.len > 1;
-    return if (compare_host or debug_outputs_enabled or artifact.onnx_input_node_ids.len > 0)
-        .{ .low_memory = true }
-    else
-        .{};
-}
-
-fn runOnnxArtifactLastLogits(
-    allocator: std.mem.Allocator,
-    artifact: compiled_artifact.Manifest,
-    graph_input_ids: []const i32,
-    fallback_vocab_size: usize,
-    query_seq_len: usize,
-) ![]f32 {
-    if (!build_options.enable_onnx) return error.BackendUnavailable;
-    const session_options = onnxArtifactSessionOptions(artifact, false);
-    var session = try backends.onnx.createSessionWithOptions(allocator, artifact.artifact_path, session_options);
-    defer session.close();
-    const last_logits = try runOnnxArtifactLastLogitsWithSession(
-        allocator,
-        artifact,
-        session,
-        graph_input_ids,
-        fallback_vocab_size,
-        query_seq_len,
-    );
-    yieldAfterShortLivedOnnxSessionClose();
-    return last_logits;
-}
-
-fn runOnnxArtifactLastLogitsWithSession(
-    allocator: std.mem.Allocator,
-    artifact: compiled_artifact.Manifest,
-    session: backends.Session,
-    graph_input_ids: []const i32,
-    fallback_vocab_size: usize,
-    query_seq_len: usize,
-) ![]f32 {
-    const input_info = session.inputInfo();
-    if (input_info.len == 0) return error.UnsupportedArtifactInputs;
-    const ids_i64 = try allocator.alloc(i64, graph_input_ids.len);
-    defer allocator.free(ids_i64);
-    for (graph_input_ids, 0..) |id, i| ids_i64[i] = id;
-
-    const full_inputs = try buildOnnxFullInputs(
-        allocator,
-        artifact,
-        input_info,
-        graph_input_ids,
-        ids_i64,
-    );
-    var full_inputs_owned = true;
-    errdefer if (full_inputs_owned) deinitTensorSlice(allocator, full_inputs);
-
-    const outputs = try session.run(full_inputs, allocator);
-    var outputs_owned = true;
-    errdefer if (outputs_owned) deinitTensorSlice(allocator, outputs);
-    deinitTensorSlice(allocator, full_inputs);
-    full_inputs_owned = false;
-
-    if (outputs.len == 0) return error.MissingValue;
-    if (outputs[0].dtype != .f32) return error.InvalidArtifactOutput;
-    var copied_logits: ?[]f32 = null;
-    defer if (copied_logits) |buf| allocator.free(buf);
-    const logits = if (outputs[0].asFloat32IfAligned()) |aligned|
-        aligned
-    else blk: {
-        copied_logits = try allocator.alloc(f32, outputs[0].data.len / @sizeOf(f32));
-        @memcpy(std.mem.sliceAsBytes(copied_logits.?), outputs[0].data);
-        break :blk copied_logits.?;
-    };
-    const output_logit_width = try inferOnnxOutputLogitWidth(
-        outputs[0].shape,
-        logits.len,
-        query_seq_len,
-        fallback_vocab_size,
-    );
-    const last_logits = try allocator.dupe(f32, logits[logits.len - output_logit_width ..]);
-    deinitTensorSlice(allocator, outputs);
-    outputs_owned = false;
-    return last_logits;
-}
-
-fn yieldAfterShortLivedOnnxSessionClose() void {
-    // ORT can still be tearing down worker state after a short-lived session
-    // close. Yield briefly before the CLI returns to avoid a native fast-exit
-    // teardown race in smoke-sized artifact runs.
-    platform.time.sleepNs(10_000_000);
-}
-
 fn yieldAfterShortLivedPjrtSessionClose() void {
     // The CPU PJRT plugin can still be quiescing runtime/ABSL state after a
-    // short compile-load-execute-destroy cycle. Match the ORT CLI guard so
-    // smoke-sized artifact runs do not abort during immediate process exit.
+    // short compile-load-execute-destroy cycle. Pause briefly so smoke-sized
+    // artifact runs do not abort during immediate process exit.
     platform.time.sleepNs(250_000_000);
-}
-
-fn runOnnxArtifactFull(
-    allocator: std.mem.Allocator,
-    artifact: compiled_artifact.Manifest,
-    graph_input_ids: []const i32,
-    fallback_vocab_size: usize,
-    compare_host: bool,
-) !FullModelRunResult {
-    if (!build_options.enable_onnx) return error.BackendUnavailable;
-    const debug_outputs_enabled = artifact.onnx_output_node_ids.len > 1;
-    if (compare_host and debug_outputs_enabled and !allowFullOnnxDebugCompare()) {
-        std.log.err(
-            "refusing full-graph ONNX debug compare because ORT can still materialize the full model and exceed memory limits; set ANTFLY_INFERENCE_ALLOW_FULL_ONNX_DEBUG_COMPARE=1 to override",
-            .{},
-        );
-        return error.UnsupportedArtifactOutput;
-    }
-    const session_options = onnxArtifactSessionOptions(artifact, compare_host);
-
-    var metadata_session = try backends.onnx.createSessionWithOptions(allocator, artifact.artifact_path, session_options);
-    var metadata_session_open = true;
-    defer if (metadata_session_open) metadata_session.close();
-    var input_info = try cloneTensorInfoList(allocator, metadata_session.inputInfo());
-    defer input_info.deinit(allocator);
-    var output_info = try cloneTensorInfoList(allocator, metadata_session.outputInfo());
-    defer output_info.deinit(allocator);
-    metadata_session.close();
-    metadata_session_open = false;
-    if (input_info.items.len == 0) return error.UnsupportedArtifactInputs;
-
-    const ids_i64 = try allocator.alloc(i64, graph_input_ids.len);
-    defer allocator.free(ids_i64);
-    for (graph_input_ids, 0..) |id, i| ids_i64[i] = id;
-
-    const full_inputs = try buildOnnxFullInputs(
-        allocator,
-        artifact,
-        input_info.items,
-        graph_input_ids,
-        ids_i64,
-    );
-    var full_inputs_owned = true;
-    errdefer if (full_inputs_owned) deinitTensorSlice(allocator, full_inputs);
-
-    const reordered_output_node_ids = if (artifact.onnx_output_node_ids.len == output_info.items.len) blk: {
-        break :blk if (artifact.onnx_output_names.len == output_info.items.len)
-            try reorderOnnxNodeIdsByName(allocator, artifact.onnx_output_node_ids, artifact.onnx_output_names, output_info.items)
-        else
-            try allocator.dupe(u32, artifact.onnx_output_node_ids);
-    } else null;
-    defer if (reordered_output_node_ids) |ids| allocator.free(ids);
-
-    const output_mapping = if (reordered_output_node_ids) |ids|
-        try summarizeOnnxOutputMapping(allocator, output_info.items, ids)
-    else
-        try allocator.dupe(u8, "");
-    defer allocator.free(output_mapping);
-
-    var session = try backends.onnx.createSessionWithOptions(allocator, artifact.artifact_path, session_options);
-    var session_open = true;
-    defer if (session_open) session.close();
-
-    const outputs = try session.run(full_inputs, allocator);
-    var outputs_owned = true;
-    errdefer if (outputs_owned) deinitTensorSlice(allocator, outputs);
-    deinitTensorSlice(allocator, full_inputs);
-    full_inputs_owned = false;
-    session.close();
-    session_open = false;
-
-    if (outputs.len == 0) return error.MissingValue;
-    if (outputs[0].dtype != .f32) return error.InvalidArtifactOutput;
-    var copied_logits: ?[]f32 = null;
-    defer if (copied_logits) |buf| allocator.free(buf);
-    const logits = if (outputs[0].asFloat32IfAligned()) |aligned|
-        aligned
-    else blk: {
-        copied_logits = try allocator.alloc(f32, outputs[0].data.len / @sizeOf(f32));
-        @memcpy(std.mem.sliceAsBytes(copied_logits.?), outputs[0].data);
-        break :blk copied_logits.?;
-    };
-    const output_logit_width = try inferOnnxOutputLogitWidth(
-        outputs[0].shape,
-        logits.len,
-        artifact.query_seq_len,
-        fallback_vocab_size,
-    );
-
-    if (compare_host) {
-        if (reordered_output_node_ids) |output_node_ids| {
-            const token_id = activations.argmax(logits[logits.len - output_logit_width ..]);
-            const compare_summary = try compareFullOnnxOutputsWithCapturedNative(
-                allocator,
-                artifact,
-                graph_input_ids,
-                logits[logits.len - output_logit_width ..],
-                output_mapping,
-                output_node_ids,
-                outputs,
-            );
-            deinitTensorSlice(allocator, outputs);
-            outputs_owned = false;
-            return .{
-                .token_id = token_id,
-                .compare_summary = compare_summary,
-            };
-        }
-
-        const last_logits = logits[logits.len - output_logit_width ..];
-        const last_logits_copy = try allocator.dupe(f32, last_logits);
-        defer allocator.free(last_logits_copy);
-        const token_id = activations.argmax(last_logits_copy);
-        deinitTensorSlice(allocator, outputs);
-        outputs_owned = false;
-        const compare_summary = try compareFullModelArtifactOutputs(allocator, artifact, graph_input_ids, last_logits_copy);
-        errdefer allocator.free(compare_summary);
-        return .{
-            .token_id = token_id,
-            .compare_summary = compare_summary,
-        };
-    }
-
-    defer {
-        deinitTensorSlice(allocator, outputs);
-        outputs_owned = false;
-    }
-    return finalizeFullModelRunResult(allocator, artifact, graph_input_ids, logits, false);
-}
-
-fn allowFullOnnxDebugCompare() bool {
-    return platform.env.getenvBool("ANTFLY_INFERENCE_ALLOW_FULL_ONNX_DEBUG_COMPARE");
-}
-
-fn inferOnnxOutputLogitWidth(
-    output_shape: []const i64,
-    logits_len: usize,
-    query_seq_len: usize,
-    fallback_vocab_size: usize,
-) !usize {
-    if (output_shape.len > 0 and output_shape[output_shape.len - 1] > 0) {
-        const width: usize = @intCast(output_shape[output_shape.len - 1]);
-        if (width > 0 and logits_len >= width) return width;
-    }
-    if (query_seq_len > 0) {
-        const width = logits_len / query_seq_len;
-        if (width > 0 and logits_len >= width) return width;
-    }
-    if (fallback_vocab_size > 0 and logits_len >= fallback_vocab_size) return fallback_vocab_size;
-    return error.InvalidArtifactOutput;
-}
-
-fn buildOnnxFullInputs(
-    allocator: std.mem.Allocator,
-    artifact: compiled_artifact.Manifest,
-    input_info: []const backends.TensorInfo,
-    graph_input_ids: []const i32,
-    ids_i64: []const i64,
-) ![]backends.Tensor {
-    if (input_info.len == 1 and artifact.onnx_input_node_ids.len == 0) {
-        const inputs = try allocator.alloc(backends.Tensor, 1);
-        errdefer allocator.free(inputs);
-        inputs[0] = switch (input_info[0].dtype) {
-            .i64 => try backends.Tensor.initInt64(allocator, input_info[0].name, &.{@intCast(graph_input_ids.len)}, ids_i64),
-            else => return error.UnsupportedArtifactInputs,
-        };
-        return inputs;
-    }
-    if (artifact.onnx_input_node_ids.len != input_info.len) return error.UnsupportedArtifactInputs;
-
-    const reordered_input_node_ids = if (artifact.onnx_input_names.len == input_info.len)
-        try reorderOnnxNodeIdsByName(allocator, artifact.onnx_input_node_ids, artifact.onnx_input_names, input_info)
-    else
-        try allocator.dupe(u32, artifact.onnx_input_node_ids);
-    defer allocator.free(reordered_input_node_ids);
-
-    var materialized: ?MaterializedPartitionInputs = null;
-    defer if (materialized) |*m| m.deinit(allocator);
-    if (onnxFullInputsNeedMaterializedValues(artifact.attention_bindings)) {
-        const capture_node_ids = try collectOnnxFullInputCaptureNodeIds(
-            allocator,
-            reordered_input_node_ids,
-            artifact.attention_bindings,
-        );
-        defer allocator.free(capture_node_ids);
-        materialized = try materializePartitionInputs(
-            allocator,
-            artifact,
-            graph_input_ids,
-            capture_node_ids,
-        );
-    }
-
-    const inputs = try allocator.alloc(backends.Tensor, input_info.len);
-    errdefer allocator.free(inputs);
-    var initialized: usize = 0;
-    errdefer {
-        for (inputs[0..initialized]) |*tensor| tensor.deinit();
-    }
-    for (input_info, reordered_input_node_ids, 0..) |info, node_id_u32, i| {
-        if (materialized) |*m| {
-            if (findCapturedNodeIndex(m.node_ids, @intCast(node_id_u32))) |capture_idx| {
-                inputs[i] = try tensorFromCapturedValue(allocator, info.name, info.shape, info.dtype, m.values[capture_idx], &m.cb);
-                initialized += 1;
-                continue;
-            }
-        }
-        inputs[i] = try tensorFromGraphInputIds(allocator, info.name, info.shape, info.dtype, graph_input_ids);
-        initialized += 1;
-    }
-    return inputs;
-}
-
-fn onnxFullInputsNeedMaterializedValues(attention_bindings: []const compiled_artifact.AttentionBindingMeta) bool {
-    for (attention_bindings) |binding| {
-        if (binding.skip_kv_write) return true;
-    }
-    return false;
-}
-
-fn collectOnnxFullInputCaptureNodeIds(
-    allocator: std.mem.Allocator,
-    input_node_ids: []const u32,
-    attention_bindings: []const compiled_artifact.AttentionBindingMeta,
-) ![]ml.graph.NodeId {
-    var out = std.ArrayListUnmanaged(ml.graph.NodeId).empty;
-    defer out.deinit(allocator);
-    for (input_node_ids) |node_id| {
-        if (node_id == std.math.maxInt(u32)) continue;
-        try appendUniqueCaptureNodeId(allocator, &out, @intCast(node_id));
-    }
-    for (attention_bindings) |binding| {
-        if (!binding.skip_kv_write) continue;
-        try appendUniqueCaptureNodeId(allocator, &out, @intCast(binding.node_id));
-    }
-    return out.toOwnedSlice(allocator);
 }
 
 fn appendUniqueCaptureNodeId(
@@ -1786,30 +1290,6 @@ fn appendUniqueCaptureNodeId(
         if (existing == node_id) return;
     }
     try out.append(allocator, node_id);
-}
-
-fn finalizeFullModelRunResult(
-    allocator: std.mem.Allocator,
-    artifact: compiled_artifact.Manifest,
-    graph_input_ids: []const i32,
-    logits: []const f32,
-    compare_host: bool,
-) !FullModelRunResult {
-    const vocab_size = switch (artifact.query_seq_len) {
-        0 => return error.InvalidArtifactOutput,
-        else => logits.len / artifact.query_seq_len,
-    };
-    if (vocab_size == 0 or logits.len < vocab_size) return error.InvalidArtifactOutput;
-    const last_logits = logits[logits.len - vocab_size ..];
-    const compare_summary = if (compare_host)
-        try compareFullModelArtifactOutputs(allocator, artifact, graph_input_ids, last_logits)
-    else
-        try allocator.dupe(u8, "");
-    errdefer allocator.free(compare_summary);
-    return .{
-        .token_id = activations.argmax(last_logits),
-        .compare_summary = compare_summary,
-    };
 }
 
 const MaterializedPartitionInputs = struct {
@@ -1841,98 +1321,6 @@ const PartitionRunResult = struct {
         self.* = undefined;
     }
 };
-
-fn runOnnxPartitionArtifact(
-    allocator: std.mem.Allocator,
-    artifact: compiled_artifact.Manifest,
-    graph_input_ids: []const i32,
-    compare_host: bool,
-) !PartitionRunResult {
-    if (!build_options.enable_onnx) return error.BackendUnavailable;
-    if (artifact.onnx_output_node_ids.len == 0) return error.MissingArtifactMetadata;
-
-    const capture_node_ids = try collectOnnxPartitionNodeIds(
-        allocator,
-        artifact.onnx_input_node_ids,
-        artifact.onnx_output_node_ids,
-    );
-    defer allocator.free(capture_node_ids);
-
-    var materialized = try materializePartitionInputs(
-        allocator,
-        artifact,
-        graph_input_ids,
-        capture_node_ids,
-    );
-    defer materialized.deinit(allocator);
-
-    var session = try backends.onnx.createSession(allocator, artifact.artifact_path);
-    defer session.close();
-    const input_info = session.inputInfo();
-    const output_info = session.outputInfo();
-    if (input_info.len != artifact.onnx_input_node_ids.len) return error.UnsupportedArtifactInputs;
-    if (output_info.len != artifact.onnx_output_node_ids.len) return error.InvalidArtifactOutput;
-
-    const reordered_input_node_ids = if (artifact.onnx_input_names.len == input_info.len)
-        try reorderOnnxNodeIdsByName(allocator, artifact.onnx_input_node_ids, artifact.onnx_input_names, input_info)
-    else
-        try allocator.dupe(u32, artifact.onnx_input_node_ids);
-    defer allocator.free(reordered_input_node_ids);
-
-    const inputs = try allocator.alloc(backends.Tensor, input_info.len);
-    defer {
-        for (inputs) |*tensor| tensor.deinit();
-        allocator.free(inputs);
-    }
-    for (input_info, reordered_input_node_ids, 0..) |info, node_id_u32, i| {
-        if (findCapturedNodeIndex(materialized.node_ids, @intCast(node_id_u32))) |capture_idx| {
-            inputs[i] = try tensorFromCapturedValue(allocator, info.name, info.shape, info.dtype, materialized.values[capture_idx], &materialized.cb);
-            continue;
-        }
-        inputs[i] = try tensorFromGraphInputIds(allocator, info.name, info.shape, info.dtype, graph_input_ids);
-    }
-
-    const outputs = try session.run(inputs, allocator);
-    defer {
-        for (outputs) |*tensor| tensor.deinit();
-        allocator.free(outputs);
-    }
-
-    const output_shapes = try allocator.alloc([]const i64, outputs.len);
-    defer allocator.free(output_shapes);
-    for (outputs, 0..) |tensor, i| output_shapes[i] = tensor.shape;
-
-    const reordered_output_node_ids = if (artifact.onnx_output_names.len == output_info.len)
-        try reorderOnnxNodeIdsByName(allocator, artifact.onnx_output_node_ids, artifact.onnx_output_names, output_info)
-    else
-        try allocator.dupe(u32, artifact.onnx_output_node_ids);
-    defer allocator.free(reordered_output_node_ids);
-
-    const output_shapes_summary = try summarizeShapesConst(allocator, output_shapes);
-    errdefer allocator.free(output_shapes_summary);
-    const compare_summary = if (compare_host) blk: {
-        const diffs = try compareOnnxPartitionOutputs(
-            allocator,
-            reordered_output_node_ids,
-            outputs,
-            0,
-            materialized.node_ids,
-            materialized.values,
-            &materialized.cb,
-        );
-        defer allocator.free(diffs);
-        const mapping = try summarizeOnnxOutputMapping(allocator, output_info, reordered_output_node_ids);
-        defer allocator.free(mapping);
-        break :blk try std.fmt.allocPrint(allocator, "{s}; {s}", .{ mapping, diffs });
-    } else try allocator.dupe(u8, "");
-    errdefer allocator.free(compare_summary);
-
-    return .{
-        .output_count = outputs.len,
-        .output_shapes_summary = output_shapes_summary,
-        .compare_summary = compare_summary,
-    };
-}
 
 fn runPjrtPartitionArtifact(
     allocator: std.mem.Allocator,
@@ -2115,7 +1503,6 @@ fn materializePartitionInputs(
         .metal => .metal,
         .cuda => .cuda,
         .pjrt => return error.UnexpectedPjrtBackend,
-        .onnx => return error.UnexpectedOnnxBackend,
         .wasm => return error.UnexpectedWasmBackend,
     };
     const kv_dtype = session_factory.recommendedKvDTypeForSession(model.session, backend_kind);
@@ -2373,137 +1760,6 @@ fn shapeElementCount(shape: ml.graph.Shape) ?usize {
     return total;
 }
 
-fn compareFullModelArtifactOutputs(
-    allocator: std.mem.Allocator,
-    artifact: compiled_artifact.Manifest,
-    graph_input_ids: []const i32,
-    artifact_last_logits: []const f32,
-) ![]u8 {
-    const host_last_logits = try computeNativeLastLogitsForArtifact(allocator, artifact, graph_input_ids);
-    defer allocator.free(host_last_logits);
-
-    if (host_last_logits.len != artifact_last_logits.len) return error.ArtifactShapeMismatch;
-
-    var max_abs_diff: f32 = 0.0;
-    var mean_abs_diff: f64 = 0.0;
-    for (host_last_logits, artifact_last_logits) |host_v, artifact_v| {
-        const diff = @abs(host_v - artifact_v);
-        if (diff > max_abs_diff) max_abs_diff = diff;
-        mean_abs_diff += diff;
-    }
-    mean_abs_diff /= @floatFromInt(host_last_logits.len);
-
-    const host_top1 = activations.argmax(host_last_logits);
-    const artifact_top1 = activations.argmax(artifact_last_logits);
-    return std.fmt.allocPrint(
-        allocator,
-        "host_top1={d}, artifact_top1={d}, max_abs_diff={d}, mean_abs_diff={d}",
-        .{ host_top1, artifact_top1, max_abs_diff, mean_abs_diff },
-    );
-}
-
-fn compareFullOnnxOutputsWithCapturedNative(
-    allocator: std.mem.Allocator,
-    artifact: compiled_artifact.Manifest,
-    graph_input_ids: []const i32,
-    artifact_logits: []const f32,
-    output_mapping: []const u8,
-    reordered_output_node_ids: []const u32,
-    outputs: []const backends.Tensor,
-) ![]u8 {
-    if (reordered_output_node_ids.len == 0 or outputs.len == 0) return error.MissingArtifactMetadata;
-
-    const capture_node_ids = try collectOnnxPartitionNodeIds(allocator, &.{}, reordered_output_node_ids);
-    defer allocator.free(capture_node_ids);
-
-    var materialized = try materializePartitionInputs(
-        allocator,
-        artifact,
-        graph_input_ids,
-        capture_node_ids,
-    );
-    defer materialized.deinit(allocator);
-
-    var last_logits_max_abs_diff: f32 = 0.0;
-    var last_logits_mean_abs_diff: f64 = 0.0;
-    const host_top1 = blk: {
-        const capture_idx = findCapturedNodeIndex(materialized.node_ids, @intCast(reordered_output_node_ids[0])) orelse return error.MissingRuntimeInput;
-        const host_data = try materialized.cb.toFloat32(materialized.values[capture_idx], allocator);
-        defer allocator.free(host_data);
-        if (host_data.len < artifact_logits.len) return error.ArtifactShapeMismatch;
-        const host_logits = host_data[host_data.len - artifact_logits.len ..];
-        for (host_logits, artifact_logits) |host_v, artifact_v| {
-            const diff = @abs(host_v - artifact_v);
-            if (diff > last_logits_max_abs_diff) last_logits_max_abs_diff = diff;
-            last_logits_mean_abs_diff += diff;
-        }
-        last_logits_mean_abs_diff /= @floatFromInt(artifact_logits.len);
-        break :blk activations.argmax(host_logits);
-    };
-    const artifact_top1 = activations.argmax(artifact_logits);
-
-    const diffs = try compareOnnxPartitionOutputs(
-        allocator,
-        reordered_output_node_ids,
-        outputs,
-        0,
-        materialized.node_ids,
-        materialized.values,
-        &materialized.cb,
-    );
-    defer allocator.free(diffs);
-    return std.fmt.allocPrint(
-        allocator,
-        "host_top1={d}, artifact_top1={d}; last_logits:max_abs_diff={d}, mean_abs_diff={d}; graph_{s}; graph_{s}",
-        .{ host_top1, artifact_top1, last_logits_max_abs_diff, last_logits_mean_abs_diff, output_mapping, diffs },
-    );
-}
-
-fn computeNativeLastLogitsForArtifact(
-    allocator: std.mem.Allocator,
-    artifact: compiled_artifact.Manifest,
-    graph_input_ids: []const i32,
-) ![]f32 {
-    var session_manager = backends.SessionManager.init(allocator);
-    session_manager.preferred_backends = &.{backends.BackendType.native};
-    var model_manager = model_manager_mod.ModelManager.init(allocator, session_manager);
-    defer model_manager.deinit();
-
-    const model = try model_manager.loadFromDirWithPreferredBackends(
-        artifact.model_dir,
-        &.{backends.BackendType.native},
-        true,
-    );
-    const gpt_config = session_factory.getGptConfig(model.session) orelse return error.InvalidModelForGeneration;
-
-    const input_ids = try allocator.alloc(i64, graph_input_ids.len);
-    defer allocator.free(input_ids);
-    for (graph_input_ids, 0..) |id, i| input_ids[i] = id;
-
-    var cb = try session_factory.getComputeBackend(model.session, allocator);
-    defer cb.deinit();
-
-    const backend_kind: runtime.kv.pool.BackendKind = switch (model.session.backend()) {
-        .native => .native,
-        .metal => .metal,
-        .cuda => .cuda,
-        .pjrt => return error.UnexpectedPjrtBackend,
-        .onnx => return error.UnexpectedOnnxBackend,
-        .wasm => return error.UnexpectedWasmBackend,
-    };
-
-    return computeNativeLastLogitsWithBackend(
-        allocator,
-        artifact,
-        graph_input_ids,
-        gpt_config,
-        &cb,
-        backend_kind,
-        session_factory.recommendedKvDTypeForSession(model.session, backend_kind),
-        model.shared_moe_cache,
-    );
-}
-
 fn computeNativeLastLogitsWithBackend(
     allocator: std.mem.Allocator,
     artifact: compiled_artifact.Manifest,
@@ -2553,38 +1809,6 @@ fn computeNativeLastLogitsWithBackend(
     const vocab_size = gpt_config.vocab_size;
     if (logits.len < vocab_size) return error.InvalidArtifactOutput;
     return try allocator.dupe(f32, logits[logits.len - vocab_size ..]);
-}
-
-fn collectOnnxPartitionNodeIds(
-    allocator: std.mem.Allocator,
-    input_node_ids: []const u32,
-    output_node_ids: []const u32,
-) ![]ml.graph.NodeId {
-    var out = std.ArrayListUnmanaged(ml.graph.NodeId).empty;
-    defer out.deinit(allocator);
-    for (input_node_ids) |node_id_u32| {
-        const node_id: ml.graph.NodeId = @intCast(node_id_u32);
-        var found = false;
-        for (out.items) |existing| {
-            if (existing == node_id) {
-                found = true;
-                break;
-            }
-        }
-        if (!found) try out.append(allocator, node_id);
-    }
-    for (output_node_ids) |node_id_u32| {
-        const node_id: ml.graph.NodeId = @intCast(node_id_u32);
-        var found = false;
-        for (out.items) |existing| {
-            if (existing == node_id) {
-                found = true;
-                break;
-            }
-        }
-        if (!found) try out.append(allocator, node_id);
-    }
-    return out.toOwnedSlice(allocator);
 }
 
 fn buildGraphRuntimeInputs(
@@ -2745,45 +1969,6 @@ fn summarizeShapesConst(allocator: std.mem.Allocator, shapes: []const []const i6
     return out.toOwnedSlice(allocator);
 }
 
-fn compareOnnxPartitionOutputs(
-    allocator: std.mem.Allocator,
-    output_node_ids_u32: []const u32,
-    outputs: []const backends.Tensor,
-    output_index_offset: usize,
-    captured_node_ids: []const ml.graph.NodeId,
-    captured_values: []const ops.CT,
-    cb: *const ops.ComputeBackend,
-) ![]u8 {
-    var out = std.ArrayListUnmanaged(u8).empty;
-    defer out.deinit(allocator);
-    for (output_node_ids_u32, outputs, 0..) |node_id_u32, tensor, idx| {
-        const capture_idx = findCapturedNodeIndex(captured_node_ids, @intCast(node_id_u32)) orelse return error.MissingRuntimeInput;
-        const host_data = try cb.toFloat32(captured_values[capture_idx], allocator);
-        defer allocator.free(host_data);
-        if (tensor.dtype != .f32) return error.InvalidArtifactOutput;
-        var copied_output: ?[]f32 = null;
-        defer if (copied_output) |buf| allocator.free(buf);
-        const onnx_data = if (tensor.asFloat32IfAligned()) |aligned|
-            aligned
-        else blk: {
-            copied_output = try allocator.alloc(f32, tensor.data.len / @sizeOf(f32));
-            @memcpy(std.mem.sliceAsBytes(copied_output.?), tensor.data);
-            break :blk copied_output.?;
-        };
-        if (host_data.len != onnx_data.len) return error.ArtifactShapeMismatch;
-        var max_abs_diff: f32 = 0.0;
-        for (host_data, onnx_data) |host_v, onnx_v| {
-            const diff = @abs(host_v - onnx_v);
-            if (diff > max_abs_diff) max_abs_diff = diff;
-        }
-        if (idx > 0) try out.appendSlice(allocator, ", ");
-        const line = try std.fmt.allocPrint(allocator, "out{d}:max_abs_diff={d}", .{ idx + output_index_offset, max_abs_diff });
-        defer allocator.free(line);
-        try out.appendSlice(allocator, line);
-    }
-    return out.toOwnedSlice(allocator);
-}
-
 fn comparePjrtPartitionOutputs(
     allocator: std.mem.Allocator,
     output_node_ids: []const ml.graph.NodeId,
@@ -2813,111 +1998,6 @@ fn comparePjrtPartitionOutputs(
         try out.appendSlice(allocator, line);
     }
     return out.toOwnedSlice(allocator);
-}
-
-fn reorderOnnxNodeIdsByName(
-    allocator: std.mem.Allocator,
-    node_ids: []const u32,
-    node_names: []const []u8,
-    info_list: []const backends.TensorInfo,
-) ![]u32 {
-    const reordered = try allocator.alloc(u32, info_list.len);
-    errdefer allocator.free(reordered);
-    for (info_list, 0..) |info, idx| {
-        const src_idx = findFeatureIndexConst(node_names, info.name) orelse return error.InvalidArtifactOutput;
-        reordered[idx] = node_ids[src_idx];
-    }
-    return reordered;
-}
-
-fn findFeatureIndexConst(features: []const []u8, name: []const u8) ?usize {
-    for (features, 0..) |feature, idx| {
-        if (std.mem.eql(u8, feature, name)) return idx;
-    }
-    return null;
-}
-
-fn summarizeOnnxOutputMapping(
-    allocator: std.mem.Allocator,
-    output_info: []const backends.TensorInfo,
-    reordered_output_node_ids: []const u32,
-) ![]u8 {
-    var out = std.ArrayListUnmanaged(u8).empty;
-    defer out.deinit(allocator);
-    try out.appendSlice(allocator, "mapping=");
-    for (output_info, reordered_output_node_ids, 0..) |info, node_id, idx| {
-        if (idx > 0) try out.appendSlice(allocator, ",");
-        const piece = try std.fmt.allocPrint(allocator, "{s}->{d}", .{ info.name, node_id });
-        defer allocator.free(piece);
-        try out.appendSlice(allocator, piece);
-    }
-    return out.toOwnedSlice(allocator);
-}
-
-fn tensorFromCapturedValue(
-    allocator: std.mem.Allocator,
-    name: []const u8,
-    expected_shape: []const i64,
-    expected_dtype: backends.DType,
-    value: ops.CT,
-    cb: *const ops.ComputeBackend,
-) !backends.Tensor {
-    const actual_dtype = try cb.tensorDType(value);
-    const actual_shape = try cb.tensorShape(value, allocator);
-    defer allocator.free(actual_shape);
-    if (actual_shape.len != expected_shape.len) return error.ArtifactShapeMismatch;
-    for (actual_shape, expected_shape) |actual_dim, expected_dim| {
-        if (actual_dim != expected_dim) return error.ArtifactShapeMismatch;
-    }
-
-    if (expected_dtype == .f32) {
-        const f32_data = try cb.toFloat32(value, allocator);
-        defer allocator.free(f32_data);
-        return backends.Tensor.initFloat32(allocator, name, expected_shape, f32_data);
-    }
-
-    if (actual_dtype == expected_dtype) {
-        if (try cb.exportTensorData(value, allocator)) |exported| {
-            defer switch (exported.payload) {
-                .bytes => |bytes| allocator.free(bytes),
-                .quantized_f32 => |quantized| {
-                    allocator.free(quantized.raw_bytes);
-                    allocator.free(quantized.shape);
-                },
-            };
-            switch (exported.payload) {
-                .bytes => |bytes| return .{
-                    .data = try allocator.dupe(u8, bytes),
-                    .dtype = expected_dtype,
-                    .shape = try allocator.dupe(i64, expected_shape),
-                    .name = name,
-                    .allocator = allocator,
-                    .owns_data = true,
-                    .owns_shape = true,
-                },
-                .quantized_f32 => {},
-            }
-        }
-    }
-
-    return error.UnsupportedArtifactInputs;
-}
-
-fn tensorFromGraphInputIds(
-    allocator: std.mem.Allocator,
-    name: []const u8,
-    expected_shape: []const i64,
-    expected_dtype: backends.DType,
-    graph_input_ids: []const i32,
-) !backends.Tensor {
-    if (expected_dtype != .i64) return error.MissingRuntimeInput;
-    if (expected_shape.len != 1 or expected_shape[0] != @as(i64, @intCast(graph_input_ids.len))) {
-        return error.ArtifactShapeMismatch;
-    }
-    const ids_i64 = try allocator.alloc(i64, graph_input_ids.len);
-    defer allocator.free(ids_i64);
-    for (graph_input_ids, 0..) |id, i| ids_i64[i] = id;
-    return backends.Tensor.initInt64(allocator, name, expected_shape, ids_i64);
 }
 
 fn findFeatureIndex(names: []const []u8, target: []const u8) ?usize {
@@ -3030,14 +2110,7 @@ test "validateArtifact keeps XLA metadata inspection outside execution policy" {
         .chat_template_applied = false,
     });
 
-    var session_manager = backends.SessionManager.init(allocator);
-    session_manager.required_backend_invalid = true;
-    var validation = try validateArtifactWithSessionManager(
-        allocator,
-        io,
-        manifest_path,
-        &session_manager,
-    );
+    var validation = try validateArtifact(allocator, io, manifest_path);
     defer validation.deinit(allocator);
     try std.testing.expectEqualStrings("xla", validation.backend);
 }
@@ -3130,14 +2203,7 @@ test "validateArtifact summarizes package manifests" {
         },
     });
 
-    var session_manager = backends.SessionManager.init(allocator);
-    session_manager.required_backend_invalid = true;
-    var validation = try validateArtifactWithSessionManager(
-        allocator,
-        io,
-        package_path,
-        &session_manager,
-    );
+    var validation = try validateArtifact(allocator, io, package_path);
     defer validation.deinit(allocator);
     try std.testing.expect(validation.is_package);
     try std.testing.expectEqualStrings("xla", validation.backend);
@@ -3363,52 +2429,4 @@ test "findMatchingFullModelPackageManifest prefers embedded PJRT package" {
     try std.testing.expect(found != null);
     defer allocator.free(found.?);
     try std.testing.expectEqualStrings(embedded_package_path, found.?);
-}
-
-test "findMatchingFullModelPackageManifest resolves matching ONNX package" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const base_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
-    defer allocator.free(base_dir);
-    const package_path = try compiled_artifact.packageManifestPath(
-        allocator,
-        base_dir,
-        "onnx",
-        "/tmp/model",
-        "onnx_graph",
-        null,
-    );
-    defer allocator.free(package_path);
-    try compiled_artifact.writePackageManifest(allocator, io, package_path, .{
-        .backend = "onnx",
-        .model_dir = "/tmp/model",
-        .kind = "onnx_graph",
-        .artifacts = &.{
-            .{
-                .manifest_path = "/tmp/model.prefill.onnx.inference.json",
-                .artifact_path = "/tmp/model.prefill.onnx",
-                .artifact_role = compiled_artifact.artifact_role_prefill,
-                .seq_len = 2,
-                .query_seq_len = 2,
-                .attention_mode = "paged_prefill",
-            },
-        },
-    });
-
-    const found = try findMatchingFullModelPackageManifest(
-        allocator,
-        io,
-        base_dir,
-        "onnx",
-        "/tmp/model",
-        2,
-        2,
-        "paged_prefill",
-    );
-    try std.testing.expect(found != null);
-    defer allocator.free(found.?);
-    try std.testing.expectEqualStrings(package_path, found.?);
 }

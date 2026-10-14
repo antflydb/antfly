@@ -17,7 +17,6 @@ class InferenceBackendRuntimes:
 
     Attributes:
         native (bool | Unset): Whether the native CPU backend is built into this runtime Example: True.
-        onnx (bool | Unset): Whether the ONNX Runtime backend is built into this runtime
         metal (bool | Unset): Whether the Metal backend is built into this runtime Example: True.
         cuda (bool | Unset): Whether the CUDA backend is built into this runtime
         xla (bool | Unset): Whether the PJRT/XLA backend is built into this runtime
@@ -25,7 +24,6 @@ class InferenceBackendRuntimes:
     """
 
     native: bool | Unset = UNSET
-    onnx: bool | Unset = UNSET
     metal: bool | Unset = UNSET
     cuda: bool | Unset = UNSET
     xla: bool | Unset = UNSET
@@ -34,8 +32,6 @@ class InferenceBackendRuntimes:
 
     def to_dict(self) -> dict[str, Any]:
         native = self.native
-
-        onnx = self.onnx
 
         metal = self.metal
 
@@ -50,8 +46,6 @@ class InferenceBackendRuntimes:
         field_dict.update({})
         if native is not UNSET:
             field_dict["native"] = native
-        if onnx is not UNSET:
-            field_dict["onnx"] = onnx
         if metal is not UNSET:
             field_dict["metal"] = metal
         if cuda is not UNSET:
@@ -68,8 +62,6 @@ class InferenceBackendRuntimes:
         d = dict(src_dict)
         native = d.pop("native", UNSET)
 
-        onnx = d.pop("onnx", UNSET)
-
         metal = d.pop("metal", UNSET)
 
         cuda = d.pop("cuda", UNSET)
@@ -80,7 +72,6 @@ class InferenceBackendRuntimes:
 
         inference_backend_runtimes = cls(
             native=native,
-            onnx=onnx,
             metal=metal,
             cuda=cuda,
             xla=xla,

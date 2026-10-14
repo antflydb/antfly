@@ -528,6 +528,14 @@ components:
       type: object
       description: Information about a model including its capabilities
       properties:
+        qualified_limits:
+          type: object
+          additionalProperties: true
+          description: |
+            Pull-time qualified request profiles for this exact artifact,
+            including backend, supported features and min/max geometry.
+            Runtime admission revalidates artifact identity and resource limits.
+            Omitted for artifacts without a qualification receipt.
         capabilities:
           type: array
           items:
@@ -621,10 +629,6 @@ components:
           type: boolean
           description: Whether the native CPU backend is built into this runtime
           example: true
-        onnx:
-          type: boolean
-          description: Whether the ONNX Runtime backend is built into this runtime
-          example: false
         metal:
           type: boolean
           description: Whether the Metal backend is built into this runtime
@@ -1102,7 +1106,7 @@ components:
         `ANTFLY_INFERENCE_XLA_PLUGIN`, `ANTFLY_INFERENCE_PJRT_PLUGIN`,
         `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`.
         `webgpu` selects the Wasm/WebGPU backend in Wasm builds.
-      enum: [auto, native, onnx, metal, cuda, xla, webgpu, wasm]
+      enum: [auto, native, metal, cuda, xla, webgpu, wasm]
 
     ModelFormat:
       type: string

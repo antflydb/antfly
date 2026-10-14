@@ -830,7 +830,7 @@ fn chainConditionToOpenApi(condition: ChainCondition) openapi.ChainCondition {
 test "generator config round trips through generating openapi types" {
     const alloc = std.testing.allocator;
     const raw =
-        \\{"provider":"antfly","model":"onnxruntime/Gemma-3-ONNX","api_url":"http://localhost:8082"}
+        \\{"provider":"antfly","model":"ggml-org/gemma-4-E4B-it-GGUF","api_url":"http://localhost:8082"}
     ;
     var cfg = try parseConfigFromSlice(alloc, raw);
     defer cfg.deinit(alloc);

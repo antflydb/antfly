@@ -563,6 +563,8 @@ fn prepareRestoreSnapshotIfNeeded(
                 defer db.close();
                 if (!db.core.identity_namespace.eql(namespace))
                     try db.reassignIdentityNamespaceForInternalTransition(namespace);
+                if (prepared.nativeOpenPlan() != null)
+                    try db.rebindUnstartedNativeRestoreRepairIdentity(prepared.stagedGeneration());
             }
         }
     }

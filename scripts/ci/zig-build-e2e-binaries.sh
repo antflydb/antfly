@@ -47,6 +47,16 @@ case "$strip" in
     exit 2
     ;;
 esac
+
+# Functional Debug artifacts must retain actionable panic traces. This policy
+# also applies when approved PR CI uses main's older workflow environment.
+# Optimized release, scale, and GPU builds retain their explicit strip policy.
+if [[ "$optimize" == debug || "$optimize" == Debug ]]; then
+  if [[ "$strip" == true ]]; then
+    echo "Retaining E2E Debug symbols so runtime panics include stack traces"
+  fi
+  strip=false
+fi
 case "$build_capi" in
   true|false) ;;
   *)

@@ -147,6 +147,8 @@ func compiledInferenceOptionsSize() uint32 {
 // returns Unsupported when this build does not link the inference runtime or
 // the runtime cannot start.
 func OpenInference(opts *InferenceOptions) (*Inference, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	if err := ValidateABI(); err != nil {
 		return nil, err
 	}
@@ -230,6 +232,8 @@ func (inf *Inference) acquire() (handle unsafe.Pointer, release func(), err erro
 // an *InferenceError carrying the JSON error body fn wrote to *out (the C
 // ABI fills *out with a JSON error document on failure too).
 func (inf *Inference) call(request []byte, fn func(unsafe.Pointer, C.antfly_slice, *C.antfly_buffer) C.antfly_error_code) ([]byte, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	handle, release, err := inf.acquire()
 	if err != nil {
 		return nil, err
@@ -295,6 +299,8 @@ func (inf *Inference) Generate(request []byte) ([]byte, error) {
 // errors.As(err, &InferenceError{}); a failure mid-stream returns Internal
 // with API code "STREAM_FAILED".
 func (inf *Inference) GenerateStream(ctx context.Context, request []byte, onChunk func(chunk []byte) bool) error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	if onChunk == nil {
 		return InvalidArgument
 	}
@@ -397,6 +403,8 @@ func (inf *Inference) Transcribe(request []byte) ([]byte, error) {
 // ListModels returns the installed models, as returned by the inference
 // API's GET /ai/v1/models.
 func (inf *Inference) ListModels() ([]byte, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	handle, release, err := inf.acquire()
 	if err != nil {
 		return nil, err
@@ -440,6 +448,8 @@ type PullProgress struct {
 // Pull for the same model resumes rather than restarts. A nil ctx is treated
 // as context.Background() (no cancellation via ctx).
 func (inf *Inference) Pull(ctx context.Context, request []byte, progress func(PullProgress) bool) ([]byte, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	if ctx == nil {
 		ctx = context.Background()
 	}

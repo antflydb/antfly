@@ -15,8 +15,9 @@
 
 //! Standalone reproduction of the partitioned Linux executable's static TLS.
 //! Run from the repository root with the real MemoryAF component and Wasmtime
-//! library; see zig/FLAKES.md. A small unit executable otherwise misses this
-//! failure because its static TLS fits beside Rayon's default compiler stack.
+//! library; the command is in zig/FLAKES.md as of commit bf383c979c (PR #832).
+//! A small unit executable otherwise misses this failure because its static TLS
+//! fits beside Rayon's default compiler stack.
 const std = @import("std");
 const runtime = @import("wasmtime");
 

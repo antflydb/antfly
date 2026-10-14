@@ -555,7 +555,7 @@ test "buildExportableSubgraph preserves fused decomposition closure for lowering
     };
     const part_nodes = [_]NodeId{y};
     const part = partition_mod.Partition{
-        .backend = .onnx,
+        .backend = .pjrt,
         .node_ids = &part_nodes,
         .external_inputs = &ext_inputs,
     };
@@ -610,7 +610,7 @@ test "buildExportableSubgraph materializes external pair second output as runtim
     };
     const part_nodes = [_]NodeId{ second, out };
     const part = partition_mod.Partition{
-        .backend = .onnx,
+        .backend = .pjrt,
         .node_ids = &part_nodes,
         .external_inputs = &ext_inputs,
     };
@@ -648,7 +648,7 @@ test "buildExportableSubgraph preserves typed constant bytes" {
 
     const part_nodes = [_]NodeId{c};
     const part = partition_mod.Partition{
-        .backend = .onnx,
+        .backend = .pjrt,
         .node_ids = &part_nodes,
         .external_inputs = &.{},
     };
@@ -699,7 +699,7 @@ test "buildExportableSubgraph keeps skip-kv attention cache inputs runtime" {
     };
     const part_nodes = [_]NodeId{attn};
     const part = partition_mod.Partition{
-        .backend = .onnx,
+        .backend = .pjrt,
         .node_ids = &part_nodes,
         .external_inputs = &ext_inputs,
     };

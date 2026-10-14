@@ -274,6 +274,7 @@ test "SQL prepared parameter frames match PostgreSQL descriptors values and diag
     }
 }
 pub const Limits = struct {
+    error_context: ?*@import("errors.zig").Context = null,
     bytes: usize = @import("resource_limits.zig").default_memory_bytes,
     wire_bytes: usize = @import("resource_limits.zig").request_bytes,
     work: usize = @import("resource_limits.zig").default_memory_bytes,
@@ -492,8 +493,13 @@ fn prepareLeaky(a: A, descriptors: []const scalar.Type, inputs: []const Input, l
         descriptor.element_type = try scalar.parameterElementType(descriptor.*);
     };
     const values = try a.alloc(scalar.Datum, inputs.len);
-    for (types, inputs, values) |descriptor, input, *value| {
-        value.* = try decodeInput(a, descriptor, input, limits, &work, &wire_bytes);
+    for (types, inputs, values, 1..) |descriptor, input, *value, index| {
+        value.* = decodeInput(a, descriptor, input, limits, &work, &wire_bytes) catch |err| {
+            if (err == error.SqlUntranslatableCharacter) if (limits.error_context) |context| {
+                context.untranslatableParameter(index);
+            };
+            return err;
+        };
     }
     return .{ .descriptors = types, .values = values, .work = limits.work - work.remaining };
 }
@@ -591,4 +597,23 @@ fn decodeInput(a: A, descriptor: scalar.Type, input: Input, limits: Limits, work
     };
     _ = try arrays.Value.initWithBudget(kind, &.{.{ .length = 1 }}, &.{value}, .{ .bytes = limits.bytes }, work);
     return value;
+}
+
+test "SQL NUL parameters retain position for nested JSONB strings keys and TEXT" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { kind: @import("ast.zig").ColumnType, json: []const u8 }{
+        .{ .kind = .string, .json = "\"a\\u0000b\"" },
+        .{ .kind = .json, .json = "{\"output\":[\"a\\u0000b\"]}" },
+        .{ .kind = .json, .json = "{\"a\\u0000b\":1}" },
+    };
+    for (cases) |case| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, case.json, .{});
+        defer parsed.deinit();
+        var context: @import("errors.zig").Context = .{};
+        try std.testing.expectError(error.SqlUntranslatableCharacter, Frame.prepareJson(a, &.{ .{ .kind = .integer }, .{ .kind = case.kind } }, &.{ .{ .integer = 1 }, parsed.value }, .{ .error_context = &context }));
+        const diagnostic = context.diagnostic(error.SqlUntranslatableCharacter);
+        try std.testing.expectEqualStrings("22P05", diagnostic.code);
+        try std.testing.expectEqual(@as(?usize, 2), diagnostic.parameter_index);
+        try std.testing.expect(std.mem.indexOf(u8, diagnostic.message, "parameter $2") != null);
+    }
 }

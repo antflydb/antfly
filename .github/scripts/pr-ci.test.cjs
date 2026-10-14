@@ -286,6 +286,50 @@ test('PR updates cancel old compute and mark the current head as needing approva
   assert.equal(f.checks[0].conclusion,'action_required');
 });
 
+test('delayed push events preserve newer approvals for the live snapshot', async t => {
+  for (const admitted of [false, true]) await t.test(admitted ? 'running' : 'queued', async () => {
+    const f=fixture(); await f.call();
+    if (admitted) await f.call('admit');
+    f.runs.push({id:91,status:admitted ? 'in_progress' : 'queued',
+      display_title:'PR CI #7 / check 1 / approval 17'});
+    f.context.eventName='pull_request_target'; f.context.payload.action='synchronize';
+    f.context.payload.pull_request={updated_at:'2026-09-15T00:59:59Z'};
+    await f.call();
+    assert.deepEqual(f.cancelled,[]);
+    assert.equal(f.checks.length,1);
+    assert.equal(JSON.parse(f.checks[0].output.text).revoked,undefined);
+    assert.equal(f.checks[0].status,admitted ? 'in_progress' : 'queued');
+    if (!admitted) await f.call('admit');
+    f.finish(); await f.call();
+    assert.equal(f.checks[0].conclusion,'success');
+  });
+});
+
+test('delayed push events still revoke stale or invalid approvals', async t => {
+  const cases = {
+    'head changed': f => {f.pr.head.sha=BASE;},
+    'base changed': f => {f.pr.base.sha=SHA;},
+    'suite changed': f => {f.pr.labels=[{name:config.suites.find(s=>s.label).label}];},
+    'draft': f => {f.pr.draft=true;},
+    'closed': f => {f.pr.state='closed';},
+    'comment edited': f => {f.comment.updated_at='2026-09-15T01:00:01Z';},
+    'permission revoked': f => {f.permission('read');},
+    'earlier approval': f => {f.context.payload.pull_request.updated_at='2026-09-15T01:00:01Z';},
+    'timestamp tie': f => {f.context.payload.pull_request.updated_at=f.comment.created_at;},
+    'missing timestamp': f => {delete f.context.payload.pull_request.updated_at;},
+    'invalid timestamp': f => {f.context.payload.pull_request.updated_at='invalid';},
+  };
+  for (const [name,change] of Object.entries(cases)) await t.test(name,async()=>{
+    const f=fixture(); await f.call(); await f.call('admit');
+    f.runs.push({id:91,status:'in_progress',display_title:'PR CI #7 / check 1 / approval 17'});
+    f.context.eventName='pull_request_target'; f.context.payload.action='synchronize';
+    f.context.payload.pull_request={updated_at:'2026-09-15T00:59:59Z'};
+    change(f); await f.call();
+    assert.deepEqual(f.cancelled,[91]);
+    assert.equal(JSON.parse(f.checks[0].output.text).revoked,true);
+  });
+});
+
 test('editing or deleting an approval invalidates it even after a successful run', async () => {
   for (const action of ['edited','deleted']) {
     const f=fixture(); await f.call(); await f.call('admit'); f.finish(); await f.call();

@@ -1,0 +1,73 @@
+{
+  "kind": "local_native_recovery_qualification",
+  "source_revision": "9663fe3bdcf2b2fb57643cc753fb76a3b66926f7",
+  "binary_sha256": "d3653a392408cd8e179ec1b890507be5131346981323b0c0ab6e0a8d2a082bc6",
+  "profiles": [
+    "primary_lsm",
+    "vector_store"
+  ],
+  "provider": "filesystem",
+  "loss_modes": [
+    "missing_local_manifest",
+    "malformed_local_manifest",
+    "missing_sealed_source_vector_file",
+    "complete_local_generation_loss",
+    "missing_remote_authority"
+  ],
+  "safety": [
+    "original_rows_and_text_matches_after_mutation_and_restart",
+    "remote_recovery_without_recreating_missing_local_files",
+    "active_local_reader_prevents_cache_cleanup",
+    "missing_remote_authority_rejects_cursor_without_recapturing_live_rows"
+  ],
+  "logs": {
+    "cache_regressions": {
+      "sha256": "ba1dbf4d95968d3beae63344d0a3295fd3bba783ce04150a444c7187794032a7"
+    },
+    "public_http": {
+      "sha256": "c34e0762cf2e2f48e7da3954dfe8b2395a45cbbc0735074ab91863c7913e4c8a"
+    },
+    "storage_audit": {
+      "sha256": "2ac378709808f91f5b7125db5f6a9ff3a9fa20e708d8d96e256fd1762b2e0586"
+    },
+    "page_tests": {
+      "sha256": "fca65220f01e50aa2ec52b5ead6d49f847196ec00060ee42992cc78de7fe6e1b"
+    },
+    "lake_tests": {
+      "sha256": "e45604441b6ffa9c43904e8e21f7d62f7b43dd00940d94405635a5c2325a5858"
+    },
+    "python_tests": {
+      "sha256": "18b99f6af45a8deed746ed6f130f9759738e23e739f2095cb100740bd56245f4"
+    }
+  },
+  "repeated_vector_probes": {
+    "binary_role": "diagnostic_recovery_build",
+    "passed": 6,
+    "failed": 0
+  },
+  "limitations": [
+    "Local wire qualification uses a Linux container and filesystem object storage.",
+    "S3/GCS transport, full archive and managed Cloud deployment need separate qualification."
+  ],
+  "coverage": {
+    "public_http_both_profiles": [
+      "updates_and_deletes",
+      "sorted_numeric_filters",
+      "field_score_and_composed_cursor_restart",
+      "missing_local_manifests_with_directories_preserved",
+      "complete_local_generation_loss",
+      "missing_remote_authority"
+    ],
+    "vector_repository_unit": [
+      "reader_priming_and_live_database_restart",
+      "missing_manifest",
+      "malformed_manifest",
+      "missing_sealed_vector_file",
+      "missing_remote_commit_authority"
+    ],
+    "admission_unit": [
+      "missing_or_malformed_cache_metadata",
+      "exclusive_cleanup_blocked_by_active_local_reader"
+    ]
+  }
+}

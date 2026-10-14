@@ -41,10 +41,22 @@ pub const Provider = struct {
     pub const BuildProgress = struct {
         ptr: *anyopaque,
         save: *const fn (*anyopaque, local.serverless_segment_sidecar_manifest.DeclaredArtifact) anyerror!void,
+        save_batch: ?*const fn (*anyopaque, []const local.serverless_segment_sidecar_manifest.DeclaredArtifact) anyerror!void = null,
     };
     pub fn checkpoint(self: *Provider, declaration: local.serverless_segment_sidecar_manifest.DeclaredArtifact) !void {
         try self.context.ensureActive();
         if (self.progress) |progress| try progress.save(progress.ptr, declaration);
+    }
+    /// Builders that complete a declaration set together checkpoint it once.
+    /// Per-file builders keep their individual resumable boundaries.
+    pub fn checkpointBatch(self: *Provider, declarations: []const local.serverless_segment_sidecar_manifest.DeclaredArtifact) !void {
+        try self.context.ensureActive();
+        const progress = self.progress orelse return;
+        if (progress.save_batch) |save_batch| {
+            try save_batch(progress.ptr, declarations);
+        } else {
+            for (declarations) |declaration| try self.checkpoint(declaration);
+        }
     }
     pub fn provider(self: *Provider) @import("../serverless/build/lake_rebuild.zig").RowSourceProvider {
         return .{ .ptr = self, .open_fn = open, .open_with_cancellation_fn = openCanceled };

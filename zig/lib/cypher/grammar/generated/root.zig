@@ -16,7 +16,7 @@ pub const cockroach_reference = .{
     .sql_y = "",
 };
 
-pub const source_sha256_hex = "ada7ff3a79aa45c73554da4ce8a71aaa24dfc945bcd7e52c8de49f73f4494339";
+pub const source_sha256_hex = "b571ce04d91858ddc5a24db5a3f03ee65d996b626e57683446457ede4f53d7d7";
 pub const start_symbol = "query";
 pub const token_count = 81;
 pub const token_class_count = 0;

@@ -148,6 +148,7 @@ pub fn stripPublicInternalFieldsValue(alloc: std.mem.Allocator, value: *std.json
     if (value.* != .object) return;
     removeOwnedObjectField(alloc, &value.object, unit_fingerprint_field);
     removeOwnedObjectField(alloc, &value.object, grouped_unit_revision_envelope_field);
+    removeOwnedObjectField(alloc, &value.object, "_resolution_work");
 }
 
 fn removeOwnedObjectField(
@@ -347,7 +348,8 @@ pub fn publicArtifactPayloadAlloc(alloc: std.mem.Allocator, stored: []const u8) 
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidDocumentExtractionState;
     if (parsed.value.object.get(unit_fingerprint_field) == null and
-        parsed.value.object.get(grouped_unit_revision_envelope_field) == null)
+        parsed.value.object.get(grouped_unit_revision_envelope_field) == null and
+        parsed.value.object.get("_resolution_work") == null)
     {
         return try alloc.dupe(u8, stored);
     }
@@ -372,7 +374,8 @@ fn objectContainsPrivateFieldToken(stored: []const u8) bool {
         if (stored[index] == '"') {
             const content_start = index + 1;
             if (jsonQuotedAsciiEnd(stored, content_start, unit_fingerprint_field) orelse
-                jsonQuotedAsciiEnd(stored, content_start, grouped_unit_revision_envelope_field)) |closing_quote|
+                jsonQuotedAsciiEnd(stored, content_start, grouped_unit_revision_envelope_field) orelse
+                jsonQuotedAsciiEnd(stored, content_start, "_resolution_work")) |closing_quote|
             {
                 var after = closing_quote + 1;
                 while (after < stored.len and std.ascii.isWhitespace(stored[after])) : (after += 1) {}

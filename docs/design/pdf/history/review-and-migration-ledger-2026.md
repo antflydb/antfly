@@ -1,0 +1,114 @@
+# PDF Review and Migration Ledgers (2026)
+
+> Summary of a verbatim log. Full text: [docs/design/pdf/history/review-and-migration-ledger-2026.md@f3fd4d3](https://github.com/antflydb/antfly/blob/f3fd4d35258791fe16ab927a1e7f9b3af247b074/docs/design/pdf/history/review-and-migration-ledger-2026.md). Originally relocated verbatim from `zig/PDF.md` (lines 837–2193 and 2348–3672 at commit 0f7fec50c5) on 2026-10-12; durable decisions were folded into [PDF.md](../../../../zig/PDF.md) before the move.
+
+The verbatim file holds two numbered ledgers from the bounded document preparation and multimodal inference work: 189 **review findings** (what each review found and the required fix) and 169 **migration/implementation-status** items (what landed after each review). Item numbers below, written as F*n* (finding) and M*n* (migration item), point into the verbatim text. The living contract, limits and defaults are in `zig/PDF.md`; the ledger ends by noting that the renderer design there stays normative for `PreparedDocument -> PageImage`, and that Florence references describe the initial `ReaderExecutor`, not a restriction on the pipeline.
+
+## Model-work contract and capabilities
+
+### Decisions
+- **Task-specific executors, not reader wrapping** — OCR selects a `reader` or `generator` executor explicitly; Gemma4 is not wrapped in `LoadedReader` to reuse rendering. (F1, M4)
+- **Capabilities come from the resolved executor, never provider identity or model-name text** — `provider == antfly` checks and name-based prompt detection were removed (name detection survives only in config migration, with a diagnostic). Manifests may lower limits but can never promote a serial executor to native batching. (F2, F6, F34, F184, M8, M25, M83, M146)
+- **Honest execution reporting** — native, `serial_compatibility` and native-to-serial fallback are distinct; observed execution reports (not capability predictions) drive telemetry; old servers without reports are treated as serial; aggregate counters are never converted into invented per-item modes. Multimodal generation stays `serial_compatibility` until a backend executes natively. (F3, F21, F29, M2, M7, M15)
+- **Eight public task families** — readers, generators, embedders, rerankers, chunkers, extractors, rewriters, transcribers. **Classification is not a public task**: it runs under `POST /extract`, is advertised through `extract`, and has no `/classify` surface. (F41, F43, M80)
+- **Extract and rewrite** publish a shared hard item ceiling with `serial_compatibility`; rerank, chunk and transcribe stay one logical item. (F47)
+- **One exported resolver** derives task ceilings, execution mode, media limits and manifest reductions for both local callbacks and `/ai/v1/models`. (F49, M29)
+- **No raw-PDF capability** — resolved modalities are the intersection of manifest inputs and the concrete executor; no current executor decodes a PDF container, so none advertises `document`/`application/pdf`. PDFs enter inference only as bounded page images or text chunks. (F23, F58, M16)
+- **Codec-coupled MIME advertisement** — image MIME essences must map to the shared inference codec registry (catalog, linked resolution, physical accounting and decode all consult it); remote V4 image sets intersect that registry; audio MIME is advertised only for codecs compiled in (e.g. MP3 disappears without build support). (F108, F111, F112, M37)
+- **Final admission belongs to the concrete executor** — HTTP, linked ABI and proxy layers may narrow work, but every node executor resolves and enforces its model contract again; tokenizer-dependent limits are measured after model acquisition; no character/byte proxy stands in for a tokenizer. (F104, F110, F114, M36)
+- **Chunking** advertises only the built-in `fixed` executor (legacy `fixed_bert`/`fixed_bpe` aliases normalize to `fixed` at discovery/routing); an unsupported semantic model fails closed; catalogs do not publish loaded chunker manifests without a model-backed executor. (F42, F51, M137)
+- **Empty invocations are invalid** at every executor boundary, so an upstream cardinality bug cannot become a successful durable publication. (F131, M49)
+- Model identity is explicit and nonempty for transcription, Antfly readers and rerankers; provider-specific defaults stay private to providers such as OpenAI and Vertex. (F157, F163)
+
+### Capability wire versions
+- **V2** uses null for unknown and preserves zero as a known disabled ceiling; field renamed `max_encoded_media_bytes`. Conservative intersection: any unknown stays unknown; known values intersect by minimum, including zero. (F39)
+- **V3** publishes exact modalities, MIME types, granularity, output kind, cardinality, prompt policy, borrowed-attachment compatibility and batch descriptor; unknown or duplicate set members and other malformed descriptors poison the model rather than read as a narrower contract. V1/V2 stay readable but cannot acquire V3 claims. (F52, F56, F61, F62)
+- **V4** replaces the closed eight-MIME allowlist with bounded canonical essences, adds task-resource ceilings (text bytes, input/output tokens, candidates, schema bytes), and later additive feature bits for framed attachments and `numeric_responses_v1`. (F100, F101, M116, M162)
+- Provider ABI **v23** adds typed chunk/rewrite operations, the internal classification callback and borrowed extraction attachments; internal inference ABI **v25** adds task-typed numeric rows for dense embeddings and reranker scores. (F44, F50, M3, M154)
+
+## Admission and invocation memory
+
+### Decisions
+- **Executor boundaries are the security/memory boundary**; planner windows are only an optimization. Every concrete call partitions by resolved item and byte limits and validates MIME, modality, media cardinality, pixels and aggregate bytes. (F15)
+- **`InvocationMemoryPlan`** — reader, generator, extractor and part-item embedder routes publish one route-specific plan: concrete attachment transport plus the fixed peak for request envelopes, bounded responses, parser state, results and control storage. The planner inverts both wire and resident ceilings before rendering. It replaced a fixed four-times-PNG heuristic for OCR and the use of `max_encoded_media_bytes` as a raw PNG allowance for embedding. Missing plans fail closed with `InferenceInvocationMemoryUnavailable`. (F69, F72, F76, F78, M31)
+- **`AttachmentTransport`** (borrowed binary, base64 payload, data URI) is selected by the concrete route, not inferred from model capabilities; a data URI is charged raw bytes plus both encoded copies; remote capabilities are normalized to non-borrowed and the proxy never republishes a linked-memory claim. Later, `segmented_framed_binary` borrows window payloads so a 64-MiB encoded window no longer reserves another 64 MiB for an absent copy. (F64, F77, M164)
+- **Two-layer ownership** — caller-owned adapters run under a hard bounded allocator for request/result bridge allocations; linked and distributed inference nodes own decoder/model admission. Executor ownership is an explicit `AntflyProvider` guarantee, not granted by provider name, and it does not disable the caller boundary cap. (F80, F92, F98)
+- **Plans cover every producer call**, not just the `media` field (structured `source_parts_json`, transcription `source_text`, legacy reader `source_text`, copy and document extraction results); mixed task/config/representation batches are repartitioned rather than inheriting the first item's plan; direct `Producer.produce*` and `embedDensePartItems` calls resolve the plan themselves. (F81, F87, F88, F93, M34, M35)
+- **Result policy** is enforced per item and in aggregate (`max_result_bytes_per_item`, `max_result_bytes`); every embedding vector must have exact dimensions and finite values (a `dims - 1` / `dims + 1` pair previously passed). Logical result limits reserve a six-times JSON string expansion and are reduced when an outer transport cap is smaller. (F91, F94, F95)
+- **Operation-scoped response ceilings** — route-derived limits per request; the HTTP client's 64-MiB setting is only an outer safety ceiling; catalog discovery keeps a separate four-MiB limit. (F79, F83)
+- **Encoded budgets before materialization** — shaping and partitioning check known wire length before decoding a data URI; generation retains a structural decoded-size fact so definitely oversized envelopes are rejected before decode even when malformed. (F109, M109)
+- **Decoded pixels bound model invocations, not render waves** — previously a serial eight-page render could satisfy a 50-megapixel wave limit while building an 80-megapixel model batch. Planners now accumulate exact adaptive geometry and executors partition on pixels as well as items and bytes. (F105)
+- **Memory pressure changes throughput, not input quality** — windows admit only the largest prefix that preserves each page's singleton encoded-output allowance, with the same minimum render dimension and bounded retries for OCR and embedding. (F102)
+- PDF visual embedding gets a separate 64-MiB media default; the 256-KiB generic text-embedding default had forced every page-image window to one page. When remote discovery omits a media ceiling, the planner no longer invents a 256-MiB value; unknown capacity is a retryable capability gap unless an operator batch-byte ceiling supplies the bound. (F130, M43)
+- Renderer scratch and allocator-owned invocation output are independent owners, reserved from the process resource manager before worker creation and leased per window (composite lease), never numerically subtracted from each other. (F115, F181, M38, M44, M68, M69, M74)
+- OCR control-plane batches are capped at 128 items and PDF media staging is sized from `min(pending_pages, admitted_batch_items)`; the legacy unconditional base64 precheck was removed in favor of the invocation plan. (F182, F183, M70)
+
+## Data URIs and MIME
+
+- **One RFC 2397 parser** in `antfly_scraping` (canonical base64, percent decoding, case-insensitive markers, parameters, omitted-media-type default `text/plain;charset=US-ASCII`) is shared by host preflight, inference-node decoding, remote-content downloads, reader adaptation, transcription and Vertex/Gemini/Bedrock serialization. Scheme recognition belongs to the parser; case-sensitive `data:` prefix checks had let uppercase schemes bypass admission. (F73, F84, F89)
+- **`mediaTypeEssence`** is the validated authority for capability admission; parameters do not create new input types, but an explicitly declared parameter must match the physical attachment (`codecs=opus` cannot authorize `codecs=vorbis`). HTTP media adapters use the same declaration-compatibility relation as borrowed attachments. (F96, F99, F103)
+- Every media boundary requires a nonzero decoded size. (F71)
+
+## Durable PDF publication, staging and leases
+
+- **Typed staging keys** — a dedicated internal key kind with length-encoded document/artifact/embedding/unit components replaced concatenated user strings that could alias. (F12, M13)
+- **Exact-set page-vector publication** — current page artifacts, stale deletes, dense counters and the vector-replacement replay record change in one document-store transaction inside the generated-record writer; a partial attempt cannot overwrite or delete the last complete public set. Stale-page scans return artifact keys only (the parallel `vector_keys` list was removed). (F13, F145, M5)
+- **Page-count admission instead of an unbounded commit set** — `execution.max_document_pages`, default 2,048, absolute ceiling 16,384; the effective limit is the minimum of request, operator and absolute ceilings. Lifting the absolute limit requires an active generation on vector records and query filtering first; a manifest pointer alone is insufficient. Fanout overflow, scan-work exhaustion and page-count admission are distinct terminal errors. (F18, M14, M18)
+- **Lease fencing** — each lease tenure has a monotonic epoch; heartbeats cover render/inference windows; the writer validates owner, epoch and expiry in the same transaction that promotes stages. Stage keys include lease epoch and attempt identity; a stale worker can observe but never delete or publish a replacement's keys; garbage transfer is bounded to one fixed-size page per replacement. (F27, F28, F155, M21, M77)
+- **Attempt-private spools** — resolved units serialize once into a bounded hybrid spool (direct replay below 128 units and four MiB, otherwise spilled), replacing three extraction walks; replay copies one bounded segment, closes the LMDB read transaction, then calls sinks; segments are pre-admitted through the no-reclaim path so reclaim callbacks never enter storage under a held transaction. Materialization writes only to a publication spool and promotes in bounded windows with the manifest last. (F30, M22, M71, M77, M93)
+- **Resumable visual embedding** — versioned page identity (source digest, page, renderer contract, pixel limit, output cap, transport, dimensions, model producer); only missing pages render; successful window stages survive a later-page failure within the same lease generation; publication happens in bounded replay windows with coverage committed last. (M104, M118, M119)
+
+## Per-item results and retries
+
+- `WorkItemResult(T)` / `ProducedBatch` per request: deterministic item errors stay attached to their item, valid siblings are applied exactly once and not rerun serially; invalid reports or cardinality destroy successful payloads at the producer boundary. (F16, F17, M12, M57, M62)
+- Retryable failures carry a stable code, authoritative `retryable` flag and optional `retry_after_ms`; reader/generator batches preflight every retryable failure before mutating any sibling. (F26, M58)
+- Remote batches restore identity by validated response indexes, never completion order; extraction uses invocation-local opaque wire IDs because page IDs like `page:000001` repeat across documents. Non-JSON extraction falls back to independent executions. (F11, F60, F67)
+- A shared-window peer explicitly rejected by inference admission (`QueueFull` or 503 `reason=inference_admission, retryable=true`) gets exactly one serial retry after its overlapping cohort joins; other failures do not. Owner/peer inference overlap stays disabled until a provider can atomically grant a group's weighted permits. (M155, M166)
+
+## Distributed proxy, routing and capability leases
+
+- **Bounded proxy memory** — retained request bodies limited (256 MiB default) with a process-wide weighted body-plus-decode budget (768 MiB default) held through retries; admission charges physical replay capacity rather than logical length. Explicit process limits are authoritative: per-request ceilings shrink to fit three-copy request / four-copy response reservations with a diagnostic, never grow. (F35, F122, F178, M65)
+- **Fair admission** — strict FIFO weighted semaphore, impossible requests rejected immediately; refined to allow at most eight bounded bypasses of an oversized head before it becomes a barrier. (F116, M39, M123)
+- **Catalog fan-out** — at most eight concurrent upstream bodies, 8 MiB each, 32 MiB merged, later derived from the configured byte ceiling; cache hits are partitioned out before sizing workers. (F36, F140, M46, M115)
+- **Task-aware inventory** — explicit bootstrap / task-unknown / known-operation states; only current per-endpoint operation advertisements are routable; bootstrap names serve only task-unscoped legacy inventory, so topology churn yields temporary unavailability, not capability-unsafe execution. Partial catalog fan-out leases only successful responders. (F32, F37, F117, F127, M23, M40)
+- **Capability leases** — scoped discovery returns an opaque token plus a SHA-256 descriptor revision bound to model, task, concrete operation (`generate`, `generate.batch`, `chat.completions`, `rerank_multimodal` are distinct), authorization digest, source table, route-policy generation and endpoint incarnations. Leases are immutable; the table refuses issuance under live saturation rather than evicting; equivalent snapshots reuse one token. Mismatch returns an explicit stale-plan conflict that invalidates the exact cache entry, including in-flight and completed single-flights. Valid use renews a five-minute idle timeout. (F119–F121, F128, F136, F148, M45, M47, M162, M163)
+- **Route policy** — every semantic route change advances a generation; informer resyncs and equivalent updates do not; `UpsertRoute(*Route) (bool, error)` is a deliberate breaking API; regex patterns carry an explicit syntax mode instead of relying on `regexp.String()`; tombstone deletes are handled. (F137, F138, F144, F149, M48, M59)
+- **Routing context** — configured routes win, then explicit pool, then process default, for both discovery and execution; source identity comes only from a `VerifiedSourceResolver`; `RouteCohort` distinguishes terminal rejects from fallthrough. Endpoint identity is `(namespace, pool, address, incarnation)`; same-named pools in different namespaces cannot share leases. (F125, F133–F135, M51)
+- **Endpoint lifecycle** — monotonic incarnation IDs, immutable endpoint references reserved with their circuit breaker, owned `EndpointLease` completion; mutable registry exports were removed. (F143, F146, F147, F154, M53)
+- **Scale-to-zero** forms one state machine with leases: discovery wakes only cold pools in the reachable cohort (activating only the matched route's destination, with redirect fallback), re-derives the cohort at the same generation, and execution never smuggles a newly woken incarnation into an old plan. (F151–F153, M50, M52)
+- **Mixed-model generation batches** — partitioned by model, eight-worker pool, per-partition hybrid spool (spill above one MiB), only validated envelopes count against the retained budget; unknown upstream execution omits the aggregate report rather than inventing `rejected_items`. Framed attachment batches must be homogeneous. (F179, F180, M63, M66, M67, M82)
+- **Rolling upgrades** — a 404, 405 or 501 catalog response is negatively cached as `discovery unsupported` and legacy endpoints run conservatively; the discovering owner keeps its own cancellation outcome. (M97, M106)
+- Request bodies over the OpenAPI `maxItems: 128` generation-batch limit fail at the proxy without materializing the batch; framed bodies are routed by reading only the exact descriptor/metadata prefix and streaming the tail, with a process-admitted replay spool only for retry-enabled routes (seal deadline at most 30 seconds). (F156, M141)
+
+## Execution context, cancellation and deadlines
+
+- A durable `ExecutionEnvironment` (routing, capability cache, I/O pool, provider defaults) is separate from one canonical `RequestContext` (I/O, absolute deadline, cancellation, progress); invocation controls can only tighten runtime controls. (F166, M61)
+- Single-flight waits observe cancellation and deadlines; cancellation and timeout are control flow, not discovery failure. All absolute comparisons use `antfly_platform.time`'s monotonic clock; `std.Io` clocks only for relative waits. (F22, M17)
+- One absolute operation deadline spans discovery and execution; residual transport timeouts are recomputed just before dispatch. (F170, F174)
+- Hosted reads, reranking, semantic chunking and all embedding variants share the route-aware, lease-fenced context; URL-less configs on data-only nodes resolve the provisioned default inference endpoint rather than localhost. (F160–F162, F165, F167, F168, M60)
+- `AntflyProviderBoundary` is the single versioned checked callback boundary for every provider callback. (F173)
+- Backend lanes (API, inference, control, Raft, PDF render) are lazy, with independently configurable shares under one 256-thread aggregate ceiling; managed embedders own one persistent executor and keep-alive client rather than one per request. (F172, F186, M79, M85, M107)
+
+## Performance work and measurements
+
+| Change | Recorded effect |
+| --- | --- |
+| One-window render prefetch for visual embedding and OCR (`ANTFLY_ENRICHMENT_PDF_RENDER_PREFETCH_BATCHES`, clamped to one; `0` disables) | Overlaps rendering N+1 with inference on N; admission miss falls back to sequential (M9, M101, M108) |
+| Paint once, downsample from one decode on output-size retries | No PDF re-render (F187, M76, M86) |
+| Borrowed RGBA8 raster transport for linked Florence and image embedders | Removes PNG encode/decode; remote keeps encoded transport because full RGBA over the network is usually a bandwidth regression (M92, M100) |
+| Task-neutral cross-request microbatch broker keyed by exact model generation | Coalesces only native-batch executors; PDF pages coalesce across documents (M91, M121, M122) |
+| Florence mixed-EOS row compaction on CUDA/Metal | Finished pages excluded from later decode; in-place compaction avoids a second KV-cache allocation (M113, M120) |
+| On-device Florence patch embedding | Roughly 36 MiB less device-to-host-to-device traffic per page at the default 768px geometry (M142) |
+| Model-published exact image transform | PDF renders at the lowest DPI that still supplies the model input (M145) |
+| Image preprocessing slab | Up to eight workers; 128-MiB default physical boundary; exact growth permits instead of reserving the full ceiling per request (M81, M110) |
+| AFN1 numeric responses (`application/vnd.antfly.numeric.v1`) | 4-MiB frame cap; 24-byte header means 127, not 128, 8192-dimensional rows fit; four 384-dimensional vectors need under 384 KiB of non-media invocation credit vs the previous 32-MiB response allowance (admission calculation, not RSS) (M159, M162, M167) |
+| Framed attachment envelope (`application/vnd.antfly.attachments.v1`) across all binary families | No base64 expansion or inference-node copy; proxy forwards unchanged (M116, M126–M128, M140) |
+
+Hardware throughput and peak-RSS qualification were explicitly left separate from these deterministic regressions; on macOS, CoreGraphics internal allocations are outside `BudgetedAllocator`, so peak RSS qualification is the enforcement evidence there (M76).
+
+## Testing and CI
+
+- Deterministic two-page production-mode fixture through generic fake reader, generator and embedder executors; opt-in real-model release gate `zig build pdf-model-qualification-test` for Florence, Gemma4 and ClipClap. (F10, M10)
+- Fixtures must satisfy the production capability contract rather than weakening discovery. (F189, M88)
+- Defects caught in test infrastructure: TestServer matched the full request target including the query string (F65), and client fibers swallowed failures so a 404 could pass (F70); focused Zig test roots must declare their complete import closure (M54).
+- Ownership leaks fixed: unused provider-only enrichment set (F171), chunk-provider routing table in config cleanup (F188, M87), dense JSON vector prefix on later allocation failure (F75).

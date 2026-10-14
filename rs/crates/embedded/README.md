@@ -120,6 +120,11 @@ detail.
 For typed decision requests and answer semantics, see the
 [decision guide](../../../docs/guides/decisions.md).
 
+Database failures copy the native diagnostic into the returned `Error`, so it
+survives subsequent calls. `Error` is `Clone` rather than `Copy`; use
+`error.kind()` when matching stable variants and `error.detail()` for the
+message. Equality and hashing compare the stable code, independent of detail.
+
 [`Inference`] opens the same embedded inference runtime on its own, with no
 database -- `Inference::open`/`open_default` (options: [`InferenceOptions`],
 covering models directory, resource budgets, and a per-call timeout) and

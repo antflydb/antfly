@@ -34,6 +34,7 @@ pub const VTable = struct {
     recover: *const fn (*anyopaque, std.Io, []const u8, Request, Namespace, Cancellation) anyerror!void,
     open_read: ?*const fn (*anyopaque, std.Io, []const u8, Request, Namespace, Cancellation) anyerror!StorageLease = null,
     warm: ?*const fn (*anyopaque, std.Io, []const u8, Request, Namespace, Cancellation, u64) anyerror!bool = null,
+    can_evict: ?*const fn (*anyopaque, std.Io, []const u8, Request, Namespace, u64, Cancellation) anyerror!bool = null,
     reference: ?*const fn (*anyopaque, std.Io, Request, Namespace, Storage, Cancellation) anyerror!bool = null,
 };
 const Boundary = @import("../../runtime_callback_abi.zig").Boundary(VTable);
@@ -55,6 +56,11 @@ pub const Port = struct {
     pub fn warm(self: Port, io: std.Io, root: []const u8, request: Request, namespace: Namespace, cancellation: Cancellation, max_bytes: u64) !bool {
         const callback = self.vtable.warm orelse return true;
         return Boundary.call("warm", self.dispatch, callback, .{ self.ptr, io, root, request, namespace, cancellation, max_bytes });
+    }
+    /// Confirm a matching immutable repository manifest before local eviction.
+    pub fn canEvict(self: Port, io: std.Io, root: []const u8, request: Request, namespace: Namespace, sequence: u64, cancellation: Cancellation) !bool {
+        const callback = self.vtable.can_evict orelse return false;
+        return Boundary.call("can_evict", self.dispatch, callback, .{ self.ptr, io, root, request, namespace, sequence, cancellation });
     }
     pub fn reference(self: Port, io: std.Io, request: Request, namespace: Namespace, source: Storage, cancellation: Cancellation) !bool {
         const callback = self.vtable.reference orelse return false;

@@ -74,31 +74,6 @@ const runtime = @import("../runtime/root.zig");
 const onnx_graph = @import("onnx_graph");
 const ml = @import("ml");
 
-fn shouldPreferNativeSession(man: manifest_mod.ModelManifest) bool {
-    // GLiNER has a native DeBERTa + span-head path. When native weights are
-    // present, prefer the directory-backed session so the model does not get
-    // pinned to ONNX just because an export also exists.
-    if (!manifestHasNativeAssets(man)) return false;
-    if (man.model_type == .embedder and
-        man.visual_model_path == null and
-        man.audio_model_path == null and
-        man.text_projection_path == null and
-        man.visual_projection_path == null and
-        man.audio_projection_path == null)
-    {
-        return true;
-    }
-    if (man.gliner_model_type.len > 0) return true;
-    switch (man.model_type) {
-        .classifier, .extractor => return true,
-        else => {},
-    }
-    return switch (man.native_arch_hint) {
-        .clip, .whisper, .florence, .layoutlmv3 => true,
-        .clap, .none => false,
-    };
-}
-
 fn nativeBackendsAvailable() bool {
     return build_options.enable_native or build_options.enable_metal or build_options.enable_cuda;
 }
@@ -119,7 +94,6 @@ fn artifactCandidateForBackend(
     backend: backends.BackendType,
 ) ?ArtifactCandidateKind {
     if (backend == .pjrt) return null;
-    if (backend == .onnx) return if (man.onnx_path != null) .onnx else null;
     if (man.nativeWeightArtifactKind()) |artifact| {
         return switch (artifact) {
             .gguf => .gguf,
@@ -683,19 +657,17 @@ pub fn compatibilitySummaryForBackend(
         };
         artifacts.deinit();
 
-        if (backend != .onnx or !build_options.enable_onnx) {
-            backends.imported_onnx_session.inspectGraphCompatibility(
-                allocator,
-                path,
-            ) catch |err| {
-                if (err == error.OutOfMemory) return err;
-                return .{
-                    .level = .incompatible,
-                    .code = .invalid_graph,
-                    .message = "ONNX graph cannot be converted and validated by the selected backend",
-                };
+        backends.imported_onnx_session.inspectGraphCompatibility(
+            allocator,
+            path,
+        ) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return .{
+                .level = .incompatible,
+                .code = .invalid_graph,
+                .message = "ONNX graph cannot be converted and validated by the selected backend",
             };
-        }
+        };
     }
     return summaryFromAssessment(assessment);
 }
@@ -848,17 +820,7 @@ const ComponentInspection = struct {
         backend: backends.BackendType,
     ) CompatibilitySummary {
         if (self.invalid_summary) |summary| return summary;
-        if (backend == .onnx and self.has_native_component) {
-            return .{
-                .level = .incompatible,
-                .code = .unsupported_backend,
-                .message = "the ONNX Runtime backend cannot load a directory-backed component",
-            };
-        }
-        if (self.has_onnx_component and
-            (backend != .onnx or !build_options.enable_onnx) and
-            !self.imported_graph_compatible)
-        {
+        if (self.has_onnx_component and !self.imported_graph_compatible) {
             return .{
                 .level = .incompatible,
                 .code = .invalid_graph,
@@ -1243,7 +1205,7 @@ fn validateComponentNativeArtifacts(
         );
         if (inspection.invalid_summary != null) return;
         for (preferred_backends) |backend| {
-            if (!backend.supportsDirectSessionLoad() or backend == .onnx) continue;
+            if (!backend.supportsDirectSessionLoad()) continue;
             const summary = try compatibilitySummaryForBackend(
                 allocator,
                 path,
@@ -1265,14 +1227,7 @@ fn validateComponentImportedGraphs(
     preferred_backends: []const backends.BackendType,
     inspection: *ComponentInspection,
 ) !void {
-    var required = false;
-    for (preferred_backends) |backend| {
-        if (backend != .onnx or !build_options.enable_onnx) {
-            required = true;
-            break;
-        }
-    }
-    if (!required or !inspection.has_onnx_component or inspection.invalid_summary != null) return;
+    if (preferred_backends.len == 0 or !inspection.has_onnx_component or inspection.invalid_summary != null) return;
 
     for (component_paths, 0..) |path, path_index| {
         if (!std.mem.endsWith(u8, path, ".onnx")) continue;
@@ -2343,7 +2298,137 @@ fn ownSelectedFirstBackendPreference(
     return result;
 }
 
+fn resolutionModelRevision(a: std.mem.Allocator, io: std.Io, manifest: manifest_mod.ModelManifest) ![32]u8 {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var paths: std.ArrayList([]const u8) = .empty;
+    inline for (@typeInfo(manifest_mod.ModelManifest).@"struct".field_names) |field| {
+        if (comptime std.mem.endsWith(u8, field, "_path") and @TypeOf(@field(manifest, field)) == ?[]const u8) {
+            if (@field(manifest, field)) |path| try paths.append(alloc, path);
+        }
+    }
+    if (manifest.safetensors_index_path) |path| {
+        const raw = try @import("../util/c_file.zig").readFile(alloc, path);
+        const index = try std.json.parseFromSliceLeaky(std.json.Value, alloc, raw, .{});
+        if (index == .object) if (index.object.get("weight_map")) |weights| {
+            if (weights != .object) return error.InvalidModelLayout;
+            var seen: std.StringHashMapUnmanaged(void) = .empty;
+            for (weights.object.values()) |file| {
+                if (file != .string) return error.InvalidModelLayout;
+                const slot = try seen.getOrPut(alloc, file.string);
+                if (!slot.found_existing) try paths.append(alloc, try std.fs.path.join(alloc, &.{ std.fs.path.dirname(path).?, file.string }));
+            }
+        };
+    }
+    var external: std.ArrayList([]const u8) = .empty;
+    for (paths.items) |path| {
+        if (!std.mem.endsWith(u8, path, ".onnx")) continue;
+        var artifacts = try backends.imported_onnx_session.inspectArtifactSet(alloc, path);
+        defer artifacts.deinit();
+        for (artifacts.external_paths) |tensor_path| try external.append(alloc, try alloc.dupe(u8, tensor_path));
+    }
+    try paths.appendSlice(alloc, external.items);
+    return componentDependencySignature(io, paths.items);
+}
+
+// Legacy managed receipts may lack a digest. Hash those files once per local
+// file generation, keeping the resulting identity content-based across copies.
+const LegacyArtifactDigestCache = struct {
+    const Entry = struct { signature: [32]u8, digest: [32]u8 };
+    var mutex: std.atomic.Mutex = .unlocked;
+    var entries: [256]?Entry = @splat(null);
+    var next: usize = 0;
+    var forbid_hashing_for_test: bool = false;
+
+    fn digest(io: std.Io, artifact: managed_receipt.ValidatedArtifact) ![32]u8 {
+        const signature = try componentDependencySignature(io, &.{artifact.canonical_path});
+        spinLock(&mutex);
+        for (entries) |item| if (item) |entry| {
+            if (std.mem.eql(u8, &entry.signature, &signature)) {
+                mutex.unlock();
+                return entry.digest;
+            }
+        };
+        mutex.unlock();
+        const memo_path = try std.fmt.allocPrint(std.heap.page_allocator, "{s}.antfly-sha256-cache", .{artifact.canonical_path});
+        defer std.heap.page_allocator.free(memo_path);
+        const memo_bytes = std.Io.Dir.cwd().readFileAlloc(io, memo_path, std.heap.page_allocator, .limited(1024)) catch null;
+        defer if (memo_bytes) |bytes| std.heap.page_allocator.free(bytes);
+        if (memo_bytes) |bytes| {
+            if (std.json.parseFromSlice(Entry, std.heap.page_allocator, bytes, .{})) |memo| {
+                defer memo.deinit();
+                if (std.mem.eql(u8, &signature, &memo.value.signature)) {
+                    spinLock(&mutex);
+                    defer mutex.unlock();
+                    entries[next] = memo.value;
+                    next = (next + 1) % entries.len;
+                    return memo.value.digest;
+                }
+            } else |_| {}
+        }
+        if (builtin.is_test and forbid_hashing_for_test) return error.UnexpectedModelRehash;
+        var file = try std.Io.Dir.cwd().openFile(io, artifact.canonical_path, .{});
+        defer file.close(io);
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        var buffer: [64 * 1024]u8 = undefined;
+        while (true) {
+            const count = file.readStreaming(io, &.{&buffer}) catch |err| switch (err) {
+                error.EndOfStream => 0,
+                else => return err,
+            };
+            if (count == 0) break;
+            hasher.update(buffer[0..count]);
+        }
+        var result: [32]u8 = undefined;
+        hasher.final(&result);
+        if (!std.mem.eql(u8, &signature, &try componentDependencySignature(io, &.{artifact.canonical_path}))) return error.ModelArtifactsChanging;
+        const memo = std.json.Stringify.valueAlloc(std.heap.page_allocator, Entry{ .signature = signature, .digest = result }, .{}) catch null;
+        defer if (memo) |bytes| std.heap.page_allocator.free(bytes);
+        if (memo) |bytes| std.Io.Dir.cwd().writeFile(io, .{ .sub_path = memo_path, .data = bytes }) catch {};
+        spinLock(&mutex);
+        defer mutex.unlock();
+        entries[next] = .{ .signature = signature, .digest = result };
+        next = (next + 1) % entries.len;
+        return result;
+    }
+};
+
+/// Stable identity before loading weights. Managed receipts use relative paths
+/// and pinned content digests, so copying/restoring a model preserves reuse.
+pub fn modelIdentity(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, manifest: manifest_mod.ModelManifest) ![32]u8 {
+    var receipt = try managed_receipt.loadValidated(a, io, model_dir);
+    defer if (receipt) |*validated| validated.deinit();
+    if (receipt) |*validated| {
+        const artifacts = try a.dupe(managed_receipt.ValidatedArtifact, validated.artifacts);
+        defer a.free(artifacts);
+        std.mem.sort(managed_receipt.ValidatedArtifact, artifacts, {}, struct {
+            fn less(_: void, left: managed_receipt.ValidatedArtifact, right: managed_receipt.ValidatedArtifact) bool {
+                return std.mem.lessThan(u8, left.path, right.path);
+            }
+        }.less);
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        for (artifacts) |artifact| {
+            const decoded = try LegacyArtifactDigestCache.digest(io, artifact);
+            if (artifact.sha256) |digest| {
+                if (digest.len != 64) return error.InvalidManagedDownload;
+                var expected: [32]u8 = undefined;
+                _ = std.fmt.hexToBytes(&expected, digest) catch return error.InvalidManagedDownload;
+                if (!std.mem.eql(u8, &expected, &decoded)) return error.ChecksumMismatch;
+            }
+            hash.update(artifact.path);
+            hash.update(&.{0});
+            hash.update(&decoded);
+        }
+        var result: [32]u8 = undefined;
+        hash.final(&result);
+        return result;
+    }
+    return resolutionModelRevision(a, io, manifest);
+}
+
 pub const LoadedModel = struct {
+    resolution_revision: ?[32]u8 = null,
     embedding_identity: ?[64]u8 = null,
     embedding_asset_signature: ?[32]u8 = null,
     manifest: manifest_mod.ModelManifest,
@@ -3393,7 +3478,6 @@ test "target inference gates are GPU-only and model-local" {
     try std.testing.expectEqual(&second, targetInferenceExecutionMutexForBackend(.metal, &second).?);
     try std.testing.expectEqual(&first, targetInferenceExecutionMutexForBackend(.cuda, &first).?);
     try std.testing.expect(targetInferenceExecutionMutexForBackend(.native, &first) == null);
-    try std.testing.expect(targetInferenceExecutionMutexForBackend(.onnx, &first) == null);
     try std.testing.expect(targetInferenceExecutionMutexForBackend(.wasm, &first) == null);
 }
 
@@ -3570,22 +3654,6 @@ fn admissionBackendClassForRuntime(
     return if (backend_runtime.usesGpuHostedSession()) .gpu else .cpu;
 }
 
-fn admittedSessionCudaLimit(
-    backend_runtime: backends.BackendRuntime,
-    resident: runtime.tier.memory.AdmissionAmounts,
-) !?usize {
-    if (backend_runtime.backend != .onnx or
-        backend_runtime.onnx_execution_provider != .cuda)
-    {
-        return null;
-    }
-    return try std.math.add(
-        usize,
-        resident.backend_weight_bytes,
-        resident.backend_scratch_bytes,
-    );
-}
-
 fn qwenEmbeddingAdmissionConfig(
     backend: backends.BackendType,
     man: ?*const manifest_mod.ModelManifest,
@@ -3632,8 +3700,6 @@ fn attachSessionRunAdmission(
         .backend_class = backend_class,
         .limits = limits,
         .static_workspace_bytes = modelRunWorkspaceAllowance(weight_bytes),
-        .backend_workspace_reserved = backend_runtime.backend == .onnx and
-            backend_runtime.onnx_execution_provider == .cuda,
         .model_profile = sessionRunAdmissionModelProfile(backend_runtime, man, qwen_cfg),
     };
 }
@@ -3649,7 +3715,6 @@ fn sessionRunAdmissionModelProfile(
         .hidden_size = manifest.hidden_size,
         .intermediate_size = manifest.intermediate_size,
         .attention_heads = manifest.num_attention_heads,
-        .quadratic_attention = backend_runtime.backend == .onnx and backend_runtime.onnx_execution_provider != .cuda,
         .qwen_dense_workspace = qwen_cfg != null,
         .query_width = if (qwen_cfg) |cfg| @as(usize, cfg.num_attention_heads) * cfg.headDim() else 0,
         .kv_width = if (qwen_cfg) |cfg| @as(usize, cfg.effectiveKVHeads()) * cfg.headDim() else 0,
@@ -5853,14 +5918,13 @@ pub const ModelManager = struct {
                 rememberPreferredLoadError(&first_err, err);
                 continue;
             };
-            session_manager.onnx_execution_provider = backend_runtime.onnx_execution_provider;
 
             var resource_lease: ?runtime.tier.memory.AdmissionLease = null;
             defer if (resource_lease) |*lease| lease.release();
             var resident_amounts = runtime.tier.memory.AdmissionAmounts{};
             var admission_limits = runtime.tier.memory.Limits{};
             if (self.admission_enabled) {
-                const artifact_bytes = artifact_estimate.bytesForBackend(backend) catch |err| {
+                const artifact_bytes = artifact_estimate.encodedBytes() catch |err| {
                     rememberPreferredLoadError(&first_err, err);
                     continue;
                 };
@@ -5885,12 +5949,6 @@ pub const ModelManager = struct {
                     rememberPreferredLoadError(&first_err, err);
                     continue;
                 };
-                if (try admittedSessionCudaLimit(
-                    backend_runtime,
-                    resident_amounts,
-                )) |cuda_limit| {
-                    session_manager.onnx_cuda_memory_limit_bytes = cuda_limit;
-                }
                 resource_lease = self.acquireAmountsWithEviction(
                     admissionBackendClassForRuntime(backend_runtime),
                     admission_limits,
@@ -7402,6 +7460,10 @@ pub const ModelManager = struct {
         return self.waitForLoadFlight(flight_key, flight, control);
     }
 
+    pub fn modelIdentityForManifest(self: *ModelManager, model_dir: []const u8, manifest: manifest_mod.ModelManifest) ![32]u8 {
+        return modelIdentity(self.allocator, try self.componentPlanIo(), model_dir, manifest);
+    }
+
     fn loadFromDirUncached(
         self: *ModelManager,
         model_dir: []const u8,
@@ -7450,6 +7512,8 @@ pub const ModelManager = struct {
             sm.preferred_backends = eg2_backends[0..count];
         }
 
+        const resolution_file_revision = try resolutionModelRevision(self.allocator, sm.io orelse std.Options.debug_io, man);
+        const resolution_revision = try modelIdentity(self.allocator, sm.io orelse std.Options.debug_io, model_dir, man);
         const eg2_identity = @import("../models/embedding_gemma2_identity.zig");
         const embedding_signature: ?[32]u8 = if (man.embedding_style == .embedding_gemma2)
             try eg2_identity.signature(self.allocator, sm.io orelse std.Options.debug_io, model_dir, man.safetensors_path orelse return error.UnsupportedEmbeddingGemma2Weights)
@@ -7682,7 +7746,9 @@ pub const ModelManager = struct {
         var model_storage_owned = true;
         errdefer if (model_storage_owned) self.allocator.destroy(model);
         if (embedding_snapshot) |snapshot| if (!std.mem.eql(u8, &snapshot.signature, &try eg2_identity.signature(self.allocator, sm.io orelse std.Options.debug_io, model_dir, man.safetensors_path.?))) return error.ModelArtifactsChanging;
+        if (!std.mem.eql(u8, &resolution_file_revision, &try resolutionModelRevision(self.allocator, sm.io orelse std.Options.debug_io, man))) return error.ModelArtifactsChanging;
         model.* = .{
+            .resolution_revision = resolution_revision,
             .embedding_identity = if (embedding_snapshot) |snapshot| snapshot.digest else null,
             .embedding_asset_signature = if (embedding_snapshot) |snapshot| snapshot.signature else null,
             .manifest = man,
@@ -8826,35 +8892,12 @@ fn preferredModelPathForBackend(
     backend: backends.BackendType,
 ) ?[]const u8 {
     return switch (backend) {
-        .onnx => man.onnx_path orelse model_dir,
         .native, .metal, .cuda, .wasm => if (!manifestHasNativeAssets(man) and man.onnx_path != null)
             man.onnx_path.?
         else
             model_dir,
         .pjrt => null,
     };
-}
-
-fn effectiveLoadBackends(
-    scratch: *[7]backends.BackendType,
-    preferred_backends: []const backends.BackendType,
-    man: manifest_mod.ModelManifest,
-) []const backends.BackendType {
-    if (!shouldPreferNativeSession(man)) return preferred_backends;
-
-    var idx: usize = 0;
-    for (preferred_backends) |backend| {
-        if (backend == .onnx) continue;
-        scratch[idx] = backend;
-        idx += 1;
-    }
-    for (preferred_backends) |backend| {
-        if (backend == .onnx) {
-            scratch[idx] = backend;
-            idx += 1;
-        }
-    }
-    return scratch[0..idx];
 }
 
 fn sessionManagerForPreferredBackends(
@@ -8873,8 +8916,6 @@ fn sessionManagerForPreferredBackends(
         .a4b_inference_request = source.a4b_inference_request,
         .gliner_cuda_precision = source.gliner_cuda_precision,
         .test_allow_unqualified_gliner_cuda_precision = source.test_allow_unqualified_gliner_cuda_precision,
-        .onnx_execution_provider = source.onnx_execution_provider,
-        .onnx_cuda_memory_limit_bytes = source.onnx_cuda_memory_limit_bytes,
         .io = source.io,
         .process_isolation_available = source.process_isolation_available,
     };
@@ -8998,12 +9039,6 @@ const ModelLoadAdmissionPlan = struct {
 fn modelRunWorkspaceAllowance(weight_bytes: usize) usize {
     const min_workspace = 16 * 1024 * 1024;
     const max_workspace = 1024 * 1024 * 1024;
-    return std.math.clamp(weight_bytes / 8, min_workspace, max_workspace);
-}
-
-fn onnxCudaArenaAllowance(weight_bytes: usize) usize {
-    const min_workspace = 64 * 1024 * 1024;
-    const max_workspace = 2 * 1024 * 1024 * 1024;
     return std.math.clamp(weight_bytes / 8, min_workspace, max_workspace);
 }
 
@@ -9170,14 +9205,11 @@ const ComponentArtifactEstimate = union(enum) {
         self.* = .disabled;
     }
 
-    fn bytesForBackend(
-        self: *const ComponentArtifactEstimate,
-        backend: backends.BackendType,
-    ) !usize {
+    fn encodedBytes(self: *const ComponentArtifactEstimate) !usize {
         return switch (self.*) {
             .disabled => 0,
             .onnx => |bytes| bytes,
-            .native => |man| estimateModelArtifactBytes(man, backend),
+            .native => |man| estimateModelArtifactBytes(man),
         };
     }
 
@@ -9250,12 +9282,9 @@ fn addArtifactBytes(total: *usize, allocator: std.mem.Allocator, maybe_path: ?[]
     total.* = std.math.add(usize, total.*, size) catch return error.ResourceLimitExceeded;
 }
 
-fn estimateModelArtifactBytes(
-    man: manifest_mod.ModelManifest,
-    backend: backends.BackendType,
-) !usize {
+fn estimateModelArtifactBytes(man: manifest_mod.ModelManifest) !usize {
     var total: usize = 0;
-    const uses_native_weights = backend != .onnx and manifestHasNativeAssets(man);
+    const uses_native_weights = manifestHasNativeAssets(man);
     if (uses_native_weights) {
         const native_weight_bytes = std.math.cast(
             usize,
@@ -9311,9 +9340,8 @@ fn estimateModelLoadAdmission(
     a4b_request: ?backend_contracts.A4bInferenceRequest,
     laya_packed: bool,
 ) !ModelLoadAdmissionPlan {
-    const weights = try estimateModelArtifactBytes(man, backend_runtime.backend);
-    const uses_onnx_artifact = backend_runtime.backend == .onnx or !manifestHasNativeAssets(man);
-    if (uses_onnx_artifact) return onnxModelLoadAdmission(weights, backend_runtime);
+    const weights = try estimateModelArtifactBytes(man);
+    if (!manifestHasNativeAssets(man)) return onnxModelLoadAdmission(weights, backend_runtime);
     if (backend_runtime.backend == .metal) {
         if (!laya_packed) {
             if (try session_factory.layaResidentLoadAmounts(man, weights)) |resident| {
@@ -9561,29 +9589,6 @@ fn onnxModelLoadAdmission(
     backend_runtime: backends.BackendRuntime,
 ) !ModelLoadAdmissionPlan {
     return switch (backend_runtime.backend) {
-        .onnx => if (backend_runtime.onnx_execution_provider == .cuda) .{
-            .peak = .{
-                // ORT parses and materializes the protobuf on the host before
-                // CUDA owns its device initializers. Charge the same two-copy
-                // host construction peak as ORT CPU plus device residency.
-                .host_weight_bytes = std.math.mul(usize, weights, 2) catch
-                    return error.ResourceLimitExceeded,
-                .backend_weight_bytes = weights,
-                .backend_scratch_bytes = onnxCudaArenaAllowance(weights),
-            },
-            .resident = .{
-                .backend_weight_bytes = weights,
-                // ORT's CUDA arena retains its high-water allocation. Reserve
-                // and cap one bounded workspace for the session lifetime.
-                .backend_scratch_bytes = onnxCudaArenaAllowance(weights),
-            },
-        } else .{
-            .peak = .{
-                .host_weight_bytes = std.math.mul(usize, weights, 2) catch
-                    return error.ResourceLimitExceeded,
-            },
-            .resident = .{ .host_weight_bytes = weights },
-        },
         .metal, .cuda => .{
             .peak = .{
                 // The importer retains encoded host bytes while constructing device
@@ -9640,7 +9645,7 @@ fn nativeModelLoadAdmission(
                 .backend_weight_bytes = try session_factory.estimateBackendWeightResidencyBytes(.cuda, weights),
             },
         },
-        .native, .onnx, .wasm => .{
+        .native, .wasm => .{
             .peak = .{
                 // Native import may retain a source mapping while materializing or
                 // repacking resident weights.
@@ -9678,8 +9683,7 @@ fn loadSessionForPreferredBackends(
         preferred_backends,
         &required_backend_scratch,
     );
-    var effective_scratch: [7]backends.BackendType = undefined;
-    const effective_backends = effectiveLoadBackends(&effective_scratch, policy_backends, man);
+    const effective_backends = policy_backends;
     const fail_closed_cuda_a4b = source_session_manager.a4b_inference_request == null and
         backends.backendOrderSelectsCudaBeforeCpu(effective_backends) and
         (try session_factory.resolveCudaA4bInferenceConfigForModelListing(
@@ -9737,7 +9741,6 @@ fn loadSessionForPreferredBackends(
             rememberPreferredLoadError(&first_err, err);
             continue;
         };
-        backend_session_manager.onnx_execution_provider = backend_runtime.onnx_execution_provider;
         var resource_lease: ?runtime.tier.memory.AdmissionLease = null;
         // This attempt owns admission until the successful result explicitly
         // takes it. Includes cancellation, guard-arm failure, and fallback.
@@ -9766,15 +9769,6 @@ fn loadSessionForPreferredBackends(
                 rememberPreferredLoadError(&first_err, err);
                 continue;
             };
-            if (admittedSessionCudaLimit(
-                backend_runtime,
-                resident_amounts,
-            ) catch |err| {
-                rememberPreferredLoadError(&first_err, err);
-                continue;
-            }) |cuda_limit| {
-                backend_session_manager.onnx_cuda_memory_limit_bytes = cuda_limit;
-            }
             if (control) |active| try active.check();
             resource_lease = manager.acquireAmountsWithEviction(
                 admissionBackendClassForRuntime(backend_runtime),
@@ -10296,8 +10290,7 @@ test "preferred load attempt releases admission on cancellation and guard failur
         .{ .hard_cancellation = .{ .ptr = &manager, .arm_fn = Hooks.failArm, .disarm_fn = Hooks.disarm } },
     };
     const errors = [_]anyerror{ error.ProcessIsolationRequired, error.Timeout, error.OutOfMemory };
-    // Metal and CPU ONNX have the same process-required construction contract;
-    // use Metal's runtime descriptor so this test needs no optional ORT install.
+    // Use Metal's process-required construction contract for this test.
     for (0..3) |_| for (controls, errors) |control, expected| {
         try std.testing.expectError(expected, loadSessionForPreferredBackends(
             &manager,
@@ -10760,20 +10753,6 @@ test "serving admission applies the node-wide host-memory override" {
     );
 }
 
-test "shouldPreferNativeSession prefers native GLiNER weights" {
-    const allocator = std.testing.allocator;
-    var man = manifest_mod.ModelManifest{ .allocator = allocator };
-    defer man.deinit();
-
-    try std.testing.expect(!shouldPreferNativeSession(man));
-
-    man.gliner_model_type = try allocator.dupe(u8, "gliner2");
-    try std.testing.expect(!shouldPreferNativeSession(man));
-
-    man.safetensors_path = try allocator.dupe(u8, "model.safetensors");
-    try std.testing.expect(shouldPreferNativeSession(man));
-}
-
 test "optional sessions retain the selected backend before fallbacks" {
     const preferred = [_]backends.BackendType{ .metal, .native };
     const owned = try ownSelectedFirstBackendPreference(
@@ -10855,7 +10834,6 @@ test "preferredModelPathForBackend keeps metal/native on model directory when na
     man.onnx_path = try allocator.dupe(u8, "/tmp/model.onnx");
     man.safetensors_path = try allocator.dupe(u8, "/tmp/model.safetensors");
 
-    try std.testing.expectEqualStrings("/tmp/model.onnx", preferredModelPathForBackend("/tmp/model", man, .onnx).?);
     try std.testing.expectEqualStrings("/tmp/model", preferredModelPathForBackend("/tmp/model", man, .metal).?);
     try std.testing.expectEqualStrings("/tmp/model", preferredModelPathForBackend("/tmp/model", man, .native).?);
     try std.testing.expectEqualStrings("/tmp/model", preferredModelPathForBackend("/tmp/model", man, .metal).?);
@@ -10870,21 +10848,9 @@ test "preferredModelPathForBackend routes direct compute backends to onnx path f
     man.visual_model_path = try allocator.dupe(u8, "/tmp/visual_model.onnx");
     man.audio_model_path = try allocator.dupe(u8, "/tmp/audio_model.onnx");
 
-    try std.testing.expectEqualStrings("/tmp/text_model.onnx", preferredModelPathForBackend("/tmp/model", man, .onnx).?);
     try std.testing.expectEqualStrings("/tmp/text_model.onnx", preferredModelPathForBackend("/tmp/model", man, .native).?);
     try std.testing.expectEqualStrings("/tmp/text_model.onnx", preferredModelPathForBackend("/tmp/model", man, .metal).?);
     try std.testing.expectEqualStrings("/tmp/text_model.onnx", preferredModelPathForBackend("/tmp/model", man, .metal).?);
-}
-
-test "shouldPreferNativeSession prefers split GLiNER gguf bundle" {
-    const allocator = std.testing.allocator;
-    var man = manifest_mod.ModelManifest{ .allocator = allocator };
-    defer man.deinit();
-
-    man.gliner_model_type = try allocator.dupe(u8, "gliner2");
-    man.gguf_path = try allocator.dupe(u8, "encoder.gguf");
-    man.gliner_head_gguf_path = try allocator.dupe(u8, "gliner_head.gguf");
-    try std.testing.expect(shouldPreferNativeSession(man));
 }
 
 test "isManifestPotentiallyLoadableInCurrentBuild rejects incomplete GLiNER bundle" {
@@ -10897,74 +10863,10 @@ test "isManifestPotentiallyLoadableInCurrentBuild rejects incomplete GLiNER bund
     try std.testing.expect(!isManifestPotentiallyLoadableInCurrentBuild(man));
 }
 
-test "shouldPreferNativeSession prefers native CLIP, Whisper, and Florence weights" {
-    const allocator = std.testing.allocator;
-
-    var clip = manifest_mod.ModelManifest{ .allocator = allocator, .native_arch_hint = .clip };
-    defer clip.deinit();
-    try std.testing.expect(!shouldPreferNativeSession(clip));
-    clip.safetensors_path = try allocator.dupe(u8, "model.safetensors");
-    try std.testing.expect(shouldPreferNativeSession(clip));
-
-    var whisper = manifest_mod.ModelManifest{ .allocator = allocator, .native_arch_hint = .whisper };
-    defer whisper.deinit();
-    try std.testing.expect(!shouldPreferNativeSession(whisper));
-    whisper.safetensors_path = try allocator.dupe(u8, "model.safetensors");
-    try std.testing.expect(shouldPreferNativeSession(whisper));
-
-    var florence = manifest_mod.ModelManifest{ .allocator = allocator, .native_arch_hint = .florence };
-    defer florence.deinit();
-    try std.testing.expect(!shouldPreferNativeSession(florence));
-    florence.safetensors_path = try allocator.dupe(u8, "model.safetensors");
-    try std.testing.expect(shouldPreferNativeSession(florence));
-}
-
-test "shouldPreferNativeSession prefers native classifier and extractor weights" {
-    const allocator = std.testing.allocator;
-
-    var classifier = manifest_mod.ModelManifest{ .allocator = allocator, .model_type = .classifier };
-    defer classifier.deinit();
-    try std.testing.expect(!shouldPreferNativeSession(classifier));
-    classifier.safetensors_path = try allocator.dupe(u8, "model.safetensors");
-    try std.testing.expect(shouldPreferNativeSession(classifier));
-
-    var extractor = manifest_mod.ModelManifest{ .allocator = allocator, .model_type = .extractor };
-    defer extractor.deinit();
-    try std.testing.expect(!shouldPreferNativeSession(extractor));
-    extractor.safetensors_path = try allocator.dupe(u8, "model.safetensors");
-    try std.testing.expect(shouldPreferNativeSession(extractor));
-}
-
-test "effectiveLoadBackends keeps gpu native backends ahead of cpu native before onnx" {
-    const allocator = std.testing.allocator;
-    const preferred = [_]backends.BackendType{ .onnx, .metal, .native };
-    var scratch: [7]backends.BackendType = undefined;
-
-    var classifier = manifest_mod.ModelManifest{ .allocator = allocator, .model_type = .classifier };
-    defer classifier.deinit();
-    classifier.safetensors_path = try allocator.dupe(u8, "model.safetensors");
-
-    const effective = effectiveLoadBackends(&scratch, &preferred, classifier);
-    try std.testing.expectEqualSlices(backends.BackendType, &.{ .metal, .native, .onnx }, effective);
-}
-
-test "effectiveLoadBackends preserves explicit onnx-only classifier preference" {
-    const allocator = std.testing.allocator;
-    const preferred = [_]backends.BackendType{.onnx};
-    var scratch: [7]backends.BackendType = undefined;
-
-    var classifier = manifest_mod.ModelManifest{ .allocator = allocator, .model_type = .classifier };
-    defer classifier.deinit();
-    classifier.safetensors_path = try allocator.dupe(u8, "model.safetensors");
-
-    const effective = effectiveLoadBackends(&scratch, &preferred, classifier);
-    try std.testing.expectEqualSlices(backends.BackendType, &preferred, effective);
-}
-
 test "required backend is applied before model manager backend planning" {
     const allocator = std.testing.allocator;
     var source = backends.SessionManager.init(allocator);
-    source.preferred_backends = &.{ .native, .onnx };
+    source.preferred_backends = &.{ .native, .metal };
     source.required_backend = .cuda;
     source.required_backend_invalid = false;
 
@@ -10974,13 +10876,7 @@ test "required backend is applied before model manager backend planning" {
         &required_scratch,
     );
 
-    var load_scratch: [7]backends.BackendType = undefined;
-    var classifier = manifest_mod.ModelManifest{ .allocator = allocator, .model_type = .classifier };
-    defer classifier.deinit();
-    classifier.safetensors_path = try allocator.dupe(u8, "model.safetensors");
-
-    const effective = effectiveLoadBackends(&load_scratch, policy_backends, classifier);
-    try std.testing.expectEqualSlices(backends.BackendType, &.{.cuda}, effective);
+    try std.testing.expectEqualSlices(backends.BackendType, &.{.cuda}, policy_backends);
 }
 
 test "model manager rejects an unavailable required backend before artifact selection" {
@@ -11028,10 +10924,6 @@ test "hybrid artifact candidates are isolated by backend" {
     hybrid.safetensors_path = try allocator.dupe(u8, "model.safetensors");
     hybrid.onnx_path = try allocator.dupe(u8, "model.onnx");
 
-    try std.testing.expectEqual(
-        ArtifactCandidateKind.onnx,
-        artifactCandidateForBackend(hybrid, .onnx).?,
-    );
     try std.testing.expectEqual(
         ArtifactCandidateKind.safetensors,
         artifactCandidateForBackend(hybrid, .native).?,
@@ -12152,7 +12044,7 @@ test "projector residency follows its request-scoped lifecycle" {
 
     try std.testing.expectEqual(
         decoder_bytes,
-        try estimateModelArtifactBytes(man, .native),
+        try estimateModelArtifactBytes(man),
     );
     const request = try projectorRunAdmissionAmounts(man, .native, .{});
     try std.testing.expectEqual(projector_bytes, request.host_weight_bytes);
@@ -12170,32 +12062,18 @@ test "projector residency follows its request-scoped lifecycle" {
 
 test "onnx admission separates encoded staging from completed residency" {
     const weights: usize = 1024 * 1024;
-    const cpu = try onnxModelLoadAdmission(weights, .{ .backend = .onnx });
+    const cpu = try onnxModelLoadAdmission(weights, .{ .backend = .native });
     try std.testing.expectEqual(weights * 2, cpu.peak.host_weight_bytes);
     try std.testing.expectEqual(weights, cpu.resident.host_weight_bytes);
 
-    const gpu = try onnxModelLoadAdmission(weights, .{
-        .backend = .onnx,
-        .onnx_execution_provider = .cuda,
-    });
-    try std.testing.expectEqual(weights * 2, gpu.peak.host_weight_bytes);
+    const gpu = try onnxModelLoadAdmission(weights, .{ .backend = .metal });
+    try std.testing.expectEqual(weights, gpu.peak.host_weight_bytes);
     try std.testing.expectEqual(weights, gpu.peak.backend_weight_bytes);
     try std.testing.expectEqual(@as(usize, 0), gpu.resident.host_weight_bytes);
     try std.testing.expectEqual(weights, gpu.resident.backend_weight_bytes);
     try std.testing.expectEqual(
-        onnxCudaArenaAllowance(weights),
-        gpu.peak.backend_scratch_bytes,
-    );
-    try std.testing.expectEqual(
-        onnxCudaArenaAllowance(weights),
-        gpu.resident.backend_scratch_bytes,
-    );
-    try std.testing.expectEqual(
         runtime.tier.memory.BackendClass.gpu,
-        admissionBackendClassForRuntime(.{
-            .backend = .onnx,
-            .onnx_execution_provider = .cuda,
-        }),
+        admissionBackendClassForRuntime(.{ .backend = .metal }),
     );
 }
 
@@ -12218,10 +12096,10 @@ test "directory-backed component admission charges native model artifacts" {
     defer estimate.deinit();
     try std.testing.expectEqual(
         @as(usize, weight_bytes),
-        try estimate.bytesForBackend(.native),
+        try estimate.encodedBytes(),
     );
     const plan = try nativeModelLoadAdmission(
-        try estimate.bytesForBackend(.native),
+        try estimate.encodedBytes(),
         .native,
         .{},
     );
@@ -13729,4 +13607,51 @@ test "ONNX export tokenizer format takes precedence over root JSON" {
         defer a.free(ids);
         try std.testing.expectEqualSlices(i32, if (export_json) &.{7} else &.{5}, ids);
     }
+}
+
+test "capi resolver model identity uses receipt digests before load and survives copying" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var first = std.testing.tmpDir(.{});
+    defer first.cleanup();
+    var second = std.testing.tmpDir(.{});
+    defer second.cleanup();
+    const body = "identical fake model weights";
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(body, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    const receipt = try std.json.Stringify.valueAlloc(a, managed_receipt.DownloadReceipt{ .version = 2, .source = .{ .owner = "test", .name = "identity", .variant = "safetensors", .selected_format = "safetensors" }, .artifacts = &.{.{ .path = "model.safetensors", .size = body.len, .sha256 = &hex }} }, .{});
+    defer a.free(receipt);
+    for ([_]std.Io.Dir{ first.dir, second.dir }) |dir| {
+        try dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = body });
+        try dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = receipt });
+    }
+    const first_path = try first.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(first_path);
+    const second_path = try second.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(second_path);
+    const manifest: manifest_mod.ModelManifest = .{ .allocator = a };
+    const original = try modelIdentity(a, io, first_path, manifest);
+    const copied = try modelIdentity(a, io, second_path, manifest);
+    try std.testing.expectEqualSlices(u8, &original, &copied);
+    LegacyArtifactDigestCache.entries = @splat(null); // a reopened owner/process
+    LegacyArtifactDigestCache.forbid_hashing_for_test = true;
+    defer LegacyArtifactDigestCache.forbid_hashing_for_test = false;
+    try std.testing.expectEqualSlices(u8, &original, &try modelIdentity(a, io, second_path, manifest));
+    LegacyArtifactDigestCache.forbid_hashing_for_test = false;
+    const legacy = try std.json.Stringify.valueAlloc(a, managed_receipt.DownloadReceipt{ .artifacts = &.{.{ .path = "model.safetensors", .size = body.len }} }, .{});
+    defer a.free(legacy);
+    try second.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = legacy });
+    const legacy_identity = try modelIdentity(a, io, second_path, manifest);
+    try std.testing.expectEqualSlices(u8, &original, &legacy_identity);
+    try std.testing.expectEqualSlices(u8, &legacy_identity, &try modelIdentity(a, io, second_path, manifest));
+    // Invalid weight bytes deliberately prove identity lookup does not load a model.
+    const changed = try std.mem.replaceOwned(u8, a, receipt, &hex, "0000000000000000000000000000000000000000000000000000000000000000");
+    defer a.free(changed);
+    try second.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = changed });
+    try std.testing.expectError(error.ChecksumMismatch, modelIdentity(a, io, second_path, manifest));
+    // A stale pinned receipt must also reject in-place weight replacement.
+    try second.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = receipt });
+    try second.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = "different fake model weights" });
+    try std.testing.expectError(error.ChecksumMismatch, modelIdentity(a, io, second_path, manifest));
 }

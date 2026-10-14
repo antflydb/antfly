@@ -12528,6 +12528,7 @@ test "algebraic distributed range aggregations merge nested exact cardinality" {
         &left_identity_writes,
         left_doc_keys[0..],
         &.{},
+        null,
     );
     try left_store.putBatchWithReplay(null, left_identity_writes.items, &.{}, null);
     {
@@ -14629,6 +14630,7 @@ test "algebraic aggregation planner answers range buckets from scalar facts" {
         &identity_writes,
         doc_keys[0..],
         &.{},
+        null,
     );
     try store.putBatchWithReplay(null, identity_writes.items, &.{}, null);
     try manager.algebraic_indexes.items[0].index.applyBatch(&store, .{ .documents = docs[0..] });
@@ -14758,6 +14760,7 @@ test "algebraic aggregation planner answers range buckets from scalar facts" {
         &extra_identity_writes,
         extra_doc_keys[0..],
         &.{},
+        null,
     );
     try store.putBatchWithReplay(null, extra_identity_writes.items, &.{}, null);
     try manager.algebraic_indexes.items[0].index.applyBatch(&store, .{ .documents = extra_docs[0..] });
@@ -15381,6 +15384,7 @@ test "algebraic aggregation planner rolls up date cylinders across extra dimensi
         &identity_writes,
         doc_keys[0..],
         &.{},
+        null,
     );
     try store.putBatchWithReplay(null, identity_writes.items, &.{}, null);
     try manager.algebraic_indexes.items[0].index.applyBatch(&store, .{ .documents = docs[0..] });

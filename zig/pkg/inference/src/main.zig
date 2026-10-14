@@ -75,6 +75,7 @@ const RunConfig = struct {
     preload: []const WarmModelConfig = &.{},
     keep_alive_ms: ?u64 = null,
     max_loaded_models: ?usize = null,
+    http_max_body_mb: ?usize = null,
     /// Deprecated compatibility alias for admission.inference.max_concurrent_requests.
     max_concurrent_requests: ?u32 = null,
     admission: ?AdmissionConfig = null,
@@ -175,7 +176,6 @@ fn parseRunConfig(allocator: std.mem.Allocator, raw: []const u8) !std.json.Parse
 
 fn parseBackendType(value: []const u8) ?inference.backends.BackendType {
     if (std.mem.eql(u8, value, "native")) return .native;
-    if (std.mem.eql(u8, value, "onnx")) return .onnx;
     if (std.mem.eql(u8, value, "metal")) return .metal;
     if (std.mem.eql(u8, value, "cuda")) return .cuda;
     if (std.mem.eql(u8, value, "xla") or std.mem.eql(u8, value, "pjrt")) return .pjrt;
@@ -204,6 +204,7 @@ fn parsePreloadModelFlag(value: []const u8) !inference.server.WarmModel {
     var backend: ?inference.backends.BackendType = null;
     if (std.mem.indexOfScalar(u8, model_name, ':')) |backend_separator| {
         const backend_name = model_name[0..backend_separator];
+        if (inference.backends.isRemovedOnnxBackendName(backend_name)) return error.InvalidArguments;
         if (parseBackendType(backend_name)) |parsed_backend| {
             backend = parsed_backend;
             model_name = model_name[backend_separator + 1 ..];
@@ -234,6 +235,8 @@ test "preload model parser preserves registry variants and recognizes explicit b
     const backend = try parsePreloadModelFlag("generator:metal:owner/model:i8");
     try std.testing.expectEqualStrings("owner/model:i8", backend.name);
     try std.testing.expectEqual(inference.backends.BackendType.metal, backend.backend.?);
+
+    try std.testing.expectError(error.InvalidArguments, parsePreloadModelFlag("generator:onnx:owner/model"));
 }
 
 fn parseAdmissionLimit(value: []const u8) !usize {
@@ -398,6 +401,7 @@ const run_usage_options =
     \\  --config <path>                     JSON run configuration
     \\  --max-loaded-models <count>          Residency limit; 0 means unlimited
     \\  --max-concurrent-requests <count>    Request concurrency limit
+    \\  --http-max-body-mb <n>                Encoded HTTP body limit (MiB; default: 10)
     \\  --process-memory-budget-mb <n>       Whole-process/container memory envelope
     \\  --host-budget-mb <n>                 Host-memory admission override (MiB)
     \\  --backend-budget-mb <n>              Device-memory admission override (MiB)
@@ -483,6 +487,7 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const
     var config_path: ?[]const u8 = null;
     const max_loaded_models_override = try inference.run_options.parseMaxLoadedModelsOverride(args);
     var max_concurrent_requests_override: ?usize = null;
+    var http_max_body_bytes_override: ?usize = null;
     var process_memory_budget_mb_override: ?usize = null;
     var budget_overrides_mib = inference.runtime.tier.memory.BudgetOverridesMib{};
     var kernel_jit_mode_override: ?inference.graph.kernel_jit.Mode = null;
@@ -517,6 +522,9 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const
             // last-value-wins behavior without a second conversion path.
         } else if (std.mem.eql(u8, args[i], "--max-concurrent-requests") and i + 1 < args.len) {
             max_concurrent_requests_override = try parseAdmissionLimit(args[i + 1]);
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--http-max-body-mb") and i + 1 < args.len) {
+            http_max_body_bytes_override = try inference.server.httpBodyLimitBytesFromMib(try parseAdmissionLimit(args[i + 1]));
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--process-memory-budget-mb") and i + 1 < args.len) {
             process_memory_budget_mb_override = try parseAdmissionLimit(args[i + 1]);
@@ -565,10 +573,9 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const
     }
 
     print("antfly inference v{s}\n", .{build_info.version()});
-    print("backends: native={} onnx={} onnx_runtime={} metal={} cuda={}\n", .{
+    print("backends: native={} onnx={} metal={} cuda={}\n", .{
         build_options.enable_native,
         !build_options.enable_wasm,
-        build_options.enable_onnx,
         build_options.enable_metal,
         build_options.enable_cuda,
     });
@@ -633,6 +640,7 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const
         if (cfg.max_loaded_models) |value| node_cfg.max_loaded_models = value;
         if (try resolvedMaxConcurrentRequests(cfg)) |value| node_cfg.max_concurrent_requests = value;
         if (cfg.pool_size) |value| node_cfg.pool_size = value;
+        if (cfg.http_max_body_mb) |value| node_cfg.http_max_body_bytes = try inference.server.httpBodyLimitBytesFromMib(value);
         if (cfg.generation_batching) |value| node_cfg.generation_batching = value;
         if (cfg.prompt_cache) |value| node_cfg.prompt_cache = .{
             .enabled = value.enabled,
@@ -657,6 +665,7 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const
     }
     if (max_loaded_models_override) |value| node_cfg.max_loaded_models = value;
     if (max_concurrent_requests_override) |value| node_cfg.max_concurrent_requests = value;
+    if (http_max_body_bytes_override) |value| node_cfg.http_max_body_bytes = value;
 
     var node = try inference.server.Node.init(allocator, node_cfg);
     defer node.deinit();
@@ -782,10 +791,9 @@ fn isPredictorPull(args: []const []const u8) bool {
 
 pub fn printVersion(usage_name: []const u8) void {
     print("{s} v{s}\n", .{ usage_name, build_info.version() });
-    print("backends: native={} onnx={} onnx_runtime={} metal={} cuda={}\n", .{
+    print("backends: native={} onnx={} metal={} cuda={}\n", .{
         build_options.enable_native,
         !build_options.enable_wasm,
-        build_options.enable_onnx,
         build_options.enable_metal,
         build_options.enable_cuda,
     });

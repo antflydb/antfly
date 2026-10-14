@@ -6,7 +6,7 @@ Point it at a folder of screenshots and ask questions like "terminal with error 
 
 ## Prerequisites
 
-- Antfly running with Antfly inference and ONNX Runtime
+- Antfly running with Antfly inference
 - CLIP model: `antfly inference pull openai/clip-vit-base-patch32`
 
 ## Supported File Types

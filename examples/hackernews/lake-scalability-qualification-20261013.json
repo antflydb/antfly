@@ -1,0 +1,938 @@
+{
+  "kind": "hackernews-lake-scalability-local-qualification",
+  "date": "2026-10-13",
+  "scope": "Native ARM64 local filesystem; application cache cleared before readiness warming; OS caches not flushed; shared development host. Not full-archive or cloud qualification.",
+  "percentile_method": "Nearest rank ceil(0.95 * n), with 20 warm samples per cycle.",
+  "source": {
+    "rows": 142577,
+    "files": 1024,
+    "parquet_bytes": 69006338,
+    "inventory_sha256": "0bfc5fbb3b7eeecbb6024c3f6f7819f5eeed3a6868de061e2ce46a1000131cb2",
+    "note": "Original logical sample rows re-encoded in original order into Snappy files; not raw BigQuery physical encoding."
+  },
+  "runs": {
+    "canonical_files": 1024,
+    "canonical_segments": 1024,
+    "serving_units": 128,
+    "serving_segments": 128,
+    "documents": 142577,
+    "metadata_version": 11
+  },
+  "baseline": {
+    "binary_sha256": "799101d278a772718f3d3e42563424d570fa0451a36a835f2de88369d5f84ed3",
+    "note": "Retained optimized PR #1081 qualification executable, not a released image.",
+    "cycles": [
+      {
+        "first_search_ms": 326.82,
+        "warm_samples_ms": [
+          76.12,
+          75.44,
+          74.17,
+          81.28,
+          74.63,
+          77.8,
+          77.2,
+          75.99,
+          76.91,
+          76.7,
+          72.6,
+          77.41,
+          79.64,
+          83.47,
+          76.2,
+          85.86,
+          92.02,
+          82.29,
+          88.02,
+          113.75
+        ],
+        "warm_p95_ms": 92.02,
+        "after_restart_ms": 182.77,
+        "cursor": {
+          "hits": 1408,
+          "samples_ms": [
+            212.94,
+            181.81,
+            175.03,
+            174.22,
+            180.76,
+            166.58,
+            188.39,
+            187.09,
+            188.26,
+            207.86
+          ],
+          "term": "AI",
+          "initial_ms": 364.14,
+          "restart_ms": 432.88,
+          "p95_ms": 212.94
+        },
+        "cold_metrics": {
+          "antfly_lake_cache_provider_reads_total": 1461,
+          "antfly_lake_cache_provider_bytes_total": 50846885
+        },
+        "filters": {
+          "item_type": {
+            "samples_ms": [
+              191.86,
+              141.89,
+              140.26,
+              139.35,
+              140.63,
+              144.06,
+              140.37,
+              139.91,
+              153.02,
+              143.96,
+              139.78,
+              140.89,
+              140.88,
+              140.68,
+              141.17,
+              144.12,
+              144.26,
+              140.77,
+              141.26,
+              140.14
+            ],
+            "p95_ms": 153.02,
+            "after_restart_ms": 173.87
+          },
+          "author": {
+            "samples_ms": [
+              102.81,
+              68.04,
+              75.29,
+              67.37,
+              67.56,
+              67.4,
+              67.52,
+              67.79,
+              69.05,
+              67.59,
+              69.19,
+              66.94,
+              68.1,
+              67.31,
+              67.23,
+              69.07,
+              75.29,
+              67.13,
+              71.08,
+              67.69
+            ],
+            "p95_ms": 75.29,
+            "after_restart_ms": 80.49
+          },
+          "points": {
+            "samples_ms": [
+              181.92,
+              140.07,
+              138.05,
+              141.09,
+              140.12,
+              139.89,
+              141.7,
+              137.74,
+              139.0,
+              139.1,
+              139.14,
+              139.44,
+              138.08,
+              138.79,
+              142.49,
+              139.72,
+              139.89,
+              139.42,
+              139.98,
+              148.15
+            ],
+            "p95_ms": 148.15,
+            "after_restart_ms": 168.77
+          },
+          "created_at": {
+            "samples_ms": [
+              263.89,
+              139.71,
+              134.95,
+              150.41,
+              130.03,
+              143.47,
+              154.7,
+              162.51,
+              186.63,
+              147.24,
+              137.68,
+              150.23,
+              142.46,
+              135.93,
+              141.31,
+              141.19,
+              130.97,
+              126.54,
+              125.48,
+              131.68
+            ],
+            "p95_ms": 186.63,
+            "after_restart_ms": 145.71
+          },
+          "combined": {
+            "samples_ms": [
+              157.89,
+              111.12,
+              113.17,
+              110.86,
+              109.61,
+              110.39,
+              115.65,
+              110.48,
+              113.28,
+              111.54,
+              111.9,
+              112.84,
+              112.7,
+              110.07,
+              112.75,
+              113.73,
+              111.79,
+              113.47,
+              114.19,
+              113.16
+            ],
+            "p95_ms": 115.65,
+            "after_restart_ms": 121.25
+          }
+        },
+        "top_hits": [
+          {
+            "id": "lake1:febfa7d451f621d1a2a8152643fd57c495ca0c5415345086a5c7d04ae31ca302:00000000:0000000000000059",
+            "hn_id": 42108980,
+            "score": 9.366081237792969
+          },
+          {
+            "id": "lake1:81dc2bd15b3d3db54128651e192d5631f33ed031f713eec030a67ecad14dea22:00000000:0000000000000015",
+            "hn_id": 42076462,
+            "score": 9.22985553741455
+          },
+          {
+            "id": "lake1:9903e146a825cf2d98c7370330b9580e6a3d931152dafc6ec5bf1ce6430716ae:00000000:000000000000002a",
+            "hn_id": 42053930,
+            "score": 9.126331329345703
+          },
+          {
+            "id": "lake1:32b50dcde2c76dfe004457ffea375ddb6757583f5d7830e4b3a1b56d5d37adeb:00000000:0000000000000047",
+            "hn_id": 42128520,
+            "score": 9.025105476379395
+          },
+          {
+            "id": "lake1:cf969a036e078b5edbbe712fa01f806194b73d976720bb63e62e7c982183afa1:00000000:0000000000000037",
+            "hn_id": 42019605,
+            "score": 8.680729866027832
+          }
+        ],
+        "verified": [
+          "remote_bm25",
+          "projected_highlights",
+          "snapshot_pagination",
+          "restart_scores",
+          "restart_pagination",
+          "metadata_filters_match_residual",
+          "metadata_filters_after_restart",
+          "empty_date_filter_before_and_after_restart",
+          "concurrent_search",
+          "exact_filter"
+        ],
+        "navigation_warming_enabled": true
+      },
+      {
+        "first_search_ms": 406.73,
+        "warm_samples_ms": [
+          74.37,
+          73.49,
+          74.94,
+          73.76,
+          72.43,
+          74.03,
+          72.82,
+          74.74,
+          77.61,
+          76.69,
+          75.4,
+          73.33,
+          73.6,
+          75.94,
+          74.43,
+          75.47,
+          74.46,
+          76.42,
+          76.03,
+          72.2
+        ],
+        "warm_p95_ms": 76.69,
+        "after_restart_ms": 172.13,
+        "cursor": {
+          "hits": 1408,
+          "samples_ms": [
+            205.35,
+            170.45,
+            159.61,
+            168.97,
+            182.04,
+            175.83,
+            189.04,
+            187.76,
+            192.56,
+            217.74
+          ],
+          "term": "AI",
+          "initial_ms": 335.41,
+          "restart_ms": 247.02,
+          "p95_ms": 217.74
+        },
+        "cold_metrics": {
+          "antfly_lake_cache_provider_reads_total": 1461,
+          "antfly_lake_cache_provider_bytes_total": 50846885
+        },
+        "filters": {
+          "item_type": {
+            "samples_ms": [
+              188.07,
+              141.29,
+              142.88,
+              140.2,
+              139.89,
+              139.74,
+              139.89,
+              139.68,
+              140.62,
+              140.32,
+              141.53,
+              139.18,
+              139.55,
+              137.87,
+              141.56,
+              142.39,
+              141.96,
+              142.84,
+              141.3,
+              141.0
+            ],
+            "p95_ms": 142.88,
+            "after_restart_ms": 150.53
+          },
+          "author": {
+            "samples_ms": [
+              92.49,
+              70.13,
+              69.31,
+              67.03,
+              68.13,
+              69.64,
+              69.27,
+              69.41,
+              69.34,
+              68.08,
+              68.39,
+              67.92,
+              69.17,
+              68.4,
+              69.12,
+              68.86,
+              68.46,
+              69.37,
+              68.26,
+              67.79
+            ],
+            "p95_ms": 70.13,
+            "after_restart_ms": 76.36
+          },
+          "points": {
+            "samples_ms": [
+              183.8,
+              139.87,
+              172.81,
+              167.81,
+              153.64,
+              149.17,
+              150.88,
+              151.13,
+              135.77,
+              136.95,
+              137.49,
+              139.48,
+              138.33,
+              137.91,
+              138.36,
+              138.33,
+              139.51,
+              139.68,
+              139.29,
+              138.37
+            ],
+            "p95_ms": 172.81,
+            "after_restart_ms": 142.47
+          },
+          "created_at": {
+            "samples_ms": [
+              207.32,
+              127.04,
+              126.13,
+              121.82,
+              122.06,
+              123.53,
+              121.36,
+              124.22,
+              122.58,
+              122.07,
+              122.6,
+              125.11,
+              122.9,
+              123.81,
+              121.24,
+              122.33,
+              121.94,
+              123.22,
+              123.35,
+              124.44
+            ],
+            "p95_ms": 127.04,
+            "after_restart_ms": 131.2
+          },
+          "combined": {
+            "samples_ms": [
+              135.13,
+              110.96,
+              111.35,
+              112.14,
+              111.74,
+              111.52,
+              111.7,
+              110.57,
+              111.57,
+              110.6,
+              110.86,
+              113.13,
+              112.1,
+              111.4,
+              112.04,
+              111.3,
+              110.79,
+              112.15,
+              111.89,
+              111.68
+            ],
+            "p95_ms": 113.13,
+            "after_restart_ms": 115.04
+          }
+        },
+        "top_hits": [
+          {
+            "id": "lake1:febfa7d451f621d1a2a8152643fd57c495ca0c5415345086a5c7d04ae31ca302:00000000:0000000000000059",
+            "hn_id": 42108980,
+            "score": 9.366081237792969
+          },
+          {
+            "id": "lake1:81dc2bd15b3d3db54128651e192d5631f33ed031f713eec030a67ecad14dea22:00000000:0000000000000015",
+            "hn_id": 42076462,
+            "score": 9.22985553741455
+          },
+          {
+            "id": "lake1:9903e146a825cf2d98c7370330b9580e6a3d931152dafc6ec5bf1ce6430716ae:00000000:000000000000002a",
+            "hn_id": 42053930,
+            "score": 9.126331329345703
+          },
+          {
+            "id": "lake1:32b50dcde2c76dfe004457ffea375ddb6757583f5d7830e4b3a1b56d5d37adeb:00000000:0000000000000047",
+            "hn_id": 42128520,
+            "score": 9.025105476379395
+          },
+          {
+            "id": "lake1:cf969a036e078b5edbbe712fa01f806194b73d976720bb63e62e7c982183afa1:00000000:0000000000000037",
+            "hn_id": 42019605,
+            "score": 8.680729866027832
+          }
+        ],
+        "verified": [
+          "remote_bm25",
+          "projected_highlights",
+          "snapshot_pagination",
+          "restart_scores",
+          "restart_pagination",
+          "metadata_filters_match_residual",
+          "metadata_filters_after_restart",
+          "empty_date_filter_before_and_after_restart",
+          "concurrent_search",
+          "exact_filter"
+        ],
+        "navigation_warming_enabled": true
+      }
+    ]
+  },
+  "followup": {
+    "engine_source_commit": "31b3b6f29c88ad7522a13f481cd2aa3cc698de84",
+    "binary_sha256": "942e82d8cdc15a498d79b989cbfae5a7b202d7220ee3097dc18453d939e0ae6b",
+    "note": "Optimized qualification executable built from frozen implementation files; build metadata may identify the earlier build-input revision. Not a released image.",
+    "cycles": [
+      {
+        "first_search_ms": 240.35,
+        "warm_samples_ms": [
+          54.64,
+          51.18,
+          49.92,
+          54.63,
+          53.65,
+          51.87,
+          51.66,
+          51.01,
+          52.43,
+          48.49,
+          51.38,
+          50.1,
+          49.1,
+          48.29,
+          49.78,
+          50.47,
+          48.94,
+          49.66,
+          49.93,
+          51.5
+        ],
+        "warm_p95_ms": 54.63,
+        "after_restart_ms": 95.15,
+        "cursor": {
+          "hits": 1408,
+          "samples_ms": [
+            147.1,
+            174.43,
+            151.41,
+            144.93,
+            146.35,
+            152.0,
+            155.4,
+            170.66,
+            169.79,
+            178.46
+          ],
+          "term": "AI",
+          "initial_ms": 345.41,
+          "restart_ms": 212.24,
+          "p95_ms": 178.46
+        },
+        "cold_metrics": {
+          "antfly_lake_cache_provider_reads_total": 405,
+          "antfly_lake_cache_provider_bytes_total": 24332866,
+          "antfly_lake_query_best_first_calls_total": 1,
+          "antfly_lake_query_best_first_segments_total": 58,
+          "antfly_lake_query_best_first_pruned_nodes_total": 70
+        },
+        "filters": {
+          "item_type": {
+            "samples_ms": [
+              199.06,
+              90.79,
+              90.17,
+              90.25,
+              89.98,
+              89.14,
+              89.42,
+              89.04,
+              92.41,
+              91.49,
+              91.45,
+              91.99,
+              92.17,
+              92.77,
+              91.85,
+              108.8,
+              91.74,
+              89.68,
+              94.18,
+              91.58
+            ],
+            "p95_ms": 108.8,
+            "after_restart_ms": 109.53
+          },
+          "author": {
+            "samples_ms": [
+              63.49,
+              84.54,
+              112.52,
+              76.97,
+              62.6,
+              66.07,
+              61.56,
+              59.2,
+              77.14,
+              65.06,
+              57.92,
+              76.97,
+              207.26,
+              62.23,
+              59.49,
+              57.23,
+              55.96,
+              58.82,
+              56.24,
+              56.85
+            ],
+            "p95_ms": 112.52,
+            "after_restart_ms": 61.37
+          },
+          "points": {
+            "samples_ms": [
+              140.03,
+              92.98,
+              93.21,
+              101.03,
+              96.26,
+              93.56,
+              92.46,
+              95.09,
+              92.38,
+              93.13,
+              98.95,
+              93.83,
+              94.37,
+              92.85,
+              94.15,
+              92.58,
+              92.67,
+              93.33,
+              93.56,
+              91.22
+            ],
+            "p95_ms": 101.03,
+            "after_restart_ms": 110.84
+          },
+          "created_at": {
+            "samples_ms": [
+              128.58,
+              80.94,
+              85.7,
+              83.1,
+              83.18,
+              86.56,
+              80.01,
+              83.88,
+              84.06,
+              79.39,
+              87.2,
+              82.52,
+              81.26,
+              85.6,
+              81.1,
+              89.32,
+              86.56,
+              87.37,
+              85.19,
+              82.45
+            ],
+            "p95_ms": 89.32,
+            "after_restart_ms": 86.08
+          },
+          "combined": {
+            "samples_ms": [
+              186.28,
+              121.97,
+              121.96,
+              123.06,
+              120.26,
+              120.81,
+              132.83,
+              130.94,
+              123.16,
+              121.2,
+              126.64,
+              139.38,
+              157.71,
+              126.07,
+              123.8,
+              121.52,
+              123.61,
+              121.43,
+              134.89,
+              168.41
+            ],
+            "p95_ms": 168.41,
+            "after_restart_ms": 130.07
+          }
+        },
+        "top_hits": [
+          {
+            "id": "lake1:febfa7d451f621d1a2a8152643fd57c495ca0c5415345086a5c7d04ae31ca302:00000000:0000000000000059",
+            "hn_id": 42108980,
+            "score": 9.366081237792969
+          },
+          {
+            "id": "lake1:81dc2bd15b3d3db54128651e192d5631f33ed031f713eec030a67ecad14dea22:00000000:0000000000000015",
+            "hn_id": 42076462,
+            "score": 9.22985553741455
+          },
+          {
+            "id": "lake1:9903e146a825cf2d98c7370330b9580e6a3d931152dafc6ec5bf1ce6430716ae:00000000:000000000000002a",
+            "hn_id": 42053930,
+            "score": 9.126331329345703
+          },
+          {
+            "id": "lake1:32b50dcde2c76dfe004457ffea375ddb6757583f5d7830e4b3a1b56d5d37adeb:00000000:0000000000000047",
+            "hn_id": 42128520,
+            "score": 9.025105476379395
+          },
+          {
+            "id": "lake1:cf969a036e078b5edbbe712fa01f806194b73d976720bb63e62e7c982183afa1:00000000:0000000000000037",
+            "hn_id": 42019605,
+            "score": 8.680729866027832
+          }
+        ],
+        "verified": [
+          "remote_bm25",
+          "projected_highlights",
+          "snapshot_pagination",
+          "restart_scores",
+          "restart_pagination",
+          "metadata_filters_match_residual",
+          "metadata_filters_after_restart",
+          "empty_date_filter_before_and_after_restart",
+          "concurrent_search",
+          "exact_filter"
+        ],
+        "navigation_warming_enabled": true
+      },
+      {
+        "first_search_ms": 136.35,
+        "warm_samples_ms": [
+          48.73,
+          49.27,
+          48.2,
+          48.71,
+          48.97,
+          50.18,
+          49.35,
+          48.94,
+          48.74,
+          48.48,
+          49.61,
+          48.32,
+          50.71,
+          48.68,
+          49.01,
+          48.35,
+          49.04,
+          60.57,
+          50.24,
+          50.45
+        ],
+        "warm_p95_ms": 50.71,
+        "after_restart_ms": 101.75,
+        "cursor": {
+          "hits": 1408,
+          "samples_ms": [
+            136.23,
+            160.44,
+            134.08,
+            139.43,
+            139.59,
+            144.6,
+            145.57,
+            224.33,
+            206.2,
+            175.67
+          ],
+          "term": "AI",
+          "initial_ms": 267.45,
+          "restart_ms": 228.92,
+          "p95_ms": 224.33
+        },
+        "cold_metrics": {
+          "antfly_lake_cache_provider_reads_total": 405,
+          "antfly_lake_cache_provider_bytes_total": 24332866,
+          "antfly_lake_query_best_first_calls_total": 1,
+          "antfly_lake_query_best_first_segments_total": 58,
+          "antfly_lake_query_best_first_pruned_nodes_total": 70
+        },
+        "filters": {
+          "item_type": {
+            "samples_ms": [
+              160.51,
+              96.98,
+              96.24,
+              92.73,
+              93.7,
+              91.78,
+              93.04,
+              92.06,
+              92.36,
+              90.14,
+              92.47,
+              93.21,
+              92.37,
+              94.0,
+              95.34,
+              90.14,
+              91.03,
+              91.8,
+              91.17,
+              92.63
+            ],
+            "p95_ms": 96.98,
+            "after_restart_ms": 112.9
+          },
+          "author": {
+            "samples_ms": [
+              60.57,
+              54.26,
+              55.93,
+              54.15,
+              55.14,
+              54.38,
+              54.84,
+              57.15,
+              54.03,
+              55.45,
+              54.38,
+              56.49,
+              55.29,
+              55.67,
+              53.36,
+              53.85,
+              53.93,
+              56.55,
+              55.87,
+              53.84
+            ],
+            "p95_ms": 57.15,
+            "after_restart_ms": 60.74
+          },
+          "points": {
+            "samples_ms": [
+              178.55,
+              187.46,
+              153.29,
+              117.46,
+              95.94,
+              99.57,
+              112.01,
+              115.18,
+              108.11,
+              99.68,
+              125.31,
+              112.71,
+              100.22,
+              89.88,
+              90.06,
+              91.19,
+              90.24,
+              92.94,
+              90.95,
+              90.58
+            ],
+            "p95_ms": 178.55,
+            "after_restart_ms": 110.23
+          },
+          "created_at": {
+            "samples_ms": [
+              326.74,
+              77.58,
+              76.32,
+              75.8,
+              76.3,
+              77.29,
+              78.31,
+              77.74,
+              76.47,
+              75.64,
+              79.62,
+              76.65,
+              78.8,
+              78.1,
+              77.17,
+              78.09,
+              78.31,
+              78.95,
+              77.37,
+              79.67
+            ],
+            "p95_ms": 79.67,
+            "after_restart_ms": 87.12
+          },
+          "combined": {
+            "samples_ms": [
+              185.94,
+              121.59,
+              121.31,
+              121.44,
+              122.36,
+              119.29,
+              121.34,
+              122.16,
+              120.87,
+              120.4,
+              120.82,
+              120.98,
+              122.56,
+              123.89,
+              123.71,
+              122.14,
+              123.36,
+              117.56,
+              119.76,
+              128.68
+            ],
+            "p95_ms": 128.68,
+            "after_restart_ms": 132.82
+          }
+        },
+        "top_hits": [
+          {
+            "id": "lake1:febfa7d451f621d1a2a8152643fd57c495ca0c5415345086a5c7d04ae31ca302:00000000:0000000000000059",
+            "hn_id": 42108980,
+            "score": 9.366081237792969
+          },
+          {
+            "id": "lake1:81dc2bd15b3d3db54128651e192d5631f33ed031f713eec030a67ecad14dea22:00000000:0000000000000015",
+            "hn_id": 42076462,
+            "score": 9.22985553741455
+          },
+          {
+            "id": "lake1:9903e146a825cf2d98c7370330b9580e6a3d931152dafc6ec5bf1ce6430716ae:00000000:000000000000002a",
+            "hn_id": 42053930,
+            "score": 9.126331329345703
+          },
+          {
+            "id": "lake1:32b50dcde2c76dfe004457ffea375ddb6757583f5d7830e4b3a1b56d5d37adeb:00000000:0000000000000047",
+            "hn_id": 42128520,
+            "score": 9.025105476379395
+          },
+          {
+            "id": "lake1:cf969a036e078b5edbbe712fa01f806194b73d976720bb63e62e7c982183afa1:00000000:0000000000000037",
+            "hn_id": 42019605,
+            "score": 8.680729866027832
+          }
+        ],
+        "verified": [
+          "remote_bm25",
+          "projected_highlights",
+          "snapshot_pagination",
+          "restart_scores",
+          "restart_pagination",
+          "metadata_filters_match_residual",
+          "metadata_filters_after_restart",
+          "empty_date_filter_before_and_after_restart",
+          "concurrent_search",
+          "exact_filter"
+        ],
+        "navigation_warming_enabled": true
+      }
+    ]
+  },
+  "sql_fixture": {
+    "rows": 1000,
+    "request_limit": 1000,
+    "qualification": "Antfly SQL seeding passed in the composed diagnostic before its cold-search rejection."
+  },
+  "composed_diagnostic": {
+    "baseline": "HTTP 422 query_candidate_budget_exceeded",
+    "followup": "HTTP 422 query_candidate_budget_exceeded",
+    "qualification": "1024-file cold composed search remains unqualified. The stream requires exact leaf totals; large ranked pages can return lower-bound totals."
+  }
+}

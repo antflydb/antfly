@@ -18,7 +18,7 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<'EOF'
-usage: build_zig_release_archive.sh --version VERSION --target TARGET --archive-name NAME --out-dir DIR [--product server|embedded|lite|inference] [--apple-providers true|false] [--metal true|false] [--system-blas true|false] [--optimize MODE] [--strip true|false] [--jobs N]
+usage: build_zig_release_archive.sh --version VERSION --target TARGET --archive-name NAME --out-dir DIR [--product server|embedded|lite|inference] [--apple-providers true|false] [--metal true|false] [--system-blas true|false] [--optimize MODE] [--strip true|false] [--jobs N] [--shared-inference-core true|false] [--measured-darwin-compile-memory true|false]
 
 Builds the native Antfly Zig runtime and writes a release archive whose root
 contains:
@@ -48,6 +48,8 @@ system_blas=false
 optimize=fast
 strip=true
 jobs=
+shared_inference_core=false
+measured_darwin_compile_memory=false
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -95,6 +97,14 @@ while [ "$#" -gt 0 ]; do
       jobs="${2:?missing --jobs value}"
       shift 2
       ;;
+    --shared-inference-core)
+      shared_inference_core="${2:?missing --shared-inference-core value}"
+      shift 2
+      ;;
+    --measured-darwin-compile-memory)
+      measured_darwin_compile_memory="${2:?missing --measured-darwin-compile-memory value}"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -140,6 +150,13 @@ case "$strip" in
     exit 2
     ;;
 esac
+
+for setting in "$shared_inference_core" "$measured_darwin_compile_memory"; do
+  case "$setting" in
+    true|false) ;;
+    *) echo "inference core and compile memory settings must be true or false" >&2; exit 2 ;;
+  esac
+done
 
 case "$apple_providers" in
   true|false) ;;
@@ -213,7 +230,6 @@ zig_build_options=(
   -Dstrip="$strip"
   -Dcpu=baseline
   -Dantfly-version="$version"
-  -Donnx=false
   -Dmetal="$metal"
   -Dcuda="$cuda"
   -Dpjrt="$pjrt"
@@ -221,6 +237,7 @@ zig_build_options=(
 )
 if [ "$product" = server ]; then
   zig_build_options+=(-Dantfly-bin-name=antfly -Dapple-providers="$apple_providers")
+  zig_build_options+=(-Dshared-inference-core="$shared_inference_core" -Dmeasured-darwin-compile-memory="$measured_darwin_compile_memory")
 fi
 
 zig_install_args=(
@@ -229,16 +246,20 @@ zig_install_args=(
 )
 
 run_zig_build_steps() {
+  # Darwin storage reserves 28 GiB and API reserves 24 GiB. Use the bounded
+  # runner's 80% host/cgroup budget for Darwin rather than an arbitrary cap
+  # that rejects these units or prevents safe overlap on larger CI hosts.
   local -a command=(
     python3
     "$repo_root/zig/tools/run_bounded_zig_build.py"
     --zig
     zig
-    --max-rss-cap
-    21474836480
-    --
-    build
   )
+  case "$target" in
+    *macos*) ;;
+    *) command+=(--max-rss-cap 21474836480) ;;
+  esac
+  command+=(-- build --summary all)
 
   if [[ "$product" = lite || "$product" = embedded ]]; then
     command+=(--build-file embedded.build.zig)

@@ -38,7 +38,9 @@ fi
 # Hash the two source files independently instead of hashing unified diff
 # output, whose formatting differs between BSD and GNU diff implementations.
 # With the upstream source pinned above, this also pins the exact patch.
-expected_compat=23316976277d5960102376254bf34d871ea0866e50456ba41d865d8f71bcb3af
+# The reviewed patch includes optional client-certificate handshakes and
+# retaining plaintext across ciphertext-buffer boundaries during flush.
+expected_compat=39d9852d4b6638aa31b6c147051bd970a9c3d54545ee59e28fd43dc734aa0122
 actual_compat=$(hash_file "$compat")
 if [ "$actual_compat" != "$expected_compat" ]; then
     echo "Zig TLS compatibility patch drift: expected compatibility source $expected_compat, found $actual_compat" >&2

@@ -10,6 +10,7 @@ dependencies = [
 ]
 [dependency-groups]
 dev = ["pytest>=8,<10", "ruff>=0.15,<0.16"]
+comparison = ["duckdb==1.5.6"]
 
 [tool.uv.sources]
 antfly-embedded = { path = "../../py/packages/embedded", editable = true }

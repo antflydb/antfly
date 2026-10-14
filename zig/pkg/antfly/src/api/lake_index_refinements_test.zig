@@ -156,11 +156,260 @@ test "external lake overlapping text generations share every physical segment on
     var parsed = try local.metadata_lake_index_catalog.parse(a, published);
     defer parsed.deinit();
     try @import("lake_index_directory.zig").hydrate(parsed.arena.allocator(), store, &parsed.value.published.?, .none, null);
-    const declaration = parsed.value.published.?.declarations[0];
+    const declaration = for (parsed.value.published.?.declarations) |candidate| {
+        if (std.mem.eql(u8, candidate.name, "body_text")) break candidate;
+    } else return error.TestUnexpectedResult;
     const full = try @import("lake_index_native_text.zig").loadRoot(ca, store, declaration.artifact, .none, null);
     try std.testing.expectEqual(@as(usize, 3), full.segments.len);
     var read_cache = local.serverless_query_lake_serving_cache.Cache.init(a);
     defer read_cache.deinit();
+    {
+        const native = @import("lake_index_native_text.zig");
+        const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &read_cache, .scope = @splat(1), .context = .{ .io = std.testing.io } };
+        const wire_directory = try native.loadRootDirectory(ca, store, declaration.artifact, .none, cached);
+        try std.testing.expectEqual(@as(u8, 3), wire_directory.inventory_version);
+        try std.testing.expectEqual(@as(usize, 0), wire_directory.manifests.len);
+        const directory_root = try native.text_directory.withManifests(ca, wire_directory, store, cached, .none);
+        try std.testing.expectEqual(@as(usize, 0), directory_root.segments.len);
+        try std.testing.expect(directory_root.serving_inventory == null);
+        try std.testing.expect(directory_root.serving_routes == null);
+        try std.testing.expect(directory_root.segment_files == null);
+        try std.testing.expect(directory_root.directories.files != null);
+        {
+            const Cache = @import("lake_index_native_text_cache.zig").Cache;
+            const Gate = struct {
+                entered: std.Io.Event = .unset,
+                released: std.Io.Event = .unset,
+                fn check(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.entered.set(std.testing.io);
+                    try self.released.wait(std.testing.io);
+                }
+            };
+            const Acquire = struct {
+                fn run(owner: *Cache, st: stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, root: native.Root, schema: []const u8, read: @import("lake_index_aggregate_artifact.zig").CachedRead, started: ?*std.Io.Event) anyerror!local.storage_db_query_search_exec.PinnedTextSource {
+                    if (started) |event| event.set(std.testing.io);
+                    return owner.acquire(std.testing.io, st, ref, root, schema, read, .{ .io = std.testing.io }, .none);
+                }
+            };
+            var gate: Gate = .{};
+            defer gate.released.set(std.testing.io);
+            var owner: Cache = .{};
+            defer owner.deinit();
+            var blocked = cached;
+            blocked.context.checkpoint = .{ .ptr = &gate, .check = Gate.check };
+            var leader = try std.testing.io.concurrent(Acquire.run, .{ &owner, store, declaration.artifact, directory_root, schema_json, blocked, @as(?*std.Io.Event, null) });
+            defer {
+                gate.released.set(std.testing.io);
+                if (leader.any_future != null) {
+                    var value = leader.cancel(std.testing.io) catch null;
+                    if (value) |*source_| source_.deinit();
+                }
+            }
+            try gate.entered.wait(std.testing.io);
+            var started: std.Io.Event = .unset;
+            var waiter = try std.testing.io.concurrent(Acquire.run, .{ &owner, store, declaration.artifact, directory_root, schema_json, cached, @as(?*std.Io.Event, &started) });
+            defer if (waiter.any_future != null) {
+                var value = waiter.cancel(std.testing.io) catch null;
+                if (value) |*source_| source_.deinit();
+            };
+            try started.wait(std.testing.io);
+            try std.testing.io.sleep(.fromMilliseconds(20), .awake);
+            try std.testing.expectEqual(@as(u64, 1), owner.inventory_builds.load(.monotonic));
+            try std.testing.expectError(error.Canceled, waiter.cancel(std.testing.io));
+            gate.released.set(std.testing.io);
+            var admitted = try leader.await(std.testing.io);
+            defer admitted.deinit();
+            var resident = try owner.acquire(std.testing.io, store, declaration.artifact, directory_root, schema_json, cached, cached.context, .none);
+            defer resident.deinit();
+            try std.testing.expectEqual(@as(u64, 1), owner.inventory_builds.load(.monotonic));
+            try std.testing.expectEqual(@as(usize, 0), owner.inventory_budget.live);
+            try std.testing.expectEqual(@as(u32, 3), resident.snapshot.liveDocCount());
+            // A canceled constructor relinquishes admission; a healthy waiter
+            // retries with its own authority rather than inheriting the error.
+            var second_gate: Gate = .{};
+            defer second_gate.released.set(std.testing.io);
+            var healthy_read = cached;
+            healthy_read.scope = @splat(33);
+            var canceled_read = healthy_read;
+            canceled_read.context.checkpoint = .{ .ptr = &second_gate, .check = Gate.check };
+            var constructor = try std.testing.io.concurrent(Acquire.run, .{ &owner, store, declaration.artifact, directory_root, schema_json, canceled_read, @as(?*std.Io.Event, null) });
+            defer if (constructor.any_future != null) {
+                var value = constructor.cancel(std.testing.io) catch null;
+                if (value) |*source_| source_.deinit();
+            };
+            try second_gate.entered.wait(std.testing.io);
+            var joining: std.Io.Event = .unset;
+            var healthy = try std.testing.io.concurrent(Acquire.run, .{ &owner, store, declaration.artifact, directory_root, schema_json, healthy_read, @as(?*std.Io.Event, &joining) });
+            defer if (healthy.any_future != null) {
+                var value = healthy.cancel(std.testing.io) catch null;
+                if (value) |*source_| source_.deinit();
+            };
+            try joining.wait(std.testing.io);
+            try std.testing.expectError(error.Canceled, constructor.cancel(std.testing.io));
+            var recovered = try healthy.await(std.testing.io);
+            defer recovered.deinit();
+            try std.testing.expectEqual(@as(u32, 3), recovered.snapshot.liveDocCount());
+            try std.testing.expectEqual(@as(u64, 3), owner.inventory_builds.load(.monotonic));
+        }
+        {
+            var capped: @import("lake_index_native_text_cache.zig").Cache = .{};
+            defer capped.deinit();
+            capped.inventory_budget.limit = 1;
+            try std.testing.expectError(error.NativeLakeTextCacheBusy, capped.acquire(std.testing.io, store, declaration.artifact, directory_root, schema_json, cached, cached.context, .none));
+            try std.testing.expectEqual(@as(usize, 0), capped.admissions.count());
+            try std.testing.expectEqual(@as(usize, 0), capped.inventory_budget.live);
+            try std.testing.expectError(error.NativeLakeTextCacheBusy, capped.acquireSelected(std.testing.io, store, declaration.artifact, directory_root, schema_json, cached, cached.context, .none, &.{native.term_directory.identity(full.file_groups[0].segments[0].artifact_id)}));
+            try std.testing.expectEqual(@as(usize, 0), capped.admissions.count());
+            try std.testing.expectEqual(@as(usize, 0), capped.inventory_budget.live);
+        }
+        {
+            var owner: @import("lake_index_native_text_cache.zig").Cache = .{};
+            defer owner.deinit();
+            const chosen = [_][32]u8{native.term_directory.identity(full.file_groups[1].segments[0].artifact_id)};
+            var selected = try owner.acquireSelected(std.testing.io, store, declaration.artifact, directory_root, schema_json, cached, cached.context, .none, &chosen);
+            defer selected.deinit();
+            var complete = try owner.acquire(std.testing.io, store, declaration.artifact, directory_root, schema_json, cached, cached.context, .none);
+            defer complete.deinit();
+            const tokens = try local.search_analysis.default_analyzer.analyze(a, "needle");
+            defer local.search_analysis.Analyzer.freeTokens(a, tokens);
+            try std.testing.expectEqual(@as(usize, 1), tokens.len);
+            const term = tokens[0].term;
+            try std.testing.expectEqual(@as(u32, 1), selected.snapshot.liveDocCount());
+            try std.testing.expectEqual(@as(u32, 3), selected.snapshot.scoringDocCount());
+            try std.testing.expectEqual(@as(u32, 3), try selected.snapshot.termDocFreq(a, "body", term));
+            try std.testing.expectEqual(complete.snapshot.textAvgDocLen("body"), selected.snapshot.textAvgDocLen("body"));
+            const request: local.search_search.SearchRequest = .{ .query = .{ .term = .{ .field = "body", .term = term } }, .k = 10 };
+            // Compare actual search scores: native lake identities use their
+            // physical-row sidecar rather than embedded document ordinals.
+            var oracle = try local.search_search.execute(a, complete.snapshot, request);
+            defer oracle.deinit();
+            try std.testing.expectEqual(@as(usize, 3), oracle.hits.len);
+            var result = try local.search_search.execute(a, selected.snapshot, request);
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+            try std.testing.expectEqual(oracle.hits[0].score, result.hits[0].score);
+            // A different file subset gets its own corpus and statistics facade.
+            const other = [_][32]u8{native.term_directory.identity(full.file_groups[2].segments[0].artifact_id)};
+            var different = try owner.acquireSelected(std.testing.io, store, declaration.artifact, directory_root, schema_json, cached, cached.context, .none, &other);
+            defer different.deinit();
+            try std.testing.expect(different.snapshot.inventory_owner != selected.snapshot.inventory_owner);
+            var none = try owner.acquireSelected(std.testing.io, store, declaration.artifact, directory_root, schema_json, cached, cached.context, .none, &.{});
+            defer none.deinit();
+            try std.testing.expectEqual(@as(u32, 0), none.snapshot.liveDocCount());
+            try std.testing.expectEqual(@as(u32, 3), none.snapshot.scoringDocCount());
+            try std.testing.expectEqual(@as(u64, 4), owner.inventory_builds.load(.monotonic));
+        }
+        var legacy = directory_root;
+        legacy.serving_inventory = null;
+        const first = try native.admitInventory(ca, legacy, store, cached, .none);
+        defer first.deinit();
+        const second = try native.admitInventory(ca, legacy, store, cached, .none);
+        defer second.deinit();
+        try std.testing.expectEqual(full.segments.len, second.root.segments.len);
+        for (first.manifests, second.manifests) |left, right| try std.testing.expect(left.?.value == right.?.value);
+        {
+            const manifest = directory_root.manifests[0];
+            const bytes = try store.getAlloc(manifest.artifact_id);
+            defer a.free(bytes);
+            const scope = (try stores.uploadScopeFromArtifactId(manifest.artifact_id)).?;
+            try store.delete(manifest.artifact_id);
+            defer {
+                var restored = store.putScoped(scope, bytes, .none) catch unreachable;
+                restored.deinit(a);
+            }
+            var fresh = cached;
+            fresh.scope = @splat(19);
+            try std.testing.expectError(error.FileNotFound, native.loadFileManifest(ca, store, manifest, directory_root.domain, .none, null));
+            const paged = try native.admitInventory(ca, directory_root, store, fresh, .none);
+            defer paged.deinit();
+            try std.testing.expectEqual(full.segments.len, paged.root.segments.len);
+            try std.testing.expectEqual(@as(usize, 0), paged.manifests.len);
+            // Cold compact admission never touches missing detailed manifests.
+            // Binding and hydration use independent per-segment and physical
+            // descriptors, so missing maintenance manifests do not affect reads.
+            var selective_cache: @import("lake_index_native_text_cache.zig").Cache = .{};
+            defer selective_cache.deinit();
+            var selective = try selective_cache.acquire(std.testing.io, store, declaration.artifact, directory_root, schema_json, fresh, fresh.context, .none);
+            defer selective.deinit();
+            try std.testing.expectEqual(@as(usize, 0), selective.snapshot.bound_segments.count());
+            for (selective.snapshot.segments) |segment| {
+                try std.testing.expect(segment.reader.deferred != null);
+                try std.testing.expect(segment.reader.native == null);
+            }
+            try std.testing.expectEqual(@as(u32, 1), (try selective.snapshot.readSegment(0)).reader.doc_count);
+            try std.testing.expectEqual(@as(usize, 1), selective.snapshot.bound_segments.count());
+            for (full.segments, paged.root.segments) |expected, actual| try std.testing.expectEqualStrings(expected.artifact_id, actual.artifact_id);
+        }
+        {
+            const refs = try ca.dupe(@import("lake_index_aggregate_artifact.zig").ChunkRef, directory_root.manifests);
+            refs[0].byte_len += 1;
+            var inconsistent = directory_root;
+            inconsistent.manifests = refs;
+            try std.testing.expectError(error.InvalidNativeLakeTextCorpus, native.admitInventory(ca, inconsistent, store, cached, .none));
+        }
+        var directory_cache: @import("lake_index_native_text_cache.zig").Cache = .{};
+        defer directory_cache.deinit();
+        var cold = try directory_cache.acquire(std.testing.io, store, declaration.artifact, directory_root, schema_json, cached, cached.context, .none);
+        defer cold.deinit();
+        // A resident corpus must not revisit even a missing file manifest.
+        // Root authentication remains the caller's prerequisite; this sentinel
+        // exercises the cache-hit admission path rather than serving a root.
+        var missing = directory_root.manifests[0];
+        missing.byte_len = 0;
+        var sentinel = directory_root;
+        sentinel.manifests = &.{missing};
+        var warm = try directory_cache.acquire(std.testing.io, store, declaration.artifact, sentinel, schema_json, cached, cached.context, .none);
+        defer warm.deinit();
+        try std.testing.expectEqual(@as(u32, 3), warm.snapshot.liveDocCount());
+        try std.testing.expect(cold.snapshot.segments[0].shared == warm.snapshot.segments[0].shared);
+        {
+            // Reissued manifests may have the same digest in a new upload
+            // attempt. Physical reader reuse must route through the current
+            // generation, whose reader lease retains that exact object.
+            const scope = try stores.UploadScope.forPublication(directory_root.domain, 55, std.testing.io);
+            const admitted = try native.admitServingInventory(ca, a, directory_root, store, cached, .none);
+            defer admitted.deinit();
+            const original = admitted.root.routing[0][0].descriptor.?;
+            const manifest_bytes = try store.getAlloc(original.artifact_id);
+            defer a.free(manifest_bytes);
+            var reissued = try store.putScoped(scope, manifest_bytes, .none);
+            defer reissued.deinit(a);
+            var alias_root = admitted.root;
+            const routes = try ca.dupe([]const native.SegmentRouting, admitted.root.routing);
+            const first_routes = try ca.dupe(native.SegmentRouting, routes[0]);
+            first_routes[0].descriptor = .{ .artifact_id = reissued.artifact_id, .checksum = reissued.checksum, .byte_len = reissued.byte_len };
+            routes[0] = first_routes;
+            alias_root.routing = routes;
+            const root_bytes = try std.json.Stringify.valueAlloc(ca, alias_root, .{});
+            var uploaded_root = try store.putScoped(scope, root_bytes, .none);
+            defer uploaded_root.deinit(a);
+            var alias_ref = declaration.artifact;
+            alias_ref.artifact_id = uploaded_root.artifact_id;
+            alias_ref.checksum = uploaded_root.checksum;
+            alias_ref.byte_len = uploaded_root.byte_len;
+            var alias = try directory_cache.acquire(std.testing.io, store, alias_ref, alias_root, schema_json, cached, cached.context, .none);
+            defer alias.deinit();
+            try std.testing.expect(alias.snapshot.segments[0].shared == cold.snapshot.segments[0].shared);
+            try store.delete(reissued.artifact_id);
+            var restored = false;
+            defer if (!restored) {
+                var replacement = store.putScoped(scope, manifest_bytes, .none) catch unreachable;
+                replacement.deinit(a);
+            };
+            // The original descriptor is still available. Binding must fail
+            // rather than silently inherit the physical owner's old manifest.
+            try std.testing.expectError(error.FileNotFound, alias.snapshot.readSegment(0));
+            try std.testing.expectEqual(@as(usize, 0), alias.snapshot.bound_segments.count());
+            var replacement = try store.putScoped(scope, manifest_bytes, .none);
+            replacement.deinit(a);
+            restored = true;
+            try std.testing.expectEqual(@as(u32, 1), (try alias.snapshot.readSegment(0)).reader.doc_count);
+        }
+        var expired = cached;
+        expired.context.deadline_ns = 1;
+        try std.testing.expectError(error.DeadlineExceeded, native.admitInventory(ca, directory_root, store, expired, .none));
+    }
     var cache: @import("lake_index_native_text_cache.zig").Cache = .{};
     defer cache.deinit();
     var held: [3]?local.storage_db_query_search_exec.PinnedTextSource = @splat(null);

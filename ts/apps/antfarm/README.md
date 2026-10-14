@@ -41,5 +41,6 @@ The command palette index is generated from the page sources. Run
 
 ## Build into the server
 
-The repo-level `make build-antfarm` target builds the production assets that
-the Zig server embeds. `make build` runs it automatically.
+The repo-level `make generate` target builds the production assets into
+`zig/pkg/antfly/antfarm`, which the Zig server embeds. Run it after changing
+antfarm and commit the result; `make build` uses the committed copy.

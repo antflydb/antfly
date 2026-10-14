@@ -1,0 +1,37 @@
+diff --git a/zig/pkg/antfly-embedded/src/capi/db.zig b/zig/pkg/antfly-embedded/src/capi/db.zig
+index 8b3e00bfc3..552875987d 100644
+--- a/zig/pkg/antfly-embedded/src/capi/db.zig
++++ b/zig/pkg/antfly-embedded/src/capi/db.zig
+@@ -7534,3 +7534,32 @@ test "capi SQL contention diagnostics preserve busy and unknown outcomes" {
+         try std.testing.expectEqualStrings(case.state, parsed.value.object.get("error").?.object.get("code").?.string);
+     }
+ }
++
++
++test "capi issue1089 original revision exact two hop request" {
++    const a = std.testing.allocator;
++    var tmp = try TestDirectory.init("original-two-hop");
++    defer tmp.cleanup();
++    const path = try std.fmt.allocPrint(a, "{s}.aflite", .{tmp.path()});
++    defer a.free(path);
++    const handle = try openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .native, .externally_locked = true }, true, null, null);
++    const id = try publishHandle(handle);
++    defer antfly_db_close(id);
++    try handle.db.addIndex(.{ .name = "knowledge", .kind = .graph, .config_json = "{\"edge_types\":[{\"name\":\"about\",\"field\":\"about\"}]}" });
++    try handle.db.addIndex(.{ .name = "claim_text", .kind = .full_text, .config_json = "{\"field\":\"search_text\"}" });
++    try handle.db.batch(.{ .writes = &.{
++        .{ .key = "claim:a", .value = "{\"about\":[\"concept/shared\"],\"search_text\":\"embedder\"}" },
++        .{ .key = "claim:b", .value = "{\"about\":[\"concept/shared\"]}" },
++    }, .sync_level = .write });
++    try handle.database().*.runUntilIdle();
++    const request =
++        \\{"full_text_search":{"match":{"field":"search_text","text":"embedder"}},"limit":5,"graph_queries":{"q":{"index":"knowledge","traverse":{"start":{"result_ref":"$query_results","limit":5},"direction":"both","edge_types":["about"],"max_depth":2,"include_documents":true,"include_paths":true,"limit":20}}}}
++    ;
++    var response: capi.Buffer = .{};
++    defer antfly_buffer_free(&response);
++    const code = antfly_db_search_json(id, .fromSlice(request), &response);
++    std.debug.print("ORIGINAL_TWO_HOP code={s}\n", .{@tagName(code)});
++    if (response.ptr) |ptr| std.debug.print("ORIGINAL_TWO_HOP response={s}\n", .{ptr[0..response.len]});
++    try std.testing.expectEqual(capi.ErrorCode.ok, code);
++    try std.testing.expect(std.mem.indexOf(u8, response.ptr.?[0..response.len], "claim:b") != null);
++}

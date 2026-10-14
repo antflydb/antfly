@@ -970,7 +970,6 @@ pub fn tensorStorageForBackend(backend: BackendKind) contracts.TensorStorageClas
         .native, .graph => .host_dense,
         .webgpu => .webgpu_buffer,
         .metal => .metal_buffer,
-        .onnx => .onnx_tensor,
         .pjrt => .pjrt_buffer,
         .cuda => .cuda_buffer,
         else => .unknown,
@@ -1051,7 +1050,6 @@ fn inferComputeDesc(graph: *const Graph, descs: []const ?contracts.TensorDesc, n
         const backend = desc.resident_backend orelse switch (desc.storage) {
             .webgpu_buffer => BackendKind.webgpu,
             .metal_buffer => BackendKind.metal,
-            .onnx_tensor => BackendKind.onnx,
             .pjrt_buffer => BackendKind.pjrt,
             .cuda_buffer => BackendKind.cuda,
             else => continue,

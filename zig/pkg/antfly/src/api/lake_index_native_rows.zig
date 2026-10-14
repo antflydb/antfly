@@ -27,13 +27,11 @@ const Declared = local.serverless_segment_sidecar_manifest.DeclaredArtifact;
 const Cancellation = @import("antfly_cancellation").CancellationToken;
 const A = std.mem.Allocator;
 const cohort_files = @import("lake_index_cohort_files.zig");
-// Share the existing 4 MiB sort workspace between two builders. Reserving
-// 24 runs each leaves room for pending runs, merge outputs and shared replay
-// within the manager's 64-file limit, without repeatedly compacting a large
-// run into a four-slot directory on every subsequent flush.
-const cohort_size = 2;
-const sort_memory_bytes = 2 * 1024 * 1024;
-const sort_run_limit = 24;
+// Share the existing 4 MiB workspace across active builders. Reusable spill
+// extents decouple logical merge levels from the 64-file descriptor limit.
+// Small cohorts receive larger runs; fused cohorts avoid extra replay passes.
+const cohort_size = 8;
+const sort_workspace_bytes = 4 * 1024 * 1024;
 
 pub fn logicalName(a: A, name: []const u8) ![]u8 {
     var digest: [32]u8 = undefined;
@@ -65,6 +63,8 @@ const Entry = struct {
     changed: []const bool,
     slots: []const u32,
     delta: ordered.Delta,
+    initial_build: bool = false,
+    reverse: ?*ordered.ReverseBuilder = null,
     built_hashes: [][32]u8,
     retained: []bool,
     published: ?local.serverless_manifest_artifact_ref.ArtifactRef = null,
@@ -72,6 +72,7 @@ const Entry = struct {
     fn deinit(self: *Entry, a: A) void {
         a.free(self.retained);
         self.sort.deinit();
+        if (self.reverse) |reverse| reverse.deinit();
         self.root_arena.deinit();
         if (self.predicate) |*predicate| predicate.deinit();
         self.tuple.deinit();
@@ -80,7 +81,7 @@ const Entry = struct {
 /// The same seed proof is used by shared replay planning and cohort execution.
 fn priorRoot(a: A, scratch: A, store: *stores.ArtifactStore, binding: local.serverless_segment_source_binding.Binding, name: []const u8, digest: [32]u8, candidates: []const Declared, context: local.serverless_query_lake_read_context.Context, cancellation: Cancellation) !?ordered.Root {
     for (candidates) |decl| {
-        if (decl.artifact.kind != .ordered_row_index or decl.artifact.metadata_version != ordered.metadata_version or !std.mem.eql(u8, decl.name, name)) continue;
+        if (decl.artifact.kind != .ordered_row_index or !ordered.supportsBuildMetadata(decl.artifact.metadata_version) or !std.mem.eql(u8, decl.name, name)) continue;
         var previous_binding = decl.binding;
         previous_binding.snapshot_id = binding.snapshot_id;
         if (!@import("../serverless/build/lake_rebuild.zig").bindingsEqual(binding, previous_binding)) continue;
@@ -121,7 +122,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
     defer schemas.deinit();
     const sql_table = try schemas.resolve(io, ca, table.schema_json, table.table_id, table.name);
     const contract = try ca.alloc(local.serverless_query_lake_schema.Column, sql_table.columns.len);
-    for (contract, sql_table.columns) |*column, definition| column.* = .{ .name = definition.path, .kind = @tagName(definition.type), .required = !definition.nullable };
+    for (contract, sql_table.columns) |*column, definition| column.* = .{ .name = definition.path, .kind = if (definition.element_type == .numeric) "numeric" else @tagName(definition.type), .required = !definition.nullable };
     var input = provider.*;
     input.schema_contract = if (source.iceberg_schema) |selected| selected.columns else contract;
     // Publication normally supplies a replay shared with text/vector builders.
@@ -173,6 +174,8 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
     const orders = [_]local.sql_operators.Order{.{}};
     var first: usize = 0;
     while (first < definitions.len) {
+        // Retained runs share one anonymous extent container per sort.
+        // Pending runs and bounded merges remain within the 64-file manager.
         const end = @min(first + cohort_size, definitions.len);
         defer first = end;
         var entries: std.ArrayList(Entry) = .empty;
@@ -248,10 +251,47 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             };
             const retained = try a.alloc(bool, slot_names.items.len);
             errdefer a.free(retained);
-            try entries.append(a, .{ .tuple = tuple, .predicate = predicate, .binding = binding, .name = name, .cover = cover, .sort = spill.Sort.init(a, &manager, &orders, sort_memory_bytes), .changed = changed, .slots = slots, .built_hashes = built_hashes, .retained = retained, .root_arena = .init(a), .delta = .{ .previous = prior, .keep = keep, .files = slot_names.items, .fingerprints = slot_hashes.items } });
-            entries.items[entries.items.len - 1].sort.run_limit = sort_run_limit;
+            try entries.append(a, .{ .tuple = tuple, .predicate = predicate, .binding = binding, .name = name, .cover = cover, .sort = spill.Sort.init(a, &manager, &orders, sort_workspace_bytes / (end - first)), .changed = changed, .slots = slots, .built_hashes = built_hashes, .retained = retained, .root_arena = .init(a), .initial_build = prior == null or prior.?.building, .delta = .{ .previous = prior, .keep = keep, .files = slot_names.items, .fingerprints = slot_hashes.items } });
+            entries.items[entries.items.len - 1].sort.shared_runs = true;
+            entries.items[entries.items.len - 1].sort.encoded_bytes = true;
         }
         if (entries.items.len == 0) continue;
+        for (entries.items) |*entry| entry.sort.memory_bytes = sort_workspace_bytes / entries.items.len;
+        for (entries.items) |*entry| {
+            const prior = entry.delta.previous orelse continue;
+            if (entry.initial_build) continue;
+            var changed_files: usize = 0;
+            var changed_rows: u64 = 0;
+            var unknown_files: u64 = 0;
+            for (entry.changed, source.inventory.files) |changed, file| if (changed) {
+                changed_files += 1;
+                changed_rows +|= file.row_count;
+                if (file.row_count == 0) unknown_files += 1;
+            };
+            const prior_rows = if (prior.page) |page| page.records else 0;
+            // Lightweight Parquet discovery can leave row counts unknown until
+            // decode. Use the retained index's average instead of treating those
+            // files as zero-cost changes and rebuilding once per file.
+            changed_rows +|= unknown_files *| @max(1, prior_rows / @max(1, prior.files.len));
+            if (!bulkRefresh(changed_files, changed_rows, prior_rows)) continue;
+            // Retire changed coordinates once, then checkpoint fresh files in
+            // the same bounded merge forest used by initial builds. Avoid N
+            // complete forward/reverse/tie/predicate rebuilds for a dense refresh.
+            var base_sort = spill.Sort.init(a, &manager, &orders, entry.sort.memory_bytes);
+            defer base_sort.deinit();
+            base_sort.encoded_bytes = true;
+            base_sort.shared_runs = true;
+            const ref = try ordered.publishIncremental(a, ca, store, &base_sort, entry.name, fingerprint(entry.tuple, entry.predicate, entry.cover), source.inventory, entry.cover, cancellation, .{ .run_only = true, .previous = prior, .keep = entry.delta.keep, .files = entry.delta.files, .fingerprints = entry.built_hashes });
+            entry.published = ref;
+            try input.checkpoint(.{ .name = entry.name, .binding = entry.binding, .artifact = ref });
+            entry.delta.previous = try ordered.loadRoot(entry.root_arena.allocator(), store.*, ref, cancellation, null);
+            entry.initial_build = true;
+            @memset(entry.retained, true);
+            entry.delta.keep = entry.retained;
+        }
+        for (entries.items) |*entry| if (entry.delta.previous == null) {
+            entry.reverse = try ordered.ReverseBuilder.create(a, store, cancellation);
+        };
         var names: std.ArrayList([]const u8) = .empty;
         defer names.deinit(a);
         var keys = columns.keyIterator();
@@ -264,8 +304,8 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             need.* = need.* or changed;
         };
         var ordinal: u64 = 0;
-        // Sort and publish one source file at a time. Neither the fused
-        // metadata sorts nor replay retain archive-sized local runs.
+        // Checkpoint one source file at a time into durable merge levels.
+        // Fused sorts and replay never retain archive-sized local runs.
         for (needed, 0..) |need, file_index| {
             if (!need) continue;
             input.only_files = null;
@@ -281,7 +321,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             while (try rows.next(a)) |batch| {
                 try cancellation.check();
                 for (entries.items) |*entry| {
-                    var bound = try entry.tuple.bindBatch(a, batch);
+                    var bound = try entry.tuple.bindExternalBatch(a, batch);
                     defer bound.deinit();
                     var condition_batches: std.ArrayList(tuples.BatchKeys) = .empty;
                     defer {
@@ -289,7 +329,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                         condition_batches.deinit(a);
                     }
                     if (entry.predicate) |plan| for (plan.conditions) |condition| {
-                        var selected = try condition.tuple.bindBatch(a, batch);
+                        var selected = try condition.tuple.bindExternalBatch(a, batch);
                         errdefer selected.deinit();
                         try condition_batches.append(a, selected);
                     };
@@ -322,6 +362,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                             const cell = try page.cell(row_scratch.allocator(), 0, column);
                             value.* = .{ .value = cell.value, .sql_null = cell.sql_null };
                         }
+                        if (entry.reverse) |reverse| try reverse.add(key.items);
                         try entry.sort.add(.{ .values = values, .keys = &.{local.sql_scalar.Datum.fromJson(.{ .string = key.items })}, .ordinal = ordinal });
                         ordinal = std.math.add(u64, ordinal, 1) catch return error.LakeSidecarBuildLimitExceeded;
                     }
@@ -334,31 +375,45 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 const keep = try a.dupe(bool, entry.delta.keep);
                 defer a.free(keep);
                 if (slot < keep.len) keep[slot] = false;
-                const delta: ordered.Delta = .{ .previous = entry.delta.previous, .keep = keep, .files = entry.delta.files, .fingerprints = entry.built_hashes };
-                const ref = ordered.publishIncremental(a, ca, store, &entry.sort, entry.name, fingerprint(entry.tuple, entry.predicate, entry.cover), source.inventory, entry.cover, cancellation, delta) catch |err| {
+                var delta: ordered.Delta = .{ .previous = entry.delta.previous, .keep = keep, .files = entry.delta.files, .fingerprints = entry.built_hashes };
+                if (entry.reverse) |reverse| {
+                    delta.built_reverse = try reverse.finish();
+                    delta.reverse_built = true;
+                }
+                const ref = (if (entry.initial_build) ordered.publishRunCheckpoint(a, ca, store, &entry.sort, entry.name, fingerprint(entry.tuple, entry.predicate, entry.cover), source.inventory, entry.cover, cancellation, delta) else ordered.publishIncremental(a, ca, store, &entry.sort, entry.name, fingerprint(entry.tuple, entry.predicate, entry.cover), source.inventory, entry.cover, cancellation, delta)) catch |err| {
                     if (err == error.SqlProgramLimitExceeded) {
                         const admission = manager.admissionStats();
                         std.log.warn("native ordered lake admission exhausted file_index={d} total_files={d} peak_spill_files={d} peak_spill_bytes={d} spill_byte_limit={d}", .{ file_index, needed.len, admission.peak_files, admission.peak_bytes, admission.max_bytes });
                     }
                     return err;
                 };
+                if (entry.reverse) |reverse| {
+                    reverse.deinit();
+                    entry.reverse = null;
+                }
                 entry.published = ref;
                 try input.checkpoint(.{ .name = entry.name, .binding = entry.binding, .artifact = ref });
                 // Only the latest root directory is needed for the next file.
                 // Retaining every prefix here would grow metadata quadratically.
                 _ = entry.root_arena.reset(.free_all);
                 entry.delta.previous = try ordered.loadRoot(entry.root_arena.allocator(), store.*, ref, cancellation, null);
+                entry.initial_build = entry.delta.previous.?.building;
                 @memset(entry.retained, true);
                 entry.delta.keep = entry.retained;
                 entry.sort.deinit();
-                entry.sort = spill.Sort.init(a, &manager, &orders, sort_memory_bytes);
-                entry.sort.run_limit = sort_run_limit;
+                entry.sort = spill.Sort.init(a, &manager, &orders, sort_workspace_bytes / entries.items.len);
+                entry.sort.shared_runs = true;
+                entry.sort.encoded_bytes = true;
             }
         }
         for (entries.items) |*entry| {
+            if (entry.reverse) |reverse| {
+                entry.delta.built_reverse = try reverse.finish();
+                entry.delta.reverse_built = true;
+            }
             // With no changed file, an empty incremental merge still retires
             // deleted source slots. Otherwise the last per-file root is final.
-            const root = entry.published orelse try ordered.publishIncremental(a, out, store, &entry.sort, entry.name, fingerprint(entry.tuple, entry.predicate, entry.cover), source.inventory, entry.cover, cancellation, entry.delta);
+            const root = if (entry.initial_build) try ordered.finalizeRunCheckpoint(a, out, store, &entry.sort, entry.name, fingerprint(entry.tuple, entry.predicate, entry.cover), source.inventory, entry.cover, cancellation, entry.delta) else entry.published orelse try ordered.publishIncremental(a, out, store, &entry.sort, entry.name, fingerprint(entry.tuple, entry.predicate, entry.cover), source.inventory, entry.cover, cancellation, entry.delta);
             var owned_binding = entry.binding;
             owned_binding.source_id = try out.dupe(u8, entry.binding.source_id);
             owned_binding.snapshot_id = try out.dupe(u8, entry.binding.snapshot_id);
@@ -373,6 +428,11 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         }
     }
     return result.toOwnedSlice(out);
+}
+fn bulkRefresh(changed_files: usize, changed_rows: u64, previous_rows: u64) bool {
+    // Keep selective copy-on-write updates for tiny deltas. Dense multi-file
+    // refreshes amortize the single base pass and final assembly.
+    return changed_files > 1 and changed_rows >= @max(1, previous_rows / 4);
 }
 fn claimSlot(a: A, names: *std.ArrayList([]const u8), hashes: *std.ArrayList([32]u8), vacant: *std.ArrayList(u32), file: []const u8, digest: [32]u8) !u32 {
     if (vacant.pop()) |slot| {
@@ -524,4 +584,91 @@ pub fn coverColumns(a: A, definition: local.storage_relational_index.RelationalI
         if (!exists) try columns.append(a, column);
     }
     return columns.items;
+}
+
+test "external lake dense ordered refresh checkpoints durable deltas and resumes without stale coordinates" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("native-dense-refresh");
+    defer directory.cleanup();
+    var fs = try local.storage_object_storage.FilesystemObjectStorage.init(a, directory.path());
+    defer fs.deinit();
+    var client = fs.client();
+    try client.makeBucket("antfly");
+    const old_bytes = try local.serverless_query_lake_parquet_rowgroup.buildTestPlainI64ParquetObjectAlloc(a, &.{.{ .column_id = "amount", .values = &.{ -4, 9, 1, 5 }, .field_id = 1 }});
+    defer a.free(old_bytes);
+    const new_bytes = try local.serverless_query_lake_parquet_rowgroup.buildTestPlainI64ParquetObjectAlloc(a, &.{.{ .column_id = "amount", .values = &.{ 100, 100, 101, 102 }, .field_id = 1 }});
+    defer a.free(new_bytes);
+    for ([_][]const u8{ "a.parquet", "b.parquet", "c.parquet" }) |name| {
+        var uploaded = try client.putObject("antfly", name, old_bytes, .{});
+        uploaded.deinit(a);
+    }
+    const schema_json = try std.fmt.allocPrint(a,
+        \\{{"version":1,"storage_mode":"relational","default_type":"row","base_source":{{"kind":"external","table_id":"lake","format":"parquet","uri":"file://{s}","schema_fingerprint":"schema"}},"relational_indexes":[{{"name":"amount_idx","keys":[{{"column":"amount"}}]}}],"document_schemas":{{"row":{{"schema":{{"type":"object","properties":{{"amount":{{"type":"integer"}}}},"additionalProperties":false}}}}}}}}
+    , .{directory.path()});
+    defer a.free(schema_json);
+    var binding = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, schema_json)).?;
+    defer binding.deinit(a);
+    var original = try local.serverless_query_lake_serving.ServingSource.open(a, .{ .storage_mode = .relational, .external_base_source = binding }, .{});
+    defer original.deinit();
+    const artifact_path = try std.fs.path.join(a, &.{ directory.path(), "artifacts" });
+    defer a.free(artifact_path);
+    var artifacts = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, artifact_path);
+    defer artifacts.deinit();
+    var store = artifacts.artifactStore();
+    store.upload_scope = .{ .domain = @splat(9), .attempt = @splat(1) };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const table: local.common_topology_records.TableRecord = .{ .table_id = 1, .name = "lake", .schema_json = schema_json, .indexes_json = "{}" };
+    var provider: @import("lake_index_row_source.zig").Provider = .{ .source = &original, .context = .{ .io = std.testing.io } };
+    const prior = try build(a, ca, table, &original, &store, &provider, .none, &.{});
+    for ([_][]const u8{ "a.parquet", "b.parquet" }) |name| {
+        var uploaded = try client.putObject("antfly", name, new_bytes, .{});
+        uploaded.deinit(a);
+    }
+    var source = try local.serverless_query_lake_serving.ServingSource.open(a, .{ .storage_mode = .relational, .external_base_source = binding }, .{});
+    defer source.deinit();
+    const Progress = struct {
+        store: *stores.ArtifactStore,
+        a: A,
+        saved: ?Declared = null,
+        count: usize = 0,
+        fn save(raw: *anyopaque, declaration: Declared) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const root = try ordered.loadRoot(self.a, self.store.*, declaration.artifact, .none, null);
+            try std.testing.expect(root.building);
+            // Progress arguments belong to the active build's scratch arena.
+            // A simulated durable checkpoint must own its metadata after the
+            // injected error unwinds that build.
+            const bytes = try std.json.Stringify.valueAlloc(self.a, declaration, .{});
+            self.saved = try std.json.parseFromSliceLeaky(Declared, self.a, bytes, .{ .allocate = .alloc_always });
+            self.count += 1;
+            if (self.count == 2) return error.InjectedCheckpointStop;
+        }
+    };
+    var progress: Progress = .{ .store = &store, .a = ca };
+    store.upload_scope = .{ .domain = @splat(9), .attempt = @splat(2) };
+    provider = .{ .source = &source, .context = .{ .io = std.testing.io }, .progress = .{ .ptr = &progress, .save = Progress.save } };
+    try std.testing.expectError(error.InjectedCheckpointStop, buildIncremental(a, ca, table, &source, &store, &provider, .none, &.{}, prior));
+    try std.testing.expectEqual(@as(usize, 2), progress.count);
+    store.upload_scope = .{ .domain = @splat(9), .attempt = @splat(3) };
+    provider.progress = null;
+    const resumed = try buildIncremental(a, ca, table, &source, &store, &provider, .none, &.{}, &.{progress.saved.?});
+    const root = try ordered.loadRoot(ca, store, resumed[0].artifact, .none, null);
+    try std.testing.expect(!root.building and root.build_runs.len == 0);
+    try std.testing.expectEqual(@as(u64, 12), root.page.?.records);
+    try std.testing.expectEqual(root.page.?.records, root.reverse.?.records);
+    var reader: ordered.Reader = undefined;
+    try reader.init(a, &store, root, root.fingerprint, "", null, .none);
+    defer reader.deinit();
+    var old_count: usize = 0;
+    var new_count: usize = 0;
+    for (try reader.nextEntries(ca, 100)) |entry| {
+        const cover = entry.cover.?;
+        const payload = try @import("lake_index_aggregate_artifact.zig").readArtifact(ca, store, cover.block, .none, null);
+        const block = try spill.decodeColumnarBlockInArena(ca, payload, @import("lake_index_aggregate_artifact.zig").max_block_bytes);
+        if ((try block.cell(cover.row, 0)).value.integer < 100) old_count += 1 else new_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 4), old_count);
+    try std.testing.expectEqual(@as(usize, 8), new_count);
 }

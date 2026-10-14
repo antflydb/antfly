@@ -149,6 +149,7 @@ async function main({github, context, core, mode, config, env = process.env}) {
       throw new Error('Approval comment was edited, moved, or no longer matches.');
     }
     await human(comment);
+    return comment;
   };
   const cancel = async () => {
     // Only cancel this PR's orchestrator, never main, schedules, or releases.
@@ -318,6 +319,25 @@ async function main({github, context, core, mode, config, env = process.env}) {
   if (['labeled', 'unlabeled'].includes(p.action) &&
       !config.suites.some(s => s.label === p.label?.name)) return;
   if (p.action === 'edited' && !p.changes?.base) return;
+  if (p.action === 'synchronize') {
+    // Push and comment controllers can arrive out of order. A push must revoke
+    // older approvals, but not an approval issued after that push for the live
+    // snapshot. Timestamp ties and missing event timestamps remain fail closed.
+    const pushedAt = Date.parse(p.pull_request?.updated_at);
+    const check = await checkFor(pr);
+    if (Number.isFinite(pushedAt) && check) {
+      const data = metadata(check);
+      if (!data.revoked) {
+        try {
+          validateSnapshot(pr, data, config);
+          const comment = await validateComment(data);
+          if (Date.parse(comment.created_at) > pushedAt) return;
+        } catch (error) {
+          core.notice(error.message);
+        }
+      }
+    }
+  }
   await cancel();
   await save(pr, {number, revoked: true}, pr.draft
     ? 'Draft PR: test runners remain idle.'

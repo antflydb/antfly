@@ -299,6 +299,37 @@ fn gemma4MtpVerifyTailFrameEnabled() bool {
         !getenvBool("TERMITE_METAL_DISABLE_GEMMA4_MTP_VERIFY_TAIL_FRAME");
 }
 
+fn gemma4MtpVerifyInputFrameEnabled() bool {
+    return getenvBool("TERMITE_METAL_ENABLE_GEMMA4_MTP_VERIFY_INPUT_FRAME") and
+        !getenvBool("TERMITE_METAL_DISABLE_GEMMA4_MTP_VERIFY_INPUT_FRAME");
+}
+
+fn supportsMtpVerifyInputFrame(config: gpt_mod.Config, rows: usize, seq_len: usize) bool {
+    return config.family == .gemma and config.global_head_dim != 0 and
+        config.hasPle() and !config.usesMoe() and rows >= 2 and rows <= 4 and seq_len > rows;
+}
+
+// The direct Gemma decoder adopts an already-active frame. Only cancel an
+// input frame we opened if preparation fails or the direct path declines;
+// successful decoding/tail readout has already submitted and consumed it.
+const MtpVerifyInputFrame = struct {
+    cb: *const ops.ComputeBackend,
+    owned: bool,
+
+    fn begin(cb: *const ops.ComputeBackend) !MtpVerifyInputFrame {
+        if (cb.decoderRuntimeHasActiveFrame()) return .{ .cb = cb, .owned = false };
+        var result: MtpVerifyInputFrame = .{ .cb = cb, .owned = try cb.decoderRuntimeBeginFrame() };
+        errdefer result.deinit();
+        if (result.owned) try cb.decoderRuntimeSetActiveFrameRegime(.prefill);
+        return result;
+    }
+
+    fn deinit(self: *MtpVerifyInputFrame) void {
+        if (self.owned and self.cb.decoderRuntimeHasActiveFrame()) cancelDecoderRuntimeFrame(self.cb, &self.owned);
+        self.owned = false;
+    }
+};
+
 fn gatedFamilyCompareRequested() bool {
     return getenvBool("TERMITE_METAL_COMPARE_GATED_FAMILY") or gemmaPrefillCompareRequested();
 }
@@ -1739,6 +1770,114 @@ fn tryBackendOwnedTokenResultPhaseHidden(
     return null;
 }
 
+pub const GreedyBatchItem = struct {
+    token_id: i64,
+    seq_len: usize,
+    decode_context: *const gpt_arch.DecodeContext,
+};
+
+/// Coordinate independent paged Gemma4 sequences with the prepared singleton
+/// arithmetic. Metal owns the layer-major cohort and returns token IDs only.
+pub fn forwardGreedyTokensBatch(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    cfg: gpt_mod.Config,
+    configured_layers: usize,
+    items: []const GreedyBatchItem,
+) !?[]u32 {
+    if (cb.kind() != .metal or items.len == 0 or items.len > 4 or !cfg.hasPle() or cfg.usesMoe()) return null;
+    for (items) |item| {
+        if (!supportsDirectGemmaRuntime(cfg, configured_layers, item.decode_context) or
+            item.decode_context.attention_mode != .paged_decode or item.decode_context.query_sequence_len != 1) return null;
+    }
+    if (getenvBool("ANTFLY_GEMMA4_METAL_OCR_DIFFERENTIAL") and getenvBool("ANTFLY_GEMMA4_METAL_OCR_DIFFERENTIAL_STEP")) return error.UnsupportedBackend;
+    const choices = try allocator.alloc(u32, items.len);
+    var success = false;
+    defer if (!success) allocator.free(choices);
+    if (items.len == 1) {
+        const token = (try forwardGreedyToken(cb, allocator, cfg, configured_layers, items[0].token_id, items[0].seq_len, items[0].decode_context)) orelse return null;
+        choices[0] = @intCast(token);
+        success = true;
+        return choices;
+    }
+    var maximum_seq: usize = 0;
+    for (items) |item| maximum_seq = @max(maximum_seq, item.seq_len);
+    if (!(try cb.decoderRuntimePrepareOrReuseFamily(allocator, cfg, maximum_seq, configured_layers)).prepared) return null;
+    var layers_buf: [256]contracts.DecoderRuntimeLayerSpec = undefined;
+    if (cfg.num_hidden_layers > layers_buf.len) return null;
+    const layers = try gemma4_runtime.fillLayerSpecsCached(cb, allocator, cfg, configured_layers, &layers_buf, true, items[0].decode_context.gemma4_layer_spec_cache);
+    var decode_items: [4]contracts.DecoderRuntimeDecodeItem = undefined;
+    var token_ids: [4]i64 = undefined;
+    for (items, decode_items[0..items.len]) |item, *decoded| {
+        decoded.* = .{ .token_id = item.token_id, .position = item.seq_len - 1, .seq_len = item.seq_len, .attention = gpt_arch.attentionContextFromDecode(item.decode_context) };
+    }
+    const embedding = try gpt_arch.getEmbeddingWeight(cb, cfg);
+    defer cb.free(embedding);
+    const ple_embedding = gpt_arch.getModelEmbeddingWeight(cb, cfg, "model.per_layer_input.per_layer_token_embd.weight") catch |err| switch (err) {
+        error.MissingWeight => try gpt_arch.getModelEmbeddingWeight(cb, cfg, "model.embed_tokens_per_layer.weight"),
+        else => return err,
+    };
+    defer cb.free(ple_embedding);
+    const request = contracts.DecoderRuntimeDecodeRequest{
+        .contract = .gemma4_gated_ple_shared_kv,
+        .configured_layer_count = configured_layers,
+        .layer_count = layers.len,
+        .hidden_size = cfg.hidden_size,
+        .vocab_size = cfg.vocab_size,
+        .num_attention_heads = cfg.num_attention_heads,
+        .norm_eps = cfg.norm_eps,
+        .ple_hidden_size = cfg.ple_hidden_size,
+        .token_embedding_scale = cfg.tokenEmbeddingScale(),
+        .global_head_dim = cfg.global_head_dim,
+        .rope_freq_scale = cfg.rope_freq_scale,
+        .rope_consecutive_pairs = cfg.rope_layout == .consecutive_pairs,
+        .activation = decoderActivationKind(cfg),
+        .final_norm_slot = finalNormSlot(configured_layers),
+        .final_lm_head_slot = finalLmHeadSlot(configured_layers),
+        .ple_model_proj_slot = pleModelProjSlot(configured_layers),
+        .ple_proj_norm_slot = pleProjNormSlot(configured_layers),
+        .layers = layers,
+        .items = decode_items[0..items.len],
+        .token_embedding_weight = embedding,
+        .ple_token_embedding_weight = ple_embedding,
+        .suppress_token_ids = cfg.suppressTokenIds(),
+        .output_token_ids = token_ids[0..items.len],
+    };
+    if (!try cb.decoderRuntimeDecodeBatch(&request)) return null;
+    for (choices, token_ids[0..items.len], items, 0..) |*choice, token, item, row| {
+        if (token < 0 or token >= cfg.vocab_size) return error.InvalidModelOutput;
+        var selected = token;
+        if (getenvBool("ANTFLY_GEMMA4_METAL_OCR_DIFFERENTIAL_STEP")) {
+            // Matrix runs first with the canonical committed prefix. This
+            // singleton rewrites the same current KV positions across all
+            // layers, and its choice is emitted. Thus the NEXT step again has
+            // canonical history; no divergent token or matrix KV accumulates.
+            var canonical = (try tryBackendOwnedGreedyTokenResult(cb, allocator, cfg, configured_layers, item.token_id, item.seq_len, item.decode_context, true)) orelse return error.UnsupportedBackend;
+            defer canonical.deinit(cb);
+            selected = canonical.token_id;
+            const hidden = canonical.final_hidden orelse return error.UnexpectedNull;
+            const logits = (try cb.decoderRuntimeApplyLinear(&.{ .slot = finalLmHeadSlot(configured_layers), .input = hidden, .in_dim = cfg.hidden_size, .out_dim = cfg.vocab_size })) orelse return error.UnsupportedBackend;
+            defer cb.free(logits);
+            const values = try cb.toFloat32(logits, allocator);
+            defer allocator.free(values);
+            const summary = try @import("../util/ocr_parity.zig").ocrLogitSummary(values, cfg.suppressTokenIds());
+            std.debug.print("ocr-parity-step row={d} seq={d} input={d} matrix={d} canonical={d} match={} canonical_runner_up={d} canonical_margin={e} head_matches={}\n", .{ row, item.seq_len, item.token_id, token, selected, token == selected, summary.runner_up, summary.margin, summary.token == selected });
+        }
+        if (getenvBool("ANTFLY_GEMMA4_METAL_OCR_CONFIRM_EOS") and cfg.isEosToken(@intCast(token))) {
+            // The batched suffix has written this input token's KV already.
+            // Recompute the same position without appending another slot. A
+            // canonical singleton checks termination before a page is retired.
+            selected = (try forwardGreedyTokenPreparedOnly(cb, allocator, cfg, configured_layers, item.token_id, item.seq_len, item.decode_context)) orelse return error.UnsupportedBackend;
+            if (selected < 0 or selected >= cfg.vocab_size) return error.InvalidModelOutput;
+            if (getenvBool("TERMITE_METAL_TRACE_GEMMA4_OCR_STOP")) std.debug.print("metal-ocr-stop-check: seq={d} batched={d} canonical={d} replaced={}\n", .{ item.seq_len, token, selected, selected != token });
+        }
+        if (selected < 0 or selected >= cfg.vocab_size) return error.InvalidModelOutput;
+        choice.* = @intCast(selected);
+    }
+    success = true;
+    return choices;
+}
+
 /// Backend-owned sampled decode: run the whole forward through the planned
 /// decode frame (same as greedy), capture the PRE-norm backbone row, and
 /// sample from it via the fused norm+lm-head tail. The frame's argmax token
@@ -2000,6 +2139,7 @@ fn tryBackendOwnedGreedyToken(
     seq_len: usize,
     decode_context: *const gpt_arch.DecodeContext,
 ) !?i64 {
+    const trace_choices = gpt_config.hasPle() and !gpt_config.usesMoe() and getenvBool("ANTFLY_GEMMA4_METAL_OCR_TRACE_CHOICES");
     var result = (try tryBackendOwnedGreedyTokenResult(
         cb,
         allocator,
@@ -2008,9 +2148,21 @@ fn tryBackendOwnedGreedyToken(
         token_id,
         seq_len,
         decode_context,
-        false,
+        trace_choices,
     )) orelse return null;
     defer result.deinit(cb);
+    if (trace_choices) {
+        // Read the actual singleton result without recomputing this position
+        // or replacing its KV. Matrix tracing likewise retains free-running
+        // history, unlike the canonical-prefix differential diagnostics.
+        const hidden = result.final_hidden orelse return error.UnexpectedNull;
+        const logits = (try cb.decoderRuntimeApplyLinear(&.{ .slot = finalLmHeadSlot(configured_layer_count), .input = hidden, .in_dim = gpt_config.hidden_size, .out_dim = gpt_config.vocab_size })) orelse return error.UnsupportedBackend;
+        defer cb.free(logits);
+        const values = try cb.toFloat32(logits, allocator);
+        defer allocator.free(values);
+        const summary = try @import("../util/ocr_parity.zig").ocrLogitSummary(values, gpt_config.suppressTokenIds());
+        std.debug.print("ocr-parity-singleton seq={d} input={d} token={d} runner_up={d} margin={e} top_logit={e} runner_up_logit={e} head_matches={}\n", .{ seq_len, token_id, result.token_id, summary.runner_up, summary.margin, values[summary.token], values[summary.runner_up], summary.token == result.token_id });
+    }
     return result.token_id;
 }
 
@@ -6075,6 +6227,23 @@ pub fn pipelinedCancelPending(cb: *const ops.ComputeBackend) void {
     _ = decoderRuntimePipelinedControl(cb, .cancel_pending) catch {};
 }
 
+/// Canonical backend-owned singleton, without the unused normalized-hidden
+/// snapshot. Declines rather than changing to the generic decoder route.
+pub fn forwardGreedyTokenPreparedOnly(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    gpt_config: gpt_mod.Config,
+    configured_layer_count: usize,
+    token_id: i64,
+    seq_len: usize,
+    decode_context: *const gpt_arch.DecodeContext,
+) !?i64 {
+    if (!supportsPreparedDecodeConfig(gpt_config) or decode_context.query_sequence_len != 1 or decode_context.attention_mode != .paged_decode) return null;
+    var result = (try tryBackendOwnedGreedyTokenResult(cb, allocator, gpt_config, configured_layer_count, token_id, seq_len, decode_context, false)) orelse return null;
+    defer result.deinit(cb);
+    return result.token_id;
+}
+
 pub fn forwardGreedyTokenAndFinalHidden(
     cb: *const ops.ComputeBackend,
     allocator: std.mem.Allocator,
@@ -6586,6 +6755,14 @@ fn forwardFinalHiddenRowsInternal(
     if (decode_context.attention_mode != .paged_prefill and decode_context.attention_mode != .paged_decode) return null;
 
     const phase: BlockTimingPhase = if (decode_context.attention_mode == .paged_decode) .greedy else .prefill;
+    var input_frame: ?MtpVerifyInputFrame = if (cb.kind() == .metal and
+        gemma4MtpVerifyInputFrameEnabled() and supportsMtpVerifyInputFrame(gpt_config, input_ids.len, seq_len) and
+        !disableDirectGatedFamilyRequested() and shouldUseDecoderRuntimeFrame(phase, gpt_config, configured_layer_count, decode_context))
+        try MtpVerifyInputFrame.begin(cb)
+    else
+        null;
+    defer if (input_frame) |*frame| frame.deinit();
+
     const started_at = monotonicNowNs();
     const hidden = try decoder_rms_runtime.embedTokens(cb, allocator, gpt_config, input_ids);
     const finished_at = monotonicNowNs();
@@ -6817,10 +6994,11 @@ pub fn forwardPreparedLmHeadArgmaxRows(
     const trace_started_at = if (trace) monotonicNowNs() else 0;
     const choices = try allocator.alloc(u32, rows);
     errdefer allocator.free(choices);
-    // Preferred at rows 2-8: ONE multi-row apply — the q6_k head rides the
-    // r2-reduce kernel (pairs of rows share a single pass over the ~550MB
-    // weight stream) instead of re-reading the head once per row. Falls back
-    // to the per-row loop below on any unsupported condition.
+    // Prefer ONE multi-row apply. Eligible Q6_K heads at rows 2-8 can use
+    // r2-reduce when TERMITE_METAL_ENABLE_Q6_K_R2_REDUCE is enabled; pairs
+    // then share a pass over the weight stream. This helper alone does not
+    // guarantee that kernel selection. Fall back to per-row applies below
+    // when the backend does not support this route.
     if (rows >= 2) multi_row: {
         const logits = (try cb.decoderRuntimeApplyLinear(&.{
             .slot = lm_head_slot,
@@ -7219,6 +7397,87 @@ test "resident sampled decode rejects sampling outside exact nucleus contract be
 
 test "Gemma4 MTP verify-tail frame defaults off" {
     try std.testing.expect(!gemma4MtpVerifyTailFrameEnabled());
+}
+
+test "Gemma4 MTP input frame excludes full prompts and unsupported models" {
+    const base: gpt_mod.Config = .{ .family = .gemma, .global_head_dim = 512, .ple_hidden_size = 256 };
+    for (2..5) |rows| try std.testing.expect(supportsMtpVerifyInputFrame(base, rows, 1024));
+    for ([_]usize{ 0, 1, 5, 16 }) |rows| try std.testing.expect(!supportsMtpVerifyInputFrame(base, rows, 1024));
+    try std.testing.expect(!supportsMtpVerifyInputFrame(base, 3, 3));
+    var other = base;
+    other.family = .qwen3;
+    try std.testing.expect(!supportsMtpVerifyInputFrame(other, 3, 1024));
+    other = base;
+    other.global_head_dim = 0;
+    try std.testing.expect(!supportsMtpVerifyInputFrame(other, 3, 1024));
+    other = base;
+    other.ple_hidden_size = 0;
+    try std.testing.expect(!supportsMtpVerifyInputFrame(other, 3, 1024));
+    other = base;
+    other.num_local_experts = 8;
+    other.num_experts_per_tok = 2;
+    try std.testing.expect(!supportsMtpVerifyInputFrame(other, 3, 1024));
+}
+
+test "Gemma4 MTP input frame transfers and cancels only owned frames" {
+    const Probe = struct {
+        active: bool = false,
+        fail_regime: bool = false,
+        begins: usize = 0,
+        cancels: usize = 0,
+
+        fn from(raw: *anyopaque) *@This() {
+            return @ptrCast(@alignCast(raw));
+        }
+        fn begin(raw: *anyopaque) !bool {
+            const self = from(raw);
+            try std.testing.expect(!self.active);
+            self.active = true;
+            self.begins += 1;
+            return true;
+        }
+        fn hasActive(raw: *anyopaque) bool {
+            return from(raw).active;
+        }
+        fn regime(raw: *anyopaque, value: ops.DecoderRuntimeFrameRegime) !void {
+            try std.testing.expectEqual(ops.DecoderRuntimeFrameRegime.prefill, value);
+            if (from(raw).fail_regime) return error.DeviceLost;
+        }
+        fn cancel(raw: *anyopaque) !void {
+            const self = from(raw);
+            try std.testing.expect(self.active);
+            self.active = false;
+            self.cancels += 1;
+        }
+    };
+    var table = @import("../ops/native_compute.zig").vtable_impl;
+    table.decoderRuntimeBeginFrame = Probe.begin;
+    table.decoderRuntimeHasActiveFrame = Probe.hasActive;
+    table.decoderRuntimeSetActiveFrameRegime = Probe.regime;
+    table.decoderRuntimeCancelFrame = Probe.cancel;
+    var probe = Probe{};
+    const cb: ops.ComputeBackend = .{ .ptr = &probe, .vtable = &table };
+    var frame = try MtpVerifyInputFrame.begin(&cb);
+    frame.deinit(); // Preparation error/decline leaves an owned frame to cancel.
+    try std.testing.expectEqual(@as(usize, 1), probe.cancels);
+
+    probe.active = true;
+    frame = try MtpVerifyInputFrame.begin(&cb);
+    frame.deinit(); // A borrowed caller frame must survive our cleanup.
+    try std.testing.expect(probe.active);
+    try std.testing.expectEqual(@as(usize, 1), probe.begins);
+    try std.testing.expectEqual(@as(usize, 1), probe.cancels);
+
+    probe.active = false;
+    frame = try MtpVerifyInputFrame.begin(&cb);
+    probe.active = false; // Direct decoder/tail consumed the transferred frame.
+    frame.deinit();
+    try std.testing.expectEqual(@as(usize, 1), probe.cancels);
+
+    probe.fail_regime = true;
+    try std.testing.expectError(error.DeviceLost, MtpVerifyInputFrame.begin(&cb));
+    try std.testing.expect(!probe.active);
+    try std.testing.expectEqual(@as(usize, 2), probe.cancels);
 }
 
 test "raw whole-token gated supports multimodal decode-only gemma config" {

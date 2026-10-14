@@ -407,7 +407,7 @@ components:
         model:
           type: string
           description: "The name of the generator model."
-          example: "onnxruntime/Gemma-3-ONNX"
+          example: "ggml-org/gemma-4-E4B-it-GGUF"
         api_url:
           type: string
           format: uri

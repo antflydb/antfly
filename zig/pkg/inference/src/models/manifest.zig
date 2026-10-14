@@ -322,6 +322,7 @@ pub const ModelManifest = struct {
     preprocessor_config_path: ?[]const u8 = null,
     processor_config_path: ?[]const u8 = null,
     inference_bundle_family: []const u8 = "",
+    qualified_limits_json: []const u8 = "",
     gliner_boundary_bundle: ?boundary_bundle.Parsed = null,
     gliner_boundary_config_digest: ?boundary_bundle.Digest = null,
     gliner_boundary_encoder_digest: ?boundary_bundle.Digest = null,
@@ -504,6 +505,7 @@ pub const ModelManifest = struct {
         if (self.preprocessor_config_path) |p| self.allocator.free(p);
         if (self.processor_config_path) |p| self.allocator.free(p);
         if (self.inference_bundle_family.len > 0) self.allocator.free(self.inference_bundle_family);
+        if (self.qualified_limits_json.len > 0) self.allocator.free(self.qualified_limits_json);
         if (self.visual_model_path) |p| self.allocator.free(p);
         if (self.audio_model_path) |p| self.allocator.free(p);
         if (self.text_projection_path) |p| self.allocator.free(p);
@@ -1848,6 +1850,12 @@ fn applySentenceTransformersPrompts(
 }
 
 fn applyImplicitModelTypeHints(manifest: *ModelManifest, model_dir_path: []const u8) !void {
+    // No non-empty extraction evaluation qualifies the current ModernBERT
+    // span checkpoint. Apply to both live loading and discovery, including
+    // manifests synthesized by older versions or supplied by the caller.
+    if (manifest.gliner_span_declared and manifest.gliner_span_encoder_family == .modern_bert) {
+        try removeManifestStrings(manifest.allocator, &manifest.capabilities, &.{ "named_entity_recognition", "relations", "extraction" });
+    }
     if (@import("../architectures/embedding_gemma2_config.zig").isModel(manifest.config_model_arch)) {
         if (manifest.model_type != .embedder or manifest.embedding_style != .embedding_gemma2 or
             manifest.pooling != .mean or !manifest.normalize) return error.InvalidEmbeddingTaskProfile;
@@ -1934,7 +1942,8 @@ fn applyImplicitModelTypeHints(manifest: *ModelManifest, model_dir_path: []const
     }
     if (manifest.model_type != .embedder) return;
     if (manifest.native_arch_hint == .florence or
-        std.mem.eql(u8, manifest.config_model_arch, "vision-encoder-decoder"))
+        std.mem.eql(u8, manifest.config_model_arch, "vision-encoder-decoder") or
+        std.mem.eql(u8, manifest.config_model_arch, "moondream1"))
     {
         manifest.model_type = .reader;
         manifest.model_type_origin = .config;
@@ -3177,6 +3186,14 @@ fn parseModelManifestJson(manifest: *ModelManifest, allocator: std.mem.Allocator
         else => return error.InvalidModelManifest,
     };
 
+    // Discovery metadata only. Runtime admission always binds actual bytes.
+    if (obj.get("qualified_limits")) |value| {
+        if (value != .object) return error.InvalidModelManifest;
+        const json = try std.json.Stringify.valueAlloc(allocator, value, .{});
+        if (manifest.qualified_limits_json.len > 0) allocator.free(manifest.qualified_limits_json);
+        manifest.qualified_limits_json = json;
+    }
+
     if (obj.get("type")) |v| {
         manifest.model_type = try parseManifestModelTypeJson(v);
         manifest.model_type_origin = .manifest;
@@ -3582,7 +3599,7 @@ fn shouldUseClipclapGgufVariant(catalog: *const ArtifactCatalog) !bool {
 
 fn shouldParseClipclapGgufVariant(catalog: *const ArtifactCatalog) !bool {
     if (try shouldUseClipclapGgufVariant(catalog)) return true;
-    if (build_options.enable_cuda and !build_options.enable_onnx) {
+    if (build_options.enable_cuda) {
         return try catalog.exists("antfly_inference_variants.json");
     }
     return false;
@@ -8015,6 +8032,7 @@ test "manifest clone owns metadata and unwinds every allocation failure" {
         .id2label = &strings,
         .gliner_default_labels = &strings,
         .gliner_relation_labels = &strings,
+        .qualified_limits_json = "{\"runtime_revalidates_artifact\":true}",
         .chat_template = "{{ message }}",
         .eos_token = "<eos>",
         .gliner_boundary_bundle = parsed,
@@ -8122,4 +8140,17 @@ test "span wrapper manifest rejects unknown and malformed nested encoder contrac
         \\{"model_type":"modernbert","attention_bias":false,"mlp_bias":false,"norm_bias":false,"tie_word_embeddings":true,"hidden_size":-1,"intermediate_size":3840,"num_hidden_layers":28,"num_attention_heads":28,"vocab_size":50378,"max_position_embeddings":7999,"global_attn_every_n_layers":3,"local_attention":128,"pad_token_id":50283}
     });
     try std.testing.expectError(error.InvalidGlinerSpanEncoderConfig, loadFromDir(allocator, model_path));
+}
+
+test "ModernBERT span discovery withholds unevaluated extraction capabilities" {
+    const a = std.testing.allocator;
+    var manifest = ModelManifest{ .allocator = a, .gliner_span_declared = true, .gliner_span_encoder_family = .modern_bert };
+    defer manifest.deinit();
+    try appendManifestStrings(a, &manifest.capabilities, &.{ "named_entity_recognition", "relations", "extraction", "classification", "typed_decisions" });
+    try applyImplicitModelTypeHints(&manifest, "decide-1b");
+    try std.testing.expect(!manifest.hasCapability("named_entity_recognition"));
+    try std.testing.expect(!manifest.hasCapability("relations"));
+    try std.testing.expect(!manifest.hasCapability("extraction"));
+    try std.testing.expect(manifest.hasCapability("classification"));
+    try std.testing.expect(manifest.hasCapability("typed_decisions"));
 }

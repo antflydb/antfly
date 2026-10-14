@@ -80,7 +80,8 @@ pub fn encodePreparedImageTokensTensor(
     }
 
     var hidden = try patchEmbed(cb, allocator, patch_rows, seq_len, patch_size, temporal_patch_size, embed_dim);
-    errdefer cb.free(hidden);
+    var hidden_live = true;
+    errdefer if (hidden_live) cb.free(hidden);
     if (trace_enabled) {
         std.debug.print("vision_trace stage=patch_embed elapsed_ms={d}\n", .{nsToMs(try elapsedSince(stage_start_ns))});
         stage_start_ns = try nowNs();
@@ -106,7 +107,9 @@ pub fn encodePreparedImageTokensTensor(
 
     if (trace_enabled) stage_start_ns = try nowNs();
     const projected = try patchMergerTensor(cb, allocator, hidden, seq_len, embed_dim, merge_size, cfg);
+    errdefer cb.free(projected);
     cb.free(hidden);
+    hidden_live = false;
     if (trace_enabled) {
         std.debug.print("vision_trace stage=patch_merger elapsed_ms={d} output_tokens={d}\n", .{ nsToMs(try elapsedSince(stage_start_ns)), merged_tokens });
     }
@@ -184,21 +187,11 @@ fn patchEmbed(
 
     const patch_w = try getVisionWeight(cb, "visual.patch_embed.proj.weight");
     defer cb.free(patch_w);
-    const patch_w_data = try cb.toFloat32(patch_w, allocator);
-    defer allocator.free(patch_w_data);
-    if (trace_enabled) {
-        std.debug.print("vision_trace stage=patch_embed.load_weight elapsed_ms={d}\n", .{nsToMs(try elapsedSince(stage_start_ns))});
-        stage_start_ns = try nowNs();
-    }
-
-    const weight_shape = [_]i32{ @intCast(embed_dim), @intCast(patch_dim) };
-    const weight_ct = try cb.fromFloat32Shape(patch_w_data, &weight_shape);
+    const weight_ct = if (cb.kind() == .metal)
+        try cb.reshape2D(allocator, patch_w, embed_dim, patch_dim, embed_dim, patch_dim)
+    else
+        try cb.primReshape(patch_w, &.{ @intCast(embed_dim), @intCast(patch_dim) });
     defer cb.free(weight_ct);
-    if (trace_enabled) {
-        std.debug.print("vision_trace stage=patch_embed.from_weight elapsed_ms={d}\n", .{nsToMs(try elapsedSince(stage_start_ns))});
-        stage_start_ns = try nowNs();
-    }
-
     const out = try cb.linearNoBias(patch_ct, weight_ct, seq_len, patch_dim, embed_dim);
     if (trace_enabled) {
         std.debug.print("vision_trace stage=patch_embed.linear elapsed_ms={d}\n", .{nsToMs(try elapsedSince(stage_start_ns))});
@@ -240,16 +233,18 @@ fn buildVisionRotaryPosEmb(
 
     const freqs = try allocator.alloc(f32, seq_len * rot_dim);
     var token: usize = 0;
-    for (0..merged_h) |block_y| {
-        for (0..merged_w) |block_x| {
-            for (0..merge_size) |iy| {
-                for (0..merge_size) |ix| {
-                    const hpos = block_y * merge_size + iy;
-                    const wpos = block_x * merge_size + ix;
-                    const dst = token * rot_dim;
-                    @memcpy(freqs[dst..][0..inv_len], full[hpos * inv_len ..][0..inv_len]);
-                    @memcpy(freqs[dst + inv_len ..][0..inv_len], full[wpos * inv_len ..][0..inv_len]);
-                    token += 1;
+    for (0..@as(usize, @intCast(grid_thw[0]))) |_| {
+        for (0..merged_h) |block_y| {
+            for (0..merged_w) |block_x| {
+                for (0..merge_size) |iy| {
+                    for (0..merge_size) |ix| {
+                        const hpos = block_y * merge_size + iy;
+                        const wpos = block_x * merge_size + ix;
+                        const dst = token * rot_dim;
+                        @memcpy(freqs[dst..][0..inv_len], full[hpos * inv_len ..][0..inv_len]);
+                        @memcpy(freqs[dst + inv_len ..][0..inv_len], full[wpos * inv_len ..][0..inv_len]);
+                        token += 1;
+                    }
                 }
             }
         }
@@ -377,19 +372,9 @@ fn selfAttention(
     }
 
     const attn_shape = [_]i32{ @intCast(seq_len), @intCast(embed_dim) };
-    const q_rot = cb.rope(split.first, seq_len, head_dim, head_dim, vision_rope_theta, 1.0, 0, false) catch blk: {
-        const q_data = try cb.toFloat32(split.first, allocator);
-        defer allocator.free(q_data);
-        applyVisionRotary(q_data, seq_len, num_heads, head_dim, rotary);
-        break :blk try cb.fromFloat32Shape(q_data, &attn_shape);
-    };
+    const q_rot = try visionRotaryTensor(cb, allocator, split.first, seq_len, num_heads, head_dim, rotary);
     defer cb.free(q_rot);
-    const k_rot = cb.rope(split.second, seq_len, head_dim, head_dim, vision_rope_theta, 1.0, 0, false) catch blk: {
-        const k_data = try cb.toFloat32(split.second, allocator);
-        defer allocator.free(k_data);
-        applyVisionRotary(k_data, seq_len, num_heads, head_dim, rotary);
-        break :blk try cb.fromFloat32Shape(k_data, &attn_shape);
-    };
+    const k_rot = try visionRotaryTensor(cb, allocator, split.second, seq_len, num_heads, head_dim, rotary);
     defer cb.free(k_rot);
     if (trace_enabled) {
         std.debug.print("vision_trace stage=self_attention.backend_rope layer={d} elapsed_ms={d}\n", .{ layer, nsToMs(try elapsedSince(stage_start_ns)) });
@@ -400,7 +385,11 @@ fn selfAttention(
     defer allocator.free(mask);
     @memset(mask, 1);
 
-    const attn_ct = cb.scaledDotProductAttention(q_rot, k_rot, split.third, mask, null, 1, seq_len, num_heads, head_dim) catch blk: {
+    const attn_ct = cb.scaledDotProductAttention(q_rot, k_rot, split.third, mask, null, 1, seq_len, num_heads, head_dim) catch |err| blk: {
+        switch (err) {
+            error.UnsupportedPrimitiveOp, error.UnsupportedTensorType, error.UnsupportedOperation, error.UnsupportedShape => {},
+            else => return err,
+        }
         if (trace_enabled) {
             std.debug.print("vision_trace stage=self_attention.backend_fallback layer={d}\n", .{layer});
         }
@@ -486,6 +475,26 @@ fn manualVisionAttention(
         }
     }
     return out;
+}
+
+fn visionRotaryTensor(cb: *const ComputeBackend, allocator: std.mem.Allocator, input: CT, tokens: usize, heads: usize, head_dim: usize, rotary: []const f32) !CT {
+    if (head_dim == 0 or head_dim % 4 != 0 or rotary.len != tokens * (head_dim / 2)) return error.InvalidMultimodalConfig;
+    if (cb.vtable.visionRope != null) {
+        // The first frequency of each spatial axis is exactly its integer
+        // position. Preserve merge-group token ordering, rather than applying
+        // ordinary sequential text RoPE to a vision grid.
+        const positions = try allocator.alloc(u32, 2 * tokens);
+        defer allocator.free(positions);
+        for (0..tokens) |token| {
+            positions[token] = @intFromFloat(rotary[token * (head_dim / 2)]);
+            positions[tokens + token] = @intFromFloat(rotary[token * (head_dim / 2) + head_dim / 4]);
+        }
+        return try cb.visionRope(input, tokens, head_dim, vision_rope_theta, positions) orelse error.UnsupportedResidentQwenVision;
+    }
+    const data = try cb.toFloat32(input, allocator);
+    defer allocator.free(data);
+    applyVisionRotary(data, tokens, heads, head_dim, rotary);
+    return cb.fromFloat32Shape(data, &.{ @intCast(tokens), @intCast(heads * head_dim) });
 }
 
 fn applyVisionRotary(data: []f32, seq_len: usize, num_heads: usize, head_dim: usize, rotary: []const f32) void {
@@ -656,4 +665,44 @@ fn elapsedSince(start_ns: u64) !u64 {
 
 fn nsToMs(ns: u64) u64 {
     return @divFloor(ns, std.time.ns_per_ms);
+}
+
+fn checkQwen2Residency(cb: ComputeBackend, _: ComputeBackend) !void {
+    const allocator = std.testing.allocator;
+    const fixture = @import("../ops/media_residency_test.zig");
+    const tokens = 48;
+    const heads = 2;
+    const head_dim = 8;
+    const rotary = try buildVisionRotaryPosEmb(allocator, .{ 2, 4, 6 }, 2, head_dim);
+    defer allocator.free(rotary);
+    // Every temporal slice repeats the same spatial rotary positions.
+    try std.testing.expectEqualSlices(f32, rotary[0 .. 24 * 4], rotary[24 * 4 ..]);
+    var data: [tokens * heads * head_dim]f32 = undefined;
+    for (&data, 0..) |*v, i| v.* = (@as(f32, @floatFromInt(i % 19)) - 9) * 0.03;
+    var expected = data;
+    applyVisionRotary(&expected, tokens, heads, head_dim, rotary);
+    const input = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&data, &.{ tokens, heads * head_dim }));
+    defer cb.free(input);
+    const before = fixture.Transfers.snapshot(cb);
+    const output = try visionRotaryTensor(&cb, allocator, input, tokens, heads, head_dim, rotary);
+    defer cb.free(output);
+    try before.expectUnchanged(cb);
+    const actual = try cb.toFloat32(output, allocator);
+    defer allocator.free(actual);
+    for (expected, actual) |e, a| try std.testing.expectApproxEqAbs(e, a, 1e-6);
+}
+
+test "media residency Qwen2 VL spatial rotary native parity" {
+    const fixture = @import("../ops/media_residency_test.zig");
+    try fixture.onNative(fixture.noWeights, checkQwen2Residency);
+}
+
+test "media residency Qwen2 VL spatial rotary Metal parity" {
+    const fixture = @import("../ops/media_residency_test.zig");
+    try fixture.onMetal(fixture.noWeights, checkQwen2Residency);
+}
+
+test "media residency Qwen2 VL spatial rotary CUDA parity" {
+    const fixture = @import("../ops/media_residency_test.zig");
+    try fixture.onCuda(fixture.noWeights, checkQwen2Residency);
 }

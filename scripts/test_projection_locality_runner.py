@@ -114,13 +114,8 @@ class QualificationRunnerTest(unittest.TestCase):
                 == "1"
                 or kwargs["env"].get("ANTFLY_EXPERIMENT_PROJECTION_BORROW") == "1"
                 or (
-                    any(
-                        kwargs["env"].get(flag) == "1"
-                        for flag in (
-                            "ANTFLY_EXPERIMENT_SUBGROUP_ROUTING",
-                            "ANTFLY_EXPERIMENT_GLOBAL_SUBGROUP_ROUTING",
-                        )
-                    )
+                    kwargs["env"].get("ANTFLY_EXPERIMENT_GLOBAL_SUBGROUP_ROUTING")
+                    == "1"
                     and any(
                         kwargs["env"].get(f"ANTFLY_EXPERIMENT_SUBGROUPS_{count}") == "1"
                         for count in (4, 8, 16)
@@ -357,10 +352,10 @@ class QualificationRunnerTest(unittest.TestCase):
         calls, receipts = self.run_fixture(
             module=posting_runner,
             refinement="subgroups_4",
-            common_refinement="subgroup_routing",
+            common_refinement="global_subgroup_routing",
         )
         for (_, env), receipt in zip(calls, receipts, strict=True):
-            self.assertEqual(env["ANTFLY_EXPERIMENT_SUBGROUP_ROUTING"], "1")
+            self.assertEqual(env["ANTFLY_EXPERIMENT_GLOBAL_SUBGROUP_ROUTING"], "1")
             self.assertEqual(env["ANTFLY_EXPERIMENT_POSTING_LOCAL_PROJECTIONS"], "0")
             self.assertEqual(
                 env["ANTFLY_EXPERIMENT_SUBGROUPS_4"],
@@ -392,7 +387,7 @@ class QualificationRunnerTest(unittest.TestCase):
 
     def test_subgroup_qualification_rejects_missing_or_inert_evidence(self):
         environment = {
-            "ANTFLY_EXPERIMENT_SUBGROUP_ROUTING": "1",
+            "ANTFLY_EXPERIMENT_GLOBAL_SUBGROUP_ROUTING": "1",
             "ANTFLY_EXPERIMENT_SUBGROUPS_4": "1",
         }
         with tempfile.TemporaryDirectory() as directory:

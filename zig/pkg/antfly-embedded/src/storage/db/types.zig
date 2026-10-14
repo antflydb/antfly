@@ -1821,11 +1821,15 @@ pub const GraphQueryTransport = struct {
     }
 };
 
+pub const document_authority = @import("query/document_authority.zig");
 pub const SearchRequest = struct {
     pub fn hasHitEvaluation(self: @This()) bool {
         return self.evaluation_limit > 0 and !self.evaluation_graph;
     }
 
+    /// Authenticated internal two-phase hydration, never set by public parsing.
+    document_authority_mode: document_authority.Mode = .none,
+    document_authority_group: u64 = 0,
     evaluation_json: []const u8 = "",
     evaluation_limit: u32 = 0,
     evaluation_matches: bool = false,
@@ -1861,6 +1865,10 @@ pub const SearchRequest = struct {
     remote_snapshot: ?[]const u8 = null,
     /// Borrowed, trusted coordinator control; never accepted from public JSON.
     native_query_cut: ?@import("native_query_cut_contract.zig").Request = null,
+    /// Trusted lower bound from already retained publication-wide winners.
+    /// Strict score pruning only: equal scores retain their global tie chance.
+    /// Never populated from public JSON or forwarded to count-only execution.
+    minimum_competitive_score: ?f32 = null,
     lake_read: ?struct {
         visibility: enum { accepted, published } = .accepted,
         through: ?struct { table_id: u64, object_generation: u64, wal_lsn: u64 } = null,
@@ -2008,6 +2016,8 @@ const hierarchy_children_validated_fields = [_][]const u8{
 };
 
 const hierarchy_children_supported_internal_fields = [_][]const u8{
+    "document_authority_mode",
+    "document_authority_group",
     "response_table_name",
     "prepared_read_table_id",
     "native_query_cut",
@@ -2089,6 +2099,7 @@ const hierarchy_children_rejected_fields = [_][]const u8{
     "graph_table_read_authorizer",
     "require_algebraic_filter_resolution",
     "distributed_text_stats",
+    "minimum_competitive_score",
 };
 
 fn auditHierarchyChildrenSearchRequestFields() void {
@@ -2310,6 +2321,8 @@ pub const GraphMetricFreshness = enum {
     fresh,
 };
 
+pub const GraphMetricDirection = enum { out, in, both };
+
 pub const GraphMetricQuery = struct {
     index_name: []const u8,
     metric_name: []const u8,
@@ -2323,6 +2336,7 @@ pub const GraphMetricQuery = struct {
     /// Damping override for personalized reads. Null keeps the metric's
     /// configured damping. Only valid together with seed_nodes.
     damping: ?f64 = null,
+    direction: GraphMetricDirection = .out,
 };
 
 pub const NamedGraphMetricQuery = struct {
@@ -2344,6 +2358,7 @@ pub const GraphMetricRerank = struct {
     seed_nodes: []const []const u8 = &.{},
     /// Damping override for personalized blends. Only valid with seed_nodes.
     damping: ?f64 = null,
+    direction: GraphMetricDirection = .out,
 };
 
 pub const graph_metric_rerank_max_candidates: u32 = 10_000;
@@ -2512,6 +2527,8 @@ pub const ColumnSource = @import("column_source.zig").Row;
 pub const ColumnSourcePage = @import("column_source.zig").Page;
 
 pub const SearchHit = struct {
+    /// Owned internal selection proof; absent on ordinary/public results.
+    document_authority: ?*const @import("query/document_authority.zig").Authority = null,
     computed_json: ?[]u8 = null,
     id: []u8,
     /// Internal graph-hydration namespace. Null means the query's source
@@ -2547,6 +2564,7 @@ pub const SearchHit = struct {
         var cloned = SearchHit{ .id = try alloc.dupe(u8, self.id) };
         errdefer {
             alloc.free(cloned.id);
+            if (cloned.document_authority) |proof| alloc.destroy(proof);
             if (cloned.computed_json) |data| alloc.free(data);
             if (cloned.source_table) |table| alloc.free(table);
             if (cloned.score_details) |*details| details.deinit(alloc);
@@ -2559,6 +2577,11 @@ pub const SearchHit = struct {
             if (cloned.ancestor_unit_data) |data| alloc.free(data);
             if (cloned.artifact_ref) |*artifact_ref| artifact_ref.deinit(alloc);
             freeHighlights(alloc, cloned.highlights);
+        }
+        if (self.document_authority) |proof| {
+            const owned = try alloc.create(@import("query/document_authority.zig").Authority);
+            owned.* = proof.*;
+            cloned.document_authority = owned;
         }
         cloned.computed_json = if (self.computed_json) |data| try alloc.dupe(u8, data) else null;
         cloned.source_table = if (self.source_table) |table| try alloc.dupe(u8, table) else null;
@@ -2595,6 +2618,7 @@ pub const SearchHit = struct {
 
     pub fn deinit(self: *SearchHit, alloc: Allocator) void {
         alloc.free(self.id);
+        if (self.document_authority) |proof| alloc.destroy(proof);
         if (self.computed_json) |data| alloc.free(data);
         if (self.source_table) |table| alloc.free(table);
         if (self.score_details) |*details| details.deinit(alloc);
@@ -2854,6 +2878,7 @@ pub const ShardIdentityReadGeneration = struct {
 };
 
 pub const SearchResult = struct {
+    document_authority_version: u32 = 0,
     alloc: Allocator,
     hits: []SearchHit,
     total_hits: u32,
@@ -2943,8 +2968,10 @@ pub const GraphMetricResult = struct {
 pub const GraphSearchResult = struct {
     name: []u8,
     nodes: []graph_query_mod.GraphResultNode = &.{},
+    metric_columns: ?*graph_query_mod.GraphMetricColumns = null,
     metric_values_slab: []graph_query_mod.GraphMetricValue = &.{},
     metric_value_names: [][]u8 = &.{},
+    metric_owners: []graph_query_mod.GraphMetricOwner = &.{},
     paths: []GraphPath = &.{},
     matches: []GraphPatternMatch = &.{},
     aggregates: []GraphAggregateResult = &.{},
@@ -2985,9 +3012,12 @@ pub const GraphSearchResult = struct {
         alloc.free(self.name);
         for (self.nodes) |*node| node.deinit(alloc);
         if (self.nodes.len > 0) alloc.free(self.nodes);
+        if (self.metric_columns) |columns| columns.deinit(alloc);
         if (self.metric_values_slab.len > 0) alloc.free(self.metric_values_slab);
         for (self.metric_value_names) |name| alloc.free(name);
         if (self.metric_value_names.len > 0) alloc.free(self.metric_value_names);
+        for (self.metric_owners) |*owner| owner.deinit(alloc);
+        alloc.free(self.metric_owners);
         for (self.paths) |path| paths_mod.freePath(alloc, path);
         if (self.paths.len > 0) alloc.free(self.paths);
         for (self.matches) |*match| match.deinit(alloc);
@@ -3235,6 +3265,7 @@ pub const EnrichmentActiveModel = InlineStatusText(256);
 pub const EnrichmentActiveBackend = InlineStatusText(32);
 
 pub const EnrichmentStats = struct {
+    last_error_code: RuntimeErrorName = .{},
     enabled: bool = false,
     lease_owned: bool = true,
     has_lease: bool = false,

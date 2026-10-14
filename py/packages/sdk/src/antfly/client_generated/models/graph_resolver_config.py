@@ -11,6 +11,7 @@ from ..models.graph_resolver_config_source_artifact_kind import GraphResolverCon
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.graph_resolver_config_aliases_item import GraphResolverConfigAliasesItem
     from ..models.graph_resolver_scorer_config import GraphResolverScorerConfig
 
 
@@ -29,6 +30,10 @@ class GraphResolverConfig:
         key_template (str):
         source_artifact_kind (GraphResolverConfigSourceArtifactKind | Unset):  Default:
             GraphResolverConfigSourceArtifactKind.ASSET.
+        promote (bool | Unset): Materialize canonical entity documents. False resolves graph keys without promotion.
+            Default: True.
+        aliases (list[GraphResolverConfigAliasesItem] | Unset): Explicit redirects between fully rendered keys in this
+            resolver's table; no entity documents required. Changes trigger corpus re-resolution.
         labels (list[str] | Unset): Mention labels this resolver consumes; empty consumes every label (catch-all).
             Labeled resolvers sharing a source artifact must claim disjoint label sets, and every catch-all on that artifact
             skips the labels claimed by labeled siblings, so extraction labels stay open-vocabulary while each mention
@@ -58,6 +63,8 @@ class GraphResolverConfig:
     resolution_artifact: str
     key_template: str
     source_artifact_kind: GraphResolverConfigSourceArtifactKind | Unset = GraphResolverConfigSourceArtifactKind.ASSET
+    promote: bool | Unset = True
+    aliases: list[GraphResolverConfigAliasesItem] | Unset = UNSET
     labels: list[str] | Unset = UNSET
     type_must_match: bool | Unset = True
     scorer: GraphResolverScorerConfig | Unset = UNSET
@@ -88,6 +95,15 @@ class GraphResolverConfig:
         source_artifact_kind: str | Unset = UNSET
         if not isinstance(self.source_artifact_kind, Unset):
             source_artifact_kind = self.source_artifact_kind.value
+
+        promote = self.promote
+
+        aliases: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.aliases, Unset):
+            aliases = []
+            for aliases_item_data in self.aliases:
+                aliases_item = aliases_item_data.to_dict()
+                aliases.append(aliases_item)
 
         labels: list[str] | Unset = UNSET
         if not isinstance(self.labels, Unset):
@@ -140,6 +156,10 @@ class GraphResolverConfig:
         )
         if source_artifact_kind is not UNSET:
             field_dict["source_artifact_kind"] = source_artifact_kind
+        if promote is not UNSET:
+            field_dict["promote"] = promote
+        if aliases is not UNSET:
+            field_dict["aliases"] = aliases
         if labels is not UNSET:
             field_dict["labels"] = labels
         if type_must_match is not UNSET:
@@ -175,6 +195,7 @@ class GraphResolverConfig:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.graph_resolver_config_aliases_item import GraphResolverConfigAliasesItem
         from ..models.graph_resolver_scorer_config import GraphResolverScorerConfig
 
         d = dict(src_dict)
@@ -194,6 +215,17 @@ class GraphResolverConfig:
             source_artifact_kind = UNSET
         else:
             source_artifact_kind = GraphResolverConfigSourceArtifactKind(_source_artifact_kind)
+
+        promote = d.pop("promote", UNSET)
+
+        _aliases = d.pop("aliases", UNSET)
+        aliases: list[GraphResolverConfigAliasesItem] | Unset = UNSET
+        if _aliases is not UNSET:
+            aliases = []
+            for aliases_item_data in _aliases:
+                aliases_item = GraphResolverConfigAliasesItem.from_dict(aliases_item_data)
+
+                aliases.append(aliases_item)
 
         labels = cast(list[str], d.pop("labels", UNSET))
 
@@ -247,6 +279,8 @@ class GraphResolverConfig:
             resolution_artifact=resolution_artifact,
             key_template=key_template,
             source_artifact_kind=source_artifact_kind,
+            promote=promote,
+            aliases=aliases,
             labels=labels,
             type_must_match=type_must_match,
             scorer=scorer,

@@ -28,6 +28,10 @@ pub const CandidateSource = struct {
         index_name: []const u8,
         embedding: []const f32,
         k: usize,
+        /// Candidate record fields consumed by comparisons against the mention vector.
+        /// Empty means ANN blocking only: return stored JSON without vector hydration.
+        vector_fields: []const []const u8 = &.{},
+        cache_vectors: bool = false,
     };
     pub const ScanOptions = struct {
         limit: usize = 0,
@@ -48,7 +52,29 @@ pub const CandidateSource = struct {
         if (self.vtable.bound_table) |f| return f(self.ptr, table);
         return null;
     }
+    /// Revisions must cover the complete candidate universe (including newly
+    /// inserted records, table rebinding, index rebuilds and ANN visibility),
+    /// and the selected embedding producer. Null disables cross-run reuse.
+    pub const Revisions = struct {
+        candidates: ?[32]u8 = null,
+        embedding: ?[32]u8 = null,
+    };
+    pub const CacheBatch = struct {
+        pub const Write = struct { key: []const u8, value: []const u8 };
+        ptr: *anyopaque,
+        writes: []const Write,
+        deletes: []const []const u8,
+        finish: *const fn (*anyopaque, bool) void,
+    };
     pub const VTable = struct {
+        /// Root-source caches join the resolution transaction. Other physical
+        /// stores flush one optional shared-cache batch after resolution commit.
+        embedding_cache_prepare: ?*const fn (*anyopaque, std.mem.Allocator, *anyopaque) anyerror!?CacheBatch = null,
+        embedding_cache_flush: ?*const fn (*anyopaque) anyerror!void = null,
+        embedding_cache_get: ?*const fn (*anyopaque, std.mem.Allocator, [32]u8) anyerror!?[]const f32 = null,
+        embedding_cache_put: ?*const fn (*anyopaque, [32]u8, []const f32) anyerror!void = null,
+        load_vector: ?*const fn (*anyopaque, std.mem.Allocator, @import("antfly_resolver").VectorReference) anyerror!?[]const f32 = null,
+        revisions: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8, []const u8) anyerror!Revisions = null,
         /// Bulk point candidates. Missing keys are omitted. Values are borrowed
         /// during consume; this optional capability must preserve point-read semantics.
         get_many: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, []const []const u8, *anyopaque, Consume) anyerror!void = null,
@@ -56,6 +82,8 @@ pub const CandidateSource = struct {
         begin_batch: ?*const fn (*anyopaque, std.mem.Allocator, []const []const u8) anyerror!Batch = null,
         /// Borrowed immutable destination, retained through batch deinit.
         bound_table: ?*const fn (*anyopaque, []const u8) anyerror!?[]const u8 = null,
+        /// Optional table-scoped embedding configuration for mention blocking.
+        embed_mention: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8, []const u8, u32) anyerror![]f32 = null,
         /// Fetch the entity doc for `key` in `table` (owned bytes or null).
         get: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, table: []const u8, key: []const u8) anyerror!?[]u8,
         /// Scan `table` for entities whose key starts with `prefix`.

@@ -422,7 +422,7 @@ test "ordered artifact inventory resolver inherits causal sources with stable so
             try result.validate(a);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, AllocationFailure.run, .{ proof, input_key, output_key });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, AllocationFailure.run, .{ proof, input_key, output_key });
 }
 
 test "ordered resolver preparation binds output to exact source and configured generation" {

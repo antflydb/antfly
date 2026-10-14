@@ -20,7 +20,6 @@
 // replays a Graph through a real backend.
 
 const build_options = @import("build_options");
-const supports_onnx_compiler = !build_options.enable_wasm;
 
 pub const tracing_compute = @import("tracing_compute.zig");
 pub const interpreter = @import("interpreter.zig");
@@ -114,11 +113,7 @@ pub const metal_executor = if (build_options.enable_metal) @import("metal_execut
 };
 pub const execution = @import("execution.zig");
 pub const onnx_kv_cache = @import("onnx_kv_cache.zig");
-pub const onnx_artifact_executor = if (build_options.enable_onnx) @import("onnx_artifact_executor.zig") else struct {};
-pub const compiled_onnx = if (build_options.enable_onnx) @import("compiled_onnx.zig") else struct {};
 pub const compiled_pjrt = if (build_options.enable_pjrt) @import("compiled_pjrt.zig") else struct {};
-pub const onnx_compiler = if (supports_onnx_compiler) @import("onnx_compiler.zig") else struct {};
-pub const onnx_executor = if (build_options.enable_onnx) @import("onnx_executor.zig") else struct {};
 pub const pjrt_compiler = if (build_options.enable_pjrt) @import("pjrt_compiler.zig") else struct {};
 pub const pjrt_executor = if (build_options.enable_pjrt) @import("pjrt_executor.zig") else struct {};
 pub const pjrt_artifact_executor = if (build_options.enable_pjrt) @import("pjrt_artifact_executor.zig") else struct {};
@@ -183,14 +178,6 @@ test {
     _ = training_loop;
     _ = segmented_encoder;
     _ = distributed_training;
-    if (build_options.enable_onnx) {
-        _ = onnx_artifact_executor;
-        _ = compiled_onnx;
-        _ = onnx_executor;
-    }
-    if (supports_onnx_compiler) {
-        _ = onnx_compiler;
-    }
     if (build_options.enable_pjrt) {
         _ = compiled_pjrt;
         _ = pjrt_compiler;

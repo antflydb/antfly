@@ -865,6 +865,8 @@ pub fn bindLiteral(allocator: std.mem.Allocator, node: ast.Value, kind: ast.Colu
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.SqlTypeMismatch,
         };
+        var work: @import("json_order.zig").Budget = .{};
+        try @import("json_order.zig").validateTextDomain(parsed, &work, 0);
         return parsed;
     }
     return coerce(switch (node) {

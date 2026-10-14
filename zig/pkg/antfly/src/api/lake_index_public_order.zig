@@ -30,6 +30,7 @@ pub const Cursor = struct {
     directory: ?tree.Cursor = null,
     pending: ?tree.Cursor.Record = null,
     reader: *ordered.Reader,
+    navigation: ?*Navigation = null,
     digests: []const [32]u8,
     lower: []const u8,
     upper: ?[]const u8,
@@ -43,9 +44,33 @@ pub const Cursor = struct {
     file_position: usize = 0,
     rows: ?tree.Cursor = null,
     exhausted: bool = false,
+    /// One statement-owned cache amortizes seeks across distinct tie groups.
+    /// It retains immutable pages only, with the original query's read context.
+    const Navigation = struct {
+        reader: *ordered.Reader,
+        context: ?local.serverless_query_lake_read_context.Context,
+        cache: tree.Cache,
+        fn check(raw: *anyopaque) !void {
+            const owner: *@This() = @ptrCast(@alignCast(raw));
+            if (owner.context) |context| try context.ensureActive();
+            try owner.reader.pages.cancellation.check();
+        }
+        fn get(raw: *anyopaque, a_: A, ref: tree.Ref) ![]u8 {
+            const owner: *@This() = @ptrCast(@alignCast(raw));
+            try check(raw);
+            const backing = owner.reader.pages.store();
+            return backing.get(backing.ptr, a_, ref);
+        }
+        fn put(_: *anyopaque, _: tree.Ref, _: []const u8) !void {
+            return error.InvalidNativeLakeRowIndex;
+        }
+    };
     pub fn init(a: A, reader: *ordered.Reader, lower: []const u8, upper: ?[]const u8, boundary: ?[]const u8, id: ?[]const u8, id_descending: bool, before: bool) !Cursor {
         var result: Cursor = .{ .a = a, .arena = .init(a), .group_arena = .init(a), .file_arena = .init(a), .reader = reader, .digests = &.{}, .lower = undefined, .upper = null, .boundary = null, .reverse = before, .reverse_ids = id_descending != before };
         errdefer result.deinit();
+        const navigation = try a.create(Navigation);
+        navigation.* = .{ .reader = reader, .context = if (reader.cached) |cached| cached.context else null, .cache = .{ .alloc = a, .underlying = .{ .domain = reader.root.domain, .ptr = navigation, .get = Navigation.get, .put = Navigation.put, .check = Navigation.check } } };
+        result.navigation = navigation;
         const ca = result.arena.allocator();
         result.lower = try ca.dupe(u8, lower);
         result.upper = if (upper) |end| try ca.dupe(u8, end) else null;
@@ -89,14 +114,19 @@ pub const Cursor = struct {
             result.exhausted = true;
         };
         if (!result.exhausted) result.directory = if (before)
-            try tree.Cursor.initReverse(a, reader.pages.store(), reader.root.ties, result.lower, result.upper)
+            try tree.Cursor.initReverse(a, result.navigation.?.cache.store(), reader.root.ties, result.lower, result.upper)
         else
-            try tree.Cursor.init(a, reader.pages.store(), reader.root.ties, result.lower, result.upper);
+            try tree.Cursor.init(a, result.navigation.?.cache.store(), reader.root.ties, result.lower, result.upper);
         return result;
     }
     pub fn deinit(self: *Cursor) void {
         if (self.rows) |*rows| rows.deinit();
         self.group_arena.deinit();
+        if (self.navigation) |navigation| {
+            navigation.cache.deinit();
+            self.a.destroy(navigation);
+            self.navigation = null;
+        }
         self.file_arena.deinit();
         if (self.directory) |*directory| directory.deinit();
         self.arena.deinit();
@@ -143,9 +173,9 @@ pub const Cursor = struct {
                 self.directory.?.deinit();
                 self.directory = null;
                 self.directory = if (self.reverse)
-                    try tree.Cursor.initReverse(self.a, self.reader.pages.store(), self.reader.root.ties, self.lower, self.group)
+                    try tree.Cursor.initReverse(self.a, self.navigation.?.cache.store(), self.reader.root.ties, self.lower, self.group)
                 else if (try orderedSuccessor(ca, self.group)) |end|
-                    try tree.Cursor.init(self.a, self.reader.pages.store(), self.reader.root.ties, end, self.upper)
+                    try tree.Cursor.init(self.a, self.navigation.?.cache.store(), self.reader.root.ties, end, self.upper)
                 else blk: {
                     self.exhausted = true;
                     break :blk null;
@@ -251,9 +281,9 @@ pub const Cursor = struct {
             }
         };
         self.rows = if (self.reverse_ids)
-            try tree.Cursor.initReverse(self.a, self.reader.pages.store(), self.reader.root.page, lower, upper)
+            try tree.Cursor.initReverse(self.a, self.navigation.?.cache.store(), self.reader.root.page, lower, upper)
         else
-            try tree.Cursor.init(self.a, self.reader.pages.store(), self.reader.root.page, lower, upper);
+            try tree.Cursor.init(self.a, self.navigation.?.cache.store(), self.reader.root.page, lower, upper);
         return true;
     }
     pub fn next(self: *Cursor, a: A, count: usize) ![]const local.storage_rowsource_types.RowRef {

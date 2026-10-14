@@ -24,16 +24,12 @@ const model_manager_mod = @import("server/model_manager.zig");
 const runtime = @import("runtime/root.zig");
 const native_backend_choice = @import("native_backend_choice.zig");
 const ops = @import("ops/ops.zig");
-const export_source_mod = @import("models/export_source.zig");
 const compiled_artifact = @import("compiled_artifact.zig");
 
 const print = std.debug.print;
 const BackendChoice = native_backend_choice.Choice;
 const Graph = @import("ml").graph.Graph;
 const NodeId = @import("ml").graph.NodeId;
-const max_debug_output_nodes = 32;
-const OnnxWeightExportMode = graph_mod.onnx_compiler.QuantExportMode;
-const OnnxWeightExportRule = graph_mod.onnx_compiler.WeightExportRule;
 const PjrtInputBinding = if (build_options.enable_pjrt)
     graph_mod.pjrt_compiler.InputBinding
 else
@@ -42,7 +38,6 @@ else
         embedding_ids: NodeId,
         semantic_past_graph_node: NodeId,
     };
-const max_weight_export_rules = 32;
 
 const PjrtArtifactExportKind = enum {
     hlo,
@@ -59,12 +54,6 @@ const Options = struct {
     prompt: []const u8,
     backend: BackendChoice,
     attention_mode: CompileAttentionMode = .auto,
-    onnx_weight_mode: OnnxWeightExportMode = .dense,
-    onnx_weight_export_rules: [max_weight_export_rules]OnnxWeightExportRule = undefined,
-    onnx_weight_export_rule_count: usize = 0,
-    onnx_reuse_initializers_from: ?[]const u8 = null,
-    onnx_import_from: ?[]const u8 = null,
-    onnx_semantic_entrypoint: bool = false,
     artifact_role: ?[]const u8 = null,
     xla_artifact_kind: PjrtArtifactExportKind = .hlo,
     xla_artifact_kind_explicit: bool = false,
@@ -77,8 +66,6 @@ const Options = struct {
     node_index: ?u32 = null,
     node_range_start: ?u32 = null,
     node_range_end: ?u32 = null,
-    debug_output_nodes: [max_debug_output_nodes]u32 = @as([max_debug_output_nodes]u32, @splat(0)),
-    debug_output_node_count: usize = 0,
     node_neighborhood: usize = 0,
     node_closure: bool = false,
     partition_index: ?u32 = null,
@@ -137,9 +124,6 @@ fn printCompiledPackageSummary(
 pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     const opts = try parseArgs(args);
     try validateCompileBackend(opts.backend);
-    if (opts.onnx_import_from != null) {
-        return writeImportedOnnxArtifactManifest(allocator, io, opts);
-    }
 
     var session_manager = backends.SessionManager.initWithIo(allocator, io);
     session_manager.preferred_backends = &.{backends.BackendType.native};
@@ -188,7 +172,6 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
 
     var cb = try session_factory.getComputeBackend(model.session, allocator);
     defer cb.deinit();
-    const weight_export_source = session_factory.getWeightExportSource(model.session);
 
     var kv_manager = runtime.kv.manager.KvManager.init(allocator);
     defer kv_manager.deinit();
@@ -198,7 +181,6 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .metal => .metal,
         .cuda => .cuda,
         .pjrt => return error.UnexpectedPjrtBackend,
-        .onnx => return error.UnexpectedOnnxBackend,
         .wasm => return error.UnexpectedWasmBackend,
     };
     const kv_dtype = session_factory.recommendedKvDTypeForSession(model.session, backend_kind);
@@ -267,7 +249,6 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             allocator,
             &entry.graph,
             compileBackendKind(opts.backend),
-            opts.backend == .onnx and graph_attention_mode != .full_recompute,
         ) };
     defer {
         deinitOwnedPartition(allocator, &selection.part);
@@ -283,7 +264,6 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             opts,
             model,
             &cb,
-            weight_export_source,
             prompt_tokens,
             seq_len,
             max_decode_seq_len,
@@ -301,7 +281,6 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         opts,
         &entry.graph,
         &cb,
-        weight_export_source,
         selection,
         prompt_tokens,
         seq_len,
@@ -326,115 +305,12 @@ fn artifactRole(attention_mode: []const u8) []const u8 {
     return compiled_artifact.artifact_role_prefill;
 }
 
-fn onnxExportEstimateOnlyEnabled() bool {
-    return platform.env.getenv("ANTFLY_INFERENCE_ONNX_EXPORT_ESTIMATE_ONLY") != null;
-}
-
-fn shouldUseSemanticOnnxEntrypoint(
-    explicit: bool,
-    is_partial_artifact: bool,
-    attention_mode: []const u8,
-    seq_len: usize,
-    query_seq_len: usize,
-    debug_output_count: usize,
-) bool {
-    if (explicit) return true;
-    if (std.mem.eql(u8, attention_mode, "paged_decode")) return true;
-    if (!std.mem.eql(u8, attention_mode, "paged_prefill")) return false;
-    if (seq_len != query_seq_len) return false;
-    if (is_partial_artifact) return false;
-    if (debug_output_count != 0) return false;
-    return true;
-}
-
-fn writeImportedOnnxArtifactManifest(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    opts: Options,
-) !void {
-    if (opts.backend != .onnx) return error.InvalidArgs;
-    const import_path = opts.onnx_import_from orelse return error.InvalidArgs;
-    const seq_len = opts.seq_len orelse return error.InvalidArgs;
-    const query_seq_len = opts.query_seq_len orelse return error.InvalidArgs;
-    const attention_mode = switch (opts.attention_mode) {
-        .auto => return error.InvalidArgs,
-        .full_recompute => "full_recompute",
-        .paged_prefill => "paged_prefill",
-        .paged_decode => "paged_decode",
-    };
-    const role = opts.artifact_role orelse artifactRole(attention_mode);
-    if (!std.mem.eql(u8, role, compiled_artifact.artifact_role_prefill) and
-        !std.mem.eql(u8, role, compiled_artifact.artifact_role_decode))
-    {
-        return error.InvalidArgs;
-    }
-
-    const output_path_is_default = opts.output_path == null;
-    const output_path = if (opts.output_path) |path|
-        path
-    else
-        try defaultOutputPath(
-            allocator,
-            opts.model_dir,
-            .onnx,
-            opts.xla_artifact_kind,
-            null,
-            role,
-            seq_len,
-            query_seq_len,
-            attention_mode,
-        );
-    defer if (output_path_is_default) allocator.free(output_path);
-
-    try ensureParentDir(io, output_path);
-    const manifest_path = try compiled_artifact.artifactManifestPath(allocator, output_path);
-    defer allocator.free(manifest_path);
-
-    try compiled_artifact.writeManifest(allocator, io, manifest_path, .{
-        .kind = artifactKind(.onnx, false, opts.xla_artifact_kind),
-        .artifact_role = role,
-        .backend = "onnx",
-        .model_dir = opts.model_dir,
-        .artifact_path = import_path,
-        .source_path = import_path,
-        .prompt_tokens = seq_len,
-        .seq_len = seq_len,
-        .query_seq_len = query_seq_len,
-        .attention_mode = attention_mode,
-        .raw_prompt = opts.raw_prompt,
-        .chat_template_applied = false,
-    });
-    const refreshed_package = try refreshWholeModelPackageManifest(
-        allocator,
-        io,
-        std.fs.path.dirname(manifest_path) orelse ".",
-        "onnx",
-        opts.model_dir,
-        artifactKind(.onnx, false, opts.xla_artifact_kind),
-        null,
-    );
-    defer refreshed_package.deinit(allocator);
-    print(
-        "imported backend=onnx artifact_role={s} seq_len={d} query_seq_len={d} attention_mode={s} artifact={s} manifest={s}\n",
-        .{ role, seq_len, query_seq_len, attention_mode, import_path, manifest_path },
-    );
-    printCompiledPackageSummary(
-        "onnx",
-        artifactKind(.onnx, false, opts.xla_artifact_kind),
-        refreshed_package.package_path,
-        refreshed_package.artifact_count,
-        refreshed_package.prefill_count,
-        refreshed_package.decode_count,
-    );
-}
-
 fn writeCompiledArtifact(
     allocator: std.mem.Allocator,
     io: std.Io,
     opts: Options,
     graph: *const Graph,
     cb: *const ops.ComputeBackend,
-    weight_export_source: ?export_source_mod.Source,
     selection: SelectedPartition,
     prompt_tokens: usize,
     seq_len: usize,
@@ -449,12 +325,6 @@ fn writeCompiledArtifact(
         opts.xla_artifact_kind_explicit,
         selection.is_partial_artifact,
     );
-    const debug_output_label = if (opts.backend == .onnx and opts.debug_output_node_count > 0 and selection.output_label == null)
-        try buildOnnxDebugOutputLabel(allocator, opts.debug_output_nodes[0..opts.debug_output_node_count])
-    else
-        null;
-    defer if (debug_output_label) |label| allocator.free(label);
-
     const output_path_is_default = opts.output_path == null;
     var output_path = if (opts.output_path) |path|
         path
@@ -465,7 +335,7 @@ fn writeCompiledArtifact(
             opts.backend,
             resolved_xla_artifact_kind,
             selection.selected_index,
-            selection.output_label orelse debug_output_label,
+            selection.output_label,
             seq_len,
             query_seq_len,
             attention_mode,
@@ -475,10 +345,6 @@ fn writeCompiledArtifact(
     try ensureParentDir(io, output_path);
 
     var artifact_path = output_path;
-    var onnx_input_node_ids: []u32 = &.{};
-    var onnx_input_names: [][]u8 = &.{};
-    var onnx_output_node_ids: []u32 = &.{};
-    var onnx_output_names: [][]u8 = &.{};
     var pjrt_input_bindings: []compiled_artifact.PjrtInputBindingMeta = &.{};
     var pjrt_output_node_ids: []u32 = &.{};
     var pjrt_output_bindings: []compiled_artifact.PjrtOutputBindingMeta = &.{};
@@ -487,12 +353,6 @@ fn writeCompiledArtifact(
     const attention_bindings = try buildAttentionBindingMeta(allocator, graph, &selection.part);
     defer allocator.free(attention_bindings);
     defer {
-        if (onnx_input_node_ids.len > 0) allocator.free(onnx_input_node_ids);
-        for (onnx_input_names) |name| allocator.free(name);
-        if (onnx_input_names.len > 0) allocator.free(onnx_input_names);
-        if (onnx_output_node_ids.len > 0) allocator.free(onnx_output_node_ids);
-        for (onnx_output_names) |name| allocator.free(name);
-        if (onnx_output_names.len > 0) allocator.free(onnx_output_names);
         freePjrtInputBindingMeta(allocator, pjrt_input_bindings);
         if (pjrt_output_node_ids.len > 0) allocator.free(pjrt_output_node_ids);
         freePjrtOutputBindingMeta(allocator, pjrt_output_bindings);
@@ -507,77 +367,6 @@ fn writeCompiledArtifact(
         resolved_xla_artifact_kind == .executable;
 
     switch (opts.backend) {
-        .onnx => {
-            if (opts.node_closure and opts.onnx_reuse_initializers_from == null and !onnxExportEstimateOnlyEnabled()) {
-                std.log.err(
-                    "ONNX node-closure exports duplicate large external weight blobs; use --onnx-reuse-initializers-from <existing.onnx> or --debug-output-node for lightweight probes",
-                    .{},
-                );
-                return error.InvalidArguments;
-            }
-            if (opts.onnx_reuse_initializers_from) |reuse_path| {
-                try guardOnnxInitializerReuseOutput(output_path, reuse_path);
-            }
-            var extra_output_storage: [max_debug_output_nodes]NodeId = undefined;
-            for (opts.debug_output_nodes[0..opts.debug_output_node_count], 0..) |node_id, idx| {
-                extra_output_storage[idx] = @intCast(node_id);
-            }
-            const extra_output_node_ids = extra_output_storage[0..opts.debug_output_node_count];
-            const external_data_name = try std.fmt.allocPrint(allocator, "{s}.weights.bin", .{std.fs.path.basename(output_path)});
-            defer allocator.free(external_data_name);
-            const output_dir = std.fs.path.dirname(output_path) orelse ".";
-            const external_output_path = try std.fs.path.join(allocator, &.{ output_dir, external_data_name });
-            defer allocator.free(external_output_path);
-            const semantic_decoder_entrypoint = shouldUseSemanticOnnxEntrypoint(
-                opts.onnx_semantic_entrypoint,
-                selection.is_partial_artifact,
-                attention_mode,
-                seq_len,
-                query_seq_len,
-                opts.debug_output_node_count,
-            );
-            var result = graph_mod.onnx_compiler.compilePartition(
-                allocator,
-                graph,
-                &selection.part,
-                cb,
-                weight_export_source,
-                .{
-                    .default_mode = opts.onnx_weight_mode,
-                    .rules = opts.onnx_weight_export_rules[0..opts.onnx_weight_export_rule_count],
-                },
-                external_data_name,
-                external_output_path,
-                opts.onnx_reuse_initializers_from,
-                extra_output_node_ids,
-                .{ .semantic_decoder_entrypoint = semantic_decoder_entrypoint },
-            ) catch |err| switch (err) {
-                error.ConstantPoolTooLarge => {
-                    std.log.err(
-                        "ONNX full-model export requires external-data weight export for this graph shape; the Antfly inference graph constant pool exceeds 4 GiB",
-                        .{},
-                    );
-                    return err;
-                },
-                error.ExportEstimateOnly => return .{ .xla_artifact_kind = resolved_xla_artifact_kind },
-                else => return err,
-            };
-            defer result.deinit();
-            onnx_input_node_ids = try cloneNodeIdsAsU32(allocator, result.input_node_ids);
-            onnx_input_names = try cloneStringSlices(allocator, result.input_names);
-            onnx_output_node_ids = try cloneNodeIdsAsU32(allocator, result.output_node_ids);
-            onnx_output_names = try cloneStringSlices(allocator, result.output_names);
-            try std.Io.Dir.cwd().writeFile(io, .{
-                .sub_path = output_path,
-                .data = result.onnx_bytes,
-            });
-            if (result.external_data_path != null and result.external_data_bytes.len > 0) {
-                try std.Io.Dir.cwd().writeFile(io, .{
-                    .sub_path = external_output_path,
-                    .data = result.external_data_bytes,
-                });
-            }
-        },
         .xla => {
             if (comptime build_options.enable_pjrt) {
                 const semantic_kv_bindings = !selection.is_partial_artifact and !std.mem.eql(u8, attention_mode, "full_recompute");
@@ -628,7 +417,7 @@ fn writeCompiledArtifact(
                                     opts.model_dir,
                                     resolved_xla_artifact_kind,
                                     selection.selected_index,
-                                    selection.output_label orelse debug_output_label,
+                                    selection.output_label,
                                     seq_len,
                                     query_seq_len,
                                     attention_mode,
@@ -671,10 +460,6 @@ fn writeCompiledArtifact(
             .raw_prompt = opts.raw_prompt,
             .chat_template_applied = apply_chat_template,
             .attention_bindings = attention_bindings,
-            .onnx_input_node_ids = onnx_input_node_ids,
-            .onnx_input_names = onnx_input_names,
-            .onnx_output_node_ids = onnx_output_node_ids,
-            .onnx_output_names = onnx_output_names,
             .pjrt_parameter_mode = switch (opts.xla_parameter_mode) {
                 .embedded => compiled_artifact.pjrt_parameter_mode_embedded,
                 .inputs => compiled_artifact.pjrt_parameter_mode_inputs,
@@ -686,7 +471,7 @@ fn writeCompiledArtifact(
             .pjrt_output_shapes = pjrt_output_shapes,
         },
     );
-    const refreshed_package = if (!selection.is_partial_artifact and (opts.backend == .xla or opts.backend == .onnx))
+    const refreshed_package = if (!selection.is_partial_artifact and opts.backend == .xla)
         try refreshWholeModelPackageManifest(
             allocator,
             io,
@@ -736,7 +521,6 @@ fn writeWholeModelPjrtPackageArtifacts(
     opts: Options,
     model: *model_manager_mod.LoadedModel,
     cb: *const ops.ComputeBackend,
-    weight_export_source: ?export_source_mod.Source,
     prompt_tokens: usize,
     prefill_seq_len: usize,
     max_decode_seq_len: usize,
@@ -759,7 +543,6 @@ fn writeWholeModelPjrtPackageArtifacts(
         package_opts,
         prefill_graph,
         cb,
-        weight_export_source,
         prefill_selection,
         prompt_tokens,
         prefill_seq_len,
@@ -784,7 +567,6 @@ fn writeWholeModelPjrtPackageArtifacts(
             package_opts,
             model,
             cb,
-            weight_export_source,
             prompt_tokens,
             decode_seq_len,
             1,
@@ -829,7 +611,6 @@ fn validateWholeModelPjrtPackageRequest(
         opts.node_range_start != null or
         opts.list_op_nodes != null or
         opts.list_node_window != null or
-        opts.debug_output_node_count > 0 or
         opts.node_closure or
         opts.node_neighborhood != 0)
     {
@@ -870,7 +651,6 @@ fn writeWholeModelPjrtArtifactForShape(
     opts: Options,
     model: *model_manager_mod.LoadedModel,
     cb: *const ops.ComputeBackend,
-    weight_export_source: ?export_source_mod.Source,
     prompt_tokens: usize,
     seq_len: usize,
     query_seq_len: usize,
@@ -887,7 +667,6 @@ fn writeWholeModelPjrtArtifactForShape(
         .metal => .metal,
         .cuda => .cuda,
         .pjrt => return error.UnexpectedPjrtBackend,
-        .onnx => return error.UnexpectedOnnxBackend,
         .wasm => return error.UnexpectedWasmBackend,
     };
     const kv_dtype = session_factory.recommendedKvDTypeForSession(model.session, backend_kind);
@@ -925,13 +704,11 @@ fn writeWholeModelPjrtArtifactForShape(
         &decode_context,
     );
 
-    const graph_attention_mode = toGraphAttentionMode(decode_context.attention_mode);
     const selection = SelectedPartition{
         .part = try buildWholeGraphPartition(
             allocator,
             &entry.graph,
             compileBackendKind(opts.backend),
-            opts.backend == .onnx and graph_attention_mode != .full_recompute,
         ),
     };
     defer deinitOwnedPartition(allocator, &selection.part);
@@ -942,7 +719,6 @@ fn writeWholeModelPjrtArtifactForShape(
         opts,
         &entry.graph,
         cb,
-        weight_export_source,
         selection,
         prompt_tokens,
         seq_len,
@@ -1097,7 +873,6 @@ fn deinitOwnedPartition(allocator: std.mem.Allocator, part: *const graph_mod.par
 
 fn compileBackendKind(choice: BackendChoice) ops.BackendKind {
     return switch (choice) {
-        .onnx => .onnx,
         .xla => .pjrt,
         else => unreachable,
     };
@@ -1107,55 +882,14 @@ fn buildWholeGraphPartition(
     allocator: std.mem.Allocator,
     graph: *const @import("ml").graph.Graph,
     backend: ops.BackendKind,
-    explicit_skip_kv_inputs: bool,
 ) !graph_mod.partition.Partition {
     const node_ids = try allocator.alloc(@import("ml").graph.NodeId, graph.nodeCount());
     for (0..graph.nodeCount()) |i| node_ids[i] = @intCast(i);
-    var external_inputs = std.ArrayListUnmanaged(graph_mod.partition.ExternalInput).empty;
-    errdefer external_inputs.deinit(allocator);
-    if (explicit_skip_kv_inputs) {
-        try appendSkipKvAttentionExternalInputs(allocator, graph, &external_inputs);
-    }
     return .{
         .backend = backend,
         .node_ids = node_ids,
-        .external_inputs = try external_inputs.toOwnedSlice(allocator),
+        .external_inputs = &.{},
     };
-}
-
-fn appendSkipKvAttentionExternalInputs(
-    allocator: std.mem.Allocator,
-    graph: *const Graph,
-    external_inputs: *std.ArrayListUnmanaged(graph_mod.partition.ExternalInput),
-) !void {
-    for (0..graph.nodeCount()) |i| {
-        const node_id: NodeId = @intCast(i);
-        const node = graph.node(node_id);
-        switch (node.op) {
-            .fused_gqa_causal_attention => |attrs| {
-                if (!attrs.skip_kv_write) continue;
-                const inputs = node.getInputs();
-                if (inputs.len < 3) return error.UnsupportedShape;
-                try appendUniqueExternalInput(allocator, external_inputs, inputs[1]);
-                try appendUniqueExternalInput(allocator, external_inputs, inputs[2]);
-            },
-            else => {},
-        }
-    }
-}
-
-fn appendUniqueExternalInput(
-    allocator: std.mem.Allocator,
-    external_inputs: *std.ArrayListUnmanaged(graph_mod.partition.ExternalInput),
-    node_id: NodeId,
-) !void {
-    for (external_inputs.items) |existing| {
-        if (existing.node_id == node_id) return;
-    }
-    try external_inputs.append(allocator, .{
-        .node_id = node_id,
-        .source_partition = 0,
-    });
 }
 
 fn buildDebugNodeSelection(
@@ -1539,7 +1273,6 @@ fn buildWholeModelSelectionForShape(
         .native => .native,
         .metal => .metal,
         .pjrt => return error.UnexpectedPjrtBackend,
-        .onnx => return error.UnexpectedOnnxBackend,
         .wasm => return error.UnexpectedWasmBackend,
         else => return error.UnexpectedBackend,
     };
@@ -1588,7 +1321,6 @@ fn buildWholeModelSelectionForShape(
             allocator,
             &entry.graph,
             compileBackendKind(.xla),
-            false,
         ),
     };
 }
@@ -1763,7 +1495,6 @@ fn defaultOutputPath(
 ) ![]const u8 {
     const stem = std.fs.path.basename(model_dir);
     const ext = switch (backend) {
-        .onnx => "onnx",
         .xla => switch (xla_artifact_kind) {
             .hlo => "hlo",
             .executable => "pjrt_exec",
@@ -1816,29 +1547,6 @@ fn updateDefaultXlaOutputPathForResolvedKind(
     );
     allocator.free(output_path.*);
     output_path.* = next_path;
-}
-
-fn buildOnnxDebugOutputLabel(allocator: std.mem.Allocator, node_ids: []const u32) ![]u8 {
-    var out = std.ArrayListUnmanaged(u8).empty;
-    defer out.deinit(allocator);
-    try out.appendSlice(allocator, "debug");
-    for (node_ids) |node_id| {
-        const suffix = try std.fmt.allocPrint(allocator, "_{d}", .{node_id});
-        defer allocator.free(suffix);
-        try out.appendSlice(allocator, suffix);
-    }
-    return out.toOwnedSlice(allocator);
-}
-
-fn guardOnnxInitializerReuseOutput(output_path: []const u8, reuse_path: []const u8) !void {
-    const output_dir = std.fs.path.dirname(output_path) orelse ".";
-    const reuse_dir = std.fs.path.dirname(reuse_path) orelse ".";
-    if (std.mem.eql(u8, output_dir, reuse_dir)) return;
-    std.log.err(
-        "ONNX initializer reuse requires output beside the source artifact so relative external-data paths still resolve: output_dir={s} reuse_dir={s}",
-        .{ output_dir, reuse_dir },
-    );
-    return error.InvalidArguments;
 }
 
 fn xlaArtifactKind(artifact_kind: PjrtArtifactExportKind, is_partition: bool) []const u8 {
@@ -1915,19 +1623,9 @@ fn resolveXlaArtifactKind(
 
 fn artifactKind(backend: BackendChoice, is_partition: bool, xla_artifact_kind: PjrtArtifactExportKind) []const u8 {
     return switch (backend) {
-        .onnx => if (is_partition) "onnx_partition_graph" else "onnx_graph",
         .xla => xlaArtifactKind(xla_artifact_kind, is_partition),
         else => unreachable,
     };
-}
-
-fn cloneStringSlices(allocator: std.mem.Allocator, src: []const []u8) ![][]u8 {
-    const out = try allocator.alloc([]u8, src.len);
-    errdefer allocator.free(out);
-    for (src, 0..) |value, i| {
-        out[i] = try allocator.dupe(u8, value);
-    }
-    return out;
 }
 
 fn cloneShapeSlices(allocator: std.mem.Allocator, src: []const []i64) ![][]i64 {
@@ -2079,7 +1777,6 @@ fn ensureParentDir(io: std.Io, path: []const u8) !void {
 fn validateCompileBackend(choice: BackendChoice) !void {
     try native_backend_choice.validate(choice);
     switch (choice) {
-        .onnx => {},
         .xla => if (!build_options.enable_pjrt) return error.BackendUnavailable,
         else => return error.UnsupportedCompileBackend,
     }
@@ -2091,7 +1788,7 @@ fn parseArgs(args: []const []const u8) !Options {
     var opts = Options{
         .model_dir = args[0],
         .prompt = args[1],
-        .backend = .onnx,
+        .backend = .xla,
     };
 
     var i: usize = 2;
@@ -2102,35 +1799,6 @@ fn parseArgs(args: []const []const u8) !Options {
         } else if (std.mem.eql(u8, args[i], "--attention-mode") and i + 1 < args.len) {
             opts.attention_mode = parseCompileAttentionMode(args[i + 1]) orelse return error.InvalidArgs;
             i += 1;
-        } else if (std.mem.eql(u8, args[i], "--onnx-weight-mode") and i + 1 < args.len) {
-            opts.onnx_weight_mode = parseOnnxWeightMode(args[i + 1]) orelse return error.InvalidArgs;
-            i += 1;
-        } else if (std.mem.eql(u8, args[i], "--onnx-weight-policy") and i + 1 < args.len) {
-            const raw_rule = args[i + 1];
-            const eq = std.mem.indexOfScalar(u8, raw_rule, '=') orelse return error.InvalidArgs;
-            const lhs = std.mem.trim(u8, raw_rule[0..eq], " \t\r\n");
-            const rhs = std.mem.trim(u8, raw_rule[eq + 1 ..], " \t\r\n");
-            const mode = parseOnnxWeightMode(rhs) orelse return error.InvalidArgs;
-            if (std.mem.eql(u8, lhs, "default")) {
-                opts.onnx_weight_mode = mode;
-            } else {
-                if (lhs.len == 0) return error.InvalidArgs;
-                if (opts.onnx_weight_export_rule_count >= max_weight_export_rules) return error.InvalidArgs;
-                opts.onnx_weight_export_rules[opts.onnx_weight_export_rule_count] = .{
-                    .substring = lhs,
-                    .mode = mode,
-                };
-                opts.onnx_weight_export_rule_count += 1;
-            }
-            i += 1;
-        } else if (std.mem.eql(u8, args[i], "--onnx-reuse-initializers-from") and i + 1 < args.len) {
-            opts.onnx_reuse_initializers_from = args[i + 1];
-            i += 1;
-        } else if (std.mem.eql(u8, args[i], "--onnx-import-from") and i + 1 < args.len) {
-            opts.onnx_import_from = args[i + 1];
-            i += 1;
-        } else if (std.mem.eql(u8, args[i], "--onnx-semantic-entrypoint")) {
-            opts.onnx_semantic_entrypoint = true;
         } else if (std.mem.eql(u8, args[i], "--artifact-role") and i + 1 < args.len) {
             if (!std.mem.eql(u8, args[i + 1], compiled_artifact.artifact_role_prefill) and
                 !std.mem.eql(u8, args[i + 1], compiled_artifact.artifact_role_decode))
@@ -2165,11 +1833,6 @@ fn parseArgs(args: []const []const u8) !Options {
             opts.node_range_start = try std.fmt.parseInt(u32, args[i + 1], 10);
             opts.node_range_end = try std.fmt.parseInt(u32, args[i + 2], 10);
             i += 2;
-        } else if (std.mem.eql(u8, args[i], "--debug-output-node") and i + 1 < args.len) {
-            if (opts.debug_output_node_count >= max_debug_output_nodes) return error.InvalidArgs;
-            opts.debug_output_nodes[opts.debug_output_node_count] = try std.fmt.parseInt(u32, args[i + 1], 10);
-            opts.debug_output_node_count += 1;
-            i += 1;
         } else if (std.mem.eql(u8, args[i], "--node-closure")) {
             opts.node_closure = true;
         } else if (std.mem.eql(u8, args[i], "--node-neighborhood") and i + 1 < args.len) {
@@ -2209,12 +1872,6 @@ fn countPromptTokens(attention_mask: anytype) usize {
     return count;
 }
 
-fn parseOnnxWeightMode(raw: []const u8) ?OnnxWeightExportMode {
-    if (std.mem.eql(u8, raw, "dense")) return .dense;
-    if (std.mem.eql(u8, raw, "q8_0_weight_only")) return .q8_0_weight_only;
-    return null;
-}
-
 fn parseCompileAttentionMode(raw: []const u8) ?CompileAttentionMode {
     if (std.mem.eql(u8, raw, "auto")) return .auto;
     if (std.mem.eql(u8, raw, "full_recompute")) return .full_recompute;
@@ -2237,22 +1894,16 @@ fn parsePjrtParameterExportMode(raw: []const u8) ?PjrtParameterExportMode {
 
 pub fn printUsage() void {
     print(
-        \\usage: antfly inference compile-artifact <model-dir> <prompt> [--backend onnx|xla] [--attention-mode auto|full_recompute|paged_prefill|paged_decode] [--onnx-weight-mode dense|q8_0_weight_only] [--onnx-weight-policy SUBSTRING=MODE] [--onnx-reuse-initializers-from <artifact.onnx>] [--onnx-import-from <semantic-decoder.onnx>] [--onnx-semantic-entrypoint] [--artifact-role prefill|decode] [--xla-artifact-kind hlo|executable] [--xla-parameter-mode embedded|inputs] [--xla-package-decode-max-seq-len N] [--debug-output-node N] [--output <path>] [--list-partitions] [--list-op-nodes <op>] [--list-node-window N] [--list-node-window-radius N] [--best-partition] [--partition-index N] [--node-index N] [--node-range START END] [--node-closure] [--node-neighborhood N] [--seq-len N] [--query-seq-len N] [--no-chat-template] [--raw-prompt]
+        \\usage: antfly inference compile-artifact <model-dir> <prompt> [--backend xla] [--attention-mode auto|full_recompute|paged_prefill|paged_decode] [--artifact-role prefill|decode] [--xla-artifact-kind hlo|executable] [--xla-parameter-mode embedded|inputs] [--xla-package-decode-max-seq-len N] [--output <path>] [--list-partitions] [--list-op-nodes <op>] [--list-node-window N] [--list-node-window-radius N] [--best-partition] [--partition-index N] [--node-index N] [--node-range START END] [--node-closure] [--node-neighborhood N] [--seq-len N] [--query-seq-len N] [--no-chat-template] [--raw-prompt]
         \\
         \\Compiles a traced generation graph into an offline artifact for a concrete shape.
         \\  default artifact dir mirrors model layout: ~/.antfly/inference/artifacts/<owner>/<model>/<backend>/...
-        \\  backend=onnx   emits a self-contained ONNX file
         \\  attention-mode selects the traced attention ABI; auto preserves the generation path
-        \\  onnx-weight-mode controls the default ONNX initializer export mode
-        \\  onnx-weight-policy overrides export mode for matching parameter-name substrings; repeat as needed, or use default=MODE
-        \\  onnx-reuse-initializers-from regenerates only the ONNX protobuf and points at an existing external-data blob
-        \\  onnx-import-from writes an Antfly inference manifest for an existing semantic ONNX artifact, refreshes the package manifest, and requires explicit attention-mode, seq-len, and query-seq-len
-        \\  artifact-role tags imported or compiled whole-model artifacts as prefill or decode
+        \\  artifact-role tags compiled whole-model artifacts as prefill or decode
         \\  xla-artifact-kind selects serialized HLO or a plugin-native executable artifact
         \\  xla-parameter-mode=inputs emits model weights as PJRT inputs instead of embedding dense constants in HLO
         \\  xla-package-decode-max-seq-len compiles one whole-model PJRT prefill artifact plus contiguous decode buckets through seq_len=N
-        \\  whole-model ONNX/XLA compiles refresh and print a package manifest beside the emitted artifacts
-        \\  debug-output-node marks one traced node as an additional ONNX graph output; repeat for multiple nodes
+        \\  whole-model XLA compiles refresh and print a package manifest beside the emitted artifacts
         \\  backend=xla    emits serialized HLO or a plugin-native executable plus PJRT binding metadata
         \\  list-partitions prints traced backend partitions for the selected shape and exits
         \\  list-op-nodes prints traced node IDs matching an op tag and exits
@@ -2274,20 +1925,9 @@ test "parseArgs accepts explicit output and backend" {
         "/tmp/model",
         "hello",
         "--backend",
-        "onnx",
+        "xla",
         "--attention-mode",
         "full_recompute",
-        "--onnx-weight-mode",
-        "q8_0_weight_only",
-        "--onnx-weight-policy",
-        "model.embed_tokens=dense",
-        "--onnx-weight-policy",
-        "lm_head=q8_0_weight_only",
-        "--onnx-reuse-initializers-from",
-        "/tmp/base.onnx",
-        "--onnx-import-from",
-        "/tmp/decoder.onnx",
-        "--onnx-semantic-entrypoint",
         "--artifact-role",
         "decode",
         "--xla-artifact-kind",
@@ -2307,10 +1947,6 @@ test "parseArgs accepts explicit output and backend" {
         "--node-range",
         "11",
         "19",
-        "--debug-output-node",
-        "13",
-        "--debug-output-node",
-        "17",
         "--node-closure",
         "--node-neighborhood",
         "2",
@@ -2318,7 +1954,7 @@ test "parseArgs accepts explicit output and backend" {
         "--partition-index",
         "7",
         "--output",
-        "/tmp/out.onnx",
+        "/tmp/out.hlo",
         "--seq-len",
         "128",
         "--query-seq-len",
@@ -2326,17 +1962,8 @@ test "parseArgs accepts explicit output and backend" {
         "--raw-prompt",
     });
     try std.testing.expectEqualStrings("/tmp/model", opts.model_dir);
-    try std.testing.expectEqual(BackendChoice.onnx, opts.backend);
+    try std.testing.expectEqual(BackendChoice.xla, opts.backend);
     try std.testing.expectEqual(CompileAttentionMode.full_recompute, opts.attention_mode);
-    try std.testing.expectEqual(OnnxWeightExportMode.q8_0_weight_only, opts.onnx_weight_mode);
-    try std.testing.expectEqual(@as(usize, 2), opts.onnx_weight_export_rule_count);
-    try std.testing.expectEqualStrings("model.embed_tokens", opts.onnx_weight_export_rules[0].substring);
-    try std.testing.expectEqual(OnnxWeightExportMode.dense, opts.onnx_weight_export_rules[0].mode);
-    try std.testing.expectEqualStrings("lm_head", opts.onnx_weight_export_rules[1].substring);
-    try std.testing.expectEqual(OnnxWeightExportMode.q8_0_weight_only, opts.onnx_weight_export_rules[1].mode);
-    try std.testing.expectEqualStrings("/tmp/base.onnx", opts.onnx_reuse_initializers_from.?);
-    try std.testing.expectEqualStrings("/tmp/decoder.onnx", opts.onnx_import_from.?);
-    try std.testing.expect(opts.onnx_semantic_entrypoint);
     try std.testing.expectEqualStrings("decode", opts.artifact_role.?);
     try std.testing.expectEqual(PjrtArtifactExportKind.executable, opts.xla_artifact_kind);
     try std.testing.expectEqual(PjrtParameterExportMode.inputs, opts.xla_parameter_mode);
@@ -2347,76 +1974,14 @@ test "parseArgs accepts explicit output and backend" {
     try std.testing.expectEqual(@as(?u32, 9), opts.node_index);
     try std.testing.expectEqual(@as(?u32, 11), opts.node_range_start);
     try std.testing.expectEqual(@as(?u32, 19), opts.node_range_end);
-    try std.testing.expectEqual(@as(usize, 2), opts.debug_output_node_count);
-    try std.testing.expectEqual(@as(u32, 13), opts.debug_output_nodes[0]);
-    try std.testing.expectEqual(@as(u32, 17), opts.debug_output_nodes[1]);
     try std.testing.expect(opts.node_closure);
     try std.testing.expectEqual(@as(usize, 2), opts.node_neighborhood);
     try std.testing.expect(opts.best_partition);
     try std.testing.expectEqual(@as(?u32, 7), opts.partition_index);
-    try std.testing.expectEqualStrings("/tmp/out.onnx", opts.output_path.?);
+    try std.testing.expectEqualStrings("/tmp/out.hlo", opts.output_path.?);
     try std.testing.expectEqual(@as(?usize, 128), opts.seq_len);
     try std.testing.expectEqual(@as(?usize, 1), opts.query_seq_len);
     try std.testing.expect(opts.raw_prompt);
-}
-
-test "semantic ONNX entrypoint selection keeps partial artifacts node-oriented" {
-    try std.testing.expect(shouldUseSemanticOnnxEntrypoint(
-        false,
-        false,
-        "paged_prefill",
-        3,
-        3,
-        0,
-    ));
-    try std.testing.expect(!shouldUseSemanticOnnxEntrypoint(
-        false,
-        true,
-        "paged_prefill",
-        3,
-        3,
-        0,
-    ));
-    try std.testing.expect(!shouldUseSemanticOnnxEntrypoint(
-        false,
-        false,
-        "paged_prefill",
-        3,
-        3,
-        1,
-    ));
-    try std.testing.expect(!shouldUseSemanticOnnxEntrypoint(
-        false,
-        false,
-        "paged_prefill",
-        4,
-        1,
-        0,
-    ));
-    try std.testing.expect(!shouldUseSemanticOnnxEntrypoint(
-        false,
-        false,
-        "full_recompute",
-        3,
-        3,
-        0,
-    ));
-    try std.testing.expect(shouldUseSemanticOnnxEntrypoint(
-        false,
-        true,
-        "paged_decode",
-        4,
-        1,
-        1,
-    ));
-    try std.testing.expect(shouldUseSemanticOnnxEntrypoint(
-        true,
-        true,
-        "paged_prefill",
-        4,
-        1,
-        1,
-    ));
 }
 
 test "defaultWholeModelXlaArtifactKind prefers executable for implicit whole-model exports" {
@@ -2480,15 +2045,6 @@ test "validateWholeModelPjrtPackageRequest rejects invalid package requests" {
         .model_dir = base.model_dir,
         .prompt = base.prompt,
         .backend = base.backend,
-        .attention_mode = base.attention_mode,
-        .query_seq_len = base.query_seq_len,
-        .seq_len = base.seq_len,
-        .debug_output_node_count = 1,
-    }, false, 8, 12));
-    try std.testing.expectError(error.InvalidArguments, validateWholeModelPjrtPackageRequest(.{
-        .model_dir = base.model_dir,
-        .prompt = base.prompt,
-        .backend = base.backend,
         .attention_mode = .paged_decode,
         .query_seq_len = base.query_seq_len,
         .seq_len = base.seq_len,
@@ -2544,13 +2100,9 @@ test "wholeModelPjrtPackageManifestPath tracks resolved artifact kind" {
 }
 
 test "defaultOutputPath matches backend extension" {
-    const onnx_path = try defaultOutputPath(std.testing.allocator, "/tmp/model-dir", .onnx, .hlo, null, null, 128, 128, "paged_prefill");
-    defer std.testing.allocator.free(onnx_path);
-    try std.testing.expect(std.mem.endsWith(u8, onnx_path, "model-dir/onnx/model-dir.paged_prefill.s128.q128.onnx"));
-
-    const node_path = try defaultOutputPath(std.testing.allocator, "/tmp/model-dir", .onnx, .hlo, 9, "node9.fused_gqa_causal_attention", 1, 1, "paged_prefill");
+    const node_path = try defaultOutputPath(std.testing.allocator, "/tmp/model-dir", .xla, .hlo, 9, "node9.fused_gqa_causal_attention", 1, 1, "paged_prefill");
     defer std.testing.allocator.free(node_path);
-    try std.testing.expect(std.mem.endsWith(u8, node_path, "model-dir/onnx/model-dir.node9.fused_gqa_causal_attention.paged_prefill.s1.q1.onnx"));
+    try std.testing.expect(std.mem.endsWith(u8, node_path, "model-dir/xla/model-dir.node9.fused_gqa_causal_attention.paged_prefill.s1.q1.hlo"));
 
     const xla_path = try defaultOutputPath(std.testing.allocator, "/tmp/model-dir", .xla, .hlo, null, null, 1, 1, "paged_decode");
     defer std.testing.allocator.free(xla_path);

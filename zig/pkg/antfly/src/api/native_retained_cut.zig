@@ -64,7 +64,9 @@ pub fn saveWithRetention(a: A, store: *stores.ArtifactStore, identity: Digest, i
 }
 pub fn saveWithCover(a: A, store: *stores.ArtifactStore, identity: Digest, io: std.Io, table: anytype, now: u64, retention_ms: u64, cover: []const Range, cancellation: @import("antfly_cancellation").CancellationToken) ![]const u8 {
     if (retention_ms == 0 or retention_ms > @import("lake_retained_cut.zig").max_ttl_ms) return error.InvalidQueryRequest;
-    try collect(store, table.table_id, identity, now, cancellation);
+    // Expired capabilities are collected by the maintenance owner. Capture
+    // must not enumerate retained history or depend on deletion availability.
+    try cancellation.check();
     var nonce: [32]u8 = undefined;
     try io.randomSecure(&nonce);
     const id = std.fmt.bytesToHex(nonce, .lower);

@@ -368,17 +368,37 @@ pub const FilesystemClient = struct {
 
     fn listObjects(self: *FilesystemClient, alloc: Allocator, bucket: []const u8, opts: types.ListOptions) !types.ListResult {
         if (opts.cancellation) |token| try token.check();
-        const root = try objectRootAlloc(alloc, self.root_dir, bucket);
-        defer alloc.free(root);
-        if (!fileExists(self.io, root)) {
+        if (opts.prefix.len != 0) try validateKey(std.mem.trimEnd(u8, opts.prefix, "/"));
+        // Every complete path component of the prefix confines the listing.
+        // Keep the final partial component as a string filter (logs/ab must
+        // still find logs/abc). Never walk unrelated artifact generations.
+        const directory_prefix = if (std.mem.lastIndexOfScalar(u8, opts.prefix, '/')) |slash| opts.prefix[0 .. slash + 1] else "";
+        const objects = try objectRootAlloc(alloc, self.root_dir, bucket);
+        defer alloc.free(objects);
+        if (!fileExists(self.io, objects)) {
             return .{
                 .entries = try alloc.alloc(types.ListEntry, 0),
                 .common_prefixes = try alloc.alloc([]u8, 0),
             };
         }
 
-        var dir = try std.Io.Dir.cwd().openDir(self.io, root, .{ .iterate = true });
+        var dir = try std.Io.Dir.cwd().openDir(self.io, objects, .{ .iterate = true });
         defer dir.close(self.io);
+        var components = std.mem.splitScalar(u8, directory_prefix, '/');
+        while (components.next()) |component| {
+            if (component.len == 0) continue;
+            // The old bucket walk never descended into symbolic links.
+            // Preserve that contract while opening the narrower subtree.
+            const child = dir.openDir(self.io, component, .{ .iterate = true, .follow_symlinks = false }) catch |err| switch (err) {
+                error.FileNotFound, error.NotDir, error.SymLinkLoop => return .{
+                    .entries = try alloc.alloc(types.ListEntry, 0),
+                    .common_prefixes = try alloc.alloc([]u8, 0),
+                },
+                else => return err,
+            };
+            dir.close(self.io);
+            dir = child;
+        }
 
         var walker = try dir.walk(alloc);
         defer walker.deinit();
@@ -404,13 +424,15 @@ pub const FilesystemClient = struct {
         while (try walker.next(self.io)) |entry| {
             if (opts.cancellation) |token| try token.check();
             if (entry.kind != .file) continue;
-            if (!std.mem.startsWith(u8, entry.path, opts.prefix)) continue;
-            var candidate_name: []const u8 = entry.path;
+            const key = try std.mem.concat(alloc, u8, &.{ directory_prefix, entry.path });
+            defer alloc.free(key);
+            if (!std.mem.startsWith(u8, key, opts.prefix)) continue;
+            var candidate_name: []const u8 = key;
             var is_prefix = false;
-            if (!opts.recursive and opts.delimiter.len > 0 and entry.path.len > opts.prefix.len) {
-                if (std.mem.indexOf(u8, entry.path[opts.prefix.len..], opts.delimiter)) |delimiter_offset| {
+            if (!opts.recursive and opts.delimiter.len > 0 and key.len > opts.prefix.len) {
+                if (std.mem.indexOf(u8, key[opts.prefix.len..], opts.delimiter)) |delimiter_offset| {
                     const prefix_end = opts.prefix.len + delimiter_offset + opts.delimiter.len;
-                    candidate_name = entry.path[0..prefix_end];
+                    candidate_name = key[0..prefix_end];
                     is_prefix = true;
                 }
             }
@@ -1463,6 +1485,47 @@ test "filesystem pagination retains only the requested ordered window" {
     try std.testing.expectEqualStrings("logs/a/", collapsed.common_prefixes[0]);
     try std.testing.expectEqualStrings("logs/b/", collapsed.common_prefixes[1]);
     try std.testing.expectEqualStrings("logs/b/", collapsed.next_continuation_token.?);
+}
+
+test "filesystem prefix listing work excludes unrelated generations" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf, "scoped-listing");
+    defer cleanupTmp(path);
+    var fs = try FilesystemClient.init(alloc, std.mem.span(path));
+    var client = fs.client();
+    defer client.deinit();
+    for (0..32) |i| {
+        const key = try std.fmt.allocPrint(alloc, "unrelated/{d}/extent", .{i});
+        defer alloc.free(key);
+        var result = try client.putObject("bucket", key, "unrelated", .{});
+        result.deinit(alloc);
+    }
+    for ([_][]const u8{ "cuts/live/abc", "cuts/live/abd", "cuts/lively/other" }) |key| {
+        var result = try client.putObject("bucket", key, key, .{});
+        result.deinit(alloc);
+    }
+    const Work = struct {
+        checks: usize = 0,
+        fn cancelled(raw: *const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.checks += 1;
+            return self.checks > 16;
+        }
+    };
+    var work: Work = .{};
+    var first = try client.listObjects("bucket", .{ .prefix = "cuts/live/ab", .max_keys = 1, .cancellation = .{ .ptr = &work, .is_cancelled_fn = Work.cancelled } });
+    defer first.deinit(alloc);
+    try std.testing.expectEqualStrings("cuts/live/abc", first.entries[0].key);
+    work.checks = 0;
+    var second = try client.listObjects("bucket", .{ .prefix = "cuts/live/ab", .max_keys = 1, .continuation_token = first.next_continuation_token, .cancellation = .{ .ptr = &work, .is_cancelled_fn = Work.cancelled } });
+    defer second.deinit(alloc);
+    try std.testing.expectEqualStrings("cuts/live/abd", second.entries[0].key);
+    try std.testing.expectEqual(null, second.next_continuation_token);
+    var missing = try client.listObjects("bucket", .{ .prefix = "cuts/missing/" });
+    defer missing.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), missing.entries.len);
+    try std.testing.expectError(error.InvalidObjectKey, client.listObjects("bucket", .{ .prefix = "../outside/" }));
 }
 
 test "filesystem whole-file download verifies payload checksum before publication" {

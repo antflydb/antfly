@@ -89,7 +89,7 @@ const rebel_mod = @import("../pipelines/rebel.zig");
 const resolver_mod = @import("../pipelines/resolver.zig");
 const cleanup_pipeline_mod = @import("../pipelines/entity_cleanup.zig");
 const cleanup_model_mod = @import("../finetune/entity_cleanup_model.zig");
-const onnx_decoder_only_vlm = @import("../pipelines/onnx_decoder_only_vlm.zig");
+const moondream_pipeline = @import("../pipelines/moondream.zig");
 const tool_parser_mod = @import("../pipelines/tool_parser.zig");
 const ops = @import("../ops/ops.zig");
 const runtime = @import("../runtime/root.zig");
@@ -888,7 +888,7 @@ fn generationBackendKind(backend: backends_mod.BackendType) ?runtime.kv.pool.Bac
         .native => .native,
         .metal => .metal,
         .cuda => .cuda,
-        .onnx, .pjrt, .wasm => null,
+        .pjrt, .wasm => null,
     };
 }
 
@@ -1218,6 +1218,11 @@ fn rawGenerateChatTemplateKwargsAreValid(
 
 const HardCancellationWatchdog = @import("../hard_cancellation_watchdog.zig").HardCancellationWatchdog;
 
+pub fn httpBodyLimitBytesFromMib(mib: usize) error{InvalidHttpBodyLimit}!usize {
+    if (mib == 0) return error.InvalidHttpBodyLimit;
+    return std.math.mul(usize, mib, 1024 * 1024) catch error.InvalidHttpBodyLimit;
+}
+
 pub const NodeConfig = struct {
     models_dir: []const u8 = "./models",
     ml_dir: []const u8 = "./ml",
@@ -1236,6 +1241,9 @@ pub const NodeConfig = struct {
     /// from connection lifetimes; in particular, HTTP/2 frame pumps remain
     /// available to receive streaming request bodies.
     http_max_request_tasks: u32 = 64,
+    /// Encoded HTTP payload limit, independent of GPU cohort/admission bounds.
+    /// Inline media batches can exceed the transport's 10 MiB default.
+    http_max_body_bytes: usize = 10 * 1024 * 1024,
     pool_size: usize = 2,
     /// Optional hard envelope for all memory charged to this process/container.
     /// This is required when the runtime has no finite cgroup memory.max and
@@ -1356,6 +1364,31 @@ pub const GenerationBatchingConfig = struct {
             // direct path until the multi-wave row scheduler is validated.
             .max_active_requests_for_batching = validated_max_items,
         };
+    }
+    fn gemma4MetalOcrPolicyForRows(self: @This(), requested_rows: usize) runtime.scheduler.native_generate.Policy {
+        var policy = self.schedulerPolicy();
+        const rows = @min(@max(requested_rows, 1), 4);
+        policy.max_step_items = rows;
+        policy.max_active_requests_for_batching = rows;
+        policy.max_decode_wait_us = self.max_decode_wait_us;
+        policy.allow_mixed_sequence_lengths = true;
+        return policy;
+    }
+
+    fn gemma4MetalOcrContinuousPolicyForRows(self: @This(), requested_rows: usize, requested_window: usize) runtime.scheduler.native_generate.Policy {
+        var policy = self.gemma4MetalOcrPolicyForRows(requested_rows);
+        // Admit a bounded resident window larger than a single GPU cohort.
+        // Finished tasks retire their leases immediately, so pending decoders
+        // fill the next step without waiting for the longest page in a wave.
+        policy.max_active_requests_for_batching = @min(@max(requested_window, policy.max_step_items), 16);
+        return policy;
+    }
+
+    fn gemma4MetalOcrPolicy(self: @This()) runtime.scheduler.native_generate.Policy {
+        const rows = platform.env.getenvUsize("ANTFLY_GEMMA4_METAL_OCR_BATCH_ROWS") orelse 2;
+        if (platform.env.getenvBoolDefault("ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS", false))
+            return self.gemma4MetalOcrContinuousPolicyForRows(rows, platform.env.getenvUsize("ANTFLY_GEMMA4_METAL_OCR_WINDOW") orelse 8);
+        return self.gemma4MetalOcrPolicyForRows(rows);
     }
 };
 
@@ -1627,10 +1660,6 @@ fn parseGenerateBackendSelection(
     };
 }
 
-fn validateGenerateDraftBackend(selection: GenerateBackendSelection, draft_model: ?[]const u8) !void {
-    if (draft_model != null and selection.native_choice == .onnx) return error.OnnxDraftUnsupported;
-}
-
 fn shouldAutoUseMetalWholeModelGenerate(
     loaded_backend: backends_mod.BackendType,
     metal_executor_supported: bool,
@@ -1683,7 +1712,6 @@ fn validatePromptCacheExecutionMode(
 fn modelBackendToNativeChoice(value: api.ModelBackend) native_backend_choice.Choice {
     return switch (value) {
         .auto => .auto,
-        .onnx => .onnx,
         .native => .native,
         .metal => .metal,
         .cuda => .cuda,
@@ -1702,7 +1730,6 @@ fn configureGenerateBackendPreference(
 fn singleBackendPreference(backend: backends_mod.BackendType) []const backends_mod.BackendType {
     return switch (backend) {
         .native => &.{.native},
-        .onnx => &.{.onnx},
         .metal => &.{.metal},
         .cuda => &.{.cuda},
         .pjrt => &.{.pjrt},
@@ -3107,7 +3134,6 @@ fn rejectExplicitBackendIncompatibility(
 ) !?httpx.Response {
     const backend: backends_mod.BackendType = switch (choice) {
         .auto => return null,
-        .onnx => .onnx,
         .native => .native,
         .metal => .metal,
         .cuda => .cuda,
@@ -3743,7 +3769,7 @@ test "GLiNER span backend selection preserves the DeBERTa CUDA exclusion" {
     try std.testing.expect(spanV2BackendSupported(.{ .deberta = .{} }, .metal));
     try std.testing.expect(!spanV2BackendSupported(.{ .deberta = .{} }, .cuda));
     try std.testing.expect(spanV2BackendSupported(.{ .modern_bert = .{} }, .cuda));
-    try std.testing.expect(!spanV2BackendSupported(.{ .modern_bert = .{} }, .onnx));
+    try std.testing.expect(!spanV2BackendSupported(.{ .modern_bert = .{} }, .pjrt));
 }
 
 test "GLiNER span identity gate preserves ordinary DeBERTa classification" {
@@ -3971,7 +3997,7 @@ pub const Node = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator, config: NodeConfig) !Node {
-        if (config.http_max_connections == 0 or config.http_max_request_tasks == 0)
+        if (config.http_max_connections == 0 or config.http_max_request_tasks == 0 or config.http_max_body_bytes == 0)
             return error.InvalidHttpTransportCapacity;
         if (config.kernel_jit.profile_capture_only) {
             return error.KernelJitProfileCaptureUnsupportedInServer;
@@ -5637,7 +5663,7 @@ pub const Node = struct {
             .native => .native,
             .metal => .metal,
             .cuda => .cuda,
-            .pjrt, .onnx, .wasm => return error.UnsupportedGeneratorProvider,
+            .pjrt, .wasm => return error.UnsupportedGeneratorProvider,
         };
         const kv_dtype = session_factory.recommendedKvDTypeForSession(model.session, backend_kind);
         const prompt_cache_requested = prompt_cache_key != null and
@@ -6583,6 +6609,33 @@ pub const Node = struct {
     }
 
     fn tryEmbedParsedViaBroker(self: *Node, allocator: std.mem.Allocator, io: std.Io, model: *model_manager_mod.LoadedModel, parsed: *const ParsedDenseEmbedInputs, control: InferenceExecutionControl, task_type: EmbeddingTaskType, instruction: ?[]const u8, audio_working_bytes: usize) !?[][]f32 {
+        if (model.manifest.embedding_style == .embedding_gemma2 and parsed.audio.items.len == parsed.total_count and parsed.total_count > 0 and instruction == null) {
+            const grouped = @import("../pipelines/embedding_gemma2.zig");
+            const parts = try allocator.alloc(grouped.Part, parsed.total_count);
+            defer allocator.free(parts);
+            const groups = try allocator.alloc(grouped.Group, parsed.total_count);
+            defer allocator.free(groups);
+            for (parsed.audio.items, parts, groups, 0..) |input, *part, *group, index| {
+                // Ambiguous codecs retain the MIME-aware pipeline executor.
+                if (@import("../pipelines/audio.zig").detectFormat(input.bytes) == null) return null;
+                part.* = .{ .audio = input.bytes };
+                group.* = .{ .content = parts[index..][0..1] };
+            }
+            const contract = try resolvedInferenceExecutorContract(self, "embed", &model.manifest);
+            const batch = (try self.tryEmbedGemma4MediaGroups(allocator, model, groups, .{ .task_type = @tagName(task_type) }, control, contract)) orelse return null;
+            defer batch.deinit();
+            const vectors = try allocator.alloc([]f32, parsed.total_count);
+            @memset(vectors, &.{});
+            errdefer freeDirectDenseVectors(allocator, vectors);
+            for (batch.items, parsed.audio.items) |*item, input| switch (item.result) {
+                .value => |*value| {
+                    vectors[input.index] = value.vector;
+                    value.vector = &.{};
+                },
+                .item_error => |failure| return failure.cause,
+            };
+            return vectors;
+        }
         if (model.manifest.embedding_style == .embedding_gemma2 and (parsed.images.items.len != 0 or parsed.audio.items.len != 0)) return null;
         const contract = try resolvedInferenceExecutorContract(self, "embed", &model.manifest);
         if (contract.batch.mode != .native or contract.batch.max_items <= 1 or model.manifest.hasCapability("sparse")) return null;
@@ -6679,9 +6732,9 @@ pub const Node = struct {
         const contract = try resolvedInferenceExecutorContract(self, "extract", &loaded.manifest);
         var direct = pipeline.*;
         direct.batch_dispatch = null;
-        // Official ONNX GLiNER contracts are singleton executors. They retain
-        // their existing path and never pay a native batch-fill delay.
-        if (pipeline.session.backend() == .onnx or contract.batch.max_items <= 1) return if (scoring) direct.scoreLabelsBatch(texts, labels) else direct.recognizeWithLabelTokenBatch(texts, labels, label_token, threshold, flat_ner);
+        // Singleton executor contracts retain their direct path and never pay a
+        // native batch-fill delay.
+        if (contract.batch.max_items <= 1) return if (scoring) direct.scoreLabelsBatch(texts, labels) else direct.recognizeWithLabelTokenBatch(texts, labels, label_token, threshold, flat_ner);
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |*value| value.deinit();
         const control = self.bindExecutionControl(null, pipeline.execution_control orelse .{});
@@ -7033,7 +7086,39 @@ pub const Node = struct {
         task_type: EmbeddingTaskType,
         instruction: ?[]const u8,
     ) !?[][]f32 {
-        if (model.manifest.embedding_style == .embedding_gemma2) return null;
+        if (model.manifest.embedding_style == .embedding_gemma2) {
+            if (instruction != null) return null;
+            const grouped = @import("../pipelines/embedding_gemma2.zig");
+            const n = if (rasters.len != 0) rasters.len else encoded.len;
+            if (n == 0 or (rasters.len != 0 and encoded.len != 0)) return null;
+            const parts = try allocator.alloc(grouped.Part, n);
+            defer allocator.free(parts);
+            const groups = try allocator.alloc(grouped.Group, n);
+            defer allocator.free(groups);
+            for (parts, groups, 0..) |*part, *group, index| {
+                part.* = if (rasters.len != 0) .{ .raster = rasters[index] } else .{ .image = encoded[index].bytes };
+                group.* = .{ .content = parts[index..][0..1] };
+            }
+            const contract = try resolvedInferenceExecutorContract(self, "embed", &model.manifest);
+            const batch = (try self.tryEmbedGemma4MediaGroups(allocator, model, groups, .{ .task_type = @tagName(task_type) }, control, contract)) orelse return null;
+            defer batch.deinit();
+            const vectors = try allocator.alloc([]f32, n);
+            var initialized: usize = 0;
+            errdefer {
+                for (vectors[0..initialized]) |vector| allocator.free(vector);
+                allocator.free(vectors);
+            }
+            for (batch.items, vectors) |*item, *vector| switch (item.result) {
+                .value => |*value| {
+                    vector.* = value.vector;
+                    value.vector = &.{};
+                    initialized += 1;
+                },
+                .item_error => |failure| return failure.cause,
+            };
+            return vectors;
+        }
+
         const contract = try resolvedInferenceExecutorContract(self, "embed", &model.manifest);
         if (contract.batch.mode != .native or contract.batch.max_items <= 1 or !contract.accepts_image or model.manifest.hasCapability("sparse")) return null;
         const raw = rasters.len > 0;
@@ -8152,7 +8237,7 @@ pub const Node = struct {
 
     fn executorMicrobatchResourceClass(backend: backends_mod.BackendType) executor_microbatch.ResourceClass {
         return switch (backend) {
-            .native, .onnx, .wasm => .cpu,
+            .native, .wasm => .cpu,
             .metal, .cuda, .pjrt => .gpu,
         };
     }
@@ -9577,6 +9662,7 @@ pub const Node = struct {
         decision: ?@import("antfly_decisions").Request,
     ) ![]u8 {
         var options = span_v2_executor.Options{
+            .modern_span_extraction = true,
             .control = control,
             .observer = observer,
             .decide_request = decision,
@@ -9596,10 +9682,15 @@ pub const Node = struct {
         const loaded = handle.get();
         const backend = loaded.session.backend();
         if (backend != .native and backend != .metal and backend != .cuda) return error.UnsupportedExtractionBackend;
-        const qualified_variant: ?gliner_decide_qualification.QualifiedVariant = if (require_qualification or spanRequiresQualifiedDecisionIdentity(loaded.manifest))
-            try gliner_decide_qualification.require(try session_factory.getGlinerDecisionIdentity(loaded.session))
+        const qualified_identity: ?gliner_decide_qualification.Identity = if (require_qualification or spanRequiresQualifiedDecisionIdentity(loaded.manifest))
+            try session_factory.getGlinerDecisionIdentity(loaded.session)
         else
             null;
+        const qualified_variant: ?gliner_decide_qualification.QualifiedVariant = if (qualified_identity) |identity| try gliner_decide_qualification.require(identity) else null;
+        if (qualified_identity) |identity| {
+            options.modern_span_extraction = gliner_decide_qualification.supportsSpanExtraction(identity);
+            try span_v2_executor.preflight(request, options);
+        }
         const qualified_backend: gliner_decide_qualification.Backend = switch (backend) {
             .native => .native,
             .metal => .metal,
@@ -9608,23 +9699,29 @@ pub const Node = struct {
         };
         // Reject an unmeasured backend or request cardinality before parsing
         // model inputs. Sequence geometry is checked again after exact planning.
-        if (qualified_variant) |variant|
-            try gliner_decide_qualification.requireRequest(variant, qualified_backend, request.items.len, 1, 1);
+        if (qualified_identity) |identity|
+            try gliner_decide_qualification.requireRequestIdentity(identity, qualified_backend, request.items.len, 1, 1);
         const session_config = try session_factory.getGlinerSpanConfig(loaded.session);
         const config: span_v2_executor.EncoderConfig = switch (session_config) {
             .deberta => |value| .{ .deberta = value },
             .modern_bert => |value| .{ .modern_bert = value },
         };
         if (!spanV2BackendSupported(config, backend)) return error.UnsupportedExtractionBackend;
-        const max_sequence = span_v2_executor.sequenceTokenCeiling(config, options.processor.max_sequence_tokens, backend == .cuda);
+        // The executor's generic DeBERTa default is 512. An exact qualified
+        // identity supplies its own measured ceiling, including FP32 1B's
+        // 1024-token budget; Q8 retains its separate 198-token contract.
+        const requested_sequence = if (qualified_variant == .decide_1b) (try gliner_decide_qualification.requestLimits(qualified_identity.?)).?.sequence_tokens else options.processor.max_sequence_tokens;
+        const max_sequence = span_v2_executor.sequenceTokenCeiling(config, requested_sequence, backend == .cuda);
         options.processor.max_sequence_tokens = max_sequence;
         options.processor.max_batch_tokens = max_sequence;
-        options.max_prompt_tokens = @min(options.max_prompt_tokens, max_sequence);
+        options.max_prompt_tokens = if (qualified_variant == .decide_1b) max_sequence else @min(options.max_prompt_tokens, max_sequence);
         if (qualified_variant == .decide_1b) {
-            options.processor.max_sequence_tokens = @min(options.processor.max_sequence_tokens, 198);
-            options.processor.max_batch_tokens = @min(options.processor.max_batch_tokens, 198);
-            options.max_prompt_tokens = @min(options.max_prompt_tokens, 198);
-            options.max_sequences_per_item = 1;
+            const limits = (try gliner_decide_qualification.requestLimits(qualified_identity.?)).?;
+            options.processor.max_sequence_tokens = @min(options.processor.max_sequence_tokens, limits.sequence_tokens);
+            options.processor.max_batch_tokens = @min(options.processor.max_batch_tokens, limits.sequence_tokens);
+            options.max_prompt_tokens = @min(options.max_prompt_tokens, limits.sequence_tokens);
+            options.max_sequences_per_item = limits.prepared_sequences;
+            options.long_document_limits = @import("../models/gliner_span_window_limits.zig").qualified;
         }
 
         const texts = try scratch.alloc([]const u8, request.items.len);
@@ -9648,8 +9745,8 @@ pub const Node = struct {
         const longest = span_v2_executor.maxPlannedSequenceTokens(&request_plan);
         var prepared_sequences: usize = 0;
         for (request_plan.items) |item| prepared_sequences += item.batches.len;
-        if (qualified_variant) |variant|
-            try gliner_decide_qualification.requireRequest(variant, qualified_backend, request.items.len, prepared_sequences, longest);
+        if (qualified_identity) |identity|
+            try gliner_decide_qualification.requireRequestIdentity(identity, qualified_backend, request.items.len, prepared_sequences, longest);
         try validateTextExecutorInvocation(executor_contract, texts.len, texts, 0, longest, max_labels, 0);
         failure.* = .{ .stage = "model" };
         observer.emit(.{ .phase = .model });
@@ -12404,26 +12501,10 @@ pub const Node = struct {
                 },
             });
         };
-        if (auto_draft_sibling != null and backend_selection.native_choice == .onnx) {
-            // ONNX cannot host the discovered native/Metal drafter. As with all
-            // automatic-discovery incompatibilities, continue without it.
-            std.log.warn("skipping discovered MTP drafter: ONNX backend selected", .{});
-            const released = takeAutoDraftAdmissionExtra(&reserved_units, &auto_draft_extra_units);
-            if (released > 0) self.releaseSlotUnits(released);
-            ctx.allocator.free(auto_draft_sibling.?);
-            auto_draft_sibling = null;
-            config.speculation_requested = false;
-        }
         validatePromptCacheExecutionMode(config.prompt_cache_enabled, backend_selection) catch {
             return ctx.status(400).json(.{
                 .@"error" = "UNSUPPORTED_FEATURE",
                 .message = "prompt caching requires eager generation; omit mode or set mode=eager",
-            });
-        };
-        validateGenerateDraftBackend(backend_selection, effective_draft_model_name) catch {
-            return ctx.status(400).json(.{
-                .@"error" = "INVALID_REQUEST",
-                .message = "draft_model is not supported with backend=onnx; use native, metal, or cuda",
             });
         };
         if (try rejectExplicitBackendIncompatibility(
@@ -12433,12 +12514,6 @@ pub const Node = struct {
             self.config.allow_unknown_models,
         )) |response|
             return response;
-        const required_policy_allows_onnx = self.session_manager.allowsDirectBackend(.onnx) catch |err|
-            return modelLoadFailureResponse(ctx, err);
-        const allow_onnx = required_policy_allows_onnx and
-            effective_draft_model_name == null and
-            !backend_selection.graph_mode_requested and
-            (body.backend == null or backend_selection.native_choice == .onnx);
 
         if (body.response_format) |rf| {
             if (std.mem.eql(u8, rf.type, "json_object")) {
@@ -12489,249 +12564,40 @@ pub const Node = struct {
             config.grammar = grammar;
         }
 
-        // Try plain HF ONNX decoder-only VLM packages before Ort GenAI overlays.
-        if (allow_onnx and build_options.enable_onnx and
-            !c_file.fileExistsInDir(ctx.allocator, model_path, "genai_config.json") and
-            onnx_decoder_only_vlm.isSupportedModelDir(ctx.allocator, model_path))
-        {
-            var prompt_override: ?[]u8 = null;
-            defer if (prompt_override) |prompt| ctx.allocator.free(prompt);
-            if (tool_parser) |*parser| {
-                if (std.mem.eql(u8, parser.name(), "functiongemma")) {
-                    prompt_override = try buildFunctionGemmaPrompt(
-                        ctx.allocator,
-                        "",
-                        messages.items,
-                    );
-                }
-            }
-
-            var pipeline = onnx_decoder_only_vlm.Pipeline.loadWithControl(ctx.allocator, model_path, execution_control) catch |err|
-                return modelLoadFailureResponse(ctx, err);
-            defer pipeline.deinit();
-            pipeline.prompt_override = if (prompt_override) |prompt| prompt else null;
-            pipeline.execution_control = execution_control;
-
-            if (requiresNativeChannelProjection(pipeline.gpt_config)) {
+        // Native Moondream2 (moondream1 checkpoints): one image plus the
+        // last user turn's question; no ONNX Runtime.
+        if (moondream_pipeline.isSupportedModelDir(ctx.allocator, model_path)) {
+            if (config.grammar != null or body.response_format != null) {
                 return ctx.status(400).json(.{
                     .@"error" = "UNSUPPORTED_FEATURE",
-                    .message = "channel-aware Gemma generation requires the native, Metal, or CUDA backend",
+                    .message = "Moondream generation does not support grammar or response_format",
                 });
             }
-
-            if (config.grammar != null) {
+            if (tool_parser != null) {
                 return ctx.status(400).json(.{
-                    .@"error" = "INVALID_REQUEST",
-                    .message = "grammar-constrained decoding is native-backend only; ONNX generation remains unconstrained-only",
+                    .@"error" = "UNSUPPORTED_FEATURE",
+                    .message = "Moondream generation does not support tool calls",
                 });
             }
-
+            var pipeline = moondream_pipeline.Pipeline.loadWithControl(ctx.allocator, model_path, execution_control, ctx.io) catch |err|
+                return modelLoadFailureResponse(ctx, err);
+            defer pipeline.deinit();
+            pipeline.execution_control = execution_control;
             if (want_stream) {
-                return self.streamGenerate(
-                    ctx,
-                    body.model,
-                    &pipeline,
-                    null,
-                    messages.items,
-                    config,
-                    if (tool_parser) |*parser| parser else null,
-                    include_stream_usage,
-                );
+                return self.streamGenerate(ctx, body.model, &pipeline, null, messages.items, config, null, include_stream_usage);
             }
-
-            var result = generateMaybeStopOnTool(&pipeline, messages.items, config, if (tool_parser) |*parser| parser else null) catch |err|
-                return generationErrorResponse(ctx, err);
+            var result = pipeline.generate(messages.items, config) catch |err| switch (err) {
+                error.NoImages, error.MultipleImagesUnsupported => return ctx.status(400).json(.{
+                    .@"error" = "INVALID_REQUEST",
+                    .message = "Moondream generation requires exactly one image",
+                }),
+                else => return generationErrorResponse(ctx, err),
+            };
             defer result.deinit();
-
-            var response_text = result.text;
-            var tool_response_text: ?[]u8 = null;
-            defer if (tool_response_text) |text| ctx.allocator.free(text);
-            const parsed_tool_calls = if (tool_parser) |*parser| blk: {
-                parser.reset();
-                _ = parser.feed(result.text) catch |err|
-                    return generationErrorResponse(ctx, err);
-                tool_response_text = parser.finishText(ctx.allocator) catch |err|
-                    return generationErrorResponse(ctx, err);
-                response_text = tool_response_text.?;
-                if (response_text.len == 0) response_text = result.text;
-                const calls = parser.toolCalls();
-                break :blk if (calls.len > 0) calls else null;
-            } else null;
-
-            if (parsed_tool_calls == null and tool_parser != null and response_text.len == 0) {
-                response_text = "No tool call was emitted.";
-            }
-
-            var formatted_response_text: ?[]u8 = null;
-            defer if (formatted_response_text) |text| ctx.allocator.free(text);
-            if (parsed_tool_calls == null) {
-                formatted_response_text = coerceGenerateResponseFormat(ctx.allocator, body.response_format, response_text) catch |err|
-                    return ctx.status(500).json(.{
-                        .@"error" = "STRUCTURED_OUTPUT_INVALID",
-                        .message = @errorName(err),
-                    });
-                if (formatted_response_text) |text| response_text = text;
-            }
-
-            return self.buildGenerateResponse(
-                ctx,
-                body.model,
-                response_text,
-                result.reasoning_text,
-                if (parsed_tool_calls != null) "tool_calls" else result.finish_reason,
-                result.prompt_tokens,
-                result.tokens_used,
-                0,
-                parsed_tool_calls,
-                null,
-            );
+            return self.buildGenerateResponse(ctx, body.model, result.text, null, result.finish_reason, result.prompt_tokens, result.tokens_used, 0, null, null);
         }
 
-        // Try ortgenai first (models with genai_config.json)
-        if (allow_onnx and build_options.enable_onnx) {
-            const ortgenai = backends_mod.ortgenai;
-            const ort_model_dir = ortgenai.prepareGenerativeModelPackage(ctx.allocator, model_path) catch null;
-            defer if (ort_model_dir) |prepared| ctx.allocator.free(prepared);
-            if (ort_model_dir) |prepared_model_dir| {
-                if (config.ignore_eos) {
-                    return ctx.status(400).json(.{
-                        .@"error" = "UNSUPPORTED_FEATURE",
-                        .message = "ignore_eos is not supported by the ONNX Runtime GenAI backend",
-                    });
-                }
-                var ort_manifest = manifest_mod.loadFromDir(ctx.allocator, prepared_model_dir) catch |err|
-                    return modelLoadFailureResponse(ctx, err);
-                defer ort_manifest.deinit();
-                const ort_gpt_config = session_factory.loadGptConfigFromModelDir(
-                    ctx.allocator,
-                    prepared_model_dir,
-                    ort_manifest,
-                ) catch null;
-                if (ort_gpt_config) |gpt_config| {
-                    if (requiresNativeChannelProjection(gpt_config)) {
-                        return ctx.status(400).json(.{
-                            .@"error" = "UNSUPPORTED_FEATURE",
-                            .message = "channel-aware Gemma generation requires the native, Metal, or CUDA backend",
-                        });
-                    }
-                }
-
-                const use_functiongemma_prompt_override = if (tool_parser) |*parser|
-                    std.mem.eql(u8, parser.name(), "functiongemma")
-                else
-                    false;
-
-                var ort_chat_template_storage: ?generation.ChatTemplate = null;
-                defer if (ort_chat_template_storage) |*ct| ct.deinit();
-                if (!use_functiongemma_prompt_override) {
-                    if (ort_manifest.chat_template) |ct_source| {
-                        ort_chat_template_storage = generation.ChatTemplate.init(
-                            ctx.allocator,
-                            ct_source,
-                            ort_manifest.bos_token,
-                            ort_manifest.eos_token,
-                            ort_manifest.unk_token,
-                            ort_manifest.pad_token,
-                        ) catch |err| blk: {
-                            std.log.warn("chat template init failed for {s}: {s}", .{ model_path, @errorName(err) });
-                            break :blk null;
-                        };
-                    }
-                }
-
-                var prompt_override: ?[]u8 = null;
-                defer if (prompt_override) |prompt| ctx.allocator.free(prompt);
-                if (use_functiongemma_prompt_override) {
-                    prompt_override = try buildFunctionGemmaPrompt(
-                        ctx.allocator,
-                        ort_manifest.bos_token,
-                        messages.items,
-                    );
-                }
-
-                var gen_model = ortgenai.GenAiModel.loadWithControl(ctx.allocator, prepared_model_dir, execution_control) catch |err|
-                    return modelLoadFailureResponse(ctx, err);
-                defer gen_model.deinit();
-                execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
-
-                var pipeline = generation.GenerationPipeline{
-                    .allocator = ctx.allocator,
-                    .model = &gen_model,
-                    .chat_template = if (ort_chat_template_storage) |*ct| ct else null,
-                    .prompt_override = if (prompt_override) |prompt| prompt else null,
-                    .execution_control = execution_control,
-                };
-
-                if (config.grammar != null) {
-                    return ctx.status(400).json(.{
-                        .@"error" = "INVALID_REQUEST",
-                        .message = "grammar-constrained decoding is native-backend only; ONNX generation remains unconstrained-only",
-                    });
-                }
-
-                if (want_stream) {
-                    return self.streamGenerate(
-                        ctx,
-                        body.model,
-                        &pipeline,
-                        null,
-                        messages.items,
-                        config,
-                        if (tool_parser) |*parser| parser else null,
-                        include_stream_usage,
-                    );
-                }
-
-                var result = generateMaybeStopOnTool(&pipeline, messages.items, config, if (tool_parser) |*parser| parser else null) catch |err|
-                    return generationErrorResponse(ctx, err);
-                defer result.deinit();
-
-                var response_text = result.text;
-                var tool_response_text: ?[]u8 = null;
-                defer if (tool_response_text) |text| ctx.allocator.free(text);
-                const parsed_tool_calls = if (tool_parser) |*parser| blk: {
-                    parser.reset();
-                    _ = parser.feed(result.text) catch |err|
-                        return generationErrorResponse(ctx, err);
-                    tool_response_text = parser.finishText(ctx.allocator) catch |err|
-                        return generationErrorResponse(ctx, err);
-                    response_text = tool_response_text.?;
-                    if (response_text.len == 0) response_text = result.text;
-                    const calls = parser.toolCalls();
-                    break :blk if (calls.len > 0) calls else null;
-                } else null;
-
-                if (parsed_tool_calls == null and tool_parser != null and response_text.len == 0) {
-                    response_text = "No tool call was emitted.";
-                }
-
-                var formatted_response_text: ?[]u8 = null;
-                defer if (formatted_response_text) |text| ctx.allocator.free(text);
-                if (parsed_tool_calls == null) {
-                    formatted_response_text = coerceGenerateResponseFormat(ctx.allocator, body.response_format, response_text) catch |err|
-                        return ctx.status(500).json(.{
-                            .@"error" = "STRUCTURED_OUTPUT_INVALID",
-                            .message = @errorName(err),
-                        });
-                    if (formatted_response_text) |text| response_text = text;
-                }
-
-                return self.buildGenerateResponse(
-                    ctx,
-                    body.model,
-                    response_text,
-                    result.reasoning_text,
-                    if (parsed_tool_calls != null) "tool_calls" else result.finish_reason,
-                    result.prompt_tokens,
-                    result.tokens_used,
-                    0,
-                    parsed_tool_calls,
-                    null,
-                );
-            }
-        }
-
-        // Fall back to native generation (CPU/GPU GPT arch forward pass).
+        // Native generation (CPU/GPU GPT arch forward pass).
         var model_handle = if (backend_selection.native_choice != .auto) blk: {
             var request_session_manager = backends_mod.SessionManager.init(ctx.allocator);
             configureGenerateBackendPreference(&request_session_manager, backend_selection);
@@ -12765,7 +12631,6 @@ pub const Node = struct {
             .metal => .metal,
             .cuda => .cuda,
             .pjrt => return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = "unexpected PJRT backend in native generation path" }),
-            .onnx => return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = "unexpected ONNX backend in native generation path" }),
             .wasm => return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = "unexpected WASM backend in server generation path" }),
         };
         const auto_metal_whole_model = shouldAutoUseMetalWholeModelGenerate(
@@ -13009,7 +12874,7 @@ pub const Node = struct {
                     .native => .native,
                     .metal => .metal,
                     .cuda => .cuda,
-                    .pjrt, .onnx, .wasm => {
+                    .pjrt, .wasm => {
                         if (draft_was_discovered) {
                             draft_degraded = true;
                             break :draft_setup;
@@ -14022,7 +13887,7 @@ pub const Node = struct {
         if (body.compiled_target != null) return .{ .code = "UNSUPPORTED_COMPILED_TARGET", .message = "batch generation does not support compiled_target yet", .retryable = false };
         if (body.backend) |backend| switch (backend) {
             .auto, .native, .metal, .cuda => {},
-            .onnx, .xla, .webgpu, .wasm => return .{ .code = "UNSUPPORTED_BACKEND", .message = "batch generation requires a native backend", .retryable = false },
+            .xla, .webgpu, .wasm => return .{ .code = "UNSUPPORTED_BACKEND", .message = "batch generation requires a native backend", .retryable = false },
         };
         return null;
     }
@@ -14302,6 +14167,16 @@ pub const Node = struct {
         out: *BatchGenerateTaskResult,
 
         fn run(self: *@This()) std.Io.Cancelable!void {
+            // Retire completed coordinated pages immediately. A finished
+            // peer must not keep the last live page on the eager row scheduler.
+            defer if (self.pipeline.cb.kind() == .metal and self.pipeline.execution_lock != null) {
+                if (self.pipeline.scheduler) |scheduler| if (self.pipeline.scheduler_lease) |lease| {
+                    if (lease.request_id != 0) {
+                        scheduler.release(lease.*);
+                        lease.request_id = 0;
+                    }
+                };
+            };
             self.runInner() catch |err| {
                 self.out.@"error" = batchGenerationError(err);
             };
@@ -14349,6 +14224,9 @@ pub const Node = struct {
         /// those objects serially avoids racing streams, scratch buffers, and
         /// graph-capture state while still amortizing backend construction.
         shared_serial,
+        /// One backend and an outer model lease; a separate mutex serializes
+        /// projector/prefill and coordinated decode steps inside this batch.
+        coordinated_shared,
     };
 
     fn batchExecutionMode(backend: runtime.kv.pool.BackendKind) BatchExecutionMode {
@@ -14365,12 +14243,14 @@ pub const Node = struct {
     const BatchModelLock = struct {
         mutex: *std.atomic.Mutex,
         owns_outer_lock: bool,
+        coordinated: bool = false,
+        step_mutex: std.atomic.Mutex = .unlocked,
 
         fn initWithControl(mode: BatchExecutionMode, mutex: *std.atomic.Mutex, io: std.Io, control: ?InferenceExecutionControl) !@This() {
-            if (mode == .shared_serial) {
+            if (mode != .isolated_parallel) {
                 if (control) |active| try active.lock(mutex) else platform.sync.lockYieldingIo(mutex, io);
             }
-            return .{ .mutex = mutex, .owns_outer_lock = mode == .shared_serial };
+            return .{ .mutex = mutex, .owns_outer_lock = mode != .isolated_parallel, .coordinated = mode == .coordinated_shared };
         }
 
         fn init(
@@ -14378,17 +14258,18 @@ pub const Node = struct {
             mutex: *std.atomic.Mutex,
             io: std.Io,
         ) @This() {
-            const owns_outer_lock = execution_mode == .shared_serial;
+            const owns_outer_lock = execution_mode != .isolated_parallel;
             if (owns_outer_lock) platform.sync.lockYieldingIo(mutex, io);
-            return .{ .mutex = mutex, .owns_outer_lock = owns_outer_lock };
+            return .{ .mutex = mutex, .owns_outer_lock = owns_outer_lock, .coordinated = execution_mode == .coordinated_shared };
         }
 
-        fn pipelineExecutionLock(self: *const @This()) ?*std.atomic.Mutex {
+        fn pipelineExecutionLock(self: *@This()) ?*std.atomic.Mutex {
             // The request owns the model mutex for the complete lifetime of a
             // shared Metal/CUDA backend, so the pipeline must not lock it
             // again. Besides avoiding self-deadlock, this keeps request-scoped
             // backend state (including CUDA's RunBudget pointer) from being
             // rebound by another request between generation steps.
+            if (self.coordinated) return &self.step_mutex;
             return if (self.owns_outer_lock) null else self.mutex;
         }
 
@@ -14419,6 +14300,16 @@ pub const Node = struct {
             .scratch_bytes = @max(existing.scratch_bytes, next.scratch_bytes),
             .scratch_tier = existing.scratch_tier,
         };
+    }
+
+    fn mergeCoordinatedBatchEstimate(current: ?runtime.tier.memory.Estimate, next: runtime.tier.memory.Estimate) runtime.tier.memory.Estimate {
+        var total = current orelse return next;
+        std.debug.assert(total.kv_tier == next.kv_tier and total.scratch_tier == next.scratch_tier);
+        total.kv_bytes +|= next.kv_bytes;
+        total.scratch_bytes +|= next.scratch_bytes;
+        total.prompt_tokens +|= next.prompt_tokens;
+        total.retained_tokens +|= next.retained_tokens;
+        return total;
     }
 
     fn acquireBatchAdmission(
@@ -14678,7 +14569,11 @@ pub const Node = struct {
             var admitted_group_len = generateBatchWindowPrefixLen(
                 media_shapes,
                 group_indices.items,
-                provisional_contract.batch.max_items,
+                if (platform.env.getenvBoolDefault("ANTFLY_GEMMA4_METAL_OCR_CONTINUOUS", false) and
+                    (selection.native_choice == .metal or selection.native_choice == .auto) and prepared_model.manifest.gguf_projector_path != null)
+                    @min(provisional_contract.batch.max_items, self.config.generation_batching.gemma4MetalOcrPolicy().max_active_requests_for_batching.?)
+                else
+                    provisional_contract.batch.max_items,
                 provisional_contract.batch.max_encoded_media_bytes,
             );
             var group_encoded_bytes: usize = 0;
@@ -14974,7 +14869,12 @@ pub const Node = struct {
                         break;
                     }
                 }
-                const execution_mode = if (group_has_media)
+                const coordinated_metal_ocr = platform.env.getenvBoolDefault("ANTFLY_GEMMA4_METAL_OCR_BATCH", false) and
+                    group_indices.items.len >= 2 and backend_kind == .metal and gpt_config.family == .gemma and gpt_config.gemma4_channel_protocol and gpt_config.hasPle() and model.manifest.gguf_projector_path != null and
+                    group_indices.items.len <= self.config.generation_batching.gemma4MetalOcrPolicy().max_active_requests_for_batching.?;
+                const execution_mode = if (coordinated_metal_ocr)
+                    BatchExecutionMode.coordinated_shared
+                else if (group_has_media)
                     BatchExecutionMode.shared_serial
                 else
                     batchExecutionMode(backend_kind);
@@ -15097,6 +14997,9 @@ pub const Node = struct {
                             continue;
                         };
                     }
+                    // Keep CUDA's homogeneous C2 policy intact. Only this
+                    // qualified Metal cohort admits independent decode positions.
+                    if (execution_mode == .coordinated_shared) coordinator.setPolicy(self.config.generation_batching.gemma4MetalOcrPolicy());
                     for (group_indices.items, 0..) |idx, pos| {
                         if (!pending[idx]) continue;
                         leases[pos].prefill_chunk_size = coordinator.recommendPrefillChunkFor(leases[pos].request_id);
@@ -15236,7 +15139,7 @@ pub const Node = struct {
                         continue;
                     };
                     resource_estimates[pos] = resource_estimate;
-                    if (execution_mode == .shared_serial) {
+                    if (execution_mode != .isolated_parallel) {
                         runnable_count += 1;
                         continue;
                     }
@@ -15265,7 +15168,7 @@ pub const Node = struct {
                 // admission may evict an idle model and destroy its backend.
                 var shared_batch_admission: ?BatchAdmission = null;
                 defer releaseBatchAdmission(&shared_run_budget, &shared_batch_admission);
-                if (execution_mode == .shared_serial) {
+                if (execution_mode != .isolated_parallel) {
                     while (runnable_count > 0 and shared_batch_admission == null) {
                         var combined: ?runtime.tier.memory.Estimate = null;
                         var largest_pos: ?usize = null;
@@ -15273,7 +15176,10 @@ pub const Node = struct {
                         for (group_indices.items, 0..) |idx, pos| {
                             if (!pending[idx]) continue;
                             const estimate = resource_estimates[pos].?;
-                            combined = mergeSerialBatchEstimate(combined, estimate);
+                            combined = if (execution_mode == .coordinated_shared)
+                                mergeCoordinatedBatchEstimate(combined, estimate)
+                            else
+                                mergeSerialBatchEstimate(combined, estimate);
                             const pressure = estimate.kv_bytes +| estimate.scratch_bytes;
                             if (largest_pos == null or pressure > largest_pressure) {
                                 largest_pos = pos;
@@ -15321,7 +15227,7 @@ pub const Node = struct {
                 defer batch_model_lock.deinit();
 
                 var shared_cb: ?ops.ComputeBackend = null;
-                if (execution_mode == .shared_serial) {
+                if (execution_mode != .isolated_parallel) {
                     shared_cb = session_factory.getComputeBackendWithBudget(
                         model.session,
                         ctx.allocator,
@@ -16124,7 +16030,7 @@ pub const Node = struct {
         // line below reflects this request alone. Mirrors the direct-generator
         // path so per-op profiling works against the warm server's SSE route
         // (the one the long-context benchmark harness uses). Only the native
-        // pipeline exposes a backend session; ONNX/ORT pipeline instantiations
+        // pipeline exposes a backend session; other pipeline instantiations
         // must remain valid in CUDA-enabled builds too.
         const cuda_profile_session: ?backends_mod.Session =
             if (comptime build_options.enable_cuda) generationPipelineSession(pipeline) else null;
@@ -17620,6 +17526,10 @@ pub const Node = struct {
             error.NativePix2StructNotYetSupported => return ctx.status(400).json(.{
                 .@"error" = "INVALID_MODEL",
                 .message = "native Pix2Struct reader checkpoints are not supported yet",
+            }),
+            error.UnsupportedMoondreamArtifacts => return ctx.status(400).json(.{
+                .@"error" = "INVALID_MODEL",
+                .message = "Moondream readers need the native vikhyatk/moondream2@2024-03-04 safetensors checkpoint (config.json, tokenizer.json, model.safetensors)",
             }),
             error.MultiStageReaderNotYetSupported => return ctx.status(400).json(.{
                 .@"error" = "INVALID_MODEL",
@@ -20040,6 +19950,15 @@ pub const Node = struct {
         return self.embedGroupsFromPath(a, io, path, &manifest, contract, input, options, control, admission.byte_cap);
     }
 
+    fn tryEmbedGemma4MediaGroups(self: *Node, out: std.mem.Allocator, model: *model_manager_mod.LoadedModel, groups: []const @import("../pipelines/embedding_gemma2.zig").Group, options: @import("../pipelines/embedding_gemma2.zig").Options, control: InferenceExecutionControl, contract: ResolvedInferenceExecutorContract) !?@import("../pipelines/gemma4_image_broker.zig").Result {
+        const audio_only = groups.len > 0 and groups[0].content.len == 1 and groups[0].content[0] == .audio;
+        if (platform.env.getenvBool(if (audio_only) "ANTFLY_GEMMA4_DISABLE_AUDIO_BROKER" else "ANTFLY_GEMMA4_DISABLE_IMAGE_BROKER")) return null;
+        var owned_io: ?std.Io.Threaded = null;
+        defer if (owned_io) |*value| value.deinit();
+        const io = self.inferenceIo(out, control.io, &owned_io);
+        return @import("../pipelines/gemma4_image_broker.zig").submit(self.executorMicrobatchBroker(), out, io, model.model_dir, @intFromPtr(model), model.session, model.getTokenizer(), model.embeddingExecutionLock(), control, groups, options, self.config.executor_microbatch_max_wait_us, contract.batch.max_encoded_media_bytes, contract.batch.max_decoded_pixels orelse std.math.maxInt(u64), contract.batch.max_items);
+    }
+
     fn embedGroupsFromPath(self: *Node, out: std.mem.Allocator, io: std.Io, path: []const u8, manifest: *const manifest_mod.ModelManifest, contract: ResolvedInferenceExecutorContract, input: std.json.Value, options: @import("../pipelines/embedding_gemma2.zig").Options, control: InferenceExecutionControl, byte_cap: usize) ![][]f32 {
         const grouped = @import("../pipelines/embedding_gemma2.zig");
         if (manifest.embedding_style != .embedding_gemma2) return error.UnsupportedEmbeddingProvider;
@@ -20066,6 +19985,21 @@ pub const Node = struct {
         errdefer {
             for (vectors[0..count]) |vector| out.free(vector);
             out.free(vectors);
+        }
+        if (try self.tryEmbedGemma4MediaGroups(out, loaded, groups, options, control, contract)) |batch| {
+            defer batch.deinit();
+            for (batch.items, vectors) |*item, *vector| {
+                switch (item.result) {
+                    .value => |*value| {
+                        vector.* = value.vector;
+                        value.vector = &.{};
+                        count += 1;
+                    },
+                    .item_error => |failure| return failure.cause,
+                }
+            }
+            try loaded.verifyEmbeddingIdentity();
+            return vectors;
         }
         for (groups, vectors) |group, *vector| {
             const result = try grouped.embed(out, loaded.session, loaded.getTokenizer(), group, options, loaded.embeddingExecutionLock(), control);
@@ -20120,15 +20054,36 @@ pub const Node = struct {
         const loaded = handle.get();
         if (request.model_identity) |expected| if (!std.mem.eql(u8, expected, &loaded.embedding_identity.?)) return error.EmbeddingIdentityMismatch;
         try loaded.verifyEmbeddingIdentity();
-        for (groups, 0..) |maybe_group, index| {
-            const group = maybe_group orelse continue;
-            const result = grouped.embed(a, loaded.session, loaded.getTokenizer(), group, .{ .task_type = @tagName(request.task_type orelse .RETRIEVAL_DOCUMENT), .dimensions = if (request.dimensions) |dim| @intCast(dim) else 768 }, loaded.embeddingExecutionLock(), control) catch |err| {
-                if (request.error_policy == .fail_fast or isDenseEmbedRequestAbort(err)) return err;
-                try errors.append(a, embedItemFailure(index, err, "embedding"));
-                continue;
+        const compact = try a.alloc(grouped.Group, groups.len);
+        var complete = true;
+        for (groups, compact) |maybe, *value| {
+            if (maybe) |group| value.* = group else complete = false;
+        }
+        var coalesced = if (complete) try self.tryEmbedGemma4MediaGroups(a, loaded, compact, .{ .task_type = @tagName(request.task_type orelse .RETRIEVAL_DOCUMENT), .dimensions = if (request.dimensions) |dim| @intCast(dim) else 768 }, control, contract) else null;
+        if (coalesced) |*batch| {
+            defer batch.deinit();
+            for (batch.items, 0..) |*item, index| switch (item.result) {
+                .value => |*value| {
+                    vectors[index] = value.vector;
+                    input_tokens += value.input_tokens;
+                    value.vector = &.{};
+                },
+                .item_error => |failure| {
+                    if (request.error_policy == .fail_fast or isDenseEmbedRequestAbort(failure.cause)) return failure.cause;
+                    try errors.append(a, embedItemFailure(index, failure.cause, "embedding"));
+                },
             };
-            vectors[index] = result.vector;
-            input_tokens += result.input_tokens;
+        } else {
+            for (groups, 0..) |maybe_group, index| {
+                const group = maybe_group orelse continue;
+                const result = grouped.embed(a, loaded.session, loaded.getTokenizer(), group, .{ .task_type = @tagName(request.task_type orelse .RETRIEVAL_DOCUMENT), .dimensions = if (request.dimensions) |dim| @intCast(dim) else 768 }, loaded.embeddingExecutionLock(), control) catch |err| {
+                    if (request.error_policy == .fail_fast or isDenseEmbedRequestAbort(err)) return err;
+                    try errors.append(a, embedItemFailure(index, err, "embedding"));
+                    continue;
+                };
+                vectors[index] = result.vector;
+                input_tokens += result.input_tokens;
+            }
         }
         try loaded.verifyEmbeddingIdentity();
         if (request.error_policy == .per_item) {
@@ -20450,6 +20405,7 @@ pub const Node = struct {
                     chat_template_failed,
                     listing.compatibility_level,
                 );
+                try appendQualifiedLimits(&body, a, &listing.manifest);
                 if (isOpenAiListTask(task)) {
                     const enabled = listing.compatibility_level.len > 0 and
                         (!std.mem.eql(u8, listing.compatibility_level, "unknown") or self.config.allow_unknown_models) and
@@ -20506,6 +20462,7 @@ pub const Node = struct {
                     model.chat_template_failed,
                     @tagName(loaded_compatibility.level),
                 );
+                try appendQualifiedLimits(&body, a, &model.manifest);
                 if (isOpenAiListTask(task)) {
                     const enabled = loaded_compatibility.level == .compatible or
                         (loaded_compatibility.level == .unknown and self.config.allow_unknown_models);
@@ -20606,8 +20563,6 @@ pub const Node = struct {
             .runtime = "antfly-inference",
             .backends = .{
                 .native = build_options.enable_native,
-                .onnx = true,
-                .onnx_runtime = build_options.enable_onnx,
                 .wasm = build_options.enable_wasm,
             },
         });
@@ -20685,6 +20640,7 @@ pub const Node = struct {
             .port = port,
             .max_connections = self.config.http_max_connections,
             .max_request_tasks = self.config.http_max_request_tasks,
+            .max_body_size = self.config.http_max_body_bytes,
             // Generation can legitimately take longer than the generic 30s HTTP
             // default during cold model startup or first-token GPU execution.
             .header_read_timeout_ms = 300_000,
@@ -23073,6 +23029,17 @@ fn manifestMatchesModelListingTask(
         manifest.capabilities,
         manifestSupportsZeroShotClassification(manifest),
     );
+}
+
+fn appendQualifiedLimits(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, manifest: *const manifest_mod.ModelManifest) !void {
+    if (manifest.qualified_limits_json.len == 0) return;
+    std.debug.assert(buf.items.len > 0 and buf.items[buf.items.len - 1] == '}');
+    const empty = buf.items.len >= 2 and buf.items[buf.items.len - 2] == '{';
+    buf.items.len -= 1;
+    if (!empty) try buf.append(allocator, ',');
+    try buf.appendSlice(allocator, "\"qualified_limits\":");
+    try buf.appendSlice(allocator, manifest.qualified_limits_json);
+    try buf.append(allocator, '}');
 }
 
 fn appendModelInfo(
@@ -25601,7 +25568,7 @@ test "generate draft resources follow the draft backend" {
     try std.testing.expectEqual(@as(?runtime.kv.pool.BackendKind, .native), generationBackendKind(.native));
     try std.testing.expectEqual(@as(?runtime.kv.pool.BackendKind, .metal), generationBackendKind(.metal));
     try std.testing.expectEqual(@as(?runtime.kv.pool.BackendKind, .cuda), generationBackendKind(.cuda));
-    try std.testing.expectEqual(@as(?runtime.kv.pool.BackendKind, null), generationBackendKind(.onnx));
+    try std.testing.expectEqual(@as(?runtime.kv.pool.BackendKind, null), generationBackendKind(.pjrt));
     try std.testing.expectEqual(@as(?runtime.kv.pool.BackendKind, null), generationBackendKind(.pjrt));
     try std.testing.expectEqual(@as(?runtime.kv.pool.BackendKind, null), generationBackendKind(.wasm));
 
@@ -25663,13 +25630,6 @@ test "generate draft KV pool uses safe model geometry" {
         @as(?u32, 1024),
         generation.kvPoolConfig(.metal, .bf16, mixed_gemma4_config, true).sliding_window_size,
     );
-}
-
-test "generate rejects an ONNX draft before model loading" {
-    const onnx = GenerateBackendSelection{ .native_choice = .onnx };
-    try std.testing.expectError(error.OnnxDraftUnsupported, validateGenerateDraftBackend(onnx, "draft"));
-    try validateGenerateDraftBackend(onnx, null);
-    try validateGenerateDraftBackend(.{ .native_choice = .native }, "draft");
 }
 
 test "generate speculation outcome metrics classify completed requests" {
@@ -25798,7 +25758,7 @@ test "reader microbatch resource class follows the resolved physical backend" {
     );
     try std.testing.expectEqual(
         executor_microbatch.ResourceClass.cpu,
-        Node.executorMicrobatchResourceClass(.onnx),
+        Node.executorMicrobatchResourceClass(.wasm),
     );
     try std.testing.expectEqual(
         executor_microbatch.ResourceClass.gpu,
@@ -26153,6 +26113,31 @@ test "generate batch shared backends own the outer model lock" {
     shared.deinit();
     try std.testing.expect(mutex.tryLock());
     mutex.unlock();
+}
+
+test "coordinated Metal batch retains model ownership with an independent step mutex" {
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    var mutex: std.atomic.Mutex = .unlocked;
+    var shared = Node.BatchModelLock.init(.coordinated_shared, &mutex, io_impl.io());
+    try std.testing.expect(!mutex.tryLock());
+    const step = shared.pipelineExecutionLock().?;
+    try std.testing.expect(step != &mutex);
+    try std.testing.expect(step.tryLock());
+    step.unlock();
+    shared.deinit();
+    try std.testing.expect(mutex.tryLock());
+    mutex.unlock();
+}
+
+test "coordinated batch admission reserves all live KV caches and scratch" {
+    const first = runtime.tier.memory.Estimate{ .prompt_tokens = 100, .retained_tokens = 120, .kv_bytes = 900, .kv_tier = .backend, .scratch_bytes = 200, .scratch_tier = .backend };
+    const second = runtime.tier.memory.Estimate{ .prompt_tokens = 300, .retained_tokens = 320, .kv_bytes = 400, .kv_tier = .backend, .scratch_bytes = 700, .scratch_tier = .backend };
+    const merged = Node.mergeCoordinatedBatchEstimate(first, second);
+    try std.testing.expectEqual(@as(usize, 400), merged.prompt_tokens);
+    try std.testing.expectEqual(@as(usize, 440), merged.retained_tokens);
+    try std.testing.expectEqual(@as(usize, 1300), merged.kv_bytes);
+    try std.testing.expectEqual(@as(usize, 900), merged.scratch_bytes);
 }
 
 test "serial batch admission covers each request without summing them" {
@@ -34696,6 +34681,11 @@ fn generationErrorResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
 }
 
 fn batchGenerationError(err: anyerror) api.GenerateBatchError {
+    switch (err) {
+        error.ImageDecodeFailed, error.ImageTooLarge, error.ImageBatchTooLarge => return Node.generateBatchImageError(err),
+        else => {},
+    }
+
     if (generationRequestFailure(err)) |failure| {
         return .{
             .code = failure.code,
@@ -36189,4 +36179,111 @@ test "embeddinggemma2 linked reduced dimensions match HTTP and preserve ownershi
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "Metal OCR policy enables ragged rows without widening the CUDA policy" {
+    const config = GenerationBatchingConfig{ .mode = .on, .max_step_items = 8 };
+    const base = config.schedulerPolicy();
+    try std.testing.expectEqual(@as(usize, 2), base.max_step_items);
+    try std.testing.expect(!base.allow_mixed_sequence_lengths);
+    const metal = config.gemma4MetalOcrPolicyForRows(4);
+    try std.testing.expectEqual(@as(usize, 4), metal.max_step_items);
+    try std.testing.expectEqual(@as(usize, 4), metal.max_active_requests_for_batching.?);
+    try std.testing.expect(metal.allow_mixed_sequence_lengths);
+    try std.testing.expectEqual(@as(usize, 1), config.gemma4MetalOcrPolicyForRows(0).max_step_items);
+    try std.testing.expectEqual(@as(usize, 4), config.gemma4MetalOcrPolicyForRows(99).max_step_items);
+}
+
+test "Metal OCR coordinator packs four unequal page positions" {
+    const a = std.testing.allocator;
+    var coordinator = runtime.scheduler.native_generate.NativeGenerateCoordinator.init(a);
+    defer coordinator.deinit();
+    const config = GenerationBatchingConfig{};
+    coordinator.setPolicy(config.gemma4MetalOcrPolicyForRows(4));
+    var leases: [4]runtime.scheduler.native_generate.Lease = undefined;
+    var initialized: usize = 0;
+    defer for (leases[0..initialized]) |lease| coordinator.release(lease);
+    var work: [4]u8 = undefined;
+    for (&leases, 0..) |*lease, row| {
+        lease.* = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 64, .max_tokens = 8 });
+        initialized += 1;
+        coordinator.beginDecode(lease, 10 + row);
+        try coordinator.enqueueDecodeWork(lease.*, @ptrCast(&work[row]), 11 + row, 11 + row, 0, .{});
+    }
+    var claimed = std.ArrayListUnmanaged(runtime.scheduler.native_generate.StepItem).empty;
+    defer claimed.deinit(a);
+    try std.testing.expect(try coordinator.claimStep(a, &leases[0], @ptrCast(&work[0]), .decode, coordinator.defaultStepBudget(), &claimed));
+    try std.testing.expectEqual(@as(usize, 4), claimed.items.len);
+    coordinator.completeStep(&leases[0], claimed.items);
+}
+
+test "generation batch corrupt images are permanent while allocation failures remain retryable" {
+    const bad_image = batchGenerationError(error.ImageDecodeFailed);
+    try std.testing.expectEqualStrings("INVALID_IMAGE", bad_image.code);
+    try std.testing.expect(!bad_image.retryable);
+    const allocation = batchGenerationError(error.OutOfMemory);
+    try std.testing.expect(allocation.retryable);
+}
+
+test "Metal OCR continuous window keeps GPU cohorts bounded" {
+    const config = GenerationBatchingConfig{};
+    const policy = config.gemma4MetalOcrContinuousPolicyForRows(4, 8);
+    try std.testing.expectEqual(@as(usize, 4), policy.max_step_items);
+    try std.testing.expectEqual(@as(usize, 8), policy.max_active_requests_for_batching.?);
+    try std.testing.expectEqual(@as(usize, 16), config.gemma4MetalOcrContinuousPolicyForRows(4, 999).max_active_requests_for_batching.?);
+    try std.testing.expectEqual(@as(usize, 4), config.gemma4MetalOcrContinuousPolicyForRows(4, 0).max_active_requests_for_batching.?);
+}
+
+test "Metal OCR continuous coordinator refills four row cohorts from eight unequal pages" {
+    const a = std.testing.allocator;
+    var coordinator = runtime.scheduler.native_generate.NativeGenerateCoordinator.init(a);
+    defer coordinator.deinit();
+    coordinator.setPolicy((GenerationBatchingConfig{}).gemma4MetalOcrContinuousPolicyForRows(4, 8));
+    var leases: [9]runtime.scheduler.native_generate.Lease = undefined;
+    var initialized: usize = 0;
+    defer for (leases[0..initialized]) |lease| if (lease.request_id != 0) {
+        coordinator.release(lease);
+    };
+    var work: [9]u8 = undefined;
+    for (leases[0..8], 0..) |*lease, row| {
+        lease.* = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 64, .max_tokens = 8 });
+        initialized += 1;
+        coordinator.beginDecode(lease, 10 + row * 17);
+        try coordinator.enqueueDecodeWork(lease.*, @ptrCast(&work[row]), 11 + row * 17, 11 + row * 17, 0, .{});
+    }
+    var claimed = std.ArrayListUnmanaged(runtime.scheduler.native_generate.StepItem).empty;
+    defer claimed.deinit(a);
+    try std.testing.expect(coordinator.shouldBatchCurrentRequests());
+    try std.testing.expect(try coordinator.claimStep(a, &leases[0], @ptrCast(&work[0]), .decode, coordinator.defaultStepBudget(), &claimed));
+    try std.testing.expectEqual(@as(usize, 4), claimed.items.len);
+    coordinator.completeStep(&leases[0], claimed.items);
+    coordinator.release(leases[0]);
+    leases[0].request_id = 0;
+    leases[8] = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 64, .max_tokens = 8 });
+    initialized += 1;
+    coordinator.beginDecode(&leases[8], 1000);
+    try coordinator.enqueueDecodeWork(leases[8], @ptrCast(&work[8]), 1001, 1001, 0, .{});
+    claimed.clearRetainingCapacity();
+    try std.testing.expect(try coordinator.claimStep(a, &leases[4], @ptrCast(&work[4]), .decode, coordinator.defaultStepBudget(), &claimed));
+    try std.testing.expectEqual(@as(usize, 4), claimed.items.len);
+    for (claimed.items) |item| try std.testing.expect(item.work_ptr != @as(*anyopaque, @ptrCast(&work[0])));
+    coordinator.completeStep(&leases[4], claimed.items);
+    claimed.clearRetainingCapacity();
+    try std.testing.expect(try coordinator.claimStep(a, &leases[8], @ptrCast(&work[8]), .decode, coordinator.defaultStepBudget(), &claimed));
+    try std.testing.expectEqual(@as(usize, 1), claimed.items.len);
+    coordinator.completeStep(&leases[8], claimed.items);
+}
+
+test "inference HTTP inline media body limit remains bounded and configurable" {
+    try std.testing.expectEqual(@as(usize, 32 * 1024 * 1024), try httpBodyLimitBytesFromMib(32));
+    try std.testing.expectError(error.InvalidHttpBodyLimit, httpBodyLimitBytesFromMib(0));
+    try std.testing.expectError(error.InvalidHttpBodyLimit, httpBodyLimitBytesFromMib(std.math.maxInt(usize)));
+    try std.testing.expectError(error.InvalidHttpTransportCapacity, Node.init(std.testing.allocator, .{ .http_max_body_bytes = 0 }));
+    var node: Node = undefined;
+    node.config = .{};
+    try std.testing.expectEqual(@as(usize, 10 * 1024 * 1024), node.httpServerConfig("127.0.0.1", 8090).max_body_size);
+    node.config.http_max_body_bytes = try httpBodyLimitBytesFromMib(32);
+    const transport = node.httpServerConfig("127.0.0.1", 8090).normalized();
+    try std.testing.expectEqual(node.config.http_max_body_bytes, transport.max_body_size);
+    try std.testing.expectEqual(@as(usize, 64 * 1024 * 1024), transport.request_body_buffer_budget_bytes);
 }

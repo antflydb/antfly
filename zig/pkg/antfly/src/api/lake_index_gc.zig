@@ -165,7 +165,8 @@ pub const Collector = struct {
     /// Collection must understand the preceding immutable root format after an
     /// upgrade, while serving and rebuild selection continue to require current metadata.
     fn retainedNativeRoot(self: *Collector, a: A, comptime native: type, ref: local.serverless_manifest_artifact_ref.ArtifactRef) !native.Root {
-        if (ref.metadata_version == native.metadata_version) {
+        const current = if (@hasDecl(native, "supportsBuildMetadata")) native.supportsBuildMetadata(ref.metadata_version) else ref.metadata_version == native.metadata_version;
+        if (current) {
             if (@hasDecl(native, "loadRootDirectory")) return native.loadRootDirectory(a, self.store, ref, self.cancellation(), null);
             return native.loadRoot(a, self.store, ref, self.cancellation(), null);
         }
@@ -220,6 +221,7 @@ pub const Collector = struct {
         if (!fresh) return;
         try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
         const directory = try @import("lake_index_seekable_text.zig").loadDirectory(a, .{ .store = self.store, .cache = null, .context = .{}, .cancellation = self.cancellation() }, ref);
+        if (directory.metadata_bundle) |bundle| _ = try self.mark(bundle);
         for (directory.metadata) |piece| _ = try self.mark(piece.retainedArtifact());
         for (directory.blocks) |piece| _ = try self.mark(piece.retainedArtifact());
     }
@@ -230,6 +232,12 @@ pub const Collector = struct {
         try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
         const domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(self.table, self.identity, self.namespace);
         const group = try @import("lake_index_native_text.zig").loadFileManifest(a, self.store, ref, domain, self.cancellation(), null);
+        for (group.members) |member| {
+            if (self.progress) |progress| try progress.enqueue(.{ .text_manifest = .{ .ref = member.physical, .seekable = false } }) else try self.markTextManifest(a, member.physical, false);
+        }
+        for (group.opening_packs) |pack| _ = try self.mark(pack.artifact);
+        for (group.descriptors) |descriptor| _ = try self.mark(descriptor);
+        if (group.physical_manifest) |physical| _ = try self.mark(physical);
         for (group.summaries) |summary| try self.markPages(a, domain, summary, false);
         for (group.rows) |block| {
             if (block.bitmap) |bitmap| _ = try self.mark(bitmap);
@@ -261,6 +269,7 @@ pub const Collector = struct {
                 try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
                 const root = try self.retainedNativeRoot(a, @import("lake_index_ordered_rows.zig"), ref);
                 try self.markPages(a, root.domain, root.page, true);
+                for (root.build_runs) |build_run| try self.markPages(a, root.domain, build_run.page, true);
                 try self.markPages(a, root.domain, root.reverse, false);
                 try self.markPages(a, root.domain, root.ties, false);
                 try self.markPages(a, root.domain, root.predicates, false);
@@ -281,9 +290,35 @@ pub const Collector = struct {
                 if (ref.metadata_version >= 1 and ref.metadata_version <= @import("lake_index_native_text.zig").metadata_version) {
                     try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
                     const root = try self.retainedNativeRoot(a, @import("lake_index_native_text.zig"), ref);
+                    if (root.compacted) |compact| {
+                        const child: local.serverless_manifest_artifact_ref.ArtifactRef = .{ .kind = .text_segment, .metadata_version = @import("lake_index_native_text.zig").metadata_version, .artifact_id = compact.artifact_id, .checksum = compact.checksum, .byte_len = compact.byte_len };
+                        if (self.progress) |progress| try progress.enqueue(.{ .artifact = child }) else try self.markArtifact(a, child);
+                    }
+                    try self.markPages(a, root.domain, root.serving_inventory, false);
+                    try self.markPages(a, root.domain, root.serving_routes, false);
+                    try self.markPages(a, root.domain, root.segment_files, false);
+                    try self.markPages(a, root.domain, root.directories.files, false);
+                    try self.markPages(a, root.domain, root.directories.segments, false);
+                    try self.markPages(a, root.domain, root.directories.routing, false);
                     try self.markPages(a, root.domain, root.term_statistics, false);
-                    for (root.file_groups) |group| for (group.summaries) |summary| try self.markPages(a, root.domain, summary, false);
-                    for (root.manifests) |manifest| {
+                    for (root.statistics_deltas) |delta_run| try self.markPages(a, root.domain, delta_run.page, false);
+                    try self.markPages(a, root.domain, root.term_directory.branches, false);
+                    try self.markPages(a, root.domain, root.term_directory.leaves, false);
+                    for (root.file_groups) |group| {
+                        for (group.members) |member| {
+                            if (self.progress) |progress| try progress.enqueue(.{ .text_manifest = .{ .ref = member.physical, .seekable = false } }) else try self.markTextManifest(a, member.physical, false);
+                        }
+                        for (group.opening_packs) |pack| _ = try self.mark(pack.artifact);
+                        for (group.summaries) |summary| try self.markPages(a, root.domain, summary, false);
+                    }
+
+                    const manifests = if (root.inventory_version == 3) blk: {
+                        const records = try @import("lake_index_text_directory.zig").fileRecordsBudget(a, root, self.store, null, self.cancellation(), &self.remaining_reads);
+                        const refs = try a.alloc(artifacts.ChunkRef, records.len);
+                        for (refs, records) |*manifest, record| manifest.* = record.manifest;
+                        break :blk refs;
+                    } else root.manifests;
+                    for (manifests) |manifest| {
                         if (self.progress) |progress| try progress.enqueue(.{ .text_manifest = .{ .ref = manifest, .seekable = root.seekable } }) else try self.markTextManifest(a, manifest, root.seekable);
                     }
                     for (root.file_groups) |group| for (group.rows) |block| {
@@ -449,6 +484,22 @@ test "external lake native GC retains shared aggregate blocks and durable reader
     const segment_statistics = (try tree.buildSorted(a, stats_pages.store(), &summary_source)).?;
     var old_source: StatisticsSource = .{ .value = "old reader only statistics" };
     const old_statistics = (try tree.buildSorted(a, stats_pages.store(), &old_source)).?;
+    var branch_source: StatisticsSource = .{ .value = "term hierarchy branches" };
+    const term_branches = (try tree.buildSorted(a, stats_pages.store(), &branch_source)).?;
+    var leaf_source: StatisticsSource = .{ .value = "term hierarchy leaves" };
+    const term_leaves = (try tree.buildSorted(a, stats_pages.store(), &leaf_source)).?;
+    var old_branch_source: StatisticsSource = .{ .value = "old term hierarchy branches" };
+    const old_term_branches = (try tree.buildSorted(a, stats_pages.store(), &old_branch_source)).?;
+    var old_leaf_source: StatisticsSource = .{ .value = "old term hierarchy leaves" };
+    const old_term_leaves = (try tree.buildSorted(a, stats_pages.store(), &old_leaf_source)).?;
+    var serving_source: StatisticsSource = .{ .value = "paged serving inventory" };
+    const serving_inventory = (try tree.buildSorted(a, stats_pages.store(), &serving_source)).?;
+    var old_serving_source: StatisticsSource = .{ .value = "old reader serving inventory" };
+    const old_serving_inventory = (try tree.buildSorted(a, stats_pages.store(), &old_serving_source)).?;
+    var route_source: StatisticsSource = .{ .value = "compact scoring routes" };
+    const serving_routes = (try tree.buildSorted(a, stats_pages.store(), &route_source)).?;
+    var old_route_source: StatisticsSource = .{ .value = "old reader compact scoring routes" };
+    const old_serving_routes = (try tree.buildSorted(a, stats_pages.store(), &old_route_source)).?;
     const manifest_bytes = try std.json.Stringify.valueAlloc(ca, text.FileGroup{
         .file = .{ .id = "part", .digest = @splat(7) },
         .segments = &.{.{ .artifact_id = text_segment.artifact_id, .checksum = text_segment.checksum, .byte_len = text_segment.byte_len }},
@@ -457,11 +508,11 @@ test "external lake native GC retains shared aggregate blocks and durable reader
     }, .{});
     var text_manifest = try store.put(manifest_bytes);
     defer text_manifest.deinit(a);
-    const text_root_bytes = try std.json.Stringify.valueAlloc(ca, text.Root{ .domain = domain, .binding = text_binding, .config_json = "{}", .statistics_version = 1, .term_statistics = global_statistics, .manifests = &.{.{ .artifact_id = text_manifest.artifact_id, .checksum = text_manifest.checksum, .byte_len = text_manifest.byte_len }} }, .{});
+    const text_root_bytes = try std.json.Stringify.valueAlloc(ca, text.Root{ .domain = domain, .binding = text_binding, .config_json = "{}", .serving_inventory = serving_inventory, .serving_routes = serving_routes, .statistics_version = 2, .term_statistics = global_statistics, .term_directory = .{ .branches = term_branches, .leaves = term_leaves }, .manifests = &.{.{ .artifact_id = text_manifest.artifact_id, .checksum = text_manifest.checksum, .byte_len = text_manifest.byte_len }} }, .{});
     var text_upload = try store.put(text_root_bytes);
     defer text_upload.deinit(a);
     const text_ref: local.serverless_manifest_artifact_ref.ArtifactRef = .{ .name = "text", .kind = .text_segment, .metadata_version = @import("lake_index_native_text.zig").metadata_version, .artifact_id = text_upload.artifact_id, .checksum = text_upload.checksum, .byte_len = text_upload.byte_len };
-    const old_text_bytes = try std.json.Stringify.valueAlloc(ca, text.Root{ .domain = domain, .binding = text_binding, .config_json = "{}", .statistics_version = 1, .term_statistics = old_statistics, .manifests = &.{.{ .artifact_id = text_manifest.artifact_id, .checksum = text_manifest.checksum, .byte_len = text_manifest.byte_len }} }, .{});
+    const old_text_bytes = try std.json.Stringify.valueAlloc(ca, text.Root{ .domain = domain, .binding = text_binding, .config_json = "{}", .serving_inventory = old_serving_inventory, .serving_routes = old_serving_routes, .statistics_version = 2, .term_statistics = old_statistics, .term_directory = .{ .branches = old_term_branches, .leaves = old_term_leaves }, .manifests = &.{.{ .artifact_id = text_manifest.artifact_id, .checksum = text_manifest.checksum, .byte_len = text_manifest.byte_len }} }, .{});
     var old_text_upload = try store.put(old_text_bytes);
     defer old_text_upload.deinit(a);
     var old_text_ref = text_ref;
@@ -564,16 +615,24 @@ test "external lake native GC retains shared aggregate blocks and durable reader
     defer a.free(retained_old);
     const retained_old_statistics = try store.getAlloc(&try page_store.PageStore.identity(domain, old_statistics));
     defer a.free(retained_old_statistics);
+    const retained_old_inventory = try store.getAlloc(&try page_store.PageStore.identity(domain, old_serving_inventory));
+    defer a.free(retained_old_inventory);
+    const retained_old_routes = try store.getAlloc(&try page_store.PageStore.identity(domain, old_serving_routes));
+    defer a.free(retained_old_routes);
     harness.state = try harness.state.release(ca, @splat(9));
     var second: Collector = .{ .a = a, .table = 4, .authority = authority, .store = store, .identity = identity, .context = .{}, .options = .{ .dry_run = false }, .token = @splat(8) };
     try std.testing.expect((try second.run()).deleted >= 2);
     try std.testing.expectEqual(@as(usize, 1), harness.state.publications.len);
-    for ([_]tree.Ref{ global_statistics, segment_statistics }) |ref| {
+    for ([_]tree.Ref{ global_statistics, segment_statistics, serving_inventory, serving_routes, term_branches, term_leaves }) |ref| {
         const retained_statistics = try store.getAlloc(&try page_store.PageStore.identity(domain, ref));
         defer a.free(retained_statistics);
         try std.testing.expectEqual(ref.bytes, retained_statistics.len);
     }
+    try std.testing.expectError(error.FileNotFound, store.getAlloc(&try page_store.PageStore.identity(domain, old_serving_inventory)));
+    try std.testing.expectError(error.FileNotFound, store.getAlloc(&try page_store.PageStore.identity(domain, old_serving_routes)));
     try std.testing.expectError(error.FileNotFound, store.getAlloc(&try page_store.PageStore.identity(domain, old_statistics)));
+    try std.testing.expectError(error.FileNotFound, store.getAlloc(&try page_store.PageStore.identity(domain, old_term_branches)));
+    try std.testing.expectError(error.FileNotFound, store.getAlloc(&try page_store.PageStore.identity(domain, old_term_leaves)));
     const retained_holes = try store.getAlloc(hole_upload.artifact_id);
     defer a.free(retained_holes);
     try std.testing.expectEqualSlices(u8, hole_bytes, retained_holes);
@@ -675,4 +734,157 @@ test "external lake native GC admits text manifest reads before storage access" 
     }
     try std.testing.expectError(error.ArtifactReadBudgetExceeded, collector.markArtifact(ca, ref));
     try std.testing.expectEqual(@as(u64, 0), collector.remaining_reads);
+}
+
+test "external lake native GC follows paged file catalogs and independent text descriptors" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("paged-text-gc");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    const identity: [32]u8 = @splat(4);
+    const namespace: [32]u8 = @splat(8);
+    const domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(4, identity, namespace);
+    store.upload_scope = try stores.UploadScope.forPublication(domain, 1, std.testing.io);
+    var child = try store.put("legacy heap segment");
+    defer child.deinit(a);
+    var descriptor = try store.put("independent authenticated segment admission");
+    defer descriptor.deinit(a);
+    var physical = try store.put("independent authenticated physical directory");
+    defer physical.deinit(a);
+    const text = @import("lake_index_native_text.zig");
+    const group: text.FileGroup = .{ .file = .{ .id = "part", .digest = @splat(7) }, .segments = &.{.{ .artifact_id = child.artifact_id, .checksum = child.checksum, .byte_len = child.byte_len }}, .descriptors = &.{.{ .artifact_id = descriptor.artifact_id, .checksum = descriptor.checksum, .byte_len = descriptor.byte_len }}, .physical_manifest = .{ .artifact_id = physical.artifact_id, .checksum = physical.checksum, .byte_len = physical.byte_len } };
+    const bytes = try std.json.Stringify.valueAlloc(ca, group, .{});
+    var manifest = try store.put(bytes);
+    defer manifest.deinit(a);
+    const record = try std.json.Stringify.valueAlloc(ca, text.text_directory.FileRecord{ .file = group.file, .manifest = .{ .artifact_id = manifest.artifact_id, .checksum = manifest.checksum, .byte_len = manifest.byte_len } }, .{});
+    var key: [36]u8 = @splat(0);
+    key[0..32].* = text.term_directory.identity(group.file.id);
+    const Source = struct {
+        key: []const u8,
+        value: []const u8,
+        done: bool = false,
+        pub fn next(self: *@This()) !?@import("../serverless/graph_segment/page_tree.zig").Cursor.Record {
+            if (self.done) return null;
+            self.done = true;
+            return .{ .key = self.key, .value = self.value };
+        }
+    };
+    var reads: u64 = 1024 * 1024;
+    var writes: u64 = 1024 * 1024;
+    const page_store = @import("../serverless/graph_segment/page_store.zig");
+    var pages: page_store.PageStore = .{ .domain = domain, .attempt = store.upload_scope.?.attempt, .artifacts = &store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    var source: Source = .{ .key = &key, .value = record };
+    const files = (try @import("../serverless/graph_segment/page_tree.zig").buildSorted(a, pages.store(), &source)).?;
+    const binding: local.serverless_segment_source_binding.Binding = .{ .sidecar_kind = .text, .source_kind = .external_parquet, .row_ref_kind = .external, .source_id = "source", .snapshot_id = "snapshot", .schema_fingerprint = "schema", .index_config_hash = "recipe", .column_bindings = &.{"body"} };
+    const root_bytes = try std.json.Stringify.valueAlloc(ca, text.Root{ .domain = domain, .binding = binding, .config_json = "{}", .inventory_version = 3, .file_count = 1, .directories = .{ .files = files } }, .{});
+    var root = try store.put(root_bytes);
+    defer root.deinit(a);
+    var collector: Collector = .{ .a = a, .table = 4, .authority = undefined, .store = store, .identity = identity, .context = .{}, .token = @splat(1), .expires_ms = std.math.maxInt(u64), .authority_deadline = std.math.maxInt(u64), .remaining_reads = 1024 * 1024, .namespace = namespace };
+    defer {
+        var keys = collector.marked.keyIterator();
+        while (keys.next()) |owned| a.free(owned.*);
+        collector.marked.deinit(a);
+    }
+    try collector.markArtifact(ca, .{ .kind = .text_segment, .metadata_version = text.metadata_version, .artifact_id = root.artifact_id, .checksum = root.checksum, .byte_len = root.byte_len });
+    for ([_][]const u8{ root.artifact_id, manifest.artifact_id, child.artifact_id, descriptor.artifact_id, physical.artifact_id, &try page_store.PageStore.identity(domain, files) }) |id| try std.testing.expect(collector.marked.contains(id));
+    // A compacted serving generation is a separate root, and its original
+    // member bitmap must be protected even without another canonical marker.
+    var bitmap = try store.put("retained member hole bitmap");
+    defer bitmap.deinit(a);
+    const member_group: text.FileGroup = .{ .file = .{ .id = "member", .digest = @splat(9) }, .segments = &.{}, .rows = &.{.{ .group = 0, .high = 0, .lower = 0, .base = 0, .count = 1, .bitmap = .{ .artifact_id = bitmap.artifact_id, .checksum = bitmap.checksum, .byte_len = bitmap.byte_len } }} };
+    var member = try store.put(try std.json.Stringify.valueAlloc(ca, member_group, .{}));
+    defer member.deinit(a);
+    var merged = try store.put("distinct compacted heap segment");
+    defer merged.deinit(a);
+    const merged_ref: artifacts.ChunkRef = .{ .artifact_id = merged.artifact_id, .checksum = merged.checksum, .byte_len = merged.byte_len };
+    const merged_group: text.FileGroup = .{ .file = group.file, .segments = &.{merged_ref}, .members = &.{.{ .file = member_group.file, .physical = .{ .artifact_id = member.artifact_id, .checksum = member.checksum, .byte_len = member.byte_len }, .source_lower = 0, .lower = 0, .count = 1 }} };
+    var serving = try store.put(try std.json.Stringify.valueAlloc(ca, text.Root{ .domain = domain, .binding = binding, .config_json = "{}", .segments = &.{merged_ref}, .file_groups = &.{merged_group} }, .{}));
+    defer serving.deinit(a);
+    var parent = try store.put(try std.json.Stringify.valueAlloc(ca, text.Root{ .domain = domain, .binding = binding, .config_json = "{}", .compacted = .{ .artifact_id = serving.artifact_id, .checksum = serving.checksum, .byte_len = serving.byte_len } }, .{}));
+    defer parent.deinit(a);
+    try collector.markArtifact(ca, .{ .kind = .text_segment, .metadata_version = text.metadata_version, .artifact_id = parent.artifact_id, .checksum = parent.checksum, .byte_len = parent.byte_len });
+    for ([_][]const u8{ parent.artifact_id, serving.artifact_id, merged.artifact_id, member.artifact_id, bitmap.artifact_id }) |id| try std.testing.expect(collector.marked.contains(id));
+    // A non-serving statistics checkpoint owns pages absent from the serving
+    // base. GC must retain those signed runs until finalization or retirement.
+    var signed: [8]u8 = undefined;
+    std.mem.writeInt(i64, &signed, 1, .big);
+    var delta_source: Source = .{ .key = "pending-term", .value = &signed };
+    const delta = (try @import("../serverless/graph_segment/page_tree.zig").buildSorted(a, pages.store(), &delta_source)).?;
+    const checkpoint_bytes = try std.json.Stringify.valueAlloc(ca, text.Root{ .domain = domain, .binding = binding, .config_json = "{}", .statistics_version = 1, .term_statistics = files, .statistics_deltas = &.{.{ .page = delta, .level = 0 }} }, .{});
+    var checkpoint = try store.put(checkpoint_bytes);
+    defer checkpoint.deinit(a);
+    try collector.markArtifact(ca, .{ .kind = .text_segment, .metadata_version = text.metadata_version, .artifact_id = checkpoint.artifact_id, .checksum = checkpoint.checksum, .byte_len = checkpoint.byte_len });
+    try std.testing.expect(collector.marked.contains(&try page_store.PageStore.identity(domain, delta)));
+}
+
+test "external lake native GC marks checkpoint forests and their covering blocks" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("native-checkpoint-gc");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    const identity: [32]u8 = @splat(4);
+    const domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(4, identity, null);
+    store.upload_scope = .{ .domain = domain, .attempt = @splat(2) };
+    const Check = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Check.check };
+    defer manager.deinit();
+    const ordered = @import("lake_index_ordered_rows.zig");
+    const page_store = @import("../serverless/graph_segment/page_store.zig");
+    const names: []const []const u8 = &.{ "first", "second", "third" };
+    const files = try ca.alloc(local.serverless_external_source_types.FileEntry, names.len);
+    var hashes: [3][32]u8 = @splat(@splat(0));
+    var keep: [3]bool = @splat(true);
+    for (files, names) |*file, name| file.* = .{ .file_id = @constCast(name), .object_uri = @constCast("file://data"), .byte_len = 1, .row_count = 1, .row_groups = &.{} };
+    const inventory: local.serverless_external_source_types.Inventory = .{ .format = .parquet, .source_id = @constCast("lake"), .source_uri = @constCast("file://lake"), .snapshot_id = @constCast("snapshot"), .schema_fingerprint = @constCast("schema"), .files = files };
+    var previous: ?ordered.Root = null;
+    var ref: local.serverless_manifest_artifact_ref.ArtifactRef = undefined;
+    for (names, 0..) |name, slot| {
+        var sort = local.sql_spill.Sort.init(a, &manager, &.{.{}}, 16 * 1024);
+        defer sort.deinit();
+        sort.encoded_bytes = true;
+        const key = ordered.coordinate(@intCast(slot), .{ .source_id = "lake", .snapshot_id = "snapshot", .file_id = name, .row_group_ordinal = 0, .row_ordinal = 0 });
+        try sort.add(.{ .keys = &.{local.sql_scalar.Datum.json(.{ .string = &key })}, .values = &.{local.sql_scalar.Datum.json(.{ .integer = @intCast(slot) })}, .ordinal = 0 });
+        hashes[slot] = @splat(1);
+        keep[slot] = false;
+        ref = try ordered.publishRunCheckpoint(a, ca, &store, &sort, "ordered", @splat(3), inventory, &.{"v"}, .none, .{ .previous = previous, .keep = if (previous == null) &.{} else &keep, .files = names, .fingerprints = &hashes });
+        keep[slot] = true;
+        previous = try ordered.loadRoot(ca, store, ref, .none, null);
+    }
+    const root = previous.?;
+    try std.testing.expectEqual(ordered.checkpoint_metadata_version, ref.metadata_version);
+    try std.testing.expectEqual(@as(usize, 1), root.build_runs.len);
+    // This graph-only mark does not read or mutate the catalog authority.
+    var collector: Collector = .{ .a = ca, .table = 4, .authority = undefined, .store = store, .identity = identity, .context = .{}, .token = @splat(7), .expires_ms = std.math.maxInt(u64), .authority_deadline = std.math.maxInt(u64), .remaining_reads = 16 * 1024 * 1024 };
+    try collector.markArtifact(ca, ref);
+    try std.testing.expect(collector.marked.contains(ref.artifact_id));
+    var count: usize = 0;
+    for ([_]@import("../serverless/graph_segment/page_tree.zig").Ref{ root.page.?, root.build_runs[0].page }) |page| {
+        try std.testing.expect(collector.marked.contains(&try page_store.PageStore.identity(domain, page)));
+        var run = root;
+        run.page = page;
+        run.build_runs = &.{};
+        run.build_level = 0;
+        var reader: ordered.Reader = undefined;
+        try reader.init(a, &store, run, root.fingerprint, "", null, .none);
+        defer reader.deinit();
+        const entries = try reader.nextEntries(ca, 4);
+        for (entries) |entry| {
+            try std.testing.expect(collector.marked.contains(entry.cover.?.block.artifact_id));
+            count += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 3), count);
 }

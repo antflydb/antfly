@@ -6,7 +6,6 @@ class InferenceModelBackend(StrEnum):
     CUDA = "cuda"
     METAL = "metal"
     NATIVE = "native"
-    ONNX = "onnx"
     WASM = "wasm"
     WEBGPU = "webgpu"
     XLA = "xla"

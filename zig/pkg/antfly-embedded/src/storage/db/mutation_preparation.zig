@@ -1857,6 +1857,60 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .optional => |optional| @typeInfo(optional.child).pointer.child,
                 else => @compileError("expected an optional local mutation receiver"),
             };
+            const maybe_db: ?*Database = db;
+            var owner: ?RelationalPreparationOwner = if (maybe_db) |receiver| .{
+                .alloc = receiver.alloc,
+                .core = receiver.core,
+                .backend_runtime = receiver.backend_runtime,
+                .secret_store = &receiver.secret_store,
+                .remote_content = &receiver.remote_content,
+                .shadow = &receiver.shadow,
+                .transaction_recovery_local_context = &receiver.transaction_recovery_local_context,
+            } else null;
+            return prepareRelationalRowsOwned(allocator_guard, io, if (owner) |*view| view else null, writes, validator, table_schema, physical_layout, write_plan, retain_text_roots, preparation_timestamp_ns, rows, durable_rows, restore_timestamps, preserve_logical_values);
+        }
+
+        // Borrow state rather than cloning DB/recovery scratch or capturing a
+        // split decision before workers run. One concrete worker is emitted
+        // for both owners; all tasks join before this synchronous view expires.
+        const RelationalPreparationOwner = struct {
+            alloc: Allocator,
+            core: @FieldType(Execution, "core"),
+            backend_runtime: @FieldType(Execution, "backend_runtime"),
+            secret_store: *const @FieldType(Execution, "secret_store"),
+            remote_content: *const @FieldType(Execution, "remote_content"),
+            shadow: *const @FieldType(Execution, "shadow"),
+            transaction_recovery_local_context: *const @FieldType(Execution, "transaction_recovery_local_context"),
+
+            fn requiresLogicalRoot(self: *const @This()) bool {
+                const shadow = if (self.transaction_recovery_local_context.*) |context| context.split_shadow else self.shadow.*;
+                if (shadow == null) return false;
+                const state = self.core.splitState() orelse return false;
+                return state.phase == .splitting;
+            }
+
+            fn validateInlineSources(self: *const @This(), alloc: Allocator, plan: index_manager_mod.IndexManager.WritePlanSnapshot, value: std.json.Value, document: mapper.ExtractedWrite) !void {
+                const render_owner = .{ .secret_store = self.secret_store.*, .remote_content = self.remote_content.*, .backend_runtime = self.backend_runtime };
+                try validateDocumentExtractionInlineSourcesSnapshotParsed(alloc, &render_owner, plan, value, document);
+            }
+        };
+
+        noinline fn prepareRelationalRowsOwned(
+            allocator_guard: *PreparedRowAllocator,
+            io: ?std.Io,
+            db: ?*const RelationalPreparationOwner,
+            writes: []const types.BatchWrite,
+            validator: ?public_table_schema.CompiledTableValidator,
+            table_schema: schema_mod.TableSchema,
+            physical_layout: *const relational_row_codec.PhysicalLayout,
+            write_plan: ?index_manager_mod.IndexManager.WritePlanSnapshot,
+            retain_text_roots: bool,
+            preparation_timestamp_ns: u64,
+            rows: []?mapper.PreparedRelationalWrite,
+            durable_rows: ?*const std.StringHashMapUnmanaged([]const u8),
+            restore_timestamps: ?*const std.StringHashMapUnmanaged(u64),
+            preserve_logical_values: bool,
+        ) !void {
             const RowPreparationContext = struct {
                 alloc: Allocator,
                 scratch_child: Allocator,
@@ -1864,7 +1918,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 validator: ?public_table_schema.CompiledTableValidator,
                 table_schema: schema_mod.TableSchema,
                 physical_layout: *const relational_row_codec.PhysicalLayout,
-                db: ?*Database,
+                db: ?*const RelationalPreparationOwner,
                 write_plan: ?index_manager_mod.IndexManager.WritePlanSnapshot,
                 retain_text_roots: bool,
                 preparation_timestamp_ns: u64,
@@ -1925,7 +1979,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             ctx.fail(err);
                             return;
                         };
-                        if (ctx.db) |owner_db| if (splitShadowRequiresMaterializedDerivedBatch(owner_db)) {
+                        if (ctx.db) |owner_db| if (owner_db.requiresLogicalRoot()) {
                             prepared.requireLogicalRoot() catch |err| {
                                 prepared.deinit(owner_alloc);
                                 ctx.fail(err);
@@ -1968,9 +2022,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         }
                         if (prepared.extracted.hasDocument()) {
                             if (ctx.db) |owner_db| if (ctx.write_plan) |pinned_write_plan|
-                                validateDocumentExtractionInlineSourcesSnapshotParsed(
+                                owner_db.validateInlineSources(
                                     scratch_arena.allocator(),
-                                    owner_db,
                                     pinned_write_plan,
                                     prepared.parsedValue(),
                                     prepared.extracted,

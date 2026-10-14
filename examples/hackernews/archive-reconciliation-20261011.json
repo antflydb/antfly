@@ -1,0 +1,83 @@
+{
+  "project": "antfly-dev-01",
+  "kind": "completed_pod_compute",
+  "source_table": "antfly-billing.all_billing_data.gcp_billing_export_resource_v1_0144D7_BBC515_65A5C4",
+  "export_time_utc": "2026-10-11T16:00:53Z",
+  "billing_query_sha256": "1a3560af453649d63a3cce19ddb8643ed12b24fab15940c00cb3a8d162ac9397",
+  "billing_result_sha256": "d6e45a6fc741ee776c2afa3ddb5ad4b9c94bc41bcd9420ac1ecfe248934c39de",
+  "runs": [
+    {
+      "run_id": "hn-poc/archive-qualification/475efd685118477ea6b4c0637a55ce2e",
+      "pod": "hackernews-benchmark-4f4f74ebf4d3",
+      "pod_deleted": true,
+      "closed_at_utc": "2026-10-10T21:21:15.772351+00:00",
+      "coverage_through_utc": "2026-10-10T22:00:00Z",
+      "gross_compute_usd": 0.049471,
+      "pending_noncompute_usd": 10,
+      "cleanup_sha256": "9cbe1787d66eae1eadc8b247b39c12bba7d88f466adfb73ce5dcdebee17cb1b9",
+      "worker_sha256": "2a2235c882f8851c9a27a79589906d63eacf61e4463282e9b075b903adcadf76",
+      "plan_sha256": "d74e65b826fcae68f918e4883fed2d20ae330f7c020a179f1a4c68f483addbd1"
+    },
+    {
+      "run_id": "hn-poc/archive-qualification/29434747eb3b4bf28fa8edad4ea5cadb",
+      "pod": "hackernews-benchmark-73cefb25eb3c",
+      "pod_deleted": true,
+      "closed_at_utc": "2026-10-10T23:09:20.951977+00:00",
+      "coverage_through_utc": "2026-10-11T00:00:00Z",
+      "gross_compute_usd": 0.154022,
+      "pending_noncompute_usd": 10,
+      "cleanup_sha256": "d1bea88ce5b0ef845289a6c958917c2676694f69cfdf6a23f50cf4dd66a0402f",
+      "worker_sha256": "54a691a1c31b490087da1e11e8fd063fd81e7c7c03f8ca16cfc3be7222933cd7",
+      "plan_sha256": "11e430bcaec6d3bf2257855ebabc6db917b3f3731e01e2a1517a6fb880706e90"
+    },
+    {
+      "run_id": "hn-poc/archive-qualification/26548783c3e54c628d3a699b845c2893",
+      "pod": "hackernews-benchmark-a7a5a0637aee",
+      "pod_deleted": true,
+      "closed_at_utc": "2026-10-10T23:55:30.221860+00:00",
+      "coverage_through_utc": "2026-10-11T00:00:00Z",
+      "gross_compute_usd": 0.128462,
+      "pending_noncompute_usd": 10,
+      "cleanup_sha256": "615b231a5354d1a7079333f2af50d1f6551a20e167ddba87a2f9f844c6c16fb6",
+      "worker_sha256": "d5d8b4976d39bdd8077c89b0c5382929de61c5a5258906fe018af45322bf3c14",
+      "plan_sha256": "65810ebaacc3311490cf0aec5efcdb75604d74eb75db56ef8a080a90815155ef"
+    },
+    {
+      "run_id": "hn-poc/archive-qualification/a50a0d2af85345619b875591b0011e03",
+      "pod": "hackernews-benchmark-379f60e443a1",
+      "pod_deleted": true,
+      "closed_at_utc": "2026-10-10T23:19:59.981352+00:00",
+      "coverage_through_utc": "2026-10-11T00:00:00Z",
+      "gross_compute_usd": 0.118734,
+      "pending_noncompute_usd": 10,
+      "cleanup_sha256": "84e81543c341615d48beb40a78c19aac713f83c89af39ad7fbec48bd481f9a45",
+      "worker_sha256": "d1244cde5fb7b39bcdfcd20ce861a523f30aec1d947a558ad421f5d01f9517a3",
+      "plan_sha256": "fdbcc93ff2c6458658550c25c1a0152a8123d65dbe9715b676af4c0eaf29f60a"
+    },
+    {
+      "run_id": "hn-poc/archive-qualification/31bfb181c2734ff79067675df9e63599",
+      "pod": "hackernews-benchmark-34404d14305c",
+      "pod_deleted": true,
+      "closed_at_utc": "2026-10-10T20:50:21.603999+00:00",
+      "coverage_through_utc": "2026-10-10T21:00:00Z",
+      "gross_compute_usd": 0.019788,
+      "pending_noncompute_usd": 10,
+      "cleanup_sha256": "5ba3f041f3cdc338795aca0762aa88b91aaca64d9829f3e2348c73e7620cd19e",
+      "worker_sha256": "9a48af812d0d5088221adca2f4c5b802c846734ce775e015cfe2978808c1e6fa",
+      "plan_sha256": "219785a39c0629a1954905a5511c2cab12ba882a486027780904133eb3e79fff"
+    },
+    {
+      "run_id": "hn-poc/archive-qualification/d824b26edcff4897bbf68e2ecdbececd",
+      "pod": "hackernews-benchmark-a0018f89e88d",
+      "pod_deleted": true,
+      "closed_at_utc": "2026-10-11T00:51:36.111271+00:00",
+      "coverage_through_utc": "2026-10-11T01:00:00Z",
+      "gross_compute_usd": 0.456629,
+      "pending_noncompute_usd": 10,
+      "cleanup_sha256": "b140189c88544482a8fe9e2fb3a3aeeb26d79a698369078ed324a05cba65d704",
+      "worker_sha256": "513ea0fb770a394f58497cccac738786c1762cc1c7be4e330e17503a70d37ac9",
+      "plan_sha256": "f259b1b792ead6258f0ddd0eac64e0846ad150346cb7aaf3a72df00cfcec2757"
+    }
+  ],
+  "scope": "Settles only gross pod CPU, memory and ephemeral storage; retain $10 per run for unexported or shared noncompute costs. Promotion credits do not release budget."
+}

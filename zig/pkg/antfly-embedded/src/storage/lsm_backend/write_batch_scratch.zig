@@ -100,7 +100,13 @@ pub const ProbeScratch = struct {
 
 test "lsm writer batch scratch reuses allocations and unwinds failures" {
     const Fixture = struct {
-        fn run(a: std.mem.Allocator) !void {
+        fn run(backing: std.mem.Allocator) !void {
+            // In-place growth depends on OS mapping state. Enumerate every
+            // allocation failure through the deterministic allocate/copy path.
+            var vtable = backing.vtable.*;
+            vtable.resize = std.mem.Allocator.noResize;
+            vtable.remap = std.mem.Allocator.noRemap;
+            const a: std.mem.Allocator = .{ .ptr = backing.ptr, .vtable = &vtable };
             var scratch: Scratch = .{};
             defer scratch.deinit(a);
             try scratch.prepare(a, 16);

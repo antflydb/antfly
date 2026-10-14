@@ -208,7 +208,7 @@ pub fn inventoryAlloc(a: Allocator, io: std.Io, root: []const u8, cancellation: 
         const stat = try backup.statRegularFile(io, absolute);
         try files.append(a, .{ .path = try a.dupe(u8, entry.path), .size = stat.size, .inode = stat.inode, .mtime_ns = stat.mtime.toNanoseconds() });
     }
-    std.mem.sort(File, files.items, {}, struct {
+    std.mem.sortUnstable(File, files.items, {}, struct {
         fn less(_: void, x: File, y: File) bool {
             return std.mem.order(u8, x.path, y.path) == .lt;
         }

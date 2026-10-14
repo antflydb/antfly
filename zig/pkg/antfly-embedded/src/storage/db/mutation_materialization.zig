@@ -505,7 +505,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             while (final_it.next()) |entry| : (artifact_index += 1) {
                 artifact_keys[artifact_index] = entry.key_ptr.*;
             }
-            std.mem.sort([]const u8, artifact_keys, {}, struct {
+            std.mem.sortUnstable([]const u8, artifact_keys, {}, struct {
                 fn lessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
                     return std.mem.order(u8, lhs, rhs) == .lt;
                 }
@@ -1214,7 +1214,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 defer artifact_ref.deinit(alloc);
                 try appendUniqueOwnedKey(alloc, &artifact_names, artifact_ref.name);
             }
-            std.mem.sort([]u8, artifact_names.items, {}, struct {
+            std.mem.sortUnstable([]u8, artifact_names.items, {}, struct {
                 fn lessThan(_: void, lhs: []u8, rhs: []u8) bool {
                     return std.mem.order(u8, lhs, rhs) == .lt;
                 }
@@ -3957,6 +3957,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         defer if (graph_writes.len > 0) ctx.alloc.free(graph_writes);
                         try ctx.index_manager.applyGraphMutationsByName(index_ref.name, graph_writes, graph_deletes);
                     }
+                    // A field replacement clears the document's serving edges.
+                    // Restore every committed contributor, including unchanged
+                    // extraction artifacts whose producer hash is still current.
+                    for (batch.graph_doc_clears) |clear| {
+                        if (!containsDeleteKey(clear.index_names, index_ref.name)) continue;
+                        const surviving = try collectGraphArtifactsForDocIndex(ctx.alloc, ctx.store, clear.key, index_ref.name);
+                        defer docstore_mod.DocStore.freeResults(ctx.alloc, surviving);
+                        const keys = try ctx.alloc.alloc([]const u8, surviving.len);
+                        defer ctx.alloc.free(keys);
+                        for (surviving, keys) |entry, *key| key.* = entry.key;
+                        try applyGraphArtifactMutationPages(ctx, index_ref.name, keys, &.{}, batch.sequence);
+                    }
                     if (batch.changed_artifact_keys.len > 0 or materialized_artifact_keys.len > 0) {
                         try applyGraphArtifactMutationPages(
                             ctx,
@@ -4221,7 +4233,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             return try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = obj }, .{});
         }
 
-        pub fn buildDerivedBatch(
+        pub noinline fn buildDerivedBatch(
             alloc: Allocator,
             req: types.BatchRequest,
             extracted: []const mapper.ExtractedWrite,
@@ -8331,7 +8343,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
             }
             if (removed_indices.items.len == 0) return;
-            std.mem.sort(usize, removed_indices.items, {}, std.sort.asc(usize));
+            std.mem.sortUnstable(usize, removed_indices.items, {}, std.sort.asc(usize));
 
             const kept_len = owned.writes.len - removed_indices.items.len;
             const kept = try owned.alloc.alloc(mapper.DenseEmbeddingWrite, kept_len);
@@ -8874,31 +8886,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     error.NotFound => continue,
                     else => return err,
                 };
-                const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{}) catch continue;
-                if (parsed != .object) continue;
-                const entities = parsed.object.get("entities") orelse continue;
-                if (entities != .array) continue;
-                for (entities.array.items) |entity| {
-                    if (entity != .object) continue;
-                    // Same human-review gate as the mention-edge path
-                    // (resolutionDecisionCreatesCanonicalEdge): a review-band entry
-                    // carries a PROVISIONAL doc key, and admitting it here would make
-                    // relations traversable through that identity before a curator
-                    // approves it. Only canonical decisions become endpoints; the
-                    // relation stays absent (drop-before-resolution) and the
-                    // approval's re-resolution replay renders it.
-                    const decision = jsonStringField(entity, "decision") orelse continue;
-                    if (!std.mem.eql(u8, decision, "new") and !std.mem.eql(u8, decision, "match")) continue;
-                    const local_id = jsonStringField(entity, "local_id") orelse continue;
-                    const doc_ref = entity.object.get("doc_ref") orelse continue;
-                    if (doc_ref != .object) continue;
-                    const key = jsonStringField(doc_ref, "key") orelse continue;
-                    if (key.len == 0) continue;
-                    var ref: std.json.ObjectMap = .empty;
-                    try ref.put(a, "key", .{ .string = key });
-                    if (jsonStringField(doc_ref, "table")) |table| try ref.put(a, "table", .{ .string = table });
-                    try map.put(a, local_id, .{ .object = ref });
-                }
+                try @import("graph_endpoint_resolutions.zig").append(a, &map, raw);
             }
             // No resolver targets this artifact: return null so relation sources
             // keep their owning document (see appendRelationItem). A targeting
@@ -9760,6 +9748,22 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var changed_set = std.StringHashMapUnmanaged(void).empty;
             defer changed_set.deinit(alloc);
 
+            var resolved_assets: std.StringHashMapUnmanaged(void) = .empty;
+            defer {
+                var keys = resolved_assets.keyIterator();
+                while (keys.next()) |key| alloc.free(key.*);
+                resolved_assets.deinit(alloc);
+            }
+            for (changed_artifact_keys) |key| {
+                if (!internal_keys.isResolutionArtifactKey(key)) continue;
+                if (try resolutionOwningAssetArtifactKeyAlloc(alloc, index_manager, key)) |asset| {
+                    const entry = resolved_assets.getOrPut(alloc, asset) catch |err| {
+                        alloc.free(asset);
+                        return err;
+                    };
+                    if (entry.found_existing) alloc.free(asset);
+                }
+            }
             for (changed_artifact_keys) |artifact_key| {
                 if (internal_keys.isResolutionArtifactKey(artifact_key)) {
                     for (sources) |source| {
@@ -9773,34 +9777,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         };
                     }
                     for (changed.items) |key| try changed_set.put(alloc, key, {});
-                    // Relation edges materialize when the extraction artifact is
-                    // written, which is before its resolution artifacts exist, so
-                    // their first render carries local-id endpoints. A landed
-                    // resolution re-renders the owning extraction artifact with
-                    // canonical endpoints (graphEndpointResolutionsJsonAlloc); the
-                    // existing replacement semantics retire the stale local-id
-                    // edges. Depth-one recursion: the synthesized key is an asset
-                    // artifact, never another resolution key.
-                    if (try resolutionOwningAssetArtifactKeyAlloc(alloc, index_manager, artifact_key)) |asset_key| {
-                        defer alloc.free(asset_key);
-                        const rerendered = try materializeGraphSourceArtifactsForIndex(alloc, store, index_manager, &.{asset_key}, index_name, options);
-                        defer alloc.free(rerendered);
-                        var idx: usize = 0;
-                        errdefer for (rerendered[idx..]) |key| alloc.free(key);
-                        while (idx < rerendered.len) {
-                            const key = rerendered[idx];
-                            if (changed_set.contains(key)) {
-                                alloc.free(key);
-                                idx += 1;
-                                continue;
-                            }
-                            try changed.append(alloc, key);
-                            idx += 1;
-                            try changed_set.put(alloc, key, {});
-                        }
-                    }
+                    // Canonical relation endpoints render once per asset after
+                    // the complete resolution batch below.
                     continue;
                 }
+                if (resolved_assets.contains(artifact_key)) continue;
                 var artifact_ref = (try decodeArtifactRefIfKnownAlloc(alloc, artifact_key)) orelse continue;
                 defer artifact_ref.deinit(alloc);
                 const source = blk: {
@@ -9966,6 +9947,17 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 };
             }
 
+            // Resolve all mentions first, then render each affected extraction
+            // once using the complete canonical endpoint set.
+            var asset_keys: std.ArrayListUnmanaged([]const u8) = .empty;
+            defer asset_keys.deinit(alloc);
+            var assets = resolved_assets.keyIterator();
+            while (assets.next()) |key| try asset_keys.append(alloc, key.*);
+            if (asset_keys.items.len != 0) {
+                const rerendered = try materializeGraphSourceArtifactsForIndex(alloc, store, index_manager, asset_keys.items, index_name, options);
+                defer freeOwnedKeySlice(alloc, rerendered);
+                for (rerendered) |key| try appendUniqueOwnedKeyIndexed(alloc, &changed, &changed_set, key);
+            }
             return try changed.toOwnedSlice(alloc);
         }
 

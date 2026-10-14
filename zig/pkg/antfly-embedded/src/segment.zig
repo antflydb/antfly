@@ -690,6 +690,43 @@ pub const SegmentReader = struct {
     fields: []FieldInfo,
 
     native: ?*Native = null,
+    deferred: ?*const fn (Allocator, SegmentSource) anyerror!SegmentReader = null,
+
+    pub const RoutingField = struct { name: []const u8, stats: ?InvertedFieldStats, section_mask: u16 = 0 };
+    /// Compact immutable scoring inventory. Full navigation is admitted under
+    /// the selected query's capability, never by the corpus publication loop.
+    pub fn initRouting(a: Allocator, doc_count: u32, route: []const RoutingField, load: *const fn (Allocator, SegmentSource) anyerror!SegmentReader) !SegmentReader {
+        if (route.len > std.math.maxInt(u16)) return error.InvalidSegment;
+        for (route, 0..) |field, i| {
+            if (field.name.len > std.math.maxInt(u16) or field.section_mask >> @typeInfo(SectionType).@"enum".field_names.len != 0) return error.InvalidSegment;
+            if (i != 0 and std.mem.order(u8, route[i - 1].name, field.name) != .lt) return error.InvalidSegment;
+            if (field.stats) |stats| if (stats.doc_count > doc_count) return error.InvalidSegment;
+        }
+        const fields = try a.alloc(FieldInfo, route.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (fields[0..initialized]) |field| {
+                a.free(field.name);
+                a.free(field.sections);
+            }
+            a.free(fields);
+        }
+        for (fields, route) |*field, route_field| {
+            const name = try a.dupe(u8, route_field.name);
+            errdefer a.free(name);
+            const sections = try a.alloc(SectionInfo, @popCount(route_field.section_mask));
+            var position: usize = 0;
+            inline for (@typeInfo(SectionType).@"enum".field_values) |kind| {
+                if (route_field.section_mask & (@as(u16, 1) << kind) != 0) {
+                    sections[position] = .{ .section_type = @fromBackingInt(@intCast(kind)), .offset = 0, .length = 0 };
+                    position += 1;
+                }
+            }
+            field.* = .{ .name = name, .sections = sections, .inverted_stats = route_field.stats };
+            initialized += 1;
+        }
+        return .{ .alloc = a, .data = &.{}, .doc_count = doc_count, .num_fields = @intCast(fields.len), .fields = fields, .stored_offset = 0, .stored_length = 0, .stored_metadata_length = 0, .index_offset = 0, .deferred = load };
+    }
 
     const Native = struct {
         range: RangeSegmentReader,
@@ -700,6 +737,7 @@ pub const SegmentReader = struct {
         identity_pages: std.AutoHashMapUnmanaged(u64, []u8) = .empty,
         spanning_ids: std.AutoHashMapUnmanaged(u32, []u8) = .empty,
         identity_bytes: usize = 0,
+        navigation: std.AutoHashMapUnmanaged(u64, []u8) = .empty,
 
         // Only the legacy stable-borrow API retains identity pages. Query and
         // merge decode scopes use their own bounded identity scratch instead.
@@ -748,6 +786,122 @@ pub const SegmentReader = struct {
         checksum: u32 = 0,
         validation: std.atomic.Value(u8) = .init(integrity_valid),
     };
+
+    /// Structural metadata authenticated by an enclosing immutable manifest.
+    /// The paired range source must independently authenticate every payload.
+    /// Providers, decoder pointers and mutable validation state are never stored.
+    pub const Admission = struct {
+        pub const Section = struct { kind: SectionType, offset: u64, length: u64, checksum: u32 };
+        pub const Field = struct { name: []const u8, stats: ?InvertedFieldStats, sections: []const Section };
+        version: u8 = 1,
+        bytes: u64,
+        stored_offset: u64,
+        stored_length: u64,
+        stored_metadata_length: u64,
+        stored_header: [21]u8,
+        index_offset: u64,
+        doc_count: u32,
+        fields: []const Field,
+
+        pub fn validate(self: Admission) !void {
+            if (self.version != 1 or self.bytes < footer_size or self.index_offset > self.bytes - footer_size or self.stored_offset > self.index_offset or self.stored_length > self.index_offset - self.stored_offset or self.stored_metadata_length < 5 or self.stored_metadata_length > self.stored_length or self.fields.len > std.math.maxInt(u16)) return error.InvalidSegment;
+            if (std.mem.readInt(u32, self.stored_header[1..5], .little) != self.doc_count) return error.InvalidSegment;
+            switch (self.stored_header[0]) {
+                stored_fields_version_omitted => if (self.stored_length != 5 or self.stored_metadata_length != 5) return error.InvalidSegment,
+                stored_fields_version_block_compressed => {
+                    const blocks = std.mem.readInt(u32, self.stored_header[5..9], .little);
+                    const ids = std.mem.readInt(u64, self.stored_header[13..21], .little);
+                    const minimum = 21 + @as(u64, self.doc_count) * stored_fields_v4_doc_entry_size + @as(u64, blocks) * 12;
+                    if (std.mem.readInt(u32, self.stored_header[9..13], .little) != stored_fields_block_doc_target or (self.doc_count == 0) != (blocks == 0) or @as(u64, blocks) > self.doc_count or minimum > self.stored_metadata_length or ids != self.stored_metadata_length - minimum) return error.InvalidSegment;
+                },
+                else => return error.InvalidSegment,
+            }
+            for (self.fields, 0..) |field, i| {
+                if (field.name.len > std.math.maxInt(u16) or field.sections.len > std.math.maxInt(u16)) return error.InvalidSegment;
+                if (i != 0 and std.mem.order(u8, self.fields[i - 1].name, field.name) != .lt) return error.InvalidSegment;
+                if (field.stats) |stats| if (stats.doc_count > self.doc_count) return error.InvalidSegment;
+                var kinds: u16 = 0;
+                for (field.sections) |section| {
+                    if (section.offset < self.stored_offset + self.stored_length or section.offset > self.index_offset or section.length > self.index_offset - section.offset) return error.InvalidSegment;
+                    const bit = @as(u16, 1) << @as(u4, @intCast(@backingInt(section.kind)));
+                    if (kinds & bit != 0) return error.InvalidSegment;
+                    kinds |= bit;
+                }
+            }
+        }
+        pub fn deinit(self: Admission, a: Allocator) void {
+            for (self.fields) |field| {
+                a.free(field.name);
+                a.free(field.sections);
+            }
+            a.free(self.fields);
+        }
+    };
+
+    pub fn admission(self: *const SegmentReader, a: Allocator) !Admission {
+        const fields = try a.alloc(Admission.Field, self.fields.len);
+        errdefer a.free(fields);
+        var initialized: usize = 0;
+        errdefer for (fields[0..initialized]) |field| {
+            a.free(field.name);
+            a.free(field.sections);
+        };
+        for (self.fields, fields) |field, *out| {
+            const name = try a.dupe(u8, field.name);
+            errdefer a.free(name);
+            const sections = try a.alloc(Admission.Section, field.sections.len);
+            errdefer a.free(sections);
+            for (field.sections, sections) |section, *target| target.* = .{ .kind = section.section_type, .offset = section.offset, .length = section.length, .checksum = section.checksum };
+            out.* = .{ .name = name, .stats = try self.invertedFieldStats(field.name), .sections = sections };
+            initialized += 1;
+        }
+        std.mem.sort(Admission.Field, fields, {}, struct {
+            fn lessThan(_: void, left: Admission.Field, right: Admission.Field) bool {
+                return std.mem.order(u8, left.name, right.name) == .lt;
+            }
+        }.lessThan);
+        var header: [21]u8 = @splat(0);
+        try self.source().readInto(self.stored_offset, header[0..@intCast(@min(header.len, self.stored_metadata_length))]);
+        const result: Admission = .{ .bytes = self.source().len(), .stored_offset = self.stored_offset, .stored_length = self.stored_length, .stored_metadata_length = self.stored_metadata_length, .stored_header = header, .index_offset = self.index_offset, .doc_count = self.doc_count, .fields = fields };
+        try result.validate();
+        return result;
+    }
+
+    /// The caller attests that metadata and source identity came from the same
+    /// authenticated manifest. Admission performs no provider or payload I/O.
+    pub fn initAuthenticated(alloc: Allocator, input_source: SegmentSource, metadata: Admission) !SegmentReader {
+        try metadata.validate();
+        if (input_source.len() != metadata.bytes) return error.InvalidSegment;
+        const native = try alloc.create(Native);
+        errdefer alloc.destroy(native);
+        const fields = try alloc.alloc(RangeSegmentReader.Field, metadata.fields.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (fields[0..initialized]) |field| {
+                alloc.free(field.name);
+                alloc.free(field.sections);
+            }
+            alloc.free(fields);
+        }
+        for (metadata.fields, fields) |field, *out| {
+            const name = try alloc.dupe(u8, field.name);
+            errdefer alloc.free(name);
+            const sections = try alloc.alloc(SectionInfo, field.sections.len);
+            for (field.sections, sections) |section, *target| target.* = .{ .section_type = section.kind, .offset = section.offset, .length = section.length, .checksum = section.checksum, .validation = .init(integrity_unverified) };
+            out.* = .{ .name = name, .sections = sections };
+            initialized += 1;
+        }
+        const blocks = if (metadata.stored_header[0] == stored_fields_version_block_compressed) std.mem.readInt(u32, metadata.stored_header[5..9], .little) else 0;
+        native.* = .{ .stored_metadata = metadata.stored_header, .range = .{ .alloc = alloc, .source = input_source, .authenticated_source = true, .owns_source = false, .fields = fields, .doc_count = metadata.doc_count, .stored_offset = metadata.stored_offset, .stored_length = metadata.stored_length, .stored_metadata_length = metadata.stored_metadata_length, .num_blocks = blocks, .id_bytes_length = if (blocks != 0) std.mem.readInt(u64, metadata.stored_header[13..21], .little) else 0 } };
+        native.metadata_cache = try @import("segment_source.zig").ConcurrentBlockCache.init(alloc, input_source, 256 * 1024);
+        errdefer native.metadata_cache.?.deinit();
+        const info = try alloc.alloc(FieldInfo, fields.len);
+        errdefer alloc.free(info);
+        for (info, fields, metadata.fields) |*out, field, descriptor| out.* = .{ .name = field.name, .sections = field.sections, .inverted_stats = descriptor.stats };
+        const validations = try alloc.alloc(std.atomic.Value(u8), blocks);
+        for (validations) |*validation| validation.* = .init(integrity_unverified);
+        return .{ .alloc = alloc, .data = &.{}, .native = native, .stored_offset = metadata.stored_offset, .stored_length = metadata.stored_length, .stored_metadata_length = metadata.stored_metadata_length, .index_offset = metadata.index_offset, .doc_count = metadata.doc_count, .num_fields = @intCast(fields.len), .fields = info, .stored_block_validations = validations };
+    }
 
     /// The caller owns the immutable source and keeps it alive until reader deinit.
     pub fn initSource(alloc: Allocator, input_source: SegmentSource) !SegmentReader {
@@ -813,10 +967,33 @@ pub const SegmentReader = struct {
         return .{ .alloc = alloc, .data = &.{}, .native = native, .stored_offset = native.range.stored_offset, .stored_length = native.range.stored_length, .stored_metadata_length = native.range.stored_metadata_length, .stored_block_validations = validations, .index_offset = std.mem.readInt(u64, &index_bytes, .big), .doc_count = native.range.doc_count, .num_fields = @intCast(fields.len), .fields = fields };
     }
 
+    pub fn hasSection(self: *const SegmentReader, name: []const u8, kind: SectionType) bool {
+        for (self.fields) |field| if (std.mem.eql(u8, field.name, name)) {
+            for (field.sections) |section| if (section.section_type == kind) return true;
+        };
+        return false;
+    }
+
     /// The enclosing snapshot pins this reader's physical segment. Reuse its
     /// admitted navigation without rereading metadata under every query. Only
     /// query-local cache state and the capability-bound source are allocated.
     pub fn bindSource(self: *const SegmentReader, alloc: Allocator, input_source: SegmentSource) !SegmentReader {
+        if (self.deferred) |load| {
+            var reader = try load(alloc, input_source);
+            errdefer reader.deinit();
+            if (reader.doc_count != self.doc_count or reader.fields.len != self.fields.len) return error.InvalidSegment;
+            // Routing directories are canonicalized by name; historical
+            // physical segments retain writer field order. Bind identities,
+            // not positions, while still verifying every admitted field.
+            for (self.fields) |expected| {
+                const actual = for (reader.fields) |field| {
+                    if (std.mem.eql(u8, field.name, expected.name)) break field;
+                } else return error.InvalidSegment;
+                if (!std.meta.eql(try reader.invertedFieldStats(expected.name), expected.inverted_stats) or actual.sections.len != expected.sections.len) return error.InvalidSegment;
+                for (expected.sections) |section| if (!reader.hasSection(expected.name, section.section_type)) return error.InvalidSegment;
+            }
+            return reader;
+        }
         const base = self.native orelse return error.InvalidSegment;
         if (input_source.len() != base.range.source.len()) return error.InvalidSegment;
         const native = try alloc.create(Native);
@@ -840,7 +1017,12 @@ pub const SegmentReader = struct {
     }
 
     pub fn nativeNavigationBytes(self: *const SegmentReader) usize {
-        const native = self.native orelse return 0;
+        const native = self.native orelse {
+            if (self.deferred == null) return 0;
+            var bytes: usize = self.fields.len * @sizeOf(FieldInfo);
+            for (self.fields) |field| bytes += field.name.len + field.sections.len * @sizeOf(SectionInfo);
+            return bytes;
+        };
         @import("antfly_platform").sync.lockYielding(&native.identity_mutex);
         defer native.identity_mutex.unlock();
         var bytes = @sizeOf(Native) + native.identity_bytes + native.metadata_cache.?.retainedBytes() +
@@ -856,6 +1038,8 @@ pub const SegmentReader = struct {
                 if (section.typed_navigation) |navigation| bytes += @sizeOf(typed_dv.RangeTypedDocValuesReader) + navigation.offsets.len;
             }
         }
+        var navigation = native.navigation.valueIterator();
+        while (navigation.next()) |data| bytes += data.len;
         return bytes;
     }
 
@@ -877,7 +1061,9 @@ pub const SegmentReader = struct {
                 reader.range = .{ .view = view, .max_chunk_bytes = std.math.maxInt(usize) };
                 return reader;
             }
-            return error.InvalidSegment;
+            var navigation = try typed_dv.RangeTypedDocValuesReader.init(allocator, view, std.math.maxInt(usize), std.math.maxInt(usize));
+            navigation.reader.owned_offsets = navigation.offsets;
+            return navigation.reader;
         }
         return try typed_dv.TypedDocValuesReader.init(allocator, (try self.getSection(field, .typed_doc_values)) orelse return null);
     }
@@ -1060,6 +1246,9 @@ pub const SegmentReader = struct {
                 self.alloc.free(self.fields);
                 self.alloc.free(self.stored_block_validations.?);
             }
+            var navigation = native.navigation.valueIterator();
+            while (navigation.next()) |bytes| self.alloc.free(bytes.*);
+            native.navigation.deinit(self.alloc);
             var pages = native.identity_pages.valueIterator();
             while (pages.next()) |bytes| self.alloc.free(bytes.*);
             native.identity_pages.deinit(self.alloc);
@@ -1071,7 +1260,10 @@ pub const SegmentReader = struct {
             self.alloc.destroy(native);
             return;
         }
-        for (self.fields) |*f| self.alloc.free(f.sections);
+        for (self.fields) |*f| {
+            if (self.deferred != null) self.alloc.free(f.name);
+            self.alloc.free(f.sections);
+        }
         self.alloc.free(self.fields);
         if (self.stored_block_validations) |validations| self.alloc.free(validations);
     }
@@ -1081,7 +1273,20 @@ pub const SegmentReader = struct {
         if (self.native) |native| {
             const entry = native.range.findSection(field_name, section_type) orelse return null;
             if (entry.length == 0) return null;
-            return entry.cached_navigation orelse error.NativeSectionRequiresScope;
+            if (entry.cached_navigation) |bytes| return bytes;
+            switch (section_type) {
+                .inverted_text, .typed_doc_values, .doc_ordinals, .vector, .columnar_stored => return error.NativeSectionRequiresScope,
+                else => {},
+            }
+            @import("antfly_platform").sync.lockYielding(&native.identity_mutex);
+            defer native.identity_mutex.unlock();
+            if (native.navigation.get(entry.offset)) |bytes| return bytes;
+            const bytes = try self.alloc.alloc(u8, @intCast(entry.length));
+            errdefer self.alloc.free(bytes);
+            var scratch: [8192]u8 = undefined;
+            _ = try native.range.readSectionInto(field_name, section_type, 0, bytes, &scratch);
+            try native.navigation.put(self.alloc, entry.offset, bytes);
+            return bytes;
         }
         for (self.fields) |*field| {
             if (std.mem.eql(u8, field.name, field_name)) {
@@ -1223,7 +1428,7 @@ pub const SegmentReader = struct {
     /// Collection statistics preserve lazy payload checksum validation. Native
     /// admission reads only field descriptors, as the mapped path does.
     pub fn invertedFieldStats(self: *const SegmentReader, field: []const u8) !?InvertedFieldStats {
-        if (self.native != null) {
+        if (self.native != null or self.deferred != null) {
             // Immutable admission metadata survives cache capability sealing.
             for (self.fields) |info| if (std.mem.eql(u8, info.name, field)) return info.inverted_stats;
             return null;
@@ -1585,6 +1790,7 @@ pub const SegmentReader = struct {
     pub const V4StoredDocLocation = struct {
         id: []const u8,
         id_length: usize,
+        id_start: usize = 0,
         block_idx: u32,
         block_start: usize,
         block_end: usize,
@@ -1716,12 +1922,22 @@ pub const SegmentReader = struct {
         return .{
             .id = id,
             .id_length = id_len,
+            .id_start = @intCast(ids_start + id_offset),
             .block_idx = block,
             .block_start = @intCast(range.stored_offset + range.stored_metadata_length + start),
             .block_end = @intCast(range.stored_offset + range.stored_metadata_length + end),
             .doc_offset = std.mem.readInt(u32, entry[16..20], .little),
             .raw_len = std.mem.readInt(u32, entry[20..24], .little),
         };
+    }
+
+    pub fn prefetchStoredDoc(self: *const SegmentReader, doc: u32) !void {
+        if (self.native == null) return;
+        const backing_source = self.source();
+        if (backing_source != .ranges or backing_source.ranges.prefetch == null) return;
+        const location = (try self.storedLocationMetadata(doc)) orelse return error.StoredDocMissing;
+        backing_source.prefetch(location.id_start, location.id_length);
+        backing_source.prefetch(location.block_start, location.block_end - location.block_start);
     }
 
     fn storedBlockChecksum(self: *const SegmentReader, block: u32) !u32 {
@@ -2584,7 +2800,59 @@ pub const TypedReadScope = struct {
     entries: std.ArrayListUnmanaged(Entry) = .empty,
     signed_sort_fields: std.StringHashMapUnmanaged(bool) = .empty,
     cache: ?*typed_dv.TypedDocValuesReader.PointCache = null,
+    owners: [4]?Owner = @splat(null),
+    age: u64 = 0,
+    const Owner = struct { segment: *const SegmentReader, ptr: *anyopaque, close: *const fn (Allocator, *anyopaque) void, age: u64 };
 
+    /// Pin query-bound readers only while their typed fields are resident. A
+    /// bounded LRU evicts fields before dropping the source lease. Plain local
+    /// readers continue to borrow their snapshot's stable lifetime.
+    pub fn retainSegment(self: *TypedReadScope, lease: anytype) !void {
+        if (lease.snapshot == null) return;
+        self.age +%= 1;
+        const segment = &lease.entry.reader;
+        var victim: usize = 0;
+        for (&self.owners, 0..) |*slot, i| {
+            if (slot.*) |*owner| {
+                if (owner.segment == segment) {
+                    owner.age = self.age;
+                    return;
+                }
+                if (self.owners[victim] != null and owner.age < self.owners[victim].?.age) victim = i;
+            } else victim = i;
+        }
+        const Lease = @TypeOf(lease);
+        const owned = try self.allocator.create(Lease);
+        errdefer self.allocator.destroy(owned);
+        owned.* = try lease.clone();
+        if (self.owners[victim]) |prior| {
+            self.forget(prior.segment);
+            prior.close(self.allocator, prior.ptr);
+        }
+        self.owners[victim] = .{ .segment = segment, .ptr = owned, .age = self.age, .close = struct {
+            fn close(a: Allocator, raw: *anyopaque) void {
+                const value: *Lease = @ptrCast(@alignCast(raw));
+                value.deinit();
+                a.destroy(value);
+            }
+        }.close };
+    }
+    fn forget(self: *TypedReadScope, segment: *const SegmentReader) void {
+        var i: usize = 0;
+        while (i < self.entries.items.len) {
+            const entry = self.entries.items[i];
+            if (entry.segment != segment) {
+                i += 1;
+                continue;
+            }
+            if (entry.reader) |reader| {
+                if (self.cache) |cache| cache.forget(reader);
+                reader.deinit();
+                self.allocator.destroy(reader);
+            }
+            _ = self.entries.swapRemove(i);
+        }
+    }
     pub fn init(allocator: Allocator) TypedReadScope {
         return .{ .allocator = allocator };
     }
@@ -2598,6 +2866,7 @@ pub const TypedReadScope = struct {
             self.allocator.destroy(reader);
         };
         self.entries.deinit(self.allocator);
+        for (self.owners) |owner| if (owner) |retained| retained.close(self.allocator, retained.ptr);
         self.signed_sort_fields.deinit(self.allocator);
         self.* = undefined;
     }
@@ -6902,6 +7171,10 @@ pub const RangeSegmentReader = struct {
     num_blocks: u32,
     id_bytes_length: u64,
     paged_source: ?*integrity.PagedSource = null,
+    /// An enclosing authenticated manifest attests navigation, and the source
+    /// independently authenticates every immutable range (for example SHA-256
+    /// lake packs). Whole-section CRC scans would defeat selective access.
+    authenticated_source: bool = false,
     owns_source: bool = true,
     owns_fields: bool = true,
 
@@ -7060,7 +7333,7 @@ pub const RangeSegmentReader = struct {
     pub fn readSectionInto(self: *const RangeSegmentReader, field_name: []const u8, kind: SectionType, offset: u64, out: []u8, checksum_scratch: []u8) !bool {
         const entry = self.findSection(field_name, kind) orelse return false;
         if (offset > entry.length or out.len > entry.length - offset) return error.EndOfStream;
-        if (self.paged_source != null) {
+        if (self.paged_source != null or self.authenticated_source) {
             try self.source.readInto(entry.offset + offset, out);
             return true;
         }
@@ -7084,7 +7357,7 @@ pub const RangeSegmentReader = struct {
     pub fn sectionView(self: *const RangeSegmentReader, field_name: []const u8, kind: SectionType) !?@import("segment_source.zig").View {
         const entry = self.findSection(field_name, kind) orelse return null;
         if (entry.length == 0) return null;
-        if (self.paged_source == null) {
+        if (self.paged_source == null and !self.authenticated_source) {
             var buffer: [8192]u8 = undefined;
             _ = try self.readSectionInto(field_name, kind, 0, &.{}, &buffer);
         }
@@ -11833,4 +12106,128 @@ test "segment.typed merge estimate reuses validated indexed navigation" {
     std.debug.print("LITE_TYPED_ESTIMATE chunks={d} logical_range_reads={d} read_bytes={d} estimate={d}\n", .{ navigation.reader.num_chunks, counter.reads, counter.read_bytes, estimate });
     try std.testing.expectEqual(@as(usize, 0), counter.reads);
     try std.testing.expectEqual(@as(u64, 40012), estimate);
+}
+
+test "external lake authenticated native admission avoids ranges validates metadata and unwinds OOM" {
+    const a = std.testing.allocator;
+    var writer = SegmentWriter.init(a);
+    defer writer.deinit();
+    try writer.addStoredDoc("one", "{\"body\":\"alpha\"}");
+    try writer.addStoredDoc("two", "{\"body\":\"alpha beta\"}");
+    var text = inverted.InvertedIndexBuilder.init(a, .{});
+    defer text.deinit();
+    try text.addDocument(0, &.{.{ .term = "alpha", .freq = 1, .positions = &.{0} }});
+    try text.addDocument(1, &.{ .{ .term = "alpha", .freq = 1, .positions = &.{0} }, .{ .term = "beta", .freq = 1, .positions = &.{1} } });
+    const section = try text.build();
+    defer a.free(section);
+    try writer.addSection(try writer.addField("body"), .inverted_text, section);
+    const bytes = try writer.build();
+    defer a.free(bytes);
+    var reference = try SegmentReader.init(a, bytes);
+    defer reference.deinit();
+    const metadata = try reference.admission(a);
+    defer metadata.deinit(a);
+    const Source = struct {
+        bytes: []const u8,
+        reads: usize = 0,
+        denied: bool = true,
+        fn read(raw: *anyopaque, offset: u64, output: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.reads += 1;
+            if (self.denied) return error.TestReadDenied;
+            @memcpy(output, self.bytes[@intCast(offset)..][0..output.len]);
+        }
+        fn close(_: *anyopaque) void {}
+        fn source(self: *@This()) SegmentSource {
+            return .{ .ranges = .{ .ptr = self, .length = self.bytes.len, .read_into = read, .close = close } };
+        }
+    };
+    var source: Source = .{ .bytes = bytes };
+    var admitted = try SegmentReader.initAuthenticated(a, source.source(), metadata);
+    defer admitted.deinit();
+    try std.testing.expectEqual(@as(usize, 0), source.reads);
+    try std.testing.expectEqualDeep(try reference.invertedFieldStats("body"), try admitted.invertedFieldStats("body"));
+    try std.testing.expectEqual(@as(usize, 0), source.reads);
+    try std.testing.expectError(error.TestReadDenied, admitted.storedDoc(0));
+    source.denied = false;
+    try std.testing.expectEqualStrings("one", (try admitted.storedDoc(0)).?.id);
+    try std.testing.expectEqualDeep(reference.layoutStats(), admitted.layoutStats());
+    const Sweep = struct {
+        fn run(allocator: Allocator, input: SegmentSource, descriptor: SegmentReader.Admission) !void {
+            var reader = try SegmentReader.initAuthenticated(allocator, input, descriptor);
+            defer reader.deinit();
+        }
+        fn capture(allocator: Allocator, reader: *const SegmentReader) !void {
+            const descriptor = try reader.admission(allocator);
+            defer descriptor.deinit(allocator);
+        }
+    };
+    source.denied = true;
+    const before = source.reads;
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Sweep.run, .{ source.source(), metadata });
+    try std.testing.expectEqual(before, source.reads);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Sweep.capture, .{&reference});
+    var invalid = metadata;
+    invalid.doc_count += 1;
+    try std.testing.expectError(error.InvalidSegment, SegmentReader.initAuthenticated(a, source.source(), invalid));
+    invalid = metadata;
+    invalid.bytes += 1;
+    try std.testing.expectError(error.InvalidSegment, SegmentReader.initAuthenticated(a, source.source(), invalid));
+}
+
+test "external lake compact routing readers unwind allocation failures and preserve scoring totals" {
+    const Sweep = struct {
+        fn load(_: Allocator, _: SegmentSource) !SegmentReader {
+            return error.InvalidSegment;
+        }
+        fn run(a: Allocator) !void {
+            var reader = try SegmentReader.initRouting(a, 4, &.{
+                .{ .name = "body", .stats = .{ .doc_count = 4, .total_field_len = 12 }, .section_mask = 1 },
+                .{ .name = "id", .stats = null },
+            }, load);
+            defer reader.deinit();
+            try std.testing.expectEqual(@as(u64, 12), (try reader.invertedFieldStats("body")).?.total_field_len);
+            try std.testing.expectEqual(null, try reader.invertedFieldStats("id"));
+            try std.testing.expect(reader.nativeNavigationBytes() > 0);
+            try std.testing.expectError(error.InvalidSegment, reader.bindSource(a, .{ .contiguous = &.{} }));
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Sweep.run, .{});
+}
+
+test "external lake lazy routing binds physical field order by identity" {
+    const a = std.testing.allocator;
+    var writer = SegmentWriter.init(a);
+    defer writer.deinit();
+    try writer.addStoredDoc("one", "{\"z_body\":\"alpha\"}");
+    var text = inverted.InvertedIndexBuilder.init(a, .{});
+    defer text.deinit();
+    try text.addDocument(0, &.{.{ .term = "alpha", .freq = 1, .positions = &.{0} }});
+    const section = try text.build();
+    defer a.free(section);
+    try writer.addSection(try writer.addField("z_body"), .inverted_text, section);
+    _ = try writer.addField("a_key");
+    const bytes = try writer.build();
+    defer a.free(bytes);
+    const route = [_]SegmentReader.RoutingField{
+        .{ .name = "a_key", .stats = null },
+        .{ .name = "z_body", .stats = .{ .doc_count = 1, .total_field_len = 1 }, .section_mask = @as(u16, 1) << @backingInt(SectionType.inverted_text) },
+    };
+    var lazy = try SegmentReader.initRouting(a, 1, &route, SegmentReader.initSource);
+    defer lazy.deinit();
+    var bound = try lazy.bindSource(a, .{ .contiguous = bytes });
+    defer bound.deinit();
+    try std.testing.expectEqualStrings("one", (try bound.storedDoc(0)).?.id);
+    try std.testing.expect(bound.hasSection("z_body", .inverted_text));
+    // Order tolerance must not weaken the advertised stats/name contract.
+    var wrong_stats = route;
+    wrong_stats[1].stats.?.total_field_len = 2;
+    var corrupt = try SegmentReader.initRouting(a, 1, &wrong_stats, SegmentReader.initSource);
+    defer corrupt.deinit();
+    try std.testing.expectError(error.InvalidSegment, corrupt.bindSource(a, .{ .contiguous = bytes }));
+    var wrong_name = route;
+    wrong_name[0].name = "absent";
+    var missing = try SegmentReader.initRouting(a, 1, &wrong_name, SegmentReader.initSource);
+    defer missing.deinit();
+    try std.testing.expectError(error.InvalidSegment, missing.bindSource(a, .{ .contiguous = bytes }));
 }

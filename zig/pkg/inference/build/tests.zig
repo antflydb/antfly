@@ -50,7 +50,6 @@ pub fn create(ctx: Context) Suite {
     tests.root_module.addImport("build_info", ctx.graph.build_info_mod);
     tests.root_module.addImport("antfly_decisions", ctx.graph.inference_mod.import_table.get("antfly_decisions").?);
     ctx.graph.identities.addImports(tests.root_module);
-    runtime_build.applyCBindings(tests.root_module, ctx.graph.c_bindings);
     tests.root_module.addImport("build_options", ctx.graph.qualification_build_options_mod);
     tests.root_module.addImport("antfly-json", ctx.graph.json_mod);
     tests.root_module.addImport("httpx", ctx.graph.httpx_mod);
@@ -105,7 +104,6 @@ pub fn create(ctx: Context) Suite {
         runtime_build.configureSystemBlas(b, tests.root_module, ctx.target, ctx.backend.blas_root);
     }
     runtime_build.configureMetal(b, tests.root_module, ctx.target, ctx.backend.enable_metal, ctx.paths);
-    runtime_build.configureOnnxRuntime(b, tests.root_module, ctx.backend.enable_onnx, ctx.backend.onnx_root);
     tests.root_module.link_libc = ctx.backend.link_libc;
 
     // Keep the standalone server's CLI and configuration parsing covered too.

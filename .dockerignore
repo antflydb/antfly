@@ -26,7 +26,6 @@ metadatadb
 
 # ML models and native libraries (not needed for pure-Go build)
 models/
-onnxruntime/
 pjrt/
 examples/
 

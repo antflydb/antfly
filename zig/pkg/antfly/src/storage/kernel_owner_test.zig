@@ -1966,7 +1966,9 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     after_cancel.deinit();
 
     try std.testing.expectError(error.InvalidArgument, owner.queryJson("articles", query_json));
-    try std.testing.expectError(error.InvalidQueryRequest, owner.queryJson("docs", "{"));
+    for ([_][]const u8{ "{", "{\"query_json\":\"{\"}" }) |invalid_json| {
+        try std.testing.expectError(error.InvalidQueryRequest, owner.queryJson("docs", invalid_json));
+    }
 
     // The nested distributed -> storage-owner -> local-query path must retain
     // both the semantic status and its originating stage, not merely rethrow a

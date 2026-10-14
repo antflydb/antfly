@@ -60,7 +60,10 @@ pub const Filter = struct {
     /// Borrow an existing immutable cache or own a newly prepared one. Syntax
     /// stays borrowed; callers release only a cache they created themselves.
     pub fn prepare(self: Filter, alloc: Allocator) !Filter {
-        if (!self.active() or self.prepared != null) return self;
+        return self.prepareImpl(alloc, false);
+    }
+    fn prepareImpl(self: Filter, alloc: Allocator, routing: bool) !Filter {
+        if (!routing and (!self.active() or self.prepared != null)) return self;
         try self.validate(alloc);
         const prepared = try alloc.create(Prepared);
         errdefer alloc.destroy(prepared);
@@ -85,6 +88,16 @@ pub const Filter = struct {
             .lower = try internPath(a, &nodes, &prepared.slot_count, &.{"created_at"}, true),
             .upper = try internPath(a, &nodes, &prepared.slot_count, &.{"expired_at"}, true),
         };
+        if (routing) {
+            inline for (.{ .{ "source_table", RoutingKind.source }, .{ "target_table", RoutingKind.target } }) |entry| {
+                const existing = try nodes.items[0].children.getOrPut(a, entry[0]);
+                if (!existing.found_existing) {
+                    existing.value_ptr.* = nodes.items.len;
+                    try nodes.append(a, .{});
+                }
+                nodes.items[existing.value_ptr.*].routing = entry[1];
+            }
+        }
         prepared.nodes = try nodes.toOwnedSlice(a);
         var result = self;
         result.prepared = prepared;
@@ -172,40 +185,112 @@ pub const Filter = struct {
         const prepared = filter.prepared.?;
         var scratch = std.heap.ArenaAllocator.init(alloc);
         defer scratch.deinit();
+        return filter.matchesPrepared(scratch.allocator(), edge, prepared);
+    }
+
+    fn matchesPrepared(self: Filter, alloc: Allocator, edge: anytype, prepared: *const Prepared) !bool {
         var values: [68]?std.json.Value = @splat(null);
         if (prepared.slot_count > 0) {
             const metadata = if (edge.metadata.len > 0) edge.metadata else "{}";
-            projectMetadata(scratch.allocator(), metadata, prepared, &values) catch |err|
+            projectMetadata(alloc, metadata, prepared, &values, null) catch |err|
                 return if (err == error.OutOfMemory) err else false;
         }
+        return self.matchesValues(edge, prepared, &values);
+    }
+    fn matchesIntrinsic(_: Filter, edge: anytype, prepared: *const Prepared) !bool {
+        for (prepared.properties) |p| {
+            if (p.metadata_slot != null) continue;
+            var timestamp_buffer: [32]u8 = undefined;
+            if (!predicateMatches(p, try edgeValue(edge, p.syntax.field, &timestamp_buffer))) return false;
+        }
+        return true;
+    }
+    fn matchesValues(self: Filter, edge: anytype, prepared: *const Prepared, values: *const [68]?std.json.Value) !bool {
         if (prepared.valid_interval) |interval| if (!intervalContainsValues(values[interval.lower], values[interval.upper], self.valid_at_ns.?, false)) return false;
         if (prepared.known_interval) |interval| if (!intervalContainsValues(values[interval.lower], values[interval.upper], self.known_at_ns.?, true)) return false;
         for (prepared.properties) |p| {
             var timestamp_buffer: [32]u8 = undefined;
             const actual = if (p.metadata_slot) |slot| values[slot] else try edgeValue(edge, p.syntax.field, &timestamp_buffer);
-            const nullish = actual == null or actual.? == .null;
-            if (p.syntax.op == .is_null) {
-                if (!nullish) return false;
-                continue;
-            }
-            if (p.syntax.op == .is_not_null) {
-                if (nullish) return false;
-                continue;
-            }
-            if (nullish) return false;
-            const order = comparePrepared(actual.?, p) orelse return false;
-            const passes = switch (p.syntax.op) {
-                .eq => order == .eq,
-                .ne => order != .eq,
-                .lt => order == .lt,
-                .lte => order != .gt,
-                .gt => order == .gt,
-                .gte => order != .lt,
-                else => unreachable,
-            };
-            if (!passes) return false;
+            if (!predicateMatches(p, actual)) return false;
         }
         return true;
+    }
+};
+
+/// Query-owned predicate preparation and metadata arena. Keep this object at
+/// a stable address: its allocator accounts both cached syntax and scratch.
+pub const EvaluationScratch = struct {
+    tracked: work_budget.RetainedAllocator,
+    arena: ?std.heap.ArenaAllocator = null,
+    source: ?Filter = null,
+    filter: ?Filter = null,
+    owns_prepared: bool = false,
+    routing: bool = false,
+
+    pub fn deinit(self: *@This()) void {
+        if (self.arena) |*arena| arena.deinit();
+        if (self.owns_prepared) self.filter.?.releasePrepared(self.tracked.allocator());
+        std.debug.assert(self.tracked.live_bytes == 0);
+        self.* = undefined;
+    }
+    pub fn matches(self: *@This(), filter: Filter, edge: anytype) !bool {
+        self.tracked.denied = false;
+        return self.matchesOwned(filter, edge) catch |err| return if (err == error.OutOfMemory and self.tracked.denied) error.GraphWorkBudgetExceeded else err;
+    }
+    fn ensure(self: *@This(), input: Filter, routing: bool) !void {
+        const same = if (self.source) |source| source.properties.ptr == input.properties.ptr and source.properties.len == input.properties.len and source.valid_at_ns == input.valid_at_ns and source.known_at_ns == input.known_at_ns and source.prepared == input.prepared and (!routing or self.routing) else false;
+        if (!same) {
+            if (self.owns_prepared) self.filter.?.releasePrepared(self.tracked.allocator());
+            self.filter = null;
+            self.source = null;
+            self.owns_prepared = false;
+            self.filter = try input.prepareImpl(self.tracked.allocator(), routing);
+            self.source = input;
+            self.owns_prepared = routing or input.prepared == null;
+            self.routing = routing;
+        }
+        if (self.arena == null) self.arena = std.heap.ArenaAllocator.init(self.tracked.allocator());
+    }
+    fn reset(self: *@This()) void {
+        if (self.arena) |*arena| {
+            if (!arena.reset(.{ .retain_with_limit = 64 * 1024 })) _ = arena.reset(.free_all);
+        }
+    }
+    fn matchesOwned(self: *@This(), input: Filter, edge: anytype) !bool {
+        if (!input.active()) return true;
+        try self.ensure(input, false);
+        defer self.reset();
+        return self.filter.?.matchesPrepared(self.arena.?.allocator(), edge, self.filter.?.prepared.?);
+    }
+    /// Project predicate values and both routing tags in one validated scan.
+    /// Escaped routing names move into step-owned scratch before reset.
+    pub fn evaluateWithTables(self: *@This(), input: Filter, edge: anytype, tables: anytype) !Evaluation {
+        self.tracked.denied = false;
+        return self.evaluateOwned(input, edge, tables) catch |err| return if (err == error.OutOfMemory and self.tracked.denied) error.GraphWorkBudgetExceeded else err;
+    }
+    fn evaluateOwned(self: *@This(), input: Filter, edge: anytype, tables: anytype) !Evaluation {
+        if (edge.metadata.len == 0 or std.mem.eql(u8, edge.metadata, "{}")) return .{ .matched = try self.matchesOwned(input, edge) };
+        // Preserve cheap intrinsic rejection before any routing projection.
+        for (input.properties) |predicate| {
+            if (std.mem.startsWith(u8, predicate.field, "/metadata/")) continue;
+            try self.ensure(input, false);
+            if (!try self.filter.?.matchesIntrinsic(edge, self.filter.?.prepared.?)) return .{ .matched = false };
+            break;
+        }
+        try self.ensure(input, true);
+        defer self.reset();
+        const prepared = self.filter.?.prepared.?;
+        var values: [68]?std.json.Value = @splat(null);
+        var routes = RoutingCapture{};
+        projectMetadata(self.arena.?.allocator(), edge.metadata, prepared, &values, &routes) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            if (prepared.slot_count != 0) return .{ .matched = false };
+            // Intrinsic predicates do not depend on malformed metadata. Invalid
+            // routing syntax loses authority exactly as the legacy decoder did.
+            routes = .{};
+        };
+        if (!try self.filter.?.matchesValues(edge, prepared, &values)) return .{ .matched = false };
+        return .{ .matched = true, .source_table = try routes.materialize(.source, tables), .target_table = try routes.materialize(.target, tables) };
     }
 };
 
@@ -240,6 +325,23 @@ fn edgeValue(edge: anytype, field: []const u8, timestamp_buffer: *[32]u8) !?std.
     if (std.mem.eql(u8, field, "/created_at")) return .{ .number_string = try std.fmt.bufPrint(timestamp_buffer, "{d}", .{edge.created_at}) };
     if (std.mem.eql(u8, field, "/updated_at")) return .{ .number_string = try std.fmt.bufPrint(timestamp_buffer, "{d}", .{edge.updated_at}) };
     return null;
+}
+
+fn predicateMatches(predicate: PreparedPredicate, actual: ?std.json.Value) bool {
+    const nullish = actual == null or actual.? == .null;
+    if (predicate.syntax.op == .is_null) return nullish;
+    if (predicate.syntax.op == .is_not_null) return !nullish;
+    if (nullish) return false;
+    const order = comparePrepared(actual.?, predicate) orelse return false;
+    return switch (predicate.syntax.op) {
+        .eq => order == .eq,
+        .ne => order != .eq,
+        .lt => order == .lt,
+        .lte => order != .gt,
+        .gt => order == .gt,
+        .gte => order != .lt,
+        else => unreachable,
+    };
 }
 
 fn comparePrepared(actual: std.json.Value, predicate: PreparedPredicate) ?std.math.Order {
@@ -301,10 +403,37 @@ fn decodePointer(alloc: Allocator, text: []const u8) ![]const []const u8 {
 }
 
 const IntervalSlots = struct { lower: usize, upper: usize };
+pub const Evaluation = struct { matched: bool, source_table: ?[]const u8 = null, target_table: ?[]const u8 = null };
+const RoutingKind = enum { source, target };
+const RoutingCapture = struct {
+    const Value = struct { text: []const u8, borrowed: bool };
+    seen: [2]bool = @splat(false),
+    values: [2]?Value = @splat(null),
+    fn first(self: *@This(), kind: RoutingKind) bool {
+        const i = @backingInt(kind);
+        if (self.seen[i]) {
+            self.values[i] = null;
+            return false;
+        }
+        self.seen[i] = true;
+        return true;
+    }
+    fn capture(self: *@This(), kind: RoutingKind, text: []const u8, borrowed: bool) void {
+        if (text.len == 0) return;
+        for (text) |byte| if (std.ascii.isControl(byte)) return;
+        self.values[@backingInt(kind)] = .{ .text = text, .borrowed = borrowed };
+    }
+    fn materialize(self: *@This(), kind: RoutingKind, tables: anytype) !?[]const u8 {
+        const value = self.values[@backingInt(kind)] orelse return null;
+        return if (value.borrowed) value.text else try tables.retain(value.text);
+    }
+};
+
 const ProjectionNode = struct {
     children: std.StringHashMapUnmanaged(usize) = .empty,
     slot: ?usize = null,
     needs_value: bool = false,
+    routing: ?RoutingKind = null,
 };
 
 fn internPath(alloc: Allocator, nodes: *std.ArrayListUnmanaged(ProjectionNode), slots: *usize, path: []const []const u8, needs_value: bool) !usize {
@@ -328,35 +457,43 @@ fn internPath(alloc: Allocator, nodes: *std.ArrayListUnmanaged(ProjectionNode), 
 /// One scan projects every selected scalar. Unrelated containers are skipped,
 /// never materialized. Every selected pointer node can appear only once;
 /// duplicate keys along a selected path fail closed as ambiguous.
-fn projectMetadata(alloc: Allocator, raw: []const u8, prepared: *const Prepared, values: *[68]?std.json.Value) !void {
+fn projectMetadata(alloc: Allocator, raw: []const u8, prepared: *const Prepared, values: *[68]?std.json.Value, routes: ?*RoutingCapture) !void {
     var scanner = std.json.Scanner.initCompleteInput(alloc, raw);
     defer scanner.deinit();
     if ((prepared.valid_interval != null or prepared.known_interval != null) and try scanner.peekNextTokenType() != .object_begin) return error.InvalidRelationshipFilter;
     const seen = try alloc.alloc(bool, prepared.nodes.len);
     @memset(seen, false);
-    try projectNode(alloc, &scanner, prepared.nodes, 0, values, seen, raw.len);
+    try projectNode(alloc, &scanner, prepared.nodes, 0, values, seen, raw.len, routes);
     if (try scanner.next() != .end_of_document) return error.InvalidRelationshipFilter;
 }
 
-fn projectNode(alloc: Allocator, scanner: *std.json.Scanner, nodes: []const ProjectionNode, index: usize, values: *[68]?std.json.Value, seen: []bool, max_value_len: usize) anyerror!void {
-    if (seen[index]) return error.DuplicateField;
-    seen[index] = true;
+fn projectNode(alloc: Allocator, scanner: *std.json.Scanner, nodes: []const ProjectionNode, index: usize, values: *[68]?std.json.Value, seen: []bool, max_value_len: usize, routes: ?*RoutingCapture) anyerror!void {
     const node = nodes[index];
+    if (seen[index] and (node.slot != null or node.children.count() != 0)) return error.DuplicateField;
+    seen[index] = true;
     const kind = try scanner.peekNextTokenType();
+    const want_route = if (node.routing) |tag| if (routes) |capture| capture.first(tag) and kind == .string else false else false;
     if (kind != .object_begin and kind != .array_begin) {
-        if (node.slot != null and !node.needs_value) {
+        if (node.slot != null and !node.needs_value and !want_route) {
             values[node.slot.?] = if (kind == .null) .null else .{ .bool = true };
             try scanner.skipValue();
             return;
         }
-        if (node.slot) |slot| values[slot] = switch (try scanner.nextAllocMax(alloc, .alloc_if_needed, max_value_len)) {
+        if (node.slot == null and !want_route) return scanner.skipValue();
+        const token = try scanner.nextAllocMax(alloc, .alloc_if_needed, max_value_len);
+        if (want_route) switch (token) {
+            .string => |text| routes.?.capture(node.routing.?, text, true),
+            .allocated_string => |text| routes.?.capture(node.routing.?, text, false),
+            else => unreachable,
+        };
+        if (node.slot) |slot| values[slot] = switch (token) {
             .string, .allocated_string => |v| .{ .string = v },
             .number, .allocated_number => |v| .{ .number_string = v },
             .true => .{ .bool = true },
             .false => .{ .bool = false },
             .null => .null,
             else => return error.InvalidRelationshipFilter,
-        } else try scanner.skipValue();
+        };
         return;
     }
     if (node.slot) |slot| values[slot] = if (kind == .object_begin) .{ .object = .empty } else .{ .array = std.json.Array.init(alloc) };
@@ -370,14 +507,14 @@ fn projectNode(alloc: Allocator, scanner: *std.json.Scanner, nodes: []const Proj
                 else => return error.InvalidRelationshipFilter,
             };
             defer if (token == .allocated_string) alloc.free(token.allocated_string);
-            if (node.children.get(key)) |child| try projectNode(alloc, scanner, nodes, child, values, seen, max_value_len) else try scanner.skipValue();
+            if (node.children.get(key)) |child| try projectNode(alloc, scanner, nodes, child, values, seen, max_value_len, routes) else try scanner.skipValue();
         }
     } else {
         var ordinal: usize = 0;
         while (try scanner.peekNextTokenType() != .array_end) : (ordinal += 1) {
             var buffer: [32]u8 = undefined;
             const key = try std.fmt.bufPrint(&buffer, "{d}", .{ordinal});
-            if (node.children.get(key)) |child| try projectNode(alloc, scanner, nodes, child, values, seen, max_value_len) else try scanner.skipValue();
+            if (node.children.get(key)) |child| try projectNode(alloc, scanner, nodes, child, values, seen, max_value_len, routes) else try scanner.skipValue();
         }
     }
     _ = try scanner.next();

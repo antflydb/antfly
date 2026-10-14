@@ -190,6 +190,10 @@ pub const identity_ordinal_state_kind: u8 = 0x03;
 pub const identity_canonical_to_ordinal_kind: u8 = 0x04;
 pub const identity_visibility_chunk_kind: u8 = 0x05;
 pub const identity_visibility_deleted_chunk_kind: u8 = 0x06;
+pub const identity_live_doc_to_ordinal_kind: u8 = 0x07;
+/// Format admission for the atomically maintained current-live identity directory.
+pub const identity_live_directory_manifest_key = [_]u8{ identity_namespace, 0xff, 0x04 };
+pub const identity_live_directory_manifest_value = "ALD1";
 pub const identity_namespace_key = [_]u8{ identity_namespace, 0xff, 0x00 };
 pub const identity_next_ordinal_key = [_]u8{ identity_namespace, 0xff, 0x01 };
 pub const identity_visibility_summary_key = [_]u8{ identity_namespace, 0xff, 0x02 };
@@ -2658,6 +2662,13 @@ pub fn identityDocToOrdinalKeyAlloc(alloc: Allocator, doc_id: []const u8) ![]u8 
     key[0] = identity_namespace;
     key[1] = identity_doc_to_ordinal_kind;
     _ = encodeComponent(key[2..], doc_id);
+    return key;
+}
+
+/// Ordered current-live population; historical mappings remain independent.
+pub fn identityLiveDocToOrdinalKeyAlloc(alloc: Allocator, doc_id: []const u8) ![]u8 {
+    const key = try identityDocToOrdinalKeyAlloc(alloc, doc_id);
+    key[1] = identity_live_doc_to_ordinal_kind;
     return key;
 }
 

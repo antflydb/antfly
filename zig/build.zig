@@ -96,7 +96,6 @@ pub fn create(b: *std.Build) ?Artifacts {
     const sanitize_thread = shared.sanitize_thread;
     const runtime_artifact_role = shared.runtime_artifact_role;
     const antfly_bin_name = shared.antfly_bin_name;
-    const inference_enable_onnx = shared.inference_enable_onnx;
     const inference_enable_metal = shared.inference_enable_metal;
     const inference_enable_cuda = shared.inference_enable_cuda;
     const build_info = shared.build_info;
@@ -378,14 +377,14 @@ pub fn create(b: *std.Build) ?Artifacts {
         .root_module = matcher_mod,
     });
     const run_lib_matcher_tests = b.addRunArtifact(lib_matcher_tests);
-    const lib_matcher_test_step = b.step("lib-matcher-test", "Run standalone lib/matcher tests");
+    const lib_matcher_test_step = b.step("lib-matcher-test", "Run standalone pkg/antfly-embedded/matcher tests");
     lib_matcher_test_step.dependOn(&run_lib_matcher_tests.step);
 
     const lib_resolver_tests = b.addTest(.{
         .root_module = resolver_mod,
     });
     const run_lib_resolver_tests = b.addRunArtifact(lib_resolver_tests);
-    const lib_resolver_test_step = b.step("lib-resolver-test", "Run standalone lib/resolver tests");
+    const lib_resolver_test_step = b.step("lib-resolver-test", "Run standalone pkg/antfly-embedded/resolver tests");
     lib_resolver_test_step.dependOn(&run_lib_resolver_tests.step);
 
     const lib_toon_conformance = b.addExecutable(.{
@@ -563,12 +562,18 @@ pub fn create(b: *std.Build) ?Artifacts {
     });
     const run_lib_image_tests = image_tests.run_lib_image_tests;
     const run_png_tests = image_tests.run_png_tests;
+    const run_jpeg_tests = image_tests.run_jpeg_tests;
+    const run_webp_tests = image_tests.run_webp_tests;
     const run_jpeg2000_decode_tests = image_tests.run_jpeg2000_decode_tests;
+    b.step("lib-image-webp-test", "Run direct WebP decoder tests").dependOn(&run_webp_tests.step);
+    b.step("lib-image-jpeg-test", "Run direct JPEG decoder tests").dependOn(&run_jpeg_tests.step);
     b.step("lib-image-png-test", "Run PNG codec and checksum compatibility tests").dependOn(&run_png_tests.step);
     b.step("lib-image-jpeg2000-test", "Run direct JPEG 2000 decoder tests").dependOn(&run_jpeg2000_decode_tests.step);
     const image_test_step = b.step("lib-image-test", "Run shared image tests");
     image_test_step.dependOn(&run_lib_image_tests.step);
     image_test_step.dependOn(&run_png_tests.step);
+    image_test_step.dependOn(&run_jpeg_tests.step);
+    image_test_step.dependOn(&run_webp_tests.step);
     image_test_step.dependOn(&run_jpeg2000_decode_tests.step);
 
     const pdf_tests = pdf_build.addTests(b, .{
@@ -603,6 +608,20 @@ pub fn create(b: *std.Build) ?Artifacts {
         .spng_paths = lib_image_spng_paths,
     });
     b.step("lib-image-bench", "Build and install lib-image-bench").dependOn(&b.addInstallArtifact(image_benchmark, .{}).step);
+    const webp_bench_mod = b.createModule(.{
+        .root_source_file = b.path("lib/image/src/webp_bench.zig"),
+        .target = target,
+        .optimize = .fast,
+        .link_libc = true,
+    });
+    const webp_codec_mod = b.createModule(.{
+        .root_source_file = b.path("lib/image/src/webp.zig"),
+        .target = target,
+        .optimize = .fast,
+    });
+    webp_bench_mod.addImport("antfly_webp", webp_codec_mod);
+    const webp_bench = b.addExecutable(.{ .name = "lib-image-webp-bench", .root_module = webp_bench_mod });
+    b.step("lib-image-webp-bench", "Build the bounded WebP decode batch benchmark").dependOn(&b.addInstallArtifact(webp_bench, .{}).step);
 
     const pdf_bench_optimize = b.option(std.lang.Optimize, "pdf-optimize", "Optimization for the isolated PDF executable") orelse .fast;
     const pdf_bench_hash = if (pdf_bench_optimize == .fast) hash_bench_mod else if (pdf_bench_optimize == optimize) hash_mod else b.createModule(.{
@@ -739,6 +758,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     lib_test_step.dependOn(&run_lib_embeddings_tests.step);
     lib_test_step.dependOn(&run_lib_vectorindex_tests.step);
     lib_test_step.dependOn(&run_lib_hash_tests.step);
+    lib_test_step.dependOn(&run_lib_resolver_tests.step);
     lib_test_step.dependOn(&run_vector_cancellation_tests.step);
     lib_test_step.dependOn(&run_lib_chunking_tests.step);
     lib_test_step.dependOn(&run_lib_google_tests.step);
@@ -857,7 +877,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .strip = strip,
         .link_libc = link_libc,
         .sanitize_thread = sanitize_thread,
-        .cpu_inference = !inference_enable_cuda and !inference_enable_metal and !inference_enable_onnx,
+        .cpu_inference = !inference_enable_cuda and !inference_enable_metal,
         .runtime_artifact_role = runtime_artifact_role,
         .structlog_mod = structlog_mod,
         .platform_mod = platform_mod,
@@ -865,6 +885,8 @@ pub fn create(b: *std.Build) ?Artifacts {
         .production_antfly_imports = production_antfly_imports,
         .antfly_client_pkg_mod = antfly_client_pkg_mod,
         .capi_mod = capi_mod,
+        .native_enrichment = embedded.native_enrichment,
+        .native_inference = embedded.native_inference,
     });
     b.step("linked-inference-abi-integration-test", "Run the production-linked inference function-table and binary-payload ABI probe").dependOn(&runtime.run_linked_inference_abi_integration.step);
     owner_tests.standalone_runtime_test_step.dependOn(&runtime.run_linked_inference_abi_integration.step);
@@ -1020,6 +1042,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const lite_main = b.addExecutable(.{
         .name = "antfly-lite",
         .root_module = lite_main_mod,
+        .use_llvm = @import("build_support/embedded/shared_library.zig").llvmBackend(target.result),
     });
     lite_main_mod.linkLibrary(embedded.native_inference);
     lite_main_mod.linkLibrary(embedded.native_enrichment);

@@ -18,7 +18,7 @@ import { fileURLToPath } from "node:url";
 import { instantiateAntflyInferenceWasm } from "./test-wasm-runtime.mjs";
 
 const memoryModel = process.argv[2] ?? "wasm32";
-const runtime = await instantiateAntflyInferenceWasm(fileURLToPath(new URL("../", import.meta.url)), { memoryModel });
+const runtime = await instantiateAntflyInferenceWasm(process.argv[3] ?? fileURLToPath(new URL("../", import.meta.url)), { memoryModel });
 const bytes = new Uint8Array([0, 1, 127, 128, 255]);
 const ptr = runtime.alloc(bytes.byteLength);
 runtime.bytesIn(ptr, bytes);

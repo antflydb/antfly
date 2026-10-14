@@ -372,6 +372,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "api http server requires auth for ARD tenant catalog when auth is enabled",
         "api http server serves ARD OpenAPI, skill, resource, and registry endpoints",
         "api http server filters extension mcp tools by trusted principal table permissions",
+        "api http server serves document lookup through mcp tool",
         "ARD search filters scoped catalog entries",
         "ARD search requires text while explore accepts filter-only requests",
         "ARD search supports publisher and metadata filters",
@@ -420,6 +421,21 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     run_lib_api_auth_tests.step.dependOn(&openapi_root_check.step);
     const lib_api_auth_test_step = b.step("antfly-api-auth-test", "Run focused API auth/usermgr HTTP tests");
     lib_api_auth_test_step.dependOn(&run_lib_api_auth_tests.step);
+
+    // The real MCP transport/database security regression does not need the
+    // monolithic library discovery root or its full-suite memory reservation.
+    const mcp_auth_filters = &.{"api http server serves document lookup through mcp tool"};
+    const mcp_auth_tests = b.addTest(.{
+        .name = "api-mcp-auth-tests",
+        .root_module = options.api_http_runtime_test_mod,
+        .filters = mcp_auth_filters,
+        .test_runner = .{
+            .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    b.step("antfly-api-mcp-auth-test", "Run real MCP trusted-principal authorization regressions")
+        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, mcp_auth_tests, mcp_auth_filters).step);
 
     const authorization_sink_filters = [_][]const u8{
         "api http server document scan requires table read permission",
@@ -670,6 +686,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "api session maintenance recovers crash window after durable 2pc commit",
             "api session maintenance skips live commit execution and acknowledgement",
             "session maintenance activation follows current range leadership without follower RPCs",
+            "api http server serves status using control metadata without diagnostic transfers",
             "transaction commit execution yields through caller io and preserves ownership on cancellation",
             "transaction session registry adopts durable session ownership",
             "transaction session registry only adopts durable sessions after lease expiry",

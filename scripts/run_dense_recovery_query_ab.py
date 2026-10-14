@@ -123,7 +123,6 @@ def main():
         any(
             mode in modes + args.common_refinement
             for mode in (
-                "subgroup_routing",
                 "global_subgroup_routing",
                 "compact_subgroup_routing",
                 "borrowed_pages",

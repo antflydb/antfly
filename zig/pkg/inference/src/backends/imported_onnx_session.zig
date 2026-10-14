@@ -148,7 +148,7 @@ const BackendContext = union(enum) {
 
     fn init(allocator: std.mem.Allocator, requested: BackendType, io: ?std.Io) !BackendContext {
         return switch (requested) {
-            .native, .onnx => blk: {
+            .native => blk: {
                 if (comptime !build_options.enable_native) return error.NativeNotEnabled;
                 const compute = try allocator.create(NativeCompute);
                 errdefer allocator.destroy(compute);
@@ -1620,7 +1620,7 @@ fn validateRuntimeShapeBackend(graph: *const Graph, backend_type: BackendType) !
 
     // Native and Metal execute imported Slice and its consumers using runtime
     // dimensions. Other graph backends still require static downstream shapes.
-    if (backend_type == .native or backend_type == .onnx or backend_type == .metal) return;
+    if (backend_type == .native or backend_type == .metal) return;
 
     for (graph.nodes.items, 0..) |node, node_id| {
         const attrs = switch (node.op) {
@@ -1649,7 +1649,6 @@ test "runtime-bound ONNX slices admit native and Metal imported graph backends" 
     });
 
     try validateRuntimeShapeBackend(&graph, .native);
-    try validateRuntimeShapeBackend(&graph, .onnx);
     try validateRuntimeShapeBackend(&graph, .metal);
     try std.testing.expectError(error.UnsupportedDynamicOnnxGraphBackend, validateRuntimeShapeBackend(&graph, .wasm));
 }
@@ -1666,7 +1665,6 @@ test "imported ConvTranspose selects only the native graph backend" {
     });
 
     try validateRuntimeShapeBackend(&graph, .native);
-    try std.testing.expectError(error.UnsupportedOnnxGraphBackendOperation, validateRuntimeShapeBackend(&graph, .onnx));
     try std.testing.expectError(error.UnsupportedOnnxGraphBackendOperation, validateRuntimeShapeBackend(&graph, .metal));
     try std.testing.expectError(error.UnsupportedOnnxGraphBackendOperation, validateRuntimeShapeBackend(&graph, .cuda));
     try std.testing.expectError(error.UnsupportedOnnxGraphBackendOperation, validateRuntimeShapeBackend(&graph, .wasm));

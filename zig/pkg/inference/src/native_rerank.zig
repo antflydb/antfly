@@ -304,7 +304,7 @@ fn jsonEncodeString(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocat
 
 fn printUsage() void {
     print(
-        \\usage: antfly inference rerank <model-dir> --query <query> --doc <document>... [--image <path>...] [--backend auto|onnx|native|metal|mlx|cuda]
+        \\usage: antfly inference rerank <model-dir> --query <query> --doc <document>... [--image <path>...] [--backend auto|native|metal|mlx|cuda]
         \\  Runs local reranking and prints JSON scores in document order.
         \\  Qwen3-VL accepts up to eight --image values with exactly one --doc; images are inserted before that document in argument order.
         \\  --qwen3vl-qualification-json <path> emits offline Qwen3-VL prompt/token/raw-logit evidence.

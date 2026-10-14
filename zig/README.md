@@ -78,9 +78,9 @@ currently live under `pkg/inference/`.
   macOS packaging workflow already uses a macOS 15 runner.
 - `uv` for Python e2e suites and repository helper scripts.
 - Optional native runtime dependencies for some inference features, such as
-  ONNX Runtime, FFmpeg, CUDA, or Metal. The build detects available local
-  support and exposes flags such as `-Dmetal=...`, `-Dcuda=...`, and
-  `-Donnx=...`.
+  FFmpeg, CUDA, or Metal. The build detects available local support and
+  exposes flags such as `-Dmetal=...` and `-Dcuda=...`. ONNX models run on
+  Antfly's own ONNX implementation and need no external runtime.
 
 The [0.17 release notes](https://ziglang.org/download/0.17.0/release-notes.html)
 also describe changes that can compile successfully while changing behavior:

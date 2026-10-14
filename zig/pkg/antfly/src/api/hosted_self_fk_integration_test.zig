@@ -1515,10 +1515,10 @@ fn mountedSelfFk(lost_replies: bool, restart_after_ack: bool, leader_transfer: b
             // active. The new metadata supervisor must select work from the
             // persisted ACK, not from the old process's volatile cursor; the
             // data owner must reopen its exact old-generation fence.
-            if (paused_data_fk_server) |server| {
-                http_server.ApiHttpServer.FkGenerationPublicationTestDriver.resumeBackground(server);
-                paused_data_fk_server = null;
-            }
+            // Keep both supervisors paused through teardown. Resuming either
+            // old process can advance the persisted ACK while the fixture is
+            // replacing its owner, defeating the exact crash-cut assertion.
+            paused_data_fk_server = null;
             deinitDriverIfLive(&meta_control, &meta_control_live);
             data_control.deinit();
             data_control_live = false;
@@ -1526,10 +1526,7 @@ fn mountedSelfFk(lost_replies: bool, restart_after_ack: bool, leader_transfer: b
             data_raft_live = false;
             data.deinit();
             data_live = false;
-            if (paused_metadata_fk_server) |server| {
-                http_server.ApiHttpServer.FkGenerationPublicationTestDriver.resumeBackground(server);
-                paused_metadata_fk_server = null;
-            }
+            paused_metadata_fk_server = null;
             meta_raft.deinit();
             meta_raft_live = false;
             metadata.deinit();
@@ -1545,11 +1542,12 @@ fn mountedSelfFk(lost_replies: bool, restart_after_ack: bool, leader_transfer: b
                 .api_server_cfg = .{ .trusted_principal_secret = trusted_secret, .trusted_principal_issuer = issuer, .internal_service_secret = internal_secret, .internal_service_issuer = issuer, .internal_service_auth_capability = "v1; mode=enforce" },
             });
             metadata_live = true;
-            try metadata.start();
-            try metadata.bootstrapLocal(2297, 1);
             const new_meta_api = metadata.server.owned_public_http_server orelse return error.PublicationSupervisorUnavailable;
             try http_server.ApiHttpServer.FkGenerationPublicationTestDriver.pauseBackground(new_meta_api, io);
             paused_metadata_fk_server = new_meta_api;
+            // Pause before startup can schedule the recovered durable plan.
+            try metadata.start();
+            try metadata.bootstrapLocal(2297, 1);
             meta_raft = raft.ManagedProgressDriver.init(io, .{ .ptr = &metadata, .run_once = metadataRaft }, raft.RuntimeCadence.default_raft_tick_ms * std.time.ns_per_ms);
             meta_raft_live = true;
             try meta_raft.start();
@@ -1572,10 +1570,11 @@ fn mountedSelfFk(lost_replies: bool, restart_after_ack: bool, leader_transfer: b
                 .api_server_cfg = .{ .deployment_mode = .distributed, .trusted_principal_secret = trusted_secret, .trusted_principal_issuer = issuer, .internal_service_secret = internal_secret, .internal_service_issuer = issuer, .internal_service_auth_capability = "v1; mode=enforce" },
             }, metadata_uri);
             data_live = true;
-            try data.start();
+            try data.initApiServer();
             const new_data_api = if (data.http_server) |*api| api else return error.PublicationSupervisorUnavailable;
             try http_server.ApiHttpServer.FkGenerationPublicationTestDriver.pauseBackground(new_data_api, io);
             paused_data_fk_server = new_data_api;
+            try data.start();
             try awaitStoreRegistration(io, &data);
             data_raft = raft.ManagedProgressDriver.init(io, .{ .ptr = &data, .run_once = dataRaft }, raft.RuntimeCadence.default_raft_tick_ms * std.time.ns_per_ms);
             data_raft_live = true;
@@ -1593,7 +1592,18 @@ fn mountedSelfFk(lost_replies: bool, restart_after_ack: bool, leader_transfer: b
     defer added.deinit(alloc);
     try std.testing.expect(try hasSelfFk(alloc, added));
     if (restart_after_ack) try awaitRecoveredOwnerReady(alloc, io, &metadata, &data, table_id, &.{ &meta_raft, &meta_control, &data_raft, &data_control });
-    try awaitConstraintCoverage(alloc, io, transport, &headers, base, &.{ &meta_raft, &meta_control, &data_raft, &data_control });
+    awaitConstraintCoverage(alloc, io, transport, &headers, base, &.{ &meta_raft, &meta_control, &data_raft, &data_control }) catch |err| {
+        if (leader_transfer) {
+            const current = try tableGroup(alloc, &metadata, table_id);
+            defer alloc.free(current.name);
+            for (peers) |peer| if (peer) |active| {
+                try active.raft_driver.checkFailure();
+                try active.control_driver.checkFailure();
+            };
+            printBuilderRouteState(alloc, transport, &metadata, &data, .{ peers[0].?, peers[1].? }, current.name, current.group_id);
+        }
+        return err;
+    };
     if (lost_replies) {
         var absent = try request(alloc, transport, &headers, base, "/db/v1/tables/nodes/documents/during-fence", .GET, null);
         defer absent.deinit(alloc);
@@ -1717,7 +1727,16 @@ fn mountedSelfFk(lost_replies: bool, restart_after_ack: bool, leader_transfer: b
     // Readiness is a distributed, epoch-fenced coverage fact, not merely a
     // successful point read. Wait only on the read-only public status route;
     // an unavailable write must never be replayed to probe activation.
-    try awaitConstraintCoverage(alloc, io, transport, &headers, restarted_base, &.{ &meta_raft, &meta_control, &data_raft, &data_control });
+    awaitConstraintCoverage(alloc, io, transport, &headers, restarted_base, &.{ &meta_raft, &meta_control, &data_raft, &data_control }) catch |err| {
+        if (leader_transfer) {
+            for (peers) |peer| if (peer) |active| {
+                try active.raft_driver.checkFailure();
+                try active.control_driver.checkFailure();
+            };
+            printBuilderRouteState(alloc, transport, &metadata, &data, .{ peers[0].?, peers[1].? }, restarted_physical.name, restarted_physical.group_id);
+        }
+        return err;
+    };
     if (leader_transfer) {
         // The restarted endpoint may forward the final write to either
         // voter. Verify every current owner can serve a linearizable read

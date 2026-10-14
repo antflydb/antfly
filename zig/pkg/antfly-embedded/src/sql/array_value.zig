@@ -317,7 +317,8 @@ fn validateElement(kind: ElementType, element: Element, budget: *Budget) !void {
         .text => {
             if (value != .string) return error.SqlTypeMismatch;
             try budget.consume(value.string.len);
-            if (!std.unicode.utf8ValidateSlice(value.string) or std.mem.indexOfScalar(u8, value.string, 0) != null) return error.SqlTypeMismatch;
+            if (!std.unicode.utf8ValidateSlice(value.string)) return error.SqlInvalidTextEncoding;
+            if (std.mem.indexOfScalar(u8, value.string, 0) != null) return error.SqlUntranslatableCharacter;
         },
         .uuid => {
             if (value != .string or value.string.len != 36) return error.SqlTypeMismatch;
@@ -570,9 +571,9 @@ test "SQL typed arrays preserve dimensions lower bounds widths and NULL provenan
     const last = try Value.init(.int32, &.{.{ .length = 1, .lower = std.math.maxInt(i32) - 1 }}, elements[0..1], .{});
     try std.testing.expectEqual(@as(?i32, std.math.maxInt(i32) - 1), last.upper(1));
     try std.testing.expectError(error.SqlTypeMismatch, Value.init(.text, &.{.{ .length = 1 }}, &.{Element.json(.null)}, .{}));
-    try std.testing.expectError(error.SqlTypeMismatch, Value.init(.text, &.{.{ .length = 1 }}, &.{Element.json(.{ .string = "a\x00b" })}, .{}));
-    try std.testing.expectError(error.SqlTypeMismatch, Value.init(.jsonb, &.{.{ .length = 1 }}, &.{Element.json(.{ .string = "a\x00b" })}, .{}));
-    try std.testing.expectError(error.SqlTypeMismatch, Value.init(.jsonb, &.{.{ .length = 1 }}, &.{Element.json(.{ .string = "\xff" })}, .{}));
+    try std.testing.expectError(error.SqlUntranslatableCharacter, Value.init(.text, &.{.{ .length = 1 }}, &.{Element.json(.{ .string = "a\x00b" })}, .{}));
+    try std.testing.expectError(error.SqlUntranslatableCharacter, Value.init(.jsonb, &.{.{ .length = 1 }}, &.{Element.json(.{ .string = "a\x00b" })}, .{}));
+    try std.testing.expectError(error.SqlInvalidTextEncoding, Value.init(.jsonb, &.{.{ .length = 1 }}, &.{Element.json(.{ .string = "\xff" })}, .{}));
     try std.testing.expectError(error.SqlNumericOutOfRange, Value.init(.jsonb, &.{.{ .length = 1 }}, &.{Element.json(.{ .float = std.math.inf(f64) })}, .{}));
     try std.testing.expectError(error.SqlProgramLimitExceeded, Value.init(.int32, &.{ .{ .length = 1 }, .{ .length = 1 }, .{ .length = 1 }, .{ .length = 1 }, .{ .length = 1 }, .{ .length = 1 }, .{ .length = 1 } }, elements[0..1], .{}));
     try std.testing.expectError(error.SqlProgramLimitExceeded, Value.init(.int32, &.{.{ .length = 4 }}, elements, .{ .work = 3 }));

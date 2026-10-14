@@ -689,6 +689,36 @@ test "chatgpt generation bounds refresh and credential queueing by deadline and 
         fn serve(server: *httpx.Server) std.Io.Cancelable!void {
             server.listen() catch {};
         }
+        fn probe(a: std.mem.Allocator, io: std.Io, instance: *Manager, signal: ?*std.atomic.Value(bool), timeout_ms: u64, expected: anyerror) !u32 {
+            // The first request may expire before its handler begins. Keep
+            // each phase's signal immutable and drain that server completely
+            // before the next phase, so a late handler cannot cancel it.
+            var mock: @This() = .{ .cancel = signal };
+            {
+                var server = httpx.Server.initWithConfig(a, io, .{ .host = "127.0.0.1", .port = 0 });
+                defer server.deinit();
+                try server.post("/api/accounts/oauth/token", httpx.Handler.bind(&mock, @This().token));
+                try server.bind();
+                const origin = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}", .{server.boundAddress().?.getPort()});
+                defer a.free(origin);
+                instance.test_auth_origin = origin;
+                defer instance.test_auth_origin = null;
+                var group: std.Io.Group = .init;
+                try group.concurrent(io, @This().serve, .{&server});
+                defer {
+                    server.stop();
+                    group.cancel(io);
+                }
+                var http = instance.client(a);
+                defer http.deinit();
+                var provider: @import("responses.zig").Provider = .{ .http = &http, .registrations = instance, .owner = "alice", .connection_id = "one", .timeout_ms = timeout_ms };
+                if (signal) |cancel| provider.request_context = .{ .io = io, .deadline_ns = null, .cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(cancel) };
+                const started = @import("antfly_platform").time.monotonicNs();
+                try std.testing.expectError(expected, provider.generate(a, "model", &.{}));
+                try std.testing.expect(@import("antfly_platform").time.monotonicNs() - started < 750 * std.time.ns_per_ms);
+            }
+            return mock.requests.load(.acquire);
+        }
     };
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -703,36 +733,12 @@ test "chatgpt generation bounds refresh and credential queueing by deadline and 
     try instance.save(.{ .host_id = saved.value.host_id, .accounts = @constCast(&[_]Record{
         .{ .connection_id = "one", .owner = "alice", .subject = "user-a", .email = "a@example.com", .client_id = "client-a", .access_token = "expired", .refresh_token = "refresh", .id_token = "", .scope = protocol.scopes, .expires_at = 1 },
     }) });
-    var cancelled: std.atomic.Value(bool) = .init(false);
-    var mock: Mock = .{};
-    var server = httpx.Server.initWithConfig(a, io, .{ .host = "127.0.0.1", .port = 0 });
-    defer server.deinit();
-    try server.post("/api/accounts/oauth/token", httpx.Handler.bind(&mock, Mock.token));
-    try server.bind();
-    const origin = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}", .{server.boundAddress().?.getPort()});
-    defer a.free(origin);
-    instance.test_auth_origin = origin;
-    var group: std.Io.Group = .init;
-    try group.concurrent(io, Mock.serve, .{&server});
-    defer {
-        server.stop();
-        group.cancel(io);
-    }
-    var http = instance.client(a);
-    defer http.deinit();
-    var provider: @import("responses.zig").Provider = .{ .http = &http, .registrations = &instance, .owner = "alice", .connection_id = "one", .timeout_ms = 50 };
     // A short provider timeout includes refresh, not only the Responses POST.
-    var started = @import("antfly_platform").time.monotonicNs();
-    try std.testing.expectError(error.Timeout, provider.generate(a, "model", &.{}));
-    try std.testing.expect(@import("antfly_platform").time.monotonicNs() - started < 750 * std.time.ns_per_ms);
+    const timeout_requests = try Mock.probe(a, io, &instance, null, 50, error.Timeout);
+    try std.testing.expect(timeout_requests <= 1);
     // Cancellation arriving during refresh interrupts it and preserves the grant.
-    mock.cancel = &cancelled;
-    provider.timeout_ms = 5_000;
-    provider.request_context = .{ .io = io, .deadline_ns = null, .cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&cancelled) };
-    started = @import("antfly_platform").time.monotonicNs();
-    try std.testing.expectError(error.Cancelled, provider.generate(a, "model", &.{}));
-    try std.testing.expect(@import("antfly_platform").time.monotonicNs() - started < 750 * std.time.ns_per_ms);
-    try std.testing.expectEqual(@as(u32, 2), mock.requests.load(.acquire));
+    var cancelled: std.atomic.Value(bool) = .init(false);
+    try std.testing.expectEqual(@as(u32, 1), try Mock.probe(a, io, &instance, &cancelled, 5_000, error.Cancelled));
     var retained = try instance.load(a);
     defer {
         scrub(retained.value);
@@ -744,13 +750,12 @@ test "chatgpt generation bounds refresh and credential queueing by deadline and 
     // and leases, including cancellation before any network request.
     instance.mutex.lockUncancelable(io);
     defer instance.mutex.unlock(io);
-    const cancel_context = provider.request_context.?;
+    const cancel_context: RequestContext = .{ .io = io, .deadline_ns = null, .cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&cancelled) };
     try std.testing.expectError(error.Cancelled, instance.pinWithContext("alice", "one", cancel_context));
     try std.testing.expectError(error.Cancelled, instance.leaseBoundWithContext(a, "alice", "one", null, cancel_context));
     const deadline_context: RequestContext = .{ .io = io, .deadline_ns = @import("antfly_platform").time.monotonicNs() + 10 * std.time.ns_per_ms };
     try std.testing.expectError(error.Timeout, instance.pinWithContext("alice", "one", deadline_context));
     try std.testing.expectError(error.Timeout, instance.leaseBoundWithContext(a, "alice", "one", null, deadline_context));
-    try std.testing.expectEqual(@as(u32, 2), mock.requests.load(.acquire));
 }
 
 test "chatgpt authorization return allocation failure leaves no running attempt" {

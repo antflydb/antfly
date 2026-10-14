@@ -35,6 +35,11 @@ SHARDS = (
     "recovery-1",
     "recovery-2",
 )
+# Planning and execution must collect the same tests before partitioning.
+BASE_MARKER = (
+    "not objectstore_integration and not standalone_integration and not real_model "
+    "and not postgres_integration and not iceberg_integration and not slow"
+)
 DISTRIBUTED_FIXTURE = "three_by_three_backup_cluster"
 SEED = Path(__file__).with_name("antfly_e2e_durations.json")
 
@@ -214,3 +219,12 @@ else:
     pytest_collection_modifyitems = pytest.hookimpl(trylast=True)(
         pytest_collection_modifyitems
     )
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("command", choices=("base-marker",))
+    parser.parse_args()
+    print(BASE_MARKER)

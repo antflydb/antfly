@@ -41,7 +41,6 @@ const max_file_bytes = 512 * 1024 * 1024;
 
 const BackendChoice = enum {
     auto,
-    onnx,
     native,
     metal,
     cuda,
@@ -1016,7 +1015,6 @@ fn configureBackendPreference(session_manager: *backends.SessionManager, choice:
             &.{ backends.BackendType.metal, backends.BackendType.native }
         else
             &.{backends.BackendType.native},
-        .onnx => &.{backends.BackendType.onnx},
         .native => &.{backends.BackendType.native},
         .metal => if (build_options.enable_metal) &.{backends.BackendType.metal} else &.{backends.BackendType.native},
         .cuda => if (build_options.enable_cuda) &.{backends.BackendType.cuda} else &.{backends.BackendType.native},
@@ -1065,7 +1063,7 @@ fn nsToSeconds(ns: u64) f64 {
 
 fn printUsage() void {
     std.debug.print(
-        \\usage: zig build bench-clipclap-e2e -- --model-dir <dir> [--backend auto|onnx|native|metal|cuda] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir path] [--kernel-jit-max-cache-mb N] [--kernel-jit-preload-budget-ms N] [--kernel-jit-profile-out bundle.json] [--kernel-jit-qualified-profile bundle.json] [--graph-runtime interpreter|partitioned|compiled|compiled-required] [--text <text>]... [--image <path>]... [--audio <path>]...
+        \\usage: zig build bench-clipclap-e2e -- --model-dir <dir> [--backend auto|native|metal|cuda] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir path] [--kernel-jit-max-cache-mb N] [--kernel-jit-preload-budget-ms N] [--kernel-jit-profile-out bundle.json] [--kernel-jit-qualified-profile bundle.json] [--graph-runtime interpreter|partitioned|compiled|compiled-required] [--text <text>]... [--image <path>]... [--audio <path>]...
         \\  Options:
         \\    --warmup-iters N                 Warm request iterations before measurement (default 1)
         \\    --measure-iters N                Measurement iterations (default 5)

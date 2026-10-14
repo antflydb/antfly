@@ -23,6 +23,24 @@ The request auth layer builds an `AuthenticatedIdentity` with:
 Route authorization is coarse-grained and permission based. Document-level read narrowing is enforced separately by row filters.
 Table lookup, query, and document-scan routes require `read` permission on the target table.
 
+### Trusted Proxy Principals And MCP
+
+Cloud proxies may authenticate a request with `X-Antfly-Trusted-Principal`.
+Supplying that header always requires a configured verifier and a valid signed
+principal, even when `auth_enabled` is false. A missing verifier or invalid
+signature returns HTTP 401 rather than falling back to anonymous access. This
+also applies to separately mounted inference routes. An auth-disabled standalone
+server still permits anonymous requests when no trusted-principal header is
+present; it must not be exposed as an authenticated service.
+
+MCP authorizes each request and tool call using that request's identity, table
+permissions, and row filters. A session ID does not retain an earlier admin
+identity or bypass a proxy's API-key revocation check. Cloud deployments must
+configure the trusted-principal verifier before forwarding signed requests.
+
+Run the real HTTP/database MCP boundary regression with
+`zig build antfly-api-mcp-auth-test` from `zig/`.
+
 ### API Key Secret Storage And Verification
 
 API key secrets are generated as high-entropy random values, so verification hashes them with a salted SHA-256 rather than a slow password-style KDF: each key gets its own random salt, and the stored verifier is the hash of the salt concatenated with the secret. A slow adaptive hash exists to make guessing a low-entropy human-chosen password expensive; a random 128-bit secret is already infeasible to guess, so spending extra CPU on a deliberately slow hash on every request would only add latency without adding security.

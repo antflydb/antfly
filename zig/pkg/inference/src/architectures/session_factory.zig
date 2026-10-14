@@ -73,7 +73,6 @@ const weight_source_mod = @import("../models/weight_source.zig");
 const SafetensorsSource = @import("../models/weight_source.zig").SafetensorsSource;
 const LoadedWeight = @import("../models/weight_source.zig").LoadedWeight;
 const tensor_store_mod = @import("../models/tensor_store.zig");
-const export_source_mod = @import("../models/export_source.zig");
 const gguf_mod = @import("../gguf/root.zig");
 const c_file = @import("../util/c_file.zig");
 const runtime = @import("../runtime/root.zig");
@@ -307,7 +306,7 @@ pub fn estimateBackendWeightResidencyBytes(
     return switch (backend) {
         .cuda => cuda_load_plan.estimateEncodedArtifactDeviceBytes(encoded_bytes),
         .metal => encoded_bytes,
-        .native, .onnx, .wasm => 0,
+        .native, .wasm => 0,
         .pjrt => error.UnsupportedBackend,
     };
 }
@@ -4115,7 +4114,7 @@ pub fn ggufTensorTypeSupportsBackend(
             metal_runtime.isMetalNativeSupported(tensor_type)
         else
             true,
-        .native, .cuda, .onnx, .wasm => true,
+        .native, .cuda, .wasm => true,
         .pjrt => false,
     };
 }
@@ -4165,7 +4164,7 @@ pub fn ggufInspectionSupportsBackend(report: GgufInspectionReport, backend: Back
         return false;
     return switch (backend) {
         .metal => metalGgufIncompatibleTensorType(report) == null,
-        .native, .cuda, .onnx, .wasm => true,
+        .native, .cuda, .wasm => true,
         .pjrt => false,
     };
 }
@@ -8056,7 +8055,6 @@ fn makeComputeBackend(
                 });
             },
             .cuda => {},
-            .onnx => {},
             .wasm => {},
         }
     }
@@ -8099,7 +8097,6 @@ fn makeComputeBackend(
             }
             break :blk self.backend_data.cuda.compute.computeBackend();
         } else return error.CudaNotEnabled,
-        .onnx => return error.OnnxNotSupportedHere,
         .wasm => return error.WasmNotSupportedHere,
     };
 }
@@ -8181,15 +8178,6 @@ fn refineGptConfigFromManifestTensorMetadata(
     const all_names = try source.listNames(allocator);
     defer allocator.free(all_names);
     try refineGptConfigFromStore(allocator, store, all_names, config);
-}
-
-pub fn getWeightExportSource(session: Session) ?export_source_mod.Source {
-    if (session.vtable != &arch_vtable) return null;
-    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
-    return switch (self.backend_type) {
-        .native => export_source_mod.fromNativeWeightStore(&self.backend_data.native),
-        else => null,
-    };
 }
 
 pub fn getCudaRuntimeStats(session: Session) ?CudaRuntimeStats {
@@ -9420,7 +9408,7 @@ pub fn configureSharedCacheAdmissionForSession(
         else
             null,
         .pjrt => if (self.backend_data.pjrt.native.tier_cache) |*cache| cache else null,
-        .cuda, .onnx, .wasm => null,
+        .cuda, .wasm => null,
     };
     const cache = tier_cache orelse return;
     cache.configureHardBudget(hard_budget);
@@ -9449,7 +9437,7 @@ pub fn sharedCacheAdmissionAmounts(session: Session) runtime.tier.memory.Admissi
         else
             null,
         .pjrt => if (self.backend_data.pjrt.native.tier_cache) |*cache| cache else null,
-        .cuda, .onnx, .wasm => null,
+        .cuda, .wasm => null,
     };
     return if (tier_cache) |cache| cache.admissionAmounts() else .{};
 }
@@ -9465,7 +9453,7 @@ pub fn reclaimOneHostCacheEntryForSession(session: Session) usize {
     return switch (self.backend_type) {
         .native => native_mod.reclaimOneHostCacheEntry(&self.backend_data.native),
         .pjrt => native_mod.reclaimOneHostCacheEntry(&self.backend_data.pjrt.native),
-        .metal, .cuda, .onnx, .wasm => 0,
+        .metal, .cuda, .wasm => 0,
     };
 }
 
@@ -9495,7 +9483,6 @@ pub fn memoryBudgetExceededDetail(
         else
             std.fmt.bufPrint(buf, "request exceeds native generation memory budget", .{}),
         .cuda => std.fmt.bufPrint(buf, "request exceeds native generation memory budget", .{}),
-        .onnx => std.fmt.bufPrint(buf, "request exceeds native generation memory budget", .{}),
         .wasm => std.fmt.bufPrint(buf, "request exceeds native generation memory budget", .{}),
     };
 }
@@ -9512,7 +9499,6 @@ pub fn attachSharedPrefetchState(session: Session, shared_prefetch: *runtime.tie
         },
         .pjrt => self.backend_data.pjrt.native.shared_prefetch = shared_prefetch,
         .cuda => {},
-        .onnx => {},
         .wasm => {},
     }
 }
@@ -11181,7 +11167,6 @@ fn archClose(ptr: *anyopaque) void {
                 self.backend_data.cuda.compute.deinit();
             }
         },
-        .onnx => {},
         .wasm => {},
     }
     self.allocator.destroy(self);

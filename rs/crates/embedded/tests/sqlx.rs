@@ -478,3 +478,65 @@ fn run_with_stack<F: FnOnce() + Send + 'static>(task: F) {
         .join()
         .unwrap_or_else(|payload| std::panic::resume_unwind(payload));
 }
+
+#[test]
+fn sqlx_errors_identify_statement_and_nul_parameter() {
+    run_with_stack(|| {
+        let directory =
+            std::env::temp_dir().join(format!("antfly-sqlx-nul-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("db.aflite");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut conn = AntflyConnectOptions::new(&path).no_sync(true).connect().await.unwrap();
+            conn.execute("CREATE TABLE items (id BIGINT PRIMARY KEY, item JSONB)".into_sql_str()).await.unwrap();
+            let statement = "INSERT INTO items (id,item) VALUES ($1,$2) ON CONFLICT (id) DO UPDATE SET item=excluded.item";
+            let error = query::<Antfly>(statement.into_sql_str()).bind(1_i64).bind(serde_json::json!({"output":"bad\0output"})).execute(&mut conn).await.unwrap_err();
+            let error = error.as_database_error().unwrap();
+            assert_eq!(error.code().as_deref(), Some("22P05"));
+            assert!(error.message().contains("parameter $2"));
+            assert!(error.message().contains(statement));
+            let native = error.downcast_ref::<antfly_embedded::sql::SqlError>();
+            let diagnostic: Value = serde_json::from_slice(&native.body).unwrap();
+            assert_eq!(diagnostic["error"]["parameter_index"], 2);
+            assert_eq!(diagnostic["error"]["statement"], statement);
+            assert!(!error.message().contains("bad\0output"));
+            // A failure deferred until cursor fetch still identifies its SELECT.
+            let statement = "SELECT 1 / $1";
+            let error = query::<Antfly>(statement.into_sql_str()).bind(0_i64).fetch_all(&mut conn).await.unwrap_err();
+            assert_eq!(error.as_database_error().unwrap().code().as_deref(), Some("22012"));
+            assert!(error.to_string().contains(statement));
+            let long_statement = format!("SELECT * FROM missing_table /*{}*/", "é".repeat(300));
+            let error = conn.execute(sqlx_core::sql_str::AssertSqlSafe(long_statement.clone()).into_sql_str()).await.unwrap_err();
+            let error = error.as_database_error().unwrap().downcast_ref::<antfly_embedded::sql::SqlError>();
+            let diagnostic: Value = serde_json::from_slice(&error.body).unwrap();
+            let excerpt = diagnostic["error"]["statement"].as_str().unwrap();
+            assert!(excerpt.ends_with('…'));
+            assert!(excerpt.len() <= 515);
+            assert!(long_statement.starts_with(excerpt.trim_end_matches('…')));
+            conn.close().await.unwrap();
+        });
+        let database = antfly_embedded::Database::open_default(&path).unwrap();
+        let table = database.open_table("items").unwrap();
+        let error = table.sql_json(br#"{"statement":"SELECT 1"}"#).unwrap_err();
+        assert!(error.sqlstate.is_none());
+        assert!(error.body.is_empty());
+        assert!(
+            error
+                .message
+                .contains("SQL sessions require a root database handle")
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("SQL sessions require a root database handle")
+        );
+        assert!(error.to_string().contains("[statement: SELECT 1]"));
+        drop(table);
+        drop(database);
+        std::fs::remove_dir_all(directory).unwrap();
+    });
+}

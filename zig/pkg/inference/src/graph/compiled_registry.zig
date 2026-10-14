@@ -18,31 +18,21 @@ const build_options = @import("build_options");
 const contracts = @import("backend_contracts.zig");
 const compiled_backend = @import("compiled_backend.zig");
 const compiled_pjrt = if (build_options.enable_pjrt) @import("compiled_pjrt.zig") else struct {};
-const compiled_onnx = if (build_options.enable_onnx) @import("compiled_onnx.zig") else struct {};
 const compiled_metal = if (build_options.enable_metal) @import("compiled_metal.zig") else struct {};
 const compiled_webgpu = if (build_options.enable_wasm and build_options.enable_webgpu) @import("compiled_webgpu.zig") else struct {};
 
 pub fn all() []const compiled_backend.Definition {
-    return switch ((@as(u4, @intFromBool(build_options.enable_pjrt)) << 3) |
-        (@as(u4, @intFromBool(build_options.enable_onnx)) << 2) |
-        (@as(u4, @intFromBool(build_options.enable_metal)) << 1) |
-        @as(u4, @intFromBool(build_options.enable_wasm and build_options.enable_webgpu))) {
-        0b0000 => &.{},
-        0b0001 => &.{compiled_webgpu.backend},
-        0b0010 => &.{compiled_metal.backend},
-        0b0011 => &.{ compiled_metal.backend, compiled_webgpu.backend },
-        0b0100 => &.{compiled_onnx.backend},
-        0b0101 => &.{ compiled_onnx.backend, compiled_webgpu.backend },
-        0b0110 => &.{ compiled_metal.backend, compiled_onnx.backend },
-        0b0111 => &.{ compiled_metal.backend, compiled_onnx.backend, compiled_webgpu.backend },
-        0b1000 => &.{compiled_pjrt.backend},
-        0b1001 => &.{ compiled_pjrt.backend, compiled_webgpu.backend },
-        0b1010 => &.{ compiled_metal.backend, compiled_pjrt.backend },
-        0b1011 => &.{ compiled_metal.backend, compiled_pjrt.backend, compiled_webgpu.backend },
-        0b1100 => &.{ compiled_pjrt.backend, compiled_onnx.backend },
-        0b1101 => &.{ compiled_pjrt.backend, compiled_onnx.backend, compiled_webgpu.backend },
-        0b1110 => &.{ compiled_metal.backend, compiled_pjrt.backend, compiled_onnx.backend },
-        0b1111 => &.{ compiled_metal.backend, compiled_pjrt.backend, compiled_onnx.backend, compiled_webgpu.backend },
+    return switch ((@as(u3, @intFromBool(build_options.enable_pjrt)) << 2) |
+        (@as(u3, @intFromBool(build_options.enable_metal)) << 1) |
+        @as(u3, @intFromBool(build_options.enable_wasm and build_options.enable_webgpu))) {
+        0b000 => &.{},
+        0b001 => &.{compiled_webgpu.backend},
+        0b010 => &.{compiled_metal.backend},
+        0b011 => &.{ compiled_metal.backend, compiled_webgpu.backend },
+        0b100 => &.{compiled_pjrt.backend},
+        0b101 => &.{ compiled_pjrt.backend, compiled_webgpu.backend },
+        0b110 => &.{ compiled_metal.backend, compiled_pjrt.backend },
+        0b111 => &.{ compiled_metal.backend, compiled_pjrt.backend, compiled_webgpu.backend },
     };
 }
 
@@ -63,13 +53,6 @@ test "compiled backend registry returns enabled compiled backends" {
         try std.testing.expectEqual(compiled_backend.ModelRuntimeStrategy.inline_compiled_graph, find(.pjrt).?.model_runtime_strategy);
     } else {
         try std.testing.expect(find(.pjrt) == null);
-    }
-
-    if (build_options.enable_onnx) {
-        try std.testing.expect(find(.onnx) != null);
-        try std.testing.expectEqual(compiled_backend.ModelRuntimeStrategy.offline_artifact, find(.onnx).?.model_runtime_strategy);
-    } else {
-        try std.testing.expect(find(.onnx) == null);
     }
 
     if (build_options.enable_metal) {

@@ -22,6 +22,7 @@ const gpt_mod = @import("../models/gpt.zig");
 const ops = @import("../ops/ops.zig");
 
 pub const DraftLogitSource = enum {
+    cached_target,
     linear_argmax,
     masked_embedding,
     backend_argmax,
@@ -29,6 +30,7 @@ pub const DraftLogitSource = enum {
 
     pub fn name(self: DraftLogitSource) []const u8 {
         return switch (self) {
+            .cached_target => "cached_target",
             .linear_argmax => "linear_argmax",
             .masked_embedding => "masked_embedding",
             .backend_argmax => "backend_argmax",
@@ -797,6 +799,14 @@ pub fn draftTokenDevice(request: DraftDeviceRequest) !DraftDeviceResult {
     profileEvalTensor(request.draft_cb, draft_target_embedding, request.profile_sync);
     profile.target_embedding_ns = profileElapsedNs(target_embedding_started_at);
 
+    var draft_frame_active = false;
+    if (request.draft_cb.kind() == .metal and !request.draft_cb.decoderRuntimeHasActiveFrame() and !getenvBool("ANTFLY_GEMMA4_MTP_DISABLE_DRAFT_FRAME")) {
+        draft_frame_active = request.draft_cb.decoderRuntimeBeginFrame() catch false;
+    }
+    errdefer if (draft_frame_active) {
+        request.draft_cb.decoderRuntimeCancelFrame() catch {};
+    };
+
     const preprojection_started_at = profileNow(request.profile_enabled);
     const pre_w = try getMtpWeight(request.draft_cb, "pre_projection.weight");
     defer request.draft_cb.free(pre_w);
@@ -826,13 +836,6 @@ pub fn draftTokenDevice(request: DraftDeviceRequest) !DraftDeviceResult {
     };
     profileEvalTensor(request.draft_cb, assistant_input, request.profile_sync);
     profile.preprojection_ns = profileElapsedNs(preprojection_started_at);
-    var draft_frame_active = false;
-    if (request.draft_cb.kind() == .metal and !request.draft_cb.decoderRuntimeHasActiveFrame() and !getenvBool("ANTFLY_GEMMA4_MTP_DISABLE_DRAFT_FRAME")) {
-        draft_frame_active = request.draft_cb.decoderRuntimeBeginFrame() catch false;
-    }
-    errdefer if (draft_frame_active) {
-        request.draft_cb.decoderRuntimeCancelFrame() catch {};
-    };
 
     const assistant_started_at = profileNow(request.profile_enabled);
     const assistant_hidden = if (mtpAssistantReplayEnabled()) blk: {

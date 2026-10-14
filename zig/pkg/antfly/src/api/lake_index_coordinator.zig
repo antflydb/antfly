@@ -384,7 +384,10 @@ test "external lake native coordinator fences ambiguous admission and reuses dur
     try @import("lake_index_directory.zig").hydrateLazy(resumed.arena.allocator(), resumed_artifacts, &resumed.value.published.?, .none, null);
     const resumed_root = try @import("lake_index_native_text.zig").loadRoot(resumed.arena.allocator(), resumed_artifacts, resumed.value.published.?.declarations[0].artifact, .none, null);
     try std.testing.expectEqual(@as(usize, 2), resumed_root.file_groups.len);
-    try std.testing.expectEqualStrings(partial_root.file_groups[0].segments[0].artifact_id, resumed_root.file_groups[0].segments[0].artifact_id);
+    const resumed_file = for (resumed_root.file_groups) |group| {
+        if (std.mem.eql(u8, group.file.id, partial_root.file_groups[0].file.id)) break group;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(partial_root.file_groups[0].segments[0].artifact_id, resumed_file.segments[0].artifact_id);
     var resumed_writer = try @import("lake_index_native_text.zig").loadWriter(a, resumed_artifacts, resumed_root, .none, null, null);
     defer resumed_writer.deinit();
     const resumed_snapshot = resumed_writer.acquireSnapshot();
@@ -409,7 +412,7 @@ test "external lake native coordinator fences ambiguous admission and reuses dur
             .segment_directory => partial_root.file_groups[0].segments[0],
             .pack => checkpoint_segment.blocks[0].retainedArtifact(),
             .statistics => stats: {
-                const ref = partial_root.term_statistics.?;
+                const ref = partial_root.term_statistics orelse partial_root.statistics_deltas[0].page;
                 const id = try @import("../serverless/graph_segment/page_store.zig").PageStore.identity(partial_root.domain, ref);
                 break :stats .{ .artifact_id = try partial.arena.allocator().dupe(u8, &id), .checksum = try partial.arena.allocator().dupe(u8, &std.fmt.bytesToHex(&ref.digest, .lower)), .byte_len = ref.bytes };
             },
@@ -483,7 +486,7 @@ test "external lake native coordinator fences ambiguous admission and reuses dur
     try std.testing.expect(try durableDirectoryAvailable(a, &store, recovered.value.published.?, .none));
     // A complete older directory is still a refresh obligation after a
     // reader-format upgrade, even when every source signature is unchanged.
-    recovered.value.published.?.reader_protocol = 31;
+    recovered.value.published.?.reader_protocol = 33;
     const historical = try catalog.encode(a, recovered.value);
     if (mock.owned) |bytes| a.free(bytes);
     mock.owned = historical;
@@ -533,6 +536,8 @@ test "external lake native coordinator fences ambiguous admission and reuses dur
     for ([_]@import("lake_index_aggregate_artifact.zig").ChunkRef{
         .{ .artifact_id = healthy_ref.artifact_id, .checksum = healthy_ref.checksum, .byte_len = healthy_ref.byte_len },
         healthy_segment.blocks[0].retainedArtifact(),
+        healthy_root.file_groups[0].descriptors[0],
+        healthy_root.file_groups[0].physical_manifest.?,
     }) |target| {
         const saved_bytes = try @import("lake_index_aggregate_artifact.zig").readArtifact(a, artifacts, target, .none, null);
         defer a.free(saved_bytes);
@@ -564,7 +569,10 @@ test "external lake native coordinator fences ambiguous admission and reuses dur
         try std.testing.expect(repaired_publication.value.pending == null and repaired_publication.value.failure == null);
         try @import("lake_index_directory.zig").hydrateLazy(repaired_publication.arena.allocator(), artifacts, &repaired_publication.value.published.?, .none, null);
         const repaired_root = try @import("lake_index_native_text.zig").loadRoot(repaired_publication.arena.allocator(), artifacts, repaired_publication.value.published.?.declarations[0].artifact, .none, null);
-        try std.testing.expectEqualStrings(saved_root.file_groups[0].segments[0].artifact_id, repaired_root.file_groups[0].segments[0].artifact_id);
+        const repaired_file = for (repaired_root.file_groups) |group| {
+            if (std.mem.eql(u8, group.file.id, saved_root.file_groups[0].file.id)) break group;
+        } else return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings(saved_root.file_groups[0].segments[0].artifact_id, repaired_file.segments[0].artifact_id);
         var repaired_writer = try @import("lake_index_native_text.zig").loadWriter(a, artifacts, repaired_root, .none, null, null);
         defer repaired_writer.deinit();
         const repaired_snapshot = repaired_writer.acquireSnapshot();

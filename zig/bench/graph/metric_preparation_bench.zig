@@ -1490,10 +1490,16 @@ fn benchmarkStagedQueries(io: std.Io, out: anytype) !void {
                 try work.select(query, true, plan.orders.slice(), plan.projections.slice(), &.{});
                 try work.ensure(&session, plan.projections.slice(), nodes);
                 keys = session.reads.keys;
-                for (work.rows, 0..) |row, i| if (row != nodes.len - i - 1) return error.InvalidBenchmarkResult;
-                for (work.columns) |column| for (column.?, 0..) |value, i| {
-                    if (value != @as(f64, @floatFromInt(nodes.len - i - 1))) return error.InvalidBenchmarkResult;
-                };
+                if (work.rowCount() != 10) return error.InvalidBenchmarkResult;
+                for (0..work.rowCount()) |i| if (work.rowAt(i) != nodes.len - i - 1) return error.InvalidBenchmarkResult;
+                var columns: [names.len]query_mod.GraphQueryEngine.MetricColumn = undefined;
+                work.columnsFor(plan.projections.slice(), &columns);
+                for (columns) |column| {
+                    if (column.len != work.rowCount()) return error.InvalidBenchmarkResult;
+                    for (0..column.len) |i| {
+                        if (column.at(i) != @as(f64, @floatFromInt(nodes.len - i - 1))) return error.InvalidBenchmarkResult;
+                    }
+                }
             }
             const elapsed = antfly.platform_time.monotonicNs() - start;
             if (stats.current_bytes != 0 or keys != (if (reference) @as(usize, 1_600_000) else 100_150)) return error.InvalidBenchmarkResult;

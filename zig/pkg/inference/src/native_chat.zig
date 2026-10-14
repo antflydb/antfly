@@ -1001,7 +1001,7 @@ fn serverBackendOverride(choice: native_backend_choice.Choice) ?api.ModelBackend
         .native => .native,
         .metal => .metal,
         .cuda => .cuda,
-        .onnx, .xla, .webgpu => unreachable,
+        .xla, .webgpu => unreachable,
     };
 }
 

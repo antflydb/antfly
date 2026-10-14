@@ -300,6 +300,15 @@ pub const RetainedAllocator = struct {
         self.live_bytes = 0;
     }
 
+    /// Move live ownership between wrappers over the same stable allocator
+    /// and budget, without admitting the same physical bytes twice.
+    pub fn transferTo(self: *@This(), target: *@This(), bytes: usize) void {
+        std.debug.assert(self.backing.ptr == target.backing.ptr and self.backing.vtable == target.backing.vtable and self.budget == target.budget);
+        std.debug.assert(bytes <= self.live_bytes);
+        self.live_bytes -= bytes;
+        target.live_bytes += bytes;
+    }
+
     fn reserve(self: *@This(), bytes: usize) bool {
         if (self.budget) |budget| budget.retainStateBytes(bytes) catch {
             self.denied = true;

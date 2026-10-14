@@ -52,6 +52,8 @@ pub use db::{
     Database, MIN_THREAD_STACK_SIZE, SUPPORTED_ABI_VERSION, THREADING_SERIALIZED, Table,
     abi_version, decode_artifact_id_json, open_options_size, threading_mode, validate_abi,
 };
+#[cfg(feature = "libantfly")]
+pub use error::last_error_detail;
 pub use error::{Error, Result};
 pub use files::{check_file_json, copy_stable_snapshot_file_json, restore, restore_file};
 pub use inference::{

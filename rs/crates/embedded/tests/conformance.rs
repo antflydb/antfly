@@ -694,3 +694,27 @@ fn json_subset(want: &Value, got: &Value) -> bool {
         other => other == got,
     }
 }
+
+#[test]
+fn resolver_identity_management() {
+    std::thread::Builder::new()
+        .stack_size(antfly_embedded::MIN_THREAD_STACK_SIZE)
+        .spawn(|| {
+            let path = std::env::temp_dir().join(format!("antfly-identities-{}-{}.aflite",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+            let db = Database::create(&path, &OpenOptions::new().no_sync(true)).unwrap();
+            assert!(!db.cancel_replacement("missing").unwrap());
+            assert!(!db.backup_json(br#"{"tables":["default"]}"#).unwrap().is_empty());
+
+            db.add_index_json(br#"{"name":"knowledge","type":"graph","source":{"artifact":"kg","format":"extraction_graph","mention_edge_type":"mentions"},"artifact":{"name":"kg","kind":"asset","source":{"type":"field","value":"kg"},"content_type":"application/json"},"edge_types":[{"name":"mentions"}],"resolvers":[{"name":"concepts","table":"default","source_artifact":"kg","resolution_artifact":"resolved","key_template":"entity/{{ uslug _entity.text }}","promote":false}]}"#).unwrap();
+            let active: Value = serde_json::from_slice(&db.resolver_identities_json().unwrap()).unwrap();
+            assert_eq!(active[0]["config"]["name"], "concepts");
+            assert!(db.drop_resolver_identity("concepts").is_err());
+            assert!(db.delete_index("knowledge").unwrap());
+            let retired: Value = serde_json::from_slice(&db.resolver_identities_json().unwrap()).unwrap();
+            assert_eq!(retired[0]["config"]["retired"], true);
+            assert!(db.drop_resolver_identity("concepts").unwrap());
+            assert!(!db.drop_resolver_identity("concepts").unwrap());
+            db.close().unwrap();
+            std::fs::remove_file(path).unwrap();
+        }).unwrap().join().unwrap();
+}

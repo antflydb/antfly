@@ -18,7 +18,7 @@ class AntflyGeneratorConfig:
 
     Attributes:
         provider (AntflyGeneratorConfigProvider):
-        model (str): The name of the generator model. Example: onnxruntime/Gemma-3-ONNX.
+        model (str): The name of the generator model. Example: ggml-org/gemma-4-E4B-it-GGUF.
         api_url (str | Unset): The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL
             environment variable.
         temperature (float | Unset): Controls randomness in generation (0.0-2.0).

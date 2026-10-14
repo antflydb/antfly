@@ -79,7 +79,7 @@ class TestRunnerSelection(unittest.TestCase):
                 "--cache-dir",
                 str(root / "cache"),
                 "--global-cache-dir",
-                "/tmp/zig-global-cache",
+                os.environ.get("ZIG_GLOBAL_CACHE_DIR", str(root / "global-cache")),
             ],
             check=True,
         )

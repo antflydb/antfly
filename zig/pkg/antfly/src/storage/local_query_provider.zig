@@ -45,14 +45,27 @@ pub fn execute(
         return fail(error.InvalidArgument, .validate_request, out_failure);
 
     const alloc = std.heap.c_allocator;
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, request.request_json.slice(), .{}) catch |err| return fail(err, .validate_request, out_failure);
+    // Envelope inspection belongs to the requested operation. Preserve its
+    // diagnostic stage even when malformed JSON fails before dispatch.
+    const json_parse_stage: abi.LocalQueryOperation = switch (request.kind) {
+        .search => parseOperation(request.dialect),
+        .graph_expand => .parse_graph_expand,
+        .graph_hydrate => .parse_graph_hydrate,
+        .graph_edges => .parse_graph_edges,
+        .text_stats => .text_stats,
+        .algebraic_partials => .algebraic_partials,
+        .preflight => .preflight,
+    };
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, request.request_json.slice(), .{}) catch |err|
+        return fail(if (err == error.OutOfMemory) err else error.InvalidQueryRequest, json_parse_stage, out_failure);
     defer parsed.deinit();
     var body = parsed.value;
     if (body == .object) if (body.object.get("query_request")) |nested| {
         body = nested;
     };
     if (body == .object) if (body.object.get("query_json")) |nested| {
-        if (nested == .string) body = std.json.parseFromSliceLeaky(std.json.Value, parsed.arena.allocator(), nested.string, .{}) catch |err| return fail(err, .validate_request, out_failure);
+        if (nested == .string) body = std.json.parseFromSliceLeaky(std.json.Value, parsed.arena.allocator(), nested.string, .{}) catch |err|
+            return fail(if (err == error.OutOfMemory) err else error.InvalidQueryRequest, json_parse_stage, out_failure);
     };
     var retained: ?db_mod.DB = null;
     defer if (retained) |*cut| cut.close();

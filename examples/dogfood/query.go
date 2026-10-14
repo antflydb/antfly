@@ -398,7 +398,7 @@ func entityKeyCandidates(name string) []string {
 	return []string{"entity/" + slugify(name)}
 }
 
-// slugify mirrors zig/lib/resolver's `slug` template helper byte-for-byte:
+// slugify mirrors zig/pkg/antfly-embedded/resolver's `slug` template helper byte-for-byte:
 // ASCII-lowercased alphanumeric runs separated by single '_', no
 // leading/trailing separators, English possessives stripped
 // ("A. Lovelace" -> "a_lovelace", "Epstein's island" -> "epstein_island").

@@ -834,6 +834,11 @@ fn Engine(comptime Context: type) type {
                 .scan => |scan| self.cursors[scan.index].estimated_rows,
                 .singleton => 1,
                 .literal_rows => |rows| rows.len,
+                .values => |arms| total: {
+                    var rows: u64 = 0;
+                    for (arms) |arm| rows = std.math.add(u64, rows, self.estimate(arm) orelse break :total null) catch break :total null;
+                    break :total rows;
+                },
                 .prepared_rows => if (self.context.returning_cursor) |cursor| cursor.count() else self.context.returning_rows.len,
                 .query => |query| blk: {
                     const source = self.estimate(query.source);
@@ -919,6 +924,11 @@ fn Engine(comptime Context: type) type {
             cached_reader: ?*Replay.Reader = null,
             borrowed_hash: bool = false,
             flipped_join: bool = false,
+            // A bounded build-side cost sample is replayed before advancing
+            // its producer again. Native pages stay borrowed and valid.
+            sampled: ?@import("execution_batch.zig").Batch = null,
+            sampled_index: usize = 0,
+            sample_arena: ?std.heap.ArenaAllocator = null,
 
             const SetEntry = struct { values: []const Datum, count: usize, next: ?usize };
 
@@ -978,12 +988,25 @@ fn Engine(comptime Context: type) type {
                 if (self.set_external) |state| state.deinit();
                 self.set_entries.deinit(self.engine.context.alloc);
                 self.set_heads.deinit(self.engine.context.alloc);
+                if (self.sample_arena) |*sample| sample.deinit();
                 self.probe_arena.deinit();
                 self.arena.deinit();
                 self.scratch.deinit();
                 self.engine.context.alloc.destroy(self);
             }
-            fn nextBatch(self: *Iterator, a: Allocator, maximum: usize, failure: ?*?anyerror) anyerror!@import("execution_batch.zig").Batch {
+            pub fn nextBatch(self: *Iterator, a: Allocator, maximum: usize, failure: ?*?anyerror) anyerror!@import("execution_batch.zig").Batch {
+                if (self.sampled) |sample| {
+                    const count = @min(maximum, sample.len() - self.sampled_index);
+                    if (count != 0) {
+                        const source = try a.create(@import("execution_batch.zig").Batch);
+                        source.* = sample;
+                        const selection = try a.alloc(usize, count);
+                        for (selection, 0..) |*index, i| index.* = self.sampled_index + i;
+                        self.sampled_index += count;
+                        return source.select(a, selection);
+                    }
+                    self.sampled = null;
+                }
                 const previous_demand = self.batch_demand;
                 self.batch_demand = if (previous_demand) |prior| @min(prior, maximum) else maximum;
                 defer self.batch_demand = previous_demand;
@@ -998,15 +1021,15 @@ fn Engine(comptime Context: type) type {
                     source.* = view.values();
                     if (!self.flipped_join) return source.*;
                     const ordinals = try a.alloc(usize, self.node.columns.len);
-                    const kinds = try a.alloc(@import("ast.zig").ColumnType, self.node.columns.len);
+                    const types = try a.alloc(scalar.Type, self.node.columns.len);
                     const selection = try a.alloc(usize, view.count);
                     const width = self.node.operation.join.left.columns.len;
-                    for (ordinals, kinds, self.node.columns, 0..) |*ordinal, *kind, column, index| {
+                    for (ordinals, types, self.node.columns, 0..) |*ordinal, *type_, column, index| {
                         ordinal.* = if (index < width) self.node.operation.join.right.columns.len + index else index - width;
-                        kind.* = column.type;
+                        type_.* = .{ .kind = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
                     }
                     for (selection, 0..) |*index, i| index.* = i;
-                    return .{ .mapped = .{ .source = source, .ordinals = ordinals, .kinds = kinds, .selection = selection } };
+                    return .{ .mapped = .{ .source = source, .ordinals = ordinals, .types = types, .selection = selection } };
                 };
                 if (self.cached_reader == null and self.left != null and self.node.operation == .query) {
                     const query = self.node.operation.query;
@@ -1035,7 +1058,7 @@ fn Engine(comptime Context: type) type {
                         self.engine.visited += page.selection.len;
                         self.eof = page.after == null;
                         const definitions = try a.alloc(scalar.Column, self.node.columns.len);
-                        for (definitions, scan.source_columns, self.node.columns) |*definition, name, column| definition.* = .{ .name = name, .type = column.type };
+                        for (definitions, scan.source_columns, self.node.columns) |*definition, name, column| definition.* = .{ .name = name, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .nullable = column.nullable };
                         return .{ .columns = .{ .page = page, .definitions = definitions } };
                     }
                 }
@@ -1059,8 +1082,16 @@ fn Engine(comptime Context: type) type {
                 }
                 return .{ .rows = rows.items };
             }
-            fn next(self: *Iterator, alloc: Allocator) anyerror!?[]const Datum {
+            pub fn next(self: *Iterator, alloc: Allocator) anyerror!?[]const Datum {
                 try self.engine.checkpoint();
+                if (self.sampled) |sample| {
+                    if (self.sampled_index < sample.len()) {
+                        const row = try sample.row(alloc, self.sampled_index);
+                        self.sampled_index += 1;
+                        return row;
+                    }
+                    self.sampled = null;
+                }
                 if (self.cached_reader) |reader| return reader.next();
                 return switch (self.node.operation) {
                     .materialized_ref => unreachable,
@@ -1345,16 +1376,16 @@ fn Engine(comptime Context: type) type {
                         return .{ .rows = &.{} };
                     }
                     const ordinals = try a.alloc(usize, context.binding.scalars.columns.len);
-                    const kinds = try a.alloc(@import("ast.zig").ColumnType, ordinals.len);
-                    for (context.binding.scalars.columns, ordinals, kinds) |definition, *ordinal, *kind| {
+                    const types = try a.alloc(scalar.Type, ordinals.len);
+                    for (context.binding.scalars.columns, ordinals, types) |definition, *ordinal, *type_| {
                         ordinal.* = for (query.source.columns, 0..) |column, index| {
                             if (std.mem.eql(u8, column.internal, definition.name)) break index;
                         } else std.math.maxInt(usize);
-                        kind.* = definition.type;
+                        type_.* = .{ .kind = definition.type, .element_type = definition.element_type, .numeric_modifier = definition.numeric_modifier };
                     }
                     const identity = try a.alloc(usize, input.len());
                     for (identity, 0..) |*index, value| index.* = value;
-                    var bound: Batch = .{ .mapped = .{ .source = input, .ordinals = ordinals, .kinds = kinds, .selection = identity } };
+                    var bound: Batch = .{ .mapped = .{ .source = input, .ordinals = ordinals, .types = types, .selection = identity } };
                     const predicates = if (context.binding.scalars.predicate) |*program| try self.batchProgram(a, context, program, bound, errors) else null;
                     var selected: std.ArrayList(usize) = .empty;
                     for (0..input.len()) |index| {
@@ -1754,7 +1785,31 @@ fn Engine(comptime Context: type) type {
                 }
                 return null;
             }
-            fn prepareScanFilter(self: *Iterator, programs: []const scalar.Program) !void {
+            pub fn sampleReduction(self: *Iterator, key_columns: []const u32) !bool {
+                std.debug.assert(self.sampled == null and self.sample_arena == null);
+                self.sample_arena = .init(self.engine.context.alloc);
+                const a = self.sample_arena.?.allocator();
+                const batch = try self.nextBatch(a, @min(128, self.engine.context.limits.executionRows()), null);
+                self.sampled = batch;
+                self.sampled_index = 0;
+                if (batch.len() == 0) return false;
+                var distinct: std.AutoHashMapUnmanaged(u64, void) = .empty;
+                defer distinct.deinit(a);
+                // Hashes guide costs only; exact reducers still compare keys.
+                for (0..batch.len()) |row| {
+                    var hash = std.hash.Wyhash.init(0);
+                    for (key_columns) |column| {
+                        const value = try batch.cell(a, row, column);
+                        var bytes: [9]u8 = undefined;
+                        bytes[0] = @intFromBool(value.sql_null);
+                        std.mem.writeInt(u64, bytes[1..9], if (value.sql_null) 0 else try scalar.semanticHashDatum(value), .little);
+                        hash.update(&bytes);
+                    }
+                    try distinct.put(a, hash.final(), {});
+                }
+                return distinct.count() * 4 <= batch.len() * 3;
+            }
+            pub fn prepareScanFilter(self: *Iterator, programs: []const scalar.Program) !void {
                 const probe = self.left.?;
                 if (probe.node.operation != .scan or programs.len == 0) return;
                 const scan = probe.node.operation.scan;
@@ -1770,9 +1825,10 @@ fn Engine(comptime Context: type) type {
                         .integer, .number, .string, .boolean => {},
                         else => return,
                     }
-                    column.* = .{ .name = scan.source_columns[instruction.operation.column], .type = kind };
+                    column.* = .{ .name = scan.source_columns[instruction.operation.column], .type = kind, .element_type = instruction.type.element_type };
                 }
-                self.scan_filter = try @import("dynamic_filter.zig").Filter.create(self.engine.context.alloc, columns, self.engine.context.limits.retained_bytes / 32);
+                const exact = if (cursor.wants_exact_filter) |wants| try wants(cursor.ptr, columns) else false;
+                self.scan_filter = try @import("dynamic_filter.zig").Filter.createWithSpill(self.engine.context.alloc, columns, self.engine.context.limits.retained_bytes / 32, if (exact) self.engine.context.spill else null);
             }
             fn membershipCheckpoint(raw: *anyopaque) !void {
                 const engine: *Self = @ptrCast(@alignCast(raw));
@@ -1968,7 +2024,17 @@ fn Engine(comptime Context: type) type {
             pending_failure: ?anyerror = null,
 
             fn iface(self: *Adapter) catalog.Backend {
-                return .{ .regex_execution = self.engine.context.backend.regex_execution, .scalar_control = self.engine.context.backend.scalar_control, .execution_io = self.engine.context.backend.execution_io, .spill_manager = self.engine.context.spill, .ptr = self, .decision_provider = self.engine.context.backend.decision_provider, .pinned_statement_snapshot = true, .vtable = &.{ .resolve = resolve, .scan = scan, .open_scan = open, .mutate = mutate, .checkpoint = Adapter.checkpoint } };
+                return .{ .regex_execution = self.engine.context.backend.regex_execution, .scalar_control = self.engine.context.backend.scalar_control, .execution_io = self.engine.context.backend.execution_io, .spill_manager = self.engine.context.spill, .ptr = self, .decision_provider = self.engine.context.backend.decision_provider, .pinned_statement_snapshot = true, .vtable = &.{ .resolve = resolve, .scan = scan, .open_scan = open, .mutate = mutate, .checkpoint = Adapter.checkpoint, .aggregate_partials = openAggregatePartials } };
+            }
+            fn openAggregatePartials(ptr: *anyopaque, a: Allocator, _: catalog.Table, recipe: @import("aggregate_materialization.zig").Recipe) !?catalog.AggregatePartialCursor {
+                const self: *Adapter = @ptrCast(@alignCast(ptr));
+                if (self.opened or self.iterator.apply_mode or self.iterator.recursive_id != null or outerMask(self.iterator.node) != 0) return null;
+                const plan = (try @import("join_aggregate.zig").Plan.prove(self.engine.context.arena, self.iterator.node, recipe)) orelse return null;
+                const build_side: u1 = if (self.iterator.flipped_join) 0 else 1;
+                if (!try self.iterator.right.?.sampleReduction(plan.keys[build_side])) return null;
+                const cursor = try @import("join_aggregate.zig").open(a, self.engine, self.iterator, plan);
+                self.opened = true;
+                return cursor;
             }
             fn resolve(ptr: *anyopaque, _: Allocator, _: @import("ast.zig").Name, _: catalog.Action) !catalog.Table {
                 const self: *Adapter = @ptrCast(@alignCast(ptr));
@@ -2134,4 +2200,43 @@ pub fn execute(context: anytype) anyerror!@import("runtime.zig").Output {
     lowered.backend = owner.adapter.iface();
     lowered.binding.relation = null;
     return lowered.select(context.binding.relation.?.statement);
+}
+
+test "external lake native NUMERIC scan declarations survive exact hash joins" {
+    const Fixture = struct {
+        offset: usize = 0,
+        fn resolve(_: *anyopaque, _: Allocator, name: @import("ast.zig").Name, _: catalog.Action) !catalog.Table {
+            return .{ .id = 1, .physical_name = name.table, .schema_version = 1, .columns = &.{.{ .name = "n", .path = "n", .type = .number, .element_type = .numeric }} };
+        }
+        fn columns(raw: *anyopaque, a: Allocator, limit: u32) !catalog.ColumnPage {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const end = @min(@as(usize, 3), self.offset + limit);
+            const selection = try a.alloc(usize, end - self.offset);
+            for (selection, 0..) |*value, index| value.* = self.offset + index;
+            self.offset = end;
+            return .{ .batch = .{ .snapshot = .{ .table_id = "numeric", .snapshot_id = "one" }, .row_refs = &.{ .{ .relational_key = "one" }, .{ .relational_key = "two" }, .{ .relational_key = "three" } }, .columns = &.{.{ .name = "n", .values = .{ .i64 = &.{ 9007199254740993, 9007199254740992, 4095 } } }} }, .selection = selection, .after = if (end < 3) "more" else null };
+        }
+        fn rows(_: *anyopaque, _: Allocator, _: u32) !catalog.Page {
+            return error.UnexpectedRowAdapter;
+        }
+        fn checkpoint(_: *anyopaque) !void {}
+        fn close(_: *anyopaque) void {}
+        fn open(raw: *anyopaque, _: Allocator, _: catalog.Table, _: catalog.Scan) !?catalog.Cursor {
+            @as(*@This(), @ptrCast(@alignCast(raw))).offset = 0;
+            return .{ .ptr = raw, .next = rows, .next_columns = columns, .close = close };
+        }
+    };
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "p.n", "p.n+CAST('0' AS NUMERIC)" }) |operand| {
+        var fixture: Fixture = .{};
+        const backend: catalog.Backend = .{ .ptr = &fixture, .vtable = &.{ .resolve = Fixture.resolve, .scan = SetTestBackend.scan, .mutate = SetTestBackend.mutate, .checkpoint = Fixture.checkpoint, .open_scan = Fixture.open } };
+        const sql = try std.fmt.allocPrint(a, "SELECT p.n FROM numeric_source p JOIN (VALUES(CAST('9007199254740993' AS NUMERIC)),(CAST('9007199254740993' AS NUMERIC))) b(n) ON {s}=b.n", .{operand});
+        defer a.free(sql);
+        var compiled = try @import("compiler.zig").compile(a, sql, .{});
+        defer compiled.deinit();
+        var result = try @import("runtime.zig").execute(a, backend, &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 2), result.output.rows.len);
+        for (result.output.rows) |row| try std.testing.expectEqualStrings("9007199254740993", if (row[0] == .number_string) row[0].number_string else row[0].string);
+    }
 }

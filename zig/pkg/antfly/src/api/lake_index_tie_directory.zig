@@ -27,6 +27,7 @@ pub const Builder = struct {
     pub fn init(a: A, manager: *local.sql_spill.Manager) Builder {
         var sort = local.sql_spill.Sort.init(a, manager, &.{.{}}, 512 * 1024);
         sort.run_limit = 4;
+        sort.encoded_bytes = true;
         return .{ .a = a, .sort = sort };
     }
     pub fn deinit(self: *Builder) void {

@@ -82,7 +82,7 @@ request-path-repair rule remain live constraints.
 
 Known live gap: split-process heartbeat propagation is not yet proven in a
 real E2E run (an API-only process can still report synthetic status instead of
-the data owner's published runtime status); see TODO.md/FLAKES.md. Managed
+the data owner's published runtime status); see TODO.md. Managed
 embedding lifecycle, schema-migration full-text rebuild readiness, and CDC
 status-summary counters have also shown status-plane publisher gaps in E2E
 runs rather than proven runtime-status contract bugs.

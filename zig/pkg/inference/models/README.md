@@ -18,6 +18,7 @@ each family are under `docs/design/inference/history/<family>/`.
 | BitNet | [bitnet/BITNET.md](bitnet/BITNET.md) | BitNet-style GGUF support: tensor types, current state, and work items |
 | Laya | [laya/LAYA.md](laya/LAYA.md) | Typed decisions: tree-packed execution (shared state trunk, question and candidate branches), its evidence, training methodology, and verification |
 | Antenna | [antenna/ANTENNA.md](antenna/ANTENNA.md) | Proposed multi-head encoder (extraction, classification, decisions, embeddings, chunking) on ModernBERT/mmBERT, distilled from GLiNER2.5-Decide and GLiNER2.5; decisions, distillation recipe, and gated plan |
+| Moondream2 | [moondream/MOONDREAM.md](moondream/MOONDREAM.md) | Native Moondream2 (2024-03-04) `/read` and single-image `/generate`: SigLIP + Phi-1.5 over safetensors, prompt contract, parity qualification, and CPU performance |
 | LayoutDoc | [layoutdoc/LAYOUTDOC.md](layoutdoc/LAYOUTDOC.md) | Native LayoutDoc document-classification runtime, HTTP API, probe CLIs, and parity fixtures |
 
 Family directory names follow `scripts/<family>/` and `src/architectures/`.

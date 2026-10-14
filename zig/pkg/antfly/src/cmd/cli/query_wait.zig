@@ -223,12 +223,42 @@ test "query wake barrier bounds redirected queries with one total budget" {
     const httpx = client_mod.httpx;
     const alloc = std.testing.allocator;
     const io = std.testing.io;
+    const Observe = struct {
+        io: std.Io,
+        deadlines: [2]?i64 = @splat(null),
+        calls: usize = 0,
+        finishes: usize = 0,
+        delay_failed: bool = false,
+
+        fn before(ptr: *anyopaque, context: httpx.AttemptObserver.Context) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.calls >= self.deadlines.len) return error.UnexpectedAttempt;
+            self.deadlines[self.calls] = context.deadline_ms orelse return error.MissingRequestDeadline;
+            self.calls += 1;
+        }
+
+        fn after(ptr: *anyopaque, _: ?*const httpx.Response) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.finishes += 1;
+            // Cross a clock tick before following the redirect so restarting
+            // a duration creates a different deadline. This does not require
+            // two network requests to fit in a tight wall-clock window.
+            if (self.finishes == 1) self.io.sleep(.fromMilliseconds(2), .awake) catch {
+                self.delay_failed = true;
+            };
+        }
+    };
+    var observed = Observe{ .io = io };
     var server = try httpx.TestServer.start(alloc, io, &.{
-        .{ .method = .POST, .path = "/db/v1/tables/docs/query", .respond = .{ .status = 307, .headers = &.{.{ .name = "Location", .value = "/final" }}, .delay_ns = 100 * std.time.ns_per_ms } },
-        .{ .method = .POST, .path = "/final", .respond = .{ .delay_ns = 500 * std.time.ns_per_ms, .body = "{\"responses\":[{\"status\":200,\"took\":0}]}" } },
+        .{ .method = .POST, .path = "/db/v1/tables/docs/query", .respond = .{ .status = 307, .headers = &.{.{ .name = "Location", .value = "/final" }} } },
+        .{ .method = .POST, .path = "/final", .respond = .{ .body = "{\"responses\":[{\"status\":200,\"took\":0}]}" } },
     });
     defer server.deinit();
-    var http = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false, .retry_policy = .{ .max_retries = 0 } });
+    var http = httpx.Client.initWithConfig(alloc, io, .{
+        .keep_alive = false,
+        .retry_policy = .{ .max_retries = 0 },
+        .attempt_observer = .{ .ptr = &observed, .before = Observe.before, .after = Observe.after },
+    });
     defer http.deinit();
     var client = try client_mod.AntflyClient.init(alloc, &http, server.baseUrl());
     defer client.deinit();
@@ -240,10 +270,14 @@ test "query wake barrier bounds redirected queries with one total budget" {
     var group: std.Io.Group = .init;
     try group.concurrent(io, Task.serve, .{&server});
     defer group.cancel(io);
-    const start = std.Io.Clock.awake.now(io).nanoseconds;
-    try std.testing.expectError(error.ServingReadinessTimeout, wait(io, &client, "docs", .{}, 250));
-    try std.testing.expect(std.Io.Clock.awake.now(io).nanoseconds - start < 330 * std.time.ns_per_ms);
+    var response = try wait(io, &client, "docs", .{}, 3000);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
     try std.testing.expectEqualSlices(usize, &.{ 1, 1 }, server.route_hits);
+    try std.testing.expectEqual(@as(usize, 2), observed.calls);
+    try std.testing.expectEqual(@as(usize, 2), observed.finishes);
+    try std.testing.expect(!observed.delay_failed);
+    try std.testing.expectEqual(observed.deadlines[0], observed.deadlines[1]);
 }
 
 test "query wake barrier retries incomplete bodies without accepting incomplete chunk framing" {

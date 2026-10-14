@@ -15,6 +15,7 @@
 
 test {
     _ = @import("serverless/graph_segment/page_tree.zig");
+    _ = @import("serverless/build/lake_build_limits.zig");
     _ = @import("serverless/graph_segment/page_keys.zig");
     _ = @import("serverless/graph_segment/page_graph.zig");
     _ = @import("serverless/graph_segment/page_store.zig");

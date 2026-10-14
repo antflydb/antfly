@@ -734,6 +734,12 @@ pub const Detail = enum(c_int) {
     invalid_generated_tool_arguments,
     sql_feature_not_supported,
     catalog_publication_proof_pending,
+    warm_inference_server_unavailable,
+    unsupported_server_generate_option,
+    missing_inference_listener,
+    runtime_failed,
+    runtime_stopping,
+    runtime_already_ready,
     // Append-only Cypher details preserve graph errors across owner callbacks.
     cypher_aggregate_scope,
     cypher_aggregate_wildcard,
@@ -1555,6 +1561,12 @@ pub fn statusFromError(err: anyerror) Status {
         error.VectorMigrationUnsupportedFile => status(.conflict, .vector_migration_unsupported_file),
         error.VectorStoreRequiresOfflineCommand => status(.conflict, .vector_store_requires_offline_command),
         error.StorageKernelFailure => status(.internal, .storage_kernel_failure),
+        error.WarmInferenceServerUnavailable => status(.unavailable, .warm_inference_server_unavailable),
+        error.UnsupportedServerGenerateOption => status(.unsupported, .unsupported_server_generate_option),
+        error.MissingInferenceListener => status(.internal, .missing_inference_listener),
+        error.RuntimeFailed => status(.internal, .runtime_failed),
+        error.RuntimeStopping => status(.cancelled, .runtime_stopping),
+        error.RuntimeAlreadyReady => status(.conflict, .runtime_already_ready),
         else => status(.internal, .none),
     };
 }
@@ -2318,6 +2330,12 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .unsupported_media_token_budget => "UnsupportedMediaTokenBudget",
         .unsupported_local_rate_limit => "UnsupportedLocalRateLimit",
         .storage_kernel_failure => "StorageKernelFailure",
+        .warm_inference_server_unavailable => "WarmInferenceServerUnavailable",
+        .unsupported_server_generate_option => "UnsupportedServerGenerateOption",
+        .missing_inference_listener => "MissingInferenceListener",
+        .runtime_failed => "RuntimeFailed",
+        .runtime_stopping => "RuntimeStopping",
+        .runtime_already_ready => "RuntimeAlreadyReady",
     };
 }
 
@@ -2611,6 +2629,12 @@ test "external lake and spill errors retain exact identity across runtime archiv
 test "Cypher errors retain stable callback details" {
     inline for (.{ error.CypherAnchorBudgetExceeded, error.CypherTransactionConflict, error.CypherMemoryBudgetExceeded, error.CypherObservationsUnavailable }) |err| {
         try std.testing.expect(errorHasStableDetail(err));
+        try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
+    }
+}
+
+test "inference command and lifecycle errors retain their identities across engine calls" {
+    inline for (.{ error.WarmInferenceServerUnavailable, error.UnsupportedServerGenerateOption, error.MissingInferenceListener, error.RuntimeFailed, error.RuntimeStopping, error.RuntimeAlreadyReady }) |err| {
         try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
     }
 }

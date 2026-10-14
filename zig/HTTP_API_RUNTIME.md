@@ -860,7 +860,11 @@ Historical root aliases are not part of the target contract. `/tables`,
 `/secrets`, `/transactions`, `/backup`, `/restore`, `/status`, and similar data
 routes are removed rather than registered as compatibility aliases. Generated
 data routes are canonical only below `/db/v1`; generated authentication routes
-remain below `/auth/v1`.
+remain below `/auth/v1`. The A2A agent card is served only at
+`/.well-known/agent-card.json`; the former
+`/db/v1/.well-known/agent-card.json` compatibility location is intentionally
+not registered and receives the router's native 404
+([history](../docs/operations/http-runtime/history/implementation-checkpoint.md)).
 
 The two Kubernetes probes are deliberately not namespaced. Every runtime serves
 exactly `/healthz` and `/readyz` at the root. A runtime may provide a stricter

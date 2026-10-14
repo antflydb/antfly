@@ -430,7 +430,6 @@ def main() -> None:
                 "-Dstrip=true",
                 "-Dmetal=false",
                 "-Dsystem-blas=false",
-                "-Donnx=false",
                 "-Dantfly-version=compilation-check",
                 f"-j{args.jobs}",
                 "--summary",

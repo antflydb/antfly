@@ -18,7 +18,7 @@
 // with CLIP embeddings for image search.
 //
 // Prerequisites:
-// - Antfly running with inference and ONNX Runtime
+// - Antfly running with inference
 // - CLIP model: antfly inference pull openai/clip-vit-base-patch32
 //
 // Run: go run main.go

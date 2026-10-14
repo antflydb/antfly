@@ -16,12 +16,21 @@ The tuned profile currently uses these conservative defaults:
 - Generated E2B FFN coupled pair/down, exact-F32, and pair-only kernels: off.
 - SM89 GGML-Q8_1 E2B FFN and BF16 cuBLASLt first-use tuning profiles: off.
 - GQA prefill: typed `required-fast` profile; an unavailable or ineligible fast
-  route fails the performance run instead of silently falling back. Headline
+  route fails the performance run instead of silently falling back. Set
+  `ANTFLY_GQA_PREFILL_USE_RUNTIME_DEFAULT=1` (with no explicit profile) to keep
+  the runtime's unset automatic selector, which engages the promoted SM89
+  Flash route described below. Headline
   evidence must observe that route independently for Gemma 4's 256-d local
   heads and 512-d global heads (8 query heads / 1 KV head); route telemetry is
   deduplicated by exact `(route, head_dim)`, not by the first model-wide hit.
 - Tiled F16 exact and warp-specialized GQA prefill profiles: experimental and
   off unless selected by their explicit typed profile.
+- Q4_0 BF16 tensor-core (W4A16) prefill projections (`q4_0_tc_hmma_prefill`):
+  a runtime default on SM89, not a wrapper setting. Multi-row prefill
+  projections use BF16 tensor cores while single-row decode keeps DP4A,
+  because BF16 activations track the F32-activation reference argmax and the
+  DP4A Q8_1 path does not (96/96 vs 30/96 greedy-token match on a chunked
+  prefill run). Rollback: `ANTFLY_INFERENCE_CUDA_Q4_0_TC_HMMA_PREFILL=0`.
 - Continuous generation batching: off.
 - Request-scoped persistent CUDA graph replay: required.
 
@@ -137,9 +146,8 @@ the model-wide lock for graph, speculative/MTP, and multimodal requests.
 promotion gate passes; use `mode: on` only for an explicit row-2 run.
 
 `scripts/gemma4/benchmark_gemma4_cuda_batching.py` uses distinguishable equal-length
-prompts, alternating row order, and a staggered mixed-length/page-growth probe.
-Scheduled and release CI enforce that correctness corpus with a `0.40` C2
-regression floor. Manual promotion runs retain the `1.5x` throughput threshold.
+prompts, alternating row order, and a staggered mixed-length/page-growth probe;
+its CI floor and promotion threshold are under Server Batching.
 
 ## Model-Neutral Kernel Catalog
 
@@ -850,6 +858,20 @@ on this workload; split-K decode and the BF16 mirror-first prefill profile
 remain default-off collect-only candidates pending exact-output parity. TTFT
 is the dominant remaining gap versus llama.cpp; decode throughput is close.
 
+An Nsight Systems request-window trace on this workload attributes most GPU
+busy time to Flash attention with GPU utilization near 100%, leaving only a
+small device-idle upper bound, so CUDA Graph capture helps CPU concurrency but
+is not the primary TTFT lever. Next production priorities, each independently
+gated (projected savings overlap and must not be added without end-to-end
+device-event evidence):
+
+- an upload-packed SM89 W4A16 tensor-core projection engine with a documented
+  numerical contract;
+- model-shape cuBLASLt tuning with admitted persistent workspace;
+- fused gate/up activation output;
+- a genuinely concurrent GQA Flash redesign that reuses K/V without the
+  current design's register/tail costs.
+
 > **Relocated:** The dated SM89/E2B benchmark campaigns and candidate
 > qualification history that previously lived here (102 lines) are preserved
 > verbatim in
@@ -1071,7 +1093,7 @@ at least 1.5x C2 aggregate throughput versus batching-off C1, and bounded C1
 latency. Concurrency 4 and above remains diagnostic under the current two-row
 bounded envelope.
 
-Because continuous batching remains default-off, the GitHub release workflow
-uses an explicit `0.40` C2 speedup floor as a correctness and catastrophic-
+Because continuous batching remains default-off, scheduled and release CI
+use an explicit `0.40` C2 speedup floor as a correctness and catastrophic-
 regression check. The benchmark's `1.5` default remains the manual promotion
 gate before enabling batching by default.

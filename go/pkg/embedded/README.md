@@ -122,6 +122,11 @@ for the full rationale.
 
 ### Embedded inference without a database
 
+Database failures retain an owned native diagnostic in `NativeError`. Use
+`errors.Is(err, lite.InvalidArgument)` (or another stable `ErrorCode`) to
+classify failures. The copied detail remains valid after later native calls;
+Go keeps each native call and diagnostic read on the same OS thread.
+
 `OpenInference` opens a standalone `*Inference` handle that runs models with
 no `DB` attached -- models load on first use and stay cached until `Close`.
 Each method sends and receives the JSON of the matching `/ai/v1` route of the
@@ -265,7 +270,7 @@ schema, search, index, and enrichment methods. Close table handles before
 dropping them. Closing the database invalidates its table handles.
 
 Portable `.afb` archives back up the entire database: its table catalog,
-schemas, documents, indexes, enrichments, and constraint records. Call backup
+schemas, documents, indexes, enrichments, durable resolver merges, and constraint records. Call backup
 on the database handle. Restore publishes all tables together into either
 Lite or directory storage; import requires an empty database with no open
 table handles, SQL sessions, or cursors. Table handles cannot export or import
@@ -295,3 +300,12 @@ protected tables; authenticated principal queries use the server API.
 
 See [the Cypher contract](../../../zig/CYPHER.md) for grammar, mapping, value,
 mutation, and deployment semantics.
+
+
+The real local synonym/ANN regression is opt-in with
+`ANTFLY_LITE_EMBEDDING_MODELS_DIR=/path/to/inference/models`. It uses that explicit
+model root (containing `Qwen/Qwen3-Embedding-0.6B-GGUF`), rather than searching the
+user's home directory. The Zig CI gate separately downloads the pinned GLiNER base
+bundle and runs real extraction, promotion, and a public `direction: "both"`
+PageRank query. It also downloads the pinned Qwen bundle for a required public
+Python embedding/promotion/drain/ANN test; Unicode resolver tests run in the ordinary `lib-test` gate.

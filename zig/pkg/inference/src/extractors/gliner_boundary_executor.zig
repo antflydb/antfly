@@ -164,7 +164,7 @@ fn qualifyRequestGeometry(cb: *const compute.ComputeBackend, allocator: Allocato
     return planRequestGeometry(cb.kind(), allocator, config, tokenizer, request, options, gate);
 }
 
-/// Maximum physical B*S over serial inputs and document windows. This uses
+/// Maximum physical B*S over serial inputs and batched document windows. This uses
 /// the same bounded processor/planning path as qualification, before the
 /// accelerator mutex or any eviction-capable workspace admission is held.
 pub fn workspaceGeometry(allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, request: *const wire.Request, options: Options) !usize {
@@ -183,6 +183,9 @@ fn workspaceGeometryFor(backend: compute.BackendKind, allocator: Allocator, conf
             self.peak_tokens = @max(self.peak_tokens, prepared.input_ids.len);
         }
         pub fn observeSingle(self: *@This(), _: Allocator, _: []const u8, prepared: *const processor.PreparedBatch, _: processor.Options) !void {
+            self.peak_tokens = @max(self.peak_tokens, prepared.input_ids.len);
+        }
+        pub fn observeWindowGroup(self: *@This(), prepared: *const processor.PreparedBatch) void {
             self.peak_tokens = @max(self.peak_tokens, prepared.input_ids.len);
         }
     };
@@ -944,7 +947,13 @@ const QualificationGeometryTest = struct {
         metal_cfg.head.candidate_pool = .shared;
         metal_cfg.head.candidate_attention_layers = 0;
         metal_cfg.head.query_attention_layers = 0;
-        try std.testing.expectEqual(expected_workspace_tokens, try workspaceGeometry(a, &metal_cfg, tokenizer.tokenizer(), &request, options));
+        options.long_document.window_batch_size = 1;
+        const serial_workspace_tokens = try workspaceGeometry(a, &metal_cfg, tokenizer.tokenizer(), &request, options);
+        try std.testing.expectEqual(expected_workspace_tokens, serial_workspace_tokens);
+        options.long_document.window_batch_size = 2;
+        const batched_workspace_tokens = try workspaceGeometry(a, &metal_cfg, tokenizer.tokenizer(), &request, options);
+        try std.testing.expect(batched_workspace_tokens > serial_workspace_tokens);
+
         try std.testing.expectEqual(baseline, bounded.live);
         try std.testing.expectEqual(@as(usize, 0), receiver.events);
         try std.testing.expectEqual(@as(usize, 0), context.weight_handles.count());

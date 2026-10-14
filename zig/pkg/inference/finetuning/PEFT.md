@@ -8,8 +8,8 @@ and follow-up checklist.
 
 - [x] Fix the Metal distributed init signature drift so full test builds compile against the current C import.
 - [x] Fix the Gemma4 test tokenizer signature so generic tokenizer budget checks compile.
-- [x] Fix Metal link leakage in `zig build test -Dskip-openapi=true -Donnx=false` by gating raw Metal imports behind `enable_metal`.
-- [x] Keep `zig build test -Dskip-openapi=true -Donnx=false` green after the Gemma4 PEFT wiring pass.
+- [x] Fix Metal link leakage in `zig build test -Dskip-openapi=true` by gating raw Metal imports behind `enable_metal`.
+- [x] Keep `zig build test -Dskip-openapi=true` green after the Gemma4 PEFT wiring pass.
 
 ## Implemented Surface
 

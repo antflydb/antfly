@@ -41,11 +41,12 @@ Matryoshka truncation to 32-1024 dims).
 ## Qualification evidence
 
 `reports/` contains historical receipts and compact qualification summaries
-referenced by `BASELINE.md`. For new runs, version a summary of the protocol,
+referenced by the dated baseline history. For new runs, version a summary of the protocol,
 artifact hashes, results, failures, and qualification limits. Preserve complete
 raw reports, source snapshots, and measurement samples outside Git, in an ignored
-output directory or separately hosted artifacts. Update `BASELINE.md` alongside
-the summary when rerunning the protocol against the pinned model artifacts.
+output directory or separately hosted artifacts. Update the reference results in
+[Qwen performance](../../models/qwen/PERFORMANCE.md#qwen3-embedding-reference-results)
+alongside the summary when rerunning the protocol against the pinned model artifacts.
 
 The [M4 Q8_0 gap summary](reports/qwen3_embedding_metal_gap_m4_q8_summary.md)
 records the 2026-10-01 qualification and 2026-10-02 review-fix checks, including
@@ -123,7 +124,7 @@ Short-row projection and normalization defaults require the admitted embedding
 workspace; batching still requires eligible dense Qwen3 text embeddings and a
 dynamic, unpadded tokenizer. Other devices retain explicit opt-in. Current
 qualification and its scope are recorded in the
-[default qualification receipt](../metal_serving_defaults_m4_summary.md).
+[default qualification receipt](../../../../../docs/design/inference/history/metal/serving-defaults-m4-2026-10.md).
 Explicit empty, `0`, `false`, `no`, or `off` values disable each feature.
 
 `TERMITE_METAL_ENABLE_Q8_0_SMALL_ROWS=1` enables SG-v2 projections and fused
@@ -194,7 +195,7 @@ meet cosine 0.995. The soak requires at least 1800 seconds and eight workers,
 zero failed requests, a bounded worker-process RSS plateau, no worker restart,
 and no host swap growth. Host-wide swap growth invalidates the run without
 attributing the cause to Antfly. Competing builds or GPU work invalidate isolation.
-The [local M4 Q8_0 results](BASELINE.md#short-query-and-capacity-results--2026-10-01)
+The [local M4 Q8_0 results](../../../../../docs/design/inference/history/qwen/qwen3-embedding-baseline-results.md#short-query-and-capacity-results--2026-10-01)
 include a fixed 600-second conditioning phase before an independent 1800-second
 soak on the same worker, with unchanged plateau and swap thresholds. The archived
 raw receipt embeds that repeat driver's source and preserves the initial soak's plateau

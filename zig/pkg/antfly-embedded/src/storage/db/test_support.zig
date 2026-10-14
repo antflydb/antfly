@@ -319,10 +319,10 @@ pub fn verifyDbSingleVectorFailedPlannedRebuildPreservesPublishedPublicReads(
     try std.testing.expectEqual(@as(usize, 1), traversal_after_failure.graph_results.len);
     try std.testing.expectEqual(@as(usize, 1), traversal_after_failure.graph_results[0].nodes.len);
     try std.testing.expectEqualStrings("doc:authority", traversal_after_failure.graph_results[0].nodes[0].key);
-    try std.testing.expectEqual(@as(usize, 1), traversal_after_failure.graph_results[0].nodes[0].metrics.len);
-    try std.testing.expectEqualStrings(metric_name, traversal_after_failure.graph_results[0].nodes[0].metrics[0].name);
-    try std.testing.expect(traversal_after_failure.graph_results[0].nodes[0].metrics[0].score != null);
-    try std.testing.expect(std.math.isFinite(traversal_after_failure.graph_results[0].nodes[0].metrics[0].score.?));
+    try std.testing.expectEqual(@as(usize, 1), traversal_after_failure.graph_results[0].nodes[0].metricCount());
+    try std.testing.expectEqualStrings(metric_name, traversal_after_failure.graph_results[0].nodes[0].metricAt(0).name);
+    try std.testing.expect(traversal_after_failure.graph_results[0].nodes[0].metricAt(0).score != null);
+    try std.testing.expect(std.math.isFinite(traversal_after_failure.graph_results[0].nodes[0].metricAt(0).score.?));
     try std.testing.expectEqual(@as(usize, 1), traversal_after_failure.graph_results[0].metric_status.len);
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.failed, traversal_after_failure.graph_results[0].metric_status[0].state);
     try std.testing.expectEqual(published_generation, traversal_after_failure.graph_results[0].metric_status[0].published_generation);

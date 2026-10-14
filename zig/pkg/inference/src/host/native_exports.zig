@@ -160,5 +160,6 @@ fn reportStandaloneInferenceFailure(comptime operation: []const u8, err: anyerro
 }
 
 comptime {
+    if (@import("antfly_inference_engine").enabled) _ = @import("antfly_inference_engine").exports;
     @export(&standaloneInferenceGetFunctionTable, .{ .name = "antfly_standalone_inference_get_function_table", .visibility = .hidden });
 }

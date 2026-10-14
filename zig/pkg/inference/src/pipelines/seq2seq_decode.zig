@@ -219,7 +219,7 @@ const TestDecoder = struct {
         return &output_info;
     }
     fn backend(_: *anyopaque) backends.BackendType {
-        return .onnx;
+        return .native;
     }
     fn close(_: *anyopaque) void {}
     fn controlled(raw: *anyopaque, inputs: []const backends.Tensor, allocator: std.mem.Allocator, control: Control) ![]backends.Tensor {

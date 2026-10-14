@@ -1,0 +1,46 @@
+{
+  "kind": "failed_public_registration_probe",
+  "project": "antfly-dev-01",
+  "rows": 142577,
+  "binary_revision": "852071b2e9a148fe758870f5507e16bff6c56ed7",
+  "binary_sha256": "d112840e58301b730e9e2cfd9e8a254582ae7c31ce7b02ba3d12e7d48544e3a1",
+  "harness_sha256": {
+    "archive_qualification.py": "f9a63f9bbdb2369b558085f70991629ea74816b721f1dc8ea2938acedd1eb639",
+    "archive_budget.py": "f2b5a1ace8efa8f78992360e744ac615b7da34dbe8b1f9a8f2070ca056aae097",
+    "archive_inventory.py": "54376051370887063f8ecd23c0772cbbe02ec05a1a9e06b5b5c43771e14b64a0",
+    "regional.py": "70bdcb18e39e169d1745f13fc1ae5e6b99f3cb3c45855236cbfbe9e48936b912",
+    "poc.py": "7b7beffa00d6d2d67516b2f7f9822098ef8dd5136dfcd96d51a47b6866fe2ca7"
+  },
+  "failure": "HTTP 400 invalid create table request: public full_text contract omitted store_source",
+  "qualified": false,
+  "verdict": {
+    "passed": false,
+    "failures": [
+      "Regional run exited 1; inspect retained logs"
+    ],
+    "run_prefix": "hn-poc/archive-qualification/19607f37986740e0a3e127ae4da556f7",
+    "cleanup": {
+      "pod": "hackernews-benchmark-ec6b230499a3",
+      "created": true,
+      "deleted": true
+    },
+    "engine_failures": [
+      {
+        "phase": "startup",
+        "exception": "RuntimeError",
+        "registration_seconds": 0,
+        "completed_measurements": {
+          "complete": false,
+          "io_profiles": []
+        }
+      }
+    ]
+  },
+  "artifact_cleanup": {
+    "prefix": "hn-poc/archive-qualification/19607f37986740e0a3e127ae4da556f7",
+    "deleted": 0,
+    "bytes": 0,
+    "generation_conditioned": true,
+    "source_preserved": true
+  }
+}

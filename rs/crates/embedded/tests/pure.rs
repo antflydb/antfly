@@ -70,10 +70,15 @@ fn open_options_builder_sets_fields() {
         .mode(OpenMode::Readonly)
         .profile(Profile::Hosted)
         .no_sync(true)
+        .models_dir("/tmp/antfly-models")
         .busy_timeout(Duration::from_millis(150));
     assert_eq!(opts.mode, OpenMode::Readonly);
     assert_eq!(opts.profile, Profile::Hosted);
     assert!(opts.no_sync);
+    assert_eq!(
+        opts.models_dir.as_deref(),
+        Some(std::path::Path::new("/tmp/antfly-models"))
+    );
     assert_eq!(opts.busy_timeout, Some(Duration::from_millis(150)));
 }
 
@@ -98,4 +103,17 @@ fn busy_timeout_rounds_up_to_whole_milliseconds() {
 fn database_is_send_and_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<antfly_embedded::Database>();
+}
+
+#[test]
+fn owned_native_diagnostic_keeps_stable_error_category() {
+    let error = antfly_embedded::Error::Native {
+        code: 1,
+        detail: "sparse must be boolean".into(),
+    };
+    assert_eq!(error, antfly_embedded::Error::InvalidArgument);
+    assert_eq!(error.kind(), antfly_embedded::Error::InvalidArgument);
+    assert_eq!(error.detail(), Some("sparse must be boolean"));
+    assert!(error.to_string().contains("sparse must be boolean"));
+    assert_eq!(error.clone().detail(), error.detail());
 }

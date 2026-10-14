@@ -683,7 +683,7 @@ pub const GlinerPipeline = struct {
         if (texts.len == 0) return alloc.alloc([]ClassificationResult, 0);
         if (self.config.classification_head == .label_marker_mlp) return self.classifyDecisionBatch(texts, labels, config);
 
-        const scores = if (self.supportsClassification() and self.session.backend() != .onnx)
+        const scores = if (self.supportsClassification())
             try self.scoreLabelsBatch(texts, labels)
         else
             null;
@@ -1150,10 +1150,6 @@ pub const GlinerPipeline = struct {
         if (self.config.token_p == 0 or label_token == 0 or self.config.token_sep_text == 0)
             return error.MissingSpecialTokenIds;
 
-        if (!scoring and self.session.backend() == .onnx and texts.len > 1) {
-            return self.recognizeWithLabelTokenBatchSerial(texts, labels, label_token, threshold, flat_ner);
-        }
-
         const results = try alloc.alloc(if (scoring) []f32 else []Entity, texts.len);
         @memset(results, &.{});
         var initialized_results: usize = 0;
@@ -1216,35 +1212,6 @@ pub const GlinerPipeline = struct {
                 if (scoring) @memset(row.*, 0);
                 initialized_results += 1;
             }
-            for (prepared[0..prepared_len]) |*row| row.deinit(alloc);
-            alloc.free(prepared);
-            return results;
-        }
-
-        if (!scoring and self.usesOfficialOnnxGlinerContract()) {
-            const session_start_ns = glinerProfileStart(profile_enabled);
-            for (row_to_prepared, 0..) |prepared_i, i| {
-                const row = prepared[prepared_i];
-                results[i] = try self.recognizeOfficialOnnxGlinerSingle(row, labels, threshold, flat_ner);
-                initialized_results += 1;
-            }
-            const session_decode_ms = glinerProfileElapsedMs(session_start_ns);
-            if (profile_enabled) {
-                std.debug.print(
-                    "gliner_pipeline_profile: official_onnx=1 batch={d} labels={d} seq_len={d} num_words={d} max_width={d} prepare_ms={d:.3} session_decode_ms={d:.3} total_ms={d:.3}\n",
-                    .{
-                        texts.len,
-                        labels.len,
-                        max_seq_len,
-                        max_num_words,
-                        max_width,
-                        prepare_ms,
-                        session_decode_ms,
-                        glinerProfileElapsedMs(total_start_ns),
-                    },
-                );
-            }
-
             for (prepared[0..prepared_len]) |*row| row.deinit(alloc);
             alloc.free(prepared);
             return results;
@@ -1420,145 +1387,6 @@ pub const GlinerPipeline = struct {
         for (prepared[0..prepared_len]) |*row| row.deinit(alloc);
         alloc.free(prepared);
         return results;
-    }
-
-    fn recognizeWithLabelTokenBatchSerial(
-        self: *GlinerPipeline,
-        texts: []const []const u8,
-        labels: []const []const u8,
-        label_token: i32,
-        threshold: f32,
-        flat_ner: bool,
-    ) anyerror![][]Entity {
-        const alloc = self.allocator;
-        const results = try alloc.alloc([]Entity, texts.len);
-        @memset(results, &.{});
-        var initialized_results: usize = 0;
-        errdefer {
-            for (results[0..initialized_results]) |entities| {
-                for (entities) |entity| alloc.free(entity.text);
-                alloc.free(entities);
-            }
-            alloc.free(results);
-        }
-
-        for (texts, 0..) |_, i| {
-            const single = try self.recognizeWithLabelTokenBatch(texts[i .. i + 1], labels, label_token, threshold, flat_ner);
-            if (single.len != 1) {
-                for (single) |entities| {
-                    for (entities) |entity| alloc.free(entity.text);
-                    alloc.free(entities);
-                }
-                alloc.free(single);
-                return error.UnexpectedOutputShape;
-            }
-            results[i] = single[0];
-            alloc.free(single);
-            initialized_results += 1;
-        }
-
-        return results;
-    }
-
-    fn recognizeOfficialOnnxGlinerSingle(
-        self: *GlinerPipeline,
-        row: PreparedGlinerInput,
-        labels: []const []const u8,
-        threshold: f32,
-        flat_ner: bool,
-    ) ![]Entity {
-        const alloc = self.allocator;
-        const input_elements = std.math.add(
-            usize,
-            std.math.add(
-                usize,
-                row.input_ids.len,
-                row.attention_mask.len,
-            ) catch return error.ResourceLimitExceeded,
-            std.math.add(
-                usize,
-                std.math.add(
-                    usize,
-                    row.text_positions.len,
-                    row.schema_positions.len,
-                ) catch return error.ResourceLimitExceeded,
-                row.span_idx.len,
-            ) catch return error.ResourceLimitExceeded,
-        ) catch return error.ResourceLimitExceeded;
-        const input_bytes = std.math.mul(usize, input_elements, @sizeOf(i64)) catch
-            return error.ResourceLimitExceeded;
-        var run_permit = try self.session.admit(.{
-            .batch = 1,
-            .sequence = row.input_ids.len,
-            .input_bytes = input_bytes,
-            .host_preprocess_bytes = input_bytes,
-        });
-        defer run_permit.deinit();
-        const seq: i64 = @intCast(row.input_ids.len);
-        const shape_2d = [_]i64{ 1, seq };
-        var input_ids_tensor = try Tensor.initInt64(alloc, "input_ids", &shape_2d, row.input_ids);
-        defer input_ids_tensor.deinit();
-        var attention_mask_tensor = try Tensor.initInt64(alloc, "attention_mask", &shape_2d, row.attention_mask);
-        defer attention_mask_tensor.deinit();
-
-        const text_positions_shape = [_]i64{@intCast(row.text_positions.len)};
-        var text_positions_tensor = try Tensor.initInt64(alloc, "text_positions", &text_positions_shape, row.text_positions);
-        defer text_positions_tensor.deinit();
-
-        const schema_positions_shape = [_]i64{@intCast(row.schema_positions.len)};
-        var schema_positions_tensor = try Tensor.initInt64(alloc, "schema_positions", &schema_positions_shape, row.schema_positions);
-        defer schema_positions_tensor.deinit();
-
-        const span_shape = [_]i64{ 1, @intCast(row.num_spans), 2 };
-        var span_idx_tensor = try Tensor.initInt64(alloc, "span_idx", &span_shape, row.span_idx);
-        defer span_idx_tensor.deinit();
-
-        const outputs = try self.lockedSessionRun(&run_permit, &.{
-            input_ids_tensor,
-            attention_mask_tensor,
-            text_positions_tensor,
-            schema_positions_tensor,
-            span_idx_tensor,
-        }, alloc);
-        defer {
-            for (outputs) |*o| o.deinit();
-            alloc.free(outputs);
-        }
-        if (outputs.len == 0) return error.NoOutputTensors;
-
-        const output = outputs[0];
-        const scores = output.asFloat32();
-        const output_shape = output.shape;
-        if (output_shape.len != 4 and output_shape.len != 3) return error.UnexpectedOutputShape;
-
-        const dim_offset: usize = if (output_shape.len == 4) 1 else 0;
-        if (output_shape.len == 4 and (nonNegativeDim(output_shape[0]) catch return error.UnexpectedOutputShape) != 1) {
-            return error.UnexpectedOutputShape;
-        }
-        const output_labels = nonNegativeDim(output_shape[dim_offset]) catch return error.UnexpectedOutputShape;
-        const output_num_words = nonNegativeDim(output_shape[dim_offset + 1]) catch return error.UnexpectedOutputShape;
-        const output_max_width = nonNegativeDim(output_shape[dim_offset + 2]) catch return error.UnexpectedOutputShape;
-        if (output_labels < labels.len or output_num_words == 0 or output_max_width == 0) {
-            return error.UnexpectedOutputShape;
-        }
-        const expected_scores = std.math.mul(
-            usize,
-            std.math.mul(usize, output_labels, output_num_words) catch return error.UnexpectedOutputShape,
-            output_max_width,
-        ) catch return error.UnexpectedOutputShape;
-        if (scores.len != expected_scores) return error.UnexpectedOutputShape;
-
-        return self.decodeEntitiesFromLogits(
-            row,
-            labels,
-            scores,
-            output_num_words,
-            output_max_width,
-            labels.len,
-            threshold,
-            flat_ner,
-            .label_major_scores,
-        );
     }
 
     fn prepareGlinerInput(
@@ -1847,19 +1675,6 @@ pub const GlinerPipeline = struct {
         }.lessThan);
 
         return try dedupEntitiesByLabelText(alloc, try entities.toOwnedSlice(alloc));
-    }
-
-    fn usesOfficialOnnxGlinerContract(self: *const GlinerPipeline) bool {
-        return self.session.backend() == .onnx and
-            self.hasSessionInput("text_positions") and
-            self.hasSessionInput("schema_positions");
-    }
-
-    fn hasSessionInput(self: *const GlinerPipeline, name: []const u8) bool {
-        for (self.session.inputInfo()) |input| {
-            if (std.mem.eql(u8, input.name, name)) return true;
-        }
-        return false;
     }
 
     fn extractRelationsSingle(

@@ -118,12 +118,30 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
     // type-specific fields (external, dimension, edge_types, etc.) that the
     // generated IndexConfig struct doesn't capture.
     var parsed = metadata_server_openapi.server.parseCreateTableBody(alloc, body) catch {
-        var fallback = try tables_api.parseCreateTableRequest(alloc, body);
+        // Normalize validated public indexes before compatibility admission.
+        // Otherwise SDK nulls reach strict coverage/runtime validators first.
+        var fallback = fallback: {
+            if (raw_root.get("indexes")) |indexes_value| {
+                if (indexes_value != .null) {
+                    const normalized_indexes = try normalizeCreateTableIndexesWithDefaults(alloc, indexes_value, !external_source);
+                    defer alloc.free(normalized_indexes);
+                    var indexes = try std.json.parseFromSlice(std.json.Value, alloc, normalized_indexes, .{});
+                    defer indexes.deinit();
+                    // Preserve exact schema literal tokens while replacing only
+                    // the index object. Neither parsed arena owns the other.
+                    var exact = try std.json.parseFromSlice(std.json.Value, alloc, body, .{ .parse_numbers = false });
+                    defer exact.deinit();
+                    exact.value.object.getPtr("indexes").?.* = indexes.value;
+                    const normalized_body = try stringifyJsonAlloc(alloc, exact.value);
+                    defer alloc.free(normalized_body);
+                    // Only our validated normalizer introduced private durable
+                    // identities; public input was checked before this branch.
+                    break :fallback try tables_api.parseStoredCreateTableRequest(alloc, normalized_body);
+                }
+            }
+            break :fallback try tables_api.parseCreateTableRequest(alloc, body);
+        };
         errdefer fallback.deinit(alloc);
-        // Raw public fields were validated above. The compatibility parser
-        // adds private coverage incarnations, so re-running the public
-        // allow-list against its normalized output would reject trusted
-        // metadata that the caller never supplied.
         try validateCreateTableIndexSemantics(
             alloc,
             fallback.indexes_json orelse tables_api.default_indexes_json,
@@ -1282,7 +1300,13 @@ test "table contract parses create table via generated openapi type" {
     defer req.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(?u32, 1), req.num_shards);
     try std.testing.expectEqualStrings("docs", req.description.?);
-    try std.testing.expectEqualStrings(tables_api.default_indexes_json, req.indexes_json.?);
+    var indexes = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, req.indexes_json.?, .{});
+    defer indexes.deinit();
+    try std.testing.expectEqual(@as(usize, 1), indexes.value.object.count());
+    const default_index = indexes.value.object.get(tables_api.default_full_text_index_name).?;
+    try std.testing.expectEqualStrings(tables_api.default_full_text_index_name, default_index.object.get("name").?.string);
+    try std.testing.expectEqualStrings("full_text", default_index.object.get("type").?.string);
+    try std.testing.expect(coverage_policy.incarnation(default_index) != null);
     try std.testing.expect(std.mem.indexOf(u8, req.schema_json.?, "\"default_type\":\"doc\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, req.schema_json.?, "\"version\":0") != null);
     try std.testing.expect(std.mem.indexOf(u8, req.schema_json.?, "\"version\":null") == null);
@@ -1548,10 +1572,10 @@ test "table contract canonicalizes generated optional null fields" {
     defer request.deinit(std.testing.allocator);
     var indexes = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, request.indexes_json.?, .{});
     defer indexes.deinit();
-    const embedding = indexes.value.object.getPtr("title_body") orelse return error.TestUnexpectedResult;
-    switch (embedding.*) {
-        .object => |*object| _ = object.swapRemove(coverage_policy.incarnation_field),
-        else => return error.TestUnexpectedResult,
+    var index_it = indexes.value.object.iterator();
+    while (index_it.next()) |entry| {
+        try std.testing.expect(coverage_policy.incarnation(entry.value_ptr.*) != null);
+        _ = entry.value_ptr.object.swapRemove(coverage_policy.incarnation_field);
     }
     try ant_json.testing.expectEqualJsonValue(
         std.testing.allocator,
@@ -1750,6 +1774,36 @@ test "table contract treats nullable nested index fields as omitted" {
     );
 }
 
+test "external lake public table contract preserves boolean stored text source" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "true", "false" }) |value| {
+        const config = try std.fmt.allocPrint(a, "{{\"type\":\"full_text\",\"field\":\"body\",\"store_source\":{s}}}", .{value});
+        defer a.free(config);
+        const body = try std.fmt.allocPrint(a, "{{\"indexes\":{{\"body_text\":{s}}}}}", .{config});
+        defer a.free(body);
+        var request = try parseCreateTableRequest(a, body);
+        defer request.deinit(a);
+        var indexes = try std.json.parseFromSlice(std.json.Value, a, request.indexes_json.?, .{});
+        defer indexes.deinit();
+        try std.testing.expectEqual(std.mem.eql(u8, value, "true"), indexes.value.object.get("body_text").?.object.get("store_source").?.bool);
+        const index = try parseCreateIndexRequest(a, "body_text", config);
+        defer a.free(index);
+        const public = try indexes_api.encodeCreatedIndexConfig(a, "body_text", index);
+        defer a.free(public);
+        var response = try std.json.parseFromSlice(std.json.Value, a, public, .{});
+        defer response.deinit();
+        try std.testing.expectEqual(std.mem.eql(u8, value, "true"), response.value.object.get("store_source").?.bool);
+    }
+    for ([_][]const u8{ "1", "\"true\"", "[]", "{}" }) |value| {
+        const config = try std.fmt.allocPrint(a, "{{\"type\":\"full_text\",\"store_source\":{s}}}", .{value});
+        defer a.free(config);
+        try std.testing.expectError(error.InvalidCreateIndexRequest, parseCreateIndexRequest(a, "body_text", config));
+        const body = try std.fmt.allocPrint(a, "{{\"indexes\":{{\"body_text\":{s}}}}}", .{config});
+        defer a.free(body);
+        try std.testing.expectError(error.InvalidCreateTableRequest, parseCreateTableRequest(a, body));
+    }
+}
+
 test "table contract rejects unsupported index kinds before admission" {
     const supported = [_][]const u8{
         "{\"indexes\":{\"search\":{\"type\":\"full_text\"}}}",
@@ -1828,11 +1882,11 @@ test "table contract maps the default alias and preserves named full-text indexe
     try std.testing.expectEqualStrings("full_text_index_v0", full_text.get("name").?.string);
     try std.testing.expectEqualStrings("full_text", full_text.get("type").?.string);
     const body_search = indexes.value.object.get("body_search").?.object;
-    try std.testing.expect(body_search.get("name") == null);
+    try std.testing.expectEqualStrings("body_search", body_search.get("name").?.string);
     try std.testing.expectEqualStrings("full_text", body_search.get("type").?.string);
     try std.testing.expectEqualStrings("body", body_search.get("field").?.string);
     const embedding = indexes.value.object.get("embed_idx").?.object;
-    try std.testing.expect(embedding.get("name") == null);
+    try std.testing.expectEqualStrings("embed_idx", embedding.get("name").?.string);
     try std.testing.expectEqualStrings("embeddings", embedding.get("type").?.string);
     try std.testing.expectEqual(@as(i64, 384), embedding.get("dimension").?.integer);
     try std.testing.expect(coverage_policy.incarnation(.{ .object = embedding }) != null);
@@ -2176,9 +2230,14 @@ test "table contract preserves named full text indexes with matching name fields
         "{\"num_shards\":1,\"indexes\":{\"search_idx\":{\"name\":\"search_idx\",\"type\":\"full_text\"},\"embed_idx\":{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"external\":true,\"dimension\":3}}}",
     );
     defer req.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.indexOf(u8, req.indexes_json.?, "\"full_text_index_v0\":{\"name\":\"full_text_index_v0\",\"type\":\"full_text\"}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, req.indexes_json.?, "\"search_idx\":{\"name\":\"search_idx\",\"type\":\"full_text\"}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, req.indexes_json.?, "\"embed_idx\"") != null);
+    var indexes = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, req.indexes_json.?, .{});
+    defer indexes.deinit();
+    for ([_][]const u8{ "full_text_index_v0", "search_idx", "embed_idx" }) |name| {
+        const config = indexes.value.object.get(name).?;
+        try std.testing.expectEqualStrings(name, config.object.get("name").?.string);
+        try std.testing.expectEqualStrings(if (std.mem.eql(u8, name, "embed_idx")) "embeddings" else "full_text", config.object.get("type").?.string);
+        try std.testing.expect(coverage_policy.incarnation(config) != null);
+    }
 }
 
 test "table contract preserves arbitrary public full text names in table-definition indexes" {
@@ -2309,4 +2368,56 @@ test "external lake public contract admits typed aggregate recipes and SDK optio
     var after = try std.json.parseFromSlice(std.json.Value, a, regenerated, .{});
     defer after.deinit();
     try std.testing.expectEqual(@as(usize, 2), after.value.object.get("stats").?.object.get("materializations").?.array.items.len);
+}
+
+test "external lake public full text source storage round trips boolean opt in" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "true", "false", "null" }) |value| {
+        const config = try std.fmt.allocPrint(a, "{{\"type\":\"full_text\",\"field\":\"body\",\"store_source\":{s}}}", .{value});
+        defer a.free(config);
+        const normalized = try parseCreateIndexRequest(a, "text", config);
+        defer a.free(normalized);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, normalized, .{});
+        defer parsed.deinit();
+        if (std.mem.eql(u8, value, "null")) {
+            try std.testing.expect(!parsed.value.object.contains("store_source"));
+        } else {
+            try std.testing.expectEqual(std.mem.eql(u8, value, "true"), parsed.value.object.get("store_source").?.bool);
+        }
+        // Exercise typed scalar parsing and the compatibility path used
+        // when required OpenAPI scalars such as num_shards are omitted.
+        for ([_][]const u8{ "", "\"num_shards\":1," }) |prefix| {
+            const body = try std.fmt.allocPrint(a, "{{{s}\"indexes\":{{\"text\":{s}}}}}", .{ prefix, config });
+            defer a.free(body);
+            var request = try parseCreateTableRequest(a, body);
+            defer request.deinit(a);
+            var indexes = try std.json.parseFromSlice(std.json.Value, a, request.indexes_json.?, .{});
+            defer indexes.deinit();
+            const stored = indexes.value.object.get("text").?.object.get("store_source");
+            if (std.mem.eql(u8, value, "null")) try std.testing.expect(stored == null) else try std.testing.expectEqual(std.mem.eql(u8, value, "true"), stored.?.bool);
+        }
+    }
+    for ([_][]const u8{ "\"true\"", "1", "[]", "{}" }) |value| {
+        const config = try std.fmt.allocPrint(a, "{{\"type\":\"full_text\",\"store_source\":{s}}}", .{value});
+        defer a.free(config);
+        try std.testing.expectError(error.InvalidCreateIndexRequest, parseCreateIndexRequest(a, "text", config));
+    }
+}
+
+test "external lake public compatibility normalization preserves exact schema literals and private admission" {
+    const Check = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var request = try parseCreateTableRequest(a,
+                \\{"indexes":{"text":{"type":"full_text","field":"body","store_source":null}},"schema":{"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"amount":{"type":"number","default":9007199254740993.1}}}}}}}
+            );
+            defer request.deinit(a);
+            try std.testing.expect(std.mem.indexOf(u8, request.schema_json.?, "9007199254740993.1") != null);
+            try std.testing.expect(std.mem.indexOf(u8, request.indexes_json.?, "store_source") == null);
+        }
+    };
+    try Check.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+    try std.testing.expectError(error.InvalidCreateTableRequest, parseCreateTableRequest(std.testing.allocator,
+        \\{"indexes":{"text":{"type":"full_text","store_source":true,"_index_incarnation":7}}}
+    ));
 }

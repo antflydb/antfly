@@ -1,0 +1,1 @@
+{"version":0,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true,"properties":{"body":{"type":"string","x-antfly-types":["text"]},"category":{"type":"string","x-antfly-types":["keyword"]},"count":{"type":"integer","x-antfly-types":["numeric"]}}}}}}

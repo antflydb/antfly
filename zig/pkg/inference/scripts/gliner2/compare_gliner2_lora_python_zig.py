@@ -3409,7 +3409,6 @@ def run_zig_side(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
         str(zig_local_cache),
         "--global-cache-dir",
         str(zig_global_cache),
-        "-Donnx=false",
         f"-Dmetal={'true' if enable_metal else 'false'}",
         f"-Dcuda={'true' if enable_cuda else 'false'}",
     ]

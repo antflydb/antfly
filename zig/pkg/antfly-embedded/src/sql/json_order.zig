@@ -108,7 +108,8 @@ pub fn validateTextDomain(value: Json, budget: *Budget, depth: usize) !void {
 
 fn validateText(text: []const u8, budget: *Budget) !void {
     try budget.consume(text.len);
-    if (!std.unicode.utf8ValidateSlice(text) or std.mem.indexOfScalar(u8, text, 0) != null) return error.SqlTypeMismatch;
+    if (!std.unicode.utf8ValidateSlice(text)) return error.SqlInvalidTextEncoding;
+    if (std.mem.indexOfScalar(u8, text, 0) != null) return error.SqlUntranslatableCharacter;
 }
 
 /// The caller owns the allocation region and its byte admission. All retained

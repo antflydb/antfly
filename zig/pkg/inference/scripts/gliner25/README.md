@@ -186,3 +186,14 @@ For same-binary controls, pass `--diagnostic-disable qkv-rope` and/or
 records these controls and marks their receipts ineligible for performance
 acceptance. They map to `TERMITE_METAL_DISABLE_GLINER_QKV_ROPE=1` and
 `TERMITE_METAL_DISABLE_GLINER_ADD_NORM=1`; normal paired campaigns clear them.
+
+
+## Decide-1B extraction diagnostics
+
+Numerical span-head parity does not qualify extraction quality. The current
+pinned checkpoint produces empty NER/relation outputs on the untouched upstream
+probes, including under its declared Transformers version. See
+[the investigation](SPAN_1B_INVESTIGATION.md) and
+`investigate_span_extraction.py` for reproduction and retained evidence.
+Discovery and pull-time manifests withhold these extraction capabilities;
+typed decisions and classification remain available.

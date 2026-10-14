@@ -1331,11 +1331,11 @@ fn verifyDegreeActivePublicReadSurface(
         std.debug.print("expected degree traversal to return doc:0, got {s}\n", .{traversal.nodes[0].key});
         return error.GraphMetricDegreeProcessProofFailed;
     }
-    if (traversal.nodes[0].metrics.len != 1 or traversal.nodes[0].metrics[0].score == null) {
+    if (traversal.nodes[0].metricCount() != 1 or traversal.nodes[0].metricAt(0).score == null) {
         std.debug.print("expected service traversal published projection to serve prior degree score\n", .{});
         return error.GraphMetricDegreeProcessProofFailed;
     }
-    try std.testing.expectApproxEqAbs(@as(f64, 1.0), traversal.nodes[0].metrics[0].score.?, 0.0000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), traversal.nodes[0].metricAt(0).score.?, 0.0000001);
     if (traversal.metric_status.len != 1 or traversal.metric_status[0].state != antfly.graph.GraphIndex.GraphMetricState.building) {
         std.debug.print("expected service traversal metric status building during active degree rebuild\n", .{});
         return error.GraphMetricDegreeProcessProofFailed;

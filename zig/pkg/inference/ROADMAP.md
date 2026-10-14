@@ -1,199 +1,153 @@
 # antfly-inference-zig Roadmap
 
-antfly-inference-zig is Antfly's Zig ML inference runtime: embeddings, reranking (cross-encoder, ColBERT, ColQwen), extraction/classification (GLiNER2, LayoutLMv3/LayoutDoc), chunking, and generative text (autoregressive decoding, KV cache, tool-calling, grammar-constrained decoding, SSE streaming) across native CPU, Metal, CUDA, and ONNX Runtime backends, plus LoRA/PEFT training for supported architectures. Most of the 10-endpoint API is already working — see "Shipped" below; "Remaining API Parity" tracks what's left. The Kubernetes operator and proxy stay in Go; only the inference binary itself is Zig.
+antfly-inference-zig is Antfly's Zig ML inference runtime: embeddings,
+reranking, extraction/classification, chunking, rewriting, reading (OCR/VLM),
+transcription, and generation across native CPU, Metal, and CUDA backends (ONNX
+models run on Antfly's own ONNX implementation), plus LoRA/PEFT training. This file tracks open work only; how things
+work today lives in the design docs linked below.
 
-## Architecture
+The HTTP surface is generated from
+[specs/openapi/inference/api.yaml](../../../specs/openapi/inference/api.yaml)
+(`src/api/generated/inference_api/server.zig`) and registered under `/ai/v1`
+and `/ml/v1` by `Node.registerHttpRoutes` in `src/server/server.zig`. The
+Kubernetes operator (`InferencePool`, `InferenceProxy`, `ExternalInferencePool`
+CRDs, [go/pkg/operator](../../../go/pkg/operator)) and the inference proxy
+([go/pkg/proxy/inference](../../../go/pkg/proxy/inference)) stay in Go.
 
-```
-.onnx files ──────► ONNX Runtime (CPU, CUDA, TensorRT, ROCm)
-                         │
-SafeTensors/GGUF ──► Hand-written forward pass ──► Metal (macOS only)
-                         ├──► native (CPU everywhere, optional system BLAS)
-                         └──► CUDA (see CUDA.md)
-```
-
-ONNX Runtime is the universal backend (loads `.onnx` directly). Metal, native, and CUDA need SafeTensors/GGUF weight loading plus hand-written model architectures per model family — see [NATIVE.md](NATIVE.md), [METAL.md](METAL.md), and [CUDA.md](CUDA.md) for each backend's design.
-
----
-
-## What Stays in Go
-
-- `go/pkg/operator/` — Kubernetes operator (InferencePool, InferenceProxy CRDs)
-- `pkg/proxy/` — load-balancing proxy with circuit breaker
-- Dashboard HTML/JS serving
-
-The Go binary continues to work — Zig is a drop-in replacement for the inference binary only.
+Repository-wide open work lives in [zig/TODO.md](../../TODO.md) and
+[zig/ROADMAP.md](../../ROADMAP.md); this file does not repeat it.
 
 ---
 
-## Shipped
+## Shipped (pointers only)
 
-Backend and runtime design docs (linked below) describe how these work today; this list is what they add up to at the API/feature level.
-
-- SentencePiece BPE tokenizer (full, tested)
-- SafeTensors parser + MMapReader + ShardedIndex (full, tested)
-- WeightSource abstraction (SafeTensors adapter, f16/bf16→f32)
-- BERT config parsing + weight mapping (bert, roberta, distilbert)
-- Tensor type (multi-dtype, shape, owned/borrowed)
-- Session vtable (run, inputInfo, outputInfo, backend, close)
-- Native CPU backend math primitives (sgemm, l2Normalize, meanPool) — see [NATIVE.md](NATIVE.md)
-- Metal backend (packed/resident quantized weights, graph-planned command scopes) — see [METAL.md](METAL.md)
-- CUDA backend — see [CUDA.md](CUDA.md)
-- GGUF/GGML quantization format coverage and graph-execution partitioning — see [GGML.md](GGML.md)
-- Generic graph IR (tracing, compiler passes, execution backends, partitioning, caching, offline artifacts) — see [GRAPH.md](GRAPH.md)
-- TurboQuant KV cache codec — see [TURBOQUANT.md](TURBOQUANT.md)
-- Gemma 4 support, including MTP speculative decoding — see [GEMMA4.md](models/gemma4/GEMMA4.md)
-- Document readers (OCR/layout/extraction pipelines) — see [READERS.md](READERS.md)
-- TTL ResultCache with stats
-- Model registry (local discovery, ModelRef parsing)
-- HTTP server (httpx.zig, route stubs)
-- CLI (run, list, pull, version)
-- Build system (conditional `-Donnx`, `-Dmetal`, `-Dcuda`)
-- Working `/api/embed` via ONNX
-- Reranking pipeline and `/api/rerank`
-- Native BERT/RoBERTa cross-encoder path
-- ColBERT late-interaction text reranker
-- ColQwen multimodal reranker on `/rerank`
-- GLiNER2 native DeBERTa + span-head path
-- Document classification runtime (`/api/classify/document`, `/api/classify/document_tokens`)
-- LayoutLMv3 PEFT surface (LoRA bootstrap, train, inspect, materialize)
-- Autodiff and training loop (reverse-mode AD, VJP rules, FlatTrainingState, LoRA injection)
-- Optimizers (SGD, Adam, AdamW, LLRD, Schedule-Free AdamW, gradient clipping)
-- Distributed training (data-parallel via allReduceSum)
-- Activation checkpointing
-- Grammar masking + speculative decode parity on native generation
-- Constrained decoding (native backend only)
-- Tool-calling parity in `/api/generate` (FunctionGemma-style, streaming `tool_calls` deltas)
-- Gemma4 LoRA training (surrogate-gradient, PEFT-compatible output)
-- Text generation with autoregressive decoding, KV cache, SSE streaming
-- ONNX `ortgenai` image-bearing generation path
+- Endpoints `/embed`, `/embeddings`, `/rerank`, `/generate`,
+  `/generate/batch`, `/chat/completions`, `/chunk`, `/extract` (canonical
+  NER/relations/text and token classification), `/decisions`, `/rewrite`,
+  `/read`, `/transcribe`, `/dictate`, `/transcription/sessions/*`, `/models`,
+  `/predict`, `/predictors`, and `/ml/v1/metrics`: all registered through the
+  generated router and covered by handler tests in `src/server/server.zig`;
+  most also have Python E2E in [zig/e2e/inference](../../e2e/inference).
+- Backends: [NATIVE.md](NATIVE.md), [METAL.md](METAL.md), [CUDA.md](CUDA.md),
+  [ONNX.md](ONNX.md), [WASM.md](WASM.md), [GGML.md](GGML.md),
+  [GRAPH.md](GRAPH.md), [MULTIDEVICE.md](MULTIDEVICE.md).
+- Generation, KV cache, tool calling, grammar/speculative decoding:
+  [LLMS.md](LLMS.md), [KVCACHE.md](KVCACHE.md),
+  [TURBOQUANT.md](TURBOQUANT.md), [TOOL_CALLING.md](TOOL_CALLING.md),
+  [OPENAI.md](OPENAI.md); model families in [models/](models/README.md).
+- Reranking (cross-encoder, ColBERT, ColQwen, Qwen3-VL): [RERANKING.md](RERANKING.md).
+- Readers/OCR: [READERS.md](READERS.md). Training: [finetuning/FINETUNING.md](finetuning/FINETUNING.md).
+- Hugging Face pull with resume, receipts, and integrity checks
+  (`src/registry/download.zig`): [MODEL_COMPATIBILITY.md](MODEL_COMPATIBILITY.md), [TASKS.md](TASKS.md).
+- Admission and backpressure: fail-fast weighted admission
+  (`src/server/inference_admission.zig`, `max_concurrent_requests`) returning
+  503 with `Retry-After`; requests are intentionally never queued. Model
+  residency and budgets: [MANAGERS.md](../../MANAGERS.md), [BUDGETS.md](BUDGETS.md).
+- Cross-request batching (instead of per-model session pools): [BATCHING.md](BATCHING.md).
+- Binary dense embeddings: `/embed` returns a numeric frame for
+  `Accept: application/vnd.antfly.numeric.v1` (`buildDenseNumericFrame`).
+- Prometheus counters/gauges for requests, errors, embed batches, speculation,
+  model count, and admission (`src/server/metrics.zig`).
 
 ---
 
-## Active Work
+## Open Work
 
-### Reranker and Multimodal Verification
+### API and Spec Drift
 
-- [ ] **Multimodal `/rerank` smoke/regression surface** (request-level)
-- [ ] **Unify text and multimodal late-interaction reporting semantics**
-- [ ] **Broader multimodal server-path regression coverage**
-- [ ] **Request orchestration semantics** for server-side distributed rerank execution
-
-### Native GLiNER Parity
-
-- [ ] **GLiNER parity validation**: GLiNER has a native DeBERTa + span-head path. Remaining work: prove parity with real GLiNER models across backends, add backend-specific tests, tighten performance gaps in the native head.
-- [ ] **Bounded BLAS-vs-TP parity run** on a real local GLiNER2 bundle
-- [ ] **Server-path orchestration** for distributed multi-rank GLiNER2 execution
-- [ ] **Thread server/reporting semantics** through native `/classify` and `/extract`
+- [ ] **Semantic chunking.** `/chunk` serves only the fixed chunker
+  (`lib/chunker`, with overlap and separator fallback); semantic model names
+  fail closed (test "fixed chunk model aliases canonicalize and semantic
+  models fail closed"). The `/chunk` description in `api.yaml` still promises
+  ONNX semantic chunkers from `models_dir/chunkers/` and 2-minute result
+  caching; either implement them or correct the spec.
+- [ ] **Result cache.** `ResultCache`/singleflight in `src/cache/` are not used
+  by any handler; `Node.embed_cache` is allocated (`server.zig`, `init`) and
+  freed but never read, and `/chunk` always reports `cache_hit = false`.
+  Query-embedding caching is owned by Antfly core
+  ([INFERENCE_CACHING.md](../../INFERENCE_CACHING.md)). Decide whether the
+  server needs its own cache; otherwise delete the dead field and the
+  `cache_hits`/`cache_misses` metrics, which are never incremented.
+- [ ] **Native T5 rewriting.** `architectures/t5.zig` builds native T5
+  sessions (also used by `web/t5_api.zig`), but `/rewrite` only resolves ONNX
+  encoder/decoder pairs or the native Florence fallback
+  (`findEncoderDecoderPaths` in `src/pipelines/encoder_decoder.zig`), so
+  SafeTensors/GGUF T5 bundles are not reachable over HTTP.
 
 ### LayoutDoc
 
-- [ ] **Parity fixtures** using real `gopeft-zig` checkpoints and example pages
-- [ ] **Image-byte / content-part input** for the sequence endpoint (vs. current path-based)
-- [ ] **OCR extraction / bbox-producing flow** that can feed `classify_tokens` directly
+The runtime and checkpoint loaders are in place
+([models/layoutdoc/LAYOUTDOC.md](models/layoutdoc/LAYOUTDOC.md)), but the HTTP
+surface is not.
+
+- [ ] **Register or remove the document classification handlers.**
+  `Node.classifyDocument` and `Node.classifyDocumentTokens` in
+  `src/server/server.zig` are not bound to any route, and `api.yaml` defines
+  only their request schemas. The `/api/classify/document*` endpoints in
+  LAYOUTDOC.md do not exist. The likely target is a document task on `/extract`.
+- [ ] **Image bytes and content parts** instead of the local `image_path` input.
+- [ ] **OCR-to-token flow** that produces the bbox tokens `classify_tokens`
+  needs, from the readers in [READERS.md](READERS.md).
+- [ ] **Parity fixtures** from real `gopeft-zig` checkpoints and example pages
+  (the pipelines in `src/pipelines/document_*classification.zig` have no
+  checkpoint-backed tests).
+
+### Reranking
+
+- [ ] Multimodal `/rerank` request-level coverage and reporting semantics: see
+  [RERANKING.md#remaining-work](RERANKING.md#remaining-work). Today the
+  multimodal tests are parser/admission unit tests in `src/server/server.zig`,
+  and `zig/e2e/inference/test_rerank.py` sends no image content.
+
+### GLiNER
+
+Parity is qualified for the reviewed GLiNER2.5 rows; remaining model-level
+work is in [models/gliner2/GLINER25.md](models/gliner2/GLINER25.md#open-work)
+and [models/gliner2/CUDA.md](models/gliner2/CUDA.md#remaining-work).
+
+- [ ] **Bounded BLAS-vs-tensor-parallel parity run** on a real local GLiNER2
+  bundle. The only distributed test is the helper-level
+  "gliner distributed GPU-hosted helpers mirror pipeline/session state" in
+  `src/pipelines/gliner.zig`.
+
+### Distributed Server Execution
+
+- [ ] **Server-side multi-rank orchestration** for rerank and GLiNER
+  `/extract`. Pipelines read `runtime.distributed.configFromEnv()`
+  (`TERMITE_DISTRIBUTED_*`, `src/runtime/distributed.zig`) in
+  `src/server/model_manager.zig` and `src/server/server.zig`, but no server
+  path dispatches a request to peer ranks or reports per-rank results.
+
+### Multimodal Generation
+
+Native image/audio generation through the GGUF projector path is served. What
+remains is throughput and parity on the faster paths:
+
+- [ ] The CUDA row scheduler excludes multimodal requests
+  (`enabledForRequest`, `src/server/server.zig`).
+- [ ] The Metal whole-model executor excludes multimodal prompts because they
+  prefill from projected embeddings.
+- [ ] `/generate/batch` serializes multimodal items under the model lock until
+  a model capability advertises native multimodal batching.
+
+### Operations
+
+- [ ] **Latency histograms and model load/unload events.** `/metrics` has
+  counters and gauges only; per-endpoint latency histograms and load/evict
+  events for AI models (as opposed to tabular predictors) are missing.
+- [ ] **Graceful shutdown.** SIGINT/SIGTERM keep default OS behavior
+  (`src/main.zig`), so in-flight requests are not drained and models are not
+  unloaded on shutdown.
+- [ ] **`SessionPool` cleanup.** `src/backends/session_pool.zig` is exported
+  and unit-tested but never used; concurrency comes from cross-request
+  batching ([BATCHING.md](BATCHING.md)). Delete it or document a use.
 
 ---
 
-## Remaining API Parity
+## Testing
 
-### Endpoint Status
-
-| Endpoint | Status |
-|----------|--------|
-| `/api/embed` | Working (ONNX) |
-| `/api/rerank` | Working (ONNX + native BERT/RoBERTa + ColBERT); multimodal ColQwen documents working end-to-end, verification ongoing |
-| `/api/generate` | Working (autoregressive, streaming, tool-calling) |
-| `/api/chunk` | Basic fixed chunking; semantic chunking pending |
-| `/api/extract` | GLiNER native path; parity validation pending |
-| `/api/classify` | Stub |
-| `/api/rewrite` | Stub |
-| `/api/read` | Stub |
-| `/api/transcribe` | Stub |
-| `/api/models` | Stub |
-
-### Remaining Endpoint Work
-
-**Chunking (`/api/chunk`):**
-- Improve fixed chunking: sentence boundary detection, overlap support
-- Semantic chunking via optional token classification model
-
-**Text classification (`/api/classify`):**
-- Sequence classification: run BERT, extract `[CLS]` logits
-- Multi-label support (sigmoid per class)
-- Zero-shot via NLI model (hypothesis template)
-
-**Text rewriting (`/api/rewrite`):**
-- Seq2seq inference (T5/BART): encode input, decode output autoregressively
-- Shares generation logic with `/api/generate`
-
-**Document reading (`/api/read`):**
-- Vision2Seq: image preprocessing (resize, normalize) → vision encoder → text decoder
-- Florence2 support as primary target
-
-**Audio transcription (`/api/transcribe`):**
-- Audio preprocessing: resample to 16kHz, mel spectrogram
-- Whisper-style encoder-decoder
-
-**Model architectures needed:**
-
-| Architecture | Endpoints | Status |
-|---|---|---|
-| BERT encoder | embed, rerank, recognize, classify | Done |
-| GPT/Qwen decoder | generate, rerank (ColBERT) | Done |
-| T5 encoder-decoder | generate, rewrite | Partial |
-| CLIP vision+text | embed (multimodal) | Pending |
-| Whisper | transcribe | Pending |
-| Florence2 | read | Pending |
-
----
-
-## Infrastructure Gaps
-
-- [ ] **Result caching**: `ResultCache` and singleflight primitives exist in `src/cache/` but are not wired into any handler. Go antfly inference has per-endpoint TTL caches with singleflight dedup for: embedding, sparse embedding, chunking, reranking, NER, reading, transcription.
-- [ ] **Dense binary serialization**: Go antfly inference defaults to `application/octet-stream` for `/api/embed` (LE float32 arrays). We always return JSON.
-- [ ] **Multimodal generation parity**: native multimodal generation is missing for models like Gemma 3; multimodal success coverage and streaming behavior still lag Go inference.
-- [ ] **HuggingFace Hub download**: `antfly inference pull owner/model:variant` — HTTP client for hub.huggingface.co, token auth, variant selection, progress reporting, resume support. (`src/registry/download.zig`)
-- [ ] **Session pooling**: pool of N sessions per model for concurrent inference. (`src/backends/session_pool.zig`)
-- [ ] **Prometheus metrics**: request latency histograms, cache hit rates, model load/unload events. `/metrics` endpoint. (`src/server/metrics.zig`)
-- [ ] **Request queue + backpressure**: configurable max queue depth, 503 with Retry-After when full.
-- [ ] **Graceful shutdown**: drain in-flight requests on SIGTERM, unload all models cleanly.
-
----
-
-## E2E Testing
-
-**Structure:** Shell scripts in `e2e/` using curl + jq.
-
-| Script | Model | Validates |
-|---|---|---|
-| `test_embed.sh` | bge-small-en-v1.5 | Embedding dimensions, cosine similarity |
-| `test_rerank.sh` | ms-marco-MiniLM-L-6-v2 | Score ordering, relevant > irrelevant |
-| `test_chunk.sh` | (no model) | Chunk boundaries, overlap |
-| `test_blas.sh` | bge-small-en-v1.5 (SafeTensors) | Output matches ONNX within tolerance |
-| `test_generate.sh` | small T5/GPT model | Generates coherent text |
-| `test_ner.sh` | NER model | Correct entity spans |
-
-**CI matrix:**
-```
-macOS arm64:  ONNX + BLAS + Metal
-Linux x86_64: ONNX + BLAS
-Linux arm64:  ONNX + BLAS
-```
-
-**Golden file approach:** Run Go antfly inference on same model + inputs, save output. Zig tests compare against golden files (cosine similarity > 0.99 for embeddings, exact match for classification).
-
----
-
-## Key Reference Files
-
-| Zig File | Go Reference |
-|---|---|
-| `src/backends/onnx.zig` | `lib/hugot/backends/backend_onnx.go` |
-| `src/pipelines/embedding.zig` | `lib/embeddings/embedder.go`, `lib/pipelines/embedding.go` |
-| `src/pipelines/reranking.zig` | `lib/reranking/reranker.go` |
-| `src/pipelines/chunking.zig` | `lib/chunking/fixed.go`, `lib/chunking/chunker.go` |
-| `src/server/model_manager.zig` | `pkg/inference/registry_base.go`, `model_budget.go` |
-| `src/cache/singleflight.zig` | `pkg/inference/result_cache.go` |
-| `src/tokenizer/hf_tokenizer.zig` | `go-huggingface/tokenizers/` |
-| `src/models/manifest.zig` | `lib/modelregistry/manifest.go` |
-| `src/registry/download.zig` | `lib/modelregistry/huggingface.go` |
+Python E2E lives in [zig/e2e/inference](../../e2e/inference) (runnable via the
+`inference-e2e` scope of `.github/workflows/zig-tests.yml`); the
+cancellation E2E is described in [tests/README.md](tests/README.md). The gap
+that inference E2E is not in normal PR CI is tracked in
+[zig/TODO.md](../../TODO.md#ci-coverage-gaps).

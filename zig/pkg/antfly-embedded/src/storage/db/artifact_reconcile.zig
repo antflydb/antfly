@@ -36,7 +36,7 @@ pub fn validateDesired(alloc: std.mem.Allocator, command: inventory.Command) !vo
         return error.OnlineMergeArtifactTailsUnsupported;
     }
     if (command.catalogs.resolvers.len != 0) {
-        const configs = try resolvers.deserializeCatalog(alloc, command.catalogs.resolvers);
+        const configs = try resolvers.deserializeActiveCatalog(alloc, command.catalogs.resolvers);
         defer {
             for (configs) |*config| config.deinit(alloc);
             alloc.free(configs);

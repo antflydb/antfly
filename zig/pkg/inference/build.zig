@@ -46,20 +46,6 @@ fn selectTestFilters(b: *std.Build, default_filters: []const []const u8) []const
     );
 }
 
-fn defaultOnnxRuntimeRoot(b: *std.Build, target: std.Build.ResolvedTarget) []const u8 {
-    const platform_str = switch (target.result.os.tag) {
-        .macos => "darwin",
-        .linux => "linux",
-        else => "unknown",
-    };
-    const arch_str = switch (target.result.cpu.arch) {
-        .aarch64 => "arm64",
-        .x86_64 => "amd64",
-        else => "unknown",
-    };
-    return b.fmt("onnxruntime/{s}-{s}", .{ platform_str, arch_str });
-}
-
 fn targetRunsOnBuildHost(b: *std.Build, target: std.Build.ResolvedTarget) bool {
     const host = b.graph.host.result;
     return target.result.os.tag == host.os.tag and
@@ -110,20 +96,6 @@ fn configureMetal(
     module.addCSourceFile(.{ .file = b.path("src/backends/metal_kernels.m"), .flags = &.{"-fobjc-arc"} });
 }
 
-fn configureOnnxRuntime(
-    b: *std.Build,
-    module: *std.Build.Module,
-    enable_onnx: bool,
-    onnx_root: []const u8,
-) void {
-    if (!enable_onnx) return;
-    module.addIncludePath(b.graph.cwdRelativePath(b.fmt("{s}/include", .{onnx_root})));
-    module.addLibraryPath(b.graph.cwdRelativePath(b.fmt("{s}/lib", .{onnx_root})));
-    module.addRPath(b.graph.cwdRelativePath(b.fmt("{s}/lib", .{onnx_root})));
-    module.linkSystemLibrary("onnxruntime", .{});
-    module.linkSystemLibrary("onnxruntime-genai", .{});
-}
-
 fn configureNativeTool(
     b: *std.Build,
     artifact: *std.Build.Step.Compile,
@@ -166,10 +138,6 @@ pub fn build(b: *std.Build) void {
     if (!std.mem.eql(u8, wasm_memory_model, "wasm32") and !std.mem.eql(u8, wasm_memory_model, "wasm64")) {
         @panic("invalid -Dwasm-memory-model (expected wasm32 or wasm64)");
     }
-    const onnx_option = b.option(bool, "onnx", "Enable ONNX Runtime backend");
-    const enable_onnx = if (enable_wasm or !link_libc) false else (onnx_option orelse false);
-    const onnx_root_opt = b.option([]const u8, "onnx-root", "Path to ONNX Runtime root (default: ./onnxruntime/<platform>)");
-    const effective_onnx_root = onnx_root_opt orelse defaultOnnxRuntimeRoot(b, target);
     const enable_metal = if (enable_wasm or !link_libc) false else (b.option(bool, "metal", "Enable Apple Metal kernels (macOS only)") orelse (target.result.os.tag == .macos));
     const enable_cuda = if (enable_wasm or !link_libc) false else (b.option(bool, "cuda", "Enable CUDA backend through the NVIDIA Driver API") orelse false);
     const cuda_artifacts = b.option([]const u8, "cuda-artifacts", "CUDA artifact bundle: fatbin SASS+PTX, portable PTX, or sm89 cubin") orelse "fatbin";
@@ -255,8 +223,6 @@ pub fn build(b: *std.Build) void {
         },
         .register_public_modules = true,
         .backend = .{
-            .enable_onnx = enable_onnx,
-            .onnx_root = effective_onnx_root,
             .enable_metal = enable_metal,
             .enable_cuda = enable_cuda,
             .cuda_artifacts = cuda_artifacts,
@@ -1107,6 +1073,92 @@ pub fn build(b: *std.Build) void {
     run_embeddinggemma2_bench.addPassthruArgs();
     b.step("bench-embeddinggemma2", "Run the synchronized prepared-text encoder benchmark").dependOn(&run_embeddinggemma2_bench.step);
 
+    const gemma4_image_bench = b.addExecutable(.{
+        .name = "antfly-gemma4-image-bench",
+        .root_module = b.createModule(.{ .root_source_file = b.path("src/bench/gemma4_image.zig"), .target = target, .optimize = optimize }),
+    });
+    gemma4_image_bench.root_module.addImport("build_options", build_options_mod);
+    gemma4_image_bench.root_module.addImport("inference_internal", inference_internal_mod);
+    runtime_graph.identities.addImports(gemma4_image_bench.root_module);
+    gemma4_image_bench.root_module.link_libc = true;
+    const install_gemma4_image_bench = b.addInstallArtifact(gemma4_image_bench, .{});
+    b.step("build-gemma4-image-bench", "Build the synchronized Gemma4 image benchmark").dependOn(&install_gemma4_image_bench.step);
+    const run_gemma4_image_bench = b.addRunArtifact(gemma4_image_bench);
+    run_gemma4_image_bench.addPassthruArgs();
+    b.step("bench-gemma4-image", "Benchmark Gemma4 vision and image embeddings").dependOn(&run_gemma4_image_bench.step);
+
+    const audio_embedding_bench = b.addExecutable(.{
+        .name = "antfly-audio-embedding-bench",
+        .root_module = b.createModule(.{ .root_source_file = b.path("src/bench/audio_embedding.zig"), .target = target, .optimize = optimize }),
+    });
+    audio_embedding_bench.root_module.addImport("build_options", build_options_mod);
+    audio_embedding_bench.root_module.addImport("inference_internal", inference_internal_mod);
+    runtime_graph.identities.addImports(audio_embedding_bench.root_module);
+    audio_embedding_bench.root_module.link_libc = true;
+    const install_audio_embedding_bench = b.addInstallArtifact(audio_embedding_bench, .{});
+    b.step("build-audio-embedding-bench", "Build the synchronized real-model audio embedding benchmark").dependOn(&install_audio_embedding_bench.step);
+
+    if (target.result.os.tag == .macos) {
+        const pdf_ocr_bench = b.addExecutable(.{
+            .name = "antfly-pdf-ocr-comparison",
+            .root_module = b.createModule(.{ .root_source_file = b.path("src/bench/pdf_ocr_comparison.zig"), .target = target, .optimize = optimize }),
+        });
+        pdf_ocr_bench.root_module.addImport("inference_internal", inference_internal_mod);
+        pdf_ocr_bench.root_module.addCSourceFile(.{ .file = b.path(b.fmt("{s}/lib/readers/src/apple_vision.m", .{shared_lib_root})), .flags = &.{"-fobjc-arc"} });
+        for ([_][]const u8{ "Vision", "Foundation", "CoreGraphics", "ImageIO" }) |framework| pdf_ocr_bench.root_module.linkFramework(framework, .{});
+        runtime_graph.identities.addImports(pdf_ocr_bench.root_module);
+        pdf_ocr_bench.root_module.link_libc = true;
+        b.step("build-pdf-ocr-comparison", "Build Gemma4 versus Apple Vision corpus benchmark").dependOn(&b.addInstallArtifact(pdf_ocr_bench, .{}).step);
+    }
+
+    // Standalone PDF benchmark shares image/hash identity with inference.
+    // Font data belongs only to this tool, not the production inference graph.
+    const pdf_fonts_files = b.addWriteFiles();
+    _ = pdf_fonts_files.addCopyFile(b.path(b.fmt("{s}/lib/pdf/fonts/roboto/Roboto-Regular.ttf", .{shared_lib_root})), "lib/pdf/fonts/roboto/Roboto-Regular.ttf");
+    _ = pdf_fonts_files.addCopyFile(b.path(b.fmt("{s}/lib/pdf/fonts/roboto/Roboto-Bold.ttf", .{shared_lib_root})), "lib/pdf/fonts/roboto/Roboto-Bold.ttf");
+    const pdf_fonts = b.createModule(.{ .root_source_file = pdf_fonts_files.addCopyFile(b.path(b.fmt("{s}/pdf_standard_fonts.zig", .{shared_lib_root})), "pdf_standard_fonts.zig"), .target = target, .optimize = optimize });
+    const pdf_font = b.createModule(.{ .root_source_file = b.path(b.fmt("{s}/lib/font/src/mod.zig", .{shared_lib_root})), .target = target, .optimize = optimize });
+    const pdf_module = b.createModule(.{ .root_source_file = b.path(b.fmt("{s}/lib/pdf/src/mod.zig", .{shared_lib_root})), .target = target, .optimize = optimize });
+    pdf_module.addImport("antfly_image", antfly_image_mod);
+    pdf_module.addImport("antfly_hash", antfly_image_mod.import_table.get("antfly_hash").?);
+    pdf_module.addImport("antfly_font", pdf_font);
+    pdf_module.addImport("pdf_standard_fonts", pdf_fonts);
+    pdf_module.addImport("antfly_platform", configured_platform_mod);
+    if (target.result.os.tag == .macos) {
+        addMacosSdkPaths(b, pdf_module, target);
+        pdf_module.linkFramework("CoreFoundation", .{});
+        pdf_module.linkFramework("CoreGraphics", .{});
+    }
+    const gemma4_pdf_bench = b.addExecutable(.{ .name = "antfly-gemma4-pdf-bench", .root_module = b.createModule(.{ .root_source_file = b.path("src/bench/gemma4_pdf.zig"), .target = target, .optimize = optimize }) });
+    gemma4_pdf_bench.root_module.addImport("build_options", build_options_mod);
+    gemma4_pdf_bench.root_module.addImport("inference_internal", inference_internal_mod);
+    gemma4_pdf_bench.root_module.addImport("antfly_pdf", pdf_module);
+    runtime_graph.identities.addImports(gemma4_pdf_bench.root_module);
+    gemma4_pdf_bench.root_module.link_libc = true;
+    if (enable_metal and target.result.os.tag == .macos) {
+        addMacosSdkPaths(b, gemma4_pdf_bench.root_module, target);
+        gemma4_pdf_bench.root_module.linkFramework("Foundation", .{});
+        gemma4_pdf_bench.root_module.linkFramework("Metal", .{});
+        gemma4_pdf_bench.root_module.addCSourceFile(.{ .file = b.path("src/bench/pdf_gpu.m"), .flags = &.{"-fobjc-arc"} });
+    }
+    const pdf_gpu_test_module = b.createModule(.{ .root_source_file = b.path("src/bench/pdf_gpu.zig"), .target = target, .optimize = optimize });
+    pdf_gpu_test_module.addImport("antfly_pdf", pdf_module);
+    pdf_gpu_test_module.addImport("build_options", build_options_mod);
+    pdf_gpu_test_module.link_libc = true;
+    if (enable_metal and target.result.os.tag == .macos) {
+        addMacosSdkPaths(b, pdf_gpu_test_module, target);
+        pdf_gpu_test_module.linkFramework("Foundation", .{});
+        pdf_gpu_test_module.linkFramework("Metal", .{});
+        pdf_gpu_test_module.addCSourceFile(.{ .file = b.path("src/bench/pdf_gpu.m"), .flags = &.{"-fobjc-arc"} });
+    }
+    const pdf_gpu_tests = b.addTest(.{ .root_module = pdf_gpu_test_module });
+    b.step("pdf-gpu-test", "Validate prototype eligibility and GPU/native pixel parity").dependOn(&b.addRunArtifact(pdf_gpu_tests).step);
+    const install_gemma4_pdf_bench = b.addInstallArtifact(gemma4_pdf_bench, .{});
+    b.step("build-gemma4-pdf-bench", "Build the real-PDF Gemma4 benchmark and Metal painter prototype").dependOn(&install_gemma4_pdf_bench.step);
+    const run_gemma4_pdf_bench = b.addRunArtifact(gemma4_pdf_bench);
+    run_gemma4_pdf_bench.addPassthruArgs();
+    b.step("bench-gemma4-pdf", "Compare CPU/GPU page painting and resident Gemma4 embedding").dependOn(&run_gemma4_pdf_bench.step);
+
     const embeddinggemma2_attention_check = b.addExecutable(.{
         .name = "antfly-embeddinggemma2-attention-check",
         .root_module = b.createModule(.{
@@ -1396,7 +1448,6 @@ pub fn build(b: *std.Build) void {
     gliner2_e2e_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
     runtime_graph.identities.addImports(gliner2_e2e_bench_exe.root_module);
     gliner2_e2e_bench_exe.root_module.link_libc = true;
-    configureOnnxRuntime(b, gliner2_e2e_bench_exe.root_module, enable_onnx, effective_onnx_root);
     b.step("bench-gliner2-e2e-build", "Build the GLiNER2 end-to-end benchmark").dependOn(&b.addInstallArtifact(gliner2_e2e_bench_exe, .{}).step);
     const run_gliner2_e2e_bench = b.addRunArtifact(gliner2_e2e_bench_exe);
     run_gliner2_e2e_bench.addPassthruArgs();
@@ -1425,7 +1476,6 @@ pub fn build(b: *std.Build) void {
     runtime_graph.identities.addImports(clipclap_native_bench_exe.root_module);
     // inference_internal already owns the Metal source and frameworks.
     configureNativeTool(b, clipclap_native_bench_exe, target, enable_system_blas, blas_root, false);
-    configureOnnxRuntime(b, clipclap_native_bench_exe.root_module, enable_onnx, effective_onnx_root);
     const run_clipclap_native_bench = b.addRunArtifact(clipclap_native_bench_exe);
     run_clipclap_native_bench.addPassthruArgs();
     const clipclap_native_bench_step = b.step("bench-clipclap-native", "Run end-to-end CLIP/CLAP native encoder benches with random quantized weights");
@@ -1453,7 +1503,6 @@ pub fn build(b: *std.Build) void {
     runtime_graph.identities.addImports(clipclap_e2e_bench_exe.root_module);
     // inference_internal already owns the Metal source and frameworks.
     configureNativeTool(b, clipclap_e2e_bench_exe, target, enable_system_blas, blas_root, false);
-    configureOnnxRuntime(b, clipclap_e2e_bench_exe.root_module, enable_onnx, effective_onnx_root);
     const run_clipclap_e2e_bench = b.addRunArtifact(clipclap_e2e_bench_exe);
     run_clipclap_e2e_bench.addPassthruArgs();
     const clipclap_e2e_bench_step = b.step("bench-clipclap-e2e", "Run real-bundle CLIP/CLAP embedding E2E benchmarks");
@@ -1489,7 +1538,6 @@ pub fn build(b: *std.Build) void {
     runtime_graph.identities.addImports(qwen3_embedding_e2e_bench_exe.root_module);
     // inference_internal already owns the Metal source and frameworks.
     configureNativeTool(b, qwen3_embedding_e2e_bench_exe, target, enable_system_blas, blas_root, false);
-    configureOnnxRuntime(b, qwen3_embedding_e2e_bench_exe.root_module, enable_onnx, effective_onnx_root);
     const run_qwen3_embedding_e2e_bench = b.addRunArtifact(qwen3_embedding_e2e_bench_exe);
     run_qwen3_embedding_e2e_bench.addPassthruArgs();
     const qwen3_embedding_e2e_bench_step = b.step("bench-qwen3-embedding-e2e", "Run pretokenized Qwen3-Embedding encoder E2E benchmarks");
@@ -1517,7 +1565,6 @@ pub fn build(b: *std.Build) void {
     runtime_graph.identities.addImports(nomic_e2e_bench_exe.root_module);
     // inference_internal already owns the Metal source and frameworks.
     configureNativeTool(b, nomic_e2e_bench_exe, target, enable_system_blas, blas_root, false);
-    configureOnnxRuntime(b, nomic_e2e_bench_exe.root_module, enable_onnx, effective_onnx_root);
     const run_nomic_e2e_bench = b.addRunArtifact(nomic_e2e_bench_exe);
     run_nomic_e2e_bench.addPassthruArgs();
     const nomic_e2e_bench_step = b.step("bench-nomic-e2e", "Run pretokenized Nomic v1.5 encoder E2E benchmarks");
@@ -1544,7 +1591,6 @@ pub fn build(b: *std.Build) void {
     reranker_e2e_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
     runtime_graph.identities.addImports(reranker_e2e_bench_exe.root_module);
     reranker_e2e_bench_exe.root_module.link_libc = true;
-    configureOnnxRuntime(b, reranker_e2e_bench_exe.root_module, enable_onnx, effective_onnx_root);
     const run_reranker_e2e_bench = b.addRunArtifact(reranker_e2e_bench_exe);
     run_reranker_e2e_bench.addPassthruArgs();
     const reranker_e2e_bench_step = b.step("bench-reranker-e2e", "Run real-bundle text reranker E2E benchmarks");
@@ -1619,7 +1665,6 @@ pub fn build(b: *std.Build) void {
         }),
         .filters = &.{"wasm_compute:"},
     });
-    runtime_build.applyCBindings(wasm_compute_tests.root_module, runtime_graph.c_bindings);
     wasm_compute_tests.root_module.addImport("build_options", runtime_graph.qualification_build_options_mod);
     wasm_compute_tests.root_module.addImport("httpx", httpx_mod);
     wasm_compute_tests.root_module.addImport("inference_api", inference_api_mod);
@@ -1647,7 +1692,6 @@ pub fn build(b: *std.Build) void {
         configureSystemBlas(b, wasm_compute_tests.root_module, target, blas_root);
     }
     configureMetal(b, wasm_compute_tests.root_module, target, enable_metal);
-    configureOnnxRuntime(b, wasm_compute_tests.root_module, enable_onnx, effective_onnx_root);
     wasm_compute_tests.root_module.link_libc = true;
     const run_wasm_compute_tests = b.addRunArtifact(wasm_compute_tests);
     const test_wasm_compute_step = b.step("test-wasm-compute", "Run focused WasmCompute backend tests");
@@ -1677,7 +1721,6 @@ pub fn build(b: *std.Build) void {
         }),
         .filters = &.{"projector"},
     });
-    runtime_build.applyCBindings(web_projector_tests.root_module, runtime_graph.c_bindings);
     web_projector_tests.root_module.addImport("build_options", runtime_graph.qualification_build_options_mod);
     web_projector_tests.root_module.addImport("httpx", httpx_mod);
     web_projector_tests.root_module.addImport("inference_api", inference_api_mod);
@@ -1705,7 +1748,6 @@ pub fn build(b: *std.Build) void {
         configureSystemBlas(b, web_projector_tests.root_module, target, blas_root);
     }
     configureMetal(b, web_projector_tests.root_module, target, enable_metal);
-    configureOnnxRuntime(b, web_projector_tests.root_module, enable_onnx, effective_onnx_root);
     web_projector_tests.root_module.link_libc = true;
     const run_web_projector_tests = b.addRunArtifact(web_projector_tests);
     const test_web_projector_step = b.step("test-web-projector", "Run focused web projector/runtime tests");

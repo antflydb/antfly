@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const local = @import("antfly_local_sources");
+const stores = @import("../serverless/artifacts/store.zig");
 const publication = @import("lake_index_publication.zig");
 const catalog = local.metadata_lake_index_catalog;
 const serving = local.serverless_query_lake_serving;
@@ -75,6 +76,7 @@ test "external lake incremental native publication appends replaces removes and 
     defer constrained_corpora.deinit();
     var prior_snapshot: ?*local.index.IndexSnapshot = null;
     defer if (prior_snapshot) |snapshot| snapshot.release();
+    var unchanged_text_manifest: ?@import("lake_index_aggregate_artifact.zig").ChunkRef = null;
     for (0..5) |phase| {
         switch (phase) {
             1, 4 => {
@@ -91,7 +93,25 @@ test "external lake incremental native publication appends replaces removes and 
         var source = try serving.ServingSource.open(a, .{ .storage_mode = .relational, .external_base_source = binding }, .{});
         defer source.deinit();
         table.lake_index_catalog_json = try publication.begin(ca, std.testing.io, table, &source, @splat(7), .{}, 100, 20);
+        // Appending a file must not decode the unchanged file's maintenance
+        // manifest. Restore it before the independent full-reader oracle below.
+        const hidden = if (phase == 1) unchanged_text_manifest else null;
+        const hidden_bytes = if (hidden) |ref| try store.getAlloc(ref.artifact_id) else null;
+        defer if (hidden_bytes) |bytes| a.free(bytes);
+        var restored = hidden == null;
+        defer if (!restored) {
+            const scope = (stores.uploadScopeFromArtifactId(hidden.?.artifact_id) catch unreachable).?;
+            var replacement_upload = store.putScoped(scope, hidden_bytes.?, .none) catch unreachable;
+            replacement_upload.deinit(a);
+        };
+        if (hidden) |ref| try store.delete(ref.artifact_id);
         table.lake_index_catalog_json = try publication.build(ca, &store, table, &source, @splat(7), .{ .io = std.testing.io }, .none, .{ .ptr = &clock, .now_ms = Clock.now });
+        if (hidden) |ref| {
+            const scope = (try stores.uploadScopeFromArtifactId(ref.artifact_id)).?;
+            var replacement_upload = try store.putScoped(scope, hidden_bytes.?, .none);
+            replacement_upload.deinit(a);
+            restored = true;
+        }
         var parsed = try catalog.parse(a, table.lake_index_catalog_json);
         defer parsed.deinit();
         try @import("lake_index_directory.zig").hydrate(parsed.arena.allocator(), store, &parsed.value.published.?, .none, null);
@@ -101,9 +121,15 @@ test "external lake incremental native publication appends replaces removes and 
             .text_segment => {
                 const native = @import("lake_index_native_text.zig");
                 const root = try native.loadRoot(ca, store, declaration.artifact, .none, null);
+                // All sibling index uploads finish before publication seals its
+                // evidence. The phase-one restoration invalidates the old scope.
+                try std.testing.expectEqual(phase != 1, try store.retainedClosure(declaration.artifact.artifact_id, .none));
                 try std.testing.expectEqual(expected, root.file_groups.len);
-                try std.testing.expectEqual(@as(u8, 1), root.statistics_version);
+                if (phase == 0 and std.mem.eql(u8, declaration.name, "body_text")) unchanged_text_manifest = root.manifests[0];
+                try std.testing.expectEqual(@as(u8, 2), root.statistics_version);
                 try std.testing.expect(root.term_statistics != null);
+                try std.testing.expect(root.term_directory.branches != null);
+                try std.testing.expect(root.term_directory.leaves != null);
                 for (root.file_groups) |group| try std.testing.expectEqual(group.segments.len, group.summaries.len);
                 var writer = try native.loadWriter(a, store, root, .none, null, null);
                 defer writer.deinit();
@@ -115,9 +141,12 @@ test "external lake incremental native publication appends replaces removes and 
                 var stored = try std.json.parseFromSlice(std.json.Value, a, doc.data, .{});
                 defer stored.deinit();
                 if (std.mem.eql(u8, declaration.name, "body_text")) {
-                    try std.testing.expect(stored.value.object.contains("body"));
-                    try std.testing.expect(!stored.value.object.contains("dense"));
-                    try std.testing.expect(!stored.value.object.contains("sparse"));
+                    // Stored-source recipe v2 retains the complete declared
+                    // row even when only body contributes searchable text.
+                    try std.testing.expectEqual(@as(usize, 3), stored.value.object.count());
+                    const original = std.mem.eql(u8, stored.value.object.get("body").?.string, "needle");
+                    try std.testing.expectEqualStrings(if (original) "[1,0]" else "[0,1]", stored.value.object.get("dense").?.string);
+                    try std.testing.expectEqualStrings(if (original) "{\"1\":2}" else "{\"2\":3}", stored.value.object.get("sparse").?.string);
                 } else try std.testing.expectEqual(@as(usize, 0), stored.value.object.count());
                 var pooled = try corpora.acquire(std.testing.io, store, declaration.artifact, root, schema_json, .{ .cache = &read_cache, .scope = @splat(1), .context = .{} }, .{}, .none);
                 defer pooled.deinit();

@@ -6545,7 +6545,9 @@ test "lite persistent mapped read only fallback preserves unwritable directory q
     const a = std.testing.allocator;
     const lite_docs = @import("lite/docstore.zig");
     const lite_indexes = @import("lite/index_storage.zig");
-    var tmp = std.testing.tmpDir(.{});
+    // chmod requires a real directory fd; Linux path-only (O_PATH) handles
+    // cannot be passed to fchmod.
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/readonly-persistent.aflite", .{tmp.sub_path});
     defer a.free(path);

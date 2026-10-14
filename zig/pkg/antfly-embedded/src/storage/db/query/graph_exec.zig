@@ -223,6 +223,7 @@ pub const FusedResultExecutor = struct {
         req: types.SearchRequest,
         key: []const u8,
     ) anyerror!?[]u8,
+    load_projected_documents: ?*const fn (?*anyopaque, Allocator, types.SearchRequest, []const []const u8) anyerror![]?[]u8 = null,
 };
 
 pub const DocSetDocIdResolver = struct {
@@ -995,7 +996,7 @@ pub fn fuseNamedSets(
             errdefer if (source_table) |table| alloc.free(table);
             const owned_index_scores = try types.cloneIndexScores(alloc, hit.index_scores);
             errdefer types.freeIndexScores(alloc, owned_index_scores);
-            const stored_data = if (req.include_stored)
+            const stored_data = if (req.include_stored and executor.load_projected_documents == null)
                 try executor.load_projected_document(executor.ctx, alloc, req, output_doc_id)
             else
                 null;
@@ -1021,6 +1022,22 @@ pub fn fuseNamedSets(
         hits[i] = materialized;
         initialized += 1;
     }
+
+    if (req.include_stored and hits.len != 0) if (executor.load_projected_documents) |load_many| {
+        const keys = try alloc.alloc([]const u8, hits.len);
+        defer alloc.free(keys);
+        for (hits, keys) |hit, *key| key.* = hit.id;
+        const documents = try load_many(executor.ctx, alloc, req, keys);
+        defer {
+            for (documents) |document| if (document) |bytes| alloc.free(bytes);
+            alloc.free(documents);
+        }
+        if (documents.len != hits.len) return error.InvalidQueryRequest;
+        for (hits, documents) |*hit, *document| {
+            hit.stored_data = document.*;
+            document.* = null;
+        }
+    };
 
     return .{
         .alloc = alloc,
@@ -1776,6 +1793,8 @@ pub fn executeSingleNonPatternQueryWithSetsWithBudgets(
     errdefer types.freeGraphMetricStatuses(alloc, metric_status);
     const nodes = graph_result.nodes;
     graph_result.nodes = &.{};
+    const metric_columns = graph_result.metric_columns;
+    graph_result.metric_columns = null;
     const metric_values_slab = graph_result.metric_values_slab;
     graph_result.metric_values_slab = &.{};
     const metric_value_names = graph_result.metric_value_names;
@@ -1785,6 +1804,7 @@ pub fn executeSingleNonPatternQueryWithSetsWithBudgets(
         .name = name,
         .nodes = nodes,
         .metric_values_slab = metric_values_slab,
+        .metric_columns = metric_columns,
         .metric_value_names = metric_value_names,
         .paths = &.{},
         .matches = &.{},
@@ -3932,12 +3952,13 @@ fn compilePatternFieldPath(
     return .{ .dotted = compiled };
 }
 
-fn decodePatternJsonPointerSegmentAlloc(
+pub fn decodePatternJsonPointerSegmentAlloc(
     alloc: Allocator,
     encoded: []const u8,
 ) ![]const u8 {
     if (std.mem.indexOfScalar(u8, encoded, '~') == null) return encoded;
     const decoded = try alloc.alloc(u8, encoded.len);
+    errdefer alloc.free(decoded);
     var read: usize = 0;
     var written: usize = 0;
     while (read < encoded.len) {
@@ -3956,7 +3977,7 @@ fn decodePatternJsonPointerSegmentAlloc(
         read += 2;
         written += 1;
     }
-    return decoded[0..written];
+    return try alloc.realloc(decoded, written);
 }
 
 fn extractPatternField(filter_query: std.json.Value) !PatternFieldSpec {
