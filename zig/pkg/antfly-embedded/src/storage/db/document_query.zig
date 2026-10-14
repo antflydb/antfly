@@ -134,7 +134,11 @@ fn validateUniqueJson(alloc: Allocator, raw: []const u8, view: *@import("query/j
                     try entry.value_ptr.append(a, .{ .parts = path.parts[1..] });
                 } else if (View.projectionIndex(path.parts[0])) |i| {
                     const entry = try self.index_paths.getOrPut(a, i);
-                    if (!entry.found_existing) entry.value_ptr.* = .empty;
+                    if (!entry.found_existing) {
+                        entry.value_ptr.* = .empty;
+                        // Resolve out-of-range selectors without a later scan.
+                        try self.node.?.array_index.put(a, i, null);
+                    }
                     if (path.parts.len > 1) try entry.value_ptr.append(a, .{ .parts = path.parts[1..] });
                 } else try self.fanout.append(a, path);
             }
@@ -179,7 +183,7 @@ fn validateUniqueJson(alloc: Allocator, raw: []const u8, view: *@import("query/j
         }
         fn finishContainer(self: *@This(), a: Allocator) !void {
             if (self.node) |node| {
-                if (self.object or self.fanout.items.len != 0) node.children = try self.children.toOwnedSlice(a) else try node.array_index.put(a, std.math.maxInt(usize), node);
+                if (self.object or self.fanout.items.len != 0) node.children = try self.children.toOwnedSlice(a);
             }
         }
     };
@@ -919,6 +923,5 @@ test "public graph metric borrowed wire span projection fuses validation and spa
     try validateUniqueJson(arena.allocator(), input.written(), &view, try view.projectionPaths(&fields));
     const arr = &view.root.children.?[0].node;
     try std.testing.expect(arr.children == null);
-    try std.testing.expect(arr.array_index.contains(std.math.maxInt(usize)));
-    try std.testing.expectEqual(@as(u32, 17), arr.array_index.count());
+    try std.testing.expectEqual(@as(u32, 16), arr.array_index.count());
 }

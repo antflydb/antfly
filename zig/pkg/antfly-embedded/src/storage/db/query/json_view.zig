@@ -31,7 +31,7 @@ pub const View = struct {
         raw: []const u8,
         children: ?[]Child = null,
         object_index: std.StringHashMapUnmanaged(usize) = .empty,
-        array_index: std.AutoHashMapUnmanaged(usize, *Node) = .empty,
+        array_index: std.AutoHashMapUnmanaged(usize, ?*Node) = .empty,
         logical: ?Value = null,
 
         fn kind(self: Node) u8 {
@@ -92,11 +92,9 @@ pub const View = struct {
 
     fn element(self: *View, node: *Node, index: usize) !?*Node {
         if (node.children) |entries| return if (index < entries.len) &entries[index].node else null;
-        // No JSON array can contain maxInt(usize) elements; reserve that
-        // index as an exhaustion marker without enlarging every native node.
-        if (index == std.math.maxInt(usize)) return null;
+        // A cached null is a requested index proven absent by validation.
+        // Unplanned indices retain the ordinary lazy scan behavior.
         if (node.array_index.get(index)) |cached| return cached;
-        if (node.array_index.contains(std.math.maxInt(usize))) return null;
         var scanner = std.json.Scanner.initCompleteInput(self.alloc, node.raw);
         defer scanner.deinit();
         _ = try scanner.next();
@@ -324,6 +322,15 @@ test "relational lazy JSON errors release all arenas and deep fanout is iterativ
         var view = View.init(arena.allocator(), raw);
         var values = std.ArrayListUnmanaged(Value).empty;
         if (view.collect(&.{"x"}, false, &values)) |_| return error.TestExpectedError else |_| {}
+    }
+    {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        var view = View.init(arena.allocator(), "[1,]");
+        var values: std.ArrayListUnmanaged(Value) = .empty;
+        var index_buffer: [64]u8 = undefined;
+        const index = try std.fmt.bufPrint(&index_buffer, "{d}", .{std.math.maxInt(usize)});
+        try std.testing.expectError(error.SyntaxError, view.collect(&.{index}, true, &values));
     }
     const depth = 1024;
     const raw = try alloc.alloc(u8, 2 * depth + 7);
