@@ -59,6 +59,107 @@ pub fn parseValidatedTableSchema(alloc: std.mem.Allocator, schema_json: []const 
     return try impl.parseSchema(alloc, schema_json);
 }
 
+/// Own both representations across asynchronous preparation/publication. The
+/// runtime layout is derived once from the validated public schema, never from
+/// a caller's claimed reader version. This value does not authorize activation.
+pub const PreparedSchemaDefinition = struct {
+    public_schema: ParsedTableSchema,
+    runtime_schema: storage_schema.TableSchema,
+
+    pub fn init(alloc: std.mem.Allocator, source: []const u8) !PreparedSchemaDefinition {
+        var parsed = try parseValidatedTableSchema(alloc, source);
+        errdefer parsed.deinit(alloc);
+        return .{ .public_schema = parsed, .runtime_schema = try deriveRuntimeTableSchema(alloc, parsed) };
+    }
+
+    pub fn deinit(self: *PreparedSchemaDefinition, alloc: std.mem.Allocator) void {
+        storage_schema.freeSchema(alloc, self.runtime_schema);
+        self.public_schema.deinit(alloc);
+        self.* = undefined;
+    }
+
+    /// Requirements for the frame this compiler WILL emit. A restored frame's
+    /// decoder identity must instead come from that actual frame's header.
+    pub fn readerRequirements(self: *const PreparedSchemaDefinition) storage_schema.ReaderRequirements {
+        return .{
+            .semantic_version = storage_schema.requiredReaderVersion(self.runtime_schema),
+            .encoding_version = storage_schema.storage_format_version,
+        };
+    }
+
+    pub fn encode(self: *const PreparedSchemaDefinition, alloc: std.mem.Allocator) !EncodedSchemaDefinition {
+        return .{
+            .bytes = try storage_schema.serializeSchema(alloc, self.runtime_schema),
+            .requirements = self.readerRequirements(),
+            .schema_version = self.runtime_schema.version,
+        };
+    }
+};
+
+pub const EncodedSchemaDefinition = struct {
+    bytes: []u8,
+    requirements: storage_schema.ReaderRequirements,
+    schema_version: u32,
+
+    pub fn deinit(self: *EncodedSchemaDefinition, alloc: std.mem.Allocator) void {
+        alloc.free(self.bytes);
+        self.* = undefined;
+    }
+};
+
+/// Join active and retained read definitions without holding both compiled
+/// layouts at once. Durable publication must separately join the historical
+/// cluster floor and verified restored frames; schema JSON is not frame proof.
+pub fn readerRequirementsForDefinitions(alloc: std.mem.Allocator, active_json: []const u8, read_json: []const u8) !storage_schema.ReaderRequirements {
+    var floor: storage_schema.ReaderFloor = .{};
+    for ([_][]const u8{ if (active_json.len == 0) "{}" else active_json, read_json }) |source| {
+        if (source.len == 0) continue;
+        var prepared = try PreparedSchemaDefinition.init(alloc, source);
+        defer prepared.deinit(alloc);
+        floor = try floor.include(prepared.readerRequirements());
+    }
+    return .{ .semantic_version = floor.semantic_version, .encoding_version = floor.encoding_version };
+}
+
+test "relational index system prepared schema definitions own layouts and bind exact frame reader requirements" {
+    const a = std.testing.allocator;
+    var prepared = blk: {
+        const source = try a.dupe(u8, sql_array_fixture);
+        defer a.free(source);
+        const result = try PreparedSchemaDefinition.init(a, source);
+        @memset(source, ' ');
+        break :blk result;
+    };
+    defer prepared.deinit(a);
+    try std.testing.expectEqual(@as(u32, 31), prepared.readerRequirements().semantic_version);
+    var encoded = try prepared.encode(a);
+    defer encoded.deinit(a);
+    const restored = try storage_schema.deserializeSchema(a, encoded.bytes);
+    defer storage_schema.freeSchema(a, restored);
+    try std.testing.expectEqualDeep(encoded.requirements, storage_schema.readerRequirementsForSchema(restored));
+    try std.testing.expectEqual(encoded.schema_version, restored.version);
+    const joined = try readerRequirementsForDefinitions(a, "{}", sql_array_fixture);
+    try std.testing.expectEqualDeep(encoded.requirements, joined);
+    const active_only = try readerRequirementsForDefinitions(a, sql_array_fixture, "");
+    try std.testing.expectEqualDeep(joined, active_only);
+    const document = try readerRequirementsForDefinitions(a, "", "");
+    try std.testing.expect(document.semantic_version < joined.semantic_version);
+    try std.testing.expectEqual(storage_schema.storage_format_version, document.encoding_version);
+}
+
+test "relational index system prepared schema definitions release partial ownership on allocation faults" {
+    const Check = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var prepared = try PreparedSchemaDefinition.init(a, sql_array_fixture);
+            defer prepared.deinit(a);
+            var encoded = try prepared.encode(a);
+            defer encoded.deinit(a);
+            _ = try readerRequirementsForDefinitions(a, "{}", sql_array_fixture);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
 pub fn validateBatchWritesAgainstTableSchema(
     alloc: std.mem.Allocator,
     schema: ParsedTableSchema,

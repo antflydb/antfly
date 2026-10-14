@@ -10263,6 +10263,21 @@ test "relational integrity restore staging publishes all targets only after exac
         try std.testing.expectEqual(@as(usize, 0), still_hidden.len);
         try txn.put(reserved_key, &plan.id);
     }
+    // A late common-writer veto on the second target must precede the logical
+    // catalog delta, the first physical target and every restored range.
+    var lock_buf: [160]u8 = undefined;
+    const lock_key = try fk_generation_publication.tableLockKey(&lock_buf, group_id, targets[1].table.table_id);
+    const lock_value = RaftApplyStore.fkTableLockValue(.generation, @splat(5));
+    try txn.put(lock_key, &lock_value);
+    const source_before = try relation_reconciliation.readSourceRevision(&txn, group_id);
+    try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = plan.id, .action = .publish, .expected_revision = 2 });
+    try std.testing.expectEqual(@as(u64, 0), (try system_catalog_storage.readMeta(alloc, &txn, group_id)).revision);
+    try std.testing.expectEqual(source_before, try relation_reconciliation.readSourceRevision(&txn, group_id));
+    for (targets) |target| {
+        try std.testing.expectError(error.NotFound, txn.get(try tableKeyForGroup(&key_buf, group_id, target.table.table_id)));
+        try std.testing.expectError(error.NotFound, txn.get(try rangeKeyForGroup(&key_buf, group_id, target.ranges[0].group_id)));
+    }
+    try txn.delete(lock_key);
     try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = plan.id, .action = .publish, .expected_revision = 2 });
     try applyRestoreStagingForTest(&store, &txn, group_id, .{ .id = plan.id, .action = .publish, .expected_revision = 2 });
     const published = try store.listTablesTxn(alloc, &txn, group_id);
@@ -15418,15 +15433,27 @@ pub const RaftApplyStore = struct {
             }
             publication = .{ .plan = plan, .plan_digest = digest, .candidate = try plan.candidateIdentity(a), .revision = 1, .phase = if (plan.support_pending) .preparing_support else .provisioning_child };
             try publication.validateState(a);
+            var prepared_support: std.ArrayList(PreparedTableRecordWrite) = .empty;
+            defer {
+                for (prepared_support.items) |*prepared| prepared.deinit(self.alloc);
+                prepared_support.deinit(self.alloc);
+            }
+            // Admit and encode the entire parent cut before changing catalog
+            // counters, table rows, name indexes or source revisions. Future
+            // reader-floor publication must join this same admitted batch.
+            if (plan.support_pending) for (plan.parents) |parent| {
+                if (parent.support_after) |after| {
+                    var prepared = (try self.prepareTableRecordTxnMode(txn, group_id, try tableKeyForGroup(&key_buf, group_id, after.table_id), after, true)) orelse return error.GenerationPublicationChanged;
+                    errdefer prepared.deinit(self.alloc);
+                    try prepared_support.append(self.alloc, prepared);
+                }
+            };
             var empty: [0]system_catalog.Resource = .{};
             var command_hash: [32]u8 = undefined;
             std.crypto.hash.sha2.Sha256.hash(bytes, &command_hash, .{});
             try self.applySystemCatalogDeltaTxn(a, txn, group_id, .{ .upserts = &empty, .removes = &empty, .next_id = meta.next_id + 1 }, meta, command_hash);
-            if (plan.support_pending) for (plan.parents) |parent| {
-                if (parent.support_after) |after| {
-                    try self.putTableRecordTxnMode(txn, group_id, try tableKeyForGroup(&key_buf, group_id, after.table_id), after, true);
-                }
-            };
+            for (prepared_support.items) |prepared|
+                try self.writePreparedTableRecordTxn(txn, group_id, try tableKeyForGroup(&key_buf, group_id, prepared.identity.table_id), prepared);
             try txn.put(try fk_generation_publication.initialNameKey(&name_buf, group_id, plan.namespace_id, plan.logical_name), &plan.id);
             try txn.put(try fk_generation_publication.initialPhysicalNameKey(&name_buf, group_id, plan.child.name), &plan.id);
             try txn.put(try fk_generation_publication.initialWorkKey(&name_buf, group_id, plan.child.table_id), &plan.id);
@@ -16999,18 +17026,18 @@ pub const RaftApplyStore = struct {
         defer self.alloc.free(bytes);
         try txn.put(try lakeIndexLifecycleKeyForGroup(&buffer, group_id, table_id), bytes);
     }
-    fn synchronizeLakeIndexLifecycleTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, table: metadata.TableRecord) !void {
+    fn prepareLakeIndexLifecycleTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, table: metadata.TableRecord) !?[]u8 {
         // Legacy/native tables without lake state don't create maintenance rows.
         var buffer: [160]u8 = undefined;
         const prior = try stagingGet(txn, try lakeIndexLifecycleKeyForGroup(&buffer, group_id, table.table_id));
-        if (prior == null and table.lake_index_catalog_json.len == 0) return;
+        if (prior == null and table.lake_index_catalog_json.len == 0) return null;
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
         const state = if (prior) |bytes| try @import("../lake_index_lifecycle.zig").parse(a, bytes) else @import("../lake_index_lifecycle.zig").State{};
         var catalog_state = try @import("antfly_local_sources").metadata_lake_index_catalog.parse(a, table.lake_index_catalog_json);
         defer catalog_state.deinit();
-        try self.putLakeIndexLifecycleTxn(txn, group_id, table.table_id, try state.synchronize(a, catalog_state.value));
+        return try @import("../lake_index_lifecycle.zig").encode(self.alloc, try state.synchronize(a, catalog_state.value));
     }
     fn dropLakeIndexLifecycleTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, table: metadata.TableRecord) !void {
         var buffer: [160]u8 = undefined;
@@ -23348,9 +23375,29 @@ pub const RaftApplyStore = struct {
         group_id: u64,
         record: metadata.TableRecord,
     ) !void {
-        if (!try self.relationalParentsExistTxn(txn, group_id, record)) return;
+        var result = try self.prepareTableUpsertTxn(txn, group_id, record);
+        defer result.deinit(self.alloc);
+        if (result == .write) {
+            var key_buf: [160]u8 = undefined;
+            try self.writePreparedTableRecordTxn(txn, group_id, try tableKeyForGroup(&key_buf, group_id, record.table_id), result.write);
+        }
+    }
+
+    const PreparedTableUpsert = union(enum) {
+        rejected,
+        unchanged,
+        write: PreparedTableRecordWrite,
+
+        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            if (self.* == .write) self.write.deinit(alloc);
+            self.* = undefined;
+        }
+    };
+
+    fn prepareTableUpsertTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, record: metadata.TableRecord) !PreparedTableUpsert {
+        if (!try self.relationalParentsExistTxn(txn, group_id, record)) return .rejected;
         var reservation_buf: [catalog_name_key_buffer_bytes]u8 = undefined;
-        if (try stagingGet(txn, try fk_generation_publication.initialPhysicalNameKey(&reservation_buf, group_id, record.name)) != null) return;
+        if (try stagingGet(txn, try fk_generation_publication.initialPhysicalNameKey(&reservation_buf, group_id, record.name)) != null) return .rejected;
         // Reconciliation uses upsert_table, not compare_and_replace_table.
         // The common writer checks the FK lock and permits only the exact
         // owner-ready schema finalization; rejecting here would starve a
@@ -23369,23 +23416,23 @@ pub const RaftApplyStore = struct {
             retained = existing;
             metadata_table_manager.validateObjectTableMutation(self.alloc, existing, record) catch |err| switch (err) {
                 error.OutOfMemory => return err,
-                else => return,
+                else => return .rejected,
             };
             // Reconciliation may retain a generation but never publish, clear,
             // or steal one through an unconditional table upsert. Omission
             // retains internal state so schema reconciliation can continue
             // without taking ownership of the publication lifecycle.
-            if (record.lake_index_catalog_json.len == 0) admission.lake_index_catalog_json = existing.lake_index_catalog_json else if (!std.mem.eql(u8, existing.lake_index_catalog_json, record.lake_index_catalog_json)) return;
-            if (metadata_table_manager.tableDefinitionsEqual(existing, admission)) return;
-            if (!try self.policyDefinitionMutationAllowedTxn(txn, group_id, existing, admission)) return;
+            if (record.lake_index_catalog_json.len == 0) admission.lake_index_catalog_json = existing.lake_index_catalog_json else if (!std.mem.eql(u8, existing.lake_index_catalog_json, record.lake_index_catalog_json)) return .rejected;
+            if (metadata_table_manager.tableDefinitionsEqual(existing, admission)) return .unchanged;
+            if (!try self.policyDefinitionMutationAllowedTxn(txn, group_id, existing, admission)) return .rejected;
             if ((existing.relational_retirement_json.len != 0 or admission.relational_retirement_json.len != 0) and
-                !try @import("../relational_retirement.zig").permitsMigrationCleanup(self.alloc, existing, admission)) return;
+                !try @import("../relational_retirement.zig").permitsMigrationCleanup(self.alloc, existing, admission)) return .rejected;
             if (!std.mem.eql(u8, existing.name, admission.name) and
-                try self.relationalDropBlockedTxn(txn, group_id, existing)) return;
-            if (!try self.relationalDefinitionsRetainedForMutationTxn(txn, group_id, existing, admission)) return;
-        } else if (record.relational_retirement_json.len != 0 or record.lake_index_catalog_json.len != 0) return;
-        if ((try self.loadTableTransitionFenceTxn(txn, group_id, record.table_id)).active()) return;
-        try self.putTableRecordTxn(txn, group_id, key, admission);
+                try self.relationalDropBlockedTxn(txn, group_id, existing)) return .rejected;
+            if (!try self.relationalDefinitionsRetainedForMutationTxn(txn, group_id, existing, admission)) return .rejected;
+        } else if (record.relational_retirement_json.len != 0 or record.lake_index_catalog_json.len != 0) return .rejected;
+        if ((try self.loadTableTransitionFenceTxn(txn, group_id, record.table_id)).active()) return .rejected;
+        return .{ .write = (try self.prepareTableRecordTxnMode(txn, group_id, key, admission, false)) orelse return .rejected };
     }
 
     fn indexedTableRangeIdsTxn(
@@ -24382,6 +24429,20 @@ pub const RaftApplyStore = struct {
                         }
                     }
                     if (command.action == .publish and !try self.restoreIncomingDependenciesClosedTxn(txn, group_id, job.value.plan)) return;
+                    var prepared_targets: std.ArrayList(PreparedTableRecordWrite) = .empty;
+                    defer {
+                        for (prepared_targets.items) |*prepared| prepared.deinit(self.alloc);
+                        prepared_targets.deinit(self.alloc);
+                    }
+                    if (command.action == .publish) for (job.value.plan.targets) |target| {
+                        var table = target.table;
+                        table.restore_backup_id = "";
+                        table.restore_location = "";
+                        var table_key_buf: [256]u8 = undefined;
+                        var prepared = (try self.prepareTableRecordTxnMode(txn, group_id, try tableKeyForGroup(&table_key_buf, group_id, table.table_id), table, false)) orelse return;
+                        errdefer prepared.deinit(self.alloc);
+                        try prepared_targets.append(self.alloc, prepared);
+                    };
                     if (command.action == .publish) {
                         const delta = restoreCatalogDeltaTxn(catalog_arena.allocator(), txn, group_id, job.value.plan) catch |err| {
                             if (err == error.InvalidRestoreStaging) return;
@@ -24392,7 +24453,10 @@ pub const RaftApplyStore = struct {
                             try self.applySystemCatalogDeltaTxn(catalog_arena.allocator(), txn, group_id, delta, meta, @splat(0));
                         }
                     }
-                    if (command.action == .publish) for (job.value.plan.targets) |target| {
+                    // All table targets are admitted before removing any old
+                    // generation. Record strings remain owned by the pinned
+                    // restore plan throughout this transaction.
+                    if (command.action == .publish) for (job.value.plan.targets, prepared_targets.items) |target, prepared| {
                         if (target.replace) |old| {
                             var removed: std.ArrayList(u64) = .empty;
                             defer removed.deinit(self.alloc);
@@ -24417,10 +24481,8 @@ pub const RaftApplyStore = struct {
                             try txn.put(try restore_staging.identityKey(&key_buf, group_id, .old_table, old.table.table_id), &successor);
                         }
                         var table_key_buf: [256]u8 = undefined;
-                        var table = target.table;
-                        table.restore_backup_id = "";
-                        table.restore_location = "";
-                        try self.putTableRecordTxn(txn, group_id, try tableKeyForGroup(&table_key_buf, group_id, table.table_id), table);
+                        const table = prepared.identity;
+                        try self.writePreparedTableRecordTxn(txn, group_id, try tableKeyForGroup(&table_key_buf, group_id, table.table_id), prepared);
                         var added: std.ArrayList(u64) = .empty;
                         defer added.deinit(self.alloc);
                         for (target.ranges) |range| {
@@ -24545,7 +24607,7 @@ pub const RaftApplyStore = struct {
                 var added_range_group_ids = std.ArrayListUnmanaged(u64).empty;
                 defer added_range_group_ids.deinit(self.alloc);
                 if (encoded_table == null) {
-                    try self.putTableRecordTxn(txn, group_id, table_key, create.table);
+                    if (!try self.tryPutTableRecordTxnMode(txn, group_id, table_key, create.table, false)) return;
                     changed = true;
                 }
                 // Atomic topology commands publish one table-scoped catalog
@@ -25279,7 +25341,8 @@ pub const RaftApplyStore = struct {
         record: metadata.TableRecord,
         published_fk_generation: bool,
     ) !void {
-        _ = try self.tryPutTableRecordTxnMode(txn, group_id, key, record, published_fk_generation);
+        const accepted = try self.tryPutTableRecordTxnMode(txn, group_id, key, record, published_fk_generation);
+        if (published_fk_generation and !accepted) return error.GenerationPublicationChanged;
     }
 
     fn tryPutTableRecordTxnMode(
@@ -25290,12 +25353,48 @@ pub const RaftApplyStore = struct {
         record: metadata.TableRecord,
         published_fk_generation: bool,
     ) !bool {
+        var prepared = (try self.prepareTableRecordTxnMode(txn, group_id, key, record, published_fk_generation)) orelse return false;
+        defer prepared.deinit(self.alloc);
+        try self.writePreparedTableRecordTxn(txn, group_id, key, prepared);
+        return true;
+    }
+
+    /// Bytes and rename ownership survive preparation of every target in one
+    /// pinned transaction. Only the name borrows its enclosing command/plan;
+    /// decoded predecessor fields never escape into this prepared value.
+    /// This is local write admission, not an installed-root owner receipt.
+    const PreparedTableRecordWrite = struct {
+        identity: struct { table_id: u64, name: []const u8 },
+        value: []u8,
+        previous_name: ?[]u8,
+        lake_value: ?[]u8,
+        source_changed: bool,
+        fingerprint: [32]u8,
+
+        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            alloc.free(self.value);
+            if (self.previous_name) |name| alloc.free(name);
+            if (self.lake_value) |bytes| alloc.free(bytes);
+            self.* = undefined;
+        }
+    };
+
+    fn prepareTableRecordTxnMode(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        key: []const u8,
+        record: metadata.TableRecord,
+        published_fk_generation: bool,
+    ) !?PreparedTableRecordWrite {
         const encoded_existing = txn.get(key) catch |err| switch (err) {
             error.NotFound => null,
             else => return err,
         };
         const source_tracked = try relation_reconciliation.readSourceRevision(txn, group_id) != 0;
         var previous_digest: ?[32]u8 = null;
+        var previous_name: ?[]u8 = null;
+        errdefer if (previous_name) |name| self.alloc.free(name);
         if (encoded_existing) |encoded| {
             const existing = try decodeTableRecord(self.alloc, encoded);
             defer metadata_table_manager.freeTable(self.alloc, existing);
@@ -25310,13 +25409,13 @@ pub const RaftApplyStore = struct {
                 // however, binds an immutable table cut: allowing that same
                 // finalization would invalidate the plan after admission and
                 // strand the publication despite healthy owners.
-                if (kind != .initial_support) return false;
-                if (existing.read_schema_json.len == 0 or record.read_schema_json.len != 0) return false;
+                if (kind != .initial_support) return null;
+                if (existing.read_schema_json.len == 0 or record.read_schema_json.len != 0) return null;
                 var finalized = try metadata_table_manager.cloneTable(self.alloc, existing);
                 defer metadata_table_manager.freeTable(self.alloc, finalized);
                 try @import("../schema_migration_finalization.zig").apply(self.alloc, &finalized);
                 if (!metadata_table_manager.tableDefinitionsEqual(finalized, record) or
-                    !try self.schemaMigrationReadyTxn(txn, group_id, record.table_id, try @import("../../api/tables.zig").schemaVersion(existing.schema_json))) return false;
+                    !try self.schemaMigrationReadyTxn(txn, group_id, record.table_id, try @import("../../api/tables.zig").schemaVersion(existing.schema_json))) return null;
             }
             // Policy bytecode and owner descriptors bind the exact typed-row
             // layout. Relational index DDL changes schema_json even when its
@@ -25327,19 +25426,38 @@ pub const RaftApplyStore = struct {
             // accepting DDL that later makes protected reads unavailable.
             if (!try self.policyDefinitionMutationAllowedTxn(txn, group_id, existing, record))
                 return error.RowPolicyUnsupported;
-            try self.deleteTableNameIndexTxn(txn, group_id, existing.name);
-        } else if (!published_fk_generation and try self.fkGenerationTableLockedTxn(txn, group_id, record.table_id)) return false;
-        try self.synchronizeLakeIndexLifecycleTxn(txn, group_id, record);
+            if (!std.mem.eql(u8, existing.name, record.name)) previous_name = try self.alloc.dupe(u8, existing.name);
+        } else if (!published_fk_generation and try self.fkGenerationTableLockedTxn(txn, group_id, record.table_id)) return null;
+        const lake_value = try self.prepareLakeIndexLifecycleTxn(txn, group_id, record);
+        errdefer if (lake_value) |bytes| self.alloc.free(bytes);
         const value = try encodeTableRecord(self.alloc, record);
-        defer self.alloc.free(value);
-        if (source_tracked) {
+        const source_changed = if (source_tracked) changed: {
             const digest = relationTableSourceDigest(record.table_id, record.name, record.schema_json);
-            if (previous_digest == null or !std.mem.eql(u8, &previous_digest.?, &digest)) try relation_reconciliation.advanceSource(txn, group_id);
+            break :changed previous_digest == null or !std.mem.eql(u8, &previous_digest.?, &digest);
+        } else false;
+        return .{
+            .identity = .{ .table_id = record.table_id, .name = record.name },
+            .value = value,
+            .previous_name = previous_name,
+            .lake_value = lake_value,
+            .source_changed = source_changed,
+            .fingerprint = policyTableSchemaRecordDigest(record),
+        };
+    }
+
+    /// No semantic rejection is permitted once publication starts. Failures
+    /// here abort the containing transaction, including its catalog/outbox.
+    fn writePreparedTableRecordTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, key: []const u8, prepared: PreparedTableRecordWrite) !void {
+        const record = prepared.identity;
+        if (prepared.previous_name) |name| try self.deleteTableNameIndexTxn(txn, group_id, name);
+        if (prepared.lake_value) |bytes| {
+            var buffer: [160]u8 = undefined;
+            try txn.put(try lakeIndexLifecycleKeyForGroup(&buffer, group_id, record.table_id), bytes);
         }
-        try txn.put(key, value);
-        const fingerprint = policyTableSchemaRecordDigest(record);
+        if (prepared.source_changed) try relation_reconciliation.advanceSource(txn, group_id);
+        try txn.put(key, prepared.value);
         var fingerprint_key_buf: [192]u8 = undefined;
-        try txn.put(try tableSchemaFingerprintKeyForGroup(&fingerprint_key_buf, group_id, record.table_id), &fingerprint);
+        try txn.put(try tableSchemaFingerprintKeyForGroup(&fingerprint_key_buf, group_id, record.table_id), &prepared.fingerprint);
         try self.putTableNameIndexTxn(txn, group_id, record.name, record.table_id);
         self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
         self.notifyProjectionListeners(.{
@@ -25348,7 +25466,6 @@ pub const RaftApplyStore = struct {
             .table_name = record.name,
             .table_id = record.table_id,
         });
-        return true;
     }
 
     fn loadTableTransitionFenceTxn(
@@ -25999,7 +26116,29 @@ pub const RaftApplyStore = struct {
             }
             if ((try self.loadTableTransitionFenceTxn(txn, group_id, record.table_id)).active()) return;
         }
-        for (delta.upsert_tables) |record| try self.applyTableUpsertTxn(txn, group_id, record);
+        var prepared_tables: std.ArrayList(PreparedTableRecordWrite) = .empty;
+        defer {
+            for (prepared_tables.items) |*prepared| prepared.deinit(self.alloc);
+            prepared_tables.deinit(self.alloc);
+        }
+        var unique_tables: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        defer unique_tables.deinit(self.alloc);
+        for (delta.upsert_tables) |record| {
+            if ((try unique_tables.getOrPut(self.alloc, record.table_id)).found_existing) return;
+            switch (try self.prepareTableUpsertTxn(txn, group_id, record)) {
+                .rejected => return,
+                .unchanged => {},
+                .write => |value| {
+                    var prepared = value;
+                    errdefer prepared.deinit(self.alloc);
+                    try prepared_tables.append(self.alloc, prepared);
+                },
+            }
+        }
+        for (prepared_tables.items) |prepared| {
+            var key_buf: [160]u8 = undefined;
+            try self.writePreparedTableRecordTxn(txn, group_id, try tableKeyForGroup(&key_buf, group_id, prepared.identity.table_id), prepared);
+        }
         for (delta.remove_extension_dependencies) |record| {
             var key_buf: [320]u8 = undefined;
             const key = try extensionDependencyKeyForGroup(&key_buf, group_id, record.extension_name, record.required_extension_name, record.package_name);
@@ -37040,6 +37179,58 @@ test "metadata extension lifecycle table precondition prevents stale replacement
     ));
 }
 
+test "system catalog table extension publication rejects a late locked target before all writes" {
+    const a = std.testing.allocator;
+    const group: u64 = 21;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/extension-preparation", .{tmp.sub_path});
+    defer a.free(root);
+    var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer store.deinit();
+    const first: metadata.TableRecord = .{ .table_id = 7, .name = "one" };
+    const second: metadata.TableRecord = .{ .table_id = 8, .name = "two" };
+    try store.applyStandaloneCommand(group, .{ .upsert_table = first });
+    try store.applyStandaloneCommand(group, .{ .upsert_table = second });
+    var next_first = first;
+    next_first.description = "extension first";
+    var next_second = second;
+    next_second.description = "extension second";
+    const delta: ExtensionLifecycleDelta = .{
+        .upsert_tables = &.{ next_first, next_second },
+        .upsert_installed_extensions = &.{.{ .name = "docaf", .package_name = "docaf", .package_version = "1.0.0", .package_digest = "sha256:abc", .scope = .{ .kind = .table, .table_name = "one" }, .status = .ready }},
+    };
+    var lock_buf: [160]u8 = undefined;
+    const lock_key = try fk_generation_publication.tableLockKey(&lock_buf, group, second.table_id);
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        const value = RaftApplyStore.fkTableLockValue(.generation, @splat(1));
+        try txn.put(lock_key, &value);
+        try txn.commit();
+    }
+    try store.applyStandaloneCommand(group, .{ .apply_extension_lifecycle = delta });
+    const tables = try store.listTables(a, group);
+    defer store.freeTables(a, tables);
+    try std.testing.expectEqual(@as(usize, 2), tables.len);
+    for (tables) |table| try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(if (table.table_id == first.table_id) first else second, table));
+    const installed = try store.listInstalledExtensions(a, group);
+    defer store.freeInstalledExtensions(a, installed);
+    try std.testing.expectEqual(@as(usize, 0), installed.len);
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.delete(lock_key);
+        try txn.commit();
+    }
+    try store.applyStandaloneCommand(group, .{ .apply_extension_lifecycle = delta });
+    try std.testing.expect(try store.extensionLifecycleDeltaApplied(a, group, delta));
+    // An identical physical definition is an accepted no-op, not a rejected
+    // batch: replay still satisfies the exact installed extension contract.
+    try store.applyStandaloneCommand(group, .{ .apply_extension_lifecycle = delta });
+    try std.testing.expect(try store.extensionLifecycleDeltaApplied(a, group, delta));
+}
+
 test "metadata raft apply store projects schema progress records from committed entries" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -39126,6 +39317,100 @@ test "metadata raft apply store group status decoder accepts version one records
     try std.testing.expect(decoded.replay_caught_up);
     try std.testing.expect(decoded.voter_set_known);
     try std.testing.expectEqualSlices(u8, &fingerprint, &decoded.voter_set_fingerprint);
+}
+
+test "system catalog table prepared writes reject late targets without effects and publish owned batches across restart" {
+    const a = std.testing.allocator;
+    const group: u64 = 21;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/prepared-tables", .{tmp.sub_path});
+    defer a.free(root);
+    const first: metadata.TableRecord = .{ .table_id = 7, .name = "one", .schema_json = "{}" };
+    const second: metadata.TableRecord = .{ .table_id = 8, .name = "two", .schema_json = "{}" };
+    var next_first = first;
+    next_first.name = "one-new";
+    var next_second = second;
+    next_second.name = "two-new";
+    {
+        var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+        defer store.deinit();
+        try store.applyStandaloneCommand(group, .{ .upsert_table = first });
+        try store.applyStandaloneCommand(group, .{ .upsert_table = second });
+        var first_buf: [160]u8 = undefined;
+        var second_buf: [160]u8 = undefined;
+        const first_key = try tableKeyForGroup(&first_buf, group, first.table_id);
+        const second_key = try tableKeyForGroup(&second_buf, group, second.table_id);
+        {
+            var txn = try store.store.beginWriteTxn();
+            defer txn.abort();
+            var prepared = (try store.prepareTableRecordTxnMode(&txn, group, first_key, next_first, false)).?;
+            defer prepared.deinit(a);
+            try std.testing.expectEqualStrings(first.name, prepared.previous_name.?);
+            var invalid = next_second;
+            invalid.schema_reader_requirements = .{ .semantic_version = 0, .encoding_version = 31 };
+            // Rename ownership has already been allocated when encoding
+            // rejects this target. Neither target may have lost its name row.
+            try std.testing.expectError(error.InvalidMetadataTransitionEncoding, store.prepareTableRecordTxnMode(&txn, group, second_key, invalid, false));
+            var index_buf: [catalog_name_key_buffer_bytes]u8 = undefined;
+            _ = try txn.get(try tableNameIndexKey(&index_buf, group, first.name));
+            _ = try txn.get(try tableNameIndexKey(&index_buf, group, second.name));
+            try std.testing.expectError(error.NotFound, txn.get(try tableNameIndexKey(&index_buf, group, next_first.name)));
+            const current = try decodeTableRecord(a, try txn.get(first_key));
+            defer metadata_table_manager.freeTable(a, current);
+            try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(first, current));
+            var lock_buf: [160]u8 = undefined;
+            const value = RaftApplyStore.fkTableLockValue(.generation, @splat(1));
+            try txn.put(try fk_generation_publication.tableLockKey(&lock_buf, group, second.table_id), &value);
+            try std.testing.expect((try store.prepareTableRecordTxnMode(&txn, group, second_key, next_second, false)) == null);
+        }
+        {
+            var txn = try store.store.beginWriteTxn();
+            defer txn.abort();
+            var prepared = (try store.prepareTableRecordTxnMode(&txn, group, first_key, next_first, false)).?;
+            defer prepared.deinit(a);
+            try store.writePreparedTableRecordTxn(&txn, group, first_key, prepared);
+            // Model cancellation/authority loss between the first target's
+            // staged effects and publication of the remaining batch.
+        }
+        {
+            var read = try store.store.beginReadTxn();
+            defer read.abort();
+            const original_first = try decodeTableRecord(a, try read.get(first_key));
+            defer metadata_table_manager.freeTable(a, original_first);
+            const original_second = try decodeTableRecord(a, try read.get(second_key));
+            defer metadata_table_manager.freeTable(a, original_second);
+            try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(first, original_first));
+            try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(second, original_second));
+        }
+        {
+            var txn = try store.store.beginWriteTxn();
+            errdefer txn.abort();
+            var p1 = (try store.prepareTableRecordTxnMode(&txn, group, first_key, next_first, false)).?;
+            defer p1.deinit(a);
+            var p2 = (try store.prepareTableRecordTxnMode(&txn, group, second_key, next_second, false)).?;
+            defer p2.deinit(a);
+            try store.writePreparedTableRecordTxn(&txn, group, first_key, p1);
+            try store.writePreparedTableRecordTxn(&txn, group, second_key, p2);
+            try txn.commit();
+        }
+    }
+    var reopened = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer reopened.deinit();
+    const tables = try reopened.listTables(a, group);
+    defer reopened.freeTables(a, tables);
+    try std.testing.expectEqual(@as(usize, 2), tables.len);
+    for (tables) |table| {
+        const expected = if (table.table_id == first.table_id) next_first else next_second;
+        try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(expected, table));
+    }
+    var read = try reopened.store.beginReadTxn();
+    defer read.abort();
+    var index_buf: [catalog_name_key_buffer_bytes]u8 = undefined;
+    try std.testing.expectError(error.NotFound, read.get(try tableNameIndexKey(&index_buf, group, first.name)));
+    try std.testing.expectError(error.NotFound, read.get(try tableNameIndexKey(&index_buf, group, second.name)));
+    _ = try read.get(try tableNameIndexKey(&index_buf, group, next_first.name));
+    _ = try read.get(try tableNameIndexKey(&index_buf, group, next_second.name));
 }
 
 test "system catalog table placement publication rejected CAS preserves logical and physical cuts across restart" {

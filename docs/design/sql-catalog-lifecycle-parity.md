@@ -5693,3 +5693,91 @@ the diagnosed auditor was terminated before the permission-enabled rerun.
 No tests or gates were weakened. Formatting, license and Apache boundary,
 control-catalog freshness and inventory integrity checks passed. GC ran in
 preview-only mode. No push or full SQL release pass is claimed.
+
+### Owned schema preparation and server-derived definition requirements
+
+`PreparedSchemaDefinition` owns the validated public schema and its compiled
+runtime layout together. Runtime JSON inspection and durable encoding use that
+same compiler result. The encoded result owns its bytes, layout version and
+separate semantic/encoding requirements; the encoding requirement is the frame
+version actually emitted by this compiler, not a caller's claim or an assumed
+restored-frame identity. Restored physical frames still require header/manifest
+validation and their own publication proof.
+
+Marked ALTER/rewrite/FK candidates now recompute their reader requirements from
+the accepted active definition and retained read definition. Schema comparison
+returns the requirements of the two layouts it already compiled; a newly retained
+predecessor uses those facts instead of another compile. An independently retained
+read definition is validated separately. An unchanged active schema must still
+include a more demanding retained read layout. Unmarked producers remain unmarked:
+this does not bypass durable decoder activation, atomic native-floor publication
+or exact installed-root owner ACKs. Historical cluster floors remain monotonic
+and cannot be derived solely from the current table's two JSON definitions.
+
+Native tests destroy the ingress buffer, encode and decode the retained layout,
+compare actual frame requirements, join active/read requirements, and exhaustively
+inject allocation failures through preparation, encoding and retained-layout
+derivation. The server test checks an added JSONB-array column raises requirements,
+an unchanged active definition retains its read layout's requirement, and an
+unmarked producer is not silently activated. The SQL test-selection audit caught
+the new compiler tests missing from discovery; its root now explicitly imports
+the compiler and the gate selects those ownership contracts. The focused Debug
+gate passed both tests and 21/21 steps. The Debug catalog gate passed 54/54
+steps and 264/264 tests, including the marked-schema requirement-refresh
+regression. The earlier full SQL gate passed 819 local tests (three benchmark
+skips) and 226 native tests before the new discovery/filter wiring. The final
+full Debug SQL gate with that wiring passed 21/21 steps, 821 local tests
+(three deliberate benchmark skips) and 226 native tests. Formatting, licensing,
+Apache boundary and inventory checks
+passed; GC is preview-only. Nothing from this checkpoint has been pushed.
+No original SQL dispositions change: 483 implemented / 136 rejected /
+105 superseded / 862 unresolved.
+
+### Prepare every table target before publishing compound effects
+
+The common native table writer now has separate admission/encoding and commit
+phases. Prepared values own their table frame, optional lake-maintenance frame
+and rename bytes; their only borrowed field is the name in the enclosing
+command/plan. Fingerprints and source-change facts are prepared before writes.
+Decoded predecessor metadata never escapes through a borrowed full TableRecord.
+Unchanged names no longer require delete/reinsert of the same name-index key.
+
+Initial FK support prepares every parent before its catalog delta. Restore
+prepares every target before logical binding changes or removal of old physical
+generations. Extension lifecycle prepares the complete table set before writing
+tables or extension rows, distinguishes an accepted unchanged definition from
+a rejected upsert, and rejects duplicate target IDs with a linear hash index.
+Ordinary replicated upsert still treats rejection as a deterministic no-op;
+compound publication does not confuse that outcome with successful admission.
+Atomic topology create also requires actual table-write acceptance before it
+can install ranges. Published FK writers propagate failed admission rather than
+silently advancing their publication state.
+
+Regressions cover a malformed second target after rename allocation, a late FK
+lock, cancellation after the first staged table write, complete batch commit and
+reopen, an actual two-target restore's late-writer veto (including unchanged
+catalog/source revisions and absent ranges), and extension rejection/retry/replay.
+Schema finalization now derives a marked definition's requirements from only
+the acknowledged active layout before modifying any owned fields; this changes
+no durable cluster floor. Its independent fixture retains full-text declared
+paths requiring reader v14 after the v31 JSONB-array read layout retires. The
+initial assertion incorrectly expected v13 from relational columns alone; it
+was corrected against the existing independent format contract, not by lowering
+the derived requirement.
+
+This is the shared atomic publication boundary, not completion of schema-reader
+activation: the server-derived schema candidates still need durable decoder
+activation, one same-transaction monotonic floor join, and exact installed-root
+owner ACKs before public producers can be enabled. The final Debug metadata,
+service, reader, catalog, initial-FK and restore gates passed together at
+150/150 build steps. Standard-protocol catalog owners passed 270/270 tests;
+linked runners passed 243 native metadata-store, 318 metadata/control,
+226 metadata/runtime, 139 service, 28 replication, 25 restore and 19 initial-FK
+tests, plus reader and owner-selection checks. Two optional live PostgreSQL
+CDC tests skipped their prerequisites. Four table-reader tests include both
+the marked-update and corrected finalization contracts; seven service-reader
+tests and the existing data/pure checks passed. These suites overlap and are
+not original SQL-case totals. No leaks or failures remained in the final run.
+Formatting, licensing, Apache boundary, control-catalog freshness and original
+inventory checks passed. GC was preview-only. No original SQL case credit or
+push is claimed at this checkpoint.

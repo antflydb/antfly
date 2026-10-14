@@ -22,6 +22,9 @@ test {
     // Keep SQL schema lowering and native uniqueness/conflict admission in
     // one qualification gate; the build selects the cross-layer contract.
     _ = @import("antfly_local_sources").api_relational_integrity;
+    // Preparation owns the schema compiler as well as SQL declaration
+    // lowering. Discover its explicit cross-layer ownership contracts here.
+    _ = @import("antfly_local_sources").schema_mod;
 }
 
 /// Server fixtures retain this compilation root's source and type identity.

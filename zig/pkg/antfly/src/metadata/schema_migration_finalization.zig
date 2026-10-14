@@ -25,6 +25,13 @@ pub fn apply(alloc: std.mem.Allocator, table: *records.TableRecord) !void {
     if (table.read_schema_json.len == 0) return error.SchemaMigrationNotActive;
     const target_version = try schemaVersion(alloc, table.schema_json);
     const read_version = try schemaVersion(alloc, table.read_schema_json);
+    // This immutable definition stops admitting the retired read layout.
+    // Derive before mutating any owned field; the durable cluster floor is
+    // separate and remains monotonic over every historical layout.
+    const next_requirements = if (table.schema_reader_requirements != null)
+        try @import("antfly_local_sources").schema_mod.readerRequirementsForDefinitions(alloc, table.schema_json, "")
+    else
+        null;
     const empty_read_schema = try alloc.dupe(u8, "");
     errdefer alloc.free(empty_read_schema);
     if (read_version != target_version) {
@@ -34,6 +41,7 @@ pub fn apply(alloc: std.mem.Allocator, table: *records.TableRecord) !void {
     }
     alloc.free(table.read_schema_json);
     table.read_schema_json = empty_read_schema;
+    table.schema_reader_requirements = next_requirements;
 }
 
 fn schemaVersion(alloc: std.mem.Allocator, schema_json: []const u8) !u32 {
