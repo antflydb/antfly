@@ -721,10 +721,13 @@ def test_fragmented_text_hierarchy_preserves_boolean_scores_and_restart(
     pa = pytest.importorskip("pyarrow")
     pq = pytest.importorskip("pyarrow.parquet")
     root = tmp_path / source_format
-    # More than three 64-span packs guarantees an unrelated serving descriptor
-    # regardless of immutable file-hash order, after two-level compaction.
-    parts, rows = (193, 64) if layout == "files" else (1, 196609)
-    expected = {3 * 64, 31 * 64, 192 * 64} if layout == "files" else {0, 65536, 196608}
+    # Four eight-way tiers leave 64-, 8-, and 1-file packs for 73 tiny files.
+    # Rare matches occupy only two physical files, guaranteeing an unrelated
+    # serving descriptor regardless of immutable file-hash order.
+    parts, rows = (73, 64) if layout == "files" else (1, 196609)
+    expected = (
+        {3 * 64, 3 * 64 + 1, 31 * 64} if layout == "files" else {0, 65536, 196608}
+    )
     batches = [
         pa.table(
             {

@@ -4105,8 +4105,10 @@ are preserved. Metadata remains a small JSON state/envelope; v1 JSON row groups
 and old descriptor tokens still replay. Prefix-group digests and unchanged-group
 reuse keep their existing immutable ownership. Native WAL partition construction
 now uses the shared typed-value clone instead of serializing and parsing rows.
-The regression's 125,000-integer row previously retained about 69 MiB; new image
-and native replay each assert less than 16 MiB. This is a bounded fixture
+A 125,000-integer regression row keeps the new image and native replay below
+16 MiB each. Legacy replay also succeeds under an explicitly constrained 32 MiB
+active-load policy, using a private bounded lease. The test avoids depending on
+allocator remapping or build-specific parser peaks. This is a bounded fixture
 measurement, not an archive-throughput claim.
 
 Indexed predicate admission accepts broader native compressed block producers.
@@ -4139,3 +4141,30 @@ round trips and malformed counts, broad compressed routing over holes/high row
 bits, a 4,096-file inventory with a two-file delta under a 256 KiB planning budget,
 and a 10,000-match real-Parquet predicate compared with authoritative ranking.
 Live-provider retention qualification remains deferred and disabled by default.
+
+
+### Protocol 45 qualification on merged main
+
+Qualified with `origin/main` at `c102cbeac5` (storage merge/reopen fixes, PR
+#1131). The merge preserved native shared-segment allocator ownership.
+
+- Full Debug lake build: 61/61 steps; 162 shared plus 287 server integration
+  tests passed (449 total), alongside 51 focused tests.
+- ReleaseFast: 54/54 steps; 51 focused tests and object-store checks passed.
+  The two credentialed live-provider checks remain skipped.
+- Fifteen unique real Parquet/Iceberg E2E gates qualified with both `lake` and
+  `iceberg` extras and `ANTFLY_E2E_FULL_LAKE=1`: 13 unchanged gates from the full
+  selection, plus both final file-layout pruning cases rerun (2/2 in 23.63s).
+  The pruning fixture uses 73 = 64 + 8 + 1 source files with rare matches in two
+  sources, guaranteeing an unrelated descriptor under four-tier compaction
+  regardless of immutable file-hash order.
+- Standalone Roaring: 38/38; native typed-value codec: 2/2. Zig formatting,
+  Python formatting/naming, whitespace, Apache product boundary (2,037 source
+  files), and license-header checks passed.
+
+The retained replay regression explicitly constrains active-load admission to
+32 MiB and verifies the private 256 MiB lease, preserving the default-cache replay
+check without relying on allocator-specific parser peaks. New image and native
+replay footprints remain below 16 MiB for the 125,000-integer fixture. These are
+bounded correctness/workspace checks; archive-scale latency/RSS measurement and
+real-provider retention qualification remain deferred.
