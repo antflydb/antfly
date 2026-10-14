@@ -619,6 +619,45 @@ test "live DASH template reload uses refreshed clock retry and gap detection" {
     try std.testing.expectEqual(@as(u64, 3), reader.next_sequence.?);
     try std.testing.expect(lease.bytes.len > 0);
 }
+test "live DASH availability reload waits for exact offset boundary preserves identity and retries" {
+    const a = std.testing.allocator;
+    const mpd = "<MPD xmlns='urn:mpeg:dash:schema:mpd:2011' type='dynamic' availabilityStartTime='1970-01-01T00:00:00Z' timeShiftBufferDepth='PT4S'><BaseURL availabilityTimeOffset='0.25'>./</BaseURL><Period><AdaptationSet><Representation id='v'><SegmentTemplate duration='2' availabilityTimeOffset='0.75' initialization='init.mp4' media='seg-$Number$.m4s'/></Representation></AdaptationSet></Period></MPD>";
+    const OffsetClock = struct {
+        time: i64 = 999,
+        fn now(raw: ?*anyopaque) i64 {
+            return @as(*@This(), @ptrCast(@alignCast(raw.?))).time;
+        }
+    };
+    var clock = OffsetClock{};
+    var client = FakeHttp.Client{ .manifest = mpd };
+    var transport = network.Adapter(FakeHttp){ .allocator = a, .client = &client, .root_url = "https://example.test/live/list.m3u8" };
+    var reader = try ReaderWithManifest(FakeHttp, @import("dash.zig")).init(a, &transport, transport.root_url, .{ .clock = .{ .context = &clock, .now = OffsetClock.now } });
+    defer reader.deinit();
+    try reader.reload();
+    try std.testing.expect((try reader.next()) == null);
+    try std.testing.expectEqual(@as(usize, 1), client.calls);
+    clock.time = 1000;
+    try reader.reload();
+    var first = (try reader.next()).?;
+    defer first.deinit();
+    var lease = try first.reader.readPacket(0);
+    defer lease.deinit();
+    clock.time = 2000;
+    const changed = try std.mem.replaceOwned(u8, a, mpd, "availabilityTimeOffset='0.75'", "availabilityTimeOffset='1.75'");
+    defer a.free(changed);
+    client.manifest = changed;
+    try reader.reload();
+    client.fail_media = true;
+    try std.testing.expectError(error.ConnectionReset, reader.next());
+    try std.testing.expectEqual(@as(u64, 2), reader.next_sequence.?);
+    client.fail_media = false;
+    var second = (try reader.next()).?;
+    defer second.deinit();
+    try std.testing.expectEqual(@as(usize, 0), second.epoch);
+    try std.testing.expectEqual(@as(u64, 3), reader.next_sequence.?);
+    try std.testing.expect(lease.bytes.len > 0);
+    try std.testing.expect((try reader.next()) == null);
+}
 test "live DASH inherited BaseURL keeps authenticated origin pinned and retries safely" {
     const a = std.testing.allocator;
     const mpd = "<MPD xmlns='urn:mpeg:dash:schema:mpd:2011'><BaseURL>./</BaseURL><Period duration='PT2S'><SegmentTemplate duration='2' initialization='init.mp4' media='seg-$Number$.m4s'/><AdaptationSet><Representation id='v'/></AdaptationSet></Period></MPD>";

@@ -20,6 +20,7 @@ const std = @import("std");
 const hls = @import("hls.zig");
 pub const document = @import("dash_xml.zig");
 const hierarchy = @import("dash_hierarchy.zig");
+const availability = @import("dash_availability.zig");
 pub const Selection = hierarchy.Selection;
 pub const Limits = hls.Limits;
 pub const Playlist = hls.Playlist;
@@ -243,13 +244,21 @@ const Expansion = struct {
     offset: u64 = 0,
     sequence: u64 = 1,
     dynamic: bool = false,
-    now: i128 = 0, // period-relative scaled milliseconds (ticks * 1000)
+    now: i128 = 0, // period-relative scaled nanoseconds (ticks * 1e9)
+    availability_offset: availability.Offset = .{ .finite = 0 },
+    availability_started: bool = true,
     depth: ?u64 = null, // UTC milliseconds
-    period_end: ?u128 = null, // sample ticks * 1000, excluding offset
+    period_end: ?u128 = null, // sample ticks * 1e9, excluding offset
     media: ?[]const u8 = null,
     initialization: ?hls.Initialization = null,
     representation: ?[]const u8 = null,
     bandwidth: ?u64 = null,
+    fn availableEnd(self: *const Expansion) ?i128 {
+        return switch (self.availability_offset) {
+            .finite => |ns_| self.now + @as(i128, ns_) * self.scale,
+            .infinite => null,
+        };
+    }
     fn deinit(self: *Expansion) void {
         for (self.owned.items) |value| self.a.free(value);
         self.owned.deinit(self.a);
@@ -310,17 +319,19 @@ const Expansion = struct {
         self.target = @max(self.target, std.math.divCeil(u64, duration, self.scale) catch return error.MalformedDash);
         var first: u128 = 0;
         var last: u128 = count;
-        const origin = @as(i128, start) * 1000 - @as(i128, self.offset) * 1000;
-        const stride = @as(i128, duration) * 1000;
+        const origin = (@as(i128, start) - self.offset) * 1_000_000_000;
+        const stride = @as(i128, duration) * 1_000_000_000;
         if (self.period_end) |period| {
             // The final segment can overlap a static period's end.
             last = @min(last, @as(u128, @intCast(@max(0, -@divFloor(origin - @as(i128, @intCast(period)), stride)))));
         }
         if (self.dynamic) {
-            // Complete segments only, ATO=0, availabilityTimeComplete=true.
-            last = @min(last, @as(u128, @intCast(@max(0, @divFloor(self.now - origin, stride)))));
+            // INF makes advertised segments available at availabilityStartTime,
+            // including later Periods, but never before that global instant.
+            if (self.availability_offset == .infinite and !self.availability_started) last = 0;
+            if (self.availableEnd()) |end| last = @min(last, @as(u128, @intCast(@max(0, @divFloor(end - origin, stride)))));
             if (self.depth) |depth_ms| {
-                const cutoff = self.now - @as(i128, depth_ms) * self.scale;
+                const cutoff = self.now - @as(i128, depth_ms) * self.scale * 1_000_000;
                 first = @min(last, @as(u128, @intCast(@max(0, @divFloor(cutoff - origin, stride)))));
             }
         }
@@ -425,7 +436,7 @@ fn parseRepresentation(a: std.mem.Allocator, scratch: std.mem.Allocator, bytes: 
             seen[4] = true;
             template_mode = std.mem.eql(u8, tag.name, "SegmentTemplate");
             if (!template_mode and !std.mem.eql(u8, tag.name, "SegmentList")) return error.UnsupportedDash;
-            try attributes(tag, if (template_mode) &.{ "timescale", "duration", "startNumber", "presentationTimeOffset", "initialization", "media", "availabilityTimeOffset", "availabilityTimeComplete" } else &.{ "timescale", "duration", "startNumber" });
+            try attributes(tag, if (template_mode) &.{ "timescale", "duration", "startNumber", "presentationTimeOffset", "initialization", "media", "availabilityTimeOffset", "availabilityTimeComplete" } else &.{ "timescale", "duration", "startNumber", "availabilityTimeOffset", "availabilityTimeComplete" });
             state.scale = try integer(tag.get("timescale") orelse "1");
             if (state.scale == 0) return error.MalformedDash;
             if (state.scale > std.math.maxInt(u32)) return error.ResourceLimitExceeded;
@@ -435,7 +446,7 @@ fn parseRepresentation(a: std.mem.Allocator, scratch: std.mem.Allocator, bytes: 
             }
             state.sequence = try integer(tag.get("startNumber") orelse "1");
             state.offset = try integer(tag.get("presentationTimeOffset") orelse "0");
-            if (tag.get("availabilityTimeOffset")) |value| if (!std.mem.eql(u8, value, "0")) return error.UnsupportedDash;
+            if (tag.get("availabilityTimeOffset")) |value| state.availability_offset = try availability.parse(value);
             if (tag.get("availabilityTimeComplete")) |value| if (!std.mem.eql(u8, value, "true")) return error.UnsupportedDash;
             if (template_mode) {
                 state.media = try uri(tag.get("media"), limits);
@@ -484,16 +495,21 @@ fn parseRepresentation(a: std.mem.Allocator, scratch: std.mem.Allocator, bytes: 
         if (presentation_duration.? <= period_start) return error.MalformedDash;
         period_duration = presentation_duration.? - period_start;
     }
-    if (period_duration) |duration_ms| state.period_end = @as(u128, duration_ms) * state.scale;
+    if (period_duration) |duration_ms| state.period_end = @as(u128, duration_ms) * state.scale * 1_000_000;
     if (!template_mode and state.period_end != null) {
         var retained: usize = 0;
         for (state.segments.items) |segment| {
-            if (@as(u128, segment.dash.?.start_ticks) * 1000 >= state.period_end.?) break;
+            if (@as(u128, segment.dash.?.start_ticks) * 1_000_000_000 >= state.period_end.?) break;
             retained += 1;
         }
         state.segments.items.len = retained;
     }
-    if (state.dynamic) state.now = (@as(i128, now_unix_ms orelse return error.DashClockRequired) - (availability_start orelse return error.MalformedDash) - period_start) * state.scale;
+    if (state.dynamic) {
+        const wall = now_unix_ms orelse return error.DashClockRequired;
+        const start = availability_start orelse return error.MalformedDash;
+        state.availability_started = wall >= start;
+        state.now = (@as(i128, wall) - start - period_start) * state.scale * 1_000_000;
+    }
     if (template_mode) {
         if (timeline_seen) {
             if (timeline.items.len == 0) return error.MalformedDash;
@@ -502,9 +518,9 @@ fn parseRepresentation(a: std.mem.Allocator, scratch: std.mem.Allocator, bytes: 
                 const start = entry.start orelse cursor;
                 if (start < cursor) return error.MalformedDash;
                 const count = if (entry.repeat) |repeat| std.math.add(u64, repeat, 1) catch return error.MalformedDash else blk: {
-                    const boundary: u128 = if (i + 1 < timeline.items.len) @as(u128, timeline.items[i + 1].start orelse return error.MalformedDash) * 1000 else if (state.period_end) |period| period + @as(u128, state.offset) * 1000 else if (state.dynamic) @as(u128, @intCast(@max(0, state.now + @as(i128, state.offset) * 1000))) else return error.UnsupportedDash;
-                    if (boundary <= @as(u128, start) * 1000) break :blk @as(u64, 0);
-                    break :blk std.math.cast(u64, std.math.divCeil(u128, boundary - @as(u128, start) * 1000, @as(u128, entry.duration) * 1000) catch return error.MalformedDash) orelse return error.MalformedDash;
+                    const boundary: u128 = if (i + 1 < timeline.items.len) @as(u128, timeline.items[i + 1].start orelse return error.MalformedDash) * 1_000_000_000 else if (state.period_end) |period| period + @as(u128, state.offset) * 1_000_000_000 else if (state.dynamic) @as(u128, @intCast(@max(0, (state.availableEnd() orelse return error.ResourceLimitExceeded) + @as(i128, state.offset) * 1_000_000_000))) else return error.UnsupportedDash;
+                    if (boundary <= @as(u128, start) * 1_000_000_000) break :blk @as(u64, 0);
+                    break :blk std.math.cast(u64, std.math.divCeil(u128, boundary - @as(u128, start) * 1_000_000_000, @as(u128, entry.duration) * 1_000_000_000) catch return error.MalformedDash) orelse return error.MalformedDash;
                 };
                 state.target = @max(state.target, std.math.divCeil(u64, entry.duration, state.scale) catch return error.MalformedDash);
                 if (count == 0) continue;
@@ -513,8 +529,8 @@ fn parseRepresentation(a: std.mem.Allocator, scratch: std.mem.Allocator, bytes: 
             }
         } else {
             const duration = explicit_duration orelse return error.MalformedDash;
-            const boundary = state.period_end orelse if (state.dynamic) @as(u128, @intCast(@max(0, state.now))) else return error.UnsupportedDash;
-            const count = std.math.cast(u64, std.math.divCeil(u128, boundary, @as(u128, duration) * 1000) catch return error.MalformedDash) orelse return error.MalformedDash;
+            const boundary = state.period_end orelse if (state.dynamic) @as(u128, @intCast(@max(0, state.availableEnd() orelse return error.ResourceLimitExceeded))) else return error.UnsupportedDash;
+            const count = std.math.cast(u64, std.math.divCeil(u128, boundary, @as(u128, duration) * 1_000_000_000) catch return error.MalformedDash) orelse return error.MalformedDash;
             if (count != 0) try state.span(state.offset, duration, count);
             state.target = std.math.divCeil(u64, duration, state.scale) catch return error.MalformedDash;
         }
@@ -532,6 +548,96 @@ fn parseRepresentation(a: std.mem.Allocator, scratch: std.mem.Allocator, bytes: 
 }
 
 const fixture = "<MPD xmlns='urn:mpeg:dash:schema:mpd:2011' type='static'><Period><AdaptationSet mimeType='video/mp4'><Representation id='v'><SegmentList timescale='1000' duration='1500' startNumber='7'><Initialization sourceURL='video.mp4' range='0-127'/><SegmentURL media='video.mp4' mediaRange='128-511'/><SegmentURL media='next.m4s'/></SegmentList></Representation></AdaptationSet></Period></MPD>";
+const availability_prefix = "<MPD xmlns='urn:mpeg:dash:schema:mpd:2011' type='dynamic' availabilityStartTime='1970-01-01T00:00:00Z'><Period duration='PT4S'><AdaptationSet><Representation id='v'><SegmentTemplate timescale='1000' duration='1000' initialization='init' media='$Number$-$Time$.m4s' availabilityTimeOffset='";
+const availability_suffix = "'/></Representation></AdaptationSet></Period></MPD>";
+test "DASH availability offsets use exact eligibility while preserving clocks and expiry" {
+    const a = std.testing.allocator;
+    inline for (.{ .{ "0", @as(i64, 1999), @as(usize, 1) }, .{ "0.5", @as(i64, 1500), @as(usize, 2) }, .{ "0.499999999", @as(i64, 1500), @as(usize, 1) }, .{ "-0.5", @as(i64, 1500), @as(usize, 1) }, .{ "-0.500000001", @as(i64, 1500), @as(usize, 0) }, .{ "1e-3", @as(i64, 1999), @as(usize, 2) }, .{ "INF", @as(i64, 0), @as(usize, 4) }, .{ "INF", @as(i64, -1), @as(usize, 0) } }) |case| {
+        var playlist = try parseAt(a, availability_prefix ++ case[0] ++ availability_suffix, .{}, case[1]);
+        defer playlist.deinit();
+        try std.testing.expectEqual(case[2], playlist.segments.len);
+        for (playlist.segments, 0..) |segment, i| {
+            try std.testing.expectEqual(@as(u64, @intCast(i + 1)), segment.sequence);
+            try std.testing.expectEqual(@as(u64, @intCast(i * 1000)), segment.dash.?.start_ticks);
+        }
+    }
+    const mpd = availability_prefix ++ "1" ++ availability_suffix;
+    const expiring = try std.mem.replaceOwned(u8, a, mpd, "type='dynamic'", "type='dynamic' timeShiftBufferDepth='PT1S'");
+    defer a.free(expiring);
+    var playlist = try parseAt(a, expiring, .{}, 2500);
+    defer playlist.deinit();
+    try std.testing.expectEqual(@as(usize, 2), playlist.segments.len);
+    try std.testing.expectEqual(@as(u64, 2), playlist.segments[0].sequence);
+    try std.testing.expectEqual(@as(?i128, 1500), playlist.dash_window_start_ms);
+    var ordinary = try parseAt(a, availability_prefix ++ "0" ++ availability_suffix, .{}, 3000);
+    defer ordinary.deinit();
+    try std.testing.expectEqual(ordinary.timing_identity, playlist.timing_identity);
+    try std.testing.expectEqual(ordinary.segments[1].dash, playlist.segments[0].dash);
+}
+const inherited_availability_fixture = "<MPD xmlns='urn:mpeg:dash:schema:mpd:2011' type='dynamic' availabilityStartTime='1970-01-01T00:00:00Z'><BaseURL availabilityTimeOffset='0.25'>https://media.test/</BaseURL><Period duration='PT4S'><BaseURL availabilityTimeOffset='0.125'>period/</BaseURL><SegmentTemplate timescale='1000' duration='1000' initialization='init' media='$Number$.m4s' availabilityTimeOffset='4'/><AdaptationSet><BaseURL availabilityTimeOffset='0.25'>adaptation/</BaseURL><Representation id='v'><BaseURL availabilityTimeOffset='-0.125'>representation/</BaseURL><SegmentTemplate availabilityTimeOffset='0.5'/></Representation></AdaptationSet></Period></MPD>";
+test "DASH availability sums the selected BaseURL path and overrides inherited templates" {
+    var playlist = try parseAt(std.testing.allocator, inherited_availability_fixture, .{}, 1000);
+    defer playlist.deinit();
+    try std.testing.expectEqual(@as(usize, 2), playlist.segments.len);
+    try std.testing.expectEqualStrings("https://media.test/period/adaptation/representation/2.m4s", playlist.segments[1].uri);
+}
+test "DASH availability selects only the chosen BaseURL alternative" {
+    const a = std.testing.allocator;
+    const alternatives = try std.mem.replaceOwned(u8, a, inherited_availability_fixture, "<Period duration", "<BaseURL availabilityTimeOffset='0.5'>https://other.test/</BaseURL><Period duration");
+    defer a.free(alternatives);
+    var first = try parseAt(a, alternatives, .{}, 750);
+    defer first.deinit();
+    var second = try parseAtWithSelection(a, alternatives, .{}, 750, .{ .base_url_index = 1 });
+    defer second.deinit();
+    try std.testing.expectEqual(@as(usize, 1), first.segments.len);
+    try std.testing.expectEqual(@as(usize, 2), second.segments.len);
+    try std.testing.expectEqualStrings("https://other.test/period/adaptation/representation/2.m4s", second.segments[1].uri);
+}
+test "DASH availability expands open timelines with offset and requires finite INF extent" {
+    const a = std.testing.allocator;
+    const epoch = try dateTime("2026-01-01T00:00:00Z");
+    const early = try std.mem.replaceOwned(u8, a, live_fixture, "startNumber='7'", "startNumber='7' availabilityTimeOffset='0.999999999'");
+    defer a.free(early);
+    var waiting = try parseAt(a, early, .{}, epoch + 3000);
+    defer waiting.deinit();
+    try std.testing.expectEqual(@as(usize, 0), waiting.segments.len);
+    const boundary = try std.mem.replaceOwned(u8, a, early, "0.999999999", "1");
+    defer a.free(boundary);
+    var available = try parseAt(a, boundary, .{}, epoch + 3000);
+    defer available.deinit();
+    try std.testing.expectEqual(@as(usize, 1), available.segments.len);
+    try std.testing.expectEqual(@as(u64, 7), available.segments[0].sequence);
+    try std.testing.expectEqual(@as(u64, 9000), available.segments[0].dash.?.start_ticks);
+    const infinite = try std.mem.replaceOwned(u8, a, boundary, "availabilityTimeOffset='1'", "availabilityTimeOffset='INF'");
+    defer a.free(infinite);
+    try std.testing.expectError(error.ResourceLimitExceeded, parseAt(a, infinite, .{}, epoch + 3000));
+    const advertised = try std.mem.replaceOwned(u8, a, infinite, "r='-1'", "r='2'");
+    defer a.free(advertised);
+    var bounded = try parseAt(a, advertised, .{}, epoch + 2000);
+    defer bounded.deinit();
+    try std.testing.expectEqual(@as(usize, 3), bounded.segments.len);
+}
+test "DASH availability bounds unbounded INF timelines malformed precision and expansion" {
+    const a = std.testing.allocator;
+    const infinite = availability_prefix ++ "INF" ++ availability_suffix;
+    const unbounded = try std.mem.replaceOwned(u8, a, infinite, " duration='PT4S'", "");
+    defer a.free(unbounded);
+    try std.testing.expectError(error.ResourceLimitExceeded, parseAt(a, unbounded, .{}, 0));
+    try std.testing.expectError(error.ResourceLimitExceeded, parseAt(a, infinite, .{ .max_segments = 3 }, 0));
+    try std.testing.expectError(error.MalformedDash, parseAt(a, availability_prefix ++ "NaN" ++ availability_suffix, .{}, 0));
+    try std.testing.expectError(error.UnsupportedDash, parseAt(a, availability_prefix ++ "1e-10" ++ availability_suffix, .{}, 0));
+    const partial = try std.mem.replaceOwned(u8, a, infinite, "availabilityTimeOffset='INF'", "availabilityTimeOffset='INF' availabilityTimeComplete='false'");
+    defer a.free(partial);
+    try std.testing.expectError(error.UnsupportedDash, parseAt(a, partial, .{}, 0));
+}
+fn availabilityAllocationRun(a: std.mem.Allocator) !void {
+    var no_resize = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    var playlist = try parseAt(no_resize.allocator(), inherited_availability_fixture, .{}, 1000);
+    defer playlist.deinit();
+}
+test "DASH availability inherited addressing releases every failing allocation" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, availabilityAllocationRun, .{});
+}
 test "DASH explicit SegmentList clocks ranges and sequence use fMP4 ingest contract" {
     var playlist = try parse(std.testing.allocator, fixture, .{});
     defer playlist.deinit();

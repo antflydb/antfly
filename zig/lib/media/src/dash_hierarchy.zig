@@ -6,6 +6,7 @@
 const std = @import("std");
 const xml = @import("dash_xml.zig");
 const hls = @import("hls.zig");
+const availability = @import("dash_availability.zig");
 const ns = "urn:mpeg:dash:schema:mpd:2011";
 pub const Selection = struct {
     period_id: ?[]const u8 = null,
@@ -147,7 +148,7 @@ const Addressing = struct {
         }
     }
 };
-fn baseAt(a: std.mem.Allocator, tree: xml.Tree, level: usize, current: []const u8, selection: Selection, limit: usize) ![]const u8 {
+fn baseAt(a: std.mem.Allocator, tree: xml.Tree, level: usize, current: []const u8, selection: Selection, limit: usize, offset: *availability.Offset) ![]const u8 {
     var child = tree.nodes[level].first_child;
     var count: usize = 0;
     var chosen: ?usize = null;
@@ -167,7 +168,10 @@ fn baseAt(a: std.mem.Allocator, tree: xml.Tree, level: usize, current: []const u
     if (node.first_child != null) return error.MalformedDash;
     for (node.attributes) |attribute| {
         if (std.mem.eql(u8, attribute.name, "serviceLocation")) continue;
-        if (std.mem.eql(u8, attribute.name, "availabilityTimeOffset") and std.mem.eql(u8, attribute.value, "0")) continue;
+        if (std.mem.eql(u8, attribute.name, "availabilityTimeOffset")) {
+            offset.* = try offset.add(try availability.parse(attribute.value));
+            continue;
+        }
         if (std.mem.eql(u8, attribute.name, "availabilityTimeComplete") and std.mem.eql(u8, attribute.value, "true")) continue;
         return error.UnsupportedDash;
     }
@@ -251,14 +255,28 @@ fn planPeriod(a: std.mem.Allocator, scratch: std.mem.Allocator, tree: xml.Tree, 
     const levels = [_]usize{ 0, p, adaptation orelse return error.DashSelectionNotFound, representation orelse return error.DashSelectionNotFound };
     var base: []const u8 = selection.manifest_url orelse "";
     var addressing = Addressing{};
+    var availability_offset: availability.Offset = .{ .finite = 0 };
     for (levels) |level| {
-        base = try baseAt(scratch, tree, level, base, selection, limits.max_uri_bytes);
+        base = try baseAt(scratch, tree, level, base, selection, limits.max_uri_bytes, &availability_offset);
         if (level != 0) try addressing.inherit(scratch, tree, level);
         var child = tree.nodes[level].first_child;
         while (child) |index| : (child = tree.nodes[index].next_sibling) {
             if ((try named(tree, index, "ContentProtection")) or (try named(tree, index, "EssentialProperty"))) return error.UnsupportedDash;
         }
     }
+    // Effective SegmentTemplate attributes override their parent declaration;
+    // each selected BaseURL contributes independently along the chosen path.
+    for (addressing.attributes.items) |*attribute| if (std.mem.eql(u8, attribute.name, "availabilityTimeOffset")) {
+        availability_offset = try availability_offset.add(try availability.parse(attribute.value));
+        attribute.value = try availability_offset.text(scratch);
+        break;
+    };
+    var has_offset = false;
+    for (addressing.attributes.items) |attribute| if (std.mem.eql(u8, attribute.name, "availabilityTimeOffset")) {
+        has_offset = true;
+    };
+    if (!has_offset and (availability_offset == .infinite or availability_offset.finite != 0))
+        try addressing.attributes.append(scratch, .{ .name = "availabilityTimeOffset", .value = try availability_offset.text(scratch) });
     var output: std.ArrayList(u8) = .empty;
     try output.appendSlice(scratch, "<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\"");
     try attrs(scratch, &output, tree.nodes[0].attributes);

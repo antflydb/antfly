@@ -57,6 +57,17 @@
       "total_instrumented_edges": 48139,
       "fresh_local_cache": true,
       "command": "zig build fuzz-video -Doptimize=Debug -Dvideo-fuzz-filter=\"sequence Annex B\" --cache-dir /private/tmp/native-video-sequence-final-annexb --fuzz=10000 --summary all"
+    },
+    "av1": {
+      "source_snapshot": "fuzz_test.final.zig",
+      "report": "fuzz-final-av1.log",
+      "runs": 10734,
+      "unique_runs": 241,
+      "coverage_edges": 7258,
+      "total_instrumented_edges": 48147,
+      "fresh_local_cache": true,
+      "reported_elapsed": "30m",
+      "command": "zig build fuzz-video -Doptimize=Debug -Dvideo-fuzz-filter=\"sequence AV1\" --cache-dir /private/tmp/native-video-sequence-final-av1 --fuzz=10000 --summary all"
     }
   },
   "differential": {

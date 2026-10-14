@@ -2742,3 +2742,22 @@ emulation check; this is not native x86 hardware performance evidence. Actual
 fuzz and architecture results are retained in the [source-bound receipt](testdata/vp8-sequence-validation/README.md).
 Broader independent streams, sustained campaigns and the complete non-CUDA
 objective remain active.
+
+### DASH complete-segment availability offsets
+
+Live DASH now accepts signed decimal/scientific availabilityTimeOffset values
+with exact nanosecond arithmetic. The selected BaseURL path contributes each
+applicable offset; nearer SegmentTemplate declarations override inherited values
+and contribute once. The resulting upper availability boundary affects request
+eligibility without changing presentation clocks, sequence IDs, retention expiry
+or decoder configuration identity. Offset-only reloads preserve the live cursor,
+transport retries and already retained packet leases.
+
+INF supports finite advertised repeat/Period extents from availabilityStartTime;
+it never invents an unbounded future timeline or makes data available before
+that global instant. Existing segment/planning limits and checked int64 offset
+sums apply. Sub-nanosecond nonzero offsets and availabilityTimeComplete=false
+remain explicit unsupported policies. This is complete-segment request timing;
+incremental partial-DASH delivery and broader live-origin qualification remain
+in the active non-CUDA scope. See [source-bound qualification](../media/testdata/dash-availability/README.md)
+for exact-boundary, inheritance, live reload, cleanup and platform evidence.

@@ -1,0 +1,22 @@
+{
+  "base_commit": "ad0679f7602db60b994a8fc00dbf05894b484451",
+  "source_sha256": {
+    "zig/lib/media/src/dash_availability.zig": "f1125ea8956e24b5c726d43c44a10df03537da35ac7c2ba72e334e1ae2ef715a",
+    "zig/lib/media/src/dash.zig": "b6eb059592f78575fe155259ca86189a785af680ddc28969e66d5b9a6c8938cf",
+    "zig/lib/media/src/dash_hierarchy.zig": "3931e34603f83b9093c5459791322c5b5b7fd29fca57d7ba5740853311572c6c",
+    "zig/lib/media/src/hls_live.zig": "46db85af3c4573d253bdced417f618a7a313aee0478b7403b61b732bdb069515",
+    "zig/lib/media/media_test_root.zig": "85c8f3ab2da553ac01def04847fe076481ee65e123e5f5e09a53b292c0cf7557",
+    "zig/lib/media/http_live_test_root.zig": "df13bd04b8dc029353c490e06afcaf4b76c71c42070b55f0c595a65c63d6ebc1"
+  },
+  "status": "passed",
+  "offset_precision": "signed int64 nanoseconds; exact decimal/scientific parsing",
+  "infinite_offset": "requires finite advertised repeats/period extent; otherwise ResourceLimitExceeded",
+  "partial_segments": "availabilityTimeComplete=false remains UnsupportedDash",
+  "protocol_reference": "https://dashif.org/Guidelines-TimingModel/",
+  "macos_media_tests_pass": 161,
+  "macos_production_http_tests_pass": 11,
+  "linux_binary_sha256": "7deee29662692ab7f847aaf083a2de5916c49a166abe143949903f404254b1bf",
+  "linux_image": "sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1",
+  "linux_status": "passed",
+  "linux_arm64_media_tests_pass": 161
+}

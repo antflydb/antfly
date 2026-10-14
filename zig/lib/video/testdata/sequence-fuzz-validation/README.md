@@ -48,8 +48,10 @@ status alone does not establish successful fuzz qualification.
 The final-source VP9 campaign completes 20,005 runs, 15 unique runs and
 10,982/48,143 instrumented edges; Annex B completes 10,475 runs, 363 unique
 runs and 5,062/48,139 edges. These short campaigns are not sustained-coverage
-claims. A final-source AV1 campaign and longer VP9 campaign remain in progress;
-no completion or coverage result is attributed to them yet.
+claims. The final-source AV1 campaign completes 10,734 runs, 241 unique runs
+and 7,258/48,147 edges in a reported thirty-minute shared-host campaign. The
+longer VP9 campaign remains in progress; no completion or coverage result is
+attributed to it yet.
 
 For maintained longer campaigns, run the independent-target driver from `zig/`:
 

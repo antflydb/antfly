@@ -179,6 +179,51 @@ test "production live DASH template uses synchronized clock and authenticated fM
     try std.testing.expectEqual(@as(usize, 3), transport.requests);
 }
 
+test "production DASH availability offsets fetch authenticated media only at the exact boundary" {
+    const manifest = "<MPD xmlns='urn:mpeg:dash:schema:mpd:2011' type='dynamic' availabilityStartTime='1970-01-01T00:00:00Z'><BaseURL availabilityTimeOffset='0.25'>./</BaseURL><Period><AdaptationSet><Representation id='v'><SegmentTemplate duration='2' availabilityTimeOffset='0.75' initialization='init.mp4' media='seg-$Number$.m4s'/></Representation></AdaptationSet></Period></MPD>";
+    const OffsetClock = struct {
+        time: i64 = 999,
+        fn now(raw: ?*anyopaque) i64 {
+            return @as(*@This(), @ptrCast(@alignCast(raw.?))).time;
+        }
+    };
+    var clock = OffsetClock{};
+    const original = @embedFile("testdata/fragmented.mp4");
+    var offset: usize = 0;
+    while (offset < original.len) {
+        const box = try media.isobmff.readBox(original, offset);
+        if (box.typ == media.isobmff.fourcc("moof")) break;
+        offset = box.end;
+    }
+    var server = try http.testing_mod.TestServer.start(a, std.testing.io, &.{
+        .{ .path = "/dash/manifest.mpd", .assert_request = Verify.auth, .respond = .{ .body = manifest } },
+        .{ .path = "/dash/init.mp4", .assert_request = Verify.auth, .respond = .{ .body = original[0..offset] } },
+        .{ .path = "/dash/seg-1.m4s", .assert_request = Verify.auth, .respond = .{ .body = original[offset..] } },
+    });
+    defer server.deinit();
+    var client = http.Client.initWithConfig(a, std.testing.io, .{ .default_headers = &.{.{ "Authorization", "Bearer fixture-token" }} });
+    defer client.deinit();
+    const url = try std.fmt.allocPrint(a, "{s}/dash/manifest.mpd", .{server.baseUrl()});
+    defer a.free(url);
+    var transport = media.http_stream.Adapter(http){ .allocator = a, .client = &client, .root_url = url };
+    var reader = try media.dash_live.Reader(http).init(a, &transport, url, .{ .clock = .{ .context = &clock, .now = OffsetClock.now } });
+    defer reader.deinit();
+    var serving = try std.testing.io.concurrent(Verify.serve, .{ &server, 4 });
+    defer _ = serving.cancel(std.testing.io) catch {};
+    try reader.reload();
+    try std.testing.expect((try reader.next()) == null);
+    try std.testing.expectEqual(@as(usize, 1), transport.requests);
+    clock.time = 1000;
+    try reader.reload();
+    var segment = (try reader.next()).?;
+    defer segment.deinit();
+    var lease = try segment.reader.readPacket(0);
+    defer lease.deinit();
+    try std.testing.expect(lease.bytes.len > 0);
+    try std.testing.expect((try reader.next()) == null);
+    try serving.await(std.testing.io);
+    try std.testing.expectEqual(@as(usize, 4), transport.requests);
+}
 test "production DASH multiple periods authenticate repeated initialization and expose exact presentation mapping" {
     const manifest = "<MPD xmlns='urn:mpeg:dash:schema:mpd:2011'><Period id='one' duration='PT2S'><AdaptationSet><Representation id='v'><SegmentTemplate duration='2' initialization='init.mp4' media='one-$Number$.m4s'/></Representation></AdaptationSet></Period><Period id='two' duration='PT2S'><AdaptationSet><Representation id='v'><SegmentTemplate duration='2' initialization='init.mp4' media='two-$Number$.m4s'/></Representation></AdaptationSet></Period></MPD>";
     const original = @embedFile("testdata/fragmented.mp4");
