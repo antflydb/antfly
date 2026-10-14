@@ -15,7 +15,7 @@
 
 //! Geometry and superframe preflight before the reconstruction core allocates.
 const std = @import("std");
-pub const Geometry = struct { width: u32, height: u32 };
+pub const Geometry = struct { width: u32, height: u32, bit_depth: u8 = 8, chroma_format: u8 = 1 };
 pub const References = [8]?Geometry;
 pub const Picture = struct { geometry: Geometry, visible: bool, show_existing: bool = false, key: bool = false };
 pub const Parts = struct { packets: [8][]const u8 = undefined, len: usize = 0 };
@@ -69,20 +69,28 @@ pub fn split(bytes: []const u8) !Parts {
     result.len = count;
     return result;
 }
-fn color(bits: *Bits, profile: u32) !void {
-    if (profile >= 2) _ = try bits.read(1);
+const ColorInfo = struct { depth: u8 = 8, chroma: u8 = 1 };
+fn color(bits: *Bits, profile: u32) !ColorInfo {
+    const depth: u8 = if (profile >= 2) (if (try bits.flag()) 12 else 10) else 8;
     const space = try bits.read(3);
+    var chroma: u8 = 1;
     if (space != 7) {
         _ = try bits.read(1);
         if (profile == 1 or profile == 3) {
-            _ = try bits.read(2);
+            const horizontal = try bits.flag();
+            const vertical = try bits.flag();
+            if (!horizontal and vertical) return error.UnsupportedVideoProfile;
+            chroma = if (!horizontal) 3 else if (!vertical) 2 else 1;
             if (try bits.flag()) return error.InvalidVideoData;
         }
     } else {
         if (profile != 1 and profile != 3) return error.InvalidVideoData;
+        chroma = 3;
         if (try bits.flag()) return error.InvalidVideoData;
     }
+    return .{ .depth = depth, .chroma = chroma };
 }
+
 fn size(bits: *Bits) !Geometry {
     return .{ .width = try bits.read(16) + 1, .height = try bits.read(16) + 1 };
 }
@@ -113,17 +121,21 @@ pub fn inspect(bytes: []const u8, references: *References, max_pixels: usize) !P
     var geometry: Geometry = undefined;
     if (!inter) {
         try sync(&bits);
-        try color(&bits, profile);
+        const format = try color(&bits, profile);
         geometry = try size(&bits);
+        geometry.bit_depth = format.depth;
+        geometry.chroma_format = format.chroma;
         try render(&bits);
     } else {
         const intra = if (!show) try bits.flag() else false;
         if (!resilient) _ = try bits.read(2);
         if (intra) {
             try sync(&bits);
-            if (profile > 0) try color(&bits, profile);
+            const format: ColorInfo = if (profile > 0) try color(&bits, profile) else .{};
             refresh = try bits.read(8);
             geometry = try size(&bits);
+            geometry.bit_depth = format.depth;
+            geometry.chroma_format = format.chroma;
             try render(&bits);
         } else {
             refresh = try bits.read(8);
@@ -140,6 +152,9 @@ pub fn inspect(bytes: []const u8, references: *References, max_pixels: usize) !P
                 }
             }
             geometry = found orelse try size(&bits);
+            const format_reference = references[refs[0]] orelse return error.InvalidVideoData;
+            geometry.bit_depth = format_reference.bit_depth;
+            geometry.chroma_format = format_reference.chroma_format;
             try render(&bits);
         }
     }
@@ -180,6 +195,8 @@ test "VP9 metadata visibility and geometry match reconstruction across profiles"
                 try std.testing.expect(displayed < batch.frames.len);
                 try std.testing.expectEqual(batch.frames[displayed].width, metadata.geometry.width);
                 try std.testing.expectEqual(batch.frames[displayed].height, metadata.geometry.height);
+                try std.testing.expectEqual(batch.frames[displayed].bit_depth, metadata.geometry.bit_depth);
+                try std.testing.expectEqual(batch.frames[displayed].chroma_format, metadata.geometry.chroma_format);
                 displayed += 1;
             }
             try std.testing.expectEqual(batch.frames.len, displayed);

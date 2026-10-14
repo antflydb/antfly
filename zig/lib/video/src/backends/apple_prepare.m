@@ -27,6 +27,8 @@
 @property(nonatomic, strong) id<MTLComputePipelineState> vertical;
 @property(nonatomic, strong) id<MTLComputePipelineState> horizontalRGBA;
 @property(nonatomic, strong) id<MTLComputePipelineState> horizontalNative;
+@property(nonatomic, strong) id<MTLComputePipelineState> chromaNative;
+@property(nonatomic, strong) id<MTLComputePipelineState> chromaFloat;
 @property(nonatomic) void *cache;
 @property(nonatomic, strong) id<MTLBuffer> pqLUT;
 @property(nonatomic, strong) id<MTLBuffer> hlgLUT;
@@ -63,7 +65,9 @@ int32_t av_preparer_create(void *device, void **out) {
         p.vertical = [p.device newComputePipelineStateWithFunction:[library newFunctionWithName:@"vertical_patch"] error:&error];
         p.horizontalRGBA = [p.device newComputePipelineStateWithFunction:[library newFunctionWithName:@"horizontal_rgba"] error:&error];
         p.horizontalNative = [p.device newComputePipelineStateWithFunction:[library newFunctionWithName:@"horizontal_native"] error:&error];
-        if (!p.horizontal || !p.vertical || !p.horizontalRGBA || !p.horizontalNative) return -1;
+        p.chromaNative = [p.device newComputePipelineStateWithFunction:[library newFunctionWithName:@"chroma_horizontal_native"] error:&error];
+        p.chromaFloat = [p.device newComputePipelineStateWithFunction:[library newFunctionWithName:@"chroma_horizontal_float"] error:&error];
+        if (!p.horizontal || !p.vertical || !p.horizontalRGBA || !p.horizontalNative || !p.chromaNative || !p.chromaFloat) return -1;
         *out = (__bridge_retained void *)p; return 0;
     }
 }
@@ -102,9 +106,28 @@ int32_t av_coefficients_create(void *handle, const uint32_t *xaxis, size_t xsize
     }
 }
 void av_coefficients_destroy(void *p) { if (p) { id object = (__bridge_transfer id)p; (void)object; } }
+typedef struct { uint32_t indices[5]; int32_t weights[5]; int32_t rounding_bias; } AVChromaTap;
+_Static_assert(sizeof(AVChromaTap) == 44, "Metal chroma coefficient ABI changed");
+@interface AVChromaCoefficients : NSObject
+@property(nonatomic, strong) id<MTLBuffer> x;
+@property(nonatomic, strong) id<MTLBuffer> y;
+@end
+@implementation AVChromaCoefficients
+@end
+int32_t av_chroma_create(void *handle, const void *x, size_t xcount, const void *y, size_t ycount, void **out) {
+    *out = NULL;
+    @autoreleasepool {
+        AVPreparer *p = (__bridge AVPreparer *)handle;
+        AVChromaCoefficients *c = [AVChromaCoefficients new];
+        c.x = upload(p.device, x, xcount * sizeof(AVChromaTap)); c.y = upload(p.device, y, ycount * sizeof(AVChromaTap));
+        if (!c.x || !c.y) return -1;
+        *out = (__bridge_retained void *)c; return 0;
+    }
+}
+void av_chroma_destroy(void *p) { if (p) { id object = (__bridge_transfer id)p; (void)object; } }
 // Shared dispatch keeps resize/patch packing identical for both input formats.
 static int32_t prepare(void *handle, void *surface, const uint8_t *rgba, size_t rgba_size, const uint32_t *params,
-    void *coefficients, void **out, id<MTLTexture> nativeY, id<MTLTexture> nativeUV) {
+    void *coefficients, void *chromaCoefficients, void **out, id<MTLTexture> nativeY, id<MTLTexture> nativeUV) {
     *out = NULL;
     @autoreleasepool {
         AVPreparer *p = (__bridge AVPreparer *)handle;
@@ -164,6 +187,23 @@ static int32_t prepare(void *handle, void *surface, const uint8_t *rgba, size_t 
         result.output = [p.device newBufferWithLength:(size_t)params[2] * params[3] * 3 * sizeof(float) options:MTLResourceStorageModeShared];
         result.command = [p.queue commandBuffer];
         if (!temp || !result.output || !c.xb || !c.xw || !c.yb || !c.yw || !result.command) return -1;
+        AVChromaCoefficients *chroma = (__bridge AVChromaCoefficients *)chromaCoefficients;
+        id<MTLBuffer> chromaHorizontal = nil;
+        BOOL reconstruct = !rgba && params[10] == 5 && params[12] == 0 && params[9] != 0;
+        if (reconstruct) {
+            if (!chroma.x || !chroma.y) return -1;
+            size_t columns = ((params[0] & 1) || params[9] == 3) ? params[0] : (params[0] + 1) / 2;
+            size_t rows = params[9] == 1 ? (params[1] + 1) / 2 : params[1];
+            chromaHorizontal = [p.device newBufferWithLength:columns * rows * 4 options:MTLResourceStorageModePrivate];
+            if (!chromaHorizontal) return -1;
+            id<MTLComputeCommandEncoder> filter = [result.command computeCommandEncoder];
+            if (!filter) return -1;
+            [filter setComputePipelineState:nativeY ? p.chromaNative : p.chromaFloat];
+            [filter setTexture:uv atIndex:1]; [filter setBuffer:chromaHorizontal offset:0 atIndex:0];
+            [filter setBytes:params length:68 atIndex:1]; [filter setBuffer:chroma.x offset:0 atIndex:2];
+            [filter dispatchThreads:MTLSizeMake(columns, rows, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+            [filter endEncoding];
+        }
         id<MTLComputeCommandEncoder> encoder = [result.command computeCommandEncoder];
         if (!encoder) return -1;
         [encoder setComputePipelineState:nativeY ? p.horizontalNative : (rgba ? p.horizontalRGBA : p.horizontal)];
@@ -171,6 +211,7 @@ static int32_t prepare(void *handle, void *surface, const uint8_t *rgba, size_t 
         else { [encoder setTexture:y atIndex:0]; [encoder setTexture:uv atIndex:1]; [encoder setBuffer:params[12] ? toneLUT : c.xw offset:0 atIndex:5]; }
         [encoder setBuffer:temp offset:0 atIndex:0]; [encoder setBytes:params length:68 atIndex:1];
         [encoder setBuffer:c.xb offset:0 atIndex:2]; [encoder setBuffer:c.xw offset:0 atIndex:3];
+        if (!rgba) { [encoder setBuffer:reconstruct ? chromaHorizontal : c.xw offset:0 atIndex:6]; [encoder setBuffer:reconstruct ? chroma.y : c.xw offset:0 atIndex:7]; }
         [encoder dispatchThreads:MTLSizeMake(params[2], height, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)]; [encoder endEncoding];
         encoder = [result.command computeCommandEncoder]; if (!encoder) return -1;
         [encoder setComputePipelineState:p.vertical]; [encoder setBuffer:temp offset:0 atIndex:0]; [encoder setBuffer:result.output offset:0 atIndex:1];
@@ -179,12 +220,12 @@ static int32_t prepare(void *handle, void *surface, const uint8_t *rgba, size_t 
         [result.command commit]; *out = (__bridge_retained void *)result; return 0;
     }
 }
-int32_t av_prepare_submit(void *handle, void *surface, const uint32_t *params, void *coefficients, void **out) {
-    return prepare(handle, surface, NULL, 0, params, coefficients, out, nil, nil);
+int32_t av_prepare_submit(void *handle, void *surface, const uint32_t *params, void *coefficients, void *chromaCoefficients, void **out) {
+    return prepare(handle, surface, NULL, 0, params, coefficients, chromaCoefficients, out, nil, nil);
 }
 int32_t av_prepare_rgba_submit(void *handle, const uint8_t *rgba, size_t size, const uint32_t *params, void *coefficients, void **out) {
     if (!rgba) { *out = NULL; return -1; }
-    return prepare(handle, NULL, rgba, size, params, coefficients, out, nil, nil);
+    return prepare(handle, NULL, rgba, size, params, coefficients, NULL, out, nil, nil);
 }
 int av_prepared_poll(void *p) {
     AVPrepared *result = (__bridge AVPrepared *)p;
@@ -224,10 +265,10 @@ double av_prepared_gpu_seconds(void *p) {
 }
 uint64_t av_preparer_device_bytes(void *p) { return ((__bridge AVPreparer *)p).device.currentAllocatedSize; }
 
-int32_t av_prepare_native_submit(void *handle, void *y, void *uv, const uint32_t *params, void *coefficients, void **out) {
-    return prepare(handle, NULL, NULL, 0, params, coefficients, out, (__bridge id<MTLTexture>)y, (__bridge id<MTLTexture>)uv);
+int32_t av_prepare_native_submit(void *handle, void *y, void *uv, const uint32_t *params, void *coefficients, void *chromaCoefficients, void **out) {
+    return prepare(handle, NULL, NULL, 0, params, coefficients, chromaCoefficients, out, (__bridge id<MTLTexture>)y, (__bridge id<MTLTexture>)uv);
 }
-int32_t av_prepare_host_submit(void *handle, const uint8_t *yb, size_t ys, const uint8_t *uvb, size_t uvs, const uint32_t *params, void *coefficients, void **out) {
+int32_t av_prepare_host_submit(void *handle, const uint8_t *yb, size_t ys, const uint8_t *uvb, size_t uvs, const uint32_t *params, void *coefficients, void *chromaCoefficients, void **out) {
     *out = NULL;
     @autoreleasepool {
         AVPreparer *p = (__bridge AVPreparer *)handle;
@@ -241,7 +282,7 @@ int32_t av_prepare_host_submit(void *handle, const uint8_t *yb, size_t ys, const
         if (!y || (params[9] != 0 && !uv)) return -1;
         [y replaceRegion:MTLRegionMake2D(0, 0, params[0], params[1]) mipmapLevel:0 withBytes:yb bytesPerRow:ys];
         if (params[9] != 0) [uv replaceRegion:MTLRegionMake2D(0, 0, cw, ch) mipmapLevel:0 withBytes:uvb bytesPerRow:uvs];
-        return prepare(handle, NULL, NULL, 0, params, coefficients, out, y, uv);
+        return prepare(handle, NULL, NULL, 0, params, coefficients, chromaCoefficients, out, y, uv);
     }
 }
 

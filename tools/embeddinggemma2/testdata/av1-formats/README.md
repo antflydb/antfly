@@ -36,3 +36,10 @@ unqualified. The earlier failing reports remain historical reproduction evidence
 The subsequent combined RGB correction is in
 `zig/lib/video/testdata/av1-combined-model-validation`: all three 4:4:4 vectors
 now pass CPU/Metal gates. Four 4:2:0/4:2:2 cases and full rankings remain failing.
+
+The native chroma reconstruction correction in
+`zig/lib/video/testdata/av1-chroma-model-validation` supersedes those numerical
+failures: all nine video vectors and both query rankings pass on macOS CPU/Metal
+and actual Linux ARM64 CPU. The Linux comparison uses the pinned macOS PyTorch
+reference. Metal's later capacity-denied retry keeps its stress report failed.
+Layer/HDR/rotation and application usefulness remain outside this corpus.

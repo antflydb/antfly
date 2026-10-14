@@ -24,7 +24,7 @@ const codecs = @import("codecs/decoder.zig");
 const frames = @import("codecs/frame.zig");
 const vp8 = @import("vp8.zig");
 const sampling = @import("sampling.zig");
-pub const Picture = struct { pts: i64, duration: ?u64, width: u32, height: u32 };
+pub const Picture = struct { pts: i64, duration: ?u64, width: u32, height: u32, bit_depth: u8 = 8, chroma_format: u8 = 1 };
 pub const Restart = struct { packet: usize = 0, logical: usize = 0, sequence: ?struct { packet: usize, offset: usize, size: usize } = null };
 pub const ReplayStats = struct { first_packet: usize = 0, packets_decoded: usize = 0, bootstrap_bytes: usize = 0, output_copy_bytes: u64 = 0, outputs_skipped: usize = 0 };
 pub const Options = struct { max_packets: usize = 8192, max_pictures: usize = 65536, decoder: codecs.Options = .{}, strategy: enum { headers, reconstruct } = .headers, replay_stats: ?*ReplayStats = null, copy_unselected_outputs: bool = false };
@@ -92,7 +92,7 @@ const Collect = struct {
     }
     fn accept(raw: *anyopaque, _: usize, frame: *const codecs.Frame) !void {
         const self: *Collect = @ptrCast(@alignCast(raw));
-        try self.push(.{ .pts = frame.pts_ns, .duration = frame.duration_ns, .width = frame.width, .height = frame.height });
+        try self.push(.{ .pts = frame.pts_ns, .duration = frame.duration_ns, .width = frame.width, .height = frame.height, .bit_depth = frame.bit_depth, .chroma_format = frame.chroma_format });
     }
     fn push(self: *Collect, picture: Picture) !void {
         if (self.pictures.items.len >= self.limit) return error.ResourceLimitExceeded;
@@ -202,7 +202,7 @@ fn indexHeaders(reader: *media.webm.Reader, options: Options, collector: *Collec
     if (av1) |session| try session.finish();
 }
 fn appendHeader(collector: *Collect, packet: media.webm.Packet, geometry: @import("codecs/vp9_header.zig").Geometry) !void {
-    try collector.push(.{ .pts = packet.pts, .duration = packet.duration_ns, .width = geometry.width, .height = geometry.height });
+    try collector.push(.{ .pts = packet.pts, .duration = packet.duration_ns, .width = geometry.width, .height = geometry.height, .bit_depth = geometry.bit_depth, .chroma_format = geometry.chroma_format });
 }
 
 /// IDs are visible decoder-output ordinals, never container packet ordinals.

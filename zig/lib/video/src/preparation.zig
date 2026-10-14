@@ -17,14 +17,17 @@ const std = @import("std");
 const media = @import("antfly_media");
 const image = @import("antfly_image").processing;
 const apple = @import("backends/apple.zig");
+const chroma_filter = @import("chroma.zig");
 const supported = @import("builtin").os.tag == .macos;
 extern fn av_preparer_create(*anyopaque, *?*anyopaque) i32;
 extern fn av_preparer_destroy(*anyopaque) void;
 extern fn av_coefficients_create(*anyopaque, [*]const u32, usize, [*]const i32, usize, [*]const u32, usize, [*]const i32, usize, *?*anyopaque) i32;
+extern fn av_chroma_create(*anyopaque, [*]const chroma_filter.Tap, usize, [*]const chroma_filter.Tap, usize, *?*anyopaque) i32;
+extern fn av_chroma_destroy(*anyopaque) void;
 extern fn av_coefficients_destroy(*anyopaque) void;
-extern fn av_prepare_submit(*anyopaque, *anyopaque, [*]const u32, *anyopaque, *?*anyopaque) i32;
-extern fn av_prepare_native_submit(*anyopaque, *anyopaque, ?*anyopaque, [*]const u32, *anyopaque, *?*anyopaque) i32;
-extern fn av_prepare_host_submit(*anyopaque, [*]const u8, usize, [*]const u8, usize, [*]const u32, *anyopaque, *?*anyopaque) i32;
+extern fn av_prepare_submit(*anyopaque, *anyopaque, [*]const u32, *anyopaque, ?*anyopaque, *?*anyopaque) i32;
+extern fn av_prepare_native_submit(*anyopaque, *anyopaque, ?*anyopaque, [*]const u32, *anyopaque, ?*anyopaque, *?*anyopaque) i32;
+extern fn av_prepare_host_submit(*anyopaque, [*]const u8, usize, [*]const u8, usize, [*]const u32, *anyopaque, ?*anyopaque, *?*anyopaque) i32;
 extern fn av_prepare_rgba_submit(*anyopaque, [*]const u8, usize, [*]const u32, *anyopaque, *?*anyopaque) i32;
 extern fn av_prepared_gpu_seconds(*anyopaque) f64;
 extern fn av_preparer_device_bytes(*anyopaque) u64;
@@ -38,14 +41,14 @@ extern fn av_prepared_destroy(*anyopaque) void;
 pub const Rotation = enum(u32) { none, clockwise90, half_turn, clockwise270 };
 pub const Matrix = enum(u32) { bt601, bt709, bt2020_ncl };
 pub const ToneMapping = @import("tone.zig").Policy;
-pub const RgbRounding = enum(u32) { nearest, q13_components, q16_luma, gray_samples, q13_combined };
+pub const RgbRounding = enum(u32) { nearest, q13_components, q16_luma, gray_samples, q13_combined, q13_reconstructed };
 /// Pinned SDR software-video processor profile, independent of CPU dispatch.
 /// HDR has a separate rendering policy and must not select this profile.
-pub fn softwareSdrRounding(coded_width: u32, chroma: u8) RgbRounding {
+pub fn softwareSdrRounding(coded_width: u32, chroma: u8, depth: u8) RgbRounding {
     return switch (chroma) {
         0 => .gray_samples,
         3 => .q13_combined,
-        else => if (coded_width % 16 == 0) .q13_components else .q16_luma,
+        else => if (coded_width % 2 != 0 or depth > 8) .q13_reconstructed else if (coded_width % 16 == 0) .q13_components else .q16_luma,
     };
 }
 
@@ -108,7 +111,11 @@ pub fn geometry(source_width: u32, source_height_u32: u32, options: Options) !Ge
     const rgb_bytes = try std.math.mul(usize, source_pixels, 3);
     // One conservative bound covers both reference and device paths, including
     // CPU result/patch repacking. Coefficient storage is checked separately.
-    const scratch = try std.math.add(usize, try std.math.add(usize, horizontal_bytes, rgb_bytes), try std.math.mul(usize, output_bytes, 2));
+    const reconstruction = if (options.rgb_rounding == .q13_reconstructed and options.tone_mapping == .none)
+        try std.math.add(usize, try std.math.mul(usize, source_pixels, 4), try std.math.mul(usize, @as(usize, source_width) + source_height_u32, 128))
+    else
+        0;
+    const scratch = try std.math.add(usize, reconstruction, try std.math.add(usize, try std.math.add(usize, horizontal_bytes, rgb_bytes), try std.math.mul(usize, output_bytes, 2)));
     if (scratch > options.max_scratch_bytes / 2) return error.ResourceLimitExceeded;
     return .{ .width = options.width, .height = options.height, .patches = patches, .soft_tokens = patches / 9, .scratch_bytes = scratch * 2 };
 }
@@ -315,6 +322,10 @@ fn referenceHostImpl(allocator: std.mem.Allocator, host: HostSurface, options: O
     const width = if (rotated) cropped[1] else cropped[0];
     const height = if (rotated) cropped[0] else cropped[1];
     try host.validate();
+    var chroma_plan: ?chroma_filter.Plan = if (options.rgb_rounding == .q13_reconstructed and options.tone_mapping == .none and host.chroma_format != 0) try chroma_filter.Plan.init(allocator, host.width, host.height, host.chroma_format, control) else null;
+    defer if (chroma_plan) |*plan| plan.deinit();
+    const chroma_horizontal = if (chroma_plan) |*plan| try reconstructedHorizontal(allocator, host, plan, control, simd) else null;
+    defer if (chroma_horizontal) |values| allocator.free(values);
     const bytes = try allocator.alloc(u8, @as(usize, width) * height * 3);
     defer allocator.free(bytes);
     for (0..height) |y| {
@@ -326,12 +337,82 @@ fn referenceHostImpl(allocator: std.mem.Allocator, host: HostSurface, options: O
         while (x < width) : (x += 1) {
             const local = sourcePoint(x, y, cropped[0], cropped[1], options.rotation);
             const point = [2]usize{ local[0] + options.crop.left, local[1] + options.crop.top };
-            @memcpy(bytes[(y * width + x) * 3 ..][0..3], &rgb(host.planes, point[0], point[1], host.format, options.matrix, host.bit_depth, host.chroma_format, options.rgb_rounding, options.tone_mapping));
+            const color = if (chroma_plan) |*plan|
+                reconstructedRgb(host, plan, chroma_horizontal.?, point[0], point[1], options.matrix)
+            else
+                rgb(host.planes, point[0], point[1], host.format, options.matrix, host.bit_depth, host.chroma_format, if (options.rgb_rounding == .q13_reconstructed and host.chroma_format == 0) .gray_samples else options.rgb_rounding, options.tone_mapping);
+            @memcpy(bytes[(y * width + x) * 3 ..][0..3], &color);
         }
     }
     return prepareRgb(allocator, bytes, width, height, g, options, control);
 }
 
+fn reconstructedHorizontal(a: std.mem.Allocator, host: HostSurface, plan: *const chroma_filter.Plan, control: media.source.Control, simd: bool) ![]i16 {
+    const result = try a.alloc(i16, @as(usize, plan.width) * plan.height * 2);
+    errdefer a.free(result);
+    const bytes: usize = if (host.bit_depth == 8) 1 else 2;
+    const shift: u5 = @intCast(host.bit_depth - 1);
+    for (0..plan.height) |row| {
+        try control.check();
+        for (plan.x.taps, 0..) |tap, x| {
+            if (simd) {
+                const V = @Vector(2, i32);
+                var sum: V = @splat(0);
+                for (tap.indices, tap.weights) |index, weight| {
+                    if (weight == 0) continue;
+                    const at = row * host.planes[1].stride + @as(usize, index) * 2 * bytes;
+                    const samples: V = .{
+                        @intCast(hostSample(host.planes[1].bytes, at, host.bit_depth) >> host.format.sampleShift()),
+                        @intCast(hostSample(host.planes[1].bytes, at + bytes, host.bit_depth) >> host.format.sampleShift()),
+                    };
+                    sum += samples * @as(V, @splat(weight));
+                }
+                const rounded: @Vector(2, i16) = @truncate(@min(sum >> @as(@Vector(2, u5), @splat(shift)), @as(V, @splat(32767))));
+                const values: [2]i16 = rounded;
+                @memcpy(result[(row * plan.width + x) * 2 ..][0..2], &values);
+            } else for (0..2) |channel| {
+                var sum: i64 = 0;
+                for (tap.indices, tap.weights) |index, weight| {
+                    if (weight == 0) continue;
+                    const value = hostSample(host.planes[1].bytes, row * host.planes[1].stride + (@as(usize, index) * 2 + channel) * bytes, host.bit_depth) >> host.format.sampleShift();
+                    sum += @as(i64, value) * weight;
+                }
+                result[(row * plan.width + x) * 2 + channel] = @truncate(@min(sum >> shift, 32767));
+            }
+        }
+    }
+    return result;
+}
+fn reconstructedRgb(host: HostSurface, plan: *const chroma_filter.Plan, horizontal: []const i16, x: usize, y: usize, matrix: Matrix) [3]u8 {
+    const column = if (plan.full) x else x / 2;
+    var uv: [2]i64 = .{ 0, 0 };
+    const tap = plan.y.taps[y];
+    for (tap.indices, tap.weights) |row, weight| {
+        if (weight == 0) continue;
+        const at = (@as(usize, row) * plan.width + column) * 2;
+        uv[0] += @as(i64, horizontal[at]) * weight;
+        uv[1] += @as(i64, horizontal[at + 1]) * weight;
+    }
+    const bytes: usize = if (host.bit_depth == 8) 1 else 2;
+    const raw = hostSample(host.planes[0].bytes, y * host.planes[0].stride + x * bytes, host.bit_depth) >> host.format.sampleShift();
+    if (!plan.full) {
+        const shift: u4 = @intCast(host.bit_depth - 8);
+        const luma: i32 = @intCast((@as(u32, raw) + (if (shift == 0) @as(u32, 0) else @as(u32, 1) << (shift - 1))) >> shift);
+        return rgbQ16(luma, @as(i32, @intCast(std.math.clamp((uv[0] + (1 << 18)) >> 19, 0, 255))) - 128, @as(i32, @intCast(std.math.clamp((uv[1] + (1 << 18)) >> 19, 0, 255))) - 128, host.format.fullRange(), matrix);
+    }
+    const coefficients = combinedCoefficients(host.format.fullRange(), matrix);
+    const y9 = @as(i64, raw) << @as(u6, @intCast(17 - host.bit_depth));
+    const uq9 = (uv[0] + tap.rounding_bias - (128 << 19)) >> 10;
+    const vq9 = (uv[1] + tap.rounding_bias - (128 << 19)) >> 10;
+    const luma = (y9 - @as(i64, if (host.format.fullRange()) 0 else 16 << 9)) * @as(i64, if (host.format.fullRange()) 8192 else 9539);
+    const sums = [3]i64{ luma + vq9 * coefficients[0], luma + uq9 * coefficients[1] + vq9 * coefficients[2], luma + uq9 * coefficients[3] };
+    var output: [3]u8 = undefined;
+    for (sums, &output) |sum, *channel| {
+        const word: i32 = @bitCast(@as(u32, @truncate(@as(u64, @bitCast(sum + (1 << 21))))));
+        channel.* = @intCast(std.math.clamp(word >> 22, 0, 255));
+    }
+    return output;
+}
 fn integerRgbRow8(out: []u8, host: HostSurface, x: usize, y: usize, options: Options) void {
     const V = @Vector(8, i32);
     var luma_bytes: [8]u8 = undefined;
@@ -486,6 +567,9 @@ pub const Metal = struct {
     /// One bounded resident geometry. Commands retain replaced buffers through
     /// completion; this owner is single-consumer even across concurrent jobs.
     coefficients: ?*anyopaque = null,
+    chroma_coefficients: ?*anyopaque = null,
+    chroma_key: [3]u32 = .{ 0, 0, 0 },
+    chroma_bytes: usize = 0,
     coefficient_key: [5]u32 = .{ 0, 0, 0, 0, 0 },
     coefficient_bytes: usize = 0,
     coefficient_build_bound: usize = 0,
@@ -500,6 +584,7 @@ pub const Metal = struct {
     pub fn deinit(self: *Metal) void {
         if (supported) {
             if (self.coefficients) |resident| av_coefficients_destroy(resident);
+            if (self.chroma_coefficients) |resident| av_chroma_destroy(resident);
             av_preparer_destroy(self.handle);
             self.cache_reservation.deinit();
         }
@@ -509,7 +594,7 @@ pub const Metal = struct {
     /// submitting work. Destruction fences the queue before returning capacity.
     pub fn admit(self: *Metal, pool: *media.admission.Pool, max_coefficient_bytes: usize) !void {
         if (!supported) return error.UnsupportedVideoBackend;
-        if (self.coefficients != null or self.cache_reservation.pool != null) return error.MetalPreparerAlreadyUsed;
+        if (self.coefficients != null or self.chroma_coefficients != null or self.cache_reservation.pool != null) return error.MetalPreparerAlreadyUsed;
         self.cache_reservation = try pool.acquire(.{ .device_bytes = max_coefficient_bytes });
         self.coefficient_limit = max_coefficient_bytes;
     }
@@ -521,6 +606,10 @@ pub const Metal = struct {
     /// Evict the resident geometry without invalidating submitted commands.
     pub fn clearCoefficients(self: *Metal) void {
         if (supported) if (self.coefficients) |resident| av_coefficients_destroy(resident);
+        if (supported) if (self.chroma_coefficients) |resident| av_chroma_destroy(resident);
+        self.chroma_coefficients = null;
+        self.chroma_bytes = 0;
+        self.chroma_key = .{ 0, 0, 0 };
         self.coefficients = null;
         self.coefficient_bytes = 0;
         self.coefficient_build_bound = 0;
@@ -533,14 +622,15 @@ pub const Metal = struct {
             .hlg_reinhard_100 => 2,
         };
         const color_bytes = @as(usize, @popCount(mask | requested)) * 16385 * 4;
-        if (color_bytes > self.coefficient_limit) return error.ResourceLimitExceeded;
+        if (self.chroma_bytes > self.coefficient_limit) return error.ResourceLimitExceeded;
+        if (color_bytes > self.coefficient_limit - self.chroma_bytes) return error.ResourceLimitExceeded;
         const color_upload: usize = if (requested != 0 and mask & requested == 0) 16385 * 4 else 0;
         const rotated = options.rotation == .clockwise90 or options.rotation == .clockwise270;
         const cropped = try croppedSize(width, height, options.crop);
         const key: [5]u32 = .{ if (rotated) cropped[1] else cropped[0], if (rotated) cropped[0] else cropped[1], g.width, g.height, @intFromBool(options.torchvision) };
         if (self.coefficients != null and std.mem.eql(u32, &key, &self.coefficient_key)) {
             if (self.coefficient_build_bound > options.max_scratch_bytes / 4) return error.ResourceLimitExceeded;
-            if (self.coefficient_bytes > self.coefficient_limit - color_bytes) return error.ResourceLimitExceeded;
+            if (self.coefficient_bytes > self.coefficient_limit - color_bytes - self.chroma_bytes) return error.ResourceLimitExceeded;
             return color_upload;
         }
         var xaxis = try Axis.init(allocator, key[0], key[2], options.max_scratch_bytes / 4, options.torchvision);
@@ -549,7 +639,7 @@ pub const Metal = struct {
         defer yaxis.deinit();
         try control.check();
         const byte_count = (xaxis.table.len + xaxis.weights.len + yaxis.table.len + yaxis.weights.len) * 4;
-        if (byte_count > self.coefficient_limit - color_bytes) return error.ResourceLimitExceeded;
+        if (byte_count > self.coefficient_limit - color_bytes - self.chroma_bytes) return error.ResourceLimitExceeded;
         var resident: ?*anyopaque = null;
         if (av_coefficients_create(self.handle, xaxis.table.ptr, xaxis.table.len, xaxis.weights.ptr, xaxis.weights.len, yaxis.table.ptr, yaxis.table.len, yaxis.weights.ptr, yaxis.weights.len, &resident) != 0) return error.MetalPreparationFailed;
         if (self.coefficients) |old| av_coefficients_destroy(old);
@@ -559,6 +649,23 @@ pub const Metal = struct {
         self.coefficient_build_bound = @max(try Axis.bound(key[0], key[2]), try Axis.bound(key[1], key[3]));
         return self.coefficient_bytes + color_upload;
     }
+    fn ensureChroma(self: *Metal, a: std.mem.Allocator, width: u32, height: u32, chroma: u8, options: Options, control: media.source.Control) !usize {
+        if (options.rgb_rounding != .q13_reconstructed or options.tone_mapping != .none or chroma == 0) return 0;
+        const key = [3]u32{ width, height, chroma };
+        if (self.chroma_coefficients != null and std.mem.eql(u32, &key, &self.chroma_key)) return 0;
+        var plan = try chroma_filter.Plan.init(a, width, height, chroma, control);
+        defer plan.deinit();
+        const bytes = plan.bytes();
+        const color_bytes = @as(usize, @popCount(av_preparer_tone_mask(self.handle))) * 16385 * 4;
+        if (self.coefficient_bytes > self.coefficient_limit or color_bytes > self.coefficient_limit - self.coefficient_bytes or bytes > self.coefficient_limit - self.coefficient_bytes - color_bytes) return error.ResourceLimitExceeded;
+        var resident: ?*anyopaque = null;
+        if (av_chroma_create(self.handle, plan.x.taps.ptr, plan.x.taps.len, plan.y.taps.ptr, plan.y.taps.len, &resident) != 0) return error.MetalPreparationFailed;
+        if (self.chroma_coefficients) |old| av_chroma_destroy(old);
+        self.chroma_coefficients = resident.?;
+        self.chroma_key = key;
+        self.chroma_bytes = bytes;
+        return bytes;
+    }
     pub fn submit(self: *Metal, allocator: std.mem.Allocator, surface: *const apple.Surface, options: Options, control: media.source.Control) !Prepared {
         if (!supported) return error.UnsupportedVideoBackend;
         try control.check();
@@ -567,10 +674,10 @@ pub const Metal = struct {
         const g = try geometry(surface.width, surface.height, options);
         var reservation = if (options.admission_pool) |pool| try pool.acquire(.{ .device_bytes = g.scratch_bytes, .commands = 1 }) else media.admission.Token{};
         errdefer reservation.deinit();
-        const uploaded = try self.ensureCoefficients(allocator, surface.width, surface.height, g, options, control);
+        const uploaded = try self.ensureCoefficients(allocator, surface.width, surface.height, g, options, control) + try self.ensureChroma(allocator, surface.width, surface.height, 1, options, control);
         const params = [_]u32{ surface.width, surface.height, g.width, g.height, @backingInt(options.rotation), @backingInt(options.matrix), @intFromBool(surface.format.fullRange()), @intFromBool(options.centered), surface.format.bitDepth(), 1, @backingInt(options.rgb_rounding), surface.format.sampleShift(), @backingInt(options.tone_mapping), options.crop.left, options.crop.top, options.crop.right, options.crop.bottom };
         var out: ?*anyopaque = null;
-        if (av_prepare_submit(self.handle, surface.handle, &params, self.coefficients.?, &out) != 0) return error.MetalPreparationFailed;
+        if (av_prepare_submit(self.handle, surface.handle, &params, self.coefficients.?, self.chroma_coefficients, &out) != 0) return error.MetalPreparationFailed;
         return .{ .reservation = reservation, .handle = out.?, .geometry = g, .coefficient_staging_bytes = uploaded };
     }
     /// Caller-owned integer Metal plane textures on this preparer's device.
@@ -595,10 +702,10 @@ pub const Metal = struct {
         const g = try geometry(surface.width, surface.height, options);
         var reservation = if (options.admission_pool) |pool| try pool.acquire(.{ .device_bytes = g.scratch_bytes, .commands = 1 }) else media.admission.Token{};
         errdefer reservation.deinit();
-        const uploaded = try self.ensureCoefficients(allocator, surface.width, surface.height, g, options, control);
+        const uploaded = try self.ensureCoefficients(allocator, surface.width, surface.height, g, options, control) + try self.ensureChroma(allocator, surface.width, surface.height, surface.chroma_format, options, control);
         const params = [_]u32{ surface.width, surface.height, g.width, g.height, @backingInt(options.rotation), @backingInt(options.matrix), @intFromBool(surface.full_range), @intFromBool(options.centered), surface.bit_depth, surface.chroma_format, @backingInt(options.rgb_rounding), surface.sample_shift, @backingInt(options.tone_mapping), options.crop.left, options.crop.top, options.crop.right, options.crop.bottom };
         var out: ?*anyopaque = null;
-        if (av_prepare_native_submit(self.handle, surface.y, surface.uv, &params, self.coefficients.?, &out) != 0) return error.MetalPreparationFailed;
+        if (av_prepare_native_submit(self.handle, surface.y, surface.uv, &params, self.coefficients.?, self.chroma_coefficients, &out) != 0) return error.MetalPreparationFailed;
         return .{ .reservation = reservation, .handle = out.?, .geometry = g, .coefficient_staging_bytes = uploaded };
     }
     /// Upload native planes directly, without host RGB conversion. Metal owns
@@ -612,10 +719,10 @@ pub const Metal = struct {
         if (size > options.max_host_staging_bytes) return error.ResourceLimitExceeded;
         var reservation = if (options.admission_pool) |pool| try pool.acquire(.{ .device_bytes = try std.math.add(usize, g.scratch_bytes, size), .commands = 1 }) else media.admission.Token{};
         errdefer reservation.deinit();
-        const uploaded = try self.ensureCoefficients(allocator, surface.width, surface.height, g, options, control);
+        const uploaded = try self.ensureCoefficients(allocator, surface.width, surface.height, g, options, control) + try self.ensureChroma(allocator, surface.width, surface.height, surface.chroma_format, options, control);
         const params = [_]u32{ surface.width, surface.height, g.width, g.height, @backingInt(options.rotation), @backingInt(options.matrix), @intFromBool(surface.format.fullRange()), @intFromBool(options.centered), surface.bit_depth, surface.chroma_format, @backingInt(options.rgb_rounding), surface.format.sampleShift(), @backingInt(options.tone_mapping), options.crop.left, options.crop.top, options.crop.right, options.crop.bottom };
         var out: ?*anyopaque = null;
-        if (av_prepare_host_submit(self.handle, surface.planes[0].bytes.ptr, surface.planes[0].stride, surface.planes[1].bytes.ptr, surface.planes[1].stride, &params, self.coefficients.?, &out) != 0) return error.MetalPreparationFailed;
+        if (av_prepare_host_submit(self.handle, surface.planes[0].bytes.ptr, surface.planes[0].stride, surface.planes[1].bytes.ptr, surface.planes[1].stride, &params, self.coefficients.?, self.chroma_coefficients, &out) != 0) return error.MetalPreparationFailed;
         return .{ .reservation = reservation, .handle = out.?, .geometry = g, .native_staging_bytes = size, .coefficient_staging_bytes = uploaded };
     }
     /// Copies tightly packed RGBA into owned Metal storage before returning.
@@ -757,7 +864,7 @@ test "video portable integer RGB SIMD matches scalar across tails strides chroma
     var uv: [1024]u8 = undefined;
     for (&y, 0..) |*value, i| value.* = @intCast((i * 37 + 11) % 256);
     for (&uv, 0..) |*value, i| value.* = @intCast((i * 61 + 7) % 256);
-    for ([_]u32{ 1, 7, 8, 9, 15, 16, 17, 26, 33 }) |width| for (0..4) |chroma| for ([_]bool{ false, true }) |full| for ([_]Matrix{ .bt601, .bt709, .bt2020_ncl }) |matrix| for ([_]RgbRounding{ .q13_components, .q16_luma, .q13_combined }) |rounding| {
+    for ([_]u32{ 1, 7, 8, 9, 15, 16, 17, 26, 33 }) |width| for (0..4) |chroma| for ([_]bool{ false, true }) |full| for ([_]Matrix{ .bt601, .bt709, .bt2020_ncl }) |matrix| for ([_]RgbRounding{ .q13_components, .q16_luma, .q13_combined, .q13_reconstructed }) |rounding| {
         const cw = if (chroma == 3) width else (width + 1) / 2;
         const ch: u32 = if (chroma == 1) 3 else 5;
         const ys: usize = width + 5;
@@ -864,6 +971,55 @@ test "video combined native-depth RGB matches independent matrices ranges and od
         for ([_]Matrix{ .bt601, .bt709, .bt2020_ncl }) |matrix| for ([_]bool{ false, true }) |full| {
             for (0..size[1]) |row| for (0..size[0]) |col| {
                 const actual = rgb(planes, col, row, if (full) .nv12_full else .nv12_video, matrix, depth, 3, .q13_combined, .none);
+                try std.testing.expectEqualSlices(u8, expected[at..][0..3], &actual);
+                at += 3;
+            };
+        };
+    };
+    try std.testing.expectEqual(expected.len, at);
+}
+
+test "video reconstructed subsampled RGB matches independent odd even depth range oracle" {
+    const expected = @embedFile("../testdata/rgb-reconstructed-reference.bin");
+    var at: usize = 0;
+    const a = std.testing.allocator;
+    for ([_][2]u32{ .{ 9, 7 }, .{ 26, 16 }, .{ 127, 95 } }) |size| for ([_]u8{ 1, 2 }) |chroma| for ([_]u8{ 8, 10, 12 }) |depth| {
+        const count = @as(usize, size[0]) * size[1];
+        const cw = (size[0] + 1) / 2;
+        const ch = if (chroma == 1) (size[1] + 1) / 2 else size[1];
+        const bytes: usize = if (depth == 8) 1 else 2;
+        const yp = try a.alloc(u8, count * bytes);
+        defer a.free(yp);
+        const uvp = try a.alloc(u8, @as(usize, cw) * ch * 2 * bytes);
+        defer a.free(uvp);
+        const maximum = @as(usize, 1) << @as(u4, @intCast(depth));
+        for (0..count) |i| {
+            const value: u16 = @intCast((i * 37 + 11) % maximum);
+            if (depth == 8) yp[i] = @intCast(value) else std.mem.writeInt(u16, yp[i * 2 ..][0..2], value, .little);
+        }
+        for (0..@as(usize, cw) * ch) |i| {
+            const u: u16 = @intCast((i * 61 + 7) % maximum);
+            const v: u16 = @intCast((i * 73 + 29) % maximum);
+            if (depth == 8) {
+                uvp[i * 2] = @intCast(u);
+                uvp[i * 2 + 1] = @intCast(v);
+            } else {
+                std.mem.writeInt(u16, uvp[i * 4 ..][0..2], u, .little);
+                std.mem.writeInt(u16, uvp[i * 4 + 2 ..][0..2], v, .little);
+            }
+        }
+        var plan = try chroma_filter.Plan.init(a, size[0], size[1], chroma, .{});
+        defer plan.deinit();
+        const rounding = softwareSdrRounding(size[0], chroma, depth);
+        for ([_]Matrix{ .bt601, .bt709, .bt2020_ncl }) |matrix| for ([_]bool{ false, true }) |full| {
+            const host = HostSurface{ .width = size[0], .height = size[1], .chroma_format = chroma, .bit_depth = depth, .format = if (full) .nv12_full else .nv12_video, .planes = .{
+                .{ .bytes = yp, .width = size[0], .height = size[1], .stride = size[0] * bytes }, .{ .bytes = uvp, .width = cw, .height = ch, .stride = cw * 2 * bytes },
+            } };
+            const horizontal = try reconstructedHorizontal(a, host, &plan, .{}, true);
+            defer a.free(horizontal);
+            for (0..size[1]) |row| for (0..size[0]) |column| {
+                const actual = if (rounding == .q13_reconstructed) reconstructedRgb(host, &plan, horizontal, column, row, matrix) else rgb(host.planes, column, row, host.format, matrix, depth, chroma, rounding, .none);
+                if (!std.mem.eql(u8, expected[at..][0..3], &actual)) std.debug.print("reconstructed RGB {d}x{d} depth {d} chroma {d} matrix {s} full {any} at {d},{d}: expected {any} actual {any}\n", .{ size[0], size[1], depth, chroma, @tagName(matrix), full, column, row, expected[at..][0..3].*, actual });
                 try std.testing.expectEqualSlices(u8, expected[at..][0..3], &actual);
                 at += 3;
             };

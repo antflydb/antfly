@@ -478,7 +478,9 @@ pub fn inspectPlan(a: std.mem.Allocator, bytes: []const u8, control: Control, sa
         var plan = Plan{ .commands = preparationSlots(selected) };
         for (selected) |id| {
             const picture = index.pictures[id];
-            try plan.picture(picture.width, picture.height, try webmPolicy(reader.track, picture.width, picture.height, .{}));
+            var preparation = try webmPolicy(reader.track, picture.width, picture.height, .{});
+            if (preparation.tone_mapping == .none) preparation.rgb_rounding = video.preparation.softwareSdrRounding(picture.width, picture.chroma_format, picture.bit_depth);
+            try plan.picture(picture.width, picture.height, preparation);
         }
         return plan;
     }
@@ -1262,7 +1264,7 @@ const Capture = struct {
             .matrix = if (color.matrix == 2 or track.codec == .vp8) null else color.matrix,
         };
         var options = try webmPolicy(track, frame.width, frame.height, signal);
-        if (options.tone_mapping == .none) options.rgb_rounding = video.preparation.softwareSdrRounding(frame.width, frame.chroma_format);
+        if (options.tone_mapping == .none) options.rgb_rounding = video.preparation.softwareSdrRounding(frame.width, frame.chroma_format, frame.bit_depth);
         options.admission_pool = self.pool;
         if (self.metal) |metal| {
             const prepared = try metal.submitHost(self.a, host, options, self.control);
@@ -2178,4 +2180,23 @@ test "embeddinggemma2 video cached borrowed reader producer skips native reconst
     const ticket = cache.take(selection.projection_keys[0]) orelse return error.TestUnexpectedResult;
     defer cache.restore(ticket);
     try std.testing.expectEqualSlices(f32, &values, ticket.entry.value.cpu);
+}
+
+test "embeddinggemma2 video preflight includes native chroma reconstruction scratch" {
+    const a = std.testing.allocator;
+    const bytes = @embedFile("../testdata/video/av1-chroma-12.webm");
+    const plan = try inspectPlan(a, bytes, .{}, .reference, null, true);
+    var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "native-depth-chroma-preflight" };
+    var reader = try media.webm.Reader.init(a, &source, .{});
+    defer reader.deinit();
+    var old = try webmPolicy(reader.track, 127, 95, .{});
+    old.rgb_rounding = .nearest;
+    var actual = old;
+    actual.rgb_rounding = .q13_reconstructed;
+    const staging = std.mem.alignForward(usize, 127, 64) * std.mem.alignForward(usize, 95, 64) * 6;
+    const required = (try video.preparation.geometry(127, 95, actual)).scratch_bytes + staging;
+    const old_charge = (try video.preparation.geometry(127, 95, old)).scratch_bytes + staging;
+    try std.testing.expect(plan.preparation_bytes >= required);
+    try std.testing.expect(plan.preparation_bytes > old_charge);
+    try std.testing.expect((try plan.deviceBytes()) >= required * plan.commands + 16 * 1024 * 1024);
 }

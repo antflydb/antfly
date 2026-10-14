@@ -15,6 +15,7 @@
 
 #include <metal_stdlib>
 using namespace metal;
+struct ChromaTap { uint indices[5]; int weights[5]; int rounding_bias; };
 struct Params { uint sw, sh, tw, th, rotation, bt709, full, centered, depth, chroma, rounding, sample_shift, tone, crop_left, crop_top, crop_right, crop_bottom; };
 uint2 source_point(uint2 point, constant Params &p) {
     uint cw = p.sw - p.crop_left - p.crop_right, ch = p.sh - p.crop_top - p.crop_bottom;
@@ -74,8 +75,52 @@ float3 rgb_q13(int y, int2 uv, constant Params &p) {
                      luma + ((uv.x * c.w) >> 12));
     return float3(clamp((value + 1) >> 1, 0, 255));
 }
-float3 rgb(texture2d<float, access::read> yplane, texture2d<float, access::read> uvplane, uint2 point, constant Params &p, device const float *eotf) {
+float3 rgb_reconstructed(uint raw, uint2 xy, constant Params &p, device const short2 *horizontal, device const ChromaTap *vertical) {
+    if (p.chroma == 0) {
+        uint shift = p.depth - 8;
+        return float3(min((raw + (shift == 0 ? 0u : 1u << (shift - 1))) >> shift, 255u));
+    }
+    bool full_chroma = (p.sw & 1) || p.chroma == 3;
+    uint columns = full_chroma ? p.sw : (p.sw + 1) / 2;
+    uint column = full_chroma ? xy.x : xy.x / 2;
+    ChromaTap tap = vertical[xy.y];
+    int2 uv = int2(0);
+    for (uint i = 0; i < 5; ++i) {
+        if (tap.weights[i] != 0) uv += int2(horizontal[tap.indices[i] * columns + column]) * tap.weights[i];
+    }
+    if (!full_chroma) {
+        uint shift = p.depth - 8;
+        int luma = int((raw + (shift == 0 ? 0u : 1u << (shift - 1))) >> shift);
+        return rgb_q16(luma, clamp((uv + (1 << 18)) >> 19, 0, 255) - 128, p);
+    }
+    int4 c = p.bt709 == 1 ? (p.full ? int4(12901, -1534, -3835, 15201) : int4(14686, -1747, -4366, 17305))
+           : p.bt709 == 2 ? (p.full ? int4(12080, -1348, -4680, 15412) : int4(13752, -1535, -5328, 17545))
+                          : (p.full ? int4(11485, -2819, -5850, 14516) : int4(13075, -3209, -6660, 16525));
+    int2 chroma = (uv + tap.rounding_bias - (128 << 19)) >> 10;
+    uint luma = ((raw << (17 - p.depth)) - (p.full ? 0u : 16u << 9)) * (p.full ? 8192u : 9539u) + (1u << 21);
+    uint3 sums = uint3(luma + uint(chroma.y) * uint(c.x), luma + uint(chroma.x) * uint(c.y) + uint(chroma.y) * uint(c.z), luma + uint(chroma.x) * uint(c.w));
+    return float3(clamp(as_type<int3>(sums) >> 22, 0, 255));
+}
+kernel void chroma_horizontal_native(texture2d<uint, access::read> uv [[texture(1)]], device short2 *out [[buffer(0)]], constant Params &p [[buffer(1)]], device const ChromaTap *axis [[buffer(2)]], uint2 gid [[thread_position_in_grid]]) {
+    uint columns = ((p.sw & 1) || p.chroma == 3) ? p.sw : (p.sw + 1) / 2;
+    uint rows = p.chroma == 1 ? (p.sh + 1) / 2 : p.sh;
+    if (gid.x >= columns || gid.y >= rows) return;
+    ChromaTap tap = axis[gid.x]; int2 sum = int2(0);
+    for (uint i = 0; i < 5; ++i) if (tap.weights[i] != 0) sum += int2(uv.read(uint2(tap.indices[i], gid.y)).rg >> p.sample_shift) * tap.weights[i];
+    out[gid.y * columns + gid.x] = as_type<short2>(ushort2(min(sum >> (p.depth - 1), 32767)));
+}
+kernel void chroma_horizontal_float(texture2d<float, access::read> uv [[texture(1)]], device short2 *out [[buffer(0)]], constant Params &p [[buffer(1)]], device const ChromaTap *axis [[buffer(2)]], uint2 gid [[thread_position_in_grid]]) {
+    uint columns = ((p.sw & 1) || p.chroma == 3) ? p.sw : (p.sw + 1) / 2;
+    uint rows = p.chroma == 1 ? (p.sh + 1) / 2 : p.sh;
+    if (gid.x >= columns || gid.y >= rows) return;
+    ChromaTap tap = axis[gid.x]; int2 sum = int2(0);
+    float maximum = p.depth == 8 ? 255.0f : 65535.0f;
+    for (uint i = 0; i < 5; ++i) if (tap.weights[i] != 0) sum += int2(floor(round(uv.read(uint2(tap.indices[i], gid.y)).rg * maximum) / float(1u << p.sample_shift))) * tap.weights[i];
+    out[gid.y * columns + gid.x] = as_type<short2>(ushort2(min(sum >> (p.depth - 1), 32767)));
+}
+float3 rgb(texture2d<float, access::read> yplane, texture2d<float, access::read> uvplane, uint2 point, constant Params &p, device const float *eotf, device const short2 *chroma, device const ChromaTap *chroma_y) {
     uint2 xy = source_point(point, p);
+    if (p.rounding == 5 && p.tone == 0) return rgb_reconstructed(uint(round(yplane.read(xy).r * (p.depth == 8 ? 255.0f : 65535.0f))) >> p.sample_shift, xy, p, chroma, chroma_y);
     float scale = float(1u << (p.depth - 8));
     float storage_max = p.depth == 8 ? 255.0f : 65535.0f;
     float stored_scale = float(1u << p.sample_shift);
@@ -93,12 +138,12 @@ float3 rgb(texture2d<float, access::read> yplane, texture2d<float, access::read>
     return clamp(floor(value + 0.5f), 0.0f, 255.0f);
 }
 kernel void horizontal(texture2d<float, access::read> yplane [[texture(0)]], texture2d<float, access::read> uvplane [[texture(1)]],
-    device uchar *out [[buffer(0)]], constant Params &p [[buffer(1)]], device const uint *axis [[buffer(2)]], device const int *weights [[buffer(3)]], device const float *eotf [[buffer(5)]], uint2 gid [[thread_position_in_grid]]) {
+    device uchar *out [[buffer(0)]], constant Params &p [[buffer(1)]], device const uint *axis [[buffer(2)]], device const int *weights [[buffer(3)]], device const float *eotf [[buffer(5)]], device const short2 *chroma [[buffer(6)]], device const ChromaTap *chroma_y [[buffer(7)]], uint2 gid [[thread_position_in_grid]]) {
     uint dh = (p.rotation & 1) ? p.sw - p.crop_left - p.crop_right : p.sh - p.crop_top - p.crop_bottom;
     if (gid.x >= p.tw || gid.y >= dh) return;
     uint start = axis[gid.x * 3], offset = axis[gid.x * 3 + 1], count = axis[gid.x * 3 + 2];
     int3 sum = int3(1 << 21);
-    for (uint i = 0; i < count; ++i) sum += int3(rgb(yplane, uvplane, uint2(start + i, gid.y), p, eotf)) * weights[offset + i];
+    for (uint i = 0; i < count; ++i) sum += int3(rgb(yplane, uvplane, uint2(start + i, gid.y), p, eotf, chroma, chroma_y)) * weights[offset + i];
     uchar3 value = uchar3(clamp(sum >> 22, 0, 255));
     uint index = (gid.y * p.tw + gid.x) * 3;
     out[index] = value.r; out[index + 1] = value.g; out[index + 2] = value.b;
@@ -138,8 +183,9 @@ kernel void vertical_patch(device const uchar *in [[buffer(0)]], device float *o
     out[index] = value.r; out[index + 1] = value.g; out[index + 2] = value.b;
 }
 
-float3 native_rgb(texture2d<uint, access::read> yplane, texture2d<uint, access::read> uvplane, uint2 point, constant Params &p, device const float *eotf) {
+float3 native_rgb(texture2d<uint, access::read> yplane, texture2d<uint, access::read> uvplane, uint2 point, constant Params &p, device const float *eotf, device const short2 *chroma, device const ChromaTap *chroma_y) {
     uint2 xy = source_point(point, p);
+    if (p.rounding == 5 && p.tone == 0) return rgb_reconstructed(yplane.read(xy).r >> p.sample_shift, xy, p, chroma, chroma_y);
     if (p.rounding == 3 && p.chroma == 0 && p.tone == 0) {
         uint shift = p.depth - 8;
         uint sample = yplane.read(xy).r >> p.sample_shift;
@@ -162,12 +208,12 @@ float3 native_rgb(texture2d<uint, access::read> yplane, texture2d<uint, access::
     return clamp(floor(value + 0.5f), 0.0f, 255.0f);
 }
 kernel void horizontal_native(texture2d<uint, access::read> yplane [[texture(0)]], texture2d<uint, access::read> uvplane [[texture(1)]],
-    device uchar *out [[buffer(0)]], constant Params &p [[buffer(1)]], device const uint *axis [[buffer(2)]], device const int *weights [[buffer(3)]], device const float *eotf [[buffer(5)]], uint2 gid [[thread_position_in_grid]]) {
+    device uchar *out [[buffer(0)]], constant Params &p [[buffer(1)]], device const uint *axis [[buffer(2)]], device const int *weights [[buffer(3)]], device const float *eotf [[buffer(5)]], device const short2 *chroma [[buffer(6)]], device const ChromaTap *chroma_y [[buffer(7)]], uint2 gid [[thread_position_in_grid]]) {
     uint dh = (p.rotation & 1) ? p.sw - p.crop_left - p.crop_right : p.sh - p.crop_top - p.crop_bottom;
     if (gid.x >= p.tw || gid.y >= dh) return;
     uint start = axis[gid.x * 3], offset = axis[gid.x * 3 + 1], count = axis[gid.x * 3 + 2];
     int3 sum = int3(1 << 21);
-    for (uint i = 0; i < count; ++i) sum += int3(native_rgb(yplane, uvplane, uint2(start + i, gid.y), p, eotf)) * weights[offset + i];
+    for (uint i = 0; i < count; ++i) sum += int3(native_rgb(yplane, uvplane, uint2(start + i, gid.y), p, eotf, chroma, chroma_y)) * weights[offset + i];
     uchar3 value = uchar3(clamp(sum >> 22, 0, 255));
     uint index = (gid.y * p.tw + gid.x) * 3;
     out[index] = value.r; out[index + 1] = value.g; out[index + 2] = value.b;

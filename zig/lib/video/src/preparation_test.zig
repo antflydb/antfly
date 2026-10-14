@@ -424,3 +424,61 @@ test "video Metal monochrome code samples preserve independent CPU RGB policy" {
         }
     }
 }
+
+test "video Metal reconstructed chroma caches axes and matches independent CPU pixel policy" {
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const device = av_test_device_create() orelse return error.MetalPreparationUnavailable;
+    defer av_test_device_destroy(device);
+    var metal = try prep.Metal.init(device);
+    defer metal.deinit();
+    for ([_][2]u32{ .{ 9, 7 }, .{ 26, 16 }, .{ 127, 95 } }) |size| for ([_]u8{ 1, 2 }) |chroma| for ([_]u8{ 8, 10, 12 }) |depth| {
+        const bytes: usize = if (depth == 8) 1 else 2;
+        const cw = (size[0] + 1) / 2;
+        const ch = if (chroma == 1) (size[1] + 1) / 2 else size[1];
+        const ys = size[0] * bytes + 8;
+        const us = cw * bytes * 2 + 8;
+        const y = try a.alloc(u8, ys * size[1]);
+        defer a.free(y);
+        const uv = try a.alloc(u8, us * ch);
+        defer a.free(uv);
+        @memset(y, 0);
+        @memset(uv, 0);
+        const maximum = @as(usize, 1) << @as(u4, @intCast(depth));
+        for (0..size[1]) |row| for (0..size[0]) |x| {
+            const value: u16 = @intCast(((row * size[0] + x) * 37 + 11) % maximum);
+            if (depth == 8) y[row * ys + x] = @intCast(value) else std.mem.writeInt(u16, y[row * ys + x * 2 ..][0..2], value, .little);
+        };
+        for (0..ch) |row| for (0..cw) |x| for (0..2) |channel| {
+            const value: u16 = @intCast(((row * cw + x) * @as(usize, if (channel == 0) 61 else 73) + @as(usize, if (channel == 0) 7 else 29)) % maximum);
+            const offset = row * us + (x * 2 + channel) * bytes;
+            if (depth == 8) uv[offset] = @intCast(value) else std.mem.writeInt(u16, uv[offset..][0..2], value, .little);
+        };
+        for ([_]prep.Matrix{ .bt601, .bt709 }) |matrix| for ([_]bool{ false, true }) |full| for ([_]prep.Rotation{ .none, .clockwise90 }) |rotation| {
+            const host = prep.HostSurface{ .width = size[0], .height = size[1], .bit_depth = depth, .chroma_format = chroma, .format = if (full) .nv12_full else .nv12_video, .planes = .{
+                .{ .bytes = y, .width = size[0], .height = size[1], .stride = ys }, .{ .bytes = uv, .width = cw, .height = ch, .stride = us },
+            } };
+            const options = prep.Options{ .width = 96, .height = 48, .matrix = matrix, .torchvision = true, .rgb_rounding = .q13_reconstructed, .rotation = rotation };
+            const expected = try prep.referenceHost(a, host, options, .{});
+            defer a.free(expected);
+            var first = try metal.submitHost(a, host, options, .{});
+            defer first.deinit();
+            var second = try metal.submitHost(a, host, options, .{});
+            defer second.deinit();
+            try std.testing.expectEqual(@as(usize, 0), second.coefficient_staging_bytes);
+            try first.wait(std.testing.io, .{});
+            try second.wait(std.testing.io, .{});
+            const actual = try second.readback(a);
+            defer a.free(actual);
+            try std.testing.expectEqual(expected.len, actual.len);
+            for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 2e-6);
+        };
+    };
+}
+
+fn reconstructedAllocations(allocator: std.mem.Allocator) !void {
+    const values = try prep.referenceHost(allocator, hostFixture(), .{ .width = 48, .height = 48, .matrix = .bt601, .rgb_rounding = .q13_reconstructed }, .{});
+    defer allocator.free(values);
+}
+test "video reconstructed chroma allocation failures release every intermediate" {
+    try std.testing.checkAllAllocationFailures(a, reconstructedAllocations, .{});
+}

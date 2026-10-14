@@ -187,7 +187,7 @@ pub const Session = struct {
         const width: u32 = @intCast(frame.width[1]);
         const height: u32 = @intCast(frame.height);
         if (width > 16384 or height > 16384 or @as(u64, width) * height > self.options.max_pixels) return error.ResourceLimitExceeded;
-        return .{ .width = width, .height = height };
+        return .{ .width = width, .height = height, .bit_depth = @intCast(8 + 2 * self.sequence.hbd), .chroma_format = @intCast(self.sequence.layout) };
     }
     fn refresh(self: *Session, frame: grammar.Dav1dFrameHeader, flags: u8) void {
         for (0..8) |i| if (flags & (@as(u8, 1) << @intCast(i)) != 0) {
