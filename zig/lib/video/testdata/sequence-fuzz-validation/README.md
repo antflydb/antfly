@@ -36,10 +36,10 @@ Reproduce from `zig/` with the repository's Zig compiler:
 ```sh
 zig build test-video -Doptimize=Debug -Dvideo-test-filter=sequence --summary all
 zig build install-video-tests -Dtarget=aarch64-linux-musl -Doptimize=Debug \
-  -Dvideo-test-filter=sequence --prefix /tmp/video-sequence-linux --summary all
+  -Dvideo-test-filter=sequence --prefix zig-out --summary all
 ```
 
-Run `/tmp/video-sequence-linux/bin/video-tests` on Linux without runtime test
+Run `zig-out/bin/video-tests` on Linux without runtime test
 filters. Instrumented campaigns must use separate fresh local caches and an
 explicit target filter (`sequence VP9`, `sequence AV1`, or `sequence Annex B`).
 Inspect the complete report for panics as well as build status; Zig's build exit
@@ -49,15 +49,20 @@ The final-source VP9 campaign completes 20,005 runs, 15 unique runs and
 10,982/48,143 instrumented edges; Annex B completes 10,475 runs, 363 unique
 runs and 5,062/48,139 edges. These short campaigns are not sustained-coverage
 claims. The final-source AV1 campaign completes 10,734 runs, 241 unique runs
-and 7,258/48,147 edges in a reported thirty-minute shared-host campaign. The
-longer VP9 campaign remains in progress; no completion or coverage result is
-attributed to it yet.
+and 7,258/48,147 edges in a reported thirty-minute shared-host campaign. The continued VP9 campaign has now completed: 121,501 additional runs and 299
+additional unique runs, ending at cumulative 141,506 runs, 314 unique runs and
+12,024/48,143 instrumented edges (24.98%). It reused the prior 20,005-run cache;
+these are explicitly cumulative counts, not a fresh campaign. The raw terminal
+report records 212 minutes on the shared host, 52 MB MaxRSS and three passing
+positive/setup tests. Its historical final-source snapshot and original source
+bindings remain the measurement basis; this does not qualify whole-file identity
+with later main-merged code or establish exhaustive codec conformance.
 
 For maintained longer campaigns, run the independent-target driver from `zig/`:
 
 ```sh
 python3 lib/video/scripts/qualify_sequence_fuzz.py --zig /path/to/zig \
-  --iterations 100000 --output /tmp/sequence-fuzz-campaign
+  --iterations 100000 --output .qualification/sequence-fuzz-campaign
 ```
 
 The output directory must be new. The driver runs VP9, AV1 and Annex B

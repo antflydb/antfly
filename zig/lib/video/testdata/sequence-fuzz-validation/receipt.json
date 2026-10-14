@@ -114,5 +114,26 @@
     "report": "ci-macos-full-native.log",
     "source_scope": "fuzz_test.final.zig and ordinary root; before the added real-picture differential test, which separately passes on both platforms",
     "restricted_failure_report": "ci-macos-full-restricted.log"
+  },
+  "continued_vp9_campaign": {
+    "status": "terminal exit 0",
+    "report": "fuzz-final-vp9-sustained.log",
+    "report_sha256": "4963a9f17d9970004949b90eaa6a38a3487547148865da4d05af1c478b6899b1",
+    "source_snapshot": "fuzz_test.final.zig",
+    "source_scope": "Extends the historical final_campaigns.vp9 cached instrumented build; does not establish whole-file identity with current main-merged sources.",
+    "fresh_local_cache": false,
+    "baseline_runs": 20005,
+    "cumulative_runs": 141506,
+    "added_runs": 121501,
+    "baseline_unique_runs": 15,
+    "cumulative_unique_runs": 314,
+    "added_unique_runs": 299,
+    "baseline_coverage_edges": 10982,
+    "cumulative_coverage_edges": 12024,
+    "added_edges": 1042,
+    "total_instrumented_edges": 48143,
+    "reported_elapsed": "212m",
+    "max_rss": "52M",
+    "positive_tests_passed": 3
   }
 }
