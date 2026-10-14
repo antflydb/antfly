@@ -4287,7 +4287,7 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
         const outcome: control.ClaimOutcome = .{ .binding = binding, .claims_digest = try command.digest(), .position = .{ .namespace = binding.fence.namespace, .sequence = 7 }, .duplicate = false, .claims_added = 1 };
         const signed: index_publication.SignedClaimDelivery = .{ .outcome = outcome, .proof = try proof.sign(root, try outcome.deliveryDigest()) };
         const Source = local.storage_db_relational_index_owner_job.private_claims.SourceStream;
-        var source = try Source.PreparedSource.init(store.alloc, binding, .{ .table_name = dispatch.value.table_name, .generation = @splat(1), .schema_version = 2, .tuple_fingerprint = @splat(2), .nulls_not_distinct = false }, @splat(9), .ready, &.{.{ .key = "row", .tuple = "logical-tuple" }});
+        var source = try Source.PreparedSource.init(store.alloc, binding, .{ .table_name = dispatch.value.table_name, .generation = @splat(1), .schema_version = 2, .tuple_fingerprint = @splat(2), .nulls_not_distinct = false }, @splat(9), .building, &.{.{ .key = "row", .tuple = "logical-tuple" }});
         defer source.deinit();
         var source_header = source.header;
         std.mem.writeInt(u64, source_header[104..112], 1, .little);
@@ -4385,6 +4385,9 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
             switch (fault) {
                 .none => {
                     try std.testing.expectEqual(try closed_signed.proof.commitment(try closed.data.digest()), try store.verifyRelationalIndexSourceDeliveryTxn(&txn, group, closed_signed));
+                    runtimes[0].source_authority.?.sequence = 10;
+                    _ = try store.updateListingStoreTxn(&txn, group, current.store_id, changed_current);
+                    try testNativeAcceptance(store, &txn, group, closed_signed, &source_read, &subset, root, proof);
                     var route_arena = std.heap.ArenaAllocator.init(store.alloc);
                     defer route_arena.deinit();
                     const routes = try store.readIndexClaimRoutesTxn(route_arena.allocator(), &txn, group, reserved.head, .{ .items = &.{owner.owner.group_id} });
@@ -4403,7 +4406,154 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
                 .canceled, .active_job, .lifecycle, .range => try std.testing.expectError(error.GenerationPublicationChanged, store.verifyRelationalIndexSourceDeliveryTxn(&txn, group, closed_signed)),
                 else => try std.testing.expectError(error.IndexOwnerReceiptChanged, store.verifyRelationalIndexSourceDeliveryTxn(&txn, group, closed_signed)),
             }
+            switch (fault) {
+                .none, .signature, .claims, .binding, .candidate => {},
+                .canceled, .active_job, .lifecycle, .range => try std.testing.expectError(error.GenerationPublicationChanged, store.prepareRelationalIndexSourceAcceptanceTxn(&txn, group, .{ .signed = closed_signed })),
+                else => try std.testing.expectError(error.IndexOwnerReceiptChanged, store.prepareRelationalIndexSourceAcceptanceTxn(&txn, group, .{ .signed = closed_signed })),
+            }
         }
+    }
+
+    fn testNativeAcceptance(store: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, signed: @import("../relational_index_source_delivery.zig").Signed, read: *const @import("antfly_local_sources").storage_db_relational_index_owner_control.SourceRead, subset: *@import("antfly_local_sources").storage_db_relational_index_owner_job.private_claims.delivery.Subset, root: @import("antfly_local_sources").storage_db_root_signing_identity.State, proof: index_publication.RootProof) !void {
+        const journal = @import("../relational_index_delivery_journal.zig");
+        const complete = @import("../relational_index_source_delivery.zig");
+        const local = @import("antfly_local_sources");
+        const control = local.storage_db_relational_index_owner_control;
+        const Source = local.storage_db_relational_index_owner_job.private_claims.SourceStream;
+        const binding = signed.data.source;
+        var key_buf: [192]u8 = undefined;
+        const physical_key = try journal.sourceKey(&key_buf, group, binding.fence.namespace.table_id, binding.ordinal);
+        try std.testing.expectError(error.NotFound, txn.get(physical_key));
+        try std.testing.expectError(error.OutOfMemory, journal.prepare(std.testing.failing_allocator, txn, group, .{ .signed = signed }, RaftApplyStore.SourceDeliveryAuthority{ .store = store }));
+        try std.testing.expectError(error.NotFound, txn.get(physical_key));
+        var first = try store.prepareRelationalIndexSourceAcceptanceTxn(txn, group, .{ .signed = signed });
+        defer first.deinit();
+        try std.testing.expect(first.changed);
+        try std.testing.expectEqual(@as(u64, 1), first.head.rows);
+        try std.testing.expectEqualDeep(first.head, try journal.Head.decode(&first.head_bytes));
+        for (0..first.head_bytes.len) |i| {
+            var corrupt_byte = first.head_bytes;
+            corrupt_byte[i] ^= 1;
+            try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, journal.Head.decode(&corrupt_byte));
+        }
+        // Corruption with a recomputed outer checksum cannot change the
+        // independently domain-separated decision/prefix commitment.
+        var corrupt = first.head_bytes;
+        corrupt[136] ^= 1;
+        std.crypto.hash.Blake3.hash(corrupt[0..384], corrupt[384..416], .{});
+        try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, journal.Head.decode(&corrupt));
+        corrupt = first.head_bytes;
+        corrupt[369] = 1;
+        std.crypto.hash.Blake3.hash(corrupt[0..384], corrupt[384..416], .{});
+        try std.testing.expectError(error.InvalidPrivateIndexClaimInventory, journal.Head.decode(&corrupt));
+        try first.stage(txn, group);
+        var retry = try store.prepareRelationalIndexSourceAcceptanceTxn(txn, group, .{ .signed = signed });
+        defer retry.deinit();
+        try std.testing.expect(!retry.changed);
+        try std.testing.expectEqual(@as(usize, 0), retry.targets.len);
+        try std.testing.expectEqualDeep(first.head, retry.head);
+        try retry.stage(txn, group);
+        // A different current physical signature is the same logical delivery;
+        // retain the first durable decision and never contribute twice.
+        var retagged = signed;
+        const mutable_parts = try store.alloc.dupe(complete.Part, signed.data.parts.items);
+        defer store.alloc.free(mutable_parts);
+        retagged.data.parts.items = mutable_parts;
+        mutable_parts[0].target.outcome.position.sequence = 8;
+        mutable_parts[0].target.proof = try proof.sign(root, try mutable_parts[0].target.outcome.deliveryDigest());
+        retagged.proof = try proof.sign(root, try retagged.data.digest());
+        try std.testing.expectEqual(try signed.data.logicalDigest(), try retagged.data.logicalDigest());
+        var reattested = try store.prepareRelationalIndexSourceAcceptanceTxn(txn, group, .{ .signed = retagged });
+        defer reattested.deinit();
+        try std.testing.expect(!reattested.changed);
+        try std.testing.expectEqualDeep(first.head, reattested.head);
+        mutable_parts[0].target.outcome.claims_digest[0] ^= 1;
+        mutable_parts[0].target.proof = try proof.sign(root, try mutable_parts[0].target.outcome.deliveryDigest());
+        retagged.proof = try proof.sign(root, try retagged.data.digest());
+        try std.testing.expectError(error.GenerationPublicationChanged, store.prepareRelationalIndexSourceAcceptanceTxn(txn, group, .{ .signed = retagged }));
+
+        const scope = read.batch.?.scope;
+        var source = try Source.PreparedSource.init(store.alloc, binding, scope, @splat(10), .ready, &.{.{ .key = "row2", .tuple = "logical-tuple-2" }});
+        defer source.deinit();
+        var raw = source.header;
+        std.mem.writeInt(u64, raw[104..112], 2, .little);
+        @memcpy(raw[112..145], &try (local.storage_db_receipt_position.Position{ .native = .{ .namespace = binding.fence.namespace, .sequence = 8 } }).encode());
+        @memcpy(raw[256..288], &signed.data.header.digest());
+        std.crypto.hash.Blake3.hash(raw[0..288], raw[288..320], .{});
+        var next_read: control.SourceRead = .{ .binding = binding, .batch = try Source.OwnedBatch.takePayload(store.alloc, binding, try Source.Header.decode(&raw, binding, 2), try store.alloc.dupe(u8, source.payload)) };
+        defer next_read.deinit();
+        const next_command: control.ClaimCommand = .{ .binding = binding, .claims = &.{.{ .parent_table = scope.table_name, .parent_key = "row2", .tuple = "logical-tuple-2", .schema_version = 2 }} };
+        var next_target = signed.data.parts.items[0].target;
+        next_target.outcome.position.sequence = 8;
+        next_target.outcome.claims_digest = try next_command.digest();
+        next_target.proof = try proof.sign(root, try next_target.outcome.deliveryDigest());
+        var next = try complete.prepare(store.alloc, &next_read, subset, .{ .ordinal = 2, .batch_digest = next_read.batch.?.header.digest(), .targets = .{ .items = &.{.{ .index = 0, .signed = next_target }} } }, .{});
+        defer next.deinit();
+        const next_signed: complete.Signed = .{ .data = next.data, .proof = try proof.sign(root, try next.data.digest()) };
+        for (0..3) |fault| {
+            var changed_next = next_signed;
+            const bytes = &changed_next.data.header.bytes;
+            switch (fault) {
+                0 => std.mem.writeInt(u64, bytes[104..112], 3, .little),
+                1 => @memcpy(bytes[112..145], &try (local.storage_db_receipt_position.Position{ .native = .{ .namespace = binding.fence.namespace, .sequence = 7 } }).encode()),
+                2 => bytes[256] ^= 1,
+                else => unreachable,
+            }
+            std.crypto.hash.Blake3.hash(bytes[0..288], bytes[288..320], .{});
+            changed_next.proof = try proof.sign(root, try changed_next.data.digest());
+            try std.testing.expectError(error.GenerationPublicationChanged, store.prepareRelationalIndexSourceAcceptanceTxn(txn, group, .{ .signed = changed_next }));
+        }
+        try std.testing.expectError(error.PrivateIndexSourceConsumptionRequired, store.prepareRelationalIndexSourceAcceptanceTxn(txn, group, .{ .signed = next_signed }));
+        var consumed: journal.Consumed = .{
+            .metadata_incarnation = proof.identity.metadata_incarnation,
+            .binding_digest = try journal.bindingDigest(binding),
+            .ordinal = 1,
+            .batch_digest = first.head.batch_digest,
+            .decision_digest = first.head.decision_digest,
+            .rows = first.head.rows,
+            .position = .{ .namespace = binding.fence.namespace, .sequence = 9 },
+            .proof = proof,
+        };
+        consumed.proof = try proof.sign(root, try consumed.digest());
+        var forged = consumed;
+        forged.decision_digest[0] ^= 1;
+        forged.proof = try proof.sign(root, try forged.digest());
+        try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, store.prepareRelationalIndexSourceAcceptanceTxn(txn, group, .{ .signed = next_signed, .consumed = forged }));
+        forged = consumed;
+        forged.rows += 1;
+        forged.proof = try proof.sign(root, try forged.digest());
+        try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, store.prepareRelationalIndexSourceAcceptanceTxn(txn, group, .{ .signed = next_signed, .consumed = forged }));
+        forged = consumed;
+        forged.proof.signature[0] ^= 1;
+        try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, store.prepareRelationalIndexSourceAcceptanceTxn(txn, group, .{ .signed = next_signed, .consumed = forged }));
+        forged = consumed;
+        forged.position.sequence = 11;
+        forged.proof = try proof.sign(root, try forged.digest());
+        try std.testing.expectError(error.IndexOwnerReceiptChanged, store.prepareRelationalIndexSourceAcceptanceTxn(txn, group, .{ .signed = next_signed, .consumed = forged }));
+        var second = try store.prepareRelationalIndexSourceAcceptanceTxn(txn, group, .{ .signed = next_signed, .consumed = consumed });
+        defer second.deinit();
+        try std.testing.expect(second.changed);
+        try std.testing.expectEqual(@as(u64, 2), second.head.ordinal);
+        try std.testing.expectEqual(@as(u64, 2), second.head.rows);
+        try std.testing.expectEqual(first.head.decision_digest, second.head.previous_decision);
+        try second.stage(txn, group);
+        var buf: [192]u8 = undefined;
+        const inventory = try journal.Inventory.decode(try txn.get(try journal.targetKey(&buf, group, binding.fence.namespace.table_id, binding.ordinal)));
+        try std.testing.expectEqual(@as(u64, 2), inventory.rows);
+        try std.testing.expectEqual(@as(u64, 2), inventory.batches);
+        var final_retry = try store.prepareRelationalIndexSourceAcceptanceTxn(txn, group, .{ .signed = next_signed });
+        defer final_retry.deinit();
+        try std.testing.expect(!final_retry.changed);
+        var after_ready = next_signed;
+        std.mem.writeInt(u64, after_ready.data.header.bytes[104..112], 3, .little);
+        @memcpy(after_ready.data.header.bytes[112..145], &try (local.storage_db_receipt_position.Position{ .native = .{ .namespace = binding.fence.namespace, .sequence = 9 } }).encode());
+        @memcpy(after_ready.data.header.bytes[256..288], &next_signed.data.header.digest());
+        std.crypto.hash.Blake3.hash(after_ready.data.header.bytes[0..288], after_ready.data.header.bytes[288..320], .{});
+        after_ready.proof = try proof.sign(root, try after_ready.data.digest());
+        try std.testing.expectError(error.GenerationPublicationChanged, store.prepareRelationalIndexSourceAcceptanceTxn(txn, group, .{ .signed = after_ready, .consumed = consumed }));
+        try std.testing.expectError(error.GenerationPublicationChanged, store.prepareRelationalIndexSourceAcceptanceTxn(txn, group, .{ .signed = signed }));
+        // These postimages exist only in the test's aborted transaction. A
+        // production command must first register snapshot/capability support.
     }
 
     pub fn run(comptime Driver: type) !void {
@@ -16527,6 +16677,25 @@ pub const RaftApplyStore = struct {
             try self.requireIndexOwnerRootProofTxn(txn, group_id, target.owner, .{ .native = part.target.outcome.position }, part.target.proof, target.head.reader_requirements, false);
         }
         return signed.proof.commitment(try data.digest());
+    }
+
+    const SourceDeliveryAuthority = struct {
+        store: *RaftApplyStore,
+        pub fn verifyDelivery(self: @This(), txn: *docstore.DocStore.Txn, group: u64, signed: @import("../relational_index_source_delivery.zig").Signed) ![32]u8 {
+            return self.store.verifyRelationalIndexSourceDeliveryTxn(txn, group, signed);
+        }
+        pub fn verifyConsumption(self: @This(), txn: *docstore.DocStore.Txn, group: u64, binding: @import("antfly_local_sources").storage_db_relational_index_owner_job.Binding, consumed: @import("../relational_index_delivery_journal.zig").Consumed) !void {
+            try consumed.verify();
+            const current = try self.store.currentIndexBuildOwnerTxn(txn, group, binding, null);
+            try self.store.requireIndexOwnerRootProofTxn(txn, group, current.owner, .{ .native = consumed.position }, consumed.proof, current.head.reader_requirements, false);
+        }
+    };
+
+    /// Read-only ordered acceptance preparation. No production command stages
+    /// these postimages until the decoder/snapshot and native-consumer barriers
+    /// are implemented. Source delivery success alone still permits no deletion.
+    fn prepareRelationalIndexSourceAcceptanceTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, request: @import("../relational_index_delivery_journal.zig").Request) !@import("../relational_index_delivery_journal.zig").Prepared {
+        return @import("../relational_index_delivery_journal.zig").prepare(self.alloc, txn, group, request, SourceDeliveryAuthority{ .store = self });
     }
 
     /// Shared fixed-directory/catalog/range checks, not a caller-supplied

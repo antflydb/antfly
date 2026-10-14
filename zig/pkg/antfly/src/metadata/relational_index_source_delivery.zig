@@ -96,6 +96,30 @@ pub const Data = struct {
     routes_digest: Digest,
     parts: Parts,
 
+    /// Stable logical acceptance identity, independent of physical re-attestation
+    /// and target creation cuts. Current authority still requires digest()/proof
+    /// verification; this hash alone never authenticates delivery.
+    pub fn logicalDigest(self: Data) !Digest {
+        _ = try self.digest();
+        var state = std.crypto.hash.Blake3.init(.{});
+        state.update("antfly/private-unique-logical-delivery/v1");
+        state.update(&try self.source.encode());
+        state.update(&self.header.digest());
+        state.update(&self.routes_digest);
+        for (self.parts.items) |part| {
+            var index: [2]u8 = undefined;
+            std.mem.writeInt(u16, &index, part.index, .little);
+            state.update(&index);
+            state.update(&part.row_mask);
+            state.update(&part.inventory_xor);
+            state.update(&try part.target.outcome.binding.encode());
+            state.update(&part.target.outcome.claims_digest);
+        }
+        var result: Digest = undefined;
+        state.final(&result);
+        return result;
+    }
+
     /// Header and complete row-mask checks are independent of response order.
     /// The producer canonicalizes parts by index before hashing/signing.
     pub fn digest(self: Data) !Digest {

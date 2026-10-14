@@ -6474,3 +6474,65 @@ and terminal schema/catalog activation remain unfinished. Neither the `closed`
 response nor successful preflight permits deleting source batches. Original
 dispositions remain 483 implemented / 862 unresolved; consumption/public
 activation guards stay closed. No release pass or push is claimed.
+
+### Ordered complete-delivery acceptance postimages
+
+The metadata transaction adapter now prepares an ordered acceptance head and
+expected target-inventory postimages after repeating complete-delivery signature,
+catalog, placement, capability and observed-root/cut verification in that same
+transaction. Preparation stages no writes. The staging primitive propagates
+every write failure, including the final source-head write; its caller must
+abort the outer transaction on any error.
+
+There is one fixed 416-byte source head and one 184-byte expected inventory per
+target, not one persistent metadata record or row body per source batch. Each
+new batch updates its own source head and only the destinations it touched.
+Heads bind the metadata incarnation, reserved native binding, logical scope,
+source ordinal/header chain/cut, cumulative row count, logical delivery, previous
+accepted decision and a separate physical-proof provenance prefix. Inventories
+count logical contributions, not whether this particular target RPC inserted
+new rows: a delivery retry can report zero inserts without losing expected
+members. XOR remains diagnostic, never the activation/inventory authority.
+
+Logical delivery identity excludes target physical cuts/signatures but retains
+the exact binding, claim sets, masks, routes and member contributions. Re-attested
+delivery of the same source batch returns the existing accepted decision without
+rewriting either inventory or provenance. An older/skipped/substituted batch,
+scope/binding change, broken header chain, row-count overflow or advance beyond
+a ready source head is rejected. Acceptance itself does not imply EOF validation.
+
+Advancing a source requires a separately domain-separated, source-root-signed
+consumption statement matching the previous accepted decision, source binding,
+header, ordinal and cumulative rows. Its applying cut must follow the consumed
+source cut, and the metadata observation must have reached that actual cut.
+The next source batch may have been built before consumption; requiring its build
+cut to follow the consumption cut would incorrectly reject queued native pages.
+Consumption and delivery must name the same current physical authority. The
+native producer for this consumption statement is still missing; no request
+field or mirror ACK is accepted as a substitute for a retained native journal.
+
+The real-store fixture exercises first acceptance, exact retry, changed physical
+delivery proof with stable logical identity, ordered second acceptance, missing/
+forged/lagging consumption evidence, stale source/target metadata authority,
+allocation failure before staging, fixed-record corruption and target-count
+deduplication. Its postimages are deliberately confined to an aborted test
+transaction: no production/Raft command currently stages the new record family.
+Snapshot key registration, forward/reverse cohort verification, the coordinated
+decoder floor and proposal/status handling must precede production persistence.
+Native consumption/outbox replay, EOF seals, provenance-backed repair, data-Raft
+execution and terminal catalog/schema activation also remain unfinished.
+
+The preliminary Debug publication run passed 60/60 steps in
+`/private/tmp/antfly-source-acceptance-state-debug.log`. The broader native/C-ABI
+run passed 87/87 steps in `/private/tmp/antfly-source-acceptance-full-debug.log`.
+The extended ordering/replay faults and actual leased-owner adapters passed
+94/94 steps in `/private/tmp/antfly-source-acceptance-final-debug.log`, including
+39 publication tests, three leased-owner tests and the decoder barrier. Final
+review isolated the ready-state guard from a stale-sequence rejection; that
+stronger test passed the 60/60-step publication gate in
+`/private/tmp/antfly-source-acceptance-ready-guard-debug.log`. All gates used Debug,
+with no failures or leaks; counts overlap. Boundary, license, formatting, control
+catalog and original-inventory checks passed. GC preview deleted nothing.
+Do not infer original SQL completion from these component gates. Original
+dispositions remain 483 implemented / 862 unresolved. No activation, source
+deletion, throughput improvement, full release pass or push is claimed.
