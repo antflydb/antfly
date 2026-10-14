@@ -3867,3 +3867,7 @@ Qualification for code head `99b054525a` (including `origin/main` at `7aa031f49d
 
 These results qualify correctness and bounded execution. Provider retention
 policies and archive-scale throughput/latency/RSS remain separate qualification.
+
+Post-qualification cleanup ran `make gc`; its Zig/Rust/Go phases completed before
+its uv cache-prune phase reached the 55-second watchdog. Completed fixture output
+was removed from the worktree; qualification logs remain in `/private/tmp`.
