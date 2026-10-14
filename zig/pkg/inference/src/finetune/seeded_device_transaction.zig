@@ -27,6 +27,9 @@ const Allocator = std.mem.Allocator;
 const CT = ops.CT;
 const mib = 1024 * 1024;
 const batch_capacity = 256;
+/// Finite validations and norms take every selected tensor in one call, so
+/// each costs one synchronization rather than one per 256 tensors.
+const validation_capacity = 4096;
 
 pub const Identity = struct { optimizer_step: u64, microbatch_step: u64 };
 pub const Group = struct {
@@ -54,6 +57,12 @@ pub const State = struct {
     pytorch_clip_order: ?[]const usize = null,
     slots: []const Slot,
     groups: []const Group,
+    /// Every committed weight, moment and accumulator was proven finite (and
+    /// every absent accumulator zero) by the transaction that published it.
+    /// prepare then validates only the incoming gradients and its own
+    /// results. Owners must clear this whenever device state is written by
+    /// anything else, such as an upload from host or a restore.
+    committed_finite: bool = false,
 };
 /// An omitted slot is absent (Python grad=None). An explicit zero participates
 /// in accumulation and AdamW, including weight decay and its parameter counter.
@@ -335,7 +344,7 @@ pub fn estimate(state: State, request: Request, limits: Limits) !Estimate {
         partials = try add(partials, partial);
         largest_partial = @max(largest_partial, partial);
     }
-    const norm_count = @min(batch_capacity, try mul(count, 5));
+    const norm_count = @min(validation_capacity, try mul(count, 5));
     const norm_partials = @min(try mul(partials, 5), try mul(largest_partial, norm_count));
     const validation_partial_bytes = try ops.resident_training.validationScratch(norm_count, @min(try mul(validation_chunks, 5), try mul(largest_validation_chunks, norm_count)));
     // A flags chunk covers 64K elements and costs four bytes, plus one final
@@ -355,7 +364,7 @@ pub fn estimate(state: State, request: Request, limits: Limits) !Estimate {
     // CUDA validation uses one zeroed 2048-byte launch descriptor on the stack,
     // within this same 256KiB fixed allowance, and allocates no host payloads.
     const clipping_metadata = if (state.pytorch_clip_order != null) try mul(count, @sizeOf(ops.resident_training.NormInput)) else 0;
-    const metadata_base = try add(@sizeOf(Pending), try add(256 * 1024, try add(try mul(count, @sizeOf(Replacement) + 4096), batch_capacity * (@sizeOf(ops.resident_training.NormInput) + @sizeOf(ops.TrainingAdamWBatchInput)))));
+    const metadata_base = try add(@sizeOf(Pending), try add(256 * 1024, try add(try mul(count, @sizeOf(Replacement) + 4096), validation_capacity * @sizeOf(ops.resident_training.NormInput) + batch_capacity * @sizeOf(ops.TrainingAdamWBatchInput))));
     const metadata = try add(metadata_base, clipping_metadata);
     const transfers = try add(try add(try mul(count, 144), if (count == 0) 0 else 64), if (count > 0 and state.pytorch_clip_order != null) @as(usize, 4) else 0);
     if (device > limits.max_device_bytes or metadata > limits.max_host_metadata_bytes or transfers > limits.max_scalar_transfer_bytes)
@@ -468,7 +477,7 @@ fn norm(pending: *Pending, values: []const ops.resident_training.NormInput, limi
     for (values) |value| count = try add(count, value.elem_count);
     const summary = try pending.backend.residentTrainingNorm(values, .{
         .primitive = limits.primitive,
-        .max_tensors = batch_capacity,
+        .max_tensors = validation_capacity,
         .max_total_elements = count,
         .max_partial_bytes = limits.max_norm_partial_bytes,
     });
@@ -485,7 +494,7 @@ fn validateValues(pending: *Pending, values: []const ops.resident_training.Valid
     for (values) |value| count = try add(count, value.elem_count);
     const summary = try pending.backend.residentTrainingValidate(values, .{
         .primitive = limits.primitive,
-        .max_tensors = batch_capacity,
+        .max_tensors = validation_capacity,
         .max_total_elements = count,
         .max_partial_bytes = limits.max_norm_partial_bytes,
     });
@@ -663,7 +672,7 @@ pub fn prepare(a: Allocator, cb: *const ops.ComputeBackend, state: State, reques
     const scratch = pending.budget.allocator();
     pending.replacements = try scratch.alloc(Replacement, admission.selected_slots);
     for (pending.replacements) |*replacement| replacement.* = .{ .slot = 0, .grad_accum = null, .adam_step = 0, .present = false };
-    const norms = try scratch.alloc(ops.resident_training.NormInput, batch_capacity);
+    const norms = try scratch.alloc(ops.resident_training.NormInput, validation_capacity);
     defer scratch.free(norms);
     const adam = try scratch.alloc(ops.TrainingAdamWBatchInput, batch_capacity);
     defer scratch.free(adam);
@@ -678,7 +687,7 @@ pub fn prepare(a: Allocator, cb: *const ops.ComputeBackend, state: State, reques
         const count = try elements(slot, limits);
         for ([_]CT{ slot.weight, slot.grad_accum, slot.m, slot.v }) |tensor| {
             try validateTensor(&pending.backend, tensor, shape, limits);
-            try appendValidation(pending, norms, &norm_used, tensor, count, limits);
+            if (!state.committed_finite) try appendValidation(pending, norms, &norm_used, tensor, count, limits);
         }
         if (incoming(request, i)) |gradient| if (gradient.value == .tensor) {
             try validateTensor(&pending.backend, gradient.value.tensor, shape, limits);
@@ -694,6 +703,7 @@ pub fn prepare(a: Allocator, cb: *const ops.ComputeBackend, state: State, reques
     // admitted scratch and retain all checks before allocating replacements.
     norm_used = 0;
     for (state.slots, 0..) |slot, i| {
+        if (state.committed_finite) break;
         if (!selected(state, request, i) or slot.present) continue;
         norms[norm_used] = .{ .tensor = slot.grad_accum, .elem_count = try elements(slot, limits) };
         norm_used += 1;
