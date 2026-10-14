@@ -13880,6 +13880,10 @@ pub const DB = struct {
             // namespace marker: clear only the writer marker here, detach the
             // intent below, then let paged orphan collection drain the keys.
             try index_manager_mod.IndexManager.clearRepairShadowInProgressMarker(alloc, shadow_root);
+        } else if (self.primary_lsm_storage) |storage| {
+            try storage.deleteTree(shadow_root);
+        } else if (comptime builtin.os.tag == .freestanding) {
+            return error.UnsupportedPlatform;
         } else {
             var io_impl = threadedIo();
             defer io_impl.deinit();

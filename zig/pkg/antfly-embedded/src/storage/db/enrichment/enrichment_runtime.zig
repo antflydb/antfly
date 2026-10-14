@@ -4378,6 +4378,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     target_sequence: u64 = 0,
     activity_epoch: u64 = 0,
     processed_requests: u64 = 0,
+    last_error_code: types.RuntimeErrorName = .{},
     error_count: u64 = 0,
     retryable_error_count: u64 = 0,
     fatal_error_count: u64 = 0,

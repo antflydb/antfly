@@ -699,8 +699,16 @@ jobs:
           PYTHONPATH="$GITHUB_WORKSPACE/py/packages/embedded/src" TZ=UTC0 \
             python3 scripts/ci/run_lite_embedding_test.py --models-dir "$models_root"
 
-      - name: Upload real-model extraction evaluation
+      - name: Locate real-model extraction evaluation
+        id: lite_extraction_report
         if: always() && needs.changes.outputs.zig_tests == 'true'
+        run: |
+          if [ -f "$RUNNER_TEMP/lite-extraction-eval.json" ]; then
+            echo 'exists=true' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload real-model extraction evaluation
+        if: always() && needs.changes.outputs.zig_tests == 'true' && steps.lite_extraction_report.outputs.exists == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: lite-extraction-evaluation
@@ -1161,8 +1169,16 @@ jobs:
           PYTHONPATH="$GITHUB_WORKSPACE/py/packages/embedded/src" TZ=UTC0 \
             python3 scripts/ci/run_lite_embedding_test.py --models-dir "$models_root"
 
-      - name: Upload real-model extraction evaluation
+      - name: Locate real-model extraction evaluation
+        id: lite_extraction_report
         if: always() && !cancelled()
+        run: |
+          if [ -f "$RUNNER_TEMP/lite-extraction-eval.json" ]; then
+            echo 'exists=true' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload real-model extraction evaluation
+        if: always() && !cancelled() && steps.lite_extraction_report.outputs.exists == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: lite-extraction-evaluation
