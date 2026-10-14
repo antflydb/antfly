@@ -1222,3 +1222,64 @@ rows, 64 warmup batches) measured document medians 3.3520 -> 3.3832 s (+0.93%) a
 SQL insert medians 12.3181 -> 12.2978 s (-0.16%). All counts and read-backs passed.
 These qualify those model-free C API workloads on that snapshot; they do not
 establish equivalence for every server or inference workload.
+
+
+### Final shared-owner qualification (SDK 27.0)
+
+Frozen source `a7fb47aa4f` (production source from `162b3febe4`) was rebuilt with
+empty local/global caches and the same stripped native baseline-CPU ReleaseFast,
+Metal/Accelerate, no CUDA/PJRT settings as the baseline `2c8240e703` pair. The
+baseline received the identical serverless resolver-import repair. All 78 final
+build steps succeeded. This is one observed cold pair on a 14-core, 36 GiB Mac;
+background host load and accumulated swap prevent treating it as a universal
+speedup or a controlled multi-run result.
+
+| Final SDK 27.0 measurement | Current main | Shared owner |
+| --- | ---: | ---: |
+| Cold executable + C API build | 2,633.97 s (43m54s) | 1,316.24 s (21m56s) |
+| Stripped executable | 178,481,624 B | 195,011,208 B (+9.26%) |
+| Stripped C library | 71,561,936 B | 68,672,528 B (-4.04%) |
+
+The observed cold build is 50.03% shorter. Sampled aggregate compiler RSS peaked
+at 9.50 GiB; rounded per-unit MaxRSS was engine 7G, inference 7G, API 5G,
+server adapter 5G, distributed 3G, serverless 4G, CLI 1G and enrichment 1G.
+Reservations retain the larger peaks from the preceding repeated qualification,
+including 9G engine and API observations. API, engine and adapter each reserve
+14 GiB in the strictly qualified SDK 27.0 profile; CLI reserves 4 GiB. The final
+run demonstrates actual overlapping compilation within the normal host budget.
+
+A diagnostic link map confirms one full 1,927,048-byte prepared-mutation worker
+in the engine and a 968-byte forwarding stub in the server archive. The six
+remaining shared query/planning entries removed another 1.90 MB relative to the
+preceding shared snapshot. Exact bundled font bytes occur once per font in both
+final artifacts, versus five copies per font in the baseline executable and two
+in its library. Nevertheless, additional physical/query helper instantiations in
+the server adapter keep the executable 16.53 MB larger than current main. **The
+executable-size goal is not achieved.** Keep shared storage and measured admission
+opt-in and the PR in draft until that tradeoff is resolved or explicitly accepted.
+
+Final library throughput used isolated processes, alternating order, 64 warmup
+batches and verified insert/count/read-back checks. Six pairs of 1,200 batches of
+64 rows yielded independent medians 3.4019 -> 3.5601 s (+4.65%) for documents and
+12.7888 -> 13.3136 s (+4.10%) for SQL inserts. Timing drift was substantial:
+within-round paired median changes were +0.46% and +0.12%, with individual pairs
+ranging -9.71% to +14.65% for documents and -5.86% to +8.10% for SQL. Retain both
+summaries; neither proves broad throughput equivalence.
+
+Eight pairs of 1,200 single-row batches yielded independent median changes
+-4.95% for documents and -0.48% for SQL; paired medians were -3.56% and +0.27%.
+These model-free workloads do not demonstrate a systematic large boundary cost,
+but variability and limited coverage remain. Server query/ingest concurrency and
+model-backed inference performance require separate qualification.
+
+Final native query/direct-worker/C API validation passed 80/80 steps, and final
+Linux ELF cross-link/export validation passed 52/52 (exactly 118 public functions,
+no internal exports). Default runtime/ordinal contracts passed 8/8, including 44
+runtime tests; Apache ownership verified 2,044 sources. Earlier replay/SQL, LSM,
+relational, resource, sparse, background and PDF gates are recorded above. Raw
+JSON, logs and maps remain outside the repository. Wolfspider SDK 26.4 requires
+renewed Tailscale authentication and is not qualified by these SDK 27.0 results.
+
+The exact final stripped CLI help smoke and ordinary executable/shared-library C
+consumer linkage both passed after cold qualification. Isolated measurement caches
+were removed after preserving raw evidence; the installed release artifacts remain.
