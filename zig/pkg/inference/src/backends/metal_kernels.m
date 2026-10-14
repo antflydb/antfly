@@ -4191,6 +4191,241 @@ static void termite_metal_debug_dispatch_profile_print_submitted(void) {
     termite_metal_debug_dispatch_profile_submitted_count = 0;
 }
 
+// Opt-in GPU time per frame compute encoder (TERMITE_METAL_TRACE_ENCODER_TIMING=1).
+// Every compute encoder the runtime opens on an active frame gets timestamps
+// at its start and end stage boundaries; the dispatch hooks name each encoder
+// by its first pipeline. After the frame completes the intervals are summed
+// per label, and the totals print at exit. Encoders the runtime does not open
+// (MPS kernels, blits) appear only as the frame's untimed remainder.
+// A sample buffer holds at most 32 KB (4,096 timestamps, 2,048 intervals).
+#define TERMITE_METAL_ENCODER_TIMING_PER_BUFFER 2048u
+#define TERMITE_METAL_ENCODER_TIMING_BUFFERS 4u
+#define TERMITE_METAL_ENCODER_TIMING_CAPACITY (TERMITE_METAL_ENCODER_TIMING_PER_BUFFER * TERMITE_METAL_ENCODER_TIMING_BUFFERS)
+#define TERMITE_METAL_ENCODER_TIMING_LABEL_BYTES 96u
+#define TERMITE_METAL_ENCODER_TIMING_TABLE 512u
+
+typedef struct {
+    char label[TERMITE_METAL_ENCODER_TIMING_LABEL_BYTES];
+    uint64_t count;
+    uint64_t nanos;
+} termite_metal_encoder_timing_entry;
+
+static id<MTLCounterSampleBuffer> termite_metal_encoder_timing_samples[TERMITE_METAL_ENCODER_TIMING_BUFFERS];
+static id<MTLCommandBuffer> termite_metal_encoder_timing_cb = nil;
+static id<MTLComputeCommandEncoder> termite_metal_encoder_timing_current = nil;
+static uint32_t termite_metal_encoder_timing_intervals = 0;
+static char termite_metal_encoder_timing_labels[TERMITE_METAL_ENCODER_TIMING_CAPACITY][TERMITE_METAL_ENCODER_TIMING_LABEL_BYTES];
+static termite_metal_encoder_timing_entry termite_metal_encoder_timing_table[TERMITE_METAL_ENCODER_TIMING_TABLE];
+static size_t termite_metal_encoder_timing_table_count = 0;
+static uint64_t termite_metal_encoder_timing_frames = 0;
+static uint64_t termite_metal_encoder_timing_frame_nanos = 0;
+static uint64_t termite_metal_encoder_timing_timed_nanos = 0;
+static uint64_t termite_metal_encoder_timing_dropped = 0;
+static bool termite_metal_encoder_timing_failed = false;
+
+static bool termite_metal_encoder_timing_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *value = getenv("TERMITE_METAL_TRACE_ENCODER_TIMING");
+        cached = value != NULL && value[0] == '1';
+    }
+    return cached == 1 && !termite_metal_encoder_timing_failed;
+}
+
+static int termite_metal_encoder_timing_compare(const void *lhs_ptr, const void *rhs_ptr) {
+    const termite_metal_encoder_timing_entry *lhs = lhs_ptr;
+    const termite_metal_encoder_timing_entry *rhs = rhs_ptr;
+    if (lhs->nanos < rhs->nanos) return 1;
+    if (lhs->nanos > rhs->nanos) return -1;
+    return strcmp(lhs->label, rhs->label);
+}
+
+static void termite_metal_encoder_timing_print(void) {
+    qsort(
+        termite_metal_encoder_timing_table,
+        termite_metal_encoder_timing_table_count,
+        sizeof(termite_metal_encoder_timing_table[0]),
+        termite_metal_encoder_timing_compare);
+    const double frame_ms = (double)termite_metal_encoder_timing_frame_nanos / 1e6;
+    const double timed_ms = (double)termite_metal_encoder_timing_timed_nanos / 1e6;
+    fprintf(
+        stderr,
+        "metal_encoder_timing: frames=%llu frame_gpu_ms=%.3f timed_ms=%.3f untimed_ms=%.3f dropped=%llu\n",
+        (unsigned long long)termite_metal_encoder_timing_frames,
+        frame_ms,
+        timed_ms,
+        frame_ms - timed_ms,
+        (unsigned long long)termite_metal_encoder_timing_dropped);
+    for (size_t index = 0; index < termite_metal_encoder_timing_table_count; ++index) {
+        const termite_metal_encoder_timing_entry *entry = &termite_metal_encoder_timing_table[index];
+        fprintf(
+            stderr,
+            "metal_encoder_timing_kernel: rank=%zu share=%.1f%% total_ms=%.3f count=%llu avg_us=%.2f label=%s\n",
+            index + 1,
+            frame_ms > 0 ? 100.0 * (double)entry->nanos / 1e6 / frame_ms : 0.0,
+            (double)entry->nanos / 1e6,
+            (unsigned long long)entry->count,
+            entry->count != 0 ? (double)entry->nanos / 1e3 / (double)entry->count : 0.0,
+            entry->label);
+    }
+}
+
+static void termite_metal_encoder_timing_add(const char *label, uint64_t nanos) {
+    if (label == NULL || label[0] == 0) label = "<untagged>";
+    for (size_t index = 0; index < termite_metal_encoder_timing_table_count; ++index) {
+        termite_metal_encoder_timing_entry *entry = &termite_metal_encoder_timing_table[index];
+        if (strcmp(entry->label, label) == 0) {
+            entry->count += 1;
+            entry->nanos += nanos;
+            return;
+        }
+    }
+    if (termite_metal_encoder_timing_table_count == TERMITE_METAL_ENCODER_TIMING_TABLE) {
+        termite_metal_encoder_timing_add("<table full>", nanos);
+        return;
+    }
+    termite_metal_encoder_timing_entry *entry =
+        &termite_metal_encoder_timing_table[termite_metal_encoder_timing_table_count++];
+    snprintf(entry->label, sizeof(entry->label), "%s", label);
+    entry->count = 1;
+    entry->nanos = nanos;
+}
+
+// Resolve the sampled intervals of `cb` once it has completed. Timestamps
+// are converted to nanoseconds by scaling the sampled span to the command
+// buffer's own GPU time, so the untimed remainder covers only the gaps.
+static void termite_metal_encoder_timing_resolve(id<MTLCommandBuffer> cb) {
+    if (cb == nil || cb != termite_metal_encoder_timing_cb) return;
+    const uint32_t intervals = termite_metal_encoder_timing_intervals;
+    termite_metal_encoder_timing_cb = nil;
+    termite_metal_encoder_timing_current = nil;
+    termite_metal_encoder_timing_intervals = 0;
+    if (cb.status != MTLCommandBufferStatusCompleted || intervals == 0) return;
+    static MTLCounterResultTimestamp samples[2u * TERMITE_METAL_ENCODER_TIMING_CAPACITY];
+    for (uint32_t base = 0; base < intervals; base += TERMITE_METAL_ENCODER_TIMING_PER_BUFFER) {
+        const uint32_t used = intervals - base < TERMITE_METAL_ENCODER_TIMING_PER_BUFFER
+            ? intervals - base
+            : TERMITE_METAL_ENCODER_TIMING_PER_BUFFER;
+        NSData *data = [termite_metal_encoder_timing_samples[base / TERMITE_METAL_ENCODER_TIMING_PER_BUFFER]
+            resolveCounterRange:NSMakeRange(0, 2u * used)];
+        if (data == nil || data.length < 2u * used * sizeof(MTLCounterResultTimestamp)) return;
+        memcpy(&samples[2u * base], data.bytes, 2u * used * sizeof(MTLCounterResultTimestamp));
+    }
+    uint64_t first = UINT64_MAX;
+    uint64_t last = 0;
+    for (uint32_t index = 0; index < intervals; ++index) {
+        const uint64_t start = samples[2u * index].timestamp;
+        const uint64_t end = samples[2u * index + 1u].timestamp;
+        if (start == MTLCounterErrorValue || end == MTLCounterErrorValue || end < start) continue;
+        if (start < first) first = start;
+        if (end > last) last = end;
+    }
+    const double frame_nanos = (cb.GPUEndTime - cb.GPUStartTime) * 1e9;
+    if (last <= first || frame_nanos <= 0) return;
+    const double nanos_per_tick = frame_nanos / (double)(last - first);
+    uint64_t timed = 0;
+    for (uint32_t index = 0; index < intervals; ++index) {
+        const uint64_t start = samples[2u * index].timestamp;
+        const uint64_t end = samples[2u * index + 1u].timestamp;
+        if (start == MTLCounterErrorValue || end == MTLCounterErrorValue || end < start) continue;
+        const uint64_t nanos = (uint64_t)((double)(end - start) * nanos_per_tick);
+        timed += nanos;
+        termite_metal_encoder_timing_add(termite_metal_encoder_timing_labels[index], nanos);
+    }
+    termite_metal_encoder_timing_frames += 1;
+    termite_metal_encoder_timing_frame_nanos += (uint64_t)frame_nanos;
+    termite_metal_encoder_timing_timed_nanos += timed;
+    fprintf(
+        stderr,
+        "metal_encoder_timing_frame: encoders=%u gpu_ms=%.3f timed_ms=%.3f\n",
+        intervals,
+        frame_nanos / 1e6,
+        (double)timed / 1e6);
+}
+
+// A frame encoder with stage-boundary timestamps, or nil to fall back to the
+// ordinary encoder (timing off, another frame still pending, or capacity).
+static id<MTLComputeCommandEncoder> termite_metal_encoder_timing_encoder(
+    id<MTLDevice> device,
+    id<MTLCommandBuffer> command_buffer
+) {
+    if (!termite_metal_encoder_timing_enabled() || device == nil || command_buffer == nil) return nil;
+    if (termite_metal_encoder_timing_cb != command_buffer) {
+        if (termite_metal_encoder_timing_cb != nil) {
+            // A frame that finished outside wait_frame, or was never committed.
+            if (termite_metal_encoder_timing_cb.status == MTLCommandBufferStatusCompleted) {
+                termite_metal_encoder_timing_resolve(termite_metal_encoder_timing_cb);
+            } else if (termite_metal_encoder_timing_cb.status == MTLCommandBufferStatusNotEnqueued ||
+                termite_metal_encoder_timing_cb.status == MTLCommandBufferStatusError) {
+                termite_metal_encoder_timing_cb = nil;
+                termite_metal_encoder_timing_intervals = 0;
+            } else {
+                termite_metal_encoder_timing_dropped += 1;
+                return nil;
+            }
+        }
+        if (termite_metal_encoder_timing_samples[0] == nil) {
+            id<MTLCounterSet> timestamps = nil;
+            for (id<MTLCounterSet> set in device.counterSets) {
+                if ([set.name isEqualToString:MTLCommonCounterSetTimestamp]) timestamps = set;
+            }
+            MTLCounterSampleBufferDescriptor *descriptor = [[MTLCounterSampleBufferDescriptor alloc] init];
+            descriptor.counterSet = timestamps;
+            descriptor.storageMode = MTLStorageModeShared;
+            descriptor.sampleCount = 2u * TERMITE_METAL_ENCODER_TIMING_PER_BUFFER;
+            NSError *error = nil;
+            bool allocated = timestamps != nil && [device supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary];
+            for (uint32_t index = 0; allocated && index < TERMITE_METAL_ENCODER_TIMING_BUFFERS; ++index) {
+                termite_metal_encoder_timing_samples[index] = [device newCounterSampleBufferWithDescriptor:descriptor error:&error];
+                allocated = termite_metal_encoder_timing_samples[index] != nil;
+            }
+            if (!allocated) {
+                fprintf(stderr, "metal_encoder_timing: disabled (no stage-boundary timestamp sampling%s%s)\n",
+                    error.localizedDescription != nil ? ": " : "",
+                    error.localizedDescription != nil ? error.localizedDescription.UTF8String : "");
+                termite_metal_encoder_timing_failed = true;
+                return nil;
+            }
+            atexit(termite_metal_encoder_timing_print);
+        }
+        termite_metal_encoder_timing_cb = command_buffer;
+        termite_metal_encoder_timing_intervals = 0;
+    }
+    if (termite_metal_encoder_timing_intervals == TERMITE_METAL_ENCODER_TIMING_CAPACITY) {
+        termite_metal_encoder_timing_dropped += 1;
+        return nil;
+    }
+    const uint32_t index = termite_metal_encoder_timing_intervals;
+    MTLComputePassDescriptor *descriptor = [MTLComputePassDescriptor computePassDescriptor];
+    descriptor.dispatchType = MTLDispatchTypeSerial;
+    MTLComputePassSampleBufferAttachmentDescriptor *attachment = descriptor.sampleBufferAttachments[0];
+    const uint32_t local = index % TERMITE_METAL_ENCODER_TIMING_PER_BUFFER;
+    attachment.sampleBuffer = termite_metal_encoder_timing_samples[index / TERMITE_METAL_ENCODER_TIMING_PER_BUFFER];
+    attachment.startOfEncoderSampleIndex = 2u * local;
+    attachment.endOfEncoderSampleIndex = 2u * local + 1u;
+    id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoderWithDescriptor:descriptor];
+    if (encoder == nil) return nil;
+    termite_metal_encoder_timing_labels[index][0] = 0;
+    termite_metal_encoder_timing_intervals = index + 1;
+    termite_metal_encoder_timing_current = encoder;
+    return encoder;
+}
+
+// Name the current timed encoder after the first pipeline it dispatches.
+static void termite_metal_encoder_timing_note_dispatch(id encoder) {
+    if (termite_metal_encoder_timing_current == nil || encoder != termite_metal_encoder_timing_current) return;
+    char *label = termite_metal_encoder_timing_labels[termite_metal_encoder_timing_intervals - 1];
+    if (label[0] != 0 || termite_metal_debug_dispatch_profile_current_pipeline == nil) return;
+    const char *registered = termite_metal_debug_dispatch_profile_pipeline_label(
+        termite_metal_debug_dispatch_profile_current_pipeline);
+    if (registered == NULL) registered = termite_metal_debug_dispatch_profile_current_pipeline.label.UTF8String;
+    if (registered == NULL) {
+        id<MTLComputePipelineState> pipeline = termite_metal_debug_dispatch_profile_current_pipeline;
+        registered = pipeline.description.UTF8String;
+    }
+    snprintf(label, TERMITE_METAL_ENCODER_TIMING_LABEL_BYTES, "%s", registered != NULL ? registered : "<unlabeled>");
+}
+
 // Declared here so the encoder method hooks can attribute dispatches and
 // barriers to the runtime currently encoding a frame. The initialized
 // definition remains with the encoder-frame routing helpers below.
@@ -4314,7 +4549,8 @@ static IMP termite_metal_debug_dispatch_profile_original_imp(id encoder, size_t 
 
 @implementation NSObject (TermiteMetalDebugDispatchProfile)
 - (void)termite_metal_debug_setComputePipelineState:(id<MTLComputePipelineState>)pipeline {
-    if (termite_metal_debug_dispatch_profile_recording || termite_metal_roofline_capture_active()) {
+    if (termite_metal_debug_dispatch_profile_recording || termite_metal_roofline_capture_active() ||
+        termite_metal_encoder_timing_enabled()) {
         termite_metal_debug_dispatch_profile_current_pipeline = pipeline;
     }
     IMP original = termite_metal_debug_dispatch_profile_original_imp(self, 0);
@@ -4331,6 +4567,7 @@ static IMP termite_metal_debug_dispatch_profile_original_imp(id encoder, size_t 
                          threadsPerThreadgroup:(MTLSize)threadsPerThreadgroup {
     termite_metal_roofline_record_dispatch();
     termite_metal_debug_dispatch_profile_record(threadgroupsPerGrid, true);
+    termite_metal_encoder_timing_note_dispatch(self);
     IMP original = termite_metal_debug_dispatch_profile_original_imp(self, 1);
     if (original != NULL) {
         ((void (*)(id, SEL, MTLSize, MTLSize))original)(
@@ -4346,6 +4583,7 @@ static IMP termite_metal_debug_dispatch_profile_original_imp(id encoder, size_t 
                       threadsPerThreadgroup:(MTLSize)threadsPerThreadgroup {
     termite_metal_roofline_record_dispatch();
     termite_metal_debug_dispatch_profile_record(threadsPerGrid, false);
+    termite_metal_encoder_timing_note_dispatch(self);
     IMP original = termite_metal_debug_dispatch_profile_original_imp(self, 2);
     if (original != NULL) {
         ((void (*)(id, SEL, MTLSize, MTLSize))original)(
@@ -4430,7 +4668,8 @@ static void termite_metal_debug_dispatch_profile_install_on_encoder(
     id<MTLComputeCommandEncoder> encoder
 ) {
     if (encoder == nil ||
-        (!termite_metal_debug_dispatch_profile_enabled() && !termite_metal_roofline_capture_active())) return;
+        (!termite_metal_debug_dispatch_profile_enabled() && !termite_metal_roofline_capture_active() &&
+            !termite_metal_encoder_timing_enabled())) return;
     @synchronized ([NSObject class]) {
     Class encoder_class = object_getClass(encoder);
     if (encoder_class == Nil) return;
@@ -15566,11 +15805,17 @@ static id<MTLComputeCommandEncoder> termite_metal_tracked_compute_command_encode
             encoder_region = termite_metal_default_compute_region_for_source(source);
         }
     }
-    id<MTLComputeCommandEncoder> encoder = termite_metal_stage_timing_compute_encoder(
-        runtime,
-        command_buffer,
-        termite_metal_stage_bucket_for_region(encoder_region),
-        false);
+    id<MTLComputeCommandEncoder> encoder =
+        runtime != NULL && runtime->active_frame_cb == command_buffer && runtime->active_stage_sample.selected == 0
+            ? termite_metal_encoder_timing_encoder(runtime->device, command_buffer)
+            : nil;
+    if (encoder == nil) {
+        encoder = termite_metal_stage_timing_compute_encoder(
+            runtime,
+            command_buffer,
+            termite_metal_stage_bucket_for_region(encoder_region),
+            false);
+    }
     if (runtime != NULL && runtime->active_frame_cb == command_buffer) {
         size_t region = runtime->active_compute_region;
         if (region >= TERMITE_METAL_COMPUTE_REGION_COUNTER_COUNT) region = TERMITE_METAL_COMPUTE_REGION_OTHER;
@@ -63951,6 +64196,7 @@ int termite_metal_decode_runtime_wait_frame(termite_metal_decode_runtime *runtim
         }
     }
     int status_code = (cb.status == MTLCommandBufferStatusCompleted) ? 0 : -3;
+    termite_metal_encoder_timing_resolve(cb);
     runtime->last_frame_gpu_nanos = status_code == 0 ? termite_metal_command_buffer_gpu_elapsed_nanos(cb) : 0;
     runtime->frame_gpu_nanos = termite_metal_u64_saturating_add(
         runtime->frame_gpu_nanos,
