@@ -25,6 +25,7 @@ const artifacts = @import("lake_index_aggregate_artifact.zig");
 const stores = @import("../serverless/artifacts/store.zig");
 const Declared = local.serverless_segment_sidecar_manifest.DeclaredArtifact;
 const Ref = local.serverless_manifest_artifact_ref.ArtifactRef;
+const RowProvider = @import("lake_index_row_source.zig").Provider;
 const Cancellation = @import("antfly_cancellation").CancellationToken;
 const A = std.mem.Allocator;
 pub const statistics = @import("lake_index_text_statistics.zig");
@@ -224,6 +225,8 @@ pub const Root = struct {
     serving_metadata_bytes: ?u64 = null,
     pack_ownership: ?statistics.Ref = null,
     source_layout_version: u8 = 0,
+    /// Durable proof that inventory-only identities include the entire row set.
+    inventory_delta_version: u8 = 0,
     source_routes_version: u8 = 0,
     source_routes: ?statistics.Ref = null,
     open_packs: []const artifacts.ChunkRef = &.{},
@@ -296,6 +299,7 @@ pub const Root = struct {
         if (self.checkpoint_removed.len > 16384 or (self.checkpoint_removed.len != 0 and self.checkpoint_base == null)) return error.InvalidNativeLakeTextCorpus;
         if (self.pack_ownership) |ref| try ref.validate();
         if (self.source_layout_version > 1) return error.InvalidNativeLakeTextCorpus;
+        if (self.inventory_delta_version > 1 or (self.inventory_delta_version != 0 and self.inventory_version != 3)) return error.InvalidNativeLakeTextCorpus;
         if (self.source_routes_version > 1 or (self.source_routes != null and self.source_routes_version != 1)) return error.InvalidNativeLakeTextCorpus;
         if (self.source_routes) |ref| try ref.validate();
         if (self.open_tails.len != 0) {
@@ -808,7 +812,15 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         defer previous_refs.deinit(a);
         const baseline_ref: ?artifacts.ChunkRef = if (seed) |old| old.checkpoint_base orelse (if (old.serving != null) seed_ref else null) else null;
         const baseline: ?Root = if (seed) |old| if (old.checkpoint_base != null) try checkpointBase(ca, store.*, old, cancellation) else if (old.serving != null) old else null else null;
-        const baseline_records = if (baseline) |old| try text_directory.fileRecords(ca, old, store.*, null, cancellation) else &.{};
+        // An authenticated prior inventory replaces a full native file-catalog
+        // census for ordinary append/replacement publication. Recovery and delete
+        // migrations retain the complete reconciliation path.
+        const inventory_delta = if (paged_seed and baseline != null and seed.?.checkpoint_base == null) eligibleInventory(provider, baseline.?) else null;
+        var prepared_plan: ?state.Plan = if (inventory_delta) |inventory| try state.Plan.fromInventory(a, ca, provider, inventory) else null;
+        errdefer if (prepared_plan) |*value| value.deinit();
+        const baseline_records = if (inventory_delta) |inventory|
+            try changedInventoryRecords(a, ca, store.*, baseline.?, provider, inventory, &prepared_plan.?, cancellation, 128 * 1024 * 1024)
+        else if (baseline) |old| try text_directory.fileRecords(ca, old, store.*, null, cancellation) else &.{};
         const records = if (paged_seed) (if (baseline != null) baseline_records else try text_directory.fileRecords(ca, seed.?, store.*, null, cancellation)) else if (manifest_seed) try checkpointFiles(a, ca, seed.?, baseline_records, store.*, cancellation) else &.{};
         var checkpoint_removed: std.ArrayList([]const u8) = .empty;
         var baseline_by_id: std.StringHashMapUnmanaged(text_directory.FileRecord) = .empty;
@@ -824,7 +836,8 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             file.* = group.file;
             try previous_groups.put(a, group.file.id, group);
         };
-        var plan = try state.Plan.init(a, ca, provider, previous);
+        var plan = prepared_plan orelse try state.Plan.init(a, ca, provider, previous);
+        prepared_plan = null;
         defer plan.deinit();
         for (baseline_records) |record| if (!plan.by_id.contains(record.file.id)) try checkpoint_removed.append(ca, record.file.id);
         if (paged_seed) {
@@ -1038,7 +1051,8 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             if (index != null and std.mem.eql(u8, &record.file.digest, &plan.files[index.?].digest)) continue;
             try removed_files.append(ca, record);
         }
-        for (plan.files, file_manifests) |file, slot| {
+        for (plan.files, file_manifests, plan.changed) |file, slot, changed| {
+            if (inventory_delta != null and !changed) continue;
             if (baseline_by_id.get(file.id)) |old| if (std.mem.eql(u8, &old.file.digest, &file.digest)) continue;
             try added_files.append(ca, .{ .file = file, .manifest = slot orelse return error.InvalidNativeLakeTextCorpus });
         }
@@ -1104,6 +1118,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         var root: Root = .{ .admission_version = 1, .statistics_version = 2, .term_statistics = global_statistics, .term_directory = directory, .seekable = true, .stored_projection = store_source, .domain = store.upload_scope.?.domain, .binding = binding, .config_json = spec.config_json, .recipe = recipe, .directories = directories, .inventory_version = 3, .file_count = @intCast(plan.files.len), .segment_count = totals.segments, .collection = try totals.finish(ca) };
         root.source_layout_version = 1;
         root.source_routes_version = 1;
+        root.inventory_delta_version = if (source.inventory.deleted_row_groups.len == 0 and (if (source.scanner.iceberg_delete_plan) |deletes| deletes.files.len == 0 else true)) 1 else 0;
         root.serving = try @import("lake_index_serving_compaction.zig").publishDelta(a, ca, store, root, baseline, .{ .removed = removed_files.items, .added = added_files.items }, &plan, provider.context, cancellation);
         try root.validate();
         const bytes = try std.json.Stringify.valueAlloc(ca, root, .{});
@@ -1120,6 +1135,45 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         try declarations.append(out, try std.json.parseFromSliceLeaky(Declared, out, owned, .{ .allocate = .alloc_always }));
     }
     return declarations.toOwnedSlice(out);
+}
+fn eligibleInventory(provider: *RowProvider, baseline: Root) ?local.serverless_external_source_types.Inventory {
+    const prior = provider.previous_inventory orelse return null;
+    if (baseline.inventory_delta_version != 1 or prior.files.len != baseline.file_count or
+        prior.format != provider.source.inventory.format or
+        !std.mem.eql(u8, prior.source_id, provider.source.inventory.source_id) or
+        !std.mem.eql(u8, prior.schema_fingerprint, provider.source.inventory.schema_fingerprint) or
+        prior.deleted_row_groups.len != 0 or provider.source.inventory.deleted_row_groups.len != 0 or
+        !std.mem.eql(u8, prior.snapshot_id, baseline.binding.snapshot_id) or
+        !std.mem.eql(u8, prior.source_id, baseline.binding.source_id) or
+        !std.mem.eql(u8, prior.schema_fingerprint, baseline.binding.schema_fingerprint)) return null;
+    if (provider.source.scanner.iceberg_delete_plan) |plan| if (plan.files.len != 0) return null;
+    // Unqualified legacy inventories cannot prove the private identities used
+    // by their publication. They migrate through ordinary reconciliation.
+    for (prior.files) |file| if (file.etag.len == 0 and file.version_id.len == 0) return null;
+    return prior;
+}
+fn changedInventoryRecords(a: A, out: A, store: stores.ArtifactStore, baseline: Root, provider: *RowProvider, prior: local.serverless_external_source_types.Inventory, plan: *const state.Plan, token: Cancellation, max_read_bytes: u64) ![]const text_directory.FileRecord {
+    var remaining = max_read_bytes;
+    var changed: usize = 0;
+    for (prior.files) |file| {
+        const current = plan.by_id.get(file.file_id);
+        if (current == null or plan.changed[current.?]) changed += 1;
+    }
+    // Broad replacement is cheaper as one bounded sequential catalog walk.
+    if (changed > 64 and changed * 4 >= prior.files.len)
+        return text_directory.fileRecordsBudget(out, baseline, store, null, token, &remaining);
+    var records: std.ArrayList(text_directory.FileRecord) = .empty;
+    for (prior.files) |file| {
+        try provider.context.ensureActive();
+        try token.check();
+        const current = plan.by_id.get(file.file_id);
+        if (current != null and !plan.changed[current.?]) continue;
+        const record = try text_directory.lookupFileBudget(out, baseline, store, null, token, file.file_id, &remaining);
+        const expected = try state.inventoryIdentity(a, prior, file, local.serverless_query_lake_prepared_deletes.Prepared.emptyFileFingerprint());
+        if (!std.mem.eql(u8, &record.file.digest, &expected)) return error.InvalidNativeLakeFileState;
+        try records.append(out, record);
+    }
+    return records.items;
 }
 // Reusing manifests must prove their retained leaves still exist. HEAD checks
 // bound memory and avoid downloading the archive; normal serving continues to
@@ -1686,4 +1740,80 @@ test "external lake global frontier checkpoints page sixteen thousand files and 
     try std.testing.expect(found);
     // The old durable cut remains independently readable after COW mutation.
     try std.testing.expectEqual(records.len, (try checkpointDeltaFiles(a, ca, root, store, .none)).len);
+}
+
+test "external lake bounded WAL inventory deltas seek changed records within a bounded planning budget" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const external = local.serverless_external_source_types;
+    var directory = try local.common_test_directory.TestDirectory.init("inventory-delta-planning");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(6), 1, std.testing.io);
+    var manifest = try store.put("immutable manifest reference");
+    defer manifest.deinit(a);
+    const prior_files = try ca.alloc(external.FileEntry, 4096);
+    for (prior_files, 0..) |*file, i| file.* = .{ .file_id = try std.fmt.allocPrint(ca, "file-{d}", .{i}), .object_uri = try std.fmt.allocPrint(ca, "file:///source-{d}.parquet", .{i}), .etag = @constCast("old"), .byte_len = 128, .row_count = 0, .row_groups = &.{} };
+    const prior: external.Inventory = .{ .format = .parquet, .source_id = @constCast("source"), .source_uri = @constCast("file:///source"), .snapshot_id = @constCast("before"), .schema_fingerprint = @constCast("schema"), .files = prior_files };
+    const records = try ca.alloc(text_directory.FileRecord, prior_files.len);
+    const states = try ca.alloc(state.File, prior_files.len);
+    for (prior_files, records, states) |file, *record, *owned| {
+        owned.* = .{ .id = file.file_id, .digest = try state.inventoryIdentity(ca, prior, file, local.serverless_query_lake_prepared_deletes.Prepared.emptyFileFingerprint()) };
+        record.* = .{ .file = owned.*, .manifest = .{ .artifact_id = manifest.artifact_id, .checksum = manifest.checksum, .byte_len = manifest.byte_len } };
+    }
+    const files = try text_directory.publishFileRecords(a, &store, records, &.{}, null, .none, std.testing.io);
+    const baseline: Root = .{ .domain = store.upload_scope.?.domain, .binding = .{ .sidecar_kind = .text, .source_kind = .external_parquet, .row_ref_kind = .external, .source_id = "source", .snapshot_id = "before", .schema_fingerprint = "schema", .index_config_hash = "recipe", .column_bindings = &.{"body"} }, .config_json = "{}", .inventory_version = 3, .inventory_delta_version = 1, .file_count = @intCast(records.len), .directories = .{ .files = files } };
+    var current = prior;
+    current.snapshot_id = @constCast("after");
+    current.files = try ca.dupe(external.FileEntry, prior_files);
+    current.files[0].file_id = @constCast("appended");
+    current.files[0].object_uri = @constCast("file:///appended.parquet");
+    current.files[1].etag = @constCast("replacement");
+    // This planner consumes only immutable inventory fields; it never opens a
+    // source reader. Keep unused reader capabilities inaccessible in the test.
+    var source: local.serverless_query_lake_serving.ServingSource = undefined;
+    source.inventory = current;
+    source.verified_files = null;
+    source.prepared_deletes = null;
+    source.scanner.iceberg_delete_plan = null;
+    var provider: RowProvider = .{ .source = &source, .previous_inventory = prior, .context = .{ .io = std.testing.io } };
+    try std.testing.expect(eligibleInventory(&provider, baseline) != null);
+    var delta = try state.Plan.fromInventory(a, ca, &provider, prior);
+    defer delta.deinit();
+    var full = try state.Plan.init(a, ca, &provider, states);
+    defer full.deinit();
+    for (delta.files, full.files, delta.changed, full.changed, 0..) |left, right, changed, expected, i| {
+        try std.testing.expectEqual(left.digest, right.digest);
+        try std.testing.expectEqual(expected, changed);
+        try std.testing.expectEqual(i < 2, changed);
+    }
+    const changed = try changedInventoryRecords(a, ca, store, baseline, &provider, prior, &delta, .none, 256 * 1024);
+    try std.testing.expectEqual(@as(usize, 2), changed.len);
+    var full_budget: u64 = 256 * 1024;
+    try std.testing.expectError(error.ArtifactReadBudgetExceeded, text_directory.fileRecordsBudget(ca, baseline, store, null, .none, &full_budget));
+    var different = baseline;
+    different.inventory_delta_version = 0;
+    try std.testing.expect(eligibleInventory(&provider, different) == null);
+    different = baseline;
+    different.binding.snapshot_id = "unrelated";
+    try std.testing.expect(eligibleInventory(&provider, different) == null);
+    prior_files[0].etag = &.{};
+    try std.testing.expect(eligibleInventory(&provider, baseline) == null);
+    // Coverage contributes exact selectors, while this snapshot owns sequence
+    // and partition metadata even if the evidence came from a prior inventory.
+    current.files[1].data_sequence_number = 9;
+    var verified_file = current.files[1];
+    verified_file.etag = @constCast("qualified");
+    verified_file.data_sequence_number = 7;
+    var verified: std.StringHashMapUnmanaged(*const external.FileEntry) = .empty;
+    defer verified.deinit(a);
+    try verified.put(a, verified_file.file_id, &verified_file);
+    source.verified_files = &verified;
+    var expected_file = current.files[1];
+    expected_file.etag = verified_file.etag;
+    try std.testing.expectEqual(try state.inventoryIdentity(a, current, expected_file, local.serverless_query_lake_prepared_deletes.Prepared.emptyFileFingerprint()), try state.identity(a, &provider, current.files[1]));
 }

@@ -2266,6 +2266,10 @@ def test_native_remote_incremental_generations_keep_public_identity_and_file_art
             # Resolve both legacy arrays and authenticated paged catalogs.
             # Detailed segment descriptors are not maintenance file manifests.
             for document in roots:
+                if document.get("serving"):
+                    # The publication carries the prior-snapshot proof used by
+                    # append/replacement planning, including after cold restart.
+                    assert document.get("inventory_delta_version") == 1, document
                 if document.get("inventory_version") == 3:
                     chunks = {}
                     file_root = document["directories"]["files"]
@@ -2955,6 +2959,30 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
                 == fallback["hits"]["total"]
                 == {"value": expected, "relation": "exact"}
             )
+        # More than 4,096 matching rows can still occupy a small pack range.
+        # Compare compressed admission with an equivalent authoritative filter
+        # whose required-condition proof deliberately cannot be extracted.
+        large_range = {"range": {"path": "/amount", "gte": count - 10000}}
+        ranged_native = query(large_range, profile=True)
+        ranged_oracle = query(
+            {
+                "bool": {
+                    "should": [large_range, {"match_all": {}}],
+                    "minimum_should_match": 2,
+                }
+            }
+        )
+        assert [hit["_id"] for hit in ranged_native["hits"]["hits"]] == [
+            hit["_id"] for hit in ranged_oracle["hits"]["hits"]
+        ]
+        for direct_hit, oracle_hit in zip(
+            ranged_native["hits"]["hits"], ranged_oracle["hits"]["hits"], strict=True
+        ):
+            assert direct_hit["_score"] == pytest.approx(oracle_hit["_score"], abs=1e-6)
+        assert query(large_range, count=True, fields=[], limit=0)["hits"]["total"] == {
+            "value": 10000,
+            "relation": "exact",
+        }
         broad = {"term": {"path": "/category", "value": "comment"}}
         hits = query(broad)["hits"]["hits"]
         assert len(hits) == 10 and all(h["_source"]["amount"] >= 2 for h in hits)

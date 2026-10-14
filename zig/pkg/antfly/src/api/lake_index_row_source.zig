@@ -27,6 +27,8 @@ const Cancellation = @import("antfly_cancellation").CancellationToken;
 const A = std.mem.Allocator;
 pub const Provider = struct {
     source: *serving.ServingSource,
+    /// Borrowed authenticated prior inventory, shared by all native builders.
+    previous_inventory: ?local.serverless_external_source_types.Inventory = null,
     enrichment_columns: bool = false,
     vector_memo: ?@import("lake_vector_enrichment.zig").Memo = null,
     progress: ?BuildProgress = null,

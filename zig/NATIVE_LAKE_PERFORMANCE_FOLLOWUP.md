@@ -4086,3 +4086,56 @@ The repository cache collector ran with its bounded watchdog. Obsolete binary
 variants were reclaimed only in this worktree; two stale object-store cache
 manifests were invalidated and the optimized suite then passed. Other active
 worktrees were preserved. Provider retention qualification remains deferred.
+
+
+## Native retained payloads and compressed predicate routing (protocol 45)
+
+Retained replay keeps query admission independent of the decoded cache's 64 MiB
+residency and active-load limits. A valid legacy JSON cut which cannot use that
+cache retries in a private, process-accounted lease with a bounded 256 MiB decode
+workspace. Cancellation and each fresh reader envelope remain authoritative;
+private leases release their complete workspace with the query. The encoded
+40 MiB and 65,536-change limits remain enforced.
+
+New retained row groups use a versioned native value payload. Container counts
+allow one allocation per array/map, primitive arrays share their type tag, and
+integer lanes use exact zigzag varints. Float bits, negative zero, exact numeric
+tokens, heterogeneous arrays, object field order, and legacy stable-key encodings
+are preserved. Metadata remains a small JSON state/envelope; v1 JSON row groups
+and old descriptor tokens still replay. Prefix-group digests and unchanged-group
+reuse keep their existing immutable ownership. Native WAL partition construction
+now uses the shared typed-value clone instead of serializing and parsing rows.
+The regression's 125,000-integer row previously retained about 69 MiB; new image
+and native replay each assert less than 16 MiB. This is a bounded fixture
+measurement, not an archive-throughput claim.
+
+Indexed predicate admission accepts broader native compressed block producers.
+A selected physical bitmap is routed through authenticated source rank bounds
+and pack spans using rank/select and range cardinality, including delete holes
+and full u64 row coordinates. It never expands broad matches into scalar row-ID
+lists. Optional proofs cap files, route spans, block work, reads, and memory;
+near-full pack admission falls back to the existing bounded ranking windows.
+The complete residual predicate and publication-wide text statistics remain in
+force. Roaring intersections remove empty containers so the shared emptiness
+invariant remains true after sparse or dense intersections. Point producers
+retain their selective admission bound.
+
+Publication inventories record the exact provider selectors used by their native
+file identities. A refresh shares one authenticated previous inventory among
+builders; eligible ordinary text refreshes derive their private file plan from
+it and seek only removed/replaced native file records. Unchanged native catalogs
+are inherited through immutable directory roots. Aggregate read admission covers
+all changed-record seeks. Broad replacements use a bounded sequential catalog
+walk instead of repeated point seeks. Native roots persist a delete-free inventory proof. Legacy roots/inventories
+without that proof or version evidence, source or schema mismatches,
+delete-bearing prior/current snapshots, and partial checkpoint recovery
+retain full reconciliation. Compact source inventory decoding and fingerprinting
+remain linear in file count; this removes the separate native catalog census,
+not all source metadata work. Required closure audits remain independent of this
+planning optimization and require qualified provider retention to bypass.
+
+Regressions cover oversized legacy replay without residency, native payload
+round trips and malformed counts, broad compressed routing over holes/high row
+bits, a 4,096-file inventory with a two-file delta under a 256 KiB planning budget,
+and a 10,000-match real-Parquet predicate compared with authoritative ranking.
+Live-provider retention qualification remains deferred and disabled by default.

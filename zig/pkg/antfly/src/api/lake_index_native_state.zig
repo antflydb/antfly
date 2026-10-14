@@ -48,22 +48,39 @@ pub fn identity(a: A, provider: *Provider, input_file: local.serverless_external
     // Warm immutable plans retain an authenticated publication instead of
     // materializing every provider version into the fresh manifest inventory.
     // Private row keys must use those same versions as the index builder.
-    const file = if (provider.source.verified_files) |files| blk: {
+    var file = input_file;
+    if (provider.source.verified_files) |files| {
         const verified = files.get(input_file.file_id) orelse return error.ExternalLakeSnapshotMismatch;
         if (!std.mem.eql(u8, verified.object_uri, input_file.object_uri) or verified.byte_len != input_file.byte_len) return error.ExternalLakeSnapshotMismatch;
-        break :blk verified.*;
-    } else input_file;
-    var hash = std.crypto.hash.Blake3.init(.{});
-    part(&hash, "native-lake-private-file-v3");
+        // Selectors come from coverage evidence; sequence/partition metadata
+        // belongs to this immutable source snapshot, not a prior inventory.
+        file.etag = verified.etag;
+        file.version_id = verified.version_id;
+    }
     if (provider.source.scanner.iceberg_delete_plan != null and provider.source.prepared_deletes == null) {
         var stream = try local.serverless_query_lake_stream.Stream.init(a, provider.source, &.{}, &.{}, provider.context, provider.limits);
         defer stream.deinit();
         try stream.prepareDeletes();
     }
-    for ([_][]const u8{ provider.source.inventory.source_id, provider.source.inventory.schema_fingerprint, file.file_id, file.object_uri, file.etag, file.version_id }) |bytes| part(&hash, bytes);
+    const deletes: [32]u8 = fingerprint: {
+        if (provider.source.prepared_deletes) |prepared| {
+            if (provider.expected_delete_objects) |expected| if (!std.mem.eql(u8, &expected, &prepared.object_versions)) return error.ExternalLakeIndexSourceChanged;
+            break :fingerprint try prepared.fileFingerprint(file.file_id);
+        } else {
+            break :fingerprint local.serverless_query_lake_prepared_deletes.Prepared.emptyFileFingerprint();
+        }
+    };
+    return inventoryIdentity(a, provider.source.inventory, file, deletes);
+}
+/// The authenticated inventory and per-file delete proof fully determine the
+/// native identity. Inventory delta planning uses the same function as scans.
+pub fn inventoryIdentity(a: A, inventory: local.serverless_external_source_types.Inventory, file: local.serverless_external_source_types.FileEntry, deletes: [32]u8) ![32]u8 {
+    var hash = std.crypto.hash.Blake3.init(.{});
+    part(&hash, "native-lake-private-file-v3");
+    for ([_][]const u8{ inventory.source_id, inventory.schema_fingerprint, file.file_id, file.object_uri, file.etag, file.version_id }) |bytes| part(&hash, bytes);
     // Inventory deletes are sorted by file ID. Hash only this file's slice;
     // hashing the complete delete inventory per file would be quadratic.
-    const groups = provider.source.inventory.deleted_row_groups;
+    const groups = inventory.deleted_row_groups;
     var lower: usize = 0;
     var upper = groups.len;
     while (lower < upper) {
@@ -75,12 +92,7 @@ pub fn identity(a: A, provider: *Provider, input_file: local.serverless_external
     const encoded = try std.json.Stringify.valueAlloc(a, .{ .bytes = file.byte_len, .data_sequence = file.data_sequence_number, .partition = file.partition_spec_id, .values = file.partition_values, .deletes = groups[lower..end] }, .{});
     defer a.free(encoded);
     part(&hash, encoded);
-    if (provider.source.prepared_deletes) |prepared| {
-        if (provider.expected_delete_objects) |expected| if (!std.mem.eql(u8, &expected, &prepared.object_versions)) return error.ExternalLakeIndexSourceChanged;
-        hash.update(&try prepared.fileFingerprint(file.file_id));
-    } else {
-        hash.update(&local.serverless_query_lake_prepared_deletes.Prepared.emptyFileFingerprint());
-    }
+    hash.update(&deletes);
     var digest: [32]u8 = undefined;
     hash.final(&digest);
     return digest;
@@ -132,6 +144,15 @@ pub const Plan = struct {
             try self.by_id.put(a, file.file_id, index);
         }
         return self;
+    }
+    pub fn fromInventory(a: A, out: A, provider: *Provider, prior: local.serverless_external_source_types.Inventory) !Plan {
+        const previous = try a.alloc(File, prior.files.len);
+        defer a.free(previous);
+        for (prior.files, previous) |file, *owned| {
+            try provider.context.ensureActive();
+            owned.* = .{ .id = file.file_id, .digest = try inventoryIdentity(a, prior, file, local.serverless_query_lake_prepared_deletes.Prepared.emptyFileFingerprint()) };
+        }
+        return init(a, out, provider, previous);
     }
     pub fn deinit(self: *Plan) void {
         self.a.free(self.changed);

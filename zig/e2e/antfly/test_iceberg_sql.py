@@ -1387,19 +1387,24 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
             )
             hybrid_request["remote_snapshot"] = hybrid_first["remote_snapshot"]
 
-            def retained_artifact(artifact_id):
+            def retained_artifact(artifact_id, *, raw=False):
                 checksum = artifact_id.split(":")[1]
                 paths = list((server.root / "artifacts").rglob(checksum))
                 assert paths, artifact_id
                 payload = paths[0].read_bytes()
                 if payload.startswith(b"AFOBJ001"):
                     payload = payload[84 + struct.unpack_from("<I", payload, 16)[0] :]
-                return json.loads(payload)
+                return payload if raw else json.loads(payload)
 
             def retained_state(token):
                 envelope = retained_artifact(token[len("lake2:") :])
                 assert envelope["version"] == 2, envelope
                 state = retained_artifact(envelope["state"]["id"])
+                assert state["version"] == 2, state
+                assert all(
+                    retained_artifact(part["id"], raw=True).startswith(b"AFWC1")
+                    for part in state["change_parts"]
+                ), state
                 return (
                     envelope,
                     state,

@@ -1326,7 +1326,7 @@ const Execution = struct {
         defer arena.deinit();
         const a = arena.allocator();
         const resolver: @import("lake_index_text_predicate.zig").PhysicalResolver = .{ .server = self.server, .table = self.table, .source = self.source, .context = self.request, .store = self.store.artifactStore(), .store_identity = self.store.identity, .read_context = self.context, .pinned = .{ .artifacts = self.store.artifactStore(), .store_identity = self.store.identity, .domain = self.domain, .declarations = self.declarations, .read_context = self.context } };
-        var candidates = (try resolver.selectiveCandidates(a, json, 4096)) orelse return null;
+        var candidates = (try resolver.selectiveCandidates(a, json, std.math.maxInt(usize))) orelse return null;
         defer candidates.deinit();
         const tree = @import("../serverless/graph_segment/page_tree.zig");
         var store = self.store.artifactStore();

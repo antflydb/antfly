@@ -109,8 +109,8 @@ pub const Part = struct {
         var clauses: std.ArrayList(V) = .empty;
         var hash = std.crypto.hash.Blake3.init(.{});
         for (ids, entries, changes) |id, *entry, *change| {
-            const bytes = try std.json.Stringify.valueAlloc(sa, latest.get(id).?, .{});
-            change.* = try std.json.parseFromSliceLeaky(Change, a, bytes, .{ .allocate = .alloc_always });
+            const source = latest.get(id).?;
+            change.* = .{ .op = source.op, .row = try local.storage_typed_json.clone(a, source.row) };
             entry.* = .{ .id = try a.dupe(u8, id), .change = change.* };
             if (change.op == .upsert) {
                 try live.append(a, entry.id);

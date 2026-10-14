@@ -18,6 +18,7 @@ pub const antfly_sources = @import("source_owner_physical.zig");
 test {
     _ = @import("api/lake_metadata_memo.zig");
     _ = @import("api/lake_retained_cut.zig");
+    _ = @import("api/lake_index_publication.zig");
     _ = @import("api/lake_recent_vectors.zig");
     _ = @import("serverless/artifacts/cloud_generations.zig");
     _ = @import("api/lake_generation_envelope.zig");
@@ -33,4 +34,6 @@ test {
     _ = @import("api/lake_index_text_frontier.zig");
     _ = @import("api/lake_index_text_query.zig");
     _ = @import("antfly_local_sources").search_search;
+    _ = @import("antfly_local_sources").storage_typed_json;
+    _ = @import("antfly_local_sources").encoding_roaring;
 }

@@ -801,3 +801,29 @@ by exact ranking. Existing corpus/read/memory admission remains enforced and an
 unaffordable optional batch falls back to exact physical windows. Deferred
 highlights use the admitted snapshot's canonical segment identities, since
 priority arrival order can differ from its native document ordinal order.
+
+
+### Native retained payloads and inventory delta planning
+
+Search cursor replay must preserve fresh-cut admission independently of optional
+cache residency. Modern retained WAL groups use versioned typed native values
+with preallocated containers; legacy JSON groups have a bounded private replay
+workspace when shared decoding cannot admit them. Both use process-accounted
+ownership, exact artifact generations, independent reader envelopes, and existing
+retained-domain collection. Cache pressure must not invalidate an issued cut.
+
+Broad indexed metadata predicates route compressed physical selections through
+source rank/select and serving spans. The planner bounds metadata work and uses
+full residual evaluation; an expensive or near-full proof falls back to bounded
+text windows. Matching row count is not itself an admission limit for compressed
+producers.
+
+Publication inventories persist the exact provider identities used by native
+file state. Eligible refreshes share one authenticated previous inventory and
+seek only changed native file records, inheriting unchanged catalog roots.
+Native roots persist proof that the prior inventory was delete-free.
+Delete-bearing prior/current snapshots, partial checkpoint recovery, and legacy
+roots or unqualified inventories retain complete reconciliation. Broad
+replacement uses a bounded sequential catalog walk. Source inventory processing and
+mandatory closure auditing remain separate costs; this optimization does not
+claim constant-time snapshot discovery or waive retention qualification.

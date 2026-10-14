@@ -512,7 +512,10 @@ pub fn fileRecordsBudget(a: A, root: corpus.Root, store: stores.ArtifactStore, c
     return result.items;
 }
 pub fn lookupFile(a: A, root: corpus.Root, store: stores.ArtifactStore, cached: ?artifacts.CachedRead, token: Cancellation, file_id: []const u8) !FileRecord {
-    var read: Reader = .{ .store = store, .cached = cached, .token = token };
+    return lookupFileBudget(a, root, store, cached, token, file_id, null);
+}
+pub fn lookupFileBudget(a: A, root: corpus.Root, store: stores.ArtifactStore, cached: ?artifacts.CachedRead, token: Cancellation, file_id: []const u8, budget: ?*u64) !FileRecord {
+    var read: Reader = .{ .store = store, .cached = cached, .token = token, .external_budget = budget };
     read.init(root.domain);
     try read.check();
     const bytes = try get(a, read.pages.store(), root.directories.files, corpus.term_directory.identity(file_id));

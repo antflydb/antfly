@@ -172,6 +172,24 @@ pub fn buildWithLeaseAndEmbedding(a: A, artifact_store: *stores.ArtifactStore, t
         return buildAttempt(a, artifact_store, table, source, store_identity, context, cancellation, clock, lease, embedding_options, memo, false);
     };
 }
+/// Prior inventory is an optional planning proof. Missing/corrupt derived
+/// metadata migrates through full native reconciliation; operational failures
+/// retain their normal cancellation/retry semantics.
+fn priorInventory(a: A, store: stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, token: Cancellation) !?local.serverless_external_source_types.Inventory {
+    try token.check();
+    if (ref.byte_len == 0 or ref.byte_len > (local.serverless_external_source_mod.codec.DecodeLimits{}).max_artifact_bytes) return null;
+    const bytes = @import("lake_index_aggregate_artifact.zig").readArtifact(a, store, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, null) catch |err| switch (err) {
+        error.FileNotFound, error.NotFound, error.ObjectNotFound, error.ArtifactIntegrityMismatch, error.CloudGenerationMapUnavailable, error.LakeIndexArtifactUnavailable => return null,
+        else => return err,
+    };
+    defer a.free(bytes);
+    try token.check();
+    const inventory = local.serverless_external_source_mod.decodeInventoryAlloc(a, bytes) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return null, // pure decode/validation failure, not provider I/O
+    };
+    return inventory;
+}
 fn buildAttempt(a: A, artifact_store: *stores.ArtifactStore, table: records.TableRecord, source: *serving.ServingSource, store_identity: catalog.Digest, context: Context, cancellation: Cancellation, clock: Clock, lease: ?Lease, embedding_options: ?local.inference_managed_embedder.InitOptions, memo: ?@import("lake_vector_enrichment.zig").Memo, reuse: bool) ![]u8 {
     try context.ensureActive();
     try cancellation.check();
@@ -214,7 +232,21 @@ fn buildAttempt(a: A, artifact_store: *stores.ArtifactStore, table: records.Tabl
         cloud_object.?.cloud_writer = previous_writer;
         writer.deinit();
     };
-    const inventory_bytes = try local.serverless_external_source_mod.encodeInventoryAlloc(a, source.inventory);
+    var inventory_view = source.inventory;
+    var qualified_files: ?[]local.serverless_external_source_types.FileEntry = null;
+    defer if (qualified_files) |files| a.free(files);
+    if (source.verified_files) |verified| {
+        const files = try a.dupe(local.serverless_external_source_types.FileEntry, source.inventory.files);
+        qualified_files = files;
+        for (files) |*file| {
+            const selected_file = verified.get(file.file_id) orelse return error.ExternalLakeSnapshotMismatch;
+            if (!std.mem.eql(u8, file.object_uri, selected_file.object_uri) or file.byte_len != selected_file.byte_len) return error.ExternalLakeSnapshotMismatch;
+            file.etag = selected_file.etag;
+            file.version_id = selected_file.version_id;
+        }
+        inventory_view.files = files;
+    }
+    const inventory_bytes = try local.serverless_external_source_mod.encodeInventoryAlloc(a, inventory_view);
     defer a.free(inventory_bytes);
     var inventory_artifact = try scoped.putScoped(scope, inventory_bytes, cancellation);
     defer inventory_artifact.deinit(a);
@@ -293,15 +325,21 @@ fn buildAttempt(a: A, artifact_store: *stores.ArtifactStore, table: records.Tabl
     // The authenticated inventory supplies the file delta once per refresh.
     // Counted ownership proves all prior files belong to the unchanged recipes;
     // replay need not point-probe every file/recipe in the contribution tree.
-    if (previous_root != null and previous_ownership == 1) {
-        const previous = current.value.published.?;
-        if (std.mem.eql(u8, &previous.signature.desired, &signature.desired) and source.inventory.deleted_row_groups.len == 0 and (if (source.scanner.iceberg_delete_plan) |plan| plan.files.len == 0 else true)) {
-            if (previous.inventory.byte_len > (local.serverless_external_source_mod.codec.DecodeLimits{}).max_artifact_bytes) return error.ExternalSourceInventoryTooLarge;
-            const bytes = try @import("lake_index_aggregate_artifact.zig").readArtifact(na, scoped, .{ .artifact_id = previous.inventory.artifact_id, .checksum = previous.inventory.checksum, .byte_len = previous.inventory.byte_len }, cancellation, null);
-            const old_inventory = try local.serverless_external_source_mod.decodeInventoryAlloc(na, bytes);
-            if (old_inventory.deleted_row_groups.len == 0) {
-                for (old_inventory.files) |file| try contribution_index.covered_files.put(a, @import("lake_index_native_aggregates.zig").inventoryFileIdentity(old_inventory, file), {});
-                contribution_index.has_file_coverage = true;
+    if (current.value.published) |previous| {
+        if (reusable_directory and std.meta.eql(previous.namespace, current.value.namespace) and
+            std.mem.eql(u8, &previous.signature.credentials, &signature.credentials) and
+            std.mem.eql(u8, &previous.signature.store, &signature.store) and
+            source.inventory.deleted_row_groups.len == 0 and
+            (if (source.scanner.iceberg_delete_plan) |plan| plan.files.len == 0 else true))
+        {
+            if (try priorInventory(na, scoped, previous.inventory, cancellation)) |old_inventory| {
+                if (old_inventory.deleted_row_groups.len == 0) {
+                    provider.previous_inventory = old_inventory;
+                    if (previous_root != null and previous_ownership == 1 and std.mem.eql(u8, &previous.signature.desired, &signature.desired)) {
+                        for (old_inventory.files) |file| try contribution_index.covered_files.put(a, @import("lake_index_native_aggregates.zig").inventoryFileIdentity(old_inventory, file), {});
+                        contribution_index.has_file_coverage = true;
+                    }
+                }
             }
         }
     }
@@ -607,4 +645,30 @@ test "external lake native publication builds scoped text artifacts and fences e
 fn constructionFailure(err: anyerror, stage: []const u8, generation: u64) anyerror {
     if (err != error.Canceled and err != error.Cancelled) std.log.warn("native lake construction deferred stage={s} generation={d} err={s}", .{ stage, generation, @errorName(err) });
     return err;
+}
+
+test "external lake bounded WAL prior inventory proofs recover missing corrupt and canceled reads" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("prior-inventory-recovery");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(6), 1, std.testing.io);
+    const inventory: local.serverless_external_source_types.Inventory = .{ .format = .parquet, .source_id = @constCast("source"), .source_uri = @constCast("file:///source"), .snapshot_id = @constCast("snapshot"), .schema_fingerprint = @constCast("schema"), .files = &.{} };
+    const bytes = try local.serverless_external_source_mod.encodeInventoryAlloc(ca, inventory);
+    var good = try store.put(bytes);
+    defer good.deinit(a);
+    const ref: local.serverless_manifest_artifact_ref.ArtifactRef = .{ .kind = .external_base_source, .artifact_id = good.artifact_id, .checksum = good.checksum, .byte_len = good.byte_len };
+    try std.testing.expect((try priorInventory(ca, store, ref, .none)) != null);
+    var bad = try store.put("invalid inventory bytes");
+    defer bad.deinit(a);
+    try std.testing.expect((try priorInventory(ca, store, .{ .kind = .external_base_source, .artifact_id = bad.artifact_id, .checksum = bad.checksum, .byte_len = bad.byte_len }, .none)) == null);
+    try store.delete(good.artifact_id);
+    try std.testing.expect((try priorInventory(ca, store, ref, .none)) == null);
+    var canceled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Canceled, priorInventory(ca, store, ref, Cancellation.fromAtomic(&canceled)));
 }

@@ -442,6 +442,80 @@ pub const Identities = struct {
         const span: Span = .{ .lower = 0, .upper = count, .rows = &.{}, .manifest = .{ .kind = .text_segment, .metadata_version = corpus.metadata_version, .artifact_id = physical.artifact_id, .checksum = physical.checksum, .byte_len = physical.byte_len }, .expected_rows = count };
         return sourceRank(a, cache, store, cached, span, row);
     }
+    pub const SourceBounds = struct { lower: u32, upper: u32 };
+    /// Conservative rank bounds from compressed physical selections. Deleted
+    /// endpoints can widen a proof but can never exclude a matching live row.
+    pub fn sourceBounds(a: A, cache: *LiveRowsCache, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, physical: @import("lake_index_aggregate_artifact.zig").ChunkRef, count: u32, selected: *const PhysicalSet, file_id: []const u8) !?SourceBounds {
+        const span: Span = .{ .lower = 0, .upper = count, .rows = &.{}, .manifest = .{ .kind = .text_segment, .metadata_version = corpus.metadata_version, .artifact_id = physical.artifact_id, .checksum = physical.checksum, .byte_len = physical.byte_len }, .expected_rows = count };
+        const chosen = selected.files.getPtr(file_id) orelse return null;
+        var bounds: ?SourceBounds = null;
+        for (try span.blocks(cache, store, cached, file_id)) |block| {
+            try cached.context.ensureActive();
+            const base = block.high << corpus.physical.shift;
+            const bitmap = chosen.getPtr(.{ .group = block.group, .high = @intCast(base >> 32) }) orelse continue;
+            const offset: u32 = @truncate(base);
+            try bitmap.prepareRead();
+            const first = bitmap.rank(offset + block.lower);
+            const last = bitmap.rank(@intCast(@as(u64, offset) + (1 << corpus.physical.shift) - 1)) + @intFromBool(bitmap.contains(@intCast(@as(u64, offset) + (1 << corpus.physical.shift) - 1)));
+            if (first == last) continue;
+            const low = bitmap.read_rank.?.select(first).? - offset;
+            const high = bitmap.read_rank.?.select(last - 1).? - offset;
+            const ranks: SourceBounds = if (block.bitmap != null) deleted: {
+                const live = try liveRows(a, cache, store, cached, block);
+                break :deleted .{ .lower = block.base + @as(u32, @intCast(live.rank(low))), .upper = block.base + @as(u32, @intCast(live.rank(high + 1))) };
+            } else .{ .lower = block.base + @min(block.count, low - block.lower), .upper = block.base + @min(block.count, high - block.lower + 1) };
+            if (ranks.lower == ranks.upper) continue;
+            if (bounds) |*value| {
+                value.lower = @min(value.lower, ranks.lower);
+                value.upper = @max(value.upper, ranks.upper);
+            } else bounds = ranks;
+        }
+        return bounds;
+    }
+    /// Test a pack span using rank/select and bitmap range cardinality. Work is
+    /// proportional to immutable blocks/spans, never to matching row count.
+    pub fn sourceRangeSelected(a: A, cache: *LiveRowsCache, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, physical: @import("lake_index_aggregate_artifact.zig").ChunkRef, count: u32, selected: *const PhysicalSet, file_id: []const u8, lower: u32, length: u32, work: *usize) !bool {
+        const span: Span = .{ .lower = 0, .upper = count, .rows = &.{}, .manifest = .{ .kind = .text_segment, .metadata_version = corpus.metadata_version, .artifact_id = physical.artifact_id, .checksum = physical.checksum, .byte_len = physical.byte_len }, .expected_rows = count };
+        const chosen = selected.files.getPtr(file_id) orelse return false;
+        const upper = @as(u64, lower) + length;
+        for (try span.blocks(cache, store, cached, file_id)) |block| {
+            try cached.context.ensureActive();
+            if (work.* == 65536) return error.QueryCandidateBudgetExceeded;
+            work.* += 1;
+            if (@as(u64, block.base) + block.count <= lower) continue;
+            if (block.base >= upper) break;
+            const base = block.high << corpus.physical.shift;
+            const bitmap = chosen.getPtr(.{ .group = block.group, .high = @intCast(base >> 32) }) orelse continue;
+            const first = @max(lower, block.base) - block.base;
+            const last: u32 = @intCast(@min(upper, @as(u64, block.base) + block.count) - block.base);
+            const extent = if (block.bitmap != null) deleted: {
+                const live = try liveRows(a, cache, store, cached, block);
+                break :deleted SourceBounds{ .lower = live.read_rank.?.select(first).?, .upper = live.read_rank.?.select(last - 1).? + 1 };
+            } else SourceBounds{ .lower = block.lower + first, .upper = block.lower + last };
+            const offset: u32 = @truncate(base);
+            if (bitmap.rangeCardinality(offset + extent.lower, @as(u64, offset) + extent.upper) == 0) continue;
+            if (block.bitmap == null) return true;
+            const live = try liveRows(a, cache, store, cached, block);
+            var navigation = bitmap.iterator();
+            var target: u64 = extent.lower;
+            while (target < extent.upper) {
+                try cached.context.ensureActive();
+                if (work.* == 65536) return error.QueryCandidateBudgetExceeded;
+                work.* += 1;
+                const next = navigation.seekTo(offset + @as(u32, @intCast(target))) orelse break;
+                target = next - offset;
+                if (target >= extent.upper) break;
+                // Physical blocks are aligned to whole words. Intersect the
+                // two borrowed coordinate systems directly, without bitmap
+                // copies or allocation inside a non-fallible set operation.
+                const word = bitmap.wordMask(next) & live.wordMask(@intCast(target)) &
+                    (@as(u64, std.math.maxInt(u64)) << @as(u6, @truncate(target)));
+                if (word != 0 and (target & ~@as(u64, 63)) + @ctz(word) < extent.upper) return true;
+                target = (target & ~@as(u64, 63)) + 64;
+            }
+        }
+        return false;
+    }
     fn sourceRank(a: A, cache: *LiveRowsCache, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, span: Span, row: local.storage_rowsource_types.RowRef) !?u32 {
         if (row != .external) return error.InvalidNativeLakeRowIndex;
         const ref = row.external;
@@ -714,7 +788,8 @@ fn PredicateResolver(comptime Set: type) type {
 
         /// Optional admission proof. A required native conjunct may bound
         /// serving packs even when the complete predicate needs a residual.
-        /// Broad/unsupported filters never trigger a scan in this planner.
+        /// Only native index walks participate. Broad proofs require compressed
+        /// blocks; row-wise producers retain the selective bound.
         pub fn selectiveCandidates(self: Self, a: A, json: []const u8, limit: usize) !?PhysicalSet {
             if (Set != PhysicalSet) @compileError("physical admission requires physical coordinates");
             var scratch = std.heap.ArenaAllocator.init(a);
@@ -744,7 +819,7 @@ fn PredicateResolver(comptime Set: type) type {
                 };
                 if (try rows.tryOpenPredicateWithContext(a, self.server, self.table, selected, self.context, self.source, self.pinned)) |candidate| {
                     var predicate = candidate;
-                    if (predicate.estimatedRows() <= limit and (best == null or predicate.estimatedRows() < best.?.estimatedRows())) {
+                    if ((predicate.estimatedRows() <= 4096 or predicate.hasBlocks()) and predicate.estimatedRows() <= limit and (best == null or predicate.estimatedRows() < best.?.estimatedRows())) {
                         if (best) |*previous| previous.deinit();
                         best = predicate;
                     } else predicate.deinit();
