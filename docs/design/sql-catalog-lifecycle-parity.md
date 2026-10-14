@@ -5603,3 +5603,42 @@ refer to their historical qualification checkpoint or the separate data owner;
 Linux and non-Debug bounds remain unchanged. This is build scheduling, not
 runtime memory admission. Array-transport experiments are not included in the
 verified checkpoint commit; their twelve original dispositions remain open.
+
+### Durable metadata decoding before native schema installation
+
+Metadata admission now also derives its global decoder minimum from the existing
+durable topology activation at publication version 39 or newer. This is
+independent of the native schema-reader floor: pending private definitions can
+need the metadata decoder before a native layout is published. Ordinary appends,
+store admission and batches retain the higher decoder minimum even when they
+contain no relation mutation. Final append revalidation rejects a readiness
+proof acquired before activation. The projection verifies the current metadata
+incarnation, a nonempty membership claim and a supported decoder version;
+foreign, missing-incarnation and future-version records fail closed. Active
+native floor 38 cannot hide a stronger durable metadata activation. Legacy
+pre-publication activations retain their previous behavior.
+
+The monotonic existing activation record is reused, not another incarnation
+codec or a scan of table/private-job inventories. Its getter now borrows bytes
+from a native read transaction instead of allocating a second value copy.
+Producer admission, command encoding, apply and reader projection share the
+existing 1 KiB activation bound. The native regression verifies reopen while
+the native floor remains inactive, rejected downgrade/foreign-incarnation
+attempts, oversized-command rollback and fail-closed reads of a corrupt oversized
+record. The service regression covers mixed-version members, ordinary commands,+batches, stale pre-activation proofs and both native-floor states.
+
+This is a publication prerequisite, not activation of public producers. They
+still must derive requirements from owned schema/layout identities, durably
+activate the decoder before retaining marked private plans, bind schema CAS and
+native floor publication atomically, and require exact installed-root owner
+ACKs. No original SQL disposition changes at this checkpoint; 483 are implemented
+and 862 remain unresolved. The final Debug metadata/service gate passed
+112/112 steps, including borrowed/bounded projection and the corruption fixture.
+Linked suites passed 139 service, 318 metadata/control, 226 metadata/runtime,
+240 native metadata-store and 28 replication tests; two optional live PostgreSQL
+CDC tests skipped their external prerequisites. The focused reader owners passed
+seven service and two native catalog tests, plus the existing data/pure-contract
+checks. These suite counts overlap the broader runs and are not unique-test or
+SQL-case totals. Formatting, control-catalog freshness, Apache boundary, license
+and original inventory checks passed. No public producer is enabled by this
+checkpoint, and no push or broader SQL release pass is claimed.

@@ -3676,15 +3676,95 @@ pub fn ensureCoordinatedDecoderWithContext(service: anytype, command: metadata_s
 /// not only table writers. Every subsequent metadata append must preserve the
 /// decoder capable of interpreting that durable state.
 fn schemaReaderDecoderFloor(service: anytype) !u16 {
+    var required: u16 = 0;
     if (comptime @hasDecl(@TypeOf(service.*), "projectedStore")) {
         if (service.projectedStore()) |store| {
             if (comptime @hasDecl(@TypeOf(store.*), "getSchemaReaderFloor")) {
                 if ((try store.getSchemaReaderFloor(service.metadata_group_id)).active())
-                    return metadata_topology_protocol.schema_reader_floor_version;
+                    required = metadata_topology_protocol.schema_reader_floor_version;
+            }
+            // Pending private definitions can need the publication decoder
+            // before any native layout is installed. Reuse the monotonic
+            // durable activation instead of tying metadata safety to the
+            // data-reader floor or scanning table/job inventories per append.
+            if (comptime @hasDecl(@TypeOf(store.*), "topologyActivation")) {
+                if (try store.topologyActivation(service.metadata_group_id)) |activation| {
+                    if (activation.version >= metadata_topology_protocol.schema_reader_publication_version) {
+                        if (activation.version > metadata_topology_protocol.current_version or activation.member_count == 0)
+                            return error.TableTopologyProtocolUpgradeRequired;
+                        if (comptime !@hasDecl(@TypeOf(store.*), "getMetadataIncarnation"))
+                            return error.TableTopologyProtocolUpgradeRequired;
+                        const incarnation = (try store.getMetadataIncarnation(service.metadata_group_id)) orelse return error.TableTopologyProtocolUpgradeRequired;
+                        if (!std.meta.eql(incarnation, activation.incarnation)) return error.TableTopologyProtocolUpgradeRequired;
+                        required = @max(required, activation.version);
+                    }
+                }
             }
         }
     }
-    return 0;
+    return required;
+}
+
+test "system catalog schema reader publication durable activation guards ordinary appends before native floor" {
+    const Fake = struct {
+        metadata_group_id: u64 = 21,
+        source: Source = .{},
+        members: []const u16 = &.{ 39, 38, 39 },
+        const Source = struct {
+            activation: ?metadata_topology_protocol.Activation = null,
+            incarnation: ?metadata_mod.MetadataClusterIncarnation = "0123456789abcdef0123456789abcdef".*,
+            floor: metadata_table_manager.SchemaReaderFloor = .{},
+            pub fn getSchemaReaderFloor(self: *@This(), _: u64) !metadata_table_manager.SchemaReaderFloor {
+                return self.floor;
+            }
+            pub fn topologyActivation(self: *@This(), _: u64) !?metadata_topology_protocol.Activation {
+                return self.activation;
+            }
+            pub fn getMetadataIncarnation(self: *@This(), _: u64) !?metadata_mod.MetadataClusterIncarnation {
+                return self.incarnation;
+            }
+        };
+        pub fn projectedStore(self: *@This()) ?*Source {
+            return &self.source;
+        }
+        pub fn cachedCoordinatedDecoderReadiness(self: *@This(), version: u16) !TableTopologyProtocolReadiness {
+            for (self.members) |member| if (member < version) return error.TableTopologyProtocolUpgradeRequired;
+            return tableTopologyProtocolReadiness(1, version, self.source.incarnation, &.{ 1, 2, 3 });
+        }
+        pub fn ensureTableTopologyProtocolReadyWithContext(self: *@This(), _: api_operation.RequestContext, version: u16) !TableTopologyProtocolReadiness {
+            return self.cachedCoordinatedDecoderReadiness(version);
+        }
+    };
+    var service: Fake = .{};
+    const ordinary: metadata_storage.TransitionCommand = .{ .remove_node = .{ .node_id = 99 } };
+    const before = try prepareCoordinatedDecoderAdmission(&service, &.{ordinary});
+    try std.testing.expect(before.readiness == null);
+    service.source.activation = .{ .version = 39, .incarnation = service.source.incarnation.?, .member_count = 3, .membership_fingerprint = metadata_reallocation_request.membershipFingerprint(&.{ 1, 2, 3 }) };
+    try std.testing.expect(!service.source.floor.active());
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, validateRelationSourceDecoderFloor(&service, before));
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, ensureCoordinatedDecoderWithContext(&service, ordinary, .{}));
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, prepareCoordinatedDecoderAdmission(&service, &.{ordinary}));
+    service.members = &.{ 39, 39, 39 };
+    try ensureCoordinatedDecoderWithContext(&service, ordinary, .{});
+    const admitted = try prepareCoordinatedDecoderAdmission(&service, &.{ ordinary, ordinary });
+    try std.testing.expectEqual(@as(u16, 39), admitted.readiness.?.required_version);
+    try validateRelationSourceDecoderFloor(&service, admitted);
+    service.source.incarnation = null;
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, schemaReaderDecoderFloor(&service));
+    service.source.incarnation = "1123456789abcdef0123456789abcdef".*;
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, schemaReaderDecoderFloor(&service));
+    service.source.incarnation = service.source.activation.?.incarnation;
+    service.source.activation.?.member_count = 0;
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, schemaReaderDecoderFloor(&service));
+    service.source.activation.?.member_count = 3;
+    service.source.activation.?.version = metadata_topology_protocol.current_version + 1;
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, schemaReaderDecoderFloor(&service));
+    service.source.activation.?.version = 38;
+    try std.testing.expectEqual(@as(u16, 0), try schemaReaderDecoderFloor(&service));
+    service.source.floor = .{ .semantic_version = 30, .encoding_version = 31 };
+    try std.testing.expectEqual(@as(u16, 38), try schemaReaderDecoderFloor(&service));
+    service.source.activation.?.version = 39;
+    try std.testing.expectEqual(@as(u16, 39), try schemaReaderDecoderFloor(&service));
 }
 
 fn relationSourceDecoderFloor(service: anytype) !u16 {
@@ -3734,7 +3814,7 @@ const CoordinatedDecoderAdmission = struct {
 };
 
 fn topologyActivationAdmission(service: anytype, bytes: []const u8, readiness: TableTopologyProtocolReadiness) !CoordinatedDecoderAdmission {
-    if (bytes.len > 1024) return error.InvalidMetadataTransitionEncoding;
+    if (bytes.len > metadata_topology_protocol.max_activation_bytes) return error.InvalidMetadataTransitionEncoding;
     var parsed = try std.json.parseFromSlice(metadata_topology_protocol.Activation, service.alloc, bytes, .{});
     defer parsed.deinit();
     const activation = parsed.value;

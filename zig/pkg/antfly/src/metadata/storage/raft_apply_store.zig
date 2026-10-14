@@ -18399,11 +18399,13 @@ pub const RaftApplyStore = struct {
 
     pub fn topologyActivation(self: *RaftApplyStore, group_id: u64) !?topology_protocol.Activation {
         var key_buf: [160]u8 = undefined;
-        const bytes = self.store.get(self.alloc, try topologyActivationKeyForGroup(&key_buf, group_id)) catch |err| switch (err) {
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        const bytes = txn.get(try topologyActivationKeyForGroup(&key_buf, group_id)) catch |err| switch (err) {
             error.NotFound => return null,
             else => return err,
         };
-        defer self.alloc.free(bytes);
+        if (bytes.len > topology_protocol.max_activation_bytes) return error.InvalidMetadataTransitionEncoding;
         var parsed = try std.json.parseFromSlice(topology_protocol.Activation, self.alloc, bytes, .{});
         defer parsed.deinit();
         return parsed.value;
@@ -20741,7 +20743,7 @@ pub const RaftApplyStore = struct {
         const command = try relation_control.Command.decode(bytes);
         var buf: [160]u8 = undefined;
         const activation_bytes = (try stagingGet(txn, try topologyActivationKeyForGroup(&buf, group_id))) orelse return error.TableTopologyProtocolUpgradeRequired;
-        if (activation_bytes.len > 1024) return error.InvalidCatalogRecord;
+        if (activation_bytes.len > topology_protocol.max_activation_bytes) return error.InvalidCatalogRecord;
         var activation = try std.json.parseFromSlice(topology_protocol.Activation, self.alloc, activation_bytes, .{});
         defer activation.deinit();
         if (activation.value.version < command.requiredDecoderVersion()) return error.TableTopologyProtocolUpgradeRequired;
@@ -22454,6 +22456,7 @@ pub const RaftApplyStore = struct {
                 self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
             },
             .activate_topology_protocol => |bytes| {
+                if (bytes.len > topology_protocol.max_activation_bytes) return error.InvalidMetadataTransitionEncoding;
                 var parsed = try std.json.parseFromSlice(topology_protocol.Activation, self.alloc, bytes, .{});
                 defer parsed.deinit();
                 const activation = parsed.value;
@@ -27411,7 +27414,7 @@ test "system catalog schema reader floor advancement fences an uploaded baseline
 }
 
 fn schemaReaderDecoderActivationValid(a: std.mem.Allocator, bytes: []const u8, incarnation: metadata_incarnation.MetadataClusterIncarnation) !bool {
-    if (bytes.len > 1024) return error.InvalidCatalogRecord;
+    if (bytes.len > topology_protocol.max_activation_bytes) return error.InvalidCatalogRecord;
     var parsed = try std.json.parseFromSlice(topology_protocol.Activation, a, bytes, .{});
     defer parsed.deinit();
     const activation = parsed.value;
@@ -27845,7 +27848,7 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
             try appendRequiredString(alloc, &out, bytes);
         },
         .activate_topology_protocol => |bytes| {
-            if (bytes.len > 1024) return error.InvalidMetadataTransitionEncoding;
+            if (bytes.len > topology_protocol.max_activation_bytes) return error.InvalidMetadataTransitionEncoding;
             try out.append(alloc, @backingInt(TransitionTag.activate_topology_protocol));
             try appendRequiredString(alloc, &out, bytes);
         },
@@ -36392,6 +36395,58 @@ test "metadata raft apply store notifies committed key listeners for matched met
     try std.testing.expectEqual(@as(usize, 2), capture.matched);
     try std.testing.expect(capture.saw_table);
     try std.testing.expect(capture.saw_range);
+}
+
+test "system catalog schema reader table pending publication decoder activation survives reopen without native floor" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/pending-schema-decoder", .{tmp.sub_path});
+    defer a.free(root);
+    var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+    var open = true;
+    defer if (open) store.deinit();
+    const incarnation: metadata_incarnation.MetadataClusterIncarnation = "0123456789abcdef0123456789abcdef".*;
+    try store.applyStandaloneCommand(21, .{ .initialize_metadata_incarnation = incarnation });
+    var activation: topology_protocol.Activation = .{ .version = topology_protocol.schema_reader_publication_version, .incarnation = incarnation, .member_count = 3, .membership_fingerprint = @splat(1) };
+    const encoded = try std.json.Stringify.valueAlloc(a, activation, .{});
+    defer a.free(encoded);
+    try store.applyStandaloneCommand(21, .{ .activate_topology_protocol = encoded });
+    try std.testing.expect(!(try store.getSchemaReaderFloor(21)).active());
+    store.deinit();
+    open = false;
+    store = try RaftApplyStore.init(a, .{ .root_dir = root });
+    open = true;
+    try std.testing.expectEqualDeep(activation, (try store.topologyActivation(21)).?);
+    try std.testing.expect(!(try store.getSchemaReaderFloor(21)).active());
+    activation.version = topology_protocol.schema_reader_floor_version;
+    const older = try std.json.Stringify.valueAlloc(a, activation, .{});
+    defer a.free(older);
+    try store.applyStandaloneCommand(21, .{ .activate_topology_protocol = older });
+    try std.testing.expectEqual(topology_protocol.schema_reader_publication_version, (try store.topologyActivation(21)).?.version);
+    activation.version = topology_protocol.schema_reader_publication_version;
+    activation.incarnation = "1123456789abcdef0123456789abcdef".*;
+    const foreign = try std.json.Stringify.valueAlloc(a, activation, .{});
+    defer a.free(foreign);
+    try store.applyStandaloneCommand(21, .{ .activate_topology_protocol = foreign });
+    try std.testing.expectEqualDeep(incarnation, (try store.topologyActivation(21)).?.incarnation);
+    try std.testing.expect(!(try store.getSchemaReaderFloor(21)).active());
+    const oversized = try a.alloc(u8, topology_protocol.max_activation_bytes + 1);
+    defer a.free(oversized);
+    @memset(oversized, ' ');
+    @memcpy(oversized[0..encoded.len], encoded);
+    try std.testing.expectError(error.InvalidMetadataTransitionEncoding, store.applyStandaloneCommand(21, .{ .activate_topology_protocol = oversized }));
+    try std.testing.expectEqual(topology_protocol.schema_reader_publication_version, (try store.topologyActivation(21)).?.version);
+    // Simulate a corrupt imported/disk value, bypassing command validation.
+    var key_buf: [160]u8 = undefined;
+    const key = try RaftApplyStore.topologyActivationKeyForGroup(&key_buf, 21);
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(key, oversized);
+        try txn.commit();
+    }
+    try std.testing.expectError(error.InvalidMetadataTransitionEncoding, store.topologyActivation(21));
 }
 
 test "system catalog schema reader table requirements preserve canonical frames projections and CAS identity" {

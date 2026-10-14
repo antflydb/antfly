@@ -248,6 +248,9 @@ test "range membership is order independent and table scoped" {
     try std.testing.expect(!lhs.finish(7).eql(rhs.finish(7)));
 }
 
+/// One bound for producer admission, command framing and durable projection.
+pub const max_activation_bytes: usize = 1024;
+
 /// Replicated proof that this exact incarnation and membership can decode a
 /// protocol. Terms are deliberately excluded: elections do not undo activation.
 pub const Activation = struct {
