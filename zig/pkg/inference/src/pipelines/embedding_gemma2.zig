@@ -89,6 +89,8 @@ fn residentImagesEnabled(cb: *const ComputeBackend, options: Options) bool {
     return options.resident_images and (cb.kind() == .metal or cb.kind() == .cuda) and cb.supportsCopyRows2D() and cb.vtable.concatRows2D != null and cb.vtable.sliceRows2D != null;
 }
 pub const ReaderSelection = @import("embedding_gemma2_video.zig").ReaderSelection;
+pub const LiveStream = @import("embedding_gemma2_live_stream.zig").Stream;
+pub const LiveStreamDelivery = @import("embedding_gemma2_live_stream.zig").Delivery;
 pub const FrameCache = @import("embedding_gemma2_video.zig").FrameCache;
 pub const Result = struct { vector: []f32, input_tokens: usize };
 
@@ -150,13 +152,22 @@ pub fn embedNextLiveCached(out: std.mem.Allocator, session: Session, tokenizer: 
     defer coordinator.options.window.stream.control = old_control;
     var prepared = (try coordinator.pull(reader)) orelse return null;
     defer prepared.deinit();
+    const result = try embedPreparedLiveCached(out, session, tokenizer, coordinator, &prepared, caption, options, lock, control, cache);
+    errdefer if (result.result) |value| out.free(value.vector);
+    try coordinator.commit(&prepared);
+    return result;
+}
+/// Compute an independently owned vector without advancing the live window.
+/// Streaming delivery retains it until output acknowledgement and commit succeed.
+pub fn embedPreparedLiveCached(out: std.mem.Allocator, session: Session, tokenizer: Tokenizer, coordinator: *@import("antfly_video").live_coordinator.Coordinator, prepared: *@import("antfly_video").live_coordinator.Prepared, caption: ?[]const u8, options: Options, lock: ?*std.atomic.Mutex, control: ?Control, cache: ?*FrameCache) !LiveResult {
+    const effective = control orelse Control{};
+    try effective.check();
     const sampling = @import("embedding_gemma2_video.zig").Sampling{ .source_timestamps = prepared.policy };
     var selection: ?@import("embedding_gemma2_video.zig").ReaderSelection = if (prepared.has_pictures and prepared.logical != null) try @import("embedding_gemma2_video.zig").ReaderSelection.init(out, &prepared.window.reader, sampling, &prepared.logical.?, coordinator.options.window.stream.admission_pool, coordinator.options.window.stream.control) else null;
     defer if (selection) |*owner| owner.deinit();
     const parts = [_]Part{ .{ .sampled_video = .{ .reader = &prepared.window.reader, .sampling = sampling, .selection = if (selection) |*owner| owner else null } }, .{ .text = caption orelse "" } };
     const result: ?Result = if (prepared.has_pictures) try embedCached(out, session, tokenizer, .{ .content = parts[0..if (caption != null) 2 else 1] }, options, lock, control, cache) else null;
     errdefer if (result) |value| out.free(value.vector);
-    try coordinator.commit(&prepared);
     return .{ .result = result, .source_start_ns = prepared.source_start_ns, .source_end_ns = prepared.source_end_ns, .policy = prepared.policy, .ordinal = prepared.ordinal, .epoch = prepared.window.epoch, .dash_timing = prepared.dash_timing, .hls_timing = prepared.hls_timing };
 }
 
@@ -1937,4 +1948,46 @@ fn checkResidentAudioRows(cb: ComputeBackend, _: ComputeBackend) !void {
 
 test "embeddinggemma2 resident audio packing preserves clip isolation and rejects readbacks on Metal" {
     try @import("../ops/media_residency_test.zig").onMetal(populateResidentImageRows, checkResidentAudioRows);
+}
+
+test "embeddinggemma2 video streaming output copies retain independent normalized vectors" {
+    const a = std.testing.allocator;
+    var vector = [_]f32{ 0.6, 0.8 };
+    var delivery = LiveStreamDelivery{ .value = .{ .result = .{ .vector = &vector, .input_tokens = 7 }, .source_start_ns = 0, .source_end_ns = 1, .policy = .{ .start_ns = 0, .end_ns = 1, .step_ns = 1, .max_frames = 1 }, .ordinal = 0, .epoch = 0, .dash_timing = null, .hls_timing = null } };
+    const copy = try delivery.copy(a);
+    defer a.free(copy.result.?.vector);
+    try std.testing.expectEqualSlices(f32, &vector, copy.result.?.vector);
+    copy.result.?.vector[0] = -1;
+    try std.testing.expectEqual(@as(f32, 0.6), vector[0]);
+    delivery.acknowledge();
+    try std.testing.expect(delivery.acknowledged);
+}
+test "embeddinggemma2 video streaming cancellation precedes model and Reader access" {
+    const FakeReader = struct {
+        pub fn streamNext(_: *@This(), _: *anyopaque, _: *const fn (*anyopaque, *@import("antfly_media").http_stream.FragmentDelivery) anyerror!void) !?@import("antfly_media").http_stream.ResumeStats {
+            return error.UnexpectedReaderAccess;
+        }
+        pub fn ended(_: *const @This()) bool {
+            return false;
+        }
+    };
+    const Cancel = struct {
+        fn check(_: ?*const anyopaque) !void {
+            return error.Cancelled;
+        }
+        fn accept(_: *anyopaque, _: *LiveStreamDelivery) !void {
+            return error.UnexpectedOutput;
+        }
+    };
+    var flow: @import("antfly_video").live_coordinator.Coordinator = undefined;
+    const control = Control{ .check_fn = Cancel.check };
+    try std.testing.expectError(error.Cancelled, LiveStream.init(std.testing.allocator, undefined, undefined, &flow, null, .{}, null, control, null));
+    var stream: LiveStream = undefined;
+    stream.control = control;
+    var reader = FakeReader{};
+    try std.testing.expectError(error.Cancelled, stream.process(&reader, &reader, Cancel.accept));
+}
+
+test {
+    _ = @import("embedding_gemma2_live_stream.zig");
 }

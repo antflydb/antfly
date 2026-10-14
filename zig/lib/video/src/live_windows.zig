@@ -67,7 +67,7 @@ pub fn join(a: std.mem.Allocator, identity: []const u8, segments: []const media.
         if (segment.epoch != first.epoch or !sameTrack(first.reader.track, segment.reader.track)) return error.UnsupportedDynamicVideoConfig;
         if (first.dash_timing) |left| {
             const right = segment.dash_timing orelse return error.UnsupportedDynamicVideoConfig;
-            if (!std.meta.eql(left.period, right.period)) return error.UnsupportedDynamicVideoConfig;
+            if (!left.period.compatible(right.period)) return error.UnsupportedDynamicVideoConfig;
         } else if (segment.dash_timing != null) return error.UnsupportedDynamicVideoConfig;
         for (segment.reader.packets) |packet| {
             if (previous) |last| if (packet.media_dts < try std.math.add(i64, last.media_dts, last.duration)) return error.NonMonotonicMediaSegment;

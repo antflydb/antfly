@@ -1,0 +1,26 @@
+1/25 live_window_test_root.test_0...OK
+2/25 src.live_windows.test.live packet window joins units with independently owned source metadata and leases...OK
+3/25 src.live_windows.test.live packet window releases every failing allocation and shared reservation...OK
+4/25 src.live_windows.test.live packet window rejects mixed epochs duplicate clocks and packet bounds...OK
+5/25 src.live_coordinator.test.live coordinator derives validated progressive decode clock windows and commits eviction transactionally...OK
+6/25 src.live_coordinator.test.live coordinator capacity and watermark failures retain incoming unit ownership...OK
+7/25 src.live_coordinator.test.live coordinator pumps reloads and preserves fetched units across capacity retry...OK
+8/25 src.live_coordinator.test.live coordinator drains old epoch before accepting reset presentation clocks...OK
+9/25 src.live_coordinator.test.live coordinator allocation failures release decoder snapshots units and shared admission...OK
+10/25 src.live_coordinator.test.live coordinator emits explicit empty intervals without dropping future presentation samples...OK
+11/25 src.live_coordinator.test.live coordinator timing violations fail before transfer or payload reads...OK
+12/25 src.live_coordinator.test.live coordinator unfinished fields cap automatic and explicit watermarks...OK
+13/25 src.live_coordinator.test.live coordinator reuses admitted validation metadata across prepare commit and eviction...OK
+14/25 src.live_coordinator.test.live coordinator overlapping advance retains preroll retries and clipped tail ownership...OK
+15/25 src.live_coordinator.test.live coordinator window advance rejects invalid intervals and preserves window cap...OK
+16/25 src.live_coordinator.test.live coordinator rolling windows drain old epoch before accepting reset clocks...OK
+17/25 src.live_coordinator.test.live coordinator sparse window advance skips presentation intervals and stops at EOF...OK
+18/25 src.live_coordinator.test.live coordinator sparse pumping evicts skipped units within a two-unit budget...OK
+19/25 src.live_coordinator.test.live coordinator incremental validation avoids old packet reconstruction and matches replay...OK
+20/25 src.live_coordinator.test.live coordinator dynamic checkpoints preserve geometry windows and held output after eviction...OK
+21/25 src.live_coordinator.test.live coordinator dynamic checkpoint construction and replacement allocation failures clean up...OK
+22/25 src.live_coordinator.test.live coordinator dynamic failed append preserves owned checkpoint and retries retained preroll...OK
+23/25 src.live_coordinator.test.streamed live epoch transition drains old outputs before accepting new picture ownership...OK
+24/25 src.live_coordinator.test.streamed live compatible DASH period bounds do not reset decoded reference continuity...OK
+25/25 src.sampling.test.source timestamp sampling retains rational VFR boundaries across preroll eviction...OK
+All 25 tests passed.

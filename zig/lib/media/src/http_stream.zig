@@ -24,6 +24,8 @@ const live = @import("live_mp4.zig");
 /// otherwise it is destroyed when the callback returns, including on failure.
 pub const FragmentDelivery = struct {
     segment: ?live.Segment,
+    /// True only for the final fragment published after successful HTTP EOF.
+    body_complete: bool = false,
     /// Successful callback return acknowledges automatically. On failure the
     /// consumer may acknowledge an irreversible accepted side effect explicitly.
     /// Taking ownership alone does not acknowledge queue/model acceptance.
@@ -63,15 +65,18 @@ pub const ResumeOptions = struct {
     epoch: usize = 0,
     max_attempts: usize = 8,
     max_fragments: usize = 8192,
+    /// Stable manifest/resource identity when the same URL is reused.
+    resource_context: [32]u8 = @splat(0),
 };
 pub const ResumeStats = struct {
     transport: StreamStats = .{},
     replayed: usize = 0,
     acknowledged: usize = 0,
 };
-fn resumeBinding(url: []const u8, range: ?hls.Range, initialization: []const u8, epoch: usize, control: source.Control) ![32]u8 {
+fn resumeBinding(url: []const u8, range: ?hls.Range, initialization: []const u8, epoch: usize, resource_context: [32]u8, control: source.Control) ![32]u8 {
     var state = std.crypto.hash.sha2.Sha256.init(.{});
-    state.update("antfly-fmp4-replay-v1");
+    state.update("antfly-fmp4-replay-v2");
+    state.update(&resource_context);
     var header: [33]u8 = undefined;
     std.mem.writeInt(u64, header[0..8], url.len, .big);
     std.mem.writeInt(u64, header[8..16], epoch, .big);
@@ -285,8 +290,8 @@ pub fn Adapter(comptime http: type) type {
                     if (response.header("Content-Encoding")) |encoding| if (!std.ascii.eqlIgnoreCase(encoding, "identity")) return error.UnsupportedMediaEncoding;
                     sink.started = true;
                 }
-                fn publish(sink: *@This(), segment: live.Segment) !void {
-                    var delivery = FragmentDelivery{ .segment = segment };
+                fn publish(sink: *@This(), segment: live.Segment, body_complete: bool) !void {
+                    var delivery = FragmentDelivery{ .segment = segment, .body_complete = body_complete };
                     defer if (delivery.segment) |*owner| owner.deinit();
                     try sink.adapter.control.check();
                     sink.stats.fragments += 1;
@@ -307,7 +312,7 @@ pub fn Adapter(comptime http: type) type {
                         try sink.ingest.push(bytes[offset..end]);
                         sink.stats.largest_pending_capacity = @max(sink.stats.largest_pending_capacity, sink.ingest.pending.capacity);
                         offset = end;
-                        while (try sink.ingest.nextSegment(false)) |segment| try sink.publish(segment);
+                        while (try sink.ingest.nextSegment(false)) |segment| try sink.publish(segment, false);
                     }
                 }
             };
@@ -336,7 +341,7 @@ pub fn Adapter(comptime http: type) type {
             if (!sink.started) return error.UnexpectedHttpStatus;
             if (sink.stats.bytes == 0) return error.EmptyMediaResource;
             if (range) |requested| if (sink.stats.bytes != requested.length) return error.InvalidRemoteRange;
-            if (ingest.pending.items.len != 0) try sink.publish(try ingest.finishSegment());
+            if (ingest.pending.items.len != 0) try sink.publish(try ingest.finishSegment(), true);
             self.charged_bytes -= cap - sink.stats.bytes;
             return sink.stats;
         }
@@ -354,7 +359,7 @@ pub fn Adapter(comptime http: type) type {
             if (initialization.len > options.ingest.stream.max_bytes or initialization.len > options.ingest.max_ingested_bytes) return error.ResourceLimitExceeded;
             const url = try resolve(self.allocator, self.root_url, base, reference, self.limits.max_uri_bytes);
             defer self.allocator.free(url);
-            const binding = try resumeBinding(url, range, initialization, options.epoch, self.control);
+            const binding = try resumeBinding(url, range, initialization, options.epoch, options.resource_context, self.control);
             if (ledger.binding) |previous| if (!std.mem.eql(u8, &previous, &binding)) {
                 ledger.invalid = true;
                 return error.SourceVersionChanged;

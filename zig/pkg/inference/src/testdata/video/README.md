@@ -37,3 +37,13 @@ prepared F32 patch hashes against original MP4 and aligned TS. Independent
 packet/picture evidence and FFprobe's timestamp-loss limitation are recorded in
 `zig/lib/media/testdata/transport/assembly-validation`. This continuation does
 not rerun pretrained checkpoint inference for the split-layout files.
+
+`live-fragmented.mp4` is an exact copy of the synthetic Apache-2.0
+`zig/lib/media/testdata/fragmented.mp4` and
+`zig/lib/video/testdata/live/fragmented.mp4` fixture (SHA-256
+`8b0d6caa76acfa98258536bce04d1ae058ba2ff2c4dcfb4e109cd289bea8d8be`).
+Its existing generator and FFprobe receipts live in those libraries. The file
+contains six one-second moof/mdat fragments, 60 H.264 samples at 10 FPS and native
+1/10240 clocks. Its B-picture presentation timeline begins at 0.2 seconds and
+ends at 6.2 seconds. Streaming model tests use six one-second source windows,
+explicit output/commit retry and an authenticated server-withheld-tail gate.

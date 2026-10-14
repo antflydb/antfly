@@ -1,11 +1,23 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Stable DASH cursor across period-local segment-number resets and live windows.
 const std = @import("std");
 const hls = @import("hls.zig");
 pub fn compatible(old: hls.DashPeriod, new: hls.DashPeriod) bool {
-    return std.meta.eql(old.identity, new.identity) and std.meta.eql(old.configuration, new.configuration) and old.start_ms == new.start_ms and (old.duration_ms == null or old.duration_ms == new.duration_ms) and (old.next_start_ms == null or old.next_start_ms == new.next_start_ms) and (old.next_identity == null or std.meta.eql(old.next_identity, new.next_identity));
+    return old.compatible(new);
 }
 pub fn sameTiming(left: hls.DashTiming, right: hls.DashTiming) bool {
     return compatible(left.period, right.period) and left.start_ticks == right.start_ticks and left.duration_ticks == right.duration_ticks and left.timescale == right.timescale and left.presentation_offset == right.presentation_offset;

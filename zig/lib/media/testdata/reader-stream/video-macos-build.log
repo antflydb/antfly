@@ -1,0 +1,7 @@
+Build Summary: 5/5 steps succeeded; 267/269 tests passed (2 skipped)
+test-video success
++- run test 267 pass, 2 skip (269 total) 3m MaxRSS:380M
+   +- compile test debug native success 1m MaxRSS:1G
+      +- WriteFile macos-sdk-libc.txt cached
+      +- WriteFile video_prepare_shader.h cached
+

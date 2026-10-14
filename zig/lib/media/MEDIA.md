@@ -2004,6 +2004,48 @@ one prior fragment and publishes five new independent snapshots. See
 [replay qualification](testdata/http-replay/README.md) for final sources, executable hashes,
 raw logs and macOS/actual Linux ARM64 execution.
 
-Manifest `availabilityTimeComplete=false`, Reader-selected resource cursors and
-direct live model coordinator delivery remain active implementation work. The
-complete non-CUDA objective stays open.
+Manifest `availabilityTimeComplete=false` remains active implementation work.
+Reader-selected complete-resource streaming and model delivery are described below.
+The complete non-CUDA objective stays open.
+
+### Reader-selected streaming model delivery
+
+The live HLS/DASH Reader now streams a selected plaintext fMP4 resource through
+prefix-verified HTTP callbacks. Accepted fragments retain their clock/ordinal
+progress across transport, inference and consumer failure; the manifest cursor
+advances after successful resource EOF. Reload validates that an unfinished
+resource remains selected and immutable before replacing the owned playlist.
+Buffered next() cannot bypass unfinished streamed progress. Initialization and
+codec epochs are shared between both APIs, with cumulative byte/fragment limits.
+Resource context includes manifest addressing/sequence identity so reused URLs
+produce distinct immutable snapshot identities. Callback metadata distinguishes
+an early fragment from a completed DASH resource; compatible announcements of
+Period bounds preserve decoder continuity.
+
+`embedding_gemma2.LiveStream` owns copied caption/task parameters and persistent
+output retry state while borrowing the model session, tokenizer, coordinator and
+cache. A fragment moves into the coordinator before inference; its acknowledgement
+survives a later model/output failure. Each ready window computes one vector and
+retains its independently owned checkpoint and admitted preprocessing permit until
+output acknowledgement and coordinator commit succeed. An acknowledged output
+is not repeated after commit failure. Unacknowledged output retries the exact
+retained vector before requesting more HTTP bytes. New codec epochs drain old
+windows before transferring incoming ownership. Callbacks borrow vectors and can
+copy them for independent retention.
+
+The real authenticated chunked model server withholds its retry tail until a
+pretrained embedding callback executes. The test injects failure on the first
+computed output, checks that two accepted fragments survive, then retries the
+identical vector before any new request. Six source-time windows preserve the
+buffered model's vectors/token counts/clocks. The synthetic fixture's FFprobe
+clock is explicit: 60 pictures, six one-second fragments, presentation interval
+0.2–6.2 seconds. See [streaming model qualification](testdata/reader-stream/README.md) for source,
+binary, completion, ownership and platform evidence.
+
+This API currently streams complete plaintext fMP4 resources. Encrypted media,
+normalized TS and LL-HLS part/parent reconciliation retain buffered Reader APIs.
+Partial-DASH availability policies, append-only selected-resource cursor completion
+and those additional streaming formats remain active work. Reader transport and
+model controls are explicit borrowed controls whose owners outlive retained state;
+no callback-scoped control address is stored in the immutable source snapshots.
+The complete non-CUDA objective remains active.

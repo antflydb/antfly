@@ -29,6 +29,9 @@ pub const DashPeriod = struct {
     duration_ms: ?u64 = null,
     next_start_ms: ?u64 = null,
     next_identity: ?[32]u8 = null,
+    pub fn compatible(old: DashPeriod, new: DashPeriod) bool {
+        return std.meta.eql(old.identity, new.identity) and std.meta.eql(old.configuration, new.configuration) and old.start_ms == new.start_ms and (old.duration_ms == null or old.duration_ms == new.duration_ms) and (old.next_start_ms == null or old.next_start_ms == new.next_start_ms) and (old.next_identity == null or std.meta.eql(old.next_identity, new.next_identity));
+    }
 };
 pub const DashTiming = struct {
     period: DashPeriod = .{},
@@ -38,6 +41,10 @@ pub const DashTiming = struct {
     presentation_offset: u64,
     /// Explicit static lists can finish without an MPD period duration.
     final: bool = false,
+    /// Fragment snapshots retain parent addressing but cannot finish its Period
+    /// until the selected resource reaches successful EOF.
+    resource_complete: bool = true,
+    fragment_index: ?usize = null,
     pub const Time = struct { numerator: i128, denominator: u32 };
     /// Exact presentation milliseconds, avoiding float clock comparisons.
     pub fn presentationStart(self: DashTiming) Time {
@@ -48,12 +55,14 @@ pub const DashTiming = struct {
         return .{ .numerator = start.numerator + @as(i128, self.duration_ticks) * 1000, .denominator = start.denominator };
     }
     pub fn finishesPeriod(self: DashTiming) bool {
+        if (!self.resource_complete) return false;
         if (self.final) return true;
         const duration = self.period.duration_ms orelse return false;
         const end = (@as(i128, self.start_ticks) + self.duration_ticks - self.presentation_offset) * 1000;
         return end >= @as(i128, duration) * self.timescale;
     }
     pub fn startsPeriod(self: DashTiming) bool {
+        if (self.fragment_index) |index| if (index != 0) return false;
         return self.start_ticks <= self.presentation_offset and @as(u128, self.start_ticks) + self.duration_ticks > self.presentation_offset;
     }
 };

@@ -112,7 +112,7 @@ pub const Coordinator = struct {
         if (self.count == 0) return true;
         const first = self.units[0];
         if (first.epoch != unit.epoch) return false;
-        if (first.dash_timing) |left| return unit.dash_timing != null and std.meta.eql(left.period, unit.dash_timing.?.period);
+        if (first.dash_timing) |left| return unit.dash_timing != null and left.period.compatible(unit.dash_timing.?.period);
         return unit.dash_timing == null;
     }
     fn joined(self: *Coordinator, identity: []const u8, count: usize) !windows.Window {
@@ -357,6 +357,35 @@ pub const Coordinator = struct {
         std.mem.copyForwards(media.live_mp4.Segment, self.units[0 .. self.count - keep], self.units[keep..self.count]);
         self.count -= keep;
     }
+    /// Caller drains finished old-epoch windows before accepting a new epoch.
+    /// No incoming ownership transfers while an old output remains uncommitted.
+    pub fn beginEpoch(self: *Coordinator, unit: media.live_mp4.Segment) !void {
+        try self.options.window.stream.control.check();
+        if (self.sameEpoch(unit)) return;
+        try self.finish();
+        if (try self.prepare()) |value| {
+            var prepared = value;
+            prepared.deinit();
+            return error.LiveEpochUndrained;
+        }
+        self.resetEpoch();
+    }
+    fn resetEpoch(self: *Coordinator) void {
+        for (self.units[0..self.count]) |*unit| unit.deinit();
+        self.count = 0;
+        self.retained_bytes = 0;
+        self.start_ns = null;
+        self.sealed_ns = null;
+        self.tail_ns = 0;
+        self.pending_ns = null;
+        if (self.logical) |*logical| logical.deinit();
+        self.logical = null;
+        self.dropStream();
+        self.parameters.deinit();
+        self.logical_base = 0;
+        self.finished = false;
+        self.epoch_committed = false;
+    }
     /// Explicit reload bridge; bounded HTTP waiting is opt-in, and polling
     /// delay remains visible through reader.reloadAfterSeconds().
     pub fn reload(self: *Coordinator, reader: anytype, blocking: bool) !?Prepared {
@@ -377,20 +406,7 @@ pub const Coordinator = struct {
             if (!self.sameEpoch(self.pending.?)) {
                 try self.finish();
                 if (try self.prepare()) |prepared| return prepared;
-                for (self.units[0..self.count]) |*unit| unit.deinit();
-                self.count = 0;
-                self.retained_bytes = 0;
-                self.start_ns = null;
-                self.sealed_ns = null;
-                self.tail_ns = 0;
-                self.pending_ns = null;
-                if (self.logical) |*logical| logical.deinit();
-                self.logical = null;
-                self.dropStream();
-                self.parameters.deinit();
-                self.logical_base = 0;
-                self.finished = false;
-                self.epoch_committed = false;
+                self.resetEpoch();
             }
             try self.append(&self.pending);
             if (try self.prepare()) |prepared| return prepared;
@@ -1018,4 +1034,59 @@ test "live coordinator dynamic failed append preserves owned checkpoint and retr
     defer prepared.deinit();
     try assertDynamicPixels(a, &prepared, &reader, 2);
     try flow.commit(&prepared);
+}
+
+test "streamed live epoch transition drains old outputs before accepting new picture ownership" {
+    const a = std.testing.allocator;
+    var ingest = try media.live_mp4.Ingest.init(a, "streamed-epoch-old", fixture[0..797], .{});
+    defer ingest.deinit();
+    var old = try part(&ingest, 797, 20811);
+    defer if (old) |*unit| unit.deinit();
+    var replacement = try media.live_mp4.Ingest.init(a, "streamed-epoch-new", fixture[0..797], .{});
+    defer replacement.deinit();
+    replacement.epoch = 1;
+    var incoming = try part(&replacement, 797, 11206);
+    defer if (incoming) |*unit| unit.deinit();
+    var flow = try Coordinator.init(a, .{ .duration_ns = std.time.ns_per_s / 2 });
+    defer flow.deinit();
+    try flow.append(&old);
+    try std.testing.expectError(error.LiveEpochUndrained, flow.beginEpoch(incoming.?));
+    try std.testing.expect(incoming != null);
+    try std.testing.expectEqual(@as(usize, 0), flow.units[0].epoch);
+    while (try flow.prepare()) |value| {
+        var prepared = value;
+        defer prepared.deinit();
+        try flow.commit(&prepared);
+    }
+    try flow.beginEpoch(incoming.?);
+    try std.testing.expectEqual(@as(usize, 0), flow.count);
+    try flow.append(&incoming);
+    try std.testing.expect(incoming == null);
+    var prepared = (try flow.prepare()).?;
+    defer prepared.deinit();
+    try std.testing.expectEqual(@as(usize, 1), prepared.window.epoch);
+    try std.testing.expectEqual(@as(usize, 4), prepared.ordinal);
+    try std.testing.expectEqual(@as(i64, 200 * std.time.ns_per_ms), prepared.source_start_ns);
+}
+test "streamed live compatible DASH period bounds do not reset decoded reference continuity" {
+    const a = std.testing.allocator;
+    var ingest = try media.live_mp4.Ingest.init(a, "period-bounds", fixture[0..797], .{});
+    defer ingest.deinit();
+    var first = try part(&ingest, 797, 11206);
+    defer if (first) |*unit| unit.deinit();
+    var next_unit = try part(&ingest, 11206, 20811);
+    defer if (next_unit) |*unit| unit.deinit();
+    first.?.dash_timing = .{ .start_ticks = 0, .duration_ticks = 10240, .timescale = 10240, .presentation_offset = 0 };
+    next_unit.?.dash_timing = .{ .period = .{ .duration_ms = 2000 }, .start_ticks = 10240, .duration_ticks = 10240, .timescale = 10240, .presentation_offset = 0 };
+    var flow = try Coordinator.init(a, .{ .duration_ns = std.time.ns_per_s });
+    defer flow.deinit();
+    try flow.append(&first);
+    try flow.beginEpoch(next_unit.?);
+    try std.testing.expect(!flow.finished);
+    try flow.append(&next_unit);
+    try std.testing.expectEqual(@as(usize, 2), flow.count);
+    var prepared = (try flow.prepare()).?;
+    defer prepared.deinit();
+    try std.testing.expect(prepared.has_pictures);
+    try std.testing.expectEqual(@as(i64, 1200 * std.time.ns_per_ms), prepared.source_end_ns);
 }
