@@ -763,3 +763,174 @@ test "production partial DASH authenticates growing HTTP versions and advances o
     defer packet.deinit();
     try std.testing.expect(packet.bytes.len != 0);
 }
+
+test "production encrypted HTTP fragment replay publishes before tail and retries truncated ciphertext" {
+    const bytes = @embedFile("testdata/hls/aes-stream/media.bin");
+    const clear = @embedFile("testdata/fragmented.mp4");
+    const key: [16]u8 = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f".*;
+    var iv: [16]u8 = @splat(0);
+    iv[15] = 10;
+    const options = media.http_stream.ResumeOptions{ .encryption = .{ .key = &key, .iv = iv } };
+    const State = struct {
+        first_delivered: std.Io.Event = .unset,
+        new_delivered: std.Io.Event = .unset,
+        sent_retry_tail: std.atomic.Value(bool) = .init(false),
+        count: usize = 0,
+        held: [6]?media.live_mp4.Segment = @splat(null),
+        fn serve(self: *@This(), listener: *http.TcpListener) !void {
+            for (0..2) |attempt| {
+                const accepted = try listener.accept();
+                var socket = accepted.socket;
+                defer socket.close();
+                try socket.setRecvTimeout(5000);
+                try socket.setSendTimeout(5000);
+                var request: [4096]u8 = undefined;
+                var used: usize = 0;
+                while (std.mem.indexOf(u8, request[0..used], "\r\n\r\n") == null) {
+                    if (used == request.len) return error.TestUnexpectedResult;
+                    const n = try socket.recv(request[used..]);
+                    if (n == 0) return error.UnexpectedEof;
+                    used += n;
+                }
+                try std.testing.expect(std.ascii.findIgnoreCase(request[0..used], "authorization: Bearer fixture-token\r\n") != null);
+                try std.testing.expect(std.ascii.findIgnoreCase(request[0..used], "accept-encoding: identity\r\n") != null);
+                try socket.sendAll("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
+                if (attempt == 0) {
+                    try chunk(&socket, bytes[0 .. ((11206 + 8 - 797 + 16 + 15) / 16) * 16]);
+                    try self.first_delivered.wait(std.testing.io);
+                    // Close without a terminating chunk: the first accepted
+                    // fragment survives a genuinely incomplete HTTP response.
+                } else {
+                    const boundary = ((20811 + 8 - 797 + 16 + 15) / 16) * 16;
+                    try chunk(&socket, bytes[0..boundary]);
+                    // Retry must suppress the old prefix, then deliver the next
+                    // fragment before the server is allowed to send the tail.
+                    try self.new_delivered.wait(std.testing.io);
+                    self.sent_retry_tail.store(true, .release);
+                    try chunk(&socket, bytes[boundary..]);
+                    try socket.sendAll("0\r\n\r\n");
+                }
+            }
+        }
+        fn chunk(socket: *http.Socket, body: []const u8) !void {
+            var header: [32]u8 = undefined;
+            try socket.sendAll(try std.fmt.bufPrint(&header, "{x}\r\n", .{body.len}));
+            try socket.sendAll(body);
+            try socket.sendAll("\r\n");
+        }
+        fn accept(raw: *anyopaque, delivery: *media.http_stream.FragmentDelivery) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.count >= self.held.len) return error.TestUnexpectedResult;
+            try std.testing.expectEqual(self.count, delivery.segment.?.ordinal);
+            if (self.count == 1) try std.testing.expect(!self.sent_retry_tail.load(.acquire));
+            self.held[self.count] = try delivery.take();
+            self.count += 1;
+            if (self.count == 1) self.first_delivered.set(std.testing.io);
+            if (self.count == 2) self.new_delivered.set(std.testing.io);
+        }
+    };
+    var state = State{};
+    defer for (&state.held) |*entry| if (entry.*) |*segment| segment.deinit();
+    var listener = try http.TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, std.testing.io);
+    defer listener.deinit();
+    const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/media.m4s", .{listener.getLocalAddress().getPort()});
+    defer a.free(url);
+    var client = http.Client.initWithConfig(a, std.testing.io, .{ .default_headers = &.{.{ "Authorization", "Bearer fixture-token" }} });
+    defer client.deinit();
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 4 * 1024 * 1024 } };
+    var transport = media.http_stream.Adapter(http){ .allocator = a, .client = &client, .root_url = url, .pool = &pool, .limits = .{ .timeout_ms = 5000 } };
+    var ledger = media.http_stream.FragmentLedger{};
+    var serving = try std.testing.io.concurrent(State.serve, .{ &state, &listener });
+    defer _ = serving.cancel(std.testing.io) catch {};
+    try std.testing.expectError(error.UnexpectedEof, transport.streamFmp4Resuming(url, "media.m4s", null, bytes.len, clear[0..797], &ledger, options, &state, State.accept));
+    try std.testing.expectEqual(@as(usize, 1), ledger.acknowledged);
+    try std.testing.expect(!ledger.invalid and !ledger.complete);
+    const result = try transport.streamFmp4Resuming(url, "media.m4s", null, bytes.len, clear[0..797], &ledger, options, &state, State.accept);
+    try serving.await(std.testing.io);
+    try std.testing.expectEqual(@as(usize, 1), result.replayed);
+    try std.testing.expectEqual(@as(usize, 5), result.acknowledged);
+    try std.testing.expectEqual(@as(usize, 2), transport.requests);
+    try std.testing.expect(ledger.complete);
+    try std.testing.expectEqual(bytes.len, result.transport.bytes);
+    try std.testing.expectEqual(clear.len - 797, result.transport.plaintext_bytes);
+    for (&state.held) |*entry| {
+        var lease = try entry.*.?.reader.readPacket(0);
+        try std.testing.expect(lease.bytes.len > 0);
+        lease.deinit();
+        entry.*.?.deinit();
+        entry.* = null;
+    }
+    try std.testing.expectEqual(@as(usize, 0), pool.snapshot().host_bytes);
+}
+
+test "production HLS AES streaming authenticates keys decrypts exact ranges and rotates retained packets" {
+    const key1 = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f";
+    const key2 = "\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f";
+    const init = @embedFile("testdata/hls/aes/init1.bin");
+    const first = @embedFile("testdata/hls/aes/media10.bin");
+    const second = @embedFile("testdata/hls/aes/media11.bin");
+    const total = first.len + second.len;
+    const manifest = std.fmt.comptimePrint("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:10\n#EXT-X-KEY:METHOD=AES-128,URI=\"key1\",IV=0x1\n#EXT-X-MAP:URI=\"init\"\n#EXT-X-KEY:METHOD=AES-128,URI=\"key1\"\n#EXTINF:1,\n#EXT-X-BYTERANGE:{d}@0\nblob\n#EXT-X-KEY:METHOD=AES-128,URI=\"key2\"\n#EXTINF:1,\n#EXT-X-BYTERANGE:{d}\nblob\n#EXT-X-ENDLIST\n", .{ first.len, second.len });
+    const Ranges = struct {
+        fn firstRange(request: http.testing_mod.RequestInfo) !void {
+            try Verify.auth(request);
+            try std.testing.expectEqualStrings(std.fmt.comptimePrint("bytes=0-{d}", .{first.len - 1}), request.header("Range").?);
+        }
+        fn secondRange(request: http.testing_mod.RequestInfo) !void {
+            try Verify.auth(request);
+            try std.testing.expectEqualStrings(std.fmt.comptimePrint("bytes={d}-{d}", .{ first.len, total - 1 }), request.header("Range").?);
+        }
+    };
+    var server = try http.testing_mod.TestServer.start(a, std.testing.io, &.{
+        .{ .path = "/aes/list.m3u8", .assert_request = Verify.auth, .respond = .{ .body = manifest } },
+        .{ .path = "/aes/key1", .assert_request = Verify.auth, .max_uses = 1, .respond = .{ .body = key1 } },
+        .{ .path = "/aes/key2", .assert_request = Verify.auth, .max_uses = 1, .respond = .{ .body = key2 } },
+        .{ .path = "/aes/init", .assert_request = Verify.auth, .respond = .{ .body = init } },
+        .{ .path = "/aes/blob", .assert_request = Ranges.firstRange, .max_uses = 1, .respond = .{ .status = 206, .headers = &.{.{ .name = "Content-Range", .value = std.fmt.comptimePrint("bytes 0-{d}/{d}", .{ first.len - 1, total }) }}, .body = first } },
+        .{ .path = "/aes/blob", .assert_request = Ranges.secondRange, .max_uses = 1, .respond = .{ .status = 206, .headers = &.{.{ .name = "Content-Range", .value = std.fmt.comptimePrint("bytes {d}-{d}/{d}", .{ first.len, total - 1, total }) }}, .body = second } },
+    });
+    defer server.deinit();
+    var client = http.Client.initWithConfig(a, std.testing.io, .{ .default_headers = &.{.{ "Authorization", "Bearer fixture-token" }} });
+    defer client.deinit();
+    const url = try std.fmt.allocPrint(a, "{s}/aes/list.m3u8", .{server.baseUrl()});
+    defer a.free(url);
+    var transport = media.http_stream.Adapter(http){ .allocator = a, .client = &client, .root_url = url };
+    var reader = try media.hls_live.Reader(http).init(a, &transport, url, .{});
+    defer reader.deinit();
+    var serving = try std.testing.io.concurrent(Verify.serve, .{ &server, 6 });
+    defer _ = serving.cancel(std.testing.io) catch {};
+    const Capture = struct {
+        unit: ?media.live_mp4.Segment = null,
+        fn accept(raw: *anyopaque, delivery: *media.http_stream.FragmentDelivery) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.unit != null) return error.TestUnexpectedResult;
+            try std.testing.expect(delivery.body_complete);
+            self.unit = try delivery.take();
+        }
+        fn take(self: *@This()) media.live_mp4.Segment {
+            const value = self.unit.?;
+            self.unit = null;
+            return value;
+        }
+    };
+    var capture = Capture{};
+    defer if (capture.unit) |*unit| unit.deinit();
+    try reader.reload();
+    _ = try reader.streamNext(&capture, Capture.accept);
+    var one = capture.take();
+    defer one.deinit();
+    const original = @embedFile("testdata/fragmented.mp4");
+    try std.testing.expectEqualSlices(u8, original[0..11206], one.backing.bytes);
+    var held = try one.reader.readPacket(0);
+    defer held.deinit();
+    const retained = try a.dupe(u8, held.bytes);
+    defer a.free(retained);
+    _ = try reader.streamNext(&capture, Capture.accept);
+    var two = capture.take();
+    defer two.deinit();
+    try std.testing.expectEqual(@as(usize, 0), two.epoch);
+    try std.testing.expectEqualSlices(u8, retained, held.bytes);
+    try std.testing.expect(reader.ended());
+    try serving.await(std.testing.io);
+    try std.testing.expectEqual(@as(usize, 6), transport.requests);
+}

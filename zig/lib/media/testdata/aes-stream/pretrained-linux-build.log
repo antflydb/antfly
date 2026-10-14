@@ -1,0 +1,15 @@
+Build Summary: 11/11 steps succeeded
+test-bin success
++- install test success
+   +- compile test safe aarch64-linux-musl success 4m MaxRSS:4G
+      +- options cached
+      +- WriteFile tokenizer.json cached
+      +- run exe patch_sentencepiece_proto (sentencepiece_proto) cached
+      |  +- compile exe patch_sentencepiece_proto safe native cached 56ms MaxRSS:31M
+      |  |  +- WriteFile macos-sdk-libc.txt cached
+      |  +- run exe protoc-zig (sentencepiece_proto_raw) cached
+      |  |  +- compile exe protoc-zig safe native cached 56ms MaxRSS:31M
+      |  |     +- WriteFile macos-sdk-libc.txt (reused)
+      |  +- run exe protoc-zig (sentencepiece_proto_raw) (+1 more reused dependencies)
+      +- options cached
+

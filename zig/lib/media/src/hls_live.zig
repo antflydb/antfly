@@ -458,20 +458,21 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
             const timing = item.dash orelse return false;
             return (@as(i128, end) - start) * timing.timescale >= @as(i128, timing.duration_ticks) * scale;
         }
-        /// Stream one selected plaintext fMP4 resource with callback backpressure.
+        /// Stream one selected plaintext or whole-object AES fMP4 resource with
+        /// callback backpressure.
         /// Fragment acceptance survives failures; the manifest cursor commits
         /// only after successful EOF and, for partial DASH, a continuous native
         /// decode span covering the advertised resource duration. Retry/reload
         /// cannot silently drop or mutate
         /// the selected resource. next() cannot mix buffered consumption into an
-        /// unfinished streaming resource. AES/TS/LL-HLS parts retain next().
+        /// unfinished streaming resource. TS/LL-HLS parts retain next().
         pub fn streamNext(self: *Self, context: *anyopaque, accept: *const fn (*anyopaque, *network.FragmentDelivery) anyerror!void) !?network.ResumeStats {
             try self.transport.control.check();
             if (self.stream_call_active) return error.InvalidMediaStreamState;
             const playlist = self.playlist orelse return error.MediaPlaylistRequired;
             const item = (try self.selectedResource(playlist)) orelse return null;
             if (item.part) |part| if (part.gap) return error.MediaStreamGap;
-            if (item.initialization.uri.len == 0 or item.encryption != null) return error.UnsupportedStreamingResource;
+            if (item.initialization.uri.len == 0) return error.UnsupportedStreamingResource;
             if (item.part != null or self.next_part != 0) return error.UnsupportedHlsStreamingParts;
             if (self.ingest) |*ingest| if (ingest.pending.items.len != 0) return error.PendingMediaSegment;
             const key = try self.streamDescriptor(item);
@@ -486,6 +487,7 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
                 self.stream_was_partial = !item.availability_complete;
                 self.stream_ledger = .{};
             }
+            const encryption: ?network.Encryption = if (item.encryption) |declaration| .{ .key = try self.loadKey(declaration), .iv = declaration.mediaIv(item.sequence) } else null;
             if (self.stream_ledger.complete) try self.stream_ledger.reopen();
             const Sink = struct {
                 owner: *Self,
@@ -547,7 +549,7 @@ pub fn ReaderWithManifest(comptime http: type, comptime manifest_parser: type) t
             defer self.ingest.?.ingested_bytes += self.transport.transferred_bytes - transferred_before;
             const remaining = self.ingest.?.options.max_ingested_bytes -| self.ingest.?.ingested_bytes;
             const resource_limit: usize = @intCast(@min(options.stream.max_bytes, remaining));
-            var result = try self.transport.streamFmp4Resuming(self.mediaUrl(), item.uri, item.range, resource_limit, self.ingest.?.initialization.bytes, &self.stream_ledger, .{ .ingest = options, .epoch = self.ingest.?.epoch, .max_attempts = self.options.max_resource_attempts, .resource_context = key }, &sink, Sink.publish);
+            var result = try self.transport.streamFmp4Resuming(self.mediaUrl(), item.uri, item.range, resource_limit, self.ingest.?.initialization.bytes, &self.stream_ledger, .{ .ingest = options, .epoch = self.ingest.?.epoch, .max_attempts = self.options.max_resource_attempts, .resource_context = key, .encryption = encryption }, &sink, Sink.publish);
             result.resource_complete = if (self.stream_start_decode_time) |start| self.completeResource(item, start, self.ingest.?.next_decode_time.?, self.stream_track_scale) else false;
             if (!result.resource_complete) {
                 if (item.availability_complete) return error.IncompleteMediaSegment;
@@ -1108,6 +1110,9 @@ const AesHttp = struct {
         short_key: bool = false,
         changed_key1: bool = false,
         reused_media11: bool = false,
+        stream_body: ?[]const u8 = null,
+        fail_stream_prefix: bool = false,
+        stream_complete: bool = false,
         pub fn get(self: *@This(), url: []const u8, _: anytype) !FakeHttp.Response {
             self.calls += 1;
             if (std.mem.endsWith(u8, url, "list.m3u8")) return .{ .body = self.manifest };
@@ -1123,6 +1128,22 @@ const AesHttp = struct {
             if (std.mem.endsWith(u8, url, "media11")) return .{ .body = @embedFile("../testdata/hls/aes/media11.bin") };
             if (std.mem.endsWith(u8, url, "changed12")) return .{ .body = @embedFile("../testdata/hls/aes/changed12.bin") };
             return error.UnexpectedAesResource;
+        }
+
+        pub fn getToWriter(self: *@This(), url: []const u8, options: anytype, writer: anytype, _: anytype, _: anytype) !FakeHttp.Response {
+            self.stream_complete = false;
+            const response = try self.get(url, options);
+            try writer.startResponse(response);
+            const body = self.stream_body orelse response.body.?;
+            var offset: usize = 0;
+            while (offset < body.len) {
+                if (self.fail_stream_prefix and offset >= 11206 - 797 + 64) return error.ConnectionReset;
+                const end = @min(body.len, offset + 128);
+                try writer.writeAll(body[offset..end]);
+                offset = end;
+            }
+            self.stream_complete = true;
+            return response;
         }
     };
 };
@@ -1971,4 +1992,97 @@ test "partial DASH rejects a new fragment decode gap without advancing accepted 
     try std.testing.expect(result.resource_complete);
     try std.testing.expectEqual(@as(usize, 6), capture.count);
     try std.testing.expect(reader.ended());
+}
+
+const aes_stream_manifest = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:10\n#EXT-X-KEY:METHOD=AES-128,URI=\"key1\",IV=0x1\n#EXT-X-MAP:URI=\"init1\"\n#EXT-X-KEY:METHOD=AES-128,URI=\"key1\"\n#EXTINF:6,\nmedia10\n#EXT-X-ENDLIST\n";
+const EncryptedCapture = struct {
+    count: usize = 0,
+    held: [8]?live.Segment = @splat(null),
+    fn deinit(self: *@This()) void {
+        for (&self.held) |*entry| if (entry.*) |*unit| unit.deinit();
+    }
+    fn accept(raw: *anyopaque, delivery: *network.FragmentDelivery) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        try std.testing.expectEqual(self.count, delivery.segment.?.ordinal);
+        self.held[self.count] = try delivery.take();
+        self.count += 1;
+    }
+};
+test "live HLS encrypted streaming refreshes keys on reload and preserves accepted fragments across transport failure" {
+    var client = AesHttp.Client{ .manifest = aes_stream_manifest, .stream_body = @embedFile("../testdata/hls/aes-stream/media.bin"), .fail_stream_prefix = true };
+    var transport = network.Adapter(AesHttp){ .allocator = std.testing.allocator, .client = &client, .root_url = "https://example.test/live/list.m3u8" };
+    var reader = try Reader(AesHttp).init(std.testing.allocator, &transport, transport.root_url, .{});
+    defer reader.deinit();
+    var capture = EncryptedCapture{};
+    defer capture.deinit();
+    try reader.reload();
+    try std.testing.expectError(error.ConnectionReset, reader.streamNext(&capture, EncryptedCapture.accept));
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expectEqual(@as(u64, 10), reader.next_sequence.?);
+    try std.testing.expectEqual(@as(usize, 1), client.key_calls);
+    try reader.reload();
+    client.fail_stream_prefix = false;
+    const result = (try reader.streamNext(&capture, EncryptedCapture.accept)).?;
+    try std.testing.expectEqual(@as(usize, 1), result.replayed);
+    try std.testing.expectEqual(@as(usize, 5), result.acknowledged);
+    try std.testing.expectEqual(@as(usize, 2), client.key_calls);
+    try std.testing.expectEqual(@as(usize, 6), capture.count);
+    try std.testing.expectEqual(@as(u64, 11), reader.next_sequence.?);
+    try std.testing.expect(reader.ended());
+    var packet = try capture.held[0].?.reader.readPacket(0);
+    defer packet.deinit();
+    try std.testing.expect(packet.bytes.len != 0);
+}
+test "live HLS encrypted streaming reused key URI cannot change an accepted resource binding" {
+    var client = AesHttp.Client{ .manifest = aes_stream_manifest, .stream_body = @embedFile("../testdata/hls/aes-stream/media.bin"), .fail_stream_prefix = true };
+    var transport = network.Adapter(AesHttp){ .allocator = std.testing.allocator, .client = &client, .root_url = "https://example.test/live/list.m3u8" };
+    var reader = try Reader(AesHttp).init(std.testing.allocator, &transport, transport.root_url, .{});
+    defer reader.deinit();
+    var capture = EncryptedCapture{};
+    defer capture.deinit();
+    try reader.reload();
+    try std.testing.expectError(error.ConnectionReset, reader.streamNext(&capture, EncryptedCapture.accept));
+    try reader.reload();
+    client.changed_key1 = true;
+    client.fail_stream_prefix = false;
+    const calls = client.calls;
+    try std.testing.expectError(error.SourceVersionChanged, reader.streamNext(&capture, EncryptedCapture.accept));
+    try std.testing.expectEqual(calls + 1, client.calls); // Key refresh only, no media request.
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expectEqual(@as(u64, 10), reader.next_sequence.?);
+}
+test "live HLS encrypted streaming rotates keys between resources without invalidating prior packets" {
+    var client = AesHttp.Client{};
+    var transport = network.Adapter(AesHttp){ .allocator = std.testing.allocator, .client = &client, .root_url = "https://example.test/live/list.m3u8" };
+    var reader = try Reader(AesHttp).init(std.testing.allocator, &transport, transport.root_url, .{});
+    defer reader.deinit();
+    var capture = EncryptedCapture{};
+    defer capture.deinit();
+    try reader.reload();
+    _ = try reader.streamNext(&capture, EncryptedCapture.accept);
+    var old = try capture.held[0].?.reader.readPacket(0);
+    defer old.deinit();
+    const copy = try std.testing.allocator.dupe(u8, old.bytes);
+    defer std.testing.allocator.free(copy);
+    _ = try reader.streamNext(&capture, EncryptedCapture.accept);
+    try std.testing.expectEqual(@as(usize, 2), client.key_calls);
+    try std.testing.expect(reader.ended());
+    try std.testing.expectEqualSlices(u8, copy, old.bytes);
+}
+fn encryptedReaderAllocations(a: std.mem.Allocator) !void {
+    var client = AesHttp.Client{ .manifest = aes_stream_manifest, .stream_body = @embedFile("../testdata/hls/aes-stream/media.bin"), .fail_stream_prefix = true };
+    var transport = network.Adapter(AesHttp){ .allocator = a, .client = &client, .root_url = "https://example.test/live/list.m3u8" };
+    var reader = try Reader(AesHttp).init(a, &transport, transport.root_url, .{});
+    defer reader.deinit();
+    var capture = EncryptedCapture{};
+    defer capture.deinit();
+    try reader.reload();
+    _ = reader.streamNext(&capture, EncryptedCapture.accept) catch |err| {
+        if (err != error.ConnectionReset) return err;
+    };
+    client.fail_stream_prefix = false;
+    _ = try reader.streamNext(&capture, EncryptedCapture.accept);
+}
+test "live HLS encrypted streaming allocation failures drain keys initialization and independent packets" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, encryptedReaderAllocations, .{});
 }

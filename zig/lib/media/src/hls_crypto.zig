@@ -112,6 +112,193 @@ pub fn decrypt(bytes: []u8, key: *const [16]u8, iv: [16]u8, control: source.Cont
     return bytes[0 .. bytes.len - padding];
 }
 
+/// Bounded CBC body decoder. Retains one final plaintext block until PKCS7 is
+/// validated at EOF, plus an incomplete ciphertext block. Callback slices are
+/// transient and must be copied/consumed before returning. Errors terminalize
+/// and erase the key schedule; retry requires a fresh decoder and prefix replay.
+pub const Stream = struct {
+    /// Conservative fixed stack/key-schedule envelope charged by HTTP admission.
+    pub const workspace_bytes: usize = 16 * 1024;
+    ctx: std.crypto.core.aes.AesDecryptCtx(std.crypto.core.aes.Aes128),
+    previous: [16]u8,
+    carry: [16]u8 = @splat(0),
+    carry_len: usize = 0,
+    pending: [16]u8 = @splat(0),
+    has_pending: bool = false,
+    control: source.Control,
+    ended: bool = false,
+    active: bool = false,
+    pub fn init(key: *const [16]u8, iv: [16]u8, control: source.Control) Stream {
+        return .{ .ctx = std.crypto.core.aes.Aes128.initDec(key.*), .previous = iv, .control = control };
+    }
+    pub fn deinit(self: *Stream) void {
+        std.crypto.secureZero(u8, std.mem.asBytes(self));
+        self.ended = true;
+    }
+    pub fn push(self: *Stream, bytes: []const u8, context: anytype, comptime write: anytype) !void {
+        if (self.ended or self.active) return error.InvalidHlsCipherState;
+        self.active = true;
+        defer self.active = false;
+        errdefer self.deinit();
+        try self.control.check();
+        var output: [8192]u8 = undefined;
+        defer std.crypto.secureZero(u8, &output);
+        var used: usize = 0;
+        var offset: usize = 0;
+        var next_check: usize = 4096;
+        while (offset < bytes.len) {
+            if (offset >= next_check) {
+                try self.control.check();
+                next_check = offset +| 4096;
+            }
+            if (used + 64 > output.len) {
+                try write(context, output[0..used]);
+                used = 0;
+            }
+            if (self.carry_len == 0 and bytes.len - offset >= 64) {
+                const cipher = bytes[offset..][0..64].*;
+                var plain: [64]u8 = undefined;
+                defer std.crypto.secureZero(u8, &plain);
+                self.ctx.decryptWide(4, &plain, &cipher);
+                inline for (0..4) |block| {
+                    const before = if (block == 0) self.previous else cipher[(block - 1) * 16 ..][0..16].*;
+                    const left: @Vector(16, u8) = plain[block * 16 ..][0..16].*;
+                    const right: @Vector(16, u8) = before;
+                    plain[block * 16 ..][0..16].* = left ^ right;
+                }
+                if (self.has_pending) {
+                    @memcpy(output[used..][0..16], &self.pending);
+                    used += 16;
+                }
+                @memcpy(output[used..][0..48], plain[0..48]);
+                used += 48;
+                self.pending = plain[48..64].*;
+                self.has_pending = true;
+                self.previous = cipher[48..64].*;
+                offset += 64;
+            } else {
+                const count = @min(16 - self.carry_len, bytes.len - offset);
+                @memcpy(self.carry[self.carry_len..][0..count], bytes[offset..][0..count]);
+                self.carry_len += count;
+                offset += count;
+                if (self.carry_len != 16) continue;
+                var plain: [16]u8 = undefined;
+                defer std.crypto.secureZero(u8, &plain);
+                self.ctx.decrypt(&plain, &self.carry);
+                if (self.has_pending) {
+                    @memcpy(output[used..][0..16], &self.pending);
+                    used += 16;
+                }
+                const left: @Vector(16, u8) = plain;
+                const right: @Vector(16, u8) = self.previous;
+                self.pending = left ^ right;
+                self.previous = self.carry;
+                self.has_pending = true;
+                self.carry_len = 0;
+            }
+        }
+        if (used != 0) try write(context, output[0..used]);
+        try self.control.check();
+    }
+    pub fn finish(self: *Stream, context: anytype, comptime write: anytype) !void {
+        if (self.ended or self.active) return error.InvalidHlsCipherState;
+        self.active = true;
+        defer self.deinit();
+        try self.control.check();
+        if (self.carry_len != 0 or !self.has_pending) return error.InvalidHlsCiphertext;
+        const padding: usize = self.pending[15];
+        if (padding == 0 or padding > 16) return error.InvalidHlsCiphertext;
+        var invalid: u8 = 0;
+        for (self.pending[16 - padding ..]) |byte| invalid |= byte ^ @as(u8, @intCast(padding));
+        if (invalid != 0) return error.InvalidHlsCiphertext;
+        if (padding != 16) try write(context, self.pending[0 .. 16 - padding]);
+        try self.control.check();
+    }
+};
+
+test "HLS streaming CBC matches independent OpenSSL vectors for every chunk boundary" {
+    const a = std.testing.allocator;
+    const fixture = @embedFile("../testdata/hls/aes/vectors.bin");
+    const Capture = struct {
+        bytes: std.ArrayList(u8) = .empty,
+        fn write(self: *@This(), bytes: []const u8) !void {
+            try self.bytes.appendSlice(std.testing.allocator, bytes);
+        }
+    };
+    var key: [16]u8 = undefined;
+    var iv: [16]u8 = undefined;
+    for (0..16) |i| {
+        key[i] = @intCast(i);
+        iv[i] = @intCast(15 - i);
+    }
+    var cursor: usize = 0;
+    while (cursor < fixture.len) {
+        const length = std.mem.readInt(u32, fixture[cursor..][0..4], .little);
+        const cipher_length = std.mem.readInt(u32, fixture[cursor + 4 ..][0..4], .little);
+        cursor += 8;
+        const cipher = fixture[cursor..][0..cipher_length];
+        for (1..66) |chunk| {
+            var stream = Stream.init(&key, iv, .{});
+            defer stream.deinit();
+            var capture = Capture{};
+            defer capture.bytes.deinit(a);
+            var offset: usize = 0;
+            while (offset < cipher.len) {
+                const end = @min(cipher.len, offset + chunk);
+                try stream.push(cipher[offset..end], &capture, Capture.write);
+                offset = end;
+            }
+            try std.testing.expect(capture.bytes.items.len <= cipher.len - 16);
+            try stream.finish(&capture, Capture.write);
+            try std.testing.expectEqual(@as(usize, length), capture.bytes.items.len);
+            for (capture.bytes.items, 0..) |value, i| try std.testing.expectEqual(@as(u8, @intCast((i * 37 + 11) % 256)), value);
+            try std.testing.expectError(error.InvalidHlsCipherState, stream.push("", &capture, Capture.write));
+        }
+        cursor += cipher_length;
+    }
+}
+test "HLS streaming CBC terminalizes cancellation consumer failure truncated blocks and invalid padding" {
+    const fixture = @embedFile("../testdata/hls/aes/media10.bin");
+    var key: [16]u8 = undefined;
+    for (0..16) |i| key[i] = @intCast(i);
+    var iv: [16]u8 = @splat(0);
+    iv[15] = 10;
+    const Gate = struct {
+        cancel: bool = false,
+        fail: bool = false,
+        bytes: usize = 0,
+        fn check(raw: ?*const anyopaque) !void {
+            if (@as(*const @This(), @ptrCast(@alignCast(raw.?))).cancel) return error.Cancelled;
+        }
+        fn write(self: *@This(), bytes: []const u8) !void {
+            if (self.fail) return error.ConsumerFailure;
+            self.bytes += bytes.len;
+        }
+    };
+    var gate = Gate{};
+    var stream = Stream.init(&key, iv, .{ .context = &gate, .check_fn = Gate.check });
+    defer stream.deinit();
+    try stream.push(fixture[0..32], &gate, Gate.write);
+    gate.cancel = true;
+    try std.testing.expectError(error.Cancelled, stream.push(fixture[32..], &gate, Gate.write));
+    try std.testing.expect(stream.ended);
+    gate.cancel = false;
+    gate.fail = true;
+    stream = Stream.init(&key, iv, .{});
+    try std.testing.expectError(error.ConsumerFailure, stream.push(fixture, &gate, Gate.write));
+    try std.testing.expect(stream.ended);
+    gate.fail = false;
+    stream = Stream.init(&key, iv, .{});
+    try stream.push(fixture[0 .. fixture.len - 1], &gate, Gate.write);
+    try std.testing.expectError(error.InvalidHlsCiphertext, stream.finish(&gate, Gate.write));
+    const damaged = try std.testing.allocator.dupe(u8, fixture);
+    defer std.testing.allocator.free(damaged);
+    damaged[damaged.len - 17] ^= 128;
+    stream = Stream.init(&key, iv, .{});
+    try stream.push(damaged, &gate, Gate.write);
+    try std.testing.expectError(error.InvalidHlsCiphertext, stream.finish(&gate, Gate.write));
+}
+
 test "HLS AES CBC matches independent OpenSSL vectors across block SIMD and padding boundaries" {
     const a = std.testing.allocator;
     const fixture = @embedFile("../testdata/hls/aes/vectors.bin");

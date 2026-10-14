@@ -2245,9 +2245,10 @@ clock is explicit: 60 pictures, six one-second fragments, presentation interval
 0.2–6.2 seconds. See [streaming model qualification](../../zig/lib/media/testdata/reader-stream/README.md) for source,
 binary, completion, ownership and platform evidence.
 
-This complete-resource qualification predates the partial-DASH opt-in described
-below. Encrypted media, normalized TS and LL-HLS part/parent reconciliation retain
-buffered Reader APIs; their incremental streaming extensions remain active work. Reader transport and
+This complete-resource qualification predates the partial-DASH and encrypted
+fMP4 extensions described below. Normalized TS and LL-HLS part/parent
+reconciliation retain buffered Reader APIs; their incremental streaming
+extensions remain active work. Reader transport and
 model controls are explicit borrowed controls whose owners outlive retained state;
 no callback-scoped control address is stored in the immutable source snapshots.
 The complete non-CUDA objective remains active.
@@ -2259,5 +2260,17 @@ polls. HTTP EOF alone does not advance the manifest cursor. Portable Reader and
 authenticated HTTP qualification cover short, unchanged and completed versions;
 pretrained CPU/Metal partial-DASH vectors match buffered complete-DASH exactly
 for all six windows. Actual Linux ARM64 checkpoint execution also preserves all six windows exactly;
-AES/TS/LL-HLS streaming remains open. See
+Encrypted fMP4 streaming is described below; TS/LL-HLS streaming remains open. See
 `zig/lib/media/testdata/partial-dash/README.md`.
+
+
+Whole-object AES-128 fMP4 now flows through incremental CBC decryption, automatic
+framing, prefix replay and Reader/model delivery. Key bytes and IV bind replay;
+PKCS7 validates before EOF completion; fixed cipher workspace participates in
+shared admission. TS and LL-HLS part/parent incremental reconciliation remain open.
+Terminal qualification is recorded in `zig/lib/media/testdata/aes-stream/README.md`.
+
+Encrypted-streaming qualification passes 204 media and 16 production HTTP tests
+on macOS and actual Linux ARM64, plus 42 model unit checks (three optional skips).
+Configured CPU, Metal and Linux checkpoint gates each preserve all six buffered
+plaintext HLS vectors exactly through first-output failure and before-EOF retry.

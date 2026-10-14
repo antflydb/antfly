@@ -2042,9 +2042,10 @@ clock is explicit: 60 pictures, six one-second fragments, presentation interval
 0.2–6.2 seconds. See [streaming model qualification](testdata/reader-stream/README.md) for source,
 binary, completion, ownership and platform evidence.
 
-This complete-resource qualification predates the partial-DASH opt-in described
-below. Encrypted media, normalized TS and LL-HLS part/parent reconciliation retain
-buffered Reader APIs; their incremental streaming extensions remain active work. Reader transport and
+This complete-resource qualification predates the partial-DASH and encrypted
+fMP4 extensions described below. Normalized TS and LL-HLS part/parent
+reconciliation retain buffered Reader APIs; their incremental streaming
+extensions remain active work. Reader transport and
 model controls are explicit borrowed controls whose owners outlive retained state;
 no callback-scoped control address is stored in the immutable source snapshots.
 The complete non-CUDA objective remains active.
@@ -2080,5 +2081,46 @@ Pretrained CPU and Metal each preserve all six buffered complete-DASH window
 vectors exactly, including token counts and source clocks, through output retry
 and short clean EOF. The authenticated server withholds its tail until model
 output executes. Actual Linux ARM64 checkpoint execution also preserves all six windows exactly.
-AES/TS/LL-HLS streaming still uses the buffered path. See
+Encrypted fMP4 streaming is described below; TS/LL-HLS streaming still uses
+the buffered path. See
 [partial DASH qualification](testdata/partial-dash/README.md).
+
+
+### Incremental AES-128 HLS delivery
+
+`Reader.streamNext` now handles whole-object AES-128 fMP4 encryption as well as
+plaintext. Encrypted initialization still uses the existing owned map path;
+media body chunks decrypt into the automatic framer while complete fragments
+can reach preparation/inference before HTTP EOF. Key/IV and selected-resource
+identity bind the replay ledger, including actual key bytes rather than merely
+a key URI. A refreshed URI cannot silently replace the key for accepted progress.
+
+The native Zig CBC stream retains one incomplete ciphertext block and one final
+plaintext block. An 8 KiB transient output buffer batches writes; four-block AES
+and portable vector XOR reuse the existing native crypto implementation. The HTTP
+admission envelope includes a conservative 16 KiB fixed cipher workspace. There
+is no whole-resource plaintext allocation. Cancellation, sink errors and EOF
+terminalize and erase the key schedule. The final plaintext block is withheld
+until PKCS7 validation, and no cursor commits on malformed padding or truncation.
+Earlier accepted fragments survive those errors for an explicit healthy retry.
+Wire and plaintext byte counts are distinct in `StreamStats`.
+
+A byte range must describe one complete independently padded encrypted segment;
+CBC restarts at the segment boundary using its explicit or sequence-derived IV,
+as specified by [RFC 8216](https://www.rfc-editor.org/rfc/rfc8216.html#section-4.3.2.4).
+Existing key scopes, encrypted-map IV validation, same-origin authentication,
+exact Content-Range checks, key rotation, work limits and prefix verification apply.
+TS and LL-HLS part/parent incremental reconciliation remain active work.
+
+Qualification uses independent OpenSSL vectors over chunk sizes 1–65, a six-fragment
+ciphertext fixture, native packet/timestamp parity, consumer/cancellation/padding
+failures, changed key/IV binding, workspace denial before HTTP, key refresh/rotation
+and every allocation failure. A real authenticated chunked server truncates the
+first ciphertext response after an accepted fragment and holds the retry tail
+until the first new callback. Another real Reader gate checks encrypted maps,
+independent exact-range objects and key rotation. Pretrained CPU, Metal and actual Linux ARM64 each preserve all six buffered
+plaintext HLS vectors exactly, with matching token counts and source clocks.
+The final gate passes 204 media and 16 production HTTP checks on both platforms,
+plus 42 model unit checks with three optional checkpoint skips.
+See [encrypted-streaming qualification](testdata/aes-stream/README.md) for terminal
+results, source/binary/checkpoint hashes and platform scope.

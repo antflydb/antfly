@@ -538,3 +538,126 @@ test "HTTP fragment replay reopens append-only live bodies and publishes only ne
     defer new_packet.deinit();
     try std.testing.expectEqualSlices(u8, old_packet.bytes, new_packet.bytes);
 }
+
+const encrypted = @embedFile("../testdata/hls/aes-stream/media.bin");
+const aes_key: [16]u8 = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f".*;
+fn encryptedOptions() network.ResumeOptions {
+    var iv: [16]u8 = @splat(0);
+    iv[15] = 10;
+    return .{ .encryption = .{ .key = &aes_key, .iv = iv } };
+}
+fn compareAllPackets(a: std.mem.Allocator, capture: *Capture) !void {
+    var input = media_source.Source{ .allocator = a, .identity = "encrypted-independent-baseline", .storage = .{ .borrowed = original } };
+    var baseline = try mp4.Reader.init(a, &input, .{});
+    defer baseline.deinit();
+    var index: usize = 0;
+    for (capture.held[0..capture.count]) |entry| {
+        var unit = entry.?;
+        for (unit.reader.packets, 0..) |packet, local| {
+            const expected = baseline.packets[index];
+            try std.testing.expectEqual(expected.media_dts, packet.media_dts);
+            try std.testing.expectEqual(expected.media_pts, packet.media_pts);
+            try std.testing.expectEqual(expected.duration, packet.duration);
+            var left = try baseline.readPacket(index);
+            defer left.deinit();
+            var right = try unit.reader.readPacket(local);
+            defer right.deinit();
+            try std.testing.expectEqualSlices(u8, left.bytes, right.bytes);
+            index += 1;
+        }
+    }
+    try std.testing.expectEqual(baseline.packets.len, index);
+}
+test "HTTP encrypted fragment replay publishes before EOF and preserves independent coded bytes after retry" {
+    const a = std.testing.allocator;
+    var client = Fake.Client{ .body = encrypted, .fail_after_bytes = 11206 - init_end + 64 };
+    var capture = Capture{ .client = &client };
+    var ledger = network.FragmentLedger{};
+    var pool = admission.Pool{ .limits = .{ .host_bytes = 4 * 1024 * 1024 } };
+    defer std.debug.assert(pool.snapshot().host_bytes == 0);
+    defer capture.deinit();
+    var adapter = network.Adapter(Fake){ .allocator = a, .client = &client, .root_url = "https://example.test/live/list.mpd", .pool = &pool };
+    try std.testing.expectError(error.ConnectionReset, adapter.streamFmp4Resuming(adapter.root_url, "media.m4s", null, encrypted.len, original[0..init_end], &ledger, encryptedOptions(), &capture, Capture.accept));
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expectEqual(@as(usize, 1), ledger.acknowledged);
+    client.fail_after_bytes = null;
+    const stats = try adapter.streamFmp4Resuming(adapter.root_url, "media.m4s", null, encrypted.len, original[0..init_end], &ledger, encryptedOptions(), &capture, Capture.accept);
+    try std.testing.expectEqual(@as(usize, 1), stats.replayed);
+    try std.testing.expectEqual(@as(usize, 5), stats.acknowledged);
+    try std.testing.expectEqual(encrypted.len, stats.transport.bytes);
+    try std.testing.expectEqual(original.len - init_end, stats.transport.plaintext_bytes);
+    try std.testing.expect(stats.transport.largest_pending_capacity < stats.transport.bytes);
+    try std.testing.expect(capture.early >= 5);
+    try compareAllPackets(a, &capture);
+}
+test "HTTP encrypted replay binds actual key and IV before entering transport" {
+    const a = std.testing.allocator;
+    inline for (.{ true, false }) |change_key| {
+        var client = Fake.Client{ .body = encrypted, .fail_after_bytes = 11206 - init_end + 64 };
+        var capture = Capture{ .client = &client };
+        defer capture.deinit();
+        var ledger = network.FragmentLedger{};
+        var adapter = network.Adapter(Fake){ .allocator = a, .client = &client, .root_url = "https://example.test/live/list.mpd" };
+        try std.testing.expectError(error.ConnectionReset, adapter.streamFmp4Resuming(adapter.root_url, "media.m4s", null, encrypted.len, original[0..init_end], &ledger, encryptedOptions(), &capture, Capture.accept));
+        var options = encryptedOptions();
+        var changed_key = aes_key;
+        if (change_key) {
+            changed_key[0] ^= 1;
+            options.encryption.?.key = &changed_key;
+        } else options.encryption.?.iv[15] ^= 1;
+        const calls = client.calls;
+        try std.testing.expectError(error.SourceVersionChanged, adapter.streamFmp4Resuming(adapter.root_url, "media.m4s", null, encrypted.len, original[0..init_end], &ledger, options, &capture, Capture.accept));
+        try std.testing.expectEqual(calls, client.calls);
+        try std.testing.expectEqual(@as(usize, 1), capture.count);
+        try std.testing.expect(ledger.invalid);
+    }
+}
+test "HTTP encrypted padding failure retains acknowledged prefix and healthy retry completes only after validated EOF" {
+    const a = std.testing.allocator;
+    const damaged = try a.dupe(u8, encrypted);
+    defer a.free(damaged);
+    damaged[damaged.len - 17] ^= 128;
+    var client = Fake.Client{ .body = damaged };
+    var capture = Capture{ .client = &client };
+    defer capture.deinit();
+    var ledger = network.FragmentLedger{};
+    var adapter = network.Adapter(Fake){ .allocator = a, .client = &client, .root_url = "https://example.test/live/list.mpd" };
+    try std.testing.expectError(error.InvalidHlsCiphertext, adapter.streamFmp4Resuming(adapter.root_url, "media.m4s", null, encrypted.len, original[0..init_end], &ledger, encryptedOptions(), &capture, Capture.accept));
+    try std.testing.expect(!ledger.complete and !ledger.invalid);
+    try std.testing.expectEqual(@as(usize, 5), capture.count);
+    client.body = encrypted;
+    const stats = try adapter.streamFmp4Resuming(adapter.root_url, "media.m4s", null, encrypted.len, original[0..init_end], &ledger, encryptedOptions(), &capture, Capture.accept);
+    try std.testing.expectEqual(@as(usize, 5), stats.replayed);
+    try std.testing.expectEqual(@as(usize, 1), stats.acknowledged);
+    try std.testing.expect(ledger.complete);
+    try compareAllPackets(a, &capture);
+}
+fn encryptedAllocationRun(a: std.mem.Allocator) !void {
+    var client = Fake.Client{ .body = encrypted, .fail_after_bytes = 11206 - init_end + 64 };
+    var capture = Capture{ .client = &client };
+    defer capture.deinit();
+    var ledger = network.FragmentLedger{};
+    var adapter = network.Adapter(Fake){ .allocator = a, .client = &client, .root_url = "https://example.test/live/list.mpd" };
+    _ = adapter.streamFmp4Resuming(adapter.root_url, "media.m4s", null, encrypted.len, original[0..init_end], &ledger, encryptedOptions(), &capture, Capture.accept) catch |err| {
+        if (err != error.ConnectionReset) return err;
+    };
+    client.fail_after_bytes = null;
+    _ = try adapter.streamFmp4Resuming(adapter.root_url, "media.m4s", null, encrypted.len, original[0..init_end], &ledger, encryptedOptions(), &capture, Capture.accept);
+}
+test "HTTP encrypted fragment retries release every failed allocation and independent plaintext snapshot" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, encryptedAllocationRun, .{});
+}
+
+test "HTTP encrypted streaming charges fixed CBC workspace before transport admission" {
+    var client = Fake.Client{ .body = encrypted };
+    var capture = Capture{ .client = &client };
+    defer capture.deinit();
+    var ledger = network.FragmentLedger{};
+    var pool = admission.Pool{ .limits = .{ .host_bytes = encrypted.len * 2 + @import("hls_crypto.zig").Stream.workspace_bytes - 1 } };
+    var adapter = network.Adapter(Fake){ .allocator = std.testing.allocator, .client = &client, .root_url = "https://example.test/live/list.mpd", .pool = &pool };
+    try std.testing.expectError(error.SharedAdmissionExceeded, adapter.streamFmp4Resuming(adapter.root_url, "media.m4s", null, encrypted.len, original[0..init_end], &ledger, encryptedOptions(), &capture, Capture.accept));
+    try std.testing.expectEqual(@as(usize, 0), client.calls);
+    try std.testing.expectEqual(@as(usize, 0), ledger.attempts);
+    try std.testing.expect(ledger.binding == null);
+    try std.testing.expectEqual(@as(usize, 0), pool.snapshot().host_bytes);
+}

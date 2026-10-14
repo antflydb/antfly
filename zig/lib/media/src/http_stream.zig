@@ -39,7 +39,7 @@ pub const FragmentDelivery = struct {
         return result;
     }
 };
-pub const StreamStats = struct { bytes: usize = 0, fragments: usize = 0, largest_pending_capacity: usize = 0 };
+pub const StreamStats = struct { bytes: usize = 0, plaintext_bytes: usize = 0, fragments: usize = 0, largest_pending_capacity: usize = 0 };
 /// Caller-owned, constant-space in-process prefix commitment. One ledger binds
 /// one immutable URL/range/init/epoch. Fresh resources require fresh ledgers.
 /// No automatic retry or durable/external exactly-once delivery is implied.
@@ -60,7 +60,10 @@ pub const FragmentLedger = struct {
         self.complete = false;
     }
 };
+/// Borrowed for one call; never retained by the ledger or immutable snapshots.
+pub const Encryption = struct { key: *const [16]u8, iv: [16]u8 };
 pub const ResumeOptions = struct {
+    encryption: ?Encryption = null,
     ingest: live.Options = .{},
     epoch: usize = 0,
     max_attempts: usize = 8,
@@ -75,9 +78,15 @@ pub const ResumeStats = struct {
     replayed: usize = 0,
     acknowledged: usize = 0,
 };
-fn resumeBinding(url: []const u8, range: ?hls.Range, initialization: []const u8, epoch: usize, resource_context: [32]u8, control: source.Control) ![32]u8 {
+fn resumeBinding(url: []const u8, range: ?hls.Range, initialization: []const u8, epoch: usize, resource_context: [32]u8, encryption: ?Encryption, control: source.Control) ![32]u8 {
     var state = std.crypto.hash.sha2.Sha256.init(.{});
-    state.update("antfly-fmp4-replay-v2");
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&state));
+    state.update("antfly-fmp4-replay-v3");
+    state.update(&.{@intFromBool(encryption != null)});
+    if (encryption) |cipher| {
+        state.update(cipher.key);
+        state.update(&cipher.iv);
+    }
     state.update(&resource_context);
     var header: [33]u8 = undefined;
     std.mem.writeInt(u64, header[0..8], url.len, .big);
@@ -252,6 +261,12 @@ pub fn Adapter(comptime http: type) type {
         /// Transport-entry failures make the borrowed ingest terminal; recreate it for an
         /// explicit restart. Already taken snapshots remain independently owned.
         pub fn streamFmp4(self: *Self, base: []const u8, reference: []const u8, range: ?hls.Range, resource_limit: usize, ingest: *live.Ingest, context: *anyopaque, accept: *const fn (*anyopaque, *FragmentDelivery) anyerror!void) !StreamStats {
+            return self.streamFmp4WithEncryption(base, reference, range, resource_limit, ingest, null, context, accept);
+        }
+        /// Incremental whole-object AES-128 CBC. Range bytes must describe one
+        /// independently padded object. Final padding validates before body EOF
+        /// completion; earlier acknowledged fragments retain replay progress.
+        pub fn streamFmp4WithEncryption(self: *Self, base: []const u8, reference: []const u8, range: ?hls.Range, resource_limit: usize, ingest: *live.Ingest, encryption: ?Encryption, context: *anyopaque, accept: *const fn (*anyopaque, *FragmentDelivery) anyerror!void) !StreamStats {
             try self.control.check();
             if (ingest.ended or ingest.pending.items.len != 0) return error.InvalidMediaStreamState;
             if (self.requests >= self.limits.max_requests) return error.ResourceLimitExceeded;
@@ -267,7 +282,9 @@ pub fn Adapter(comptime http: type) type {
             // Preserve the existing conservative transport envelope, including
             // httpx's buffered HTTP/2 fallback. Framer/snapshot owners separately
             // charge their actual allocations through their admission pool.
-            var reservation = if (self.pool) |pool| try pool.acquire(.{ .host_bytes = try std.math.mul(u64, cap, 2) }) else admission.Token{};
+            const workspace: u64 = if (encryption != null) hls.crypto.Stream.workspace_bytes else 0;
+            const transport_bytes = try std.math.add(u64, try std.math.mul(u64, cap, 2), workspace);
+            var reservation = if (self.pool) |pool| try pool.acquire(.{ .host_bytes = transport_bytes }) else admission.Token{};
             defer reservation.deinit();
             var headers: [2][2][]const u8 = undefined;
             headers[0] = .{ "Accept-Encoding", "identity" };
@@ -281,6 +298,7 @@ pub fn Adapter(comptime http: type) type {
                 range: ?hls.Range,
                 cap: usize,
                 started: bool = false,
+                decryptor: ?hls.crypto.Stream = null,
                 stats: StreamStats = .{},
                 pub fn startResponse(sink: *@This(), response: anytype) !void {
                     try sink.adapter.control.check();
@@ -311,14 +329,23 @@ pub fn Adapter(comptime http: type) type {
                     while (offset < bytes.len) {
                         try sink.adapter.control.check();
                         const end = @min(bytes.len, offset + 8192);
-                        try sink.ingest.push(bytes[offset..end]);
-                        sink.stats.largest_pending_capacity = @max(sink.stats.largest_pending_capacity, sink.ingest.pending.capacity);
+                        if (sink.decryptor) |*decryptor| {
+                            try decryptor.push(bytes[offset..end], sink, @This().writePlain);
+                        } else try sink.writePlain(bytes[offset..end]);
                         offset = end;
-                        while (try sink.ingest.nextSegment(false)) |segment| try sink.publish(segment, false);
                     }
+                }
+                fn writePlain(sink: *@This(), bytes: []const u8) !void {
+                    try sink.adapter.control.check();
+                    sink.stats.plaintext_bytes += bytes.len;
+                    try sink.ingest.push(bytes);
+                    sink.stats.largest_pending_capacity = @max(sink.stats.largest_pending_capacity, sink.ingest.pending.capacity);
+                    while (try sink.ingest.nextSegment(false)) |segment| try sink.publish(segment, false);
                 }
             };
             var sink = Sink{ .adapter = self, .ingest = ingest, .context = context, .accept = accept, .range = range, .cap = cap };
+            if (encryption) |cipher| sink.decryptor = hls.crypto.Stream.init(cipher.key, cipher.iv, self.control);
+            defer if (sink.decryptor) |*decryptor| decryptor.deinit();
             const cancel = Cancel{ .control = self.control };
             self.requests += 1;
             self.charged_bytes += cap;
@@ -343,6 +370,8 @@ pub fn Adapter(comptime http: type) type {
             if (!sink.started) return error.UnexpectedHttpStatus;
             if (sink.stats.bytes == 0) return error.EmptyMediaResource;
             if (range) |requested| if (sink.stats.bytes != requested.length) return error.InvalidRemoteRange;
+            if (sink.decryptor) |*decryptor| try decryptor.finish(&sink, Sink.writePlain);
+            if (sink.stats.plaintext_bytes == 0) return error.EmptyMediaResource;
             if (ingest.pending.items.len != 0) try sink.publish(try ingest.finishSegment(), true);
             self.charged_bytes -= cap - sink.stats.bytes;
             return sink.stats;
@@ -361,7 +390,7 @@ pub fn Adapter(comptime http: type) type {
             if (initialization.len > options.ingest.stream.max_bytes or initialization.len > options.ingest.max_ingested_bytes) return error.ResourceLimitExceeded;
             const url = try resolve(self.allocator, self.root_url, base, reference, self.limits.max_uri_bytes);
             defer self.allocator.free(url);
-            const binding = try resumeBinding(url, range, initialization, options.epoch, options.resource_context, self.control);
+            const binding = try resumeBinding(url, range, initialization, options.epoch, options.resource_context, options.encryption, self.control);
             if (ledger.binding) |previous| if (!std.mem.eql(u8, &previous, &binding)) {
                 ledger.invalid = true;
                 return error.SourceVersionChanged;
@@ -450,7 +479,7 @@ pub fn Adapter(comptime http: type) type {
                 ledger.attempts += 1;
                 ledger.binding = binding;
             };
-            replay.stats.transport = try self.streamFmp4(base, reference, range, resource_limit, &ingest, &replay, Replay.publish);
+            replay.stats.transport = try self.streamFmp4WithEncryption(base, reference, range, resource_limit, &ingest, options.encryption, &replay, Replay.publish);
             if (replay.count < replay.previous_count) {
                 ledger.invalid = true;
                 return error.SourceVersionChanged;

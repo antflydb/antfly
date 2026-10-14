@@ -1,0 +1,5 @@
+Build Summary: 3/3 steps succeeded; 16/16 tests passed
+test-media-http success
++- run test 16 pass (16 total) 1s MaxRSS:9M
+   +- compile test debug native success 5s MaxRSS:651M
+

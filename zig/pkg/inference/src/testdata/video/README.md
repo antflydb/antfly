@@ -47,3 +47,11 @@ contains six one-second moof/mdat fragments, 60 H.264 samples at 10 FPS and nati
 1/10240 clocks. Its B-picture presentation timeline begins at 0.2 seconds and
 ends at 6.2 seconds. Streaming model tests use six one-second source windows,
 explicit output/commit retry and an authenticated server-withheld-tail gate.
+
+
+`live-encrypted.bin` is an exact copy of
+`zig/lib/media/testdata/hls/aes-stream/media.bin`: OpenSSL AES-128 CBC/PKCS7
+encryption of `live-fragmented.mp4[797:]` with public fixture key bytes 00..0f
+and sequence IV 10. The media fixture manifest records its tool, command and
+source/plaintext/ciphertext hashes. Runtime uses native Zig decryption; the
+checkpoint streaming gate compares against buffered plaintext HLS windows.

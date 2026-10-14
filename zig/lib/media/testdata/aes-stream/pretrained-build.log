@@ -1,0 +1,22 @@
+1/38 server.server.test.embeddinggemma2 video encrypted streaming pretrained windows preserve buffered vectors and retry before more HTTP...SKIP
+1 selected; 0 passed; 1 skipped.
+Build Summary: 14/14 steps succeeded
+test-inference-unit success
++- run test success 550ms
+   +- compile test debug native success 49s MaxRSS:4G
+      +- WriteFile macos-sdk-libc.txt cached
+      +- run exe jit-source-identity (metal_identity.zig) cached
+      |  +- compile exe jit-source-identity safe native cached 40ms MaxRSS:31M
+      |     +- WriteFile macos-sdk-libc.txt (reused)
+      +- options cached
+      +- WriteFile video_prepare_shader.h cached
+      +- WriteFile tokenizer.json cached
+      +- run exe patch_sentencepiece_proto (sentencepiece_proto) cached
+      |  +- compile exe patch_sentencepiece_proto safe native cached 44ms MaxRSS:31M
+      |  |  +- WriteFile macos-sdk-libc.txt (reused)
+      |  +- run exe protoc-zig (sentencepiece_proto_raw) cached
+      |  |  +- compile exe protoc-zig safe native cached 42ms MaxRSS:31M
+      |  |     +- WriteFile macos-sdk-libc.txt (reused)
+      |  +- run exe protoc-zig (sentencepiece_proto_raw) (+1 more reused dependencies)
+      +- options cached
+
