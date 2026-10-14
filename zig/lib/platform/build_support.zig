@@ -227,6 +227,22 @@ pub fn macosSdkLibCFile(b: *std.Build, target: std.Build.ResolvedTarget) ?std.Bu
     return file;
 }
 
+/// Match the selected SDK, including an explicit -Dmacos-sdk-root override.
+/// Unknown SDK metadata must not select measured compiler admission claims.
+pub fn macosSdkMatchesVersion(b: *std.Build, target: std.Build.ResolvedTarget, version: []const u8) bool {
+    const root = macosSdkRoot(b, target) orelse return false;
+    const settings = root.path(b, "SDKSettings.json");
+    if (settings != .relative) return false;
+    if (settings.relative.base != .cwd) return false;
+    b.dependOnFileContents(settings);
+    const path = settings.relative;
+    const bytes = std.Io.Dir.cwd().readFileAlloc(b.graph.io, path.sub_path, b.allocator, .limited(4 * 1024 * 1024)) catch return false;
+    defer b.allocator.free(bytes);
+    const parsed = std.json.parseFromSlice(struct { Version: []const u8 }, b.allocator, bytes, .{ .ignore_unknown_fields = true }) catch return false;
+    defer parsed.deinit();
+    return std.mem.eql(u8, parsed.value.Version, version);
+}
+
 /// Configure every macOS artifact after its owners have constructed the graph,
 /// including linked libraries and generated host tools.
 pub fn finalizeMacosSdk(b: *std.Build) void {

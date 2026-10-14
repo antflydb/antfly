@@ -31,6 +31,24 @@ pub const AddTestsResult = struct {
 
 pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const antfly_test_mod = options.antfly_test_mod;
+    const row_preparation_filters = [_][]const u8{
+        "prepared relational",
+        "relational durable preparation",
+        "relational direct intents",
+        "relational cumulative prepares",
+        "relational preparation budget",
+        "relational transform preparation releases",
+        "db transaction recovery",
+    };
+    const row_preparation_tests = b.addTest(.{
+        .name = "row-preparation-tests",
+        .root_module = antfly_test_mod,
+        .filters = &row_preparation_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+        .max_rss = 8 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-storage-row-preparation-test", "Run resident and recovery row preparation, admission and ownership contracts")
+        .dependOn(&addCuratedTestRunArtifact(b, row_preparation_tests, &row_preparation_filters).step);
     const producer_receipt_filters = [_][]const u8{
         "producer readiness",
         "derived coverage outcome transitions are exclusive and idempotent",
