@@ -891,3 +891,30 @@ native-source fixture verifies grouped highlight acquisition, reordered hits,
 identity mismatch rejection and cancellation independently of the HN timings.
 The complete optimized executable also requires the resolver import in the
 serverless object-runtime dependency set; the follow-up fixes that missing import.
+
+### Cold overlay attribution and native warming recovery
+
+The saved-overlay outlier includes native current-table execution, which the
+lake phase counters cannot attribute. Composed query counters now measure the
+whole operation, saved-definition expansion, leaves, native leaves and cursor
+storage. Native leaf time includes checkpoint capture/recovery and overlaps leaf
+time; lake totals also overlap leaves. The HN harness records this profile only
+for an interval containing one composed operation. It reports composition as the
+remainder after definition, leaves and cursor storage, and keeps transport/admission
+outside the composed total. Nested counters must not be added to their parents.
+
+The retained fixture also contains an empty `.warming.json` progress hint,
+producing repeated `UnexpectedEndOfInput` warnings and preventing the affected
+native current table from warming. Local warming progress is optional; malformed
+or oversized hints now trigger fresh warming. Writes use a synced temporary file
+and atomic replacement, preserving the last complete state if canceled. Validate
+request IDs before using a recovered hint to select a cleanup path. Published
+native generations remain subject to their existing independent validation.
+
+[Investigation evidence](../../examples/hackernews/overlay-latency-investigation-20261014.json)
+retains the original failure and twelve additional union-then-overlay sequences
+on the preceding optimized binary. Cold saved overlays return the expected
+results in 211–652 ms. A 923 ms union triggered stack sampling; no overlay crossed
+the 750 ms sampling threshold. These shared-host runs do not explain the original
+2,366 ms sample or establish a controlled performance improvement. The warming
+fault is a separately reproduced startup bug, not proof of that sample's cause.
