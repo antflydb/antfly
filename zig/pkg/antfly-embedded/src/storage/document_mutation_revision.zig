@@ -23,7 +23,7 @@ pub const Key = [prefix.len + 32]u8;
 const content_prefix = "\x00\x00__metadata__:document_content_authority_v1:";
 pub const ContentKey = [content_prefix.len + 32]u8;
 pub const Content = struct { revision: u64, bytes: u64, kind: u8, digest: [32]u8 };
-fn contentKey(key: Key) ContentKey {
+pub fn contentKey(key: Key) ContentKey {
     var result: ContentKey = undefined;
     @memcpy(result[0..content_prefix.len], content_prefix);
     @memcpy(result[content_prefix.len..], key[prefix.len..]);
@@ -139,6 +139,100 @@ pub fn load(txn: anytype, key: Key) !u64 {
     if (raw.len != 8) return error.InvalidDocumentMutationRevision;
     return std.mem.readInt(u64, raw[0..8], .little);
 }
+
+const backfill_key = "\x00\x00__metadata__:document_content_backfill_v1";
+
+/// A disposable cache migration. Hash under a read snapshot; publish only
+/// under the ordinary leader/apply gate with matching document revisions.
+/// Cursor and cache records share one physical transaction; user data and
+/// logical mutation revisions are never rewritten by this migration.
+pub const BackfillPage = struct {
+    const Entry = struct { physical: []const u8, content: Content };
+    arena: std.heap.ArenaAllocator,
+    before: ?[]const u8,
+    after: []const u8,
+    entries: []const Entry,
+    complete: bool,
+    pub fn deinit(self: *@This()) void {
+        self.arena.deinit();
+    }
+    pub fn prepare(alloc: std.mem.Allocator, store: anytype, restart: bool) !?@This() {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        var read = try store.beginReadTxnWithBlockCacheAdmission(.transient);
+        defer read.abort();
+        const before: ?[]const u8 = before: {
+            const raw = read.get(backfill_key) catch |err| switch (err) {
+                error.NotFound => break :before null,
+                else => return err,
+            };
+            if (raw.len == 0 or raw.len > 65537 or raw[0] > 1) return error.InvalidDocumentAuthorityCursor;
+            break :before try a.dupe(u8, raw);
+        };
+        if (!restart) if (before) |state| if (state[0] == 1) {
+            arena.deinit();
+            return null;
+        };
+        var metadata = try read.openReadScope(a);
+        defer metadata.close();
+        var cursor = try read.openPhysicalCursorAdapter();
+        defer cursor.close();
+        const previous = if (!restart and before != null) before.?[1..] else &.{keys.user_namespace};
+        var item = try cursor.seekAtOrAfter(previous);
+        if (!restart and before != null) if (item) |row| if (std.mem.eql(u8, previous, row.key)) {
+            item = try cursor.next();
+        };
+        var entries = std.ArrayListUnmanaged(Entry).empty;
+        var last: []const u8 = previous;
+        var rows: usize = 0;
+        var bytes: usize = 0;
+        const deadline = @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_ms;
+        while (item) |row| {
+            if (!keys.isInternalUserKey(row.key)) break;
+            if (rows > 0 and (rows >= 128 or entries.items.len >= 32 or bytes >= 4 * 1024 * 1024 or row.value.len > 4 * 1024 * 1024 -| bytes or @import("antfly_platform").time.monotonicNs() >= deadline)) break;
+            if (row.key.len > 65536) return error.InvalidDocumentAuthorityCursor;
+            last = try a.dupe(u8, row.key);
+            // Metadata has a separate scope; its point reads cannot retire
+            // the physical cursor's current primary value.
+            if (keys.isStoredDocumentRowKey(row.key)) {
+                var digest: [32]u8 = undefined;
+                // Physical primary rows have no embedding-payload indirection.
+                // Check the cache first; cursor values retain their own lease.
+                if (try loadContent(&metadata, last) == null) {
+                    std.crypto.hash.sha2.Sha256.hash(row.value, &digest, .{});
+                    const revision = try load(&metadata, keyForPhysical(last).?);
+                    try entries.append(a, .{ .physical = last, .content = .{ .revision = revision, .bytes = row.value.len, .kind = last[last.len - 1], .digest = digest } });
+                }
+            }
+            rows += 1;
+            bytes +|= row.value.len;
+            item = try cursor.next();
+        }
+        const complete = item == null or !keys.isInternalUserKey(item.?.key);
+        const after = try a.alloc(u8, 1 + last.len);
+        after[0] = if (complete) 1 else 0;
+        @memcpy(after[1..], last);
+        return .{ .arena = arena, .before = before, .after = after, .entries = entries.items, .complete = complete };
+    }
+    pub fn stage(self: *const @This(), txn: anytype) !usize {
+        const current = txn.get(backfill_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if ((current == null) != (self.before == null) or (current != null and !std.mem.eql(u8, current.?, self.before.?))) return error.DocumentAuthorityCursorChanged;
+        var installed: usize = 0;
+        for (self.entries) |entry| {
+            const key = keyForPhysical(entry.physical).?;
+            if (try load(txn, key) != entry.content.revision or !try txn.contains(entry.physical)) continue;
+            if (try loadContent(txn, entry.physical) != null) continue;
+            try txn.put(&contentKey(key), &encodeContent(entry.content));
+            installed += 1;
+        }
+        try txn.put(backfill_key, self.after);
+        return installed;
+    }
+};
 
 /// One revision per affected document per transaction, including artifact-only
 /// commits. Capture fixed keys rather than retaining every artifact key.

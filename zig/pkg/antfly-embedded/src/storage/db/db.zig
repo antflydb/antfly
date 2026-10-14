@@ -2958,6 +2958,43 @@ test "db optional row policy authority preserves scoped secret denial and outage
     try std.testing.expectError(error.Unavailable, optionalRowPolicyAuthority(std.testing.allocator, &reader, "antfly.trusted_principal.secret"));
 }
 
+/// Scope pins belong to a byte window, never to the long-lived metadata txn.
+/// Cached lengths preflight the next row. Uncached/oversized rows are isolated
+/// and retired immediately, preserving formerly valid large-document reads.
+const DocumentPrimaryReadWindow = struct {
+    const max_bytes: usize = 8 * 1024 * 1024;
+    arena: std.heap.ArenaAllocator,
+    scope: ?@import("../backend_erased.zig").ReadScope = null,
+    bytes: usize = 0,
+    retirements: usize = 0,
+    fn init(alloc: Allocator) @This() {
+        return .{ .arena = .init(@import("antfly_platform").allocator.reclaimingScratch(alloc)) };
+    }
+    fn retire(self: *@This()) void {
+        if (self.scope) |*scope| {
+            scope.close();
+            self.scope = null;
+            self.retirements += 1;
+        }
+        _ = self.arena.reset(.free_all);
+        self.bytes = 0;
+    }
+    fn deinit(self: *@This()) void {
+        self.retire();
+        self.arena.deinit();
+    }
+    fn get(self: *@This(), txn: *docstore_mod.DocStore.Txn, physical: []const u8, expected: ?u64) ![]const u8 {
+        if (self.bytes > 0 and (expected == null or expected.? > max_bytes -| self.bytes)) self.retire();
+        if (self.scope == null) self.scope = try txn.openReadScope(self.arena.allocator());
+        const raw = try self.scope.?.get(physical);
+        self.bytes +|= raw.len;
+        return raw;
+    }
+    fn finishRow(self: *@This(), uncached: bool) void {
+        if (uncached or self.bytes >= max_bytes) self.retire();
+    }
+};
+
 pub const DB = struct {
     retained_query_lease: ?@import("native_query_cut.zig").Guard = null,
     retained_remote_query_lease: ?@import("native_query_cut_repository.zig").StorageLease = null,
@@ -3059,6 +3096,10 @@ pub const DB = struct {
     // quarantined indexes recover or the DB closes.
     quarantine_recovery: quarantine_recovery.Owner = .{},
     independent_maintenance: independent_maintenance.Owner = .{},
+    document_authority_backfill_active: std.atomic.Value(bool) = .init(true),
+    document_authority_backfill_requested: std.atomic.Value(bool) = .init(false),
+    document_authority_backfill_mutex: std.atomic.Mutex = .unlocked,
+    document_authority_backfill_restart: bool = false,
     relational_columns_building: std.atomic.Value(bool) = .init(false),
     relational_columns_rebuild_requested: std.atomic.Value(bool) = .init(false),
     relational_column_maintenance: relational_columns.Maintenance = .{},
@@ -18195,9 +18236,9 @@ pub const DB = struct {
     }
 
     fn lookupPrimarySnapshotWithSchema(self: *DB, alloc: Allocator, key: []const u8, opts: types.LookupOptions, probe: *docstore_mod.DocStore.Txn, schema_view: ?schema_registry_mod.SchemaView) !?types.LookupResult {
-        return self.lookupPrimarySnapshotWithSchemaAndOutput(alloc, alloc, key, opts, probe, schema_view);
+        return self.lookupPrimarySnapshotWithSchemaAndOutput(alloc, alloc, key, opts, probe, schema_view, null, null);
     }
-    fn lookupPrimarySnapshotWithSchemaAndOutput(self: *DB, alloc: Allocator, output: Allocator, key: []const u8, opts: types.LookupOptions, probe: *docstore_mod.DocStore.Txn, schema_view: ?schema_registry_mod.SchemaView) !?types.LookupResult {
+    fn lookupPrimarySnapshotWithSchemaAndOutput(self: *DB, alloc: Allocator, output: Allocator, key: []const u8, opts: types.LookupOptions, probe: *docstore_mod.DocStore.Txn, schema_view: ?schema_registry_mod.SchemaView, primary: ?[]const u8, primary_timestamp: ?u64) !?types.LookupResult {
         var verified_principal: ?std.json.Parsed(row_policy_authority_mod.Payload) = null;
         defer if (verified_principal) |*principal| principal.deinit();
         var row_policy_lease = if (opts.row_policy_principal_proof.len != 0) bound: {
@@ -18208,10 +18249,10 @@ pub const DB = struct {
         // Projection borrows the caller's immutable schema and primary snapshot.
         const store_key = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self, alloc, key, schema_view);
         defer alloc.free(store_key);
-        const raw = probe.getLeased(store_key) catch |err| switch (err) {
+        const raw = primary orelse (probe.getLeased(store_key) catch |err| switch (err) {
             error.NotFound => return null,
             else => return err,
-        };
+        });
         const relational = internal_keys.isRelationalRowKey(store_key);
         var historical_schema_view: ?schema_registry_mod.SchemaView = null;
         defer if (historical_schema_view) |*view| view.release();
@@ -18257,7 +18298,7 @@ pub const DB = struct {
                 const timestamp_ns = if (ordinal_row) |row|
                     row.writeTimestampNs()
                 else
-                    try lookupSnapshotTimestamp(alloc, key, probe);
+                    primary_timestamp orelse try lookupSnapshotTimestamp(alloc, key, probe);
                 if (timestamp_ns != 0 and ttl_mod.isExpired(timestamp_ns, ttl_duration_ns, currentTimeNs())) return null;
             }
         }
@@ -18275,9 +18316,16 @@ pub const DB = struct {
                 fields,
             );
             defer projection.deinit();
-            break :blk try projection.project(output, row);
+            break :blk try projection.projectWithOutput(alloc, output, row);
         } else blk: {
-            if (opts.fields.len == 0 and opts.include_all_fields) break :blk if (ordinal_row) |row| try row.reconstructValueAlloc(output) else try output.dupe(u8, raw);
+            if (opts.fields.len == 0 and opts.include_all_fields) {
+                if (ordinal_row) |row| {
+                    const bytes = try row.reconstructValueAlloc(alloc);
+                    defer alloc.free(bytes);
+                    break :blk try output.dupe(u8, bytes);
+                }
+                break :blk try output.dupe(u8, raw);
+            }
             const materialized = if (ordinal_row) |row| try row.reconstructValueAlloc(alloc) else null;
             defer if (materialized) |bytes| alloc.free(bytes);
             break :blk try db_query_projection.projectLookupStoredBytesWithOutput(alloc, output, key, materialized orelse raw, opts, .{
@@ -18296,7 +18344,7 @@ pub const DB = struct {
             std.crypto.hash.sha2.Sha256.hash(raw, &primary_digest, .{});
             digest = primary_digest;
             if (version == null) {
-                version = try lookupSnapshotTimestamp(alloc, key, probe);
+                version = primary_timestamp orelse try lookupSnapshotTimestamp(alloc, key, probe);
             }
         }
         try row_policy_lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
@@ -30656,6 +30704,7 @@ pub const DB = struct {
         const self: *DB = @ptrCast(@alignCast(ptr));
         switch (work) {
             .upload => return self.advanceArtifactUploadRecoveryWithTrigger(.maintenance),
+            .authority => return self.advanceDocumentAuthorityBackfillPage(),
             .baseline => return self.advanceArtifactProducerBaselinePage(),
             .producer => return self.advanceArtifactProducerWorkPage(),
             .footprint => return self.advanceArtifactFootprintPage(),
@@ -30686,13 +30735,56 @@ pub const DB = struct {
         const self: *DB = @ptrCast(@alignCast(ptr));
         const source = self.local_execution.source_vectors.load(.acquire);
         return .{
-            .artifacts = self.hasPendingGraphReplacements() or self.artifact_repair_metadata_pending or self.artifact_footprint_pending.load(.acquire) or self.artifact_producer_baseline_pending.load(.acquire) or (if (source) |value| value.collectionPending() else false),
+            .artifacts = (replicationWriteGateAllowsBackgroundWork(self.local_execution.replication_write_gate) and (self.document_authority_backfill_active.load(.acquire) or self.document_authority_backfill_requested.load(.acquire))) or self.hasPendingGraphReplacements() or self.artifact_repair_metadata_pending or self.artifact_footprint_pending.load(.acquire) or self.artifact_producer_baseline_pending.load(.acquire) or (if (source) |value| value.collectionPending() else false),
             .producers = self.artifact_producer_scheduler.active(self.independentMaintenanceNowNs()),
             .indexes = self.local_execution.relational_index_maintenance_sweep.isPending() and platform_time.monotonicNs() >= self.local_execution.relational_index_retry_after_ns.load(.acquire),
             .columns = self.relational_column_maintenance.pending.load(.acquire) and !self.relational_column_maintenance.backing_off.load(.acquire),
             .scan_pause_ns = if (source) |value| value.activeScanPauseNs() else null,
             .background_checkpoint = if (source) |value| value.background_checkpoint else false,
         };
+    }
+
+    /// Local derived-cache metadata, not a user mutation or replication fact.
+    /// Leadership and root-image gates cover the short publication transaction;
+    /// hashing and scanning happen beforehand under a disposable read snapshot.
+    pub fn advanceDocumentAuthorityBackfillPage(self: *DB) !bool {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return true;
+        if (!replicationWriteGateAllowsBackgroundWork(self.local_execution.replication_write_gate)) return false;
+        if (!self.document_authority_backfill_mutex.tryLock()) return false;
+        defer self.document_authority_backfill_mutex.unlock();
+        const restart = if (!self.document_authority_backfill_active.load(.acquire)) self.document_authority_backfill_requested.swap(false, .acq_rel) else false;
+        if (!self.document_authority_backfill_active.load(.acquire) and !restart) return true;
+        self.document_authority_backfill_active.store(true, .release);
+        self.document_authority_backfill_restart = self.document_authority_backfill_restart or restart;
+        var ctx = self.batchContext();
+        var replication_mutation = acquireReplicationMutationSharedContext(&ctx);
+        defer if (replication_mutation) |*lease| lease.release();
+        try enforceReplicationWriteGateOptional(ctx.replication_write_gate);
+        var snapshot_replay = try acquireSnapshotReplayContext(&ctx);
+        defer if (snapshot_replay) |*lease| lease.release();
+        var budget = if (self.core.index_manager.resource_manager) |manager|
+            resource_manager_mod.BudgetedAllocator.init(manager, .relational_preparation_working_set, self.alloc, 1)
+        else
+            null;
+        defer if (budget) |*value| value.deinit();
+        const scratch = if (budget) |*value| value.allocator() else self.alloc;
+        var prepared = (@import("../document_mutation_revision.zig").BackfillPage.prepare(scratch, self.core.store, self.document_authority_backfill_restart) catch |err| {
+            if (err == error.OutOfMemory) if (budget) |*value| if (value.denied()) return error.ResourceBudgetExceeded;
+            return err;
+        }) orelse {
+            self.document_authority_backfill_active.store(false, .release);
+            return true;
+        };
+        defer prepared.deinit();
+        try lockApplyForPortableRuntimeContext(&ctx);
+        defer ctx.apply_mutex.unlockExclusive();
+        var writer = try self.core.store.beginWriteTxn();
+        errdefer writer.abort();
+        _ = try prepared.stage(&writer);
+        try writer.commit();
+        self.document_authority_backfill_restart = false;
+        self.document_authority_backfill_active.store(!prepared.complete, .release);
+        return prepared.complete;
     }
 
     /// One bounded physical-key page, never under the DB apply lock. Both
@@ -39281,6 +39373,8 @@ pub const DB = struct {
         defer metadata_scratch.deinit();
         var projection_scratch = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
         defer projection_scratch.deinit();
+        var primary_window = DocumentPrimaryReadWindow.init(alloc);
+        defer primary_window.deinit();
         var physical: [64][]const u8 = undefined;
         var ids: [64][]const u8 = undefined;
         var contents: [64]?@import("../document_mutation_revision.zig").Content = undefined;
@@ -39294,6 +39388,7 @@ pub const DB = struct {
             // Apply-shared fences ordinary reads; captured dense reads fork
             // the original visibility cut. Retire page scratch every 64 hits.
             if (index != 0 and index % 64 == 0) {
+                primary_window.retire();
                 read.?.abort();
                 read = null;
                 read = if (pinned) |captured_read| try captured_read.forkRead() else try self.core.store.beginReadTxn();
@@ -39306,18 +39401,24 @@ pub const DB = struct {
                     ids[row] = candidate.id;
                     physical[row] = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self, m, candidate.id, schema_view);
                 }
-                try @import("../document_mutation_revision.zig").loadWindow(&read.?, m, physical[0..count], ids[0..count], contents[0..count], versions[0..count]);
+                var scope = try read.?.openReadScope(@import("antfly_platform").allocator.reclaimingScratch(alloc));
+                defer scope.close();
+                try @import("../document_mutation_revision.zig").loadWindow(&scope, m, physical[0..count], ids[0..count], contents[0..count], versions[0..count]);
             }
             if (req.cancellation) |token| try token.check();
             if (req.execution_deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.Timeout;
             const store_key = physical[index % 64];
             const cached = contents[index % 64];
+            var raw_primary: ?[]const u8 = null;
+            defer primary_window.finishRow(cached == null);
             var digest: [32]u8 = undefined;
             const primary_bytes = if (cached) |content| cached: {
                 digest = content.digest;
                 break :cached content.bytes;
             } else legacy: {
-                const raw = read.?.getLeased(store_key) catch |err| return if (err == error.NotFound) error.StorageReadTemporarilyUnavailable else err;
+                self.document_authority_backfill_requested.store(true, .release);
+                const raw = primary_window.get(&read.?, store_key, null) catch |err| return if (err == error.NotFound) error.StorageReadTemporarilyUnavailable else err;
+                raw_primary = raw;
                 std.crypto.hash.sha2.Sha256.hash(raw, &digest, .{});
                 break :legacy raw.len;
             };
@@ -39326,9 +39427,10 @@ pub const DB = struct {
             // Small pages stay in one round trip; large candidates travel
             // as proofs until their global window has been selected.
             const eager = req.document_authority_mode == .candidates and primary_bytes <= 8 * 1024 and primary_bytes <= 64 * 1024 -| eager_bytes;
+            if (raw_primary == null and (req.document_authority_mode == .hydrate or eager)) raw_primary = primary_window.get(&read.?, store_key, primary_bytes) catch |err| return if (err == error.NotFound) error.StorageReadTemporarilyUnavailable else err;
             if (!projection_scratch.reset(.{ .retain_with_limit = 64 * 1024 })) _ = projection_scratch.reset(.free_all);
             var projected: ?types.LookupResult = if (req.document_authority_mode == .hydrate or eager)
-                try self.lookupPrimarySnapshotWithSchemaAndOutput(projection_scratch.allocator(), body_allocator, hit.id, .{ .fields = if (req.defer_stored_projection) &.{} else req.fields, .include_all_fields = req.defer_stored_projection or req.include_all_fields }, &read.?, schema_view)
+                try self.lookupPrimarySnapshotWithSchemaAndOutput(projection_scratch.allocator(), body_allocator, hit.id, .{ .fields = if (req.defer_stored_projection) &.{} else req.fields, .include_all_fields = req.defer_stored_projection or req.include_all_fields }, &read.?, schema_view, raw_primary, version)
             else
                 null;
             if (req.document_authority_mode == .candidates) if (projected) |*document| {
@@ -136617,4 +136719,134 @@ test "capi resolver replacement clock clamp skips denied and ordered writes" {
         try std.testing.expectEqual(future, jobs.value[0].retry_after_ns);
         try std.testing.expectEqual(@as(u32, 0), jobs.value[0].total_retry_count);
     }
+}
+
+test "public graph metric borrowed wire content migration fences edits abort deletion and restart" {
+    const a = std.testing.allocator;
+    const revision = @import("../document_mutation_revision.zig");
+    var directory = try TestDirectory.init("content-migration");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtimes = false, .start_independent_maintenance = false });
+    defer db.close();
+    try db.batch(.{ .writes = &.{ .{ .key = "a", .value = "{\"n\":1}" }, .{ .key = "b", .value = "{\"n\":2}" }, .{ .key = "c", .value = "{\"n\":3}" } } });
+    const ka = try internal_keys.documentKeyAlloc(a, "a");
+    defer a.free(ka);
+    const kb = try internal_keys.documentKeyAlloc(a, "b");
+    defer a.free(kb);
+    const kc = try internal_keys.documentKeyAlloc(a, "c");
+    defer a.free(kc);
+    {
+        var write = try db.core.store.beginWriteTxn();
+        errdefer write.abort();
+        for ([_][]const u8{ ka, kb, kc }) |key| try write.delete(&revision.contentKey(revision.keyForPhysical(key).?));
+        try write.commit();
+    }
+    var prepared = (try revision.BackfillPage.prepare(a, db.core.store, false)).?;
+    defer prepared.deinit();
+    // The publisher must skip records modified/deleted after hashing.
+    try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"n\":4}" }}, .deletes = &.{"c"} });
+    {
+        var write = try db.core.store.beginWriteTxn();
+        defer write.abort();
+        try std.testing.expectEqual(@as(usize, 1), try prepared.stage(&write));
+    }
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect((try revision.loadContent(&read, kb)) == null);
+    }
+    {
+        var write = try db.core.store.beginWriteTxn();
+        errdefer write.abort();
+        try std.testing.expectEqual(@as(usize, 1), try prepared.stage(&write));
+        try write.commit();
+    }
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect((try revision.loadContent(&read, kb)) != null);
+        try std.testing.expect((try revision.loadContent(&read, kc)) == null);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash("{\"n\":4}", &digest, .{});
+        try std.testing.expectEqualSlices(u8, &digest, &(try revision.loadContent(&read, ka)).?.digest);
+    }
+    {
+        var stale = try db.core.store.beginWriteTxn();
+        defer stale.abort();
+        try std.testing.expectError(error.DocumentAuthorityCursorChanged, prepared.stage(&stale));
+    }
+    try std.testing.expect(try db.advanceDocumentAuthorityBackfillPage());
+    try std.testing.expect(!db.document_authority_backfill_active.load(.acquire));
+    // Simulate a revision-aware older writer that cannot refresh our cache.
+    var expected_revision: u64 = undefined;
+    {
+        var write = try db.core.store.beginWriteTxn();
+        errdefer write.abort();
+        expected_revision = (try revision.load(&write, revision.keyForPhysical(kb).?)) + 1;
+        var bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &bytes, expected_revision, .little);
+        try write.write.?.put(kb, "{\"n\":5}");
+        try write.put(&revision.keyForPhysical(kb).?, &bytes);
+        try write.commit();
+    }
+    const hits = try a.alloc(types.SearchHit, 1);
+    hits[0] = .{ .id = try a.dupe(u8, "b") };
+    var result: types.SearchResult = .{ .alloc = a, .hits = hits, .total_hits = 1 };
+    defer result.deinit();
+    var schema_view = db.core.acquireSchemaView();
+    defer if (schema_view) |*view| view.release();
+    try db.attachDistributedDocumentAuthorityAtSnapshot(a, .{ .include_stored = false, .document_authority_mode = .candidates, .document_authority_group = 11 }, &result, null, schema_view);
+    try std.testing.expect(db.document_authority_backfill_requested.load(.acquire));
+    const sequence = db.core.nextDerivedSequence();
+    for (0..16) |_| {
+        if (try db.advanceDocumentAuthorityBackfillPage()) break;
+    }
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        const cached = (try revision.loadContent(&read, kb)).?;
+        try std.testing.expectEqual(expected_revision, cached.revision);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash("{\"n\":5}", &digest, .{});
+        try std.testing.expectEqualSlices(u8, &digest, &cached.digest);
+        try std.testing.expectEqual(sequence, db.core.nextDerivedSequence());
+    }
+    std.debug.print("CONTENT_MIGRATION stale_and_deleted_skipped=2 aborted_publish_visible=0 logical_rewrites=0\n", .{});
+}
+
+test "public graph metric borrowed wire primary byte windows retain original cut across edits" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("primary-byte-window");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtimes = false, .start_independent_maintenance = false });
+    defer db.close();
+    const raw = try a.alloc(u8, 2 * 1024 * 1024);
+    defer a.free(raw);
+    @memset(raw, 'a');
+    var physical: [5][]u8 = undefined;
+    var count: usize = 0;
+    defer for (physical[0..count]) |key| a.free(key);
+    for (&physical, 0..) |*key, i| {
+        const id = try std.fmt.allocPrint(a, "doc{d}", .{i});
+        defer a.free(id);
+        key.* = try internal_keys.documentKeyAlloc(a, id);
+        count += 1;
+        try db.core.store.put(key.*, raw);
+    }
+    var pinned = try db.core.store.beginReadTxn();
+    defer pinned.abort();
+    try db.core.store.put(physical[4], "changed");
+    var window = DocumentPrimaryReadWindow.init(a);
+    defer window.deinit();
+    for (physical) |key| {
+        const value = try window.get(&pinned, key, raw.len);
+        try std.testing.expectEqual(raw.len, value.len);
+        try std.testing.expectEqual(@as(u8, 'a'), value[0]);
+        window.finishRow(false);
+        try std.testing.expect(window.bytes <= DocumentPrimaryReadWindow.max_bytes);
+    }
+    try std.testing.expectEqual(@as(usize, 1), window.retirements);
+    window.finishRow(true);
+    try std.testing.expect(window.scope == null);
+    std.debug.print("PRIMARY_BYTE_WINDOW rows=5 bytes_per_row=2097152 retired_windows=2 old_cut_preserved=5\n", .{});
 }

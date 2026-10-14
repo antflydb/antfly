@@ -71,9 +71,19 @@ pub const Plan = struct {
     }
 
     pub fn project(self: Plan, alloc: std.mem.Allocator, row: codec.OrdinalRowView) ![]u8 {
+        var arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
+        defer arena.deinit();
+        return self.projectWithOutput(arena.allocator(), alloc, row);
+    }
+
+    pub fn projectWithOutput(self: Plan, scratch_alloc: std.mem.Allocator, output: std.mem.Allocator, row: codec.OrdinalRowView) ![]u8 {
         if (self.base.schema_version != row.table_schema.version) return error.RelationalRowSchemaMismatch;
-        if (self.paths.len == 0) return try row.projectAlloc(alloc, self.base);
-        var arena = std.heap.ArenaAllocator.init(alloc);
+        if (self.paths.len == 0) {
+            const bytes = try row.projectAlloc(scratch_alloc, self.base);
+            defer scratch_alloc.free(bytes);
+            return output.dupe(u8, bytes);
+        }
+        var arena = std.heap.ArenaAllocator.init(scratch_alloc);
         defer arena.deinit();
         const scratch = arena.allocator();
         var source = Sources.empty;
@@ -86,13 +96,13 @@ pub const Plan = struct {
             } else .{ .logical = try row.materializeCellAlloc(scratch, cell) };
             try source.put(scratch, row.table_schema.relational_columns[ordinal].name, value);
         }
-        return self.projectSources(alloc, scratch, source);
+        return self.projectSources(output, scratch, source);
     }
 
     pub fn projectSources(self: Plan, alloc: std.mem.Allocator, scratch: std.mem.Allocator, source: Sources) ![]u8 {
         var result = std.json.ObjectMap.empty;
         if (self.paths.len == 0) {
-            var output = std.Io.Writer.Allocating.init(alloc);
+            var output = std.Io.Writer.Allocating.init(scratch);
             defer output.deinit();
             output.writer.writeByte('{') catch return error.OutOfMemory;
             // Sources are inserted in projection ordinal order.
@@ -108,7 +118,7 @@ pub const Plan = struct {
                 }
             }
             output.writer.writeByte('}') catch return error.OutOfMemory;
-            return output.toOwnedSlice();
+            return alloc.dupe(u8, output.written());
         } else for (self.paths) |parts| {
             if (parts.len == 0) continue;
             const value = source.get(parts[0]) orelse continue;
@@ -121,7 +131,7 @@ pub const Plan = struct {
                 },
             }
         }
-        return std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = result }, .{});
+        return document_query.serializeWithOutput(scratch, alloc, std.json.Value{ .object = result });
     }
 };
 

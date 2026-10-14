@@ -42,7 +42,16 @@ pub fn lookupJsonWithOutput(alloc: Allocator, output: Allocator, raw: []const u8
     defer parsed.deinit();
     var projected = try projectLookupView(alloc, parsed.value, opts);
     defer deinitProjectionView(alloc, &projected);
-    return .{ .json = try std.json.Stringify.valueAlloc(output, projected, .{}) };
+    return .{ .json = try serializeWithOutput(alloc, output, projected) };
+}
+
+/// Encode once in reclaimable scratch, then publish one exact-sized body.
+/// Growing writers must never leave superseded buffers in a response arena.
+pub fn serializeWithOutput(scratch: Allocator, output: Allocator, value: std.json.Value) ![]u8 {
+    var writer = std.Io.Writer.Allocating.init(scratch);
+    defer writer.deinit();
+    try std.json.Stringify.value(value, .{}, &writer.writer);
+    return output.dupe(u8, writer.written());
 }
 
 pub fn projectLookupJsonValue(
@@ -535,4 +544,86 @@ fn projectionViewScenario(a: Allocator) !void {
 test "external lake projection views borrow lexemes and own containers across allocation failures" {
     try projectionViewScenario(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, projectionViewScenario, .{});
+}
+
+test "public graph metric borrowed wire bounded projection writer response memory" {
+    const a = std.testing.allocator;
+    const Counter = @import("../lite/test_allocator.zig").BudgetAllocator;
+    var input = std.Io.Writer.Allocating.init(a);
+    defer input.deinit();
+    try input.writer.writeAll("{\"values\":[");
+    for (0..8192) |i| {
+        if (i > 0) try input.writer.writeAll(",");
+        try input.writer.writeAll("123456789");
+    }
+    try input.writer.writeAll("],\"omit\":true}");
+    const opts: types.LookupOptions = .{ .fields = &.{"values"}, .include_all_fields = false };
+    var previous_retained: usize = 0;
+    for (0..2) |mode| {
+        var counted: Counter = .{ .backing = a, .limit = 8 * 1024 * 1024 };
+        var output = std.heap.ArenaAllocator.init(counted.allocator());
+        var scratch = std.heap.ArenaAllocator.init(a);
+        var body_bytes: usize = 0;
+        for (0..64) |_| {
+            const document = if (mode == 0) old: {
+                const projected = try lookupJson(scratch.allocator(), input.written(), opts);
+                break :old try output.allocator().dupe(u8, projected.json);
+            } else (try lookupJsonWithOutput(scratch.allocator(), output.allocator(), input.written(), opts)).json;
+            body_bytes += document.len;
+            try std.testing.expect(std.mem.startsWith(u8, document, "{\"values\":[123456789"));
+            _ = scratch.reset(.{ .retain_with_limit = 64 * 1024 });
+        }
+        std.debug.print("PROJECTION_RESPONSE mode={d} documents=64 body_bytes={d} retained_output_bytes={d} peak_output_bytes={d} allocations={d}\n", .{ mode, body_bytes, counted.live, counted.peak, counted.alloc_calls });
+        if (mode == 0) previous_retained = counted.live else try std.testing.expect(counted.live <= previous_retained + 4096);
+        scratch.deinit();
+        output.deinit();
+        try std.testing.expectEqual(@as(usize, 0), counted.live);
+    }
+}
+
+test "public graph metric borrowed wire bounded native projection scratch response memory" {
+    const a = std.testing.allocator;
+    const ProbeSchema = @import("../schema.zig");
+    const ProbeCodec = @import("algebraic/relational_row_codec.zig");
+    const ProbePlan = @import("query/relational_projection.zig").Plan;
+    const Counter = @import("../lite/test_allocator.zig").BudgetAllocator;
+    const columns = [_]ProbeSchema.RelationalColumn{.{ .name = "payload", .path = "payload", .column_type = .json, .is_json = true, .json_kind = .any }};
+    const table = ProbeSchema.TableSchema{ .version = 1, .storage_mode = .relational, .relational_columns = &columns };
+    var layout = try ProbeCodec.PhysicalLayout.init(a, table);
+    defer layout.deinit();
+    var input = std.Io.Writer.Allocating.init(a);
+    defer input.deinit();
+    try input.writer.writeAll("{\"items\":[");
+    for (0..1024) |i| {
+        if (i > 0) try input.writer.writeAll(",");
+        try input.writer.writeAll("{\"id\":123,\"junk\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}");
+    }
+    try input.writer.writeAll("]}");
+    const cells = [_]ProbeCodec.Cell{.{ .ordinal = 0, .path = "payload", .is_json = true, .value_type = .bytes_val, .value = .{ .bytes_val = input.written() } }};
+    const encoded = try ProbeCodec.serializeOrdinal(a, 1, &columns, &cells, @splat(0));
+    defer a.free(encoded);
+    const row = try ProbeCodec.ordinalRowViewTrusted(encoded, table, &layout);
+    var previous_retained: usize = 0;
+    for (0..2) |mode| {
+        var counted: Counter = .{ .backing = a, .limit = 8 * 1024 * 1024 };
+        var output = std.heap.ArenaAllocator.init(counted.allocator());
+        var scratch = std.heap.ArenaAllocator.init(a);
+        var body_bytes: usize = 0;
+        for (0..16) |_| {
+            var plan = try ProbePlan.init(scratch.allocator(), table, &layout, &.{"payload.items.id"});
+            const document = if (mode == 0) old: {
+                const projected = try plan.project(scratch.allocator(), row);
+                break :old try output.allocator().dupe(u8, projected);
+            } else try plan.projectWithOutput(scratch.allocator(), output.allocator(), row);
+            body_bytes += document.len;
+            try std.testing.expect(std.mem.startsWith(u8, document, "{\"payload\":{\"items\":[{\"id\":123}"));
+            plan.deinit();
+            _ = scratch.reset(.{ .retain_with_limit = 64 * 1024 });
+        }
+        std.debug.print("NATIVE_PROJECTION_RESPONSE mode={d} documents=16 body_bytes={d} retained_output_bytes={d} peak_output_bytes={d} allocations={d}\n", .{ mode, body_bytes, counted.live, counted.peak, counted.alloc_calls });
+        if (mode == 0) previous_retained = counted.live else try std.testing.expect(counted.live <= previous_retained + 4096);
+        scratch.deinit();
+        output.deinit();
+        try std.testing.expectEqual(@as(usize, 0), counted.live);
+    }
 }
