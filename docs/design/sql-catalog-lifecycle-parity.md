@@ -1,7 +1,7 @@
 # SQL catalog lifecycle and original-case qualification
 
 Status: draft follow-up PR #1061 to merged PR #1048, merged with `origin/main`
-at `f986d952d7` in merge checkpoint `728c2abdb4`. Earlier implementation and
+at `7aa031f49d` in merge checkpoint `8e962ee4e2`. Earlier implementation and
 qualification checkpoints are retained below with their exact scope.
 This is an implementation and qualification backlog, not
 a completion claim. PostgreSQL is the SQL standard and independent test oracle.
@@ -5625,7 +5625,8 @@ Producer admission, command encoding, apply and reader projection share the
 existing 1 KiB activation bound. The native regression verifies reopen while
 the native floor remains inactive, rejected downgrade/foreign-incarnation
 attempts, oversized-command rollback and fail-closed reads of a corrupt oversized
-record. The service regression covers mixed-version members, ordinary commands,+batches, stale pre-activation proofs and both native-floor states.
+record. The service regression covers mixed-version members, ordinary commands,
+batches, stale pre-activation proofs and both native-floor states.
 
 This is a publication prerequisite, not activation of public producers. They
 still must derive requirements from owned schema/layout identities, durably
@@ -5642,3 +5643,53 @@ checks. These suite counts overlap the broader runs and are not unique-test or
 SQL-case totals. Formatting, control-catalog freshness, Apache boundary, license
 and original inventory checks passed. No public producer is enabled by this
 checkpoint, and no push or broader SQL release pass is claimed.
+
+### Explicit table publication outcomes and retained CREATE preparation
+
+Compound placement publication now inspects the authoritative table CAS outcome.
+Previously, the common table writer could silently reject a late FK-generation
+reservation while its caller continued to publish the logical tablespace delta
+and catalog revision. The CAS and common writer now expose acceptance to compound
+callers; ordinary single-command replicated rejection remains a deterministic
+no-op. Standalone compound replacement also aborts explicitly on rejection.
+An identical already-installed replacement is accepted without a table rewrite;
+a stale expected definition is not. Rejection branches remain before mutations.
+
+Placement preparation and apply also require the physical replacement and derive
+its only permitted fields from the same logical catalog cut. The logical table
+binding must identify the expected physical table. Omitted updates, different
+target IDs, unrelated table-definition changes and incorrect replica counts are
+rejected. Catalog reads/storage failures propagate rather than becoming successful
+publication. The native regression prepares a valid command, installs a late FK
+reservation, checks unchanged logical and physical cuts, releases the reservation,
+reopens the store, retries the original command and checks idempotent replay.
+
+CREATE retains its owned parsed request across readiness and the catalog barrier
+instead of parsing it a second time under the serialized catalog lock. This also
+avoids minting a second set of private index identities. Storage and object-create
+validation stay before that lock; namespace-dependent naming, schema-derived
+index expansion and placement still use the admitted cut. The ownership test
+overwrites and frees the original ingress buffer before reading retained fields,
+and checks invalid command shapes and rejected creation cleanup.
+
+These changes do not enable new schema producers or certify more original SQL
+cases. Server-derived reader requirements, atomic reader-floor publication,
+exact installed-root owner ACKs and their distributed faults remain required for
+the larger DDL activation batch. Counts remain 483 implemented / 136 rejected /
+105 superseded / 862 unresolved.
+
+Final `zig build antfly-metadata-test antfly-metadata-service-test
+-Doptimize=Debug -j2 --summary all` passed 80/80 steps: 139 service, 318
+metadata/control, 226 metadata/runtime, 241 native metadata-store and 28
+replication tests passed, plus the selection-owner check. Two optional live
+PostgreSQL CDC tests skipped their external prerequisites. The explicit
+`zig build antfly-system-catalog-test -Doptimize=Debug -j1 --summary all`
+gate passed 54/54 steps and 262/262 tests; its catalog label filter includes
+the CREATE-preparation test omitted by broad metadata runtime-prefix filters.
+These overlapping suites are not original SQL-case totals. The initial
+sandboxed run failed socket bind with errno 1 and its Python auditor blocked
+in macOS timezone-service startup; a process sample confirmed that wait and
+the diagnosed auditor was terminated before the permission-enabled rerun.
+No tests or gates were weakened. Formatting, license and Apache boundary,
+control-catalog freshness and inventory integrity checks passed. GC ran in
+preview-only mode. No push or full SQL release pass is claimed.

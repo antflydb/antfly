@@ -73,19 +73,53 @@ pub fn storeRootEnrollmentStatus(svc: anytype, alloc: std.mem.Allocator, context
     return store.storeRootControlJson(alloc, svc.metadata_group_id, .{ .enrollment_status = identity });
 }
 
+// Own the validated ingress representation across the catalog barrier. JSON
+// request parsing and storage validation stay outside the serialized lane;
+// name allocation, schema-derived index expansion and placement still use its
+// admitted cut. Reparsing also needlessly mints new private index identities.
+fn prepareCreateRequest(alloc: std.mem.Allocator, request: Request) !?tables_api.CreateTableRequest {
+    const creating_table = request.mutation.kind == .table and request.mutation.action == .create;
+    if (creating_table != (request.create_table_json != null)) return error.InvalidCatalogMutation;
+    const json = request.create_table_json orelse return null;
+    var req = try tables_api.parseStoredCreateTableRequest(alloc, json);
+    errdefer req.deinit(alloc);
+    const settings_value = req.storage orelse @import("antfly_local_sources").common_table_storage.Settings{};
+    try settings_value.validateCreate(req.num_shards, if (req.replication_sources_json) |sources| !std.mem.eql(u8, sources, "[]") else false);
+    try tables_api.validateObjectCreateDefinition(alloc, req);
+    return req;
+}
+
+test "system catalog table create preparation owns one validated request across publication" {
+    const alloc = std.testing.allocator;
+    var req = blk: {
+        const input = try alloc.dupe(u8, "{\"num_shards\":2,\"description\":\"owned create\",\"schema\":{\"version\":0}}");
+        defer alloc.free(input);
+        const prepared = (try prepareCreateRequest(alloc, .{ .mutation = .{ .kind = .table, .action = .create, .name = "items" }, .create_table_json = input })).?;
+        @memset(input, ' ');
+        break :blk prepared;
+    };
+    defer req.deinit(alloc);
+    try std.testing.expectEqualStrings("owned create", req.description.?);
+    try std.testing.expectEqual(@as(u32, 2), req.num_shards.?);
+    try std.testing.expect(req.indexes_json.?.len != 0);
+    var schema = try std.json.parseFromSlice(std.json.Value, alloc, req.schema_json.?, .{});
+    defer schema.deinit();
+    try std.testing.expectEqual(@as(i64, 0), schema.value.object.get("version").?.integer);
+    try std.testing.expect((try prepareCreateRequest(alloc, .{ .mutation = .{ .kind = .database, .action = .create, .name = "db" } })) == null);
+    try std.testing.expectError(error.InvalidCatalogMutation, prepareCreateRequest(alloc, .{ .mutation = .{ .kind = .table, .action = .create, .name = "items" } }));
+    try std.testing.expectError(error.InvalidCatalogMutation, prepareCreateRequest(alloc, .{ .mutation = .{ .kind = .table, .action = .drop, .name = "items" }, .create_table_json = "{}" }));
+    try std.testing.expectError(error.InvalidCreateTableRequest, prepareCreateRequest(alloc, .{ .mutation = .{ .kind = .table, .action = .create, .name = "items" }, .create_table_json = "{\"num_shards\":0}" }));
+}
+
 pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: Request) ![]u8 {
     try context.ensureActive();
     if (request.mutation.table_id != 0 or request.mutation.storage_name.len != 0) return error.InvalidCatalogMutation;
     if (request.generated_constraint_names.len != 0 and (request.mutation.kind != .table or request.mutation.action != .create)) return error.InvalidCatalogMutation;
-    var object_create = false;
-    if (request.create_table_json) |json| {
-        var create_req = try tables_api.parseStoredCreateTableRequest(alloc, json);
-        defer create_req.deinit(alloc);
-        const storage_settings = create_req.storage orelse @import("antfly_local_sources").common_table_storage.Settings{};
-        try storage_settings.validateCreate(create_req.num_shards, if (create_req.replication_sources_json) |sources| !std.mem.eql(u8, sources, "[]") else false);
-        try tables_api.validateObjectCreateDefinition(alloc, create_req);
-        object_create = storage_settings.engine == .object;
-    }
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const create_req = try prepareCreateRequest(a, request);
+    const object_create = if (create_req) |req| (req.storage orelse @import("antfly_local_sources").common_table_storage.Settings{}).engine == .object else false;
     const ordinary_version = if (object_create) protocol.object_table_engine_version else if (request.mutation.kind == .table and request.mutation.action == .drop) protocol.system_catalog_drop_version else protocol.system_catalog_version;
     const required_version = if (request.generated_constraint_names.len != 0) @max(ordinary_version, protocol.constraint_occupancy_version) else ordinary_version;
     const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, required_version);
@@ -94,14 +128,10 @@ pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.Request
     try svc.ensureLinearizableReadWithContext(context);
     try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    const a = arena.allocator();
     const admission = try store.systemCatalogAdmission(a, svc.metadata_group_id, request.mutation);
     var command: storage.SystemCatalogCommand = .{ .expected_revision = admission.meta.revision, .mutation = request.mutation };
     if (request.mutation.action == .create and request.mutation.kind == .table) {
-        const json = request.create_table_json orelse return error.InvalidCatalogMutation;
-        var req = try tables_api.parseStoredCreateTableRequest(a, json);
+        var req = create_req orelse return error.InvalidCatalogMutation;
         if (request.generated_constraint_names.len != 0) {
             const bytes = try store.prepareConstraintNamesJsonWithContext(a, svc.metadata_group_id, .{ .create = .{ .expected_revision = admission.meta.revision, .namespace_id = admission.namespace_id, .logical_name = request.mutation.name, .schema_json = req.schema_json orelse return error.InvalidCatalogMutation, .generated_names = request.generated_constraint_names } }, context);
             const names = try std.json.parseFromSliceLeaky(domain.ConstraintNamePrepared, a, bytes, .{});

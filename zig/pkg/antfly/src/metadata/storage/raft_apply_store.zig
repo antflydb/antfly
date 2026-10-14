@@ -13349,7 +13349,8 @@ pub const RaftApplyStore = struct {
             // Reuse replicated lifecycle admission, including owner coverage,
             // dependencies and topology fences. A rejected CAS aborts the whole
             // local transaction, including its logical delta and standby record.
-            try self.applyTableCompareAndReplaceTxn(&txn, group_id, change.expected, change.replacement);
+            if (!try self.tryApplyTableCompareAndReplaceTxn(&txn, group_id, change.expected, change.replacement))
+                return error.TableLifecycleConflict;
             const actual = try decodeTableRecord(self.alloc, (try stagingGet(&txn, key)) orelse return error.TableLifecycleConflict);
             defer metadata_table_manager.freeTable(self.alloc, actual);
             if (!metadata_table_manager.tableDefinitionsEqual(actual, change.replacement)) return error.TableLifecycleConflict;
@@ -16339,10 +16340,34 @@ pub const RaftApplyStore = struct {
     fn validateCatalogTopology(command: SystemCatalogCommand) !void {
         const physical = command.mutation.kind == .table and (command.mutation.action == .create or command.mutation.action == .drop);
         if (physical != (command.topology != null)) return error.InvalidCatalogMutation;
+        const placement = command.mutation.kind == .table and command.mutation.action == .set_tablespace;
+        if (placement != (command.placement_update != null)) return error.InvalidCatalogMutation;
         if (command.topology) |topology| switch (topology) {
             .create => |create| if (command.mutation.action != .create or create.table.table_id != command.mutation.table_id or !std.mem.eql(u8, create.table.name, command.mutation.storage_name)) return error.InvalidCatalogMutation,
             .drop => |drop| if (command.mutation.action != .drop or drop.table_id != command.mutation.table_id or !std.mem.eql(u8, drop.expected_name, command.mutation.storage_name)) return error.InvalidCatalogMutation,
         };
+    }
+
+    /// Bind placement to the logical target and derive the ONLY permitted
+    /// physical delta from this same catalog cut. A placement command cannot
+    /// substitute another table, smuggle schema changes, or omit its writer.
+    fn validateCatalogPlacement(reader: CatalogReader, command: SystemCatalogCommand, delta: system_catalog.Delta) !void {
+        const update = command.placement_update orelse return;
+        if (delta.upserts.len != 1 or delta.removes.len != 0) return error.InvalidCatalogMutation;
+        const binding = delta.upserts[0];
+        if (binding.kind != .table or binding.id != update.expected.table_id or
+            !std.mem.eql(u8, binding.storage_name, update.expected.name)) return error.InvalidCatalogMutation;
+        const namespace = try reader.namespaceFor(command.mutation.database, command.mutation.namespace);
+        const policy = if (try reader.view.effectiveTablespace(namespace, binding.tablespace_id)) |space|
+            space.placement_policy
+        else
+            system_catalog.PlacementPolicy{};
+        try policy.validate();
+        var derived = update.expected;
+        derived.placement_role = policy.placement_role orelse "data";
+        derived.desired_replica_count = if (derived.storage.engine == .object) 0 else policy.desired_replica_count orelse 3;
+        derived.min_ranges = if (derived.storage.engine == .object) 0 else policy.min_ranges orelse 1;
+        if (!metadata_table_manager.tableDefinitionsEqual(derived, update.replacement)) return error.InvalidCatalogMutation;
     }
 
     /// Validate and serialize the exact admitted projection before proposing.
@@ -16359,6 +16384,7 @@ pub const RaftApplyStore = struct {
         try validateCatalogTopology(command);
         var delta = try system_catalog.planWithTopology(a, reader, meta.next_id, command.mutation, command.mutation.kind == .table and command.mutation.action == .drop);
         defer delta.deinit(a);
+        try validateCatalogPlacement(reader, command, delta);
         if (command.placement_update) |update| {
             if (command.mutation.kind != .table or command.mutation.action != .set_tablespace or update.expected.table_id != update.replacement.table_id or !std.mem.eql(u8, update.expected.name, update.replacement.name)) return error.InvalidCatalogMutation;
             if ((try self.loadTableTransitionFenceTxn(&txn, group_id, update.expected.table_id)).active()) return error.TableTransitionActive;
@@ -16671,13 +16697,17 @@ pub const RaftApplyStore = struct {
             else => return, // A concurrent catalog/topology operation defeated admission.
         };
         defer delta.deinit(a);
+        validateCatalogPlacement(reader, command, delta) catch |err| switch (err) {
+            error.InvalidCatalogMutation => return,
+            else => return err, // Storage/corruption failures must abort.
+        };
         if (command.placement_update) |update| {
             if (command.mutation.kind != .table or command.mutation.action != .set_tablespace or update.expected.table_id != update.replacement.table_id or !std.mem.eql(u8, update.expected.name, update.replacement.name)) return;
             if ((try self.loadTableTransitionFenceTxn(txn, group_id, update.expected.table_id)).active()) return;
             const current = (try self.getTableByNameTxn(self.alloc, txn, group_id, update.expected.name)) orelse return;
             defer metadata_table_manager.freeTable(self.alloc, current);
             if (!metadata_table_manager.tableDefinitionsEqual(current, update.expected)) return;
-            try self.applyTableCompareAndReplaceTxn(txn, group_id, update.expected, update.replacement);
+            if (!try self.tryApplyTableCompareAndReplaceTxn(txn, group_id, update.expected, update.replacement)) return;
         }
         if (command.topology) |topology| {
             try self.applyTableTopologyMutationTxn(txn, group_id, topology);
@@ -24939,24 +24969,37 @@ pub const RaftApplyStore = struct {
         expected: metadata.TableRecord,
         replacement: metadata.TableRecord,
     ) !void {
+        // A standalone replicated CAS intentionally treats a rejected proposal
+        // as a deterministic no-op. Compound publications must inspect the
+        // outcome instead of publishing their dependent catalog effects.
+        _ = try self.tryApplyTableCompareAndReplaceTxn(txn, group_id, expected, replacement);
+    }
+
+    fn tryApplyTableCompareAndReplaceTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        expected: metadata.TableRecord,
+        replacement: metadata.TableRecord,
+    ) !bool {
         var key_buf: [160]u8 = undefined;
         const key = try tableKeyForGroup(&key_buf, group_id, expected.table_id);
         const encoded = txn.get(key) catch |err| switch (err) {
-            error.NotFound => return,
+            error.NotFound => return false,
             else => return err,
         };
         const current = try decodeTableRecord(self.alloc, encoded);
         defer metadata_table_manager.freeTable(self.alloc, current);
-        if (!metadata_table_manager.tableDefinitionsEqual(current, expected)) return;
+        if (!metadata_table_manager.tableDefinitionsEqual(current, expected)) return false;
         metadata_table_manager.validateObjectTableMutation(self.alloc, current, replacement) catch |err| switch (err) {
             error.OutOfMemory => return err,
-            else => return,
+            else => return false,
         };
         const lake_transition_allowed = @import("antfly_local_sources").metadata_lake_index_catalog.transitionAllowed(self.alloc, current, replacement) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => false,
         };
-        if (!lake_transition_allowed) return;
+        if (!lake_transition_allowed) return false;
         if (replacement.lake_index_catalog_json.len != 0 or current.lake_index_catalog_json.len != 0) {
             var arena = std.heap.ArenaAllocator.init(self.alloc);
             defer arena.deinit();
@@ -24967,21 +25010,21 @@ pub const RaftApplyStore = struct {
             defer catalog_state.deinit();
             const next = state.synchronize(a, catalog_state.value) catch |err| switch (err) {
                 error.OutOfMemory => return err,
-                else => return,
+                else => return false,
             };
             _ = lifecycle.encode(a, next) catch |err| switch (err) {
                 error.OutOfMemory => return err,
-                else => return,
+                else => return false,
             };
         }
-        if (!try self.policyDefinitionMutationAllowedTxn(txn, group_id, current, replacement)) return;
+        if (!try self.policyDefinitionMutationAllowedTxn(txn, group_id, current, replacement)) return false;
         var admission = replacement;
         // A completed subtract-only retirement changes active policy, not
         // historical row/index decoding. Old read-schema FK declarations
         // must not resurrect a retired generation at final publication.
         if (try @import("../relational_retirement.zig").permitsSchema(self.alloc, current, replacement)) admission.read_schema_json = "";
-        if (!try self.relationalParentsExistTxn(txn, group_id, admission)) return;
-        if (!try @import("../relational_retirement.zig").transitionAllowed(self.alloc, current, replacement)) return;
+        if (!try self.relationalParentsExistTxn(txn, group_id, admission)) return false;
+        if (!try @import("../relational_retirement.zig").transitionAllowed(self.alloc, current, replacement)) return false;
         if (replacement.relational_retirement_json.len != 0) {
             var retirement = try @import("../relational_retirement.zig").parse(self.alloc, replacement.relational_retirement_json);
             defer retirement.deinit();
@@ -24989,7 +25032,7 @@ pub const RaftApplyStore = struct {
                 var target = current;
                 target.schema_json = retirement.value.target_schema_json;
                 target.read_schema_json = "";
-                if (!try self.relationalParentsExistTxn(txn, group_id, target)) return;
+                if (!try self.relationalParentsExistTxn(txn, group_id, target)) return false;
                 var retirement_prefix_buf: [128]u8 = undefined;
                 const retirement_prefix = try tablePrefixForGroup(&retirement_prefix_buf, group_id);
                 var retirement_cursor = try txn.openCursor();
@@ -25001,32 +25044,32 @@ pub const RaftApplyStore = struct {
                     defer metadata_table_manager.freeTable(self.alloc, candidate);
                     const external = candidate.table_id != current.table_id;
                     for ([_][]const u8{ if (external) candidate.schema_json else target.schema_json, if (external) candidate.read_schema_json else "" }) |schema| {
-                        if (!try @import("../relational_retirement.zig").incomingAllowed(self.alloc, current.name, current.schema_json, retirement.value, schema, external)) return;
+                        if (!try @import("../relational_retirement.zig").incomingAllowed(self.alloc, current.name, current.schema_json, retirement.value, schema, external)) return false;
                     }
                 }
             }
             const owners = try self.indexedTableRangeIdsTxn(self.alloc, txn, group_id, current.table_id);
             defer self.alloc.free(owners);
-            if (owners.len != retirement.value.owners.len) return;
+            if (owners.len != retirement.value.owners.len) return false;
             for (retirement.value.owners) |owner| {
                 var range_key_buf: [160]u8 = undefined;
                 const range_key = try rangeKeyForGroup(&range_key_buf, group_id, owner.group_id);
                 const raw_range = txn.get(range_key) catch |err| switch (err) {
-                    error.NotFound => return,
+                    error.NotFound => return false,
                     else => return err,
                 };
                 const range = try decodeRangeRecord(self.alloc, raw_range);
                 defer metadata_table_manager.freeRange(self.alloc, range);
                 if (range.table_id != current.table_id or range.range_id != owner.range_id or !std.mem.eql(u8, range.start_key, owner.start) or
-                    !std.mem.eql(u8, range.end_key orelse "", owner.end)) return;
+                    !std.mem.eql(u8, range.end_key orelse "", owner.end)) return false;
             }
         }
         if (!std.mem.eql(u8, current.name, replacement.name) and
-            try self.relationalDropBlockedTxn(txn, group_id, current)) return;
-        if (!try self.relationalDefinitionsRetainedForMutationTxn(txn, group_id, current, replacement)) return;
-        if ((try self.loadTableTransitionFenceTxn(txn, group_id, expected.table_id)).active()) return;
-        if (metadata_table_manager.tableDefinitionsEqual(current, replacement)) return;
-        try self.putTableRecordTxn(txn, group_id, key, replacement);
+            try self.relationalDropBlockedTxn(txn, group_id, current)) return false;
+        if (!try self.relationalDefinitionsRetainedForMutationTxn(txn, group_id, current, replacement)) return false;
+        if ((try self.loadTableTransitionFenceTxn(txn, group_id, expected.table_id)).active()) return false;
+        if (metadata_table_manager.tableDefinitionsEqual(current, replacement)) return true;
+        return self.tryPutTableRecordTxnMode(txn, group_id, key, replacement, false);
     }
 
     fn relationalDefinitionsRetained(self: *RaftApplyStore, previous: metadata.TableRecord, next: metadata.TableRecord) !bool {
@@ -25236,6 +25279,17 @@ pub const RaftApplyStore = struct {
         record: metadata.TableRecord,
         published_fk_generation: bool,
     ) !void {
+        _ = try self.tryPutTableRecordTxnMode(txn, group_id, key, record, published_fk_generation);
+    }
+
+    fn tryPutTableRecordTxnMode(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        key: []const u8,
+        record: metadata.TableRecord,
+        published_fk_generation: bool,
+    ) !bool {
         const encoded_existing = txn.get(key) catch |err| switch (err) {
             error.NotFound => null,
             else => return err,
@@ -25256,13 +25310,13 @@ pub const RaftApplyStore = struct {
                 // however, binds an immutable table cut: allowing that same
                 // finalization would invalidate the plan after admission and
                 // strand the publication despite healthy owners.
-                if (kind != .initial_support) return;
-                if (existing.read_schema_json.len == 0 or record.read_schema_json.len != 0) return;
+                if (kind != .initial_support) return false;
+                if (existing.read_schema_json.len == 0 or record.read_schema_json.len != 0) return false;
                 var finalized = try metadata_table_manager.cloneTable(self.alloc, existing);
                 defer metadata_table_manager.freeTable(self.alloc, finalized);
                 try @import("../schema_migration_finalization.zig").apply(self.alloc, &finalized);
                 if (!metadata_table_manager.tableDefinitionsEqual(finalized, record) or
-                    !try self.schemaMigrationReadyTxn(txn, group_id, record.table_id, try @import("../../api/tables.zig").schemaVersion(existing.schema_json))) return;
+                    !try self.schemaMigrationReadyTxn(txn, group_id, record.table_id, try @import("../../api/tables.zig").schemaVersion(existing.schema_json))) return false;
             }
             // Policy bytecode and owner descriptors bind the exact typed-row
             // layout. Relational index DDL changes schema_json even when its
@@ -25274,7 +25328,7 @@ pub const RaftApplyStore = struct {
             if (!try self.policyDefinitionMutationAllowedTxn(txn, group_id, existing, record))
                 return error.RowPolicyUnsupported;
             try self.deleteTableNameIndexTxn(txn, group_id, existing.name);
-        } else if (!published_fk_generation and try self.fkGenerationTableLockedTxn(txn, group_id, record.table_id)) return;
+        } else if (!published_fk_generation and try self.fkGenerationTableLockedTxn(txn, group_id, record.table_id)) return false;
         try self.synchronizeLakeIndexLifecycleTxn(txn, group_id, record);
         const value = try encodeTableRecord(self.alloc, record);
         defer self.alloc.free(value);
@@ -25294,6 +25348,7 @@ pub const RaftApplyStore = struct {
             .table_name = record.name,
             .table_id = record.table_id,
         });
+        return true;
     }
 
     fn loadTableTransitionFenceTxn(
@@ -39071,6 +39126,110 @@ test "metadata raft apply store group status decoder accepts version one records
     try std.testing.expect(decoded.replay_caught_up);
     try std.testing.expect(decoded.voter_set_known);
     try std.testing.expectEqualSlices(u8, &fingerprint, &decoded.voter_set_fingerprint);
+}
+
+test "system catalog table placement publication rejected CAS preserves logical and physical cuts across restart" {
+    const alloc = std.testing.allocator;
+    const group = group_ids.main_metadata_group_id;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/placement-cas", .{tmp.sub_path});
+    defer alloc.free(root);
+    const table: metadata.TableRecord = .{ .table_id = 7, .name = "table:placement", .schema_json = "{}" };
+    const binding: system_catalog.Resource = .{ .kind = .table, .id = 7, .parent_id = system_catalog.default_namespace_id, .name = "items", .storage_name = table.name };
+    const space: system_catalog.Resource = .{ .kind = .tablespace, .id = 8, .parent_id = 0, .name = "archive", .placement_policy = .{ .desired_replica_count = 5 } };
+    var replacement = table;
+    replacement.desired_replica_count = 5;
+    const command: SystemCatalogCommand = .{
+        .expected_revision = 1,
+        .mutation = .{ .action = .set_tablespace, .kind = .table, .name = "items", .tablespace = "archive" },
+        .placement_update = .{ .expected = table, .replacement = replacement },
+    };
+    const bytes = try std.json.Stringify.valueAlloc(alloc, command, .{});
+    defer alloc.free(bytes);
+    {
+        var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+        defer store.deinit();
+        try store.updateStandaloneCatalog(group, 0, .{ .tables = &.{table}, .auxiliary_json = "{}", .import_catalog = .{ .revision = 1, .next_id = 9, .resources = &.{ binding, space } } });
+        const before = try store.systemCatalogMeta(alloc, group);
+        var forged: [4]SystemCatalogCommand = @splat(command);
+        forged[0].placement_update = null;
+        forged[1].placement_update.?.expected.table_id = 999;
+        forged[1].placement_update.?.replacement.table_id = 999;
+        forged[2].placement_update.?.replacement.description = "unrelated definition change";
+        forged[3].placement_update.?.replacement.desired_replica_count = 4;
+        for (forged) |invalid| {
+            try std.testing.expectError(error.InvalidCatalogMutation, store.prepareSystemCatalogResult(alloc, group, invalid));
+            const invalid_bytes = try std.json.Stringify.valueAlloc(alloc, invalid, .{});
+            defer alloc.free(invalid_bytes);
+            try store.applyStandaloneCommand(group, .{ .apply_system_catalog = invalid_bytes });
+            try std.testing.expectEqualDeep(before, try store.systemCatalogMeta(alloc, group));
+        }
+        // The coordinator prepared a valid command, then an FK generation
+        // reserved the exact physical table before authoritative apply. This
+        // rejection occurs in the common writer, after CAS's other preflight.
+        const prepared = try store.prepareSystemCatalogResult(alloc, group, command);
+        defer alloc.free(prepared);
+        var lock_buf: [160]u8 = undefined;
+        const lock_key = try fk_generation_publication.tableLockKey(&lock_buf, group, table.table_id);
+        {
+            var txn = try store.store.beginWriteTxn();
+            errdefer txn.abort();
+            const value = RaftApplyStore.fkTableLockValue(.generation, @splat(1));
+            try txn.put(lock_key, &value);
+            try txn.commit();
+        }
+        try store.applyStandaloneCommand(group, .{ .apply_system_catalog = bytes });
+        try std.testing.expectEqualDeep(before, try store.systemCatalogMeta(alloc, group));
+        var state = try store.systemCatalogSnapshot(alloc, group);
+        defer state.deinit();
+        var bindings: usize = 0;
+        for (state.value.resources) |resource| if (resource.kind == .table) {
+            bindings += 1;
+            try std.testing.expectEqual(table.table_id, resource.id);
+            try std.testing.expectEqual(@as(u64, 0), resource.tablespace_id);
+        };
+        try std.testing.expectEqual(@as(usize, 1), bindings);
+        const tables = try store.listTables(alloc, group);
+        defer store.freeTables(alloc, tables);
+        try std.testing.expectEqual(@as(usize, 1), tables.len);
+        try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(table, tables[0]));
+        {
+            var txn = try store.store.beginWriteTxn();
+            errdefer txn.abort();
+            try txn.delete(lock_key);
+            try std.testing.expect(try store.tryApplyTableCompareAndReplaceTxn(&txn, group, table, table));
+            var stale = table;
+            stale.description = "stale expected definition";
+            try std.testing.expect(!try store.tryApplyTableCompareAndReplaceTxn(&txn, group, stale, replacement));
+            try txn.commit();
+        }
+    }
+    {
+        var reopened = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+        defer reopened.deinit();
+        try std.testing.expectEqual(@as(u64, 1), (try reopened.systemCatalogMeta(alloc, group)).revision);
+        // Retry the same admitted operation after releasing the reservation:
+        // both cuts publish together. Replaying it must not advance revision.
+        try reopened.applyStandaloneCommand(group, .{ .apply_system_catalog = bytes });
+        const published = try reopened.systemCatalogMeta(alloc, group);
+        try std.testing.expectEqual(@as(u64, 2), published.revision);
+        try reopened.applyStandaloneCommand(group, .{ .apply_system_catalog = bytes });
+        try std.testing.expectEqualDeep(published, try reopened.systemCatalogMeta(alloc, group));
+        var state = try reopened.systemCatalogSnapshot(alloc, group);
+        defer state.deinit();
+        var bindings: usize = 0;
+        for (state.value.resources) |resource| if (resource.kind == .table) {
+            bindings += 1;
+            try std.testing.expectEqual(table.table_id, resource.id);
+            try std.testing.expectEqual(space.id, resource.tablespace_id);
+        };
+        try std.testing.expectEqual(@as(usize, 1), bindings);
+        const tables = try reopened.listTables(alloc, group);
+        defer reopened.freeTables(alloc, tables);
+        try std.testing.expectEqual(@as(usize, 1), tables.len);
+        try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(replacement, tables[0]));
+    }
 }
 
 test "SQL settings apply through Raft and survive catalog restart" {
