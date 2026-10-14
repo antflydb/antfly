@@ -788,7 +788,7 @@ pub const Stream = struct {
         statement_backend.execution_binding_validator = null;
         self.parameter_invocation = binding.parameter_invocation;
         statement_backend.parameter_invocation = binding.parameter_invocation;
-        if (self.parameter_invocation) |invocation| try invocation.prepareJson(self.budget.allocator(), parameters, .{ .bytes = limits.retained_bytes, .wire_bytes = limits.retained_bytes });
+        if (self.parameter_invocation) |invocation| try invocation.prepareJson(self.budget.allocator(), parameters, .{ .bytes = limits.retained_bytes, .wire_bytes = limits.retained_bytes, .error_context = limits.error_context });
         const statement = if (binding.relation) |relation| relation.statement else compiled.statement.select;
         self.context = .{ .alloc = self.budget.allocator(), .arena = arena, .backend = @import("decision_eval.zig").scopedBackend(statement_backend, binding), .binding = binding, .parameters = &.{}, .limits = limits, .typed_output = true };
         const params = if (self.parameter_invocation) |invocation| try invocation.compatibilityValues(arena) else try arena.dupe(Json, parameters);
