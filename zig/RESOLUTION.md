@@ -1305,3 +1305,36 @@ without opening unrelated namespaces. Restore reconstructs only that explicit
 scope. Include dependency tables when exporting schemas with cross-table
 constraints or resolver references. Go and Rust expose `BackupJSON`/`backup_json`;
 all bindings expose replacement cancellation.
+
+## Inline resolvers during graph replacement
+
+Embedded `add_index` with `replaces` can transfer an inline resolver to a new
+graph version without changing its public resolver name. A changed resolver must
+use fresh extraction **and** resolution artifact names. Admission stages a
+separate execution contract alongside the serving resolver, records it with the
+durable shadow reservation, and resets the existing bounded resolution replay
+cursors. Inline extraction producers are admitted in that transaction too;
+existing documents are replayed in resumable pages before graph construction,
+without a corpus scan at admission or activation. The old graph and public resolver remain authoritative during the build.
+The successor takes the public name in the same transaction that activates the
+shadow graph; cancellation or terminal build failure retires only the staged
+execution contract. Pending replacement and resolution work resume after reopen.
+
+The successor inherits durable merges and, when omitted in its declaration,
+inline aliases. Resolver mutations return `replacement_pending` during the build;
+finish or cancel the replacement before making further identity changes. A
+resolver independently created through the resolver API, or declared by another
+serving graph, cannot be taken over. An unchanged resolver contract can be reused
+without creating a new execution stream.
+
+Changing a key template is supported when no aliases, merges, or explicit
+namespace fence exist. Curated namespaces still require an explicit
+`set_resolver_namespace` migration with an endpoint mapping (or an explicit reset)
+before requesting a replacement with a different table or template. Replacement
+cannot infer an arbitrary old-key to new-key mapping and does not discard curated
+redirects to make that change succeed.
+
+Internal predecessor contracts remain retired so replay can recognize old
+resolution artifacts without executing the old resolver. They do not appear in
+public resolver or identity listings. Databases containing staged contracts
+require resolver reader version 3; older readers reject them before parsing.

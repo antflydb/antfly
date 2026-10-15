@@ -11561,6 +11561,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             for (index_manager.resolvers.items) |*cfg| {
                 if (std.mem.eql(u8, cfg.resolution_artifact, resolution_artifact)) return cfg;
             }
+            for (index_manager.retired_resolvers.items) |*cfg| {
+                if (std.mem.eql(u8, cfg.resolution_artifact, resolution_artifact)) return cfg;
+            }
             return null;
         }
 

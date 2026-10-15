@@ -63,20 +63,21 @@ fn cloneLabels(alloc: Allocator, labels: []const []const u8) ![]const []const u8
 
 /// Monotonic feature epoch, published with catalog mutations and checked before parsing.
 pub const minimum_reader_key = "\x00\x00__metadata__:minimum_reader_version";
-pub const supported_reader_version: u32 = 2;
+pub const supported_reader_version: u32 = 3;
 
 pub fn catalogReaderVersion(a: Allocator, data: []const u8) !u32 {
     const parsed = try std.json.parseFromSlice(std.json.Value, a, data, .{});
     defer parsed.deinit();
     const rows = try catalogRows(parsed.value);
-    if (parsed.value == .object) return 2;
+    var required: u32 = if (parsed.value == .object) @intCast(parsed.value.object.get("version").?.integer) else 1;
     for (rows.array.items) |entry| {
         if (entry != .object) return error.InvalidResolverConfig;
+        if (entry.object.contains("replacement_index") or entry.object.contains("replacement_resolver")) return 3;
         for ([_][]const u8{ "inline_managed", "retired", "aliases", "promote", "merge_generation", "merge_state_version", "resolution_generation", "namespace_generation", "retain_work", "max_work_bytes" }) |field| {
-            if (entry.object.contains(field)) return 2;
+            if (entry.object.contains(field)) required = @max(required, 2);
         }
     }
-    return 1;
+    return required;
 }
 
 pub fn readMinimumReaderVersion(txn: anytype, supported: u32) !u32 {
@@ -91,7 +92,7 @@ pub fn readMinimumReaderVersion(txn: anytype, supported: u32) !u32 {
 
 pub fn stampMinimumReaderVersion(a: Allocator, txn: anytype, catalog: []const u8) !u32 {
     const version = @max(try readMinimumReaderVersion(txn, supported_reader_version), try catalogReaderVersion(a, catalog));
-    try txn.put(minimum_reader_key, if (version == 1) "1" else "2");
+    try txn.put(minimum_reader_key, if (version == 1) "1" else if (version == 2) "2" else "3");
     return version;
 }
 
@@ -144,6 +145,11 @@ pub const ResolverConfig = struct {
     /// state for re-add/rename. These fields are catalog-owned, never public config.
     inline_managed: ?bool = null,
     retired: bool = false,
+    /// Unpublished execution contract owned by a durable graph replacement.
+    /// Its internal name keeps the serving resolver addressable during replay.
+    replacement_index: []const u8 = "",
+    replacement_resolver: []const u8 = "",
+
     /// Materialize canonical entity documents; false resolves graph keys only.
     promote: bool = true,
     /// Optional work is bounded independently of authoritative resolutions.
@@ -245,7 +251,7 @@ pub const ResolverConfig = struct {
         try writer.beginObject();
         inline for (@typeInfo(ResolverConfig).@"struct".field_names) |field| {
             if (comptime !std.mem.eql(u8, field, "merges")) {
-                const omit = if (comptime std.mem.eql(u8, field, "aliases")) self.aliases.len == 0 else if (comptime std.mem.eql(u8, field, "promote")) self.promote else if (comptime std.mem.eql(u8, field, "merge_generation")) self.merge_generation == 0 else if (comptime std.mem.eql(u8, field, "merge_state_version")) self.merge_state_version == 0 else if (comptime std.mem.eql(u8, field, "resolution_generation")) self.resolution_generation == 0 else if (comptime std.mem.eql(u8, field, "namespace_generation")) self.namespace_generation == 0 else if (comptime std.mem.eql(u8, field, "inline_managed")) self.inline_managed == null else if (comptime std.mem.eql(u8, field, "retired")) !self.retired else if (comptime std.mem.eql(u8, field, "retain_work")) self.retain_work == .full else if (comptime std.mem.eql(u8, field, "max_work_bytes")) self.max_work_bytes == 1024 * 1024 else false;
+                const omit = if (comptime std.mem.eql(u8, field, "aliases")) self.aliases.len == 0 else if (comptime std.mem.eql(u8, field, "promote")) self.promote else if (comptime std.mem.eql(u8, field, "merge_generation")) self.merge_generation == 0 else if (comptime std.mem.eql(u8, field, "merge_state_version")) self.merge_state_version == 0 else if (comptime std.mem.eql(u8, field, "resolution_generation")) self.resolution_generation == 0 else if (comptime std.mem.eql(u8, field, "namespace_generation")) self.namespace_generation == 0 else if (comptime std.mem.eql(u8, field, "inline_managed")) self.inline_managed == null else if (comptime std.mem.eql(u8, field, "replacement_index")) self.replacement_index.len == 0 else if (comptime std.mem.eql(u8, field, "replacement_resolver")) self.replacement_resolver.len == 0 else if (comptime std.mem.eql(u8, field, "retired")) !self.retired else if (comptime std.mem.eql(u8, field, "retain_work")) self.retain_work == .full else if (comptime std.mem.eql(u8, field, "max_work_bytes")) self.max_work_bytes == 1024 * 1024 else false;
                 if (!omit) {
                     try writer.objectField(field);
                     try writer.write(@field(self, field));
@@ -304,6 +310,8 @@ pub const ResolverConfig = struct {
             .namespace_generation = cfg.namespace_generation,
             .inline_managed = cfg.inline_managed,
             .retired = cfg.retired,
+            .replacement_index = if (cfg.replacement_index.len > 0) try alloc.dupe(u8, cfg.replacement_index) else "",
+            .replacement_resolver = if (cfg.replacement_resolver.len > 0) try alloc.dupe(u8, cfg.replacement_resolver) else "",
             .promote = cfg.promote,
             .retain_work = cfg.retain_work,
             .max_work_bytes = cfg.max_work_bytes,
@@ -347,6 +355,8 @@ pub const ResolverConfig = struct {
         if (self.candidate_ann_index.len > 0) alloc.free(@constCast(self.candidate_ann_index));
         if (self.name_embedding.len > 0) alloc.free(@constCast(self.name_embedding));
         if (self.fusion_combine.len > 0) alloc.free(@constCast(self.fusion_combine));
+        if (self.replacement_index.len > 0) alloc.free(self.replacement_index);
+        if (self.replacement_resolver.len > 0) alloc.free(self.replacement_resolver);
         self.* = undefined;
     }
 
@@ -418,7 +428,7 @@ fn catalogRows(value: std.json.Value) !std.json.Value {
     if (value == .array) return value;
     if (value != .object) return error.InvalidResolverConfig;
     const version = value.object.get("version") orelse return error.InvalidResolverConfig;
-    if (version != .integer or version.integer != supported_reader_version) return error.UnsupportedResolverCatalogVersion;
+    if (version != .integer or (version.integer < 2 or version.integer > supported_reader_version)) return error.UnsupportedResolverCatalogVersion;
     const rows = value.object.get("resolvers") orelse return error.InvalidResolverConfig;
     if (rows != .array) return error.InvalidResolverConfig;
     return rows;
@@ -427,8 +437,9 @@ fn catalogRows(value: std.json.Value) !std.json.Value {
 pub fn serializeCatalog(alloc: Allocator, resolvers: []const ResolverConfig) ![]u8 {
     const rows = try std.json.Stringify.valueAlloc(alloc, resolvers, .{});
     errdefer alloc.free(rows);
-    if (try catalogReaderVersion(alloc, rows) == 1) return rows;
-    const wrapped = try std.fmt.allocPrint(alloc, "{{\"version\":2,\"resolvers\":{s}}}", .{rows});
+    const version = try catalogReaderVersion(alloc, rows);
+    if (version == 1) return rows;
+    const wrapped = try std.fmt.allocPrint(alloc, "{{\"version\":{d},\"resolvers\":{s}}}", .{ version, rows });
     alloc.free(rows);
     return wrapped;
 }

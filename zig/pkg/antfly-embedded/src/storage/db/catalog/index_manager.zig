@@ -126,6 +126,9 @@ pub const GraphReplacementBuild = struct {
     total_retry_count: u32 = 0,
     retry_after_ns: u64 = 0,
     activation_attempts: u32 = 0,
+    producer_replay_complete: bool = true,
+    producer_replay_resume_b64: ?[]const u8 = null,
+    producer_replay_target: u64 = 0,
 };
 const text_field_analyzers_prefix = "\x00\x00__metadata__:text_field_analyzers:";
 const active_index_root_pointer_file = ".antfly-active-index-root";
@@ -11955,30 +11958,137 @@ pub const IndexManager = struct {
         }
         const previous = self.get(old) orelse return error.NotFound;
         if (previous.kind != .graph or cfg.kind != .graph) return error.UnsupportedOperation;
+        const enrichment_checkpoint = self.enrichments.items.len;
+        errdefer self.truncateEnrichments(enrichment_checkpoint);
+        const enrichments_changed = try self.ensureShorthandEnrichments(cfg);
+        for (self.enrichments.items) |entry| try self.validateNeighborDependencyGraph(entry);
+        const has_generated_targets = if (enrichments_changed) try self.computeGeneratedEnrichmentTargetCache() else false;
         var validated = try parseGraphConfig(self.alloc, cfg.config_json);
         defer validated.deinit(self.alloc);
         for (validated.artifact_sources) |source| {
             _ = self.getEnrichmentByName(source.artifact_name) orelse return error.InvalidIndexConfig;
         }
+        const resolver_checkpoint = self.resolvers.items.len;
+        errdefer self.truncateResolvers(resolver_checkpoint);
         var stored = try indexConfigWithCoverageGeneration(self.alloc, self.io, cfg);
         errdefer stored.deinit(self.alloc);
+        try self.stageGraphReplacementResolvers(old, stored);
         try self.prepareStorageForFreshCatalogEntry(store, stored);
         try self.provisionConfiguredIndexDirDurable(stored);
         const key = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ graph_replacement_build_prefix, stored.name });
         defer self.alloc.free(key);
-        const value = try std.json.Stringify.valueAlloc(self.alloc, GraphReplacementBuild{ .name = stored.name, .generation = stored.coverage_generation, .old = old, .config = stored, .request_hash = types.indexConfigHash(cfg), .applied_sequence = floor }, .{});
+        const value = try std.json.Stringify.valueAlloc(self.alloc, GraphReplacementBuild{ .name = stored.name, .generation = stored.coverage_generation, .old = old, .config = stored, .request_hash = types.indexConfigHash(cfg), .applied_sequence = floor, .producer_replay_complete = self.resolvers.items.len == resolver_checkpoint or validated.artifact_sources.len == 0 }, .{});
         defer self.alloc.free(value);
         var runtime_store = try initRuntimeStore(self.alloc, store);
         defer runtime_store.deinit();
         var txn = try runtime_store.store.beginWrite();
         errdefer txn.abort();
         try txn.put(key, value);
+        if (enrichments_changed) {
+            const enrichment_data = try enrichment_catalog.serializeCatalog(self.alloc, self.enrichments.items);
+            defer self.alloc.free(enrichment_data);
+            try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, enrichment_catalog_key, enrichment_data);
+            try txn.put(enrichment_catalog_key, enrichment_data);
+        }
+        if (self.resolvers.items.len != resolver_checkpoint) {
+            try txn.put(resolver_catalog.reresolve_resume_key, "");
+            try txn.put(resolver_catalog.reresolve_repair_resume_key, "");
+        }
         const resolver_data = try self.serializeResolverDefinitions(self.alloc);
         defer self.alloc.free(resolver_data);
         const reader_version = try self.stampCatalogReaderVersion(&txn, resolver_data);
+        const merge_data = try self.serializeResolverMerges(self.alloc);
+        defer self.alloc.free(merge_data);
+        try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, resolver_catalog.merge_catalog_key, merge_data);
+        try txn.put(resolver_catalog.merge_catalog_key, merge_data);
+        try @import("../artifact_inventory.zig").refresh(&txn);
         try txn.commit();
         self.minimum_reader_version.store(reader_version, .release);
+        if (enrichments_changed) self.storeGeneratedEnrichmentTargetCache(has_generated_targets);
+        _ = self.write_plan_generation.fetchAdd(1, .release);
         return stored;
+    }
+
+    /// Stage a distinct execution stream, never mutate the serving contract.
+    /// Both the reservation and these definitions are committed by the caller.
+    fn stageGraphReplacementResolvers(self: *IndexManager, old: []const u8, cfg: types.IndexConfig) !void {
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, cfg.config_json, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidIndexConfig;
+        const declarations = parsed.value.object.get("resolvers") orelse return;
+        if (declarations != .array) return error.InvalidResolverConfig;
+        for (declarations.array.items) |item| {
+            var input = try std.json.parseFromValue(ResolverConfig, self.alloc, item, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
+            defer input.deinit();
+            var next = input.value;
+            next.inline_managed = true;
+            next.retired = false;
+            next.merges = &.{};
+            next.merge_generation = 0;
+            next.merge_state_version = 0;
+            next.resolution_generation = 0;
+            next.namespace_generation = 0;
+            next.replacement_index = "";
+            next.replacement_resolver = "";
+            if (self.getResolver(next.name)) |previous| {
+                next.merges = previous.merges;
+                next.merge_generation = previous.merge_generation;
+                next.merge_state_version = previous.merge_state_version;
+                // A declaration cannot erase identity aliases as a side effect
+                // of changing the extraction producer.
+                if (next.aliases.len == 0) next.aliases = previous.aliases;
+                next.namespace_generation = previous.namespace_generation;
+                if (previous.namespace_generation > 0 and !ResolverConfig.aliasesEqual(previous.aliases, next.aliases))
+                    return error.ResolverMergeNamespaceChange;
+                if ((!std.mem.eql(u8, previous.table, next.table) or !std.mem.eql(u8, previous.key_template, next.key_template)) and
+                    (previous.merges.len > 0 or previous.aliases.len > 0 or previous.namespace_generation > 0))
+                    return error.ResolverMergeNamespaceChange;
+                next.resolution_generation = previous.resolution_generation;
+                next.inline_managed = previous.inline_managed;
+                if (previous.eql(next)) continue;
+                next.inline_managed = true;
+                if (previous.inline_managed != true or !try self.indexDeclaresResolver(self.get(old).?.config_json, next.name))
+                    return error.ResolverReplacementOwnershipConflict;
+                for (self.graph_indexes.items) |graph| {
+                    if (!std.mem.eql(u8, graph.config.name, old) and try self.indexDeclaresResolver(graph.config.config_json, next.name))
+                        return error.ResolverReplacementOwnershipConflict;
+                }
+                for (self.resolvers.items) |entry| if (std.mem.eql(u8, entry.replacement_resolver, next.name))
+                    return error.IndexReplacementPending;
+                // Separate source and output streams keep the serving graph's
+                // endpoint maps and label routing unchanged throughout build.
+                if (std.mem.eql(u8, previous.source_artifact, next.source_artifact) or
+                    std.mem.eql(u8, previous.resolution_artifact, next.resolution_artifact))
+                    return error.ResolverReplacementRequiresFreshArtifacts;
+                next.resolution_generation = @max(next.effectiveGeneration(), try std.math.add(u64, previous.effectiveGeneration(), 1));
+            }
+            for (self.retired_resolvers.items) |retired| {
+                if (std.mem.eql(u8, retired.name, next.name)) return error.ResolverAlreadyExists;
+                if (std.mem.eql(u8, retired.resolution_artifact, next.resolution_artifact)) {
+                    if (!std.mem.eql(u8, retired.replacement_resolver, next.name)) return error.ResolverArtifactAlreadyExists;
+                    // Cancellation releases execution, not its artifact bytes.
+                    // A retry must invalidate every decision the old attempt
+                    // could have written, including a changed retry config.
+                    next.resolution_generation = @max(next.effectiveGeneration(), try std.math.add(u64, retired.effectiveGeneration(), 1));
+                }
+            }
+            if (std.mem.startsWith(u8, next.name, "__antfly_replacement/")) return error.InvalidResolverConfig;
+            try next.validate();
+            if (self.resolverResolutionArtifactInUse(next.resolution_artifact, null)) return error.ResolverArtifactAlreadyExists;
+            if (self.resolverLabelRoutingConflicts(next)) return error.ResolverLabelRoutingConflict;
+            const internal_name = try std.fmt.allocPrint(self.alloc, "__antfly_replacement/{s}/{d}/{s}", .{ cfg.name, cfg.coverage_generation, next.name });
+            defer self.alloc.free(internal_name);
+            if (self.getResolver(internal_name) != null) return error.ResolverAlreadyExists;
+            next.replacement_resolver = next.name;
+            next.replacement_index = cfg.name;
+            next.name = internal_name;
+            try self.resolvers.append(self.alloc, try ResolverConfig.clone(self.alloc, next));
+        }
+    }
+
+    pub fn requireResolverNotReplacing(self: *const IndexManager, name: []const u8) !void {
+        for (self.resolvers.items) |cfg| if (std.mem.eql(u8, cfg.replacement_resolver, name))
+            return error.IndexReplacementPending;
     }
 
     pub fn graphReplacementBuildsAlloc(self: *IndexManager, store: anytype, alloc: Allocator) !std.json.Parsed([]GraphReplacementBuild) {
@@ -12488,6 +12598,7 @@ pub const IndexManager = struct {
             effective.merge_generation = existing.merge_generation;
             effective.merge_state_version = existing.merge_state_version;
         }
+        if (effective.inline_managed == true and effective.aliases.len == 0) effective.aliases = existing.aliases;
         if (existing.inline_managed == false) effective.inline_managed = false;
         if (effective.inline_managed == null) effective.inline_managed = existing.inline_managed;
         effective.resolution_generation = existing.resolution_generation;
@@ -12554,6 +12665,10 @@ pub const IndexManager = struct {
         cfg.inline_managed = false;
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
+        try self.requireResolverNotReplacing(cfg.name);
+        if (std.mem.startsWith(u8, cfg.name, "__antfly_replacement/")) return error.InvalidResolverConfig;
+        cfg.replacement_index = "";
+        cfg.replacement_resolver = "";
         if (self.getResolver(cfg.name) != null) return error.ResolverAlreadyExists;
         for (self.retired_resolvers.items) |entry| if (std.mem.eql(u8, entry.name, cfg.name)) return error.ResolverAlreadyExists;
         if (self.resolverResolutionArtifactInUse(cfg.resolution_artifact, null)) return error.ResolverArtifactAlreadyExists;
@@ -12577,6 +12692,10 @@ pub const IndexManager = struct {
         var cfg = input_cfg;
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
+        try self.requireResolverNotReplacing(cfg.name);
+        if (std.mem.startsWith(u8, cfg.name, "__antfly_replacement/")) return error.InvalidResolverConfig;
+        cfg.replacement_index = "";
+        cfg.replacement_resolver = "";
         // Namespace management must not reactivate a retired execution contract.
         if (migrate_namespace and cfg.retired) {
             for (self.retired_resolvers.items) |*entry| {
@@ -12616,6 +12735,7 @@ pub const IndexManager = struct {
             // when an index also declares it inline.
             if (entry.inline_managed == false) cfg.inline_managed = false;
             if (cfg.inline_managed == null) cfg.inline_managed = entry.inline_managed;
+            if (cfg.inline_managed == true and cfg.aliases.len == 0 and !migrate_namespace) cfg.aliases = entry.aliases;
             if (cfg.merge_generation == 0 and !migrate_namespace) {
                 cfg.merges = entry.merges;
                 cfg.merge_generation = entry.merge_generation;
@@ -12688,6 +12808,7 @@ pub const IndexManager = struct {
     fn removeResolverIdentity(self: *IndexManager, store: anytype, name: []const u8, retired_only: bool) !bool {
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
+        try self.requireResolverNotReplacing(name);
         if (retired_only and self.getResolver(name) != null) return error.ResolverIdentityActive;
         for ([_]*std.ArrayListUnmanaged(ResolverConfig){ &self.resolvers, &self.retired_resolvers }) |definitions| {
             for (definitions.items, 0..) |entry, i| {
@@ -12708,16 +12829,18 @@ pub const IndexManager = struct {
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
         const definitions = try self.resolverDefinitionsAlloc(alloc);
-        var initialized: usize = 0;
+        defer alloc.free(definitions);
+        var result: std.ArrayList(ResolverConfig) = .empty;
         errdefer {
-            for (definitions[0..initialized]) |*cfg| cfg.deinit(alloc);
-            alloc.free(definitions);
+            for (result.items) |*cfg| cfg.deinit(alloc);
+            result.deinit(alloc);
         }
-        for (definitions) |*cfg| {
-            cfg.* = try ResolverConfig.clone(alloc, cfg.*);
-            initialized += 1;
+        try result.ensureTotalCapacity(alloc, definitions.len);
+        for (definitions) |cfg| {
+            if (std.mem.startsWith(u8, cfg.name, "__antfly_replacement/")) continue;
+            result.appendAssumeCapacity(try ResolverConfig.clone(alloc, cfg));
         }
-        return definitions;
+        return result.toOwnedSlice(alloc);
     }
 
     /// Trusted admission rollback restores ownership as well as configuration.
@@ -14588,14 +14711,26 @@ pub const IndexManager = struct {
     /// would omit its upstream asset producer and create durable work that can
     /// never reach the requested projection.
     pub fn artifactProducerNamesForIndexAlloc(self: *const IndexManager, alloc: Allocator, name: []const u8) ![][]u8 {
-        var names = std.ArrayListUnmanaged([]u8).fromOwnedSlice(
-            try self.artifactSourceNamesForIndexAlloc(alloc, name),
-        );
+        const sources = try self.artifactSourceNamesForIndexAlloc(alloc, name);
+        defer {
+            for (sources) |source| alloc.free(source);
+            alloc.free(sources);
+        }
+        return self.artifactProducerNamesForArtifactsAlloc(alloc, sources);
+    }
+
+    /// Also usable before a shadow has a public index catalog entry.
+    pub fn artifactProducerNamesForArtifactsAlloc(self: *const IndexManager, alloc: Allocator, sources: []const []const u8) ![][]u8 {
+        var names: std.ArrayListUnmanaged([]u8) = .empty;
         errdefer {
             for (names.items) |value| alloc.free(value);
             names.deinit(alloc);
         }
 
+        try names.ensureTotalCapacity(alloc, sources.len);
+        for (sources) |source| {
+            if (!containsOwnedString(names.items, source)) names.appendAssumeCapacity(try alloc.dupe(u8, source));
+        }
         var cursor: usize = 0;
         while (cursor < names.items.len) : (cursor += 1) {
             const enrichment = self.getEnrichmentByName(names.items[cursor]) orelse continue;
@@ -22437,10 +22572,57 @@ pub const IndexManager = struct {
             definitions[next_definition] = cfg;
             next_definition += 1;
         }
+        // A published successor takes the public identity atomically with its
+        // graph. Preserve the predecessor as a nonexecuting parse contract for
+        // old resolution records still present in the shared artifact store.
+        for (definitions) |*next| {
+            if (next.replacement_index.len == 0) continue;
+            if (self.get(next.replacement_index) != null and !std.mem.eql(u8, next.replacement_index, excluded_name)) {
+                for (definitions) |*previous| {
+                    if (!std.mem.eql(u8, previous.name, next.replacement_resolver)) continue;
+                    previous.name = next.name;
+                    previous.replacement_resolver = next.replacement_resolver;
+                    previous.retired = true;
+                    previous.inline_managed = true;
+                    break;
+                }
+                next.name = next.replacement_resolver;
+                next.replacement_index = "";
+                next.replacement_resolver = "";
+            } else {
+                const cancelled = std.mem.eql(u8, next.replacement_index, excluded_name) or for (jobs.value) |job| {
+                    if (std.mem.eql(u8, job.old, excluded_name) and std.mem.eql(u8, job.name, next.replacement_index)) break true;
+                } else false;
+                if (cancelled) {
+                    next.retired = true;
+                    next.replacement_index = "";
+                }
+            }
+        }
+        // Allocate the complete post-commit catalog before crossing durability.
+        var next_active: std.ArrayListUnmanaged(ResolverConfig) = .empty;
+        var next_retired: std.ArrayListUnmanaged(ResolverConfig) = .empty;
+        var transferred = false;
+        defer if (!transferred) {
+            for (next_active.items) |*entry| entry.deinit(self.alloc);
+            next_active.deinit(self.alloc);
+            for (next_retired.items) |*entry| entry.deinit(self.alloc);
+            next_retired.deinit(self.alloc);
+        };
+        try next_active.ensureTotalCapacity(self.alloc, definitions.len);
+        try next_retired.ensureTotalCapacity(self.alloc, definitions.len);
+        for (definitions) |definition| {
+            const owned = try ResolverConfig.clone(self.alloc, definition);
+            if (definition.retired) next_retired.appendAssumeCapacity(owned) else next_active.appendAssumeCapacity(owned);
+        }
         const resolver_data = try resolver_catalog.serializeCatalog(self.alloc, definitions);
         defer self.alloc.free(resolver_data);
         try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, resolver_catalog_key, resolver_data);
         try txn.put(resolver_catalog_key, resolver_data);
+        const merge_data = try resolver_catalog.serializeMergeState(self.alloc, definitions);
+        defer self.alloc.free(merge_data);
+        try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, resolver_catalog.merge_catalog_key, merge_data);
+        try txn.put(resolver_catalog.merge_catalog_key, merge_data);
         // Revisions and durable replay cursors publish with ownership removal.
         for (definitions) |cfg| {
             if (!cfg.retired and self.routingChangedByRetirement(cfg, retiring)) {
@@ -22474,23 +22656,13 @@ pub const IndexManager = struct {
         const reader_version = try self.stampCatalogReaderVersion(&txn, resolver_data);
         try txn.commit();
         self.minimum_reader_version.store(reader_version, .release);
-        for (definitions) |cfg| {
-            if (cfg.retired) continue;
-            for (self.resolvers.items) |*entry| if (std.mem.eql(u8, entry.name, cfg.name)) {
-                entry.resolution_generation = cfg.resolution_generation;
-                break;
-            };
-        }
-        for (retiring) |resolver_name| {
-            for (self.resolvers.items, 0..) |cfg, i| {
-                if (!std.mem.eql(u8, cfg.name, resolver_name)) continue;
-                var retired = self.resolvers.orderedRemove(i);
-                retired.retired = true;
-                retired.inline_managed = true;
-                self.retired_resolvers.appendAssumeCapacity(retired);
-                break;
-            }
-        }
+        self.truncateResolvers(0);
+        self.resolvers.deinit(self.alloc);
+        self.truncateRetiredResolvers(0);
+        self.retired_resolvers.deinit(self.alloc);
+        self.resolvers = next_active;
+        self.retired_resolvers = next_retired;
+        transferred = true;
         _ = self.write_plan_generation.fetchAdd(1, .release);
     }
 
@@ -22616,9 +22788,9 @@ pub const IndexManager = struct {
         const stored_catalog = fenced_catalog orelse catalog;
         try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(txn, resolver_catalog_key, stored_catalog);
         try txn.put(resolver_catalog_key, stored_catalog);
-        try txn.put(resolver_catalog.minimum_reader_key, if (version == 1) "1" else "2");
+        try txn.put(resolver_catalog.minimum_reader_key, if (version == 1) "1" else if (version == 2) "2" else "3");
         if (pending) {
-            try txn.put(replacement_reader_base_key, if (authoritative == 1) "1" else "2");
+            try txn.put(replacement_reader_base_key, if (authoritative == 1) "1" else if (authoritative == 2) "2" else "3");
         } else if (baseline_raw != null) try txn.delete(replacement_reader_base_key);
         return version;
     }
@@ -22665,9 +22837,9 @@ pub const IndexManager = struct {
             error.NotFound => null,
             else => return err,
         };
-        if (fenced != null) try txn.put(replacement_reader_base_key, if (required == 1) "1" else "2");
+        if (fenced != null) try txn.put(replacement_reader_base_key, if (required == 1) "1" else if (required == 2) "2" else "3");
         const version = @max(current, required);
-        try txn.put(resolver_catalog.minimum_reader_key, if (version == 1) "1" else "2");
+        try txn.put(resolver_catalog.minimum_reader_key, if (version == 1) "1" else if (version == 2) "2" else "3");
         try txn.commit();
         self.minimum_reader_version.store(version, .release);
     }
