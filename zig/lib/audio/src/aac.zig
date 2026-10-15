@@ -3158,11 +3158,22 @@ fn decodeChannelPairPcmSequenceWithExpectedLayoutAllocAndShapeMaybeTrailingInfos
     shape: FrameShape,
     collect_trailing_infos: bool,
 ) !ChannelPairPcmSequenceDecode {
+    return decodeChannelPairPcmSequenceWithExpectedLayoutAllocAndShapeMaybeTrailingInfosTo(allocator, sample_rate, access_units, expected_layout, shape, collect_trailing_infos, null);
+}
+fn decodeChannelPairPcmSequenceWithExpectedLayoutAllocAndShapeMaybeTrailingInfosTo(
+    allocator: std.mem.Allocator,
+    sample_rate: u32,
+    access_units: []const []const u8,
+    expected_layout: ?ProgramConfigLayout,
+    shape: FrameShape,
+    collect_trailing_infos: bool,
+    sink: ?@import("pcm_sink.zig").Sink,
+) !ChannelPairPcmSequenceDecode {
     const plans = try sharedAacImdctPlans(shape);
 
     var interleaved = std.ArrayList(f32).empty;
     defer interleaved.deinit(allocator);
-    try interleaved.ensureTotalCapacityPrecise(allocator, access_units.len * shape.pcm_samples * 2);
+    try interleaved.ensureTotalCapacityPrecise(allocator, (if (sink != null) @as(usize, 1) else access_units.len) * shape.pcm_samples * 2);
     const trailing_infos: []TrailingElementInfo = if (collect_trailing_infos)
         try allocator.alloc(TrailingElementInfo, access_units.len)
     else
@@ -3224,6 +3235,10 @@ fn decodeChannelPairPcmSequenceWithExpectedLayoutAllocAndShapeMaybeTrailingInfos
         allocator.free(block.ms_mask);
         allocator.free(block.left_pcm);
         allocator.free(block.right_pcm);
+        if (sink) |consumer| {
+            try consumer.push(interleaved.items, sample_rate, 2);
+            interleaved.clearRetainingCapacity();
+        }
         perfAccumulate(.sequence_output_ns, output_started);
     }
 
@@ -3292,11 +3307,22 @@ fn decodeFirstChannelPcmSequenceWithExpectedLayoutAllocAndShapeMaybeTrailingInfo
     shape: FrameShape,
     collect_trailing_infos: bool,
 ) !FirstChannelPcmSequenceDecode {
+    return decodeFirstChannelPcmSequenceWithExpectedLayoutAllocAndShapeMaybeTrailingInfosTo(allocator, sample_rate, access_units, expected_layout, shape, collect_trailing_infos, null);
+}
+fn decodeFirstChannelPcmSequenceWithExpectedLayoutAllocAndShapeMaybeTrailingInfosTo(
+    allocator: std.mem.Allocator,
+    sample_rate: u32,
+    access_units: []const []const u8,
+    expected_layout: ?ProgramConfigLayout,
+    shape: FrameShape,
+    collect_trailing_infos: bool,
+    sink: ?@import("pcm_sink.zig").Sink,
+) !FirstChannelPcmSequenceDecode {
     const plans = try sharedAacImdctPlans(shape);
 
     var pcm = std.ArrayList(f32).empty;
     defer pcm.deinit(allocator);
-    try pcm.ensureTotalCapacityPrecise(allocator, access_units.len * shape.pcm_samples);
+    try pcm.ensureTotalCapacityPrecise(allocator, (if (sink != null) @as(usize, 1) else access_units.len) * shape.pcm_samples);
     const trailing_infos: []TrailingElementInfo = if (collect_trailing_infos)
         try allocator.alloc(TrailingElementInfo, access_units.len)
     else
@@ -3345,6 +3371,10 @@ fn decodeFirstChannelPcmSequenceWithExpectedLayoutAllocAndShapeMaybeTrailingInfo
 
         pcm.appendSliceAssumeCapacity(block.pcm);
         allocator.free(block.pcm);
+        if (sink) |consumer| {
+            try consumer.push(pcm.items, sample_rate, 1);
+            pcm.clearRetainingCapacity();
+        }
         perfAccumulate(.sequence_output_ns, output_started);
     }
 
@@ -3807,6 +3837,40 @@ pub fn decodeInterleavedMonoAdtsAlloc(
     defer access_units.deinit();
     if (access_units.units.items.len == 0) return error.UnsupportedAudioFormat;
     return decodeFirstChannelPcmSequenceWithExpectedLayoutAlloc(allocator, decode_config.sample_rate, access_units.units.items, decode_config.expected_layout);
+}
+
+/// LC/Main core blocks use the same filterbank and prediction history as batch
+/// decoding. Enhancement profiles retain their existing bounded fallback.
+pub fn visitAdts(allocator: std.mem.Allocator, bytes: []const u8, sink: @import("pcm_sink.zig").Sink) !void {
+    const frames = try scanAdtsFramesAlloc(allocator, bytes);
+    defer allocator.free(frames);
+    if (frames.len == 0) return error.UnsupportedAudioFormat;
+    const channels = frames[0].header.channel_config;
+    const config = try adtsDecodeConfig(allocator, frames, if (channels == 1) 1 else 2);
+    var units = try collectAdtsAccessUnitsAlloc(allocator, frames, config.sample_rate);
+    defer units.deinit();
+    if (channels == 1) {
+        var decoded = try decodeFirstChannelPcmSequenceWithExpectedLayoutAllocAndShapeMaybeTrailingInfosTo(allocator, config.sample_rate, units.units.items, config.expected_layout, FrameShape.default(), false, sink);
+        defer decoded.sequence.deinit();
+    } else {
+        var decoded = try decodeChannelPairPcmSequenceWithExpectedLayoutAllocAndShapeMaybeTrailingInfosTo(allocator, config.sample_rate, units.units.items, config.expected_layout, FrameShape.default(), false, sink);
+        defer decoded.sequence.deinit();
+    }
+}
+pub fn visitAccessUnits(allocator: std.mem.Allocator, config_bytes: []const u8, units: []const []const u8, sink: @import("pcm_sink.zig").Sink) !void {
+    const config = try parseAudioSpecificConfig(config_bytes);
+    if (configNeedsEnhancementTrailingInfos(config)) return error.UnsupportedStreamingAudioProfile;
+    const channels = config.explicit_channel_count orelse config.channel_config;
+    const shape = FrameShape.forFrameLength960(config.frame_length_960);
+    var filtered = try collectChannelAccessUnitsAlloc(allocator, config.sample_rate, config.explicit_layout, units);
+    defer filtered.deinit();
+    if (channels == 1) {
+        var decoded = try decodeFirstChannelPcmSequenceWithExpectedLayoutAllocAndShapeMaybeTrailingInfosTo(allocator, config.sample_rate, filtered.units.items, config.explicit_layout, shape, false, sink);
+        defer decoded.sequence.deinit();
+    } else if (channels == 2) {
+        var decoded = try decodeChannelPairPcmSequenceWithExpectedLayoutAllocAndShapeMaybeTrailingInfosTo(allocator, config.sample_rate, filtered.units.items, config.explicit_layout, shape, false, sink);
+        defer decoded.sequence.deinit();
+    } else return error.UnsupportedAudioFormat;
 }
 
 fn configNeedsEnhancementTrailingInfos(config: AudioSpecificConfig) bool {

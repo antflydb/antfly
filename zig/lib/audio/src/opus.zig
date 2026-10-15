@@ -450,6 +450,22 @@ pub fn decodeInterleavedPacketsAlloc(
     pre_skip: u16,
     playable_frames_opt: ?u64,
 ) !DecodedInterleaved {
+    return decodePacketsTo(allocator, packets, packet_tocs, channels, output_gain_q8, pre_skip, playable_frames_opt, null);
+}
+pub fn visitPackets(allocator: std.mem.Allocator, packets: []const []const u8, tocs: []const Toc, channels: u8, gain: i16, skip: u16, playable: ?u64, sink: @import("pcm_sink.zig").Sink) !void {
+    var decoded = try decodePacketsTo(allocator, packets, tocs, channels, gain, skip, playable, sink);
+    defer decoded.deinit();
+}
+fn decodePacketsTo(
+    allocator: std.mem.Allocator,
+    packets: []const []const u8,
+    packet_tocs: []const Toc,
+    channels: u8,
+    output_gain_q8: i16,
+    pre_skip: u16,
+    playable_frames_opt: ?u64,
+    sink: ?@import("pcm_sink.zig").Sink,
+) !DecodedInterleaved {
     if (packets.len != packet_tocs.len) return error.UnsupportedAudioFormat;
 
     var frame_state = OpusFrameState{ .celt = try opus_celt.Decoder.init(channels) };
@@ -457,6 +473,8 @@ pub fn decodeInterleavedPacketsAlloc(
     var samples = std.ArrayList(f32).empty;
     defer samples.deinit(allocator);
 
+    var emitted: u64 = 0;
+    var remaining_skip: usize = pre_skip;
     for (packets, packet_tocs) |packet, toc| {
         try @import("work_control.zig").check();
         var split = try splitFramesAlloc(allocator, packet);
@@ -478,7 +496,22 @@ pub fn decodeInterleavedPacketsAlloc(
                     try samples.appendSlice(allocator, out);
                 },
             }
+            if (sink) |consumer| {
+                const frames = samples.items.len / channels;
+                const drop = @min(remaining_skip, frames);
+                remaining_skip -= drop;
+                const count: usize = @intCast(@min(frames - drop, (playable_frames_opt orelse std.math.maxInt(u64)) -| emitted));
+                const output = samples.items[drop * channels ..][0 .. count * channels];
+                applyOutputGainInPlace(output, output_gain_q8);
+                if (output.len != 0) try consumer.push(output, 48_000, channels);
+                emitted += count;
+                samples.clearRetainingCapacity();
+            }
         }
+    }
+    if (sink != null) {
+        if (remaining_skip != 0 or (playable_frames_opt != null and emitted != playable_frames_opt.?)) return error.UnsupportedAudioFormat;
+        return .{ .samples = try samples.toOwnedSlice(allocator), .sample_rate = 48_000, .channels = channels, .allocator = allocator };
     }
 
     var owned = try samples.toOwnedSlice(allocator);

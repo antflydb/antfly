@@ -1609,7 +1609,7 @@ pub fn build(b: *std.Build) void {
     const chunk_audio_root = b.createModule(.{ .root_source_file = b.path(b.fmt("{s}/lib/audio/audio_module_test_root.zig", .{shared_lib_root})), .target = target, .optimize = optimize });
     @import("antfly_media").support.attach(b, chunk_audio_root, b.path(b.fmt("{s}/lib/media", .{shared_lib_root})));
     chunk_audio_root.link_libc = link_libc;
-    const chunk_audio_tests = b.addTest(.{ .root_module = chunk_audio_root, .filters = &.{"bounded audio cancellation"} });
+    const chunk_audio_tests = b.addTest(.{ .root_module = chunk_audio_root, .filters = &.{ "bounded audio cancellation", "streaming audio" } });
     media_chunk_step.dependOn(&b.addRunArtifact(chunk_audio_tests).step);
     const chunk_planning_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path(b.fmt("{s}/lib/chunker/src/planning.zig", .{shared_lib_root})), .target = target, .optimize = optimize }) });
     media_chunk_step.dependOn(&b.addRunArtifact(chunk_planning_tests).step);

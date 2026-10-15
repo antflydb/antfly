@@ -862,6 +862,53 @@ pub fn decodeDemuxedInterleavedAlloc(allocator: std.mem.Allocator, demuxed: Demu
     };
 }
 
+/// Overlap-add into a bounded rolling timeline. Samples are released only once
+/// no future packet's largest legal window can contribute to them.
+pub fn visitDemuxed(allocator: std.mem.Allocator, demuxed: Demuxed, sink: @import("pcm_sink.zig").Sink) !void {
+    const channels = demuxed.headers.identification.channels;
+    if (channels == 0 or demuxed.audio_packets.len == 0) return error.UnsupportedAudioFormat;
+    const small = demuxed.headers.identification.blocksize_small;
+    const large = demuxed.headers.identification.blocksize_large;
+    const short_plan = try sharedVorbisImdctPlan(small);
+    const long_plan = try sharedVorbisImdctPlan(large);
+    var scratch = VorbisDecodeScratch{ .allocator = allocator };
+    defer scratch.deinit();
+    const capacity = @as(usize, large) * 2;
+    const timeline = try allocator.alloc(f32, capacity * channels);
+    defer allocator.free(timeline);
+    @memset(timeline, 0);
+    const first = demuxed.audio_packets[0].header.blocksize / 2;
+    const playable = std.math.cast(usize, demuxed.playable_samples) orelse return error.UnsupportedAudioFormat;
+    const stop = try std.math.add(usize, first, playable);
+    var center: usize = first;
+    var base: usize = 0;
+    var emitted: usize = 0;
+    for (demuxed.audio_packets, 0..) |packet, index| {
+        try @import("work_control.zig").check();
+        if (index != 0) center = try std.math.add(usize, center, (demuxed.audio_packets[index - 1].header.blocksize + @as(usize, packet.header.blocksize)) / 4);
+        if (center < base or center - base + packet.header.blocksize / 2 > capacity) return error.UnsupportedAudioFormat;
+        const block = try decodeAudioPacketBlockAlloc(allocator, &scratch, demuxed.headers, packet.bytes, short_plan, long_plan);
+        try addPacketBlockToTimelineWithWindow(timeline, capacity, channels, block, center - base, small, packet.header);
+        const safe = if (index + 1 == demuxed.audio_packets.len) center + packet.header.blocksize / 2 else center + (packet.header.blocksize + @as(usize, demuxed.audio_packets[index + 1].header.blocksize)) / 4 -| large / 2;
+        const end = @min(stop, @max(base, safe));
+        const begin = @max(first, base);
+        if (end > begin) {
+            try sink.push(timeline[(begin - base) * channels .. (end - base) * channels], demuxed.headers.identification.sample_rate, channels);
+            emitted += end - begin;
+        }
+        const consumed = end - base;
+        std.mem.copyForwards(f32, timeline[0 .. (capacity - consumed) * channels], timeline[consumed * channels ..]);
+        @memset(timeline[(capacity - consumed) * channels ..], 0);
+        base = end;
+    }
+    if (emitted != playable) return error.UnsupportedAudioFormat;
+}
+pub fn visitOgg(allocator: std.mem.Allocator, bytes: []const u8, sink: @import("pcm_sink.zig").Sink) !void {
+    var demuxed = try demuxOggAlloc(allocator, bytes);
+    defer demuxed.deinit();
+    try visitDemuxed(allocator, demuxed, sink);
+}
+
 pub fn parseAudioPacketHeader(packet: []const u8, headers: Headers) !AudioPacketHeader {
     if (packet.len == 0) return error.UnsupportedAudioFormat;
 

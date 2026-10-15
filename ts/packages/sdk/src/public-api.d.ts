@@ -19424,6 +19424,16 @@ export interface components {
         };
         /** @description Information about a model including its capabilities */
         InferenceModelInfo: {
+            /**
+             * @description Effective model-aware chunk operational ceilings for working/output/event
+             *     bytes, chunk/dependency/index counts and remote fetched bytes, requests
+             *     and cache bytes. Independent of model token limits and object length.
+             *     Configure through NodeConfig.chunking_limits or ANTFLY_CHUNK_<NAME>.
+             *     Scoped and unscoped embedding discovery expose the same values.
+             */
+            chunking_limits?: {
+                [key: string]: number;
+            };
             /** @description Immutable resolved embedding generation, returned for scoped model/task discovery without loading weights. */
             model_revision?: string;
             /**

@@ -276,6 +276,76 @@ fn flush(capture: *Capture, sink: ?Sink) !void {
 }
 /// Conservative platform picture-pool estimate shared by request admission
 /// and session qualification. Opaque driver workspace remains unmeasured.
+/// Stable VideoToolbox owner across forward windows. Every call drains native
+/// callbacks before releasing borrowed selection/sink state; references persist.
+pub const Continuation = struct {
+    allocator: std.mem.Allocator,
+    handle: ?*anyopaque = null,
+    capture: Capture,
+    slots: [32]?Frame = @splat(null),
+    seen: [32]bool = @splat(false),
+    next_packet: usize = 0,
+    options: Options,
+    pub fn create(a: std.mem.Allocator, reader: *media.mp4.Reader, options: Options) !*Continuation {
+        if (!supported) return error.UnsupportedVideoBackend;
+        const self = try a.create(Continuation);
+        self.* = .{ .allocator = a, .capture = .{ .reader = reader, .indexes = &.{}, .slots = &.{}, .seen = &.{}, .control = reader.input.control, .max_retained = options.max_retained_surface_bytes }, .options = options };
+        errdefer self.deinit();
+        const status = av_decoder_create(reader.track.avcc.ptr, reader.track.avcc.len, reader.track.width, reader.track.height, @intFromBool(options.require_hardware), Capture.callback, &self.capture, &self.handle);
+        if (status == -108) return error.OutOfMemory;
+        if (status != 0) return error.VideoDecoderUnavailable;
+        return self;
+    }
+    pub fn deinit(self: *Continuation) void {
+        if (self.handle) |handle| if (supported) av_decoder_destroy(handle);
+        for (&self.slots) |*slot| if (slot.*) |*frame| frame.surface.deinit();
+        self.allocator.destroy(self);
+    }
+    pub fn decodeTo(self: *Continuation, indexes: []const usize, sink: Sink) !usize {
+        if (!supported or indexes.len == 0 or indexes.len > self.slots.len) return error.InvalidPacketIndex;
+        var reader_view = self.capture.reader.*;
+        const reader = &reader_view;
+        var first = reader.packets.len;
+        var last: usize = 0;
+        for (indexes) |index| {
+            if (index < self.next_packet or index >= reader.packets.len) return error.InvalidPacketIndex;
+            first = @min(first, index);
+            last = @max(last, index);
+        }
+        var start = self.next_packet;
+        if (self.next_packet == 0) {
+            var plan = try decode_plan.create(self.allocator, reader, indexes, .{ .mode = .verified_idr, .max_decode_packets = self.options.max_decode_packets });
+            defer plan.deinit();
+            if (plan.runs.len == 0) return error.UnverifiedDecodeStart;
+            start = plan.runs[0].first;
+        }
+        if (last - start + 1 > self.options.max_decode_packets) return error.ResourceLimitExceeded;
+        if (try surfaceAdmissionBytes(reader.track.width, reader.track.height, indexes.len) > self.options.max_surface_bytes) return error.ResourceLimitExceeded;
+        @memset(&self.seen, false);
+        self.capture.indexes = indexes;
+        self.capture.slots = self.slots[0..indexes.len];
+        self.capture.seen = self.seen[0..indexes.len];
+        for (start..last + 1) |index| {
+            try reader.input.control.check();
+            var lease = try reader.readPacket(index);
+            defer lease.deinit();
+            const packet = reader.packets[index];
+            if (lease.bytes.len > self.options.max_packet_bytes) return error.ResourceLimitExceeded;
+            try avc.validatePacket(lease.bytes, reader.track.nal_length_bytes);
+            if (av_decoder_submit(self.handle.?, lease.bytes.ptr, lease.bytes.len, index, packet.pts, packet.dts, packet.duration, reader.track.timescale) != 0) return error.VideoDecodeFailed;
+            try flush(&self.capture, sink);
+        }
+        if (av_decoder_drain(self.handle.?) != 0) return error.VideoDecodeFailed;
+        try flush(&self.capture, sink);
+        for (self.seen[0..indexes.len]) |seen| if (!seen) return error.MissingDecodedFrame;
+        self.next_packet = last + 1;
+        return last - start + 1;
+    }
+    pub fn hardware(self: *const Continuation) bool {
+        return supported and av_decoder_hardware(self.handle.?) != 0;
+    }
+};
+
 pub fn surfaceAdmissionBytes(width: u32, height: u32, selections: usize) !u64 {
     return surfaceAdmissionBytesForDepth(width, height, selections, 8);
 }

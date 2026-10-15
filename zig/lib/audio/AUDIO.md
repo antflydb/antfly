@@ -287,6 +287,15 @@ check it between coded units; the scope restores the prior caller control on
 success or failure. The callback must outlive the decode and must not suspend.
 The model-aware runner also checks cancellation between model windows and source
 reads. WAV inputs can decode exact sample ranges without retaining full PCM;
-other codecs currently use the shared bounded decode allocation before windowing.
+MP3, FLAC, core AAC, ALAC and Opus/Vorbis visitors retain codec prediction/overlap
+state while emitting bounded PCM blocks. A two-block queue overlaps decoding with
+model work, retaining only the current PCM window plus overlap. MP4/CAF priming
+and remainder trimming, Opus gain/pre-skip, channel clipping before downmixing and
+supported WebM timeline gaps preserve the ordinary decode contract. Unsupported
+incremental profiles use the existing bounded full-decode fallback (including
+enhanced AAC, chained Ogg and WebM FLAC without declared sample totals).
+Compressed input and packet metadata are still contiguous bounded owners.
+Metadata without a trustworthy duration uses a bounded PCM-free validation pass;
+that trades additional decoding for stable final-tail and continuation semantics.
 See [model-aware chunking](../../../docs/plans/model-aware-media-chunking.md) for
 sample clocks, duration/token budgets, pause boundaries and coverage metadata.

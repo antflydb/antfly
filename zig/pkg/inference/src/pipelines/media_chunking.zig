@@ -43,7 +43,9 @@ pub const Executor = struct {
     audio_tokens: ?*const fn (*anyopaque, usize, u32) anyerror!usize = null,
     embed: *const fn (*anyopaque, std.mem.Allocator, Payload) anyerror!Output,
 };
+pub const Limits = @import("media_chunk_limits.zig").Limits;
 pub const Request = struct {
+    limits: Limits = .{},
     input: chunker.Input,
     /// Borrow immutable provider context through completed execution/cancellation.
     native_source: ?*const media.source.Source = null,
@@ -99,7 +101,8 @@ pub const Runner = struct {
     pub fn init(a: std.mem.Allocator, request: Request, executor: Executor, control: Control, sink: Sink) !Runner {
         try control.check();
         try request.policy.validate();
-        if (request.max_chunks > 4096 or request.max_working_bytes == 0) return error.InvalidChunkPolicy;
+        try request.limits.validate();
+        if (request.max_chunks > request.limits.max_chunks or request.max_working_bytes == 0) return error.InvalidChunkPolicy;
         const bytes = switch (request.input) {
             .text => |text| text,
             .binary => |b| b.data,
@@ -305,6 +308,12 @@ pub const Runner = struct {
             try self.soundWindows(wav.provider());
             return;
         };
+        if (try providers.Stream.start(self.allocator, bytes, self.control)) |stream| {
+            defer stream.deinit();
+            try self.soundWindows(stream.provider());
+            if (!self.stopped) try stream.finish();
+            return;
+        }
         var permit = try self.pool.acquire(.{ .host_bytes = self.request.max_working_bytes });
         defer permit.deinit();
         const adapter = self.control.imageWorkControl();
@@ -444,14 +453,14 @@ pub const Runner = struct {
             const webm = prefix.bytes.len == 4 and std.mem.eql(u8, prefix.bytes, "\x1a\x45\xdf\xa3");
             prefix.deinit();
             if (webm) {
-                var reader = try media.webm.Reader.init(self.allocator, &source, .{ .max_packets = 1_000_000 });
+                var reader = try media.webm.Reader.init(self.allocator, &source, .{ .max_packets = self.request.limits.max_index_packets });
                 defer reader.deinit();
                 try self.webmWindows(&reader);
                 return;
             } else {
-                var reader = try media.mp4.Reader.init(self.allocator, &source, .{});
+                var reader = try media.mp4.Reader.init(self.allocator, &source, .{ .max_samples = self.request.limits.max_index_packets, .max_index_bytes = @min(self.request.max_working_bytes, try std.math.mul(usize, self.request.limits.max_index_packets, @sizeOf(media.mp4.Packet))) });
                 defer reader.deinit();
-                var owner = try @import("media_chunking_video.zig").Owner.init(self.allocator, &reader, &self.pool);
+                var owner = try @import("media_chunking_video.zig").Owner.init(self.allocator, &reader, &self.pool, self.request.limits);
                 defer owner.deinit();
                 try self.videoWindows(&.{}, &reader, try owner.durationNs(), owner.origin, reader.track.timescale, &owner, null);
                 return;
@@ -483,13 +492,13 @@ pub const Runner = struct {
         const content_identity = std.fmt.bytesToHex(self.summary.identity.source, .lower);
         var source = media.source.Source{ .allocator = self.allocator, .storage = .{ .borrowed = bytes }, .identity = &content_identity, .limits = .{ .max_total_bytes = 512 * 1024 * 1024 }, .admission_pool = &self.pool, .control = .{ .context = adapter.context, .check_fn = adapter.check_fn } };
         if (bytes.len >= 4 and std.mem.eql(u8, bytes[0..4], "\x1a\x45\xdf\xa3")) {
-            var reader = try media.webm.Reader.init(self.allocator, &source, .{ .max_packets = 1_000_000 });
+            var reader = try media.webm.Reader.init(self.allocator, &source, .{ .max_packets = self.request.limits.max_index_packets });
             defer reader.deinit();
             try self.webmWindows(&reader);
         } else {
             var input = try @import("embedding_gemma2_video.zig").PacketInput.init(self.allocator, &source, bytes);
             defer input.deinit();
-            var owner = try @import("media_chunking_video.zig").Owner.init(self.allocator, &input.reader, &self.pool);
+            var owner = try @import("media_chunking_video.zig").Owner.init(self.allocator, &input.reader, &self.pool, self.request.limits);
             defer owner.deinit();
             try self.videoWindows(bytes, &input.reader, try owner.durationNs(), owner.origin, input.reader.track.timescale, &owner, null);
         }
@@ -497,7 +506,7 @@ pub const Runner = struct {
     fn webmWindows(self: *Runner, reader: *media.webm.Reader) !void {
         var end: i128 = std.math.minInt(i128);
         var origin: i64 = std.math.maxInt(i64);
-        var indexed = try video.webm_pictures.index(self.allocator, reader, .{ .max_packets = 1_000_000, .max_pictures = 1_000_000, .decoder = .{ .av1_all_layers = false, .control = reader.input.control } });
+        var indexed = try video.webm_pictures.index(self.allocator, reader, .{ .max_packets = self.request.limits.max_index_packets, .max_pictures = self.request.limits.max_index_packets, .decoder = .{ .av1_all_layers = false, .control = reader.input.control } });
         defer indexed.deinit();
         var last_pts: i64 = std.math.minInt(i64);
         var last_duration: ?u64 = null;
@@ -537,6 +546,10 @@ pub const Runner = struct {
                 var prepared = try source_owner.prepare(policy);
                 defer prepared.deinit();
                 try prepared.bind(policy, &self.pool);
+                if (prepared.selection) |*selection| {
+                    selection.continuation = &source_owner.continuation;
+                    selection.packet_base = prepared.packet_base;
+                }
                 if (!try self.emit(shape, .{ .video = .{ .bytes = &.{}, .reader = &prepared.coded.reader, .policy = policy, .source_timestamps = true, .selection = if (prepared.selection) |*selection| selection else null, .packet_base = prepared.packet_base } }, self.request.input.binary.mime_type)) break;
             } else if (!try self.emit(shape, .{ .video = .{ .bytes = bytes, .reader = reader, .webm = webm, .policy = policy } }, self.request.input.binary.mime_type)) break;
         }
@@ -544,7 +557,7 @@ pub const Runner = struct {
 };
 pub fn abort(err: anyerror) bool {
     return switch (err) {
-        error.Cancelled, error.Canceled, error.Timeout, error.DeadlineExceeded, error.OutOfMemory, error.MemoryBudgetExceeded, error.SharedAdmissionExceeded, error.ResourceTemporarilyUnavailable, error.ConcurrencyUnavailable, error.InferenceAdmissionQueueFull, error.ResourceLimitExceeded, error.AudioTooLarge, error.StreamTooLong => true,
+        error.Cancelled, error.Canceled, error.Timeout, error.DeadlineExceeded, error.OutOfMemory, error.MemoryBudgetExceeded, error.SharedAdmissionExceeded, error.ResourceTemporarilyUnavailable, error.ConcurrencyUnavailable, error.InferenceAdmissionQueueFull, error.ResourceLimitExceeded, error.AudioTooLarge, error.StreamTooLong, error.RemoteReadBudgetExceeded, error.RemoteRequestBudgetExceeded, error.ChunkWorkingBudgetExceeded, error.ChunkDependencyBudgetExceeded, error.ChunkCodedWindowBudgetExceeded, error.ChunkEventBudgetExceeded => true,
         else => false,
     };
 }
@@ -823,4 +836,29 @@ test "model aware media WebM retains one verified index across range-backed mode
     try std.testing.expect((try runner.run()).complete);
     try std.testing.expect(result.seen > 0);
     try std.testing.expect(provider.bytes < 256 * 1024);
+}
+
+test "model aware media streaming audio retains only forward windows and overlap" {
+    const a = std.testing.allocator;
+    const bytes = std.Io.Dir.cwd().readFileAlloc(std.testing.io, "zig/lib/audio/testdata/tone.mp3", a, .limited(1024 * 1024)) catch try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "../../lib/audio/testdata/tone.mp3", a, .limited(1024 * 1024));
+    defer a.free(bytes);
+    var bounded = @import("../runtime/bounded_allocator.zig").BoundedAllocator{ .backing = a, .limit = 8 * 1024 * 1024 };
+    const stream = (try @import("media_chunking_audio.zig").Stream.start(bounded.allocator(), bytes, .{ .io = std.testing.io })) orelse return error.TestUnexpectedResult;
+    var live = true;
+    defer if (live) stream.deinit();
+    var decoded = try audio.decode(a, bytes, .{});
+    defer decoded.deinit();
+    const provider = stream.provider();
+    var first: usize = 0;
+    while (first < provider.samples) {
+        const last = @min(provider.samples, first + 4000);
+        const window = try provider.read(provider.context, a, first, last);
+        try std.testing.expectEqualSlices(f32, decoded.samples[first..last], window.pcm.samples);
+        if (last == provider.samples) break;
+        first = last - 400;
+    }
+    try stream.finish();
+    stream.deinit();
+    live = false;
+    try std.testing.expectEqual(@as(usize, 0), bounded.live);
 }

@@ -73,20 +73,22 @@ fn sourceReference(request: Request) !?api.ChunkSourceReference {
 pub const Collector = struct {
     allocator: std.mem.Allocator,
     writer: ?httpx.StreamWriter = null,
+    event_backing: ?std.mem.Allocator = null,
     request: ?pipeline.Request = null,
     started: bool = false,
     items: std.ArrayList(WireItem) = .empty,
     gaps: std.ArrayList(WireCoordinates) = .empty,
     retained: usize = 0,
     limit: usize = 100 * 1024 * 1024,
+    event_limit: usize = 16 * 1024 * 1024,
     pub fn accept(raw: *anyopaque, item: pipeline.Item) !void {
         const self: *@This() = @ptrCast(@alignCast(raw));
         const bytes = try std.math.add(usize, 1024 + item.id.len + (if (item.text) |s| s.len else 0) + (if (item.data) |d| std.base64.standard.Encoder.calcSize(d.len) else 0), if (item.embedding) |v| try std.math.mul(usize, v.len, 24) else 0);
-        if (bytes > (if (self.writer != null) @min(self.limit, 16 * 1024 * 1024) else self.limit) or (self.writer == null and bytes > self.limit -| self.retained)) return error.ChunkOutputTooLarge;
+        if (bytes > (if (self.writer != null) @min(self.limit, self.event_limit) else self.limit) or (self.writer == null and bytes > self.limit -| self.retained)) return error.ChunkOutputTooLarge;
         if (self.gaps.items.len >= 4096) return error.ChunkOutputTooLarge;
         // Temporary event ownership retires after a completed write. Buffered
         // mode copies into the request arena only after the output bound passes.
-        var bounded = @import("../runtime/bounded_allocator.zig").BoundedAllocator{ .backing = std.heap.smp_allocator, .limit = self.limit };
+        var bounded = @import("../runtime/bounded_allocator.zig").BoundedAllocator{ .backing = self.event_backing orelse std.heap.smp_allocator, .limit = self.limit };
         var event = std.heap.ArenaAllocator.init(bounded.allocator());
         defer event.deinit();
         const a = if (self.writer != null) event.allocator() else self.allocator;
@@ -117,7 +119,7 @@ pub const Collector = struct {
                 self.started = true;
             }
             const json = try std.json.Stringify.valueAlloc(a, .{ .object = "chunk.embedding", .data = wire }, .{ .emit_null_optional_fields = false });
-            if (json.len >= 16 * 1024 * 1024) return error.ChunkOutputTooLarge;
+            if (json.len >= self.event_limit) return error.ChunkEventBudgetExceeded;
             try writer.write(json);
             try writer.write("\n");
         } else {
@@ -133,7 +135,7 @@ pub const Collector = struct {
         const plan = std.fmt.bytesToHex(summary.identity.plan, .lower);
         var cursor: [85]u8 = undefined;
         const resumable = if (execution.failure) |err| pipeline.abort(err) or err == error.ChunkOutputTooLarge or err == error.ResourceLimitExceeded or err == error.StreamTooLong else !summary.complete;
-        const partial = if (execution.failure) |err| err == error.ChunkOutputTooLarge else !summary.complete;
+        const partial = if (execution.failure) |err| (err == error.ChunkOutputTooLarge or err == error.ChunkEventBudgetExceeded) else !summary.complete;
         return .{
             .object = "chunk.embedding.list",
             .data = self.items.items,
@@ -168,7 +170,7 @@ pub const Collector = struct {
             }
             const json = try std.json.Stringify.valueAlloc(self.allocator, .{ .object = "chunk.embedding.complete", .response = value }, .{ .emit_null_optional_fields = false });
             defer self.allocator.free(json);
-            if (json.len >= 16 * 1024 * 1024) return error.ChunkOutputTooLarge;
+            if (json.len >= self.event_limit) return error.ChunkEventBudgetExceeded;
             try writer.write(json);
             try writer.write("\n");
             try writer.close();

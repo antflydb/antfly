@@ -53,7 +53,90 @@ pub const Configuration = struct {
 };
 /// Owned selection from a validated logical index. Input and policy are
 /// content-bound; this owner must outlive all Prefetch workers borrowing it.
+pub const DecoderContinuation = struct {
+    allocator: std.mem.Allocator,
+    reader: *media.mp4.Reader,
+    decoder: ?*video.h264.Incremental = null,
+    apple: ?*video.apple.Continuation = null,
+    session: ?@import("../backends/session.zig").Session = null,
+    surface_permit: ?@import("../backends/session.zig").RunPermit = null,
+    max_packets: usize = 8192,
+    decoded_packets: u64 = 0,
+    reused_windows: u64 = 0,
+    pub fn deinit(self: *@This()) void {
+        if (self.apple) |apple| apple.deinit();
+        self.apple = null;
+        if (self.surface_permit) |*permit| permit.deinit();
+        self.surface_permit = null;
+        if (self.decoder) |decoder| decoder.deinit();
+        self.decoder = null;
+    }
+    fn decodeApple(self: *@This(), selected: []const usize, packet_base: usize, capture: *Capture) !bool {
+        if (self.reader.track.codec != .avc or self.reader.track.inband_parameter_sets or !try compatibleApple(self.allocator, self.reader.track.avcc)) return false;
+        var absolute: [32]usize = undefined;
+        if (selected.len > absolute.len) return error.ResourceLimitExceeded;
+        for (selected, absolute[0..selected.len]) |index, *target| target.* = try std.math.add(usize, index, packet_base);
+        if (self.apple) |apple| for (absolute[0..selected.len]) |index| {
+            if (index < apple.next_packet) return false;
+        };
+        if (self.apple == null) {
+            const bytes = try video.apple.surfaceAdmissionBytes(self.reader.track.width, self.reader.track.height, 32);
+            const session = self.session orelse return false;
+            self.surface_permit = try session.admitHostPreprocess(std.math.cast(usize, bytes) orelse return error.ResourceLimitExceeded);
+            errdefer {
+                self.surface_permit.?.deinit();
+                self.surface_permit = null;
+            }
+            self.apple = try video.apple.Continuation.create(self.allocator, self.reader, .{ .require_hardware = false, .max_decode_packets = self.max_packets });
+        }
+        const Forward = struct {
+            target: *Capture,
+            base: usize,
+            fn accept(raw: *anyopaque, frame: *const video.apple.Frame) !void {
+                const forwarder: *@This() = @ptrCast(@alignCast(raw));
+                var local = frame.*;
+                local.decode_index = try std.math.sub(usize, frame.decode_index, forwarder.base);
+                try Capture.publishApple(forwarder.target, &local);
+            }
+        };
+        var forward = Forward{ .target = capture, .base = packet_base };
+        const warm = self.apple.?.next_packet != 0;
+        const packets = self.apple.?.decodeTo(absolute[0..selected.len], .{ .context = &forward, .accept = Forward.accept }) catch |err| {
+            self.deinit();
+            return err;
+        };
+        self.decoded_packets += packets;
+        self.reused_windows += @intFromBool(warm);
+        capture.decoder.record(if (self.apple.?.hardware()) .apple_hardware else .apple_software);
+        return true;
+    }
+    fn decode(self: *@This(), selected: []const usize, packet_base: usize, context: *anyopaque, callback: video.h264.SelectionCallback) !bool {
+        if (self.reader.track.codec != .avc or self.reader.track.inband_parameter_sets) return false;
+        var absolute: [32]usize = undefined;
+        if (selected.len > absolute.len) return error.ResourceLimitExceeded;
+        for (selected, absolute[0..selected.len]) |index, *target| target.* = try std.math.add(usize, index, packet_base);
+        if (self.decoder) |decoder| {
+            for (absolute[0..selected.len]) |index| if (index < decoder.cursor()) return false;
+        } else {
+            const cfg = try video.h264.configParse(self.allocator, self.reader.track.avcc);
+            defer cfg.groups.deinit(self.allocator);
+            if (cfg.separate_planes) return false;
+            self.decoder = try video.h264.Incremental.init(self.allocator, self.reader, .{ .max_dependency_packets = self.max_packets });
+        }
+        const was_warm = self.decoder.?.cursor() != 0;
+        const stats = self.decoder.?.decodeSelected(self.reader, absolute[0..selected.len], context, callback) catch |err| {
+            self.deinit();
+            return err;
+        };
+        self.decoded_packets += stats.decoded_packets;
+        self.reused_windows += @intFromBool(was_warm);
+        return true;
+    }
+};
+
 pub const ReaderSelection = struct {
+    continuation: ?*DecoderContinuation = null,
+    packet_base: usize = 0,
     allocator: std.mem.Allocator,
     selected: []const usize,
     projection_keys: []const CacheKey,
@@ -1081,6 +1164,25 @@ fn decodeSelection(a: std.mem.Allocator, reader: *media.mp4.Reader, selected: []
             try capture.project(slot, patches, options);
         }
     } else {
+        // Keep the automatic Apple policy on the native device path. Portable
+        // execution retains reference state across forward chunk selections.
+        if (capture.decoder.policy == .portable or @import("builtin").os.tag != .macos) {
+            if (capture.reader_selection) |selection| if (selection.continuation) |continuation| {
+                if (try continuation.decode(selected, selection.packet_base, capture, Capture.publishDecoded)) {
+                    capture.decoder.record(.portable);
+                    return;
+                }
+            };
+        }
+        if (capture.decoder.policy != .portable and appleAllowed(capture.decoder)) {
+            if (capture.reader_selection) |selection| if (selection.continuation) |continuation| {
+                const used = continuation.decodeApple(selected, selection.packet_base, capture) catch |err| retry: {
+                    try appleUnavailable(capture, err);
+                    break :retry false;
+                };
+                if (used) return;
+            };
+        }
         if (try decodeAppleH264(a, reader, selected, capture)) return;
         capture.decoder.record(.portable);
         // Decode references once for the whole selection, never once per frame.
@@ -2507,4 +2609,78 @@ test "embeddinggemma2 video decoder policy isolates cached projections and fallb
     defer fallback.deinit();
     try std.testing.expectEqual(@as(usize, 1), stats.portable.load(.monotonic));
     try std.testing.expectEqual(@as(usize, 2), stats.fallbacks.load(.monotonic));
+}
+
+test "embeddinggemma2 video continuation preserves reference pictures across windows" {
+    const Oracle = struct {
+        hashes: [32][32]u8 = undefined,
+        count: usize = 0,
+        fn accept(raw: *anyopaque, slot: usize, frame: *const video.h264.Frame) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (slot >= self.hashes.len) return error.InvalidPacketIndex;
+            std.crypto.hash.sha2.Sha256.hash(frame.nv12, &self.hashes[slot], .{});
+            self.count += 1;
+        }
+    };
+    inline for (.{ "closed", "bframes" }) |name| {
+        const a = std.testing.allocator;
+        const bytes = @embedFile("../testdata/video/" ++ name ++ ".mp4");
+        var source = media.source.Source{ .allocator = a, .identity = name, .storage = .{ .borrowed = bytes }, .limits = .{ .max_total_bytes = 512 * 1024 * 1024 } };
+        var reader = try media.mp4.Reader.init(a, &source, .{});
+        defer reader.deinit();
+        var continuation = DecoderContinuation{ .allocator = a, .reader = &reader };
+        defer continuation.deinit();
+        var offset: usize = 0;
+        var independent_packets: u64 = 0;
+        while (offset < reader.packets.len) {
+            const count = @min(if (offset == 0) @as(usize, 1) else 2, reader.packets.len - offset);
+            var indexes: [2]usize = undefined;
+            for (indexes[0..count], offset..) |*index, value| index.* = value;
+            var expected = Oracle{};
+            const stats = try video.h264.decodeSelected(a, &reader, indexes[0..count], .{ .max_dependency_packets = 8192 }, &expected, Oracle.accept);
+            independent_packets += stats.decoded_packets;
+            var actual = Oracle{};
+            try std.testing.expect(try continuation.decode(indexes[0..count], 0, &actual, Oracle.accept));
+            try std.testing.expectEqual(expected.count, actual.count);
+            try std.testing.expectEqualSlices([32]u8, expected.hashes[0..count], actual.hashes[0..count]);
+            offset += count;
+        }
+        try std.testing.expect(continuation.reused_windows > 0);
+        try std.testing.expect(continuation.decoded_packets < independent_packets);
+    }
+}
+
+test "embeddinggemma2 video Apple continuation drains windows while preserving native references" {
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const bytes = @embedFile("../testdata/video/closed.mp4");
+    var source = media.source.Source{ .allocator = a, .identity = "apple-forward", .storage = .{ .borrowed = bytes }, .limits = .{ .max_total_bytes = 512 * 1024 * 1024 } };
+    var reader = try media.mp4.Reader.init(a, &source, .{});
+    defer reader.deinit();
+    const decoder = try video.apple.Continuation.create(a, &reader, .{ .require_hardware = false });
+    defer decoder.deinit();
+    const Oracle = struct {
+        hash: [32]u8 = undefined,
+        fn accept(raw: *anyopaque, frame: *const video.apple.Frame) !void {
+            const oracle: *@This() = @ptrCast(@alignCast(raw));
+            var mapping = try frame.surface.map();
+            defer mapping.deinit();
+            var hash = std.crypto.hash.sha2.Sha256.init(.{});
+            for (mapping.planes, 0..) |plane, index| {
+                const row_bytes = plane.width * (if (index == 0) @as(usize, 1) else 2) * (if (frame.surface.format.bitDepth() == 8) @as(usize, 1) else 2);
+                for (0..plane.height) |row| hash.update(plane.bytes[row * plane.stride ..][0..row_bytes]);
+            }
+            oracle.hash = hash.finalResult();
+        }
+    };
+    var total: usize = 0;
+    for (0..@min(reader.packets.len, 8)) |index| {
+        var expected = Oracle{};
+        var batch = try video.apple.decodeTo(a, &reader, &.{index}, .{ .require_hardware = false }, .{ .context = &expected, .accept = Oracle.accept });
+        defer batch.deinit();
+        var actual = Oracle{};
+        total += try decoder.decodeTo(&.{index}, .{ .context = &actual, .accept = Oracle.accept });
+        try std.testing.expectEqualSlices(u8, &expected.hash, &actual.hash);
+    }
+    try std.testing.expectEqual(@min(reader.packets.len, 8), total);
 }

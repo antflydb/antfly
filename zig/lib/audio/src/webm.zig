@@ -504,6 +504,168 @@ fn trimTrailingFramesAlloc(allocator: std.mem.Allocator, samples: []f32, channel
     return out;
 }
 
+const TimelineSink = struct {
+    sink: @import("pcm_sink.zig").Sink,
+    times: []const u64,
+    counts: []const usize,
+    rate: u32,
+    channels: u8,
+    delay: usize,
+    total: usize,
+    keep: usize = 0,
+    unit: usize = 0,
+    unit_offset: usize = 0,
+    source_frames: usize = 0,
+    timeline_frames: usize = 0,
+    inserted: usize = 0,
+    fn init(sink: @import("pcm_sink.zig").Sink, times: []const u64, counts: []const usize, rate: u32, channels: u8, delay: usize, total: usize, padding: i64) !TimelineSink {
+        if (counts.len != times.len or rate == 0 or channels == 0) return error.UnsupportedAudioFormat;
+        var cursor: usize = 0;
+        var source_cursor: usize = 0;
+        var inserted: usize = 0;
+        for (counts, times) |count, time| {
+            const wanted = nsToFrames(time, rate) -| delay;
+            if (wanted > cursor + @max(1, rate / 1000)) {
+                inserted = try std.math.add(usize, inserted, wanted - cursor);
+                if (inserted > max_timeline_silence_seconds * rate) return error.UnsupportedAudioFormat;
+                cursor = wanted;
+            }
+            const available = @min(count, total -| source_cursor);
+            source_cursor += available;
+            cursor = try std.math.add(usize, cursor, available);
+        }
+        cursor = try std.math.add(usize, cursor, total - source_cursor);
+        const trim = if (padding > 0) nsToFrames(@intCast(padding), rate) else 0;
+        return .{ .sink = sink, .times = times, .counts = counts, .rate = rate, .channels = channels, .delay = delay, .total = total, .keep = if (trim < cursor) cursor - trim else cursor };
+    }
+    fn output(self: *@This(), samples: []const f32) !void {
+        const frames = samples.len / self.channels;
+        const keep = @min(frames, self.keep -| self.timeline_frames);
+        if (keep != 0) try self.sink.push(samples[0 .. keep * self.channels], self.rate, self.channels);
+        self.timeline_frames += frames;
+    }
+    fn write(raw: *anyopaque, samples: []const f32, rate: u32, channels: u8) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (rate != self.rate or channels != self.channels) return error.UnsupportedAudioFormat;
+        var offset: usize = 0;
+        while (offset < samples.len) {
+            if (self.unit < self.counts.len and self.unit_offset == 0) {
+                const wanted = nsToFrames(self.times[self.unit], rate) -| self.delay;
+                if (wanted > self.timeline_frames + @max(1, rate / 1000)) {
+                    var gap = wanted - self.timeline_frames;
+                    self.inserted += gap;
+                    if (self.inserted > max_timeline_silence_seconds * rate) return error.UnsupportedAudioFormat;
+                    const zeros: [2048]f32 = @splat(0);
+                    while (gap != 0) {
+                        const count = @min(gap, zeros.len / channels);
+                        try self.output(zeros[0 .. count * channels]);
+                        gap -= count;
+                    }
+                }
+                if (self.counts[self.unit] == 0) {
+                    self.unit += 1;
+                    continue;
+                }
+            }
+            const available = (samples.len - offset) / channels;
+            const count = if (self.unit < self.counts.len) @min(available, self.counts[self.unit] - self.unit_offset) else available;
+            try self.output(samples[offset..][0 .. count * channels]);
+            self.source_frames += count;
+            offset += count * channels;
+            if (self.unit < self.counts.len) {
+                self.unit_offset += count;
+                if (self.unit_offset == self.counts[self.unit]) {
+                    self.unit += 1;
+                    self.unit_offset = 0;
+                }
+            }
+        }
+    }
+    fn finish(self: *@This()) !void {
+        if (self.source_frames != self.total) return error.UnsupportedAudioFormat;
+        const zeros: [2048]f32 = @splat(0);
+        while (self.timeline_frames < self.keep) {
+            const count = @min(self.keep - self.timeline_frames, zeros.len / self.channels);
+            try self.output(zeros[0 .. count * self.channels]);
+        }
+    }
+    fn consumer(self: *@This()) @import("pcm_sink.zig").Sink {
+        return .{ .context = self, .write = write };
+    }
+};
+
+pub fn visitInterleaved(a: std.mem.Allocator, bytes: []const u8, sink: @import("pcm_sink.zig").Sink) !void {
+    var demuxed = try demux(a, bytes);
+    defer demuxed.deinit();
+    const frames = try a.alloc(usize, demuxed.access_units.len);
+    defer a.free(frames);
+    switch (demuxed.codec) {
+        .opus => {
+            const head = try opus.parseHead(demuxed.codec_private);
+            const skip = effectiveOpusPreSkip(head.pre_skip, demuxed.codec_delay_ns);
+            var remaining_skip: usize = skip;
+            const tocs = try a.alloc(opus.Toc, frames.len);
+            defer a.free(tocs);
+            var total: usize = 0;
+            for (demuxed.access_units, frames, tocs) |unit, *count, *toc| {
+                if (unit.len == 0) return error.UnsupportedAudioFormat;
+                toc.* = try opus.parseToc(unit[0]);
+                const decoded = try opus.packetSamples(unit, 48_000);
+                const drop = @min(remaining_skip, decoded);
+                remaining_skip -= drop;
+                count.* = decoded - drop;
+                total = try std.math.add(usize, total, count.*);
+            }
+            var timeline = try TimelineSink.init(sink, demuxed.access_unit_times_ns, frames, 48_000, head.channels, skip, total, demuxed.discard_padding_ns);
+            try opus.visitPackets(a, demuxed.access_units, tocs, head.channels, head.output_gain_q8, skip, null, timeline.consumer());
+            try timeline.finish();
+        },
+        .vorbis => {
+            const packets = try buildOggPackets(a, try splitXiphLacedTriple(demuxed.codec_private), demuxed.access_units);
+            defer {
+                for (packets) |packet| a.free(packet.bytes);
+                a.free(packets);
+            }
+            var decoded = try vorbis.demuxPacketsAlloc(a, packets);
+            defer decoded.deinit();
+            if (decoded.audio_packets.len != frames.len) return error.UnsupportedStreamingAudioProfile;
+            for (decoded.audio_packets, frames, 0..) |packet, *count, i| count.* = if (i == 0) 0 else packet.decoded_sample_count;
+            const rate = decoded.headers.identification.sample_rate;
+            const delay = @max(nsToFrames(demuxed.codec_delay_ns, rate), decoded.audio_packets[0].decoded_sample_count);
+            var timeline = try TimelineSink.init(sink, demuxed.access_unit_times_ns, frames, rate, decoded.headers.identification.channels, delay, @intCast(decoded.playable_samples), demuxed.discard_padding_ns);
+            try vorbis.visitDemuxed(a, decoded, timeline.consumer());
+            try timeline.finish();
+        },
+        .flac => {
+            var native = std.ArrayList(u8).empty;
+            defer native.deinit(a);
+            try native.appendSlice(a, demuxed.codec_private);
+            for (demuxed.access_units) |unit| try native.appendSlice(a, unit);
+            const info = try flac.parseStreamInfo(native.items);
+            if (info.total_samples == 0) return error.UnsupportedStreamingAudioProfile;
+            const count = [_]usize{@intCast(info.total_samples)};
+            var timeline = try TimelineSink.init(sink, demuxed.access_unit_times_ns[0..1], &count, info.sample_rate, info.channels, nsToFrames(demuxed.codec_delay_ns, info.sample_rate), count[0], demuxed.discard_padding_ns);
+            try flac.visitInterleaved(a, native.items, timeline.consumer());
+            try timeline.finish();
+        },
+    }
+}
+
+fn expectStreaming(a: std.mem.Allocator, bytes: []const u8, expected: DecodedInterleaved) !void {
+    const Collector = struct {
+        a: std.mem.Allocator,
+        values: std.ArrayList(f32) = .empty,
+        fn write(raw: *anyopaque, values: []const f32, _: u32, _: u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.values.appendSlice(self.a, values);
+        }
+    };
+    var collector = Collector{ .a = a };
+    defer collector.values.deinit(a);
+    try visitInterleaved(a, bytes, .{ .context = &collector, .write = Collector.write });
+    try std.testing.expectEqualSlices(f32, expected.samples, collector.values.items);
+}
+
 // --- Test-fixture support -------------------------------------------------
 //
 // The rest of this file, from here down, builds and exercises synthetic
@@ -1052,7 +1214,7 @@ test "webm decoding refuses a gap it cannot place" {
     }
 }
 
-test "webm decoding leaves uninterrupted opus alone" {
+test "streaming audio webm leaves uninterrupted opus alone" {
     const allocator = std.testing.allocator;
 
     var ogg_packets = try ogg.parsePacketsAlloc(allocator, tone_opus_bytes);
@@ -1103,11 +1265,13 @@ test "webm decoding leaves uninterrupted opus alone" {
     var timed_pcm = try decodeInterleaved(allocator, timed_file);
     defer timed_pcm.deinit();
 
+    try expectStreaming(allocator, laced_file, laced_pcm);
+    try expectStreaming(allocator, timed_file, timed_pcm);
     try std.testing.expectEqual(laced_pcm.samples.len, timed_pcm.samples.len);
     try std.testing.expectEqualSlices(f32, laced_pcm.samples, timed_pcm.samples);
 }
 
-test "webm decoding leaves a remuxed vorbis recording alone" {
+test "streaming audio webm leaves a remuxed vorbis recording alone" {
     const allocator = std.testing.allocator;
 
     var ogg_packets = try ogg.parsePacketsAlloc(allocator, tone_ogg_bytes);
@@ -1164,6 +1328,8 @@ test "webm decoding leaves a remuxed vorbis recording alone" {
     var timed_pcm = try decodeInterleaved(allocator, timed_file);
     defer timed_pcm.deinit();
 
+    try expectStreaming(allocator, laced_file, laced_pcm);
+    try expectStreaming(allocator, timed_file, timed_pcm);
     try std.testing.expectEqual(laced_pcm.samples.len, timed_pcm.samples.len);
     try std.testing.expectEqualSlices(f32, laced_pcm.samples, timed_pcm.samples);
 
@@ -1188,7 +1354,7 @@ fn vorbisCodecPrivateAlloc(allocator: std.mem.Allocator, headers: []const ogg.Pa
     return out.toOwnedSlice(allocator);
 }
 
-test "webm decoding keeps a paused recording's gap on the timeline" {
+test "streaming audio webm keeps a paused recording's gap on the timeline" {
     const allocator = std.testing.allocator;
 
     var ogg_packets = try ogg.parsePacketsAlloc(allocator, tone_opus_bytes);
@@ -1266,13 +1432,19 @@ fn decodeTwoClusterWebm(
     if (second_blocks.len == 0) {
         const file = try buildWebmFile(allocator, tracks, &.{first});
         defer allocator.free(file);
-        return decodeInterleaved(allocator, file);
+        var decoded = try decodeInterleaved(allocator, file);
+        errdefer decoded.deinit();
+        try expectStreaming(allocator, file, decoded);
+        return decoded;
     }
     const second = try buildCluster(allocator, second_cluster_timecode, @ptrCast(second_blocks));
     defer allocator.free(second);
     const file = try buildWebmFile(allocator, tracks, &.{ first, second });
     defer allocator.free(file);
-    return decodeInterleaved(allocator, file);
+    var decoded = try decodeInterleaved(allocator, file);
+    errdefer decoded.deinit();
+    try expectStreaming(allocator, file, decoded);
+    return decoded;
 }
 
 test "webm demux reconstructs frames for all three lacing modes" {

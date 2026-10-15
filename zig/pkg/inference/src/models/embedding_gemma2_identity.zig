@@ -152,6 +152,30 @@ pub fn snapshot(a: std.mem.Allocator, io: std.Io, directory: []const u8, weights
     return .{ .digest = fromDigests(digests), .signature = before };
 }
 
+/// Cache only fully verified digests, guarded by the same before/after file
+/// signature as execution. Warm planning does not touch checkpoint pages.
+pub fn snapshotCached(a: std.mem.Allocator, io: std.Io, directory: []const u8, weights: []const u8, control: Control) !Snapshot {
+    const Cache = struct {
+        var mutex: std.atomic.Mutex = .unlocked;
+        var entries: [8]?Snapshot = @splat(null);
+        var next: usize = 0;
+    };
+    try control.check();
+    const current = try signature(a, io, directory, weights);
+    while (!Cache.mutex.tryLock()) std.atomic.spinLoopHint();
+    for (Cache.entries) |entry| if (entry) |cached| if (std.mem.eql(u8, &cached.signature, &current)) {
+        Cache.mutex.unlock();
+        return cached;
+    };
+    Cache.mutex.unlock();
+    const value = try snapshot(a, io, directory, weights, control);
+    while (!Cache.mutex.tryLock()) std.atomic.spinLoopHint();
+    defer Cache.mutex.unlock();
+    Cache.entries[Cache.next] = value;
+    Cache.next = (Cache.next + 1) % Cache.entries.len;
+    return value;
+}
+
 test "embeddinggemma2 processor changes fail closed" {
     const a = std.testing.allocator;
     try validateProcessor(a, @embedFile("embedding_gemma2_processor.json"));

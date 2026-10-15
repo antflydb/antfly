@@ -110,12 +110,15 @@ coded-window limit applies to each MP4 dependency closure, independently of the
 object length. Sources that exceed index, dependency or read budgets fail with
 explicit incomplete coverage.
 
-Each coded window replays from a verified restart point, including required
-references. Indexes and projected selected frames persist across windows; decoder
-reference state currently belongs to each window. This bounds ownership but can
-repeat reference reconstruction across adjacent windows. A future retained
-decoder optimization must preserve the same dependency proofs and identities. Decode required references while preparing only
-selected outputs. Reuse frame preparations and vision/projector results when
+Each coded window retains verified restart/preroll proofs. Forward, static AVC
+selections retain a bounded decoder owner across windows on portable H.264 and
+Apple VideoToolbox. Backward selections, separate colour planes, dynamic parameter
+sets and other codec paths use verified replay; projections still remain reusable.
+Failed owners are destroyed before retry. Native callbacks drain before borrowed
+window state retires, and Apple decoder surface reservations survive until owner
+release. Required dependency bytes are still materialized per window; retained
+references reduce reconstruction, rather than removing all repeat reads.
+Decode required references while preparing only selected outputs. Reuse frame preparations and vision/projector results when
 source dependencies, model identity and display/geometry policy match. Retain
 device projections on Metal where possible. Each window still runs its own
 contextual language backbone; reused KV state or averaged window vectors do not
@@ -191,7 +194,11 @@ S3 credentials, cancellation and byte/request limits apply; credentials are neve
 accepted in a source recipe. Source length is separate from its admitted read
 budget. Retention and authorization remain the caller/database's responsibility.
 
-`embedding.execute:false` returns descriptors without computing vectors;
+`embedding.execute:false` resolves tokenizer, processor and manifest assets
+without constructing a backend session or importing model tensors. Immutable
+identity verification can still read checkpoint bytes on a cold identity cache;
+warm verified identities are guarded by file signatures. Planning is not a promise
+of zero file I/O. It returns descriptors without computing vectors;
 `include_content:true` includes text or independently usable PNG/WAV windows.
 Video returns a source/window recipe without remuxing. Native database calls keep
 text and descriptors while avoiding PNG/WAV transport encoding. A supplied
@@ -224,8 +231,14 @@ time rather than jumping a long VFR hold to the next picture.
 MP4 uses one index/configuration owner and bounded coded windows including verified
 preroll, reorder and picture-assembly dependencies. WebM shares a logical/header
 index across model windows and replays from verified codec restart points. WAV
-range input reads/decode only the selected samples. Other audio codecs and
-contiguous image/PDF decoders use an explicitly bounded source/decode allocation;
+range input reads/decode only the selected samples. Compressed MP3, FLAC, core AAC, ALAC and Opus/Vorbis paths deliver codec blocks
+through a two-block queue and retain only the current PCM window plus overlap.
+Container trim, gain, per-channel clipping, and supported WebM timeline gaps are
+preserved. Formats/profiles without an incremental visitor (including enhanced
+AAC, chained Ogg and WebM FLAC without declared sample totals) retain the bounded
+fallback. Compressed input and packet metadata remain bounded contiguous owners;
+this does not yet promise remote packet-range streaming for every audio codec.
+Contiguous image/PDF decoders also use a bounded source/decode allocation;
 unsupported sizes fail without claiming completion. Model calls reuse the
 request's projected-frame cache and bounded CPU/Metal preparation queue. Execution
 admission includes source ownership, transport/cache allowance, output retention
@@ -243,6 +256,48 @@ Native failures retain semantic identities across runtime units through named
 worker replies and checked callback statuses. The generated registry and callback
 round-trip tests preserve coverage, continuation and source-version failures;
 the registry is checked with the other generated contracts.
+
+## Operational limits and admission
+
+`NodeConfig.chunking_limits` and `ANTFLY_CHUNK_<UPPERCASE_FIELD>` configure the
+same ceilings in standalone and embedded inference. `/models` embedding entries
+publish `chunking_limits` in scoped and unscoped discovery. These limits do not
+change chunk/plan identities; a retry can resume under a larger operational budget
+with the same source, model and semantic policy. Native callers can request lower
+ceilings but cannot exceed the configured node ceiling.
+
+| Field | Default |
+|---|---:|
+| `max_working_bytes` | 512 MiB |
+| `max_output_bytes` | 100 MiB |
+| `max_event_bytes` | 16 MiB (also the protocol ceiling) |
+| `max_chunks` | 4096 for explicit caps; zero request cap means no count cap |
+| `max_dependency_packets` | 8192 (also the current decoder ceiling) |
+| `max_coded_window_bytes` | 64 MiB |
+| `max_index_packets` | 1,000,000; index memory/metadata ceilings also apply |
+| `remote_fetched_bytes` | 512 MiB per execution |
+| `remote_requests` | 100,000 upstream reads per execution |
+| `remote_cache_bytes` | 256 KiB |
+
+Source/extraction and HTTP result allocation grow admission in small leases before
+allocating, instead of reserving the full working/output ceilings for every
+request. Bounds wrap reclaiming allocators; failed growth rolls back, and released
+allocations return spare reservations. Shared process/model admission still
+arbitrates concurrent requests. Model execution workspace estimates remain
+independent of source allocation; these changes do not remove backend safety
+margins. Buffered HTTP response serialization still follows normal HTTP ownership.
+
+Remote fetched-byte, upstream-request and cache budgets are independent of
+whole-object download size policy. Cache hits consume neither another upstream
+request nor fetched bytes; the final partial fill uses the remaining wire budget.
+Content security, immutable versions and exact ranges continue to apply, including
+per-response transport size bounds. The object can be much larger than the bytes
+fetched. Logical source lease counters are distinct from wire transfer counters.
+
+Budget errors distinguish working allocation, coded dependency count/bytes,
+stream event size, remote fetched bytes and remote request count. Coverage and
+continuations survive retryable stops; named native errors preserve those
+identities across runtime units. Resource errors never certify complete coverage.
 
 ## Reproduction
 
@@ -264,3 +319,24 @@ Use `--telemetry` for admission, transfer and Metal memory counters,
 each exact text, crop, composited frame, PDF page, audio window and video interval;
 reported warm/cold throughput is backend-specific. Retrieval relevance remains an
 end-user workload evaluation, separate from preserving reference embeddings.
+
+For sustained load, run `python3 zig/pkg/inference/scripts/qualify_chunk_load.py
+--binary zig/zig-out/bin/antfly-inference-bench-server --model-dir
+.benchmark-assets/native-video/model --backend metal --seconds 60 --concurrency 2
+--video /path/to/real-clip.mp4 --output .benchmark-results/chunk-load.json`.
+The harness checks cold planning without a backend session, page-by-page vector
+and descriptor equivalence, disconnect/retry cleanup, completed concurrent
+requests, latency and sampled memory/admission/transfer counters. Admission
+rejections use bounded backoff and source/plan-bound continuations, retaining
+only acknowledged ordinals; generation/context changes and non-admission errors
+remain failures. Reports separate admission retries from failed operations and
+verify request/scratch admission drains after cancellation and load. Add `--audio
+/path/to/recording.mp3` to exercise longer compressed inputs. Sampled peaks
+are not allocator-independent RSS high-water measurements. Use longer runs and
+larger production clips to qualify a deployment rather than extrapolating one
+host's throughput.
+
+Run `python3 -m unittest discover -s zig/pkg/inference/scripts -p
+test_qualify_chunk_load.py` for fault-injected retry qualification: partial
+acknowledgement, initial admission rejection, bounded exhaustion and refusal to
+mix generations or retry non-admission errors.

@@ -179,7 +179,13 @@ adds opt-in long-video retrieval windows through `/ai/v1/chunk`; `/embed` retain
 one vector per explicit group. Chunk windows preserve cadence, half-open source
 clocks, VFR holds and exact selected picture IDs. MP4 retains its index and verified
 preroll/assembly context; WebM reuses a logical index and verified restart points.
-Request-local projected reuse and bounded preparation overlap apply on CPU/Metal.
+Static AVC forward windows also retain bounded portable H.264 or VideoToolbox
+reference state. Backward selections, dynamic parameter sets, separate colour
+planes and other codecs retain verified replay. Dependency bytes remain bounded
+per window even when reconstruction reuses references. Native decoder callbacks
+drain before window release; retained Apple surfaces keep their admission until
+decoder destruction. Request-local projected reuse and bounded preparation overlap
+apply on CPU/Metal.
 Descriptors, model identity, gaps and terminal coverage travel with the vectors.
 Overview sampling remains distinct from retrieval coverage; audio inclusion stays
 opt-in. See the design for source references, admission bounds and qualification.

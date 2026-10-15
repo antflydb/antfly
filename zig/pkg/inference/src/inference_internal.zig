@@ -169,6 +169,7 @@ test "GLiNER Decide artifact test reachability" {
 
 test "model aware media module declarations" {
     _ = pipelines.media_chunking;
+    _ = @import("backends/admitted_allocator.zig");
 }
 
 test "model aware media audio projector declarations" {

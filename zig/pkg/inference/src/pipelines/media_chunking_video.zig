@@ -19,6 +19,7 @@ const media = @import("antfly_media");
 const video = @import("antfly_video");
 const model_video = @import("embedding_gemma2_video.zig");
 pub const Owner = struct {
+    continuation: model_video.DecoderContinuation,
     allocator: std.mem.Allocator,
     reader: *media.mp4.Reader,
     timed: []video.sampling.TimedPicture,
@@ -26,7 +27,8 @@ pub const Owner = struct {
     registry: ?*video.h264_dynamic.Session = null,
     origin: i64,
     pool: *media.admission.Pool,
-    pub fn init(a: std.mem.Allocator, reader: *media.mp4.Reader, pool: *media.admission.Pool) !Owner {
+    limits: @import("media_chunk_limits.zig").Limits,
+    pub fn init(a: std.mem.Allocator, reader: *media.mp4.Reader, pool: *media.admission.Pool, limits: @import("media_chunk_limits.zig").Limits) !Owner {
         if (reader.packets.len == 0) return error.EmptyVideo;
         var logical: ?video.h264_pictures.Index = null;
         errdefer if (logical) |*index| index.deinit();
@@ -50,9 +52,10 @@ pub const Owner = struct {
             }
         }
         const registry = if (reader.track.inband_parameter_sets) try video.h264_dynamic.Session.init(a, reader, .{}) else null;
-        return .{ .allocator = a, .reader = reader, .timed = timed, .logical = logical, .registry = registry, .origin = origin, .pool = pool };
+        return .{ .continuation = .{ .allocator = a, .reader = reader, .max_packets = limits.max_dependency_packets }, .allocator = a, .reader = reader, .timed = timed, .logical = logical, .registry = registry, .origin = origin, .pool = pool, .limits = limits };
     }
     pub fn deinit(self: *Owner) void {
+        self.continuation.deinit();
         if (self.registry) |registry| registry.deinit();
         if (self.logical) |*index| index.deinit();
         self.allocator.free(self.timed);
@@ -77,7 +80,7 @@ pub const Owner = struct {
             stop = @max(stop, last + 1);
         }
         if (self.reader.track.codec == .avc) {
-            var plan = try video.decode_plan.create(a, self.reader, packets, .{ .portable_config = true, .max_decode_packets = 8192, .max_run_packets = 8192 });
+            var plan = try video.decode_plan.create(a, self.reader, packets, .{ .portable_config = true, .max_decode_packets = self.limits.max_dependency_packets, .max_run_packets = self.limits.max_dependency_packets });
             defer plan.deinit();
             for (plan.runs) |run| first = @min(first, run.first);
             // Reorder drain is bounded. Logical completion below extends this
@@ -100,15 +103,18 @@ pub const Owner = struct {
                         changed = true;
                     }
                 }
-                if (stop - first > 8192) return error.ResourceLimitExceeded;
+                if (stop - first > self.limits.max_dependency_packets) return error.ChunkDependencyBudgetExceeded;
             }
         }
-        if (stop <= first or stop - first > 8192) return error.ResourceLimitExceeded;
+        if (stop <= first or stop - first > self.limits.max_dependency_packets) return error.ChunkDependencyBudgetExceeded;
+        var coded_bytes: u64 = 0;
+        for (self.reader.packets[first..stop]) |packet| coded_bytes = try std.math.add(u64, coded_bytes, packet.size);
+        if (coded_bytes > self.limits.max_coded_window_bytes) return error.ChunkCodedWindowBudgetExceeded;
         var view = self.reader.*;
         view.packets = self.reader.packets[first..stop];
         const bootstrap = if (self.registry) |registry| try registry.bootstrapBefore(a, first) else null;
         defer if (bootstrap) |bytes| a.free(bytes);
-        var window = try video.live_windows.copyWithParameters(a, self.reader.input.identity, &view, 0, bootstrap orelse &.{}, .{ .stream = .{ .admission_pool = self.pool, .control = self.reader.input.control } });
+        var window = try video.live_windows.copyWithParameters(a, self.reader.input.identity, &view, 0, bootstrap orelse &.{}, .{ .max_packets = self.limits.max_dependency_packets, .stream = .{ .max_bytes = self.limits.max_coded_window_bytes, .admission_pool = self.pool, .control = self.reader.input.control } });
         errdefer window.deinit();
         for (window.reader.packets) |*packet| packet.pts = try std.math.sub(i64, packet.pts, self.origin);
         var subset: ?video.h264_pictures.Index = null;

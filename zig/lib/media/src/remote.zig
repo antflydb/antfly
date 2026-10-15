@@ -121,7 +121,7 @@ pub const ReadAhead = struct {
         try control.check();
         if (offset > self.upstream.length or out.len > self.upstream.length - offset) return error.UnexpectedEndOfSource;
         if (out.len == 0) return 0;
-        if (self.window_bytes == 0) return error.ResourceLimitExceeded;
+        if (self.window_bytes == 0) return error.InvalidRemoteCacheBudget;
         if (offset >= self.start and offset - self.start <= self.valid and out.len <= self.valid - @as(usize, @intCast(offset - self.start))) {
             const delta: usize = @intCast(offset - self.start);
             @memcpy(out, self.buffer.?[delta..][0..out.len]);
@@ -138,13 +138,13 @@ pub const ReadAhead = struct {
         errdefer self.valid = 0;
         self.start = offset;
         // Large callers receive a short read, keeping the cache allocation fixed.
-        const wanted: usize = @intCast(@min(self.buffer.?.len, self.upstream.length - offset));
-        if (wanted > self.max_bytes -| self.charged_bytes) return error.ResourceLimitExceeded;
+        const wanted: usize = @intCast(@min(self.buffer.?.len, self.upstream.length - offset, self.max_bytes -| self.charged_bytes));
+        if (wanted == 0) return error.RemoteReadBudgetExceeded;
         while (self.valid < wanted) {
             try control.check();
             if (self.reads >= self.max_reads) {
                 self.valid = 0;
-                return error.ResourceLimitExceeded;
+                return error.RemoteRequestBudgetExceeded;
             }
             self.reads += 1;
             const requested_bytes = wanted - self.valid;
@@ -249,4 +249,27 @@ test "remote versions ranges wire budgets and cancellation fail closed" {
     cache.deinit();
     cache.deinit();
     try std.testing.expectEqual(@import("admission.zig").Resources{}, pool.snapshot());
+}
+
+test "range budgets bound fetched bytes independently of large object length" {
+    const Provider = struct {
+        fn read(_: *anyopaque, offset: u64, out: []u8, _: source.Control) !usize {
+            for (out, 0..) |*byte, index| byte.* = @truncate(offset + index);
+            return out.len;
+        }
+    };
+    var owner: u8 = 0;
+    var cache = ReadAhead{ .allocator = std.testing.allocator, .upstream = .{ .context = &owner, .read_at = Provider.read, .length = 1 << 40 }, .window_bytes = 16, .max_bytes = 20, .max_reads = 2 };
+    defer cache.deinit();
+    var out: [4]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 4), try ReadAhead.readAt(&cache, 0, &out, .{}));
+    try std.testing.expectEqual(@as(usize, 4), try ReadAhead.readAt(&cache, 8, &out, .{}));
+    try std.testing.expectEqual(@as(usize, 1), cache.reads);
+    // The final small read fits the remaining wire budget even though a full
+    // speculative cache fill would exceed it.
+    try std.testing.expectEqual(@as(usize, 4), try ReadAhead.readAt(&cache, 1000, &out, .{}));
+    try std.testing.expectEqual(@as(u64, 20), cache.transferred_bytes);
+    try std.testing.expectError(error.RemoteReadBudgetExceeded, ReadAhead.readAt(&cache, 2000, &out, .{}));
+    cache.max_bytes = 100;
+    try std.testing.expectError(error.RemoteRequestBudgetExceeded, ReadAhead.readAt(&cache, 2000, &out, .{}));
 }

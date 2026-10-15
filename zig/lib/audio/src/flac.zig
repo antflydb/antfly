@@ -95,6 +95,13 @@ const FrameDecoded = struct {
 };
 
 pub fn decodeInterleaved(allocator: std.mem.Allocator, bytes: []const u8) !DecodedInterleaved {
+    return decodeTo(allocator, bytes, null);
+}
+pub fn visitInterleaved(allocator: std.mem.Allocator, bytes: []const u8, sink: @import("pcm_sink.zig").Sink) !void {
+    var decoded = try decodeTo(allocator, bytes, sink);
+    defer decoded.deinit();
+}
+fn decodeTo(allocator: std.mem.Allocator, bytes: []const u8, sink: ?@import("pcm_sink.zig").Sink) !DecodedInterleaved {
     const parsed = try parseStream(bytes);
     var cursor = parsed.data_offset;
 
@@ -109,7 +116,7 @@ pub fn decodeInterleaved(allocator: std.mem.Allocator, bytes: []const u8) !Decod
             owned.deinit();
         }
         cursor += frame.consumed;
-        try samples.appendSlice(allocator, frame.samples);
+        if (sink) |consumer| try consumer.push(frame.samples, frame.sample_rate, frame.channels) else try samples.appendSlice(allocator, frame.samples);
     }
 
     return .{

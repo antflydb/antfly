@@ -788,6 +788,15 @@ pub const Detail = enum(c_int) {
     model_chunk_unresolved_chunk_source,
     model_chunk_unsupported_audio_format,
     model_chunk_unsupported_chunk_media_type,
+    model_chunk_working_budget,
+    model_chunk_dependency_budget,
+    model_chunk_coded_window_budget,
+    model_chunk_event_budget,
+    model_chunk_remote_bytes_budget,
+    model_chunk_remote_requests_budget,
+    model_chunk_invalid_limits,
+    model_chunk_streaming_profile,
+    model_chunk_incomplete_audio_stream,
 };
 
 pub const Status = extern struct {
@@ -805,6 +814,16 @@ pub const Status = extern struct {
 
 pub fn statusFromError(err: anyerror) Status {
     return switch (err) {
+        error.ChunkWorkingBudgetExceeded => status(.invalid_argument, .model_chunk_working_budget),
+        error.ChunkDependencyBudgetExceeded => status(.invalid_argument, .model_chunk_dependency_budget),
+        error.ChunkCodedWindowBudgetExceeded => status(.invalid_argument, .model_chunk_coded_window_budget),
+        error.ChunkEventBudgetExceeded => status(.invalid_argument, .model_chunk_event_budget),
+        error.RemoteReadBudgetExceeded => status(.invalid_argument, .model_chunk_remote_bytes_budget),
+        error.RemoteRequestBudgetExceeded => status(.invalid_argument, .model_chunk_remote_requests_budget),
+        error.InvalidChunkLimits => status(.invalid_argument, .model_chunk_invalid_limits),
+        error.UnsupportedStreamingAudioProfile => status(.unsupported, .model_chunk_streaming_profile),
+        error.IncompleteAudioStream => status(.unavailable, .model_chunk_incomplete_audio_stream),
+
         error.AudioTooLarge => status(.invalid_argument, .model_chunk_audio_too_large),
         error.ChunkOutputTooLarge => status(.invalid_argument, .model_chunk_chunk_output_too_large),
         error.ChunkRequestFailed => status(.unavailable, .model_chunk_chunk_request_failed),
@@ -1599,6 +1618,16 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .model_chunk_unresolved_chunk_source => "UnresolvedChunkSource",
         .model_chunk_unsupported_audio_format => "UnsupportedAudioFormat",
         .model_chunk_unsupported_chunk_media_type => "UnsupportedChunkMediaType",
+        .model_chunk_working_budget => "ChunkWorkingBudgetExceeded",
+        .model_chunk_dependency_budget => "ChunkDependencyBudgetExceeded",
+        .model_chunk_coded_window_budget => "ChunkCodedWindowBudgetExceeded",
+        .model_chunk_event_budget => "ChunkEventBudgetExceeded",
+        .model_chunk_remote_bytes_budget => "RemoteReadBudgetExceeded",
+        .model_chunk_remote_requests_budget => "RemoteRequestBudgetExceeded",
+        .model_chunk_invalid_limits => "InvalidChunkLimits",
+        .model_chunk_streaming_profile => "UnsupportedStreamingAudioProfile",
+        .model_chunk_incomplete_audio_stream => "IncompleteAudioStream",
+
         .document_extraction_working_set_too_large => "DocumentExtractionWorkingSetTooLarge",
         .document_artifact_publication_failed => "DocumentArtifactPublicationFailed",
         .external_lake_read_only => "ExternalLakeReadOnly",

@@ -9,6 +9,7 @@ from attrs import field as _attrs_field
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.inference_model_info_chunking_limits import InferenceModelInfoChunkingLimits
     from ..models.inference_model_info_qualified_limits import InferenceModelInfoQualifiedLimits
 
 
@@ -20,6 +21,12 @@ class InferenceModelInfo:
     """Information about a model including its capabilities
 
     Attributes:
+        chunking_limits (InferenceModelInfoChunkingLimits | Unset): Effective model-aware chunk operational ceilings for
+            working/output/event
+            bytes, chunk/dependency/index counts and remote fetched bytes, requests
+            and cache bytes. Independent of model token limits and object length.
+            Configure through NodeConfig.chunking_limits or ANTFLY_CHUNK_<NAME>.
+            Scoped and unscoped embedding discovery expose the same values.
         model_revision (str | Unset): Immutable resolved embedding generation, returned for scoped model/task discovery
             without loading weights.
         qualified_limits (InferenceModelInfoQualifiedLimits | Unset): Pull-time qualified request profiles for this
@@ -32,6 +39,7 @@ class InferenceModelInfo:
         inputs (list[str] | Unset): List of input modalities this model accepts, such as `text`, `image`, or `audio`
     """
 
+    chunking_limits: InferenceModelInfoChunkingLimits | Unset = UNSET
     model_revision: str | Unset = UNSET
     qualified_limits: InferenceModelInfoQualifiedLimits | Unset = UNSET
     capabilities: list[str] | Unset = UNSET
@@ -39,6 +47,10 @@ class InferenceModelInfo:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        chunking_limits: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.chunking_limits, Unset):
+            chunking_limits = self.chunking_limits.to_dict()
+
         model_revision = self.model_revision
 
         qualified_limits: dict[str, Any] | Unset = UNSET
@@ -56,6 +68,8 @@ class InferenceModelInfo:
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
+        if chunking_limits is not UNSET:
+            field_dict["chunking_limits"] = chunking_limits
         if model_revision is not UNSET:
             field_dict["model_revision"] = model_revision
         if qualified_limits is not UNSET:
@@ -69,9 +83,17 @@ class InferenceModelInfo:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.inference_model_info_chunking_limits import InferenceModelInfoChunkingLimits
         from ..models.inference_model_info_qualified_limits import InferenceModelInfoQualifiedLimits
 
         d = dict(src_dict)
+        _chunking_limits = d.pop("chunking_limits", UNSET)
+        chunking_limits: InferenceModelInfoChunkingLimits | Unset
+        if isinstance(_chunking_limits, Unset):
+            chunking_limits = UNSET
+        else:
+            chunking_limits = InferenceModelInfoChunkingLimits.from_dict(_chunking_limits)
+
         model_revision = d.pop("model_revision", UNSET)
 
         _qualified_limits = d.pop("qualified_limits", UNSET)
@@ -86,6 +108,7 @@ class InferenceModelInfo:
         inputs = cast(list[str], d.pop("inputs", UNSET))
 
         inference_model_info = cls(
+            chunking_limits=chunking_limits,
             model_revision=model_revision,
             qualified_limits=qualified_limits,
             capabilities=capabilities,

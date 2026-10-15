@@ -307,6 +307,14 @@ pub fn decodeInterleavedSupportedPrefix(
     allocator: std.mem.Allocator,
     mp3_bytes: []const u8,
 ) !InterleavedPrefixDecodeResult {
+    return decodeInterleavedTo(allocator, mp3_bytes, null);
+}
+pub fn visitInterleaved(allocator: std.mem.Allocator, bytes: []const u8, sink: @import("../pcm_sink.zig").Sink) !void {
+    var result = try decodeInterleavedTo(allocator, bytes, sink);
+    defer result.deinit(allocator);
+    if (result.unsupported_table != null) return error.Mp3PureZigUnimplemented;
+}
+fn decodeInterleavedTo(allocator: std.mem.Allocator, mp3_bytes: []const u8, sink: ?@import("../pcm_sink.zig").Sink) !InterleavedPrefixDecodeResult {
     const plans = try collectFrameDecodePlans(allocator, mp3_bytes);
     defer {
         for (plans) |*plan| plan.deinit(allocator);
@@ -500,6 +508,10 @@ pub fn decodeInterleavedSupportedPrefix(
                 try appendGranuleInterleavedPcm(allocator, &samples, base_pcm, other_pcm);
             }
 
+            if (sink) |consumer| {
+                try consumer.push(samples.items, plans[0].header.sample_rate, output_channels);
+                samples.clearRetainingCapacity();
+            }
             granules_decoded += 1;
             if (unsupported_table != null) break;
         }

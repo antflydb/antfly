@@ -127,6 +127,7 @@ pub const mp3 = mp3_impl;
 pub const mp4 = mp4_impl;
 pub const caf = caf_impl;
 pub const aac = aac_impl;
+pub const streaming = @import("streaming.zig");
 pub const alac = alac_impl;
 pub const aiff = aiff_impl;
 pub const au = au_impl;
@@ -3178,4 +3179,34 @@ test "bounded audio cancellation interrupts compressed packets and restores call
     var recovered = try decodeBounded(std.testing.allocator, tone_mp3_bytes, .{}, 16 * 1024 * 1024);
     defer recovered.deinit();
     try std.testing.expect(recovered.samples.len > 0);
+}
+
+test "streaming audio codec blocks preserve full decode sample clocks trim gain and PCM" {
+    const Capture = struct {
+        samples: std.ArrayList(f32) = .empty,
+        rate: u32 = 0,
+        largest_block: usize = 0,
+        fn write(raw: *anyopaque, pcm: []const f32, rate: u32, channels: u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(u8, 1), channels);
+            self.rate = rate;
+            self.largest_block = @max(self.largest_block, pcm.len);
+            try self.samples.appendSlice(std.testing.allocator, pcm);
+        }
+    };
+    inline for (.{ "../tone.mp3", "tone-stereo.flac", "tone-stereo-24bit.flac", "tone-mono-44k.aac", "transient-stereo-44k-short.aac", "tone-stereo.mp4", "tone-stereo-alac.m4a", "tone-stereo-opus.ogg", "tone-stereo.oga", "tone-stereo-flac.ogg", "tone-stereo.caf", "tone-stereo-alac-24bit.caf", "probe-silk-mono-16k-fec-60ms.ogg" }) |name| {
+        const bytes = @embedFile("../testdata/codec-corpus/" ++ name);
+        var expected = try decode(std.testing.allocator, bytes, .{});
+        defer expected.deinit();
+        var capture = Capture{};
+        defer capture.samples.deinit(std.testing.allocator);
+        try streaming.visit(std.testing.allocator, bytes, .{}, .{ .context = &capture, .write = Capture.write });
+        try std.testing.expectEqual(expected.sample_rate, capture.rate);
+        try std.testing.expectEqual(expected.samples.len, capture.samples.items.len);
+        for (expected.samples, capture.samples.items) |x, y| try std.testing.expectApproxEqAbs(x, y, 0.000001);
+        try std.testing.expect(capture.largest_block <= 65535);
+        const info = try streaming.inspect(std.testing.allocator, bytes, .{});
+        try std.testing.expectEqual(expected.sample_rate, info.sample_rate);
+        try std.testing.expectEqual(expected.samples.len, info.samples);
+    }
 }

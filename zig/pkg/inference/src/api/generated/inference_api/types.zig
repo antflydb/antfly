@@ -2808,6 +2808,8 @@ pub const ModelFormat = enum {
 
 /// Information about a model including its capabilities
 pub const ModelInfo = struct {
+    /// Effective model-aware chunk operational ceilings for working/output/event bytes, chunk/dependency/index counts and remote fetched bytes, requests and cache bytes. Independent of model token limits and object length. Configure through NodeConfig.chunking_limits or ANTFLY_CHUNK_<NAME>. Scoped and unscoped embedding discovery expose the same values.
+    chunking_limits: ?std.json.ArrayHashMap(i64) = null,
     /// Immutable resolved embedding generation, returned for scoped model/task discovery without loading weights.
     model_revision: ?[]const u8 = null,
     /// Pull-time qualified request profiles for this exact artifact, including backend, supported features and min/max geometry. Runtime admission revalidates artifact identity and resource limits. Omitted for artifacts without a qualification receipt.
@@ -2819,6 +2821,7 @@ pub const ModelInfo = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "chunking_limits", "chunking_limits", true },
         .{ "model_revision", "model_revision", true },
         .{ "qualified_limits", "qualified_limits", true },
         .{ "capabilities", "capabilities", true },
@@ -2835,6 +2838,10 @@ pub const ModelInfo = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.chunking_limits) |value| {
+            try jw.objectField("chunking_limits");
+            try jw.write(value);
+        }
         if (self.model_revision) |value| {
             try jw.objectField("model_revision");
             try jw.write(value);

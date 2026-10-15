@@ -14,7 +14,13 @@ coded windows; WebM retains its logical index; WAV ranges decode selected sample
 HTTP/S3 references enforce immutable versions and exact range responses through
 configured scraping security/credentials. Media supplies leases, clocks and
 admission; model adapters supply token budgets. Container packets remain distinct
-from searchable chunks. The design documents contiguous-decoder and read budgets.
+from searchable chunks. Chunk range reads have separate fetched-byte, upstream
+request and cache ceilings, independent of whole-object download policy. A partial
+last cache fill uses remaining wire capacity, and cache hits do not spend upstream
+budgets. Effective operational ceilings are configured through
+`NodeConfig.chunking_limits` / `ANTFLY_CHUNK_<FIELD>` and published by model
+discovery. Source/output allocation grows shared admission with actual ownership.
+The design documents contiguous-decoder and read budgets.
 
 See [qualification and reproduction](../../../docs/plans/native-video-noncuda-audit.md)
 for measured results and platform limitations. Historical run logs and progress

@@ -885,6 +885,7 @@ from .inference_media_content_part_type import InferenceMediaContentPartType
 from .inference_model_backend import InferenceModelBackend
 from .inference_model_format import InferenceModelFormat
 from .inference_model_info import InferenceModelInfo
+from .inference_model_info_chunking_limits import InferenceModelInfoChunkingLimits
 from .inference_model_info_qualified_limits import InferenceModelInfoQualifiedLimits
 from .inference_model_kind import InferenceModelKind
 from .inference_model_quantization import InferenceModelQuantization
@@ -2419,6 +2420,7 @@ __all__ = (
     "InferenceModelBackend",
     "InferenceModelFormat",
     "InferenceModelInfo",
+    "InferenceModelInfoChunkingLimits",
     "InferenceModelInfoQualifiedLimits",
     "InferenceModelKind",
     "InferenceModelQuantization",

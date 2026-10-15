@@ -1351,6 +1351,36 @@ pub const Incremental = struct {
             .wide => |lanes| lanes[0].next_packet,
         };
     }
+    /// Continue reconstruction for later selections. Earlier pictures require
+    /// replay from a verified restart point; callers must not rewind this owner.
+    pub fn decodeSelected(self: *Incremental, reader: *media.mp4.Reader, indexes: []const usize, callback_context: *anyopaque, callback: SelectionCallback) !Statistics {
+        if (!self.valid or self.cfg.?.separate_planes) return error.UnsupportedIncrementalConfiguration;
+        if (indexes.len == 0) return error.InvalidPacketIndex;
+        var first = reader.packets.len;
+        var last: usize = 0;
+        for (indexes) |index| {
+            if (index >= reader.packets.len or index < self.cursor()) return error.InvalidPacketIndex;
+            first = @min(first, index);
+            last = @max(last, index);
+        }
+        errdefer self.valid = false;
+        switch (self.lanes) {
+            inline else => |*lanes| for (&lanes[0].workspaces) |*slot| if (slot.*) |*workspace| {
+                workspace.selected = try self.budget.allocator().realloc(workspace.selected, indexes.len);
+                @memset(workspace.selected, false);
+            },
+        }
+        var frame = switch (self.lanes) {
+            .eight => |*lanes| try decodeConfiguredState(u8, self.cfg.?, &self.config_reservation, &self.budget, reader, indexes, self.options, callback_context, callback, last, first, null, &lanes[0]),
+            .wide => |*lanes| try decodeConfiguredState(u16, self.cfg.?, &self.config_reservation, &self.budget, reader, indexes, self.options, callback_context, callback, last, first, null, &lanes[0]),
+        };
+        const result = Statistics{ .decoded_packets = frame.decoded_packets, .payload_bytes = frame.payload_bytes, .decode_high_water = frame.decode_high_water };
+        // This internal frame dies before the retained decoder budget.
+        frame.allocator = self.budget.allocator();
+        frame.deinit();
+        return result;
+    }
+
     pub fn canRebase(self: *const Incremental, removed: usize) bool {
         const count: usize = if (self.cfg.?.separate_planes) 3 else 1;
         return switch (self.lanes) {

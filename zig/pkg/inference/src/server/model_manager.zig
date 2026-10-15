@@ -2474,6 +2474,44 @@ fn chunkPlanningSnapshot(a: std.mem.Allocator, io: std.Io, manifest: manifest_mo
     return .{ .digest = hash.finalResult(), .signature = signature };
 }
 
+/// Tokenizer/processor-only ownership for planning. Never constructs a backend
+/// session or loads model tensors. Immutable identity checks still apply.
+pub const ChunkPlanningAssets = struct {
+    model_dir: []const u8,
+    identity_signature: ?[32]u8 = null,
+    allocator: std.mem.Allocator,
+    manifest: manifest_mod.ModelManifest,
+    hf_tok: ?*hf_tokenizer.HfTokenizer = null,
+    sp_tok: ?*sentencepiece.Processor = null,
+    lease: ?runtime.tier.memory.AdmissionLease = null,
+    revision: [32]u8,
+    identity: [64]u8,
+    planning: ChunkPlanningSnapshot,
+    io: std.Io,
+    pub fn tokenizer(self: *@This()) tokenizer_mod.Tokenizer {
+        if (self.hf_tok) |tok| return tok.tokenizer();
+        return self.sp_tok.?.tokenizer();
+    }
+    pub fn verify(self: *@This()) !void {
+        if (self.identity_signature) |expected| {
+            const actual = try @import("../models/embedding_gemma2_identity.zig").signature(self.allocator, self.io, self.model_dir, self.manifest.safetensors_path.?);
+            if (!std.mem.eql(u8, &actual, &expected)) return error.ModelArtifactsChanging;
+        }
+        var paths: [9][]const u8 = undefined;
+        const signature = try componentDependencySignature(self.io, chunkPlanningPaths(self.manifest, &paths));
+        if (!std.mem.eql(u8, &signature, &self.planning.signature)) return error.ModelArtifactsChanging;
+    }
+    pub fn deinit(self: *@This()) void {
+        if (self.hf_tok) |tok| tok.deinitSelf();
+        if (self.sp_tok) |tok| {
+            tok.deinit();
+            self.allocator.destroy(tok);
+        }
+        self.manifest.deinit();
+        if (self.lease) |*lease| lease.release();
+    }
+};
+
 pub const LoadedModel = struct {
     chunk_planning: ?ChunkPlanningSnapshot = null,
     resolution_revision: ?[32]u8 = null,
@@ -4476,6 +4514,15 @@ pub const ModelManager = struct {
         self: *const ModelManager,
     ) *runtime.tier.memory.AdmissionController {
         return &self.resource_domain.?.admission;
+    }
+
+    /// Read the physical admission ledger without holding model/catalog locks.
+    /// ResourceDomain stays owned by the live manager until requests drain.
+    pub fn currentAdmissionAmounts(self: *ModelManager) runtime.tier.memory.AdmissionAmounts {
+        spinLock(&self.tokenizer_cache_config_mutex);
+        const domain = self.resource_domain;
+        self.tokenizer_cache_config_mutex.unlock();
+        return if (domain) |owner| owner.admission.snapshot() else .{};
     }
 
     /// Account bounded metadata/codec inspection before a model is loaded.
@@ -7530,6 +7577,44 @@ pub const ModelManager = struct {
         return self.waitForLoadFlight(flight_key, flight, control);
     }
 
+    pub fn loadChunkPlanningAssets(self: *ModelManager, model_dir: []const u8, io: std.Io, control: InferenceExecutionControl) !ChunkPlanningAssets {
+        try control.check();
+        var man = try manifest_mod.loadFromDir(self.allocator, model_dir);
+        errdefer man.deinit();
+        const revision = try self.modelIdentityForManifest(model_dir, man);
+        const planning = try chunkPlanningSnapshot(self.allocator, io, man, revision);
+        const kind = if (shouldPreferSentencePieceOverride(man, model_dir, self.allocator)) manifest_mod.TokenizerType.sentencepiece else man.tokenizer_type orelse return error.NoTokenizerFound;
+        const plan = try tokenizerLoadAdmissionPlan(self.allocator, model_dir, &man, kind);
+        var lease = try self.acquireTokenizerAdmission(plan);
+        errdefer if (lease) |*active| active.release();
+        var hf: ?*hf_tokenizer.HfTokenizer = null;
+        var sp: ?*sentencepiece.Processor = null;
+        errdefer if (hf) |tok| tok.deinitSelf();
+        errdefer if (sp) |tok| {
+            tok.deinit();
+            self.allocator.destroy(tok);
+        };
+        switch (kind) {
+            .huggingface => {
+                hf = try loadHuggingFaceTokenizerFromManifest(self.allocator, &man);
+                try hf.?.configureBpeCache(self.tokenizer_cache_config);
+                try hf.?.configureParallelBpe(self.tokenizer_parallel_bpe_config);
+            },
+            .sentencepiece => {
+                sp = try loadSentencePieceTokenizerFromDirOrGguf(self.allocator, model_dir, man.gguf_path);
+                if (shouldEnableGemmaSentencePieceCompat(man, model_dir, self.allocator)) sp.?.setPreserveInlineSpecialsAfterLiteralBos(true);
+                try loadSentencePieceAddedTokens(model_dir, self.allocator, sp.?);
+            },
+        }
+        const identity = if (man.embedding_style == .embedding_gemma2)
+            (try @import("../models/embedding_gemma2_identity.zig").snapshotCached(self.allocator, io, model_dir, man.safetensors_path orelse return error.UnsupportedEmbeddingGemma2Weights, control)).digest
+        else
+            std.fmt.bytesToHex(revision, .lower);
+        if (lease) |*active| try active.retain(plan.resident);
+        try control.check();
+        return .{ .model_dir = model_dir, .identity_signature = if (man.embedding_style == .embedding_gemma2) try @import("../models/embedding_gemma2_identity.zig").signature(self.allocator, io, model_dir, man.safetensors_path.?) else null, .allocator = self.allocator, .manifest = man, .hf_tok = hf, .sp_tok = sp, .lease = lease, .revision = revision, .identity = identity, .planning = planning, .io = io };
+    }
+
     pub fn modelIdentityForManifest(self: *ModelManager, model_dir: []const u8, manifest: manifest_mod.ModelManifest) ![32]u8 {
         return modelIdentity(self.allocator, try self.componentPlanIo(), model_dir, manifest);
     }
@@ -7805,7 +7890,7 @@ pub const ModelManager = struct {
         } else null;
         // Hash only after tokenizer/session admission owns the loaded assets.
         const embedding_snapshot: ?eg2_identity.Snapshot = if (embedding_signature) |before| blk: {
-            const snapshot = try eg2_identity.snapshot(self.allocator, sm.io orelse std.Options.debug_io, model_dir, man.safetensors_path.?, control orelse .{});
+            const snapshot = try eg2_identity.snapshotCached(self.allocator, sm.io orelse std.Options.debug_io, model_dir, man.safetensors_path.?, control orelse .{});
             if (!std.mem.eql(u8, &before, &snapshot.signature)) return error.ModelArtifactsChanging;
             break :blk snapshot;
         } else null;
