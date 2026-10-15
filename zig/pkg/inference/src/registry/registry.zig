@@ -527,7 +527,9 @@ pub const ModelRegistry = struct {
         capabilities_csv: ?[]const u8,
         projector_selection: download.ProjectorSelection,
         caller_sink: download.ProgressSink,
-    ) !void {
+    ) anyerror!void {
+        // Companion pulls recurse through this diagnostic wrapper, so the
+        // error set cannot be inferred through both sides of that cycle.
         // Both CLIs and the linked engine use this path. Preserve the cause
         // and report it here before a caller reduces it to a startup error.
         return self.pullWithProgressImpl(io, ref_str, hub_config, tasks_csv, capabilities_csv, projector_selection, caller_sink) catch |err| {
