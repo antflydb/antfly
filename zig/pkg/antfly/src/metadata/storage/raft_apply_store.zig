@@ -22264,7 +22264,7 @@ pub const RaftApplyStore = struct {
             .accept_relational_index_delivery => metadataSnapshotProjectionBit(.index_delivery_source) | metadataSnapshotProjectionBit(.index_delivery_target) | metadataSnapshotProjectionBit(.index_publication_owner) | metadataSnapshotProjectionBit(.standalone_native_owner),
             .complete_relational_index_source => metadataSnapshotProjectionBit(.index_delivery_source) | metadataSnapshotProjectionBit(.index_publication_owner) | metadataSnapshotProjectionBit(.index_publication_head) | metadataSnapshotProjectionBit(.standalone_native_owner),
             .begin_relational_index_publication => metadataSnapshotProjectionBit(.index_publication_proof) | metadataSnapshotProjectionBit(.index_publication_inputs) | metadataSnapshotProjectionBit(.index_publication_dispatch) | metadataSnapshotProjectionBit(.index_publication_owner_group) | metadataSnapshotProjectionBit(.index_publication_plan) | metadataSnapshotProjectionBit(.index_publication_active) | metadataSnapshotProjectionBit(.index_publication_head) | metadataSnapshotProjectionBit(.index_publication_owner) | metadataSnapshotProjectionBit(.fk_generation_table_lock) | metadataSnapshotProjectionBit(.table),
-            .ack_relational_index_publication => metadataSnapshotProjectionBit(.index_publication_head) | metadataSnapshotProjectionBit(.index_publication_owner) | metadataSnapshotProjectionBit(.index_publication_proof),
+            .ack_relational_index_publication => metadataSnapshotProjectionBit(.index_publication_head) | metadataSnapshotProjectionBit(.index_publication_owner) | metadataSnapshotProjectionBit(.index_publication_proof) | metadataSnapshotProjectionBit(.fk_generation_table_lock),
             .decide_relational_index_publication => metadataSnapshotProjectionBit(.index_publication_head) | metadataSnapshotProjectionBit(.index_publication_active) | metadataSnapshotProjectionBit(.table) | metadataSnapshotProjectionBit(.lake_index_lifecycle),
             .apply_relation_reconciliation => metadataSnapshotProjectionBit(.relation_source) | metadataSnapshotProjectionBit(.relation_reconciliation) |
                 metadataSnapshotProjectionBit(.relation_retirements) | metadataSnapshotProjectionBit(.relation_candidates) | metadataSnapshotProjectionBit(.relation_root) | metadataSnapshotProjectionBit(.relation_live) |
@@ -35444,6 +35444,15 @@ fn metadataSnapshotKeyBelongsToGroup(group_id: u64, key: []const u8) bool {
         }
     }
     return false;
+}
+
+test "relational index publication terminal ACK snapshot key registry includes exact lock retirement" {
+    const mask = RaftApplyStore.transitionCommandProjectionMask(.ack_relational_index_publication);
+    const expected = RaftApplyStore.metadataSnapshotProjectionBit(.index_publication_head) |
+        RaftApplyStore.metadataSnapshotProjectionBit(.index_publication_owner) |
+        RaftApplyStore.metadataSnapshotProjectionBit(.index_publication_proof) |
+        RaftApplyStore.metadataSnapshotProjectionBit(.fk_generation_table_lock);
+    try std.testing.expectEqual(expected, mask);
 }
 
 test "metadata raft apply store snapshot key registry covers every durable projection class" {
