@@ -115238,6 +115238,23 @@ test "db text merge descriptor admission failures retry without quarantine" {
     defer text_merge_runtime_mod.test_lookup_prepare_apply_lock_released.store(false, .release);
     defer text_merge_runtime_mod.test_publication_handoffs.store(0, .release);
 
+    defer text_merge_runtime_mod.test_task_failure_error = error.PersistentDescriptorAdmissionExhausted;
+    // Cancellation may cross the runtime boundary under either spelling.
+    // Execute and publication must both retire the task without quarantine,
+    // preserve the error for the caller, and leave the source retryable.
+    for ([_]anyerror{ error.Canceled, error.Cancelled, error.EnrichmentWaitCanceled }) |cancellation| {
+        text_merge_runtime_mod.test_task_failure_error = cancellation;
+        for ([_]*std.atomic.Value(u32){ &text_merge_runtime_mod.test_execute_admission_failures_remaining, &text_merge_runtime_mod.test_finish_admission_failures_remaining }) |counter| {
+            counter.store(1, .release);
+            try std.testing.expectError(cancellation, runtime.runOnce());
+            const canceled_stats = runtime.stats();
+            try std.testing.expectEqual(@as(u64, 0), canceled_stats.failed_merges);
+            try std.testing.expectEqual(@as(u64, 0), canceled_stats.quarantined_merges);
+            try std.testing.expectEqual(@as(u64, 0), canceled_stats.in_flight_merges);
+        }
+    }
+    text_merge_runtime_mod.test_task_failure_error = error.PersistentDescriptorAdmissionExhausted;
+
     text_merge_runtime_mod.test_execute_admission_failures_remaining.store(1, .release);
     try std.testing.expect(!try runtime.runOnce());
     var stats = runtime.stats();

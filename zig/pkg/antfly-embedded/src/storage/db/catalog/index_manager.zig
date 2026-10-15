@@ -23453,8 +23453,7 @@ pub const IndexManager = struct {
                 error.Unsupported => source_map.reset(),
                 else => {
                     if (task.deletion_state.budget.denied()) return error.ResourceBudgetExceeded;
-                    if (err == error.EnrichmentWaitCanceled or err == error.Canceled) return err;
-                    std.log.err("scheduled text merge file-backed build failed index={s}: {s}", .{ task.index_name, @errorName(err) });
+                    logTextMergeFailure("file-backed build", task.index_name, err);
                     return err;
                 },
             }
@@ -23470,9 +23469,7 @@ pub const IndexManager = struct {
                 .elapsed_ns = platform_time.monotonicNs() -| started_ns,
                 .peak_task_alloc_bytes = @intCast(task.deletion_state.budget.peakTaskLiveBytes()),
             };
-            if (builtin.os.tag != .freestanding) {
-                std.log.err("scheduled text merge failed index={s}: {s}", .{ task.index_name, @errorName(err) });
-            }
+            logTextMergeFailure("build", task.index_name, err);
             return err;
         };
         var output_bytes: u64 = 0;
@@ -23559,6 +23556,24 @@ pub const IndexManager = struct {
         result.pending_delta_counts = &.{};
         result.publication_lookup_built = true;
         result.peak_task_alloc_bytes = @max(result.peak_task_alloc_bytes, @as(u64, @intCast(task.deletion_state.budget.peakTaskLiveBytes())));
+    }
+
+    /// Native Io cancellation and runtime-boundary cancellation have the same
+    /// retry/shutdown semantics. Neither indicates a damaged merge source.
+    pub fn isTextMergeCancellation(err: anyerror) bool {
+        return switch (err) {
+            error.Canceled, error.Cancelled, error.EnrichmentWaitCanceled => true,
+            else => false,
+        };
+    }
+
+    fn logTextMergeFailure(comptime phase: []const u8, index_name: []const u8, err: anyerror) void {
+        if (builtin.os.tag == .freestanding) return;
+        if (isTextMergeCancellation(err)) {
+            std.log.debug("scheduled text merge " ++ phase ++ " canceled index={s}: {s}", .{ index_name, @errorName(err) });
+        } else {
+            std.log.err("scheduled text merge " ++ phase ++ " failed index={s}: {s}", .{ index_name, @errorName(err) });
+        }
     }
 
     fn logTextMergeTaskMemory(label: []const u8, task: *const TextMergeTask, output_bytes: u64) void {
@@ -23686,9 +23701,7 @@ pub const IndexManager = struct {
                 error.EmptySegment => try entry.persistent.removeSegmentsIfActive(old_ids),
                 else => {
                     const mapped_err = task.deletion_state.allocationError(err);
-                    if (builtin.os.tag != .freestanding and mapped_err != error.Canceled) {
-                        std.log.err("scheduled text merge apply failed index={s}: {s}", .{ task.index_name, @errorName(mapped_err) });
-                    }
+                    logTextMergeFailure("apply", task.index_name, mapped_err);
                     return mapped_err;
                 },
             };
@@ -23704,9 +23717,7 @@ pub const IndexManager = struct {
                 error.EmptySegment => try entry.persistent.removeSegmentsIfActive(old_ids),
                 else => {
                     const mapped_err = task.deletion_state.allocationError(err);
-                    if (builtin.os.tag != .freestanding and mapped_err != error.Canceled) {
-                        std.log.err("scheduled text merge apply failed index={s}: {s}", .{ task.index_name, @errorName(mapped_err) });
-                    }
+                    logTextMergeFailure("apply", task.index_name, mapped_err);
                     return mapped_err;
                 },
             };
