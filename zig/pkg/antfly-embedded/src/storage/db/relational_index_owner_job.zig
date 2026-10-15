@@ -887,6 +887,7 @@ pub fn stageCancellationCleanupWithReplay(txn: anytype, manager: *transactions.T
     try @import("relational_index_private_claims.zig").SourceStream.stageCanceled(txn, binding);
     try txn.delete(&private_claims.InventoryValidation.key(binding));
     try txn.delete(&@import("relational_index_validation.zig").key(binding));
+    try txn.delete(@import("relational_index_validation.zig").Seal.key);
     // No page can resume after this exact cancellation has queued its data.
     // Retire the bounded retry slot before GC removes the progress it binds.
     try txn.delete(@import("relational_index_owner_control.zig").PreparedBuild.checkpoint_key);

@@ -7363,3 +7363,52 @@ are not original SQL coverage. Boundary, license, inventory, generated
 control-catalog, formatting and diff checks passed. These are macOS Debug
 executions; no additional distributed restore or Linux runtime qualification
 is claimed.
+
+### Durable logical validation seal, independent of physical audit witnesses
+
+The native owner now has a bounded validation-seal effect. Its logical evidence
+commits the reserved binding, frozen target expectation, canonical inventory
+and generation digests, source-member count and canonical generation position.
+It deliberately excludes signing identity, physical incarnation and root-local
+checkpoint bytes. Identity-preserving restore must preserve this logical receipt
+while obtaining a fresh physical audit for the replacement root.
+
+Seal staging rechecks complete inventory and generation records in the same
+transaction as the native authority cut. It uses the existing native effect
+transaction for standby outbox and replay-marker atomicity. Retries recover the
+original cut, and publication receipts are populated only after commit and
+successful outbox flushing. One reusable namespace slot bounds retained state;
+cancellation cleanup removes it. Recovery checks its canonical dependencies,
+including rejecting a seal whose generation record disappeared. The cut does
+no table scans; its work is bounded by fixed-size validation records. No measured
+throughput gain is claimed.
+
+Ordinary catalog metadata extras now reserve the complete colon-delimited
+private owner-key family, not an enumerated set of known slots. This covers the
+new seal, existing inventory/generation validation records and future receipt
+slots without incorrectly reserving a merely similarly named sibling key.
+
+The private canonical envelope is version 28 and kernel ABI is 85. The metadata
+decoder floor remains 47: it still does not advertise complete native index
+activation. No legacy reader is added for these unpublished private formats.
+
+Still unfinished are C-ABI/leased-worker seal production and signing, atomic
+accepting ACK integration joining the stable receipt to a fresh physical audit,
+the separate full native capability barrier, restore/adoption enforcement,
+install/release, durable terminal failure, missing-root repair, actual data-Raft
+execution, terminal catalog publication and complete distributed faults.
+Public UNIQUE activation remains guarded. Original dispositions remain
+483 implemented / 862 unresolved; this milestone adds no original SQL coverage.
+
+Qualification: `/private/tmp/antfly-validation-seal-full-debug-v2.log` passed
+159/159 Debug steps, including ten native-page, six C-ABI, 48 publication,
+four ACK, three leased-owner, 46 runtime-contract and 104 standalone tests.
+The real LSM fixture covers incomplete-generation rejection, cancellation,
+allocation-failure/abort cleanup, forged commitments, fresh ordered replay,
+duplicate receipt recovery, close/reopen, missing canonical generation,
+corrupt seal bytes, private-key write/delete guards and cancellation cleanup.
+It preserves the existing candidate-cache assertion before the added reopen.
+Boundary, license, inventory, generated control-catalog, formatting and diff
+checks passed. These are macOS Debug results, not original SQL case credit.
+Seal-specific outbox-failure, staged-restore and distributed failover injection
+remain unqualified; the private seal does not enable a public producer.

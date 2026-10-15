@@ -7995,6 +7995,11 @@ pub const DB = struct {
                     defer prepared.deinit();
                     _ = try self.applyPreparedNativeIndexEffect(&prepared, .{ .position = frame.position, .lsn = sequence });
                 },
+                .validation_seal => |command| {
+                    var prepared: native_index_control.PreparedValidationSeal = .{ .alloc = self.alloc, .command = command };
+                    defer prepared.deinit();
+                    _ = try self.applyPreparedNativeIndexEffect(&prepared, .{ .position = frame.position, .lsn = sequence });
+                },
                 .control => |command| {
                     var prepared = self.prepareNativeIndexOwnerControl(command) catch |err| {
                         // Another replay may retire inputs during preparation.
@@ -8341,6 +8346,35 @@ pub const DB = struct {
         };
         try outcome.validateFor(request);
         return .{ .generation = outcome };
+    }
+
+    /// Commit logical validation separately from replica-local audit evidence.
+    /// Receiving workers must independently authorize the frozen expectation;
+    /// this durable receipt alone cannot activate an index or authorize restore.
+    pub fn sealNativeIndexOwnerValidation(self: *DB, request: NativeIndexOwnerBuildRequest, context: @import("../../api/operation.zig").RequestContext) !native_index_control.ValidationSealOutcome {
+        try context.ensureActive();
+        try request.validate();
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        try self.enforceReplicationWriteGate();
+        const binding = (try self.nativeIndexOwnerState(request.identity)) orelse return error.PrivateIndexRootRecoveryRequired;
+        try request.requireBinding(binding);
+        const expected = request.target_expectation orelse return error.PrivateIndexTargetValidationRequired;
+        var budget = if (self.core.index_manager.resource_manager) |manager| resource_manager_mod.BudgetedAllocator.initReclaiming(manager, .relational_preparation_working_set, self.alloc, 1) else null;
+        defer if (budget) |*value| value.deinit();
+        const alloc = if (budget) |*value| value.allocator() else self.alloc;
+        var prepared: native_index_control.PreparedValidationSeal = .{ .alloc = alloc, .command = command: {
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            break :command @import("relational_index_validation.zig").SealCommand.prepare(alloc, &read, binding, expected) catch |err| {
+                if (budget) |value| if (value.denied()) return error.ResourceBudgetExceeded;
+                return err;
+            };
+        }, .context = context };
+        defer prepared.deinit();
+        return self.applyPreparedNativeIndexEffect(&prepared, null) catch |err| {
+            if (budget) |value| if (value.denied()) return error.ResourceBudgetExceeded;
+            return err;
+        };
     }
 
     /// Reservation retains its compiled candidate across bounded page prepares.

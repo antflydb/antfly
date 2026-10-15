@@ -33,7 +33,7 @@ const validation = @import("relational_index_validation.zig");
 const resources = @import("../resource_manager.zig");
 const RequestContext = @import("../../api/operation.zig").RequestContext;
 const Waiters = @import("../admission_waiter.zig").Fifo(void);
-pub const envelope_version = 27;
+pub const envelope_version = 28;
 pub const max_cancellation_wire_bytes = 32 * 1024;
 pub const max_encoded_inputs = std.base64.standard.Encoder.calcSize(inputs.max_bytes);
 pub const max_claim_wire_bytes = 6 * private_claims.max_bytes + 128 * 1024;
@@ -313,6 +313,7 @@ pub const Effect = union(enum) {
     consume: ConsumeCommand,
     inventory_validation: private_claims.InventoryValidation.Command,
     generation_validation: validation.Command,
+    validation_seal: validation.SealCommand,
 
     pub fn namespace(self: Effect) @FieldType(Native, "namespace") {
         return switch (self) {
@@ -321,6 +322,7 @@ pub const Effect = union(enum) {
             .consume => |value| value.binding.fence.namespace,
             .inventory_validation => |value| value.binding.fence.namespace,
             .generation_validation => |value| value.binding.fence.namespace,
+            .validation_seal => |value| value.binding.fence.namespace,
             .build => |value| value.binding.fence.namespace,
             .cancel_intent => |value| value.fence.namespace,
             .cancel_cleanup => |value| value.fence.namespace,
@@ -334,6 +336,7 @@ pub const Effect = union(enum) {
             .consume => |value| try value.validate(),
             .inventory_validation => |value| try value.validate(),
             .generation_validation => |value| try value.validate(),
+            .validation_seal => |value| try value.validate(),
             .build => |value| try value.validate(),
             .cancel_intent => |value| try value.validate(),
             .cancel_cleanup => |value| {
@@ -350,6 +353,7 @@ pub const Effect = union(enum) {
             .build => pages.Page.PrivateCommand.max_wire_bytes,
             .inventory_validation => private_claims.InventoryValidation.max_wire_bytes,
             .generation_validation => validation.max_wire_bytes,
+            .validation_seal => validation.Seal.max_wire_bytes,
             else => max_cancellation_wire_bytes,
         };
     }
@@ -933,6 +937,62 @@ pub const PreparedGenerationValidation = struct {
     pub fn populateReceipt(_: *const @This(), _: anytype, _: *GenerationOutcome) !void {}
     pub fn preparePayload(self: *@This()) !void {
         try prepareNativePayload(self, "generation_validation", self.page.command, validation.max_wire_bytes);
+    }
+    pub fn finalizePayload(self: *@This(), position: Native) ![]const u8 {
+        return finalizeNativePayload(self, position);
+    }
+};
+
+pub const ValidationSealOutcome = struct {
+    command: validation.SealCommand,
+    position: Native,
+    duplicate: bool,
+    replication_pending: bool = false,
+    error_name: ?[]const u8 = null,
+    receipt: ?@import("relational_index_publication_progress.zig").Receipt = null,
+};
+
+pub const PreparedValidationSeal = struct {
+    pub const ApplyOutcome = ValidationSealOutcome;
+    alloc: Allocator,
+    command: validation.SealCommand,
+    context: RequestContext = .{},
+    payload: ?[]u8 = null,
+    prefix_len: usize = 0,
+
+    pub fn deinit(self: *@This()) void {
+        if (self.payload) |bytes| self.alloc.free(bytes);
+        self.* = undefined;
+    }
+    pub fn validate(self: *const @This()) !void {
+        try self.context.ensureActive();
+        try self.command.validate();
+    }
+    pub fn namespace(self: *const @This()) @FieldType(Native, "namespace") {
+        return self.command.binding.fence.namespace;
+    }
+    pub fn validateReplay(self: *const @This(), position: Native) !void {
+        try (Frame{ .effect = .{ .validation_seal = self.command }, .position = position }).validate();
+        _ = try self.command.receipt(position);
+    }
+    pub fn replayDuplicateOutcome(self: *const @This(), position: Native) ValidationSealOutcome {
+        return .{ .command = self.command, .position = position, .duplicate = true };
+    }
+    pub fn stage(self: *@This(), _: anytype, txn: anytype, position: ?Native) !ValidationSealOutcome {
+        try self.validate();
+        const result = try validation.Seal.stage(self.alloc, txn, self.command, position);
+        return .{ .command = self.command, .position = result.seal.position, .duplicate = result.duplicate };
+    }
+    pub fn hasPublicationReceipt(_: *const @This()) bool {
+        return true;
+    }
+    pub fn populateReceipt(self: *const @This(), txn: anytype, outcome: *ValidationSealOutcome) !void {
+        const sealed = (try validation.Seal.load(self.alloc, txn, self.command.binding)) orelse return error.InvalidPrivateIndexNativeReceipt;
+        if (!std.meta.eql(sealed.command, self.command) or !std.meta.eql(sealed.position, outcome.position)) return error.InvalidPrivateIndexNativeReceipt;
+        outcome.receipt = try sealed.command.receipt(sealed.position);
+    }
+    pub fn preparePayload(self: *@This()) !void {
+        try prepareNativePayload(self, "validation_seal", self.command, validation.Seal.max_wire_bytes);
     }
     pub fn finalizePayload(self: *@This(), position: Native) ![]const u8 {
         return finalizeNativePayload(self, position);

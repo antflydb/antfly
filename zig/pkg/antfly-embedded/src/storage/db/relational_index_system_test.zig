@@ -884,6 +884,7 @@ test "relational index build pages native owner control preserves committed cuts
 }
 
 test "relational index build pages identity dispatch caches immutable candidates and keeps completion receipt free" {
+    @setEvalBranchQuota(4000);
     const native = @import("relational_index_owner_control.zig");
     const catalog = @import("relational_integrity_catalog.zig");
     const candidates = @import("relational_index_candidate.zig");
@@ -1683,6 +1684,7 @@ test "relational index build pages identity dispatch caches immutable candidates
         {
             var lease = try db.native_index_build_cache.acquire(std.testing.io, alloc, &manager, db.core, validation_request, binding, .{});
             defer lease.deinit();
+            try std.testing.expectError(error.PrivateIndexTargetValidationRequired, db.sealNativeIndexOwnerValidation(validation_request, .{}));
             var page = (try native.PreparedGenerationValidation.prepare(alloc, db.core, lease.reservation(), validation_request.target_expectation.?, validation_request.budget, .{})).?;
             defer page.deinit();
             {
@@ -1979,6 +1981,101 @@ test "relational index build pages identity dispatch caches immutable candidates
             }
         }
         try std.testing.expectEqual(@as(u64, 1), db.native_index_build_cache.compilations);
+        {
+            const MetadataController = @import("relational_index_catalog.zig").Controller;
+            const reserved_keys = [_][]const u8{ Verification.Seal.key, &Verification.key(binding), &Validation.key(binding), @import("relational_index_owner_job.zig").key ++ ":future-receipt" };
+            for (reserved_keys) |reserved_key| {
+                try std.testing.expectError(error.ReservedRelationalIndexMetadataKey, MetadataController.validateExtraMetadata(&.{.{ .key = reserved_key, .value = "forged" }}, &.{}));
+                try std.testing.expectError(error.ReservedRelationalIndexMetadataKey, MetadataController.validateExtraMetadata(&.{}, &.{reserved_key}));
+            }
+            try MetadataController.validateExtraMetadata(&.{.{ .key = @import("relational_index_owner_job.zig").key ++ "-unrelated", .value = "allowed" }}, &.{});
+            const command = command: {
+                var read = try db.core.store.beginReadTxn();
+                defer read.abort();
+                break :command try Verification.SealCommand.prepare(alloc, &read, binding, validation_request.target_expectation.?);
+            };
+            const sequence = current: {
+                var read = try db.core.store.beginReadTxn();
+                defer read.abort();
+                break :current (try authority.load(&read)).?.sequence;
+            };
+            const AllocationFaults = struct {
+                fn stage(task_alloc: std.mem.Allocator, database: *db_mod.DB, seal_command: @import("relational_index_validation.zig").SealCommand) !void {
+                    var txn = try database.core.store.beginWriteTxn();
+                    defer txn.abort();
+                    _ = try @import("relational_index_validation.zig").Seal.stage(task_alloc, &txn, seal_command, null);
+                }
+            };
+            try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, AllocationFaults.stage, .{ &db, command });
+            var canceled_seal = std.atomic.Value(bool).init(true);
+            try std.testing.expectError(error.Canceled, db.sealNativeIndexOwnerValidation(validation_request, .{ .cancellation = @import("../../api/operation.zig").CancellationToken.fromAtomic(&canceled_seal) }));
+            // A staged receipt is not durable. Abort must remove both the seal
+            // and its native cut, leaving the same retry position available.
+            {
+                var txn = try db.core.store.beginWriteTxn();
+                defer txn.abort();
+                const staged = try Verification.Seal.stage(alloc, &txn, command, null);
+                try std.testing.expect(!staged.duplicate);
+                try std.testing.expectEqual(sequence + 1, staged.seal.position.sequence);
+            }
+            {
+                var read = try db.core.store.beginReadTxn();
+                defer read.abort();
+                try std.testing.expect(try Verification.Seal.load(alloc, &read, binding) == null);
+                try std.testing.expectEqual(sequence, (try authority.load(&read)).?.sequence);
+            }
+            var forged = command;
+            forged.generation_digest[0] ^= 1;
+            {
+                var txn = try db.core.store.beginWriteTxn();
+                defer txn.abort();
+                try std.testing.expectError(error.InvalidRelationalIndexValidation, Verification.Seal.stage(alloc, &txn, forged, null));
+                try std.testing.expectEqual(sequence, (try authority.load(&txn)).?.sequence);
+            }
+            var prepared: native.PreparedValidationSeal = .{ .alloc = alloc, .command = command };
+            defer prepared.deinit();
+            try prepared.preparePayload();
+            const position: @import("receipt_position.zig").Native = .{ .namespace = binding.fence.namespace, .sequence = sequence + 1 };
+            const payload = try prepared.finalizePayload(position);
+            const record: @import("replication_record.zig").Record = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 4, .previous_lsn = 3, .payload = payload };
+            try replication_ingress.applyRecord(&db, record);
+            try replication_ingress.applyRecord(&db, record);
+            try std.testing.expectEqual(@as(u64, 4), try db.replicationAppliedSequence());
+            const observed = try db.sealNativeIndexOwnerValidation(validation_request, .{});
+            try std.testing.expect(observed.duplicate);
+            try std.testing.expectEqual(position, observed.position);
+            try std.testing.expectEqualDeep(try command.receipt(position), observed.receipt.?);
+            try std.testing.expectEqual(@import("relational_index_publication_progress.zig").Action.validated, observed.receipt.?.action);
+            // Reopen exercises structural seal recovery; it does not grant a
+            // replacement root permission to reuse physical audit evidence.
+            db.close();
+            db = try db_mod.DB.open(alloc, directory.path(), options);
+            const reopened = try db.sealNativeIndexOwnerValidation(validation_request, .{});
+            try std.testing.expectEqualDeep(observed, reopened);
+            {
+                var read = try db.core.store.beginReadTxn();
+                defer read.abort();
+                const durable = (try Verification.Seal.load(alloc, &read, binding)).?;
+                try std.testing.expectEqualDeep(command, durable.command);
+                try std.testing.expectEqual(sequence + 1, (try authority.load(&read)).?.sequence);
+                try std.testing.expect(try @import("relational_integrity_topology.zig").completed(&read) == null);
+            }
+            {
+                var txn = try db.core.store.beginWriteTxn();
+                defer txn.abort();
+                try txn.delete(&Verification.key(binding));
+                try std.testing.expectError(error.InvalidRelationalIndexValidation, Verification.verifyRecovery(alloc, &txn, binding));
+            }
+            {
+                var txn = try db.core.store.beginWriteTxn();
+                defer txn.abort();
+                const corrupt = try alloc.dupe(u8, try txn.get(Verification.Seal.key));
+                defer alloc.free(corrupt);
+                corrupt[corrupt.len - 1] ^= 1;
+                try txn.put(Verification.Seal.key, corrupt);
+                try std.testing.expectError(error.InvalidRelationalIndexValidation, Verification.Seal.load(alloc, &txn, binding));
+            }
+        }
         try std.testing.expectEqual(@as(u32, 1), db.core.schema.?.version);
     }
     var cancellation = try db.prepareNativeIndexOwnerCancellation(native.Admission.fromBinding(binding));
@@ -1994,6 +2091,7 @@ test "relational index build pages identity dispatch caches immutable candidates
         defer read.abort();
         try std.testing.expectError(error.NotFound, read.get(&@import("relational_index_private_claims.zig").InventoryValidation.key(binding)));
         try std.testing.expectError(error.NotFound, read.get(&@import("relational_index_validation.zig").key(binding)));
+        try std.testing.expectError(error.NotFound, read.get(@import("relational_index_validation.zig").Seal.key));
     }
     db.close();
     try std.testing.expectEqual(@as(u64, 0), manager.snapshot().slices[slice].used_bytes);

@@ -198,12 +198,138 @@ pub const Command = struct {
 /// physical rescan before this progress can become authenticated publication
 /// evidence; a retained cursor is not an audit of its already-scanned prefix.
 pub fn verifyRecovery(alloc: Allocator, txn: anytype, binding: owner.Binding) !void {
-    var loaded = (try load(alloc, txn, binding)) orelse return;
+    var loaded = (try load(alloc, txn, binding)) orelse {
+        if (try Seal.load(alloc, txn, binding) != null) return error.InvalidRelationalIndexValidation;
+        return;
+    };
     defer loaded.deinit();
     if (try @import("relational_index_cancellation_intent.zig").load(txn)) |closed| if (closed.intent.fence.admission_epoch == binding.fence.admission_epoch) return;
     const frozen = try claims.InventoryValidation.requireReady(alloc, txn, binding, loaded.summary.expected);
     if (!equal(frozen.digest, loaded.summary.inventory_digest) or frozen.source_members != loaded.summary.source_members or loaded.summary.position.sequence <= frozen.position.sequence) return error.InvalidRelationalIndexValidation;
+    if (try Seal.load(alloc, txn, binding)) |sealed| {
+        const command = try SealCommand.prepare(alloc, txn, binding, loaded.summary.expected);
+        if (!std.meta.eql(command, sealed.command)) return error.InvalidRelationalIndexValidation;
+    }
 }
+
+/// A logical validation commitment, independent of the signing key, local
+/// checkpoint and physical DB incarnation. Restored roots must independently
+/// re-audit the physical bytes before signing/accepting this durable receipt.
+pub const SealCommand = struct {
+    binding: owner.Binding,
+    expected: Expected,
+    generation_digest: Digest,
+    inventory_digest: Digest,
+    source_members: u64,
+    generation_position: Native,
+
+    pub fn validate(self: @This()) !void {
+        try self.expected.requireBinding(self.binding);
+        try self.generation_position.validate();
+        if (self.binding.authority != .native or self.binding.phase != .reserved or
+            !self.generation_position.namespace.eql(self.binding.fence.namespace) or
+            !nonzero(self.generation_digest) or !nonzero(self.inventory_digest)) return error.InvalidRelationalIndexValidation;
+    }
+
+    pub fn evidenceDigest(self: @This()) !Digest {
+        try self.validate();
+        var buffer: [16384]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buffer);
+        try std.json.Stringify.value(self, .{}, &writer);
+        var state = std.crypto.hash.Blake3.init(.{});
+        state.update("antfly/private-index-logical-validation/v1");
+        state.update(writer.buffered());
+        var result: Digest = undefined;
+        state.final(&result);
+        return result;
+    }
+
+    /// O(1) in table size: all row/claim scans precede this atomic cut. Recheck
+    /// the complete canonical records and frozen source/target scope in the
+    /// applying transaction; a caller-supplied digest alone is not evidence.
+    pub fn prepare(alloc: Allocator, txn: anytype, binding: owner.Binding, expected: Expected) !@This() {
+        const frozen = try claims.InventoryValidation.requireReady(alloc, txn, binding, expected);
+        var generation = (try load(alloc, txn, binding)) orelse return error.PrivateIndexTargetValidationRequired;
+        defer generation.deinit();
+        if (generation.summary.fields.phase != .ready or
+            !equal(try generation.summary.expected.digest(), try expected.digest()) or
+            !equal(generation.summary.inventory_digest, frozen.digest) or
+            generation.summary.source_members != frozen.source_members or
+            generation.summary.position.sequence <= frozen.position.sequence) return error.PrivateIndexTargetValidationRequired;
+        const result: @This() = .{ .binding = binding, .expected = expected, .generation_digest = generation.digest, .inventory_digest = frozen.digest, .source_members = frozen.source_members, .generation_position = generation.summary.position };
+        try result.validate();
+        return result;
+    }
+
+    pub fn receipt(self: @This(), position: Native) !@import("relational_index_publication_progress.zig").Receipt {
+        try self.validate();
+        try position.validate();
+        if (!position.namespace.eql(self.binding.fence.namespace) or position.sequence <= self.generation_position.sequence) return error.InvalidPrivateIndexNativeReceipt;
+        const binding = self.binding;
+        const result: @import("relational_index_publication_progress.zig").Receipt = .{
+            .owner = .{ .plan_id = binding.id, .plan_digest = binding.plan_digest, .ordinal = binding.ordinal, .group_id = binding.fence.owner_group_id, .namespace = binding.fence.namespace, .authority = .native, .fence_digest = binding.owner_digest },
+            .action = .validated,
+            .position = .{ .native = position },
+            .candidate_digest = binding.integrity_candidate,
+            .reservation_digest = binding.integrity_reserved,
+            .evidence_digest = try self.evidenceDigest(),
+        };
+        _ = try result.digest();
+        return result;
+    }
+};
+
+/// One reusable namespace slot, committed with native authority, the standby
+/// outbox and replay marker by the normal native effect transaction. No local
+/// root identity is retained here. This seal is not publication permission.
+pub const Seal = struct {
+    pub const key = owner.key ++ ":validated";
+    pub const max_wire_bytes = 32 * 1024;
+    command: SealCommand,
+    position: Native,
+
+    pub fn load(alloc: Allocator, txn: anytype, binding: owner.Binding) !?@This() {
+        const raw = (try optional(txn, Seal.key)) orelse return null;
+        if (raw.len < 40 or raw.len > Seal.max_wire_bytes or !std.mem.eql(u8, raw[0..8], "AIVS\x01\x00\x00\x00") or
+            !equal(raw[raw.len - 32 ..][0..32].*, hash(raw[0 .. raw.len - 32]))) return error.InvalidRelationalIndexValidation;
+        var parsed = try std.json.parseFromSlice(@This(), alloc, raw[8 .. raw.len - 32], .{ .ignore_unknown_fields = false, .max_value_len = 128 });
+        defer parsed.deinit();
+        const result = parsed.value;
+        _ = try result.command.receipt(result.position);
+        const canonical = try std.json.Stringify.valueAlloc(alloc, result, .{});
+        defer alloc.free(canonical);
+        if (!std.mem.eql(u8, canonical, raw[8 .. raw.len - 32])) return error.InvalidRelationalIndexValidation;
+        if (!std.meta.eql(result.command.binding, binding)) return null;
+        const current = try authority.require(txn, .native, @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace));
+        if (result.position.sequence > current.sequence) return error.InvalidRelationalIndexValidation;
+        return result;
+    }
+
+    pub fn stage(alloc: Allocator, txn: anytype, command: SealCommand, replay: ?Native) !struct { seal: Seal, duplicate: bool } {
+        try command.validate();
+        if (replay) |position| _ = try command.receipt(position);
+        const actual = try SealCommand.prepare(alloc, txn, command.binding, command.expected);
+        if (!std.meta.eql(actual, command)) return error.InvalidRelationalIndexValidation;
+        if (try Seal.load(alloc, txn, command.binding)) |existing| {
+            if (!std.meta.eql(command, existing.command)) return error.InvalidRelationalIndexValidation;
+            if (replay) |position| if (!std.meta.eql(position, existing.position)) return error.InvalidPrivateIndexNativeReceipt;
+            return .{ .seal = existing, .duplicate = true };
+        }
+        const position: Native = .{ .namespace = command.binding.fence.namespace, .sequence = try authority.advance(txn, @import("online_source_contract.zig").namespaceBytes(command.binding.fence.namespace), if (replay) |value| value.sequence else null) };
+        const result: @This() = .{ .command = command, .position = position };
+        _ = try command.receipt(position);
+        const json = try std.json.Stringify.valueAlloc(alloc, result, .{});
+        defer alloc.free(json);
+        if (json.len + 40 > Seal.max_wire_bytes) return error.InvalidRelationalIndexValidation;
+        const bytes = try alloc.alloc(u8, json.len + 40);
+        defer alloc.free(bytes);
+        @memcpy(bytes[0..8], "AIVS\x01\x00\x00\x00");
+        @memcpy(bytes[8..][0..json.len], json);
+        @memcpy(bytes[bytes.len - 32 ..], &hash(bytes[0 .. bytes.len - 32]));
+        try txn.put(Seal.key, bytes);
+        return .{ .seal = result, .duplicate = false };
+    }
+};
 /// Owned, root-local progress only. Never import this from a replicated
 /// snapshot or submit it as an ordered native effect. Durable checkpoint
 /// ownership and adoption/signing authority belong to the physical-root owner.

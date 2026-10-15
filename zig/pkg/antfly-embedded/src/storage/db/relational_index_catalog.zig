@@ -654,15 +654,12 @@ pub const Controller = struct {
     pub fn isReservedMetadataKey(key: []const u8) bool {
         return std.mem.eql(u8, key, head_key) or std.mem.startsWith(u8, key, blob_prefix) or
             std.mem.eql(u8, key, @import("relational_index_owner_job.zig").key) or
-            std.mem.eql(u8, key, @import("relational_index_owner_job.zig").cancellation_cleanup_key) or
-            std.mem.eql(u8, key, @import("relational_index_owner_control.zig").PreparedBuild.checkpoint_key) or
-            std.mem.eql(u8, key, @import("relational_index_private_claims.zig").SourceStream.head_key) or
-            std.mem.startsWith(u8, key, @import("relational_index_private_claims.zig").SourceStream.batch_prefix) or
-            std.mem.startsWith(u8, key, @import("relational_index_private_claims.zig").prefix) or
-            std.mem.startsWith(u8, key, @import("relational_index_private_claims.zig").registration_prefix) or
+            // The entire private owner family is reserved, including future
+            // validation/receipt slots. An enumerated list left new protocol
+            // records writable through otherwise ordinary catalog extras.
+            std.mem.startsWith(u8, key, @import("relational_index_owner_job.zig").key ++ ":") or
             std.mem.eql(u8, key, @import("relational_index_cancellation_intent.zig").key) or
             std.mem.eql(u8, key, @import("relational_index_inputs.zig").key) or
-            std.mem.startsWith(u8, key, @import("relational_index_owner_job.zig").native_effect_prefix) or
             std.mem.eql(u8, key, @import("relational_constraint_jobs.zig").progress_key) or
             std.mem.startsWith(u8, key, @import("relational_index_jobs.zig").progress_prefix) or
             std.mem.startsWith(u8, key, @import("relational_index_maintenance_contract.zig").control_prefix) or
