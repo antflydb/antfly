@@ -7519,3 +7519,57 @@ standby transport failure. The independent real LSM/C-ABI gates remain green.
 Boundary, license, inventory, generated control-catalog, formatting and diff
 checks passed. These are macOS Debug results, not original SQL case credit or
 complete native publication/restore qualification.
+
+### Automatic native validation ACK scheduling and outcome recovery
+
+The validation receiver carries the metadata revision observed before its
+physical turn as an explicit CAS hint. A paired signed reply can be converted
+to an ACK only after checking both proofs, their captured applying-root context,
+request/owner identity and a valid revision. The revision is not a capability;
+accepting metadata still repeats the authority/provenance checks atomically.
+Decoder floor 50 covers this private reply field and worker behavior. Native
+kernel ABI 86 and canonical envelope 28 are unchanged.
+
+The bounded worker now owns the receipt/witness pair and submits it through its
+existing ACK/status stages instead of retiring on physical completion. Unknown
+commit outcomes poll exact status. Pending metadata replication stays in status
+polling without resubmission. An unaccepted receipt or stale revision/root
+refreshes permission and recovers the existing durable seal. Physical-only and
+unsigned replies cannot complete validation. Metadata replication backpressure
+retains control/validation lanes with bounded retry, is preserved across the
+private HTTP error boundary, and is a retryable standalone reconciliation error.
+
+The same recovery policy also removes indefinite stale-revision resubmission
+from earlier fence/reservation ACK stages. Successful validation completes only
+after metadata acknowledgement; cancellation/expiry still releases volatile
+slots. Discovery and per-owner work remain bounded; no
+cohort/table scan is added to a physical or metadata applying transaction.
+
+Still unfinished are full latest-stage re-attestation and native capability
+barriers, restore/adoption enforcement beyond retained metadata verification,
+install/release, durable terminal failure, missing-root repair, actual data-Raft
+execution, terminal catalog publication and complete distributed fault tests.
+Public UNIQUE activation remains guarded. Original dispositions remain
+483 implemented / 862 unresolved; this protocol milestone alone grants no
+original SQL case credit.
+
+Qualification: `/private/tmp/antfly-validation-worker-full-debug.log` passed
+159/159 Debug steps, including 48 publication, four ACK, six C-ABI, ten native
+page, three leased-owner, 46 runtime-contract and 104 standalone tests. Component
+scheduler cases cover pre-commit loss, lost post-commit replies, three pending
+mirror observations, a revision conflict, physical-only replies, and scheduler
+restart before ACK submission or after an uncertain committed ACK. They assert
+one seal effect and one metadata acceptance; only pre-commit/revision rejection
+causes a second submission. Restart-after-commit must observe fresh metadata
+acknowledgement rather than merely count the earlier commit. Completion checks
+inspect every resident owner slot, not slot zero alone.
+
+Existing exhaustive OOM/leak checks exercise the baseline and source-completion
+failure variants through the stable backing-allocator wrapper. Initial logical
+fence/reservation receipts receive genuine fixture signatures rather than
+weakening ACK-status attestation checks. These scheduler observations are
+synthetic; real native durability and atomic metadata acceptance retain their
+independent LSM/C-ABI and metadata-store qualification. They are not complete
+distributed restart/restore fault tests. Boundary, license, inventory, generated
+control-catalog, formatting and diff checks passed. Results are macOS Debug;
+no original SQL disposition or measured throughput change is claimed.

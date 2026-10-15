@@ -209,7 +209,13 @@ const Job = struct {
             },
             .control => {
                 const request: execution.Request = .{ .table_id = self.identity.table_id, .group_id = identity.group_id, .id = self.identity.id, .operation = if (owner.head.?.phase == .fencing) .fence else .reserve };
-                var response = try transport.control(alloc, self.table_name.?, request, context_);
+                var response = transport.control(alloc, self.table_name.?, request, context_) catch |err| switch (@as(anyerror, err)) {
+                    error.MetadataReplicationPending => {
+                        owner.retry_at_ns = now_ns +| retry_ns;
+                        return;
+                    },
+                    else => return err,
+                };
                 defer response.deinit();
                 try response.value.validate(request);
                 const ack = switch (response.value) {
@@ -240,11 +246,26 @@ const Job = struct {
                         owner.retry_at_ns = now_ns +| retry_ns;
                         return;
                     },
+                    error.GenerationPublicationChanged, error.IndexOwnerReceiptChanged, error.MetadataReplicationPending => {
+                        owner.ack = null;
+                        owner.stage = .refresh;
+                        owner.retry_at_ns = now_ns +| retry_ns;
+                        return;
+                    },
                     else => return err,
                 };
                 defer response.deinit();
-                if (try response.value.isAcknowledged(owner.ack.?)) self.retireOwner(index) else {
-                    owner.stage = .acknowledge;
+                const acknowledged = try response.value.isAcknowledged(owner.ack.?);
+                if (response.value.replication_pending) {
+                    owner.stage = .resolve_ack;
+                    owner.retry_at_ns = now_ns +| retry_ns;
+                    return;
+                }
+                if (acknowledged) self.retireOwner(index) else {
+                    // A rejected pre-commit attempt or superseded root needs
+                    // fresh permission, not indefinite stale-revision retries.
+                    owner.ack = null;
+                    owner.stage = .refresh;
                     owner.retry_at_ns = now_ns +| retry_ns;
                 }
             },
@@ -273,6 +294,10 @@ const Job = struct {
                     }
                 } else |err| switch (@as(anyerror, err)) {
                     error.PrivateIndexClaimBacklogFull => {},
+                    error.MetadataReplicationPending => {
+                        owner.retry_at_ns = now_ns +| retry_ns;
+                        return;
+                    },
                     else => return err,
                 }
                 owner.stream = try producer.Producer.init(alloc, cohort, self.table_name.?, .{ .table_id = self.identity.table_id, .group_id = identity.group_id, .id = self.identity.id, .operation = .source }, context_);
@@ -287,7 +312,13 @@ const Job = struct {
             },
             .inventory => {
                 const request: execution.Request = .{ .table_id = self.identity.table_id, .group_id = identity.group_id, .id = self.identity.id, .operation = .validate, .build_budget = .{ .records = 128, .bytes = 16 * 1024 * 1024 } };
-                var response = try transport.control(alloc, self.table_name.?, request, context_);
+                var response = transport.control(alloc, self.table_name.?, request, context_) catch |err| switch (@as(anyerror, err)) {
+                    error.MetadataReplicationPending => {
+                        owner.retry_at_ns = now_ns +| retry_ns;
+                        return;
+                    },
+                    else => return err,
+                };
                 defer response.deinit();
                 try response.value.validate(request);
                 if (response.value == .acknowledged) {
@@ -309,14 +340,13 @@ const Job = struct {
                 }
                 switch (outcome) {
                     .validated => {
-                        if (response.value.building.signed_audit == null or response.value.building.signed_receipt == null) {
+                        const ack = (try response.value.validationAck(request)) orelse {
                             owner.retry_at_ns = now_ns +| retry_ns;
                             return;
-                        }
-                        // Paired proofs complete only volatile physical work.
-                        // Atomic metadata acceptance/publication is separate.
-                        self.retireOwner(index);
-                        self.retry_at_ns = now_ns +| std.time.ns_per_s;
+                        };
+                        if (!std.meta.eql(ack.signed.receipt.owner, identity)) return error.InvalidIndexOwnerReceipt;
+                        owner.ack = ack;
+                        owner.stage = .acknowledge;
                     },
                     .inventory => |value| if (value.record.fields.phase == .failed) {
                         return error.PrivateIndexTargetInventoryMismatch;
@@ -337,10 +367,9 @@ const Job = struct {
                                     owner.retry_at_ns = now_ns +| retry_ns;
                                     return;
                                 }
-                                // An authenticated physical witness is still
-                                // not a transactionally joined metadata ACK.
-                                self.retireOwner(index);
-                                self.retry_at_ns = now_ns +| std.time.ns_per_s;
+                                // A physical witness alone cannot complete the
+                                // stage. Recover its durable seal on a retry.
+                                owner.retry_at_ns = now_ns +| retry_ns;
                             },
                             else => {},
                         };

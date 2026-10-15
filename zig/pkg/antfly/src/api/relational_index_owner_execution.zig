@@ -91,6 +91,7 @@ pub const Result = union(enum) {
     controlled: struct { root_generation: u64, outcome: std.json.Parsed(native.Outcome), signing: SigningState = .{} },
     building: struct {
         root_generation: u64,
+        expected_revision: u64 = 0,
         outcome: std.json.Parsed(native.BuildResponse),
         audit_signing: ?publication.NativeSigningView = null,
         signed_audit: ?publication.SignedAudit = null,
@@ -149,6 +150,7 @@ pub const Result = union(enum) {
             const audit = value.outcome.value.physicalAudit() orelse return false;
             _ = audit.readyDigest() catch return false;
             if (value.outcome.value == .validated and value.outcome.value.validated.logical.receipt == null) return false;
+            if (value.outcome.value == .validated and value.expected_revision == 0) return false;
             return true;
         }
         const state = self.signingState() orelse return false;
@@ -173,6 +175,7 @@ pub const Result = union(enum) {
             const signed: publication.SignedAudit = .{ .outcome_digest = digest, .proof = proof };
             _ = try signed.verifiedDigest(audit);
             const logical: ?publication.SignedReceipt = if (value.outcome.value == .validated) receipt: {
+                if (value.expected_revision == 0 or value.expected_revision == std.math.maxInt(u64)) return error.NativeIndexSigningUnavailable;
                 const sealed = value.outcome.value.validated.logical;
                 try sealed.validate();
                 if (!std.meta.eql(sealed.command, try audit.logicalCommand())) return error.InvalidPrivateIndexNativeReceipt;
@@ -230,7 +233,7 @@ pub const Result = union(enum) {
             .applied => |value| .{ .admitted = value.value },
             .controlled => |value| .{ .controlled = .{ .root_generation = value.root_generation, .outcome = value.outcome.value, .signed_ack = value.signing.ack, .signing_failure = value.signing.failure } },
             .recovered => |value| .{ .recovered = .{ .root_generation = value.root_generation, .outcome = value.outcome.value orelse return error.InvalidPrivateIndexNativeReceipt, .signed_ack = value.signing.ack, .signing_failure = value.signing.failure } },
-            .building => |value| .{ .building = .{ .root_generation = value.root_generation, .outcome = value.outcome.value, .signed_audit = value.signed_audit, .signed_receipt = value.signed_receipt, .signing_failure = value.signing_failure } },
+            .building => |value| .{ .building = .{ .root_generation = value.root_generation, .expected_revision = value.expected_revision, .outcome = value.outcome.value, .signed_audit = value.signed_audit, .signed_receipt = value.signed_receipt, .signing_failure = value.signing_failure } },
             .source => |*value| .{ .source = value.response() },
         };
     }
@@ -246,8 +249,21 @@ pub const ControlResponse = union(enum) {
     admitted: native.Outcome,
     controlled: RootedOutcome,
     recovered: RootedOutcome,
-    building: struct { root_generation: u64, outcome: native.BuildResponse, signed_audit: ?publication.SignedAudit = null, signed_receipt: ?publication.SignedReceipt = null, signing_failure: ?SigningFailure = null },
+    building: struct { root_generation: u64, expected_revision: u64 = 0, outcome: native.BuildResponse, signed_audit: ?publication.SignedAudit = null, signed_receipt: ?publication.SignedReceipt = null, signing_failure: ?SigningFailure = null },
     source: SourceResponse,
+
+    /// A captured metadata revision is a CAS hint, never authority. The
+    /// accepting metadata transaction rechecks scope, signatures and liveness.
+    pub fn validationAck(self: @This(), request: Request) !?publication.Ack {
+        try self.validate(request);
+        if (self != .building or self.building.outcome != .validated) return null;
+        const value = self.building;
+        const receipt = value.signed_receipt orelse return null;
+        const witness = value.signed_audit orelse return null;
+        const ack: publication.Ack = .{ .table_id = request.table_id, .expected_revision = value.expected_revision, .signed = receipt, .validation = .{ .outcome = value.outcome.validated.physical, .signed = witness } };
+        try ack.validate();
+        return ack;
+    }
 
     pub const RootedOutcome = struct {
         root_generation: u64,
@@ -290,6 +306,7 @@ pub const ControlResponse = union(enum) {
                 }
                 if (value.outcome == .validated and (value.signed_audit != null) != (value.signed_receipt != null)) return error.InvalidPrivateIndexNativeReceipt;
                 if (value.signed_receipt) |signed| {
+                    if (value.expected_revision == 0 or value.expected_revision == std.math.maxInt(u64)) return error.InvalidPrivateIndexNativeReceipt;
                     if (value.signing_failure != null or value.outcome != .validated or value.signed_audit == null or
                         !std.meta.eql(value.outcome.validated.logical.receipt orelse return error.InvalidPrivateIndexNativeReceipt, signed.receipt)) return error.InvalidPrivateIndexNativeReceipt;
                     try signed.verifySignature();
@@ -435,7 +452,7 @@ pub fn claimHttpFailure(status: u16, body: []const u8) ?anyerror {
         408 => inline for (.{ error.Canceled, error.Cancelled, error.DeadlineExceeded }) |err| {
             if (std.mem.eql(u8, body, @errorName(err))) return err;
         },
-        503 => inline for (.{ error.InvalidPrivateIndexClaimReceipt, error.InvalidPrivateIndexClaimInventory, error.InvalidPrivateIndexOwnerJob, error.InvalidPrivateIndexInputs, error.InvalidPrivateIndexNativeReceipt, error.PrivateIndexJobRequired, error.PrivateIndexRootRecoveryRequired, error.PrivateIndexPublicationRequired, error.PrivateIndexCancellationPending, error.PrivateIndexCancellationRequired, error.ImmutableRelationalIndexDefinitionConflict, error.InvalidIndexPublicationCandidate, error.InvalidRelationalIndexProgress, error.InvalidRelationalIndexValidation, error.PrivateIndexTargetValidationRequired, error.MissingRelationalIndexDefinitions, error.RelationalIndexCatalogSchemaMismatch, error.InvalidPrivateIndexCancellation, error.ResourceBudgetExceeded, error.PrivateIndexClaimBacklogFull }) |err| {
+        503 => inline for (.{ error.InvalidPrivateIndexClaimReceipt, error.InvalidPrivateIndexClaimInventory, error.InvalidPrivateIndexOwnerJob, error.InvalidPrivateIndexInputs, error.InvalidPrivateIndexNativeReceipt, error.PrivateIndexJobRequired, error.PrivateIndexRootRecoveryRequired, error.PrivateIndexPublicationRequired, error.PrivateIndexCancellationPending, error.PrivateIndexCancellationRequired, error.ImmutableRelationalIndexDefinitionConflict, error.InvalidIndexPublicationCandidate, error.InvalidRelationalIndexProgress, error.InvalidRelationalIndexValidation, error.PrivateIndexTargetValidationRequired, error.MissingRelationalIndexDefinitions, error.RelationalIndexCatalogSchemaMismatch, error.InvalidPrivateIndexCancellation, error.ResourceBudgetExceeded, error.PrivateIndexClaimBacklogFull, error.MetadataReplicationPending }) |err| {
             if (std.mem.eql(u8, body, @errorName(err))) return err;
         },
         else => {},
@@ -1059,7 +1076,7 @@ pub fn step(alloc: std.mem.Allocator, source: anytype, metadata: anytype, table_
         errdefer rooted.outcome.deinit();
         try rooted.outcome.value.validateFor(build);
         if (rooted.root_generation == 0) return error.InvalidPrivateIndexNativeReceipt;
-        return .{ .building = .{ .root_generation = rooted.root_generation, .outcome = rooted.outcome, .audit_signing = permission.value.native_signing } };
+        return .{ .building = .{ .root_generation = rooted.root_generation, .expected_revision = permission.value.head.revision, .outcome = rooted.outcome, .audit_signing = permission.value.native_signing } };
     }
     if (state.value) |binding| {
         const effect: @FieldType(native.ReceiptRequest, "effect") = switch (request.operation) {
@@ -1101,6 +1118,7 @@ pub fn step(alloc: std.mem.Allocator, source: anytype, metadata: anytype, table_
 // never committed cut correctness or root attestation. Those require the
 // physical-owner/C-ABI and distributed fault gates, not these component tests.
 const TestDriver = struct {
+    const ValidationFault = enum { none, before_commit, lost_reply, pending, stale_revision, physical_only, restart, restart_committed };
     value: publication.OwnerDecision,
     binding: ?jobs.Binding = null,
     receipt_result: ?native.Outcome = null,
@@ -1127,6 +1145,14 @@ const TestDriver = struct {
     inventory_pages: usize = 0,
     generation_pages: usize = 0,
     audit_pages: usize = 0,
+    validation_fault: ValidationFault = .none,
+    validation_ack_requests: usize = 0,
+    validation_acks: usize = 0,
+    validation_status_calls: usize = 0,
+    validation_permission_acks: usize = 0,
+    validation_pending_checks: usize = 0,
+    validation_digest: ?publication.Digest = null,
+    validation_seal_effects: usize = 0,
     inventory_finished: bool = false,
     source_reads: usize = 0,
     source_failed: bool = false,
@@ -1144,6 +1170,37 @@ const TestDriver = struct {
 
     pub fn systemCatalog(self: *TestDriver, alloc: std.mem.Allocator, context: operation.RequestContext, call: calls.Call) ![]u8 {
         try std.testing.expect(context.index_publication_authority);
+        if (call == .relational_index_owner_ack or call == .relational_index_owner_ack_status) {
+            const request = if (call == .relational_index_owner_ack) call.relational_index_owner_ack else call.relational_index_owner_ack_status;
+            try request.validate();
+            try std.testing.expect(request.signed.receipt.action == .validated and request.validation != null);
+            if (call == .relational_index_owner_ack) {
+                self.validation_ack_requests += 1;
+                if (self.validation_fault == .stale_revision) {
+                    self.validation_fault = .none;
+                    self.value.head.revision += 1;
+                    return error.GenerationPublicationChanged;
+                }
+                if (self.validation_fault == .before_commit) {
+                    self.validation_fault = .none;
+                    return error.MetadataMutationOutcomeUnknown;
+                }
+                const update = try local.storage_db_relational_index_publication_progress.acknowledge(self.value.head, self.value.owner, request.expected_revision, request.signed.receipt);
+                self.value.head = update.head;
+                self.value.owner = update.owner;
+                self.value.owner.attestations[@backingInt(request.signed.receipt.action)] = try request.signed.commitment();
+                self.validation_digest = request.validation.?.signed.outcome_digest;
+                self.validation_acks += 1;
+                if (self.validation_fault == .lost_reply or self.validation_fault == .pending or self.validation_fault == .restart_committed) {
+                    if (self.validation_fault == .pending) self.validation_pending_checks = 3;
+                    self.validation_fault = .none;
+                    return error.MetadataMutationOutcomeUnknown;
+                }
+            } else self.validation_status_calls += 1;
+            const pending = self.validation_pending_checks != 0;
+            if (pending) self.validation_pending_checks -= 1;
+            return std.json.Stringify.valueAlloc(alloc, publication.AckStatus{ .head = self.value.head, .owner = self.value.owner, .validation_digest = self.validation_digest, .replication_pending = pending }, .{});
+        }
         if (call == .relational_index_source_accept_status) return std.json.Stringify.valueAlloc(alloc, delivery_journal.Status{ .query = call.relational_index_source_accept_status, .head = self.acceptance_head, .completed = self.completed }, .{});
         if (call == .relational_index_source_complete) {
             const request = call.relational_index_source_complete;
@@ -1174,7 +1231,14 @@ const TestDriver = struct {
         }
         const request = call.relational_index_owner_decision;
         var value = self.value;
-        if (call.relational_index_owner_decision.operation == .validate) {
+        if (self.validation_acks != 0 and (request.operation == .validate or request.operation == .build)) {
+            self.validation_permission_acks += 1;
+            value.disposition = .acknowledged;
+            value.dispatch = null;
+            value.inputs = null;
+            value.native_signing = null;
+            value.target_expectation = null;
+        } else if (request.operation == .validate) {
             const consumed = self.consumed_record orelse return error.InvalidPrivateIndexClaimReceipt;
             const member: local.storage_db_relational_integrity_contract.Claim = .{ .tuple = "logical\x00\xff\x80", .parent_table = value.dispatch.?.table_name, .parent_key = "row", .schema_version = self.binding.?.physical_candidate.schema_version };
             value.target_expectation = .{ .metadata_incarnation = consumed.accepted.metadata_incarnation, .binding_digest = consumed.accepted.binding_digest, .generation = consumed.header.bytes[72..88].*, .completion_revision = value.head.completion_revision, .source_consumption_digest = try consumed.prefix().digest(), .source_progress_digest = consumed.header.progressDigest(), .table_name_digest = local.storage_db_relational_integrity_contract.hash(value.dispatch.?.table_name), .rows = 1, .inventory_xor = member.memberDigest(), .provenance = @splat(1) };
@@ -1272,10 +1336,12 @@ const TestDriver = struct {
                     const fields: local.storage_db_relational_index_validation.Fields = .{ .phase = if (self.audit_pages == 1) .primary else .ready, .counts = @splat(@as(u64, if (self.audit_pages == 1) 0 else 1)), .chain = @splat(7), .cursor_digest = local.storage_db_relational_integrity_contract.hash("") };
                     const audit_summary: local.storage_db_relational_index_audit_checkpoint.Summary = .{ .root_incarnation = audit_root_incarnation orelse 7, .physical_root_incarnation = 11, .expectation_digest = try expected.digest(), .inventory = .{ .phase = .ready, .rows = 1, .inventory_xor = expected.inventory_xor, .claim_rows = 1, .claim_xor = expected.inventory_xor, .claim_cursor = address.claimKey(), .chain = @splat(7), .cursor = jobs.private_claims.inventoryKey(address) }, .generation = fields, .inventory_canonical_digest = @splat(9), .generation_canonical_digest = @splat(8), .source_members = 1, .canonical_position = .{ .namespace = binding.fence.namespace, .sequence = 7 }, .checkpoint_digest = @splat(9) };
                     const physical: native.AuditOutcome = .{ .binding = binding, .expected = expected, .audit = audit_summary };
-                    if (fields.phase == .ready) {
+                    if (fields.phase == .ready and !(self.validation_fault == .physical_only and self.audit_pages < 5)) {
                         const command = try physical.logicalCommand();
                         const position: local.storage_db_receipt_position.Native = .{ .namespace = binding.fence.namespace, .sequence = 8 };
-                        return .{ .root_generation = self.root_generation, .outcome = try parsed(native.BuildResponse, alloc, .{ .validated = .{ .physical = physical, .logical = .{ .command = command, .position = position, .duplicate = self.audit_pages > 2, .receipt = try command.receipt(position) } } }) };
+                        const duplicate = self.validation_seal_effects != 0;
+                        if (!duplicate) self.validation_seal_effects += 1;
+                        return .{ .root_generation = self.root_generation, .outcome = try parsed(native.BuildResponse, alloc, .{ .validated = .{ .physical = physical, .logical = .{ .command = command, .position = position, .duplicate = duplicate, .receipt = try command.receipt(position) } } }) };
                     }
                     return .{ .root_generation = self.root_generation, .outcome = try parsed(native.BuildResponse, alloc, .{ .audit = physical }) };
                 }
@@ -1499,6 +1565,12 @@ const TestDeliveryTransport = struct {
                 try result.building.signed_receipt.?.verifySignature();
                 const response = try result.response();
                 try response.validate(request);
+                const ack = (try response.validationAck(request)).?;
+                try std.testing.expectEqual(result.building.expected_revision, ack.expected_revision);
+                try std.testing.expectEqualDeep(result.building.signed_receipt.?, ack.signed);
+                var missing_revision = response;
+                missing_revision.building.expected_revision = 0;
+                try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, missing_revision.validationAck(request));
                 var mismatched = response;
                 const logical = &mismatched.building.signed_receipt.?;
                 logical.proof.root_generation += 1;
@@ -1508,7 +1580,7 @@ const TestDeliveryTransport = struct {
                 pending_value.validated.logical.replication_pending = true;
                 pending_value.validated.logical.error_name = "ReplicationOutboxPending";
                 pending_value.validated.logical.receipt = null;
-                var pending: Result = .{ .building = .{ .root_generation = result.building.root_generation, .outcome = try TestDriver.parsed(native.BuildResponse, alloc, pending_value), .audit_signing = result.building.audit_signing } };
+                var pending: Result = .{ .building = .{ .root_generation = result.building.root_generation, .expected_revision = result.building.expected_revision, .outcome = try TestDriver.parsed(native.BuildResponse, alloc, pending_value), .audit_signing = result.building.audit_signing } };
                 defer pending.deinit();
                 try std.testing.expect(!pending.needsSigning());
                 try std.testing.expectError(error.NativeIndexSigningUnavailable, pending.signNative(self.root, 2, 3, 4));
@@ -1569,14 +1641,26 @@ const TestSchedulerHost = struct {
 };
 
 fn testSchedulerDelivery(alloc: std.mem.Allocator, permission: publication.OwnerDecision, binding: jobs.Binding, root: local.storage_db_root_signing_identity.State) !void {
-    return testSchedulerDeliveryFault(alloc, permission, binding, root, false);
+    return testSchedulerDeliveryFault(alloc, permission, binding, root, false, .none);
 }
 fn testSchedulerDeliveryBeforeCommit(alloc: std.mem.Allocator, permission: publication.OwnerDecision, binding: jobs.Binding, root: local.storage_db_root_signing_identity.State) !void {
-    return testSchedulerDeliveryFault(alloc, permission, binding, root, true);
+    return testSchedulerDeliveryFault(alloc, permission, binding, root, true, .none);
 }
-fn testSchedulerDeliveryFault(alloc: std.mem.Allocator, permission: publication.OwnerDecision, binding: jobs.Binding, root: local.storage_db_root_signing_identity.State, before_commit: bool) !void {
+fn testSchedulerValidationFaults(alloc: std.mem.Allocator, permission: publication.OwnerDecision, binding: jobs.Binding, root: local.storage_db_root_signing_identity.State) !void {
+    for ([_]TestDriver.ValidationFault{ .before_commit, .lost_reply, .pending, .stale_revision, .physical_only, .restart, .restart_committed }) |fault| try testSchedulerDeliveryFault(alloc, permission, binding, root, false, fault);
+}
+fn testSchedulerDeliveryFault(alloc: std.mem.Allocator, permission: publication.OwnerDecision, binding: jobs.Binding, root: local.storage_db_root_signing_identity.State, before_commit: bool, validation_fault: TestDriver.ValidationFault) !void {
     const worker = @import("../metadata/relational_index_worker.zig");
-    var driver: TestDriver = .{ .value = permission, .binding = binding, .lose_acceptance_reply = true, .lose_completion_reply = !before_commit, .lose_completion_before_commit = before_commit };
+    var driver: TestDriver = .{ .value = permission, .binding = binding, .lose_acceptance_reply = true, .lose_completion_reply = !before_commit, .lose_completion_before_commit = before_commit, .validation_fault = validation_fault };
+    // Qualify the fixture's already-completed fence/reservation receipts too;
+    // ACK status must not be weakened to accept unattested logical progress.
+    const view = permission.native_signing.?;
+    for ([_]local.storage_db_relational_index_publication_progress.Action{ .fenced, .reserved }, 1..) |action, sequence| {
+        const receipt: local.storage_db_relational_index_publication_progress.Receipt = .{ .owner = permission.owner.owner, .action = action, .position = .{ .native = .{ .namespace = binding.fence.namespace, .sequence = sequence } }, .candidate_digest = permission.head.candidate_digest, .reservation_digest = permission.head.reservation_digest, .evidence_digest = @splat(9) };
+        try std.testing.expectEqual(try receipt.digest(), permission.owner.receipts[@backingInt(action)]);
+        const proof = try (publication.RootProof{ .identity = view.identity, .reporter_incarnation = view.reporter_incarnation, .authority = .{ .native = view.binding_digest }, .root_generation = driver.root_generation, .signature = undefined }).sign(root, try receipt.digest());
+        driver.value.owner.attestations[@backingInt(action)] = try proof.commitment(try receipt.digest());
+    }
     var host: TestSchedulerHost = .{ .driver = &driver };
     var sender: TestDeliveryTransport = .{ .driver = &driver, .root = root };
     var transport = sender.localTransport();
@@ -1587,7 +1671,11 @@ fn testSchedulerDeliveryFault(alloc: std.mem.Allocator, permission: publication.
         const before = sender.calls;
         _ = try coordinator.step(std.testing.io, alloc, null, &host, &transport, now);
         try std.testing.expect(sender.calls - before <= 1);
-        if (driver.completion_calls == 1 and coordinator.jobs[0].?.owners[0] == null) break;
+        const resident = active: {
+            for (coordinator.jobs[0].?.owners) |owner| if (owner != null) break :active true;
+            break :active false;
+        };
+        if (driver.completion_calls == 1 and !resident) break;
         now += 300 * std.time.ns_per_ms;
     }
     try std.testing.expectEqual(@as(usize, 1), driver.build_pages);
@@ -1599,14 +1687,41 @@ fn testSchedulerDeliveryFault(alloc: std.mem.Allocator, permission: publication.
     driver.value.head.completion_revision = driver.value.head.revision;
     driver.value.owner.source_delivery = driver.acceptance_head.?.decision_digest;
     driver.value.owner.source_completed = true;
-    for (0..12) |_| {
+    var restarted = false;
+    for (0..60) |_| {
         now += 300 * std.time.ns_per_ms;
         _ = try coordinator.step(std.testing.io, alloc, null, &host, &transport, now);
+        if (!restarted and (validation_fault == .restart or validation_fault == .restart_committed)) {
+            var cut = false;
+            for (coordinator.jobs[0].?.owners) |owner| if (owner) |value| {
+                if (value.ack != null and driver.validation_acks == @as(usize, if (validation_fault == .restart_committed) 1 else 0)) cut = true;
+            };
+            if (cut) {
+                coordinator.deinit(std.testing.io);
+                coordinator = .{};
+                restarted = true;
+                continue;
+            }
+        }
+        const resident = active: {
+            for (coordinator.jobs[0].?.owners) |owner| if (owner != null) break :active true;
+            break :active false;
+        };
+        if (driver.validation_acks == 1 and !resident and (validation_fault != .restart_committed or driver.validation_permission_acks != 0)) break;
     }
     try std.testing.expect(driver.inventory_pages != 0);
     try std.testing.expect(driver.generation_pages != 0);
     try std.testing.expect(driver.audit_pages >= 2);
     try std.testing.expect(sender.signed_audits != 0);
+    try std.testing.expectEqual(@as(usize, 1), driver.validation_seal_effects);
+    try std.testing.expectEqual(@as(usize, 1), driver.validation_acks);
+    try std.testing.expectEqual(@as(usize, if (validation_fault == .before_commit or validation_fault == .stale_revision) 2 else 1), driver.validation_ack_requests);
+    if (validation_fault == .pending) try std.testing.expect(driver.validation_status_calls >= 4);
+    if (validation_fault == .lost_reply or validation_fault == .before_commit) try std.testing.expect(driver.validation_status_calls != 0);
+    if (validation_fault == .physical_only) try std.testing.expect(driver.audit_pages >= 5);
+    if (validation_fault == .restart or validation_fault == .restart_committed) try std.testing.expect(restarted);
+    if (validation_fault == .restart_committed) try std.testing.expect(driver.validation_permission_acks != 0);
+    try std.testing.expectEqual(@as(u16, 1), driver.value.head.counts[@backingInt(local.storage_db_relational_index_publication_progress.Action.validated)]);
     try std.testing.expectEqual(@as(usize, 1), driver.build_pages);
     try std.testing.expectEqual(@as(usize, 1), driver.consumption_calls);
     try std.testing.expect(driver.value.head.phase == .building);
@@ -1813,7 +1928,7 @@ test "relational index publication native cancellation receiver uses fixed permi
 }
 
 test "relational index publication claim HTTP errors preserve conflicts corruption and cancellation" {
-    inline for (.{ .{ 409, error.UniqueConstraintViolation }, .{ 409, error.PrivateIndexOwnerJobChanged }, .{ 409, error.PrivateIndexPublicationCanceled }, .{ 503, error.InvalidPrivateIndexClaimReceipt }, .{ 503, error.PrivateIndexJobRequired }, .{ 503, error.ResourceBudgetExceeded }, .{ 503, error.PrivateIndexClaimBacklogFull }, .{ 408, error.DeadlineExceeded } }) |entry| {
+    inline for (.{ .{ 409, error.UniqueConstraintViolation }, .{ 409, error.PrivateIndexOwnerJobChanged }, .{ 409, error.PrivateIndexPublicationCanceled }, .{ 503, error.InvalidPrivateIndexClaimReceipt }, .{ 503, error.PrivateIndexJobRequired }, .{ 503, error.ResourceBudgetExceeded }, .{ 503, error.PrivateIndexClaimBacklogFull }, .{ 503, error.MetadataReplicationPending }, .{ 408, error.DeadlineExceeded } }) |entry| {
         try std.testing.expectEqual(entry[1], claimHttpFailure(entry[0], @errorName(entry[1])).?);
     }
     try std.testing.expect(claimHttpFailure(200, "PrivateIndexOwnerJobChanged") == null);
@@ -2145,6 +2260,7 @@ test "relational index publication claim receiver binds fresh build permission w
         try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, testSchedulerDelivery, .{ permission, binding.?, root });
         try testSchedulerDeliveryBeforeCommit(alloc, permission, binding.?, root);
         try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, testSchedulerDeliveryBeforeCommit, .{ permission, binding.?, root });
+        try testSchedulerValidationFaults(alloc, permission, binding.?, root);
         {
             var cohort = try jobs.private_claims.delivery.Cohort.init(alloc, &.{.{ .owner = permission.owner.owner, .start = "", .end = "" }});
             defer cohort.deinit();

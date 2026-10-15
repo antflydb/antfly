@@ -101,9 +101,11 @@ const std = @import("std");
 /// It does not advertise the complete native install/release protocol.
 /// Version 49 requires retained physical evidence for native validation ACKs.
 /// Complete native install/release activation remains a separate barrier.
-pub const current_version: u16 = 49;
-pub const index_publication_head_version: u16 = 49;
-pub const index_delivery_version: u16 = 49;
+/// Version 50 decodes metadata-revision hints on signed validation replies.
+/// This enables validation ACK scheduling, not full native install/release.
+pub const current_version: u16 = 50;
+pub const index_publication_head_version: u16 = 50;
+pub const index_delivery_version: u16 = 50;
 pub const schema_reader_publication_version: u16 = 39;
 pub const schema_reader_floor_version: u16 = 38;
 pub const schema_reader_capability_version: u16 = 37;
