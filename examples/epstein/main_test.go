@@ -273,6 +273,10 @@ func TestCreateArtifactGraphIndexDefaultsToExtractorConfig(t *testing.T) {
 	if cfg["provider"] != "antfly" || cfg["model"] != DefaultRecognizerModel {
 		t.Fatalf("unexpected extractor config: %#v", cfg)
 	}
+	options := cfg["options"].(map[string]any)
+	if options["long_document"].(map[string]any)["mode"] != "window" {
+		t.Fatalf("extractor must window long documents: %#v", options)
+	}
 	schema := cfg["schema"].(map[string]any)
 	if len(schema["entities"].([]any)) != 2 || len(schema["relations"].([]any)) != 1 {
 		t.Fatalf("unexpected extractor schema: %#v", schema)

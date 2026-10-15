@@ -878,7 +878,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     embedding_name,
                     request.source_field,
                     source.key,
-                    .{ .generated = enrichment_artifact_codec.hashEmbeddingSource(source.text, request.producer_json) },
+                    .{ .generated = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source.text, request.producer_json, request.reprocess_generation) },
                     vector,
                 );
                 defer alloc.free(artifact_key);
@@ -913,7 +913,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer source_indexes.deinit(alloc);
 
             for (sources.items, 0..) |source, i| {
-                const source_hash = enrichment_artifact_codec.hashEmbeddingSource(source.text, request.producer_json);
+                const source_hash = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source.text, request.producer_json, request.reprocess_generation);
                 const artifact_key = try embeddingArtifactKeyForBaseAlloc(alloc, source.key, embedding_name);
                 defer alloc.free(artifact_key);
                 if (skip_unchanged_artifacts) {
@@ -963,6 +963,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             sparse_embedder: embedder_mod.SparseEmbedder,
             embedding_name: []const u8,
             semantic_producer: []const u8,
+            reprocess_generation: u64,
             artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
             sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
             sources: []const ChunkEmbeddingSource,
@@ -983,7 +984,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     artifact_writes,
                     source.key,
                     embedding_name,
-                    .{ .generated = enrichment_artifact_codec.hashEmbeddingSource(source.text, semantic_producer) },
+                    .{ .generated = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source.text, semantic_producer, reprocess_generation) },
                     sparse.indices,
                     sparse.values,
                 );
@@ -1002,11 +1003,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             sparse_embedder: embedder_mod.SparseEmbedder,
             embedding_name: []const u8,
             semantic_producer: []const u8,
+            reprocess_generation: u64,
             artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
             sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
             sources: *std.ArrayListUnmanaged(ChunkEmbeddingSource),
             consumer_indexes: []const []const u8,
             pending_lookup: *const PendingArtifactWriteIndex,
+            reuse_unchanged: bool,
         ) !void {
             if (sources.items.len == 0) return;
             defer clearChunkEmbeddingSourceList(alloc, sources);
@@ -1017,20 +1020,20 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer source_indexes.deinit(alloc);
 
             for (sources.items, 0..) |source, i| {
-                const source_hash = enrichment_artifact_codec.hashEmbeddingSource(source.text, semantic_producer);
+                const source_hash = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source.text, semantic_producer, reprocess_generation);
                 const artifact_key = try embeddingArtifactKeyForBaseAlloc(alloc, source.key, embedding_name);
                 defer alloc.free(artifact_key);
-                if (try storedOrPendingEmbeddingSourceHash(db, pending_lookup, artifact_key)) |existing_hash| {
+                if (reuse_unchanged) if (try storedOrPendingEmbeddingSourceHash(db, pending_lookup, artifact_key)) |existing_hash| {
                     if (existing_hash == source_hash) {
                         try appendDerivedSparseEmbeddingForConsumers(alloc, sparse_embeddings, source.key, artifact_key, &.{}, &.{}, consumer_indexes);
                         continue;
                     }
-                }
+                };
                 try chunk_texts.append(alloc, source.text);
                 try source_indexes.append(alloc, i);
             }
 
-            try flushGeneratedSparseChunkBatch(alloc, runtime, sparse_embedder, embedding_name, semantic_producer, artifact_writes, sparse_embeddings, sources.items, &source_indexes, &chunk_texts, consumer_indexes);
+            try flushGeneratedSparseChunkBatch(alloc, runtime, sparse_embedder, embedding_name, semantic_producer, reprocess_generation, artifact_writes, sparse_embeddings, sources.items, &source_indexes, &chunk_texts, consumer_indexes);
         }
 
         pub fn flushGeneratedSparseMemoJobs(
@@ -1208,7 +1211,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (!extracted[i].hasDocument()) continue;
                 var owned_row_plan: ?GeneratedBatchWritePlan = null;
                 defer if (owned_row_plan) |*plan| plan.deinit();
-                const generated = if (preplanned) |plan|
+                const generated_templates = if (preplanned) |plan|
                     plan.rows[i].requests
                 else blk: {
                     owned_row_plan = try planGeneratedEnrichmentsForRows(
@@ -1219,7 +1222,30 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     );
                     break :blk owned_row_plan.?.rows[0].requests;
                 };
-                if (generated.len == 0) continue;
+                if (generated_templates.len == 0) continue;
+                const generated = try alloc.dupe(enrichment_types.GeneratedEnrichmentRequest, generated_templates);
+                defer alloc.free(generated);
+                for (generated) |*request| {
+                    if (request.kind != .dense_embedding and request.kind != .sparse_embedding) continue;
+                    const intent = @import("artifact_reprocess_intent.zig");
+                    const key = try intent.embeddingKeyAlloc(alloc, request.doc_key, requestEmbeddingName(request.*));
+                    defer alloc.free(key);
+                    const old = self.core.*.store.get(alloc, key) catch |err| switch (err) {
+                        error.NotFound => null,
+                        else => return err,
+                    };
+                    defer if (old) |raw| alloc.free(raw);
+                    request.reprocess_generation = if (old) |raw| try intent.generationForConfig(raw, request.producer_json) else 0;
+                    if (containsName(force_generated_artifact_names, requestEmbeddingName(request.*))) {
+                        request.reprocess_generation = std.math.add(u64, request.reprocess_generation, 1) catch return error.ResourceLimitExceeded;
+                        const encoded = intent.encode(request.producer_json, request.reprocess_generation);
+                        const owned_key = try alloc.dupe(u8, key);
+                        errdefer alloc.free(owned_key);
+                        const value = try alloc.dupe(u8, &encoded);
+                        errdefer alloc.free(value);
+                        try artifact_writes.append(alloc, .{ .key = owned_key, .value = value });
+                    }
+                }
 
                 var chunk_cache = std.ArrayListUnmanaged(ChunkCacheEntry).empty;
                 defer {
@@ -1341,7 +1367,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             try pending_deletes.extend(alloc, artifact_delete_keys.items);
                             try indexPendingArtifactWrites(alloc, &pending_writes, artifact_writes.items, &indexed_write_count);
                             const before = dense_embeddings.items.len;
-                            computeDenseRequestDerived(alloc, self, cleaned, request, &artifact_writes, &pending_deletes.keys, &dense_embeddings, &chunk_cache, generated_memo, &pending_writes) catch |err| switch (err) {
+                            const reuse_unchanged = !containsName(force_generated_artifact_names, requestArtifactName(request)) and !containsName(force_generated_artifact_names, requestEmbeddingName(request));
+                            computeDenseRequestDerived(alloc, self, cleaned, request, &artifact_writes, &pending_deletes.keys, &dense_embeddings, &chunk_cache, generated_memo, &pending_writes, reuse_unchanged) catch |err| switch (err) {
                                 error.MissingDenseEmbedder => {
                                     try appendGeneratedEnrichmentRef(alloc, &planned, request);
                                     continue;
@@ -1360,7 +1387,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             try pending_deletes.extend(alloc, artifact_delete_keys.items);
                             try indexPendingArtifactWrites(alloc, &pending_writes, artifact_writes.items, &indexed_write_count);
                             const before = sparse_embeddings.items.len;
-                            computeSparseRequestDerived(alloc, self, cleaned, request, &artifact_writes, &pending_deletes.keys, &sparse_embeddings, &chunk_cache, generated_memo, &pending_writes) catch |err| switch (err) {
+                            const reuse_unchanged = !containsName(force_generated_artifact_names, requestArtifactName(request)) and !containsName(force_generated_artifact_names, requestEmbeddingName(request));
+                            computeSparseRequestDerived(alloc, self, cleaned, request, &artifact_writes, &pending_deletes.keys, &sparse_embeddings, &chunk_cache, generated_memo, &pending_writes, reuse_unchanged) catch |err| switch (err) {
                                 error.MissingSparseEmbedder => {
                                     try appendGeneratedEnrichmentRef(alloc, &planned, request);
                                     continue;
@@ -1475,7 +1503,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     else => return err,
                 };
                 const expected_kind: enrichment_artifact_codec.Kind = if (request.kind == .dense_embedding) .dense_embedding else .sparse_embedding;
-                if (metadata.header.kind != expected_kind or metadata.sourceHash() != enrichment_artifact_codec.hashEmbeddingSource(source.text, request.producer_json) or
+                if (metadata.header.kind != expected_kind or metadata.sourceHash() != enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source.text, request.producer_json, request.reprocess_generation) or
                     (request.kind == .dense_embedding and metadata.dense_dimensions != request.expected_dims)) return null;
             }
             const result = try sources.toOwnedSlice(alloc);
@@ -1587,7 +1615,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             };
             defer memo.alloc.free(raw);
             const source_hash = enrichment_artifact_codec.sourceHash(raw) catch return false;
-            if (source_hash == null or source_hash.? != enrichment_artifact_codec.hashEmbeddingSource(text, request.producer_json)) return false;
+            if (source_hash == null or source_hash.? != enrichment_artifact_codec.hashEmbeddingSourceForGeneration(text, request.producer_json, request.reprocess_generation)) return false;
             switch (request.kind) {
                 .dense_embedding => {
                     const dims = enrichment_artifact_codec.decodeDenseEmbeddingDims(raw) catch return false;
@@ -1775,6 +1803,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // the composed neighbor input/skip hash. Retain this request for postcommit
             // replay; synchronous levels still wait for its generated coverage there.
             if (request.requires_committed_graph or request.neighbor_context_json.len != 0) return false;
+            // PDF page embeddings require their renderer, page-stage namespace
+            // and capability lease. The ordinary text precompute path must not
+            // embed the source URL as if it were document text.
+            if (request.embedding_input == .pdf_page_images) return false;
             return switch (mode) {
                 .none => false,
                 .all => true,

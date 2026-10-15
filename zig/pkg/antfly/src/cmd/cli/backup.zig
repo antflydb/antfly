@@ -522,7 +522,7 @@ fn validateRestoreArgs(opts: RestoreArgs) !void {
 }
 
 fn isPortableRestoreInputPath(path: []const u8) bool {
-    return std.mem.endsWith(u8, path, ".aflite") or std.mem.endsWith(u8, path, ".afb");
+    return std.mem.endsWith(u8, path, ".aflite") or std.mem.endsWith(u8, path, ".afb") or std.mem.endsWith(u8, path, ".afb2");
 }
 
 fn restoreInputLocationAlloc(allocator: std.mem.Allocator, input_path: []const u8, opts: RestoreArgs) ![]u8 {
@@ -574,7 +574,7 @@ fn printRestoreUsage() void {
         \\usage:
         \\  antfly restore --table <name> --backup-id <id> --connection <id> --location <uri> [--idempotency-key <key>] [--wait] [--wait-timeout <seconds>] [--url <url>]
         \\  antfly restore --tables <a,b> --backup-id <id> --connection <id> --location <uri> [--mode <mode>] [--idempotency-key <key>] [--wait] [--wait-timeout <seconds>] [--url <url>]
-        \\  antfly restore --input <db.aflite|backup.afb> --table <name> --connection <id> --location <shared-uri> [--backup-id <id>] [--idempotency-key <key>] [--wait] [--wait-timeout <seconds>] [--url <url>]
+        \\  antfly restore --input <db.aflite|backup.afb|backup.afb2> --table <name> --connection <id> --location <shared-uri> [--backup-id <id>] [--idempotency-key <key>] [--wait] [--wait-timeout <seconds>] [--url <url>]
         \\
         \\notes:
         \\  `--input` auto-detects AFB1 portable, AFB2 portable, or AFB2 native.
@@ -703,18 +703,19 @@ test "restore input location requires explicit shared staging" {
     try std.testing.expectError(error.RestoreInputLocationRequired, restoreInputLocationAlloc(allocator, opts.input_path.?, opts));
 }
 
-test "restore afb input also requires explicit shared staging" {
+test "restore afb2 input is accepted and requires explicit shared staging" {
     const allocator = std.testing.allocator;
 
     var argv = [_][*:0]const u8{
         "--input",
-        "app.afb",
+        "app.afb2",
         "--table",
         "docs",
     };
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
     const opts = try parseRestoreArgs(&iter);
     try std.testing.expect(!opts.location_explicit);
+    try std.testing.expectError(error.RestoreLocationRequired, validateRestoreArgs(opts));
 
     try std.testing.expectError(error.RestoreInputLocationRequired, restoreInputLocationAlloc(allocator, opts.input_path.?, opts));
 }

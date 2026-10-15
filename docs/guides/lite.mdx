@@ -208,6 +208,22 @@ antfly restore \
   --url http://127.0.0.1:8080
 ```
 
+The normal `restore --input` command also accepts `.afb2`. Preparation detects
+Lite and AFB formats from their contents, validates portable records with the
+restore reader, and streams files through temporary disk storage. Portable
+backups retain their bytes; Lite exports retain the metadata from the same
+snapshot as their documents. A native AFB2 bundle keeps its native representation.
+Delta bundles need their base and are not supported by this input path.
+
+The default preparation limits are 64 GiB of input and 128 GiB per prepared
+artifact or expanded logical stream. These are safety limits, not a guarantee
+that a destination has enough capacity. Allow disk space for the input,
+temporary copies, and native extraction. Format validation does not check
+whether the destination can access media or run the configured models; the
+shared location and named connection are still required.
+Preparation places scratch files and native extraction directories under
+`TMPDIR`, then `TEMP`, falling back to `/tmp` when neither is set.
+
 **A normal instance into Lite.** Back up the table with `--format portable` (Lite cannot read a native bundle), then restore or import it:
 
 ```bash

@@ -2522,6 +2522,7 @@ func artifactProducerConfig(producerType, model, inferenceAPIURL string, labels,
 				"options": map[string]any{
 					"include_confidence": true,
 					"include_spans":      true,
+					"long_document":      map[string]any{"mode": "window"},
 				},
 			},
 		}

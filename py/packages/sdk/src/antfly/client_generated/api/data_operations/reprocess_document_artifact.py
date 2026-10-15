@@ -81,12 +81,16 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
 ) -> Response[DocumentArtifactReprocessResponse | Error]:
-    """Reprocess a derived asset
+    """Reprocess a derived artifact
 
      Invalidates the current artifact state and requests the producer to
     rebuild the derived asset for the source document. Copy, generator,
     reader, transcriber, extractor, and document-extraction producers are
-    all supported.
+    all supported, as are dense and sparse embedding producers. Embedding
+    reprocessing regenerates vectors even when the source chunks are unchanged.
+    Embedding requests are committed durably and queued for supervised
+    inference. Acceptance does not wait for inference; inspect index coverage
+    and repair issues for the eventual outcome.
 
     Args:
         table_name (str):
@@ -121,12 +125,16 @@ def sync(
     *,
     client: AuthenticatedClient,
 ) -> DocumentArtifactReprocessResponse | Error | None:
-    """Reprocess a derived asset
+    """Reprocess a derived artifact
 
      Invalidates the current artifact state and requests the producer to
     rebuild the derived asset for the source document. Copy, generator,
     reader, transcriber, extractor, and document-extraction producers are
-    all supported.
+    all supported, as are dense and sparse embedding producers. Embedding
+    reprocessing regenerates vectors even when the source chunks are unchanged.
+    Embedding requests are committed durably and queued for supervised
+    inference. Acceptance does not wait for inference; inspect index coverage
+    and repair issues for the eventual outcome.
 
     Args:
         table_name (str):
@@ -156,12 +164,16 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient,
 ) -> Response[DocumentArtifactReprocessResponse | Error]:
-    """Reprocess a derived asset
+    """Reprocess a derived artifact
 
      Invalidates the current artifact state and requests the producer to
     rebuild the derived asset for the source document. Copy, generator,
     reader, transcriber, extractor, and document-extraction producers are
-    all supported.
+    all supported, as are dense and sparse embedding producers. Embedding
+    reprocessing regenerates vectors even when the source chunks are unchanged.
+    Embedding requests are committed durably and queued for supervised
+    inference. Acceptance does not wait for inference; inspect index coverage
+    and repair issues for the eventual outcome.
 
     Args:
         table_name (str):
@@ -194,12 +206,16 @@ async def asyncio(
     *,
     client: AuthenticatedClient,
 ) -> DocumentArtifactReprocessResponse | Error | None:
-    """Reprocess a derived asset
+    """Reprocess a derived artifact
 
      Invalidates the current artifact state and requests the producer to
     rebuild the derived asset for the source document. Copy, generator,
     reader, transcriber, extractor, and document-extraction producers are
-    all supported.
+    all supported, as are dense and sparse embedding producers. Embedding
+    reprocessing regenerates vectors even when the source chunks are unchanged.
+    Embedding requests are committed durably and queued for supervised
+    inference. Acceptance does not wait for inference; inspect index coverage
+    and repair issues for the eventual outcome.
 
     Args:
         table_name (str):

@@ -755,6 +755,12 @@ fn generatedEmbedBatchItems() usize {
     return @max(@as(usize, 1), parsed);
 }
 
+fn generatedEmbedParallelBatches() usize {
+    const raw = getenv("ANTFLY_ENRICHMENT_EMBED_PARALLEL_BATCHES") orelse return 2;
+    const requested = std.fmt.parseUnsigned(usize, raw, 10) catch return 2;
+    return std.math.clamp(requested, 1, 4);
+}
+
 fn generatedEmbedBatchBytes() usize {
     if (comptime builtin.os.tag == .freestanding) return generated_embed_default_batch_bytes;
     const raw = getenv("ANTFLY_ENRICHMENT_EMBED_BATCH_BYTES") orelse return generated_embed_default_batch_bytes;
@@ -875,9 +881,30 @@ test "PDF render prefetch is capped at one window" {
 /// Producer JSON cannot raise these limits; both streaming enrichment and the
 /// synchronous precompute path call this before reserving PDF working memory.
 pub fn applyDocumentExtractionRuntimePolicy(config: *document_extraction_mod.Config) void {
+    config.pdf_decode_limits.max_working_set_bytes = pdfDecodeBudget(
+        getenv("ANTFLY_ENRICHMENT_PDF_DECODE_WORKING_SET_BYTES"),
+        config.pdf_decode_limits.max_working_set_bytes,
+    );
+    config.pdf_decode_limits.max_decoded_stream_bytes = @min(pdfDecodeBudget(
+        getenv("ANTFLY_ENRICHMENT_PDF_DECODE_STREAM_BYTES"),
+        config.pdf_decode_limits.max_decoded_stream_bytes,
+    ), config.pdf_decode_limits.max_working_set_bytes);
     config.pdf_render_max_parallel_pages = generatedOcrRenderParallelPages();
     config.pdf_render_max_inflight_pixels = @max(@as(u64, 1), generatedOcrRenderInflightPixels());
     config.pdf_render_max_inflight_bytes = @max(@as(usize, 1), generatedOcrRenderInflightBytes());
+}
+
+fn pdfDecodeBudget(raw: ?[]const u8, default: usize) usize {
+    const value = std.fmt.parseUnsigned(usize, raw orelse return default, 10) catch return default;
+    return if (value == 0) default else value;
+}
+
+test "PDF decode operator budgets accept large documents and reject invalid overrides" {
+    const default: usize = 128 * 1024 * 1024;
+    try std.testing.expectEqual(@as(usize, 1024 * 1024 * 1024), pdfDecodeBudget("1073741824", default));
+    for ([_]?[]const u8{ null, "", "0", "-1", "invalid", "184467440737095516160" }) |raw| {
+        try std.testing.expectEqual(default, pdfDecodeBudget(raw, default));
+    }
 }
 
 fn requestEmbedBatchItems(alloc: Allocator, request: enrichment_types.GeneratedEnrichmentRequest) usize {
@@ -2198,6 +2225,7 @@ fn enrichmentErrorDisposition(err: anyerror) EnrichmentErrorDisposition {
         error.ArtifactDependencyFailed,
         error.InvalidEmbeddingResponse,
         error.InvalidEmbeddingDimensions,
+        error.EmbedRequestFailed,
         error.ReadRequestFailed,
         error.ExtractionInvalidRequest,
         error.ExtractionUnauthorized,
@@ -2715,12 +2743,13 @@ test "enrichment distinguishes transient capacity from permanent resource limits
 
 test "enrichment retries unknown errors and isolates known permanent errors" {
     try std.testing.expectEqual(EnrichmentErrorDisposition.retryable_request, enrichmentErrorDisposition(error.UnexpectedEndOfInput));
-    for ([_]anyerror{ error.MissingPdfEof, error.InvalidPdfHeader, error.MalformedXrefStream, error.InvalidFlateStream, error.InvalidPageTree }) |err| {
+    for ([_]anyerror{ error.MissingPdfEof, error.InvalidPdfHeader, error.MalformedXrefStream, error.InvalidFlateStream, error.InvalidPageTree, error.MissingRoot, error.MissingPages, error.EmptyPdfPageTree, error.InvalidPdf }) |err| {
         try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(err));
     }
     try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.UnsupportedEmbeddingProvider));
     try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.InvalidEmbeddingDimensions));
     try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.ReadRequestFailed));
+    try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.EmbedRequestFailed));
     inline for (.{ error.ExtractionInvalidRequest, error.ExtractionUnauthorized, error.ExtractionForbidden, error.ExtractionNotFound, error.ExtractionRequestTooLarge, error.ExtractionRequestRejected }) |err| {
         try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(err));
     }
@@ -3595,17 +3624,17 @@ fn cacheableVector(vector: []const f32, dims: u32) bool {
     return true;
 }
 
-fn embedDenseWithRetry(provider: embedder_mod.DenseEmbedder, runtime: *EnrichmentRuntime, name: []const u8, text: []const u8, dims: u32) ![]f32 {
+fn embedDenseWithRetry(provider: embedder_mod.DenseEmbedder, runtime: *EnrichmentRuntime, name: []const u8, text: []const u8, dims: u32, reuse_computation: bool) ![]f32 {
     const cache = runtime.dense_result_cache orelse return embedDenseWithRetryUncached(provider, runtime, name, text, dims);
     const key = computationKey(provider, name, text, dims) orelse return embedDenseWithRetryUncached(provider, runtime, name, text, dims);
     try runtime.active_provider_guard.check();
-    if (try cache.lookup(cache.ptr, runtime.alloc, key)) |vector| return vector;
+    if (reuse_computation) if (try cache.lookup(cache.ptr, runtime.alloc, key)) |vector| return vector;
     const vector = try embedDenseWithRetryUncached(provider, runtime, name, text, dims);
     if (cacheableVector(vector, dims)) cache.remember(cache.ptr, key, vector);
     return vector;
 }
 
-fn embedDenseBatchWithRetry(provider: embedder_mod.DenseEmbedder, runtime: *EnrichmentRuntime, name: []const u8, texts: []const []const u8, dims: u32) ![]const []const f32 {
+fn embedDenseBatchWithRetry(provider: embedder_mod.DenseEmbedder, runtime: *EnrichmentRuntime, name: []const u8, texts: []const []const u8, dims: u32, reuse_computation: anytype) ![]const []const f32 {
     const cache = runtime.dense_result_cache orelse return embedDenseBatchWithRetryUncached(provider, runtime, name, texts, dims);
     if (provider.computation_key_fn == null) return embedDenseBatchWithRetryUncached(provider, runtime, name, texts, dims);
     try runtime.active_provider_guard.check();
@@ -3620,7 +3649,7 @@ fn embedDenseBatchWithRetry(provider: embedder_mod.DenseEmbedder, runtime: *Enri
     defer missing_texts.deinit(runtime.alloc);
     for (texts, 0..) |text, i| {
         keys[i] = computationKey(provider, name, text, dims);
-        if (keys[i]) |key| if (try cache.lookup(cache.ptr, runtime.alloc, key)) |vector| {
+        if (mayReuseDenseComputation(reuse_computation, i)) if (keys[i]) |key| if (try cache.lookup(cache.ptr, runtime.alloc, key)) |vector| {
             vectors[i] = vector;
             continue;
         };
@@ -3640,6 +3669,89 @@ fn embedDenseBatchWithRetry(provider: embedder_mod.DenseEmbedder, runtime: *Enri
         }
     }
     return vectors;
+}
+
+fn mayReuseDenseComputation(reuse: anytype, index: usize) bool {
+    // Single-source batches supply one policy; cross-document batches borrow
+    // their existing item slice. Forced items bypass lookup individually,
+    // preserving ordinary siblings' cache hits without allocating a mask.
+    return if (comptime @TypeOf(reuse) == bool) reuse else reuse[index].request.reprocess_generation == 0;
+}
+
+test "forced dense generations recompute cached vectors and refresh the memo" {
+    const Harness = struct {
+        calls: usize = 0,
+        lookups: usize = 0,
+        remembered: usize = 0,
+        cached: f32 = 99,
+        reject: bool = false,
+
+        fn key(_: *anyopaque, _: []const u8, _: []const u8, _: u32) !?[32]u8 {
+            return @splat(0);
+        }
+        fn lookup(ptr: *anyopaque, alloc: Allocator, _: [32]u8) !?[]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.lookups += 1;
+            return try alloc.dupe(f32, &.{self.cached});
+        }
+        fn remember(ptr: *anyopaque, _: [32]u8, vector: []const f32) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.remembered += 1;
+            self.cached = vector[0];
+        }
+        fn embed(ptr: *anyopaque, alloc: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.reject) return error.EmbedRequestFailed;
+            return alloc.dupe(f32, &.{@floatFromInt(self.calls)});
+        }
+    };
+    const alloc = std.testing.allocator;
+    var harness = Harness{};
+    const provider: embedder_mod.DenseEmbedder = .{ .ptr = &harness, .dense_embed_fn = Harness.embed, .computation_key_fn = Harness.key };
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .io = std.testing.io },
+        .ownership = undefined,
+        .dense_result_cache = .{ .ptr = &harness, .lookup = Harness.lookup, .remember = Harness.remember },
+    };
+    const Item = struct { request: struct { reprocess_generation: u64 } };
+    const ordinary = [_]Item{ .{ .request = .{ .reprocess_generation = 0 } }, .{ .request = .{ .reprocess_generation = 0 } } };
+    var mixed = ordinary;
+    mixed[1].request.reprocess_generation = 1;
+    const texts = [_][]const u8{ "same", "same" };
+    const cached = try embedDenseBatchWithRetry(provider, &runtime, "model", &texts, 1, &ordinary);
+    defer embedder_mod.freeDenseEmbeddingBatch(alloc, cached);
+    try std.testing.expectEqual(@as(usize, 0), harness.calls);
+    for (cached) |vector| try std.testing.expectEqual(@as(f32, 99), vector[0]);
+    const forced = try embedDenseBatchWithRetry(provider, &runtime, "model", &texts, 1, &mixed);
+    defer embedder_mod.freeDenseEmbeddingBatch(alloc, forced);
+    try std.testing.expectEqual(@as(usize, 1), harness.calls);
+    try std.testing.expectEqual(@as(f32, 99), forced[0][0]);
+    try std.testing.expectEqual(@as(f32, 1), forced[1][0]);
+    const single = try embedDenseWithRetry(provider, &runtime, "model", "same", 1, false);
+    defer alloc.free(single);
+    try std.testing.expectEqual(@as(f32, 2), single[0]);
+    const refreshed = try embedDenseWithRetry(provider, &runtime, "model", "same", 1, true);
+    defer alloc.free(refreshed);
+    try std.testing.expectEqual(@as(f32, 2), refreshed[0]);
+    try std.testing.expectEqual(@as(usize, 2), harness.calls);
+    try std.testing.expectEqual(@as(usize, 4), harness.lookups);
+    try std.testing.expectEqual(@as(usize, 2), harness.remembered);
+    harness.reject = true;
+    try std.testing.expectError(error.EmbedRequestFailed, embedDenseWithRetry(provider, &runtime, "model", "same", 1, false));
+    try std.testing.expectEqual(@as(usize, 3), harness.calls);
+    try std.testing.expectEqual(@as(usize, 2), harness.remembered);
 }
 
 fn embedDenseWithRetryUncached(
@@ -3692,10 +3804,7 @@ fn embedDenseBatchWithRetryUncached(
     var attempt: u32 = 0;
     while (true) : (attempt += 1) {
         try checkProviderInvocation(runtime, recovery_key, dense_embedder.foreground_bounded);
-        const vectors = (if (foregroundProviderRequestContext(runtime)) |context|
-            dense_embedder.embedDenseBatchWithContext(runtime.alloc, embedding_name, texts, dims, context)
-        else
-            dense_embedder.embedDenseBatch(runtime.alloc, embedding_name, texts, dims)) catch |err| {
+        const vectors = embedDenseBatchAttempt(dense_embedder, runtime, embedding_name, texts, dims) catch |err| {
             try checkProviderFailureGuardRecording(runtime, recovery_key, texts.len);
             if (inferenceControlFailure(err)) {
                 noteInferenceControlFailure(runtime, recovery_key, err, texts.len);
@@ -3717,6 +3826,210 @@ fn embedDenseBatchWithRetryUncached(
         };
         noteInferenceControlSuccess(runtime, recovery_key, texts.len);
         return vectors;
+    }
+}
+
+fn embedDenseBatchAttempt(dense_embedder: embedder_mod.DenseEmbedder, runtime: *EnrichmentRuntime, name: []const u8, texts: []const []const u8, dims: u32) ![]const []const f32 {
+    // Context-aware callbacks still require an explicit reentrancy guarantee.
+    // Custom and legacy providers retain their serial path by default.
+    const parallelism = @min(@min(generatedEmbedParallelBatches(), @max(@as(usize, 1), dense_embedder.dense_batch_concurrency)), texts.len);
+    if (parallelism <= 1 or dense_embedder.dense_embed_batch_with_context_fn == null) {
+        if (dense_embedder.dense_embed_batch_with_context_fn != null)
+            return dense_embedder.embedDenseBatchWithContext(runtime.alloc, name, texts, dims, assetProviderRequestContext(runtime));
+        return if (foregroundProviderRequestContext(runtime)) |context|
+            dense_embedder.embedDenseBatchWithContext(runtime.alloc, name, texts, dims, context)
+        else
+            dense_embedder.embedDenseBatch(runtime.alloc, name, texts, dims);
+    }
+    return parallelDenseBatchWithCapacityFallback(runtime.alloc, concurrencyIo(runtime), dense_embedder, name, texts, dims, assetProviderRequestContext(runtime), parallelism);
+}
+
+fn parallelDenseBatchWithCapacityFallback(alloc: Allocator, io: Io, provider: embedder_mod.DenseEmbedder, name: []const u8, texts: []const []const u8, dims: u32, context: inference_request_context.RequestContext, parallelism: usize) ![]const []const f32 {
+    return parallelDenseBatch(alloc, io, provider, name, texts, dims, context, parallelism, true);
+}
+
+fn denseBatchCapacityFailure(err: anyerror) bool {
+    return err == error.EmbedTransientFailure or err == error.ResourceTemporarilyUnavailable;
+}
+
+fn noteDenseBatchFailure(failure: *?anyerror, err: anyerror) void {
+    if (failure.*) |previous| {
+        // A busy sibling must not hide cancellation, permanent rejection or
+        // rate limiting and trigger an immediate extra provider invocation.
+        if (denseBatchFailurePriority(previous) >= denseBatchFailurePriority(err)) return;
+    }
+    failure.* = err;
+}
+
+fn denseBatchFailurePriority(err: anyerror) u8 {
+    if (inferenceControlFailure(err)) return 4;
+    if (denseBatchCapacityFailure(err)) return 0;
+    if (!isRetryableEnrichmentError(err)) return 3;
+    if (err == error.EmbedRateLimited) return 2;
+    return 1;
+}
+
+fn parallelDenseBatch(alloc: Allocator, io: Io, provider: embedder_mod.DenseEmbedder, name: []const u8, texts: []const []const u8, dims: u32, context: inference_request_context.RequestContext, parallelism: usize, allow_capacity_fallback: bool) ![]const []const f32 {
+    std.debug.assert(parallelism >= 1 and parallelism <= 4 and parallelism <= texts.len);
+    try context.check();
+    const Task = struct {
+        provider: embedder_mod.DenseEmbedder,
+        alloc: Allocator,
+        name: []const u8,
+        texts: []const []const u8,
+        dims: u32,
+        context: inference_request_context.RequestContext,
+        fn run(self: *@This()) anyerror![]const []const f32 {
+            return self.provider.embedDenseBatchWithContext(self.alloc, self.name, self.texts, self.dims, self.context);
+        }
+    };
+    const vectors = try alloc.alloc([]const f32, texts.len);
+    var ready: [4]bool = @splat(false);
+    errdefer {
+        for (0..parallelism) |index| {
+            if (ready[index]) {
+                for (vectors[texts.len * index / parallelism .. texts.len * (index + 1) / parallelism]) |vector| alloc.free(vector);
+            }
+        }
+        alloc.free(vectors);
+    }
+    var tasks: [4]Task = undefined;
+    var futures: [4]?std.Io.Future(anyerror![]const []const f32) = @splat(null);
+    var inline_results: [4]anyerror![]const []const f32 = undefined;
+    for (0..parallelism) |index| {
+        tasks[index] = .{ .provider = provider, .alloc = alloc, .name = name, .texts = texts[texts.len * index / parallelism .. texts.len * (index + 1) / parallelism], .dims = dims, .context = context };
+        futures[index] = io.concurrent(Task.run, .{&tasks[index]}) catch null;
+        if (futures[index] == null) inline_results[index] = Task.run(&tasks[index]);
+    }
+    // Drain every submitted call before retry, cancellation, or publication.
+    // Replay cursors advance only after the complete logical batch commits.
+    var failure: ?anyerror = null;
+    for (0..parallelism) |index| {
+        const result = if (futures[index]) |*future| future.await(io) else inline_results[index];
+        const batch = result catch |err| {
+            noteDenseBatchFailure(&failure, err);
+            continue;
+        };
+        defer alloc.free(batch);
+        if (batch.len != tasks[index].texts.len) {
+            for (batch) |vector| alloc.free(vector);
+            noteDenseBatchFailure(&failure, error.InvalidEmbeddingResponse);
+            continue;
+        }
+        @memcpy(vectors[texts.len * index / parallelism ..][0..batch.len], batch);
+        ready[index] = true;
+    }
+    if (failure) |err| {
+        if (!allow_capacity_fallback or !denseBatchCapacityFailure(err)) return err;
+        // All submitted calls have drained. Retain successful slices and use
+        // one execution slot for the failed slices, without re-embedding work
+        // already completed by a sibling or widening the original deadline.
+        for (0..parallelism) |index| {
+            if (ready[index]) continue;
+            try context.check();
+            const batch = try Task.run(&tasks[index]);
+            defer alloc.free(batch);
+            if (batch.len != tasks[index].texts.len) {
+                for (batch) |vector| alloc.free(vector);
+                return error.InvalidEmbeddingResponse;
+            }
+            @memcpy(vectors[texts.len * index / parallelism ..][0..batch.len], batch);
+            ready[index] = true;
+        }
+    }
+    try context.check();
+    return vectors;
+}
+
+test "parallel dense inference preserves order drains failures and bounds provider concurrency" {
+    const Harness = struct {
+        active: std.atomic.Value(usize) = .init(0),
+        peak: std.atomic.Value(usize) = .init(0),
+        completed: std.atomic.Value(usize) = .init(0),
+        successful_items: std.atomic.Value(usize) = .init(0),
+        fail: bool = false,
+        busy_when_parallel: bool = false,
+        mixed_failure: ?anyerror = null,
+        fn unused(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
+            return error.UnexpectedSerialCallback;
+        }
+        fn batch(ptr: *anyopaque, alloc: Allocator, _: []const u8, texts: []const []const u8, _: u32, context: inference_request_context.RequestContext) ![]const []const f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const active = self.active.fetchAdd(1, .acq_rel) + 1;
+            _ = self.peak.fetchMax(active, .acq_rel);
+            defer {
+                _ = self.active.fetchSub(1, .acq_rel);
+                _ = self.completed.fetchAdd(1, .acq_rel);
+            }
+            try context.io.sleep(.fromMilliseconds(10), .awake);
+            if (self.mixed_failure) |err| return if (std.mem.eql(u8, texts[0], "0")) error.EmbedTransientFailure else err;
+            if (self.busy_when_parallel and active > 1) return error.ResourceTemporarilyUnavailable;
+            if (self.fail and std.mem.eql(u8, texts[0], "4")) return error.EmbedRateLimited;
+            const out = try alloc.alloc([]const f32, texts.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (out[0..initialized]) |vector| alloc.free(vector);
+                alloc.free(out);
+            }
+            for (texts, out) |text, *vector| {
+                vector.* = try alloc.alloc(f32, 1);
+                initialized += 1;
+                @constCast(vector.*)[0] = @floatFromInt(try std.fmt.parseUnsigned(u32, text, 10));
+            }
+            _ = self.successful_items.fetchAdd(texts.len, .acq_rel);
+            return out;
+        }
+    };
+    var harness = Harness{};
+    const provider: embedder_mod.DenseEmbedder = .{ .ptr = &harness, .dense_embed_fn = Harness.unused, .dense_embed_batch_with_context_fn = Harness.batch, .dense_batch_concurrency = 2 };
+    const texts = [_][]const u8{ "0", "1", "2", "3", "4", "5", "6", "7" };
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    const context: inference_request_context.RequestContext = .{ .io = io, .deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s };
+    const vectors = try parallelDenseBatch(alloc, io, provider, "model", &texts, 1, context, 2, false);
+    defer embedder_mod.freeDenseEmbeddingBatch(alloc, vectors);
+    for (vectors, 0..) |vector, index| try std.testing.expectEqual(@as(f32, @floatFromInt(index)), vector[0]);
+    try std.testing.expectEqual(@as(usize, 2), harness.peak.load(.acquire));
+    harness.fail = true;
+    try std.testing.expectError(error.EmbedRateLimited, parallelDenseBatch(alloc, io, provider, "model", &texts, 1, context, 2, false));
+    try std.testing.expectEqual(@as(usize, 0), harness.active.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 4), harness.completed.load(.acquire));
+    harness.fail = false;
+    harness.busy_when_parallel = true;
+    const fallback = try parallelDenseBatchWithCapacityFallback(alloc, io, provider, "model", &texts, 1, context, 2);
+    defer embedder_mod.freeDenseEmbeddingBatch(alloc, fallback);
+    for (fallback, 0..) |vector, index| try std.testing.expectEqual(@as(f32, @floatFromInt(index)), vector[0]);
+    try std.testing.expectEqual(@as(usize, 0), harness.active.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 7), harness.completed.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 20), harness.successful_items.load(.acquire));
+    harness.busy_when_parallel = false;
+    harness.peak.store(0, .release);
+    var serial_provider = provider;
+    serial_provider.dense_batch_concurrency = 1;
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .io = io },
+        .ownership = undefined,
+    };
+    const serial = try embedDenseBatchAttempt(serial_provider, &runtime, "model", &texts, 1);
+    defer embedder_mod.freeDenseEmbeddingBatch(alloc, serial);
+    try std.testing.expectEqual(@as(usize, 1), harness.peak.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 8), harness.completed.load(.acquire));
+    for ([_]anyerror{ error.EmbedRateLimited, error.EmbedRequestFailed, error.UnexpectedProviderFailure, error.Cancelled }, 0..) |err, index| {
+        harness.mixed_failure = err;
+        try std.testing.expectError(err, parallelDenseBatchWithCapacityFallback(alloc, io, provider, "model", &texts, 1, context, 2));
+        try std.testing.expectEqual(@as(usize, 0), harness.active.load(.acquire));
+        try std.testing.expectEqual(8 + 2 * (index + 1), harness.completed.load(.acquire));
     }
 }
 
@@ -8943,7 +9256,7 @@ const SharedPdfWindowScheduler = struct {
             defer alloc.free(unit_id);
             const key = try pdfPageEmbeddingStageKeyAlloc(alloc, request.doc_key, requestArtifactName(request), embedding_name, stage_id, unit_id);
             errdefer alloc.free(key);
-            const hash = pdfPageEmbeddingSourceHash(source_sha, result.page_number, request.producer_json, consumer.config, pixel_cap, page_bytes, consumer.transform.raster, request.expected_dims, consumer.capabilities.image_transform);
+            const hash = pdfPageEmbeddingSourceHash(source_sha, result.page_number, request.producer_json, consumer.config, pixel_cap, page_bytes, consumer.transform.raster, request.expected_dims, consumer.capabilities.image_transform, request.reprocess_generation);
             const value = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, hash, result.vector orelse return error.MissingPdfPageEmbedding);
             errdefer alloc.free(value);
             try writes.append(alloc, .{ .key = key, .value = value });
@@ -8971,7 +9284,7 @@ const SharedPdfWindowScheduler = struct {
         const embedding_name = requestEmbeddingName(request);
         const pixel_cap = consumer.capabilities.renderPixelLimit(consumer.transform.raster);
         const page_bytes = if (consumer.transform.raster) 1 else consumer.transform.output_bytes;
-        const generation_hash = pdfPageEmbeddingSourceHash(source_sha, 0, request.producer_json, consumer.config, pixel_cap, page_bytes, consumer.transform.raster, request.expected_dims, consumer.capabilities.image_transform);
+        const generation_hash = pdfPageEmbeddingSourceHash(source_sha, 0, request.producer_json, consumer.config, pixel_cap, page_bytes, consumer.transform.raster, request.expected_dims, consumer.capabilities.image_transform, request.reprocess_generation);
         const stage_id = try std.fmt.allocPrint(runtime.alloc, "epoch-{d}:sequence-{d}:source-{x}", .{
             if (currentGeneratedWriteFence(runtime)) |fence| fence.epoch else 0, request.sequence, generation_hash,
         });
@@ -8991,7 +9304,7 @@ const SharedPdfWindowScheduler = struct {
                 const page = switch (window) {
                     inline else => |batch| batch.results[i].page_number,
                 };
-                const hash = pdfPageEmbeddingSourceHash(source_sha, page, request.producer_json, consumer.config, pixel_cap, page_bytes, consumer.transform.raster, request.expected_dims, consumer.capabilities.image_transform);
+                const hash = pdfPageEmbeddingSourceHash(source_sha, page, request.producer_json, consumer.config, pixel_cap, page_bytes, consumer.transform.raster, request.expected_dims, consumer.capabilities.image_transform, request.reprocess_generation);
                 const unit_id = try std.fmt.allocPrint(runtime.alloc, "page:{d:0>6}", .{page});
                 defer runtime.alloc.free(unit_id);
                 const page_key = try internal_keys.documentUnitArtifactKeyAlloc(runtime.alloc, request.doc_key, requestArtifactName(request), unit_id);
@@ -9013,7 +9326,7 @@ const SharedPdfWindowScheduler = struct {
         const embedding_name = requestEmbeddingName(request);
         const pixel_cap = consumer.capabilities.renderPixelLimit(consumer.transform.raster);
         const page_bytes = if (consumer.transform.raster) 1 else consumer.transform.output_bytes;
-        const generation_hash = pdfPageEmbeddingSourceHash(source_sha, 0, request.producer_json, consumer.config, pixel_cap, page_bytes, consumer.transform.raster, request.expected_dims, consumer.capabilities.image_transform);
+        const generation_hash = pdfPageEmbeddingSourceHash(source_sha, 0, request.producer_json, consumer.config, pixel_cap, page_bytes, consumer.transform.raster, request.expected_dims, consumer.capabilities.image_transform, request.reprocess_generation);
         const stage_id = try std.fmt.allocPrint(runtime.alloc, "epoch-{d}:sequence-{d}:source-{x}", .{
             if (currentGeneratedWriteFence(runtime)) |fence| fence.epoch else 0, request.sequence, generation_hash,
         });
@@ -9344,9 +9657,9 @@ test "shared PDF transform identity includes decoder and spatial limits" {
     try std.testing.expect(!std.meta.eql(baseline, SharedPdfTransform.init(config, 1_000_000, null, null, 100, false)));
     const digest = @as([32]u8, @splat(0));
     var spatial = inference_work.ImageTransform{ .target_width = 224, .target_height = 224, .resize_mode = .stretch, .resample = .bilinear };
-    const hash = pdfPageEmbeddingSourceHash(&digest, 1, "model", config, 1_000_000, 100, false, 2, spatial);
+    const hash = pdfPageEmbeddingSourceHash(&digest, 1, "model", config, 1_000_000, 100, false, 2, spatial, 0);
     spatial.target_width = 256;
-    try std.testing.expect(hash != pdfPageEmbeddingSourceHash(&digest, 1, "model", config, 1_000_000, 100, false, 2, spatial));
+    try std.testing.expect(hash != pdfPageEmbeddingSourceHash(&digest, 1, "model", config, 1_000_000, 100, false, 2, spatial, 0));
     const private_root = try internal_keys.sharedPdfConsumerRootPrefixAlloc(std.testing.allocator, "document");
     defer std.testing.allocator.free(private_root);
     const unit_root = try internal_keys.documentExtractionUnitSpoolRootPrefixAlloc(std.testing.allocator, "document", "artifact", "attempt");
@@ -11720,7 +12033,13 @@ fn processPendingDocumentGroup(
 ) !void {
     try guard.check();
     try servicePendingArtifactUnitJobs(runtime, pending.doc_key, guard);
-    const planned = try getOrCreatePlannedRequests(runtime, pending.doc_key, request_plan_cache);
+    const templates = try getOrCreatePlannedRequests(runtime, pending.doc_key, request_plan_cache);
+    const planned = try runtime.alloc.dupe(enrichment_types.GeneratedEnrichmentRequest, templates);
+    defer runtime.alloc.free(planned);
+    for (planned) |*request| {
+        if (request.kind != .dense_embedding and request.kind != .sparse_embedding) continue;
+        request.reprocess_generation = try embeddingReprocessGeneration(runtime, request.doc_key, requestEmbeddingName(request.*), request.producer_json);
+    }
     var prepared_sources = PreparedDocumentSourceCache.init(runtime);
     defer prepared_sources.deinit();
     var shared_windows = SharedPdfWindowScheduler.init(runtime, planned, pending.sequence);
@@ -13100,6 +13419,15 @@ fn runtimeDocumentExtractionReprocessPending(
     defer if (requested) |raw| runtime.alloc.free(raw);
     if (requested) |raw| return intent.pending(raw, producer_json, generation);
     return false;
+}
+
+pub fn embeddingReprocessGeneration(runtime: *EnrichmentRuntime, doc_key: []const u8, embedding_name: []const u8, producer_json: []const u8) !u64 {
+    const intent = @import("../artifact_reprocess_intent.zig");
+    const key = try intent.embeddingKeyAlloc(runtime.alloc, doc_key, embedding_name);
+    defer runtime.alloc.free(key);
+    const raw = try storeGetOptionalAllocWithRetry(runtime, key);
+    defer if (raw) |bytes| runtime.alloc.free(bytes);
+    return if (raw) |bytes| try intent.generationForConfig(bytes, producer_json) else 0;
 }
 
 fn skipRuntimeDocumentExtractionByFingerprint(
@@ -23140,7 +23468,7 @@ fn flushChunkedDenseItems(
     yieldToInteractiveEmbeds(runtime);
     noteEmbedBatchStartedFor(runtime, scope.fingerprint, consumer_indexes, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes);
     const embed_started_ns = runtime.clock.nowRealtimeNs();
-    const vectors = embedDenseBatchWithRetry(dense_embedder, runtime, embedding_artifact_name, batch_texts, expected_dims) catch |err| {
+    const vectors = embedDenseBatchWithRetry(dense_embedder, runtime, embedding_artifact_name, batch_texts, expected_dims, batch_items) catch |err| {
         noteEmbedBatchFinished(runtime, consumer_indexes, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
         if (scope.shouldYield(runtime, err)) return err;
         try recordUniqueChunkedDenseRequestErrors(runtime, window, batch_items, err, requestAttemptNumberFor(runtime, scope.fingerprint));
@@ -23302,6 +23630,7 @@ fn driveOrderedChunkVectorCensus(runtime: *EnrichmentRuntime, alloc: Allocator, 
         var read = try runtime.store.beginRead();
         defer read.abort();
         if (try ordered_publication.authority(&read) == null) return false;
+        try @import("../artifact_reprocess_intent.zig").requireEmbeddingGeneration(alloc, &read, request.doc_key, requestEmbeddingName(request), request.producer_json, request.reprocess_generation);
         if (runtime.config.root_incarnation == 0) return error.DurableRootIncarnationUnavailable;
         const fence = try requiredRuntimeStoreWriteFence(runtime);
         try validateRuntimeStoreWriteFenceTxn(runtime, &read, fence);
@@ -23361,6 +23690,7 @@ fn processOrderedChunkVectorWithAllocator(runtime: *EnrichmentRuntime, alloc: Al
                 if (after != null) return error.ArtifactCatalogDrift;
                 return false;
             }
+            try @import("../artifact_reprocess_intent.zig").requireEmbeddingGeneration(alloc, &read, request.doc_key, requestEmbeddingName(request), request.producer_json, request.reprocess_generation);
             const fence = try requiredRuntimeStoreWriteFence(runtime);
             try validateRuntimeStoreWriteFenceTxn(runtime, &read, fence);
             var plan = try runtime.index_manager.acquireWritePlanSnapshot();
@@ -23520,7 +23850,7 @@ fn processOrderedChunkVectorWithAllocator(runtime: *EnrichmentRuntime, alloc: Al
             var succeeded = false;
             defer noteEmbedBatchFinished(runtime, consumers, texts.items.len, stats.total_bytes, stats.max_bytes, elapsedNsSince(runtime, started), succeeded);
             if (dense) |provider| {
-                dense_vectors = try embedDenseBatchWithRetry(provider, runtime, requestEmbeddingName(request), texts.items, request.expected_dims);
+                dense_vectors = try embedDenseBatchWithRetry(provider, runtime, requestEmbeddingName(request), texts.items, request.expected_dims, request.reprocess_generation == 0);
                 if (dense_vectors.?.len != texts.items.len) return error.InvalidEmbeddingResponse;
             } else if (sparse) |provider| {
                 sparse_vectors = try embedSparseBatchWithRetry(provider, runtime, requestEmbeddingName(request), texts.items);
@@ -23532,7 +23862,7 @@ fn processOrderedChunkVectorWithAllocator(runtime: *EnrichmentRuntime, alloc: Al
         var vector_index: usize = 0;
         for (items.items) |*item| {
             const value = if (item.text) |text| blk: {
-                const hash = enrichment_artifact_codec.hashEmbeddingSource(text, request.producer_json);
+                const hash = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(text, request.producer_json, request.reprocess_generation);
                 const encoded = if (dense_vectors) |values|
                     try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, hash, values[vector_index])
                 else
@@ -23659,7 +23989,7 @@ fn processMaterializedChunkDenseRequest(
                 const text = (try chunkPayloadTextAlloc(ctx.runtime.alloc, value, ctx.request.source_field)) orelse return .@"continue";
                 var text_owned = true;
                 errdefer if (text_owned) ctx.runtime.alloc.free(text);
-                const source_hash = enrichment_artifact_codec.hashEmbeddingSource(text, ctx.request.producer_json);
+                const source_hash = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(text, ctx.request.producer_json, ctx.request.reprocess_generation);
                 const embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(ctx.runtime.alloc, key, ctx.embedding_artifact_name);
                 var embedding_key_owned = true;
                 errdefer if (embedding_key_owned) ctx.runtime.alloc.free(embedding_key);
@@ -23892,7 +24222,7 @@ fn processMaterializedChunkSparseRequest(
                 const text = (try chunkPayloadTextAlloc(ctx.runtime.alloc, value, ctx.request.source_field)) orelse return .@"continue";
                 var text_owned = true;
                 errdefer if (text_owned) ctx.runtime.alloc.free(text);
-                const source_hash = enrichment_artifact_codec.hashEmbeddingSource(text, ctx.request.producer_json);
+                const source_hash = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(text, ctx.request.producer_json, ctx.request.reprocess_generation);
                 const embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(ctx.runtime.alloc, key, ctx.embedding_artifact_name);
                 var embedding_key_owned = true;
                 errdefer if (embedding_key_owned) ctx.runtime.alloc.free(embedding_key);
@@ -23999,7 +24329,7 @@ fn collectPlainDenseBatchItem(
         return null;
     };
     errdefer runtime.alloc.free(@constCast(source_text));
-    const source_hash = enrichment_artifact_codec.hashEmbeddingSource(source_text, request.producer_json);
+    const source_hash = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source_text, request.producer_json, request.reprocess_generation);
 
     const artifact_key = try embeddingArtifactKey(runtime, request.doc_key, embedding_artifact_name);
     errdefer runtime.alloc.free(artifact_key);
@@ -24048,7 +24378,7 @@ fn flushPlainDenseItems(
     yieldToInteractiveEmbeds(runtime);
     noteEmbedBatchStartedFor(runtime, scope.fingerprint, consumer_indexes, items.len, total_source_bytes, max_source_bytes);
     const embed_started_ns = runtime.clock.nowRealtimeNs();
-    const vectors = embedDenseBatchWithRetry(dense_embedder, runtime, embedding_artifact_name, texts, expected_dims) catch |err| {
+    const vectors = embedDenseBatchWithRetry(dense_embedder, runtime, embedding_artifact_name, texts, expected_dims, items) catch |err| {
         noteEmbedBatchFinished(runtime, consumer_indexes, items.len, total_source_bytes, max_source_bytes, elapsedNsSince(runtime, embed_started_ns), false);
         return err;
     };
@@ -24502,7 +24832,7 @@ fn processChunkedDenseWindow(
             var request_batch_items_pending = false;
             source_loop: for (source_set.sources) |*source| {
                 if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
-                const source_hash = enrichment_artifact_codec.hashEmbeddingSource(source.text, request.producer_json);
+                const source_hash = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source.text, request.producer_json, request.reprocess_generation);
                 const embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(runtime.alloc, source.key, embedding_artifact_name);
                 defer runtime.alloc.free(embedding_key);
                 if (try shouldSkipEmbeddingArtifact(runtime, embedding_key, source_hash)) {
@@ -24856,6 +25186,7 @@ fn pdfPageEmbeddingSourceHash(
     use_borrowed_rasters: bool,
     expected_dims: u32,
     image_transform: ?inference_work.ImageTransform,
+    reprocess_generation: u64,
 ) u64 {
     var hasher = std.hash.XxHash64.init(0);
     hasher.update(pdf_page_embedding_identity_version);
@@ -24886,7 +25217,7 @@ fn pdfPageEmbeddingSourceHash(
     }
     updatePdfPageEmbeddingHashInt(&hasher, u64, @intCast(semantic_producer.len));
     hasher.update(semantic_producer);
-    return hasher.final();
+    return enrichment_artifact_codec.hashEmbeddingIdentityForGeneration(hasher.final(), reprocess_generation);
 }
 
 fn appendOwnedDenseEmbeddingsToWindow(
@@ -25755,6 +26086,7 @@ fn processPdfPageImageEmbeddingWithAllocator(
         use_borrowed_rasters,
         request.expected_dims,
         capabilities.image_transform,
+        request.reprocess_generation,
     );
     // Retries by the same fenced generation reuse page stages. A new lease
     // epoch gets a distinct namespace so a superseded writer can never race a
@@ -25800,6 +26132,7 @@ fn processPdfPageImageEmbeddingWithAllocator(
                 use_borrowed_rasters,
                 request.expected_dims,
                 capabilities.image_transform,
+                request.reprocess_generation,
             );
             page_source_hashes[page_number - 1] = source_hash;
             const unit_id = try std.fmt.allocPrint(metadata_alloc, "page:{d:0>6}", .{page_number});
@@ -26523,7 +26856,8 @@ test "PDF page embedding identity covers source page transform and transport" {
     const digest_a = @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0x11));
     const digest_b = @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0x22));
     const config = document_extraction_mod.Config{};
-    const baseline = pdfPageEmbeddingSourceHash(&digest_a, 1, "model-a", config, 10_000_000, 4 * 1024 * 1024, true, 768, null);
+    const baseline = pdfPageEmbeddingSourceHash(&digest_a, 1, "model-a", config, 10_000_000, 4 * 1024 * 1024, true, 768, null, 0);
+    try std.testing.expect(baseline != pdfPageEmbeddingSourceHash(&digest_a, 1, "model-a", config, 10_000_000, 4 * 1024 * 1024, true, 768, null, 1));
     for (0..4) |limit| {
         var changed = config;
         switch (limit) {
@@ -26533,13 +26867,13 @@ test "PDF page embedding identity covers source page transform and transport" {
             3 => changed.pdf_decode_limits.max_working_set_bytes /= 2,
             else => unreachable,
         }
-        try std.testing.expect(baseline != pdfPageEmbeddingSourceHash(&digest_a, 1, "model-a", changed, 10_000_000, 4 * 1024 * 1024, true, 768, null));
+        try std.testing.expect(baseline != pdfPageEmbeddingSourceHash(&digest_a, 1, "model-a", changed, 10_000_000, 4 * 1024 * 1024, true, 768, null, 0));
     }
-    try std.testing.expectEqual(baseline, pdfPageEmbeddingSourceHash(&digest_a, 1, "model-a", config, 10_000_000, 4 * 1024 * 1024, true, 768, null));
-    try std.testing.expect(baseline != pdfPageEmbeddingSourceHash(&digest_b, 1, "model-a", config, 10_000_000, 4 * 1024 * 1024, true, 768, null));
-    try std.testing.expect(baseline != pdfPageEmbeddingSourceHash(&digest_a, 2, "model-a", config, 10_000_000, 4 * 1024 * 1024, true, 768, null));
-    try std.testing.expect(baseline != pdfPageEmbeddingSourceHash(&digest_a, 1, "model-b", config, 10_000_000, 4 * 1024 * 1024, true, 768, null));
-    try std.testing.expect(baseline != pdfPageEmbeddingSourceHash(&digest_a, 1, "model-a", config, 10_000_000, 4 * 1024 * 1024, false, 768, null));
+    try std.testing.expectEqual(baseline, pdfPageEmbeddingSourceHash(&digest_a, 1, "model-a", config, 10_000_000, 4 * 1024 * 1024, true, 768, null, 0));
+    try std.testing.expect(baseline != pdfPageEmbeddingSourceHash(&digest_b, 1, "model-a", config, 10_000_000, 4 * 1024 * 1024, true, 768, null, 0));
+    try std.testing.expect(baseline != pdfPageEmbeddingSourceHash(&digest_a, 2, "model-a", config, 10_000_000, 4 * 1024 * 1024, true, 768, null, 0));
+    try std.testing.expect(baseline != pdfPageEmbeddingSourceHash(&digest_a, 1, "model-b", config, 10_000_000, 4 * 1024 * 1024, true, 768, null, 0));
+    try std.testing.expect(baseline != pdfPageEmbeddingSourceHash(&digest_a, 1, "model-a", config, 10_000_000, 4 * 1024 * 1024, false, 768, null, 0));
 }
 
 test "durable enrichment PDF page embedding queues complete staged generations without publishing" {
@@ -26840,7 +27174,7 @@ fn processDenseEmbedding(
         return;
     };
     defer runtime.alloc.free(source_text);
-    const source_hash = enrichment_artifact_codec.hashEmbeddingSource(source_text, request.producer_json);
+    const source_hash = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source_text, request.producer_json, request.reprocess_generation);
 
     const artifact_key = try embeddingArtifactKey(runtime, request.doc_key, embedding_artifact_name);
     defer runtime.alloc.free(artifact_key);
@@ -26851,7 +27185,7 @@ fn processDenseEmbedding(
         return;
     }
 
-    const vector = try embedDenseWithRetry(dense_embedder, runtime, embedding_artifact_name, source_text, request.expected_dims);
+    const vector = try embedDenseWithRetry(dense_embedder, runtime, embedding_artifact_name, source_text, request.expected_dims, request.reprocess_generation == 0);
     defer runtime.alloc.free(vector);
 
     if (!try writeEmbeddingArtifact(runtime, .{
@@ -26949,7 +27283,7 @@ fn processSparseEmbedding(
         return;
     };
     defer runtime.alloc.free(source_text);
-    const source_hash = enrichment_artifact_codec.hashEmbeddingSource(source_text, request.producer_json);
+    const source_hash = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source_text, request.producer_json, request.reprocess_generation);
 
     const artifact_key = try embeddingArtifactKey(runtime, request.doc_key, embedding_artifact_name);
     defer runtime.alloc.free(artifact_key);
@@ -27013,7 +27347,7 @@ fn buildChunkDenseEmbeddingsFromSources(
         const chunk_key = try runtime.alloc.dupe(u8, source.key);
         var chunk_key_owned = true;
         errdefer if (chunk_key_owned) runtime.alloc.free(chunk_key);
-        const source_hash = enrichment_artifact_codec.hashEmbeddingSource(source.text, request.producer_json);
+        const source_hash = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source.text, request.producer_json, request.reprocess_generation);
         const embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(runtime.alloc, source.key, requestEmbeddingName(request));
         defer runtime.alloc.free(embedding_key);
         if (try shouldSkipEmbeddingArtifact(runtime, embedding_key, source_hash)) {
@@ -27049,7 +27383,7 @@ fn buildChunkDenseEmbeddingsFromSources(
         const batch_stats = textBatchByteStats(batch_texts);
         noteEmbedBatchStarted(runtime, consumer_indexes, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes);
         const embed_started_ns = runtime.clock.nowRealtimeNs();
-        const vectors = embedDenseBatchWithRetry(dense_embedder, runtime, requestEmbeddingName(request), batch_texts, request.expected_dims) catch |err| {
+        const vectors = embedDenseBatchWithRetry(dense_embedder, runtime, requestEmbeddingName(request), batch_texts, request.expected_dims, request.reprocess_generation == 0) catch |err| {
             noteEmbedBatchFinished(runtime, consumer_indexes, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
             return err;
         };
@@ -27141,7 +27475,7 @@ fn buildChunkSparseEmbeddingsFromSources(
         const chunk_key = try runtime.alloc.dupe(u8, source.key);
         var chunk_key_owned = true;
         errdefer if (chunk_key_owned) runtime.alloc.free(chunk_key);
-        const source_hash = enrichment_artifact_codec.hashEmbeddingSource(source.text, request.producer_json);
+        const source_hash = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source.text, request.producer_json, request.reprocess_generation);
         const embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(runtime.alloc, source.key, requestEmbeddingName(request));
         defer runtime.alloc.free(embedding_key);
         if (try shouldSkipEmbeddingArtifact(runtime, embedding_key, source_hash)) {

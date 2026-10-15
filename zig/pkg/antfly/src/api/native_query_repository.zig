@@ -371,7 +371,9 @@ pub const Repository = struct {
         const expected_domain = try self.domain(a, namespace);
         return marked.version == 1 and marked.namespace.eql(namespace) and marked.request.table_id == request.table_id and marked.request.expires_ms == request.expires_ms and std.mem.eql(u8, marked.request.id, request.id) and std.mem.eql(u8, &marked.domain, &expected_domain);
     }
-    fn canEvict(raw: *anyopaque, io: std.Io, root: []const u8, request: cut.Request, namespace: Namespace, sequence: u64, cancellation: Cancellation) !bool {
+    fn canEvict(raw: *anyopaque, executor: port.Executor, root: []const u8, request: cut.Request, namespace: Namespace, sequence: u64, cancellation: Cancellation) !bool {
+        var receiver = try executor.receive();
+        const io = receiver.io();
         const self = from(raw);
         try cancellation.check();
         var arena = std.heap.ArenaAllocator.init(self.a);
@@ -396,19 +398,27 @@ pub const Repository = struct {
         const bytes = try std.json.Stringify.valueAlloc(a, LocalCommit{ .domain = try self.domain(a, namespace), .request = request, .namespace = namespace }, .{});
         _ = try local.storage_db_native_backup.writeFileDurable(io, path, bytes);
     }
-    fn publish(raw: *anyopaque, io: std.Io, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation) !void {
+    fn publish(raw: *anyopaque, executor: port.Executor, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation) !void {
+        var receiver = try executor.receive();
+        const io = receiver.io();
         _ = try publishLimited(raw, io, root, request, namespace, cancellation, std.math.maxInt(u64));
     }
-    fn warm(raw: *anyopaque, io: std.Io, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation, max_bytes: u64) !bool {
+    fn warm(raw: *anyopaque, executor: port.Executor, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation, max_bytes: u64) !bool {
+        var receiver = try executor.receive();
+        const io = receiver.io();
         if (max_bytes < chunk_bytes or max_bytes > 32 * 1024 * 1024) return error.InvalidQueryRequest;
         return publishLimited(raw, io, root, request, namespace, cancellation, max_bytes);
     }
-    fn publishWithProof(raw: *anyopaque, io: std.Io, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation) !?port.ReuseProof {
+    fn publishWithProof(raw: *anyopaque, executor: port.Executor, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation) !?port.ReuseProof {
+        var receiver = try executor.receive();
+        const io = receiver.io();
         var proof: ?port.ReuseProof = null;
         _ = try publishLimitedImpl(raw, io, root, request, namespace, cancellation, std.math.maxInt(u64), &proof);
         return proof;
     }
-    fn warmWithProof(raw: *anyopaque, io: std.Io, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation, max_bytes: u64) !port.WarmResult {
+    fn warmWithProof(raw: *anyopaque, executor: port.Executor, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation, max_bytes: u64) !port.WarmResult {
+        var receiver = try executor.receive();
+        const io = receiver.io();
         if (max_bytes < chunk_bytes or max_bytes > 32 * 1024 * 1024) return error.InvalidQueryRequest;
         var proof: ?port.ReuseProof = null;
         const complete = try publishLimitedImpl(raw, io, root, request, namespace, cancellation, max_bytes, &proof);
@@ -553,7 +563,9 @@ pub const Repository = struct {
     /// A complete remote-native checkpoint already owns its immutable extents.
     /// Publish only a new authenticated manifest; never read/download/re-upload
     /// those extents or derive a checkpoint from a partial storage view.
-    fn reference(raw: *anyopaque, io: std.Io, request: cut.Request, namespace: Namespace, source: port.Storage, cancellation: Cancellation) !bool {
+    fn reference(raw: *anyopaque, executor: port.Executor, request: cut.Request, namespace: Namespace, source: port.Storage, cancellation: Cancellation) !bool {
+        var receiver = try executor.receive();
+        const io = receiver.io();
         _ = io;
         const self = from(raw);
         try request.validate(cut.nowMs());
@@ -600,8 +612,7 @@ pub const Repository = struct {
     }
     /// Rebind a proved unchanged physical generation to a new logical cursor.
     /// Extent horizons must cover the new cursor; never extend them by assertion.
-    fn reuse(raw: *anyopaque, io: std.Io, previous: cut.Request, request: cut.Request, namespace: Namespace, proof: port.ReuseProof, cancellation: Cancellation) !?port.ReuseProof {
-        _ = io;
+    fn reuse(raw: *anyopaque, _: port.Executor, previous: cut.Request, request: cut.Request, namespace: Namespace, proof: port.ReuseProof, cancellation: Cancellation) !?port.ReuseProof {
         const self = from(raw);
         try cancellation.check();
         try request.validate(cut.nowMs());
@@ -652,7 +663,7 @@ pub const Repository = struct {
         };
         return expected_domain;
     }
-    fn openRead(raw: *anyopaque, io: std.Io, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation) !port.StorageLease {
+    fn openRead(raw: *anyopaque, executor: port.Executor, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation) !port.StorageLease {
         const self: *Repository = @ptrCast(@alignCast(raw));
         var arena = std.heap.ArenaAllocator.init(self.a);
         defer arena.deinit();
@@ -668,11 +679,14 @@ pub const Repository = struct {
         const expected_domain = try self.validateManifestAuthority(a, manifest, request, namespace);
         const expiry = @import("antfly_platform").time.monotonicNs() +| (request.expires_ms -| cut.nowMs()) * std.time.ns_per_ms;
         const control: cut.Control = .{ .parent = cancellation, .deadline_ns = if (request.timeout_ms) |value| @min(expiry, @import("antfly_platform").time.monotonicNs() +| value *| std.time.ns_per_ms) else expiry };
-        const reader = try port.remote_storage.Reader.create(self.a, io, root, manifest.files, .{ .ptr = self, .read = readChunk }, control);
+        const reader = try port.remote_storage.Reader.createWithExecutor(self.a, executor, root, manifest.files, .{ .ptr = self, .read = readChunk }, control);
+        errdefer reader.release();
         reader.checkpoint_reference = try std.json.Stringify.valueAlloc(reader.arena.allocator(), port.CheckpointReference{ .authority = expected_domain, .namespace = namespace, .sequence = manifest.sequence, .files = reader.files }, .{});
         return reader.lease();
     }
-    fn recover(raw: *anyopaque, io: std.Io, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation) !void {
+    fn recover(raw: *anyopaque, executor: port.Executor, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation) !void {
+        var receiver = try executor.receive();
+        const io = receiver.io();
         const self = from(raw);
         var arena = std.heap.ArenaAllocator.init(self.a);
         defer arena.deinit();

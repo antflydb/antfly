@@ -697,6 +697,28 @@ test "merge policy skips idle index within tier budget" {
     try std.testing.expect(planned == null);
 }
 
+test "merge policy ignores tiny deletion debt and skewed rewrite windows" {
+    const alloc = std.testing.allocator;
+    const policy = MergePolicy{ .max_segments_per_tier = 10, .floor_segment_size = 16 * 1024 * 1024 };
+    const stale = [_]SegmentInfo{
+        .{ .index = 0, .size = 100_000, .doc_count = 10_000, .deleted_count = 1, .has_deletions = true },
+        .{ .index = 1, .size = 100_000, .doc_count = 10_000, .deleted_count = 0, .has_deletions = false },
+    };
+    try std.testing.expect((try policy.plan(alloc, &stale)) == null);
+    const skewed = [_]SegmentInfo{
+        .{ .index = 0, .size = 1024, .doc_count = 10, .deleted_count = 0, .has_deletions = false },
+        .{ .index = 1, .size = 8 * 1024 * 1024, .doc_count = 10_000, .deleted_count = 0, .has_deletions = false },
+    };
+    var pressured = policy;
+    pressured.max_segments_per_tier = 1;
+    try std.testing.expect((try pressured.plan(alloc, &skewed)) == null);
+    var reclaimable = stale;
+    reclaimable[0].deleted_count = 5000;
+    const plan = (try policy.plan(alloc, &reclaimable)).?;
+    defer alloc.free(plan);
+    try std.testing.expectEqual(@as(usize, 2), plan.len);
+}
+
 test "merge policy reclaims deleted docs within tier budget" {
     const alloc = std.testing.allocator;
     const policy = MergePolicy{

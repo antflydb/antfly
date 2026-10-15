@@ -1538,6 +1538,30 @@ pub fn defaultLimitsForBackend(backend: BackendClass) Limits {
     return defaultLimitsForBackendWithProcessLimit(backend, 0);
 }
 
+/// Automatic workload scratch caps must accommodate the admitted model's
+/// execution envelope. Physical host/backend/combined limits remain unchanged;
+/// an explicit operator scratch cap remains authoritative.
+pub fn withAutomaticScratchFloor(limits: Limits, explicit_scratch_limit: usize, host_scratch: usize, backend_scratch: usize) !Limits {
+    var result = limits;
+    if (explicit_scratch_limit == 0) {
+        const required = std.math.add(usize, host_scratch, backend_scratch) catch return error.MemoryBudgetExceeded;
+        result.scratch_limit_bytes = @max(result.scratch_limit_bytes, required);
+    }
+    return result;
+}
+
+test "model scratch floors preserve explicit caps and physical memory envelopes" {
+    const limits: Limits = .{ .host_limit_bytes = 8192, .backend_limit_bytes = 8192, .combined_limit_bytes = 12288, .scratch_limit_bytes = 1024 };
+    const automatic = try withAutomaticScratchFloor(limits, 0, 512, 4096);
+    try std.testing.expectEqual(@as(usize, 4608), automatic.scratch_limit_bytes);
+    try std.testing.expectEqual(limits.host_limit_bytes, automatic.host_limit_bytes);
+    try std.testing.expectEqual(limits.backend_limit_bytes, automatic.backend_limit_bytes);
+    try std.testing.expectEqual(limits.combined_limit_bytes, automatic.combined_limit_bytes);
+    try std.testing.expectEqual(limits, try withAutomaticScratchFloor(limits, 1024, 512, 4096));
+    var budget = RunBudget.init(try withAutomaticScratchFloor(limits, 0, 16384, 0));
+    try std.testing.expectError(error.MemoryBudgetExceeded, budget.reserveEstimate(.{ .prompt_tokens = 0, .retained_tokens = 0, .kv_bytes = 0, .kv_tier = .host, .scratch_bytes = 16384, .scratch_tier = .host }));
+}
+
 pub fn defaultLimitsForBackendWithProcessLimit(
     backend: BackendClass,
     process_memory_limit_bytes: usize,

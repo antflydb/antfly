@@ -240,6 +240,7 @@ func corpusPrepareCmd(args []string) error {
 	}
 	reader := bufio.NewReader(input)
 	store := newCorpusStore(cfg)
+	store.pageCache = filepath.Join(*state, "page-windows")
 	defer store.Close()
 	started := time.Now()
 	priorSeconds := progress.Seconds
@@ -250,6 +251,7 @@ func corpusPrepareCmd(args []string) error {
 		progress.Seconds = priorSeconds + time.Since(started).Seconds()
 		return atomicCorpusJSON(progressPath, progress)
 	}
+	visited := 0
 	for {
 		if (cfg.LimitFiles > 0 && progress.Files >= cfg.LimitFiles) || (cfg.LimitPages > 0 && progress.Pages >= cfg.LimitPages) {
 			progress.Complete = true
@@ -264,14 +266,30 @@ func corpusPrepareCmd(args []string) error {
 		if e != nil {
 			return e
 		}
+		visited++
 		totalPages := 0
 		if entry.MIME == "application/pdf" {
 			totalPages, e = store.pages(entry.Locator)
-			if e != nil {
-				return fmt.Errorf("count pages %s: %w", entry.ID, e)
+			if e == nil && totalPages < 1 {
+				e = fmt.Errorf("PDF has no pages")
 			}
-			if totalPages < 1 {
-				return fmt.Errorf("PDF %s has no pages", entry.ID)
+			if e != nil {
+				var ioFailure *os.PathError
+				if errors.As(e, &ioFailure) {
+					return fmt.Errorf("count pages %s: %w", entry.ID, e)
+				}
+				// An unreadable source (e.g. a corrupt archive entry) must not
+				// abort a full-corpus preparation; record it and move on.
+				if e = recordSkippedSource(filepath.Join(*state, "skipped.ndjson"), entry.ID, e); e != nil {
+					return e
+				}
+				progress.InputOffset += n
+				if visited%100 == 0 {
+					if err = save(); err != nil {
+						return err
+					}
+				}
+				continue
 			}
 		} else if entry.Locator.Size > corpusMaxBytes {
 			return fmt.Errorf("audio %s exceeds 128 MiB; split it before preparation", entry.ID)
@@ -279,6 +297,36 @@ func corpusPrepareCmd(args []string) error {
 		selectedPages := totalPages
 		if cfg.LimitPages > 0 {
 			selectedPages = min(selectedPages, cfg.LimitPages-progress.Pages)
+		}
+		// Prepare every window before publishing any rows for this source.
+		// A corrupt later page must not leave a half-published source manifest.
+		if selectedPages > 0 {
+			for first := 1; first <= selectedPages; first += cfg.PagesPerRecord {
+				loc := entry.Locator
+				loc.First, loc.Last = first, min(first+cfg.PagesPerRecord-1, selectedPages)
+				if loc.First == 1 && loc.Last == totalPages {
+					continue
+				}
+				if e = store.preparePageWindow(loc); e != nil {
+					break
+				}
+			}
+			if e != nil {
+				var invalid *corpusPDFWindowError
+				if !errors.As(e, &invalid) {
+					return fmt.Errorf("prepare page windows %s: %w", entry.ID, e)
+				}
+				if e = recordSkippedSource(filepath.Join(*state, "skipped.ndjson"), entry.ID, e); e != nil {
+					return e
+				}
+				progress.InputOffset += n
+				if visited%100 == 0 {
+					if err = save(); err != nil {
+						return err
+					}
+				}
+				continue
+			}
 		}
 		emit := func(loc sourceLocator) error {
 			versionBytes, _ := json.Marshal(loc)
@@ -322,7 +370,7 @@ func corpusPrepareCmd(args []string) error {
 		progress.InputOffset += n
 		progress.Files++
 		progress.SourceBytes += entry.Locator.Size
-		if progress.Files%100 == 0 {
+		if visited%100 == 0 {
 			if err = save(); err != nil {
 				return err
 			}
@@ -365,6 +413,12 @@ func corpusIndexes(embeddingModel, extractorModel, inferenceURL, language string
 		map[string]any{"name": corpusUnits, "kind": "asset", "field": "url", "content_type": "application/json", "producer_json": string(producerJSON)},
 		map[string]any{"name": corpusChunks, "kind": "chunk", "field": "text", "source_artifact_name": corpusUnits, "chunk_size": 512, "chunk_overlap": 50, "full_text_index": true},
 	}}}
+	// Corpus names and wildcard/regexp expressions must share lexical tokens.
+	// The default English stemmer turns Maxwell into maxwel; pattern queries
+	// deliberately operate on indexed terms and do not stem their expressions.
+	indexes[corpusTextIndex].(map[string]any)["analysis_config"] = map[string]any{
+		"field_analyzers": map[string]any{"text": "simple", "_all": "simple"},
+	}
 	apiURL, err := inferenceMLBaseURL(inferenceURL)
 	if err != nil {
 		return nil, err
@@ -404,6 +458,7 @@ type corpusHTTPError struct {
 	Method, Path string
 	StatusCode   int
 	Body         []byte
+	RetryAfter   time.Duration
 }
 
 func (e *corpusHTTPError) Error() string {
@@ -443,7 +498,13 @@ func corpusRawRequestWithHeaders(client *http.Client, method, endpoint string, b
 		return nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, &corpusHTTPError{Method: method, Path: req.URL.Path, StatusCode: resp.StatusCode, Body: data}
+		var retryAfter time.Duration
+		if seconds, e := time.ParseDuration(resp.Header.Get("Retry-After") + "s"); e == nil {
+			retryAfter = seconds
+		} else if deadline, e := http.ParseTime(resp.Header.Get("Retry-After")); e == nil {
+			retryAfter = time.Until(deadline)
+		}
+		return nil, &corpusHTTPError{Method: method, Path: req.URL.Path, StatusCode: resp.StatusCode, Body: data, RetryAfter: retryAfter}
 	}
 	if len(data) > 16<<20 {
 		return nil, fmt.Errorf("response from %s exceeds 16 MiB", req.URL.Path)
@@ -464,6 +525,7 @@ func corpusLoadCmd(args []string) error {
 	model := flags.String("embedding-model", DefaultEmbeddingModel, "Embedding model, with 512 dimensions")
 	extractorModel := flags.String("artifact-extractor-model", DefaultAutographModel, "Registered inference model for relation extraction")
 	language := flags.String("language", "en-US", "Apple OCR and transcription locale")
+	numShards := flags.Int("num-shards", 1, "Number of shards when creating the table")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -497,7 +559,7 @@ func corpusLoadCmd(args []string) error {
 	}
 	description := corpusDescription(indexes, sourceConfig.PagesPerRecord)
 	if *create {
-		if _, err = corpusRequest(client, http.MethodPost, tableURL, map[string]any{"num_shards": 1, "indexes": indexes, "schema": corpusTableSchema(), "description": description}); err != nil {
+		if _, err = corpusRequest(client, http.MethodPost, tableURL, map[string]any{"num_shards": *numShards, "indexes": indexes, "schema": corpusTableSchema(), "description": description}); err != nil {
 			return err
 		}
 	}
@@ -617,11 +679,57 @@ func corpusServeCmd(args []string) error {
 		return err
 	}
 	store := newCorpusStore(cfg)
+	store.pageCache = filepath.Join(*state, "page-windows")
 	defer store.Close()
+	// Upgrade old manifests before accepting requests. Parsing and splitting
+	// giant PDFs belongs to preparation, outside the consumer's fetch deadline.
+	if err := warmCorpusPageWindows(store, filepath.Join(*state, "records.ndjson")); err != nil {
+		return err
+	}
 	mux := http.NewServeMux()
 	mux.Handle("/sources/", store)
 	fmt.Printf("Serving signed PDF/audio sources on %s; keep running during enrichment and browsing\n", *listen)
 	return (&http.Server{Addr: *listen, Handler: mux, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: time.Minute}).ListenAndServe()
+}
+
+func warmCorpusPageWindows(store *corpusStore, manifest string) error {
+	input, err := os.Open(manifest)
+	if err != nil {
+		return err
+	}
+	defer input.Close()
+	reader := bufio.NewReader(input)
+	for {
+		var record corpusRecord
+		if _, err := readCorpusLine(reader, &record); errors.Is(err, io.EOF) {
+			return nil
+		} else if err != nil {
+			return err
+		}
+		metadata, ok := record.Document["metadata"].(map[string]any)
+		if !ok {
+			return fmt.Errorf("missing source metadata for %s", record.ID)
+		}
+		encoded, err := json.Marshal(metadata["source_locator"])
+		if err != nil {
+			return err
+		}
+		var loc sourceLocator
+		if err := json.Unmarshal(encoded, &loc); err != nil {
+			return err
+		}
+		total, _ := metadata["original_pages"].(float64)
+		if loc.First > 0 && (loc.First != 1 || loc.Last != int(total)) {
+			if err := store.preparePageWindow(loc); err != nil {
+				var invalid *corpusPDFWindowError
+				if errors.As(err, &invalid) {
+					fmt.Fprintf(os.Stderr, "Skipping unreadable page window %s: %v\n", record.ID, err)
+					continue
+				}
+				return fmt.Errorf("prepare page window %s: %w", record.ID, err)
+			}
+		}
+	}
 }
 func corpusStatsCmd(args []string) error {
 	flags := flag.NewFlagSet("corpus stats", flag.ContinueOnError)
@@ -726,4 +834,19 @@ func corpusDescription(indexes map[string]any, pagesPerRecord int) string {
 	encoded, _ := json.Marshal([]any{indexes, pagesPerRecord})
 	sum := sha256.Sum256(encoded)
 	return "epstein-corpus-v1:" + hex.EncodeToString(sum[:])
+}
+
+func recordSkippedSource(path, id string, cause error) error {
+	fmt.Printf("Skipping unreadable source %s: %v\n", id, cause)
+	line, err := json.Marshal(map[string]string{"id": id, "error": cause.Error()})
+	if err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = f.Write(append(line, '\n'))
+	return err
 }

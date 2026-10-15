@@ -128,6 +128,10 @@ test "template remote byte budget reads the reloadable config snapshot" {
 
     try std.testing.expectEqual(@as(u64, 4096), remoteByteBudget(&facade));
     try std.testing.expectEqual(@as(usize, 1), harness.releases);
+    harness.config.security.?.max_download_size_bytes = 1024 * 1024 * 1024;
+    try std.testing.expectEqual(@as(u64, 1024 * 1024 * 1024), remoteByteBudget(&facade));
+    harness.config.security.?.max_download_size_bytes = null;
+    try std.testing.expectEqual(default_remote_fetch_max_download_size_bytes, remoteByteBudget(&facade));
 }
 
 pub fn renderJsonToText(

@@ -522,9 +522,12 @@ it contains the signing key. Keep the gateway running while enrichment or browsi
 needs the originals. ZIP audio supports browser range requests, and the search UI
 provides playback with transcript snippets and timestamp links. PDF links preserve
 original page numbers; PDF extraction URLs select at most `--pages-per-record` pages.
-Temporary ZIP/PDF ranges use the host's temporary directory, not permanent split
-files. Large consolidated PDFs require enough temporary space and memory for the
-PDF parser; smaller source PDFs avoid page rewriting when the whole file is selected.
+Preparation writes split PDF windows atomically under `<state>/page-windows`.
+It parses each source once and reuses that context across its windows. `corpus
+serve` prepares missing windows from older manifests before accepting requests,
+then serves the cached files without parsing giant PDFs inside Antfly's fetch
+timeout. Keep space for these persistent windows as well as temporary ZIP spools.
+Whole-file ranges retain the original bytes at any size.
 
 If Antfly fetches sources from localhost or Tailscale, explicitly allow the source
 host in its common JSON config (use your actual DNS name):
@@ -556,6 +559,19 @@ Use `--semantic=false` on both load commands for a BM25-only pilot, and
 `corpus graph` command to measure text/semantic storage without graph costs. Install
 the embedding model and optional extractor model using the existing model-pull
 instructions above. Use `--language` to select the Apple OCR/transcription locale.
+The corpus text index uses lowercase lexical tokens without stemming, so
+`match "maxwell"`, `wildcard "maxwel?"`, and `regexp "maxwell"` select the same
+term. Other indexes retain their configured analyzers: wildcard and regexp
+operate on indexed terms and do not stem their expressions. Existing corpus
+indexes need rebuilding with the new analysis configuration; changing query
+text cannot recover terms discarded by an earlier analyzer.
+`corpus graph` retries transient coordinator failures, connection failures, and
+timeouts by reconciling the source revision again, including work committed
+before a response was lost.
+Preparation completes every page window for a PDF before writing that source's
+manifest rows. PDFs rejected during validation or splitting are recorded in
+`skipped.ndjson`; filesystem failures still stop preparation. Server warmup
+reports unreadable PDF windows and continues preparing other sources.
 The relation extractor defaults to the registered model ID `antflydb/gliner2-base-v1`;
 its installed bundle selects the quantized weights. Use `--artifact-extractor-model`
 on both corpus load commands to select another registered extractor. Inspect
@@ -568,6 +584,11 @@ Permanent extraction HTTP errors (including missing models and authorization
 failures) settle as failed artifacts; provider recovery or configuration changes
 require reprocessing. Rate limits, temporary server errors, and stale capability
 leases remain retryable. Provider logs include the HTTP status and error details.
+The graph extractor requests `long_document: {mode: window}`. Qualified short
+GLiNER 2.5 inputs use the equivalent single-window route. GPU extraction derives
+its automatic scratch ceiling from the planned host and device working sets;
+an explicit `--inference-scratch-budget-mb` remains a hard operator limit, and
+physical host, backend, and combined admission budgets still apply.
 `ANTFLY_API_KEY`, when set, supplies a bearer token to corpus API requests.
 
 Preparation checkpoints every 100 sources and at completion. Resume with

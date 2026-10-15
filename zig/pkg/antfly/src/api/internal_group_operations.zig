@@ -56,6 +56,7 @@ pub const Error = operation.ApiError || @import("relational_integrity_errors.zig
     IndexGenerationMismatch,
     GenerationTransitionActive,
     HierarchyCursorStale,
+    DocumentArtifactPublicationFailed,
     DocIdentityNamespaceMismatch,
     StorageReadTemporarilyUnavailable,
     ReadIndexTimeout,
@@ -305,6 +306,7 @@ pub const Operations = struct {
             error.IndexGenerationMismatch => error.IndexGenerationMismatch,
             error.GenerationTransitionActive => error.GenerationTransitionActive,
             error.DocIdentityNamespaceMismatch => error.DocIdentityNamespaceMismatch,
+            error.DocumentArtifactPublicationFailed => error.DocumentArtifactPublicationFailed,
             // Reads share the same leadership admission as point lookup. Do
             // not turn a leader election/routing race into an opaque 500 at
             // the internal scan boundary.
@@ -2123,6 +2125,104 @@ fn consumerTests() type {
                 "documents",
                 .{},
                 forwarding,
+            ));
+        }
+
+        test "typed internal query workers preserve identity generation validation" {
+            const FakeReads = struct {
+                fn source() table_reads.TableReadSource {
+                    return .{ .ptr = undefined, .vtable = &.{
+                        .lookup = lookup,
+                        .scan = scan,
+                        .query = publicQuery,
+                        .query_group_local = groupQuery,
+                        .graph_expand_group_local = graphExpand,
+                    } };
+                }
+
+                fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+                    return null;
+                }
+
+                fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+                    return null;
+                }
+
+                fn publicQuery(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+                    return null;
+                }
+
+                fn groupQuery(_: *anyopaque, _: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_mod.types.SearchRequest, consistency: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+                    try std.testing.expectEqual(@as(u64, 17), group_id);
+                    try std.testing.expectEqualStrings("documents", table_name);
+                    try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency);
+                    try std.testing.expectEqual(@as(?u64, 12345), req.identity_read_generation);
+                    if (req.hierarchy_children) |navigation| {
+                        if (std.mem.eql(u8, navigation.parent_id, "doc:failed")) return error.DocumentArtifactPublicationFailed;
+                        return error.HierarchyCursorStale;
+                    }
+                    return error.UnsupportedQueryRequest;
+                }
+
+                fn graphExpand(_: *anyopaque, _: std.mem.Allocator, group_id: u64, table_name: []const u8, req: distributed_graph.GraphExpandRequest, consistency: raft_mod.ReadConsistency) !?distributed_graph.GraphExpandResponse {
+                    try std.testing.expectEqual(@as(u64, 17), group_id);
+                    try std.testing.expectEqualStrings("documents", table_name);
+                    try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency);
+                    try std.testing.expectEqual(@as(?u64, 12345), req.identity_read_generation);
+                    return error.UnsupportedQueryRequest;
+                }
+            };
+
+            const operations = Operations{
+                .reads = FakeReads.source(),
+                .shard_db_adapter = null,
+            };
+
+            try std.testing.expectError(error.InvalidArgument, operations.query(
+                std.testing.allocator,
+                .{},
+                17,
+                "documents",
+                .{ .identity_read_generation = 12345 },
+            ));
+            try std.testing.expectError(error.HierarchyCursorStale, operations.query(
+                std.testing.allocator,
+                .{},
+                17,
+                "documents",
+                .{
+                    .identity_read_generation = 12345,
+                    .hierarchy_children = .{ .parent_id = "doc:a" },
+                },
+            ));
+            try std.testing.expectError(error.DocumentArtifactPublicationFailed, operations.query(
+                std.testing.allocator,
+                .{},
+                17,
+                "documents",
+                .{
+                    .identity_read_generation = 12345,
+                    .hierarchy_children = .{ .parent_id = "doc:failed" },
+                },
+            ));
+
+            var frontier: [0]distributed_graph.GraphFrontierItem = .{};
+            var exclude_nodes: [0]distributed_graph.GraphNodeIdentity = .{};
+            var exclude_edges: [0][]u8 = .{};
+            try std.testing.expectError(error.InvalidArgument, operations.graphExpand(
+                std.testing.allocator,
+                .{},
+                17,
+                "documents",
+                .{
+                    .name = @constCast("graph"),
+                    .index_name = @constCast("graph-index"),
+                    .frontier = frontier[0..],
+                    .exclude_nodes = exclude_nodes[0..],
+                    .exclude_edges = exclude_edges[0..],
+                    .params = .{},
+                    .identity_read_generation = 12345,
+                },
             ));
         }
 

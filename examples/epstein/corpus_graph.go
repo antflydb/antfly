@@ -25,11 +25,13 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	antfly "github.com/antflydb/antfly/go/pkg/sdk"
@@ -119,7 +121,7 @@ func corpusGraphCmd(args []string) error {
 		if e != nil {
 			return e
 		}
-		submitted, deleted, unchanged, e := reconcileCorpusGraphSource(client, tableURL, record)
+		submitted, deleted, unchanged, e := reconcileCorpusGraphSourceWithRetry(client, tableURL, record)
 		if e != nil {
 			return fmt.Errorf("source %s: %w", record.ID, e)
 		}
@@ -143,6 +145,43 @@ func corpusGraphCmd(args []string) error {
 		return err
 	}
 	return printCorpusJSON(progress)
+}
+
+// Retry the revision reconciliation, so an already committed transaction is
+// observed before another write is attempted. Replaying an individual write
+// could instead reuse a stale transaction precondition.
+func reconcileCorpusGraphSourceWithRetry(client *http.Client, tableURL string, record corpusRecord) (int, int, bool, error) {
+	for attempt := 0; ; attempt++ {
+		submitted, deleted, unchanged, err := reconcileCorpusGraphSource(client, tableURL, record)
+		var response *corpusHTTPError
+		if err == nil || attempt >= 6 || !corpusGraphRetryableError(err) {
+			return submitted, deleted, unchanged, err
+		}
+		delay := time.Duration(1<<attempt) * 250 * time.Millisecond
+		if errors.As(err, &response) && response.RetryAfter > delay {
+			delay = response.RetryAfter
+		}
+		if delay > 30*time.Second {
+			delay = 30 * time.Second
+		}
+		time.Sleep(delay)
+	}
+}
+
+func corpusGraphRetryableError(err error) bool {
+	var response *corpusHTTPError
+	if errors.As(err, &response) {
+		return response.StatusCode == 429 || response.StatusCode == 502 || response.StatusCode == 503 || response.StatusCode == 504
+	}
+	// A lost response may follow a committed transaction. Reconcile its
+	// revision again rather than replaying stale conditional writes.
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNREFUSED) ||
+		errors.Is(err, syscall.EPIPE) {
+		return true
+	}
+	var network net.Error
+	return errors.As(err, &network) && network.Timeout()
 }
 
 func readCorpusGraphManifest(client *http.Client, tableURL string, record corpusRecord) (corpusGraphManifest, error) {

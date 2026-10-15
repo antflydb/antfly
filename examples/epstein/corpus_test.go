@@ -335,6 +335,10 @@ func TestCorpusAppleIndexConfiguration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	analysis := indexes[corpusTextIndex].(map[string]any)["analysis_config"].(map[string]any)
+	if analysis["field_analyzers"].(map[string]any)["text"] != "simple" {
+		t.Fatalf("corpus name search must use lexical tokens: %#v", analysis)
+	}
 	raw, _ := json.Marshal(indexes)
 	var decoded map[string]any
 	if err = json.Unmarshal(raw, &decoded); err != nil {
@@ -496,6 +500,138 @@ func TestCorpusPDFWhitespaceHeader(t *testing.T) {
 				t.Fatalf("split PDF: %v", err)
 			}
 		}
+	}
+}
+
+func TestCorpusPreparedPageWindowsSurviveRestartAndValidateSource(t *testing.T) {
+	source := t.TempDir()
+	file := filepath.Join(source, "pages.pdf")
+	writeCorpusFixture(t, file, createMultiPagePDF(4))
+	info := mustStat(t, file)
+	cfg := corpusConfig{Key: "test-key", Sources: []corpusSource{{Dataset: "test", Path: source}}}
+	store := newCorpusStore(cfg)
+	store.pageCache = t.TempDir()
+	loc := sourceLocator{Source: 0, Name: "pages.pdf", Size: info.Size(), Modified: info.ModTime().UnixNano(), First: 1, Last: 2}
+	if err := store.preparePageWindow(loc); err != nil {
+		t.Fatal(err)
+	}
+	firstContext := store.pdfContext
+	next := loc
+	next.First, next.Last = 3, 4
+	if err := store.preparePageWindow(next); err != nil {
+		t.Fatal(err)
+	}
+	if store.pdfContext != firstContext {
+		t.Fatal("page windows reparsed the source PDF")
+	}
+	cache := store.pageCache
+	store.Close()
+	reopened := newCorpusStore(cfg)
+	reopened.pageCache = cache
+	defer reopened.Close()
+	var group sync.WaitGroup
+	for _, window := range []sourceLocator{loc, next, loc, next} {
+		group.Go(func() {
+			response := httptest.NewRecorder()
+			reopened.ServeHTTP(response, httptest.NewRequest("GET", "/sources/"+sourceToken(cfg, window), nil))
+			if response.Code != http.StatusOK {
+				t.Errorf("cached window: %d %s", response.Code, response.Body.String())
+				return
+			}
+			doc, err := pdf.NewReader(bytes.NewReader(response.Body.Bytes()), int64(response.Body.Len()))
+			if err != nil || doc.NumPage() != 2 {
+				t.Errorf("cached page count: %v", err)
+			}
+		})
+	}
+	group.Wait()
+	if reopened.pdfContext != nil {
+		t.Fatal("serving cached windows parsed the source")
+	}
+	writeCorpusFixture(t, file, createMultiPagePDF(3))
+	response := httptest.NewRecorder()
+	reopened.ServeHTTP(response, httptest.NewRequest("GET", "/sources/"+sourceToken(cfg, loc), nil))
+	if response.Code != http.StatusConflict {
+		t.Fatalf("changed source accepted stale cache: %d", response.Code)
+	}
+}
+
+func TestCorpusPrepareRetainsSourceAfterTemporaryStorageFailure(t *testing.T) {
+	dir := t.TempDir()
+	state := filepath.Join(dir, "state")
+	source := filepath.Join(dir, "source.zip")
+	var archive bytes.Buffer
+	zw := zip.NewWriter(&archive)
+	entry, err := zw.Create("EFTA00000001.pdf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := entry.Write(createMultiPagePDF(2)); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	writeCorpusFixture(t, source, archive.Bytes())
+	missingTemp := filepath.Join(dir, "missing-temp")
+	t.Setenv("TMPDIR", missingTemp)
+	args := []string{"--state", state, "--source", "test=" + source}
+	err = corpusPrepareCmd(args)
+	var ioFailure *os.PathError
+	if !errors.As(err, &ioFailure) || filepath.Dir(ioFailure.Path) != missingTemp {
+		t.Fatalf("expected temporary storage failure, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(state, "skipped.ndjson")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("filesystem failure was recorded as a skipped source: %v", err)
+	}
+	var progress corpusProgress
+	if err := readCorpusJSON(filepath.Join(state, "prepare.json"), &progress); err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatal(err)
+	}
+	if progress.Complete || progress.InputOffset != 0 || len(testCorpusRecords(t, state)) != 0 {
+		t.Fatalf("preparation advanced past the failed source: %+v", progress)
+	}
+	// Fixing the filesystem must let the same checkpoint publish the source.
+	t.Setenv("TMPDIR", dir)
+	if err := corpusPrepareCmd([]string{"--state", state, "--resume"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(testCorpusRecords(t, state)); got != 1 {
+		t.Fatalf("records after recovery=%d", got)
+	}
+}
+
+func TestCorpusPrepareSkipsPDFRejectedAfterPageCounting(t *testing.T) {
+	dir := t.TempDir()
+	source, state := filepath.Join(dir, "sources"), filepath.Join(dir, "state")
+	broken := bytes.ReplaceAll(createMultiPagePDF(4), []byte("/Type /Page /Parent"), []byte("/Type /Fail /Parent"))
+	badPath := filepath.Join(source, "EFTA00000001.pdf")
+	writeCorpusFixture(t, badPath, broken)
+	writeCorpusFixture(t, filepath.Join(source, "EFTA00000002.pdf"), createMultiPagePDF(2))
+	f, err := os.Open(badPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pages, err := corpusPDFPages(f, int64(len(broken)))
+	f.Close()
+	if err != nil || pages != 4 {
+		t.Fatalf("fixture must pass page counting: %d %v", pages, err)
+	}
+	if err := corpusPrepareCmd([]string{"--state", state, "--source", "test=" + source, "--pages-per-record", "1"}); err != nil {
+		t.Fatal(err)
+	}
+	records := testCorpusRecords(t, state)
+	if len(records) != 2 {
+		t.Fatalf("records=%d", len(records))
+	}
+	for _, record := range records {
+		if strings.Contains(record.ID, "EFTA00000001") {
+			t.Fatal("published a partial unreadable source")
+		}
+	}
+	skipped, err := os.ReadFile(filepath.Join(state, "skipped.ndjson"))
+	if err != nil || !bytes.Contains(skipped, []byte("EFTA00000001")) {
+		t.Fatalf("missing skipped source: %s %v", skipped, err)
 	}
 }
 

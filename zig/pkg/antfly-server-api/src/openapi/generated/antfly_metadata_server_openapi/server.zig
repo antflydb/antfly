@@ -790,7 +790,7 @@ pub const DeleteArtifactEnrichmentPathParams = struct {
     artifact_name: []const u8,
 };
 
-/// Reprocess a derived asset across a table range
+/// Reprocess a derived artifact across a table range
 pub const ReprocessDocumentArtifactRangePathParams = struct {
     /// Name of the table
     table_name: []const u8,
@@ -963,7 +963,7 @@ pub const GetDocumentArtifactManifestParams = struct {
     detail: ?[]const u8 = null,
 };
 
-/// Reprocess a derived asset
+/// Reprocess a derived artifact
 pub const ReprocessDocumentArtifactPathParams = struct {
     /// Name of the table
     table_name: []const u8,
@@ -2651,7 +2651,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.deleteArtifactEnrichment(ctx, table_name, artifact_name);
         }
 
-        /// Reprocess a derived asset across a table range
+        /// Reprocess a derived artifact across a table range
         /// POST /tables/{tableName}/artifacts/{artifactName}/reprocess
         fn reprocessDocumentArtifactRange(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
@@ -2785,7 +2785,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.getDocumentArtifactManifest(ctx, table_name, key, artifact_name, query_params);
         }
 
-        /// Reprocess a derived asset
+        /// Reprocess a derived artifact
         /// POST /tables/{tableName}/documents/{key}/artifacts/{artifactName}/reprocess
         fn reprocessDocumentArtifact(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });

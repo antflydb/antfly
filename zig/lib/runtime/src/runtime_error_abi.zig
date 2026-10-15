@@ -44,6 +44,14 @@ test "FK publication progress and corrupt retirement proofs retain distinct boun
     try std.testing.expectEqual(error.InitialChildProvisionAlreadyCommitted, errorFromStatus(duplicate_child));
 }
 
+test "document extraction failures retain terminal identity across callbacks" {
+    for ([_]anyerror{ error.DocumentExtractionWorkingSetTooLarge, error.DocumentArtifactPublicationFailed }) |err| {
+        const transported = statusFromError(err);
+        try std.testing.expect(transported.code != @backingInt(Code.retryable));
+        try std.testing.expectEqual(err, errorFromStatus(transported));
+    }
+}
+
 pub const Code = enum(c_int) {
     ok = 0,
     out_of_memory,
@@ -740,6 +748,8 @@ pub const Detail = enum(c_int) {
     runtime_failed,
     runtime_stopping,
     runtime_already_ready,
+    document_extraction_working_set_too_large,
+    document_artifact_publication_failed,
     // Append-only Cypher details preserve graph errors across owner callbacks.
     cypher_aggregate_scope,
     cypher_aggregate_wildcard,
@@ -1567,6 +1577,8 @@ pub fn statusFromError(err: anyerror) Status {
         error.RuntimeFailed => status(.internal, .runtime_failed),
         error.RuntimeStopping => status(.cancelled, .runtime_stopping),
         error.RuntimeAlreadyReady => status(.conflict, .runtime_already_ready),
+        error.DocumentExtractionWorkingSetTooLarge => status(.invalid_argument, .document_extraction_working_set_too_large),
+        error.DocumentArtifactPublicationFailed => status(.conflict, .document_artifact_publication_failed),
         else => status(.internal, .none),
     };
 }
@@ -1611,6 +1623,8 @@ pub fn errorFromStatus(value: Status) anyerror {
 
 fn detailErrorName(comptime detail: Detail) []const u8 {
     return switch (detail) {
+        .document_extraction_working_set_too_large => "DocumentExtractionWorkingSetTooLarge",
+        .document_artifact_publication_failed => "DocumentArtifactPublicationFailed",
         .cypher_aggregate_scope => "CypherAggregateScope",
         .cypher_aggregate_wildcard => "CypherAggregateWildcard",
         .cypher_ambiguous_search_table => "CypherAmbiguousSearchTable",

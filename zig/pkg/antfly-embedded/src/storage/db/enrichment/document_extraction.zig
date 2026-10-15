@@ -418,7 +418,8 @@ pub fn failureStageFromErrorName(error_name: []const u8, fallback: []const u8) [
         "InvalidPdfHeader",    "MissingPdfEof",       "MissingStartXref",   "MissingTrailer",
         "InvalidStartXref",    "InvalidXref",         "CyclicXref",         "UnsupportedXrefFormat",
         "ExpectedTrailerDict", "MalformedXrefStream", "MalformedXrefTable", "InvalidObjectStream",
-        "InvalidPageTree",
+        "InvalidPageTree",     "MissingRoot",         "MissingPages",       "EmptyPdfPageTree",
+        "InvalidPdf",
     };
     inline for (structure_errors) |name| if (std.mem.eql(u8, error_name, name)) return "pdf_structure";
     return fallback;
