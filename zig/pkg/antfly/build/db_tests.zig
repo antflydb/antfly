@@ -404,6 +404,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "storage.db.enrichment.enrichment_runtime.test.enrichment distinguishes transient capacity from permanent resource limits",
         "PDF decode operator budgets",
         "parallel dense inference preserves order",
+        "forced dense generations recompute cached vectors",
         "storage.db.enrichment.enrichment_runtime.test.enrichment extractSourceText with template error directive fails instead of returning text",
         "storage.db.enrichment.enrichment_runtime.test.enrichment foreground catch up reconciles retry state after checkpoint apply",
         "storage.db.enrichment.enrichment_runtime.test.enrichment generated preparation window bounds time to first publication",

@@ -361,6 +361,9 @@ already completed chunks stay cached during retries. Generation zero preserves
 the identities of existing embedding artifacts. Public embedding reprocess
 acceptance commits this generation and queues supervised inference without
 entering the provider; coverage and repair issues expose its eventual outcome.
+Forced generations bypass the optional dense computation memo and refresh it
+with newly computed vectors. Ordinary maintenance can still reuse memoized
+results, and completed artifact hashes prevent repeating fulfilled work.
 Repair operations that explicitly wait for completion retain full-index sync.
 PDF page image embeddings use
 the page renderer and staged generation path, including for full-index sync;

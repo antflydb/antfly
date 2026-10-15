@@ -6235,6 +6235,22 @@ test "constant score pages remain bounded after a cursor and cancel while exclud
     }));
     try std.testing.expectEqual(@as(usize, 2), cancel.calls);
 
+    // minimum_should_match counts potentially millions of bitmap members
+    // after clause evaluation. Cancellation must interrupt that counting,
+    // before its hash table exhausts a bounded request allocator.
+    var boolean_scratch: [64 * 1024]u8 = undefined;
+    var boolean_alloc = std.heap.FixedBufferAllocator.init(&boolean_scratch);
+    cancel.calls = 0;
+    const should = [_]query_mod.Filter{
+        .{ .doc_num = .{ .doc_nums = &doc_nums } },
+        .{ .doc_num = .{ .doc_nums = &doc_nums } },
+    };
+    const boolean_filter: query_mod.Filter = .{ .bool_filter = .{ .must = &.{}, .must_not = &.{}, .should = &should, .min_should_match = 2 } };
+    try std.testing.expectError(error.Canceled, boolean_filter.withControl(.{
+        .cancellation = .{ .ptr = &cancel, .is_cancelled_fn = Cancel.check },
+    }).execute(boolean_alloc.allocator(), &writer.snapshot().segments[0]));
+    try std.testing.expectEqual(@as(usize, 2), cancel.calls);
+
     const LimitedChecks = struct {
         calls: usize = 0,
         fn check(ptr: *const anyopaque) bool {

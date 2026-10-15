@@ -3624,17 +3624,17 @@ fn cacheableVector(vector: []const f32, dims: u32) bool {
     return true;
 }
 
-fn embedDenseWithRetry(provider: embedder_mod.DenseEmbedder, runtime: *EnrichmentRuntime, name: []const u8, text: []const u8, dims: u32) ![]f32 {
+fn embedDenseWithRetry(provider: embedder_mod.DenseEmbedder, runtime: *EnrichmentRuntime, name: []const u8, text: []const u8, dims: u32, reuse_computation: bool) ![]f32 {
     const cache = runtime.dense_result_cache orelse return embedDenseWithRetryUncached(provider, runtime, name, text, dims);
     const key = computationKey(provider, name, text, dims) orelse return embedDenseWithRetryUncached(provider, runtime, name, text, dims);
     try runtime.active_provider_guard.check();
-    if (try cache.lookup(cache.ptr, runtime.alloc, key)) |vector| return vector;
+    if (reuse_computation) if (try cache.lookup(cache.ptr, runtime.alloc, key)) |vector| return vector;
     const vector = try embedDenseWithRetryUncached(provider, runtime, name, text, dims);
     if (cacheableVector(vector, dims)) cache.remember(cache.ptr, key, vector);
     return vector;
 }
 
-fn embedDenseBatchWithRetry(provider: embedder_mod.DenseEmbedder, runtime: *EnrichmentRuntime, name: []const u8, texts: []const []const u8, dims: u32) ![]const []const f32 {
+fn embedDenseBatchWithRetry(provider: embedder_mod.DenseEmbedder, runtime: *EnrichmentRuntime, name: []const u8, texts: []const []const u8, dims: u32, reuse_computation: anytype) ![]const []const f32 {
     const cache = runtime.dense_result_cache orelse return embedDenseBatchWithRetryUncached(provider, runtime, name, texts, dims);
     if (provider.computation_key_fn == null) return embedDenseBatchWithRetryUncached(provider, runtime, name, texts, dims);
     try runtime.active_provider_guard.check();
@@ -3649,7 +3649,7 @@ fn embedDenseBatchWithRetry(provider: embedder_mod.DenseEmbedder, runtime: *Enri
     defer missing_texts.deinit(runtime.alloc);
     for (texts, 0..) |text, i| {
         keys[i] = computationKey(provider, name, text, dims);
-        if (keys[i]) |key| if (try cache.lookup(cache.ptr, runtime.alloc, key)) |vector| {
+        if (mayReuseDenseComputation(reuse_computation, i)) if (keys[i]) |key| if (try cache.lookup(cache.ptr, runtime.alloc, key)) |vector| {
             vectors[i] = vector;
             continue;
         };
@@ -3669,6 +3669,89 @@ fn embedDenseBatchWithRetry(provider: embedder_mod.DenseEmbedder, runtime: *Enri
         }
     }
     return vectors;
+}
+
+fn mayReuseDenseComputation(reuse: anytype, index: usize) bool {
+    // Single-source batches supply one policy; cross-document batches borrow
+    // their existing item slice. Forced items bypass lookup individually,
+    // preserving ordinary siblings' cache hits without allocating a mask.
+    return if (comptime @TypeOf(reuse) == bool) reuse else reuse[index].request.reprocess_generation == 0;
+}
+
+test "forced dense generations recompute cached vectors and refresh the memo" {
+    const Harness = struct {
+        calls: usize = 0,
+        lookups: usize = 0,
+        remembered: usize = 0,
+        cached: f32 = 99,
+        reject: bool = false,
+
+        fn key(_: *anyopaque, _: []const u8, _: []const u8, _: u32) !?[32]u8 {
+            return @splat(0);
+        }
+        fn lookup(ptr: *anyopaque, alloc: Allocator, _: [32]u8) !?[]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.lookups += 1;
+            return try alloc.dupe(f32, &.{self.cached});
+        }
+        fn remember(ptr: *anyopaque, _: [32]u8, vector: []const f32) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.remembered += 1;
+            self.cached = vector[0];
+        }
+        fn embed(ptr: *anyopaque, alloc: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.reject) return error.EmbedRequestFailed;
+            return alloc.dupe(f32, &.{@floatFromInt(self.calls)});
+        }
+    };
+    const alloc = std.testing.allocator;
+    var harness = Harness{};
+    const provider: embedder_mod.DenseEmbedder = .{ .ptr = &harness, .dense_embed_fn = Harness.embed, .computation_key_fn = Harness.key };
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .io = std.testing.io },
+        .ownership = undefined,
+        .dense_result_cache = .{ .ptr = &harness, .lookup = Harness.lookup, .remember = Harness.remember },
+    };
+    const Item = struct { request: struct { reprocess_generation: u64 } };
+    const ordinary = [_]Item{ .{ .request = .{ .reprocess_generation = 0 } }, .{ .request = .{ .reprocess_generation = 0 } } };
+    var mixed = ordinary;
+    mixed[1].request.reprocess_generation = 1;
+    const texts = [_][]const u8{ "same", "same" };
+    const cached = try embedDenseBatchWithRetry(provider, &runtime, "model", &texts, 1, &ordinary);
+    defer embedder_mod.freeDenseEmbeddingBatch(alloc, cached);
+    try std.testing.expectEqual(@as(usize, 0), harness.calls);
+    for (cached) |vector| try std.testing.expectEqual(@as(f32, 99), vector[0]);
+    const forced = try embedDenseBatchWithRetry(provider, &runtime, "model", &texts, 1, &mixed);
+    defer embedder_mod.freeDenseEmbeddingBatch(alloc, forced);
+    try std.testing.expectEqual(@as(usize, 1), harness.calls);
+    try std.testing.expectEqual(@as(f32, 99), forced[0][0]);
+    try std.testing.expectEqual(@as(f32, 1), forced[1][0]);
+    const single = try embedDenseWithRetry(provider, &runtime, "model", "same", 1, false);
+    defer alloc.free(single);
+    try std.testing.expectEqual(@as(f32, 2), single[0]);
+    const refreshed = try embedDenseWithRetry(provider, &runtime, "model", "same", 1, true);
+    defer alloc.free(refreshed);
+    try std.testing.expectEqual(@as(f32, 2), refreshed[0]);
+    try std.testing.expectEqual(@as(usize, 2), harness.calls);
+    try std.testing.expectEqual(@as(usize, 4), harness.lookups);
+    try std.testing.expectEqual(@as(usize, 2), harness.remembered);
+    harness.reject = true;
+    try std.testing.expectError(error.EmbedRequestFailed, embedDenseWithRetry(provider, &runtime, "model", "same", 1, false));
+    try std.testing.expectEqual(@as(usize, 3), harness.calls);
+    try std.testing.expectEqual(@as(usize, 2), harness.remembered);
 }
 
 fn embedDenseWithRetryUncached(
@@ -23385,7 +23468,7 @@ fn flushChunkedDenseItems(
     yieldToInteractiveEmbeds(runtime);
     noteEmbedBatchStartedFor(runtime, scope.fingerprint, consumer_indexes, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes);
     const embed_started_ns = runtime.clock.nowRealtimeNs();
-    const vectors = embedDenseBatchWithRetry(dense_embedder, runtime, embedding_artifact_name, batch_texts, expected_dims) catch |err| {
+    const vectors = embedDenseBatchWithRetry(dense_embedder, runtime, embedding_artifact_name, batch_texts, expected_dims, batch_items) catch |err| {
         noteEmbedBatchFinished(runtime, consumer_indexes, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
         if (scope.shouldYield(runtime, err)) return err;
         try recordUniqueChunkedDenseRequestErrors(runtime, window, batch_items, err, requestAttemptNumberFor(runtime, scope.fingerprint));
@@ -23765,7 +23848,7 @@ fn processOrderedChunkVectorWithAllocator(runtime: *EnrichmentRuntime, alloc: Al
             var succeeded = false;
             defer noteEmbedBatchFinished(runtime, consumers, texts.items.len, stats.total_bytes, stats.max_bytes, elapsedNsSince(runtime, started), succeeded);
             if (dense) |provider| {
-                dense_vectors = try embedDenseBatchWithRetry(provider, runtime, requestEmbeddingName(request), texts.items, request.expected_dims);
+                dense_vectors = try embedDenseBatchWithRetry(provider, runtime, requestEmbeddingName(request), texts.items, request.expected_dims, request.reprocess_generation == 0);
                 if (dense_vectors.?.len != texts.items.len) return error.InvalidEmbeddingResponse;
             } else if (sparse) |provider| {
                 sparse_vectors = try embedSparseBatchWithRetry(provider, runtime, requestEmbeddingName(request), texts.items);
@@ -24293,7 +24376,7 @@ fn flushPlainDenseItems(
     yieldToInteractiveEmbeds(runtime);
     noteEmbedBatchStartedFor(runtime, scope.fingerprint, consumer_indexes, items.len, total_source_bytes, max_source_bytes);
     const embed_started_ns = runtime.clock.nowRealtimeNs();
-    const vectors = embedDenseBatchWithRetry(dense_embedder, runtime, embedding_artifact_name, texts, expected_dims) catch |err| {
+    const vectors = embedDenseBatchWithRetry(dense_embedder, runtime, embedding_artifact_name, texts, expected_dims, items) catch |err| {
         noteEmbedBatchFinished(runtime, consumer_indexes, items.len, total_source_bytes, max_source_bytes, elapsedNsSince(runtime, embed_started_ns), false);
         return err;
     };
@@ -27100,7 +27183,7 @@ fn processDenseEmbedding(
         return;
     }
 
-    const vector = try embedDenseWithRetry(dense_embedder, runtime, embedding_artifact_name, source_text, request.expected_dims);
+    const vector = try embedDenseWithRetry(dense_embedder, runtime, embedding_artifact_name, source_text, request.expected_dims, request.reprocess_generation == 0);
     defer runtime.alloc.free(vector);
 
     if (!try writeEmbeddingArtifact(runtime, .{
@@ -27298,7 +27381,7 @@ fn buildChunkDenseEmbeddingsFromSources(
         const batch_stats = textBatchByteStats(batch_texts);
         noteEmbedBatchStarted(runtime, consumer_indexes, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes);
         const embed_started_ns = runtime.clock.nowRealtimeNs();
-        const vectors = embedDenseBatchWithRetry(dense_embedder, runtime, requestEmbeddingName(request), batch_texts, request.expected_dims) catch |err| {
+        const vectors = embedDenseBatchWithRetry(dense_embedder, runtime, requestEmbeddingName(request), batch_texts, request.expected_dims, request.reprocess_generation == 0) catch |err| {
             noteEmbedBatchFinished(runtime, consumer_indexes, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
             return err;
         };

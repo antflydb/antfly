@@ -294,7 +294,10 @@ fn executeShouldClauses(
         defer clause_bm.deinit();
 
         var iter = clause_bm.iterator();
+        var visited: usize = 0;
         while (iter.next()) |doc_id| {
+            if (visited % 256 == 0) try control.check();
+            visited += 1;
             const entry = try counts.getOrPut(alloc, doc_id);
             if (!entry.found_existing) entry.value_ptr.* = 0;
             entry.value_ptr.* += 1;
@@ -304,7 +307,10 @@ fn executeShouldClauses(
     var result = roaring.RoaringBitmap.init(alloc);
     errdefer result.deinit();
     var iter = counts.iterator();
+    var visited: usize = 0;
     while (iter.next()) |entry| {
+        if (visited % 256 == 0) try control.check();
+        visited += 1;
         if (entry.value_ptr.* >= min_should_match) {
             try result.add(entry.key_ptr.*);
         }
