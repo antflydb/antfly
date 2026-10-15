@@ -41,6 +41,8 @@ import (
 
 	"github.com/ajroetker/pdf"
 	"github.com/pdfcpu/pdfcpu/pkg/api"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
 )
 
 const corpusMaxBytes = 128 << 20
@@ -346,6 +348,15 @@ type corpusStore struct {
 	cfg corpusConfig
 	mu  sync.Mutex
 	zip *corpusArchive
+	// Keep one parsed source, shared by its page windows. pdfcpu mutates page
+	// caches during extraction, so all access is serialized. Eviction closes
+	// the backing file (including a ZIP spool) and releases the whole context.
+	pdfMu      sync.Mutex
+	pdfSource  sourceLocator
+	pdfContext *model.Context
+	pdfError   error
+	pdfCleanup func()
+	pageCache  string
 }
 
 type corpusArchive struct {
@@ -377,10 +388,117 @@ func (r *corpusArchiveReader) Close() error {
 }
 
 func newCorpusStore(cfg corpusConfig) *corpusStore { return &corpusStore{cfg: cfg} }
+
+type corpusPDFWindowError struct{ cause error }
+
+func (e *corpusPDFWindowError) Error() string { return e.cause.Error() }
+func (e *corpusPDFWindowError) Unwrap() error { return e.cause }
 func (s *corpusStore) Close() {
+	s.pdfMu.Lock()
+	if s.pdfCleanup != nil {
+		s.pdfCleanup()
+		s.pdfCleanup = nil
+	}
+	s.pdfContext = nil
+	s.pdfError = nil
+	s.pdfMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.closeArchive()
+}
+
+func (s *corpusStore) trimPDF(loc sourceLocator, output io.Writer) error {
+	s.pdfMu.Lock()
+	defer s.pdfMu.Unlock()
+	identity := loc
+	identity.First, identity.Last = 0, 0
+	// Validate the signed locator on every hit, including source replacement.
+	check, err := s.open(identity)
+	if err != nil {
+		return err
+	}
+	check.Close()
+	if s.pdfSource == identity && s.pdfError != nil {
+		return s.pdfError
+	}
+	if s.pdfContext == nil || s.pdfSource != identity {
+		if s.pdfCleanup != nil {
+			s.pdfCleanup()
+			s.pdfCleanup = nil
+		}
+		s.pdfContext = nil
+		s.pdfError = nil
+		s.pdfSource = identity
+		source, cleanup, err := s.seekable(identity)
+		if err != nil {
+			return err
+		}
+		conf := model.NewDefaultConfiguration()
+		conf.Cmd = model.TRIM
+		ctx, err := api.ReadValidateAndOptimize(source, conf)
+		if err != nil {
+			cleanup()
+			var ioFailure *os.PathError
+			if errors.As(err, &ioFailure) {
+				return err
+			}
+			s.pdfError = &corpusPDFWindowError{err}
+			return s.pdfError
+		}
+		s.pdfContext, s.pdfSource, s.pdfCleanup = ctx, identity, cleanup
+	}
+	if loc.First < 1 || loc.Last < loc.First || loc.Last > s.pdfContext.PageCount {
+		return fmt.Errorf("invalid PDF page range")
+	}
+	pages := make([]int, loc.Last-loc.First+1)
+	for i := range pages {
+		pages[i] = loc.First + i
+	}
+	ctx, err := pdfcpu.ExtractPages(s.pdfContext, pages, false)
+	if err != nil {
+		return &corpusPDFWindowError{err}
+	}
+	if ctx.Conf.PostProcessValidate {
+		if err := api.ValidateContext(ctx); err != nil {
+			return &corpusPDFWindowError{err}
+		}
+	}
+	return api.WriteContext(ctx, output)
+}
+
+func (s *corpusStore) pageCachePath(loc sourceLocator) string {
+	data, _ := json.Marshal(loc)
+	digest := sha256.Sum256(data)
+	return filepath.Join(s.pageCache, hex.EncodeToString(digest[:])+".pdf")
+}
+
+func (s *corpusStore) preparePageWindow(loc sourceLocator) error {
+	if s.pageCache == "" || loc.First == 0 {
+		return nil
+	}
+	target := s.pageCachePath(loc)
+	if info, err := os.Stat(target); err == nil && info.Mode().IsRegular() && info.Size() > 0 {
+		return nil
+	}
+	if err := os.MkdirAll(s.pageCache, 0700); err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(s.pageCache, ".window-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name())
+	defer f.Close()
+	if err = s.trimPDF(loc, f); err != nil {
+		return err
+	}
+	if err = f.Sync(); err != nil {
+		return err
+	}
+	if err = f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(f.Name(), target)
 }
 
 // Caller holds mu. Readers of an evicted archive close it when the last finishes.
@@ -561,13 +679,26 @@ func (s *corpusStore) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=%q", path.Base(loc.Name)))
 	if loc.First > 0 {
-		source, cleanup, e := s.seekable(loc)
-		if e != nil {
-			http.Error(w, e.Error(), 409)
-			return
+		if s.pageCache != "" {
+			if cached, err := os.Open(s.pageCachePath(loc)); err == nil {
+				defer cached.Close()
+				original, err := s.open(loc)
+				if err != nil {
+					http.Error(w, err.Error(), 409)
+					return
+				}
+				original.Close()
+				http.ServeContent(w, r, path.Base(loc.Name), time.Time{}, cached)
+				return
+			}
 		}
-		defer cleanup()
-		if loc.First == 1 && loc.Size <= corpusMaxBytes {
+		if loc.First == 1 {
+			source, cleanup, e := s.seekable(loc)
+			if e != nil {
+				http.Error(w, e.Error(), 409)
+				return
+			}
+			defer cleanup()
 			pages, parseErr := corpusPDFPages(source, loc.Size)
 			if parseErr == nil && pages == loc.Last {
 				http.ServeContent(w, r, path.Base(loc.Name), time.Time{}, source)
@@ -580,13 +711,8 @@ func (s *corpusStore) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		defer func() { output.Close(); os.Remove(output.Name()) }()
-		if e = api.Trim(source, output, []string{fmt.Sprintf("%d-%d", loc.First, loc.Last)}, nil); e != nil {
+		if e = s.trimPDF(loc, output); e != nil {
 			http.Error(w, "PDF page extraction failed", 422)
-			return
-		}
-		info, e := output.Stat()
-		if e != nil || info.Size() > corpusMaxBytes {
-			http.Error(w, "PDF range exceeds 128 MiB; reduce --pages-per-record", 413)
 			return
 		}
 		http.ServeContent(w, r, path.Base(loc.Name), time.Time{}, output)

@@ -1282,6 +1282,7 @@ pub fn freeDocumentExtractionUnitDescriptors(alloc: Allocator, descriptors: []Do
 }
 
 pub const PendingDocumentUnitDenseChunkEmbedding = struct {
+    reprocess_generation: ?u64 = null,
     embedding_name: []const u8,
     source_field: []const u8,
     expected_dims: u32,
@@ -1303,6 +1304,7 @@ pub const PendingDocumentUnitDenseChunkEmbedding = struct {
 };
 
 pub const PendingDocumentUnitSparseChunkEmbedding = struct {
+    reprocess_generation: ?u64 = null,
     embedding_name: []const u8,
     producer_json: []const u8,
     consumer_indexes: [][]u8,
