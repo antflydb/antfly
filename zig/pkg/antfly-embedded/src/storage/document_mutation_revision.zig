@@ -66,16 +66,27 @@ pub fn loadWindowWithRevisions(txn: anytype, a: std.mem.Allocator, physical: []c
     };
     const entries = try a.alloc(Entry, ids.len * 3);
     defer a.free(entries);
-    var initialized: usize = 0;
-    defer for (entries[0..initialized]) |entry| a.free(entry.key);
+    var key_bytes: usize = 0;
+    for (ids) |id| key_bytes = try std.math.add(usize, key_bytes, @sizeOf(ContentKey) + @sizeOf(Key) + 2 + keys.encodedComponentLen(id));
+    const slab = try a.alloc(u8, key_bytes);
+    defer a.free(slab);
+    var offset: usize = 0;
     for (physical, ids, 0..) |row, id, i| {
         const revision = keyForPhysical(row) orelse return error.InvalidArgument;
-        entries[initialized] = .{ .key = try a.dupe(u8, &contentKey(revision)), .row = i, .kind = .content };
-        initialized += 1;
-        entries[initialized] = .{ .key = try a.dupe(u8, &revision), .row = i, .kind = .revision };
-        initialized += 1;
-        entries[initialized] = .{ .key = try keys.ttlKeyAlloc(a, id), .row = i, .kind = .timestamp };
-        initialized += 1;
+        const content = slab[offset..][0..@sizeOf(ContentKey)];
+        @memcpy(content, &contentKey(revision));
+        offset += content.len;
+        const mutation = slab[offset..][0..@sizeOf(Key)];
+        @memcpy(mutation, &revision);
+        offset += mutation.len;
+        const ttl = slab[offset..][0 .. 2 + keys.encodedComponentLen(id)];
+        ttl[0] = keys.user_namespace;
+        const end = 1 + keys.encodeComponent(ttl[1..], id);
+        ttl[end] = keys.ttl_kind;
+        offset += ttl.len;
+        entries[i * 3] = .{ .key = content, .row = i, .kind = .content };
+        entries[i * 3 + 1] = .{ .key = mutation, .row = i, .kind = .revision };
+        entries[i * 3 + 2] = .{ .key = ttl, .row = i, .kind = .timestamp };
     }
     std.mem.sort(Entry, entries, {}, Entry.less);
     var sorted: [192][]const u8 = undefined;
@@ -741,4 +752,68 @@ test "public graph metric borrowed wire backfill deadline yields one row and res
         std.crypto.hash.sha2.Sha256.hash(id, &expected, .{});
         try std.testing.expectEqualSlices(u8, &expected, &content.digest);
     }
+}
+
+test "public graph metric borrowed wire metadata window slab encodes binary identities with two allocations" {
+    const Case = struct {
+        const ids = [_][]const u8{ "a\x00b", "", "\xc3\xa9", "plain" };
+        const Fake = struct {
+            ttl: [ids.len][]const u8,
+            calls: usize = 0,
+            pub fn getManySorted(self: *@This(), sorted: []const []const u8, values: []?[]const u8) !void {
+                self.calls += 1;
+                try std.testing.expectEqual(@as(usize, ids.len * 3), sorted.len);
+                var ttl_count: usize = 0;
+                for (sorted, values, 0..) |key, *value, i| {
+                    if (i > 0) try std.testing.expect(std.mem.order(u8, sorted[i - 1], key) == .lt);
+                    if (key[0] == keys.user_namespace) {
+                        const matched = for (self.ttl) |expected| {
+                            if (std.mem.eql(u8, expected, key)) break true;
+                        } else false;
+                        try std.testing.expect(matched);
+                        ttl_count += 1;
+                    }
+                    value.* = null;
+                }
+                try std.testing.expectEqual(ids.len, ttl_count);
+            }
+        };
+        fn run(a: std.mem.Allocator) !void {
+            var physical: [ids.len][]u8 = undefined;
+            var ttl: [ids.len][]u8 = undefined;
+            var initialized: usize = 0;
+            defer for (0..initialized) |i| {
+                a.free(physical[i]);
+                a.free(ttl[i]);
+            };
+            for (ids, 0..) |id, i| {
+                physical[i] = try keys.documentKeyAlloc(a, id);
+                errdefer a.free(physical[i]);
+                ttl[i] = try keys.ttlKeyAlloc(a, id);
+                initialized += 1;
+            }
+            var rows: [64][]const u8 = undefined;
+            var names: [64][]const u8 = undefined;
+            for (&rows, &names, 0..) |*row, *name, i| {
+                row.* = physical[i % ids.len];
+                name.* = ids[i % ids.len];
+            }
+            var contents: [64]?Content = undefined;
+            var timestamps: [64]u64 = undefined;
+            var revisions: [64]u64 = undefined;
+            var fake: Fake = .{ .ttl = ttl };
+            var counted: std.testing.FailingAllocator = .init(a, .{});
+            try loadWindowWithRevisions(&fake, counted.allocator(), &rows, &names, &contents, &timestamps, &revisions);
+            try std.testing.expectEqual(@as(usize, 2), counted.allocations);
+            try std.testing.expectEqual(counted.allocated_bytes, counted.freed_bytes);
+            try std.testing.expectEqual(@as(usize, 1), fake.calls);
+            for (contents, timestamps, revisions) |content, timestamp, revision| {
+                try std.testing.expect(content == null);
+                try std.testing.expectEqual(@as(u64, 0), timestamp);
+                try std.testing.expectEqual(@as(u64, 0), revision);
+            }
+        }
+    };
+    try Case.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }

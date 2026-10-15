@@ -26,68 +26,128 @@ const std = @import("std");
 pub fn validateTyped(comptime T: type, alloc: std.mem.Allocator, input: []const u8) !void {
     var scanner = std.json.Scanner.initCompleteInput(alloc, input);
     defer scanner.deinit();
-    var validator: Validator = .{ .alloc = alloc, .scanner = &scanner, .options = .{ .allocate = .alloc_if_needed, .max_value_len = input.len } };
+    var validator: Validator = .{ .alloc = alloc, .scanner = &scanner, .options = .{ .allocate = .alloc_if_needed, .max_value_len = input.len }, .dynamic_scan = .init(alloc) };
+    defer validator.dynamic_scan.deinit();
     try validator.value(T);
     if (try scanner.next() != .end_of_document) return error.UnexpectedToken;
 }
 
-const Validator = struct {
-    alloc: std.mem.Allocator,
-    scanner: *std.json.Scanner,
-    options: std.json.ParseOptions,
+/// Observe validated members of the root object. Names borrow object scratch
+/// until this callback returns; ranges borrow the scanner's complete input.
+pub const MemberObserver = struct {
+    ctx: *anyopaque,
+    member_fn: *const fn (*anyopaque, []const u8, []const u8) anyerror!void,
+};
 
-    fn expect(self: *@This(), comptime token: std.meta.Tag(std.json.Token)) !void {
-        if (try self.scanner.next() != token) return error.UnexpectedToken;
-    }
+/// Validate one value at the current position, leaving the scanner immediately
+/// after it. Each active object owns independently reclaimable duplicate-key
+/// storage. Completed siblings reuse at most 16 KiB per depth. This requires a
+/// complete-input scanner; optional member observation adds no second scan.
+pub fn scanValue(alloc: std.mem.Allocator, scanner: *std.json.Scanner, max_len: usize, observer: ?MemberObserver) !void {
+    var workspace: ValueScanner = .init(alloc);
+    defer workspace.deinit();
+    try workspace.scan(scanner, max_len, observer);
+}
+
+/// Parser-owned workspace. Small key arenas survive sibling values and rows;
+/// retained frames and arenas share a 256 KiB ceiling between calls. Active
+/// ancestor key sets remain live for duplicate detection, regardless of depth.
+pub const ValueScanner = struct {
     const Frame = struct {
         object: bool,
         keys: std.heap.ArenaAllocator,
         seen: std.StringHashMapUnmanaged(void) = .empty,
     };
-    fn dynamic(self: *@This()) anyerror!void {
-        var stack: std.ArrayListUnmanaged(Frame) = .empty;
-        defer {
-            for (stack.items) |*frame| frame.keys.deinit();
-            stack.deinit(self.alloc);
-        }
-        try self.dynamicValue(&stack);
-        while (stack.items.len != 0) {
-            const top = &stack.items[stack.items.len - 1];
-            if (top.object) {
-                const token = try self.scanner.nextAllocMax(top.keys.allocator(), .alloc_if_needed, self.options.max_value_len.?);
-                const name = switch (token) {
-                    .string, .allocated_string => |name| name,
-                    .object_end => {
-                        var completed = stack.pop().?;
-                        completed.keys.deinit();
-                        continue;
-                    },
-                    else => return error.UnexpectedToken,
-                };
-                if ((try top.seen.getOrPut(top.keys.allocator(), name)).found_existing) return error.DuplicateField;
-            } else if (try self.scanner.peekNextTokenType() == .array_end) {
-                try self.expect(.array_end);
-                var completed = stack.pop().?;
-                completed.keys.deinit();
-                continue;
-            }
-            // No pointer into stack survives a push/reallocation. Each object
-            // owns its keys until it closes; sibling values reuse that space.
-            try self.dynamicValue(&stack);
-        }
+    allocator: std.mem.Allocator,
+    stack: std.ArrayListUnmanaged(Frame) = .empty,
+
+    pub fn init(allocator: std.mem.Allocator) @This() {
+        return .{ .allocator = allocator };
     }
-    fn dynamicValue(self: *@This(), stack: *std.ArrayListUnmanaged(Frame)) !void {
-        switch (try self.scanner.peekNextTokenType()) {
-            .object_begin, .array_begin => |kind| {
-                _ = try self.scanner.next();
-                try stack.append(self.alloc, .{ .object = kind == .object_begin, .keys = .init(self.alloc) });
-            },
-            // Value accepts every syntactically valid scalar. Numeric
-            // conversion cannot reject one (overflow stays a number_string),
-            // so validation need not allocate/copy/convert each component.
-            .string, .number, .true, .false, .null => try self.scanner.skipValue(),
-            else => return error.UnexpectedToken,
+    pub fn deinit(self: *@This()) void {
+        for (self.stack.items) |*frame| frame.keys.deinit();
+        self.stack.deinit(self.allocator);
+        self.stack = .empty;
+    }
+    pub fn scan(self: *@This(), scanner: *std.json.Scanner, max_len: usize, observer: ?MemberObserver) !void {
+        errdefer self.deinit();
+        const stack = &self.stack;
+        var root_seen = false;
+        var depth: usize = 0;
+        var member_name: ?[]const u8 = null;
+        var member_start: usize = 0;
+        while (!root_seen or depth != 0) {
+            if (depth != 0) {
+                const top = &stack.items[depth - 1];
+                if (top.object) {
+                    const token = try scanner.nextAllocMax(top.keys.allocator(), .alloc_if_needed, max_len);
+                    const name = switch (token) {
+                        .string, .allocated_string => |name| name,
+                        .object_end => {
+                            if (!top.keys.reset(if (top.keys.queryCapacity() > 16 * 1024) .free_all else .retain_capacity)) return error.OutOfMemory;
+                            top.seen = .empty;
+                            depth -= 1;
+                            if (depth == 1 and member_name != null) {
+                                try observer.?.member_fn(observer.?.ctx, member_name.?, scanner.input[member_start..scanner.cursor]);
+                                member_name = null;
+                            }
+                            continue;
+                        },
+                        else => return error.UnexpectedToken,
+                    };
+                    if ((try top.seen.getOrPut(top.keys.allocator(), name)).found_existing) return error.DuplicateField;
+                    if (observer != null and depth == 1) {
+                        member_name = name;
+                        member_start = scanner.cursor;
+                        while (member_start < scanner.input.len and (std.ascii.isWhitespace(scanner.input[member_start]) or scanner.input[member_start] == ':')) : (member_start += 1) {}
+                    }
+                } else if (try scanner.peekNextTokenType() == .array_end) {
+                    _ = try scanner.next();
+                    if (!top.keys.reset(if (top.keys.queryCapacity() > 16 * 1024) .free_all else .retain_capacity)) return error.OutOfMemory;
+                    top.seen = .empty;
+                    depth -= 1;
+                    if (depth == 1 and member_name != null) {
+                        try observer.?.member_fn(observer.?.ctx, member_name.?, scanner.input[member_start..scanner.cursor]);
+                        member_name = null;
+                    }
+                    continue;
+                }
+            }
+            root_seen = true;
+            switch (try scanner.peekNextTokenType()) {
+                .object_begin, .array_begin => |kind| {
+                    _ = try scanner.next();
+                    if (depth == stack.items.len) try stack.append(self.allocator, .{ .object = kind == .object_begin, .keys = .init(self.allocator) });
+                    stack.items[depth].object = kind == .object_begin;
+                    depth += 1;
+                },
+                .string, .number, .true, .false, .null => {
+                    try scanner.skipValue();
+                    if (depth == 1 and member_name != null) {
+                        try observer.?.member_fn(observer.?.ctx, member_name.?, scanner.input[member_start..scanner.cursor]);
+                        member_name = null;
+                    }
+                },
+                else => return error.UnexpectedToken,
+            }
         }
+        var retained = stack.capacity * @sizeOf(Frame);
+        for (stack.items) |*frame| retained += frame.keys.queryCapacity();
+        if (retained > 256 * 1024) self.deinit();
+    }
+};
+
+const Validator = struct {
+    alloc: std.mem.Allocator,
+    scanner: *std.json.Scanner,
+    options: std.json.ParseOptions,
+    dynamic_scan: ValueScanner,
+
+    fn expect(self: *@This(), comptime token: std.meta.Tag(std.json.Token)) !void {
+        if (try self.scanner.next() != token) return error.UnexpectedToken;
+    }
+    fn dynamic(self: *@This()) anyerror!void {
+        try self.dynamic_scan.scan(self.scanner, self.options.max_value_len.?, null);
     }
     fn array(self: *@This(), comptime Child: type) anyerror!void {
         try self.expect(.array_begin);
@@ -188,4 +248,102 @@ test "typed validation scans deep dynamic values without native recursion" {
         }
     };
     try std.testing.checkAllAllocationFailures(a, Fail.run, .{});
+}
+
+test "value scan observes only root members and preserves lexical ranges" {
+    const Capture = struct {
+        count: usize = 0,
+        fn member(ctx: *anyopaque, name: []const u8, raw: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const names = [_][]const u8{ "a", "b", "c", "d", "e" };
+            const ranges = [_][]const u8{ "{\"nested\":[1,2]}", "[true,{\"a\":2}]", "1e2", "\"escaped \\u263a\"", "null" };
+            try std.testing.expect(self.count < names.len);
+            try std.testing.expectEqualStrings(names[self.count], name);
+            try std.testing.expectEqualStrings(ranges[self.count], raw);
+            self.count += 1;
+        }
+        fn run(alloc: std.mem.Allocator) !void {
+            const input = "[{\"\\u0061\" : {\"nested\":[1,2]},\"b\":[true,{\"a\":2}],\"c\":1e2,\"d\":\"escaped \\u263a\",\"e\":null},0]";
+            var scanner = std.json.Scanner.initCompleteInput(alloc, input);
+            defer scanner.deinit();
+            try std.testing.expectEqual(std.json.TokenType.array_begin, try scanner.peekNextTokenType());
+            _ = try scanner.next();
+            var capture: @This() = .{};
+            try scanValue(alloc, &scanner, input.len, .{ .ctx = &capture, .member_fn = member });
+            try std.testing.expectEqual(@as(usize, 5), capture.count);
+            try std.testing.expectEqual(std.json.TokenType.number, try scanner.peekNextTokenType());
+        }
+    };
+    try Capture.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Capture.run, .{});
+}
+
+test "value scan observer survives deep stack growth and callback errors" {
+    const a = std.testing.allocator;
+    const depth = 10000;
+    const prefix = "{\"\\u0061\":";
+    const input = try a.alloc(u8, prefix.len + 2 * depth + 2);
+    defer a.free(input);
+    @memcpy(input[0..prefix.len], prefix);
+    @memset(input[prefix.len..][0..depth], '[');
+    input[prefix.len + depth] = '0';
+    @memset(input[prefix.len + depth + 1 ..][0..depth], ']');
+    input[input.len - 1] = '}';
+    const Capture = struct {
+        reject: bool,
+        calls: usize = 0,
+        fn member(ctx: *anyopaque, name: []const u8, raw: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            try std.testing.expectEqualStrings("a", name);
+            try std.testing.expectEqual(@as(usize, 2 * depth + 1), raw.len);
+            try std.testing.expectEqual(@as(u8, '0'), raw[depth]);
+            self.calls += 1;
+            if (self.reject) return error.ObserverRejected;
+        }
+    };
+    var workspace: ValueScanner = .init(a);
+    defer workspace.deinit();
+    for ([_]bool{ false, true }) |reject| {
+        var scanner = std.json.Scanner.initCompleteInput(a, input);
+        defer scanner.deinit();
+        var capture: Capture = .{ .reject = reject };
+        const result = workspace.scan(&scanner, input.len, .{ .ctx = &capture, .member_fn = Capture.member });
+        if (reject) try std.testing.expectError(error.ObserverRejected, result) else try result;
+        try std.testing.expectEqual(@as(usize, 1), capture.calls);
+        try std.testing.expectEqual(@as(usize, 0), workspace.stack.capacity);
+    }
+}
+
+test "value scanner reuses scratch across rows and resets after errors" {
+    const Fixture = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var counted: std.testing.FailingAllocator = .init(a, .{});
+            var workspace: ValueScanner = .init(counted.allocator());
+            defer workspace.deinit();
+            const good = "{\"a\":[{\"\\u0061\":0},{\"b\":1}]}";
+            var warm = std.json.Scanner.initCompleteInput(a, good);
+            defer warm.deinit();
+            try workspace.scan(&warm, good.len, null);
+            const calls = counted.allocations;
+            for (0..16) |_| {
+                var scanner = std.json.Scanner.initCompleteInput(a, good);
+                defer scanner.deinit();
+                try workspace.scan(&scanner, good.len, null);
+            }
+            try std.testing.expectEqual(calls, counted.allocations);
+            const bad = "{\"x\":0,\"\\u0078\":1}";
+            var invalid = std.json.Scanner.initCompleteInput(a, bad);
+            defer invalid.deinit();
+            if (workspace.scan(&invalid, bad.len, null)) |_| return error.TestUnexpectedResult else |err| {
+                if (err == error.OutOfMemory) return err;
+                try std.testing.expectEqual(error.DuplicateField, err);
+            }
+            try std.testing.expectEqual(@as(usize, 0), workspace.stack.capacity);
+            var recovered = std.json.Scanner.initCompleteInput(a, good);
+            defer recovered.deinit();
+            try workspace.scan(&recovered, good.len, null);
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }

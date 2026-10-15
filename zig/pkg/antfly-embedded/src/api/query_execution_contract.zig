@@ -4760,56 +4760,28 @@ fn expectScanner(scanner: *std.json.Scanner, token: std.json.TokenType) !void {
     if (try scanner.peekNextTokenType() != token) return error.UnexpectedToken;
     _ = try scanner.next();
 }
-fn rawObjectSource(alloc: std.mem.Allocator, scratch: *std.heap.ArenaAllocator, scanner: *std.json.Scanner, options: std.json.ParseOptions) !?[]u8 {
-    const raw = (try rawObjectSourceRange(scratch, scanner, options)) orelse return null;
+fn rawObjectSource(alloc: std.mem.Allocator, workspace: *@import("antfly-json").ValueScanner, scanner: *std.json.Scanner, options: std.json.ParseOptions) !?[]u8 {
+    const raw = (try rawObjectSourceRange(workspace, scanner, options, null)) orelse return null;
     return try alloc.dupe(u8, raw);
 }
-fn rawObjectSourceRange(scratch: *std.heap.ArenaAllocator, scanner: *std.json.Scanner, options: std.json.ParseOptions) !?[]const u8 {
+fn rawObjectSourceRange(workspace: *@import("antfly-json").ValueScanner, scanner: *std.json.Scanner, options: std.json.ParseOptions, observer: ?@import("antfly-json").MemberObserver) !?[]const u8 {
     var start = scanner.*.cursor;
     while (start < scanner.*.input.len and (std.ascii.isWhitespace(scanner.*.input[start]) or scanner.*.input[start] == ':')) : (start += 1) {}
     if (try scanner.*.peekNextTokenType() == .null) {
         _ = try scanner.*.next();
         return null;
     }
-    try expectScanner(scanner, .object_begin);
-    const Frame = struct { object: bool, keys: std.StringHashMapUnmanaged(void) = .empty };
-    const a = scratch.allocator();
-    var stack = std.ArrayListUnmanaged(Frame).empty;
-    defer {
-        for (stack.items) |*frame| frame.keys.deinit(a);
-        stack.deinit(a);
-    }
-    try stack.append(a, .{ .object = true });
-    while (stack.items.len != 0) {
-        const frame = &stack.items[stack.items.len - 1];
-        const ending: std.json.TokenType = if (frame.object) .object_end else .array_end;
-        if (try scanner.*.peekNextTokenType() == ending) {
-            _ = try scanner.*.next();
-            var retired = stack.pop().?;
-            retired.keys.deinit(a);
-            continue;
-        }
-        if (frame.object) {
-            const name = try std.json.innerParse([]const u8, a, scanner, options);
-            const entry = try frame.keys.getOrPut(a, name);
-            if (entry.found_existing) return error.DuplicateField;
-        }
-        switch (try scanner.*.peekNextTokenType()) {
-            .object_begin, .array_begin => |kind| {
-                _ = try scanner.*.next();
-                try stack.append(a, .{ .object = kind == .object_begin });
-            },
-            else => try scanner.*.skipValue(),
-        }
-    }
-    return scanner.*.input[start..scanner.*.cursor];
+    if (try scanner.peekNextTokenType() != .object_begin) return error.UnexpectedToken;
+    try workspace.scan(scanner, options.max_value_len orelse scanner.input.len, observer);
+    return scanner.input[start..scanner.cursor];
 }
 
 const RemoteSearchParser = struct {
     authority_group: ?u64 = null,
     // Borrow ranges until capability metadata has been checked. Old providers
     // may put arbitrary user documents in _source; never interpret them early.
-    pending_sources: std.ArrayListUnmanaged(?[]const u8) = .empty,
+    pending_sources: std.ArrayListUnmanaged(?db_mod.types.document_authority.Pending) = .empty,
+    source_workspace: @import("antfly-json").ValueScanner,
     alloc: std.mem.Allocator,
     scanner: std.json.Scanner,
     metadata: std.heap.ArenaAllocator,
@@ -4820,6 +4792,7 @@ const RemoteSearchParser = struct {
     graph_results: ?[]db_mod.types.GraphSearchResult = null,
     fn deinit(self: *@This()) void {
         self.pending_sources.deinit(self.alloc);
+        self.source_workspace.deinit();
         if (self.graph_results) |results| {
             for (results) |*result| result.deinit(self.alloc);
             self.alloc.free(results);
@@ -4865,7 +4838,7 @@ const RemoteSearchParser = struct {
         unreachable;
     }
     fn source(self: *@This()) !?[]u8 {
-        return rawObjectSource(self.alloc, &self.scratch, &self.scanner, self.options);
+        return rawObjectSource(self.alloc, &self.source_workspace, &self.scanner, self.options);
     }
     fn row(self: *@This()) !db_mod.types.SearchHit {
         if (!self.scratch.reset(.{ .retain_with_limit = 256 * 1024 })) _ = self.scratch.reset(.free_all);
@@ -4873,14 +4846,15 @@ const RemoteSearchParser = struct {
         try self.expect(.object_begin);
         var wire: metadata_openapi.QueryHit = .{ ._id = "", ._score = 0 };
         var stored: ?[]u8 = null;
-        var pending: ?[]const u8 = null;
+        var pending: ?db_mod.types.document_authority.Pending = null;
         errdefer if (stored) |value| self.alloc.free(value);
         var seen: u64 = 0;
         while (try self.key(a)) |name| {
             const i = try index(metadata_openapi.QueryHit, name, &seen);
             if (std.mem.eql(u8, name, "_source")) {
                 if (self.authority_group != null) {
-                    pending = try rawObjectSourceRange(&self.scratch, &self.scanner, self.options);
+                    var captured: db_mod.types.document_authority.Pending = .{};
+                    if (try rawObjectSourceRange(&self.source_workspace, &self.scanner, self.options, .{ .ctx = &captured, .member_fn = db_mod.types.document_authority.Pending.observe }) != null) pending = captured;
                 } else stored = try self.source();
             } else try self.member(metadata_openapi.QueryHit, &wire, i, a);
         }
@@ -4996,6 +4970,7 @@ pub fn parseRemoteSearchResultWithAuthority(alloc: std.mem.Allocator, scratch: s
 fn parseRemoteSearchResultOwned(alloc: std.mem.Allocator, scratch: std.mem.Allocator, body: []const u8, authority_group: ?u64, document_allocator: ?std.mem.Allocator) !db_mod.types.SearchResult {
     var parser: RemoteSearchParser = .{
         .authority_group = authority_group,
+        .source_workspace = .init(@import("antfly_platform").allocator.reclaimingScratch(scratch)),
         .alloc = alloc,
         .scanner = std.json.Scanner.initCompleteInput(scratch, body),
         .metadata = std.heap.ArenaAllocator.init(scratch),
@@ -5032,7 +5007,7 @@ fn parseRemoteSearchResultOwned(alloc: std.mem.Allocator, scratch: std.mem.Alloc
             hit.stored_data = null;
         };
         for (hits, parser.pending_sources.items) |*hit, source| {
-            const authority_envelope = (try db_mod.types.document_authority.parse(scratch, source orelse return error.InvalidRemoteResponse)) orelse return error.InvalidRemoteResponse;
+            const authority_envelope = (try (source orelse return error.InvalidRemoteResponse).finish(scratch)) orelse return error.InvalidRemoteResponse;
             if (authority_envelope.authority.group != group) return error.InvalidRemoteResponse;
             const proof = try alloc.create(db_mod.types.document_authority.Authority);
             proof.* = authority_envelope.authority;
@@ -5344,7 +5319,7 @@ fn parseRemoteGraphResultsStreaming(alloc: std.mem.Allocator, scratch: std.mem.A
     if (try scanner.next() != .end_of_document) return error.InvalidRemoteResponse;
     return results.toOwnedSlice(alloc);
 }
-fn parseRemoteGraphNodeStreaming(alloc: std.mem.Allocator, scratch: *std.heap.ArenaAllocator, scanner: *std.json.Scanner, options: std.json.ParseOptions) !struct { node: indexes_openapi.GraphResultNode, document: ?[]u8 } {
+fn parseRemoteGraphNodeStreaming(alloc: std.mem.Allocator, scratch: *std.heap.ArenaAllocator, workspace: *@import("antfly-json").ValueScanner, scanner: *std.json.Scanner, options: std.json.ParseOptions) !struct { node: indexes_openapi.GraphResultNode, document: ?[]u8 } {
     try expectScanner(scanner, .object_begin);
     var wire: indexes_openapi.GraphResultNode = .{ .key = "", .depth = 0 };
     var document: ?[]u8 = null;
@@ -5354,7 +5329,7 @@ fn parseRemoteGraphNodeStreaming(alloc: std.mem.Allocator, scratch: *std.heap.Ar
         const name = try std.json.innerParse([]const u8, scratch.allocator(), scanner, options);
         const index = try RemoteSearchParser.index(indexes_openapi.GraphResultNode, name, &seen);
         if (std.mem.eql(u8, name, "document")) {
-            document = try rawObjectSource(alloc, scratch, scanner, options);
+            document = try rawObjectSource(alloc, workspace, scanner, options);
         } else {
             inline for (@typeInfo(indexes_openapi.GraphResultNode).@"struct".field_names, @typeInfo(indexes_openapi.GraphResultNode).@"struct".field_types, 0..) |field, Field, i| {
                 if (i == index) @field(wire, field) = try std.json.innerParse(Field, scratch.allocator(), scanner, options);
@@ -5433,6 +5408,8 @@ fn parseRemoteGraphResultStreaming(alloc: std.mem.Allocator, scratch: std.mem.Al
     if (try rows.next() != .array_begin) return error.UnexpectedToken;
     var row_arena = std.heap.ArenaAllocator.init(scratch);
     defer row_arena.deinit();
+    var source_workspace: @import("antfly-json").ValueScanner = .init(@import("antfly_platform").allocator.reclaimingScratch(scratch));
+    defer source_workspace.deinit();
     const node_count = if (kind == .nodes) try @import("graph_expand_decode.zig").countObjectRows(payload, 20) else 0;
     if (node_count > public_limits.max_graph_result_items) return error.InvalidRemoteResponse;
     var builder = @import("graph_expand_decode.zig").NodeBuilder{ .a = alloc, .total_rows = node_count };
@@ -5457,7 +5434,7 @@ fn parseRemoteGraphResultStreaming(alloc: std.mem.Allocator, scratch: std.mem.Al
         const ra = row_arena.allocator();
         switch (kind) {
             .nodes => {
-                var parsed_wire = try parseRemoteGraphNodeStreaming(alloc, &row_arena, &rows, options);
+                var parsed_wire = try parseRemoteGraphNodeStreaming(alloc, &row_arena, &source_workspace, &rows, options);
                 defer if (parsed_wire.document) |bytes| alloc.free(bytes);
                 const wire = parsed_wire.node;
                 var node = try parseRemoteGraphNodeWithKey(ra, wire.key, wire);
@@ -7345,4 +7322,89 @@ test "public graph metric borrowed wire authority decoder copies only final docu
     };
     try Case.run(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "public graph metric borrowed wire source scan bounds sibling scratch" {
+    const a = std.testing.allocator;
+    const Counter = @import("../storage/lite/test_allocator.zig").BudgetAllocator;
+    for (0..2) |shape| {
+        var body: std.Io.Writer.Allocating = .init(a);
+        defer body.deinit();
+        try body.writer.writeAll("{\"responses\":[{\"took\":0,\"status\":200,\"hits\":{\"total\":{\"value\":1,\"relation\":\"exact\"},\"hits\":[{\"_id\":\"x\",\"_score\":1,\"_source\":{\"items\":[");
+        const count: usize = if (shape == 0) 50000 else 100;
+        for (0..count) |i| {
+            if (i != 0) try body.writer.writeByte(',');
+            if (shape == 0) {
+                try body.writer.writeAll("{\"\\u0061\":1,\"\\u0062\":2,\"\\u0063\":3}");
+            } else {
+                try body.writer.writeByte('{');
+                for (0..1000) |j| {
+                    if (j != 0) try body.writer.writeByte(',');
+                    try body.writer.print("\"k{d}\":1", .{j});
+                }
+                try body.writer.writeByte('}');
+            }
+        }
+        try body.writer.writeAll("]}}]}}]}");
+        var counter: Counter = .{ .backing = a, .limit = 192 * 1024 };
+        var result = try parseRemoteSearchResultWithScratch(a, counter.allocator(), body.written());
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 0), counter.live);
+        try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+        try std.testing.expect(std.mem.startsWith(u8, result.hits[0].stored_data.?, "{\"items\":["));
+        std.debug.print("SOURCE_SCAN shape={d} bytes={d} scratch_peak={d} scratch_allocations={d}\n", .{ shape, body.written().len, counter.peak, counter.alloc_calls });
+    }
+}
+
+test "public graph metric borrowed wire source scan captures proofs after capability validation" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            const authority = db_mod.types.document_authority;
+            const proof: authority.Authority = .{ .group = 7, .version = 9, .digest = @splat(3) };
+            const source = "{\"escaped\":\"a\\nb\",\"n\":1e2,\"items\":[{},[]]}";
+            const envelope = try authority.encode(a, proof, source);
+            defer a.free(envelope);
+            for (0..2) |order| {
+                const profile = "\"profile\":{\"document_authority_version\":1},";
+                const wire = try std.fmt.allocPrint(a, "{{\"responses\":[{{{s}\"took\":0,\"hits\":{{\"total\":{{\"value\":1,\"relation\":\"exact\"}},\"hits\":[{{\"_id\":\"doc\",\"_score\":1,\"_source\":{s}}}]}},{s}\"status\":200}}]}}", .{ if (order == 0) profile else "", envelope, if (order == 1) profile else "" });
+                defer a.free(wire);
+                var result = try parseRemoteSearchResultWithAuthority(a, a, wire, 7, null);
+                defer result.deinit();
+                try std.testing.expectEqualStrings(source, result.hits[0].stored_data.?);
+                try std.testing.expect(result.hits[0].document_authority.?.eql(proof));
+            }
+            // Marker-like user fields from old providers are never interpreted.
+            const legacy = "{\"responses\":[{\"took\":0,\"status\":200,\"hits\":{\"total\":{\"value\":1,\"relation\":\"exact\"},\"hits\":[{\"_id\":\"x\",\"_score\":1,\"_source\":{\"__antfly_document_authority_v1\":\"user data\",\"document\":[]}}]}}]}";
+            var result = try parseRemoteSearchResultWithAuthority(a, a, legacy, 7, null);
+            defer result.deinit();
+            try std.testing.expectEqual(@as(u32, 0), result.document_authority_version);
+            try std.testing.expect(result.hits[0].document_authority == null);
+        }
+    };
+    try Case.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "public graph metric borrowed wire source scan rejects invalid authority envelopes" {
+    const a = std.testing.allocator;
+    const proof = "{\"group\":7,\"version\":9,\"sha256\":\"0303030303030303030303030303030303030303030303030303030303030303\"}";
+    const valid = "\"__antfly_document_authority_v1\":" ++ proof;
+    const invalid = [_][]const u8{
+        "null",
+        "{}",
+        "{\"__antfly_document_authority_v1\":null}",
+        "{\"__antfly_document_authority_v1\":{}}",
+        "{\"__antfly_document_authority_v1\":{\"group\":0,\"version\":9,\"sha256\":\"invalid\"}}",
+        "{" ++ valid ++ ",\"document\":null}",
+        "{" ++ valid ++ ",\"document\":[]}",
+        "{" ++ valid ++ ",\"extra\":0}",
+        "{" ++ valid ++ "," ++ valid ++ "}",
+        "{" ++ valid ++ ",\"document\":{},\"\\u0064ocument\":{}}",
+        "{" ++ valid ++ ",\"document\":{\"x\":0,\"\\u0078\":1}}",
+    };
+    for (invalid) |source| {
+        const wire = try std.fmt.allocPrint(a, "{{\"responses\":[{{\"took\":0,\"status\":200,\"hits\":{{\"total\":{{\"value\":1,\"relation\":\"exact\"}},\"hits\":[{{\"_id\":\"doc\",\"_score\":1,\"_source\":{s}}}]}},\"profile\":{{\"document_authority_version\":1}}}}]}}", .{source});
+        defer a.free(wire);
+        try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteSearchResultWithAuthority(a, a, wire, 7, null));
+    }
 }
