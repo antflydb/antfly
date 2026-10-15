@@ -4744,7 +4744,8 @@ Delete-selector pages use the same immutable decoded navigation cache. Ordered
 readers also keep a bounded decoded-name memo to avoid parsing slot JSON per row;
 output names remain independently owned across eviction.
 
-The final Debug CLI builds. All 47 real Parquet/Iceberg E2Es passed in
+Before the final main merge, the Debug CLI built and all 47 real Parquet/Iceberg
+E2Es passed in
 633.06 seconds; after the final provider-selector ownership cleanup, the cold
 Iceberg navigation/scan regression passed again against the rebuilt CLI in
 8.81 seconds. That regression hides real data manifests before cold COUNT and
@@ -4754,3 +4755,8 @@ failures or leaks. All 492 integration tests passed (184 shared-engine + 308
 server), also without failures or leaks.
 Formatting, lint, generated error metadata, source licenses and the Apache
 product boundary passed (2,065 source files).
+
+After merging origin/main at `f9f1582346` (#1145), the Debug CLI rebuilt,
+all 87 focused native tests passed again without failures or leaks, and the
+cold real-Iceberg navigation/scan E2E passed against that binary in 9.29 seconds.
+Merged generated error metadata and the Apache product boundary also passed.
