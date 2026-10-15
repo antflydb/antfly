@@ -1336,6 +1336,10 @@ A durable intra-record cursor advances only after source output publication, and
 the resolution watermark stays pinned until the entire record completes. Restart
 and ordinary workers resume this cursor. The resident runtime retains one decoded
 record across quanta to avoid repeatedly parsing a large batch.
+The same deadline bounds indexed backfill discovery and legacy source-index
+repair. These scans count physical rows, including stale markers, and retain
+cursors behind unfinished sources. Replay is durable before discovery markers
+are repaired; a failed append cannot hide source work from a retry.
 Write-fenced and ordered owners leave prerequisites queued; waiting can still
 observe completion or reach its deadline without choosing local mutations.
 Producer replay yields after at most 4096 physical records, a 4 MiB byte budget,

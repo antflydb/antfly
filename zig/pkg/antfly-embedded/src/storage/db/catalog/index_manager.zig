@@ -12102,7 +12102,10 @@ pub const IndexManager = struct {
             next.replacement_resolver = next.name;
             next.replacement_index = cfg.name;
             next.name = internal_name;
-            try self.resolvers.append(self.alloc, try ResolverConfig.clone(self.alloc, next));
+            // Reserve before cloning so every successful clone transfers
+            // directly to the catalog's rollback owner.
+            try self.resolvers.ensureUnusedCapacity(self.alloc, 1);
+            self.resolvers.appendAssumeCapacity(try ResolverConfig.clone(self.alloc, next));
         }
     }
 
@@ -48490,4 +48493,39 @@ test "inline resolver replacement public listing filters before cloning and unwi
         a.free(all);
     }
     try std.testing.expectEqual(@as(usize, 2), all.len);
+}
+
+test "inline resolver replacement staging owns every clone across allocation failures" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(path);
+    var manager = try IndexManager.init(a, path);
+    defer manager.deinit();
+    const Check = struct {
+        fn run(alloc: Allocator, target: *IndexManager) !void {
+            const original = target.alloc;
+            target.alloc = alloc;
+            defer target.alloc = original;
+            // Match reservation rollback, then release array capacity so each
+            // injected run exercises the initial append allocation too.
+            defer {
+                target.truncateResolvers(0);
+                target.resolvers.deinit(alloc);
+                target.resolvers = .empty;
+            }
+            const config: types.IndexConfig = .{
+                .name = "new",
+                .kind = .graph,
+                .coverage_generation = 42,
+                .config_json = "{\"resolvers\":[{\"name\":\"concepts\",\"table\":\"entities\",\"source_artifact\":\"kg\",\"resolution_artifact\":\"resolved\",\"key_template\":\"entity/{{ slug _entity.text }}\",\"labels\":[\"person\"],\"aliases\":[{\"key\":\"a\",\"target\":\"b\"}]}]}",
+            };
+            try target.stageGraphReplacementResolvers("old", config, &.{});
+            try std.testing.expectEqual(@as(usize, 1), target.resolvers.items.len);
+            try std.testing.expectEqualStrings("concepts", target.resolvers.items[0].replacement_resolver);
+            try std.testing.expectEqualStrings("b", target.resolvers.items[0].aliases[0].target);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Check.run, .{&manager});
 }

@@ -1877,6 +1877,9 @@ fn repairAssetSourceIndexWindow(
     resume_after: ?[]const u8,
     max_records: usize,
     out: *std.ArrayListUnmanaged([]const u8),
+    resolvers: []const ResolverConfig,
+    deadline_ns: ?u64,
+    marker_repairs: *std.ArrayListUnmanaged(ArtifactWrite),
 ) !ReresolveEnqueueResult {
     const limit = if (max_records > 0) max_records else default_max_reresolve_records_per_window;
     var candidate_keys = std.ArrayListUnmanaged([]const u8).empty;
@@ -1890,6 +1893,7 @@ fn repairAssetSourceIndexWindow(
         source_artifacts: []const SourceSubscription,
         resume_after: ?[]const u8,
         limit: usize,
+        deadline_ns: ?u64,
         scanned: usize = 0,
         candidates: *std.ArrayListUnmanaged([]const u8),
         last_scan_key: ?[]u8 = null,
@@ -1901,18 +1905,19 @@ fn repairAssetSourceIndexWindow(
             if (self.resume_after) |resume_key_value| {
                 if (std.mem.order(u8, key, resume_key_value) != .gt) return;
             }
-            if (self.scanned >= self.limit) {
+            if (self.scanned >= self.limit or backfillDeadlineReached(self.deadline_ns)) {
                 self.limit_reached = true;
                 return error.ReresolveWindowFull;
             }
             self.scanned += 1;
             if (self.last_scan_key) |previous| self.gpa.free(previous);
+            self.last_scan_key = null;
             self.last_scan_key = try self.gpa.dupe(u8, key);
 
             var parsed = (try parseSourceArtifactKeyAlloc(self.gpa, key)) orelse return;
             defer parsed.deinit(self.gpa);
             if (!sourceArtifactInSet(self.source_artifacts, parsed)) return;
-            try self.candidates.append(self.gpa, try self.gpa.dupe(u8, key));
+            try appendOwnedKey(self.gpa, self.candidates, key);
         }
     };
 
@@ -1921,6 +1926,7 @@ fn repairAssetSourceIndexWindow(
         .source_artifacts = source_artifacts,
         .resume_after = resume_after,
         .limit = limit,
+        .deadline_ns = deadline_ns,
         .candidates = &candidate_keys,
     };
     errdefer if (collector.last_scan_key) |key| gpa.free(key);
@@ -1935,13 +1941,26 @@ fn repairAssetSourceIndexWindow(
     };
 
     var queued: usize = 0;
-    for (candidate_keys.items) |asset_key| {
+    for (candidate_keys.items, 0..) |asset_key, i| {
+        // Discovery and the first candidate form one cooperative unit. Always
+        // finish that unit so a short deadline cannot repeatedly discover the
+        // same source without making progress. Later candidates remain behind
+        // the durable cursor, including any not yet queued or repaired.
+        if (i > 0 and backfillDeadlineReached(deadline_ns)) {
+            if (collector.last_scan_key) |key| gpa.free(key);
+            collector.last_scan_key = null;
+            collector.last_scan_key = try gpa.dupe(u8, candidate_keys.items[i - 1]);
+            collector.limit_reached = true;
+            break;
+        }
         var parsed = (try parseSourceArtifactKeyAlloc(gpa, asset_key)) orelse continue;
         defer parsed.deinit(gpa);
         if (parsed.source_artifact_kind == .asset) {
             const marker_key = (try assetSourceIndexMarkerKeyForAssetKeyAlloc(gpa, asset_key)) orelse {
-                try out.append(gpa, try gpa.dupe(u8, asset_key));
-                queued += 1;
+                if (try sourceNeedsReresolve(gpa, store, resolvers, asset_key)) {
+                    try appendOwnedKey(gpa, out, asset_key);
+                    queued += 1;
+                }
                 continue;
             };
             defer gpa.free(marker_key);
@@ -1950,10 +1969,18 @@ fn repairAssetSourceIndexWindow(
             if (existing) |raw| {
                 if (std.mem.eql(u8, raw, asset_key)) continue;
             }
-            try store.put(marker_key, asset_key);
+            try marker_repairs.ensureUnusedCapacity(gpa, 1);
+            const repair: ArtifactWrite = blk: {
+                const owned_key = try gpa.dupe(u8, marker_key);
+                errdefer gpa.free(owned_key);
+                break :blk .{ .key = owned_key, .value = try gpa.dupe(u8, asset_key) };
+            };
+            marker_repairs.appendAssumeCapacity(repair);
         }
-        try out.append(gpa, try gpa.dupe(u8, asset_key));
-        queued += 1;
+        if (try sourceNeedsReresolve(gpa, store, resolvers, asset_key)) {
+            try appendOwnedKey(gpa, out, asset_key);
+            queued += 1;
+        }
     }
 
     const repair_complete = !collector.limit_reached;
@@ -2015,6 +2042,15 @@ fn sourceNeedsReresolve(gpa: std.mem.Allocator, store: resolver_lib.ArtifactStor
     return false;
 }
 
+fn backfillDeadlineReached(deadline_ns: ?u64) bool {
+    return if (deadline_ns) |deadline| replayNowNs() >= deadline else false;
+}
+
+fn appendOwnedKey(gpa: Allocator, out: *std.ArrayListUnmanaged([]const u8), key: []const u8) !void {
+    try out.ensureUnusedCapacity(gpa, 1);
+    out.appendAssumeCapacity(try gpa.dupe(u8, key));
+}
+
 pub fn enqueueReresolveBacklogWindow(
     gpa: std.mem.Allocator,
     store: resolver_lib.ArtifactStore,
@@ -2024,6 +2060,20 @@ pub fn enqueueReresolveBacklogWindow(
     max_records: usize,
     write_ctx: *anyopaque,
     write_fn: DerivedRecordWriter,
+) !ReresolveEnqueueResult {
+    return enqueueReresolveBacklogWindowUntil(gpa, store, resolvers, resume_after, repair_resume_after, max_records, write_ctx, write_fn, null);
+}
+
+fn enqueueReresolveBacklogWindowUntil(
+    gpa: std.mem.Allocator,
+    store: resolver_lib.ArtifactStore,
+    resolvers: []const ResolverConfig,
+    resume_after: ?[]const u8,
+    repair_resume_after: ?[]const u8,
+    max_records: usize,
+    write_ctx: *anyopaque,
+    write_fn: DerivedRecordWriter,
+    deadline_ns: ?u64,
 ) !ReresolveEnqueueResult {
     const limit = if (max_records > 0) max_records else default_max_reresolve_records_per_window;
     var asset_keys = std.ArrayListUnmanaged([]const u8).empty;
@@ -2054,6 +2104,10 @@ pub fn enqueueReresolveBacklogWindow(
         gpa: std.mem.Allocator,
         resume_after: ?[]const u8,
         limit: usize,
+        scanned: usize = 0,
+        store: resolver_lib.ArtifactStore,
+        resolvers: []const ResolverConfig,
+        deadline_ns: ?u64,
         out: *std.ArrayListUnmanaged([]const u8),
         last_index_key: ?[]u8 = null,
         limit_reached: bool = false,
@@ -2063,14 +2117,21 @@ pub fn enqueueReresolveBacklogWindow(
             if (self.resume_after) |resume_key_value| {
                 if (std.mem.order(u8, key, resume_key_value) != .gt) return;
             }
-            var parsed = (try parseSourceArtifactKeyAlloc(self.gpa, value)) orelse return;
-            defer parsed.deinit(self.gpa);
-            if (self.out.items.len >= self.limit) {
+            if (self.scanned >= self.limit or backfillDeadlineReached(self.deadline_ns)) {
                 self.limit_reached = true;
                 return error.ReresolveWindowFull;
             }
-            try self.out.append(self.gpa, try self.gpa.dupe(u8, value));
+            self.scanned += 1;
+            if (try parseSourceArtifactKeyAlloc(self.gpa, value)) |source| {
+                var parsed = source;
+                defer parsed.deinit(self.gpa);
+                if (try sourceNeedsReresolve(self.gpa, self.store, self.resolvers, value))
+                    try appendOwnedKey(self.gpa, self.out, value);
+            }
+            // Advance only after checking/queuing this source. Include stale
+            // marker rows in the physical scan budget and cursor.
             if (self.last_index_key) |previous| self.gpa.free(previous);
+            self.last_index_key = null;
             self.last_index_key = try self.gpa.dupe(u8, key);
         }
     };
@@ -2079,12 +2140,19 @@ pub fn enqueueReresolveBacklogWindow(
         .gpa = gpa,
         .resume_after = resume_after,
         .limit = limit,
+        .store = store,
+        .resolvers = resolvers,
+        .deadline_ns = deadline_ns,
         .out = &asset_keys,
     };
     errdefer if (collector.last_index_key) |key| gpa.free(key);
     var source_index_complete = true;
     if (resume_after != null) {
         for (asset_source_artifacts.items) |source_artifact| {
+            if (backfillDeadlineReached(deadline_ns)) {
+                collector.limit_reached = true;
+                break;
+            }
             const prefix = try internal_keys.assetArtifactSourceIndexPrefixAlloc(gpa, source_artifact);
             defer gpa.free(prefix);
             const upper = (try internal_keys.nextPrefixAlloc(gpa, prefix)) orelse continue;
@@ -2106,23 +2174,33 @@ pub fn enqueueReresolveBacklogWindow(
             };
             if (collector.limit_reached) break;
         }
-        source_index_complete = !collector.limit_reached and asset_keys.items.len < limit;
+        source_index_complete = !collector.limit_reached and collector.scanned < limit;
     }
 
-    const remaining = limit -| asset_keys.items.len;
-    var repair_result: ReresolveEnqueueResult = if (repair_resume_after != null and remaining > 0)
-        try repairAssetSourceIndexWindow(gpa, store, source_subscriptions.items, repair_resume_after, remaining, &asset_keys)
+    var marker_repairs: std.ArrayListUnmanaged(ArtifactWrite) = .empty;
+    defer {
+        for (marker_repairs.items) |write| {
+            gpa.free(write.key);
+            gpa.free(write.value);
+        }
+        marker_repairs.deinit(gpa);
+    }
+    const remaining = limit -| collector.scanned;
+    var repair_result: ReresolveEnqueueResult = if (repair_resume_after != null and remaining > 0 and !backfillDeadlineReached(deadline_ns))
+        try repairAssetSourceIndexWindow(gpa, store, source_subscriptions.items, repair_resume_after, remaining, &asset_keys, resolvers, deadline_ns, &marker_repairs)
     else
         .{ .repair_complete = repair_resume_after == null };
     errdefer repair_result.deinit(gpa);
 
-    var i: usize = 0;
-    while (i < asset_keys.items.len) {
-        if (try sourceNeedsReresolve(gpa, store, resolvers, asset_keys.items[i])) {
-            i += 1;
-        } else gpa.free(@constCast(asset_keys.orderedRemove(i)));
-    }
     const sequence = try enqueueChangedArtifactKeys(&asset_keys, write_ctx, write_fn);
+    // Publish replay before repairing discovery metadata. A failed append must
+    // never leave a marker that makes the repair retry skip unqueued work.
+    // Markers are an accelerator: if time runs out, the next corpus backfill
+    // can repair them, while this window's source work is already durable.
+    for (marker_repairs.items) |write| {
+        if (backfillDeadlineReached(deadline_ns)) break;
+        try store.put(write.key, write.value);
+    }
     const complete = source_index_complete and repair_result.repair_complete;
     const repair_cursor = repair_result.repair_resume_after;
     repair_result.repair_resume_after = null;
@@ -2587,7 +2665,7 @@ pub const ResolutionRuntime = struct {
         const applied = self.applied_sequence.load(.acquire);
         if (applied >= self.target_sequence.load(.acquire)) {
             if (self.backfill_pending.load(.acquire)) {
-                var tick = try self.runReresolveBacklogWindowLocked();
+                var tick = try self.runReresolveBacklogWindowLocked(deadline_ns);
                 tick.deinit(self.alloc);
             }
             return;
@@ -2701,7 +2779,7 @@ pub const ResolutionRuntime = struct {
             }
             if (applied >= target) {
                 if (!self.backfill_pending.load(.acquire)) return;
-                var tick = try self.runReresolveBacklogWindowLocked();
+                var tick = try self.runReresolveBacklogWindowLocked(null);
                 tick.deinit(self.alloc);
                 if (single_window) return;
                 continue;
@@ -2788,10 +2866,10 @@ pub const ResolutionRuntime = struct {
         if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionRunReresolveBacklogWindow", .{self});
         lockMutex(&self.catch_up_mutex);
         defer self.catch_up_mutex.unlock();
-        return self.runReresolveBacklogWindowLocked();
+        return self.runReresolveBacklogWindowLocked(null);
     }
 
-    fn runReresolveBacklogWindowLocked(self: *ResolutionRuntime) !ReresolveEnqueueResult {
+    fn runReresolveBacklogWindowLocked(self: *ResolutionRuntime, deadline_ns: ?u64) !ReresolveEnqueueResult {
         const resume_key_value = try loadReresolveCursor(self.alloc, &self.store_handle.store, resolver_catalog.reresolve_resume_key);
         defer if (resume_key_value) |key| self.alloc.free(key);
         const repair_resume_key_value = try loadReresolveCursor(self.alloc, &self.store_handle.store, resolver_catalog.reresolve_repair_resume_key);
@@ -2817,7 +2895,7 @@ pub const ResolutionRuntime = struct {
             .store = &self.store_handle.store,
             .index_manager = self.index_manager,
         };
-        var result = try enqueueReresolveBacklogWindow(
+        var result = try enqueueReresolveBacklogWindowUntil(
             self.alloc,
             das.artifactStore(),
             resolvers,
@@ -2826,6 +2904,7 @@ pub const ResolutionRuntime = struct {
             default_max_reresolve_records_per_window,
             self.write_ctx,
             self.write_fn,
+            deadline_ns,
         );
         errdefer result.deinit(self.alloc);
         if (result.source_index_complete) {
@@ -5199,4 +5278,145 @@ test "incremental resolution invalidates effective blocking and cross-table surv
     const deleted_cold_value = (try memory.store().get(a, deleted_cold.resolution_key)).?;
     defer a.free(deleted_cold_value);
     try testing.expectEqualStrings(deleted_value, deleted_cold_value);
+}
+
+test "inline resolver replacement backfill deadlines retain indexed and repair progress" {
+    const a = std.testing.allocator;
+    const ClockStore = struct {
+        map: *MapStore,
+        scan_tick: bool,
+        var now: u64 = 0;
+        fn clock() u64 {
+            return now;
+        }
+        fn get(ptr: *anyopaque, alloc: Allocator, key: []const u8) anyerror!?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            now += 1;
+            return self.map.store().get(alloc, key);
+        }
+        fn put(ptr: *anyopaque, key: []const u8, value: []const u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.map.store().put(key, value);
+        }
+        fn delete(ptr: *anyopaque, key: []const u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.map.store().delete(key);
+        }
+        fn scan(ptr: *anyopaque, lower: []const u8, upper: []const u8, ctx: *anyopaque, consume: *const fn (*anyopaque, []const u8, []const u8) anyerror!void) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const Forward = struct {
+                ctx: *anyopaque,
+                consume: *const fn (*anyopaque, []const u8, []const u8) anyerror!void,
+                scan_tick: bool,
+                fn visit(raw: *anyopaque, key: []const u8, value: []const u8) anyerror!void {
+                    const forward: *@This() = @ptrCast(@alignCast(raw));
+                    try forward.consume(forward.ctx, key, value);
+                    if (forward.scan_tick) now += 1;
+                }
+            };
+            var forward = Forward{ .ctx = ctx, .consume = consume, .scan_tick = self.scan_tick };
+            return self.map.store().scanPrefix(lower, upper, &forward, Forward.visit);
+        }
+        fn store(self: *@This()) resolver_lib.ArtifactStore {
+            return .{ .ptr = self, .vtable = &.{ .get = get, .put = put, .delete = delete, .scan_prefix = scan } };
+        }
+    };
+    test_replay_now_ns = ClockStore.clock;
+    defer test_replay_now_ns = null;
+    const configs = [_]ResolverConfig{.{ .name = "kg", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "{{ slug _entity.text }}", .resolution_generation = 1 }};
+    for ([_]bool{ true, false }) |indexed| for ([_]bool{ true, false }) |scan_tick| {
+        var map = MapStore{ .alloc = a };
+        defer map.deinit();
+        var clock_store = ClockStore{ .map = &map, .scan_tick = scan_tick };
+        const store = clock_store.store();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        var keys: [3][]const u8 = undefined;
+        for (&keys, 0..) |*key, i| {
+            const doc = try std.fmt.allocPrint(scratch, "doc:{d}", .{i});
+            key.* = try internal_keys.artifactNamedPrefixAlloc(scratch, doc, "asset", "kg");
+            try store.put(key.*, test_extraction);
+            if (indexed) try store.put(try internal_keys.assetArtifactSourceIndexKeyAlloc(scratch, "kg", doc), key.*);
+        }
+        var writer = CaptureWriter{ .alloc = a };
+        defer writer.deinit();
+        ClockStore.now = 0;
+        var expired = try enqueueReresolveBacklogWindowUntil(a, store, &configs, if (indexed) "" else null, if (indexed) null else "", 256, &writer, CaptureWriter.writeFn, 0);
+        defer expired.deinit(a);
+        try testing.expect(!expired.complete);
+        try testing.expectEqual(@as(u64, 0), writer.calls);
+        try testing.expectEqual(@as(u64, 0), ClockStore.now);
+        var first = try enqueueReresolveBacklogWindowUntil(a, store, &configs, if (indexed) "" else null, if (indexed) null else "", 256, &writer, CaptureWriter.writeFn, 1);
+        defer first.deinit(a);
+        try testing.expect(!first.complete);
+        try testing.expectEqual(@as(usize, 1), first.queued);
+        try testing.expectEqualStrings(keys[0], writer.keys.items[0]);
+        if (!indexed) try testing.expectEqualStrings(keys[0], first.repair_resume_after.?);
+        // An ordinary drain takes over without repeating or skipping queued keys.
+        var rest = try enqueueReresolveBacklogWindow(a, store, &configs, first.resume_after, if (indexed) null else first.repair_resume_after, 256, &writer, CaptureWriter.writeFn);
+        defer rest.deinit(a);
+        try testing.expect(rest.complete);
+        try testing.expectEqual(@as(usize, 3), writer.keys.items.len);
+        for (keys, writer.keys.items) |expected, actual| try testing.expectEqualStrings(expected, actual);
+    };
+}
+
+test "inline resolver replacement backfill append failure cannot hide legacy repair work" {
+    const a = std.testing.allocator;
+    var map = MapStore{ .alloc = a };
+    defer map.deinit();
+    const store = map.store();
+    const configs = [_]ResolverConfig{.{ .name = "kg", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "{{ slug _entity.text }}" }};
+    const key = try internal_keys.artifactNamedPrefixAlloc(a, "doc", "asset", "kg");
+    defer a.free(key);
+    const marker = try internal_keys.assetArtifactSourceIndexKeyAlloc(a, "kg", "doc");
+    defer a.free(marker);
+    try store.put(key, test_extraction);
+    const Fail = struct {
+        fn write(_: *anyopaque, _: RecordWrite) anyerror!u64 {
+            return error.TestWriteFailed;
+        }
+    };
+    var writer = CaptureWriter{ .alloc = a };
+    defer writer.deinit();
+    try testing.expectError(error.TestWriteFailed, enqueueReresolveBacklogWindow(a, store, &configs, null, "", 256, &writer, Fail.write));
+    try testing.expect((try store.get(a, marker)) == null);
+    var retry = try enqueueReresolveBacklogWindow(a, store, &configs, null, "", 256, &writer, CaptureWriter.writeFn);
+    defer retry.deinit(a);
+    try testing.expect(retry.complete);
+    try testing.expectEqual(@as(usize, 1), retry.queued);
+}
+
+test "inline resolver replacement backfill bounds stale marker rows without journaling" {
+    const a = std.testing.allocator;
+    var map = MapStore{ .alloc = a };
+    defer map.deinit();
+    const configs = [_]ResolverConfig{.{ .name = "kg", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "{{ slug _entity.text }}" }};
+    for (0..5) |i| {
+        const doc = try std.fmt.allocPrint(a, "doc:{d}", .{i});
+        defer a.free(doc);
+        const marker = try internal_keys.assetArtifactSourceIndexKeyAlloc(a, "kg", doc);
+        defer a.free(marker);
+        try map.store().put(marker, "invalid-artifact-key");
+    }
+    var writer = CaptureWriter{ .alloc = a };
+    defer writer.deinit();
+    var scan_resume: ?[]u8 = try a.dupe(u8, "");
+    defer if (scan_resume) |key| a.free(key);
+    var windows: usize = 0;
+    while (true) {
+        var window = try enqueueReresolveBacklogWindow(a, map.store(), &configs, scan_resume, null, 2, &writer, CaptureWriter.writeFn);
+        defer window.deinit(a);
+        windows += 1;
+        try testing.expect(windows <= 3);
+        try testing.expectEqual(@as(usize, 0), window.queued);
+        if (window.complete) break;
+        try testing.expect(std.mem.order(u8, window.resume_after.?, scan_resume.?) == .gt);
+        a.free(scan_resume.?);
+        scan_resume = window.resume_after;
+        window.resume_after = null;
+    }
+    try testing.expectEqual(@as(usize, 3), windows);
+    try testing.expectEqual(@as(u64, 0), writer.calls);
 }
