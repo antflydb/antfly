@@ -56,6 +56,29 @@ conformance or origin interoperability. TS LL-HLS parts remain outside the
 streamed TS contract. HDR/display tests qualify the declared rendering policy,
 not every real-world mastering convention. CUDA is excluded.
 
+## Apple decoder qualification
+
+On macOS 27.0.1 ARM64 with deployment target 15.0, the video suite passes
+290 checks with two skips; the CPU/Metal model suite passes all 70 checks.
+The CPU-only build passes 58 checks with eight Metal skips. Actual hardware
+receipts establish VP9/AV1 8/10-bit decoding, pixel parity, AV1 seek bootstrap
+and direct NV12/P010 Metal preparation. Forced Apple and portable H.264/VP9/AV1
+CPU preparation produce identical model inputs for the declared fixtures.
+
+With the unchanged pinned checkpoint and independent WebM PyTorch oracle,
+both automatic CPU and Metal inference pass eight vectors, three exact rankings,
+all top-k sets, cancellation/retry, half-close and concurrent cleanup. Maximum
+coordinate errors are 1.9931e-6 (CPU) and 6.2213e-7 (Metal); maximum cosine-score
+errors are 6.7102e-7 and 2.5996e-7. These qualify the five-video corpus, not
+arbitrary streams or end-user relevance. Fresh reports stay in ignored
+`.benchmark-results/apple-video/`.
+
+The current decoder suite executes on offline Linux ARM64: 254 passes, 38
+platform skips and no failures. The pinned 15.5 SDK compile check passes. Native macOS 15/26 compatibility and
+optional self-hosted GPU jobs are defined in the
+[Apple workflow](../../.github/workflows/zig-apple-video.yml); those OS runs
+remain pending and are not established by the local macOS 27 result.
+
 ## Reproduce
 
 Use the repository-pinned Zig toolchain and the qualification environment pinned

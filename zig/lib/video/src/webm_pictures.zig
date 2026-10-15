@@ -24,7 +24,20 @@ const codecs = @import("codecs/decoder.zig");
 const frames = @import("codecs/frame.zig");
 const vp8 = @import("vp8.zig");
 const sampling = @import("sampling.zig");
-pub const Picture = struct { pts: i64, duration: ?u64, width: u32, height: u32, bit_depth: u8 = 8, chroma_format: u8 = 1 };
+pub const Picture = struct {
+    pts: i64,
+    duration: ?u64,
+    width: u32,
+    height: u32,
+    bit_depth: u8 = 8,
+    chroma_format: u8 = 1,
+    /// Present for header indexes; reconstructed indexes remain portable-only.
+    packet_index: ?usize = null,
+    color: frames.Color = .{},
+    profile: u8 = 0,
+    av1_config: ?[4]u8 = null,
+    apple_compatible: bool = true,
+};
 pub const Restart = struct { packet: usize = 0, logical: usize = 0, sequence: ?struct { packet: usize, offset: usize, size: usize } = null };
 pub const ReplayStats = struct { first_packet: usize = 0, packets_decoded: usize = 0, bootstrap_bytes: usize = 0, output_copy_bytes: u64 = 0, outputs_skipped: usize = 0 };
 pub const Options = struct { max_packets: usize = 8192, max_pictures: usize = 65536, decoder: codecs.Options = .{}, strategy: enum { headers, reconstruct } = .headers, replay_stats: ?*ReplayStats = null, copy_unselected_outputs: bool = false };
@@ -33,6 +46,7 @@ pub const Index = struct {
     pictures: []Picture,
     restarts: []Restart = &.{},
     reader: ?*const media.webm.Reader = null,
+    apple_packet_layout: bool = false,
     operating_point: u5 = 0,
     all_layers: bool = true,
     reservation: media.admission.Token = .{},
@@ -82,6 +96,7 @@ const Collect = struct {
     limit: usize,
     restarts: std.ArrayList(Restart) = .empty,
     restart_limit: usize = 8192,
+    apple_packet_layout: bool = true,
     fn restart(self: *Collect, value: Restart) !void {
         if (self.restarts.items.len >= self.restart_limit) return error.ResourceLimitExceeded;
         if (self.restarts.items.len == self.restarts.capacity) {
@@ -92,7 +107,7 @@ const Collect = struct {
     }
     fn accept(raw: *anyopaque, _: usize, frame: *const codecs.Frame) !void {
         const self: *Collect = @ptrCast(@alignCast(raw));
-        try self.push(.{ .pts = frame.pts_ns, .duration = frame.duration_ns, .width = frame.width, .height = frame.height, .bit_depth = frame.bit_depth, .chroma_format = frame.chroma_format });
+        try self.push(.{ .pts = frame.pts_ns, .duration = frame.duration_ns, .width = frame.width, .height = frame.height, .bit_depth = frame.bit_depth, .chroma_format = frame.chroma_format, .color = frame.color });
     }
     fn push(self: *Collect, picture: Picture) !void {
         if (self.pictures.items.len >= self.limit) return error.ResourceLimitExceeded;
@@ -123,7 +138,7 @@ pub fn index(a: std.mem.Allocator, reader: *media.webm.Reader, options: Options)
     const restarts = try collector.restarts.toOwnedSlice(a);
     errdefer a.free(restarts);
     try reservation.resize(.{ .host_bytes = pictures.len * @sizeOf(Picture) + restarts.len * @sizeOf(Restart) });
-    return .{ .allocator = a, .pictures = pictures, .restarts = restarts, .reader = reader, .operating_point = options.decoder.av1_operating_point, .all_layers = options.decoder.av1_all_layers, .reservation = reservation, .duration_seconds = reader.duration_seconds };
+    return .{ .allocator = a, .pictures = pictures, .restarts = restarts, .reader = reader, .apple_packet_layout = options.strategy == .headers and collector.apple_packet_layout, .operating_point = options.decoder.av1_operating_point, .all_layers = options.decoder.av1_all_layers, .reservation = reservation, .duration_seconds = reader.duration_seconds };
 }
 /// Header indexing validates visible-picture geometry/reference metadata. Pixel
 /// reconstruction and entropy validity remain the selected replay's responsibility.
@@ -136,9 +151,10 @@ fn indexHeaders(reader: *media.webm.Reader, options: Options, collector: *Collec
     const Av1Publish = struct {
         collector: *Collect,
         packet: media.webm.Packet,
+        packet_id: usize,
         fn accept(raw: *anyopaque, geometry: @import("codecs/vp9_header.zig").Geometry) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            if (!self.packet.invisible) try appendHeader(self.collector, self.packet, geometry);
+            if (!self.packet.invisible) try appendHeader(self.collector, self.packet, self.packet_id, geometry);
         }
     };
     if (av1) |session| {
@@ -175,16 +191,16 @@ fn indexHeaders(reader: *media.webm.Reader, options: Options, collector: *Collec
                 const width = std.mem.readInt(u16, bytes[6..8], .little);
                 const height = std.mem.readInt(u16, bytes[8..10], .little);
                 if (width >> 14 != 0 or height >> 14 != 0) return error.UnsupportedVideoProfile;
-                vp8_geometry = .{ .width = width, .height = height };
+                vp8_geometry = .{ .width = width, .height = height, .color = .{ .matrix = 6 } };
                 try collector.restart(.{ .packet = packet_id, .logical = logical_before });
                 if (width != reader.track.width or height != reader.track.height) return error.UnsupportedDynamicGeometry;
             }
             const g = vp8_geometry orelse return error.InvalidVideoData;
             if (g.width == 0 or g.height == 0 or @as(u64, g.width) * g.height > options.decoder.max_pixels) return error.ResourceLimitExceeded;
-            if (tag & 16 != 0 and !packet.invisible) try appendHeader(collector, packet, g);
+            if (tag & 16 != 0 and !packet.invisible) try appendHeader(collector, packet, packet_id, g);
         } else if (av1) |session| {
             const sequence_before = sequence;
-            var publish = Av1Publish{ .collector = collector, .packet = packet };
+            var publish = Av1Publish{ .collector = collector, .packet = packet, .packet_id = packet_id };
             try session.walk(lease.bytes, &publish, Av1Publish.accept);
             if (session.packet_sequence) |span| sequence = .{ .packet = packet_id, .offset = span.offset, .size = span.size };
             if (session.packet_restart_key) {
@@ -192,17 +208,18 @@ fn indexHeaders(reader: *media.webm.Reader, options: Options, collector: *Collec
             }
         } else {
             const parts = try @import("codecs/vp9_header.zig").split(lease.bytes);
+            if (parts.len != 1) collector.apple_packet_layout = false;
             for (parts.packets[0..parts.len], 0..) |part, part_id| {
                 const picture = try @import("codecs/vp9_header.zig").inspect(part, &references, options.decoder.max_pixels);
                 if (part_id == 0 and picture.key) try collector.restart(.{ .packet = packet_id, .logical = logical_before });
-                if (picture.visible and !packet.invisible) try appendHeader(collector, packet, picture.geometry);
+                if (picture.visible and !packet.invisible) try appendHeader(collector, packet, packet_id, picture.geometry);
             }
         }
     }
     if (av1) |session| try session.finish();
 }
-fn appendHeader(collector: *Collect, packet: media.webm.Packet, geometry: @import("codecs/vp9_header.zig").Geometry) !void {
-    try collector.push(.{ .pts = packet.pts, .duration = packet.duration_ns, .width = geometry.width, .height = geometry.height, .bit_depth = geometry.bit_depth, .chroma_format = geometry.chroma_format });
+fn appendHeader(collector: *Collect, packet: media.webm.Packet, packet_id: usize, geometry: @import("codecs/vp9_header.zig").Geometry) !void {
+    try collector.push(.{ .pts = packet.pts, .duration = packet.duration_ns, .width = geometry.width, .height = geometry.height, .bit_depth = geometry.bit_depth, .chroma_format = geometry.chroma_format, .packet_index = packet_id, .color = geometry.color, .profile = geometry.profile, .av1_config = geometry.av1_config, .apple_compatible = geometry.apple_compatible });
 }
 
 /// IDs are visible decoder-output ordinals, never container packet ordinals.
@@ -512,7 +529,15 @@ test "WebM header indexes match fully reconstructed logical timelines" {
         defer headers.deinit();
         var decoded = try index(a, &reader, .{ .strategy = .reconstruct });
         defer decoded.deinit();
-        try std.testing.expectEqualSlices(Picture, decoded.pictures, headers.pictures);
+        for (decoded.pictures, headers.pictures) |pixel, header| {
+            var expected = pixel;
+            expected.packet_index = header.packet_index;
+            expected.profile = header.profile;
+            expected.av1_config = header.av1_config;
+            expected.apple_compatible = header.apple_compatible;
+            try std.testing.expect(header.packet_index.? < reader.packets.len);
+            try std.testing.expectEqualDeep(expected, header);
+        }
         const expected = try decoded.select();
         defer a.free(expected);
         const actual = try headers.select();

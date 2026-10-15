@@ -187,7 +187,13 @@ pub const Session = struct {
         const width: u32 = @intCast(frame.width[1]);
         const height: u32 = @intCast(frame.height);
         if (width > 16384 or height > 16384 or @as(u64, width) * height > self.options.max_pixels) return error.ResourceLimitExceeded;
-        return .{ .width = width, .height = height, .bit_depth = @intCast(8 + 2 * self.sequence.hbd), .chroma_format = @intCast(self.sequence.layout) };
+        const s = self.sequence;
+        const op = s.operating_points[self.options.operating_point];
+        const depth: u8 = @intCast(8 + 2 * s.hbd);
+        const config = [4]u8{ 0x81, (s.profile << 5) | ((op.major_level - 2) * 4 + op.minor_level), (op.tier << 7) | (@as(u8, @intFromBool(depth > 8)) << 6) | (@as(u8, @intFromBool(depth == 12)) << 5) |
+            (@as(u8, @intFromBool(s.layout == 0)) << 4) | (@as(u8, @intFromBool(s.layout != 3)) << 3) |
+            (@as(u8, @intFromBool(s.layout <= 1)) << 2) | @as(u8, @intCast(s.chr)), 0 };
+        return .{ .width = width, .height = height, .bit_depth = depth, .chroma_format = @intCast(s.layout), .profile = s.profile, .av1_config = config, .apple_compatible = s.num_operating_points == 1 and s.film_grain_present == 0, .color = .{ .full_range = s.color_range != 0, .primaries = @intCast(s.pri), .transfer = @intCast(s.trc), .matrix = @intCast(s.mtrx) } };
     }
     fn refresh(self: *Session, frame: grammar.Dav1dFrameHeader, flags: u8) void {
         for (0..8) |i| if (flags & (@as(u8, 1) << @intCast(i)) != 0) {

@@ -34,6 +34,54 @@ static void output_frame(void *context, void *ref, OSStatus status,
     AVDecoder *decoder = context;
     decoder->output(decoder->context, (size_t)(uintptr_t)ref - 1, status, image);
 }
+static OSStatus create_session(AVDecoder *d, OSType pixel, int hardware) {
+    @autoreleasepool {
+        NSDictionary *spec = @{
+            (__bridge NSString *)kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder: @YES,
+            (__bridge NSString *)kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder: @(hardware != 0)
+        };
+        NSDictionary *attrs = @{
+            (__bridge NSString *)kCVPixelBufferPixelFormatTypeKey: @(pixel),
+            (__bridge NSString *)kCVPixelBufferMetalCompatibilityKey: @YES,
+            (__bridge NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{}
+        };
+        VTDecompressionOutputCallbackRecord callback = { output_frame, d };
+        return VTDecompressionSessionCreate(kCFAllocatorDefault, d->format,
+            (__bridge CFDictionaryRef)spec, (__bridge CFDictionaryRef)attrs, &callback, &d->session);
+    }
+}
+int av_decoder_supports(uint32_t codec) {
+    if (__builtin_available(macOS 10.13, *)) return VTIsHardwareDecodeSupported(codec);
+    return 0;
+}
+// Codec IDs and configuration atoms are values, not references to symbols added
+// by newer SDKs. Decoder creation establishes actual OS/profile availability.
+int32_t av_decoder_create_coded(uint32_t codec, const uint8_t *config, size_t length,
+                               uint32_t width, uint32_t height, uint32_t pixel, int hardware,
+                               av_output output, void *context, void **result) {
+    *result = NULL;
+    if (!output || !config || !length || !width || !height || width > 16384 || height > 16384 ||
+        (codec != 0x76703039 && codec != 0x61763031)) return paramErr;
+    AVDecoder *d = calloc(1, sizeof(*d));
+    if (!d) return memFullErr;
+    d->output = output; d->context = context;
+    @autoreleasepool {
+        if (__builtin_available(macOS 11.0, *)) VTRegisterSupplementalVideoDecoderIfAvailable(codec);
+        NSString *atom = codec == 0x76703039 ? @"vpcC" : @"av1C";
+        NSData *data = [NSData dataWithBytes:config length:length];
+        NSDictionary *extensions = @{
+            (__bridge NSString *)kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms: @{atom: data}
+        };
+        OSStatus status = CMVideoFormatDescriptionCreate(kCFAllocatorDefault, codec,
+            width, height, (__bridge CFDictionaryRef)extensions, &d->format);
+        if (!status) status = create_session(d, pixel, hardware);
+        if (status) {
+            if (d->format) CFRelease(d->format);
+            free(d); return status;
+        }
+    }
+    *result = d; return 0;
+}
 int32_t av_decoder_create(const uint8_t *config, size_t length, uint32_t width, uint32_t height, int hardware,
                          av_output output, void *context, void **result) {
     *result = NULL;
@@ -60,32 +108,20 @@ int32_t av_decoder_create(const uint8_t *config, size_t length, uint32_t width, 
         CFRelease(d->format); free(d); return paramErr;
     }
     d->output = output; d->context = context;
-    @autoreleasepool {
-        NSDictionary *spec = @{
-            (__bridge NSString *)kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder: (hardware ? @YES : @NO)
-        };
-        NSDictionary *attrs = @{
-            (__bridge NSString *)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
-            (__bridge NSString *)kCVPixelBufferMetalCompatibilityKey: @YES,
-            (__bridge NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{}
-        };
-        VTDecompressionOutputCallbackRecord callback = { output_frame, d };
-        status = VTDecompressionSessionCreate(kCFAllocatorDefault, d->format,
-            (__bridge CFDictionaryRef)spec, (__bridge CFDictionaryRef)attrs, &callback, &d->session);
-    }
+    status = create_session(d, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, hardware);
     if (status) { CFRelease(d->format); free(d); return status; }
     *result = d;
     return 0;
 }
-int32_t av_decoder_submit(void *handle, const uint8_t *bytes, size_t length,
-                         size_t index, int64_t pts, int64_t dts, uint32_t duration, uint32_t scale) {
-    if (!handle || !length || !scale || scale > INT32_MAX || index == SIZE_MAX) return paramErr;
+static OSStatus submit_sample(void *handle, const uint8_t *bytes, size_t length,
+                              size_t index, CMTime pts, CMTime dts, CMTime duration) {
+    if (!handle || !bytes || !length || index == SIZE_MAX) return paramErr;
     AVDecoder *d = handle; CMBlockBufferRef block = NULL; CMSampleBufferRef sample = NULL;
     OSStatus status = CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault, NULL, length,
         kCFAllocatorDefault, NULL, 0, length, 0, &block);
     if (status) return status;
     status = CMBlockBufferReplaceDataBytes(bytes, block, 0, length);
-    CMSampleTimingInfo timing = { CMTimeMake(duration, scale), CMTimeMake(pts, scale), CMTimeMake(dts, scale) };
+    CMSampleTimingInfo timing = { duration, pts, dts };
     if (!status) status = CMSampleBufferCreateReady(kCFAllocatorDefault, block, d->format,
         1, 1, &timing, 1, &length, &sample);
     if (!status) status = VTDecompressionSessionDecodeFrame(d->session, sample, 0,
@@ -93,6 +129,19 @@ int32_t av_decoder_submit(void *handle, const uint8_t *bytes, size_t length,
     if (sample) CFRelease(sample);
     CFRelease(block);
     return status;
+}
+int32_t av_decoder_submit(void *handle, const uint8_t *bytes, size_t length,
+                         size_t index, int64_t pts, int64_t dts, uint32_t duration, uint32_t scale) {
+    if (!scale || scale > INT32_MAX) return paramErr;
+    return submit_sample(handle, bytes, length, index, CMTimeMake(pts, scale),
+                         CMTimeMake(dts, scale), CMTimeMake(duration, scale));
+}
+int32_t av_decoder_submit_coded(void *handle, const uint8_t *bytes, size_t length,
+                               size_t index, int64_t pts, int64_t duration, uint32_t scale) {
+    if (!scale || scale > INT32_MAX) return paramErr;
+    // WebM supplies presentation time and optional duration, never a DTS.
+    return submit_sample(handle, bytes, length, index, CMTimeMake(pts, scale),
+                         kCMTimeInvalid, duration < 0 ? kCMTimeInvalid : CMTimeMake(duration, scale));
 }
 int32_t av_decoder_drain(void *handle) {
     return VTDecompressionSessionWaitForAsynchronousFrames(((AVDecoder *)handle)->session);

@@ -123,3 +123,21 @@ ignored `.benchmark-results/`; CI may retain them as artifacts. Historical logs,
 experiments and detailed reports remain recoverable at the commit linked from
 the qualification summary. A cleanup does not refresh old measurements or expand
 codec/origin conformance claims.
+
+## Apple system decoder rollout
+
+Keep maintained Zig decoders in standard builds. Optional VideoToolbox selection
+is independent of CPU/Metal inference and has explicit portable/Apple overrides,
+actual-backend counters, and pre-publication capability fallback. Extend the
+existing H.264 lane with fixed-format VP9/AV1 WebM NV12/P010 replay, preserving the
+logical index, display policy, admission and surface lifetimes. Formats outside
+that qualified lane continue through Zig. Native decode/consumer errors remain
+explicit; no automatic replay follows publication.
+
+Pin the existing macOS 15 binary deployment floor and correct the Python wheel
+floor to match it. Use the pinned 15.5 SDK cross-compilation check and native
+macOS 15/26 decoder/model jobs. Qualification must distinguish absent hardware
+from successful decode, compare portable pixels/model inputs and pretrained
+rankings, and retain independent references. Apple-only packaging that removes
+portable fallback remains deferred until a separately measured coverage/size
+tradeoff is justified.

@@ -30,6 +30,8 @@ pub const capabilities = @import("capabilities.zig");
 pub const avc = @import("avc.zig");
 pub const preparation = @import("preparation.zig");
 pub const apple = @import("backends/apple.zig");
+pub const decoding = @import("decoding.zig");
+pub const apple_webm = @import("backends/apple_webm.zig");
 pub const decode_plan = @import("decode_plan.zig");
 pub const windows = @import("windows.zig");
 pub const apple_jobs = @import("apple_jobs.zig");
@@ -57,6 +59,8 @@ test {
     _ = preparation;
     _ = @import("preparation_test.zig");
     _ = apple;
+    _ = decoding;
+    _ = apple_webm;
     _ = @import("backends/apple_test.zig");
     _ = sampling;
     _ = display;

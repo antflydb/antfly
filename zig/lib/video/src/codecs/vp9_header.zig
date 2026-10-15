@@ -15,7 +15,16 @@
 
 //! Geometry and superframe preflight before the reconstruction core allocates.
 const std = @import("std");
-pub const Geometry = struct { width: u32, height: u32, bit_depth: u8 = 8, chroma_format: u8 = 1 };
+pub const Geometry = struct {
+    width: u32,
+    height: u32,
+    bit_depth: u8 = 8,
+    chroma_format: u8 = 1,
+    color: @import("frame.zig").Color = .{},
+    profile: u8 = 0,
+    av1_config: ?[4]u8 = null,
+    apple_compatible: bool = true,
+};
 pub const References = [8]?Geometry;
 pub const Picture = struct { geometry: Geometry, visible: bool, show_existing: bool = false, key: bool = false };
 pub const Parts = struct { packets: [8][]const u8 = undefined, len: usize = 0 };
@@ -69,13 +78,14 @@ pub fn split(bytes: []const u8) !Parts {
     result.len = count;
     return result;
 }
-const ColorInfo = struct { depth: u8 = 8, chroma: u8 = 1 };
+const ColorInfo = struct { depth: u8 = 8, chroma: u8 = 1, signal: @import("frame.zig").Color = .{} };
 fn color(bits: *Bits, profile: u32) !ColorInfo {
     const depth: u8 = if (profile >= 2) (if (try bits.flag()) 12 else 10) else 8;
     const space = try bits.read(3);
+    var full: bool = true;
     var chroma: u8 = 1;
     if (space != 7) {
-        _ = try bits.read(1);
+        full = try bits.flag();
         if (profile == 1 or profile == 3) {
             const horizontal = try bits.flag();
             const vertical = try bits.flag();
@@ -88,7 +98,19 @@ fn color(bits: *Bits, profile: u32) !ColorInfo {
         chroma = 3;
         if (try bits.flag()) return error.InvalidVideoData;
     }
-    return .{ .depth = depth, .chroma = chroma };
+    return .{ .depth = depth, .chroma = chroma, .signal = .{
+        .full_range = full,
+        .primaries = if (space == 7) 1 else 2,
+        .transfer = if (space == 7) 13 else 2,
+        .matrix = switch (space) {
+            1, 3 => 6,
+            2 => 1,
+            4 => 7,
+            5 => 9,
+            7 => 0,
+            else => 2,
+        },
+    } };
 }
 
 fn size(bits: *Bits) !Geometry {
@@ -125,17 +147,19 @@ pub fn inspect(bytes: []const u8, references: *References, max_pixels: usize) !P
         geometry = try size(&bits);
         geometry.bit_depth = format.depth;
         geometry.chroma_format = format.chroma;
+        geometry.color = format.signal;
         try render(&bits);
     } else {
         const intra = if (!show) try bits.flag() else false;
         if (!resilient) _ = try bits.read(2);
         if (intra) {
             try sync(&bits);
-            const format: ColorInfo = if (profile > 0) try color(&bits, profile) else .{};
+            const format: ColorInfo = if (profile > 0) try color(&bits, profile) else .{ .signal = .{ .matrix = 6 } };
             refresh = try bits.read(8);
             geometry = try size(&bits);
             geometry.bit_depth = format.depth;
             geometry.chroma_format = format.chroma;
+            geometry.color = format.signal;
             try render(&bits);
         } else {
             refresh = try bits.read(8);
@@ -155,10 +179,12 @@ pub fn inspect(bytes: []const u8, references: *References, max_pixels: usize) !P
             const format_reference = references[refs[0]] orelse return error.InvalidVideoData;
             geometry.bit_depth = format_reference.bit_depth;
             geometry.chroma_format = format_reference.chroma_format;
+            geometry.color = format_reference.color;
             try render(&bits);
         }
     }
     try validate(geometry, max_pixels);
+    geometry.profile = @intCast(profile);
     for (0..8) |i| {
         if (refresh & (@as(u32, 1) << @intCast(i)) != 0) references[i] = geometry;
     }

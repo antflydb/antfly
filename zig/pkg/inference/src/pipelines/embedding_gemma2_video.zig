@@ -41,6 +41,14 @@ pub const Encoded = struct {
 /// Sample logical presentation frames, then map them to decode packet indexes.
 /// The FPS policy matches HF; timestamp selection remains a separate video API.
 pub const Sampling = union(enum) { reference, timestamps: video.sampling.TimestampPolicy, source_timestamps: video.sampling.TimestampPolicy };
+/// Decoder controls apply equally to CPU and Metal model execution.
+pub const Configuration = struct {
+    sampling: Sampling = .reference,
+    pool: ?*media.admission.Pool = null,
+    cache: ?*FrameCache = null,
+    selection: ?*const ReaderSelection = null,
+    decoder: video.decoding.Options = .{},
+};
 /// Owned selection from a validated logical index. Input and policy are
 /// content-bound; this owner must outlive all Prefetch workers borrowing it.
 pub const ReaderSelection = struct {
@@ -139,8 +147,16 @@ fn projectionReset(logical: *const video.h264_pictures.Index, packet: usize) boo
     }
     return complete;
 }
-fn projectionKey(selection: ?*const ReaderSelection, clip: [32]u8, selected: []const usize, slot: usize) CacheKey {
-    return if (selection) |owner| owner.projection_keys[slot] else .{ .clip = clip, .picture = selected[slot] };
+fn projectionKey(selection: ?*const ReaderSelection, clip: [32]u8, selected: []const usize, slot: usize, policy_value: video.decoding.Policy) CacheKey {
+    var key: CacheKey = if (selection) |owner| owner.projection_keys[slot] else .{ .clip = clip, .picture = selected[slot] };
+    if (policy_value != .automatic) {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("antfly-video-decoder-policy-v1");
+        hash.update(&key.clip);
+        hashValue(&hash, @as(u8, @backingInt(policy_value)));
+        key.clip = hash.finalResult();
+    }
+    return key;
 }
 fn hashValue(hash: *std.crypto.hash.sha2.Sha256, value: anytype) void {
     const T = @TypeOf(value);
@@ -388,26 +404,29 @@ fn webmPolicy(track: media.webm.Track, width: u32, height: u32, signal: video.h2
     return options;
 }
 fn webmHost(track: media.webm.Track, frame: *const video.codecs.Frame) !video.preparation.HostSurface {
+    try validateWebmSignal(track, frame.bit_depth, frame.chroma_format, frame.color.full_range);
+    var host = frame.host();
+    if (track.colour.range != 0) host.format = if (track.colour.range == 2) .nv12_full else .nv12_video;
+    return host;
+}
+fn validateWebmSignal(track: media.webm.Track, depth: u8, chroma: u8, full_range: bool) !void {
     const c = track.colour;
-    if (c.bits_per_channel != 0 and c.bits_per_channel != frame.bit_depth) return error.UnsupportedVideoColor;
-    const horizontal: u8 = if (frame.chroma_format == 3) 0 else 1;
-    const vertical: u8 = if (frame.chroma_format == 1) 1 else 0;
-    if (c.subsampling_h) |v| if (frame.chroma_format == 0 or v != horizontal) return error.UnsupportedVideoColor;
-    if (c.subsampling_v) |v| if (frame.chroma_format == 0 or v != vertical) return error.UnsupportedVideoColor;
+    if (c.bits_per_channel != 0 and c.bits_per_channel != depth) return error.UnsupportedVideoColor;
+    const horizontal: u8 = if (chroma == 3) 0 else 1;
+    const vertical: u8 = if (chroma == 1) 1 else 0;
+    if (c.subsampling_h) |v| if (chroma == 0 or v != horizontal) return error.UnsupportedVideoColor;
+    if (c.subsampling_v) |v| if (chroma == 0 or v != vertical) return error.UnsupportedVideoColor;
     if (c.cb_subsampling_h) |v| if (v != 0) return error.UnsupportedVideoColor;
     if (c.cb_subsampling_v) |v| if (v != 0) return error.UnsupportedVideoColor;
     // Default SDR reconstruction follows the reference geometry. Explicit
     // chroma siting requires a separately qualified filter policy.
     if (c.siting_h != 0 or c.siting_v != 0) return error.UnsupportedVideoColor;
-    var host = frame.host();
     if (c.range == 3) return error.UnsupportedVideoColor;
     if (c.range != 0) {
         const full = c.range == 2;
         // VP8 has no full/limited-range signal; container Range is authoritative.
-        if (track.codec != .vp8 and full != frame.color.full_range) return error.UnsupportedVideoColor;
-        host.format = if (full) .nv12_full else .nv12_video;
+        if (track.codec != .vp8 and full != full_range) return error.UnsupportedVideoColor;
     }
-    return host;
 }
 
 /// Conservative decoded-pixel charge used before admitted HTTP model execution.
@@ -473,6 +492,11 @@ pub fn inspectReaderPlanWithSelection(a: std.mem.Allocator, borrowed: *const med
     reader.input = &source;
     return inspectPacketPlan(a, &reader, control, sampling, metal, selection);
 }
+pub fn inspectConfiguredPlan(a: std.mem.Allocator, bytes: []const u8, reader: ?*const media.mp4.Reader, control: Control, configuration: Configuration, metal: bool) !Plan {
+    var plan = if (reader) |r| try inspectReaderPlanWithSelection(a, r, control, configuration.sampling, configuration.pool, metal, configuration.selection) else try inspectPlan(a, bytes, control, configuration.sampling, configuration.pool, metal);
+    if (configuration.decoder.policy == .portable) plan.apple_surface_bytes = 0;
+    return plan;
+}
 pub fn inspectPlan(a: std.mem.Allocator, bytes: []const u8, control: Control, sampling: Sampling, pool: ?*media.admission.Pool, metal: bool) !Plan {
     if (bytes.len == 0 or bytes.len > 64 * 1024 * 1024) return error.ResourceLimitExceeded;
     const adapter = control.imageWorkControl();
@@ -490,6 +514,10 @@ pub fn inspectPlan(a: std.mem.Allocator, bytes: []const u8, control: Control, sa
             var preparation = try webmPolicy(reader.track, picture.width, picture.height, .{});
             if (preparation.tone_mapping == .none) preparation.rgb_rounding = video.preparation.softwareSdrRounding(picture.width, picture.chroma_format, picture.bit_depth, preparation.matrix);
             try plan.picture(picture.width, picture.height, preparation);
+            if (metal and @import("builtin").os.tag == .macos and reader.track.codec != .vp8 and picture.chroma_format == 1 and (picture.bit_depth == 8 or picture.bit_depth == 10)) {
+                const estimate = try video.apple.surfaceAdmissionBytesForDepth(picture.width, picture.height, selected.len, picture.bit_depth);
+                if (estimate <= 512 * 1024 * 1024) plan.apple_surface_bytes = @max(plan.apple_surface_bytes, @as(usize, @intCast(estimate)));
+            }
         }
         return plan;
     }
@@ -509,7 +537,7 @@ fn inspectPacketPlan(a: std.mem.Allocator, reader: *media.mp4.Reader, control: C
     var plan = Plan{ .commands = preparationSlots(selected) };
     if (metal and reader.track.codec == .avc and !reader.track.inband_parameter_sets and try compatibleApple(a, reader.track.avcc)) {
         plan.apple_surface_bytes = std.math.cast(usize, try video.apple.surfaceAdmissionBytes(reader.track.width, reader.track.height, selected.len)) orelse return error.ResourceLimitExceeded;
-        if (plan.apple_surface_bytes > 512 * 1024 * 1024) return error.ResourceLimitExceeded;
+        if (plan.apple_surface_bytes > 512 * 1024 * 1024) plan.apple_surface_bytes = 0;
     }
     for (selected) |index| {
         try control.check();
@@ -544,6 +572,7 @@ pub const Prefetch = struct {
     pool: ?*media.admission.Pool,
     device: ?*anyopaque,
     cache: ?*FrameCache = null,
+    decoder: video.decoding.Options = .{},
     clip_hash: [32]u8 = @splat(0),
     preparer: ?video.preparation.Metal = null,
     storage: [2]Job = undefined,
@@ -558,7 +587,7 @@ pub const Prefetch = struct {
         return startCached(a, io, device, bytes, control, sampling, pool, null);
     }
     pub fn startCached(a: std.mem.Allocator, io: std.Io, device: ?*anyopaque, bytes: []const u8, control: Control, sampling: Sampling, pool: ?*media.admission.Pool, cache: ?*FrameCache) !*Prefetch {
-        return startInput(a, io, device, bytes, null, control, sampling, pool, cache, null);
+        return startInput(a, io, device, bytes, null, control, sampling, pool, cache, null, .{});
     }
     pub fn startReader(a: std.mem.Allocator, io: std.Io, device: ?*anyopaque, reader: *const media.mp4.Reader, control: Control, sampling: Sampling, pool: ?*media.admission.Pool) !*Prefetch {
         return startReaderWithSelection(a, io, device, reader, control, sampling, pool, null);
@@ -567,13 +596,16 @@ pub const Prefetch = struct {
         return startReaderCachedWithSelection(a, io, device, reader, control, sampling, pool, selection, null);
     }
     pub fn startReaderCachedWithSelection(a: std.mem.Allocator, io: std.Io, device: ?*anyopaque, reader: *const media.mp4.Reader, control: Control, sampling: Sampling, pool: ?*media.admission.Pool, selection: ?*const ReaderSelection, cache: ?*FrameCache) !*Prefetch {
-        return startInput(a, io, device, try packetBytes(reader), reader, control, sampling, pool, cache, selection);
+        return startInput(a, io, device, try packetBytes(reader), reader, control, sampling, pool, cache, selection, .{});
     }
-    fn startInput(a: std.mem.Allocator, io: std.Io, device: ?*anyopaque, bytes: []const u8, reader: ?*const media.mp4.Reader, control: Control, sampling: Sampling, pool: ?*media.admission.Pool, cache: ?*FrameCache, selection: ?*const ReaderSelection) !*Prefetch {
+    pub fn startConfigured(a: std.mem.Allocator, io: std.Io, device: ?*anyopaque, bytes: []const u8, reader: ?*const media.mp4.Reader, control: Control, configuration: Configuration) !*Prefetch {
+        return startInput(a, io, device, if (reader) |r| try packetBytes(r) else bytes, reader, control, configuration.sampling, configuration.pool, configuration.cache, configuration.selection, configuration.decoder);
+    }
+    fn startInput(a: std.mem.Allocator, io: std.Io, device: ?*anyopaque, bytes: []const u8, reader: ?*const media.mp4.Reader, control: Control, sampling: Sampling, pool: ?*media.admission.Pool, cache: ?*FrameCache, selection: ?*const ReaderSelection, decoder: video.decoding.Options) !*Prefetch {
         try control.check();
         const self = try a.create(Prefetch);
         errdefer a.destroy(self);
-        self.* = .{ .a = a, .io = io, .device = device, .bytes = bytes, .packet_reader = reader, .reader_selection = selection, .control = control, .sampling = sampling, .pool = pool, .cache = cache };
+        self.* = .{ .a = a, .io = io, .device = device, .bytes = bytes, .packet_reader = reader, .reader_selection = selection, .control = control, .sampling = sampling, .pool = pool, .cache = cache, .decoder = decoder };
         if (cache != null and bytes.len <= 64 * 1024 * 1024) {
             if (reader) |input| {
                 const adapter = control.imageWorkControl();
@@ -671,14 +703,14 @@ pub const Prefetch = struct {
             self.preparer = try video.preparation.Metal.init(device);
             if (pool) |shared| try self.preparer.?.admit(shared, 16 * 1024 * 1024);
         }
-        var capture = Capture{ .a = a, .cb = undefined, .track = track, .webm_track = if (webm) webm_reader.track else null, .pool = pool, .control = source.control, .output = &.{}, .frame_tokens = &.{}, .selected = selected, .signal = signal, .metal = if (self.preparer) |*value| value else null, .io = self.io, .prefetch = self };
+        var capture = Capture{ .a = a, .cb = undefined, .track = track, .webm_track = if (webm) webm_reader.track else null, .pool = pool, .control = source.control, .output = &.{}, .frame_tokens = &.{}, .selected = selected, .signal = signal, .metal = if (self.preparer) |*value| value else null, .io = self.io, .prefetch = self, .decoder = self.decoder };
         try self.put(.{ .header = selected });
         var misses: [32]usize = undefined;
         var miss_slots: [32]usize = undefined;
         var missing: usize = 0;
         for (selected, 0..) |id, slot| {
             if (std.mem.indexOfScalar(usize, selected[0..slot], id) != null) continue;
-            if (self.cache) |cache| if (cache.take(projectionKey(self.reader_selection, self.clip_hash, selected, slot))) |ticket| {
+            if (self.cache) |cache| if (cache.take(projectionKey(self.reader_selection, self.clip_hash, selected, slot, self.decoder.policy))) |ticket| {
                 self.put(.{ .cached = .{ .slot = slot, .ticket = ticket } }) catch |err| {
                     cache.restore(ticket);
                     return err;
@@ -692,7 +724,7 @@ pub const Prefetch = struct {
         if (missing == 0) return;
         capture.decode_slots = miss_slots[0..missing];
         if (webm) {
-            try video.webm_pictures.walkIndexed(a, &webm_reader, webmDecodeOptions(source.control, pool), webm_index.?, misses[0..missing], &capture, Capture.publishWebm);
+            try decodeWebm(a, &webm_reader, webm_index.?, misses[0..missing], &capture);
         } else try decodeSelection(a, &reader, misses[0..missing], configurations, &capture);
     }
 
@@ -725,7 +757,7 @@ pub const Prefetch = struct {
         };
         if (resident) |tensors| @memset(tensors, null);
         const adapter = self.control.imageWorkControl();
-        var capture = Capture{ .reader_selection = self.reader_selection, .a = a, .cb = cb, .track = undefined, .control = .{ .context = adapter.context, .check_fn = adapter.check_fn }, .output = output, .resident = resident, .frame_tokens = frame_tokens, .selected = selected, .io = self.io, .native_batching = cb.kind() == .native, .cache = self.cache, .clip_hash = self.clip_hash };
+        var capture = Capture{ .reader_selection = self.reader_selection, .a = a, .cb = cb, .track = undefined, .control = .{ .context = adapter.context, .check_fn = adapter.check_fn }, .output = output, .resident = resident, .frame_tokens = frame_tokens, .selected = selected, .io = self.io, .native_batching = cb.kind() == .native, .cache = self.cache, .clip_hash = self.clip_hash, .decoder = self.decoder };
         defer capture.discardNativePending();
         var jobs: [2]Job = undefined;
         while (true) {
@@ -804,7 +836,7 @@ pub fn encodeWithBudget(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: 
     return encodeCached(a, cb, bytes, control, sampling, pool, null);
 }
 pub fn encodeCached(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u8, control: Control, sampling: Sampling, pool: ?*media.admission.Pool, cache: ?*FrameCache) !Encoded {
-    return encodeInput(a, cb, bytes, null, control, sampling, pool, cache, null);
+    return encodeInput(a, cb, bytes, null, control, sampling, pool, cache, null, .{});
 }
 pub fn encodeReader(a: std.mem.Allocator, cb: *const ComputeBackend, reader: *const media.mp4.Reader, control: Control, sampling: Sampling, pool: ?*media.admission.Pool) !Encoded {
     return encodeReaderWithSelection(a, cb, reader, control, sampling, pool, null);
@@ -813,9 +845,12 @@ pub fn encodeReaderWithSelection(a: std.mem.Allocator, cb: *const ComputeBackend
     return encodeReaderCachedWithSelection(a, cb, reader, control, sampling, pool, selection, null);
 }
 pub fn encodeReaderCachedWithSelection(a: std.mem.Allocator, cb: *const ComputeBackend, reader: *const media.mp4.Reader, control: Control, sampling: Sampling, pool: ?*media.admission.Pool, selection: ?*const ReaderSelection, cache: ?*FrameCache) !Encoded {
-    return encodeInput(a, cb, try packetBytes(reader), reader, control, sampling, pool, cache, selection);
+    return encodeInput(a, cb, try packetBytes(reader), reader, control, sampling, pool, cache, selection, .{});
 }
-fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u8, borrowed: ?*const media.mp4.Reader, control: Control, sampling: Sampling, pool: ?*media.admission.Pool, cache: ?*FrameCache, selection: ?*const ReaderSelection) !Encoded {
+pub fn encodeConfigured(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u8, reader: ?*const media.mp4.Reader, control: Control, configuration: Configuration) !Encoded {
+    return encodeInput(a, cb, if (reader) |r| try packetBytes(r) else bytes, reader, control, configuration.sampling, configuration.pool, configuration.cache, configuration.selection, configuration.decoder);
+}
+fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u8, borrowed: ?*const media.mp4.Reader, control: Control, sampling: Sampling, pool: ?*media.admission.Pool, cache: ?*FrameCache, selection: ?*const ReaderSelection, decoder: video.decoding.Options) !Encoded {
     if (bytes.len == 0 or bytes.len > 64 * 1024 * 1024) return error.ResourceLimitExceeded;
     const adapter = control.imageWorkControl();
     var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "embedding-video", .admission_pool = pool, .control = .{ .context = adapter.context, .check_fn = adapter.check_fn }, .limits = .{ .max_total_bytes = 512 * 1024 * 1024 } };
@@ -870,7 +905,7 @@ fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u
     if (cache != null) {
         if (borrowed) |input_reader| clip_hash = try readerBinding(input_reader, .reference, source.control) else std.crypto.hash.sha2.Sha256.hash(bytes, &clip_hash, .{});
     }
-    var capture = Capture{ .reader_selection = selection, .cache = cache, .clip_hash = clip_hash, .pool = pool, .native_batching = cb.kind() == .native, .resident = resident, .signal = signal, .selected = selected, .io = control.io orelse cb.getIo(), .metal = if (preparer) |*value| value else null, .a = a, .cb = cb, .track = track, .webm_track = if (webm) webm_reader.track else null, .control = source.control, .output = output, .frame_tokens = frame_tokens };
+    var capture = Capture{ .decoder = decoder, .reader_selection = selection, .cache = cache, .clip_hash = clip_hash, .pool = pool, .native_batching = cb.kind() == .native, .resident = resident, .signal = signal, .selected = selected, .io = control.io orelse cb.getIo(), .metal = if (preparer) |*value| value else null, .a = a, .cb = cb, .track = track, .webm_track = if (webm) webm_reader.track else null, .control = source.control, .output = output, .frame_tokens = frame_tokens };
     defer capture.discardNativePending();
     var jobs: [2]ProjectionJob = undefined;
     var scheduler = ProjectionScheduler{ .queue = .init(&jobs), .capture = &capture };
@@ -890,7 +925,7 @@ fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u
     var missing: usize = 0;
     for (selected, 0..) |id, slot| {
         if (std.mem.indexOfScalar(usize, selected[0..slot], id) != null) continue;
-        if (cache) |shared| if (shared.take(projectionKey(selection, clip_hash, selected, slot))) |ticket| {
+        if (cache) |shared| if (shared.take(projectionKey(selection, clip_hash, selected, slot, decoder.policy))) |ticket| {
             defer shared.restore(ticket);
             try capture.loadCached(slot, ticket);
             continue;
@@ -901,7 +936,7 @@ fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u
     }
     capture.decode_slots = miss_slots[0..missing];
     const decoded = if (missing == 0) {} else if (webm)
-        video.webm_pictures.walkIndexed(a, &webm_reader, webmDecodeOptions(source.control, pool), webm_index.?, misses[0..missing], &capture, Capture.publishWebm)
+        decodeWebm(a, &webm_reader, webm_index.?, misses[0..missing], &capture)
     else
         decodeSelection(a, &reader, misses[0..missing], configurations, &capture);
     const decode_error: ?anyerror = if (decoded) |_| null else |err| err;
@@ -942,9 +977,59 @@ fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u
     }
     return .{ .embeddings = try a.dupe(f32, output[0..count]), .frame_tokens = frame_tokens };
 }
+fn appleAllowed(decoder: video.decoding.Options) bool {
+    return @import("builtin").os.tag == .macos and decoder.policy != .portable;
+}
+fn appleUnavailable(capture: *Capture, err: anyerror) !void {
+    if (capture.decoder.policy == .apple or capture.apple_published != 0 or !video.decoding.unavailable(err)) return err;
+    capture.decoder.fallback();
+}
+fn decodeAppleH264(a: std.mem.Allocator, reader: *media.mp4.Reader, selected: []const usize, capture: *Capture) !bool {
+    if (capture.decoder.policy == .portable) return false;
+    if (!appleAllowed(capture.decoder) or reader.track.inband_parameter_sets or !try compatibleApple(a, reader.track.avcc)) {
+        try appleUnavailable(capture, if (@import("builtin").os.tag == .macos) error.UnsupportedVideoProfile else error.UnsupportedVideoBackend);
+        return false;
+    }
+    const surface_bytes = try video.apple.surfaceAdmissionBytes(reader.track.width, reader.track.height, selected.len);
+    if (surface_bytes > 512 * 1024 * 1024 and capture.decoder.policy == .automatic) {
+        capture.decoder.fallback();
+        return false;
+    }
+    var surfaces = if (capture.pool) |pool| try pool.acquire(if (capture.metal != null)
+        .{ .device_bytes = surface_bytes }
+    else
+        .{ .host_bytes = surface_bytes }) else media.admission.Token{};
+    defer surfaces.deinit();
+    var batch = video.apple.decodeTo(a, reader, selected, .{ .require_hardware = false, .seek_mode = .verified_idr }, .{ .context = capture, .accept = Capture.publishApple }) catch |err| {
+        try appleUnavailable(capture, err);
+        return false;
+    };
+    defer batch.deinit();
+    capture.decoder.record(if (batch.hardware) .apple_hardware else .apple_software);
+    return true;
+}
+fn decodeWebm(a: std.mem.Allocator, reader: *media.webm.Reader, indexed: video.webm_pictures.Index, selected: []const usize, capture: *Capture) !void {
+    const estimate = if (indexed.pictures.len != 0) try video.apple.surfaceAdmissionBytesForDepth(indexed.pictures[0].width, indexed.pictures[0].height, selected.len, indexed.pictures[0].bit_depth) else 0;
+    if (capture.decoder.policy == .automatic and estimate > 512 * 1024 * 1024) capture.decoder.fallback();
+    if (capture.decoder.policy != .portable and (capture.decoder.policy == .apple or estimate <= 512 * 1024 * 1024)) {
+        const receipt: ?video.apple_webm.Receipt = video.apple_webm.decodeTo(a, reader, indexed, selected, .{ .decode = .{ .require_hardware = false, .max_decode_packets = 8192 }, .pool = capture.pool, .device_surfaces = capture.metal != null }, .{ .context = capture, .accept = Capture.publishAppleWebm }) catch |err| blk: {
+            try appleUnavailable(capture, err);
+            break :blk @as(?video.apple_webm.Receipt, null);
+        };
+        if (receipt) |value| {
+            capture.decoder.record(if (value.hardware) .apple_hardware else .apple_software);
+            return;
+        }
+    }
+    capture.decoder.record(.portable);
+    try video.webm_pictures.walkIndexed(a, reader, webmDecodeOptions(reader.input.control, capture.pool), indexed, selected, capture, Capture.publishWebm);
+}
+
 fn decodeSelection(a: std.mem.Allocator, reader: *media.mp4.Reader, selected: []const usize, configurations: ?*video.h264_dynamic.Session, capture: *Capture) !void {
     const control = reader.input.control;
     if (reader.track.codec == .mjpeg) {
+        if (capture.decoder.policy == .apple) return error.UnsupportedVideoProfile;
+        capture.decoder.record(.portable);
         for (selected) |index| {
             const slot = std.mem.indexOfScalar(usize, capture.selected, index) orelse return error.InvalidPacketIndex;
             try control.check();
@@ -962,15 +1047,9 @@ fn decodeSelection(a: std.mem.Allocator, reader: *media.mp4.Reader, selected: []
             defer a.free(patches);
             try capture.project(slot, patches, options);
         }
-    } else if (capture.metal != null and !reader.track.inband_parameter_sets and try compatibleApple(a, reader.track.avcc)) {
-        // VideoToolbox's bounded decoder surface working set shares the same
-        // prepaid device budget as queued preparation commands.
-        const surface_bytes = try video.apple.surfaceAdmissionBytes(reader.track.width, reader.track.height, selected.len);
-        var surfaces = if (capture.pool) |pool| try pool.acquire(.{ .device_bytes = surface_bytes }) else media.admission.Token{};
-        defer surfaces.deinit();
-        var batch = try video.apple.decodeTo(a, reader, selected, .{ .require_hardware = false, .seek_mode = .verified_idr }, .{ .context = capture, .accept = Capture.publishApple });
-        defer batch.deinit();
     } else {
+        if (try decodeAppleH264(a, reader, selected, capture)) return;
+        capture.decoder.record(.portable);
         // Decode references once for the whole selection, never once per frame.
         if (configurations) |session| _ = try session.decodeSelected(selected, capture, Capture.publishDecoded) else _ = try video.h264_sparse.decodeSelected(a, reader, selected, .{ .max_total_packets = 8192 }, capture, Capture.publishDecoded);
     }
@@ -980,7 +1059,7 @@ fn compatibleApple(a: std.mem.Allocator, avcc: []const u8) !bool {
     video.avc.validateConfig(avcc) catch return false;
     const cfg = video.h264.configParse(a, avcc) catch |err| return if (err == error.OutOfMemory) err else false;
     defer cfg.groups.deinit(a);
-    return cfg.frame_only and cfg.profile != 88 and !cfg.separate_planes;
+    return cfg.frame_only and cfg.profile != 88 and !cfg.separate_planes and !cfg.full_range;
 }
 const ProjectionJob = struct { slot: usize, prepared: video.preparation.Prepared, options: video.preparation.Options };
 
@@ -1024,6 +1103,7 @@ const Capture = struct {
     a: std.mem.Allocator,
     cb: *const ComputeBackend,
     cache: ?*FrameCache = null,
+    decoder: video.decoding.Options = .{},
     clip_hash: [32]u8 = @splat(0),
     reader_selection: ?*const ReaderSelection = null,
     decode_slots: ?[]const usize = null,
@@ -1043,6 +1123,7 @@ const Capture = struct {
     native_batching: bool = false,
     native_pending: ?NativeProjectionJob = null,
     claimed: [32]bool = @splat(false),
+    apple_published: usize = 0,
     fn loadCached(self: *Capture, slot: usize, ticket: CacheTicket) !void {
         try self.control.check();
         const tokens = ticket.entry.tokens;
@@ -1059,7 +1140,7 @@ const Capture = struct {
         };
     }
     fn storeDevice(self: *Capture, slot: usize, tensor: CT, tokens: usize) void {
-        if (self.cache) |cache| cache.storeDevice(projectionKey(self.reader_selection, self.clip_hash, self.selected, slot), tensor, tokens);
+        if (self.cache) |cache| cache.storeDevice(projectionKey(self.reader_selection, self.clip_hash, self.selected, slot, self.decoder.policy), tensor, tokens);
     }
     fn finishDuplicates(self: *Capture) !void {
         for (self.selected, 0..) |id, slot| {
@@ -1153,7 +1234,7 @@ const Capture = struct {
     }
     fn save(self: *Capture, slot: usize, encoded: anytype) !void {
         if (encoded.tokens == 0 or encoded.tokens > 140 or encoded.embeddings.len != encoded.tokens * 512) return error.InvalidTensorShape;
-        if (self.cache) |cache| cache.storeCpu(projectionKey(self.reader_selection, self.clip_hash, self.selected, slot), encoded.embeddings, encoded.tokens);
+        if (self.cache) |cache| cache.storeCpu(projectionKey(self.reader_selection, self.clip_hash, self.selected, slot, self.decoder.policy), encoded.embeddings, encoded.tokens);
         @memcpy(self.output[slot * 140 * 512 ..][0..encoded.embeddings.len], encoded.embeddings);
         self.frame_tokens[slot] = encoded.tokens;
     }
@@ -1283,16 +1364,44 @@ const Capture = struct {
         defer self.a.free(patches);
         try self.project(slot, patches, options);
     }
+    fn publishAppleWebm(raw: *anyopaque, id: usize, surface: *const video.apple.Surface, picture: video.webm_pictures.Picture) !void {
+        const self: *Capture = @ptrCast(@alignCast(raw));
+        self.apple_published += 1;
+        const slot = std.mem.indexOfScalar(usize, self.selected, id) orelse return error.InvalidPacketIndex;
+        if (self.copyDuplicate(slot)) return;
+        const track = self.webm_track orelse return error.InvalidSamplingMetadata;
+        if (track.colour.range != 0 and (track.colour.range == 2) != surface.format.fullRange()) return error.UnsupportedVideoColor;
+        // Reuse portable declaration validation, including siting and depth.
+        try validateWebmSignal(track, picture.bit_depth, picture.chroma_format, picture.color.full_range);
+        const c = picture.color;
+        var options = try webmPolicy(track, picture.width, picture.height, .{ .primaries = if (c.primaries == 2) null else c.primaries, .transfer = if (c.transfer == 2) null else c.transfer, .matrix = if (c.matrix == 2) null else c.matrix });
+        if (options.tone_mapping == .none) options.rgb_rounding = video.preparation.softwareSdrRounding(picture.width, picture.chroma_format, picture.bit_depth, options.matrix);
+        options.admission_pool = self.pool;
+        if (self.metal) |metal| {
+            const prepared = try metal.submit(self.a, surface, options, self.control);
+            return self.projectGpu(slot, prepared, options);
+        }
+        const patches = try video.preparation.reference(self.a, surface, options, self.control);
+        defer self.a.free(patches);
+        try self.project(slot, patches, options);
+    }
     fn publishApple(raw: *anyopaque, frame: *const video.apple.Frame) !void {
         const self: *Capture = @ptrCast(@alignCast(raw));
+        self.apple_published += 1;
         try self.validateRange(frame.surface.format.fullRange());
         var options = try policySignal(self.track, frame.surface.width, frame.surface.height, self.signal);
         options.admission_pool = self.pool;
         // Duplicate logical samples must receive the same projection.
         const first = std.mem.indexOfScalar(usize, self.selected, frame.decode_index) orelse return error.InvalidPacketIndex;
         if (self.copyDuplicate(first)) return;
-        const prepared = try self.metal.?.submit(self.a, &frame.surface, options, self.control);
-        try self.projectGpu(first, prepared, options);
+        if (self.metal) |metal| {
+            const prepared = try metal.submit(self.a, &frame.surface, options, self.control);
+            try self.projectGpu(first, prepared, options);
+        } else {
+            const patches = try video.preparation.reference(self.a, &frame.surface, options, self.control);
+            defer self.a.free(patches);
+            try self.project(first, patches, options);
+        }
         if (self.prefetch != null or self.scheduler != null) return;
         const n = self.frame_tokens[first] * 512;
         for (self.selected, 0..) |index, slot| if (index == frame.decode_index and slot != first) {
@@ -2280,4 +2389,89 @@ test "embeddinggemma2 video identity GBR declarations select native RGB compatib
         invalid.colour.transfer = 16;
         try std.testing.expectError(error.UnsupportedVideoColor, webmPolicy(invalid, invalid.width, invalid.height, .{}));
     }
+}
+
+const PreparedQualification = struct {
+    a: std.mem.Allocator,
+    ids: [32]usize = @splat(0),
+    count: usize = 0,
+    patches: [32]?[]f32 = @splat(null),
+    fn deinit(self: *@This()) void {
+        for (self.patches) |value| if (value) |patch| self.a.free(patch);
+    }
+    fn run(a: std.mem.Allocator, bytes: []const u8, decoder: video.decoding.Options) !PreparedQualification {
+        var result = PreparedQualification{ .a = a };
+        errdefer result.deinit();
+        var pool = media.admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024 } };
+        defer std.debug.assert(std.meta.eql(pool.snapshot(), media.admission.Resources{}));
+        const producer = try Prefetch.startConfigured(a, std.testing.io, null, bytes, null, .{}, .{ .pool = &pool, .decoder = decoder });
+        defer producer.deinit();
+        var jobs: [1]Prefetch.Job = undefined;
+        while (true) {
+            _ = producer.queue.getUncancelable(std.testing.io, &jobs, 1) catch break;
+            defer producer.discard(&jobs[0]);
+            switch (jobs[0]) {
+                .header => |ids| {
+                    if (ids.len > result.ids.len) return error.TestUnexpectedResult;
+                    result.count = ids.len;
+                    @memcpy(result.ids[0..ids.len], ids);
+                },
+                .native => |value| {
+                    if (result.patches[value.slot] != null) return error.TestUnexpectedResult;
+                    result.patches[value.slot] = try a.dupe(f32, value.patches);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+        producer.join();
+        if (producer.failure) |err| return err;
+        return result;
+    }
+};
+fn qualifyApplePreparation(bytes: []const u8) !void {
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var stats = video.decoding.Telemetry{};
+    var apple_frames = PreparedQualification.run(a, bytes, .{ .policy = .apple, .telemetry = &stats }) catch |err| {
+        if (err == error.VideoDecoderUnavailable) return error.SkipZigTest;
+        return err;
+    };
+    defer apple_frames.deinit();
+    var portable_frames = try PreparedQualification.run(a, bytes, .{ .policy = .portable, .telemetry = &stats });
+    defer portable_frames.deinit();
+    try std.testing.expectEqualSlices(usize, portable_frames.ids[0..portable_frames.count], apple_frames.ids[0..apple_frames.count]);
+    for (portable_frames.patches, apple_frames.patches) |portable, accelerated| {
+        try std.testing.expectEqual(portable != null, accelerated != null);
+        if (portable) |expected| try std.testing.expectEqualSlices(f32, expected, accelerated.?);
+    }
+    try std.testing.expectEqual(@as(usize, 1), stats.portable.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), stats.apple_hardware.load(.acquire) + stats.apple_software.load(.acquire));
+}
+test "embeddinggemma2 video Apple H264 CPU preparation preserves portable model inputs" {
+    try qualifyApplePreparation(@embedFile("../testdata/video/closed.mp4"));
+}
+test "embeddinggemma2 video Apple VP9 CPU preparation preserves portable model inputs" {
+    try qualifyApplePreparation(@embedFile("../testdata/video/vp9.webm"));
+}
+test "embeddinggemma2 video Apple AV1 CPU preparation preserves portable model inputs" {
+    try qualifyApplePreparation(@embedFile("../testdata/video/av1.webm"));
+}
+test "embeddinggemma2 video decoder policy isolates cached projections and fallback cannot replay consumers" {
+    const a = std.testing.allocator;
+    const automatic = projectionKey(null, @splat(1), &.{0}, 0, .automatic);
+    const portable = projectionKey(null, @splat(1), &.{0}, 0, .portable);
+    try std.testing.expect(!std.meta.eql(automatic, portable));
+    try std.testing.expect(!std.meta.eql(portable, projectionKey(null, @splat(1), &.{0}, 0, .apple)));
+    var stats = video.decoding.Telemetry{};
+    var capture = Capture{ .a = a, .cb = undefined, .track = undefined, .control = .{}, .output = &.{}, .frame_tokens = &.{}, .selected = &.{}, .decoder = .{ .telemetry = &stats } };
+    try appleUnavailable(&capture, error.VideoDecoderUnavailable);
+    try std.testing.expectEqual(@as(usize, 1), stats.fallbacks.load(.monotonic));
+    capture.apple_published = 1;
+    try std.testing.expectError(error.VideoDecoderUnavailable, appleUnavailable(&capture, error.VideoDecoderUnavailable));
+    capture.apple_published = 0;
+    try std.testing.expectError(error.VideoDecodeFailed, appleUnavailable(&capture, error.VideoDecodeFailed));
+    var fallback = try PreparedQualification.run(a, @embedFile("../testdata/video/vp8.webm"), .{ .telemetry = &stats });
+    defer fallback.deinit();
+    try std.testing.expectEqual(@as(usize, 1), stats.portable.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 2), stats.fallbacks.load(.monotonic));
 }

@@ -178,3 +178,9 @@ separate from Apple device qualification. Cloud-client tests use local endpoints
 they do not establish arbitrary cloud/origin interoperability. Model-level
 reference preservation and final source scopes are recorded in the
 [non-CUDA qualification summary](../../../docs/plans/native-video-noncuda-audit.md).
+
+Optional Apple decoding remains in `lib/video`; media sources and container
+indexes stay portable. WebM header indexes now carry packet bindings, codec
+configuration and colour metadata so VideoToolbox and Zig replay use the same
+logical selections. Apple release artifacts declare a macOS 15 deployment target;
+framework SDK availability does not imply a hardware decoder for every stream.

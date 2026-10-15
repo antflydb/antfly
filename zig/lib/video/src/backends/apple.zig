@@ -20,9 +20,12 @@ const decode_plan = @import("../decode_plan.zig");
 const supported = @import("builtin").os.tag == .macos;
 extern fn av_decoder_create([*]const u8, usize, u32, u32, c_int, *const fn (*anyopaque, usize, i32, ?*anyopaque) callconv(.c) void, *anyopaque, *?*anyopaque) i32;
 extern fn av_decoder_submit(*anyopaque, [*]const u8, usize, usize, i64, i64, u32, u32) i32;
+extern fn av_decoder_submit_coded(*anyopaque, [*]const u8, usize, usize, i64, i64, u32) i32;
 extern fn av_decoder_drain(*anyopaque) i32;
 extern fn av_decoder_destroy(*anyopaque) void;
 extern fn av_decoder_hardware(*anyopaque) c_int;
+extern fn av_decoder_supports(u32) c_int;
+extern fn av_decoder_create_coded(u32, [*]const u8, usize, u32, u32, u32, c_int, *const fn (*anyopaque, usize, i32, ?*anyopaque) callconv(.c) void, *anyopaque, *?*anyopaque) i32;
 extern fn av_surface_retain(*anyopaque) void;
 extern fn av_surface_release(*anyopaque) void;
 extern fn av_surface_width(*anyopaque) u32;
@@ -51,6 +54,40 @@ pub const Format = enum(u32) {
     }
     pub fn sampleShift(self: Format) u4 {
         return if (self.bitDepth() == 10) 6 else 0;
+    }
+};
+pub const Codec = enum(u32) { h264 = 0x61766331, vp9 = 0x76703039, av1 = 0x61763031 };
+pub fn hardwareSupported(codec: Codec) bool {
+    return supported and av_decoder_supports(@backingInt(codec)) != 0;
+}
+/// Caller callback/context must stay at a stable address until deinit fences
+/// all callbacks. No asynchronous/temporal processing flags are requested.
+pub const CodedSession = struct {
+    handle: *anyopaque,
+    pub fn init(codec: Codec, config: []const u8, width: u32, height: u32, format: Format, require_hardware: bool, callback: *const fn (*anyopaque, usize, i32, ?*anyopaque) callconv(.c) void, context: *anyopaque) !CodedSession {
+        if (!supported) return error.UnsupportedVideoBackend;
+        if (codec == .h264) return error.UnsupportedVideoProfile;
+        var handle: ?*anyopaque = null;
+        const status = av_decoder_create_coded(@backingInt(codec), config.ptr, config.len, width, height, @backingInt(format), @intFromBool(require_hardware), callback, context, &handle);
+        if (status == -108) return error.OutOfMemory; // memFullErr
+        if (status != 0) return error.VideoDecoderUnavailable;
+        return .{ .handle = handle.? };
+    }
+    pub fn submit(self: CodedSession, bytes: []const u8, id: usize, pts: i64, duration: ?u64, scale: u32) !void {
+        if (!supported) return error.UnsupportedVideoBackend;
+        const ticks = if (duration) |d| std.math.cast(i64, d) orelse return error.UnsupportedTimeline else @as(i64, -1);
+        if (av_decoder_submit_coded(self.handle, bytes.ptr, bytes.len, id, pts, ticks, scale) != 0) return error.VideoDecodeFailed;
+    }
+    pub fn drain(self: CodedSession) !void {
+        if (!supported) return error.UnsupportedVideoBackend;
+        if (av_decoder_drain(self.handle) != 0) return error.VideoDecodeFailed;
+    }
+    pub fn hardware(self: CodedSession) bool {
+        return supported and av_decoder_hardware(self.handle) != 0;
+    }
+    pub fn deinit(self: *CodedSession) void {
+        if (supported) av_decoder_destroy(self.handle);
+        self.* = undefined;
     }
 };
 /// Move-only owned retain. Not locked for CPU access until map() is called.
@@ -240,8 +277,11 @@ fn flush(capture: *Capture, sink: ?Sink) !void {
 /// Conservative platform picture-pool estimate shared by request admission
 /// and session qualification. Opaque driver workspace remains unmeasured.
 pub fn surfaceAdmissionBytes(width: u32, height: u32, selections: usize) !u64 {
+    return surfaceAdmissionBytesForDepth(width, height, selections, 8);
+}
+pub fn surfaceAdmissionBytesForDepth(width: u32, height: u32, selections: usize, depth: u8) !u64 {
     const row = std.mem.alignForward(u64, @as(u64, width) + 256, 256);
-    const per_frame = try std.math.mul(u64, row, (@as(u64, height) + 32) * 2);
+    const per_frame = try std.math.mul(u64, row, (@as(u64, height) + 32) * (if (depth > 8) @as(u64, 4) else 2));
     return std.math.mul(u64, per_frame, try std.math.add(u64, selections, 24));
 }
 fn decode(allocator: std.mem.Allocator, reader: *media.mp4.Reader, indexes: []const usize, options: Options, sink: ?Sink) !Batch {
@@ -271,7 +311,9 @@ fn decode(allocator: std.mem.Allocator, reader: *media.mp4.Reader, indexes: []co
     @memset(seen, false);
     var capture = Capture{ .reader = reader, .indexes = indexes, .slots = slots, .seen = seen, .control = reader.input.control, .max_retained = options.max_retained_surface_bytes };
     var handle: ?*anyopaque = null;
-    if (av_decoder_create(reader.track.avcc.ptr, reader.track.avcc.len, reader.track.width, reader.track.height, @intFromBool(options.require_hardware), Capture.callback, &capture, &handle) != 0) return error.VideoDecoderUnavailable;
+    const creation = av_decoder_create(reader.track.avcc.ptr, reader.track.avcc.len, reader.track.width, reader.track.height, @intFromBool(options.require_hardware), Capture.callback, &capture, &handle);
+    if (creation == -108) return error.OutOfMemory;
+    if (creation != 0) return error.VideoDecoderUnavailable;
     // This defer runs before capture/slot cleanup on every failure path.
     defer av_decoder_destroy(handle.?);
     for (plan.runs) |run| {

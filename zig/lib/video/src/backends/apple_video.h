@@ -19,9 +19,12 @@
 typedef void (*av_output)(void *, size_t, int32_t, void *);
 int32_t av_decoder_create(const uint8_t *, size_t, uint32_t, uint32_t, int, av_output, void *, void **);
 int32_t av_decoder_submit(void *, const uint8_t *, size_t, size_t, int64_t, int64_t, uint32_t, uint32_t);
+int32_t av_decoder_submit_coded(void *, const uint8_t *, size_t, size_t, int64_t, int64_t, uint32_t);
 int32_t av_decoder_drain(void *);
 void av_decoder_destroy(void *);
 int av_decoder_hardware(void *);
+int av_decoder_supports(uint32_t);
+int32_t av_decoder_create_coded(uint32_t, const uint8_t *, size_t, uint32_t, uint32_t, uint32_t, int, av_output, void *, void **);
 void av_surface_retain(void *);
 void av_surface_release(void *);
 uint32_t av_surface_width(void *);

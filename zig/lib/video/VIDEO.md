@@ -20,7 +20,7 @@ current contracts; historical progress and raw reports live in Git history.
 | Portable VP8 | Versions 0–3, stateful interframes and hidden references; planar owned output. |
 | Portable VP9 | Profiles 0–3, 8/10/12-bit 4:2:0/4:2:2/4:4:4, interframes and superframes. |
 | Portable AV1 | Profiles 0–2, 8/10/12-bit monochrome and 4:2:0/4:2:2/4:4:4, interframes, show-existing and film grain; low-overhead and Annex B framing. |
-| Apple VideoToolbox | Eligible static avc1 Baseline/Main/High 8-bit 4:2:0; hardware required by default, explicit platform-software opt-in. |
+| Apple VideoToolbox | Eligible static progressive limited-range avc1 8-bit 4:2:0; fixed-format VP9/AV1 WebM 8/10-bit 4:2:0 with one visible picture per packet. Library hardware-only default; model automatic selection explicitly permits Apple software. |
 
 Compile-time [capabilities](src/capabilities.zig) distinguish built routes from
 runtime hardware/profile availability. Unsupported tools fail explicitly; the
@@ -223,3 +223,38 @@ seeds, attribution and generators remain in [testdata](testdata/README.md).
 [Qualification and reproduction](../../../docs/plans/native-video-noncuda-audit.md)
 records platform/source scopes, final production checks and benchmark limitations.
 Write generated run output under ignored `.benchmark-results/`.
+
+## Optional Apple decoder selection
+
+`decoding.Options.policy` selects `automatic`, `portable`, or `apple` independently
+of CPU/Metal model execution. `embedding_gemma2.Options.video_decoder` propagates
+that policy through synchronous encoding and preparation workers. Optional atomic
+`Telemetry` counters distinguish portable, Apple hardware and Apple
+software routes and capability fallbacks. Request-local projection cache keys
+isolate explicit decoder policies. The standard release retains Zig decoders.
+
+Automatic selection tries the eligible Apple path and falls back for unavailable
+sessions or unsupported layouts before any picture reaches the consumer. Native
+corruption, cancellation, allocation/admission failures and consumer failures do
+not trigger replay. Once a consumer has been called, a later native failure is
+returned; partially published model work is never silently replayed or mixed.
+Portable replay reconstructs from the original verified dependency boundaries.
+
+Apple WebM replay binds surfaces to the existing header index's logical picture
+IDs and starts at a verified key packet, restoring AV1 sequence OBUs when needed.
+It retains NV12/P010 surfaces through callback completion, imports them directly
+into Metal, and maps them only for CPU preparation. Format/color changes,
+monochrome/4:2:2/4:4:4/12-bit output, multi-frame VP9 superframes, multiple visible pictures per
+packet, AV1 multiple operating points and film grain currently use Zig. The
+Apple bridge requests hardware preference and checks actual session receipts;
+codec availability probes alone do not establish stream acceptance.
+
+Release Apple Silicon artifacts explicitly target macOS 15.0 and carry matching
+`macosx_15_0_arm64` wheel tags. The release SDK remains pinned at 15.5. CI compiles
+against that SDK and executes decoder/CPU model compatibility on macOS 15 and 26,
+recording hardware and actual decoder receipts. Unavailable codec tests are skips,
+not successful decoder qualifications. These jobs must pass before claiming
+qualification on those hosts; local hardware results establish only the tested
+Mac. Hosted VM capability skips do not establish GPU qualification; a manually
+selected self-hosted Apple Silicon job executes the full Metal suite. Intel builds
+and macOS releases below 15 are not release-qualified here.
