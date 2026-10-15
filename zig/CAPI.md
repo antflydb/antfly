@@ -415,6 +415,22 @@ reclamation do not consume its deadline. Lite background maintenance advances
 one table per turn, including one relational index page, and releases the writer lease between
 turns, retaining pending work for subsequent turns.
 
+Detached maintenance primary transactions and index publications join the fair
+writer queue. They adopt the latest primary checkpoint when the namespace,
+catalog, and physical index inputs remain unchanged, so unrelated foreground
+commits do not force a retry. Inference and segment construction run outside
+the writer gate; changed index inputs or file replacement still cancel stale
+publication. Reclamation continues to yield on contention.
+
+`antfly_db_pending_work_stats_json` includes `index_replay_debt` per namespace:
+each index reports its `applied_sequence`, `target_sequence`, and
+`catch_up_required`. Their sequence difference measures replay lag, rather
+than elapsed time or a count of documents. Lite connections also expose
+`background_publications` with owner-lifetime `attempts`, `refused` admission
+counts (including admission errors), and successful checkpoint `rebased`
+counts. These totals survive foreground runtime refreshes and reset on closing
+the last compatible connection. Root results include per-table debt in `tables`.
+
 Failed UNIQUE coverage admits constraint-checked UPDATE/DELETE repairs under
 the exact native activation checkpoint, including SQL transactions with cascades and multiple repair targets.
 Repair admission follows the complete mutation closure, including failed tables

@@ -349,6 +349,13 @@ pub const Owner = struct {
     maintenance_table_cursor: usize = 0,
     maintenance_round_pending: bool = false,
     maintenance_capture_misses: u8 = 0,
+    // Connection-owner lifetime totals, protected by the path gate. They survive
+    // foreground runtime refreshes and distinguish conflicts from a moving tip.
+    publication_stats: struct {
+        attempts: u64 = 0,
+        refused: u64 = 0,
+        rebased: u64 = 0,
+    } = .{},
     test_runtime_snapshot_opens: if (h.builtin.is_test) u64 else void = if (h.builtin.is_test) 0 else {},
     embedding_memo: ?memo_mod.QueryEmbeddingCache = null,
     embedding_memo_budget: cache_budget.CacheBudget = .init(embedding_memo_bytes),
@@ -461,9 +468,9 @@ pub const Owner = struct {
         self.embedding_memo.?.remember(&self.embedding_memo_budget, key, vector);
     }
 
-    // Index publications queue behind foreground operations. Their DB/index
-    // locks belong to the detached runtime; foreground refresh opens a separate
-    // runtime. Primary/reclamation admission yields on contention.
+    // Primary transactions and index publications join the fair writer queue.
+    // Their DB/index locks belong to the detached runtime; foreground refresh
+    // opens a separate runtime. Reclamation admission yields on contention.
     fn enterMaintenanceWriter(ptr: *anyopaque, scope: PublicationScope) !void {
         const root: *h.Handle = @ptrCast(@alignCast(ptr));
         const self = root.maintenance_owner.?;
@@ -474,9 +481,12 @@ pub const Owner = struct {
             return;
         }
         if (self.stopping.load(.acquire)) return error.Canceled;
-        if (scope == .index) self.gate.mutex.lockUncancelable(h.handleLockIo()) else if (!self.gate.mutex.tryLock()) return error.EnrichmentWaitCanceled;
+        if (scope != .reclamation) self.gate.mutex.lockUncancelable(h.handleLockIo()) else if (!self.gate.mutex.tryLock()) return error.EnrichmentWaitCanceled;
         errdefer self.gate.mutex.unlock(h.handleLockIo());
-        if (scope == .index) if (root.maintenance_publication) |p| if (p.index_inputs_changed) return error.EnrichmentWaitCanceled;
+        if (self.stopping.load(.acquire)) return error.Canceled;
+        self.publication_stats.attempts +|= 1;
+        errdefer self.publication_stats.refused +|= 1;
+        if (scope != .reclamation) if (root.maintenance_publication) |p| if (p.index_inputs_changed) return error.EnrichmentWaitCanceled;
         if (self.current) |current| if (needsOutcomeReconciliation(current)) return error.EnrichmentWaitCanceled;
         var lease = native.lockWriterPathWithIo(alloc, h.handleLockIo(), self.path) catch |err| switch (err) {
             error.FileBusy, error.WouldBlock => return error.EnrichmentWaitCanceled,
@@ -488,11 +498,15 @@ pub const Owner = struct {
         const file = &root.owned_lite_backend.?.native_docstore.?.file;
         if ((try probe.file.stat(probe.runtime())).inode != (try file.file.stat(file.runtime())).inode) return error.EnrichmentWaitCanceled;
         if (!std.meta.eql(probe.header, file.header)) {
-            if (scope != .index) return error.EnrichmentWaitCanceled;
+            if (scope == .reclamation) return error.EnrichmentWaitCanceled;
             const publication = root.maintenance_publication orelse return error.EnrichmentWaitCanceled;
             _ = try publication.current();
-            // Foreground refresh may create reader leases. Those are outside
-            // the index's physical path and cannot invalidate its LSM inputs.
+            // Rebase before opening a primary transaction as well as before
+            // publishing immutable index bytes. Lease acquisition and replay
+            // checkpoints must not require a quiet interval between capture
+            // and publication. Unchanged physical index inputs and catalog
+            // identity keep detached computations valid; transactions opened
+            // after this admission read the current primary checkpoint.
             var latest = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.path, .{ .read_only = true, .internal_reader = true });
             defer latest.close();
             if ((try latest.file.stat(latest.runtime())).inode != (try file.file.stat(file.runtime())).inode) return error.EnrichmentWaitCanceled;
@@ -500,6 +514,7 @@ pub const Owner = struct {
                 if (!try file.indexCatalogPrefixUnchanged(&latest, publication.index_prefix)) return error.EnrichmentWaitCanceled;
             }
             try root.owned_lite_backend.?.native_docstore.?.refreshIndexPublicationCheckpoint(latest.header);
+            self.publication_stats.rebased +|= 1;
         }
         root.maintenance_writer_lease = lease;
         root.maintenance_writer_references = 1;

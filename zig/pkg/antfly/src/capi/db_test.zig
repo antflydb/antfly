@@ -5326,7 +5326,8 @@ test "capi SQL batched conflict validation reclaims prior row scratch" {
 test "capi SQL index publication accepts unrelated primary commits and fences changed inputs" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
     const alloc = std.testing.allocator;
-    for ([_]bool{ false, true }) |index_changed| {
+    for ([_]enum { bookkeeping, append, conflicting_index }{ .bookkeeping, .append, .conflicting_index }) |mode| {
+        const index_changed = mode == .conflicting_index;
         const Gate = struct {
             entered: std.atomic.Value(bool) = .init(false),
             started: std.Io.Event = .unset,
@@ -5340,6 +5341,23 @@ test "capi SQL index publication accepts unrelated primary commits and fences ch
                     self.publication_error = err;
                     return;
                 };
+                // Lease/progress transactions must also survive a moved primary
+                // checkpoint before the first immutable segment is published.
+                var txn = root.db.core.store.beginWriteTxn() catch |err| {
+                    self.publication_error = err;
+                    return;
+                };
+                var committed = false;
+                defer if (!committed) txn.abort();
+                txn.put("__antfly_test_detached_progress", "progress") catch |err| {
+                    self.publication_error = err;
+                    return;
+                };
+                txn.commit() catch |err| {
+                    self.publication_error = err;
+                    return;
+                };
+                committed = true;
                 // Deliver already prepared immutable bytes through the same
                 // storage port used by full-text segments, after foreground
                 // commits have moved the primary checkpoint.
@@ -5400,7 +5418,7 @@ test "capi SQL index publication accepts unrelated primary commits and fences ch
         };
         try gate.started.waitTimeout(shared.handleLockIo(), .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
         for (0..8) |i| {
-            if (index_changed) {
+            if (mode != .bookkeeping) {
                 const statement = try std.fmt.allocPrint(alloc, "INSERT INTO \"default\" (_id,body) VALUES ('other{d}','unrelated')", .{i});
                 defer alloc.free(statement);
                 try sqlFkRecoveryStatement(handle, statement);
@@ -5437,6 +5455,15 @@ test "capi SQL index publication accepts unrelated primary commits and fences ch
             // must yield and retry, preserving the foreground artifact.
             if (!owner.maintenance_pending) return error.TestIndexChangeNotPending;
         }
+        if (!index_changed) {
+            // Prove progress in the captured turn, before any quiet-time drain.
+            const guard = public.enterHandle(handle, .exclusive).?;
+            defer guard.leave();
+            const progress = (try guard.handle.db.core.getStoreValue(alloc, "__antfly_test_detached_progress")) orelse return error.TestExpectedProgress;
+            defer alloc.free(progress);
+            try std.testing.expectEqualStrings("progress", progress);
+            try std.testing.expect(owner.publication_stats.rebased > 0);
+        }
         for (0..64) |_| {
             if (!try owner.maintenanceTurnForTest()) break;
         }
@@ -5453,12 +5480,96 @@ test "capi SQL index publication accepts unrelated primary commits and fences ch
         defer result.deinit();
         try std.testing.expect(result.hits.len != 0);
         try std.testing.expectEqualStrings("original", result.hits[0].id);
-        if (index_changed) {
+        if (mode != .bookkeeping) {
             var unrelated = try guard.handle.db.search(alloc, .{ .index_name = "body_text", .full_text = .{ .match = .{ .field = "body", .text = "unrelated" } }, .limit = 10 });
             defer unrelated.deinit();
             try std.testing.expectEqual(@as(usize, 8), unrelated.hits.len);
         }
     }
+}
+
+test "capi SQL maintenance advances every captured full text prefix during steady appends" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("capi-sql-steady-append-progress");
+    defer directory.cleanup();
+    const path = try tempTestAflitePath(alloc, directory.path(), "database");
+    defer alloc.free(path);
+    defer cleanupTestFile(path);
+    var options: capi.OpenOptions = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
+    options.storage_kind = capi.storage_kind_lite;
+    options.profile = capi.profile_native;
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
+    defer antfly_db_close(handle);
+    const owner = blk: {
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        break :blk guard.connection.?.owner;
+    };
+    owner.stopping.store(true, .release);
+    owner.wake.set(shared.handleLockIo());
+    owner.worker.?.join();
+    owner.worker = null;
+    owner.stopping.store(false, .release);
+    {
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        try guard.handle.db.addIndex(.{ .name = "body_text", .kind = .full_text, .config_json = "{\"field\":\"body\"}" });
+        try guard.handle.db.batch(.{ .writes = &.{.{ .key = "original", .value = "{\"body\":\"needle\"}" }}, .sync_level = .write });
+    }
+    const Append = struct {
+        handle: ?*anyopaque,
+        count: usize = 0,
+        target: u64 = 0,
+        failure: ?anyerror = null,
+        fn notify(ptr: *anyopaque, root: *shared.Handle) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.target = root.db.core.nextDerivedSequence();
+            self.append() catch |err| {
+                self.failure = err;
+            };
+        }
+        fn append(self: *@This()) !void {
+            const guard = public.enterHandle(self.handle, .exclusive).?;
+            defer guard.leave();
+            var key: [64]u8 = undefined;
+            const name = try std.fmt.bufPrint(&key, "append{d}", .{self.count});
+            try guard.handle.db.batch(.{ .writes = &.{.{ .key = name, .value = "{\"body\":\"continuous\"}" }}, .sync_level = .write });
+            self.count += 1;
+        }
+    };
+    var append: Append = .{ .handle = handle };
+    owner.test_after_capture = .{ .ptr = &append, .notify = Append.notify };
+    defer owner.test_after_capture = null;
+    for (0..4) |_| {
+        owner.maintenance_pending = true;
+        _ = try owner.maintenanceTurnForTest();
+        if (append.failure) |err| return err;
+        // A foreground append moves the tip in every turn. Inspect durable
+        // coverage before another maintenance turn or any search/idle drain.
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        const debt = try guard.handle.db.listDerivedReplayDebt(alloc);
+        defer {
+            for (debt) |*item| item.deinit(alloc);
+            alloc.free(debt);
+        }
+        var found = false;
+        for (debt) |item| if (std.mem.eql(u8, item.index_name, "body_text")) {
+            found = true;
+            try std.testing.expect(item.applied_sequence >= append.target);
+        };
+        try std.testing.expect(found);
+        const json = try public.pendingWorkStatsJson(guard.handle);
+        defer freeRawBuffer(json.ptr, json.len);
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json.ptr.?[0..json.len], .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.object.get("index_replay_debt").?.array.items.len != 0);
+        try std.testing.expect(parsed.value.object.get("background_publications").?.object.get("rebased").?.integer > 0);
+    }
+    try std.testing.expectEqual(@as(usize, 4), append.count);
 }
 
 test "capi SQL missing namespace forces coordinated catalog validation" {
