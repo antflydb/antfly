@@ -15695,6 +15695,27 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return try self.ctFromOwnedMetalTensor(output);
     }
 
+    fn dropoutMaskOp(ctx: *anyopaque, shape: []const i32, probability: f32, seed: u64) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (!(probability >= 0 and probability < 1)) return error.InvalidDropoutProbability;
+        var count: usize = 1;
+        for (shape) |dim| count *= @intCast(dim);
+        if (count > 0 and count <= std.math.maxInt(u32)) {
+            var request = ops.gliner_boundary_device.Kernel{ .kind = .dropout_mask };
+            request.dims[0] = @intCast(count);
+            request.dims[1] = @truncate(seed);
+            request.dims[2] = @truncate(seed >> 32);
+            request.dims[3] = ops.dropout_mask.threshold(probability);
+            request.scalars[0] = 1 / (1 - probability);
+            if (try self.boundaryKernelDevice(request, &.{}, shape)) |tensor| return tensor;
+        }
+        warnHostFallbackOnce(5, "dropout mask");
+        const values = try self.allocator.alloc(f32, count);
+        defer self.allocator.free(values);
+        try ops.dropout_mask.fill(values, probability, seed);
+        return fromFloat32ShapeOp(ctx, values, shape);
+    }
+
     fn qkvRopeTableOp(ctx: *anyopaque, input: CT, cos: CT, sin: CT, width: usize, head_dim: usize, inverse: bool) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const count = bufElemCount(toBuf(input));
@@ -32817,6 +32838,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.layerNormBackward = layerNormBackwardOp;
         vt.ropeTable = ropeTableOp;
         vt.qkvRopeTable = qkvRopeTableOp;
+        vt.dropoutMask = dropoutMaskOp;
         vt.geglu = gegluOp;
         vt.gegluBackward = gegluBackwardOp;
         vt.addLayerNorm = addLayerNormOp;

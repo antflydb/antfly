@@ -354,6 +354,9 @@ pub const Kind = enum(u32) {
     /// `fused_qkv_rope_table` (ops/rope_table.zig applyQkv): rows, width,
     /// head_dim, inverse.
     qkv_rope_table = 54,
+    /// Inverted-dropout mask (ops/dropout_mask.zig): count, seed low, seed
+    /// high, drop threshold; scalars[0] is the keep scale.
+    dropout_mask = 55,
 };
 
 pub const Params = extern struct {
@@ -415,6 +418,10 @@ pub fn layoutFor(kind: Kind, d: [8]u32, scalars: [4]f32) !Layout {
             r.input_elements[0] = r.output_elements;
             r.input_elements[1] = d[0];
             r.integer_inputs = 1 << 1;
+        },
+        .dropout_mask => {
+            if (d[0] == 0) return error.InvalidBoundaryDeviceShape;
+            r.output_elements = d[0];
         },
         .qkv_rope_table => { // rows, width, head_dim, inverse
             if (d[2] == 0 or d[2] % 2 != 0 or d[1] == 0 or d[1] % d[2] != 0 or d[3] > 1) return error.InvalidBoundaryDeviceShape;
