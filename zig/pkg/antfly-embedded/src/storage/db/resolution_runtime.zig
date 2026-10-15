@@ -139,8 +139,7 @@ pub fn siblingClaimedLabelsAlloc(
     for (resolvers) |*sibling| {
         if (sibling == cfg) continue;
         if (!std.mem.eql(u8, sibling.source_artifact, cfg.source_artifact)) continue;
-        if (!sibling.source_artifact_kind.matches(cfg.source_artifact_kind) and
-            !cfg.source_artifact_kind.matches(sibling.source_artifact_kind)) continue;
+        if (!sibling.source_artifact_kind.overlaps(cfg.source_artifact_kind)) continue;
         for (sibling.labels) |label| try claimed.append(gpa, label);
     }
     return try claimed.toOwnedSlice(gpa);
@@ -246,6 +245,9 @@ pub const ProcessOutcome = struct {
     resolution_key: []u8,
     /// Deferred artifact bytes for an atomic artifact + replay commit.
     resolution_value: ?[]u8 = null,
+    /// Revision/cache-only refresh: reconcile graph confidence/config, but do
+    /// not republish unchanged canonical documents to the entity sink.
+    graph_only: bool = false,
 };
 
 pub const PersistenceMode = enum { immediate, deferred };
@@ -362,7 +364,7 @@ pub fn resolveQueryExtractionAlloc(
     // while retaining the durable catalog's label-routing rules.
     for (resolvers) |*sibling| {
         if (std.mem.eql(u8, sibling.name, cfg.name)) continue;
-        const outcome = (try processChangedExtractionWithConfig(gpa, resolvers, sibling, store, null, key, candidate_source, embedder, .deferred, overlay.items)) orelse continue;
+        const outcome = (try processChangedExtractionWithConfigOptions(gpa, resolvers, sibling, store, null, key, candidate_source, embedder, .deferred, overlay.items, false)) orelse continue;
         if (outcome.resolution_value) |value| {
             overlay.append(gpa, .{ .key = outcome.resolution_key, .value = value }) catch |err| {
                 gpa.free(outcome.resolution_key);
@@ -371,7 +373,7 @@ pub fn resolveQueryExtractionAlloc(
             };
         } else gpa.free(outcome.resolution_key);
     }
-    const outcome = (try processChangedExtractionWithConfig(gpa, resolvers, cfg, store, null, key, candidate_source, embedder, .deferred, overlay.items)) orelse return error.InvalidArgument;
+    const outcome = (try processChangedExtractionWithConfigOptions(gpa, resolvers, cfg, store, null, key, candidate_source, embedder, .deferred, overlay.items, false)) orelse return error.InvalidArgument;
     defer gpa.free(outcome.resolution_key);
     return outcome.resolution_value orelse error.InvalidArgument;
 }
@@ -388,13 +390,30 @@ pub fn processChangedExtractionWithConfig(
     persistence: PersistenceMode,
     pending_overlay: []const ArtifactWrite,
 ) !?ProcessOutcome {
+    return processChangedExtractionWithConfigOptions(gpa, resolvers, cfg, store, provider, changed_key, candidate_source, embedder, persistence, pending_overlay, true);
+}
+
+fn processChangedExtractionWithConfigOptions(
+    gpa: std.mem.Allocator,
+    resolvers: []const ResolverConfig,
+    cfg: *const ResolverConfig,
+    store: resolver_lib.ArtifactStore,
+    provider: ?resolver_lib.CandidateProvider,
+    changed_key: []const u8,
+    candidate_source: ?CandidateSource,
+    embedder: ?embedder_mod.DenseEmbedder,
+    persistence: PersistenceMode,
+    pending_overlay: []const ArtifactWrite,
+    retain_work: bool,
+) !?ProcessOutcome {
     var parsed = (try parseSourceArtifactKeyAlloc(gpa, changed_key)) orelse return null;
     defer parsed.deinit(gpa);
     if (!resolverMatchesArtifact(cfg, parsed.source_artifact_kind, parsed.artifact_name)) return null;
 
     const candidate_batch = if (candidate_source) |source| try source.beginBatch(gpa, &.{cfg.table}) else null;
     defer if (candidate_batch) |batch| batch.deinit(gpa);
-    const batch_source = if (candidate_batch) |batch| batch.source else null;
+    var receiving_source = if (candidate_batch) |batch| batch.source.receive() else null;
+    const batch_source = if (receiving_source) |*receiver| receiver.sourceView() else null;
 
     const sibling_excludes = try siblingClaimedLabelsAlloc(gpa, resolvers, cfg);
     defer freeSiblingClaimedLabels(gpa, sibling_excludes);
@@ -420,11 +439,12 @@ pub fn processChangedExtractionWithConfig(
     var exact_provider = ExactKeyCandidateProvider{ .store = store, .resolver = &resolver, .table = cfg.table };
     var prefix_provider = PrefixCandidateProvider{ .store = store, .resolver = &resolver, .table = cfg.table, .candidate_limit = candidateLimit(cfg) };
     var source_provider: SourceCandidateProvider = undefined;
+    const effective_strategy = if (resolver.scorer == null) "exact_key" else cfg.candidate_search;
     const blocked_provider = provider orelse blk: {
         // A cross-shard source (injected by the api layer) wins over the local
         // in-store providers when the resolver declares a candidate search mode.
         if (batch_source) |src| {
-            if (candidateModeFromConfig(if (resolver.scorer == null) "exact_key" else cfg.candidate_search)) |mode| {
+            if (candidateModeFromConfig(effective_strategy)) |mode| {
                 source_provider = .{
                     .source = src,
                     .resolver = &resolver,
@@ -432,6 +452,7 @@ pub fn processChangedExtractionWithConfig(
                     .mode = mode,
                     .ann_index_name = annIndexName(cfg),
                     .candidate_limit = candidateLimit(cfg),
+                    .cache_vectors = retain_work and cfg.retain_work == .full,
                 };
                 break :blk source_provider.provider();
             }
@@ -487,10 +508,25 @@ pub fn processChangedExtractionWithConfig(
     const sibling_resolutions = try siblingResolutionsJsonAlloc(gpa, resolvers, cfg, store, parsed, pending_overlay);
     defer if (sibling_resolutions) |raw| gpa.free(raw);
 
+    const revisions: CandidateSource.Revisions = if (retain_work and provider == null) revisions: {
+        const source = batch_source orelse break :revisions .{};
+        const read = source.vtable.revisions orelse break :revisions .{};
+        break :revisions try read(source.ptr, gpa, cfg.table, annIndexName(cfg), cfg.name_embedding);
+    } else .{};
+    const vector_fields = try resolver.candidateVectorFields(gpa);
+    defer gpa.free(vector_fields);
     const stage = resolver_lib.ResolutionStage{
         .resolver = &resolver,
         .config_generation = cfg.effectiveGeneration(),
+        .promotion_enabled = cfg.promote,
+        .retain_work = retain_work,
+        .work_retention = cfg.retain_work,
+        .max_work_bytes = cfg.max_work_bytes,
+        .embedding_dependency = if (revisions.embedding) |revision| try resolver_lib.fingerprint(gpa, .{ revision, cfg.name_embedding_dims }) else null,
+        .candidate_dependency = if (revisions.candidates) |revision| try resolver_lib.fingerprint(gpa, .{ revision, cfg.table, cfg.key_template, effective_strategy, annIndexName(cfg), candidateLimit(cfg), vector_fields }) else null,
         .embedder = stage_embedder,
+        .embedding_cache = if (batch_source) |source| if (source.vtable.embedding_cache_get != null and source.vtable.embedding_cache_put != null) .{ .ptr = source.ptr, .get = source.vtable.embedding_cache_get.?, .put = source.vtable.embedding_cache_put.? } else null else null,
+        .vector_loader = if (batch_source) |source| if (source.vtable.load_vector) |load| .{ .ptr = source.ptr, .load = load } else null else null,
         .overrides = stage_overrides,
         .sibling_resolutions_json = sibling_resolutions,
         .doc_ref_binding = if (batch_source) |source| .{
@@ -507,10 +543,10 @@ pub fn processChangedExtractionWithConfig(
         return .{ .result = result, .resolution_key = resolution_key };
     }
 
-    var computed = try stage.computeAlloc(gpa, store, effective_provider, changed_key);
-    defer if (computed) |bytes| gpa.free(bytes);
     const existing = try store.get(gpa, resolution_key);
     defer if (existing) |bytes| gpa.free(bytes);
+    var computed = try stage.computeCachedAlloc(gpa, store, effective_provider, changed_key, existing);
+    defer if (computed) |bytes| gpa.free(bytes);
 
     if (computed == null) {
         const stale_handoff = try resolution_handoff.exists(gpa, store, resolution_key);
@@ -533,13 +569,48 @@ pub fn processChangedExtractionWithConfig(
         }
     }
 
+    const graph_only = if (existing) |bytes|
+        (try resolution_handoff.matches(gpa, store, resolution_key, bytes)) and
+            (try sameResolutionDecisions(gpa, bytes, computed.?))
+    else
+        false;
     const resolution_value = computed.?;
     computed = null;
     return .{
         .result = .written,
         .resolution_key = resolution_key,
         .resolution_value = resolution_value,
+        .graph_only = graph_only,
     };
+}
+
+fn sameResolutionDecisions(gpa: Allocator, left: []const u8, right: []const u8) !bool {
+    var a = try std.json.parseFromSlice(std.json.Value, gpa, left, .{});
+    defer a.deinit();
+    var b = try std.json.parseFromSlice(std.json.Value, gpa, right, .{});
+    defer b.deinit();
+    if (a.value != .object or b.value != .object) return false;
+    // The previous generation's queued promotion can be fenced by catalog
+    // DDL before it reaches the sink. Its journal handoff does not prove sink
+    // completion, so a new generation must carry a promotion hint even when
+    // the decisions match. The promotion receipt still suppresses sink writes
+    // when those documents were already published.
+    const ag = a.value.object.get("config_generation") orelse return false;
+    const bg = b.value.object.get("config_generation") orelse return false;
+    if (ag != .integer or ag.integer < 0 or bg != .integer or ag.integer != bg.integer) return false;
+    const aw = a.value.object.get("_resolution_work") orelse return false;
+    const bw = b.value.object.get("_resolution_work") orelse return false;
+    if (aw != .object or bw != .object) return false;
+    const ap = aw.object.get("promotion_enabled") orelse return false;
+    const bp = bw.object.get("promotion_enabled") orelse return false;
+    if (ap != .bool or bp != .bool or ap.bool != bp.bool) return false;
+    const ae = a.value.object.get("entities") orelse return false;
+    const be = b.value.object.get("entities") orelse return false;
+    const av = try std.json.Stringify.valueAlloc(gpa, ae, .{});
+    defer gpa.free(av);
+    const bv = try std.json.Stringify.valueAlloc(gpa, be, .{});
+    defer gpa.free(bv);
+    return std.mem.eql(u8, av, bv);
 }
 
 fn processChangedExtractionForAllResolvers(
@@ -563,16 +634,18 @@ fn processChangedExtractionForAllResolvers(
         switch (outcome.result) {
             .written => {
                 const value = outcome.resolution_value.?;
-                pending.full_keys.append(gpa, outcome.resolution_key) catch |err| {
+                const keys = if (outcome.graph_only) &pending.graph_only_keys else &pending.full_keys;
+                const writes = if (outcome.graph_only) &pending.refresh_writes else &pending.artifact_writes;
+                keys.append(gpa, outcome.resolution_key) catch |err| {
                     gpa.free(outcome.resolution_key);
                     gpa.free(value);
                     return err;
                 };
-                pending.artifact_writes.append(gpa, .{
+                writes.append(gpa, .{
                     .key = outcome.resolution_key,
                     .value = value,
                 }) catch |err| {
-                    _ = pending.full_keys.pop();
+                    _ = keys.pop();
                     gpa.free(outcome.resolution_key);
                     gpa.free(value);
                     return err;
@@ -608,11 +681,14 @@ const PendingRecordCommit = struct {
     graph_only_keys: std.ArrayListUnmanaged([]const u8) = .empty,
     artifact_writes: std.ArrayListUnmanaged(ArtifactWrite) = .empty,
     artifact_deletes: std.ArrayListUnmanaged([]const u8) = .empty,
+    refresh_writes: std.ArrayListUnmanaged(ArtifactWrite) = .empty,
 
     pub fn deinit(self: *PendingRecordCommit, alloc: Allocator) void {
         for (self.full_keys.items) |key| alloc.free(@constCast(key));
         for (self.graph_only_keys.items) |key| alloc.free(@constCast(key));
         for (self.artifact_writes.items) |write| alloc.free(@constCast(write.value));
+        for (self.refresh_writes.items) |write| alloc.free(@constCast(write.value));
+        self.refresh_writes.deinit(alloc);
         self.full_keys.deinit(alloc);
         self.graph_only_keys.deinit(alloc);
         self.artifact_writes.deinit(alloc);
@@ -931,6 +1007,7 @@ fn appendEntityCandidateWithResolved(
             .key = try allocator.dupe(u8, rk),
         } else null,
         .resolved_record = resolved_record,
+        .vector_refs = if (parsed.value.object.get("_resolution_vector_refs")) |refs| try std.json.parseFromValueLeaky([]const resolver_lib.VectorReference, allocator, refs, .{ .allocate = .alloc_always }) else &.{},
     });
 }
 
@@ -963,6 +1040,7 @@ const SourceCandidateProvider = struct {
     mode: CandidateMode,
     ann_index_name: []const u8,
     candidate_limit: usize,
+    cache_vectors: bool = false,
 
     fn provider(self: *SourceCandidateProvider) resolver_lib.CandidateProvider {
         return .{ .ptr = self, .vtable = &vtable };
@@ -1087,11 +1165,32 @@ const SourceCandidateProvider = struct {
                     try appendEntityCandidateWithResolved(alloc, self.table, candidate_key, raw, resolved_key, resolved_raw, &candidates);
                 }
             }
+            try self.referenceVectors(alloc, candidates.items);
             try prepared.put(a, key, candidates.items);
         }
         // Candidate records are immutable; repeated mentions share decoding and
         // allocation while the scorer still evaluates each mention separately.
         for (keys, lists) |key, *list| list.* = prepared.get(key).?;
+    }
+
+    fn referenceVectors(self: *SourceCandidateProvider, a: std.mem.Allocator, candidates: []resolver_lib.Candidate) !void {
+        if (!self.cache_vectors) return;
+        const revisions = self.source.vtable.revisions orelse return;
+        const revision = (try revisions(self.source.ptr, a, self.table, self.ann_index_name, "")).candidates orelse return;
+        for (candidates) |*candidate| {
+            var refs: std.ArrayListUnmanaged(resolver_lib.VectorReference) = .empty;
+            try refs.appendSlice(a, candidate.vector_refs);
+            for (candidate.record.fields) |field| {
+                if (field.value != .vector) continue;
+                var found = false;
+                for (refs.items) |ref| if (std.mem.eql(u8, ref.field, field.name)) {
+                    found = true;
+                    break;
+                };
+                if (!found) try refs.append(a, .{ .field = field.name, .table = candidate.doc_ref.table, .index_name = self.ann_index_name, .key = candidate.doc_ref.key, .index_revision = revision, .dimensions = field.value.vector.len });
+            }
+            candidate.vector_refs = refs.items;
+        }
     }
 
     const ScanCtx = struct {
@@ -1153,6 +1252,7 @@ const SourceCandidateProvider = struct {
                 var ctx = ScanCtx{ .allocator = allocator, .table = self.table, .source = self.source, .out = out, .limit = self.candidate_limit };
                 self.source.nearest(allocator, self.table, .{
                     .index_name = self.ann_index_name,
+                    .cache_vectors = self.cache_vectors,
                     .embedding = emb,
                     .k = self.candidate_limit,
                     .vector_fields = try self.resolver.candidateVectorFields(allocator),
@@ -1375,6 +1475,8 @@ pub fn processRecordKeys(
     if (pending.graph_only_keys.items.len > 0) {
         _ = try write_fn(write_ctx, .{
             .batch = .{ .changed_artifact_keys = pending.graph_only_keys.items },
+            .artifact_writes = pending.refresh_writes.items,
+            .publish_resolution_handoff = pending.refresh_writes.items.len > 0,
             .target_hints = &.{.graph},
         });
     }
@@ -2163,6 +2265,7 @@ pub const ResolutionRuntime = struct {
     }
 
     pub fn deinit(self: *ResolutionRuntime) void {
+        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionDeinit", .{self}) catch @panic("incompatible storage owner");
         self.stop();
         self.store_handle.deinit();
         self.* = undefined;
@@ -2213,6 +2316,7 @@ pub const ResolutionRuntime = struct {
     }
 
     pub fn start(self: *ResolutionRuntime) !void {
+        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionStart", .{self});
         // Without io there is no background thread; the stage is then driven
         // synchronously via catchUp (e.g. from runUntilIdle).
         const io = self.io orelse return;
@@ -2226,6 +2330,7 @@ pub const ResolutionRuntime = struct {
     }
 
     pub fn stop(self: *ResolutionRuntime) void {
+        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionStop", .{self}) catch @panic("incompatible storage owner");
         self.shutdown_flag.store(true, .release);
         if (self.io) |io| {
             self.worker_mutex.lockUncancelable(io);
@@ -2256,6 +2361,7 @@ pub const ResolutionRuntime = struct {
     /// unchanged decisions use graph-only reconciliation. `applied_sequence`
     /// advances only after those durable writes.
     pub fn catchUp(self: *ResolutionRuntime) !void {
+        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionCatchUp", .{self});
         lockMutex(&self.catch_up_mutex);
         defer self.catch_up_mutex.unlock();
         return self.catchUpLocked(false);
@@ -2321,6 +2427,7 @@ pub const ResolutionRuntime = struct {
     /// Mark the resolver backfill dirty. `runReresolveBacklogWindow` then enqueues
     /// extraction artifacts in bounded windows into the normal replay pipeline.
     pub fn requestReresolveBacklog(self: *ResolutionRuntime) !void {
+        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionRequestReresolveBacklog", .{self});
         lockMutex(&self.catch_up_mutex);
         defer self.catch_up_mutex.unlock();
         defer self.notifyBackfill();
@@ -2339,6 +2446,7 @@ pub const ResolutionRuntime = struct {
     /// True when a prior resolver catalog mutation has durably marked corpus
     /// backfill dirty but the bounded reresolve backlog has not fully drained.
     pub fn hasReresolveBacklog(self: *ResolutionRuntime) !bool {
+        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionHasReresolveBacklog", .{self});
         lockMutex(&self.catch_up_mutex);
         defer self.catch_up_mutex.unlock();
         return (try hasReresolveCursor(&self.store_handle.store, resolver_catalog.reresolve_resume_key)) or
@@ -2349,6 +2457,7 @@ pub const ResolutionRuntime = struct {
     /// re-resolution. This does not run resolver work inline; it appends a replay
     /// record and lets `catchUp` process it through the normal stage.
     pub fn runReresolveBacklogWindow(self: *ResolutionRuntime) !ReresolveEnqueueResult {
+        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionRunReresolveBacklogWindow", .{self});
         lockMutex(&self.catch_up_mutex);
         defer self.catch_up_mutex.unlock();
         return self.runReresolveBacklogWindowLocked();
@@ -2422,6 +2531,7 @@ pub const ResolutionRuntime = struct {
     /// The review queue: every stored review-band mention awaiting curation.
     /// Caller owns the result (`freePendingReviews`).
     pub fn pendingReviews(self: *ResolutionRuntime, alloc: std.mem.Allocator) ![]PendingReview {
+        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionPendingReviews", .{ self, alloc });
         lockMutex(&self.catch_up_mutex);
         defer self.catch_up_mutex.unlock();
         const resolvers = try self.index_manager.listResolvers(self.alloc);
@@ -4643,4 +4753,121 @@ test "resolver backfill skips stale empty resolutions without routed mentions" {
     cfg.labels = &.{"person"};
     try store.put(resolution_key, "{\"config_generation\":1,\"entities\":[{}]}");
     try std.testing.expect(try sourceNeedsReresolve(alloc, store, &.{cfg}, key));
+}
+
+test "incremental resolution replay atomically hands off new generations and suppresses same-generation promotion" {
+    const a = std.testing.allocator;
+    var memory: MapStore = .{ .alloc = a };
+    defer memory.deinit();
+    const source = try internal_keys.artifactNamedPrefixAlloc(a, "doc", "asset", "kg");
+    defer a.free(source);
+    const resolved = try internal_keys.resolutionArtifactKeyAlloc(a, "doc", "resolved");
+    defer a.free(resolved);
+    try memory.store().put(source, "{\"entities\":[{\"id\":\"e\",\"label\":\"person\",\"text\":\"Ada\"}]}");
+    var configs = [_]ResolverConfig{.{ .name = "r", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "{{ uslug _entity.text }}", .config_generation = 1 }};
+    var writer: CaptureWriter = .{ .alloc = a, .store = memory.store() };
+    defer writer.deinit();
+    _ = try reresolveAll(a, memory.store(), &configs, null, null, &writer, CaptureWriter.writeFn);
+    try std.testing.expectEqual(@as(u64, 1), writer.inferred_calls);
+    configs[0].config_generation = 2;
+    // Failure before the atomic refresh leaves old work and generation intact.
+    try std.testing.expectError(error.InjectedRecordWriteFailure, reresolveAll(a, memory.store(), &configs, null, null, &writer, FailingWriter.writeFn));
+    const old = (try memory.store().get(a, resolved)).?;
+    defer a.free(old);
+    try std.testing.expect(std.mem.indexOf(u8, old, "\"config_generation\":1") != null);
+    _ = try reresolveAll(a, memory.store(), &configs, null, null, &writer, CaptureWriter.writeFn);
+    try std.testing.expectEqual(@as(u64, 2), writer.inferred_calls);
+    try std.testing.expectEqual(@as(u64, 0), writer.graph_only_calls);
+    const current = (try memory.store().get(a, resolved)).?;
+    defer a.free(current);
+    try std.testing.expect(std.mem.indexOf(u8, current, "\"config_generation\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, current, "_resolution_work") != null);
+    try std.testing.expect(try resolution_handoff.matches(a, memory.store(), resolved, current));
+    // At the same generation, a retention-only refresh keeps the decisions
+    // and their existing promotion work, without another promotion hint.
+    configs[0].retain_work = .embeddings;
+    _ = try reresolveAll(a, memory.store(), &configs, null, null, &writer, CaptureWriter.writeFn);
+    try std.testing.expectEqual(@as(u64, 2), writer.inferred_calls);
+    try std.testing.expectEqual(@as(u64, 1), writer.graph_only_calls);
+    // A superseding template change uses current extraction and replaces real
+    // decisions via the full promotion/graph handoff, never old pending work.
+    configs[0].config_generation = 3;
+    configs[0].key_template = "person/{{ uslug _entity.text }}";
+    _ = try reresolveAll(a, memory.store(), &configs, null, null, &writer, CaptureWriter.writeFn);
+    try std.testing.expectEqual(@as(u64, 3), writer.inferred_calls);
+    const changed = (try memory.store().get(a, resolved)).?;
+    defer a.free(changed);
+    var decoded = try resolver_lib.parseResolution(a, changed);
+    defer decoded.deinit();
+    try std.testing.expectEqualStrings("person/ada", decoded.entities[0].doc_ref.key);
+}
+
+test "incremental resolution invalidates effective blocking and cross-table survivors" {
+    const a = testing.allocator;
+    const Epoch = struct {
+        fn revisions(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: []const u8) anyerror!CandidateSource.Revisions {
+            // Deliberately unchanged source table while the survivor changes.
+            return .{ .candidates = @as([32]u8, @splat(7)) };
+        }
+    };
+    var source: FakeCandidateSource = .{ .alloc = a };
+    defer source.deinit();
+    const candidates: CandidateSource = .{ .ptr = &source, .vtable = &.{ .get = FakeCandidateSource.getFn, .scan_prefix = FakeCandidateSource.scanPrefixFn, .revisions = Epoch.revisions } };
+    var memory: MapStore = .{ .alloc = a };
+    defer memory.deinit();
+    const extraction = try internal_keys.artifactNamedPrefixAlloc(a, "doc", "asset", "kg");
+    defer a.free(extraction);
+    try memory.store().put(extraction, "{\"entities\":[{\"id\":\"e\",\"text\":\"Ada\",\"label\":\"person\"}]}");
+    var configs = [_]ResolverConfig{.{ .name = "r", .table = "people", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "person/{{ uslug _entity.text }}", .candidate_search = "prefix", .config_generation = 1 }};
+    try source.put("person/canonical", "{\"canonical_name\":\"Ada\",\"label\":\"person\"}");
+    const first = (try processChangedExtraction(a, &configs, memory.store(), null, extraction, candidates, null)).?;
+    defer a.free(first.resolution_key);
+    // Without a scorer the effective strategy is exact_key, caching no hits.
+    configs[0].scorer_json =
+        \\{"comparisons":[{"name":"n","left":"text","right":"canonical_name","levels":[{"when":"exact","weight":8},{"else":true,"weight":-8}]}],"combine":{"bias":-3},"decision":{"match":0.9}}
+    ;
+    configs[0].config_generation += 1;
+    const warm = (try processChangedExtraction(a, &configs, memory.store(), null, extraction, candidates, null)).?;
+    defer a.free(warm.resolution_key);
+    const warm_value = (try memory.store().get(a, warm.resolution_key)).?;
+    defer a.free(warm_value);
+    var parsed = try resolver_lib.parseResolution(a, warm_value);
+    defer parsed.deinit();
+    try testing.expectEqual(resolver_lib.Decision.match, parsed.entities[0].decision);
+    try testing.expectEqualStrings("person/canonical", parsed.entities[0].doc_ref.key);
+    try memory.store().delete(warm.resolution_key);
+    const cold = (try processChangedExtraction(a, &configs, memory.store(), null, extraction, candidates, null)).?;
+    defer a.free(cold.resolution_key);
+    const cold_value = (try memory.store().get(a, cold.resolution_key)).?;
+    defer a.free(cold_value);
+    try testing.expectEqualStrings(warm_value, cold_value);
+
+    // Add a redirect to a different table and then remove only its survivor.
+    // The source-table revision stays unchanged, so cross-table reuse is unsafe.
+    try source.put("person/canonical", "{\"canonical_name\":\"Ada\",\"label\":\"person\",\"merged_into\":\"survivor\",\"merged_into_table\":\"curated\"}");
+    try source.put("survivor", "{\"canonical_name\":\"Ada\",\"label\":\"person\"}");
+    try memory.store().delete(cold.resolution_key);
+    const redirected = (try processChangedExtraction(a, &configs, memory.store(), null, extraction, candidates, null)).?;
+    defer a.free(redirected.resolution_key);
+    const redirected_value = (try memory.store().get(a, redirected.resolution_key)).?;
+    defer a.free(redirected_value);
+    var redirected_parsed = try resolver_lib.parseResolution(a, redirected_value);
+    defer redirected_parsed.deinit();
+    try testing.expectEqualStrings("curated", redirected_parsed.entities[0].doc_ref.table);
+    const removed = source.map.fetchRemove("survivor").?;
+    a.free(removed.key);
+    a.free(removed.value);
+    const deleted_warm = (try processChangedExtraction(a, &configs, memory.store(), null, extraction, candidates, null)).?;
+    defer a.free(deleted_warm.resolution_key);
+    const deleted_value = (try memory.store().get(a, deleted_warm.resolution_key)).?;
+    defer a.free(deleted_value);
+    var deleted = try resolver_lib.parseResolution(a, deleted_value);
+    defer deleted.deinit();
+    try testing.expect(deleted.entities[0].decision != .match);
+    try memory.store().delete(deleted_warm.resolution_key);
+    const deleted_cold = (try processChangedExtraction(a, &configs, memory.store(), null, extraction, candidates, null)).?;
+    defer a.free(deleted_cold.resolution_key);
+    const deleted_cold_value = (try memory.store().get(a, deleted_cold.resolution_key)).?;
+    defer a.free(deleted_cold_value);
+    try testing.expectEqualStrings(deleted_value, deleted_cold_value);
 }

@@ -1415,7 +1415,7 @@ fn artifactRefRetainedBytes(artifact: db_mod.types.ArtifactRef) usize {
 }
 
 fn graphHitRetainedBytes(hit: db_mod.types.SearchHit) usize {
-    var total: usize = 0;
+    var total: usize = if (hit.document_authority != null) @sizeOf(db_mod.types.document_authority.Authority) else 0;
     retainedAdd(&total, hit.id.len);
     if (hit.source_table) |table| retainedAdd(&total, table.len);
     retainedAdd(&total, retainedBytesForSlice(std.meta.Child(@TypeOf(hit.index_scores)), hit.index_scores.len));

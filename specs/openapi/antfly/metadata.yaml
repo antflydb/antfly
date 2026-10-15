@@ -2323,15 +2323,34 @@ components:
           type: boolean
           enum: [true]
           description: Retrying the complete query against fresh topology may succeed.
+    DocumentArtifactPublicationFailedError:
+      type: object
+      additionalProperties: false
+      description: The requested source artifact failed publication and requires inspection and reprocessing.
+      required: [code, error, message, retryable]
+      properties:
+        code:
+          type: string
+          enum: [document_artifact_publication_failed]
+        error:
+          type: string
+          enum: [document_artifact_publication_failed]
+        message:
+          type: string
+        retryable:
+          type: boolean
+          enum: [false]
     QueryConflictError:
       oneOf:
         - $ref: '#/components/schemas/HierarchyCursorStaleError'
         - $ref: '#/components/schemas/TopologyChangedError'
+        - $ref: '#/components/schemas/DocumentArtifactPublicationFailedError'
       discriminator:
         propertyName: error
         mapping:
           hierarchy_cursor_stale: '#/components/schemas/HierarchyCursorStaleError'
           topology_changed: '#/components/schemas/TopologyChangedError'
+          document_artifact_publication_failed: '#/components/schemas/DocumentArtifactPublicationFailedError'
     UnsupportedHierarchyGroupingError:
       type: object
       additionalProperties: false
@@ -3574,6 +3593,7 @@ components:
             $ref: "#/components/schemas/TableRepairIssue"
     RepairIssueListRequest:
       type: object
+      additionalProperties: false
       description: Bounded request to list table repair issues.
       properties:
         target:
@@ -3597,6 +3617,7 @@ components:
           description: Maximum repair records to return.
     RepairRunRequest:
       type: object
+      additionalProperties: false
       description: Bounded request to run a table repair pass.
       properties:
         target:
@@ -11947,7 +11968,7 @@ components:
           schema:
             $ref: "#/components/schemas/HierarchyCursorStaleError"
     QueryConflict:
-      description: The query's pinned hierarchy or table topology changed while it was running
+      description: The query's pinned hierarchy or table topology changed, or a requested source artifact failed publication
       content:
         application/json:
           schema:
@@ -15980,9 +16001,9 @@ paths:
         schema:
           type: string
     post:
-      summary: Reprocess a derived asset across a table range
+      summary: Reprocess a derived artifact across a table range
       description: |
-        Runs a bounded operational repair pass for any asset producer type
+        Runs a bounded operational repair pass for any asset or embedding producer
         across source rows in key order. Use `next_key` from the response as
         the next request's `from_key` for simple single-cursor continuation.
         Distributed repair controllers should persist `shard_cursors` from the
@@ -16105,7 +16126,7 @@ paths:
       summary: Create a derived document artifact reprocess job
       description: |
         Creates a durable user-facing repair job for a derived document
-        artifact. The job advances through the same bounded per-shard repair
+        asset or embedding artifact. The job advances through the same bounded per-shard repair
         primitive used by `/reprocess`, and stores returned continuation
         cursors so hosted controllers can resume large sharded table repairs
         without collapsing progress into a single global key cursor.
@@ -16348,12 +16369,16 @@ paths:
         schema:
           type: string
     post:
-      summary: Reprocess a derived asset
+      summary: Reprocess a derived artifact
       description: |
         Invalidates the current artifact state and requests the producer to
         rebuild the derived asset for the source document. Copy, generator,
         reader, transcriber, extractor, and document-extraction producers are
-        all supported.
+        all supported, as are dense and sparse embedding producers. Embedding
+        reprocessing regenerates vectors even when the source chunks are unchanged.
+        Embedding requests are committed durably and queued for supervised
+        inference. Acceptance does not wait for inference; inspect index coverage
+        and repair issues for the eventual outcome.
       tags:
         - data_operations
       operationId: reprocessDocumentArtifact
@@ -17291,6 +17316,8 @@ paths:
                 $ref: "#/components/schemas/QueryResponses"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/QueryConflict"
         "404":
           $ref: "#/components/responses/NotFound"
         "500":

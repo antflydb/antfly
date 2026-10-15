@@ -262,16 +262,26 @@ Read-only snapshots without a lock sidecar also open from read-only directories
 or media. Their calls use a shared inode fence when sidecar creation is denied;
 every sidecar creator takes the exclusive inode fence before installing it.
 Reopened native writers discover pending generated enrichment in the durable
-journals of all tables and resume it under their connection lease.
+journals of all tables and resume it through their shared maintenance owner.
 
 After an external commit or atomic file replacement, the shared owner reopens
 its cached runtime before the next operation. An in-process handoff between
 compatible connections reuses the live runtime. Streaming SQL cursors retain the
 runtime and immutable pages they originally pinned; retiring that runtime
 releases caches without flushing them over a newer generation. Read-only
-connections observe new commits at operation boundaries. Automatic enrichment,
-TTL, and reclamation maintenance run under the same file gate and kernel lease.
-Foreground refresh defers reclamation to that owner. Lease-scoped publication
+connections observe new commits at operation boundaries. Background enrichment and index builds capture one table at a time under the
+file gate, then compute outside it. Generated artifacts, private staging, and progress writes reacquire the
+kernel writer lease and publish through the current namespace. Source digests,
+document incarnations, catalog identity, and lease tenure fence acceptance.
+Index file publications may adopt a newer primary checkpoint only while their
+immutable index inputs and inode remain unchanged; changes to those inputs
+cancel the prepared work. A bounded owner cache retains only
+pure embedding results with matching model revision, credentials, task, input and
+dimensions, allowing retries without publishing stale artifacts. Native capture
+runtimes use inode-fenced immutable inputs and release them before reclamation.
+TTL retains its short publication fence. Reclamation scans and copies outside
+the gate and validates before adoption. Foreground refresh defers allocator
+conversion, reclamation, and historical index backfill to that owner. Lease-scoped publication
 fences new read pins until page reuse and checkpoint publication finish; temporary
 lock contention reports `ANTFLY_BUSY` and SQLSTATE `55P03`.
 
@@ -402,7 +412,7 @@ indexes. MATCH PARTIAL FK publication requires ready parent support indexes;
 a readiness deadline expires before any FK publication decision is admitted.
 Admission builds only the selected witness indexes; unrelated builds and
 reclamation do not consume its deadline. Lite background maintenance advances
-one relational index page per table and releases the writer lease between
+one table per turn, including one relational index page, and releases the writer lease between
 turns, retaining pending work for subsequent turns.
 
 Failed UNIQUE coverage admits constraint-checked UPDATE/DELETE repairs under
@@ -520,3 +530,66 @@ The runner includes Rust's embedded SQLx integration. Model-dependent inference
 suites are excluded by default; set `ANTFLY_SDK_NATIVE_INFERENCE=1` to include
 them after installing their required models. This is separate from the remote
 PostgreSQL driver matrix in `scripts/test_pgwire_drivers.py`.
+
+
+### Replacement retry and publication boundaries
+
+Replacement `retry_count` counts consecutive transient failures since the last
+acknowledged source/replay checkpoint. A durable forward step resets the count
+and backoff; volatile progress does not. `total_retry_count` never resets and
+bounds each accepted job to 64 lifetime retries; status exposes that count and
+`max_total_retries`. Persisted deadlines more than 3.2 seconds ahead of the
+scheduler's wall clock are clamped and saved once, including after reopen. Explicit resource exhaustion, full-disk
+and temporary remote failures retry up to four times. Unclassified
+`Unexpected`, `InputOutput`, `ReadFailed` and `WriteFailed` errors fail immediately
+rather than assuming storage corruption is transient. A failure after a newer
+checkpoint uses that checkpoint for both retry accounting and recovery.
+
+Replacement ownership uses an IO mutex. Blocking cancellation and deletion park
+on it; backoff sleeps occur after releasing it. Regular activation catch-up has
+a 100 ms cooperative budget. After eight attempts its budget rises to at most
+one second, still limited by an explicit wait deadline. The durable journal
+sequence and intra-entry cursor survive each yield. These are cooperative work
+budgets: a storage operation already underway, including fsync, may overrun one.
+There is no unlimited escalated drain. Sustained producers can require further
+bounded rounds; the old graph remains available until activation commits.
+
+A successful replacement wait observes the catalog under the publication read
+lease. The write lease spans the atomic catalog transaction and old-index
+retirement, so an entry appended provisionally during installation cannot make
+wait return success before commit. If a missing job races publication, wait
+checks the committed catalog again before returning cancellation.
+`ANTFLY_CANCELLED` describes the operation: it covers replacement cancellation,
+progress/stream callbacks returning false, and IO/mutex interruption. Interrupting
+an owner preserves accepted work and its durable checkpoint rather than marking
+the job failed. Completion may have raced interruption; inspect current state.
+
+
+Pending replacements temporarily require reader version 2, because an older
+writer's journal cleanup does not honor shadow retention. Registration publishes
+this fence and a versioned resolver envelope with the build marker. Libraries
+that predate the epoch key reject that envelope through their strict parser;
+already-open Lite writers encounter it when refreshing their connection. Failed
+jobs release replay retention but keep their reservation fence until cancellation.
+Swap and cancellation remove the temporary fence in their catalog transaction
+once no reservations remain. Cancellation rejects a foreign serving generation
+with `ANTFLY_REPLACEMENT_CONFIGURATION_MISMATCH`, leaving the catalog and job intact.
+A separate baseline preserves any permanent reader requirement from resolver
+features; a plain completed replacement returns to version 1. Named tables
+aggregate permanent requirements into the root baseline; temporary child fences
+never become permanent root requirements. This also excludes
+older read-only handles during the build, since older libraries do not distinguish
+reader and writer compatibility epochs.
+
+In-process writers block on the apply lock during replacement activation: the
+ordinary work budget is 100 ms, escalating to about 1 s after eight attempts.
+The current batch and durability checkpoint may overrun that cooperative budget.
+Clock-backoff correction leaves queued jobs unchanged on replicas, write-gated
+handles and databases requiring ordered maintenance; it never chooses a local
+write merely to shorten a retry deadline.
+
+Optional replacement waits capture the admitted generation before releasing
+registration admission and retain it across all wait quanta. Cancelling that
+reservation returns `ANTFLY_CANCELLED`, even if another index or replacement
+subsequently reuses the same name and configuration. Identical requests joining
+an existing reservation wait for that reservation's generation.

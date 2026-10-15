@@ -567,7 +567,7 @@ jobs:
           # The @antfly/web package contract suite runs from its built ESM
           # artifact in the TypeScript SDK gate.
           node pkg/antfly-embedded/wasm_client_test.mjs
-          zig build wasm-test inference-wasm -Dmetal=false -j1 -freference-trace=30 --summary all
+          python3 tools/run_bounded_zig_build.py build wasm-test inference-wasm -Dmetal=false -j1 -freference-trace=30 --summary all
           EXTRACTION_WASM=zig-out/antfly-extraction-cpu.wasm node --test pkg/inference/web/test-extraction-runtime.mjs pkg/inference/web/test-laya-runtime.mjs pkg/inference/web/test-decide-runtime.mjs pkg/inference/web/test-backends-runtime.mjs
           zig build inference-wasm -Dwebgpu=true -Dmetal=false -j1 -freference-trace=30 --summary all
           zig build inference-wasm -Dwasm-memory-model=wasm64 -Dmetal=false -j1 -freference-trace=30 --summary all
@@ -609,6 +609,7 @@ jobs:
           tools/test_test_runner.py
           tools/test_local_test_partitions.py
           tools/test_sync_generated.py
+          pkg/inference/build/test_prepare_wasm64_zig_lib.py
 
       - name: Test benchmark orchestration and fixture setup
         run: |
@@ -679,9 +680,18 @@ jobs:
           cd zig
           ANTFLY_LITE_REQUIRE_EXTRACTOR_TEST=1 ANTFLY_LITE_EXTRACTOR_MODEL_DIR="$model_dir" python3 tools/run_bounded_zig_build.py build capi capi-test \
             -Dembedded-only=true -Dlite-local-inference-runtime=true -Dmetal=false -Dcuda=false \
-            '-Dtest-filter=--test-filter=capi Lite models_dir loads a real extractor' \
-            '-Dtest-filter=--test-filter=capi native text queries' -j1
-          cd ..
+            -j1
+          cd pkg/inference
+          python3 ../../tools/run_bounded_zig_build.py build test \
+            '-Dtest-filter=capi resolver model identity' -Dmetal=false -Dcuda=false -j1 \
+            --cache-dir ../../.zig-cache --prefix ../../zig-out
+          cd ../../..
+          python3 scripts/ci/prepare_lite_previous_reader.py
+          ANTFLY_LIBRARY="$GITHUB_WORKSPACE/zig/zig-out/lib/libantfly.so" \
+          ANTFLY_LITE_PREVIOUS_LIBRARY="$GITHUB_WORKSPACE/.worktrees/reader-baseline-e8666a5b75/zig/zig-out/lib/libantfly.so" \
+          ANTFLY_LITE_REQUIRE_PREVIOUS_READER=1 \
+          ANTFLY_LITE_REQUIRE_LIBRARY=1 PYTHONPATH="$GITHUB_WORKSPACE/py/packages/embedded/src" TZ=UTC0 \
+            uv run --no-project --with pytest python -m pytest -q py/packages/embedded/tests/test_graph_edge_readiness.py
           ANTFLY_LIBRARY="$GITHUB_WORKSPACE/zig/zig-out/lib/libantfly.so" \
           PYTHONPATH="$GITHUB_WORKSPACE/py/packages/embedded/src" TZ=UTC0 \
             python3 scripts/ci/run_lite_extraction_eval.py --models-dir "$models_root" \
@@ -690,8 +700,16 @@ jobs:
           PYTHONPATH="$GITHUB_WORKSPACE/py/packages/embedded/src" TZ=UTC0 \
             python3 scripts/ci/run_lite_embedding_test.py --models-dir "$models_root"
 
-      - name: Upload real-model extraction evaluation
+      - name: Locate real-model extraction evaluation
+        id: lite_extraction_report
         if: always() && needs.changes.outputs.zig_tests == 'true'
+        run: |
+          if [ -f "$RUNNER_TEMP/lite-extraction-eval.json" ]; then
+            echo 'exists=true' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload real-model extraction evaluation
+        if: always() && needs.changes.outputs.zig_tests == 'true' && steps.lite_extraction_report.outputs.exists == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: lite-extraction-evaluation
@@ -1132,9 +1150,18 @@ jobs:
           cd zig
           ANTFLY_LITE_REQUIRE_EXTRACTOR_TEST=1 ANTFLY_LITE_EXTRACTOR_MODEL_DIR="$model_dir" python3 tools/run_bounded_zig_build.py build capi capi-test \
             -Dembedded-only=true -Dlite-local-inference-runtime=true -Dmetal=false -Dcuda=false \
-            '-Dtest-filter=--test-filter=capi Lite models_dir loads a real extractor' \
-            '-Dtest-filter=--test-filter=capi native text queries' -j1
-          cd ..
+            -j1
+          cd pkg/inference
+          python3 ../../tools/run_bounded_zig_build.py build test \
+            '-Dtest-filter=capi resolver model identity' -Dmetal=false -Dcuda=false -j1 \
+            --cache-dir ../../.zig-cache --prefix ../../zig-out
+          cd ../../..
+          python3 scripts/ci/prepare_lite_previous_reader.py
+          ANTFLY_LIBRARY="$GITHUB_WORKSPACE/zig/zig-out/lib/libantfly.so" \
+          ANTFLY_LITE_PREVIOUS_LIBRARY="$GITHUB_WORKSPACE/.worktrees/reader-baseline-e8666a5b75/zig/zig-out/lib/libantfly.so" \
+          ANTFLY_LITE_REQUIRE_PREVIOUS_READER=1 \
+          ANTFLY_LITE_REQUIRE_LIBRARY=1 PYTHONPATH="$GITHUB_WORKSPACE/py/packages/embedded/src" TZ=UTC0 \
+            uv run --no-project --with pytest python -m pytest -q py/packages/embedded/tests/test_graph_edge_readiness.py
           ANTFLY_LIBRARY="$GITHUB_WORKSPACE/zig/zig-out/lib/libantfly.so" \
           PYTHONPATH="$GITHUB_WORKSPACE/py/packages/embedded/src" TZ=UTC0 \
             python3 scripts/ci/run_lite_extraction_eval.py --models-dir "$models_root" \
@@ -1143,8 +1170,16 @@ jobs:
           PYTHONPATH="$GITHUB_WORKSPACE/py/packages/embedded/src" TZ=UTC0 \
             python3 scripts/ci/run_lite_embedding_test.py --models-dir "$models_root"
 
-      - name: Upload real-model extraction evaluation
+      - name: Locate real-model extraction evaluation
+        id: lite_extraction_report
         if: always() && !cancelled()
+        run: |
+          if [ -f "$RUNNER_TEMP/lite-extraction-eval.json" ]; then
+            echo 'exists=true' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload real-model extraction evaluation
+        if: always() && !cancelled() && steps.lite_extraction_report.outputs.exists == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: lite-extraction-evaluation
@@ -1463,7 +1498,9 @@ jobs:
       needs.changes.outputs.e2e == 'true') }}
     name: e2e-base / build
     needs: [admission, changes]
-    runs-on: arc-antfly-heavy-runtime
+    # Compilation needs the heavy runner's 50 GiB scratch PVC; runtime-only
+    # runners have a 10 GiB ephemeral container disk and no scratch mount.
+    runs-on: arc-antfly-heavy
     timeout-minutes: 90
     env:
       # Override ARC's 20 GiB default: storage reserves 22 GiB. The 24 GiB
@@ -1478,7 +1515,8 @@ jobs:
       # this artifact bounded; release, scale, and GPU workflows qualify their
       # optimized artifacts separately.
       ANTFLY_CI_ZIG_OPTIMIZE: debug
-      ANTFLY_CI_ZIG_STRIP: "true"
+      # Retain source locations for runtime panics in functional qualification.
+      ANTFLY_CI_ZIG_STRIP: "false"
       ANTFLY_CI_BUILD_CAPI: "true"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1504,11 +1542,13 @@ jobs:
 
       - name: Prepare job-local Zig cache dirs
         run: |
-          local_cache="${RUNNER_TEMP}/antfly/zig/zig-local"
-          global_cache="${RUNNER_TEMP}/antfly/zig/zig-global"
-          echo "ZIG_LOCAL_CACHE_DIR=$local_cache" >> "$GITHUB_ENV"
-          echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
-          mkdir -p "$local_cache" "$global_cache"
+          mountpoint -q /mnt/cache || { echo "E2E compilation requires the heavy runner scratch PVC" >&2; exit 1; }
+          cache_root="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}"
+          mkdir -p "$cache_root/zig-local" "$cache_root/zig-global" "$cache_root/tmp"
+          echo "ANTFLY_E2E_BUILD_CACHE_ROOT=$cache_root" >> "$GITHUB_ENV"
+          echo "ZIG_LOCAL_CACHE_DIR=$cache_root/zig-local" >> "$GITHUB_ENV"
+          echo "ZIG_GLOBAL_CACHE_DIR=$cache_root/zig-global" >> "$GITHUB_ENV"
+          echo "TMPDIR=$cache_root/tmp" >> "$GITHUB_ENV"
 
       - name: Build E2E executable once
         run: scripts/ci/zig-build-e2e-binaries.sh
@@ -1537,6 +1577,13 @@ jobs:
           overwrite: true
           if-no-files-found: error
           retention-days: 1
+
+      - name: Release completed E2E build scratch
+        if: always()
+        run: |
+          if [[ -n "${ANTFLY_E2E_BUILD_CACHE_ROOT:-}" ]]; then
+            rm -rf -- "$ANTFLY_E2E_BUILD_CACHE_ROOT"
+          fi
 
   embedded-sdk-native:
     if: >-
@@ -1841,7 +1888,7 @@ jobs:
         run: >-
           taskset -c ${{ steps.e2e_cpus.outputs.list }} go test
           -tags runtimeintegration ./controllers/inference
-          -run '^TestInferenceRuntimeContract$' -count=1 -v -timeout=20m
+          -run '^Test(InferenceRuntimeContract|RuntimeModelPullRetry)$' -count=1 -v -timeout=20m
 
       - name: Test exhaustive E2E shard partition
         if: matrix.suite == 'antfly-ordinary-0'
@@ -2109,7 +2156,9 @@ jobs:
       github.event.schedule == '0 8 * * *') }}
     name: e2e-full / build
     needs: [admission, changes]
-    runs-on: arc-antfly-heavy-runtime
+    # Compilation needs the heavy runner's 50 GiB scratch PVC; runtime-only
+    # runners have a 10 GiB ephemeral container disk and no scratch mount.
+    runs-on: arc-antfly-heavy
     timeout-minutes: 90
     env:
       ANTFLY_ZIG_MAX_RSS: "23622320128"
@@ -2117,9 +2166,9 @@ jobs:
       # without recompiling every storage/SQL owner through LLVM optimization.
       # Release, scale, and GPU workflows qualify their optimized builds.
       ANTFLY_CI_ZIG_OPTIMIZE: debug
-      # Match release artifact symbol handling without disabling safe
-      # checks or std.debug.assert invariants.
-      ANTFLY_CI_ZIG_STRIP: "true"
+      # Runtime failures must retain actionable stack traces. Optimized
+      # release workflows qualify stripped release artifacts separately.
+      ANTFLY_CI_ZIG_STRIP: "false"
       ANTFLY_CI_BUILD_CAPI: "true"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -2145,11 +2194,13 @@ jobs:
 
       - name: Prepare job-local Zig cache dirs
         run: |
-          local_cache="${RUNNER_TEMP}/antfly/zig/zig-local"
-          global_cache="${RUNNER_TEMP}/antfly/zig/zig-global"
-          echo "ZIG_LOCAL_CACHE_DIR=$local_cache" >> "$GITHUB_ENV"
-          echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
-          mkdir -p "$local_cache" "$global_cache"
+          mountpoint -q /mnt/cache || { echo "E2E compilation requires the heavy runner scratch PVC" >&2; exit 1; }
+          cache_root="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}"
+          mkdir -p "$cache_root/zig-local" "$cache_root/zig-global" "$cache_root/tmp"
+          echo "ANTFLY_E2E_BUILD_CACHE_ROOT=$cache_root" >> "$GITHUB_ENV"
+          echo "ZIG_LOCAL_CACHE_DIR=$cache_root/zig-local" >> "$GITHUB_ENV"
+          echo "ZIG_GLOBAL_CACHE_DIR=$cache_root/zig-global" >> "$GITHUB_ENV"
+          echo "TMPDIR=$cache_root/tmp" >> "$GITHUB_ENV"
 
       - name: Build E2E executable once
         run: scripts/ci/zig-build-e2e-binaries.sh
@@ -2178,6 +2229,13 @@ jobs:
           overwrite: true
           if-no-files-found: error
           retention-days: 1
+
+      - name: Release completed E2E build scratch
+        if: always()
+        run: |
+          if [[ -n "${ANTFLY_E2E_BUILD_CACHE_ROOT:-}" ]]; then
+            rm -rf -- "$ANTFLY_E2E_BUILD_CACHE_ROOT"
+          fi
 
   e2e-full-tests:
     if: >-

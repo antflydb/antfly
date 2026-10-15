@@ -38,6 +38,14 @@ test "FK publication progress and corrupt retirement proofs retain distinct boun
     try std.testing.expectEqual(error.InitialChildProvisionAlreadyCommitted, errorFromStatus(duplicate_child));
 }
 
+test "document extraction failures retain terminal identity across callbacks" {
+    for ([_]anyerror{ error.DocumentExtractionWorkingSetTooLarge, error.DocumentArtifactPublicationFailed }) |err| {
+        const transported = statusFromError(err);
+        try std.testing.expect(transported.code != @backingInt(Code.retryable));
+        try std.testing.expectEqual(err, errorFromStatus(transported));
+    }
+}
+
 pub const Code = enum(c_int) {
     ok = 0,
     out_of_memory,
@@ -728,6 +736,14 @@ pub const Detail = enum(c_int) {
     invalid_generated_tool_arguments,
     sql_feature_not_supported,
     catalog_publication_proof_pending,
+    warm_inference_server_unavailable,
+    unsupported_server_generate_option,
+    missing_inference_listener,
+    runtime_failed,
+    runtime_stopping,
+    runtime_already_ready,
+    document_extraction_working_set_too_large,
+    document_artifact_publication_failed,
 };
 
 pub const Status = extern struct {
@@ -1399,6 +1415,14 @@ pub fn statusFromError(err: anyerror) Status {
         error.VectorMigrationUnsupportedFile => status(.conflict, .vector_migration_unsupported_file),
         error.VectorStoreRequiresOfflineCommand => status(.conflict, .vector_store_requires_offline_command),
         error.StorageKernelFailure => status(.internal, .storage_kernel_failure),
+        error.WarmInferenceServerUnavailable => status(.unavailable, .warm_inference_server_unavailable),
+        error.UnsupportedServerGenerateOption => status(.unsupported, .unsupported_server_generate_option),
+        error.MissingInferenceListener => status(.internal, .missing_inference_listener),
+        error.RuntimeFailed => status(.internal, .runtime_failed),
+        error.RuntimeStopping => status(.cancelled, .runtime_stopping),
+        error.RuntimeAlreadyReady => status(.conflict, .runtime_already_ready),
+        error.DocumentExtractionWorkingSetTooLarge => status(.invalid_argument, .document_extraction_working_set_too_large),
+        error.DocumentArtifactPublicationFailed => status(.conflict, .document_artifact_publication_failed),
         else => status(.internal, .none),
     };
 }
@@ -1443,6 +1467,8 @@ pub fn errorFromStatus(value: Status) anyerror {
 
 fn detailErrorName(comptime detail: Detail) []const u8 {
     return switch (detail) {
+        .document_extraction_working_set_too_large => "DocumentExtractionWorkingSetTooLarge",
+        .document_artifact_publication_failed => "DocumentArtifactPublicationFailed",
         .external_lake_read_only => "ExternalLakeReadOnly",
         .external_lake_snapshot_mismatch => "ExternalLakeSnapshotMismatch",
         .external_lake_schema_mismatch => "ExternalLakeSchemaMismatch",
@@ -2087,6 +2113,12 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .unsupported_media_token_budget => "UnsupportedMediaTokenBudget",
         .unsupported_local_rate_limit => "UnsupportedLocalRateLimit",
         .storage_kernel_failure => "StorageKernelFailure",
+        .warm_inference_server_unavailable => "WarmInferenceServerUnavailable",
+        .unsupported_server_generate_option => "UnsupportedServerGenerateOption",
+        .missing_inference_listener => "MissingInferenceListener",
+        .runtime_failed => "RuntimeFailed",
+        .runtime_stopping => "RuntimeStopping",
+        .runtime_already_ready => "RuntimeAlreadyReady",
     };
 }
 
@@ -2373,6 +2405,12 @@ test "external lake and spill errors retain exact identity across runtime archiv
         error.InvalidSqlSpill,
     }) |err| {
         try std.testing.expect(errorHasStableDetail(err));
+        try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
+    }
+}
+
+test "inference command and lifecycle errors retain their identities across engine calls" {
+    inline for (.{ error.WarmInferenceServerUnavailable, error.UnsupportedServerGenerateOption, error.MissingInferenceListener, error.RuntimeFailed, error.RuntimeStopping, error.RuntimeAlreadyReady }) |err| {
         try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
     }
 }

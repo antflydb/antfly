@@ -291,8 +291,14 @@ def main():
     parser.add_argument("--cursor-pages", type=int, default=0)
     parser.add_argument("--cursor-term")
     parser.add_argument("--qualify-composed-sources", action="store_true")
+    parser.add_argument("--benchmark-composed", action="store_true")
+    parser.add_argument("--composed-current-rows", type=int, default=1000)
     parser.add_argument("--store-source", action="store_true")
     args = parser.parse_args()
+    if args.benchmark_composed and not args.qualify_composed_sources:
+        parser.error("composed benchmarks require --qualify-composed-sources")
+    if not 2 <= args.composed_current_rows <= 4096:
+        parser.error("composed current rows must be between 2 and 4096")
     if len(set(args.modes)) != len(args.modes):
         parser.error("modes must not contain duplicates")
     if not args.binary.is_file():
@@ -489,6 +495,14 @@ def main():
                 command.append("--store-source")
             if args.qualify_composed_sources:
                 command.append("--qualify-composed-sources")
+            if args.benchmark_composed:
+                command.extend(
+                    [
+                        "--benchmark-composed",
+                        "--composed-current-rows",
+                        str(args.composed_current_rows),
+                    ]
+                )
             if args.cursor_term:
                 command.extend(["--cursor-term", args.cursor_term])
             if args.workload_terms:

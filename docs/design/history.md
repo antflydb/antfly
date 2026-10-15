@@ -22,10 +22,11 @@ subsystem designs.
 ### Relocated Implementation Logs
 
 Dated implementation logs, defect ledgers, benchmark diaries, and roadmap
-restatements moved out of the Zig design docs on 2026-09-16. The original
-narrative is retained, with links updated for the consolidated documentation
-layout. Durable decisions were folded into the design doc first,
-and the design doc keeps a pointer. The placement rule is
+restatements moved out of the Zig design docs on 2026-09-16. Durable decisions
+were folded into the design doc first, and the design doc keeps a pointer.
+Logs longer than ~300 lines were later condensed into summaries of decisions,
+rejected approaches, and key measurements; each summary links to its full
+verbatim text at a pinned commit. The placement rule is
 recorded under Planning Rules in [`zig/ROADMAP.md`](../../zig/ROADMAP.md).
 
 | Area | Document | Design doc | Summary |
@@ -109,6 +110,9 @@ recorded under Planning Rules in [`zig/ROADMAP.md`](../../zig/ROADMAP.md).
 
 
 ## Additional records
+
+- [Media and OCR optimization](inference/history/gemma4/media-optimization-2026-10.md) — final results, rejected trials and pinned detailed evidence; current [batching](../../zig/pkg/inference/BATCHING.md#gpu-residency-for-media-embeddings) and [OCR contracts](inference/gemma4-ocr-optimization.md).
+
 
 - [Apache Lite and inference licensing](../reference/licensing/history/apache2-lite-inference-2026-09.md) — implementation, review, packaging, and WASM validation.
 - [Laya qualification](inference/history/laya/qualification.md) — measured CPU/Metal accuracy and performance.

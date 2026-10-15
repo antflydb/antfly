@@ -20,6 +20,7 @@ const dependencies = h.antfly.capi_dependencies;
 const std = h.std;
 const Request = struct { statement: []const u8, parameters: []const std.json.Value = &.{}, session_id: ?u64 = null };
 pub const Cursor = struct {
+    error_context: dependencies.sql_errors.Context = .{},
     session_id: ?u64 = null,
     alloc: std.mem.Allocator,
     budget: dependencies.sql_memory_budget,
@@ -64,7 +65,7 @@ pub fn diagnosticCode(description: dependencies.sql_errors.Diagnostic) h.capi.Er
     if (std.mem.eql(u8, description.code, "XX000") or std.mem.eql(u8, description.code, "53200")) return .internal;
     return .invalid_argument;
 }
-fn open(handle: *h.Handle, table_name: []const u8, request_json: []const u8) !u64 {
+fn open(handle: *h.Handle, table_name: []const u8, request_json: []const u8, error_context: *dependencies.sql_errors.Context) !u64 {
     if (handle.storage_owner_context != null or handle.storage_owner_path != null or handle.readable_lease_hook != null) return error.UnsupportedSqlExecution;
     if (table_name.len > 1024 or handle.sql_cursors.count() >= 64) return error.SqlProgramLimitExceeded;
     const session = try @import("sql_session.zig").requestSession(handle, request_json);
@@ -74,7 +75,7 @@ fn open(handle: *h.Handle, table_name: []const u8, request_json: []const u8) !u6
         };
         return error.SqlRequestTooLarge;
     }
-    return openWithSession(handle, table_name, request_json, session) catch |err| {
+    return openWithSession(handle, table_name, request_json, session, error_context) catch |err| {
         // Unsupported cursor shapes may fall back to materialized execution.
         if (err != error.UnsupportedSqlExecution) if (session) |value| {
             if (value.active) value.failed = true;
@@ -82,12 +83,12 @@ fn open(handle: *h.Handle, table_name: []const u8, request_json: []const u8) !u6
         return err;
     };
 }
-fn openWithSession(handle: *h.Handle, table_name: []const u8, request_json: []const u8, session: ?*@import("sql_session.zig").Session) !u64 {
-    try @import("tables.zig").load(handle);
-    try @import("sql_commit.zig").recover(handle);
-    try @import("sql_ddl.zig").recover(handle);
+fn openWithSession(handle: *h.Handle, table_name: []const u8, request_json: []const u8, session: ?*@import("sql_session.zig").Session, error_context: *dependencies.sql_errors.Context) !u64 {
+    try @import("tables.zig").loadAvailable(handle);
     const cursor = try handle.alloc.create(Cursor);
     errdefer handle.alloc.destroy(cursor);
+    cursor.error_context = .{};
+    errdefer error_context.* = cursor.error_context;
     cursor.alloc = handle.alloc;
     cursor.budget = .{ .backing = handle.alloc, .limit = sql.runtime.resource_limits.default_memory_bytes };
     cursor.arena = std.heap.ArenaAllocator.init(cursor.budget.allocator());
@@ -99,7 +100,7 @@ fn openWithSession(handle: *h.Handle, table_name: []const u8, request_json: []co
     errdefer cursor.compiled.deinit();
     cursor.lease = try handle.db.local_execution.row_policy_gate.enterRaw();
     errdefer cursor.lease.release();
-    cursor.stream = (try dependencies.sql_read_stream.Stream.open(handle.alloc, cursor.adapter.backend(), &cursor.compiled, request.parameters, .{})) orelse return error.UnsupportedSqlExecution;
+    cursor.stream = (try dependencies.sql_read_stream.Stream.open(handle.alloc, cursor.adapter.backend(), &cursor.compiled, request.parameters, .{ .error_context = &cursor.error_context })) orelse return error.UnsupportedSqlExecution;
     errdefer cursor.stream.close();
     const id = handle.next_sql_cursor_id;
     handle.next_sql_cursor_id = std.math.add(u64, id, 1) catch return error.SqlProgramLimitExceeded;
@@ -122,7 +123,9 @@ fn prepare(cursor: *Cursor, handle: *h.Handle, table_name: []const u8, request_j
     cursor.adapter = .{ .transaction = session, .handle = handle, .db = &handle.db, .table_name = try a.dupe(u8, table_name), .read_only = !h.liteOpenModeCanWrite(handle.open_mode) or (if (session) |value| value.read_only else false) };
     return request;
 }
-pub export fn antfly_db_sql_open_cursor_json(ptr: ?*anyopaque, request: h.capi.Slice, out_id: *u64, out: *h.capi.Buffer) h.capi.ErrorCode {
+pub fn antfly_db_sql_open_cursor_json(ptr: ?*anyopaque, request: h.capi.Slice, out_id: *u64, out: *h.capi.Buffer) callconv(.c) h.capi.ErrorCode {
+    if (comptime @import("../storage/engine_selection.zig").enabled)
+        return @call(.auto, @extern(*const @TypeOf(antfly_db_sql_open_cursor_json), .{ .name = "antfly_db_sql_open_cursor_json" }), .{ ptr, request, out_id, out });
     h.capi.clearLastError();
     out.* = .{};
     out_id.* = 0;
@@ -133,10 +136,17 @@ pub export fn antfly_db_sql_open_cursor_json(ptr: ?*anyopaque, request: h.capi.S
     }
     defer guard.leave();
     if (guard.handle.parent_id != null) return h.capi.recordError(.invalid_argument, @src().fn_name ++ ": operation requires a root database handle");
-    out_id.* = open(guard.handle, "default", request.bytes()) catch |err| return diagnostic(err, out);
+    var context: dependencies.sql_errors.Context = .{};
+    out_id.* = open(guard.handle, "default", request.bytes(), &context) catch |err| {
+        const description = context.diagnostic(err);
+        out.* = api.stringifyJson(.{ .@"error" = description }) catch |encoding_error| return h.capi.mapErrorContext(encoding_error, @src().fn_name);
+        return h.capi.recordError(diagnosticCode(description), if (err == error.SqlUntranslatableCharacter) out.ptr.?[0..out.len] else description.message);
+    };
     return .ok;
 }
-pub export fn antfly_db_sql_fetch_cursor_json(ptr: ?*anyopaque, id: u64, rows: u32, out: *h.capi.Buffer) h.capi.ErrorCode {
+pub fn antfly_db_sql_fetch_cursor_json(ptr: ?*anyopaque, id: u64, rows: u32, out: *h.capi.Buffer) callconv(.c) h.capi.ErrorCode {
+    if (comptime @import("../storage/engine_selection.zig").enabled)
+        return @call(.auto, @extern(*const @TypeOf(antfly_db_sql_fetch_cursor_json), .{ .name = "antfly_db_sql_fetch_cursor_json" }), .{ ptr, id, rows, out });
     h.capi.clearLastError();
     out.* = .{};
     const guard = api.enterHandlePinned(ptr, .exclusive) orelse return h.capi.recordError(.invalid_argument, @src().fn_name ++ ": invalid or closed database handle");
@@ -167,7 +177,9 @@ pub export fn antfly_db_sql_fetch_cursor_json(ptr: ?*anyopaque, id: u64, rows: u
     out.* = api.stringifyJson(.{ .result = page.output, .exhausted = page.exhausted }) catch |err| return h.capi.mapErrorContext(err, @src().fn_name);
     return .ok;
 }
-pub export fn antfly_db_sql_close_cursor(ptr: ?*anyopaque, id: u64) h.capi.ErrorCode {
+pub fn antfly_db_sql_close_cursor(ptr: ?*anyopaque, id: u64) callconv(.c) h.capi.ErrorCode {
+    if (comptime @import("../storage/engine_selection.zig").enabled)
+        return @call(.auto, @extern(*const @TypeOf(antfly_db_sql_close_cursor), .{ .name = "antfly_db_sql_close_cursor" }), .{ ptr, id });
     h.capi.clearLastError();
     const guard = api.enterHandlePinned(ptr, .exclusive) orelse return h.capi.recordError(.invalid_argument, @src().fn_name ++ ": invalid or closed database handle");
     if (guard.entry_error) |code| {
@@ -178,4 +190,12 @@ pub export fn antfly_db_sql_close_cursor(ptr: ?*anyopaque, id: u64) h.capi.Error
     const entry = guard.handle.sql_cursors.fetchRemove(id) orelse return h.capi.recordError(.invalid_argument, @src().fn_name ++ ": SQL cursor ID is unknown or closed");
     entry.value.close();
     return .ok;
+}
+
+comptime {
+    @import("exports.zig").publish(@This(), &.{
+        "antfly_db_sql_open_cursor_json",
+        "antfly_db_sql_fetch_cursor_json",
+        "antfly_db_sql_close_cursor",
+    });
 }

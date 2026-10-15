@@ -82,6 +82,7 @@ pub const local_test_sources = if (@import("builtin").is_test) @import("local_te
 test {
     _ = @import("api/lake_sql_cursor.zig");
     _ = @import("api/native_query_repository.zig");
+    _ = @import("api/lake_query_metrics.zig");
     _ = @import("api/lake_index_native_text.zig");
     _ = @import("api/lake_index_text_query.zig");
     _ = @import("api/lake_index_ordered_rows.zig");
@@ -97,4 +98,9 @@ test {
 // Schema admission is part of the public lake SQL binding contract.
 test "external lake SQL schema cache discovery" {
     _ = @import("api/sql_schema_cache.zig");
+}
+
+// Filtered roots must reach the mounted transport tests through a named anchor.
+test "api HTTP runtime discovery" {
+    _ = httpx_handler;
 }

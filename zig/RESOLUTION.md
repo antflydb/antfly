@@ -913,12 +913,26 @@ renamed. Update your declarative inline config to the new table/template and
 mapped inline aliases before reapplying it. A durable namespace fence rejects
 old table/template or alias configurations even after reset leaves zero merges.
 Further identity changes require another explicit namespace operation. Changing an existing physical index config still requires
-its normal delete/recreate lifecycle, which preserves the resolver and merges.
+its normal delete/recreate lifecycle, which retains resolver identity and merges.
 Resolver identity is scoped by source table and resolver name, independently of physical
 index names: deleting index v1 and adding index v2 with the same resolver name
 and source/output artifact bindings retains merges and namespace fences. Renaming
 the resolver itself creates a new identity; removing it deliberately deletes its
-curation.
+curation. Inline declarations own resolver execution: deleting the last declaring
+index retires its resolver, so rendering/query resolution returns not found and
+new source writes do not run that resolver. A shared declaring index keeps it
+active. Retired definitions retain merges and namespace fences in the portable
+catalog, including across backup/restore; re-add/rename reactivates them through
+the same namespace admission checks. Reactivation advances the internal revision
+so source changes made while retired cannot reuse stale decisions. Independently
+registered resolvers remain
+active when an index is removed. Reapplying an older inline declaration records
+its ownership without changing its resolution revision. Retirement is additive
+catalog metadata and does not advance the required merge-state format version.
+A previous reader that tolerates optional fields can open the database, but may
+execute retired definitions; use a lifecycle-aware library when relying on
+retirement to suspend execution. Native Lite and Directory C API handles both
+reapply inline resolvers when adding an identical existing index.
 Existing artifact/index repair APIs rebuild derived state under the declared
 identity rules; they do not infer a key migration. This namespace operation
 reuses the existing resolver replay/repair pipeline for derived reconciliation.
@@ -970,3 +984,324 @@ report even on failure. This 23-document curated regression set includes six
 negative documents, repeated names, accented/Arabic/Indic text, and a document
 long enough to require windowing. It remains a regression set, not a claim of
 production-domain accuracy; domain-specific labelled evaluation is still needed.
+
+## Incremental resolution work
+
+Resolution artifacts contain an optional, versioned `_resolution_work` cache.
+Each extraction-local mention records its embedding dependencies, candidate
+universe revision, candidate records and raw comparator features. This is
+reusable work, not authoritative identity state: old artifacts without it work
+normally, and malformed or unknown cache versions are discarded and recomputed.
+Public `resolve_query` responses omit the private cache and do not serialize
+or calculate persistence revisions for ephemeral work. Canonical records and
+vectors shared by several mentions are stored once per artifact. A validated
+candidate/mention revision also avoids rehashing unchanged vectors while
+reusing their comparison features.
+
+| Change | Repeated work |
+| --- | --- |
+| Match/review threshold, scorer weights or bias | Recombine cached features and classify candidates |
+| Comparator, comparison fields or similarity cutoff | Reuse raw similarities with matching input digests; compute missing comparisons |
+| Mention text or vector | Recompute that mention's dependent work |
+| Mention label/confidence or sibling routing | Readmit mentions and recompute affected candidate/decision dependencies |
+| Key template | Render keys again, refresh exact/blocked candidates, reuse embeddings and unchanged comparisons |
+| Blocking strategy, ANN index, candidate limit or hydrated vector fields | Fetch the new candidate set; reuse comparisons whose inputs still match |
+| Embedding producer or dimensions | Regenerate mention embeddings and dependent candidates/comparisons |
+| Alias/merge or human review | Apply current redirects/overrides to freshly classified decisions |
+
+Native Lite candidate revisions include the physical table binding, committed
+source/enrichment sequences, selected index configuration and its applied replay
+sequence. This covers canonical inserts/deletes, table recreation and vectors
+becoming visible after an ANN drain. Mention embedding keys combine the model
+identity, dimensions, effective provider settings (including input type,
+instruction and truncation), and a hash of the exact input string, independently of the
+source or destination table. Local capabilities expose identity before weights
+load: managed downloads hash sorted relative artifact paths and pinned receipt
+SHA-256 digests. Copying or restoring identical files preserves that identity.
+Receipt digests are verified against file content. Verified digests are memoized
+in memory and in disposable file-generation sidecars; inode, size, mtime and ctime
+changes invalidate verification. Legacy managed receipts use the same persistent
+content-hash memo, avoiding full rehash on every process reopen. Only
+unmanaged local models fall back to resolved weight, shard, ONNX external tensor,
+tokenizer and processor file generations (inode/size/mtime/ctime).
+Model construction cross-checks file generations to reject mid-load changes, and
+an already-loaded model retains its immutable identity. Unattested providers
+conservatively re-embed. Runtime adapters without complete candidate revisions
+refetch candidates while still allowing an attested embedding identity to reuse
+mention vectors.
+Embedding cache identities include the provider endpoint, region/project,
+credential source and resolved API-key digest, secret-store generation, and all
+embedding settings in addition to model revision. Keys never contain plaintext
+credentials. Equivalent destinations can still share vectors; distinct tenants,
+endpoints, rotated secrets and embedding settings cannot.
+
+The distributed adapter currently takes this conservative path. Candidate cache
+dependencies use the effective blocking strategy: a resolver without a scorer
+uses exact-key lookup even if its declarative strategy is prefix or ANN.
+Cross-table redirect candidates are refetched because the source-table revision
+does not cover survivor changes in another table. Comparison input hashes still
+allow safe feature reuse when the refreshed candidate fields are unchanged.
+
+The work cache is part of the resolution artifact, so the existing atomic
+artifact/replay commit, portable backup/import, source deletion and bounded
+crash-resumable replay own its lifetime. Resolver catalog changes mark the
+existing durable source-index cursors dirty in the same transaction. Replay
+loads the current configuration, so a superseding change does not install old
+cached decisions. Cache/revision-only refreshes with identical identity payloads
+publish a graph-only handoff and completion marker; they do not repeat canonical
+entity promotion. Changes to the promotion setting use the full handoff.
+
+A global scorer/template change still visits eligible source artifacts and
+mentions. It no longer requires rerunning extraction, embeddings, candidate
+search or comparisons whose dependencies are unchanged. Reuse is deliberately
+conservative: a destination mutation invalidates the table's candidate revision,
+including empty candidate sets, even if it ultimately changes no matches.
+
+
+### Embedded upgrade and identity management
+
+Prefer `add_index({..., "replaces":"knowledge_v1"})` for graph index versioning.
+Registration validates the request, reserves a hidden shadow and returns. The
+existing maintenance owner builds bounded source pages and catches up replay,
+saving its cursor and applied sequence after projection durability. The old
+index serves until the final bounded tail and atomic catalog swap. Field-backed
+changes re-process their changed sources rather than abandoning the build.
+Catch-up coalesces bounded journal windows by source key; larger activation
+windows resume per entry. Repeated updates to a hot document can share one
+reconstruction per window. Replay retention advances after durable checkpoints;
+it does not pin the entire journal.
+Restart resumes the durable marker/checkpoints, without rebuilding completed
+pages. Background construction retains its private manager across rounds, shares
+a source snapshot across each page, and checkpoints its resumable progress.
+Source pages collect at most 32 sources per turn, sharing their write plan,
+artifact transaction and graph apply. Collection yields after 100 ms, followed
+by the current bounded source batch. Resident managers are invalidated when the
+catalog revision changes, so reused builders cannot retain stale resolver rules.
+The private builder uses the LSM backend's existing bounded block cache to avoid
+repeated native immutable-source lease publication across checkpoint runs.
+It also drives the existing bounded foreground compaction policy, since private
+builders have no independent compactor to limit checkpoint-run accumulation. A resident progress cursor lets these
+short turns share a durability checkpoint: checkpoint the first turn, then at
+most once per second during construction, and always before activation. The
+journal remains pinned at the last durable cut; crash recovery repeats only
+unacknowledged work. Checkpoint fsync remains required before the durable cursor
+advances. The scan excludes unrelated metadata/journal keys, and replay begins
+strictly after the last consumed sequence.
+
+Explicit transient resource, disk-full and remote/network failures retry at most
+four consecutive times with persisted 50 ms, 200 ms, 800 ms and 3200 ms backoff.
+A durable source/replay checkpoint resets the consecutive count and backoff;
+volatile work does not. Each accepted job also has a lifetime ceiling of 64
+retries, which progress never resets. `retry_count`, `total_retry_count`,
+`max_total_retries`, `retry_after_ns` (Unix nanoseconds) and `last_error` are visible
+in replacement status. Generic `Unexpected`, `InputOutput`, `ReadFailed`,
+`WriteFailed` and `UnexpectedReadFailure` errors fail immediately, rather than
+presuming ambiguous storage failures are transient. Failure recording reloads the
+latest durable checkpoint so it cannot undo progress from the failed turn.
+Backoff survives reopen. When the scheduler reads a deadline more than 3.2 seconds
+in the future, it persistently clamps it to that horizon; a backward wall-clock
+step cannot impose an hours-long stall. Persisting the clamp once prevents it
+sliding forward on every poll. Waiting jobs yield to later replacements and
+ordinary maintenance.
+A permanent failure or exhausted retry budget enters terminal `phase: "failed"`,
+exposes `last_error`, releases its
+journal retention pin and retires any inline execution owned only by that shadow.
+It is excluded from scheduling: later replacements, artifact repair, drains and
+backups continue. Backups export serving state and exclude failed shadow outputs.
+Call `cancel_replacement(new_name)` to remove a running or failed reservation and
+schedule bounded artifact cleanup; the serving old index stays intact. Repeated
+cancellation is a no-op. Deleting the pending new name cancels its reservation.
+Deleting the serving old name removes it and cancels its shadow in one catalog
+transaction; a rejected deletion preserves the reservation and old index.
+Cancel and drain cleanup before registering a fresh attempt after failure.
+Plain `add_index` with the identical pending config joins its shadow even without
+`replaces`; conflicting configs are rejected before changing catalogs or storage.
+The final write fence consumes and durably checkpoints a bounded tail even when
+the gap exceeds 1024. An intra-entry source cursor also permits yielding within a
+large journal batch. Each pause advances completed sources rather than restarting
+the tail. Ordinary activation uses a 100 ms cooperative work budget, followed by
+the required durability checkpoint. After eight yielding attempts, the budget
+increases to at most one second, still capped by an explicit wait deadline.
+Escalation always has a finite deadline: it yields and persists its cursor when
+that budget expires. A current batch (up to 32 sources), storage operation or
+fsync may overrun the cooperative budget, so this is not a hard wall-clock bound
+on writer latency. In-process writers block on the apply lock for up to about
+one second during escalation, plus any in-flight batch and durability checkpoint.
+Sustained producers can require further bounded rounds; the
+old index keeps serving until the atomic swap. `activation_attempts` persists
+across reopen and is reported with replacement progress.
+Cutover coalesces windows containing at most 32 unique sources. Larger windows
+use resumable per-entry batches, including during escalation. Repeated writes to
+a hot document can coalesce within a window; the entire tail is not promised to
+finish in one pass. Partial large entries retain a durable source ordinal.
+Tail rebuilds share a source snapshot and write plan across batches of 32
+sources. Graph owner cleanup also pins one coherent outgoing/reverse snapshot
+pair for each batch, instead of reopening both stores for every document/prefix. Full document rebuilds cover their owned artifacts, so those artifacts
+are excluded from the source scan and journal artifact pass. Resolution batches
+also deduplicate owning extraction artifacts, rendering canonical relation
+endpoints once after all mention resolutions are applied.
+
+Identical in-progress requests join the existing reservation generation. A wait
+captures that generation under registration admission and retains it across
+quanta. Cancellation or target-name reuse returns `ANTFLY_CANCELLED`; a new
+serving index or reservation with the same name (even the same configuration)
+cannot complete the original wait. `replaces` and optional
+`"wait":{"timeout_ms":10000}` are command fields, excluded from stored config.
+Waiting cooperatively advances the same work, releasing handle/path locks between
+quanta so another caller can cancel or write. A missing job record triggers a
+second committed-catalog check, so a racing successful swap returns success.
+`ANTFLY_CANCELLED` describes cancellation of the call: it includes an explicitly
+cancelled replacement, callback cancellation, or interrupted IO/mutex admission.
+Interrupting a worker or a call does not cancel or fail accepted durable work;
+volatile work is discarded and the checkpoint remains resumable. If interruption
+races completion, inspect the index/job state. Storage/admission errors propagate, and a manual runtime sleeps through
+its control IO rather than spinning. Replacement precondition errors have distinct
+codes in C, Python, Go and Rust: `ANTFLY_REPLACEMENT_FAILED`,
+`ANTFLY_REPLACEMENT_PENDING` and `ANTFLY_REPLACEMENT_CONFIGURATION_MISMATCH`.
+Clock-backoff correction leaves queued jobs unchanged on replicas, write-gated
+handles and databases requiring ordered maintenance; it never chooses a local
+write merely to shorten a retry deadline.
+A pending plain replacement temporarily raises the minimum reader version to 2
+and publishes a versioned resolver envelope. The envelope fences pre-epoch
+writers whose replay cleanup ignores shadow retention, including already-open
+Lite writers when they refresh before mutation or maintenance. Failure releases replay retention but retains the name reservation and its
+compatibility fence. Once the last reservation swaps or is cancelled, its
+catalog transaction removes the temporary fence. Cancellation validates both
+in-memory and durable generation ownership before retiring anything; a foreign
+publication returns `ANTFLY_REPLACEMENT_CONFIGURATION_MISMATCH` without mutation. A separate baseline preserves permanent resolver-feature
+requirements: a plain completed replacement returns to version 1, while actual
+authoritative resolver features retain version 2.
+Deadline Busy means registration
+was accepted and the shadow continues in the background. Without wait, Busy is
+limited to bounded registration admission. Drain with `run_until_idle` to await
+all replacements. When both names are absent, the command behaves like ordinary
+add. Atomic replacement currently supports graph-to-graph upgrades with distinct
+names; other index kinds are rejected before inline configuration is changed.
+
+The separate-call recipe is add v2 first, then delete v1. When changing identity
+rules, migrate/reset the resolver namespace first and submit v2 with the new
+inline rules; existing v1 keeps execution active during this sequence. Delete-first
+upgrades are supported too: `list_resolver_identities` includes archived configs
+and durable merges, and `set_resolver_namespace` works on retired identities
+without reactivating them. Adding v2 then reactivates the migrated identity.
+`drop_resolver_identity` explicitly discards an archived identity and its merges;
+it rejects active identities. It does not delete existing resolution artifacts,
+canonical rows, application references or their redirects. Delete the source
+documents to remove their artifacts, and drain index cleanup to remove retired
+graph contributions. Explicitly delete canonical rows only after checking other
+resolvers and application references; shared destination rows have no single
+resolver owner. Index deletion only retires last-owner identities.
+
+The capabilities/status JSON reports the effective `minimum_reader_version`
+compatibility guard independently of package release: 1 for the baseline catalog,
+2 whenever
+extended identity/ownership/cache-policy catalog fields are present, including
+`inline_managed` or `retired`. The authoritative feature epoch is monotonic;
+a pending replacement can temporarily raise its effective guard as described
+above. Opening checks the effective epoch before parsing resolver definitions.
+Extended catalogs also use a versioned object envelope, which pre-epoch array readers
+reject even if they ignore unknown resolver fields. Older unstamped
+catalogs infer their epoch on load; the next mutation stamps it. Status polling
+uses cached epochs under a read guard. Plain table creation/drop preserves the
+original table catalog format and reader epoch 1; actual resolver format changes
+stamp the aggregate requirement in separate metadata. Authoritative feature
+epochs remain monotonic; removing a temporary replacement guard restores
+its authoritative baseline. Open loads the lightweight table catalog,
+then opens each table on demand. Named-table mutations aggregate only permanent
+format requirements into the root's authoritative baseline, including when the
+root itself has a temporary fence. Temporary guards remain scoped to their table
+reservations; status combines the effective cached epochs of loaded tables.
+Cancelling or completing a plain named-table replacement does not permanently
+upgrade the root. Background discovery isolates an unavailable table and reports its error
+in `unavailable_tables`; unrelated root/table reads remain available. Portable
+exports retain the stamp; imports validate it against supported versions and
+catalog requirements before publication. CI checks a real pinned pre-PR reader
+against both a plain database and one containing inline ownership fields.
+
+### Cache storage and mutation invariants
+
+Inline resolver configs accept `retain_work: "none" | "embeddings" | "full"`
+(default `full`) and `max_work_bytes` (default 1 MiB, maximum 16 MiB). The latter
+bounds persisted private work per resolution artifact; oversize work is omitted
+entirely without dropping authoritative entity decisions. `embeddings` retains
+only per-mention embedding references and dependencies, never candidate records
+or comparison features. Embedded mention vectors live once per model/text key
+in a shared content-addressed side store. Generated ANN candidate vectors retain
+index name, vector id and index revision; application-provided vectors reference
+the primary document field instead, preserving their values. Reuse reloads and
+validates each reference. Missing ids, moved revisions or missing/corrupt cache
+entries trigger candidate fetching or inference, never an identity change based
+on an absent vector. Scorer inputs remain lossless f32.
+
+Public artifact lookup and raw resolution lookup strip `_resolution_work`.
+Artifact deletion/replay own the reference lifetime. The mention side store is
+strictly expendable and excluded from portable backups. Inserts queue in a bounded
+16 MiB buffer. Root-source resolutions include the shared-cache writes in their
+resolution transaction; named sources flush one optional shared-cache transaction
+per resolution window after source commit, since Directory tables have distinct
+physical stores. No inference result commits independently per mention. A durable
+byte counter and eviction bound the shared store to 256 MiB across all tables.
+Periodic expiration visits at most 256 cache entries per page, never document
+keys, and expires entries after 30 days. Explicit vacuum can additionally mark
+live artifact references and discard unreferenced entries. Losing cache entries
+only costs inference.
+Portable artifacts may retain cache references; restore safely recomputes misses.
+
+Candidate epochs must advance on every visible destination insert, update,
+delete, TTL expiration and index publication. TTL uses ordinary guarded delete
+batches and advances the same replay clock. TTL-enabled destinations disable
+candidate reuse because logical expiration can precede physical cleanup. Physical
+compaction preserves that clock and cannot resurrect a deleted candidate. Directory adapters return no
+candidate revision until they can provide a pinned snapshot across tables;
+they refetch instead of reusing an unpinned candidate set. Aliases and merges are
+applied from current identity state on each resolution and override cached matches.
+Retiring a labeled resolver invalidates its source-sharing catch-all siblings and
+publishes durable backfill cursors in the retirement transaction. Routing dependencies
+use the same artifact-scope overlap rule as admission and query routing: `any`
+overlaps both `asset` and `chunk`, while `asset` and `chunk` remain disjoint.
+Activation and label changes use this rule too.
+
+### Source-table identity and retries
+
+Resolver names, aliases, merges and namespace fences are scoped by source table.
+Two source tables may use the same resolver name and key template. Separate
+destinations give independent entities. With a shared destination, identical keys
+intentionally identify the same canonical row: promotion preserves its first
+canonical name and unions aliases. Native promotions serialize under the database
+writer fence; Directory promotions use the transaction coordinator's version
+checks. Conflicting writes retry rather than silently overwrite one another.
+A merge on source A does not modify source B's resolver mappings, even when both
+promote to the same destination; shared destination rows remain shared data.
+
+`ANTFLY_BUSY` means concurrent execution/configuration prevented establishing a
+consistent operation. The public schema calls `add_index` (including `replaces`),
+`delete_index`, `set_resolver_namespace`, `drop_resolver_identity` and key merging
+may also return Busy before mutation when replay/promotion exceeds their bounded
+admission wait. Retry the identical schema request. Retry `resolve_query` with
+bounded exponential backoff (for example 5 ms doubling to 100 ms, with jitter).
+Queries perform no writes and are safe to retry. Identical index config replay,
+namespace reset/mapping to the same desired state, and repeated key merges are
+idempotent in outcome; revisions may advance on explicit namespace operations.
+Inspect identity/catalog state after an uncertain transport failure before retrying
+an irreversible drop. Catalog activity admission waits at most 100 one-millisecond
+intervals, then returns Busy before mutation; index deletion cannot spin forever
+behind extraction or promotion. No internal text-query retries repeat model work
+without the caller's latency budget. Native same-path calls retain the documented
+path serialization while inference releases the fence with pinned lifetimes.
+
+
+### Unavailable embedded namespaces
+
+Database-wide drain discovers available tables and reports failed opens in
+`pending_work_stats_json.unavailable_tables`, in both Lite and Directory.
+Healthy-table work and SQL reads continue; an operation that actually references
+an unavailable table still fails. Coordinated SQL constraints require a complete
+catalog and fail closed when dependency metadata is unavailable.
+
+Full portable backup retains its completeness guarantee and fails if any table
+cannot be opened. Explicit `backup_json({"tables":["healthy"]})` (Python
+`backup(tables=["healthy"])`) includes default plus exactly those named tables,
+without opening unrelated namespaces. Restore reconstructs only that explicit
+scope. Include dependency tables when exporting schemas with cross-table
+constraints or resolver references. Go and Rust expose `BackupJSON`/`backup_json`;
+all bindings expose replacement cancellation.

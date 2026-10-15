@@ -326,9 +326,10 @@ test "pgwire native array page delivery preserves dimensions NULLs and exact int
             defer owner.page.deinit();
             const cell = try OwnedRead.PageOwner.cell(&owner, alloc, 0, 0);
             try std.testing.expect(!cell.sql_null);
-            const decoded = try sources.sql_array_wire.decodeLeaky(alloc, .int64, cell.value, .{});
+            try std.testing.expectEqual(std.json.Value.null, cell.value);
+            try std.testing.expect(cell.array != null);
             var work: sources.sql_array_value.Budget = .{};
-            try std.testing.expectEqual(std.math.Order.eq, try array.compare(decoded, &work));
+            try std.testing.expectEqual(std.math.Order.eq, try array.compare(cell.array.?.*, &work));
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
@@ -569,14 +570,12 @@ const OwnedRead = struct {
             if (value.array) |array| {
                 const definition = self.page.columns[column];
                 if (value.sql_null or value.value != .null or value.patterns != null or definition.type != .array or definition.element_type != array.element_type) return error.InvalidSqlBackendResponse;
-                return .{ .value = try @import("antfly_local_sources").sql_array_wire.toJsonLeaky(alloc, array.*, .{}), .sql_null = false };
+                return .{ .array = array, .sql_null = false };
             }
             if (value.numeric) |number| {
                 const definition = self.page.columns[column];
                 if (value.sql_null or value.value != .null or value.patterns != null or definition.type != .number or definition.element_type != .numeric) return error.InvalidSqlBackendResponse;
-                const exact = @import("antfly_local_sources").sql_numeric_value;
-                var context: exact.Context = .{ .alloc = alloc };
-                return .{ .value = .{ .string = try exact.format(&context, number.*) }, .sql_null = false };
+                return .{ .numeric = number, .sql_null = false };
             }
             return .{ .value = if (!value.sql_null and self.page.columns[column].type == .datetime) try datetimeResult(alloc, value.value) else value.value, .sql_null = value.sql_null };
         }
@@ -1101,12 +1100,12 @@ const GuardedCatalog = struct {
         const generate = self.native.vtable.generate_row_id orelse return error.UnsupportedSqlExecution;
         return generate(self.native.ptr, alloc);
     }
-    fn resolveConflictOwners(raw: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, target: catalog.ConflictTarget, mutations: []const catalog.Mutation) ![]const catalog.ConflictOwner {
+    fn resolveConflictOwners(raw: *anyopaque, alloc: std.mem.Allocator, scratch_alloc: std.mem.Allocator, table: catalog.Table, target: catalog.ConflictTarget, mutations: []const catalog.Mutation) ![]const catalog.ConflictOwner {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
         try self.checkRead(table.physical_name);
         if (!Authority.allowsWrite(self.authority, table.physical_name)) return error.Forbidden;
         const resolve_owners = self.native.vtable.resolve_conflict_owners orelse return error.UnsupportedSqlShape;
-        return resolve_owners(self.native.ptr, alloc, table, target, mutations);
+        return resolve_owners(self.native.ptr, alloc, scratch_alloc, table, target, mutations);
     }
     fn checkpoint(raw: *anyopaque) !void {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));

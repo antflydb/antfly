@@ -31,6 +31,24 @@ pub const AddTestsResult = struct {
 
 pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const antfly_test_mod = options.antfly_test_mod;
+    const row_preparation_filters = [_][]const u8{
+        "prepared relational",
+        "relational durable preparation",
+        "relational direct intents",
+        "relational cumulative prepares",
+        "relational preparation budget",
+        "relational transform preparation releases",
+        "db transaction recovery",
+    };
+    const row_preparation_tests = b.addTest(.{
+        .name = "row-preparation-tests",
+        .root_module = antfly_test_mod,
+        .filters = &row_preparation_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+        .max_rss = 8 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-storage-row-preparation-test", "Run resident and recovery row preparation, admission and ownership contracts")
+        .dependOn(&addCuratedTestRunArtifact(b, row_preparation_tests, &row_preparation_filters).step);
     const producer_receipt_filters = [_][]const u8{
         "producer readiness",
         "derived coverage outcome transitions are exclusive and idempotent",
@@ -149,6 +167,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&addFilteredTestRunArtifact(b, repair_activation_tests).step);
     const db_enrichment_filters: []const []const u8 = &.{
         "db public artifact reprocess accepts durable work despite unrelated provider retries",
+        "db public extraction budget rejection publishes a failure manifest",
         "db document extraction manifest inspection and reprocess API",
         "db generic artifact repair queue",
         "db shared repair completion",
@@ -383,6 +402,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "storage.db.enrichment.enrichment_runtime.test.enrichment applied checkpoint stays degraded until runtime status clears",
         "storage.db.enrichment.enrichment_runtime.test.enrichment batch retry identity covers every work item",
         "storage.db.enrichment.enrichment_runtime.test.enrichment distinguishes transient capacity from permanent resource limits",
+        "PDF decode operator budgets",
+        "parallel dense inference preserves order",
+        "forced dense generations recompute cached vectors",
         "storage.db.enrichment.enrichment_runtime.test.enrichment extractSourceText with template error directive fails instead of returning text",
         "storage.db.enrichment.enrichment_runtime.test.enrichment foreground catch up reconciles retry state after checkpoint apply",
         "storage.db.enrichment.enrichment_runtime.test.enrichment generated preparation window bounds time to first publication",

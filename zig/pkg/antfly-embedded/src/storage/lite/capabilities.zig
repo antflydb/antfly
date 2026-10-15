@@ -78,6 +78,10 @@ pub const Capabilities = struct {
     // means any thread may call any function on a handle concurrently. See
     // zig/CAPI.md "Thread Safety".
     threading: []const u8 = "serialized",
+    /// Format epoch, independent of the library release. Additive cache/retirement fields do not advance it.
+    minimum_reader_version: u32 = 1,
+    resolver_identity_management: bool = true,
+    atomic_graph_index_replacement: bool = true,
     hosted_profile: bool = false,
     manual_maintenance: bool = false,
     background_enrichment_runtime: bool = true,

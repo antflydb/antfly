@@ -105,7 +105,7 @@ pub const Context = struct {
             } else false;
             if (consumes) try entries.append(self.owned, .{ .config = config, .artifact_sources = parsed.artifact_sources, .max_edges_per_document = parsed.max_edges_per_document, .ttl_duration_ns = parsed.ttl_duration_ns });
         }
-        self.catalog = .{ .entries = entries.items, .resolvers = .{ .items = if (catalogs.resolvers.len == 0) &.{} else try resolvers.deserializeCatalog(self.owned, catalogs.resolvers) } };
+        self.catalog = .{ .entries = entries.items, .resolvers = .{ .items = if (catalogs.resolvers.len == 0) &.{} else try resolvers.deserializeActiveCatalog(self.owned, catalogs.resolvers) } };
         self.index_manager = &self.catalog;
         var guards: std.ArrayList(publication.ArtifactSource) = .empty;
         for (proof.artifact_sources) |input| if (!std.mem.eql(u8, input.key, proof_key)) try guards.append(self.owned, input);

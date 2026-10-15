@@ -453,6 +453,25 @@ per-cut lease under the parent guard. Active local readers prevent that cleanup;
 the request fails its existing admission bound instead of deleting their files.
 Remote reader leases do not depend on the discarded local directory.
 
+The configured `max_native_cuts` and `max_native_retained_bytes` bound the hot
+local generation cache. When admission reaches either bound, it may evict an idle
+copy only after confirming its local publication receipt against the current
+repository's immutable manifest: incarnation/namespace, ID, expiry, sequence,
+chunk authority and retention horizons must match. The parent guard and exclusive
+per-cut lease protect against concurrent local readers. Admission preserves the
+requested generation, recomputes shared-extent accounting after each deletion,
+and honors cancellation before deleting. Missing durable authority, active
+readers and repository adapters without this capability retain the hard bound.
+Eviction deletes local cache files, never durable manifests or chunks; an old
+cursor resumes the same remote generation without recapturing live rows.
+
+Repeated first-page searches previously filled the 64-cut default even when they
+referred to unchanged native rows. Qualification must exceed a deliberately small
+local cache capacity and resume old cursors after mutation, eviction and restart.
+The native HTTP matrix uses a two-cut cache for this purpose, for both primary-LSM
+and vector-store tables with filesystem and local S3 artifact providers. GCS is
+an explicit separate opt-in qualification.
+
 The recovery regression primes the vector reader, restarts the live database,
 and then preserves the local directory while removing its manifest, corrupting
 its metadata or removing a sealed source-vector file. Each case must return the
@@ -572,3 +591,491 @@ union warm p95 60.25–65.18 ms and saved-overlay warm p95 67.54–73.56 ms. A m
 before/after diagnostic records the large reduction from removing foreground
 collection and bucket-wide enumeration. These shared-host sample measurements
 do not establish full-archive performance or a managed Cloud SLO.
+
+## Follow-up after #1081: publication traversal and cross-file serving runs
+
+Keep the canonical per-file native inventory as the incremental rebuild authority.
+An optional authenticated `compacted` root is the serving generation. It carries
+merged native runs, their own term-directory envelopes, and complete physical
+member spans referencing the original file manifests. It preserves producer IDs,
+global statistics, deleted row holes, typed filtering, highlights and public
+pagination. Source Parquet files are unchanged. Source replacement/removal retires
+the affected merged unit; unchanged units and copy-on-write directory paths are
+reused. Retained readers and GC protect both canonical and serving generations.
+
+The initial policy merges adjacent complete one-run files in groups of at most
+eight, with a 16 MiB input target, a 32 MiB output cap and a 64 MiB merge workspace.
+Larger/multi-run files retain their existing within-file policy. Workspace denial
+falls back to the original runs. Metadata version 11 and reader protocol 36 fence
+writers/readers that do not understand member mappings; historical v9/v10 roots
+remain decodable. Upgrade readers before publishing the new format.
+
+Publication-wide best-first traversal uses authenticated term-page reductions to
+prioritize promising segments. It skips only bounds strictly below the current
+competitive score, keeps equal bounds for ID ties, and reports a lower-bound total
+when pruning. Exact counts, backward/non-score ordering, unsupported query proofs,
+and exhausted optional planning retain the exact existing traversal. The initial
+query coordinator accepts single terms and single-token analyzed matches with
+explicit leading `_score DESC`; broader query shapes remain supported through
+that fallback. Frontier memory and object reads are bounded and cancellation is
+checked even on cache hits. Health counters distinguish completed best-first
+queries, admitted segments and pruned nodes from the profiling planner.
+
+The reported SQLSTATE 54000 for `ORDER BY created_at ... LIMIT 1000` was a response
+budget mismatch: HTTP SQL defaults to 128 rows unless its request `limit` is set.
+Local probes with `limit: 1000` return 1,000 rows in both directions, including body
+projection and `created_at IS NOT NULL`. The HN qualifier now seeds current rows
+through Antfly SQL for both filesystem and remote sources, sets its explicit row
+budget, and bounds that fixture to the supported 4,096-row response maximum. It
+no longer substitutes a local PyArrow projection for this SQL path.
+
+Development checks on the 142,577-row, 67-file sample produce a serving generation
+with **9 runs**, while retaining the 67-file canonical inventory. The debug runtime
+preserves the previously recorded top HN IDs/scores and passes exact filters,
+highlights, union/overlay composition, SQL seeding, pagination and restart checks.
+Debug timings are correctness evidence; optimized matched timings must be recorded
+separately before treating them as a performance comparison.
+
+
+### Optimized 1,024-file local comparison, October 13
+
+[Recorded evidence](../../examples/hackernews/lake-scalability-qualification-20261013.json)
+compares the retained optimized #1081 executable with the follow-up implementation
+on the same 142,577 logical rows, re-encoded into 1,024 Snappy files. Each executable
+ran two application-cache-cleared/restart cycles, 20 warm samples and 10 cursor
+continuations. This preserves the canonical 1,024 runs and serves **128 compacted
+runs**, exercising publication-wide traversal above the 64-run threshold.
+
+| Measurement | Retained #1081 qualifier | Follow-up |
+|---|---:|---:|
+| First highlighted `database` search | 327–407 ms | 136–240 ms |
+| Warm highlighted search p95 | 77–92 ms | 51–55 ms |
+| First highlighted search after restart | 172–183 ms | 95–102 ms |
+| Provider object reads during first search | 1,461 | 405 |
+| Provider bytes during first search | 50.85 MB | 24.33 MB |
+
+Both follow-up cycles visit 58 serving segments and prune 70 term-directory nodes.
+Top-five public row IDs and exact floating-point scores match both baseline cycles;
+highlights, exact filter comparison, empty filters, cursor continuation and restart
+checks pass. Priority candidates are admitted in windows of up to eight, and
+highlight locations follow the admitted snapshot's canonical segment order.
+The full lake gate passes 155 local and 242 integration tests with no leaks; the
+final optimized runtime also passes seven native gateway tests and nine subtests.
+
+Cursor p95 and metadata-filter timings are mixed across cycles: cursor p95 is
+178–224 ms versus 213–218 ms on the baseline; some filter cases vary or regress.
+No general filter/cursor speedup is claimed. OS file caches were not flushed,
+readiness warming remains enabled, and other local builds shared the development
+host. These small normalized-data runs establish correctness and reduced query
+I/O, not full-archive, raw BigQuery encoding or Antfly Cloud performance.
+
+At PR #1117, the 1,024-file **cold composed search returned HTTP 422
+`query_candidate_budget_exceeded` on both executables**. The composed stream
+requires exact leaf totals, while large ranked pages can return lower-bound totals.
+This is separate from SQL fixture seeding: Antfly SQL successfully supplies the
+1,000 recent rows with an explicit 1,000-row HTTP budget before that diagnostic
+fails. The smaller 67-file development composition check passes, but it does not
+qualify this larger cold composed workload. Fixing that leaf-count contract and
+full-archive/cloud qualification were the next follow-ups. No cloud job or deployment
+was launched for this comparison.
+
+### Composed cardinality and release handoff follow-up
+
+A bounded ordered page and an exact relation count are separate contracts. The
+composed executor now accepts a full requested ordered leaf window whose total
+relation is `gte`. It keeps the exact total unknown and returns a conservative
+visible-prefix lower bound. It does not add page-local lower bounds, because leaf
+adapters can report either full-relation or remaining-relation counts. A short
+window with an unknown lower-bound total still fails closed. An exact short or
+empty terminal window proves exhaustion; full and remaining exact counts are
+validated against the retained position. Explicit union `count: true` still
+requires exact leaf counts, while overlay counts stream through visibility.
+Replacement lookups retain their exact, bounded completeness requirement.
+
+Retained source continuations use version 3 and pin catalog/schema/policy identity
+independently of cardinality. Version 2 cursors remain readable: their existing
+exact total establishes that the identity was already bound. Refills reauthorize
+exhausted sources and verify immutable serving tokens. Unknown cardinality cannot
+allow a drop/recreate or schema/policy change to silently rebind a cursor. The
+merge loop checks exhaustion again after refill before indexing a possibly empty
+terminal batch.
+
+The regional runner now forwards `benchmark_composed` and
+`composed_current_rows`. The archive acceptance profile requires cold and warm
+measurements for both the historical/current union and the saved replacement
+overlay, in addition to existing suppression and retained-cursor checks. Results
+bind each public hit's table, ID and score, so equal IDs across sources do not hide
+ordering changes. The 1,000-row current fixture is bounded diagnostic coverage;
+it does not represent a year's worth of current HN data. Percentiles use nearest
+rank consistently. Missing measurements, a different fixture size or exceeded
+latency limits fail the gate.
+
+The full-archive follow-up profile must explicitly match the existing shared
+ledger before execution. A dry run reports remaining run slots, unreserved budget
+and whether another reservation can be admitted. Updating a profile cannot reset
+the retained ledger or create retry capacity. New billing and cloud-preflight
+records remain local; reconcile posted gross compute and retain unexported
+storage/network allowances before admitting another worker. Promotion credits do
+not reduce budget accounting.
+
+After local qualification, merge the fix and run the human-approved CI gate on
+its final revision. Publish an immutable native runtime release and verify the
+release/image digest includes this merge and #1117. Select that release in the
+Colony development catalog, preserving the existing rollback reference and
+leaving auto-upgrade disabled. The actual deploy uses an organization-owned
+Antfly Cloud instance, with its tenant identity and credential-refresh path; a
+standalone benchmark pod or retained 20 GiB claim does not qualify that path.
+Verify restricted object access, both HN tables and saved overlay, publication,
+cursor retention and replacement-owner recovery through the managed API. Reuse
+the pinned 334-object, 47,717,307-row export after verifying its live generations.
+Run the regional latency matrix only after budget admission is restored through
+reviewed reconciliation or a new explicit ceiling. Public DNS remains gated on
+managed deployment qualification. This follow-up does not create a release,
+promote the development catalog or deploy a tenant.
+
+The final count-normalization guard also rejects an exact count smaller than the
+returned window after earlier lower-bound pages. The final local regression run
+passes 157 core plus 247 API lake tests without skips/leaks; all thirteen composed
+regressions pass, and the qualification/budget/transport/recovery Python checks
+pass 47 tests and 25 subtests. These are engine/harness checks; the optimized HTTP
+matrix results follow below.
+
+### Rebuilt composed-query qualification, October 13
+
+[Recorded local evidence](../../examples/hackernews/composed-lake-qualification-20261013.json)
+binds production revision `37fa71b50d` and the optimized executable's digest to two
+complete cycles on the same 142,577-row, 1,024-file fixture with 128 serving runs.
+Both cycles pass filters, highlights, composition, retained pagination and
+restart correctness. Table/ID/score results match across all repeated composed
+queries and both cycles. A prior executable exhausted its default 64-cut native
+local cache during the second cycle; both rebuilt cycles complete after durable
+cache eviction was added.
+
+| Measurement | Cycle 1 | Cycle 2 |
+|---|---:|---:|
+| Cold historical/current union | 280 ms | 342 ms |
+| Union warm p95, 20 samples | 269 ms | 168 ms |
+| Cold saved replacement overlay | 345 ms | 299 ms |
+| Overlay warm p95, 20 samples | 199 ms | 162 ms |
+| Single-table first search after restart | 142 ms | 4,385 ms |
+| Retained cursor after restart | 2,583 ms | 768 ms |
+
+Finite `sqlite` pagination returns 167 union hits and 166 overlay hits over eleven
+pages each, without duplicate table/ID pairs. Both begin with lower-bound totals
+and end with exact totals matching independent explicit counts. The native HTTP
+matrix passes eleven tests and nine subtests with a two-cut cache, covering
+filesystem and local S3 repositories under both native vector-storage modes,
+mutation, restart, local-cache loss and missing/corrupt authority. Two real-GCS
+cases are excluded; these results do not qualify actual cloud providers.
+
+The 4,385 ms restart search exceeds the 2,000 ms target. Its measured ranking
+phase is 87 ms; the available phase counters do not explain the full delay, so
+its cause remains unproven. Five isolated restart probes return identical results
+in 237–774 ms. Keep the original search and cursor outliers in the evidence rather
+than replacing them with the diagnostic probes. Correctness and cache-pressure
+qualification pass; the two-cycle restart-latency criterion does not. OS caches
+are not flushed, readiness warming is enabled, and these normalized local data
+measurements do not establish full-archive or managed Cloud latency.
+
+### Restart outlier investigation after #1121
+
+[Investigation evidence](../../examples/hackernews/restart-latency-investigation-20261013.json)
+retains the original failures and records 35 isolated restart probes and four
+additional full sequences on the unchanged merged executable. The 4,385 ms
+single-search stall did not recur. Two sequences used process-local filesystem
+tracing: none of the traced `fsync`/file-lock operations exceeded 7 ms. The final
+two untraced sequences measured restart searches at 194–196 ms and retained cursor
+resumes at 899–932 ms. These observations do not prove the original stall's cause
+or erase the failed original latency criterion.
+
+The original request reports 4,377 ms inside the server versus 4,385 ms over HTTP,
+so transport does not explain it. Ranking took 87 ms and hydration 7 ms. The
+discarded aggregate phases prevent distinguishing admission/preparation from
+post-search retention/delivery for that historical sample.
+
+The original 2,583 ms cursor sample has more complete attribution: its retained
+counters record 802 ms ranking and 1,688 ms hydration. This identifies the work
+that dominated that request, but does not establish why those phases were slower
+on that shared-host run.
+
+The qualifier had dropped the engine's labeled aggregate phase counters while
+parsing Prometheus output, then would also drop labeled counters during delta
+capture. Preserve the fixed `total`, `publication`, `search`, `hydration` and
+`delivery` labels. The report now includes `lake_phase_profile`: pre-search
+includes reader admission, cache setup and metadata preparation; post-search
+includes durable cursor publication and response delivery. Hydration overlaps
+other phases and must not be added to them. Time outside the measured lake phases
+also includes native/composed work and transport; concurrent lake leaves can
+make the difference negative. Older runtimes without these counters report no
+phase profile rather than fabricated zero timings.
+
+The instrumentation regression tests and qualification/recovery tests pass 25
+tests and nine subtests. This follow-up fixes missing diagnostic evidence. It does
+not claim an engine performance fix for the unreproduced single-search stall.
+
+Further reproduction did produce a 2,498 ms retained-cursor request. Its
+aggregate counters attribute 1,361 ms to search and 1,077 ms to delivery, including
+1,070 ms hydration. Immediate first searches also reached 2,057–3,148 ms with
+persistent caching enabled, and 3,093 ms with it disabled. These are related
+latency failures, rather than proof of the original ready-cache preparation gap.
+
+A process-local filesystem trace identifies synchronous persistent-cache
+inventory restoration on the immediate first-query path: in one 1,563 ms sample,
+cache-file operations preceded the first source-file operation by approximately
+864 ms. `PersistentObjectRangeCacheState.initializeInventory` scans and validates
+retained entries before publishing the cache. Any future asynchronous restoration
+must preserve ownership, capacity accounting and retained cache hits; disabling
+the tier permanently would increase remote reads.
+
+The slow cache-enabled/disabled pair also coincided with substantial system swap
+activity. Per-process page-ins and filesystem waits support host resource
+contention as another contributor. System-wide paging does not identify who
+caused pressure, and this evidence cannot establish the historic stall's cause.
+Twenty restart probes querying six seconds after readiness did not reproduce the
+original gap. Twenty-four more probes queried 0, 50, 200 or 1,000 ms after the cache-ready
+transition and returned in 95–264 ms, without reproducing the preparation gap.
+The evidence artifact records these results and keeps the original failed
+criterion intact.
+
+### Background cache restoration and bounded highlight delivery
+
+Persistent range-cache startup now runs in a server-owned background task.
+Request preparation uses nonblocking startup admission and copies the configured
+path before returning; it neither waits for inventory nor borrows request memory
+or cancellation. RAM/source reads remain available until restoration completes.
+Only a fully inventoried owner is published, preserving the existing file lock,
+disk/entry ceilings, protected-entry priority and validation of retained hits.
+The dedicated executor admits restoration plus its write worker. Server shutdown
+cancels and joins restoration before destroying the cache or executor. Inventory
+header reads propagate cancellation rather than treating it as missing priority.
+
+Mapping retirement now detaches the idle entry under the cache lock, then unmaps
+and releases its disk lease outside it. Admission rechecks identity and capacity
+after cleanup, with bounded retries and the existing uncached-mapping fallback.
+This removes filesystem work from a global spin-lock section without changing
+active-reader pins or disk-capacity accounting.
+
+Paged stored highlights group final winner locations by authenticated segment
+identity and document ordinal. Each segment opens once per delivered batch, while one
+hidden document input is reused at a time. Streamed response hydration uses
+64-hit batches, so segment reuse is bounded by that batch. Highlight outputs remain attached to
+their original hit positions; ranked order, scores and cursor contents do not
+change. Each document still verifies its native row identity, and a four-document
+lookahead uses the existing bounded prefetch queue. This targets repeated segment
+opening during cursor hydration, rather than changing the ranking algorithm.
+
+These changes address demonstrated startup work and repeated hydration work.
+They do not establish the cause of the original already-ready-cache stall or
+eliminate host paging. Keep the retained failures and require controlled-host,
+full-archive and managed Cloud qualification before treating latency as passed.
+
+[Follow-up evidence](../../examples/hackernews/cache-startup-qualification-20261013.json)
+records the optimized build at `05420a779c` and three immediate-start cycles on
+the same 142,577-row fixture. First searches take 116–371 ms; a retained 128-hit
+cursor issued as the first request after restart takes 361–421 ms. Each cycle
+checks 1,408 unique paginated hits and preserves IDs, scores, projected fields
+and highlights. Health metrics refresh periodically, so a sampled disk-ready
+gauge is not an instantaneous proof of readiness. These are shared-host samples,
+not a controlled before/after comparison or proof of the historic stall's cause.
+
+The complete HN matrix passes keyword, filter, highlight, concurrent, composed
+union/overlay and restart-pagination correctness. Search restart is 167 ms and
+cursor restart 657 ms. A cold saved-overlay request takes 2,366 ms and fails the
+2,000 ms criterion: measured lake work accounts for 524 ms, leaving 1,842 ms
+outside those phases. Five cache-cleared follow-up probes take 291–672 ms without
+reproducing that stall. Preserve the failure; its cause remains unproven.
+
+Validation passes 47 embedded cache tests, three focused API tests, and 25 Python
+tests with nine subtests. Native tests have no skips, failures or leaks. The fresh
+native-source fixture verifies grouped highlight acquisition, reordered hits,
+identity mismatch rejection and cancellation independently of the HN timings.
+The complete optimized executable also requires the resolver import. After merging
+main through `4838edd961`, the shared database imports supply it to both API and
+serverless builds; the duplicate object-runtime import was removed.
+
+### Cold overlay attribution and native warming recovery
+
+The saved-overlay outlier includes native current-table execution, which the
+lake phase counters cannot attribute. Composed query counters now measure the
+whole operation, saved-definition expansion, leaves, native leaves and cursor
+storage. Native leaf time includes checkpoint capture/recovery and overlaps leaf
+time; lake totals also overlap leaves. The HN harness records this profile only
+for an interval containing one composed operation. It reports composition as the
+remainder after definition, leaves and cursor storage, and keeps transport/admission
+outside the composed total. Nested counters must not be added to their parents.
+
+The retained fixture also contains an empty `.warming.json` progress hint,
+producing repeated `UnexpectedEndOfInput` warnings and preventing the affected
+native table from warming. Local warming progress is optional; malformed
+or oversized hints now trigger fresh warming. Writes use a synced temporary file
+and atomic replacement, preserving the last complete state if canceled. Validate
+request IDs before using a recovered hint to select a cleanup path. Published
+native generations remain subject to their existing independent validation.
+
+The investigation retains the original failure and runs twelve additional
+union-then-overlay sequences on the preceding optimized binary. Cold saved overlays return the expected
+results in 211–652 ms. A 923 ms union triggered stack sampling; no overlay crossed
+the 750 ms sampling threshold. These shared-host runs do not explain the original
+2,366 ms sample or establish a controlled performance improvement. The warming
+fault is a separately reproduced startup bug, not proof of that sample's cause.
+
+The merged revision at `c068b72af7` builds the complete optimized executable and
+passes seven focused native tests with no skips, failures or leaks, plus 26 Python
+tests and nine subtests. Twenty-four instrumented cold requests preserve exact
+table identities, IDs, scores, projected source and highlights across twenty warm
+queries per request. Saved overlays take 169–509 ms; immediate unions take
+199–1,335 ms and unions delayed six seconds take 158–387 ms. The slowest immediate
+union spends 998 ms in native leaves and 325 ms in lake execution. Composed
+bookkeeping remains below 3 ms and time outside composed execution below 2.2 ms.
+The empty progress hint becomes valid and complete automatically, with no warming
+errors across these restarts. This verifies the recovery fix, while preserving the
+historical outlier's unproven attribution.
+
+These local measurements use 142,577 historical rows in 1,024 Parquet files and
+1,000 native current rows, with filesystem storage on a shared macOS ARM64 host.
+OS caches are retained. The `c068b72af7` executable SHA-256 is
+`f0109097be0be122fcc843d4974565cf950c755dd80fc6f16774d3d1b6ecff7e`.
+Raw probe reports are retained locally outside the repository; the measurements,
+failed gates and attribution limits are recorded here.
+
+The complete merged-revision HN matrix passes correctness, including SQL count
+142,577, exact metadata filters, 1,408 unique paginated hits and mutable composed
+cursor replay after restart. Cold search is 357 ms, search restart 149 ms, cursor
+restart 343 ms, union cold search 280 ms and saved-overlay cold search 368 ms.
+However, saved-overlay warm p95 is 1,074 ms, including a 3,325 ms request, and fails
+the 750 ms warm gate. Those warm requests lack individual phase profiles, so their
+cause remains unproven. Retain this failure and require controlled-host and
+full-archive qualification; passing cold samples do not establish the service SLO.
+
+Ten additional saved-overlay restart/cache-clear sequences arm stack sampling
+above 750 ms for every warm request and preserve exact results and highlights.
+Their 200 warm searches take 139–616 ms, with p95 310 ms, without reproducing the
+3,325 ms request. Serial-window counters cover multiple warm requests and cannot
+attribute one request within such a window. Keep the failed full-matrix sample;
+these follow-ups neither explain its cause nor replace controlled-host qualification.
+
+### Preventing composed-query latency outliers
+
+Review of the startup, mapping-retirement, grouped-highlight and warming-progress
+changes found no additional correctness regression. The warm outlier still has no
+proven cause. Process counter deltas are insufficient for an individual warm
+request in a burst or under concurrency, so each composed request now accumulates
+its own timings through the serial leaf callbacks. The server retains the slowest
+request above 750 ms since startup and exports its total, definition, leaf, native
+leaf, cursor and composition durations as fixed-name gauges. Native time overlaps
+leaf time. Optional diagnostic retention uses a nonblocking lock, fixed-size
+copies and no request-path logging or allocation; contention increments a drop
+counter. A contended status read can omit the profile until a later refresh. The
+HN benchmark samples the profile and drop counter after each warm burst before
+stopping its dedicated process. The profile includes failed work and cannot by
+itself identify which public sample produced it or attribute transport overhead.
+
+The remaining native path can still perform expensive work on a nominally warm
+query. `captureQueryCutInternal` takes a query-pin guard and constructs a coherent
+snapshot; `snapshotInternal` drains required maintenance, pauses generated-index
+workers, syncs stores and indexes, and seals/publishes the snapshot. Cached chunks
+reduce transfer, but do not eliminate this capture for a live filesystem-backed
+table. An overlay's suppression lookup reuses the changes stream's retained token;
+it does not capture a second independent current-table snapshot, though it still
+opens and queries the retained generation again.
+
+The next prevention work should follow measured attribution:
+
+- If native capture dominates, reuse a sealed immutable generation for unchanged
+  state and coalesce concurrent captures of that generation. Its identity must
+  cover table/shard/range incarnation, source/WAL visibility and generated-index
+  publication state; a WAL sequence alone is insufficient. Acquire the read lease
+  and validate that identity atomically before reuse. Publish any required
+  retention extension before returning a cursor, and preserve existing authority,
+  expiry and split/merge recovery checks.
+- Build reusable generations after accepted changes through bounded background
+  work. A fresh query with a newer required watermark must wait for or capture
+  that exact state within its deadline, rather than silently using an older warm
+  checkpoint. Qualify ingestion, enrichment, index changes and maintenance as well
+  as a static HN fixture.
+- If retained-generation opening dominates, add a bounded cache of immutable read
+  owners keyed by the authenticated generation and retention horizon. Keep reader
+  leases alive through queries, evict only idle owners, and preserve cancellation
+  and topology validation. This can amortize metadata verification and duplicate
+  opens within an overlay without weakening cursor durability.
+- If lake I/O or host paging dominates, qualify foreground reads alongside cache
+  restoration, snapshot warming and vacuum under controlled CPU/memory/I/O limits.
+  Bound background batches and admission independently of foreground work. Existing
+  asynchronous cache restoration and unlocked mapping cleanup already remove two
+  demonstrated sources of shared-query blocking.
+
+Request deadlines bound cooperative work and admission; they do not guarantee a
+successful low-latency result during arbitrary filesystem stalls or host paging.
+Use the retained request profile and controlled-host measurements before attributing
+the historical failures or claiming that one of these designs eliminates them.
+
+Native generation reuse now implements the first prevention step. One optional
+hint belongs to the physical execution owner and is serialized by the existing
+query-pin guard. Its fingerprint covers an owner nonce, table/shard/range identity
+and key bounds, source and maintenance watermarks, the primary commit revision,
+catalog epoch, index configurations and complete projection checkpoints. The
+primary revision increments before transaction and batch commit attempts, covering
+metadata/graph/enrichment changes without a new source replay record and ambiguous
+commit failures. Owner nonces prevent comparison of process-local counters across
+restarts. The coherent full snapshot records its fingerprint only when the state
+matches before primary pinning and after sealing.
+
+The repository returns a reuse proof only after committing the exact manifest
+constructed from that snapshot. The proof binds the state fingerprint, sequence
+and manifest checksum. Fresh requests validate unchanged state under short source,
+replay and apply fences, release those fences before provider I/O, verify the
+previous committed manifest against that proof, and publish a new logical cursor
+manifest referencing its immutable chunks. Every chunk's authenticated retention
+horizon must cover the new cursor; insufficient coverage forces ordinary capture.
+Successful reuse rotates the hint to the new manifest. Completed background warming
+can seed the same hint. Missing capabilities, expired hints, changed state or a
+missing/mismatched manifest fall back to capture. The shared-store manifest format
+is unchanged, and no additional object is written for a reuse proof.
+
+This removes maintenance drain, worker pause, store/index sync and filesystem
+generation sealing from unchanged-state capture. New or changed state still uses
+the existing coherent capture path. A new owner must establish a fresh proof;
+existing remote checkpoint references and retained-cursor recovery remain valid.
+Caching immutable read owners and qualification under controlled host limits
+remain separate work. The historical outliers remain unproven until attributed by
+retained request-local timings.
+
+
+### Native generation reuse runtime qualification, October 14
+
+The optimized executable built successfully from the production changes in
+`17a97cc139` (documentation cleanup at `59712a4d53`). Its SHA-256 is
+`dd9e3d820abced7fc6c84b5ca3a163e8eb5855eb95ed9eeeeead192105a49ae8`.
+The full HN matrix passes on the same 142,577 historical rows, 1,024 Parquet files
+and 1,000-row native current fixture. Filesystem storage runs on the shared macOS
+ARM64 host with OS caches retained and navigation warming enabled. Reports and
+request logs are retained locally outside the repository.
+
+| Measurement | Native generation reuse |
+| --- | ---: |
+| Cold highlighted archive search | 223 ms |
+| Warm archive search p95, 20 samples | 115 ms |
+| Archive search after restart | 103 ms |
+| Deep cursor replay after restart | 251 ms |
+| Cold union search | 192 ms |
+| Warm union p95 / maximum, 20 samples | 67 / 78 ms |
+| Cold saved-overlay search | 268 ms |
+| Warm saved-overlay p95 / maximum, 20 samples | 79 / 115 ms |
+| Indexed unordered equality filter | 90 ms |
+
+Both composed benchmarks meet the 2,000 ms cold and 750 ms warm local gates.
+Neither dedicated benchmark process retains a composed request above 750 ms;
+diagnostic drops are zero. Cold union native leaves take 7.7 ms and cold overlay
+native leaves take 88.8 ms. Readiness and the serial profiling delay allow background
+warming before these cold queries; these are cleared lake-cache measurements,
+not proof that a fresh native owner avoids its first capture.
+
+Correctness includes exact SQL count, metadata filters matching independent
+residual evaluation, projected highlights, stable identities and scores, 1,408
+unique paginated hits, and mutable composed cursor replay after restart. Forced
+residual correctness-oracle scans include requests lasting 1.42, 2.27 and 5.09
+seconds; they are distinct from the indexed search latency samples and remain
+recorded in the local request log. The historical failed warm matrix remains
+above rather than being replaced by this passing run. These bounded shared-host
+measurements do not prove the historical outlier's cause or qualify full-archive,
+concurrent-ingestion or Antfly Cloud service latency.

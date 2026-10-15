@@ -264,7 +264,7 @@ Automatically splitting data partitions ([shards](#sharding)) when they grow too
 
 ### Hot Standby
 
-A Postgres-style high-availability mode: a single primary streams its WAL to read-only standbys (`antfly standby`), with replication slots for WAL retention and explicit promotion with fencing. It is an alternative to Raft quorums for read replicas, disaster recovery, and online upgrades. It does not provide point-in-time recovery; use backups for that.
+A Postgres-style high-availability mode: a single primary streams its WAL to read-only standbys (`antfly standby`), with replication slots for WAL retention and explicit promotion with fencing. It is an alternative to Raft quorums for read replicas, disaster recovery, and online upgrades. Point-in-time recovery is not supported; backups restore a selected backup snapshot.
 
 See: [Hot standby design](https://github.com/antflydb/antfly/blob/main/zig/HOT_STANDBY.md)
 

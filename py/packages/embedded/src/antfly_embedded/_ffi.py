@@ -262,6 +262,7 @@ _FUNCTIONS: list[tuple[str, list[object], object]] = [
     ("antfly_db_capabilities_json", [_VOID_P, _BUF_P], _ERR),
     ("antfly_db_replay_generated_enrichments_json", [_VOID_P, _BUF_P], _ERR),
     ("antfly_db_backup", [_VOID_P, _BUF_P], _ERR),
+    ("antfly_db_backup_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),
     ("antfly_db_import_backup", [_VOID_P, AntflySlice], _ERR),
     (
         "antfly_restore_backup_json",
@@ -329,10 +330,13 @@ _FUNCTIONS: list[tuple[str, list[object], object]] = [
     ("antfly_db_list_indexes_json", [_VOID_P, _BUF_P], _ERR),
     ("antfly_db_render_resolver_key_json", [_VOID_P, AntflySlice, AntflySlice, _BUF_P], _ERR),
     ("antfly_db_resolve_query_json", [_VOID_P, AntflySlice, AntflySlice, _BUF_P], _ERR),
+    ("antfly_db_list_resolver_identities_json", [_VOID_P, _BUF_P], _ERR),
+    ("antfly_db_drop_resolver_identity", [_VOID_P, AntflySlice, ctypes.POINTER(ctypes.c_bool)], _ERR),
     ("antfly_db_set_resolver_namespace_json", [_VOID_P, AntflySlice, AntflySlice], _ERR),
     ("antfly_db_merge_resolver_keys_json", [_VOID_P, AntflySlice, AntflySlice], _ERR),
     ("antfly_db_add_index_json", [_VOID_P, AntflySlice], _ERR),
     ("antfly_db_delete_index", [_VOID_P, AntflySlice, ctypes.POINTER(ctypes.c_bool)], _ERR),
+    ("antfly_db_cancel_replacement", [_VOID_P, AntflySlice, ctypes.POINTER(ctypes.c_bool)], _ERR),
     ("antfly_db_list_enrichments_json", [_VOID_P, _BUF_P], _ERR),
     ("antfly_db_add_enrichment_json", [_VOID_P, AntflySlice], _ERR),
     (

@@ -1048,7 +1048,12 @@ expansion, algebraic-filter, and hybrid-composed shapes, use
 `python3 scripts/run_db_query_matrix.py --suite public` (100k documents by
 default). Dense/HBC cost is better isolated with `dense-stack-bench`, because the
 public-query guardrail does not surface dense/HBC profile counters for
-dense-filter or hybrid-composed requests.
+dense-filter or hybrid-composed requests. For that reason the matrix does not
+require symbolic dense profile rows by default; pass
+`--public-arg=--require-symbolic-profile` only on a route expected to emit those
+profiles. This flag replaces `DOCID_PERF_MATRIX_REQUIRE_SYMBOLIC_PROFILE=1` from
+the removed `run_docid_perf_matrix.sh` wrapper
+([history](../docs/design/docid/history/implementation-notes.md#key-measurements)).
 
 > **Relocated:** The DOCID query-benchmark diary (267 lines: benchmark
 > command shapes, smoke-run numbers, and the write-path optimization narrative
@@ -1111,6 +1116,11 @@ The hard parts are operational rather than syntactic:
   broad scored text query to collect matching ordinals
 - continued audit that public query errors fail closed or use exact doc-key
   fallback when ordinal coverage is missing
+- a suspected public-query guardrail harness gap, as of the 2026-05 log: at
+  100k, graph-expand direct DB-search measured `~592ms` while the handler path
+  measured `~0.4ms`; it needs separate evidence before being treated as a
+  product regression
+  ([history](../docs/design/docid/history/implementation-notes.md#key-measurements))
 
 The design should prefer correctness first: missing ordinal coverage should use
 the doc-key fallback or fail closed according to the caller's policy. It should

@@ -225,7 +225,9 @@ Near-term goals:
   `*_FINDINGS.md`/`*_EXPERIMENTS.md` ledger, or in a `RESULTS-<date>.md`
   beside the bench script that produced it, and leave a one-line pointer.
   Before moving a log out of a design doc, lift every standing rule it
-  contains into the design sections first.
+  contains into the design sections first. History files over ~300 lines
+  are kept as summaries (decisions, rejected approaches, key measurements)
+  that link to the full verbatim log at a pinned commit.
 
 ## Design documents
 

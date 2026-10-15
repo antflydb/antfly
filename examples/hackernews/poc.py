@@ -24,6 +24,7 @@ import argparse
 import hashlib
 import struct
 import json
+import math
 import shutil
 import statistics
 import sys
@@ -36,6 +37,97 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+
+
+def parse_lake_metrics(text):
+    """Retain aggregate query phases without arbitrary metric label values."""
+    phases = {"total", "publication", "search", "hydration", "delivery"}
+    phase_keys = {
+        f'antfly_lake_query_phase_nanoseconds_total{{phase="{phase}"}}'
+        for phase in phases
+    }
+    result = {}
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) != 2 or not fields[0].startswith("antfly_lake_"):
+            continue
+        key = fields[0]
+        if "{" in key and key not in phase_keys:
+            continue
+        result[key] = int(fields[1])
+    return result
+
+
+def lake_metric_deltas(before, after):
+    return {
+        key: value - before.get(key, 0)
+        for key, value in after.items()
+        if key.split("{", 1)[0].endswith("_total")
+    }
+
+
+def lake_phase_profile(delta, elapsed_ms):
+    keys = {
+        phase: f'antfly_lake_query_phase_nanoseconds_total{{phase="{phase}"}}'
+        for phase in ("total", "publication", "search", "hydration", "delivery")
+    }
+    if not all(key in delta for key in keys.values()):
+        return None
+    values = {phase: delta[key] / 1_000_000 for phase, key in keys.items()}
+    return {
+        "total_ms": values["total"],
+        "pre_search_ms": values["publication"],
+        "search_ms": values["search"],
+        "post_search_ms": values["delivery"],
+        "hydration_ms": values["hydration"],
+        "outside_lake_ms": round(elapsed_ms - values["total"], 3),
+        "scope": "Process counters for a serial query interval. Pre-search includes admission and metadata preparation; post-search includes cursor retention and response delivery. Hydration overlaps other phases; do not add it to them. Outside-lake time includes native/composed execution and transport; overlapping lake leaves can make it negative.",
+    }
+
+
+def composed_phase_profile(delta, elapsed_ms):
+    """Attribute serial composed work without adding nested native/leaf timers."""
+    phases = ("total", "definition", "leaf", "native_leaf", "cursor")
+    keys = {
+        phase: f"antfly_lake_query_composed_{phase}_nanoseconds_total"
+        for phase in phases
+    }
+    if delta.get("antfly_lake_query_composed_total_calls_total", 0) != 1 or not all(
+        key in delta for key in keys.values()
+    ):
+        return None
+    values = {phase: delta[key] / 1_000_000 for phase, key in keys.items()}
+    return {
+        "total_ms": values["total"],
+        "definition_ms": values["definition"],
+        "leaves_ms": values["leaf"],
+        "native_leaves_ms": values["native_leaf"],
+        "cursor_storage_ms": values["cursor"],
+        "composition_ms": round(
+            values["total"] - values["definition"] - values["leaf"] - values["cursor"],
+            3,
+        ),
+        "outside_composed_ms": round(elapsed_ms - values["total"], 3),
+        "scope": "Process counters for one serial composed query. Native leaves include durable snapshot capture/recovery and overlap leaves; lake totals also overlap leaves. Composition is the remainder after definition, leaves and cursor storage. Outside-composed time includes HTTP admission and transport.",
+    }
+
+
+def slowest_composed_profile(metrics):
+    """Read one retained request, rather than subtracting process-wide gauges."""
+    phases = ("total", "definition", "leaf", "native_leaf", "cursor", "composition")
+    keys = {
+        phase: f"antfly_lake_query_slowest_composed_{phase}_nanoseconds"
+        for phase in phases
+    }
+    if not all(key in metrics for key in keys.values()):
+        return None
+    return {
+        **{phase + "_ms": metrics[key] / 1_000_000 for phase, key in keys.items()},
+        "diagnostic_drops": metrics.get(
+            "antfly_lake_query_slow_profile_drops_total", 0
+        ),
+        "scope": "Request-local phases of the slowest composed request above 750 ms since this process started; includes failed work. Native overlaps leaves. Optional diagnostic contention can skip retention; drops are counted. This is a gauge snapshot, not a process counter delta or identification of a particular warm sample.",
+    }
 
 
 def wait_for_index(
@@ -330,8 +422,8 @@ def main():
     )
     parser.add_argument("--cursor-retention-ms", type=int, default=300000)
     args = parser.parse_args()
-    if not 2 <= args.composed_current_rows <= 10000:
-        parser.error("composed current rows must be between 2 and 10000")
+    if not 2 <= args.composed_current_rows <= 4096:
+        parser.error("composed current rows must be between 2 and 4096")
     if args.benchmark_composed and not args.qualify_composed_sources:
         parser.error("composed benchmarks require --qualify-composed-sources")
     if args.docker and not args.filesystem_source:
@@ -596,13 +688,7 @@ def main():
             f"http://127.0.0.1:{args.port + 1}/metrics", timeout=15
         ) as response:
             text = response.read().decode()
-        return {
-            fields[0]: int(fields[1])
-            for line in text.splitlines()
-            if line.startswith("antfly_lake_")
-            and len(fields := line.split()) == 2
-            and "{" not in fields[0]
-        }
+        return parse_lake_metrics(text)
 
     def timed_query(query, phase="search", path="/tables/hn_archive_poc/query"):
         serial_profile = phase in {
@@ -619,19 +705,26 @@ def main():
         after = resource_counters()
         metrics_after = lake_metrics() if serial_profile else None
         if before is not None or metrics_after is not None:
+            delta = (
+                lake_metric_deltas(metrics_before, metrics_after)
+                if metrics_after is not None
+                else None
+            )
             io_profiles.append(
                 {
                     "phase": phase,
                     "elapsed_ms": elapsed,
                     "took_ms": result.get("took"),
                     "filter": query.get("filter_query"),
-                    "lake_metrics_delta": (
-                        {
-                            key: value - metrics_before.get(key, 0)
-                            for key, value in metrics_after.items()
-                            if key.endswith("_total")
-                        }
-                        if metrics_after is not None
+                    "lake_metrics_delta": delta,
+                    "lake_phase_profile": (
+                        lake_phase_profile(delta, elapsed)
+                        if delta is not None
+                        else None
+                    ),
+                    "composed_phase_profile": (
+                        composed_phase_profile(delta, elapsed)
+                        if delta is not None
                         else None
                     ),
                     "lake_metrics_scope": "process; nested phases may overlap",
@@ -1082,35 +1175,18 @@ def main():
                 "points",
                 "created_at",
             ]
-            if args.filesystem_source:
-                import pyarrow.dataset as dataset
-
-                paths = sorted((args.filesystem_source / "archive").glob("*.parquet"))
-                if not paths:
-                    raise ValueError(
-                        "Local composed fixture needs original archive/*.parquet payloads"
-                    )
-                recent_rows = (
-                    dataset.dataset([str(path) for path in paths], format="parquet")
-                    .to_table(columns=columns)
-                    .sort_by([("created_at", "descending"), ("hn_id", "ascending")])
-                    .slice(0, args.composed_current_rows)
-                    .to_pylist()
-                )
-                recent = {
-                    "rows": [[row[name] for name in columns] for row in recent_rows]
-                }
-            else:
-                recent = call(
-                    "POST",
-                    "/sql",
-                    {
-                        "statement": "SELECT "
-                        + ", ".join(columns)
-                        + " FROM hn_archive_poc ORDER BY created_at DESC LIMIT "
-                        + str(args.composed_current_rows)
-                    },
-                )
+            recent = call(
+                "POST",
+                "/sql",
+                {
+                    "statement": "SELECT "
+                    + ", ".join(columns)
+                    + " FROM hn_archive_poc WHERE created_at IS NOT NULL ORDER BY created_at DESC LIMIT "
+                    + str(args.composed_current_rows),
+                    # HTTP SQL's row budget is separate from the statement LIMIT.
+                    "limit": args.composed_current_rows,
+                },
+            )
             assert len(recent["rows"]) == args.composed_current_rows
             documents = []
             for row in recent["rows"]:
@@ -1183,23 +1259,35 @@ def main():
                 start()
                 request = dict(query, source=source, source_ranking="rrf")
                 cold, cold_ms = timed_query(request, "composed_cold." + name, "/query")
-                expected = [(h["_id"], h["_score"]) for h in cold["hits"]["hits"]]
+                expected = [
+                    (h["_table"], h["_id"], h["_score"]) for h in cold["hits"]["hits"]
+                ]
                 samples = []
                 for _ in range(args.repeats):
                     result, elapsed = timed_query(
                         request, "composed_warm." + name, "/query"
                     )
                     assert [
-                        (h["_id"], h["_score"]) for h in result["hits"]["hits"]
+                        (h["_table"], h["_id"], h["_score"])
+                        for h in result["hits"]["hits"]
                     ] == expected
                     samples.append(elapsed)
+                # Read after the burst and before stopping its dedicated process.
+                final_metrics = lake_metrics()
                 composed_benchmarks[name] = {
                     "first_search_ms": cold_ms,
                     "warm_samples_ms": samples,
-                    "warm_p95_ms": sorted(samples)[
-                        min(len(samples) - 1, int(len(samples) * 0.95))
-                    ],
+                    "warm_p95_ms": sorted(samples)[math.ceil(len(samples) * 0.95) - 1],
+                    "slowest_request_profile": slowest_composed_profile(final_metrics),
+                    "slow_profile_drops": final_metrics.get(
+                        "antfly_lake_query_slow_profile_drops_total"
+                    ),
                     "result_count": len(expected),
+                    "top_hits": [
+                        {"table": table, "id": identity, "score": score}
+                        for table, identity, score in expected
+                    ],
+                    "total": cold["hits"]["total"],
                     "current_fixture_rows": args.composed_current_rows,
                     "note": "Full sample history plus its most recent rows copied into a native current table; bounded diagnostic fixture, not production current-table scale.",
                 }

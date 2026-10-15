@@ -223,6 +223,7 @@ pub const FusedResultExecutor = struct {
         req: types.SearchRequest,
         key: []const u8,
     ) anyerror!?[]u8,
+    load_projected_documents: ?*const fn (?*anyopaque, Allocator, types.SearchRequest, []const []const u8) anyerror![]?[]u8 = null,
 };
 
 pub const DocSetDocIdResolver = struct {
@@ -995,7 +996,7 @@ pub fn fuseNamedSets(
             errdefer if (source_table) |table| alloc.free(table);
             const owned_index_scores = try types.cloneIndexScores(alloc, hit.index_scores);
             errdefer types.freeIndexScores(alloc, owned_index_scores);
-            const stored_data = if (req.include_stored)
+            const stored_data = if (req.include_stored and executor.load_projected_documents == null)
                 try executor.load_projected_document(executor.ctx, alloc, req, output_doc_id)
             else
                 null;
@@ -1021,6 +1022,22 @@ pub fn fuseNamedSets(
         hits[i] = materialized;
         initialized += 1;
     }
+
+    if (req.include_stored and hits.len != 0) if (executor.load_projected_documents) |load_many| {
+        const keys = try alloc.alloc([]const u8, hits.len);
+        defer alloc.free(keys);
+        for (hits, keys) |hit, *key| key.* = hit.id;
+        const documents = try load_many(executor.ctx, alloc, req, keys);
+        defer {
+            for (documents) |document| if (document) |bytes| alloc.free(bytes);
+            alloc.free(documents);
+        }
+        if (documents.len != hits.len) return error.InvalidQueryRequest;
+        for (hits, documents) |*hit, *document| {
+            hit.stored_data = document.*;
+            document.* = null;
+        }
+    };
 
     return .{
         .alloc = alloc,

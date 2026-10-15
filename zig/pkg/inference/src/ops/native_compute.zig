@@ -36755,6 +36755,16 @@ fn multiplyOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
 
 fn conv1dOp(ctx: *anyopaque, input: CT, weight: CT, bias: CT, batch: usize, in_channels: usize, out_channels: usize, time_steps: usize, kernel_size: usize, stride: usize, padding: usize) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    // NCT/OIK is the height-one NCHW/OIHW layout. Share the accelerated,
+    // bounded convolution implementation and retain scalar execution when
+    // its optional im2col workspace cannot be admitted.
+    if (conv2dOp(ctx, input, weight, bias, batch, in_channels, out_channels, 1, time_steps, 1, kernel_size, 1, stride, 0, padding, 1)) |result| {
+        return self.withLogicalShape(result, &.{ @intCast(batch), @intCast(out_channels), @intCast((time_steps + 2 * padding - kernel_size) / stride + 1) });
+    } else |err| switch (err) {
+        error.OutOfMemory, error.UnsupportedShape => {},
+        else => return err,
+    }
+
     defer maybeDiscardMappedWeightAfterUse(self, weight);
     const in_data = getData(input);
     const w_data = getData(weight);
@@ -36844,6 +36854,19 @@ fn conv2dOp(ctx: *anyopaque, input: CT, weight: CT, bias: CT, batch: usize, in_c
     }
     const output = try self.allocator.alloc(f32, output_elems);
     errdefer self.allocator.free(output);
+
+    if (groups == 1 and kernel_h == 1 and kernel_w == 1 and stride_h == 1 and stride_w == 1 and padding_h == 0 and padding_w == 0) {
+        // Pointwise convolution is already a matrix product in channel-major
+        // storage. No im2col buffer or output transpose is needed.
+        for (0..batch) |b| {
+            const batch_out = output[b * out_channels * output_area ..][0 .. out_channels * output_area];
+            for (0..out_channels) |oc| @memset(batch_out[oc * output_area ..][0..output_area], bias_data[oc]);
+            const batch_input = input_data[b * in_channels * output_area ..][0 .. in_channels * output_area];
+            try self.dispatchSgemm(out_channels, output_area, in_channels, 1.0, weight_data, batch_input, 1.0, batch_out);
+        }
+        const result = try self.makeBuf(output, true);
+        return self.withLogicalShape(result, &.{ @intCast(batch), @intCast(out_channels), @intCast(out_h), @intCast(out_w) });
+    }
 
     if (groups == 1) {
         const rows = output_area;
@@ -51737,6 +51760,71 @@ test "native conv ops preserve runtime logical shape" {
     const conv2_shape = try cb.tensorShape(conv2_out, allocator);
     defer allocator.free(conv2_shape);
     try std.testing.expectEqualSlices(i64, &.{ 2, 1, 2, 2 }, conv2_shape);
+}
+
+test "native conv1d preserves channel order bias padding and stride" {
+    const allocator = std.testing.allocator;
+    var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    var input_values = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
+    var weights = [_]f32{ 1, 0, -1, 0.5, 1, 0, 0.5, 0.25, -0.5, 1, -1, 0.5 };
+    var pointwise_weights = [_]f32{ 2, 0.5, -1, 1 };
+    var biases = [_]f32{ 0.25, -0.25 };
+    const input = try compute.makeBuf(&input_values, false);
+    defer cb.free(input);
+    const weight = try compute.makeBuf(&weights, false);
+    defer cb.free(weight);
+    const pointwise_weight = try compute.makeBuf(&pointwise_weights, false);
+    defer cb.free(pointwise_weight);
+    const bias = try compute.makeBuf(&biases, false);
+    defer cb.free(bias);
+    const strided = try cb.conv1d(input, weight, bias, 2, 2, 2, 4, 3, 2, 1);
+    defer cb.free(strided);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 2, 2 }, tensorStoredShape(strided).?);
+    try std.testing.expectEqualSlices(f32, &.{ 3.25, 8.25, -3, 2.5, 3.25, 20.25, -9, 8.5 }, getData(strided));
+    const pointwise = try cb.conv1d(input, pointwise_weight, bias, 2, 2, 2, 4, 1, 1, 0);
+    defer cb.free(pointwise);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 2, 4 }, tensorStoredShape(pointwise).?);
+    try std.testing.expectEqualSlices(f32, &.{ 4.75, 7.25, 9.75, 12.25, 3.75, 3.75, 3.75, 3.75, 24.75, 27.25, 29.75, 32.25, 3.75, 3.75, 3.75, 3.75 }, getData(pointwise));
+    try std.testing.expectError(error.InvalidInputShape, cb.conv1d(input, weight, bias, 2, 2, 2, 4, 3, 0, 1));
+    try std.testing.expectError(error.InvalidInputShape, cb.conv1d(input, weight, bias, 2, 2, 2, 3, 3, 1, 0));
+
+    const WorkspaceAdmission = struct {
+        backing: std.mem.Allocator,
+        rejected: bool = false,
+        fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            // The general convolution's 2 x 6 im2col matrix is optional.
+            if (len == 12 * @sizeOf(f32) and !self.rejected) {
+                self.rejected = true;
+                return null;
+            }
+            return self.backing.rawAlloc(len, alignment, ret_addr);
+        }
+        fn resize(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, len: usize, ret_addr: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.backing.rawResize(memory, alignment, len, ret_addr);
+        }
+        fn remap(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, len: usize, ret_addr: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.backing.rawRemap(memory, alignment, len, ret_addr);
+        }
+        fn free(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.backing.rawFree(memory, alignment, ret_addr);
+        }
+        const vtable: std.mem.Allocator.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
+    };
+    var admission: WorkspaceAdmission = .{ .backing = allocator };
+    compute.allocator = .{ .ptr = &admission, .vtable = &WorkspaceAdmission.vtable };
+    defer compute.allocator = allocator;
+    const bounded = try cb.conv1d(input, weight, bias, 2, 2, 2, 4, 3, 2, 1);
+    defer cb.free(bounded);
+    try std.testing.expect(admission.rejected);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 2, 2 }, tensorStoredShape(bounded).?);
+    try std.testing.expectEqualSlices(f32, getData(strided), getData(bounded));
 }
 
 test "native rejects mismatched shaped buffers before conv2d" {

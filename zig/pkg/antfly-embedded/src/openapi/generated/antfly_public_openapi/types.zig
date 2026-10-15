@@ -3897,6 +3897,14 @@ pub const DocumentArtifactManifestList = struct {
     artifacts: []const DocumentArtifactManifest,
 };
 
+/// The requested source artifact failed publication and requires inspection and reprocessing.
+pub const DocumentArtifactPublicationFailedError = struct {
+    code: []const u8,
+    @"error": []const u8,
+    message: []const u8,
+    retryable: bool,
+};
+
 pub const DocumentArtifactReprocessFailure = struct {
     /// Source document key that failed during reprocessing.
     key: []const u8,
@@ -8001,6 +8009,7 @@ pub const QueryCandidateBudgetExceededError = struct {
 pub const QueryConflictError = union(enum) {
     hierarchy_cursor_stale_error: HierarchyCursorStaleError,
     topology_changed_error: TopologyChangedError,
+    document_artifact_publication_failed_error: DocumentArtifactPublicationFailedError,
 
     pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
         const DiscriminatorProbe = union(enum) {
@@ -8026,6 +8035,9 @@ pub const QueryConflictError = union(enum) {
         if (std.mem.eql(u8, disc_str, "topology_changed")) {
             return .{ .topology_changed_error = try std.json.parseFromSliceLeaky(TopologyChangedError, allocator, input, options) };
         }
+        if (std.mem.eql(u8, disc_str, "document_artifact_publication_failed")) {
+            return .{ .document_artifact_publication_failed_error = try std.json.parseFromSliceLeaky(DocumentArtifactPublicationFailedError, allocator, input, options) };
+        }
         return error.UnexpectedToken;
     }
 
@@ -8049,6 +8061,9 @@ pub const QueryConflictError = union(enum) {
         if (std.mem.eql(u8, disc_str, "topology_changed")) {
             return .{ .topology_changed_error = try std.json.parseFromValueLeaky(TopologyChangedError, allocator, source, options) };
         }
+        if (std.mem.eql(u8, disc_str, "document_artifact_publication_failed")) {
+            return .{ .document_artifact_publication_failed_error = try std.json.parseFromValueLeaky(DocumentArtifactPublicationFailedError, allocator, source, options) };
+        }
         return error.UnexpectedToken;
     }
 
@@ -8056,6 +8071,7 @@ pub const QueryConflictError = union(enum) {
         switch (self) {
             .hierarchy_cursor_stale_error => |v| try jw.write(v),
             .topology_changed_error => |v| try jw.write(v),
+            .document_artifact_publication_failed_error => |v| try jw.write(v),
         }
     }
 };

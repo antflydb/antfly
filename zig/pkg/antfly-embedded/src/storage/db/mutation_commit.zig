@@ -187,9 +187,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn batchContext(self: anytype) BatchExecutionContext {
-            const resources = self.core.batchExecutionResources();
+            const resources = S.ownerField(self, "core").*.batchExecutionResources();
             return .{
-                .alloc = self.alloc,
+                .alloc = S.ownerField(self, "alloc").*,
                 .store = resources.store,
                 .applied_sequence_checkpoint_path = resources.applied_sequence_checkpoint_path,
                 .index_repair_checkpoint = resources.index_repair_checkpoint,
@@ -198,27 +198,27 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .replay_source = resources.replay_source,
                 .index_manager = resources.index_manager,
                 .apply_mutex = resources.apply_mutex,
-                .portable_runtime_activation_pending = &self.async_context.portable_runtime_activation_pending,
+                .portable_runtime_activation_pending = &S.ownerField(self, "async_context").*.portable_runtime_activation_pending,
                 .snapshot_admission = resources.snapshot_admission,
                 .snapshot_replay_admission = resources.snapshot_replay_admission,
                 .repair_replay_mutex = resources.repair_replay_mutex,
                 .log_mutex = resources.log_mutex,
                 .identity_namespace = resources.identity_namespace,
-                .root_generation = self.core.root_generation,
-                .identity_visibility = &self.core.identity_visibility,
+                .root_generation = S.ownerField(self, "core").*.root_generation,
+                .identity_visibility = &S.ownerField(self, "core").*.identity_visibility,
                 .artifact_cleanup_maybe = resources.artifact_cleanup_maybe,
-                .executor = self.executor,
-                .io = self.backend_runtime.io(),
-                .enrichment_runtime = self.enrichment_runtime,
-                .resolution_runtime = self.resolution_runtime,
-                .promotion_runtime = self.promotion_runtime,
-                .async_context = self.async_context,
+                .executor = S.ownerField(self, "executor").*,
+                .io = S.ownerField(self, "backend_runtime").*.io(),
+                .enrichment_runtime = S.ownerField(self, "enrichment_runtime").*,
+                .resolution_runtime = S.ownerField(self, "resolution_runtime").*,
+                .promotion_runtime = S.ownerField(self, "promotion_runtime").*,
+                .async_context = S.ownerField(self, "async_context").*,
                 .relational_base_rows = relationalColumns(self) != null,
-                .table_catalog = &self.core.table_catalog,
-                .replication_async_effect_mirror = self.local_execution.replication_async_effect_mirror,
-                .replication_async_batch_mirror = self.local_execution.replication_async_batch_mirror,
-                .replication_async_metadata_mirror = self.local_execution.replication_async_metadata_mirror,
-                .replication_write_gate = self.local_execution.replication_write_gate,
+                .table_catalog = &S.ownerField(self, "core").*.table_catalog,
+                .replication_async_effect_mirror = S.ownerField(self, "local_execution").*.replication_async_effect_mirror,
+                .replication_async_batch_mirror = S.ownerField(self, "local_execution").*.replication_async_batch_mirror,
+                .replication_async_metadata_mirror = S.ownerField(self, "local_execution").*.replication_async_metadata_mirror,
+                .replication_write_gate = S.ownerField(self, "local_execution").*.replication_write_gate,
             };
         }
 
@@ -230,13 +230,31 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             generated_memo: *GeneratedEmbeddingMemo,
             prepared_row_allocator: *PreparedRowAllocator,
         ) anyerror!void {
+            if (@TypeOf(self) == *S.PreparedBatchOwner) return batchInternalPreparedOwned(self, req, profile, opts, generated_memo, prepared_row_allocator);
+            var owner = S.PreparedBatchOwner.from(self);
+            return batchInternalPreparedOwned(&owner, req, profile, opts, generated_memo, prepared_row_allocator);
+        }
+
+        noinline fn batchInternalPreparedOwned(
+            self: *S.PreparedBatchOwner,
+            req: types.BatchRequest,
+            profile: ?*BatchProfile,
+            opts: BatchExecutionOptions,
+            generated_memo: *GeneratedEmbeddingMemo,
+            prepared_row_allocator: *PreparedRowAllocator,
+        ) anyerror!void {
+            if (comptime @import("../engine_selection.zig").enabled) {
+                prepared_row_allocator.captureIoDomain();
+                return @import("antfly_source_root").antfly_sources.storage_engine.call("batchPrepared", .{ self, req, profile, opts, generated_memo, prepared_row_allocator });
+            }
+            @setEvalBranchQuota(100_000);
             const maintenance_contract = @import("relational_index_maintenance_contract.zig");
             var maintenance_attempted = false;
             defer if (maintenance_attempted) {
                 // Only a scheduling hint: the worker re-reads durable desired state.
                 // Also wake on an ambiguous result after the store committed.
-                self.local_execution.relational_index_maintenance_sweep.request();
-                self.local_execution.relational_index_retry_after_ns.store(0, .release);
+                S.ownerField(self, "local_execution").*.relational_index_maintenance_sweep.request();
+                S.ownerField(self, "local_execution").*.relational_index_retry_after_ns.store(0, .release);
             };
             for (req.writes) |write| if (relational_index_catalog.Controller.isReservedMetadataKey(write.key)) {
                 const trusted = opts.transaction_resolution != null or opts.replication_applied_lsn_marker != null;
@@ -247,11 +265,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             for (req.deletes) |key| if (relational_index_catalog.Controller.isReservedMetadataKey(key)) return error.ReservedRelationalIndexMetadataKey;
             for (req.transforms) |transform| if (relational_index_catalog.Controller.isReservedMetadataKey(transform.key)) return error.ReservedRelationalIndexMetadataKey;
             const schema_namespace = if (opts.transaction_resolution) |resolution|
-                resolution.schema_namespace_generation orelse self.core.schemaNamespaceGeneration()
+                resolution.schema_namespace_generation orelse S.ownerField(self, "core").*.schemaNamespaceGeneration()
             else
-                self.core.schemaNamespaceGeneration();
-            if (schema_namespace != self.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
-            if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+                S.ownerField(self, "core").*.schemaNamespaceGeneration();
+            if (schema_namespace != S.ownerField(self, "core").*.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
+            if (openModeRequiresReadOnlyBackends(S.ownerField(self, "open_mode").*)) return error.ReadOnly;
             if (!opts.bypass_replication_write_gate and self.denseRepairWriteBackpressured()) return error.DenseRepairBackpressure;
             var replication_mutation = if (opts.bypass_replication_write_gate) null else self.acquireReplicationMutationShared();
             defer if (replication_mutation) |*lease| lease.release();
@@ -267,7 +285,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
             }
 
-            try self.executor.checkSyncLevelHealth(req.sync_level);
+            try S.ownerField(self, "executor").*.checkSyncLevelHealth(req.sync_level);
 
             var foreground_write = resource_manager_mod.ResourceManager.ForegroundWriteLease{};
             defer foreground_write.release();
@@ -275,10 +293,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // Admit projected LSM pressure before spending CPU, memory, or provider
             // calls on a PreparedRow that cannot yet commit. Maintenance workers
             // remain able to drain the pressure because no DB apply lock is held.
-            if (self.core.index_manager.resource_manager) |manager| {
+            if (S.ownerField(self, "core").*.index_manager.resource_manager) |manager| {
                 try manager.awaitAdmission(.lsm_in_memory_state, projectedBatchLsmAdmissionBytes(req));
             }
-            const preparation_timestamp_ns = if (req.timestamp_ns != 0) req.timestamp_ns else self.backend_runtime.clock().nowRealtimeNs();
+            const preparation_timestamp_ns = if (req.timestamp_ns != 0) req.timestamp_ns else S.ownerField(self, "backend_runtime").*.clock().nowRealtimeNs();
             const preparation_alloc = prepared_row_allocator.allocator();
 
             // Resolve request ordering and transforms before row preparation. A
@@ -419,7 +437,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             // Integrity effects may only enter through durable transaction prepare.
             if (req.integrity.len != 0 or req.integrity_commands.len != 0 or req.relational_activation != null or req.relational_retirement != null or req.relational_index_maintenance != null) return error.InvalidIntegrityOperation;
-            var relational_index_snapshot = self.core.relational_indexes.acquire();
+            var relational_index_snapshot = S.ownerField(self, "core").*.relational_indexes.acquire();
             defer if (relational_index_snapshot) |*index_snapshot| index_snapshot.deinit();
             const index_ready = try preparation_alloc.alloc(bool, if (relational_index_snapshot) |index_snapshot| index_snapshot.plan.boundIndexes().len else 0);
             defer preparation_alloc.free(index_ready);
@@ -497,6 +515,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (eligible) {
                     const requires_inline_generated =
                         (req.sync_level == .full_text or req.sync_level == .enrichments or req.sync_level == .full_index) or
+                        opts.force_generated_artifact_names.len != 0 or
                         splitShadowRequiresMaterializedDerivedBatch(self);
                     const rows = try preparation_alloc.alloc(?mapper.PreparedRelationalWrite, effective_req.writes.len);
                     @memset(rows, null);
@@ -505,11 +524,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     for (effects) |*effect| effect.* = .{};
                     preprepared_effects = effects;
                     const prepare_start_ns = monotonicTimeNs();
-                    write_plan_snapshot = try self.core.index_manager.acquireWritePlanSnapshot();
+                    write_plan_snapshot = try S.ownerField(self, "core").*.index_manager.acquireWritePlanSnapshot();
                     prepared_write_plan_generation = write_plan_snapshot.?.generation();
                     try prepareRelationalRows(
                         prepared_row_allocator,
-                        self.backend_runtime.io(),
+                        S.ownerField(self, "backend_runtime").*.io(),
                         self,
                         effective_req.writes,
                         view.validator(),
@@ -546,8 +565,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     // while holding only the catalog read lease. Schema/index
                     // publication may proceed after this short phase; the commit
                     // fence validates both generations before consuming the plan.
-                    if ((request_schema_binding == null and !self.core.isSchemaViewCurrent(view)) or
-                        self.core.index_manager.writePlanGeneration() != prepared_write_plan_generation.?)
+                    if ((request_schema_binding == null and !S.ownerField(self, "core").*.isSchemaViewCurrent(view)) or
+                        S.ownerField(self, "core").*.index_manager.writePlanGeneration() != prepared_write_plan_generation.?)
                         return error.PreparedGenerationChanged;
                     {
                         const effects_alloc = prepared_effects_arena.allocator();
@@ -590,8 +609,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                                 }
                                 for (row.extracted.graph_writes) |graph_write| {
                                     const generation = write_plan_snapshot.?.plan().graphCoverageGeneration(graph_write.index_name) orelse return error.IndexNotFound;
-                                    const graph_entry = self.core.index_manager.graphIndex(graph_write.index_name) orelse return error.IndexNotFound;
-                                    try appendPreparedGraphEdgeArtifactWrite(effects_alloc, self.core.store, &effect.graph_writes, graph_write, generation, graph_entry.ttl_duration_ns, preparation_timestamp_ns);
+                                    const graph_entry = S.ownerField(self, "core").*.index_manager.graphIndex(graph_write.index_name) orelse return error.IndexNotFound;
+                                    try appendPreparedGraphEdgeArtifactWrite(effects_alloc, S.ownerField(self, "core").*.store, &effect.graph_writes, graph_write, generation, graph_entry.ttl_duration_ns, preparation_timestamp_ns);
                                 }
                                 for (row.extracted.mentioned_graph_indexes) |index_name| {
                                     const clear = try GraphArtifactClear.initAlloc(effects_alloc, write.key, index_name);
@@ -657,6 +676,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             {
                 const requires_inline_generated =
                     (effective_req.sync_level == .full_text or effective_req.sync_level == .enrichments or effective_req.sync_level == .full_index) or
+                    opts.force_generated_artifact_names.len != 0 or
                     splitShadowRequiresMaterializedDerivedBatch(self);
                 if (requires_inline_generated and effective_req.writes.len > 0) {
                     const precompute_generated_start_ns = monotonicTimeNs();
@@ -666,7 +686,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     // from an owned, refcounted WritePlanSnapshot acquired here
                     // -- the same mechanism the relational-row hoist above uses
                     // via `write_plan_snapshot` -- instead of touching
-                    // `self.core.index_manager`'s live catalog arrays directly.
+                    // `S.ownerField(self, "core").*.index_manager`'s live catalog arrays directly.
                     // The snapshot is cloned under `catalog_mutex.lockShared()`
                     // once per generation and stays valid after that lock is
                     // released, so a concurrent catalog publish can replace or
@@ -676,7 +696,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     // any catalog publication racing with this precompute is
                     // also caught as a generation change under the lock, never
                     // silently used.
-                    write_plan_snapshot = try self.core.index_manager.acquireWritePlanSnapshot();
+                    write_plan_snapshot = try S.ownerField(self, "core").*.index_manager.acquireWritePlanSnapshot();
                     document_generated_write_plan_generation = write_plan_snapshot.?.generation();
                     const extracted_rows = try preparation_alloc.alloc(mapper.ExtractedWrite, effective_req.writes.len);
                     var extracted_rows_initialized: usize = 0;
@@ -732,7 +752,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const local_graph_cleanup = req.graph_endpoint_cleanup and !req.graph_endpoint_cleanup_planned;
             // Cleanup identities depend on the current incoming directory. Encode
             // that bounded page under apply after selection, never the planner command.
-            if (!opts.bypass_replication_write_gate and !local_graph_cleanup) if (self.local_execution.replication_async_batch_mirror) |mirror| {
+            if (!opts.bypass_replication_write_gate and !local_graph_cleanup) if (S.ownerField(self, "local_execution").*.replication_async_batch_mirror) |mirror| {
                 preencoded_replication_batch_payload = (if (req.artifact_catalog != null)
                     replication_effects_mod.encodeArtifactCatalogMutationRequestAlloc(preparation_alloc, req, opts.ordered_apply_receipt orelse return error.InvalidArtifactCatalogCommand)
                 else if (opts.ordered_apply_receipt) |entry|
@@ -755,7 +775,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const extracted = try preparation_alloc.alloc(mapper.ExtractedWrite, effective_req.writes.len);
             var extracted_initialized: usize = 0;
             defer {
-                for (extracted[0..extracted_initialized]) |*item| item.deinit(self.alloc);
+                for (extracted[0..extracted_initialized]) |*item| item.deinit(S.ownerField(self, "alloc").*);
                 preparation_alloc.free(extracted);
             }
             const overwritten_flags = try preparation_alloc.alloc(bool, effective_req.writes.len);
@@ -781,9 +801,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 );
             }
 
-            var snapshot_mutation = if (opts.snapshot_mutation) |lease| lease.retain() else self.core.snapshot_admission.acquireMutation();
+            var snapshot_mutation = if (opts.snapshot_mutation) |lease| lease.retain() else S.ownerField(self, "core").*.snapshot_admission.acquireMutation();
             defer snapshot_mutation.release();
-            std.debug.assert(snapshot_mutation.admission == self.core.snapshot_admission);
+            std.debug.assert(snapshot_mutation.admission == S.ownerField(self, "core").*.snapshot_admission);
             if (builtin.is_test) {
                 if (D.test_portable_runtime_batch_prelock_hook.*) |hook| {
                     hook.entered.store(true, .release);
@@ -799,7 +819,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const apply_lock_wait_start_ns = monotonicTimeNs();
             try self.lockApplyForPortableRuntime();
             if (profile) |active_profile| active_profile.apply_lock_wait_ns += monotonicTimeNs() - apply_lock_wait_start_ns;
-            if (self.local_execution.source_vectors.load(.acquire)) |source| source.recordBatchLockWait(monotonicTimeNs() -| apply_lock_wait_start_ns);
+            if (S.ownerField(self, "local_execution").*.source_vectors.load(.acquire)) |source| source.recordBatchLockWait(monotonicTimeNs() -| apply_lock_wait_start_ns);
             var filtered_cleanup_edges: ?[]types.GraphEdgeDelete = null;
             defer if (filtered_cleanup_edges) |items| preparation_alloc.free(items);
             var filtered_cleanup_jobs: ?[][]const u8 = null;
@@ -821,24 +841,24 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             errdefer if (apply_mutex_held) unlockProfiledApply(self, profile, &apply_mutex_held, apply_lock_acquired_ns);
             // A durable epoch survives active-schema publication, not replacement
             // of the entire database namespace with reused version/transaction IDs.
-            if (schema_namespace != self.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
+            if (schema_namespace != S.ownerField(self, "core").*.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
             // A document batch has no AROW preparation to perform this fence on
             // its behalf. Check the pinned epoch again under exclusive admission.
-            if (self.local_execution.initial_child_hidden.load(.acquire) and
+            if (S.ownerField(self, "local_execution").*.initial_child_hidden.load(.acquire) and
                 (effective_req.relational_topology == null or
                     (effective_req.relational_topology.?.action != .provision_initial_child and
                         effective_req.relational_topology.?.action != .release_initial_child and
                         effective_req.relational_topology.?.action != .cancel_initial_child)))
                 return error.InitialChildNotPublished;
             if (req.schema_version != null) try self.validatePreparedSchemaViewLocked(request_schema_view);
-            if (!self.core.relational_indexes.isCurrent(relational_index_snapshot)) return error.PreparedGenerationChanged;
+            if (!S.ownerField(self, "core").*.relational_indexes.isCurrent(relational_index_snapshot)) return error.PreparedGenerationChanged;
             if (live_replication_apply) {
-                var integrity_read = try self.core.store.beginProbeTxn();
+                var integrity_read = try S.ownerField(self, "core").*.store.beginProbeTxn();
                 defer integrity_read.abort();
                 try self.validateLiveReplicationIntegrityEffects(preparation_alloc, &integrity_read, effective_req);
             }
-            if (self.local_execution.restore_staging_required.load(.acquire) or opts.restore_staging != null or effective_req.restore_staging_scope != null) {
-                var restore_read = try self.core.store.beginProbeTxn();
+            if (S.ownerField(self, "local_execution").*.restore_staging_required.load(.acquire) or opts.restore_staging != null or effective_req.restore_staging_scope != null) {
+                var restore_read = try S.ownerField(self, "core").*.store.beginProbeTxn();
                 defer restore_read.abort();
                 if (opts.restore_staging) |admission|
                     try @import("restore_staging.zig").validateImport(preparation_alloc, &restore_read, admission, effective_req.writes.len, effective_req.deletes.len)
@@ -852,7 +872,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
             if (opts.ordered_apply_receipt) |identity| {
                 switch (try orderedApplyDisposition(
-                    try readOrderedApplyReceipt(self.alloc, self.core.store),
+                    try readOrderedApplyReceipt(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store),
                     identity,
                 )) {
                     .apply => {},
@@ -864,9 +884,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
 
             var merge_page_value: ?[]u8 = null;
-            defer if (merge_page_value) |value| self.alloc.free(value);
+            defer if (merge_page_value) |value| S.ownerField(self, "alloc").*.free(value);
             var merge_source_catalog_value: ?[]u8 = null;
-            defer if (merge_source_catalog_value) |value| self.alloc.free(value);
+            defer if (merge_source_catalog_value) |value| S.ownerField(self, "alloc").*.free(value);
             // Checkpoints certify a copy; payloads must use a separately fenced
             // command so a stale checkpoint cannot smuggle destructive mutations.
             if (req.merge_checkpoint != null and (req.writes.len != 0 or req.deletes.len != 0 or
@@ -874,36 +894,36 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 req.graph_writes.len != 0 or req.graph_deletes.len != 0))
                 return error.InvalidBatchRequest;
             if (req.merge_replication) |replication| if (req.merge_checkpoint == null) {
-                const raw = try merge_state_mod.loadRawAlloc(self.alloc, self.core.store);
-                defer if (raw) |value| self.alloc.free(value);
-                var state = if (raw) |value| try merge_state_mod.decodeAlloc(self.alloc, value) else null;
-                defer if (state) |*value| value.deinit(self.alloc);
+                const raw = try merge_state_mod.loadRawAlloc(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store);
+                defer if (raw) |value| S.ownerField(self, "alloc").*.free(value);
+                var state = if (raw) |value| try merge_state_mod.decodeAlloc(S.ownerField(self, "alloc").*, value) else null;
+                defer if (state) |*value| value.deinit(S.ownerField(self, "alloc").*);
                 if (!merge_state_mod.copyAllowed(state, replication)) {
                     if (!opts.bypass_replication_write_gate) return error.MergeCopyFenced;
                     // A delayed committed command must advance the receipt without
                     // touching documents, artifacts, indexes or visibility state.
                     if (opts.ordered_apply_receipt) |identity| {
                         var marker_buf: [ordered_apply_receipt_value_len]u8 = undefined;
-                        try self.core.store.putBatch(&.{orderedApplyReceiptWrite(identity, &marker_buf)}, &.{});
+                        try S.ownerField(self, "core").*.store.putBatch(&.{orderedApplyReceiptWrite(identity, &marker_buf)}, &.{});
                     }
                     if (opts.replication_applied_lsn_marker) |lsn| {
                         var marker_buf: [replication_applied_lsn_value_len]u8 = undefined;
-                        try self.core.store.putBatch(&.{replicationAppliedSequenceWrite(lsn, &marker_buf)}, &.{});
+                        try S.ownerField(self, "core").*.store.putBatch(&.{replicationAppliedSequenceWrite(lsn, &marker_buf)}, &.{});
                     }
-                    self.core.unlockApply();
+                    S.ownerField(self, "core").*.unlockApply();
                     apply_mutex_held = false;
                     return;
                 }
                 const pages = @import("merge_page_contract.zig");
-                const page_raw = try self.core.getStoreValue(self.alloc, pages.key);
-                defer if (page_raw) |value| self.alloc.free(value);
+                const page_raw = try S.ownerField(self, "core").*.getStoreValue(S.ownerField(self, "alloc").*, pages.key);
+                defer if (page_raw) |value| S.ownerField(self, "alloc").*.free(value);
                 if (req.merge_page != null or page_raw != null) {
-                    var progress = if (page_raw) |value| try pages.decode(self.alloc, value) else return error.MergePageSourceMissing;
+                    var progress = if (page_raw) |value| try pages.decode(S.ownerField(self, "alloc").*, value) else return error.MergePageSourceMissing;
                     defer progress.deinit();
                     if (progress.value.matches(replication)) {
                         if (req.merge_page == null) return error.MergePageRequired;
-                        if (!replication.identity_namespace.eql(self.core.identity_namespace)) return error.DocIdentityNamespaceMismatch;
-                        try pages.validateRange(self.alloc, state.?, req);
+                        if (!replication.identity_namespace.eql(S.ownerField(self, "core").*.identity_namespace)) return error.DocIdentityNamespaceMismatch;
+                        try pages.validateRange(S.ownerField(self, "alloc").*, state.?, req);
                         switch (try pages.plan(progress.value, req)) {
                             .replay => {
                                 var marker_writes: [2]docstore_mod.KVPair = undefined;
@@ -918,8 +938,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                                     marker_writes[count] = replicationAppliedSequenceWrite(lsn, &standby_buffer);
                                     count += 1;
                                 }
-                                if (count != 0) try self.core.store.putBatch(marker_writes[0..count], &.{});
-                                self.core.unlockApply();
+                                if (count != 0) try S.ownerField(self, "core").*.store.putBatch(marker_writes[0..count], &.{});
+                                S.ownerField(self, "core").*.unlockApply();
                                 apply_mutex_held = false;
                                 return;
                             },
@@ -933,15 +953,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                                     const merged = state.?.merged_range orelse return error.InvalidMergeState;
                                     const base = state.?.receiver_base_range;
                                     const donor: types.ByteRange = if (!std.mem.eql(u8, merged.start, base.start)) .{ .start = merged.start, .end = base.start } else .{ .start = base.end, .end = merged.end };
-                                    var cleanup_scan = try self.core.store.beginCurrentScanTxn();
+                                    var cleanup_scan = try S.ownerField(self, "core").*.store.beginCurrentScanTxn();
                                     defer cleanup_scan.abort();
-                                    var cleanup_arena = std.heap.ArenaAllocator.init(self.alloc);
+                                    var cleanup_arena = std.heap.ArenaAllocator.init(S.ownerField(self, "alloc").*);
                                     defer cleanup_arena.deinit();
                                     const expected = try @import("online_integrity_shadow.zig").cleanup(cleanup_arena.allocator(), &cleanup_scan, donor, req.merge_page.?.after);
                                     if (expected.effects.len != req.merge_page.?.integrity.len or expected.exhausted != req.merge_page.?.exhausted) return error.InvalidMergePage;
                                     for (expected.effects, req.merge_page.?.integrity) |left, right| if (!std.mem.eql(u8, left.key, right.key) or right.value != null) return error.InvalidMergePage;
                                 }
-                                merge_page_value = try pages.encode(self.alloc, next);
+                                merge_page_value = try pages.encode(S.ownerField(self, "alloc").*, next);
                             },
                         }
                     } else if (req.merge_page != null) return error.MergePageSourceMissing;
@@ -954,17 +974,17 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const transferred_artifacts = prepared_artifacts.effects;
             const artifact_source = if (req.merge_page) |page| @as(?@import("merge_page_contract.zig").Source, page.source) else if (req.merge_checkpoint) |checkpoint| checkpoint.page_source else null;
             if (artifact_source) |source| if (source.artifact_catalog) |binding| {
-                var read = try self.core.store.beginReadTxn();
+                var read = try S.ownerField(self, "core").*.store.beginReadTxn();
                 defer read.abort();
                 var namespace: [24]u8 = undefined;
-                doc_identity.encodeNamespace(&namespace, self.core.identity_namespace);
+                doc_identity.encodeNamespace(&namespace, S.ownerField(self, "core").*.identity_namespace);
                 if (req.artifact_catalog) |install| {
                     if (!install.binding.compatible(binding) or !std.mem.eql(u8, &install.binding.digest, &(try @import("artifact_inventory.zig").local(&read)).digest)) return error.ArtifactCatalogDrift;
-                } else try @import("artifact_inventory.zig").requireCompatibleReady(self.alloc, &read, namespace, binding);
+                } else try @import("artifact_inventory.zig").requireCompatibleReady(S.ownerField(self, "alloc").*, &read, namespace, binding);
                 if (!try self.artifactMaterializationsReady(&read, try @import("artifact_inventory.zig").catalogs(&read))) return error.ArtifactCatalogDrift;
                 if (prepared_artifacts.receiver_binding) |prepared_binding| {
                     const inventory = @import("artifact_inventory.zig");
-                    const observed = try inventory.status(self.alloc, &read, namespace);
+                    const observed = try inventory.status(S.ownerField(self, "alloc").*, &read, namespace);
                     if (!observed.ready or !std.meta.eql(observed.ordered, @as(?inventory.Binding, prepared_binding))) return error.ArtifactCatalogDrift;
                 }
                 if (req.merge_page) |page| for (page.artifact_effects) |effect| {
@@ -973,11 +993,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         continue;
                     }
                     try @import("online_vector_artifacts.zig").validate(effect.key, effect.value);
-                    const identity = (try internal_keys.parseEmbeddingArtifactKeyAlloc(self.alloc, effect.key)) orelse return error.InvalidMergePage;
-                    defer self.alloc.free(identity.doc_key);
-                    defer self.alloc.free(identity.artifact_name);
-                    const dense = self.core.index_manager.denseIndex(identity.artifact_name);
-                    const sparse = self.core.index_manager.sparseIndex(identity.artifact_name);
+                    const identity = (try internal_keys.parseEmbeddingArtifactKeyAlloc(S.ownerField(self, "alloc").*, effect.key)) orelse return error.InvalidMergePage;
+                    defer S.ownerField(self, "alloc").*.free(identity.doc_key);
+                    defer S.ownerField(self, "alloc").*.free(identity.artifact_name);
+                    const dense = S.ownerField(self, "core").*.index_manager.denseIndex(identity.artifact_name);
+                    const sparse = S.ownerField(self, "core").*.index_manager.sparseIndex(identity.artifact_name);
                     if (dense) |entry| {
                         if (!entry.managed_direct_field) return error.InvalidMergePage;
                         if (effect.value) |value| {
@@ -996,18 +1016,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             };
 
             if (effective_req.merge_artifacts.len > 0 and !req.graph_endpoint_cleanup) {
-                if (!req.merge_replication.?.identity_namespace.eql(self.core.identity_namespace))
+                if (!req.merge_replication.?.identity_namespace.eql(S.ownerField(self, "core").*.identity_namespace))
                     return error.DocIdentityNamespaceMismatch;
                 for (effective_req.merge_artifacts) |row| {
-                    const owner = (try internal_keys.decodeDocumentComponentAlloc(self.alloc, row.key)) orelse
+                    const owner = (try internal_keys.decodeDocumentComponentAlloc(S.ownerField(self, "alloc").*, row.key)) orelse
                         return error.InvalidBatchRequest;
-                    defer self.alloc.free(owner);
-                    if (!self.core.byteRange().contains(owner)) return error.KeyOutOfRange;
+                    defer S.ownerField(self, "alloc").*.free(owner);
+                    if (!S.ownerField(self, "core").*.byteRange().contains(owner)) return error.KeyOutOfRange;
                 }
             }
 
             if (opts.transaction_resolution) |resolution| {
-                const intent_snapshot = try self.core.validateTransactionIntentSnapshot(
+                const intent_snapshot = try S.ownerField(self, "core").*.validateTransactionIntentSnapshot(
                     resolution.txn_id,
                     resolution.expected_intent_revision,
                 );
@@ -1024,7 +1044,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         &.{orderedApplyReceiptWrite(identity, &raft_marker_value_buf)}
                     else
                         &.{};
-                    const outcome = try self.core.resolveTransactionIntentsWithExtraBatch(
+                    const outcome = try S.ownerField(self, "core").*.resolveTransactionIntentsWithExtraBatch(
                         resolution.txn_id,
                         resolution.status,
                         resolution.commit_version,
@@ -1046,32 +1066,32 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // contributor state. Fence preparation through primary/replay commit,
             // including ordinary graph writes and document/relational deletes.
             // Acquire without retaining a catalog lease.
-            if (!opts.bypass_replication_write_gate and self.async_context.primary_replication_append_pending.load(.acquire)) return error.ReplicationPublisherUnavailable;
-            var graph_publication = if (self.core.index_manager.hasGraphIndexes())
-                self.core.index_manager.beginGraphPrimaryMutation()
+            if (!opts.bypass_replication_write_gate and S.ownerField(self, "async_context").*.primary_replication_append_pending.load(.acquire)) return error.ReplicationPublisherUnavailable;
+            var graph_publication = if (S.ownerField(self, "core").*.index_manager.hasGraphIndexes())
+                S.ownerField(self, "core").*.index_manager.beginGraphPrimaryMutation()
             else
                 null;
             defer if (graph_publication) |*lease| lease.release();
 
             var coordinated_handoff = false;
             if (req.split_replication != null or req.split_checkpoint != null) {
-                var topology_read = try self.core.store.beginProbeTxn();
+                var topology_read = try S.ownerField(self, "core").*.store.beginProbeTxn();
                 defer topology_read.abort();
-                coordinated_handoff = try @import("relational_integrity_handoff.zig").admitSplitRequest(self.alloc, &topology_read, req);
+                coordinated_handoff = try @import("relational_integrity_handoff.zig").admitSplitRequest(S.ownerField(self, "alloc").*, &topology_read, req);
                 if (hasCoordinatedConstraints(request_schema_view) and !coordinated_handoff) return error.CoordinatedConstraintTopologyUnsupported;
             }
             if (req.merge_replication != null or req.merge_checkpoint != null or req.merge_page != null) {
-                var topology_read = try self.core.store.beginProbeTxn();
+                var topology_read = try S.ownerField(self, "core").*.store.beginProbeTxn();
                 defer topology_read.abort();
                 // Source retention remains authoritative after its brief pin
                 // fence is released. Receiving another merge would replace that
                 // source's range state while its immutable cut/tail are in use.
                 if (try @import("../retained_effects.zig").load(&topology_read)) |retained| {
-                    const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
+                    const namespace = @import("online_source_contract.zig").namespaceBytes(S.ownerField(self, "core").*.identity_namespace);
                     if (retained.active() and std.mem.eql(u8, &retained.namespace, &namespace)) return error.IntegrityTopologyBusy;
                 }
-                coordinated_handoff = try @import("online_integrity_shadow.zig").admit(self.alloc, &topology_read, req, self.core.identity_namespace);
-                if (!coordinated_handoff) coordinated_handoff = try @import("relational_integrity_handoff.zig").admitMergeRequest(self.alloc, &topology_read, req);
+                coordinated_handoff = try @import("online_integrity_shadow.zig").admit(S.ownerField(self, "alloc").*, &topology_read, req, S.ownerField(self, "core").*.identity_namespace);
+                if (!coordinated_handoff) coordinated_handoff = try @import("relational_integrity_handoff.zig").admitMergeRequest(S.ownerField(self, "alloc").*, &topology_read, req);
                 if (hasCoordinatedConstraints(request_schema_view) and !coordinated_handoff) return error.CoordinatedConstraintTopologyUnsupported;
             }
             // hot-standby carries already committed effects, including prepared decisions
@@ -1080,7 +1100,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (!coordinated_handoff and opts.transaction_resolution == null and !live_replication_apply and !scoped_restore_replication_apply and (effective_req.writes.len != 0 or effective_req.deletes.len != 0 or
                 effective_req.graph_writes.len != 0 or effective_req.graph_deletes.len != 0))
             {
-                var topology_read = try self.core.store.beginProbeTxn();
+                var topology_read = try S.ownerField(self, "core").*.store.beginProbeTxn();
                 defer topology_read.abort();
                 try @import("relational_integrity_topology.zig").requireUnfenced(&topology_read);
             }
@@ -1089,7 +1109,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // visibility wait. Enter foreground scheduling only for this batch's
             // own primary mutation so nested `.full_index` work cannot be hidden
             // behind an outer maintenance-deferral lease.
-            if (self.core.index_manager.resource_manager) |manager|
+            if (S.ownerField(self, "core").*.index_manager.resource_manager) |manager|
                 foreground_write = manager.beginForegroundWrite();
 
             if (!try self.shouldApplySplitReplicationLocked(req)) {
@@ -1100,17 +1120,17 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // Validate the final post-transform rows at the storage boundary. API
             // preflight remains useful for early UX feedback, but every embedded,
             // replicated, recovery, and direct DB caller gets the same contract.
-            if (schema_namespace != self.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
+            if (schema_namespace != S.ownerField(self, "core").*.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
             // Coalescer draining above can release/reacquire apply. An index-only
             // publication need not change the schema or managed-index generation.
-            if (!self.core.relational_indexes.isCurrent(relational_index_snapshot)) return error.PreparedGenerationChanged;
+            if (!S.ownerField(self, "core").*.relational_indexes.isCurrent(relational_index_snapshot)) return error.PreparedGenerationChanged;
             const use_preprepared_rows = blk: {
                 const rows = preprepared_rows orelse break :blk false;
                 const pinned = request_schema_view orelse break :blk false;
-                if ((request_schema_binding == null and !self.core.isSchemaViewCurrent(pinned)) or
+                if ((request_schema_binding == null and !S.ownerField(self, "core").*.isSchemaViewCurrent(pinned)) or
                     rows.len != effective_req.writes.len) break :blk false;
                 const expected_plan_generation = prepared_write_plan_generation orelse break :blk false;
-                if (self.core.index_manager.writePlanGeneration() != expected_plan_generation) break :blk false;
+                if (S.ownerField(self, "core").*.index_manager.writePlanGeneration() != expected_plan_generation) break :blk false;
                 break :blk true;
             };
             // Never convert an optimistic generation race into allocation-heavy
@@ -1123,7 +1143,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // between the pre-lock read and this lock acquisition invalidates it.
             const use_preprepared_document_generated = preprepared_document_generated != null and
                 document_generated_write_plan_generation != null and
-                self.core.index_manager.writePlanGeneration() == document_generated_write_plan_generation.?;
+                S.ownerField(self, "core").*.index_manager.writePlanGeneration() == document_generated_write_plan_generation.?;
             if (preprepared_document_generated != null and !use_preprepared_document_generated)
                 return error.PreparedGenerationChanged;
             // Transform expansion or an epoch/index-plan race invalidates the
@@ -1134,7 +1154,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (request_schema_binding != null)
                     if (request_schema_view) |view| view.clone() else null
                 else
-                    self.core.acquireSchemaView()
+                    S.ownerField(self, "core").*.acquireSchemaView()
             else
                 null;
             defer if (apply_schema_view) |*view| view.release();
@@ -1167,7 +1187,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // path too. The key-oriented intent index keeps this O(touched keys)
             // instead of scanning every outstanding transaction.
             if (opts.transaction_resolution == null) {
-                try self.core.checkOrdinaryWriteConflicts(effective_ops.writes, effective_ops.deletes);
+                try S.ownerField(self, "core").*.checkOrdinaryWriteConflicts(effective_ops.writes, effective_ops.deletes);
             }
             try self.validateTransformReadSnapshot(transform_snapshot);
             // Catches a concurrent commit to one of this batch's own write keys
@@ -1181,16 +1201,16 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (effective_req.predicates.len > 0) {
                 const predicates_start_ns = monotonicTimeNs();
                 var predicates = std.ArrayListUnmanaged(transactions_mod.VersionPredicate).empty;
-                defer predicates.deinit(self.alloc);
+                defer predicates.deinit(S.ownerField(self, "alloc").*);
                 for (effective_req.predicates) |predicate| {
-                    try predicates.append(self.alloc, .{
+                    try predicates.append(S.ownerField(self, "alloc").*, .{
                         .key = predicate.key,
                         .expected_version = predicate.expected_version,
                         .expected_content_digest = predicate.expected_content_digest,
                         .unique_absence = predicate.unique_absence,
                     });
                 }
-                try self.core.checkVersionPredicates(predicates.items, null);
+                try S.ownerField(self, "core").*.checkVersionPredicates(predicates.items, null);
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.predicates_ns, predicates_start_ns);
             }
 
@@ -1206,13 +1226,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     var graph_request = effective_req;
                     graph_request.writes = &.{};
                     graph_request.deletes = &.{};
-                    try self.core.validateBatchRangeOwnership(graph_request);
-                } else try self.core.validateBatchRangeOwnership(effective_req);
+                    try S.ownerField(self, "core").*.validateBatchRangeOwnership(graph_request);
+                } else try S.ownerField(self, "core").*.validateBatchRangeOwnership(effective_req);
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.validate_range_ns, validate_range_start_ns);
             }
 
             const extract_writes_start_ns = monotonicTimeNs();
-            var index_read: ?docstore_mod.DocStore.Txn = if (relational_index_snapshot != null) try self.core.store.beginReadTxn() else null;
+            var index_read: ?docstore_mod.DocStore.Txn = if (relational_index_snapshot != null) try S.ownerField(self, "core").*.store.beginReadTxn() else null;
             defer if (index_read) |*read| read.abort();
             if (relational_index_snapshot) |index_snapshot| for (index_snapshot.plan.boundIndexes(), index_ready) |index, *ready| {
                 ready.* = (try relational_index_jobs.status(&index_read.?, index)).state == .ready;
@@ -1227,111 +1247,111 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (index_stage) |*stage| for (effective_req.deletes) |key| {
                 if (isMetadataKey(key)) continue;
                 const plan = relational_index_snapshot.?.plan;
-                const members = try prior_membership.read(self, &index_read.?, plan, index_ready, key);
+                const members = try prior_membership.read(&.{ .core = S.ownerField(self, "core").* }, &index_read.?, plan, index_ready, key);
                 if (members.len != 0) for (plan.boundIndexes(), members) |index, member| {
                     if (member) _ = try stage.deleteIndex(&index_writer, index.id(), key, .indexed);
                 };
                 try stage.deleteDocument(&index_writer, key);
             };
             var store_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
-            if (self.local_execution.row_policy_table_name) |table_name| {
-                try store_writes.append(self.alloc, .{ .key = internal_keys.graph_owning_table_key, .value = table_name });
+            if (S.ownerField(self, "local_execution").*.row_policy_table_name) |table_name| {
+                try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = internal_keys.graph_owning_table_key, .value = table_name });
             }
-            defer store_writes.deinit(self.alloc);
+            defer store_writes.deinit(S.ownerField(self, "alloc").*);
             if (req.activate_range_tracking) {
                 const ranges = @import("../range_protection.zig");
                 try ranges.validateRequest(req);
-                var probe = try self.core.store.beginReadTxn();
+                var probe = try S.ownerField(self, "core").*.store.beginReadTxn();
                 defer probe.abort();
                 if (!try ranges.isActive(&probe)) {
-                    if (try self.core.hasTopologySensitiveTransactions()) return error.IntentConflict;
-                    try store_writes.append(self.alloc, .{ .key = ranges.activation_key, .value = ranges.activation_value });
+                    if (try S.ownerField(self, "core").*.hasTopologySensitiveTransactions()) return error.IntentConflict;
+                    try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = ranges.activation_key, .value = ranges.activation_value });
                 }
             }
             var owned_store_keys = std.ArrayListUnmanaged([]u8).empty;
             defer {
-                for (owned_store_keys.items) |key| self.alloc.free(key);
-                owned_store_keys.deinit(self.alloc);
+                for (owned_store_keys.items) |key| S.ownerField(self, "alloc").*.free(key);
+                owned_store_keys.deinit(S.ownerField(self, "alloc").*);
             }
             var owned_store_values = std.ArrayListUnmanaged([]u8).empty;
             defer {
-                for (owned_store_values.items) |value| self.alloc.free(value);
-                owned_store_values.deinit(self.alloc);
+                for (owned_store_values.items) |value| S.ownerField(self, "alloc").*.free(value);
+                owned_store_values.deinit(S.ownerField(self, "alloc").*);
             }
             const vector_field_names_start_ns = monotonicTimeNs();
             const vector_store_field_names = if (relationalColumns(self) == null)
-                try self.core.index_manager.vectorStoreFieldNamesAlloc(self.alloc)
+                try S.ownerField(self, "core").*.index_manager.vectorStoreFieldNamesAlloc(S.ownerField(self, "alloc").*)
             else
                 &.{};
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_vector_field_names_ns, vector_field_names_start_ns);
             defer {
-                for (vector_store_field_names) |field| self.alloc.free(field);
-                if (vector_store_field_names.len > 0) self.alloc.free(vector_store_field_names);
+                for (vector_store_field_names) |field| S.ownerField(self, "alloc").*.free(field);
+                if (vector_store_field_names.len > 0) S.ownerField(self, "alloc").*.free(vector_store_field_names);
             }
             var timestamp_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
             defer {
                 if (!use_preprepared_rows) {
                     for (timestamp_writes.items) |item| {
-                        self.alloc.free(@constCast(item.key));
-                        self.alloc.free(@constCast(item.value));
+                        S.ownerField(self, "alloc").*.free(@constCast(item.key));
+                        S.ownerField(self, "alloc").*.free(@constCast(item.value));
                     }
                 }
-                timestamp_writes.deinit(self.alloc);
+                timestamp_writes.deinit(S.ownerField(self, "alloc").*);
             }
             var prepared_embedding_artifact_count: usize = 0;
             var explicit_embedding_artifact_writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
             defer {
                 for (explicit_embedding_artifact_writes.items[prepared_embedding_artifact_count..]) |item| {
-                    self.alloc.free(@constCast(item.key));
-                    self.alloc.free(@constCast(item.value));
+                    S.ownerField(self, "alloc").*.free(@constCast(item.key));
+                    S.ownerField(self, "alloc").*.free(@constCast(item.value));
                 }
-                explicit_embedding_artifact_writes.deinit(self.alloc);
+                explicit_embedding_artifact_writes.deinit(S.ownerField(self, "alloc").*);
             }
             var prepared_graph_artifact_count: usize = 0;
             var explicit_graph_artifact_writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
             defer {
                 for (explicit_graph_artifact_writes.items[prepared_graph_artifact_count..]) |item| {
-                    self.alloc.free(@constCast(item.key));
-                    self.alloc.free(@constCast(item.value));
+                    S.ownerField(self, "alloc").*.free(@constCast(item.key));
+                    S.ownerField(self, "alloc").*.free(@constCast(item.value));
                 }
-                explicit_graph_artifact_writes.deinit(self.alloc);
+                explicit_graph_artifact_writes.deinit(S.ownerField(self, "alloc").*);
             }
             var delete_keys = std.ArrayListUnmanaged([]const u8).empty;
-            defer delete_keys.deinit(self.alloc);
+            defer delete_keys.deinit(S.ownerField(self, "alloc").*);
             var owned_delete_keys = std.ArrayListUnmanaged([]u8).empty;
             defer {
-                for (owned_delete_keys.items) |key| self.alloc.free(key);
-                owned_delete_keys.deinit(self.alloc);
+                for (owned_delete_keys.items) |key| S.ownerField(self, "alloc").*.free(key);
+                owned_delete_keys.deinit(S.ownerField(self, "alloc").*);
             }
             var graph_artifact_clears = std.ArrayListUnmanaged(GraphArtifactClear).empty;
             defer {
                 if (!use_preprepared_rows)
-                    for (graph_artifact_clears.items) |*item| item.deinit(self.alloc);
-                graph_artifact_clears.deinit(self.alloc);
+                    for (graph_artifact_clears.items) |*item| item.deinit(S.ownerField(self, "alloc").*);
+                graph_artifact_clears.deinit(S.ownerField(self, "alloc").*);
             }
             var timestamp_delete_keys = std.ArrayListUnmanaged([]const u8).empty;
             defer {
-                for (timestamp_delete_keys.items) |key| self.alloc.free(@constCast(key));
-                timestamp_delete_keys.deinit(self.alloc);
+                for (timestamp_delete_keys.items) |key| S.ownerField(self, "alloc").*.free(@constCast(key));
+                timestamp_delete_keys.deinit(S.ownerField(self, "alloc").*);
             }
             var overwrite_probe_entries = std.ArrayListUnmanaged(OverwriteProbeEntry).empty;
-            defer overwrite_probe_entries.deinit(self.alloc);
+            defer overwrite_probe_entries.deinit(S.ownerField(self, "alloc").*);
             var identity_upsert_keys = std.ArrayListUnmanaged([]const u8).empty;
-            defer identity_upsert_keys.deinit(self.alloc);
+            defer identity_upsert_keys.deinit(S.ownerField(self, "alloc").*);
             var identity_upsert_write_indexes = std.ArrayListUnmanaged(usize).empty;
-            defer identity_upsert_write_indexes.deinit(self.alloc);
+            defer identity_upsert_write_indexes.deinit(S.ownerField(self, "alloc").*);
             var identity_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
             defer {
                 for (identity_writes.items) |item| {
-                    self.alloc.free(@constCast(item.key));
-                    self.alloc.free(@constCast(item.value));
+                    S.ownerField(self, "alloc").*.free(@constCast(item.key));
+                    S.ownerField(self, "alloc").*.free(@constCast(item.value));
                 }
-                identity_writes.deinit(self.alloc);
+                identity_writes.deinit(S.ownerField(self, "alloc").*);
             }
             var identity_visibility_deletes = std.ArrayListUnmanaged([]u8).empty;
             defer {
-                for (identity_visibility_deletes.items) |key| self.alloc.free(key);
-                identity_visibility_deletes.deinit(self.alloc);
+                for (identity_visibility_deletes.items) |key| S.ownerField(self, "alloc").*.free(key);
+                identity_visibility_deletes.deinit(S.ownerField(self, "alloc").*);
             }
 
             if (req.graph_endpoint_cleanup and !req.graph_endpoint_cleanup_planned) {
@@ -1339,7 +1359,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 // the scheduler or foreground drain probed it.
                 if (try self.maintenanceRequiresOrderedApply()) return error.InvalidBatchRequest;
                 effective_req.graph_endpoint_cleanup_planned = true;
-                graph_cleanup_page = try self.core.store.prepareGraphEndpointCleanupPage(self.alloc);
+                graph_cleanup_page = try S.ownerField(self, "core").*.store.prepareGraphEndpointCleanupPage(S.ownerField(self, "alloc").*);
                 if (graph_cleanup_page) |page| {
                     const graph_deletes = try graphEndpointCleanupDeletesAlloc(preparation_alloc, page);
                     cleanup_graph_deletes = graph_deletes;
@@ -1354,7 +1374,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 // fence. Both the durable hot-standby outbox and stream reuse these bytes.
                 // Encoding failures abort before commit even for async mirroring:
                 // falling back to a planner command could fork authoritative state.
-                if (!opts.bypass_replication_write_gate and self.local_execution.replication_async_batch_mirror != null) {
+                if (!opts.bypass_replication_write_gate and S.ownerField(self, "local_execution").*.replication_async_batch_mirror != null) {
                     try types.validateGraphEndpointCleanupCommand(effective_req);
                     preencoded_replication_batch_payload = try replication_effects_mod.encodeBatchMutationRequestAlloc(preparation_alloc, effective_req);
                 }
@@ -1372,7 +1392,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     var iterator = live_jobs.keyIterator();
                     while (iterator.next()) |job| preparation_alloc.free(job.*);
                 }
-                var read = try self.core.store.beginReadTxn();
+                var read = try S.ownerField(self, "core").*.store.beginReadTxn();
                 defer read.abort();
                 for (effective_req.graph_endpoint_cleanup_guards) |guard| {
                     const job = try contract.guardKeyAlloc(preparation_alloc, guard);
@@ -1459,7 +1479,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         .sparse_embeddings = &.{},
                     };
                     extracted_initialized += 1;
-                    try store_writes.append(self.alloc, .{
+                    try store_writes.append(S.ownerField(self, "alloc").*, .{
                         .key = write.key,
                         .value = write.value,
                     });
@@ -1472,12 +1492,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     break :blk prepared;
                 } else if (apply_schema_view) |view|
                     if (write.json_null_fields.len != 0)
-                        try mapper.PreparedRelationalWrite.initTyped(self.alloc, self.alloc, self.alloc, false, write.key, write.value, view.validator(), view.tableSchema().*, view.physicalLayout(), write.json_null_fields, opts.restore_staging != null or opts.preserve_logical_values)
+                        try mapper.PreparedRelationalWrite.initTyped(S.ownerField(self, "alloc").*, S.ownerField(self, "alloc").*, S.ownerField(self, "alloc").*, false, write.key, write.value, view.validator(), view.tableSchema().*, view.physicalLayout(), write.json_null_fields, opts.restore_staging != null or opts.preserve_logical_values)
                     else if (opts.restore_staging != null or opts.preserve_logical_values)
-                        try mapper.PreparedRelationalWrite.initPreserved(self.alloc, write.key, write.value, view.validator(), view.tableSchema().*, view.physicalLayout())
+                        try mapper.PreparedRelationalWrite.initPreserved(S.ownerField(self, "alloc").*, write.key, write.value, view.validator(), view.tableSchema().*, view.physicalLayout())
                     else
                         try mapper.PreparedRelationalWrite.initFromIntent(
-                            self.alloc,
+                            S.ownerField(self, "alloc").*,
                             write.key,
                             write.value,
                             view.validator(),
@@ -1487,8 +1507,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         )
                 else
                     null;
-                defer if (prepared_relational) |*prepared| prepared.deinit(self.alloc);
-                var fallback_consumer_plan = if (!use_preprepared_rows and prepared_relational != null) try self.core.index_manager.acquireWritePlanSnapshot() else null;
+                defer if (prepared_relational) |*prepared| prepared.deinit(S.ownerField(self, "alloc").*);
+                var fallback_consumer_plan = if (!use_preprepared_rows and prepared_relational != null) try S.ownerField(self, "core").*.index_manager.acquireWritePlanSnapshot() else null;
                 defer if (fallback_consumer_plan) |*plan| plan.release();
                 if (fallback_consumer_plan) |plan| try requireRelationalConsumerFields(&prepared_relational.?, apply_schema_view.?.tableSchema().*, plan.plan().*, false);
                 if (!use_preprepared_rows) if (prepared_relational) |prepared| if (profile) |active_profile| {
@@ -1502,7 +1522,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 extracted[i] = if (prepared_relational) |*prepared|
                     prepared.takeExtracted()
                 else
-                    try mapper.extractWrite(self.alloc, write.key, write.value);
+                    try mapper.extractWrite(S.ownerField(self, "alloc").*, write.key, write.value);
                 // Ownership has transferred even if a later graph/vector consumer
                 // rejects this row. Include it in error cleanup immediately.
                 extracted_initialized += 1;
@@ -1510,30 +1530,30 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const graph_field_extract_start_ns = monotonicTimeNs();
                 if (!use_preprepared_rows) {
                     if (prepared_relational) |*prepared|
-                        try augmentExtractedWriteWithGraphFieldEdgesParsed(self, self.alloc, write.key, prepared.parsedValue(), &extracted[i])
+                        try augmentExtractedWriteWithGraphFieldEdgesParsed(self, S.ownerField(self, "alloc").*, write.key, prepared.parsedValue(), &extracted[i])
                     else
-                        try augmentExtractedWriteWithGraphFieldEdges(self, self.alloc, write.key, write.value, &extracted[i]);
+                        try augmentExtractedWriteWithGraphFieldEdges(self, S.ownerField(self, "alloc").*, write.key, write.value, &extracted[i]);
                 }
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_graph_fields_ns, graph_field_extract_start_ns);
                 const index_field_embeddings_start_ns = monotonicTimeNs();
                 if (!use_preprepared_rows) {
                     if (prepared_relational) |*prepared|
-                        try self.core.index_manager.appendIndexFieldEmbeddingsFromPreparedToExtractedWrite(self.alloc, write.key, prepared.parsedValue(), try prepared.typedView(apply_schema_view.?.tableSchema().*, apply_schema_view.?.physicalLayout()), &extracted[i])
+                        try S.ownerField(self, "core").*.index_manager.appendIndexFieldEmbeddingsFromPreparedToExtractedWrite(S.ownerField(self, "alloc").*, write.key, prepared.parsedValue(), try prepared.typedView(apply_schema_view.?.tableSchema().*, apply_schema_view.?.physicalLayout()), &extracted[i])
                     else
-                        try self.core.index_manager.appendIndexFieldEmbeddingsToExtractedWrite(self.alloc, write.key, write.value, &extracted[i]);
+                        try S.ownerField(self, "core").*.index_manager.appendIndexFieldEmbeddingsToExtractedWrite(S.ownerField(self, "alloc").*, write.key, write.value, &extracted[i]);
                 }
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_index_field_embeddings_ns, index_field_embeddings_start_ns);
                 const embedding_artifacts_start_ns = monotonicTimeNs();
                 if (use_preprepared_rows) {
                     const effects = &preprepared_effects.?[i];
-                    try explicit_embedding_artifact_writes.appendSlice(self.alloc, effects.embedding_writes.items);
+                    try explicit_embedding_artifact_writes.appendSlice(S.ownerField(self, "alloc").*, effects.embedding_writes.items);
                     prepared_embedding_artifact_count = explicit_embedding_artifact_writes.items.len;
                     effects.embedding_writes.clearRetainingCapacity();
                 } else {
                     for (extracted[i].dense_embeddings) |*embedding| {
                         if (embedding.artifact_key != null) continue;
                         embedding.artifact_key = try appendEmbeddingArtifactWrite(
-                            self.alloc,
+                            S.ownerField(self, "alloc").*,
                             &explicit_embedding_artifact_writes,
                             write.key,
                             write.key,
@@ -1547,7 +1567,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     for (extracted[i].sparse_embeddings) |*embedding| {
                         if (embedding.artifact_key != null) continue;
                         embedding.artifact_key = try appendSparseEmbeddingArtifactWrite(
-                            self.alloc,
+                            S.ownerField(self, "alloc").*,
                             &explicit_embedding_artifact_writes,
                             write.key,
                             embedding.index_name,
@@ -1561,22 +1581,22 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const graph_artifacts_start_ns = monotonicTimeNs();
                 if (use_preprepared_rows) {
                     const effects = &preprepared_effects.?[i];
-                    try explicit_graph_artifact_writes.appendSlice(self.alloc, effects.graph_writes.items);
+                    try explicit_graph_artifact_writes.appendSlice(S.ownerField(self, "alloc").*, effects.graph_writes.items);
                     prepared_graph_artifact_count = explicit_graph_artifact_writes.items.len;
                     effects.graph_writes.clearRetainingCapacity();
-                    try graph_artifact_clears.appendSlice(self.alloc, effects.graph_clears.items);
+                    try graph_artifact_clears.appendSlice(S.ownerField(self, "alloc").*, effects.graph_clears.items);
                     effects.graph_clears.clearRetainingCapacity();
                 } else {
                     for (extracted[i].graph_writes) |graph_write| {
-                        const generation = (self.core.index_manager.graphIndex(graph_write.index_name) orelse return error.IndexNotFound).config.coverage_generation;
-                        const graph_entry = self.core.index_manager.graphIndex(graph_write.index_name) orelse return error.IndexNotFound;
-                        try appendGraphEdgeArtifactWrite(self.alloc, self.core.store, &explicit_graph_artifact_writes, graph_write, generation, graph_entry.ttl_duration_ns, batch_timestamp_ns);
+                        const generation = (S.ownerField(self, "core").*.index_manager.graphIndex(graph_write.index_name) orelse return error.IndexNotFound).config.coverage_generation;
+                        const graph_entry = S.ownerField(self, "core").*.index_manager.graphIndex(graph_write.index_name) orelse return error.IndexNotFound;
+                        try appendGraphEdgeArtifactWrite(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store, &explicit_graph_artifact_writes, graph_write, generation, graph_entry.ttl_duration_ns, batch_timestamp_ns);
                     }
                     for (extracted[i].mentioned_graph_indexes) |index_name| {
-                        const clear = try GraphArtifactClear.initAlloc(self.alloc, write.key, index_name);
-                        graph_artifact_clears.append(self.alloc, clear) catch |err| {
+                        const clear = try GraphArtifactClear.initAlloc(S.ownerField(self, "alloc").*, write.key, index_name);
+                        graph_artifact_clears.append(S.ownerField(self, "alloc").*, clear) catch |err| {
                             var owned_clear = clear;
-                            owned_clear.deinit(self.alloc);
+                            owned_clear.deinit(S.ownerField(self, "alloc").*);
                             return err;
                         };
                     }
@@ -1610,12 +1630,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         const plan = relational_index_snapshot.?.plan;
                         // Effective writes/deletes are coalesced before this loop,
                         // so the pinned base is the exact prior row for each key.
-                        const members = try prior_membership.read(self, &index_read.?, plan, index_ready, write.key);
+                        const members = try prior_membership.read(&.{ .core = S.ownerField(self, "core").* }, &index_read.?, plan, index_ready, write.key);
                         try stage.upsertPreparedWithMembership(&index_writer, plan, keys, row, write.key, index_ready, members);
                     };
                     if (!use_preprepared_rows) {
                         if (prepared_relational) |*prepared|
-                            try validateDocumentExtractionInlineSourcesSnapshotParsed(self.alloc, self, fallback_consumer_plan.?.plan().*, prepared.parsedValue(), extracted[i])
+                            try validateDocumentExtractionInlineSourcesSnapshotParsed(S.ownerField(self, "alloc").*, self, fallback_consumer_plan.?.plan().*, prepared.parsedValue(), extracted[i])
                         else
                             try validateDocumentExtractionInlineSources(self, cleaned);
                     }
@@ -1626,39 +1646,39 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         // row region. Fallback rows use the DB allocator and retain
                         // the established individual ownership list.
                         if (!use_preprepared_rows) {
-                            errdefer self.alloc.free(packed_row);
-                            try owned_store_values.append(self.alloc, packed_row);
+                            errdefer S.ownerField(self, "alloc").*.free(packed_row);
+                            try owned_store_values.append(S.ownerField(self, "alloc").*, packed_row);
                         }
                         break :blk packed_row;
                     } else try strippedStoredDocumentValueAlloc(
-                        self.alloc,
+                        S.ownerField(self, "alloc").*,
                         cleaned,
                         vector_store_field_names,
                         &owned_store_values,
                     );
                     if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_strip_store_value_ns, strip_store_value_start_ns);
-                    const store_key = if (use_preprepared_rows) preprepared_effects.?[i].store_key.? else try encodeStoreLookupKeyAlloc(self, self.alloc, write.key);
-                    if (!use_preprepared_rows) try owned_store_keys.append(self.alloc, store_key);
+                    const store_key = if (use_preprepared_rows) preprepared_effects.?[i].store_key.? else try encodeStoreLookupKeyAlloc(self, S.ownerField(self, "alloc").*, write.key);
+                    if (!use_preprepared_rows) try owned_store_keys.append(S.ownerField(self, "alloc").*, store_key);
                     if (use_preprepared_rows) preprepared_effects.?[i].store_key = null;
-                    try overwrite_probe_entries.append(self.alloc, .{
+                    try overwrite_probe_entries.append(S.ownerField(self, "alloc").*, .{
                         .key = store_key,
                         .value = store_value,
                         .write_index = i,
                         .semantic_hash = semantic_hash,
                     });
-                    try store_writes.append(self.alloc, .{
+                    try store_writes.append(S.ownerField(self, "alloc").*, .{
                         .key = store_key,
                         .value = store_value,
                     });
-                    try identity_upsert_keys.append(self.alloc, write.key);
-                    try identity_upsert_write_indexes.append(self.alloc, i);
+                    try identity_upsert_keys.append(S.ownerField(self, "alloc").*, write.key);
+                    try identity_upsert_write_indexes.append(S.ownerField(self, "alloc").*, i);
                     if (shouldWriteTimestamp(write.key)) {
                         const timestamp_start_ns = monotonicTimeNs();
-                        const timestamp_key = if (use_preprepared_rows) preprepared_effects.?[i].timestamp_key.? else try makeTimestampKey(self.alloc, write.key);
+                        const timestamp_key = if (use_preprepared_rows) preprepared_effects.?[i].timestamp_key.? else try makeTimestampKey(S.ownerField(self, "alloc").*, write.key);
                         const timestamp_value = if (use_preprepared_rows) preprepared_effects.?[i].timestamp_value.? else blk: {
-                            break :blk try encodeTimestampValue(self.alloc, resolved_write_timestamp_ns.?);
+                            break :blk try encodeTimestampValue(S.ownerField(self, "alloc").*, resolved_write_timestamp_ns.?);
                         };
-                        try timestamp_writes.append(self.alloc, .{
+                        try timestamp_writes.append(S.ownerField(self, "alloc").*, .{
                             .key = timestamp_key,
                             .value = timestamp_value,
                         });
@@ -1675,20 +1695,20 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 active_profile.identity_delete_keys += @intCast(effective_req.deletes.len);
             }
             const identity_capacity_start_ns = monotonicTimeNs();
-            if (!self.bulk_identity.enabled or effective_req.deletes.len != 0) {
+            if (!S.ownerField(self, "bulk_identity").*.enabled or effective_req.deletes.len != 0) {
                 try self.failIfIdentityOrdinalExhaustedForNewUpserts(identity_upsert_keys.items);
             }
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.identity_capacity_check_ns, identity_capacity_start_ns);
 
             var assume_all_new_identity_upserts = false;
-            if (self.bulk_identity.enabled and effective_req.deletes.len == 0 and identity_upsert_keys.items.len > 0) {
+            if (S.ownerField(self, "bulk_identity").*.enabled and effective_req.deletes.len == 0 and identity_upsert_keys.items.len > 0) {
                 assume_all_new_identity_upserts = try self.rememberBulkIngestAllNewIdentityUpserts(identity_upsert_keys.items);
                 if (!assume_all_new_identity_upserts) self.clearBulkIngestIdentityAllNewLocked();
             }
 
             if (!assume_all_new_identity_upserts and overwrite_probe_entries.items.len > 0) {
                 const overwrite_probe_start_ns = monotonicTimeNs();
-                const unchanged_derived_targets_serviceable = try self.unchangedDerivedReplayTargetsServiceable(self.alloc);
+                const unchanged_derived_targets_serviceable = try self.unchangedDerivedReplayTargetsServiceable(S.ownerField(self, "alloc").*);
                 std.sort.pdq(OverwriteProbeEntry, overwrite_probe_entries.items, {}, overwriteProbeLessThan);
                 const probe_keys = overwrite_probe_keys[0..overwrite_probe_entries.items.len];
                 const probe_values = overwrite_probe_values[0..overwrite_probe_entries.items.len];
@@ -1696,7 +1716,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     probe_keys[i] = entry.key;
                 }
                 const overwrite_probe_admission: backend_types.Namespace.BlockCacheAdmission = if (opts.store_batch_options.mode == .bulk_ingest or self.bulkSessionActive()) .transient else .retain;
-                var overwrite_probe_txn = try self.core.store.beginProbeTxnWithBlockCacheAdmission(overwrite_probe_admission);
+                var overwrite_probe_txn = try S.ownerField(self, "core").*.store.beginProbeTxnWithBlockCacheAdmission(overwrite_probe_admission);
                 defer overwrite_probe_txn.abort();
                 try overwrite_probe_txn.getManySorted(probe_keys, probe_values);
                 for (overwrite_probe_entries.items, 0..) |entry, i| {
@@ -1706,7 +1726,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     const values_equal = if (entry.semantic_hash) |expected_hash| blk: {
                         const stored_hash = try relational_store.rowSemanticHash(existing);
                         break :blk std.mem.eql(u8, &expected_hash, &stored_hash);
-                    } else storedDocumentValuesEqual(self.alloc, existing, entry.value);
+                    } else storedDocumentValuesEqual(S.ownerField(self, "alloc").*, existing, entry.value);
                     if (unchanged_derived_targets_serviceable and
                         values_equal and
                         extracted_write.dense_embeddings.len == 0 and
@@ -1745,121 +1765,121 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
 
             for (effective_req.graph_writes) |graph_write| {
-                const generation = (self.core.index_manager.graphIndex(graph_write.index_name) orelse return error.IndexNotFound).config.coverage_generation;
-                const graph_entry = self.core.index_manager.graphIndex(graph_write.index_name) orelse return error.IndexNotFound;
-                try appendGraphEdgeArtifactWrite(self.alloc, self.core.store, &explicit_graph_artifact_writes, graph_write, generation, graph_entry.ttl_duration_ns, batch_timestamp_ns);
+                const generation = (S.ownerField(self, "core").*.index_manager.graphIndex(graph_write.index_name) orelse return error.IndexNotFound).config.coverage_generation;
+                const graph_entry = S.ownerField(self, "core").*.index_manager.graphIndex(graph_write.index_name) orelse return error.IndexNotFound;
+                try appendGraphEdgeArtifactWrite(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store, &explicit_graph_artifact_writes, graph_write, generation, graph_entry.ttl_duration_ns, batch_timestamp_ns);
             }
 
             const cleanup_contract = @import("../graph_cleanup_contract.zig");
             var graph_lifecycle_generation: u64 = if (effective_req.graph_endpoint_cleanup or effective_req.graph_deletes.len != 0 or effective_req.deletes.len != 0 or
                 (std.mem.indexOfScalar(bool, derived_changed_flags, true) != null))
-                try appendGraphLifecycleGeneration(self.alloc, self.core.store, if (opts.ordered_apply_receipt) |entry| entry.index else 0, &store_writes, &owned_store_values)
+                try appendGraphLifecycleGeneration(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store, if (opts.ordered_apply_receipt) |entry| entry.index else 0, &store_writes, &owned_store_values)
             else
                 0;
 
             var changed_graph_artifact_keys = std.ArrayListUnmanaged([]u8).empty;
             defer {
-                for (changed_graph_artifact_keys.items) |key| self.alloc.free(key);
-                changed_graph_artifact_keys.deinit(self.alloc);
+                for (changed_graph_artifact_keys.items) |key| S.ownerField(self, "alloc").*.free(key);
+                changed_graph_artifact_keys.deinit(S.ownerField(self, "alloc").*);
             }
             var changed_graph_artifact_key_set = std.StringHashMapUnmanaged(void).empty;
-            defer changed_graph_artifact_key_set.deinit(self.alloc);
+            defer changed_graph_artifact_key_set.deinit(S.ownerField(self, "alloc").*);
             if (opts.restore_staging) |admission| if (admission.projection_page) {
                 for (opts.restore_artifacts) |write| if (isMergeArtifactKey(write.key)) {
-                    try appendUniqueOwnedKeyIndexed(self.alloc, &changed_graph_artifact_keys, &changed_graph_artifact_key_set, write.key);
+                    try appendUniqueOwnedKeyIndexed(S.ownerField(self, "alloc").*, &changed_graph_artifact_keys, &changed_graph_artifact_key_set, write.key);
                 };
             };
             var explicit_graph_write_key_set = std.StringHashMapUnmanaged(void).empty;
-            defer explicit_graph_write_key_set.deinit(self.alloc);
+            defer explicit_graph_write_key_set.deinit(S.ownerField(self, "alloc").*);
             try explicit_graph_write_key_set.ensureTotalCapacity(
-                self.alloc,
+                S.ownerField(self, "alloc").*,
                 std.math.cast(u32, explicit_graph_artifact_writes.items.len) orelse return error.OutOfMemory,
             );
             for (explicit_graph_artifact_writes.items) |write|
                 explicit_graph_write_key_set.putAssumeCapacity(write.key, {});
             var graph_delete_key_set = std.StringHashMapUnmanaged(void).empty;
-            defer graph_delete_key_set.deinit(self.alloc);
+            defer graph_delete_key_set.deinit(S.ownerField(self, "alloc").*);
             try graph_delete_key_set.ensureTotalCapacity(
-                self.alloc,
+                S.ownerField(self, "alloc").*,
                 std.math.cast(u32, owned_delete_keys.items.len) orelse return error.OutOfMemory,
             );
             for (owned_delete_keys.items) |key| graph_delete_key_set.putAssumeCapacity(key, {});
             for (graph_artifact_clears.items) |clear| {
-                const existing = try collectGraphArtifactsForDocIndex(self.alloc, self.core.store, clear.doc_key, clear.index_name);
-                defer docstore_mod.DocStore.freeResults(self.alloc, existing);
+                const existing = try collectGraphArtifactsForDocIndex(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store, clear.doc_key, clear.index_name);
+                defer docstore_mod.DocStore.freeResults(S.ownerField(self, "alloc").*, existing);
                 for (existing) |entry| {
                     // Field replacement owns the direct contributor only.
                     // An unchanged asset assertion must retain its primary edge.
-                    const graph_entry = self.core.index_manager.graphIndex(clear.index_name) orelse return error.IndexNotFound;
+                    const graph_entry = S.ownerField(self, "core").*.index_manager.graphIndex(clear.index_name) orelse return error.IndexNotFound;
                     if (graph_entry.artifact_sources.len > 0) {
-                        const state = try internal_keys.graphDirectStateKeyAlloc(self.alloc, clear.doc_key, clear.index_name);
-                        defer self.alloc.free(state);
-                        const contender = try internal_keys.graphGlobalEdgeContenderKeyAlloc(self.alloc, clear.index_name, graph_entry.config.coverage_generation, entry.key, @intCast(graph_mod.direct_source_priority), state);
-                        defer self.alloc.free(contender);
-                        const direct = self.core.store.get(self.alloc, contender) catch |err| switch (err) {
+                        const state = try internal_keys.graphDirectStateKeyAlloc(S.ownerField(self, "alloc").*, clear.doc_key, clear.index_name);
+                        defer S.ownerField(self, "alloc").*.free(state);
+                        const contender = try internal_keys.graphGlobalEdgeContenderKeyAlloc(S.ownerField(self, "alloc").*, clear.index_name, graph_entry.config.coverage_generation, entry.key, @intCast(graph_mod.direct_source_priority), state);
+                        defer S.ownerField(self, "alloc").*.free(contender);
+                        const direct = S.ownerField(self, "core").*.store.get(S.ownerField(self, "alloc").*, contender) catch |err| switch (err) {
                             error.NotFound => null,
                             else => return err,
                         };
-                        defer if (direct) |raw| self.alloc.free(raw);
+                        defer if (direct) |raw| S.ownerField(self, "alloc").*.free(raw);
                         if (direct == null) continue;
                     }
                     if (explicit_graph_write_key_set.contains(entry.key)) continue;
                     if (graph_delete_key_set.contains(entry.key)) continue;
-                    const owned_key = try self.alloc.dupe(u8, entry.key);
-                    try owned_delete_keys.append(self.alloc, owned_key);
-                    try graph_delete_key_set.put(self.alloc, owned_key, {});
-                    try delete_keys.append(self.alloc, owned_key);
-                    try appendUniqueOwnedKeyIndexed(self.alloc, &changed_graph_artifact_keys, &changed_graph_artifact_key_set, entry.key);
+                    const owned_key = try S.ownerField(self, "alloc").*.dupe(u8, entry.key);
+                    try owned_delete_keys.append(S.ownerField(self, "alloc").*, owned_key);
+                    try graph_delete_key_set.put(S.ownerField(self, "alloc").*, owned_key, {});
+                    try delete_keys.append(S.ownerField(self, "alloc").*, owned_key);
+                    try appendUniqueOwnedKeyIndexed(S.ownerField(self, "alloc").*, &changed_graph_artifact_keys, &changed_graph_artifact_key_set, entry.key);
                 }
             }
 
-            try store_writes.appendSlice(self.alloc, timestamp_writes.items);
+            try store_writes.appendSlice(S.ownerField(self, "alloc").*, timestamp_writes.items);
             // Scoped restore artifacts share the normal presence, source-index,
             // target-cardinality and journal transaction; extra control writes are
             // appended too late in the pipeline for those derived invariants.
             for (opts.restore_artifacts) |artifact| {
-                try store_writes.append(self.alloc, .{ .key = artifact.key, .value = artifact.value });
+                try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = artifact.key, .value = artifact.value });
             }
             for (effective_req.merge_artifacts) |row| {
                 if (internal_keys.isGraphEdgeTtlLifetimeKey(row.key) or internal_keys.isGraphEdgeTtlTombstoneKey(row.key)) {
                     var receiver_entry: ?*index_manager_mod.IndexManager.GraphIndex = null;
-                    for (self.core.index_manager.graph_indexes.items) |*entry| {
+                    for (S.ownerField(self, "core").*.index_manager.graph_indexes.items) |*entry| {
                         if (internal_keys.matchesGraphEdgeContenderIndexName(row.key, entry.config.name)) {
                             receiver_entry = entry;
                             break;
                         }
                     }
                     const entry = receiver_entry orelse return error.IndexNotFound;
-                    const key = try internal_keys.rebindGraphEdgeTtlStateKeyGenerationAlloc(self.alloc, row.key, entry.config.coverage_generation);
+                    const key = try internal_keys.rebindGraphEdgeTtlStateKeyGenerationAlloc(S.ownerField(self, "alloc").*, row.key, entry.config.coverage_generation);
                     var key_unowned = true;
-                    errdefer if (key_unowned) self.alloc.free(key);
+                    errdefer if (key_unowned) S.ownerField(self, "alloc").*.free(key);
                     if (internal_keys.isGraphEdgeTtlLifetimeKey(row.key)) {
                         if (row.value.len != 8) return error.InvalidGraphEdgeTtlLifetime;
                     } else _ = try graph_edge_ttl_tombstone.Tombstone.decode(row.value);
-                    try owned_store_keys.append(self.alloc, key);
+                    try owned_store_keys.append(S.ownerField(self, "alloc").*, key);
                     key_unowned = false;
-                    try store_writes.append(self.alloc, .{ .key = key, .value = row.value });
+                    try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = key, .value = row.value });
                     continue;
                 }
                 if (internal_keys.isGraphGlobalEdgeContenderKey(row.key)) {
                     const donor_generation = try graph_edge_contender.coverageGeneration(row.value);
                     const contender = (try graph_edge_contender.decode(row.value, donor_generation)) orelse return error.InvalidGraphEdgeContender;
                     var receiver_entry: ?*index_manager_mod.IndexManager.GraphIndex = null;
-                    for (self.core.index_manager.graph_indexes.items) |*entry| {
+                    for (S.ownerField(self, "core").*.index_manager.graph_indexes.items) |*entry| {
                         if (internal_keys.matchesGraphGlobalEdgeContenderIndexName(row.key, entry.config.name)) {
                             receiver_entry = entry;
                             break;
                         }
                     }
                     const entry = receiver_entry orelse return error.IndexNotFound;
-                    const donor_key = try internal_keys.graphGlobalEdgeContenderKeyAlloc(self.alloc, entry.config.name, donor_generation, contender.edge_key, contender.source_priority, contender.state_key);
-                    defer self.alloc.free(donor_key);
+                    const donor_key = try internal_keys.graphGlobalEdgeContenderKeyAlloc(S.ownerField(self, "alloc").*, entry.config.name, donor_generation, contender.edge_key, contender.source_priority, contender.state_key);
+                    defer S.ownerField(self, "alloc").*.free(donor_key);
                     if (!std.mem.eql(u8, donor_key, row.key)) return error.InvalidGraphEdgeContender;
-                    var donor_edge = try enrichment_artifact_codec.decodeGraphEdgeAlloc(self.alloc, contender.payload);
-                    defer donor_edge.deinit(self.alloc);
+                    var donor_edge = try enrichment_artifact_codec.decodeGraphEdgeAlloc(S.ownerField(self, "alloc").*, contender.payload);
+                    defer donor_edge.deinit(S.ownerField(self, "alloc").*);
                     if (donor_edge.generation != donor_generation) return error.InvalidGraphEdgeContender;
                     const rebound_payload = try enrichment_artifact_codec.encodeGraphEdgeWithTtlAlloc(
-                        self.alloc,
+                        S.ownerField(self, "alloc").*,
                         null,
                         entry.config.coverage_generation,
                         donor_edge.weight,
@@ -1868,54 +1888,54 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         donor_edge.ttl_created_ns,
                         donor_edge.metadata_json,
                     );
-                    defer self.alloc.free(rebound_payload);
-                    const key = try internal_keys.graphGlobalEdgeContenderKeyAlloc(self.alloc, entry.config.name, entry.config.coverage_generation, contender.edge_key, contender.source_priority, contender.state_key);
+                    defer S.ownerField(self, "alloc").*.free(rebound_payload);
+                    const key = try internal_keys.graphGlobalEdgeContenderKeyAlloc(S.ownerField(self, "alloc").*, entry.config.name, entry.config.coverage_generation, contender.edge_key, contender.source_priority, contender.state_key);
                     var key_unowned = true;
-                    errdefer if (key_unowned) self.alloc.free(key);
-                    const value = try graph_edge_contender.encodeAlloc(self.alloc, entry.config.coverage_generation, contender.source_priority, contender.edge_key, contender.state_key, rebound_payload);
+                    errdefer if (key_unowned) S.ownerField(self, "alloc").*.free(key);
+                    const value = try graph_edge_contender.encodeAlloc(S.ownerField(self, "alloc").*, entry.config.coverage_generation, contender.source_priority, contender.edge_key, contender.state_key, rebound_payload);
                     var value_unowned = true;
-                    errdefer if (value_unowned) self.alloc.free(value);
-                    try owned_store_keys.append(self.alloc, key);
+                    errdefer if (value_unowned) S.ownerField(self, "alloc").*.free(value);
+                    try owned_store_keys.append(S.ownerField(self, "alloc").*, key);
                     key_unowned = false;
-                    try owned_store_values.append(self.alloc, value);
+                    try owned_store_values.append(S.ownerField(self, "alloc").*, value);
                     value_unowned = false;
-                    try store_writes.append(self.alloc, .{ .key = key, .value = value });
+                    try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = key, .value = value });
                     // Shared reconciliation below publishes membership, lifetime,
                     // canonical payload and deadline together, including suppression.
                     continue;
                 }
                 var value = row.value;
                 if (internal_keys.isGraphEdgeArtifactKey(row.key)) {
-                    const parsed = (try internal_keys.parseGraphEdgeArtifactKeyAlloc(self.alloc, row.key)) orelse return error.InvalidGraphEdgeArtifact;
+                    const parsed = (try internal_keys.parseGraphEdgeArtifactKeyAlloc(S.ownerField(self, "alloc").*, row.key)) orelse return error.InvalidGraphEdgeArtifact;
                     defer {
-                        self.alloc.free(parsed.doc_key);
-                        self.alloc.free(parsed.index_name);
-                        self.alloc.free(parsed.edge_type);
-                        self.alloc.free(parsed.target_doc_key);
-                        self.alloc.free(parsed.edge_id);
-                        self.alloc.free(parsed.logical_source);
+                        S.ownerField(self, "alloc").*.free(parsed.doc_key);
+                        S.ownerField(self, "alloc").*.free(parsed.index_name);
+                        S.ownerField(self, "alloc").*.free(parsed.edge_type);
+                        S.ownerField(self, "alloc").*.free(parsed.target_doc_key);
+                        S.ownerField(self, "alloc").*.free(parsed.edge_id);
+                        S.ownerField(self, "alloc").*.free(parsed.logical_source);
                     }
-                    if (self.core.index_manager.graphIndex(parsed.index_name)) |entry| {
+                    if (S.ownerField(self, "core").*.index_manager.graphIndex(parsed.index_name)) |entry| {
                         if (entry.ttl_duration_ns != 0 and
-                            self.core.index_manager.graphArtifactSources(parsed.index_name).len == 0 and
+                            S.ownerField(self, "core").*.index_manager.graphArtifactSources(parsed.index_name).len == 0 and
                             enrichment_artifact_codec.isPortableUnboundGraphEdge(row.value))
                         {
-                            const bound = try enrichment_artifact_codec.bindGraphEdgeGenerationAlloc(self.alloc, row.value, entry.config.coverage_generation);
+                            const bound = try enrichment_artifact_codec.bindGraphEdgeGenerationAlloc(S.ownerField(self, "alloc").*, row.value, entry.config.coverage_generation);
                             var bound_unowned = true;
-                            errdefer if (bound_unowned) self.alloc.free(bound);
-                            try owned_store_values.append(self.alloc, bound);
+                            errdefer if (bound_unowned) S.ownerField(self, "alloc").*.free(bound);
+                            try owned_store_values.append(S.ownerField(self, "alloc").*, bound);
                             bound_unowned = false;
                             value = bound;
                         }
                     }
                 }
-                try store_writes.append(self.alloc, .{ .key = row.key, .value = value });
-                try appendDirectGraphTtlDueWrite(self.alloc, self.core.index_manager, .{ .key = row.key, .value = value }, &store_writes, &owned_store_keys, &owned_store_values);
+                try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = row.key, .value = value });
+                try appendDirectGraphTtlDueWrite(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.index_manager, .{ .key = row.key, .value = value }, &store_writes, &owned_store_keys, &owned_store_values);
                 if (internal_keys.isGraphRetirementKey(row.key)) {
-                    const artifact = try internal_keys.graphRetirementArtifactKeyAlloc(self.alloc, row.key);
-                    defer self.alloc.free(artifact);
-                    try appendUniqueOwnedKeyIndexed(self.alloc, &changed_graph_artifact_keys, &changed_graph_artifact_key_set, artifact);
-                } else try appendUniqueOwnedKeyIndexed(self.alloc, &changed_graph_artifact_keys, &changed_graph_artifact_key_set, row.key);
+                    const artifact = try internal_keys.graphRetirementArtifactKeyAlloc(S.ownerField(self, "alloc").*, row.key);
+                    defer S.ownerField(self, "alloc").*.free(artifact);
+                    try appendUniqueOwnedKeyIndexed(S.ownerField(self, "alloc").*, &changed_graph_artifact_keys, &changed_graph_artifact_key_set, artifact);
+                } else try appendUniqueOwnedKeyIndexed(S.ownerField(self, "alloc").*, &changed_graph_artifact_keys, &changed_graph_artifact_key_set, row.key);
             }
             // Typed online artifact afterimages participate in the same primary,
             // derived replay and page-receipt transaction as ordinary artifacts.
@@ -1925,57 +1945,57 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 transferred_artifact_position_bytes = try (@import("artifact_publication.zig").Position{ .raft = .{ .term = entry.term, .index = entry.index } }).encode();
             }
             var receiver_artifact_namespace: @import("artifact_publication.zig").Namespace = undefined;
-            doc_identity.encodeNamespace(&receiver_artifact_namespace, self.core.identity_namespace);
+            doc_identity.encodeNamespace(&receiver_artifact_namespace, S.ownerField(self, "core").*.identity_namespace);
             for (transferred_artifacts) |effect| {
                 const revision_key = @import("artifact_publication.zig").artifactRevisionKey(receiver_artifact_namespace, effect.key);
-                const owned_revision_key = try self.alloc.dupe(u8, &revision_key);
-                owned_store_keys.append(self.alloc, owned_revision_key) catch |err| {
-                    self.alloc.free(owned_revision_key);
+                const owned_revision_key = try S.ownerField(self, "alloc").*.dupe(u8, &revision_key);
+                owned_store_keys.append(S.ownerField(self, "alloc").*, owned_revision_key) catch |err| {
+                    S.ownerField(self, "alloc").*.free(owned_revision_key);
                     return err;
                 };
-                try store_writes.append(self.alloc, .{ .key = owned_revision_key, .value = &transferred_artifact_position_bytes });
+                try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = owned_revision_key, .value = &transferred_artifact_position_bytes });
                 if (effect.value) |value| {
-                    try store_writes.append(self.alloc, .{ .key = effect.key, .value = value });
+                    try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = effect.key, .value = value });
                     // Both thin and materialized journals route these keys to
                     // configured vector consumers. Storing bytes alone would
                     // acknowledge the page without advancing its projections.
-                    try appendUniqueOwnedKeyIndexed(self.alloc, &changed_graph_artifact_keys, &changed_graph_artifact_key_set, effect.key);
+                    try appendUniqueOwnedKeyIndexed(S.ownerField(self, "alloc").*, &changed_graph_artifact_keys, &changed_graph_artifact_key_set, effect.key);
                 }
             }
             for (explicit_embedding_artifact_writes.items) |write| {
-                try store_writes.append(self.alloc, .{
+                try store_writes.append(S.ownerField(self, "alloc").*, .{
                     .key = write.key,
                     .value = write.value,
                 });
             }
             for (explicit_graph_artifact_writes.items) |write| {
-                const retired = try internal_keys.graphRetirementKeyAlloc(self.alloc, write.key);
-                owned_delete_keys.append(self.alloc, retired) catch |err| {
-                    self.alloc.free(retired);
+                const retired = try internal_keys.graphRetirementKeyAlloc(S.ownerField(self, "alloc").*, write.key);
+                owned_delete_keys.append(S.ownerField(self, "alloc").*, retired) catch |err| {
+                    S.ownerField(self, "alloc").*.free(retired);
                     return err;
                 };
-                try delete_keys.append(self.alloc, retired);
-                try store_writes.append(self.alloc, .{
+                try delete_keys.append(S.ownerField(self, "alloc").*, retired);
+                try store_writes.append(S.ownerField(self, "alloc").*, .{
                     .key = write.key,
                     .value = write.value,
                 });
-                try appendDirectGraphTtlDueWrite(self.alloc, self.core.index_manager, write, &store_writes, &owned_store_keys, &owned_store_values);
-                try appendUniqueOwnedKeyIndexed(self.alloc, &changed_graph_artifact_keys, &changed_graph_artifact_key_set, write.key);
+                try appendDirectGraphTtlDueWrite(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.index_manager, write, &store_writes, &owned_store_keys, &owned_store_values);
+                try appendUniqueOwnedKeyIndexed(S.ownerField(self, "alloc").*, &changed_graph_artifact_keys, &changed_graph_artifact_key_set, write.key);
             }
             var deleted_graph_owners = std.StringHashMapUnmanaged(void).empty;
-            defer deleted_graph_owners.deinit(self.alloc);
-            for (effective_req.deletes) |owner| try deleted_graph_owners.put(self.alloc, owner, {});
+            defer deleted_graph_owners.deinit(S.ownerField(self, "alloc").*);
+            for (effective_req.deletes) |owner| try deleted_graph_owners.put(S.ownerField(self, "alloc").*, owner, {});
             for (effective_req.graph_deletes) |delete| {
-                const artifact_key = try internal_keys.graphRelationshipArtifactKeyAlloc(self.alloc, if (delete.owner_document.len > 0) delete.owner_document else if (delete.owner.len > 0) delete.owner else delete.source, delete.index_name, delete.edge_type, delete.target, delete.source, delete.edge_id);
-                defer self.alloc.free(artifact_key);
+                const artifact_key = try internal_keys.graphRelationshipArtifactKeyAlloc(S.ownerField(self, "alloc").*, if (delete.owner_document.len > 0) delete.owner_document else if (delete.owner.len > 0) delete.owner else delete.source, delete.index_name, delete.edge_type, delete.target, delete.source, delete.edge_id);
+                defer S.ownerField(self, "alloc").*.free(artifact_key);
                 if (explicit_graph_write_key_set.contains(artifact_key)) continue;
                 // Explicit removal overrides retained projection inputs until a
                 // new owner lifecycle or exact relationship write revives it.
                 const owner = if (delete.owner_document.len > 0) delete.owner_document else if (delete.owner.len > 0) delete.owner else delete.source;
                 if (!deleted_graph_owners.contains(owner)) {
-                    const retired = try internal_keys.graphRetirementKeyAlloc(self.alloc, artifact_key);
-                    owned_store_keys.append(self.alloc, retired) catch |err| {
-                        self.alloc.free(retired);
+                    const retired = try internal_keys.graphRetirementKeyAlloc(S.ownerField(self, "alloc").*, artifact_key);
+                    owned_store_keys.append(S.ownerField(self, "alloc").*, retired) catch |err| {
+                        S.ownerField(self, "alloc").*.free(retired);
                         return err;
                     };
                     const retirement_generation = if (effective_req.graph_endpoint_cleanup) blk: {
@@ -1983,69 +2003,69 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         break :blk graph_lifecycle_generation;
                     } else graph_lifecycle_generation;
                     const stamp = if (retirement_generation != 0) cleanup_contract.retirementValue(retirement_generation) else undefined;
-                    const value = try self.alloc.dupe(u8, if (retirement_generation != 0) &stamp else "1");
-                    owned_store_values.append(self.alloc, value) catch |err| {
-                        self.alloc.free(value);
+                    const value = try S.ownerField(self, "alloc").*.dupe(u8, if (retirement_generation != 0) &stamp else "1");
+                    owned_store_values.append(S.ownerField(self, "alloc").*, value) catch |err| {
+                        S.ownerField(self, "alloc").*.free(value);
                         return err;
                     };
-                    try store_writes.append(self.alloc, .{ .key = retired, .value = value });
+                    try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = retired, .value = value });
                 }
                 if (graph_delete_key_set.contains(artifact_key)) continue;
-                const owned_key = try self.alloc.dupe(u8, artifact_key);
-                try owned_delete_keys.append(self.alloc, owned_key);
-                try graph_delete_key_set.put(self.alloc, owned_key, {});
-                try delete_keys.append(self.alloc, owned_key);
-                try appendUniqueOwnedKeyIndexed(self.alloc, &changed_graph_artifact_keys, &changed_graph_artifact_key_set, artifact_key);
+                const owned_key = try S.ownerField(self, "alloc").*.dupe(u8, artifact_key);
+                try owned_delete_keys.append(S.ownerField(self, "alloc").*, owned_key);
+                try graph_delete_key_set.put(S.ownerField(self, "alloc").*, owned_key, {});
+                try delete_keys.append(S.ownerField(self, "alloc").*, owned_key);
+                try appendUniqueOwnedKeyIndexed(S.ownerField(self, "alloc").*, &changed_graph_artifact_keys, &changed_graph_artifact_key_set, artifact_key);
             }
             for (effective_req.deletes) |key| {
-                const store_key = try encodeStoreLookupKeyAlloc(self, self.alloc, key);
-                try owned_delete_keys.append(self.alloc, store_key);
-                try delete_keys.append(self.alloc, store_key);
+                const store_key = try encodeStoreLookupKeyAlloc(self, S.ownerField(self, "alloc").*, key);
+                try owned_delete_keys.append(S.ownerField(self, "alloc").*, store_key);
+                try delete_keys.append(S.ownerField(self, "alloc").*, store_key);
                 if (shouldWriteTimestamp(key)) {
-                    const timestamp_key = try makeTimestampKey(self.alloc, key);
-                    try timestamp_delete_keys.append(self.alloc, timestamp_key);
-                    try delete_keys.append(self.alloc, timestamp_key);
+                    const timestamp_key = try makeTimestampKey(S.ownerField(self, "alloc").*, key);
+                    try timestamp_delete_keys.append(S.ownerField(self, "alloc").*, timestamp_key);
+                    try delete_keys.append(S.ownerField(self, "alloc").*, timestamp_key);
                 }
             }
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_writes_ns, extract_writes_start_ns);
 
             var owner_job_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
-            defer owner_job_writes.deinit(self.alloc);
-            if (self.core.index_manager.hasGraphIndexes()) for (effective_req.writes, 0..) |write, write_index| {
+            defer owner_job_writes.deinit(S.ownerField(self, "alloc").*);
+            if (S.ownerField(self, "core").*.index_manager.hasGraphIndexes()) for (effective_req.writes, 0..) |write, write_index| {
                 if (!derived_changed_flags[write_index] or isMetadataKey(write.key)) continue;
-                const job_key = try cleanup_contract.ownerJobKeyAlloc(self.alloc, write.key);
+                const job_key = try cleanup_contract.ownerJobKeyAlloc(S.ownerField(self, "alloc").*, write.key);
                 var key_owned = true;
-                defer if (key_owned) self.alloc.free(job_key);
-                const pending = self.core.store.get(self.alloc, job_key) catch |err| switch (err) {
+                defer if (key_owned) S.ownerField(self, "alloc").*.free(job_key);
+                const pending = S.ownerField(self, "core").*.store.get(S.ownerField(self, "alloc").*, job_key) catch |err| switch (err) {
                     error.NotFound => null,
                     else => return err,
                 };
-                defer if (pending) |value| self.alloc.free(value);
+                defer if (pending) |value| S.ownerField(self, "alloc").*.free(value);
                 var needs_revival = pending != null;
-                if (!needs_revival and try self.core.store.mayHaveGraphRetirements()) {
-                    const prefix = try internal_keys.graphRetirementPrefixAlloc(self.alloc, write.key);
-                    defer self.alloc.free(prefix);
+                if (!needs_revival and try S.ownerField(self, "core").*.store.mayHaveGraphRetirements()) {
+                    const prefix = try internal_keys.graphRetirementPrefixAlloc(S.ownerField(self, "alloc").*, write.key);
+                    defer S.ownerField(self, "alloc").*.free(prefix);
                     // One prefix seek proves presence; never enumerate owner history
                     // or retained artifact inputs in the foreground mutation.
-                    const markers = try self.core.store.scanPrefixKeysPage(self.alloc, prefix, null, 1);
-                    defer freeOwnedKeySlice(self.alloc, markers);
+                    const markers = try S.ownerField(self, "core").*.store.scanPrefixKeysPage(S.ownerField(self, "alloc").*, prefix, null, 1);
+                    defer freeOwnedKeySlice(S.ownerField(self, "alloc").*, markers);
                     needs_revival = markers.len != 0;
                 }
                 if (!needs_revival) continue;
-                try owned_store_keys.append(self.alloc, job_key);
+                try owned_store_keys.append(S.ownerField(self, "alloc").*, job_key);
                 key_owned = false;
-                const value = try cleanup_contract.encodeOwnerJobAlloc(self.alloc, .{ .owner = write.key, .generation = graph_lifecycle_generation });
-                owned_store_values.append(self.alloc, value) catch |err| {
-                    self.alloc.free(value);
+                const value = try cleanup_contract.encodeOwnerJobAlloc(S.ownerField(self, "alloc").*, .{ .owner = write.key, .generation = graph_lifecycle_generation });
+                owned_store_values.append(S.ownerField(self, "alloc").*, value) catch |err| {
+                    S.ownerField(self, "alloc").*.free(value);
                     return err;
                 };
                 // Publish the new lifecycle before fresh graph artifact writes in
                 // this transaction; older retirement stamps then cease suppression.
-                try owner_job_writes.append(self.alloc, .{ .key = job_key, .value = value });
+                try owner_job_writes.append(S.ownerField(self, "alloc").*, .{ .key = job_key, .value = value });
             };
             // Prepend all lifecycle changes once so large owner batches remain
             // linear in their write count rather than repeatedly moving the tail.
-            try store_writes.insertSlice(self.alloc, 0, owner_job_writes.items);
+            try store_writes.insertSlice(S.ownerField(self, "alloc").*, 0, owner_job_writes.items);
 
             const delete_artifacts_start_ns = monotonicTimeNs();
             const deleted_artifact_keys = try collectEnrichmentArtifactDeletesForBatch(
@@ -2056,25 +2076,26 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 &delete_keys,
                 &owned_delete_keys,
             );
-            defer self.alloc.free(deleted_artifact_keys);
+            defer S.ownerField(self, "alloc").*.free(deleted_artifact_keys);
             // Native transfer pages can delete relationship artifacts without a
             // document or tuple delete. Classify their prepared effects too, so
             // every retirement receives this commit's nonzero lifecycle stamp.
             if (graph_lifecycle_generation == 0) for (deleted_artifact_keys) |artifact| {
                 if (internal_keys.graphInlineTargetComponent(artifact) == null) continue;
-                graph_lifecycle_generation = try appendGraphLifecycleGeneration(self.alloc, self.core.store, if (opts.ordered_apply_receipt) |entry| entry.index else 0, &store_writes, &owned_store_values);
+                graph_lifecycle_generation = try appendGraphLifecycleGeneration(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store, if (opts.ordered_apply_receipt) |entry| entry.index else 0, &store_writes, &owned_store_values);
                 break;
             };
-            try appendGraphEndpointRetirements(self.alloc, self.core.store, graph_lifecycle_generation, effective_req.deletes, self.core.index_manager.hasGraphIndexes(), deleted_artifact_keys, &store_writes, &owned_store_keys, &owned_store_values);
+            try appendGraphEndpointRetirements(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store, graph_lifecycle_generation, effective_req.deletes, S.ownerField(self, "core").*.index_manager.hasGraphIndexes(), deleted_artifact_keys, &store_writes, &owned_store_keys, &owned_store_values);
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.delete_artifacts_ns, delete_artifacts_start_ns);
 
             const use_thin_replay_fast_path =
                 effective_req.sync_level != .full_text and
                 effective_req.sync_level != .enrichments and
                 effective_req.sync_level != .full_index and
+                opts.force_generated_artifact_names.len == 0 and
                 !splitShadowRequiresMaterializedDerivedBatch(self);
             const include_generated_enrichment_hint = use_thin_replay_fast_path and
-                self.core.hasGeneratedEnrichmentTargets();
+                S.ownerField(self, "core").*.hasGeneratedEnrichmentTargets();
 
             var precomputed_generated: PrecomputedGeneratedBatch = .{};
             defer precomputed_generated.deinit(preparation_alloc);
@@ -2096,13 +2117,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             var owned_child_range_outbox_keys = std.ArrayListUnmanaged([]u8).empty;
             defer {
-                for (owned_child_range_outbox_keys.items) |key| self.alloc.free(key);
-                owned_child_range_outbox_keys.deinit(self.alloc);
+                for (owned_child_range_outbox_keys.items) |key| S.ownerField(self, "alloc").*.free(key);
+                owned_child_range_outbox_keys.deinit(S.ownerField(self, "alloc").*);
             }
             var owned_child_range_outbox_values = std.ArrayListUnmanaged([]u8).empty;
             defer {
-                for (owned_child_range_outbox_values.items) |value| self.alloc.free(value);
-                owned_child_range_outbox_values.deinit(self.alloc);
+                for (owned_child_range_outbox_values.items) |value| S.ownerField(self, "alloc").*.free(value);
+                owned_child_range_outbox_values.deinit(S.ownerField(self, "alloc").*);
             }
             if (!use_thin_replay_fast_path) {
                 const precompute_generated_start_ns = monotonicTimeNs();
@@ -2130,16 +2151,16 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
 
                 for (precomputed_generated.artifact_writes) |write| {
-                    try store_writes.append(self.alloc, .{
+                    try store_writes.append(S.ownerField(self, "alloc").*, .{
                         .key = write.key,
                         .value = write.value,
                     });
-                    try appendUniqueOwnedKeyIndexed(self.alloc, &changed_graph_artifact_keys, &changed_graph_artifact_key_set, write.key);
+                    try appendUniqueOwnedKeyIndexed(S.ownerField(self, "alloc").*, &changed_graph_artifact_keys, &changed_graph_artifact_key_set, write.key);
                 }
                 for (precomputed_generated.artifact_delete_keys) |key| {
-                    try delete_keys.append(self.alloc, key);
+                    try delete_keys.append(S.ownerField(self, "alloc").*, key);
                     if (internal_keys.isAssetArtifactKey(key)) {
-                        try appendUniqueOwnedKeyIndexed(self.alloc, &changed_graph_artifact_keys, &changed_graph_artifact_key_set, key);
+                        try appendUniqueOwnedKeyIndexed(S.ownerField(self, "alloc").*, &changed_graph_artifact_keys, &changed_graph_artifact_key_set, key);
                     }
                 }
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.precompute_generated_ns, precompute_generated_start_ns);
@@ -2150,10 +2171,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 explicit_graph_artifact_writes.items.len > 0 or
                 precomputed_generated.artifact_writes.len > 0)
             {
-                try self.core.appendArtifactPresenceMarker(&store_writes);
+                try S.ownerField(self, "core").*.appendArtifactPresenceMarker(&store_writes);
             }
             try appendAssetArtifactSourceIndexMutations(
-                self.alloc,
+                S.ownerField(self, "alloc").*,
                 &store_writes,
                 deleted_artifact_keys,
                 &delete_keys,
@@ -2162,9 +2183,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 &owned_delete_keys,
             );
             try appendMixedDirectGraphContenderMutations(
-                self.alloc,
-                self.core.store,
-                self.core.index_manager,
+                S.ownerField(self, "alloc").*,
+                S.ownerField(self, "core").*.store,
+                S.ownerField(self, "core").*.index_manager,
                 explicit_graph_artifact_writes.items,
                 &store_writes,
                 &delete_keys,
@@ -2173,9 +2194,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 &owned_delete_keys,
             );
             if (effective_req.merge_artifacts.len != 0) try appendImportedGraphContenderMutations(
-                self.alloc,
-                self.core.store,
-                self.core.index_manager,
+                S.ownerField(self, "alloc").*,
+                S.ownerField(self, "core").*.store,
+                S.ownerField(self, "core").*.index_manager,
                 effective_req.merge_artifacts,
                 &store_writes,
                 &delete_keys,
@@ -2186,9 +2207,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 &changed_graph_artifact_key_set,
             );
             try appendRetiredDirectGraphTtlDueDeletes(
-                self.alloc,
-                self.core.store,
-                self.core.index_manager,
+                S.ownerField(self, "alloc").*,
+                S.ownerField(self, "core").*.store,
+                S.ownerField(self, "core").*.index_manager,
                 store_writes.items,
                 delete_keys.items,
                 &delete_keys,
@@ -2196,17 +2217,17 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             );
 
             var sync_targets: ManagedSyncTargets = .{};
-            defer sync_targets.deinit(self.alloc);
+            defer sync_targets.deinit(S.ownerField(self, "alloc").*);
             var split_shadow_ticket: ?u64 = null;
             var materialized_derived_batch: ?derived_types.DerivedBatch = null;
             defer if (materialized_derived_batch) |*materialized_batch| derived_types.deinitDerivedBatch(preparation_alloc, materialized_batch);
             var materialized_deleted_artifact_keys = std.ArrayListUnmanaged([]const u8).empty;
-            defer materialized_deleted_artifact_keys.deinit(self.alloc);
+            defer materialized_deleted_artifact_keys.deinit(S.ownerField(self, "alloc").*);
             if (!use_thin_replay_fast_path) {
                 var seen_deleted_artifact_keys = std.StringHashMapUnmanaged(void).empty;
-                defer seen_deleted_artifact_keys.deinit(self.alloc);
-                for (deleted_artifact_keys) |key| try appendUniqueBorrowedKeyWithSet(self.alloc, &materialized_deleted_artifact_keys, &seen_deleted_artifact_keys, key);
-                for (precomputed_generated.artifact_delete_keys) |key| try appendUniqueBorrowedKeyWithSet(self.alloc, &materialized_deleted_artifact_keys, &seen_deleted_artifact_keys, key);
+                defer seen_deleted_artifact_keys.deinit(S.ownerField(self, "alloc").*);
+                for (deleted_artifact_keys) |key| try appendUniqueBorrowedKeyWithSet(S.ownerField(self, "alloc").*, &materialized_deleted_artifact_keys, &seen_deleted_artifact_keys, key);
+                for (precomputed_generated.artifact_delete_keys) |key| try appendUniqueBorrowedKeyWithSet(S.ownerField(self, "alloc").*, &materialized_deleted_artifact_keys, &seen_deleted_artifact_keys, key);
             }
             // An exact source retry that only refreshes timestamp metadata has no
             // derived visibility transition. Reuse the current committed fence
@@ -2225,40 +2246,40 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     derived_changed_flags,
                 );
             const sequence = if (elide_semantic_noop_replay)
-                self.core.nextDerivedSequence()
+                S.ownerField(self, "core").*.nextDerivedSequence()
             else
-                self.core.reserveDerivedAppendSequence();
+                S.ownerField(self, "core").*.reserveDerivedAppendSequence();
             if (profile) |active_profile| active_profile.source_sequence = sequence;
             const identity_metadata_start_ns = monotonicTimeNs();
             const identity_live_before = if (identity_upsert_keys.items.len != 0 or effective_req.deletes.len != 0)
-                (try doc_identity.fastStatsFromStore(self.core.store)).live_ordinals
+                (try doc_identity.fastStatsFromStore(S.ownerField(self, "core").*.store)).live_ordinals
             else
                 0;
             var used_trusted_identity_path = false;
             if (effective_req.deletes.len != 0) {
                 self.clearBulkIngestIdentityAllNewLocked();
             }
-            if (self.bulk_identity.enabled and
+            if (S.ownerField(self, "bulk_identity").*.enabled and
                 effective_req.deletes.len == 0 and
                 identity_upsert_keys.items.len > 0 and
                 (assume_all_new_identity_upserts or identityUpsertStoreWritesAreNew(identity_upsert_write_indexes.items, overwritten_flags)))
             {
                 used_trusted_identity_path = try doc_identity.appendBatchIdentityMetadataAllNewTrustedStateWithVisibilityDeletesForNamespaceAlloc(
-                    self.alloc,
-                    self.core.identity_namespace,
+                    S.ownerField(self, "alloc").*,
+                    S.ownerField(self, "core").*.identity_namespace,
                     sequence,
                     &identity_writes,
                     &identity_visibility_deletes,
                     identity_upsert_keys.items,
-                    &self.bulk_identity.trusted,
+                    &S.ownerField(self, "bulk_identity").*.trusted,
                 );
                 if (!used_trusted_identity_path) self.clearBulkIngestIdentityAllNewLocked();
             }
             if (!used_trusted_identity_path) {
                 try doc_identity.appendBatchIdentityMetadataForNamespaceWithDeletesAlloc(
-                    self.alloc,
-                    self.core.store,
-                    self.core.identity_namespace,
+                    S.ownerField(self, "alloc").*,
+                    S.ownerField(self, "core").*.store,
+                    S.ownerField(self, "core").*.identity_namespace,
                     sequence,
                     &identity_writes,
                     &identity_visibility_deletes,
@@ -2273,18 +2294,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const pending_identity_visibility_summary = try doc_identity.visibilitySummaryFromWrites(identity_writes.items);
             // Plan once under the apply lock: counts, page state, and the durable
             // transition must agree on whether a delayed checkpoint has authority.
-            const merge_existing_raw = if (req.merge_checkpoint != null) try merge_state_mod.loadRawAlloc(self.alloc, self.core.store) else null;
-            defer if (merge_existing_raw) |value| self.alloc.free(value);
-            var merge_existing_state: ?merge_state_mod.State = if (merge_existing_raw) |value| try merge_state_mod.decodeAlloc(self.alloc, value) else null;
-            defer if (merge_existing_state) |*state| state.deinit(self.alloc);
-            const merge_plan: ?merge_state_mod.ApplyPlan = if (req.merge_checkpoint) |checkpoint| try merge_state_mod.planCheckpointApply(self.alloc, if (merge_existing_state) |*state| state else null, self.core.byteRange(), checkpoint) else null;
-            defer if (merge_plan) |plan| plan.deinit(self.alloc);
-            const merge_count_prepared = try @import("merge_cardinality.zig").prepare(self.alloc, self.core.store, effective_req, if (merge_plan) |plan| plan.applies_checkpoint else false, identity_upsert_keys.items, effective_req.deletes, identity_live_before, if (pending_identity_visibility_summary) |summary| summary.live_ordinals else identity_live_before, &identity_writes);
+            const merge_existing_raw = if (req.merge_checkpoint != null) try merge_state_mod.loadRawAlloc(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store) else null;
+            defer if (merge_existing_raw) |value| S.ownerField(self, "alloc").*.free(value);
+            var merge_existing_state: ?merge_state_mod.State = if (merge_existing_raw) |value| try merge_state_mod.decodeAlloc(S.ownerField(self, "alloc").*, value) else null;
+            defer if (merge_existing_state) |*state| state.deinit(S.ownerField(self, "alloc").*);
+            const merge_plan: ?merge_state_mod.ApplyPlan = if (req.merge_checkpoint) |checkpoint| try merge_state_mod.planCheckpointApply(S.ownerField(self, "alloc").*, if (merge_existing_state) |*state| state else null, S.ownerField(self, "core").*.byteRange(), checkpoint) else null;
+            defer if (merge_plan) |plan| plan.deinit(S.ownerField(self, "alloc").*);
+            const merge_count_prepared = try @import("merge_cardinality.zig").prepare(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store, effective_req, if (merge_plan) |plan| plan.applies_checkpoint else false, identity_upsert_keys.items, effective_req.deletes, identity_live_before, if (pending_identity_visibility_summary) |summary| summary.live_ordinals else identity_live_before, &identity_writes);
             if (!merge_count_prepared) if (pending_identity_visibility_summary) |summary| {
                 try range_cardinality.appendIdentityTransitionAlloc(
-                    self.alloc,
-                    self.core.store,
-                    self.core.byteRange(),
+                    S.ownerField(self, "alloc").*,
+                    S.ownerField(self, "core").*.store,
+                    S.ownerField(self, "core").*.byteRange(),
                     identity_live_before,
                     summary.live_ordinals,
                     &identity_writes,
@@ -2293,10 +2314,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var next_table_catalog: ?table_catalog_mod.Catalog = null;
             var table_catalog_value: [table_catalog_mod.encoded_len]u8 = undefined;
             if (pending_identity_visibility_summary != null or merge_count_prepared) {
-                var catalog = self.core.table_catalog;
+                var catalog = S.ownerField(self, "core").*.table_catalog;
                 const previous = catalog;
                 catalog.mode_initialized = true;
-                if (self.core.schema) |table_schema| {
+                if (S.ownerField(self, "core").*.schema) |table_schema| {
                     catalog.storage_mode = table_schema.storage_mode;
                     catalog.active_schema_version = table_schema.version;
                 } else {
@@ -2306,7 +2327,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 // Persist only the empty/non-empty transition. Exact cardinality
                 // is already transactional in the range-local counter. A split
                 // intentionally retains foreign identities in the shared namespace.
-                catalog.row_count = @intFromBool(try range_cardinality.afterIdentityTransition(self.alloc, self.core.store, identity_writes.items) != 0);
+                catalog.row_count = @intFromBool(try range_cardinality.afterIdentityTransition(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store, identity_writes.items) != 0);
                 catalog.reconciled = true;
                 if (catalog.mode_initialized != previous.mode_initialized or
                     catalog.storage_mode != previous.storage_mode or
@@ -2318,7 +2339,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     table_catalog_value = catalog.encode();
                     next_table_catalog = catalog;
                 }
-            } else if (self.core.table_catalog.row_count == 0 and (effective_req.writes.len != 0 or effective_req.deletes.len != 0)) {
+            } else if (S.ownerField(self, "core").*.table_catalog.row_count == 0 and (effective_req.writes.len != 0 or effective_req.deletes.len != 0)) {
                 // An older/unreconciled owner can contain primary rows but lack a
                 // visibility summary. Absence of a counter is not an empty-table
                 // proof: a write proves presence, while a delete keeps it unknown
@@ -2326,25 +2347,25 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 // empty. Never grant empty-table CHECK/rewrite admission from zero
                 // metadata on a populated root. A later explicit reconciliation
                 // may clear this conservative presence bit after delete-only work.
-                const has_user_data = effective_req.writes.len != 0 or try storeHasUserDataBounded(self.core.store);
+                const has_user_data = effective_req.writes.len != 0 or try storeHasUserDataBounded(S.ownerField(self, "core").*.store);
                 if (has_user_data) {
-                    var catalog = self.core.table_catalog;
+                    var catalog = S.ownerField(self, "core").*.table_catalog;
                     catalog.mode_initialized = true;
-                    catalog.storage_mode = if (self.core.schema) |table_schema| table_schema.storage_mode else .document;
-                    catalog.active_schema_version = if (self.core.schema) |table_schema| table_schema.version else 0;
+                    catalog.storage_mode = if (S.ownerField(self, "core").*.schema) |table_schema| table_schema.storage_mode else .document;
+                    catalog.active_schema_version = if (S.ownerField(self, "core").*.schema) |table_schema| table_schema.version else 0;
                     catalog.row_count = 1;
                     catalog.generation +|= 1;
                     table_catalog_value = catalog.encode();
                     next_table_catalog = catalog;
                 }
             }
-            try store_writes.appendSlice(self.alloc, identity_writes.items);
-            if (next_table_catalog != null) try store_writes.append(self.alloc, .{
+            try store_writes.appendSlice(S.ownerField(self, "alloc").*, identity_writes.items);
+            if (next_table_catalog != null) try store_writes.append(S.ownerField(self, "alloc").*, .{
                 .key = table_catalog_mod.key,
                 .value = &table_catalog_value,
             });
             try appendDocumentChildRangeOutboxWrites(
-                self.alloc,
+                S.ownerField(self, "alloc").*,
                 sequence,
                 remote_child_range_dispatches.items,
                 effective_req.sync_level,
@@ -2355,7 +2376,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const build_derived_start_ns = monotonicTimeNs();
             const replay_payload = if (use_thin_replay_fast_path)
                 try encodeThinReplayRecordPayload(
-                    self.alloc,
+                    S.ownerField(self, "alloc").*,
                     effective_req,
                     extracted[0..extracted_initialized],
                     deleted_artifact_keys,
@@ -2364,9 +2385,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     derived_changed_flags,
                     sequence,
                     include_generated_enrichment_hint,
-                    self.core.index_manager,
+                    S.ownerField(self, "core").*.index_manager,
                     &sync_targets,
-                    self.local_execution.row_policy_table_name,
+                    S.ownerField(self, "local_execution").*.row_policy_table_name,
                 )
             else blk: {
                 materialized_derived_batch = try buildDerivedBatch(
@@ -2386,24 +2407,24 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 materialized_derived_batch.?.generated_enrichment_refs = precomputed_generated.generated_enrichment_refs;
                 precomputed_generated.generated_enrichment_refs = &.{};
                 materialized_derived_batch.?.sequence = sequence;
-                var record = try prepareDirectChangeRecord(&self.batchContext(), materialized_derived_batch.?, sequence, effective_req, self.local_execution.row_policy_table_name);
-                defer change_journal_mod.deinitRecord(self.alloc, &record);
-                const payload = try change_journal_mod.encodeRecord(self.alloc, record);
-                errdefer self.alloc.free(payload);
+                var record = try prepareDirectChangeRecord(&self.batchContext(), materialized_derived_batch.?, sequence, effective_req, S.ownerField(self, "local_execution").*.row_policy_table_name);
+                defer change_journal_mod.deinitRecord(S.ownerField(self, "alloc").*, &record);
+                const payload = try change_journal_mod.encodeRecord(S.ownerField(self, "alloc").*, record);
+                errdefer S.ownerField(self, "alloc").*.free(payload);
                 if (write_plan_snapshot == null or write_plan_snapshot.?.plan().has_text_consumers or splitShadowRequiresMaterializedDerivedBatch(self))
                     try attachPreparedUpsertDocumentProjections(preparation_alloc, &materialized_derived_batch.?, effective_req, extracted[0..extracted_initialized]);
 
                 const collect_sync_targets_start_ns = monotonicTimeNs();
-                sync_targets = try collectManagedSyncTargetsForRecordWithBatch(self.alloc, self.core.index_manager, record, materialized_derived_batch.?);
+                sync_targets = try collectManagedSyncTargetsForRecordWithBatch(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.index_manager, record, materialized_derived_batch.?);
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.collect_sync_targets_ns, collect_sync_targets_start_ns);
                 break :blk payload;
             };
-            defer self.alloc.free(replay_payload);
+            defer S.ownerField(self, "alloc").*.free(replay_payload);
             const append_derived_replay = !opts.suppress_derived_replay_append and
                 !elide_semantic_noop_replay;
             if (append_derived_replay) {
                 try appendArtifactSourceRevisionWritesFromReplay(
-                    self.alloc,
+                    S.ownerField(self, "alloc").*,
                     replay_payload,
                     sequence,
                     &store_writes,
@@ -2416,48 +2437,48 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var durable_replication_batch_outbox_key: ?[]const u8 = null;
             var durable_replication_replay_outbox_key: ?[]const u8 = null;
             if (!opts.bypass_replication_write_gate and (opts.transaction_resolution == null or scoped_replication)) {
-                if (self.local_execution.replication_async_batch_mirror) |mirror| if (scoped_replication or replicationMirrorRequiresDurableOutbox(mirror)) {
+                if (S.ownerField(self, "local_execution").*.replication_async_batch_mirror) |mirror| if (scoped_replication or replicationMirrorRequiresDurableOutbox(mirror)) {
                     const payload = preencoded_replication_batch_payload orelse return error.ReplicationPublisherUnavailable;
                     const from_lsn = mirror.publisher.nextLsn();
-                    const outbox = try encodeDurableReplicationOutboxAlloc(self.alloc, from_lsn, payload);
-                    owned_store_values.append(self.alloc, outbox) catch |err| {
-                        self.alloc.free(outbox);
+                    const outbox = try encodeDurableReplicationOutboxAlloc(S.ownerField(self, "alloc").*, from_lsn, payload);
+                    owned_store_values.append(S.ownerField(self, "alloc").*, outbox) catch |err| {
+                        S.ownerField(self, "alloc").*.free(outbox);
                         return err;
                     };
                     const outbox_key = try durableReplicationOutboxKeyAlloc(
-                        self.alloc,
+                        S.ownerField(self, "alloc").*,
                         if (scoped_replication) .restore_batch else .batch,
                         from_lsn,
-                        self.core.root_generation,
+                        S.ownerField(self, "core").*.root_generation,
                         outbox[replication_outbox_header_len .. outbox.len - replication_outbox_checksum_len],
                     );
                     var outbox_key_owned = true;
-                    errdefer if (outbox_key_owned) self.alloc.free(outbox_key);
-                    try owned_store_keys.append(self.alloc, outbox_key);
+                    errdefer if (outbox_key_owned) S.ownerField(self, "alloc").*.free(outbox_key);
+                    try owned_store_keys.append(S.ownerField(self, "alloc").*, outbox_key);
                     outbox_key_owned = false;
-                    try store_writes.append(self.alloc, .{ .key = outbox_key, .value = outbox });
+                    try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = outbox_key, .value = outbox });
                     durable_replication_batch_payload = outbox[replication_outbox_header_len .. outbox.len - replication_outbox_checksum_len];
                     durable_replication_batch_outbox_key = outbox_key;
                 };
-                if (append_derived_replay and !scoped_replication) if (self.local_execution.replication_async_effect_mirror) |mirror| if (replicationMirrorRequiresDurableOutbox(mirror)) {
+                if (append_derived_replay and !scoped_replication) if (S.ownerField(self, "local_execution").*.replication_async_effect_mirror) |mirror| if (replicationMirrorRequiresDurableOutbox(mirror)) {
                     const from_lsn = mirror.publisher.nextLsn();
-                    const outbox = try encodeDurableReplicationOutboxAlloc(self.alloc, from_lsn, replay_payload);
-                    owned_store_values.append(self.alloc, outbox) catch |err| {
-                        self.alloc.free(outbox);
+                    const outbox = try encodeDurableReplicationOutboxAlloc(S.ownerField(self, "alloc").*, from_lsn, replay_payload);
+                    owned_store_values.append(S.ownerField(self, "alloc").*, outbox) catch |err| {
+                        S.ownerField(self, "alloc").*.free(outbox);
                         return err;
                     };
                     const outbox_key = try durableReplicationOutboxKeyAlloc(
-                        self.alloc,
+                        S.ownerField(self, "alloc").*,
                         .replay,
                         from_lsn,
-                        self.core.root_generation,
+                        S.ownerField(self, "core").*.root_generation,
                         outbox[replication_outbox_header_len .. outbox.len - replication_outbox_checksum_len],
                     );
                     var outbox_key_owned = true;
-                    errdefer if (outbox_key_owned) self.alloc.free(outbox_key);
-                    try owned_store_keys.append(self.alloc, outbox_key);
+                    errdefer if (outbox_key_owned) S.ownerField(self, "alloc").*.free(outbox_key);
+                    try owned_store_keys.append(S.ownerField(self, "alloc").*, outbox_key);
                     outbox_key_owned = false;
-                    try store_writes.append(self.alloc, .{ .key = outbox_key, .value = outbox });
+                    try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = outbox_key, .value = outbox });
                     durable_replication_replay_payload = outbox[replication_outbox_header_len .. outbox.len - replication_outbox_checksum_len];
                     durable_replication_replay_outbox_key = outbox_key;
                 };
@@ -2475,7 +2496,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var replication_applied_lsn_value_buf: [replication_applied_lsn_value_len]u8 = undefined;
             if (opts.replication_applied_lsn_marker) |lsn| {
                 if (lsn != 0) {
-                    try store_writes.append(self.alloc, replicationAppliedSequenceWrite(lsn, &replication_applied_lsn_value_buf));
+                    try store_writes.append(S.ownerField(self, "alloc").*, replicationAppliedSequenceWrite(lsn, &replication_applied_lsn_value_buf));
                 }
             }
             var ordered_apply_receipt_value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
@@ -2488,40 +2509,40 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // while the command receipt and participant acknowledgement still
             // must be completed. Keep those completion writes separate.
             if (ordered_apply_receipt_write) |write| {
-                if (opts.transaction_resolution == null) try store_writes.append(self.alloc, write);
+                if (opts.transaction_resolution == null) try store_writes.append(S.ownerField(self, "alloc").*, write);
             }
             var split_range_value: ?[]u8 = null;
-            defer if (split_range_value) |value| self.alloc.free(value);
+            defer if (split_range_value) |value| S.ownerField(self, "alloc").*.free(value);
             var integrity_coverage_value: ?[]u8 = null;
-            defer if (integrity_coverage_value) |value| self.alloc.free(value);
+            defer if (integrity_coverage_value) |value| S.ownerField(self, "alloc").*.free(value);
             var merge_range_value: ?[]u8 = null;
-            defer if (merge_range_value) |value| self.alloc.free(value);
+            defer if (merge_range_value) |value| S.ownerField(self, "alloc").*.free(value);
             var merge_state_value = std.ArrayListUnmanaged(u8).empty;
-            defer merge_state_value.deinit(self.alloc);
-            if (merge_page_value) |value| try store_writes.append(self.alloc, .{ .key = @import("merge_page_contract.zig").key, .value = value });
+            defer merge_state_value.deinit(S.ownerField(self, "alloc").*);
+            if (merge_page_value) |value| try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = @import("merge_page_contract.zig").key, .value = value });
             var ordered_artifact_value: ?[]u8 = null;
-            defer if (ordered_artifact_value) |value| self.alloc.free(value);
+            defer if (ordered_artifact_value) |value| S.ownerField(self, "alloc").*.free(value);
             if (req.artifact_catalog) |command| {
                 const entry = opts.ordered_apply_receipt orelse return error.InvalidArtifactCatalogCommand;
-                var read = try self.core.store.beginReadTxn();
+                var read = try S.ownerField(self, "core").*.store.beginReadTxn();
                 defer read.abort();
-                if (!std.mem.eql(u8, &command.namespace, &@import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace))) return error.IdentityNamespaceMismatch;
+                if (!std.mem.eql(u8, &command.namespace, &@import("online_source_contract.zig").namespaceBytes(S.ownerField(self, "core").*.identity_namespace))) return error.IdentityNamespaceMismatch;
                 if (!std.mem.eql(u8, &command.binding.digest, &(try @import("artifact_inventory.zig").local(&read)).digest)) return error.ArtifactCatalogDrift;
-                ordered_artifact_value = try @import("artifact_inventory.zig").prepareOrdered(self.alloc, &read, command, entry.index);
-                if (ordered_artifact_value) |value| try store_writes.append(self.alloc, .{ .key = @import("artifact_inventory.zig").ordered_key, .value = value });
-                if (try @import("artifact_reconcile_intent.zig").validateCompletion(self.alloc, &read, command, entry.index)) try delete_keys.append(self.alloc, @import("artifact_reconcile_intent.zig").key);
-                try delete_keys.append(self.alloc, @import("artifact_reconcile_intent.zig").resolver_cursor_key);
+                ordered_artifact_value = try @import("artifact_inventory.zig").prepareOrdered(S.ownerField(self, "alloc").*, &read, command, entry.index);
+                if (ordered_artifact_value) |value| try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = @import("artifact_inventory.zig").ordered_key, .value = value });
+                if (try @import("artifact_reconcile_intent.zig").validateCompletion(S.ownerField(self, "alloc").*, &read, command, entry.index)) try delete_keys.append(S.ownerField(self, "alloc").*, @import("artifact_reconcile_intent.zig").key);
+                try delete_keys.append(S.ownerField(self, "alloc").*, @import("artifact_reconcile_intent.zig").resolver_cursor_key);
             }
             var split_sequence_buf: [8]u8 = undefined;
             var split_marker_buf: [4 * @sizeOf(u64) + 1]u8 = undefined;
             var persisted_range: ?types.ByteRange = null;
             var persisted_range_start_owned: ?[]u8 = null;
-            defer if (persisted_range_start_owned) |value| self.alloc.free(value);
+            defer if (persisted_range_start_owned) |value| S.ownerField(self, "alloc").*.free(value);
             var persisted_range_end_owned: ?[]u8 = null;
-            defer if (persisted_range_end_owned) |value| self.alloc.free(value);
+            defer if (persisted_range_end_owned) |value| S.ownerField(self, "alloc").*.free(value);
             if (req.split_replication) |replication| {
                 if (replication.operation == .delta) {
-                    try store_writes.append(self.alloc, .{
+                    try store_writes.append(S.ownerField(self, "alloc").*, .{
                         .key = range_state_mod.split_delta_final_seq_key,
                         .value = range_state_mod.encodeSplitDeltaFinalSeq(replication.sequence, &split_sequence_buf),
                     });
@@ -2529,26 +2550,26 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             if (req.split_checkpoint) |checkpoint| {
                 if (coordinated_handoff and checkpoint.kind == .destination_complete) {
-                    const raw_catalog = (try self.core.getStoreValue(self.alloc, @import("relational_integrity_catalog.zig").key)) orelse return error.IntegrityCatalogChanged;
-                    defer self.alloc.free(raw_catalog);
-                    integrity_coverage_value = try @import("relational_integrity_handoff.zig").coverageForRange(self.alloc, raw_catalog, self.core.identity_namespace, .{ .start = checkpoint.range_start, .end = checkpoint.range_end });
-                    try store_writes.append(self.alloc, .{ .key = @import("relational_integrity_activation.zig").key, .value = integrity_coverage_value.? });
+                    const raw_catalog = (try S.ownerField(self, "core").*.getStoreValue(S.ownerField(self, "alloc").*, @import("relational_integrity_catalog.zig").key)) orelse return error.IntegrityCatalogChanged;
+                    defer S.ownerField(self, "alloc").*.free(raw_catalog);
+                    integrity_coverage_value = try @import("relational_integrity_handoff.zig").coverageForRange(S.ownerField(self, "alloc").*, raw_catalog, S.ownerField(self, "core").*.identity_namespace, .{ .start = checkpoint.range_start, .end = checkpoint.range_end });
+                    try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = @import("relational_integrity_activation.zig").key, .value = integrity_coverage_value.? });
                 }
                 if (checkpoint.kind != .source_ack) {
                     persisted_range = .{ .start = checkpoint.range_start, .end = checkpoint.range_end };
-                    persisted_range_start_owned = try self.alloc.dupe(u8, checkpoint.range_start);
-                    persisted_range_end_owned = try self.alloc.dupe(u8, checkpoint.range_end);
-                    split_range_value = try range_state_mod.encodeRangeAlloc(self.alloc, persisted_range.?);
-                    try store_writes.append(self.alloc, .{
+                    persisted_range_start_owned = try S.ownerField(self, "alloc").*.dupe(u8, checkpoint.range_start);
+                    persisted_range_end_owned = try S.ownerField(self, "alloc").*.dupe(u8, checkpoint.range_end);
+                    split_range_value = try range_state_mod.encodeRangeAlloc(S.ownerField(self, "alloc").*, persisted_range.?);
+                    try store_writes.append(S.ownerField(self, "alloc").*, .{
                         .key = range_state_mod.range_key,
                         .value = split_range_value.?,
                     });
                 }
-                try store_writes.append(self.alloc, .{
+                try store_writes.append(S.ownerField(self, "alloc").*, .{
                     .key = range_state_mod.split_delta_final_seq_key,
                     .value = range_state_mod.encodeSplitDeltaFinalSeq(checkpoint.delta_sequence, &split_sequence_buf),
                 });
-                try store_writes.append(self.alloc, .{
+                try store_writes.append(S.ownerField(self, "alloc").*, .{
                     .key = range_state_mod.split_bootstrap_marker_key,
                     .value = range_state_mod.encodeSplitBootstrapMarker(.{
                         .transition_id = checkpoint.transition_id,
@@ -2562,7 +2583,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (req.merge_checkpoint) |checkpoint| {
                 if (checkpoint.receiver_identity_reassignment_namespace) |namespace| {
                     if (!checkpoint.allow_doc_identity_reassignment or
-                        !self.core.identity_namespace.eql(namespace))
+                        !S.ownerField(self, "core").*.identity_namespace.eql(namespace))
                         return error.DocIdentityNamespaceMismatch;
                 } else if (checkpoint.allow_doc_identity_reassignment) {
                     return error.InvalidBatchRequest;
@@ -2571,90 +2592,90 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const pages = @import("merge_page_contract.zig");
                 if ((checkpoint.page_source != null) != (checkpoint.page_receiver_namespace != null) or
                     (checkpoint.page_source != null and checkpoint.kind != .begin_copy and !(checkpoint.kind == .accept and (checkpoint.page_source.?.integrity != null or checkpoint.page_source.?.artifact_catalog != null)))) return error.InvalidMergeCheckpoint;
-                const page_raw = try self.core.getStoreValue(self.alloc, pages.key);
-                defer if (page_raw) |value| self.alloc.free(value);
-                var page_progress = if (page_raw) |value| try pages.decode(self.alloc, value) else null;
+                const page_raw = try S.ownerField(self, "core").*.getStoreValue(S.ownerField(self, "alloc").*, pages.key);
+                defer if (page_raw) |value| S.ownerField(self, "alloc").*.free(value);
+                var page_progress = if (page_raw) |value| try pages.decode(S.ownerField(self, "alloc").*, value) else null;
                 defer if (page_progress) |*value| value.deinit();
                 const page_plan = try pages.checkpointPlan(merge_existing_state, plan.state, checkpoint, if (page_progress) |value| value.value else null);
                 switch (page_plan) {
                     .unchanged => {},
                     .clear => {
-                        try delete_keys.append(self.alloc, pages.key);
-                        try delete_keys.append(self.alloc, @import("merge_artifact_catalog.zig").key);
+                        try delete_keys.append(S.ownerField(self, "alloc").*, pages.key);
+                        try delete_keys.append(S.ownerField(self, "alloc").*, @import("merge_artifact_catalog.zig").key);
                     },
                     .bind => |progress| {
-                        if (!progress.receiver_namespace.eql(self.core.identity_namespace)) return error.DocIdentityNamespaceMismatch;
-                        merge_page_value = try pages.encode(self.alloc, progress);
-                        try store_writes.append(self.alloc, .{ .key = pages.key, .value = merge_page_value.? });
-                        merge_source_catalog_value = try @import("merge_artifact_catalog.zig").encode(self.alloc, checkpoint, progress);
+                        if (!progress.receiver_namespace.eql(S.ownerField(self, "core").*.identity_namespace)) return error.DocIdentityNamespaceMismatch;
+                        merge_page_value = try pages.encode(S.ownerField(self, "alloc").*, progress);
+                        try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = pages.key, .value = merge_page_value.? });
+                        merge_source_catalog_value = try @import("merge_artifact_catalog.zig").encode(S.ownerField(self, "alloc").*, checkpoint, progress);
                         if (merge_source_catalog_value) |value| {
-                            try store_writes.append(self.alloc, .{ .key = @import("merge_artifact_catalog.zig").key, .value = value });
-                        } else try delete_keys.append(self.alloc, @import("merge_artifact_catalog.zig").key);
+                            try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = @import("merge_artifact_catalog.zig").key, .value = value });
+                        } else try delete_keys.append(S.ownerField(self, "alloc").*, @import("merge_artifact_catalog.zig").key);
                     },
                 }
                 if (page_plan != .unchanged) {
                     const chunks = @import("merge_page_chunks.zig");
-                    const manifest = self.core.store.get(self.alloc, chunks.manifest_key) catch |err| switch (err) {
+                    const manifest = S.ownerField(self, "core").*.store.get(S.ownerField(self, "alloc").*, chunks.manifest_key) catch |err| switch (err) {
                         error.NotFound => null,
                         else => return err,
                     };
-                    defer if (manifest) |value| self.alloc.free(value);
+                    defer if (manifest) |value| S.ownerField(self, "alloc").*.free(value);
                     if (manifest) |value| {
                         const count = try chunks.slotCount(value);
                         for (0..count) |i| {
-                            const slot_key = try chunks.slotKey(self.alloc, @intCast(i));
-                            owned_store_keys.append(self.alloc, slot_key) catch |err| {
-                                self.alloc.free(slot_key);
+                            const slot_key = try chunks.slotKey(S.ownerField(self, "alloc").*, @intCast(i));
+                            owned_store_keys.append(S.ownerField(self, "alloc").*, slot_key) catch |err| {
+                                S.ownerField(self, "alloc").*.free(slot_key);
                                 return err;
                             };
-                            try delete_keys.append(self.alloc, slot_key);
+                            try delete_keys.append(S.ownerField(self, "alloc").*, slot_key);
                         }
-                        try delete_keys.append(self.alloc, chunks.manifest_key);
+                        try delete_keys.append(S.ownerField(self, "alloc").*, chunks.manifest_key);
                     }
                 }
                 persisted_range = plan.range;
-                persisted_range_start_owned = try self.alloc.dupe(u8, plan.range.start);
-                persisted_range_end_owned = try self.alloc.dupe(u8, plan.range.end);
-                merge_range_value = try range_state_mod.encodeRangeAlloc(self.alloc, plan.range);
-                try store_writes.append(self.alloc, .{
+                persisted_range_start_owned = try S.ownerField(self, "alloc").*.dupe(u8, plan.range.start);
+                persisted_range_end_owned = try S.ownerField(self, "alloc").*.dupe(u8, plan.range.end);
+                merge_range_value = try range_state_mod.encodeRangeAlloc(S.ownerField(self, "alloc").*, plan.range);
+                try store_writes.append(S.ownerField(self, "alloc").*, .{
                     .key = range_state_mod.range_key,
                     .value = merge_range_value.?,
                 });
-                try merge_state_mod.encode(&merge_state_value, self.alloc, plan.state);
-                try store_writes.append(self.alloc, .{
+                try merge_state_mod.encode(&merge_state_value, S.ownerField(self, "alloc").*, plan.state);
+                try store_writes.append(S.ownerField(self, "alloc").*, .{
                     .key = merge_state_mod.key,
                     .value = merge_state_value.items,
                 });
-                try delete_keys.append(self.alloc, merge_state_mod.legacy_key);
+                try delete_keys.append(S.ownerField(self, "alloc").*, merge_state_mod.legacy_key);
                 const shadow = @import("online_integrity_shadow.zig");
                 if (plan.applies_checkpoint and (checkpoint.kind == .begin_copy or (checkpoint.kind == .accept and plan.state.copy_attempt.sequence == 0)) and plan.state.phase == .accepting and checkpoint.page_source != null and checkpoint.page_source.?.integrity != null) {
-                    const shadow_state = try std.json.Stringify.valueAlloc(self.alloc, shadow.State{ .source = checkpoint.page_source.?, .context = .{ .transition_id = checkpoint.transition_id, .donor_group_id = checkpoint.donor_group_id, .receiver_group_id = checkpoint.receiver_group_id, .identity_namespace = self.core.identity_namespace, .copy_attempt = checkpoint.copy_attempt } }, .{});
-                    try owned_store_values.append(self.alloc, shadow_state);
-                    try store_writes.append(self.alloc, .{ .key = shadow.key, .value = shadow_state });
-                    const serving_range = try range_state_mod.encodeRangeAlloc(self.alloc, plan.state.receiver_base_range);
-                    try owned_store_values.append(self.alloc, serving_range);
-                    try store_writes.append(self.alloc, .{ .key = shadow.range_key, .value = serving_range });
+                    const shadow_state = try std.json.Stringify.valueAlloc(S.ownerField(self, "alloc").*, shadow.State{ .source = checkpoint.page_source.?, .context = .{ .transition_id = checkpoint.transition_id, .donor_group_id = checkpoint.donor_group_id, .receiver_group_id = checkpoint.receiver_group_id, .identity_namespace = S.ownerField(self, "core").*.identity_namespace, .copy_attempt = checkpoint.copy_attempt } }, .{});
+                    try owned_store_values.append(S.ownerField(self, "alloc").*, shadow_state);
+                    try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = shadow.key, .value = shadow_state });
+                    const serving_range = try range_state_mod.encodeRangeAlloc(S.ownerField(self, "alloc").*, plan.state.receiver_base_range);
+                    try owned_store_values.append(S.ownerField(self, "alloc").*, serving_range);
+                    try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = shadow.range_key, .value = serving_range });
                 }
                 if (plan.applies_checkpoint and coordinated_handoff and (checkpoint.kind == .finalize or checkpoint.kind == .rollback)) {
                     // Keep one bounded exact-source terminal receipt for lost
                     // checkpoint responses. A new transition replaces it; only
                     // the serving-range override controls live shadow admission.
-                    try delete_keys.append(self.alloc, shadow.range_key);
+                    try delete_keys.append(S.ownerField(self, "alloc").*, shadow.range_key);
                 }
                 if (plan.applies_checkpoint and coordinated_handoff and (checkpoint.kind == .finalize or checkpoint.kind == .rollback)) {
                     const catalog = @import("relational_integrity_catalog.zig");
-                    const raw_catalog = try self.core.store.get(self.alloc, catalog.key);
-                    defer self.alloc.free(raw_catalog);
-                    const coverage = try @import("relational_integrity_handoff.zig").coverageForRange(self.alloc, raw_catalog, self.core.identity_namespace, plan.range);
-                    try owned_store_values.append(self.alloc, coverage);
-                    try store_writes.append(self.alloc, .{ .key = @import("relational_integrity_activation.zig").key, .value = coverage });
+                    const raw_catalog = try S.ownerField(self, "core").*.store.get(S.ownerField(self, "alloc").*, catalog.key);
+                    defer S.ownerField(self, "alloc").*.free(raw_catalog);
+                    const coverage = try @import("relational_integrity_handoff.zig").coverageForRange(S.ownerField(self, "alloc").*, raw_catalog, S.ownerField(self, "core").*.identity_namespace, plan.range);
+                    try owned_store_values.append(S.ownerField(self, "alloc").*, coverage);
+                    try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = @import("relational_integrity_activation.zig").key, .value = coverage });
                 }
             }
-            if (persisted_range) |range| try self.core.index_manager.validateRangeTransition(range);
+            if (persisted_range) |range| try S.ownerField(self, "core").*.index_manager.validateRangeTransition(range);
             try appendDenseArtifactCounterMutations(
-                self.alloc,
-                self.core.store,
-                self.core.index_manager,
+                S.ownerField(self, "alloc").*,
+                S.ownerField(self, "core").*.store,
+                S.ownerField(self, "core").*.index_manager,
                 &store_writes,
                 delete_keys.items,
                 &owned_store_keys,
@@ -2667,91 +2688,91 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // responsible only for requests retained in generated_enrichment_refs.
             // Local producer receipts are fenced by the latest primary mutation,
             // not by the immutable document identity. Stamp in the primary batch.
-            if (self.core.hasGeneratedEnrichmentTargets() and !try orderedCoverageActive(self.core.store)) {
+            if (S.ownerField(self, "core").*.hasGeneratedEnrichmentTargets() and !try orderedCoverageActive(S.ownerField(self, "core").*.store)) {
                 const readiness = @import("artifact_producer_readiness.zig");
                 for (identity_upsert_keys.items, identity_upsert_write_indexes.items) |document, write_index| {
                     // An identical logical row creates no producer replay debt.
                     if (!derived_changed_flags[write_index]) continue;
-                    const key = try readiness.localPrimaryRevisionKeyAlloc(self.alloc, document);
-                    owned_store_keys.append(self.alloc, key) catch |err| {
-                        self.alloc.free(key);
+                    const key = try readiness.localPrimaryRevisionKeyAlloc(S.ownerField(self, "alloc").*, document);
+                    owned_store_keys.append(S.ownerField(self, "alloc").*, key) catch |err| {
+                        S.ownerField(self, "alloc").*.free(key);
                         return err;
                     };
-                    const value = try self.alloc.alloc(u8, 8);
-                    owned_store_values.append(self.alloc, value) catch |err| {
-                        self.alloc.free(value);
+                    const value = try S.ownerField(self, "alloc").*.alloc(u8, 8);
+                    owned_store_values.append(S.ownerField(self, "alloc").*, value) catch |err| {
+                        S.ownerField(self, "alloc").*.free(value);
                         return err;
                     };
                     std.mem.writeInt(u64, value[0..8], sequence, .little);
-                    try store_writes.append(self.alloc, .{ .key = key, .value = value });
+                    try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = key, .value = value });
                 }
                 for (effective_req.deletes) |document| {
-                    const key = try readiness.localPrimaryRevisionKeyAlloc(self.alloc, document);
-                    owned_store_keys.append(self.alloc, key) catch |err| {
-                        self.alloc.free(key);
+                    const key = try readiness.localPrimaryRevisionKeyAlloc(S.ownerField(self, "alloc").*, document);
+                    owned_store_keys.append(S.ownerField(self, "alloc").*, key) catch |err| {
+                        S.ownerField(self, "alloc").*.free(key);
                         return err;
                     };
-                    try delete_keys.append(self.alloc, key);
+                    try delete_keys.append(S.ownerField(self, "alloc").*, key);
                 }
             }
             var local_coverage_guard = if (precomputed_generated.coverage_outcomes.len != 0)
-                self.core.index_manager.lockLocalCoverage()
+                S.ownerField(self, "core").*.index_manager.lockLocalCoverage()
             else
                 index_manager_mod.IndexManager.LocalCoverageGuard{};
             defer local_coverage_guard.release();
             try appendPrecomputedCoverageOutcomeMutations(
-                self.alloc,
-                self.core.store,
-                self.core.index_manager,
+                S.ownerField(self, "alloc").*,
+                S.ownerField(self, "core").*.store,
+                S.ownerField(self, "core").*.index_manager,
                 precomputed_generated.coverage_outcomes,
                 sequence,
                 &store_writes,
                 &owned_store_keys,
                 &owned_store_values,
             );
-            try store_writes.appendSlice(self.alloc, opts.extra_store_writes);
+            try store_writes.appendSlice(S.ownerField(self, "alloc").*, opts.extra_store_writes);
             if (req.merge_page) |page| if (page.integrity.len != 0) {
                 // Private page shape, exact generation/ownership and replay cursor
                 // have been checked under this same apply fence. The physical
                 // shadow records commit with primary/index effects and receipt.
                 if (!coordinated_handoff) return error.CoordinatedConstraintTopologyUnsupported;
                 const catalog_mod = @import("relational_integrity_catalog.zig");
-                const raw = try self.core.store.get(self.alloc, catalog_mod.key);
-                defer self.alloc.free(raw);
-                var compiled = try catalog_mod.decode(self.alloc, raw);
+                const raw = try S.ownerField(self, "core").*.store.get(S.ownerField(self, "alloc").*, catalog_mod.key);
+                defer S.ownerField(self, "alloc").*.free(raw);
+                var compiled = try catalog_mod.decode(S.ownerField(self, "alloc").*, raw);
                 defer compiled.deinit();
                 for (page.integrity) |effect| {
                     const address = (try @import("relational_integrity_contract.zig").parseKey(effect.key)).address;
                     if (page.phase != .cleanup_integrity and compiled.findGeneration(address.generation) == null) return error.IntegrityCatalogChanged;
-                    if (effect.value) |value| try store_writes.append(self.alloc, .{ .key = effect.key, .value = value }) else try delete_keys.append(self.alloc, effect.key);
+                    if (effect.value) |value| try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = effect.key, .value = value }) else try delete_keys.append(S.ownerField(self, "alloc").*, effect.key);
                 }
             };
             if (req.merge_page) |page| for (page.provenance_effects) |effect| {
                 // Inert source evidence commits with the page cursor, never with
                 // donor receipt or authority records. Adoption is a separate
                 // receiver-local validation and transaction.
-                try store_writes.append(self.alloc, .{ .key = effect.key, .value = effect.value orelse return error.InvalidMergePage });
+                try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = effect.key, .value = effect.value orelse return error.InvalidMergePage });
             };
-            try delete_keys.appendSlice(self.alloc, opts.extra_store_deletes);
+            try delete_keys.appendSlice(S.ownerField(self, "alloc").*, opts.extra_store_deletes);
             if (index_stage) |*stage| {
                 const effects = try stage.seal();
                 if (opts.transaction_resolution == null and !live_replication_apply and !scoped_restore_replication_apply) {
                     var forward_keys = std.ArrayListUnmanaged([]const u8).empty;
-                    defer forward_keys.deinit(self.alloc);
+                    defer forward_keys.deinit(S.ownerField(self, "alloc").*);
                     for (effects.writes) |effect| if (relational_index_records.isForwardKey(effect.key))
-                        try forward_keys.append(self.alloc, effect.key);
+                        try forward_keys.append(S.ownerField(self, "alloc").*, effect.key);
                     for (effects.deletes) |key| if (relational_index_records.isForwardKey(key))
-                        try forward_keys.append(self.alloc, key);
+                        try forward_keys.append(S.ownerField(self, "alloc").*, key);
                     if (forward_keys.items.len != 0) {
-                        var manager = try self.core.initTxnManager();
+                        var manager = try S.ownerField(self, "core").*.initTxnManager();
                         defer manager.deinit();
                         try manager.checkIndexForwardWriteConflicts(forward_keys.items);
                     }
                 }
-                try store_writes.appendSlice(self.alloc, effects.writes);
-                try delete_keys.appendSlice(self.alloc, effects.deletes);
+                try store_writes.appendSlice(S.ownerField(self, "alloc").*, effects.writes);
+                try delete_keys.appendSlice(S.ownerField(self, "alloc").*, effects.deletes);
             }
-            try delete_keys.appendSlice(self.alloc, identity_visibility_deletes.items);
+            try delete_keys.appendSlice(S.ownerField(self, "alloc").*, identity_visibility_deletes.items);
 
             // A synchronous hot-standby append can fail after the local transaction commit.
             // Persist the exact committed payloads in the same backend batch so an
@@ -2760,23 +2781,23 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var transaction_replication_batch_payload: ?[]const u8 = null;
             var transaction_replication_replay_payload: ?[]const u8 = null;
             if (opts.transaction_resolution) |resolution| if (!opts.bypass_replication_write_gate and !scoped_replication) {
-                if (self.local_execution.replication_async_batch_mirror) |mirror| if (replicationMirrorSyncEnabled(mirror)) {
+                if (S.ownerField(self, "local_execution").*.replication_async_batch_mirror) |mirror| if (replicationMirrorSyncEnabled(mirror)) {
                     const payload = preencoded_replication_batch_payload orelse return error.ReplicationPublisherUnavailable;
                     // The outbox borrows the request-owned buffer through commit
                     // and the hot-standby wait; keep its original budgeted owner intact.
                     const key_array = transactions_mod.makeTransactionReplicationBatchOutboxKey(resolution.txn_id);
-                    const key = try self.alloc.dupe(u8, &key_array);
-                    try owned_store_keys.append(self.alloc, key);
-                    try store_writes.append(self.alloc, .{ .key = key, .value = payload });
+                    const key = try S.ownerField(self, "alloc").*.dupe(u8, &key_array);
+                    try owned_store_keys.append(S.ownerField(self, "alloc").*, key);
+                    try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = key, .value = payload });
                     transaction_replication_batch_payload = payload;
                 };
-                if (append_derived_replay) if (self.local_execution.replication_async_effect_mirror) |mirror| if (replicationMirrorSyncEnabled(mirror)) {
-                    const payload = try self.alloc.dupe(u8, replay_payload);
-                    try owned_store_values.append(self.alloc, payload);
+                if (append_derived_replay) if (S.ownerField(self, "local_execution").*.replication_async_effect_mirror) |mirror| if (replicationMirrorSyncEnabled(mirror)) {
+                    const payload = try S.ownerField(self, "alloc").*.dupe(u8, replay_payload);
+                    try owned_store_values.append(S.ownerField(self, "alloc").*, payload);
                     const key_array = transactions_mod.makeTransactionReplicationReplayOutboxKey(resolution.txn_id);
-                    const key = try self.alloc.dupe(u8, &key_array);
-                    try owned_store_keys.append(self.alloc, key);
-                    try store_writes.append(self.alloc, .{ .key = key, .value = payload });
+                    const key = try S.ownerField(self, "alloc").*.dupe(u8, &key_array);
+                    try owned_store_keys.append(S.ownerField(self, "alloc").*, key);
+                    try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = key, .value = payload });
                     transaction_replication_replay_payload = payload;
                 };
             };
@@ -2793,7 +2814,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // returned before the primary mutation and replay intent commit.
             const backlog_admission_start_ns = monotonicTimeNs();
             var backlog_admission = if (append_derived_replay)
-                try self.executor.admitBacklogBytes(@intCast(replay_payload.len))
+                try S.ownerField(self, "executor").*.admitBacklogBytes(@intCast(replay_payload.len))
             else
                 derived_executor_mod.BacklogAdmission{};
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.backlog_admission_ns, backlog_admission_start_ns);
@@ -2803,14 +2824,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // primary commit boundary; Raft replay leases have no wall-time limit.
             if (opts.row_policy_lease) |lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
             const authored_root = blk: {
-                if (self.root_incarnation == 0 or explicit_embedding_artifact_writes.items.len == 0) break :blk 0;
-                var probe = try self.core.store.beginProbeTxn();
+                if (S.ownerField(self, "root_incarnation").* == 0 or explicit_embedding_artifact_writes.items.len == 0) break :blk 0;
+                var probe = try S.ownerField(self, "core").*.store.beginProbeTxn();
                 defer probe.abort();
                 if (try @import("artifact_publication.zig").authority(&probe) == null) break :blk 0;
-                break :blk self.root_incarnation;
+                break :blk S.ownerField(self, "root_incarnation").*;
             };
             var authored_acceptance = try @import("artifact_authored_acceptance.zig").Prepared.init(
-                self.alloc,
+                S.ownerField(self, "alloc").*,
                 authored_root,
                 explicit_embedding_artifact_writes.items,
                 store_writes.items,
@@ -2818,7 +2839,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer authored_acceptance.deinit();
             if (opts.row_policy_lease) |lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
             const transaction_applied = if (opts.transaction_resolution) |resolution| blk: {
-                const outcome = try self.core.resolveTransactionIntentsWithExtraBatch(
+                const outcome = try S.ownerField(self, "core").*.resolveTransactionIntentsWithExtraBatch(
                     resolution.txn_id,
                     resolution.status,
                     resolution.commit_version,
@@ -2835,14 +2856,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     },
                 );
                 if (outcome.applied) {
-                    if (replay_append) |entry| self.core.store.observeExternalReplayCommit(entry.sequence);
+                    if (replay_append) |entry| S.ownerField(self, "core").*.store.observeExternalReplayCommit(entry.sequence);
                 }
                 break :blk outcome;
             } else blk: {
                 if (durable_replication_batch_outbox_key != null or durable_replication_replay_outbox_key != null)
-                    self.local_execution.durable_replication_outbox_maybe.store(true, .release);
-                try self.core.store.putBatchWithReplayAndParticipant(
-                    self.backend_runtime.io(),
+                    S.ownerField(self, "local_execution").*.durable_replication_outbox_maybe.store(true, .release);
+                try S.ownerField(self, "core").*.store.putBatchWithReplayAndParticipant(
+                    S.ownerField(self, "backend_runtime").*.io(),
                     store_writes.items,
                     delete_keys.items,
                     replay_append,
@@ -2859,9 +2880,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 try self.waitForResolvedTransactionSync(effective_req.sync_level, transaction_applied.replay_sequence);
                 return;
             }
-            if (next_table_catalog) |catalog| self.core.table_catalog = catalog;
+            if (next_table_catalog) |catalog| S.ownerField(self, "core").*.table_catalog = catalog;
             if (persisted_range != null) {
-                self.core.adoptPersistedRangeOwned(persisted_range_start_owned.?, persisted_range_end_owned.?);
+                S.ownerField(self, "core").*.adoptPersistedRangeOwned(persisted_range_start_owned.?, persisted_range_end_owned.?);
                 persisted_range_start_owned = null;
                 persisted_range_end_owned = null;
             }
@@ -2887,7 +2908,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 try observer.observe(if (append_derived_replay) replay_payload else "");
             }
             if (pending_identity_visibility_summary) |summary| {
-                self.core.identity_visibility.summary = summary;
+                S.ownerField(self, "core").*.identity_visibility.summary = summary;
                 self.clearLiveDocSetCache();
                 self.clearNonVisibleDocSetCache();
             }
@@ -2902,13 +2923,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 false;
             if (shouldAppendSplitDelta(self) and !is_split_progress_checkpoint) {
                 const split_delta_start_ns = monotonicTimeNs();
-                try self.core.appendSplitDelta(batch_timestamp_ns, store_writes.items, delete_keys.items);
+                try S.ownerField(self, "core").*.appendSplitDelta(batch_timestamp_ns, store_writes.items, delete_keys.items);
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.split_delta_ns, split_delta_start_ns);
             }
 
             if (append_derived_replay) {
                 const append_replay_journal_start_ns = monotonicTimeNs();
-                self.executor.commitBacklogAdmission(sequence, &backlog_admission);
+                S.ownerField(self, "executor").*.commitBacklogAdmission(sequence, &backlog_admission);
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.append_replay_journal_ns, append_replay_journal_start_ns);
             }
             if (materialized_derived_batch != null) {
@@ -2927,7 +2948,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             foreground_write.release();
             if (append_derived_replay)
                 notifyQueryVisibilityTargetAdvancedScoped(
-                    self.async_context,
+                    S.ownerField(self, "async_context").*,
                     sequence,
                     sync_targets.target_identities,
                     sync_targets.target_scope_known,
@@ -2941,9 +2962,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // before any remote hot-standby acknowledgment so HBC/full-text progress is
             // independent of response durability latency; explicit visibility
             // waits still occur only after the hot-standby gate below.
-            if (append_derived_replay and self.executor.hasWorkers()) {
+            if (append_derived_replay and S.ownerField(self, "executor").*.hasWorkers()) {
                 const notify_executor_start_ns = monotonicTimeNs();
-                notifyExecutorForSyncLevelWithDenseBulkDeferral(self.async_context, self.executor, effective_req.sync_level, sequence, sync_targets);
+                notifyExecutorForSyncLevelWithDenseBulkDeferral(S.ownerField(self, "async_context").*, S.ownerField(self, "executor").*, effective_req.sync_level, sequence, sync_targets);
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.executor_notify_ns, notify_executor_start_ns);
             }
             if (!opts.bypass_replication_write_gate) {
@@ -2955,12 +2976,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     // the cleanup atomic with other local DB mutations without
                     // retaining the apply lock across the remote wait above.
                     lockApply(self);
-                    defer self.core.unlockApply();
+                    defer S.ownerField(self, "core").*.unlockApply();
                     if (opts.transaction_resolution) |resolution| {
                         if (transaction_replication_batch_payload != null)
-                            try self.core.clearTransactionReplicationOutbox(resolution.txn_id, .batch);
+                            try S.ownerField(self, "core").*.clearTransactionReplicationOutbox(resolution.txn_id, .batch);
                         if (transaction_replication_replay_payload != null)
-                            try self.core.clearTransactionReplicationOutbox(resolution.txn_id, .replay);
+                            try S.ownerField(self, "core").*.clearTransactionReplicationOutbox(resolution.txn_id, .replay);
                     }
                     var durable_outbox_deletes: [2][]const u8 = undefined;
                     var durable_outbox_delete_count: usize = 0;
@@ -2973,7 +2994,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         durable_outbox_delete_count += 1;
                     }
                     if (durable_outbox_delete_count != 0)
-                        try self.core.store.putBatch(&.{}, durable_outbox_deletes[0..durable_outbox_delete_count]);
+                        try S.ownerField(self, "core").*.store.putBatch(&.{}, durable_outbox_deletes[0..durable_outbox_delete_count]);
                 }
             }
             if (opts.document_child_range_dispatcher) |dispatcher| {
@@ -2987,7 +3008,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.backlog_pressure_ns, backlog_pressure_start_ns);
             }
             const wait_sync_start_ns = monotonicTimeNs();
-            if (append_derived_replay and self.executor.hasWorkers()) {
+            if (append_derived_replay and S.ownerField(self, "executor").*.hasWorkers()) {
                 if (opts.wait_for_sync_level) {
                     const sync_wait_start_ns = monotonicTimeNs();
                     try self.waitForSyncLevelWithCancellation(effective_req.sync_level, sequence, sync_targets, opts.visibility_cancellation, enrichment_fully_precomputed);
@@ -3011,7 +3032,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.wait_sync_ns, wait_sync_start_ns);
             if (append_derived_replay) {
-                if (self.enrichment_runtime) |runtime| {
+                if (S.ownerField(self, "enrichment_runtime").*) |runtime| {
                     const notify_enrichment_start_ns = monotonicTimeNs();
                     runtime.notifySequence(sequence);
                     if (profile) |active_profile| recordProfileNs(profile, &active_profile.notify_enrichment_ns, notify_enrichment_start_ns);
@@ -3055,42 +3076,42 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn clearActiveIndexRepairsLocked(self: anytype) void {
-            var it = self.active_index_repairs.keyIterator();
-            while (it.next()) |key_ptr| self.alloc.free(@constCast(key_ptr.*));
-            self.active_index_repairs.clearRetainingCapacity();
+            var it = S.ownerField(self, "active_index_repairs").*.keyIterator();
+            while (it.next()) |key_ptr| S.ownerField(self, "alloc").*.free(@constCast(key_ptr.*));
+            S.ownerField(self, "active_index_repairs").*.clearRetainingCapacity();
         }
 
         pub fn clearBulkIngestIdentityAllNewLocked(self: anytype) void {
-            self.bulk_identity.reset(self.alloc);
+            S.ownerField(self, "bulk_identity").*.reset(S.ownerField(self, "alloc").*);
         }
 
         pub fn clearDurableReplicationOutbox(self: anytype, key: []const u8) !void {
             try self.lockApplyForPortableRuntime();
-            defer self.core.unlockApply();
-            try durable_outbox_store.clearPublished(self.core.store, key);
+            defer S.ownerField(self, "core").*.unlockApply();
+            try durable_outbox_store.clearPublished(S.ownerField(self, "core").*.store, key);
         }
 
         pub fn clearLiveDocSetCache(self: anytype) void {
-            self.core.identity_visibility.clearLive();
+            S.ownerField(self, "core").*.identity_visibility.clearLive();
         }
 
         pub fn clearNonVisibleDocSetCache(self: anytype) void {
-            self.core.identity_visibility.clearNonvisible();
+            S.ownerField(self, "core").*.identity_visibility.clearNonvisible();
         }
 
         pub fn enforcePortableRuntimeGate(self: anytype) !void {
-            if (self.local_execution.vector_migration_reopen_required.load(.acquire)) return error.VectorMigrationRecoveryRequired;
-            try enforcePortableRuntimeGateOptional(&self.async_context.portable_runtime_activation_pending);
-            if (self.local_execution.graph_merge_import_recovery_pending.load(.acquire)) return error.GraphMaintenanceInProgress;
+            if (S.ownerField(self, "local_execution").*.vector_migration_reopen_required.load(.acquire)) return error.VectorMigrationRecoveryRequired;
+            try enforcePortableRuntimeGateOptional(&S.ownerField(self, "async_context").*.portable_runtime_activation_pending);
+            if (S.ownerField(self, "local_execution").*.graph_merge_import_recovery_pending.load(.acquire)) return error.GraphMaintenanceInProgress;
             // A read-only handle can predate the writer's import. Its local flag
             // cannot observe publication, so consult the shared durable fence.
-            if (openModeRequiresReadOnlyBackends(self.open_mode)) {
-                const pending = self.core.store.get(self.alloc, graph_merge_import_recovery_key) catch |err| switch (err) {
+            if (openModeRequiresReadOnlyBackends(S.ownerField(self, "open_mode").*)) {
+                const pending = S.ownerField(self, "core").*.store.get(S.ownerField(self, "alloc").*, graph_merge_import_recovery_key) catch |err| switch (err) {
                     error.NotFound => null,
                     else => return err,
                 };
                 if (pending) |record| {
-                    self.alloc.free(record);
+                    S.ownerField(self, "alloc").*.free(record);
                     return error.GraphMaintenanceInProgress;
                 }
             }
@@ -3098,8 +3119,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn enforceReplicationWriteGate(self: anytype) !void {
             try self.enforcePortableRuntimeGate();
-            try enforceReplicationWriteGateOptional(self.local_execution.replication_write_gate);
-            if (self.async_context.primary_replication_append_pending.load(.acquire)) return error.ReplicationPublisherUnavailable;
+            try enforceReplicationWriteGateOptional(S.ownerField(self, "local_execution").*.replication_write_gate);
+            if (S.ownerField(self, "async_context").*.primary_replication_append_pending.load(.acquire)) return error.ReplicationPublisherUnavailable;
         }
 
         pub fn enforceRowPolicyMutationLocked(
@@ -3114,29 +3135,29 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 return error.RowPolicyAuthenticationRequired;
             if (req.writes.len != 0 and (prepared_rows == null or prepared_rows.?.len != req.writes.len))
                 return error.RowPolicyMutationUnsupported;
-            const bundle = if (self.local_execution.row_policy_bundle) |*installed| installed else return error.RowPolicyCatalogChanged;
+            const bundle = if (S.ownerField(self, "local_execution").*.row_policy_bundle) |*installed| installed else return error.RowPolicyCatalogChanged;
             const schema = schema_view.tableSchema().*;
-            var insert_check = try bundle.captureEvaluation(self.alloc, schema, principal, .insert);
+            var insert_check = try bundle.captureEvaluation(S.ownerField(self, "alloc").*, schema, principal, .insert);
             defer insert_check.deinit();
-            var update_old = try bundle.captureEvaluation(self.alloc, schema, principal, .update_old);
+            var update_old = try bundle.captureEvaluation(S.ownerField(self, "alloc").*, schema, principal, .update_old);
             defer update_old.deinit();
-            var update_new = try bundle.captureEvaluation(self.alloc, schema, principal, .update_new);
+            var update_new = try bundle.captureEvaluation(S.ownerField(self, "alloc").*, schema, principal, .update_new);
             defer update_new.deinit();
-            var delete_old = try bundle.captureEvaluation(self.alloc, schema, principal, .delete);
+            var delete_old = try bundle.captureEvaluation(S.ownerField(self, "alloc").*, schema, principal, .delete);
             defer delete_old.deinit();
-            var probe = try self.core.store.beginProbeTxn();
+            var probe = try S.ownerField(self, "core").*.store.beginProbeTxn();
             defer probe.abort();
             for (req.writes, 0..) |write, i| {
                 if (isMetadataKey(write.key)) return error.RowPolicyMutationUnsupported;
-                const store_key = try encodeStoreLookupKeyAlloc(self, self.alloc, write.key);
-                defer self.alloc.free(store_key);
+                const store_key = try encodeStoreLookupKeyAlloc(self, S.ownerField(self, "alloc").*, write.key);
+                defer S.ownerField(self, "alloc").*.free(store_key);
                 const old_bytes: ?[]const u8 = probe.getLeased(store_key) catch |err| switch (err) {
                     error.NotFound => null,
                     else => return err,
                 };
                 if (old_bytes) |bytes| {
                     if (try relational_store.rowSchemaVersion(bytes) != schema.version) return error.RowPolicyCatalogChanged;
-                    const old = if (self.core.store.valuesAreAuthenticated())
+                    const old = if (S.ownerField(self, "core").*.store.valuesAreAuthenticated())
                         try relational_row_codec.ordinalRowViewTrusted(bytes, schema, schema_view.physicalLayout())
                     else
                         try relational_row_codec.ordinalRowViewSelective(bytes, schema, schema_view.physicalLayout());
@@ -3149,14 +3170,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             for (req.deletes) |key| {
                 if (isMetadataKey(key)) return error.RowPolicyMutationUnsupported;
-                const store_key = try encodeStoreLookupKeyAlloc(self, self.alloc, key);
-                defer self.alloc.free(store_key);
+                const store_key = try encodeStoreLookupKeyAlloc(self, S.ownerField(self, "alloc").*, key);
+                defer S.ownerField(self, "alloc").*.free(store_key);
                 const bytes = probe.getLeased(store_key) catch |err| switch (err) {
                     error.NotFound => continue,
                     else => return err,
                 };
                 if (try relational_store.rowSchemaVersion(bytes) != schema.version) return error.RowPolicyCatalogChanged;
-                const old = if (self.core.store.valuesAreAuthenticated())
+                const old = if (S.ownerField(self, "core").*.store.valuesAreAuthenticated())
                     try relational_row_codec.ordinalRowViewTrusted(bytes, schema, schema_view.physicalLayout())
                 else
                     try relational_row_codec.ordinalRowViewSelective(bytes, schema, schema_view.physicalLayout());
@@ -3167,27 +3188,27 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         pub fn ensureDurableReplicationStartupBarrier(self: anytype) !void {
             // A failed primary append must complete before a later mutation can
             // overtake its afterimage in the hot-standby tail.
-            while (self.async_context.primary_replication_append_pending.load(.acquire)) try self.flushDurableReplicationOutboxes();
-            if (!self.local_execution.durable_replication_startup_barrier_pending.load(.acquire) and
-                !self.local_execution.row_policy_replication_outbox_pending.load(.acquire)) return;
-            const io = self.backend_runtime.io() orelse std.Options.debug_io;
-            self.local_execution.durable_replication_flush_mutex.lockUncancelable(io);
-            defer self.local_execution.durable_replication_flush_mutex.unlock(io);
-            if (!self.local_execution.durable_replication_startup_barrier_pending.load(.acquire) and
-                !self.local_execution.row_policy_replication_outbox_pending.load(.acquire)) return;
+            while (S.ownerField(self, "async_context").*.primary_replication_append_pending.load(.acquire)) try self.flushDurableReplicationOutboxes();
+            if (!S.ownerField(self, "local_execution").*.durable_replication_startup_barrier_pending.load(.acquire) and
+                !S.ownerField(self, "local_execution").*.row_policy_replication_outbox_pending.load(.acquire)) return;
+            const io = S.ownerField(self, "backend_runtime").*.io() orelse std.Options.debug_io;
+            S.ownerField(self, "local_execution").*.durable_replication_flush_mutex.lockUncancelable(io);
+            defer S.ownerField(self, "local_execution").*.durable_replication_flush_mutex.unlock(io);
+            if (!S.ownerField(self, "local_execution").*.durable_replication_startup_barrier_pending.load(.acquire) and
+                !S.ownerField(self, "local_execution").*.row_policy_replication_outbox_pending.load(.acquire)) return;
             while (true) {
-                while (self.local_execution.durable_replication_outbox_maybe.load(.acquire))
+                while (S.ownerField(self, "local_execution").*.durable_replication_outbox_maybe.load(.acquire))
                     try self.flushDurableReplicationOutboxesLocked();
                 // Close the race with a policy commit that published its flag just
                 // after the final scan. The same apply fence orders that commit
                 // and the flag clear against subsequent row writers.
                 try self.lockApplyForPortableRuntime();
-                const empty = !self.local_execution.durable_replication_outbox_maybe.load(.acquire);
+                const empty = !S.ownerField(self, "local_execution").*.durable_replication_outbox_maybe.load(.acquire);
                 if (empty) {
-                    self.local_execution.durable_replication_startup_barrier_pending.store(false, .release);
-                    self.local_execution.row_policy_replication_outbox_pending.store(false, .release);
+                    S.ownerField(self, "local_execution").*.durable_replication_startup_barrier_pending.store(false, .release);
+                    S.ownerField(self, "local_execution").*.row_policy_replication_outbox_pending.store(false, .release);
                 }
-                self.core.unlockApply();
+                S.ownerField(self, "core").*.unlockApply();
                 if (empty) return;
             }
         }
@@ -3195,7 +3216,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         pub fn failIfIdentityOrdinalExhaustedForNewUpserts(self: anytype, doc_ids: []const []const u8) !void {
             if (doc_ids.len == 0) return;
 
-            var txn = try self.core.store.beginProbeTxn();
+            var txn = try S.ownerField(self, "core").*.store.beginProbeTxn();
             defer txn.abort();
 
             const raw_next = txn.get(internal_keys.identity_next_ordinal_key[0..]) catch |err| switch (err) {
@@ -3207,11 +3228,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (next_ordinal != 0 and next_ordinal < std.math.maxInt(doc_identity.DocOrdinal)) return;
 
             var seen = std.StringHashMapUnmanaged(void).empty;
-            defer seen.deinit(self.alloc);
+            defer seen.deinit(S.ownerField(self, "alloc").*);
             for (doc_ids) |doc_id| {
                 if (seen.contains(doc_id)) continue;
-                try seen.put(self.alloc, doc_id, {});
-                if (try doc_identity.lookupOrdinalTxn(self.alloc, &txn, doc_id) != null) continue;
+                try seen.put(S.ownerField(self, "alloc").*, doc_id, {});
+                if (try doc_identity.lookupOrdinalTxn(S.ownerField(self, "alloc").*, &txn, doc_id) != null) continue;
                 return error.DocOrdinalExhausted;
             }
         }
@@ -3219,14 +3240,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         pub fn finalizePendingRowPolicyReceiptLocked(self: anytype, expected: row_policy_bundle_mod.Receipt) !row_policy_bundle_mod.Receipt {
             const pending = (try self.pendingRowPolicyReceipt()) orelse return error.NotFound;
             if (!std.meta.eql(pending, expected)) return error.RowPolicyCatalogChanged;
-            if (!self.local_execution.row_policy_gate.quiesced()) return error.RowPolicyReadersActive;
-            var manager = try self.core.initTxnManager();
+            if (!S.ownerField(self, "local_execution").*.row_policy_gate.quiesced()) return error.RowPolicyReadersActive;
+            var manager = try S.ownerField(self, "core").*.initTxnManager();
             defer manager.deinit();
             if (try manager.hasSchemaLeases()) return error.RowPolicyReadersActive;
-            const schema = self.core.schema orelse return error.RowPolicyCatalogChanged;
-            const bundle_bytes = try self.core.store.get(self.alloc, row_policy_bundle_mod.key);
-            defer self.alloc.free(bundle_bytes);
-            var installed = try row_policy_bundle_mod.Installed.init(self.alloc, bundle_bytes, self.core.identity_namespace.table_id, schema);
+            const schema = S.ownerField(self, "core").*.schema orelse return error.RowPolicyCatalogChanged;
+            const bundle_bytes = try S.ownerField(self, "core").*.store.get(S.ownerField(self, "alloc").*, row_policy_bundle_mod.key);
+            defer S.ownerField(self, "alloc").*.free(bundle_bytes);
+            var installed = try row_policy_bundle_mod.Installed.init(S.ownerField(self, "alloc").*, bundle_bytes, S.ownerField(self, "core").*.identity_namespace.table_id, schema);
             var installed_owned = true;
             defer if (installed_owned) installed.deinit();
             const publication = installed.parsed.value;
@@ -3237,7 +3258,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 publication.catalog_epoch != expected.catalog_epoch or
                 publication.phase != expected.phase or
                 !std.mem.eql(u8, &digest, &expected.bundle_digest)) return error.RowPolicyCatalogChanged;
-            const previous = self.core.table_catalog;
+            const previous = S.ownerField(self, "core").*.table_catalog;
             if (previous.row_policy_phase != .preparing or
                 previous.row_policy_generation != expected.generation or
                 previous.row_policy_catalog_epoch != expected.catalog_epoch or
@@ -3253,49 +3274,49 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const encoded_receipt = expected.encode();
             var receipt_key_buf: [128]u8 = undefined;
             const receipt_key = try expected.key(&receipt_key_buf);
-            var txn = try self.core.store.beginWriteTxn();
+            var txn = try S.ownerField(self, "core").*.store.beginWriteTxn();
             errdefer txn.abort();
             try txn.put(receipt_key, &encoded_receipt);
             try txn.put(table_catalog_mod.key, &catalog_bytes);
             try txn.delete(row_policy_bundle_mod.pending_key);
             try txn.commit();
-            self.core.table_catalog = next;
+            S.ownerField(self, "core").*.table_catalog = next;
             if (next.row_policy_phase != .preparing) {
-                if (self.local_execution.row_policy_bundle) |*old| old.deinit();
-                self.local_execution.row_policy_bundle = if (next.row_policy_phase == .active) installed else null;
+                if (S.ownerField(self, "local_execution").*.row_policy_bundle) |*old| old.deinit();
+                S.ownerField(self, "local_execution").*.row_policy_bundle = if (next.row_policy_phase == .active) installed else null;
                 if (next.row_policy_phase == .active) installed_owned = false;
-                try self.local_execution.row_policy_gate.publishCommitted(next);
+                try S.ownerField(self, "local_execution").*.row_policy_gate.publishCommitted(next);
             }
             return expected;
         }
 
         pub fn flushDurableReplicationOutboxes(self: anytype) !void {
-            if (self.async_context.primary_replication_outbox_pending.load(.acquire)) self.local_execution.durable_replication_outbox_maybe.store(true, .release);
-            if (!self.local_execution.durable_replication_outbox_maybe.load(.acquire)) return;
-            const io = self.backend_runtime.io() orelse std.Options.debug_io;
-            self.local_execution.durable_replication_flush_mutex.lockUncancelable(io);
-            defer self.local_execution.durable_replication_flush_mutex.unlock(io);
+            if (S.ownerField(self, "async_context").*.primary_replication_outbox_pending.load(.acquire)) S.ownerField(self, "local_execution").*.durable_replication_outbox_maybe.store(true, .release);
+            if (!S.ownerField(self, "local_execution").*.durable_replication_outbox_maybe.load(.acquire)) return;
+            const io = S.ownerField(self, "backend_runtime").*.io() orelse std.Options.debug_io;
+            S.ownerField(self, "local_execution").*.durable_replication_flush_mutex.lockUncancelable(io);
+            defer S.ownerField(self, "local_execution").*.durable_replication_flush_mutex.unlock(io);
             try self.flushDurableReplicationOutboxesLocked();
         }
 
         pub fn flushDurableReplicationOutboxesLocked(self: anytype) !void {
-            if (!self.local_execution.durable_replication_outbox_maybe.load(.acquire)) return;
+            if (!S.ownerField(self, "local_execution").*.durable_replication_outbox_maybe.load(.acquire)) return;
             try self.lockApplyForPortableRuntime();
             var apply_held = true;
-            errdefer if (apply_held) self.core.unlockApply();
-            var page = try durable_outbox_store.readPending(self.alloc, self.core.store);
-            defer page.deinit(self.alloc);
+            errdefer if (apply_held) S.ownerField(self, "core").*.unlockApply();
+            var page = try durable_outbox_store.readPending(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store);
+            defer page.deinit(S.ownerField(self, "alloc").*);
             const batch_raw = page.legacy_batch;
             const replay_raw = page.legacy_replay;
             const schema_raw = page.legacy_schema;
             const pending = page.entries;
             const any_pending = !page.isEmpty();
             if (!any_pending) {
-                self.local_execution.durable_replication_outbox_maybe.store(false, .release);
-                self.async_context.primary_replication_outbox_pending.store(false, .release);
-                self.async_context.primary_replication_append_pending.store(false, .release);
+                S.ownerField(self, "local_execution").*.durable_replication_outbox_maybe.store(false, .release);
+                S.ownerField(self, "async_context").*.primary_replication_outbox_pending.store(false, .release);
+                S.ownerField(self, "async_context").*.primary_replication_append_pending.store(false, .release);
             }
-            self.core.unlockApply();
+            S.ownerField(self, "core").*.unlockApply();
             apply_held = false;
             if (!any_pending) return;
 
@@ -3304,34 +3325,34 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const schema_outbox = if (schema_raw) |raw| try decodeDurableReplicationOutbox(raw) else null;
 
             if (batch_outbox != null) {
-                const mirror = self.local_execution.replication_async_batch_mirror orelse return error.ReplicationPublisherUnavailable;
+                const mirror = S.ownerField(self, "local_execution").*.replication_async_batch_mirror orelse return error.ReplicationPublisherUnavailable;
                 if (!replicationMirrorRequiresDurableOutbox(mirror)) return error.ReplicationPublisherUnavailable;
             }
             if (replay_outbox != null) {
-                const mirror = self.local_execution.replication_async_effect_mirror orelse return error.ReplicationPublisherUnavailable;
+                const mirror = S.ownerField(self, "local_execution").*.replication_async_effect_mirror orelse return error.ReplicationPublisherUnavailable;
                 if (!replicationMirrorRequiresDurableOutbox(mirror)) return error.ReplicationPublisherUnavailable;
             }
             if (schema_outbox != null) {
-                const mirror = self.local_execution.replication_async_metadata_mirror orelse return error.ReplicationPublisherUnavailable;
+                const mirror = S.ownerField(self, "local_execution").*.replication_async_metadata_mirror orelse return error.ReplicationPublisherUnavailable;
                 if (!replicationMirrorRequiresDurableOutbox(mirror)) return error.ReplicationPublisherUnavailable;
             }
             // Recovery delivers the unlogged effect that closes foreground writes.
             try self.enforcePortableRuntimeGate();
-            try enforceReplicationWriteGateOptional(self.local_execution.replication_write_gate);
+            try enforceReplicationWriteGateOptional(S.ownerField(self, "local_execution").*.replication_write_gate);
 
             if (batch_outbox) |outbox| {
                 var ctx = self.batchContext();
-                try recoverDurableReplicationOutboxContext(&ctx, self.local_execution.replication_async_batch_mirror.?, outbox, .batch);
+                try recoverDurableReplicationOutboxContext(&ctx, S.ownerField(self, "local_execution").*.replication_async_batch_mirror.?, outbox, .batch);
                 try self.clearDurableReplicationOutbox(replication_batch_outbox_key);
             }
             if (replay_outbox) |outbox| {
                 var ctx = self.batchContext();
-                try recoverDurableReplicationOutboxContext(&ctx, self.local_execution.replication_async_effect_mirror.?, outbox, .replay);
+                try recoverDurableReplicationOutboxContext(&ctx, S.ownerField(self, "local_execution").*.replication_async_effect_mirror.?, outbox, .replay);
                 try self.clearDurableReplicationOutbox(replication_replay_outbox_key);
             }
             if (schema_outbox) |outbox| {
                 var ctx = self.batchContext();
-                try recoverDurableReplicationOutboxContext(&ctx, self.local_execution.replication_async_metadata_mirror.?, outbox, .schema);
+                try recoverDurableReplicationOutboxContext(&ctx, S.ownerField(self, "local_execution").*.replication_async_metadata_mirror.?, outbox, .schema);
                 try self.clearDurableReplicationOutbox(replication_schema_outbox_key);
             }
 
@@ -3339,9 +3360,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const kind = try durableReplicationOutboxKindFromKey(entry.key);
                 const outbox = try decodeDurableReplicationOutbox(entry.value);
                 const mirror = switch (kind) {
-                    .batch, .restore_batch => self.local_execution.replication_async_batch_mirror,
-                    .replay, .primary_effect => self.local_execution.replication_async_effect_mirror,
-                    .schema, .row_policy => self.local_execution.replication_async_metadata_mirror,
+                    .batch, .restore_batch => S.ownerField(self, "local_execution").*.replication_async_batch_mirror,
+                    .replay, .primary_effect => S.ownerField(self, "local_execution").*.replication_async_effect_mirror,
+                    .schema, .row_policy => S.ownerField(self, "local_execution").*.replication_async_metadata_mirror,
                 } orelse return error.ReplicationPublisherUnavailable;
                 if (kind != .restore_batch and kind != .primary_effect and kind != .row_policy and !replicationMirrorRequiresDurableOutbox(mirror)) return error.ReplicationPublisherUnavailable;
                 var ctx = self.batchContext();
@@ -3353,19 +3374,19 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn flushTransactionReplicationOutbox(self: anytype, txn_id: transactions_mod.TxnId) !void {
-            var outbox = try self.core.loadTransactionReplicationOutbox(self.alloc, txn_id);
-            defer outbox.deinit(self.alloc);
+            var outbox = try S.ownerField(self, "core").*.loadTransactionReplicationOutbox(S.ownerField(self, "alloc").*, txn_id);
+            defer outbox.deinit(S.ownerField(self, "alloc").*);
             if (outbox.batch_payload == null and outbox.replay_payload == null) return;
 
             // An outbox entry is a durable synchronous-replication obligation. Do
             // not silently discard it if a restart temporarily removes or
             // downgrades the corresponding mirror configuration.
             if (outbox.batch_payload != null) {
-                const mirror = self.local_execution.replication_async_batch_mirror orelse return error.ReplicationPublisherUnavailable;
+                const mirror = S.ownerField(self, "local_execution").*.replication_async_batch_mirror orelse return error.ReplicationPublisherUnavailable;
                 if (!replicationMirrorSyncEnabled(mirror)) return error.ReplicationPublisherUnavailable;
             }
             if (outbox.replay_payload != null) {
-                const mirror = self.local_execution.replication_async_effect_mirror orelse return error.ReplicationPublisherUnavailable;
+                const mirror = S.ownerField(self, "local_execution").*.replication_async_effect_mirror orelse return error.ReplicationPublisherUnavailable;
                 if (!replicationMirrorSyncEnabled(mirror)) return error.ReplicationPublisherUnavailable;
             }
             try self.enforceReplicationWriteGate();
@@ -3376,14 +3397,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (outbox.batch_payload) |payload| {
                 try self.mirrorReplicationEncodedBatchMutationCommit(payload);
                 try self.lockApplyForPortableRuntime();
-                defer self.core.unlockApply();
-                try self.core.clearTransactionReplicationOutbox(txn_id, .batch);
+                defer S.ownerField(self, "core").*.unlockApply();
+                try S.ownerField(self, "core").*.clearTransactionReplicationOutbox(txn_id, .batch);
             }
             if (outbox.replay_payload) |payload| {
                 try self.mirrorReplicationReplayPayloadCommit(payload);
                 try self.lockApplyForPortableRuntime();
-                defer self.core.unlockApply();
-                try self.core.clearTransactionReplicationOutbox(txn_id, .replay);
+                defer S.ownerField(self, "core").*.unlockApply();
+                try S.ownerField(self, "core").*.clearTransactionReplicationOutbox(txn_id, .replay);
             }
         }
 
@@ -3447,19 +3468,19 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         pub fn lockApplyForPortableRuntime(self: anytype) !void {
             try self.enforcePortableRuntimeGate();
             lockApply(self);
-            errdefer self.core.unlockApply();
+            errdefer S.ownerField(self, "core").*.unlockApply();
             try self.enforcePortableRuntimeGate();
         }
 
         pub fn maintenanceRequiresOrderedApply(self: anytype) !bool {
-            var read = try self.core.store.beginReadTxn();
+            var read = try S.ownerField(self, "core").*.store.beginReadTxn();
             defer read.abort();
             return try @import("../source_authority.zig").maintenanceMode(&read) == .ordered;
         }
 
         pub fn markPrecomputedEnrichmentAppliedForSync(self: anytype, sync_level: types.SyncLevel, sequence: u64) !void {
             if (sync_level != .enrichments or sequence == 0) return;
-            const runtime = self.enrichment_runtime orelse return;
+            const runtime = S.ownerField(self, "enrichment_runtime").* orelse return;
             const runtime_stats = runtime.stats();
             // A contiguous sequence may still retain a producer that requires
             // committed graph state. Only the replay lane proves no work remains.
@@ -3469,9 +3490,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn maybeFinalizePendingRowPolicyPublication(self: anytype) !void {
-            if (self.local_execution.row_policy_gate.currentPhase() != .preparing) return;
+            if (S.ownerField(self, "local_execution").*.row_policy_gate.currentPhase() != .preparing) return;
             try self.lockApplyForPortableRuntime();
-            defer self.core.unlockApply();
+            defer S.ownerField(self, "core").*.unlockApply();
             const pending = (try self.pendingRowPolicyReceipt()) orelse return;
             _ = self.finalizePendingRowPolicyReceiptLocked(pending) catch |err| switch (err) {
                 error.RowPolicyReadersActive => return,
@@ -3490,8 +3511,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn noPendingEnrichmentReplayThrough(self: anytype, applied_sequence: u64, sequence: u64) !bool {
-            var cursor = try self.core.replaySource().openMatchingCursor(self.alloc, applied_sequence, .enrichment);
-            defer cursor.deinit(self.alloc);
+            var cursor = try S.ownerField(self, "core").*.replaySource().openMatchingCursor(S.ownerField(self, "alloc").*, applied_sequence, .enrichment);
+            defer cursor.deinit(S.ownerField(self, "alloc").*);
             const Probe = struct {
                 through: u64,
                 pending: bool = false,
@@ -3529,16 +3550,16 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn notifyResolverReplayRuntimesForced(self: anytype, sequence: u64) void {
-            if (self.resolution_runtime) |runtime| runtime.notifySequence(sequence);
-            if (self.promotion_runtime) |runtime| runtime.notifySequence(sequence);
+            if (S.ownerField(self, "resolution_runtime").*) |runtime| runtime.notifySequence(sequence);
+            if (S.ownerField(self, "promotion_runtime").*) |runtime| runtime.notifySequence(sequence);
         }
 
         pub fn pendingRowPolicyReceipt(self: anytype) !?row_policy_bundle_mod.Receipt {
-            const bytes = self.core.store.get(self.alloc, row_policy_bundle_mod.pending_key) catch |err| switch (err) {
+            const bytes = S.ownerField(self, "core").*.store.get(S.ownerField(self, "alloc").*, row_policy_bundle_mod.pending_key) catch |err| switch (err) {
                 error.NotFound => return null,
                 else => return err,
             };
-            defer self.alloc.free(bytes);
+            defer S.ownerField(self, "alloc").*.free(bytes);
             return try row_policy_bundle_mod.Receipt.decode(bytes);
         }
 
@@ -3549,15 +3570,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn rememberBulkIngestAllNewIdentityUpserts(self: anytype, doc_ids: []const []const u8) !bool {
-            return self.bulk_identity.remember(self.alloc, doc_ids);
+            return S.ownerField(self, "bulk_identity").*.remember(S.ownerField(self, "alloc").*, doc_ids);
         }
 
         pub fn replicationMutationBarrier(self: anytype) ?*MutationBarrier {
             var barrier: ?*MutationBarrier = null;
             const mirrors = .{
-                self.local_execution.replication_async_effect_mirror,
-                self.local_execution.replication_async_batch_mirror,
-                self.local_execution.replication_async_metadata_mirror,
+                S.ownerField(self, "local_execution").*.replication_async_effect_mirror,
+                S.ownerField(self, "local_execution").*.replication_async_batch_mirror,
+                S.ownerField(self, "local_execution").*.replication_async_metadata_mirror,
             };
             inline for (mirrors) |maybe_mirror| {
                 if (maybe_mirror) |mirror| {
@@ -3610,10 +3631,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             preparation: *PreparedRowAllocator,
         ) !void {
             const alloc = preparation.allocator();
-            var staging_progress = if (self.local_execution.restore_staging_required.load(.acquire)) try self.restoreStagingStatus(alloc) else null;
+            var staging_progress = if (S.ownerField(self, "local_execution").*.restore_staging_required.load(.acquire)) try self.restoreStagingStatus(alloc) else null;
             defer if (staging_progress) |*progress| progress.deinit();
             const restore_scope: ?[32]u8 = if (staging_progress) |progress| progress.value.scope.digest() else null;
-            const mirror_scoped_restore = restore_scope != null and self.local_execution.replication_async_batch_mirror != null;
+            const mirror_scoped_restore = restore_scope != null and S.ownerField(self, "local_execution").*.replication_async_batch_mirror != null;
             const bypass_replication_write_gate = ordered_receipt != null and !mirror_scoped_restore;
             var replication_mutation = if (!bypass_replication_write_gate) self.acquireReplicationMutationShared() else null;
             defer if (replication_mutation) |*lease| lease.release();
@@ -3621,16 +3642,16 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (mirror_scoped_restore) try self.flushDurableReplicationOutboxes();
             if (status != .committed) {
                 try self.lockApplyForPortableRuntime();
-                defer self.core.unlockApply();
+                defer S.ownerField(self, "core").*.unlockApply();
                 var marker_value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
                 const marker_writes: []const docstore_mod.KVPair = if (ordered_receipt) |identity| blk: {
-                    switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), identity)) {
+                    switch (try orderedApplyDisposition(try readOrderedApplyReceipt(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store), identity)) {
                         .already_applied => return,
                         .apply => {},
                     }
                     break :blk &.{orderedApplyReceiptWrite(identity, &marker_value_buf)};
                 } else &.{};
-                _ = self.core.resolveTransactionIntentsWithExtraBatch(txn_id, status, commit_version, .{
+                _ = S.ownerField(self, "core").*.resolveTransactionIntentsWithExtraBatch(txn_id, status, commit_version, .{
                     .completion_writes = marker_writes,
                     .resolved_participant = resolved_participant,
                 }) catch |err| switch (err) {
@@ -3638,7 +3659,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     // never enlisted is already satisfied. Treat it as an
                     // idempotent no-op so coordinator recovery can acknowledge it.
                     transactions_mod.TxnError.TxnNotFound => {
-                        if (marker_writes.len != 0) try self.core.store.putBatch(marker_writes, &.{});
+                        if (marker_writes.len != 0) try S.ownerField(self, "core").*.store.putBatch(marker_writes, &.{});
                         return;
                     },
                     else => return err,
@@ -3648,8 +3669,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
             var attempts: usize = 0;
             while (attempts < 8) : (attempts += 1) {
-                const schema_namespace = self.core.schemaNamespaceGeneration();
-                var intents = try self.core.collectTransactionIntentBatch(alloc, txn_id);
+                const schema_namespace = S.ownerField(self, "core").*.schemaNamespaceGeneration();
+                var intents = try S.ownerField(self, "core").*.collectTransactionIntentBatch(alloc, txn_id);
                 defer intents.deinit(alloc);
                 const intent_keys = try alloc.alloc([]const u8, intents.writes.len + intents.deletes.len);
                 defer alloc.free(intent_keys);
@@ -3657,22 +3678,22 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 for (intents.deletes, 0..) |key, i| intent_keys[intents.writes.len + i] = key;
                 if (intents.writes.len == 0 and intents.deletes.len == 0) {
                     try self.lockApplyForPortableRuntime();
-                    if (schema_namespace != self.core.schemaNamespaceGeneration()) {
-                        self.core.unlockApply();
+                    if (schema_namespace != S.ownerField(self, "core").*.schemaNamespaceGeneration()) {
+                        S.ownerField(self, "core").*.unlockApply();
                         return error.PreparedGenerationChanged;
                     }
                     var marker_value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
                     const marker_writes: []const docstore_mod.KVPair = if (ordered_receipt) |identity| blk: {
-                        switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), identity)) {
+                        switch (try orderedApplyDisposition(try readOrderedApplyReceipt(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store), identity)) {
                             .already_applied => {
-                                self.core.unlockApply();
+                                S.ownerField(self, "core").*.unlockApply();
                                 return;
                             },
                             .apply => {},
                         }
                         break :blk &.{orderedApplyReceiptWrite(identity, &marker_value_buf)};
                     } else &.{};
-                    const outcome = self.core.resolveTransactionIntentsWithExtraBatch(
+                    const outcome = S.ownerField(self, "core").*.resolveTransactionIntentsWithExtraBatch(
                         txn_id,
                         status,
                         commit_version,
@@ -3683,11 +3704,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             .known_intent_keys = intent_keys,
                         },
                     ) catch |err| {
-                        self.core.unlockApply();
+                        S.ownerField(self, "core").*.unlockApply();
                         if (err == error.IntentSnapshotChanged) continue;
                         return err;
                     };
-                    self.core.unlockApply();
+                    S.ownerField(self, "core").*.unlockApply();
                     try self.flushTransactionReplicationOutbox(txn_id);
                     try self.waitForResolvedTransactionSyncWithCancellation(sync_level, outcome.replay_sequence, visibility_cancellation);
                     return;
@@ -3733,7 +3754,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn restoreStagingStatus(self: anytype, alloc: Allocator) !?std.json.Parsed(@import("restore_staging.zig").Progress) {
             const staging = @import("restore_staging.zig");
-            const raw = (try self.core.getStoreValue(alloc, staging.key)) orelse return null;
+            const raw = (try S.ownerField(self, "core").*.getStoreValue(alloc, staging.key)) orelse return null;
             defer alloc.free(raw);
             return try staging.Progress.decode(alloc, raw);
         }
@@ -3746,7 +3767,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 {
                     return error.InvalidBatchRequest;
                 }
-                const marker = try self.core.loadSplitBootstrapMarker(self.alloc);
+                const marker = try S.ownerField(self, "core").*.loadSplitBootstrapMarker(S.ownerField(self, "alloc").*);
                 switch (replication.operation) {
                     .bootstrap_chunk => {
                         const bootstrap_sequence = replication.bootstrap_sequence orelse
@@ -3756,7 +3777,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             return error.ConflictingSplitTransition;
                         }
                         if (existing.bootstrap_complete) return false;
-                        if (bootstrap_sequence != try self.core.loadSplitDeltaFinalSeq(self.alloc))
+                        if (bootstrap_sequence != try S.ownerField(self, "core").*.loadSplitDeltaFinalSeq(S.ownerField(self, "alloc").*))
                             return error.StaleSplitBootstrap;
                     },
                     .delta => {
@@ -3766,7 +3787,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         }
                         if (!complete.bootstrap_complete) return error.SplitBootstrapIncomplete;
                         if (replication.sequence == 0) return error.InvalidBatchRequest;
-                        const applied = try self.core.loadSplitDeltaFinalSeq(self.alloc);
+                        const applied = try S.ownerField(self, "core").*.loadSplitDeltaFinalSeq(S.ownerField(self, "alloc").*);
                         if (replication.sequence <= applied) return false;
                         if (replication.previous_sequence) |previous| {
                             if (previous >= replication.sequence) return error.InvalidBatchRequest;
@@ -3795,7 +3816,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             if (!splitMarkerMatches(existing, replication.transition_id, replication.attempt_epoch, replication.source_group_id, replication.destination_group_id)) {
                                 return error.ConflictingSplitTransition;
                             }
-                            const applied = try self.core.loadSplitDeltaFinalSeq(self.alloc);
+                            const applied = try S.ownerField(self, "core").*.loadSplitDeltaFinalSeq(S.ownerField(self, "alloc").*);
                             if (checkpoint.delta_sequence > applied) return error.SplitReplicationSequenceGap;
                             if (checkpoint.kind == .destination_begin or existing.bootstrap_complete) return false;
                         } else if (checkpoint.kind == .destination_complete) {
@@ -3805,11 +3826,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
             } else if (req.split_checkpoint) |checkpoint| {
                 if (checkpoint.kind != .source_ack or checkpoint.transition_id == 0) return error.MissingSplitReplicationContext;
-                if (try self.core.loadSplitBootstrapMarker(self.alloc)) |marker| {
+                if (try S.ownerField(self, "core").*.loadSplitBootstrapMarker(S.ownerField(self, "alloc").*)) |marker| {
                     if (!splitMarkerMatches(marker, checkpoint.transition_id, checkpoint.attempt_epoch, checkpoint.source_group_id, checkpoint.destination_group_id)) {
                         return error.ConflictingSplitTransition;
                     }
-                    if (checkpoint.delta_sequence <= try self.core.loadSplitDeltaFinalSeq(self.alloc)) return false;
+                    if (checkpoint.delta_sequence <= try S.ownerField(self, "core").*.loadSplitDeltaFinalSeq(S.ownerField(self, "alloc").*)) return false;
                 }
             }
             return true;
@@ -3847,9 +3868,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn unchangedDerivedReplayTargetsServiceable(self: anytype, alloc: Allocator) !bool {
-            for (self.core.index_manager.dense_indexes.items) |*entry| {
+            for (S.ownerField(self, "core").*.index_manager.dense_indexes.items) |*entry| {
                 if (!try index_manager_mod.denseConfigRequiresArtifactCoverage(alloc, entry.config)) continue;
-                const expected = (try loadDenseArtifactTargetCounter(alloc, self.core.store, entry.config.name)) orelse return false;
+                const expected = (try loadDenseArtifactTargetCounter(alloc, S.ownerField(self, "core").*.store, entry.config.name)) orelse return false;
                 if (expected != 0 and entry.index.stats().active_count == 0) return false;
             }
             return true;
@@ -3870,7 +3891,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     // The replicated desired state is fenced by its index identity,
                     // never by this replica's independent coverage progress.
                     const id = try @import("relational_index_records.zig").Id.decode(write.key[maintenance.control_prefix.len..]);
-                    var pinned = self.core.relational_indexes.acquire() orelse return error.PreparedGenerationChanged;
+                    var pinned = S.ownerField(self, "core").*.relational_indexes.acquire() orelse return error.PreparedGenerationChanged;
                     defer pinned.deinit();
                     const index = for (pinned.plan.boundIndexes()) |candidate| {
                         if (candidate.id().mapKey() == id.mapKey()) break candidate;
@@ -3901,7 +3922,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     const parsed = try integrity.parseKey(write.key);
                     const binding = catalog.findGeneration(parsed.address.generation) orelse return error.IntegrityCatalogChanged;
                     if (binding.retired or binding.definition.kind != .unique) return error.IntegrityCatalogChanged;
-                    if (!self.core.byteRange().contains(&parsed.address.routing)) return error.KeyOutOfRange;
+                    if (!S.ownerField(self, "core").*.byteRange().contains(&parsed.address.routing)) return error.KeyOutOfRange;
                     try integrity.validateOperation(.{ .kind = .put, .key = write.key, .routing_key = &parsed.address.routing, .value = write.value });
                 }
             }
@@ -3914,7 +3935,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const parsed = try integrity.parseKey(key);
                 const binding = loaded.?.findGeneration(parsed.address.generation) orelse return error.IntegrityCatalogChanged;
                 if (binding.definition.kind != .unique) return error.IntegrityCatalogChanged;
-                if (!self.core.byteRange().contains(&parsed.address.routing)) return error.KeyOutOfRange;
+                if (!S.ownerField(self, "core").*.byteRange().contains(&parsed.address.routing)) return error.KeyOutOfRange;
             }
         }
 
@@ -3925,11 +3946,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .{ .start = merged.start, .end = state.receiver_base_range.start }
             else
                 .{ .start = state.receiver_base_range.end, .end = merged.end };
-            const lower = if (page.after.len != 0) try internal_keys.documentKeyAlloc(self.alloc, page.after) else try documentRangeLowerAlloc(self.alloc, donor.start);
-            defer self.alloc.free(lower);
-            const upper = if (donor.end.len != 0) try documentRangeLowerAlloc(self.alloc, donor.end) else null;
-            defer if (upper) |value| self.alloc.free(value);
-            var txn = try self.core.store.beginReadTxn();
+            const lower = if (page.after.len != 0) try internal_keys.documentKeyAlloc(S.ownerField(self, "alloc").*, page.after) else try documentRangeLowerAlloc(S.ownerField(self, "alloc").*, donor.start);
+            defer S.ownerField(self, "alloc").*.free(lower);
+            const upper = if (donor.end.len != 0) try documentRangeLowerAlloc(S.ownerField(self, "alloc").*, donor.end) else null;
+            defer if (upper) |value| S.ownerField(self, "alloc").*.free(value);
+            var txn = try S.ownerField(self, "core").*.store.beginReadTxn();
             defer txn.abort();
             // Cleanup does not need row payload hydration or JSON reconstruction.
             var cursor = try txn.openPhysicalCursorAdapter();
@@ -3939,8 +3960,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var item = try cursor.seekAtOrAfter(lower);
             while (item) |row| : (item = try cursor.next()) {
                 if (upper) |bound| if (std.mem.order(u8, row.key, bound) != .lt) break;
-                const logical = (try internal_keys.decodeDocumentComponentAlloc(self.alloc, row.key)) orelse continue;
-                defer self.alloc.free(logical);
+                const logical = (try internal_keys.decodeDocumentComponentAlloc(S.ownerField(self, "alloc").*, row.key)) orelse continue;
+                defer S.ownerField(self, "alloc").*.free(logical);
                 if (internal_keys.isInternalUserKey(logical)) continue;
                 if (page.after.len != 0 and std.mem.order(u8, logical, page.after) != .gt) continue;
                 if (index != 0 and std.mem.eql(u8, logical, req.deletes[index - 1])) continue;
@@ -3955,9 +3976,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const integrity = @import("relational_integrity.zig");
             if (integrity.isKey(key)) {
                 const parsed = try integrity.parseKey(key);
-                return self.core.validateKeyOwnership(&parsed.address.routing);
+                return S.ownerField(self, "core").*.validateKeyOwnership(&parsed.address.routing);
             }
-            if (!isMetadataKey(key)) try self.core.validateKeyOwnership(key);
+            if (!isMetadataKey(key)) try S.ownerField(self, "core").*.validateKeyOwnership(key);
         }
 
         pub fn validateRestoreStagingReplicationEffects(self: anytype, alloc: Allocator, txn: anytype, req: types.BatchRequest) !void {
@@ -3979,7 +4000,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     if (!after.matches(catalog, before.owner) or after.schema_version != catalog.schema_version) return error.IntegrityCatalogChanged;
                 } else {
                     const parsed = try integrity.parseKey(write.key);
-                    if (!self.core.byteRange().contains(&parsed.address.routing)) return error.KeyOutOfRange;
+                    if (!S.ownerField(self, "core").*.byteRange().contains(&parsed.address.routing)) return error.KeyOutOfRange;
                     const binding = catalog.findGeneration(parsed.address.generation) orelse return error.IntegrityCatalogChanged;
                     if (binding.retired or binding.definition.kind != .unique) return error.IntegrityCatalogChanged;
                     try integrity.validateOperation(.{ .kind = .put, .key = write.key, .routing_key = &parsed.address.routing, .value = write.value });
@@ -3987,7 +4008,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             for (req.deletes) |key| {
                 const parsed = try integrity.parseKey(key);
-                if (!self.core.byteRange().contains(&parsed.address.routing)) return error.KeyOutOfRange;
+                if (!S.ownerField(self, "core").*.byteRange().contains(&parsed.address.routing)) return error.KeyOutOfRange;
                 const binding = catalog.findGeneration(parsed.address.generation) orelse return error.IntegrityCatalogChanged;
                 if (binding.retired or binding.definition.kind != .unique) return error.IntegrityCatalogChanged;
             }
@@ -4001,8 +4022,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // Recovery and the serving wrapper share the same ticket/mutex owner.
             // The context is updated under the primary apply fence during split setup
             // and teardown; a copied wrapper must not capture stale split ownership.
-            if (self.transaction_recovery_local_context) |ctx| return ctx.split_shadow;
-            return self.shadow;
+            if (S.ownerField(self, "transaction_recovery_local_context").*) |ctx| return ctx.split_shadow;
+            return S.ownerField(self, "shadow").*;
         }
 
         pub fn appendNeighborContextHintsToRecord(ctx: *const BatchExecutionContext, record: *change_journal_mod.Record, keys_to_add: []const []const u8) !void {
@@ -4076,16 +4097,16 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn applyCommittedBatchToShadow(self: anytype, shadow: *ShadowState, batch: derived_types.DerivedBatch) !void {
-            const managed_indexes = try shadow.manager.managedIndexes(self.alloc);
+            const managed_indexes = try shadow.manager.managedIndexes(S.ownerField(self, "alloc").*);
             defer {
-                for (managed_indexes) |index_ref| self.alloc.free(@constCast(index_ref.name));
-                self.alloc.free(managed_indexes);
+                for (managed_indexes) |index_ref| S.ownerField(self, "alloc").*.free(@constCast(index_ref.name));
+                S.ownerField(self, "alloc").*.free(managed_indexes);
             }
 
-            const async_resources = self.core.asyncResources();
+            const async_resources = S.ownerField(self, "core").*.asyncResources();
             const ctx = AsyncContext{
-                .alloc = self.alloc,
-                .io = self.backend_runtime.io(),
+                .alloc = S.ownerField(self, "alloc").*,
+                .io = S.ownerField(self, "backend_runtime").*.io(),
                 .store = async_resources.store,
                 .relational_base_rows = relationalColumns(self) != null,
                 .applied_sequence_checkpoint_path = async_resources.applied_sequence_checkpoint_path,
@@ -4104,7 +4125,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn applyCommittedBatchToShadowOrdered(self: anytype, batch: derived_types.DerivedBatch, ticket: u64) void {
             const shadow = activeSplitShadow(self) orelse return;
-            const io = self.backend_runtime.io() orelse self.backend_runtime.filesystemIo() orelse std.Options.debug_io;
+            const io = S.ownerField(self, "backend_runtime").*.io() orelse S.ownerField(self, "backend_runtime").*.filesystemIo() orelse std.Options.debug_io;
             shadow.apply_mutex.lockUncancelable(io);
             while (shadow.applied_ticket != ticket) {
                 shadow.apply_advanced.waitUncancelable(io, &shadow.apply_mutex);
@@ -4247,18 +4268,21 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // Point reads deliberately avoid the global apply lock. Fence before
             // consulting the runtime schema so a native generation swap cannot encode
             // a lookup with the old keyspace and execute it against the new store.
-            if (self.core.store.portableImportPublicationInProgress()) {
+            if (S.ownerField(self, "core").*.store.portableImportPublicationInProgress()) {
                 return error.PortableImportPublicationInProgress;
             }
             if (internal_keys.isInternalUserKey(key) or std.mem.startsWith(u8, key, "\x00\x00__metadata__:") or isSplitMetadataKey(key)) {
                 return try alloc.dupe(u8, key);
             }
-            var schema_view = self.core.acquireSchemaView();
+            var schema_view = S.ownerField(self, "core").*.acquireSchemaView();
             defer if (schema_view) |*view| view.release();
             return try encodeStoreLookupKeyWithPinnedSchemaAlloc(self, alloc, key, schema_view);
         }
 
-        pub const encodeStoreLookupKeyWithPinnedSchemaAlloc = execution_resources.encodeStoreLookupKeyWithPinnedSchemaAlloc;
+        pub fn encodeStoreLookupKeyWithPinnedSchemaAlloc(self: anytype, alloc: Allocator, key: []const u8, schema_view: ?schema_registry_mod.SchemaView) ![]u8 {
+            const context = .{ .core = S.ownerField(self, "core").* };
+            return execution_resources.encodeStoreLookupKeyWithPinnedSchemaAlloc(&context, alloc, key, schema_view);
+        }
 
         pub fn encodeThinReplayRecordPayload(
             alloc: Allocator,
@@ -4524,7 +4548,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn lockApply(self: anytype) void {
-            self.core.lockApply();
+            S.ownerField(self, "core").*.lockApply();
         }
 
         pub fn lockAtomicWithBackoff(mutex: *std.atomic.Mutex) void {
@@ -4769,7 +4793,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn reserveSplitShadowApplyTicket(self: anytype) ?u64 {
             const shadow = activeSplitShadow(self) orelse return null;
-            const state = self.core.splitState() orelse return null;
+            const state = S.ownerField(self, "core").*.splitState() orelse return null;
             if (state.phase != .splitting) return null;
             const ticket = shadow.next_ticket;
             shadow.next_ticket = std.math.add(u64, ticket, 1) catch @panic("split shadow ticket overflow");
@@ -4795,7 +4819,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn shouldAppendSplitDelta(self: anytype) bool {
-            const state = self.core.splitState() orelse return false;
+            const state = S.ownerField(self, "core").*.splitState() orelse return false;
             return state.phase == .splitting;
         }
 
@@ -4826,7 +4850,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn splitShadowRequiresMaterializedDerivedBatch(self: anytype) bool {
             if (activeSplitShadow(self) == null) return false;
-            const state = self.core.splitState() orelse return false;
+            const state = S.ownerField(self, "core").*.splitState() orelse return false;
             return state.phase == .splitting;
         }
 
@@ -4887,6 +4911,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     min_applied = @min(min_applied, stats.applied_sequence);
                 }
             }
+            min_applied = try ctx.index_manager.clampReplayForGraphReplacementBuilds(ctx.store, min_applied);
             min_applied = try clampReplayTruncationForRepairPins(ctx.alloc, ctx.index_repair_checkpoint, min_applied);
             if (min_applied == 0 or min_applied == std.math.maxInt(u64)) return;
             try truncateReplayLogs(ctx, min_applied);
@@ -4905,7 +4930,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         ) void {
             std.debug.assert(held.*);
             if (profile) |active_profile| active_profile.apply_lock_held_ns += monotonicTimeNs() - acquired_ns;
-            self.core.unlockApply();
+            S.ownerField(self, "core").*.unlockApply();
             held.* = false;
         }
 

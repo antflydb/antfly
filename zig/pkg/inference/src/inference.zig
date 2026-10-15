@@ -121,6 +121,7 @@ pub const native_compute = struct {
 };
 
 test {
+    _ = server;
     _ = @import("extractors/gliner_span_long_executor.zig");
     _ = @import("architectures/modern_bert.zig");
     _ = @import("models/tokenizer_special_tokens.zig");
@@ -213,6 +214,9 @@ test {
     _ = @import("graph/seeded_training_test.zig");
     _ = @import("architectures/gliner/boundary_graph_test.zig");
     _ = architectures.clipclap_format;
+    _ = @import("architectures/clip.zig");
+    _ = @import("architectures/clap.zig");
+    _ = @import("architectures/qwen2vl_vision.zig");
     _ = architectures.projector_format;
     _ = architectures.qwen3vl_plan;
     _ = architectures.qwen3vl_projector;
@@ -221,6 +225,7 @@ test {
     _ = @import("architectures/florence.zig");
     _ = @import("architectures/gemma4_runtime.zig");
     _ = @import("architectures/gemma4_projector.zig");
+    _ = @import("pipelines/embedding_gemma2.zig");
     _ = @import("embedding_trace.zig");
     _ = @import("pipelines/qwen_embedding_batch.zig");
     _ = @import("server/model_manager.zig");
@@ -262,6 +267,7 @@ test {
     _ = run_options;
     _ = native_smoke;
     _ = native_compute.native;
+    _ = @import("backends/decoder_gated_runtime.zig");
     if (build_options.enable_metal) {
         _ = backends.metal_kv_storage;
         _ = metal_runtime;

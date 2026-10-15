@@ -85,9 +85,20 @@ pub const SparseEmbedDeinitFn = *const fn (ptr: *anyopaque, alloc: Allocator) vo
 
 pub const SparseEmbedding = @import("antfly_sparse_embedding").SparseEmbedding;
 
+/// Optional pure-computation memo. Every artifact publication still validates
+/// its source revision and generation; cached vectors carry no write authority.
+pub const DenseResultCache = struct {
+    ptr: *anyopaque,
+    lookup: *const fn (*anyopaque, Allocator, [32]u8) anyerror!?[]f32,
+    remember: *const fn (*anyopaque, [32]u8, []const f32) void,
+};
+
 pub const DenseEmbedder = struct {
     ptr: *anyopaque,
     dense_embed_fn: DenseEmbedFn,
+    /// Stable effective provider/model/credential identity plus exact text and
+    /// dimensions. Opaque custom providers opt out by leaving this null.
+    computation_key_fn: ?*const fn (*anyopaque, []const u8, []const u8, u32) anyerror!?[32]u8 = null,
     dense_embed_batch_fn: ?DenseEmbedBatchFn = null,
     dense_embed_parts_fn: ?DenseEmbedPartsFn = null,
     dense_embed_part_items_fn: ?DenseEmbedPartItemsFn = null,
@@ -104,6 +115,9 @@ pub const DenseEmbedder = struct {
     dense_embed_part_items_planned_fn: ?*const fn (*anyopaque, Allocator, []const u8, []const template_mod.ContentPart, u32, ?RequestContext, inference_work.CapabilityLease) anyerror![]const []const f32 = null,
     dense_embed_with_context_fn: ?DenseEmbedWithContextFn = null,
     dense_embed_batch_with_context_fn: ?DenseEmbedBatchWithContextFn = null,
+    /// Maximum simultaneous batch calls supported by this provider instance.
+    /// Invocation-local context alone does not guarantee provider reentrancy.
+    dense_batch_concurrency: u8 = 1,
     dense_embed_parts_with_context_fn: ?DenseEmbedPartsWithContextFn = null,
     media_part_limit_fn: ?DenseMediaPartLimitFn = null,
     capabilities_fn: ?DenseCapabilitiesFn = null,
@@ -111,6 +125,7 @@ pub const DenseEmbedder = struct {
     deinit_fn: ?DenseEmbedDeinitFn = null,
     set_cancellation_fn: ?EmbedSetCancellationFn = null,
     set_progress_fn: ?EmbedSetProgressFn = null,
+    cache_revision_fn: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!?[32]u8 = null,
     recovery_identity_fn: ?EmbedRecoveryIdentityFn = null,
     /// The implementation guarantees that each provider invocation has its
     /// own finite deadline. Foreground post-commit replay rejects legacy
@@ -579,6 +594,7 @@ pub const SparseEmbedder = struct {
     deinit_fn: ?SparseEmbedDeinitFn = null,
     set_cancellation_fn: ?EmbedSetCancellationFn = null,
     set_progress_fn: ?EmbedSetProgressFn = null,
+    cache_revision_fn: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!?[32]u8 = null,
     recovery_identity_fn: ?EmbedRecoveryIdentityFn = null,
     foreground_bounded: bool = false,
 

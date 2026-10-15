@@ -1,0 +1,1221 @@
+{
+  "kind": "hackernews-composed-lake-local-qualification",
+  "date": "2026-10-13",
+  "scope": "ARM64 native local filesystem, normalized Snappy Parquet, application-cache-cleared cycles with readiness warming enabled. OS caches not flushed. Not full-archive, raw BigQuery, real S3/GCS or managed Cloud qualification.",
+  "production_revision": "37fa71b50dc52d1845ed0bd986cbbf0a2d8c31d2",
+  "binary_sha256": "0451f6ee324c91714c2d6e33c40ec31a8cdd87f4e9edd86525cfa6a167340024",
+  "build": {
+    "zig": "0.17.0",
+    "optimize": "fast",
+    "strip": true,
+    "metal": false
+  },
+  "source": {
+    "rows": 142577,
+    "files": 1024,
+    "parquet_bytes": 69006338,
+    "inventory_sha256": "0bfc5fbb3b7eeecbb6024c3f6f7819f5eeed3a6868de061e2ce46a1000131cb2",
+    "note": "Original logical sample rows re-encoded in original order into Snappy files; not raw BigQuery physical encoding."
+  },
+  "runs": {
+    "canonical_files": 1024,
+    "canonical_segments": 1024,
+    "serving_units": 128,
+    "serving_segments": 128,
+    "documents": 142577,
+    "metadata_version": 11
+  },
+  "percentile_method": "Nearest rank ceil(0.95 * n), 20 warm samples per cycle.",
+  "cycles": [
+    {
+      "first_search_ms": 352.28,
+      "warm_samples_ms": [
+        97.19,
+        77.71,
+        71.66,
+        72.12,
+        68.14,
+        67.38,
+        69.18,
+        71.12,
+        74.6,
+        69.13,
+        67.59,
+        74.47,
+        78.75,
+        67.24,
+        76.62,
+        75.92,
+        82.06,
+        75.83,
+        72.43,
+        102.33
+      ],
+      "after_restart_ms": 142.36,
+      "cursor_depth": {
+        "hits": 1408,
+        "samples_ms": [
+          265.34,
+          290.63,
+          258.99,
+          304.58,
+          287.65,
+          281.45,
+          270.58,
+          300.38,
+          344.35,
+          338.73
+        ],
+        "term": "AI",
+        "initial_ms": 451.41,
+        "restart_ms": 2582.56
+      },
+      "composed_benchmarks": {
+        "union": {
+          "first_search_ms": 279.58,
+          "warm_samples_ms": [
+            193.53,
+            268.7,
+            271.31,
+            233.71,
+            159.85,
+            204.02,
+            168.59,
+            196.25,
+            173.99,
+            151.64,
+            178.19,
+            157.01,
+            143.49,
+            191.27,
+            180.6,
+            173.26,
+            147.75,
+            151.87,
+            175.87,
+            186.19
+          ],
+          "warm_p95_ms": 268.7,
+          "result_count": 5,
+          "top_hits": [
+            {
+              "table": "hn_archive_poc",
+              "id": "lake1:febfa7d451f621d1a2a8152643fd57c495ca0c5415345086a5c7d04ae31ca302:00000000:0000000000000059",
+              "score": 0.01639344262295082
+            },
+            {
+              "table": "hn_current_benchmark",
+              "id": "42129170",
+              "score": 0.01639344262295082
+            },
+            {
+              "table": "hn_archive_poc",
+              "id": "lake1:81dc2bd15b3d3db54128651e192d5631f33ed031f713eec030a67ecad14dea22:00000000:0000000000000015",
+              "score": 0.016129032258064516
+            },
+            {
+              "table": "hn_current_benchmark",
+              "id": "42129069",
+              "score": 0.016129032258064516
+            },
+            {
+              "table": "hn_archive_poc",
+              "id": "lake1:9903e146a825cf2d98c7370330b9580e6a3d931152dafc6ec5bf1ce6430716ae:00000000:000000000000002a",
+              "score": 0.015873015873015872
+            }
+          ],
+          "total": {
+            "value": 5,
+            "relation": "gte"
+          },
+          "current_fixture_rows": 1000,
+          "note": "Full sample history plus its most recent rows copied into a native current table; bounded diagnostic fixture, not production current-table scale."
+        },
+        "saved_overlay": {
+          "first_search_ms": 344.95,
+          "warm_samples_ms": [
+            199.85,
+            154.82,
+            157.42,
+            154.02,
+            162.11,
+            188.94,
+            180.53,
+            163.72,
+            165.49,
+            198.52,
+            154.8,
+            161.53,
+            174.61,
+            197.64,
+            175.81,
+            191.81,
+            158.32,
+            186.49,
+            158.06,
+            149.83
+          ],
+          "warm_p95_ms": 198.52,
+          "result_count": 5,
+          "top_hits": [
+            {
+              "table": "hn_archive_poc",
+              "id": "lake1:febfa7d451f621d1a2a8152643fd57c495ca0c5415345086a5c7d04ae31ca302:00000000:0000000000000059",
+              "score": 0.01639344262295082
+            },
+            {
+              "table": "hn_current_benchmark",
+              "id": "42129170",
+              "score": 0.01639344262295082
+            },
+            {
+              "table": "hn_archive_poc",
+              "id": "lake1:81dc2bd15b3d3db54128651e192d5631f33ed031f713eec030a67ecad14dea22:00000000:0000000000000015",
+              "score": 0.016129032258064516
+            },
+            {
+              "table": "hn_current_benchmark",
+              "id": "42129069",
+              "score": 0.016129032258064516
+            },
+            {
+              "table": "hn_archive_poc",
+              "id": "lake1:9903e146a825cf2d98c7370330b9580e6a3d931152dafc6ec5bf1ce6430716ae:00000000:000000000000002a",
+              "score": 0.015873015873015872
+            }
+          ],
+          "total": {
+            "value": 5,
+            "relation": "gte"
+          },
+          "current_fixture_rows": 1000,
+          "note": "Full sample history plus its most recent rows copied into a native current table; bounded diagnostic fixture, not production current-table scale."
+        }
+      },
+      "composed_sources": {
+        "verified": [
+          "union_history",
+          "overlay_nonmatching_suppression",
+          "saved_current_visibility",
+          "mutable_composed_cursor_restart"
+        ],
+        "error": null
+      },
+      "verified": [
+        "remote_bm25",
+        "projected_highlights",
+        "snapshot_pagination",
+        "restart_scores",
+        "restart_pagination",
+        "metadata_filters_match_residual",
+        "metadata_filters_after_restart",
+        "empty_date_filter_before_and_after_restart",
+        "concurrent_search",
+        "exact_filter"
+      ],
+      "metadata_filters": {
+        "item_type": {
+          "total": {
+            "value": 435,
+            "relation": "gte"
+          },
+          "samples_ms": [
+            334.18,
+            139.24,
+            142.83,
+            187.84,
+            231.37,
+            222.3,
+            174.47,
+            188.24,
+            150.89,
+            160.26,
+            140.01,
+            140.88,
+            132.97,
+            128.11,
+            124.62,
+            126.83,
+            131.14,
+            133.25,
+            119.92,
+            145.68
+          ],
+          "median_ms": 141.86,
+          "predicate": {
+            "term": {
+              "path": "/item_type",
+              "value": "comment"
+            }
+          },
+          "after_restart_ms": 207.73
+        },
+        "author": {
+          "total": {
+            "value": 2,
+            "relation": "exact"
+          },
+          "samples_ms": [
+            75.71,
+            73.45,
+            71.96,
+            70.26,
+            76.36,
+            71.48,
+            69.43,
+            88.49,
+            68.88,
+            66.04,
+            71.13,
+            72.37,
+            75.6,
+            86.58,
+            76.37,
+            65.74,
+            66.33,
+            76.59,
+            70.04,
+            70.35
+          ],
+          "median_ms": 71.72,
+          "predicate": {
+            "term": {
+              "path": "/author",
+              "value": "exabrial"
+            }
+          },
+          "after_restart_ms": 82.28
+        },
+        "points": {
+          "total": {
+            "value": 445,
+            "relation": "gte"
+          },
+          "samples_ms": [
+            186.29,
+            144.77,
+            114.13,
+            108.14,
+            108.7,
+            103.93,
+            107.79,
+            109.94,
+            101.27,
+            140.94,
+            125.59,
+            140.41,
+            120.02,
+            106.13,
+            102.99,
+            108.57,
+            104.65,
+            108.16,
+            105.85,
+            110.85
+          ],
+          "median_ms": 108.63,
+          "predicate": {
+            "range": {
+              "path": "/points",
+              "gte": 0
+            }
+          },
+          "after_restart_ms": 241.32
+        },
+        "created_at": {
+          "total": {
+            "value": 6,
+            "relation": "gte"
+          },
+          "samples_ms": [
+            192.95,
+            99.54,
+            98.03,
+            100.91,
+            100.7,
+            104.2,
+            109.15,
+            106.67,
+            129.64,
+            131.1,
+            105.04,
+            135.05,
+            142.69,
+            126.88,
+            112.27,
+            104.25,
+            101.83,
+            94.98,
+            101.76,
+            94.4
+          ],
+          "median_ms": 104.65,
+          "predicate": {
+            "range": {
+              "path": "/created_at",
+              "gte": 1731347421,
+              "lt": 1731351021
+            }
+          },
+          "after_restart_ms": 166.97
+        },
+        "combined": {
+          "total": {
+            "value": 1,
+            "relation": "exact"
+          },
+          "samples_ms": [
+            353.98,
+            135.26,
+            139.16,
+            159.61,
+            160.46,
+            142.97,
+            145.68,
+            162.72,
+            144.63,
+            191.21,
+            170.7,
+            157.58,
+            214.66,
+            174.79,
+            147.12,
+            146.9,
+            162.02,
+            156.58,
+            179.81,
+            303.99
+          ],
+          "median_ms": 160.04,
+          "predicate": {
+            "bool": {
+              "filter": [
+                {
+                  "term": {
+                    "path": "/item_type",
+                    "value": "comment"
+                  }
+                },
+                {
+                  "term": {
+                    "path": "/author",
+                    "value": "exabrial"
+                  }
+                },
+                {
+                  "range": {
+                    "path": "/points",
+                    "gte": 0
+                  }
+                },
+                {
+                  "range": {
+                    "path": "/created_at",
+                    "gte": 1731347421,
+                    "lt": 1731351021
+                  }
+                }
+              ]
+            }
+          },
+          "after_restart_ms": 206.58
+        }
+      },
+      "report_sha256": "706bed4a4d782b5cd4d922b56f865fc95ff57da4addb084a460e3862731db06e",
+      "warm_p95_ms": 97.19,
+      "single_table_top_hits": [
+        {
+          "id": "lake1:febfa7d451f621d1a2a8152643fd57c495ca0c5415345086a5c7d04ae31ca302:00000000:0000000000000059",
+          "score": 9.366081237792969
+        },
+        {
+          "id": "lake1:81dc2bd15b3d3db54128651e192d5631f33ed031f713eec030a67ecad14dea22:00000000:0000000000000015",
+          "score": 9.22985553741455
+        },
+        {
+          "id": "lake1:9903e146a825cf2d98c7370330b9580e6a3d931152dafc6ec5bf1ce6430716ae:00000000:000000000000002a",
+          "score": 9.126331329345703
+        },
+        {
+          "id": "lake1:32b50dcde2c76dfe004457ffea375ddb6757583f5d7830e4b3a1b56d5d37adeb:00000000:0000000000000047",
+          "score": 9.025105476379395
+        },
+        {
+          "id": "lake1:cf969a036e078b5edbbe712fa01f806194b73d976720bb63e62e7c982183afa1:00000000:0000000000000037",
+          "score": 8.680729866027832
+        }
+      ],
+      "io_phases": [
+        {
+          "phase": "cold",
+          "elapsed_ms": 352.28,
+          "took_ms": 333,
+          "lake_metrics_delta": {
+            "antfly_lake_cache_disk_init_attempts_total": 0,
+            "antfly_lake_cache_disk_init_failures_total": 0,
+            "antfly_lake_cache_provider_reads_total": 405,
+            "antfly_lake_cache_provider_bytes_total": 24332866,
+            "antfly_lake_cache_disk_hits_total": 0,
+            "antfly_lake_cache_disk_bytes_total": 0,
+            "antfly_lake_cache_completed_queries_total": 1,
+            "antfly_lake_disk_cache_read_hits_total": 0,
+            "antfly_lake_disk_cache_read_misses_total": 347,
+            "antfly_lake_disk_cache_read_errors_total": 0,
+            "antfly_lake_disk_cache_writes_completed_total": 385,
+            "antfly_lake_disk_cache_write_errors_total": 0,
+            "antfly_lake_disk_cache_writes_dropped_total": 20,
+            "antfly_lake_disk_cache_writes_coalesced_total": 0,
+            "antfly_lake_disk_cache_dropped_bytes_total": 130979,
+            "antfly_lake_disk_cache_corrupt_entries_removed_total": 0,
+            "antfly_lake_disk_cache_evicted_entries_total": 0,
+            "antfly_lake_disk_cache_evicted_bytes_total": 0,
+            "antfly_lake_cache_hits_total": 496,
+            "antfly_lake_cache_misses_total": 752,
+            "antfly_lake_cache_mapping_hits_total": 0,
+            "antfly_lake_disk_cache_drops_policy_total": 0,
+            "antfly_lake_disk_cache_drops_queue_total": 20,
+            "antfly_lake_disk_cache_drops_memory_total": 0,
+            "antfly_lake_disk_cache_drops_capacity_total": 0,
+            "antfly_lake_disk_cache_drops_allocation_total": 0,
+            "antfly_lake_disk_cache_drops_closing_total": 0,
+            "antfly_lake_query_best_first_calls_total": 1,
+            "antfly_lake_query_best_first_segments_total": 58,
+            "antfly_lake_query_best_first_pruned_nodes_total": 70,
+            "antfly_lake_query_source_calls_total": 1,
+            "antfly_lake_query_source_nanoseconds_total": 25099000,
+            "antfly_lake_query_publication_calls_total": 1,
+            "antfly_lake_query_publication_nanoseconds_total": 42678000,
+            "antfly_lake_query_index_calls_total": 8,
+            "antfly_lake_query_index_nanoseconds_total": 66007000,
+            "antfly_lake_query_ranking_calls_total": 1,
+            "antfly_lake_query_ranking_nanoseconds_total": 260991000,
+            "antfly_lake_query_hydration_calls_total": 1,
+            "antfly_lake_query_hydration_nanoseconds_total": 13030000,
+            "antfly_lake_query_highlight_calls_total": 1,
+            "antfly_lake_query_highlight_nanoseconds_total": 511000,
+            "antfly_lake_query_total_calls_total": 1,
+            "antfly_lake_query_total_nanoseconds_total": 351147000,
+            "antfly_lake_navigation_warming_attempts_total": 0,
+            "antfly_lake_navigation_warming_failures_total": 0,
+            "antfly_lake_navigation_warming_pages_total": 0,
+            "antfly_lake_navigation_warming_nanoseconds_total": 0
+          }
+        },
+        {
+          "phase": "restart",
+          "elapsed_ms": 142.36,
+          "took_ms": 130,
+          "lake_metrics_delta": {
+            "antfly_lake_cache_disk_init_attempts_total": 0,
+            "antfly_lake_cache_disk_init_failures_total": 0,
+            "antfly_lake_cache_provider_reads_total": 11,
+            "antfly_lake_cache_provider_bytes_total": 63960,
+            "antfly_lake_cache_disk_hits_total": 395,
+            "antfly_lake_cache_disk_bytes_total": 24441150,
+            "antfly_lake_cache_completed_queries_total": 1,
+            "antfly_lake_disk_cache_read_hits_total": 395,
+            "antfly_lake_disk_cache_read_misses_total": 11,
+            "antfly_lake_disk_cache_read_errors_total": 0,
+            "antfly_lake_disk_cache_writes_completed_total": 11,
+            "antfly_lake_disk_cache_write_errors_total": 0,
+            "antfly_lake_disk_cache_writes_dropped_total": 0,
+            "antfly_lake_disk_cache_writes_coalesced_total": 0,
+            "antfly_lake_disk_cache_dropped_bytes_total": 0,
+            "antfly_lake_disk_cache_corrupt_entries_removed_total": 0,
+            "antfly_lake_disk_cache_evicted_entries_total": 11,
+            "antfly_lake_disk_cache_evicted_bytes_total": 7475,
+            "antfly_lake_cache_hits_total": 406,
+            "antfly_lake_cache_misses_total": 787,
+            "antfly_lake_cache_mapping_hits_total": 33,
+            "antfly_lake_disk_cache_drops_policy_total": 0,
+            "antfly_lake_disk_cache_drops_queue_total": 0,
+            "antfly_lake_disk_cache_drops_memory_total": 0,
+            "antfly_lake_disk_cache_drops_capacity_total": 0,
+            "antfly_lake_disk_cache_drops_allocation_total": 0,
+            "antfly_lake_disk_cache_drops_closing_total": 0,
+            "antfly_lake_query_best_first_calls_total": 1,
+            "antfly_lake_query_best_first_segments_total": 58,
+            "antfly_lake_query_best_first_pruned_nodes_total": 70,
+            "antfly_lake_query_source_calls_total": 1,
+            "antfly_lake_query_source_nanoseconds_total": 18070000,
+            "antfly_lake_query_publication_calls_total": 1,
+            "antfly_lake_query_publication_nanoseconds_total": 35105000,
+            "antfly_lake_query_index_calls_total": 8,
+            "antfly_lake_query_index_nanoseconds_total": 17265000,
+            "antfly_lake_query_ranking_calls_total": 1,
+            "antfly_lake_query_ranking_nanoseconds_total": 74382000,
+            "antfly_lake_query_hydration_calls_total": 1,
+            "antfly_lake_query_hydration_nanoseconds_total": 9926000,
+            "antfly_lake_query_highlight_calls_total": 1,
+            "antfly_lake_query_highlight_nanoseconds_total": 49000,
+            "antfly_lake_query_total_calls_total": 1,
+            "antfly_lake_query_total_nanoseconds_total": 141373000,
+            "antfly_lake_navigation_warming_attempts_total": 0,
+            "antfly_lake_navigation_warming_failures_total": 0,
+            "antfly_lake_navigation_warming_pages_total": 0,
+            "antfly_lake_navigation_warming_nanoseconds_total": 0
+          }
+        }
+      ]
+    },
+    {
+      "first_search_ms": 260.77,
+      "warm_samples_ms": [
+        75.32,
+        70.61,
+        77.21,
+        81.34,
+        84.43,
+        86.93,
+        85.84,
+        81.76,
+        103.33,
+        77.54,
+        81.07,
+        80.98,
+        75.3,
+        66.59,
+        75.86,
+        84.97,
+        78.56,
+        73.05,
+        83.33,
+        82.77
+      ],
+      "after_restart_ms": 4385.25,
+      "cursor_depth": {
+        "hits": 1408,
+        "samples_ms": [
+          503.86,
+          519.15,
+          384.46,
+          341.1,
+          288.29,
+          367.52,
+          357.04,
+          364.53,
+          310.62,
+          347.77
+        ],
+        "term": "AI",
+        "initial_ms": 2658.47,
+        "restart_ms": 767.67
+      },
+      "composed_benchmarks": {
+        "union": {
+          "first_search_ms": 341.63,
+          "warm_samples_ms": [
+            159.29,
+            132.39,
+            152.57,
+            146.52,
+            155.73,
+            147.92,
+            163.65,
+            168.8,
+            138.13,
+            147.9,
+            150.72,
+            138.95,
+            137.46,
+            159.11,
+            157.76,
+            154.02,
+            144.66,
+            158.98,
+            167.79,
+            138.28
+          ],
+          "warm_p95_ms": 167.79,
+          "result_count": 5,
+          "top_hits": [
+            {
+              "table": "hn_archive_poc",
+              "id": "lake1:febfa7d451f621d1a2a8152643fd57c495ca0c5415345086a5c7d04ae31ca302:00000000:0000000000000059",
+              "score": 0.01639344262295082
+            },
+            {
+              "table": "hn_current_benchmark",
+              "id": "42129170",
+              "score": 0.01639344262295082
+            },
+            {
+              "table": "hn_archive_poc",
+              "id": "lake1:81dc2bd15b3d3db54128651e192d5631f33ed031f713eec030a67ecad14dea22:00000000:0000000000000015",
+              "score": 0.016129032258064516
+            },
+            {
+              "table": "hn_current_benchmark",
+              "id": "42129069",
+              "score": 0.016129032258064516
+            },
+            {
+              "table": "hn_archive_poc",
+              "id": "lake1:9903e146a825cf2d98c7370330b9580e6a3d931152dafc6ec5bf1ce6430716ae:00000000:000000000000002a",
+              "score": 0.015873015873015872
+            }
+          ],
+          "total": {
+            "value": 5,
+            "relation": "gte"
+          },
+          "current_fixture_rows": 1000,
+          "note": "Full sample history plus its most recent rows copied into a native current table; bounded diagnostic fixture, not production current-table scale."
+        },
+        "saved_overlay": {
+          "first_search_ms": 298.67,
+          "warm_samples_ms": [
+            152.31,
+            159.04,
+            151.98,
+            151.4,
+            149.27,
+            147.26,
+            149.93,
+            151.84,
+            144.46,
+            152.23,
+            147.5,
+            149.54,
+            149.11,
+            162.44,
+            147.34,
+            156.8,
+            146.96,
+            151.03,
+            163.58,
+            155.55
+          ],
+          "warm_p95_ms": 162.44,
+          "result_count": 5,
+          "top_hits": [
+            {
+              "table": "hn_archive_poc",
+              "id": "lake1:febfa7d451f621d1a2a8152643fd57c495ca0c5415345086a5c7d04ae31ca302:00000000:0000000000000059",
+              "score": 0.01639344262295082
+            },
+            {
+              "table": "hn_current_benchmark",
+              "id": "42129170",
+              "score": 0.01639344262295082
+            },
+            {
+              "table": "hn_archive_poc",
+              "id": "lake1:81dc2bd15b3d3db54128651e192d5631f33ed031f713eec030a67ecad14dea22:00000000:0000000000000015",
+              "score": 0.016129032258064516
+            },
+            {
+              "table": "hn_current_benchmark",
+              "id": "42129069",
+              "score": 0.016129032258064516
+            },
+            {
+              "table": "hn_archive_poc",
+              "id": "lake1:9903e146a825cf2d98c7370330b9580e6a3d931152dafc6ec5bf1ce6430716ae:00000000:000000000000002a",
+              "score": 0.015873015873015872
+            }
+          ],
+          "total": {
+            "value": 5,
+            "relation": "gte"
+          },
+          "current_fixture_rows": 1000,
+          "note": "Full sample history plus its most recent rows copied into a native current table; bounded diagnostic fixture, not production current-table scale."
+        }
+      },
+      "composed_sources": {
+        "verified": [
+          "union_history",
+          "overlay_nonmatching_suppression",
+          "saved_current_visibility",
+          "mutable_composed_cursor_restart"
+        ],
+        "error": null
+      },
+      "verified": [
+        "remote_bm25",
+        "projected_highlights",
+        "snapshot_pagination",
+        "restart_scores",
+        "restart_pagination",
+        "metadata_filters_match_residual",
+        "metadata_filters_after_restart",
+        "empty_date_filter_before_and_after_restart",
+        "concurrent_search",
+        "exact_filter"
+      ],
+      "metadata_filters": {
+        "item_type": {
+          "total": {
+            "value": 435,
+            "relation": "gte"
+          },
+          "samples_ms": [
+            341.0,
+            180.0,
+            119.34,
+            121.75,
+            112.25,
+            124.84,
+            136.61,
+            126.04,
+            121.31,
+            120.62,
+            114.05,
+            110.6,
+            118.0,
+            111.91,
+            126.38,
+            132.02,
+            140.48,
+            113.45,
+            143.78,
+            137.23
+          ],
+          "median_ms": 123.3,
+          "predicate": {
+            "term": {
+              "path": "/item_type",
+              "value": "comment"
+            }
+          },
+          "after_restart_ms": 214.6
+        },
+        "author": {
+          "total": {
+            "value": 2,
+            "relation": "exact"
+          },
+          "samples_ms": [
+            116.79,
+            96.71,
+            83.85,
+            89.21,
+            111.04,
+            128.42,
+            94.61,
+            103.23,
+            99.03,
+            94.28,
+            89.87,
+            104.43,
+            97.5,
+            101.26,
+            108.3,
+            105.2,
+            125.16,
+            94.27,
+            104.13,
+            85.15
+          ],
+          "median_ms": 100.15,
+          "predicate": {
+            "term": {
+              "path": "/author",
+              "value": "exabrial"
+            }
+          },
+          "after_restart_ms": 98.52
+        },
+        "points": {
+          "total": {
+            "value": 445,
+            "relation": "gte"
+          },
+          "samples_ms": [
+            506.97,
+            194.43,
+            222.77,
+            202.97,
+            166.17,
+            255.16,
+            245.02,
+            218.35,
+            210.19,
+            176.17,
+            211.55,
+            167.25,
+            248.61,
+            280.85,
+            167.62,
+            225.7,
+            153.93,
+            209.96,
+            160.19,
+            163.78
+          ],
+          "median_ms": 210.07,
+          "predicate": {
+            "range": {
+              "path": "/points",
+              "gte": 0
+            }
+          },
+          "after_restart_ms": 172.09
+        },
+        "created_at": {
+          "total": {
+            "value": 6,
+            "relation": "gte"
+          },
+          "samples_ms": [
+            280.24,
+            106.94,
+            114.1,
+            128.63,
+            112.62,
+            95.64,
+            109.25,
+            122.3,
+            101.22,
+            95.59,
+            96.85,
+            102.28,
+            93.36,
+            94.75,
+            97.03,
+            97.33,
+            96.16,
+            99.3,
+            95.17,
+            96.15
+          ],
+          "median_ms": 98.31,
+          "predicate": {
+            "range": {
+              "path": "/created_at",
+              "gte": 1731347421,
+              "lt": 1731351021
+            }
+          },
+          "after_restart_ms": 154.04
+        },
+        "combined": {
+          "total": {
+            "value": 1,
+            "relation": "exact"
+          },
+          "samples_ms": [
+            300.33,
+            142.25,
+            133.97,
+            138.91,
+            181.25,
+            136.49,
+            144.02,
+            148.62,
+            135.62,
+            144.55,
+            143.46,
+            142.34,
+            160.42,
+            145.33,
+            143.62,
+            142.46,
+            135.73,
+            145.92,
+            152.02,
+            182.45
+          ],
+          "median_ms": 143.82,
+          "predicate": {
+            "bool": {
+              "filter": [
+                {
+                  "term": {
+                    "path": "/item_type",
+                    "value": "comment"
+                  }
+                },
+                {
+                  "term": {
+                    "path": "/author",
+                    "value": "exabrial"
+                  }
+                },
+                {
+                  "range": {
+                    "path": "/points",
+                    "gte": 0
+                  }
+                },
+                {
+                  "range": {
+                    "path": "/created_at",
+                    "gte": 1731347421,
+                    "lt": 1731351021
+                  }
+                }
+              ]
+            }
+          },
+          "after_restart_ms": 197.36
+        }
+      },
+      "report_sha256": "964e243d27e92babb57565d6002e1e2afbdd768ea3b6ba38e8377903fd724444",
+      "warm_p95_ms": 86.93,
+      "single_table_top_hits": [
+        {
+          "id": "lake1:febfa7d451f621d1a2a8152643fd57c495ca0c5415345086a5c7d04ae31ca302:00000000:0000000000000059",
+          "score": 9.366081237792969
+        },
+        {
+          "id": "lake1:81dc2bd15b3d3db54128651e192d5631f33ed031f713eec030a67ecad14dea22:00000000:0000000000000015",
+          "score": 9.22985553741455
+        },
+        {
+          "id": "lake1:9903e146a825cf2d98c7370330b9580e6a3d931152dafc6ec5bf1ce6430716ae:00000000:000000000000002a",
+          "score": 9.126331329345703
+        },
+        {
+          "id": "lake1:32b50dcde2c76dfe004457ffea375ddb6757583f5d7830e4b3a1b56d5d37adeb:00000000:0000000000000047",
+          "score": 9.025105476379395
+        },
+        {
+          "id": "lake1:cf969a036e078b5edbbe712fa01f806194b73d976720bb63e62e7c982183afa1:00000000:0000000000000037",
+          "score": 8.680729866027832
+        }
+      ],
+      "io_phases": [
+        {
+          "phase": "cold",
+          "elapsed_ms": 260.77,
+          "took_ms": 251,
+          "lake_metrics_delta": {
+            "antfly_lake_cache_disk_init_attempts_total": 0,
+            "antfly_lake_cache_disk_init_failures_total": 0,
+            "antfly_lake_cache_provider_reads_total": 405,
+            "antfly_lake_cache_provider_bytes_total": 24332866,
+            "antfly_lake_cache_disk_hits_total": 0,
+            "antfly_lake_cache_disk_bytes_total": 0,
+            "antfly_lake_cache_completed_queries_total": 1,
+            "antfly_lake_disk_cache_read_hits_total": 0,
+            "antfly_lake_disk_cache_read_misses_total": 347,
+            "antfly_lake_disk_cache_read_errors_total": 0,
+            "antfly_lake_disk_cache_writes_completed_total": 370,
+            "antfly_lake_disk_cache_write_errors_total": 0,
+            "antfly_lake_disk_cache_writes_dropped_total": 35,
+            "antfly_lake_disk_cache_writes_coalesced_total": 0,
+            "antfly_lake_disk_cache_dropped_bytes_total": 130562,
+            "antfly_lake_disk_cache_corrupt_entries_removed_total": 0,
+            "antfly_lake_disk_cache_evicted_entries_total": 0,
+            "antfly_lake_disk_cache_evicted_bytes_total": 0,
+            "antfly_lake_cache_hits_total": 496,
+            "antfly_lake_cache_misses_total": 752,
+            "antfly_lake_cache_mapping_hits_total": 0,
+            "antfly_lake_disk_cache_drops_policy_total": 0,
+            "antfly_lake_disk_cache_drops_queue_total": 35,
+            "antfly_lake_disk_cache_drops_memory_total": 0,
+            "antfly_lake_disk_cache_drops_capacity_total": 0,
+            "antfly_lake_disk_cache_drops_allocation_total": 0,
+            "antfly_lake_disk_cache_drops_closing_total": 0,
+            "antfly_lake_query_best_first_calls_total": 1,
+            "antfly_lake_query_best_first_segments_total": 58,
+            "antfly_lake_query_best_first_pruned_nodes_total": 70,
+            "antfly_lake_query_source_calls_total": 1,
+            "antfly_lake_query_source_nanoseconds_total": 38626000,
+            "antfly_lake_query_publication_calls_total": 1,
+            "antfly_lake_query_publication_nanoseconds_total": 52824000,
+            "antfly_lake_query_index_calls_total": 8,
+            "antfly_lake_query_index_nanoseconds_total": 27419000,
+            "antfly_lake_query_ranking_calls_total": 1,
+            "antfly_lake_query_ranking_nanoseconds_total": 157285000,
+            "antfly_lake_query_hydration_calls_total": 1,
+            "antfly_lake_query_hydration_nanoseconds_total": 7526000,
+            "antfly_lake_query_highlight_calls_total": 1,
+            "antfly_lake_query_highlight_nanoseconds_total": 84000,
+            "antfly_lake_query_total_calls_total": 1,
+            "antfly_lake_query_total_nanoseconds_total": 260053000,
+            "antfly_lake_navigation_warming_attempts_total": 0,
+            "antfly_lake_navigation_warming_failures_total": 0,
+            "antfly_lake_navigation_warming_pages_total": 0,
+            "antfly_lake_navigation_warming_nanoseconds_total": 0
+          }
+        },
+        {
+          "phase": "restart",
+          "elapsed_ms": 4385.25,
+          "took_ms": 4377,
+          "lake_metrics_delta": {
+            "antfly_lake_cache_disk_init_attempts_total": 0,
+            "antfly_lake_cache_disk_init_failures_total": 0,
+            "antfly_lake_cache_provider_reads_total": 1,
+            "antfly_lake_cache_provider_bytes_total": 65536,
+            "antfly_lake_cache_disk_hits_total": 455,
+            "antfly_lake_cache_disk_bytes_total": 25941008,
+            "antfly_lake_cache_completed_queries_total": 1,
+            "antfly_lake_disk_cache_read_hits_total": 455,
+            "antfly_lake_disk_cache_read_misses_total": 1,
+            "antfly_lake_disk_cache_read_errors_total": 0,
+            "antfly_lake_disk_cache_writes_completed_total": 1,
+            "antfly_lake_disk_cache_write_errors_total": 0,
+            "antfly_lake_disk_cache_writes_dropped_total": 0,
+            "antfly_lake_disk_cache_writes_coalesced_total": 0,
+            "antfly_lake_disk_cache_dropped_bytes_total": 0,
+            "antfly_lake_disk_cache_corrupt_entries_removed_total": 0,
+            "antfly_lake_disk_cache_evicted_entries_total": 0,
+            "antfly_lake_disk_cache_evicted_bytes_total": 0,
+            "antfly_lake_cache_hits_total": 406,
+            "antfly_lake_cache_misses_total": 887,
+            "antfly_lake_cache_mapping_hits_total": 33,
+            "antfly_lake_disk_cache_drops_policy_total": 0,
+            "antfly_lake_disk_cache_drops_queue_total": 0,
+            "antfly_lake_disk_cache_drops_memory_total": 0,
+            "antfly_lake_disk_cache_drops_capacity_total": 0,
+            "antfly_lake_disk_cache_drops_allocation_total": 0,
+            "antfly_lake_disk_cache_drops_closing_total": 0,
+            "antfly_lake_query_best_first_calls_total": 1,
+            "antfly_lake_query_best_first_segments_total": 58,
+            "antfly_lake_query_best_first_pruned_nodes_total": 70,
+            "antfly_lake_query_source_calls_total": 1,
+            "antfly_lake_query_source_nanoseconds_total": 185984000,
+            "antfly_lake_query_publication_calls_total": 1,
+            "antfly_lake_query_publication_nanoseconds_total": 73113000,
+            "antfly_lake_query_index_calls_total": 8,
+            "antfly_lake_query_index_nanoseconds_total": 16958000,
+            "antfly_lake_query_ranking_calls_total": 1,
+            "antfly_lake_query_ranking_nanoseconds_total": 86635000,
+            "antfly_lake_query_hydration_calls_total": 1,
+            "antfly_lake_query_hydration_nanoseconds_total": 6609000,
+            "antfly_lake_query_highlight_calls_total": 1,
+            "antfly_lake_query_highlight_nanoseconds_total": 45000,
+            "antfly_lake_query_total_calls_total": 1,
+            "antfly_lake_query_total_nanoseconds_total": 4384303000,
+            "antfly_lake_navigation_warming_attempts_total": 1,
+            "antfly_lake_navigation_warming_failures_total": 0,
+            "antfly_lake_navigation_warming_pages_total": 42,
+            "antfly_lake_navigation_warming_nanoseconds_total": 17486000
+          }
+        }
+      ]
+    }
+  ],
+  "pagination_exhaustion": {
+    "union": {
+      "term": "sqlite",
+      "pages": 11,
+      "hits": 167,
+      "elapsed_ms": 1189.57,
+      "count": {
+        "value": 167,
+        "relation": "exact"
+      },
+      "observed_lower_bound": true,
+      "terminal_total": {
+        "value": 167,
+        "relation": "exact"
+      },
+      "unique_table_ids": true
+    },
+    "saved_overlay": {
+      "term": "sqlite",
+      "pages": 11,
+      "hits": 166,
+      "elapsed_ms": 1013.23,
+      "count": {
+        "value": 166,
+        "relation": "exact"
+      },
+      "observed_lower_bound": true,
+      "terminal_total": {
+        "value": 166,
+        "relation": "exact"
+      },
+      "unique_table_ids": true
+    }
+  },
+  "isolated_restart_diagnostic": [
+    {
+      "cycle": 1,
+      "samples": [
+        {
+          "phase": "restart",
+          "elapsed_ms": 774.44,
+          "took_ms": 747
+        },
+        {
+          "phase": "warm",
+          "elapsed_ms": 140.27,
+          "took_ms": 138
+        }
+      ]
+    },
+    {
+      "cycle": 2,
+      "samples": [
+        {
+          "phase": "restart",
+          "elapsed_ms": 243.96,
+          "took_ms": 231
+        },
+        {
+          "phase": "warm",
+          "elapsed_ms": 133.49,
+          "took_ms": 129
+        }
+      ]
+    },
+    {
+      "cycle": 3,
+      "samples": [
+        {
+          "phase": "restart",
+          "elapsed_ms": 236.78,
+          "took_ms": 229
+        },
+        {
+          "phase": "warm",
+          "elapsed_ms": 171.81,
+          "took_ms": 169
+        }
+      ]
+    },
+    {
+      "cycle": 4,
+      "samples": [
+        {
+          "phase": "restart",
+          "elapsed_ms": 260.88,
+          "took_ms": 251
+        },
+        {
+          "phase": "warm",
+          "elapsed_ms": 105.32,
+          "took_ms": 101
+        }
+      ]
+    },
+    {
+      "cycle": 5,
+      "samples": [
+        {
+          "phase": "restart",
+          "elapsed_ms": 266.56,
+          "took_ms": 256
+        },
+        {
+          "phase": "warm",
+          "elapsed_ms": 141.58,
+          "took_ms": 134
+        }
+      ]
+    }
+  ],
+  "validation": {
+    "lake_core_passed": 157,
+    "lake_api_passed": 247,
+    "composed_regressions_passed": 13,
+    "python_qualification_passed": 47,
+    "python_qualification_subtests_passed": 25,
+    "native_http_passed": 11,
+    "native_http_subtests_passed": 9,
+    "gcs_cases_deselected": 2,
+    "native_http_matrix": "filesystem and local S3, primary_lsm and vector_store, max_native_cuts=2; HN gateway"
+  },
+  "diagnostic_before_eviction": "The previous rebuilt engine passed one cycle but exhausted the default 64-cut local cache during the second. Both cycles now complete with matching table/ID/score results.",
+  "limitations": [
+    "One cycle recorded a 4385.25 ms single-table post-restart search, exceeding the 2000 ms target; its ranking phase was 86.635 ms and the full source/publication/index phases do not account for the full delay. Root cause is unproven.",
+    "A 2582.56 ms restart cursor sample was also recorded. Five isolated first-search restart probes measured 236.78\u2013774.44 ms with identical IDs/scores; these do not erase the original outliers.",
+    "Correctness and cache-pressure qualification passed. The two-cycle restart-latency criterion did not pass; managed Cloud latency remains unqualified."
+  ]
+}

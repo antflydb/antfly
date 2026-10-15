@@ -58,10 +58,29 @@ pub const Handle = struct {
     parent_handle: ?*Handle = null,
     table_handles: std.ArrayList(*anyopaque) = .empty,
     sql_decision_uncertain: bool = false,
+    // New generations inspect durable recovery once. Every job producer dirties
+    // these flags before admission, including uncertain publication outcomes.
+    sql_commit_recovery_needed: bool = true,
+    sql_ddl_recovery_needed: bool = true,
+    sql_ddl_recovery_scans: if (builtin.is_test) u64 else void = if (builtin.is_test) 0 else {},
+    sql_commit_recovery_scans: if (builtin.is_test) u64 else void = if (builtin.is_test) 0 else {},
+    maintenance_references: usize = 0,
+    maintenance_publication: ?*@import("lite_connection.zig").PreparedPublication = null,
+    maintenance_owner: ?*@import("lite_connection.zig").Owner = null,
+    maintenance_writer_lease: ?lite_backend.native.PathWriterLock = null,
+    maintenance_writer_references: usize = 0,
+    maintenance_admission_mutex: std.Io.Mutex = .init,
     embedded_path: ?[]u8 = null,
     embedded_open_options: db_mod.OpenOptions = .{},
     embedded_tables: std.StringHashMapUnmanaged(*@import("tables.zig").Table) = .empty,
+    embedding_cache_mutex: std.atomic.Mutex = .unlocked,
+    embedding_cache_commit_mutex: std.atomic.Mutex = .unlocked,
+    embedding_cache_pending: std.AutoHashMapUnmanaged([32]u8, []u8) = .empty,
+    embedding_cache_pending_bytes: usize = 0,
+    embedded_table_open_mutex: std.Io.Mutex = .init,
     embedded_catalog_loaded: bool = false,
+    embedded_table_records: std.StringHashMapUnmanaged(u64) = .empty,
+    embedded_table_errors: std.StringHashMapUnmanaged([]const u8) = .empty,
     embedded_next_table_id: u64 = 2,
     sql_cursors: std.AutoHashMapUnmanaged(u64, *@import("sql_cursor.zig").Cursor) = .empty,
     next_sql_cursor_id: u64 = 1,
@@ -117,6 +136,7 @@ pub const Handle = struct {
     api_lock: std.Io.RwLock = .init,
     write_mutex: std.Io.Mutex = .init,
     maintenance_mutex: std.Io.Mutex = .init,
+    promotion_commit_mutex: std.Io.Mutex = .init,
 
     pub fn database(self: *Handle) *db_mod.DB {
         return self.selected_db orelse &self.db;
@@ -226,6 +246,9 @@ pub fn closeHandle(handle: *Handle) void {
     if (handle.db_live) {
         if (handle.lease_snapshot) handle.db.closeImmutableSnapshot() else handle.db.close();
     }
+    var cached = handle.embedding_cache_pending.valueIterator();
+    while (cached.next()) |value| handle.alloc.free(value.*);
+    handle.embedding_cache_pending.deinit(handle.alloc);
     stopLiteEmbeddedInference(handle);
     if (handle.server_cleanup) |cleanup| cleanup(handle);
     if (handle.owned_lite_backend) |*backend| {
@@ -304,6 +327,9 @@ pub const ReadableLeaseHook = struct {
             .unsupported => return error.UnsupportedOperation,
             .stalled => return error.Stalled,
             .cancelled => return error.Canceled,
+            .replacement_failed => return error.IndexReplacementFailed,
+            .replacement_pending => return error.IndexReplacementPending,
+            .replacement_configuration_mismatch => return error.IndexReplacementConfigurationMismatch,
             .internal => return error.Internal,
         }
     }
@@ -313,8 +339,8 @@ pub const ReadableLeaseHook = struct {
 /// `enterHandle` instead; this is for close and for internal callers (the
 /// storage-owner ABI, tests) that do not race close.
 pub fn asHandle(ptr: ?*anyopaque) ?*Handle {
-    const id = handle_registry.decode(ptr) orelse return null;
-    const slot = handle_registry.slotFor(id.index) orelse return null;
+    const id = handleRegistry().decode(ptr) orelse return null;
+    const slot = handleRegistry().slotFor(id.index) orelse return null;
     if (slot.state.load(.acquire) >> 1 != id.generation) return null;
     const handle = slot.handle.load(.acquire) orelse return null;
     if (handle.lite_connection) |connection| return connection.current orelse handle;
@@ -529,13 +555,17 @@ pub fn HandleRegistryOf(comptime T: type) type {
 pub const HandleRegistry = HandleRegistryOf(Handle);
 
 pub var handle_registry: HandleRegistry = .{};
+/// Access the one registry after the storage descriptor validates its layout.
+pub fn handleRegistry() *HandleRegistry {
+    if (comptime @import("../storage/engine_selection.zig").enabled)
+        return @ptrCast(@alignCast(@import("antfly_source_root").antfly_sources.storage_engine.call("registry", .{}) catch unreachable));
+    return &handle_registry;
+}
 
-/// Closes a handle id: rejects new calls, drains entered ones, frees it.
-/// Safe for stale ids and concurrent or repeated closes.
 pub fn closeHandleId(ptr: ?*anyopaque) void {
-    const handle, const id = handle_registry.beginClose(ptr) orelse return;
+    const handle, const id = handleRegistry().beginClose(ptr) orelse return;
     closeHandle(handle);
-    handle_registry.finishClose(id);
+    handleRegistry().finishClose(id);
 }
 
 /// The handle locks are called from arbitrary foreign threads, so they use

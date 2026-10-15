@@ -219,3 +219,22 @@ sequence.
 - Whether Hilbert-seeded or doc-key-seeded bulk build should replace recursive
   bulk build as the default depends on further product-shaped benchmarking,
   not just the synthetic HBC bench comparison recorded above.
+- Resource-derived query capacity should feed public admission. Admission is a
+  fixed request count (`max_concurrent_requests`, default 32), so an index-sized
+  dense-search workspace whose estimator or configuration is wrong can still
+  surface an internal `ResourceBudgetExceeded` 500 instead of being rejected at
+  admission ([history](../docs/design/dense-indexing/history/vectordbbench-native-hbc-2026-08.md)).
+- Runtime status should distinguish `temporarily_unavailable` from a literal
+  empty index; as of the 2026-09-03–05 log, a busy managed writer briefly
+  produced a zero-count status placeholder
+  ([history](../docs/design/dense-indexing/history/vectordbbench-2026-09-03-05.md)).
+- As of the 2026-09-08 log, the default-off stable scoring origins experiment
+  (`ANTFLY_EXPERIMENT_STABLE_POSTING_ORIGINS`) showed a mixed query p99
+  regression (70.941→90.486 ms and 67.605→74.486 ms at 50K) that still needs
+  attribution
+  ([history](../docs/design/dense-indexing/history/vectordbbench-2026-09-07-14.md)).
+- As of the 2026-09-07–14 log, the Debug test `db dense auto bulk finish wakes
+  weak-sync replay and publishes visibility after catch-up` failed its
+  `publish_blocking_checkpoint_clean` assertion with the capture flag both on
+  and off; the cause was not established
+  ([history](../docs/design/dense-indexing/history/vectordbbench-2026-09-07-14.md)).

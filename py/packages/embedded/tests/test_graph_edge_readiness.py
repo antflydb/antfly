@@ -23,6 +23,9 @@ import os
 import random
 import subprocess
 import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -308,7 +311,7 @@ def test_query_resolution_uses_durable_aliases_without_promotion(
         assert (
             db.render_resolver_key("concepts", {"text": "Qwen3", "label": "concept"})["key"] == "concept/qwen_embedding"
         )
-        assert db.resolve_query("concepts", request)["resolution"]["config_generation"] == 2
+        assert db.resolve_query("concepts", request)["resolution"]["config_generation"] == 3
         assert len(db.edges("knowledge", "concept/qwen_embedding", "uses", 0)) == 1
         assert db.edges("knowledge", "concept/qwen", "uses", 0) == []
         for field, value in (("table", "other"), ("key_template", "other/{{ uslug _entity.text }}")):
@@ -419,14 +422,8 @@ def test_query_resolution_uses_durable_aliases_without_promotion(
         )
         # A reset fences the namespace even though the durable merge list is empty.
         stale = json.loads(json.dumps(config))
-        if destination_storage == antfly_embedded.Storage.LITE:
-            with pytest.raises(antfly_embedded.InvalidArgumentError, match="resetting or migrating"):
-                restored.add_index(stale)
-        else:
-            # Directory index admission does not reapply inline resolvers.
-            assert (
-                restored.render_resolver_key("concepts", {"text": "Qwen3", "label": "concept"})["key"] == "fresh/qwen3"
-            )
+        with pytest.raises(antfly_embedded.InvalidArgumentError, match="resetting or migrating"):
+            restored.add_index(stale)
         current = json.loads(json.dumps(config))
         current["name"] = "fresh_namespace"
         current["resolvers"][0]["key_template"] = "fresh/{{ uslug _entity.text }}"
@@ -444,9 +441,8 @@ def test_query_resolution_uses_durable_aliases_without_promotion(
         # Even an alias-only stale replacement is rejected.
         current["name"] = "stale_aliases"
         current["resolvers"][0]["aliases"] = [{"key": "fresh/qwen3", "target": "fresh/old"}]
-        if destination_storage == antfly_embedded.Storage.LITE:
-            with pytest.raises(antfly_embedded.InvalidArgumentError, match="resetting or migrating"):
-                restored.add_index(current)
+        with pytest.raises(antfly_embedded.InvalidArgumentError, match="aliases.*resetting or migrating"):
+            restored.add_index(current)
         restored.set_resolver_namespace(
             "concepts",
             {
@@ -464,7 +460,7 @@ def test_query_resolution_uses_durable_aliases_without_promotion(
         assert len(db.edges("knowledge_v2", "concept/qwen_embedding", "uses", 0)) == 1
     with antfly_embedded.open_readonly(aflite_path) as db:
         result = db.resolve_query("concepts", request)
-        assert result["resolution"]["config_generation"] == 2
+        assert result["resolution"]["config_generation"] == 4
         assert result["resolution"]["entities"][0]["doc_ref"]["key"] == "concept/qwen_embedding"
         assert json.loads(db.resolve_query("concepts", request, raw=True)) == result
 
@@ -513,6 +509,13 @@ def test_resolver_revision_advances_for_unmerged_config_changes(tmp_path):
         changed["resolvers"][0]["min_confidence"] = 0.2
         db.add_index(changed)
         assert db.render_resolver_key("concepts", mention)["config_generation"] == 4
+        # An explicit reset must clear merges even when namespace and aliases
+        # exactly match the current declarative config.
+        db.set_resolver_namespace(
+            "concepts", {"table": "default", "key_template": "concept/{{ uslug _entity.text }}", "reset_merges": True}
+        )
+        assert db.render_resolver_key("concepts", mention)["key"] == "concept/qwen3"
+        db.merge_resolver_keys("concepts", "concept/qwen3", "concept/qwen")
         db.set_resolver_namespace(
             "concepts", {"table": "default", "key_template": "topic/{{ uslug _entity.text }}", "reset_merges": True}
         )
@@ -523,3 +526,850 @@ def test_resolver_revision_advances_for_unmerged_config_changes(tmp_path):
         with pytest.raises(antfly_embedded.InvalidArgumentError, match="resetting or migrating"):
             restored.add_index(changed)
         assert restored.render_resolver_key("concepts", mention)["key"] == "topic/qwen3"
+
+
+@pytest.mark.parametrize("storage", [antfly_embedded.Storage.LITE, antfly_embedded.Storage.DIRECTORY])
+def test_inline_resolver_ownership_and_table_scoped_identity(tmp_path, storage) -> None:
+    path = tmp_path / ("scoped.aflite" if storage == antfly_embedded.Storage.LITE else "scoped")
+    options = antfly_embedded.OpenOptions(
+        storage=storage, profile=antfly_embedded.Profile.NATIVE, generated_enrichment_replay=True
+    )
+    mention = {"id": "a", "text": "Ada", "label": "person"}
+    render_mention = {"text": "Ada", "label": "person"}
+    extraction = {
+        "entities": [mention, {"id": "b", "text": "Bob", "label": "person"}],
+        "relations": [{"type": "knows", "source": "a", "target": "b"}],
+    }
+    configs = {}
+    for suffix in ("alpha", "beta"):
+        configs[suffix] = {
+            "name": "knowledge",
+            "type": "graph",
+            "source": {"artifact": "kg", "format": "extraction_graph", "mention_edge_type": "mentions"},
+            "artifact": {
+                "name": "kg",
+                "kind": "asset",
+                "source": {"type": "field", "value": "kg"},
+                "content_type": "application/json",
+            },
+            "edge_types": [{"name": "mentions"}, {"name": "knows"}],
+            "resolvers": [
+                {
+                    "name": "people",
+                    "table": f"entities_{suffix}",
+                    "promote": False,
+                    "source_artifact": "kg",
+                    "resolution_artifact": "resolved",
+                    "key_template": suffix + "/{{ uslug _entity.text }}",
+                    "config_generation": 1,
+                }
+            ],
+        }
+    opener = (
+        antfly_embedded.create_with_options
+        if storage == antfly_embedded.Storage.LITE
+        else antfly_embedded.open_with_options
+    )
+    with opener(path, options) as db:
+        for suffix in configs:
+            db.create_table(f"entities_{suffix}", {})
+            db.create_table(f"source_{suffix}", {})
+        for suffix, config in configs.items():
+            with db.open_table(f"source_{suffix}") as table:
+                table.add_index(config)
+                table.batch_json({"inserts": {"claim": {"kg": extraction}}})
+                table.run_until_idle()
+        with db.open_table("source_alpha") as alpha, db.open_table("source_beta") as beta:
+            alpha.merge_resolver_keys("people", "alpha/ada", "alpha/canonical")
+            alpha.run_until_idle()
+            assert alpha.render_resolver_key("people", render_mention)["key"] == "alpha/canonical"
+            assert beta.render_resolver_key("people", render_mention)["key"] == "beta/ada"
+            assert len(alpha.edges("knowledge", "alpha/canonical", "knows", 0)) == 1
+            assert len(beta.edges("knowledge", "beta/ada", "knows", 0)) == 1
+            # One resolver may have multiple declaring indexes. Only the last
+            # owner retires it; table-local curation never affects its sibling.
+            shared = json.loads(json.dumps(configs["alpha"]))
+            shared["name"] = "shared"
+            alpha.add_index(shared)
+            alpha.run_until_idle()
+            assert alpha.delete_index("knowledge")
+            assert alpha.render_resolver_key("people", render_mention)["key"] == "alpha/canonical"
+            assert alpha.delete_index("shared")
+            with pytest.raises(antfly_embedded.NotFoundError):
+                alpha.render_resolver_key("people", render_mention)
+            with pytest.raises(antfly_embedded.NotFoundError):
+                alpha.resolve_query("people", {"extraction": extraction})
+            assert beta.render_resolver_key("people", render_mention)["key"] == "beta/ada"
+            # Updates while retired must be resolved on reactivation, even if
+            # an older resolution artifact has the same declarative generation.
+            updated = json.loads(json.dumps(extraction))
+            updated["entities"][1]["text"] = "Carol"
+            alpha.batch_json({"inserts": {"claim": {"kg": updated}}})
+            alpha.run_until_idle()
+        # A backup made while retired must retain identity without reactivating it.
+        backup = db.backup()
+    restored_path = tmp_path / ("archived.aflite" if storage == antfly_embedded.Storage.LITE else "archived")
+    antfly_embedded.restore(restored_path, backup, storage=storage)
+    with antfly_embedded.open_with_options(restored_path, options) as restored:
+        with restored.open_table("source_alpha") as alpha:
+            with pytest.raises(antfly_embedded.NotFoundError):
+                alpha.render_resolver_key("people", render_mention)
+            # Failed reactivation of a retained namespace cannot lose its merges.
+            invalid = json.loads(json.dumps(configs["alpha"]))
+            invalid["resolvers"][0]["key_template"] = "wrong/{{ uslug _entity.text }}"
+            with pytest.raises(antfly_embedded.InvalidArgumentError, match="resetting or migrating"):
+                alpha.add_index(invalid)
+            alpha.run_until_idle()
+            # Partial registration must restore a previously retired identity.
+            invalid = json.loads(json.dumps(configs["alpha"]))
+            invalid["resolvers"].append({**invalid["resolvers"][0], "name": "conflicting"})
+            with pytest.raises(antfly_embedded.InvalidArgumentError):
+                alpha.add_index(invalid)
+            alpha.run_until_idle()
+            with pytest.raises(antfly_embedded.NotFoundError):
+                alpha.render_resolver_key("people", render_mention)
+            renamed = json.loads(json.dumps(configs["alpha"]))
+            renamed["name"] = "knowledge_v2"
+            alpha.add_index(renamed)
+            alpha.run_until_idle()
+            assert alpha.render_resolver_key("people", render_mention)["key"] == "alpha/canonical"
+            restored_edges = alpha.edges("knowledge_v2", "alpha/canonical", "knows", 0)
+            assert len(restored_edges) == 1
+            assert base64.b64decode(restored_edges[0]["target_b64"]).decode() == "alpha/carol"
+    # Exact consumer pattern on two tables: reopen, reapply identical inline
+    # configs on existing indexes, then render/resolve and check relation edges.
+    with antfly_embedded.open_with_options(path, options) as db:
+        for suffix, config in configs.items():
+            with db.open_table(f"source_{suffix}") as table:
+                table.add_index(config)
+                table.run_until_idle()
+    with antfly_embedded.open_with_options(path, options) as db:
+        for suffix, config in configs.items():
+            with db.open_table(f"source_{suffix}") as table:
+                table.add_index(config)
+                table.run_until_idle()
+                expected = "alpha/canonical" if suffix == "alpha" else "beta/ada"
+                rendered = table.render_resolver_key("people", render_mention)
+                assert rendered["key"] == expected
+                assert rendered["table"] == f"entities_{suffix}"
+                result = table.resolve_query("people", {"extraction": extraction})
+                endpoint = result["resolution"]["entities"][0]["doc_ref"]
+                assert endpoint["key"] == expected
+                assert endpoint["table"] == f"entities_{suffix}"
+                edges = table.edges("knowledge", expected, "knows", 0)
+                assert len(edges) == 1
+                expected_target = "alpha/carol" if suffix == "alpha" else "beta/bob"
+                assert base64.b64decode(edges[0]["target_b64"]).decode() == expected_target
+
+
+def _open_graph_test(path, options):
+    opener = (
+        antfly_embedded.create_with_options
+        if options.storage == antfly_embedded.Storage.LITE and not path.exists()
+        else antfly_embedded.open_with_options
+    )
+    return opener(path, options)
+
+
+def _resolver_graph(name, resolver, *, labels=None, template="entity/{{ uslug _entity.text }}", destination="default"):
+    return {
+        "name": name,
+        "type": "graph",
+        "source": {"artifact": "kg", "format": "extraction_graph", "mention_edge_type": "mentions"},
+        "artifact": {
+            "name": "kg",
+            "kind": "asset",
+            "source": {"type": "field", "value": "kg"},
+            "content_type": "application/json",
+        },
+        "edge_types": [{"name": "mentions"}, {"name": "knows"}],
+        "resolvers": [
+            {
+                "name": resolver,
+                "table": destination,
+                "source_artifact": "kg",
+                "resolution_artifact": "resolved_" + resolver,
+                "key_template": template,
+                "labels": labels or [],
+                "promote": False,
+            }
+        ],
+    }
+
+
+def _stored_resolution(db, name):
+    key = b"\x01claim\x00\x00\x20resolution\x00\x00" + name.encode() + b"\x00\x00"
+    return json.loads(db.get_raw(key.decode()))
+
+
+@pytest.mark.parametrize("storage", [antfly_embedded.Storage.LITE, antfly_embedded.Storage.DIRECTORY])
+@pytest.mark.parametrize("owner_kind,catchall_kind", [("asset", "asset"), ("any", "asset"), ("asset", "any")])
+def test_retirement_replays_catchall_routing(tmp_path, storage, owner_kind, catchall_kind):
+    options = antfly_embedded.OpenOptions(storage=storage, generated_enrichment_replay=True)
+    with _open_graph_test(
+        tmp_path / ("routing.aflite" if storage == antfly_embedded.Storage.LITE else "routing"), options
+    ) as db:
+        # Catch-all initially skips the person mention claimed by its sibling.
+        owner = _resolver_graph("people_index", "people", labels=["person"])
+        owner["resolvers"][0]["source_artifact_kind"] = owner_kind
+        catchall = _resolver_graph("catchall_index", "catchall")
+        catchall["resolvers"][0]["source_artifact_kind"] = catchall_kind
+        db.add_index(owner)
+        db.add_index(catchall)
+        extraction = {"entities": [{"id": "a", "text": "Ada", "label": "person"}]}
+        db.batch_json({"inserts": {"claim": {"kg": extraction}}})
+        db.run_until_idle()
+        assert _stored_resolution(db, "resolved_catchall")["entities"] == []
+        assert db.delete_index("people_index")
+        db.run_until_idle()
+        stored = _stored_resolution(db, "resolved_catchall")
+        query = db.resolve_query("catchall", {"extraction": extraction})
+        assert [e["doc_ref"]["key"] for e in stored["entities"]] == ["entity/ada"]
+        for entity in query["resolution"]["entities"]:
+            entity["doc_ref"].pop("storage_table", None)
+        for entity in stored["entities"]:
+            entity["doc_ref"].pop("storage_table", None)
+        assert stored["entities"] == query["resolution"]["entities"]
+        assert "_resolution_work" not in stored
+        # Reactivation restores the label owner and retires the catch-all's
+        # previous entity, without changing the catch-all's inline config.
+        owner["name"] = "people_index_v2"
+        db.add_index(owner)
+        db.run_until_idle()
+        assert _stored_resolution(db, "resolved_catchall")["entities"] == []
+
+
+@pytest.mark.parametrize("storage", [antfly_embedded.Storage.LITE, antfly_embedded.Storage.DIRECTORY])
+@pytest.mark.parametrize("order", ["add_first", "delete_first", "atomic"])
+def test_index_upgrade_and_retired_identity_management(tmp_path, storage, order):
+    options = antfly_embedded.OpenOptions(storage=storage, generated_enrichment_replay=True)
+    config = _resolver_graph("knowledge_v1", "concepts")
+    mention = {"text": "Ada", "label": "person"}
+    path = tmp_path / ("upgrade.aflite" if storage == antfly_embedded.Storage.LITE else "upgrade")
+    with _open_graph_test(path, options) as db:
+        db.add_index(config)
+        db.merge_resolver_keys("concepts", "entity/ada", "entity/canonical")
+        db.run_until_idle()
+        reader_version = db.capabilities()["minimum_reader_version"]
+        assert reader_version == db.status()["capabilities"]["minimum_reader_version"] == 2
+        with pytest.raises(antfly_embedded.InvalidArgumentError, match="retire"):
+            db.drop_resolver_identity("concepts")
+        upgraded = json.loads(json.dumps(config))
+        upgraded["name"] = "knowledge_v2"
+        if order == "delete_first":
+            assert db.delete_index("knowledge_v1")
+            identities = db.list_resolver_identities()
+            assert identities[0]["config"]["retired"] is True
+            assert identities[0]["config"].get("merge_state_version", 0) <= 1
+            assert db.capabilities()["minimum_reader_version"] == reader_version
+            db.set_resolver_namespace(
+                "concepts",
+                {
+                    "table": "default",
+                    "key_template": "v2/{{ uslug _entity.text }}",
+                    "key_map": [
+                        {"key": "entity/ada", "target": "v2/ada"},
+                        {"key": "entity/canonical", "target": "v2/canonical"},
+                    ],
+                },
+            )
+            assert db.list_resolver_identities()[0]["config"]["retired"] is True
+            upgraded["resolvers"][0]["key_template"] = "v2/{{ uslug _entity.text }}"
+            db.add_index(upgraded)
+            expected = "v2/canonical"
+        else:
+            if order == "atomic":
+                upgraded["replaces"] = "knowledge_v1"
+                rejected = dict(upgraded, name="broken", edge_types=False)
+                with pytest.raises(antfly_embedded.AntflyError):
+                    db.add_index(rejected)
+                assert db.render_resolver_key("concepts", mention)["key"] == "entity/canonical"
+            db.add_index(upgraded)
+            if order == "add_first":
+                assert db.delete_index("knowledge_v1")
+            expected = "entity/canonical"
+        if order == "atomic":
+            # Repeating the command after the old index is gone is idempotent.
+            db.add_index(upgraded)
+        db.run_until_idle()
+        assert db.render_resolver_key("concepts", mention)["key"] == expected
+        names = {i["name"] for i in db.list_indexes()}
+        assert "knowledge_v2" in names
+        assert "knowledge_v1" not in names
+        upgraded.pop("replaces", None)
+    with _open_graph_test(path, options) as db:
+        db.add_index(upgraded)
+        assert db.render_resolver_key("concepts", mention)["key"] == expected
+        assert db.delete_index("knowledge_v2")
+        assert db.drop_resolver_identity("concepts")
+        assert db.list_resolver_identities() == []
+        assert not db.drop_resolver_identity("concepts")
+
+
+@pytest.mark.parametrize("storage", [antfly_embedded.Storage.LITE, antfly_embedded.Storage.DIRECTORY])
+@pytest.mark.parametrize("shared", [False, True])
+def test_same_name_and_template_across_source_tables(tmp_path, storage, shared):
+    options = antfly_embedded.OpenOptions(storage=storage, generated_enrichment_replay=True)
+    mention = {"text": "Ada", "label": "person"}
+    with _open_graph_test(
+        tmp_path / ("same_keys.aflite" if storage == antfly_embedded.Storage.LITE else "same_keys"), options
+    ) as db:
+        for destination in ["entities"] if shared else ["entities_a", "entities_b"]:
+            db.create_table(destination, {})
+        for source in ("a", "b"):
+            db.create_table(source, {})
+            with db.open_table(source) as table:
+                cfg = _resolver_graph("knowledge", "people", destination="entities" if shared else "entities_" + source)
+                cfg["resolvers"][0]["promote"] = True
+                table.add_index(cfg)
+                table.batch_json({"inserts": {"claim": {"kg": {"entities": [dict(mention, id="a")]}}}})
+                table.run_until_idle()
+        with db.open_table("a") as a, db.open_table("b") as b:
+            assert (
+                a.render_resolver_key("people", mention)["key"]
+                == b.render_resolver_key("people", mention)["key"]
+                == "entity/ada"
+            )
+            a.merge_resolver_keys("people", "entity/ada", "entity/canonical")
+            a.run_until_idle()
+            assert a.render_resolver_key("people", mention)["key"] == "entity/canonical"
+            assert b.render_resolver_key("people", mention)["key"] == "entity/ada"
+            assert b.list_resolver_identities()[0]["merges"] == []
+        with db.open_table("entities" if shared else "entities_b") as entities:
+            assert entities.lookup("entity/ada")["canonical_name"] == "Ada"
+
+
+@pytest.mark.parametrize("storage", [antfly_embedded.Storage.LITE, antfly_embedded.Storage.DIRECTORY])
+def test_fresh_replacement_and_rejected_target_preserve_identity(tmp_path, storage):
+    options = antfly_embedded.OpenOptions(storage=storage, generated_enrichment_replay=True)
+    path = tmp_path / ("replace.aflite" if storage == antfly_embedded.Storage.LITE else "replace")
+    with _open_graph_test(path, options) as db:
+        assert db.capabilities()["minimum_reader_version"] == 1
+        config = _resolver_graph("knowledge_v2", "concepts")
+        config["resolvers"][0]["min_confidence"] = 0.2
+        config["resolvers"][0]["promote"] = True
+        config["replaces"] = "knowledge_v1"
+        db.add_index(config)
+        assert db.capabilities()["minimum_reader_version"] == 2
+        before = db.list_resolver_identities()
+        # Existing-target replacement must reject non-graph old indexes before
+        # registering changed inline resolver config, for either storage mode.
+        db.add_index({"name": "text_target", "type": "full_text"})
+        bad = json.loads(json.dumps(config))
+        bad["replaces"] = "text_target"
+        bad["resolvers"][0]["min_confidence"] = 0
+        with pytest.raises(antfly_embedded.InvalidArgumentError):
+            db.add_index(bad)
+        assert db.list_resolver_identities() == before
+        db.add_index(config)
+    with _open_graph_test(path, options) as db:
+        assert db.capabilities()["minimum_reader_version"] == 2
+        assert db.list_resolver_identities() == before
+
+
+@pytest.mark.parametrize("storage", [antfly_embedded.Storage.LITE, antfly_embedded.Storage.DIRECTORY])
+def test_plain_database_reader_version_stays_one(tmp_path, storage):
+    options = antfly_embedded.OpenOptions(storage=storage)
+    path = tmp_path / ("plain.aflite" if storage == antfly_embedded.Storage.LITE else "plain")
+    with _open_graph_test(path, options) as db:
+        assert db.capabilities()["minimum_reader_version"] == 1
+    with _open_graph_test(path, options) as db:
+        assert db.status()["capabilities"]["minimum_reader_version"] == 1
+
+
+@pytest.mark.parametrize("storage", [antfly_embedded.Storage.LITE, antfly_embedded.Storage.DIRECTORY])
+def test_concurrent_shared_destination_promotion_preserves_aliases(tmp_path, storage):
+    options = antfly_embedded.OpenOptions(storage=storage, generated_enrichment_replay=True)
+    path = tmp_path / ("concurrent.aflite" if storage == antfly_embedded.Storage.LITE else "concurrent")
+    with _open_graph_test(path, options) as db:
+        db.create_table("entities", {})
+        for name in ["source_a", "source_b"]:
+            db.create_table(name, {})
+            with db.open_table(name) as source:
+                config = _resolver_graph("knowledge", "people", destination="entities")
+                config["resolvers"][0]["promote"] = True
+                source.add_index(config)
+        barrier = threading.Barrier(2)
+
+        def promote(name, text):
+            # Directory storage has one writer owner. Both source tables share
+            # that owner and its destination transaction coordinator.
+            with db.open_table(name) as source:
+                barrier.wait(timeout=30)
+                source.batch_json(
+                    {"inserts": {"claim": {"kg": {"entities": [{"id": "a", "text": text, "label": "person"}]}}}}
+                )
+                for attempt in range(20):
+                    try:
+                        db.run_until_idle()
+                        return
+                    except antfly_embedded.BusyError:
+                        if attempt == 19:
+                            raise
+                        time.sleep(0.01)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(promote, name, text) for name, text in [("source_a", "Ada"), ("source_b", "ADA")]
+            ]
+            for future in futures:
+                future.result(timeout=60)
+        db.run_until_idle()
+        with db.open_table("entities") as entities:
+            row = json.loads(entities.get_raw("entity/ada"))
+            assert row["canonical_name"] in ["Ada", "ADA"]
+            assert set(row["aliases"]) == {"Ada", "ADA"}
+
+
+def test_previous_reader_opens_plain_database_and_rejects_new_features(tmp_path):
+    previous = os.environ.get("ANTFLY_LITE_PREVIOUS_LIBRARY")
+    if not previous:
+        if os.environ.get("ANTFLY_LITE_REQUIRE_PREVIOUS_READER") == "1":
+            pytest.fail("ANTFLY_LITE_PREVIOUS_LIBRARY is required")
+        pytest.skip("set ANTFLY_LITE_PREVIOUS_LIBRARY to the pinned pre-PR reader")
+    options = antfly_embedded.OpenOptions(storage=antfly_embedded.Storage.LITE)
+    plain = tmp_path / "previous-plain.aflite"
+    identity = tmp_path / "previous-identity.aflite"
+    pending = tmp_path / "previous-pending.aflite"
+    with _open_graph_test(plain, options) as db:
+        db.create_table("plain_named", {})
+        db.create_table("dropped_named", {})
+        db.drop_table("dropped_named")
+        graph = {"name": "old", "type": "graph", "edge_types": [{"name": "R", "field": "links"}]}
+        db.add_index(graph)
+        db.add_index(dict(graph, name="new", replaces="old"))
+        db.run_until_idle()
+        assert db.capabilities()["minimum_reader_version"] == 1
+    with _open_graph_test(identity, options) as db:
+        config = _resolver_graph("knowledge", "concepts")
+        config["resolvers"][0]["promote"] = True
+        db.add_index(config)
+        assert db.capabilities()["minimum_reader_version"] == 2
+    # Hosted maintenance leaves the shadow pending deterministically. The old
+    # writer must fail open before it can truncate the retained journal.
+    with antfly_embedded.create_hosted(pending) as db:
+        graph = {"name": "old", "type": "graph", "edge_types": [{"name": "R", "field": "links"}]}
+        db.add_index(graph)
+        db.batch_json({"inserts": {"source": {"links": ["before"]}}})
+        db.run_until_idle()
+        db.add_index(dict(graph, name="new", replaces="old"))
+        assert db.pending_work_stats()["replacements"]
+        assert db.capabilities()["minimum_reader_version"] == 2
+    script = r"""
+import ctypes, sys
+lib = ctypes.CDLL(sys.argv[1])
+lib.antfly_lite_open.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p)]
+lib.antfly_lite_open.restype = ctypes.c_int
+lib.antfly_db_close.argtypes = [ctypes.c_void_p]
+for path, accepted in [(sys.argv[2], True), (sys.argv[3], False), (sys.argv[4], False)]:
+    handle = ctypes.c_void_p()
+    code = lib.antfly_lite_open(path.encode(), ctypes.byref(handle))
+    assert (code == 0) == accepted, (path, code)
+    if handle.value:
+        lib.antfly_db_close(handle)
+"""
+    subprocess.run(
+        [sys.executable, "-c", script, previous, str(plain), str(identity), str(pending)], check=True, timeout=60
+    )
+
+    # A previously opened Lite writer must also reject mutation after the
+    # registration commit, when its connection refreshes the catalog.
+    live = tmp_path / "previous-live-writer.aflite"
+    graph = {"name": "old", "type": "graph", "edge_types": [{"name": "R", "field": "links"}]}
+    with antfly_embedded.create_hosted(live) as db:
+        db.add_index(graph)
+        db.batch_json({"inserts": {"source": {"links": ["before"]}}})
+        db.run_until_idle()
+    writer_script = r"""
+import ctypes, sys
+class Slice(ctypes.Structure):
+    _fields_ = [("ptr", ctypes.c_void_p), ("len", ctypes.c_size_t)]
+lib = ctypes.CDLL(sys.argv[1])
+lib.antfly_lite_open.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p)]
+lib.antfly_lite_open.restype = ctypes.c_int
+lib.antfly_db_batch_json.argtypes = [ctypes.c_void_p, Slice]
+lib.antfly_db_batch_json.restype = ctypes.c_int
+lib.antfly_db_close.argtypes = [ctypes.c_void_p]
+handle = ctypes.c_void_p()
+assert lib.antfly_lite_open(sys.argv[2].encode(), ctypes.byref(handle)) == 0
+print("ready", flush=True)
+assert sys.stdin.readline().strip() == "write"
+request = b'{"inserts":{"source":{"links":["obsolete"]}}}'
+buffer = ctypes.create_string_buffer(request)
+code = lib.antfly_db_batch_json(handle, Slice(ctypes.cast(buffer, ctypes.c_void_p), len(request)))
+assert code != 0, "old writer admitted mutation across the replacement fence"
+lib.antfly_db_close(handle)
+"""
+    writer = subprocess.Popen(
+        [sys.executable, "-c", writer_script, previous, str(live)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        import select
+
+        assert writer.stdout is not None
+        ready, _, _ = select.select([writer.stdout], [], [], 30)
+        assert ready and writer.stdout.readline().strip() == "ready"
+        with antfly_embedded.open_hosted(live) as db:
+            db.add_index(dict(graph, name="new", replaces="old"))
+            _, stderr = writer.communicate("write\n", timeout=30)
+            assert writer.returncode == 0, stderr
+            db.batch_json({"inserts": {"source": {"links": ["latest"]}}})
+            db.run_until_idle()
+            edges = db.edges("new", "source", "R", antfly_embedded.GraphDirection.OUT)
+            assert [base64.b64decode(edge["target_b64"]).decode() for edge in edges] == ["latest"]
+    finally:
+        if writer.poll() is None:
+            writer.kill()
+        writer.wait(timeout=30)
+
+
+@pytest.mark.parametrize("storage", [antfly_embedded.Storage.LITE, antfly_embedded.Storage.DIRECTORY])
+def test_atomic_replacement_rebuilds_changed_graph_field_mapping(tmp_path, storage):
+    options = antfly_embedded.OpenOptions(storage=storage)
+    path = tmp_path / ("fields.aflite" if storage == antfly_embedded.Storage.LITE else "fields")
+    with _open_graph_test(path, options) as db:
+        db.add_index({"name": "old", "type": "graph", "edge_types": [{"name": "R", "field": "links"}]})
+        db.batch_json({"inserts": {"a": {"links": ["b"], "new_links": ["c"]}}})
+        db.run_until_idle()
+        assert [base64.b64decode(e["target_b64"]).decode() for e in db.edges("old", "a", "R", 0)] == ["b"]
+        db.add_index(
+            {
+                "name": "new",
+                "type": "graph",
+                "replaces": "old",
+                "wait": {"timeout_ms": 10000},
+                "edge_types": [{"name": "R", "field": "new_links"}],
+            }
+        )
+        assert [base64.b64decode(e["target_b64"]).decode() for e in db.edges("new", "a", "R", 0)] == ["c"]
+        db.batch_json({"inserts": {"a": {"links": ["b"], "new_links": ["d"]}}})
+        db.run_until_idle()
+        assert [base64.b64decode(e["target_b64"]).decode() for e in db.edges("new", "a", "R", 0)] == ["d"]
+    with _open_graph_test(path, options) as db:
+        assert [base64.b64decode(e["target_b64"]).decode() for e in db.edges("new", "a", "R", 0)] == ["d"]
+
+
+@pytest.mark.parametrize("storage", [antfly_embedded.Storage.LITE, antfly_embedded.Storage.DIRECTORY])
+def test_replacement_registration_and_optional_wait(tmp_path, storage):
+    options = antfly_embedded.OpenOptions(storage=storage)
+    path = tmp_path / ("shadow.aflite" if storage == antfly_embedded.Storage.LITE else "shadow")
+    with _open_graph_test(path, options) as db:
+        db.add_index({"name": "old", "type": "graph", "edge_types": [{"name": "R", "field": "links"}]})
+        db.batch_json({"inserts": {f"source:{i:04}": {"links": ["old"], "next_links": ["new"]} for i in range(300)}})
+        db.run_until_idle()
+        request = {
+            "name": "new",
+            "type": "graph",
+            "replaces": "old",
+            "edge_types": [{"name": "R", "field": "next_links"}],
+        }
+        with pytest.raises(antfly_embedded.BusyError):
+            db.add_index(dict(request, wait={"timeout_ms": 0}))
+        # The timeout follows accepted registration; it must preserve the job.
+        progress = db.pending_work_stats()["replacements"]
+        assert progress[0]["name"] == "new"
+        assert progress[0]["replaces"] == "old"
+        assert progress[0]["last_error"] is None
+        assert progress[0]["retry_count"] == 0
+        assert progress[0]["total_retry_count"] == 0
+        assert progress[0]["max_total_retries"] == 64
+        db.add_index(request)
+        names = {i["name"] for i in db.list_indexes()}
+        if "old" in names:
+            assert [base64.b64decode(e["target_b64"]).decode() for e in db.edges("old", "source:0000", "R", 0)] == [
+                "old"
+            ]
+        db.add_index(dict(request, wait={"timeout_ms": 10000}))
+        assert not db.pending_work_stats()["replacements"]
+        assert [base64.b64decode(e["target_b64"]).decode() for e in db.edges("new", "source:0000", "R", 0)] == ["new"]
+        db.add_index(dict(request, wait={"timeout_ms": 0}))
+
+
+def test_directory_open_does_not_open_broken_named_table(tmp_path):
+    options = antfly_embedded.OpenOptions(storage=antfly_embedded.Storage.DIRECTORY)
+    path = tmp_path / "lazy"
+    with _open_graph_test(path, options) as db:
+        db.create_table("bad", {})
+        db.batch_json({"inserts": {"healthy": {"text": "available"}}})
+    table_path = path / "embedded" / "tables" / "2"
+    table_path.rename(path / "saved-table")
+    table_path.write_bytes(b"not a table directory")
+    with _open_graph_test(path, options) as db:
+        assert "bad" in db.list_tables()
+        assert db.lookup("healthy")["text"] == "available"
+        db.status()
+        db.capabilities()
+        with pytest.raises(antfly_embedded.AntflyError):
+            db.open_table("bad")
+        db.run_until_idle()
+        assert "bad" in db.pending_work_stats()["unavailable_tables"]
+        assert db.sql("SELECT 42 AS value")["rows"] == [["42"]]
+        with pytest.raises(antfly_embedded.AntflyError):
+            db.backup()  # A full archive must not silently lose a table.
+        scoped = db.backup(tables=["default"])
+    with antfly_embedded.create(tmp_path / "healthy-restore.aflite") as restored:
+        restored.import_backup(scoped)
+        assert restored.lookup("healthy")["text"] == "available"
+        assert "bad" not in restored.list_tables()
+
+
+@pytest.mark.parametrize("storage", [antfly_embedded.Storage.LITE, antfly_embedded.Storage.DIRECTORY])
+def test_background_replacement_finishes_under_concurrent_writes(tmp_path, storage):
+    options = antfly_embedded.OpenOptions(storage=storage)
+    path = tmp_path / ("busy-shadow.aflite" if storage == antfly_embedded.Storage.LITE else "busy-shadow")
+    with _open_graph_test(path, options) as db:
+        db.add_index({"name": "old", "type": "graph", "edge_types": [{"name": "R", "field": "links"}]})
+        db.batch_json({"inserts": {f"source:{i:04}": {"links": ["old"], "next_links": ["new"]} for i in range(500)}})
+        db.run_until_idle()
+        stop = threading.Event()
+        started = threading.Event()
+
+        def write():
+            revisions = 0
+            started.set()
+            while not stop.is_set():
+                db.batch_json({"inserts": {"source:0000": {"links": ["old"], "next_links": [f"v{revisions}"]}}})
+                revisions += 1
+                time.sleep(0.002)
+            return revisions
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(write)
+            try:
+                assert started.wait(timeout=5)
+                request = {
+                    "name": "new",
+                    "type": "graph",
+                    "replaces": "old",
+                    "edge_types": [{"name": "R", "field": "next_links"}],
+                }
+                db.add_index(request)
+                db.add_index(request)
+                deadline = time.monotonic() + 90
+                while "new" not in {i["name"] for i in db.list_indexes()}:
+                    assert time.monotonic() < deadline, json.dumps(db.pending_work_stats())
+                    time.sleep(0.01)
+            finally:
+                stop.set()
+            assert future.result(timeout=10) > 1
+        db.batch_json({"inserts": {"source:0000": {"links": ["old"], "next_links": ["final"]}}})
+        db.run_until_idle()
+        assert [base64.b64decode(e["target_b64"]).decode() for e in db.edges("new", "source:0000", "R", 0)] == ["final"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX SIGKILL and pipe-polling fixture")
+@pytest.mark.parametrize("storage", [antfly_embedded.Storage.LITE, antfly_embedded.Storage.DIRECTORY])
+def test_replacement_recovers_after_process_exit(tmp_path, storage):
+    import select
+    import signal
+
+    path = tmp_path / ("crash-shadow.aflite" if storage == antfly_embedded.Storage.LITE else "crash-shadow")
+    script = r"""
+import sys, time, json
+import antfly_embedded as af
+options = af.OpenOptions(storage=af.Storage(int(sys.argv[2])), busy_timeout=5)
+opener = af.create_with_options if options.storage == af.Storage.LITE else af.open_with_options
+db = opener(sys.argv[1], options)
+db.add_index({"name": "old", "type": "graph", "edge_types": [{"name": "R", "field": "links"}]})
+# Many source pages force a partial build; endpoint rows check both the
+# acknowledged prefix and the unbuilt suffix without benchmarking graph size.
+db.batch_json({"inserts": {f"source:{i:04}": {"links": ["old"] if i in (0, 9999) else [],
+                    "next_links": ["new"] if i in (0, 9999) else []} for i in range(10000)}})
+db.run_until_idle()
+print("ready", flush=True)
+assert sys.stdin.readline().strip() == "build"
+while True:
+    try:
+        db.add_index({"name": "new", "type": "graph", "replaces": "old",
+                      "edge_types": [{"name": "R", "field": "next_links"}], "wait": {"timeout_ms": 25}})
+    except af.BusyError:
+        pass
+    else:
+        raise AssertionError("replacement finished before the parent observed its crash point")
+    progress = db.pending_work_stats()["replacements"]
+    if progress and progress[0]["phase"] == "building" and progress[0]["scanned_keys"] > 0:
+        assert "old" in {i["name"] for i in db.list_indexes()}
+        print(json.dumps(progress[0]), flush=True)
+        sys.stdin.readline()  # Parent kills us; never close or flush.
+        raise AssertionError("parent did not crash the builder")
+    time.sleep(0.05)
+"""
+    with subprocess.Popen(
+        [sys.executable, "-u", "-c", script, str(path), str(int(storage))],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    ) as child:
+        try:
+            assert child.stdin is not None
+            assert child.stdout is not None
+            assert child.stderr is not None
+            assert select.select([child.stdout], [], [], 60)[0], "child did not initialize"
+            assert child.stdout.readline().strip() == "ready"
+            child.stdin.write("build\n")
+            child.stdin.flush()
+            assert select.select([child.stdout], [], [], 30)[0], "builder did not checkpoint"
+            line = child.stdout.readline()
+            assert line, child.stderr.read()
+            observed = json.loads(line)
+            assert observed["phase"] == "building" and observed["scanned_keys"] > 0
+            child.kill()
+            assert child.wait(timeout=10) == -signal.SIGKILL
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=10)
+    # Observe the durable marker after the crash and before any writer can
+    # resume. This proves the fixture killed a partially built replacement.
+    with _open_graph_test(
+        path, antfly_embedded.OpenOptions(storage=storage, mode=antfly_embedded.OpenMode.READONLY)
+    ) as observer:
+        progress = observer.pending_work_stats()["replacements"]
+        assert len(progress) == 1 and progress[0]["phase"] == "building"
+        assert progress[0]["scanned_keys"] >= observed["scanned_keys"]
+    with _open_graph_test(path, antfly_embedded.OpenOptions(storage=storage)) as db:
+        db.run_until_idle()
+        assert "old" not in {i["name"] for i in db.list_indexes()}
+        for key in ("source:0000", "source:9999"):
+            assert [base64.b64decode(e["target_b64"]).decode() for e in db.edges("new", key, "R", 0)] == ["new"]
+
+
+@pytest.mark.parametrize("storage", [antfly_embedded.Storage.LITE, antfly_embedded.Storage.DIRECTORY])
+def test_pending_replacement_name_is_reserved_and_cancellable(tmp_path, storage):
+    options = antfly_embedded.OpenOptions(storage=storage)
+    path = tmp_path / ("reserved.aflite" if storage == antfly_embedded.Storage.LITE else "reserved")
+    with _open_graph_test(path, options) as db:
+        db.add_index({"name": "old", "type": "graph", "edge_types": [{"name": "R", "field": "links"}]})
+        db.batch_json({"inserts": {f"s:{i:04}": {"links": ["old"], "next_links": ["new"]} for i in range(300)}})
+        db.run_until_idle()
+        config = {"name": "new", "type": "graph", "edge_types": [{"name": "R", "field": "next_links"}]}
+        with pytest.raises(antfly_embedded.BusyError):
+            db.add_index(dict(config, replaces="old", wait={"timeout_ms": 0}))
+        db.add_index(config)  # Codex's plain inline config replay joins the shadow.
+        with pytest.raises(antfly_embedded.ReplacementConfigurationMismatchError):
+            db.add_index(dict(config, edge_types=[{"name": "R", "field": "wrong"}]))
+        assert db.cancel_replacement("new")
+        assert not db.cancel_replacement("new")
+        assert "old" in {i["name"] for i in db.list_indexes()}
+        db.run_until_idle()
+        assert not db.pending_work_stats()["replacements"]
+        db.add_index(dict(config, replaces="old"))
+        db.run_until_idle()
+        assert [base64.b64decode(e["target_b64"]).decode() for e in db.edges("new", "s:0000", "R", 0)] == ["new"]
+
+
+@pytest.mark.parametrize("storage", [antfly_embedded.Storage.LITE, antfly_embedded.Storage.DIRECTORY])
+def test_plain_table_lifecycle_preserves_reader_version_one(tmp_path, storage):
+    options = antfly_embedded.OpenOptions(storage=storage)
+    path = tmp_path / ("epoch.aflite" if storage == antfly_embedded.Storage.LITE else "epoch")
+    with _open_graph_test(path, options) as db:
+        db.create_table("plain", {})
+        assert db.capabilities()["minimum_reader_version"] == 1
+        db.drop_table("plain")
+        assert db.capabilities()["minimum_reader_version"] == 1
+    with _open_graph_test(path, options) as db:
+        assert db.capabilities()["minimum_reader_version"] == 1
+
+
+@pytest.mark.parametrize("storage", [antfly_embedded.Storage.LITE, antfly_embedded.Storage.DIRECTORY])
+def test_plain_replacement_temporarily_fences_older_writers(tmp_path, storage):
+    path = tmp_path / ("plain-replace.aflite" if storage == antfly_embedded.Storage.LITE else "plain-replace")
+    options = antfly_embedded.OpenOptions(storage=storage)
+    with _open_graph_test(path, options) as db:
+        db.add_index({"name": "old", "type": "graph", "edge_types": [{"name": "R", "field": "links"}]})
+        db.batch_json({"inserts": {f"s:{i:04}": {"links": ["target"]} for i in range(300)}})
+        db.run_until_idle()
+        with pytest.raises(antfly_embedded.BusyError):
+            db.add_index(
+                {
+                    "name": "new",
+                    "type": "graph",
+                    "replaces": "old",
+                    "edge_types": [{"name": "R", "field": "links"}],
+                    "wait": {"timeout_ms": 0},
+                }
+            )
+        assert db.capabilities()["minimum_reader_version"] == 2
+        db.run_until_idle()
+        assert db.capabilities()["minimum_reader_version"] == 1
+    with _open_graph_test(path, options) as db:
+        assert db.capabilities()["minimum_reader_version"] == 1
+
+
+@pytest.mark.parametrize("storage", [antfly_embedded.Storage.LITE, antfly_embedded.Storage.DIRECTORY])
+def test_replacement_wait_observes_cancellation(tmp_path, storage):
+    import concurrent.futures
+    import time
+
+    path = tmp_path / ("cancel-wait.aflite" if storage == antfly_embedded.Storage.LITE else "cancel-wait")
+    options = antfly_embedded.OpenOptions(storage=storage)
+    with _open_graph_test(path, options) as db:
+        db.add_index({"name": "old", "type": "graph", "edge_types": [{"name": "R", "field": "links"}]})
+        db.batch_json({"inserts": {f"s:{i:05}": {"links": ["target"]} for i in range(3000)}})
+        db.run_until_idle()
+        config = {"name": "new", "type": "graph", "replaces": "old", "edge_types": [{"name": "R", "field": "links"}]}
+        with pytest.raises(antfly_embedded.BusyError):
+            db.add_index(dict(config, wait={"timeout_ms": 0}))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            waiter = pool.submit(db.add_index, dict(config, wait={"timeout_ms": 60000}))
+            time.sleep(0.02)
+            assert db.cancel_replacement("new")
+            with pytest.raises(antfly_embedded.CancelledError):
+                waiter.result(timeout=10)
+        assert "old" in {i["name"] for i in db.list_indexes()}
+
+
+@pytest.mark.parametrize("storage", [antfly_embedded.Storage.LITE, antfly_embedded.Storage.DIRECTORY])
+@pytest.mark.parametrize("finish", ["cancel", "swap"])
+def test_named_replacement_does_not_permanently_upgrade_root(tmp_path, storage, finish):
+    path = tmp_path / ("named-fence.aflite" if storage == antfly_embedded.Storage.LITE else "named-fence")
+    options = antfly_embedded.OpenOptions(storage=storage)
+    graph = {"name": "old", "type": "graph", "edge_types": [{"name": "R", "field": "links"}]}
+    with _open_graph_test(path, options) as db:
+        db.create_table("source", {})
+        with db.open_table("source") as table:
+            table.add_index(graph)
+            table.batch_json({"inserts": {f"s:{i:04}": {"links": ["target"]} for i in range(300)}})
+            db.run_until_idle()
+            with pytest.raises(antfly_embedded.BusyError):
+                table.add_index(dict(graph, name="new", replaces="old", wait={"timeout_ms": 0}))
+            assert table.capabilities()["minimum_reader_version"] == 2
+            assert db.capabilities()["minimum_reader_version"] == 2
+            if finish == "cancel":
+                assert table.cancel_replacement("new")
+            else:
+                db.run_until_idle()
+            assert table.capabilities()["minimum_reader_version"] == 1
+            assert db.capabilities()["minimum_reader_version"] == 1
+    with _open_graph_test(path, options) as db:
+        assert db.capabilities()["minimum_reader_version"] == 1
+        with db.open_table("source") as table:
+            assert table.capabilities()["minimum_reader_version"] == 1
+            names = {i["name"] for i in table.list_indexes()}
+            assert names & {"old", "new"} == {"old" if finish == "cancel" else "new"}
+
+
+@pytest.mark.parametrize("storage", [antfly_embedded.Storage.LITE, antfly_embedded.Storage.DIRECTORY])
+def test_child_permanent_epoch_survives_root_temporary_fence(tmp_path, storage):
+    path = tmp_path / ("aggregate-fence.aflite" if storage == antfly_embedded.Storage.LITE else "aggregate-fence")
+    options = antfly_embedded.OpenOptions(storage=storage)
+    graph = {"name": "old", "type": "graph", "edge_types": [{"name": "R", "field": "links"}]}
+    with _open_graph_test(path, options) as db:
+        db.create_table("source", {})
+        db.add_index(graph)
+        db.batch_json({"inserts": {f"s:{i:04}": {"links": ["target"]} for i in range(300)}})
+        db.run_until_idle()
+        with pytest.raises(antfly_embedded.BusyError):
+            db.add_index(dict(graph, name="new", replaces="old", wait={"timeout_ms": 0}))
+        with db.open_table("source") as table:
+            table.add_index(_resolver_graph("knowledge", "concepts", destination="source"))
+        assert db.cancel_replacement("new")
+        assert db.capabilities()["minimum_reader_version"] == 2
+    with _open_graph_test(path, options) as db:
+        # Permanent aggregation is durable, even before opening the child.
+        assert db.capabilities()["minimum_reader_version"] == 2

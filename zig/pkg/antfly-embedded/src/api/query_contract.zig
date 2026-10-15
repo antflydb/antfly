@@ -129,7 +129,7 @@ pub fn publicExactSortRejection(reason: []const u8, detail: []const u8) PublicEx
 pub fn validatePublicQuerySortTupleContract(alloc: std.mem.Allocator, body: []const u8) !void {
     if (std.mem.indexOf(u8, body, "\"order_by\"") == null) return;
 
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     defer parsed.deinit();
     const object = switch (parsed.value) {
         .object => |object| object,
@@ -570,6 +570,8 @@ pub const OwnedNativeDocIdConstraintEnvelope = struct {
 };
 
 pub const AlgebraicVectorWorkerRequestOptions = struct {
+    document_authority_mode: db_mod.types.document_authority.Mode = .none,
+    document_authority_group: u64 = 0,
     fields: [][]const u8 = &.{},
     filter_prefix: []const u8 = "",
     filter_query_json: []const u8 = "",
@@ -825,6 +827,10 @@ pub const OwnedAlgebraicTensorExprEnvelope = struct {
         self.* = undefined;
     }
 
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.write(.{ .expr_id = self.expr_id, .fragment = self.fragment, .input_dims = self.input_dims, .output_dims = self.output_dims, .semantic_id = self.semantic_id, .owner = self.owner, .layout = self.layout, .dictionary = self.dictionary, .law_id = self.law_id, .metadata = self.metadata });
+    }
+
     pub fn asExpr(self: *const @This()) algebraic_ir.TensorExpr {
         const dictionary = if (self.dictionary) |*value| value.asIdentity() else null;
         return .{
@@ -844,6 +850,10 @@ pub const OwnedAlgebraicTensorExprEnvelope = struct {
 pub const OwnedAlgebraicTensorProgramStepEnvelope = struct {
     expr: OwnedAlgebraicTensorExprEnvelope,
     inputs: []algebraic_ir.TensorProgramRef,
+
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.write(.{ .expr = self.expr, .inputs = TensorRefsWire{ .refs = self.inputs } });
+    }
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         self.expr.deinit(alloc);
@@ -869,6 +879,10 @@ pub const OwnedAlgebraicTensorProgramEnvelope = struct {
         self.* = undefined;
     }
 
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.write(.{ .program_id = self.program_id, .inputs = self.inputs, .steps = self.steps, .output = TensorRefWire{ .ref = self.output }, .outputs = TensorRefsWire{ .refs = self.outputs } });
+    }
+
     pub fn asProgramAlloc(self: *const @This(), alloc: std.mem.Allocator) !OwnedAlgebraicTensorProgramView {
         const inputs = try alloc.alloc(algebraic_ir.TensorExpr, self.inputs.len);
         errdefer if (inputs.len > 0) alloc.free(inputs);
@@ -891,6 +905,24 @@ pub const OwnedAlgebraicTensorProgramEnvelope = struct {
             .input_exprs = inputs,
             .steps = steps,
         };
+    }
+};
+
+const TensorRefWire = struct {
+    ref: algebraic_ir.TensorProgramRef,
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        const index = switch (self.ref) {
+            inline else => |v| v,
+        };
+        try writer.write(.{ .kind = @tagName(self.ref), .index = index });
+    }
+};
+const TensorRefsWire = struct {
+    refs: []const algebraic_ir.TensorProgramRef,
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.beginArray();
+        for (self.refs) |ref| try writer.write(TensorRefWire{ .ref = ref });
+        try writer.endArray();
     }
 };
 
@@ -957,7 +989,7 @@ pub fn parseAlgebraicTensorAccessPathEnvelopeAlloc(
     alloc: std.mem.Allocator,
     body: []const u8,
 ) !OwnedAlgebraicTensorAccessPathEnvelope {
-    var parsed = std.json.parseFromSlice(AlgebraicTensorAccessPathEnvelopeInput, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    var parsed = std.json.parseFromSlice(AlgebraicTensorAccessPathEnvelopeInput, alloc, body, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     defer parsed.deinit();
     return try parseAlgebraicTensorAccessPathEnvelopeInputAlloc(alloc, parsed.value);
 }
@@ -1073,7 +1105,7 @@ pub fn parseAlgebraicTensorExprEnvelopeAlloc(
     alloc: std.mem.Allocator,
     body: []const u8,
 ) !OwnedAlgebraicTensorExprEnvelope {
-    var parsed = std.json.parseFromSlice(AlgebraicTensorExprEnvelopeInput, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    var parsed = std.json.parseFromSlice(AlgebraicTensorExprEnvelopeInput, alloc, body, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     defer parsed.deinit();
     return try parseAlgebraicTensorExprEnvelopeInputAlloc(alloc, parsed.value);
 }
@@ -1127,11 +1159,79 @@ pub fn parseAlgebraicTensorExprEnvelopeInputAlloc(
     };
 }
 
+// Native programs already carry typed dimensions, references and identities.
+// Clone ownership directly; JSON belongs only at the transport boundary.
+pub fn cloneAlgebraicTensorProgramEnvelopeAlloc(alloc: std.mem.Allocator, program: algebraic_ir.TensorProgram) !OwnedAlgebraicTensorProgramEnvelope {
+    const inputs = try alloc.alloc(OwnedAlgebraicTensorExprEnvelope, program.inputs.len);
+    var input_count: usize = 0;
+    errdefer {
+        for (inputs[0..input_count]) |*expr| expr.deinit(alloc);
+        alloc.free(inputs);
+    }
+    for (program.inputs, inputs) |expr, *owned| {
+        owned.* = try cloneTensorExprEnvelopeAlloc(alloc, expr);
+        input_count += 1;
+    }
+    const steps = try alloc.alloc(OwnedAlgebraicTensorProgramStepEnvelope, program.steps.len);
+    var step_count: usize = 0;
+    errdefer {
+        for (steps[0..step_count]) |*step| step.deinit(alloc);
+        alloc.free(steps);
+    }
+    for (program.steps, steps) |step, *owned| {
+        var expr = try cloneTensorExprEnvelopeAlloc(alloc, step.expr);
+        errdefer expr.deinit(alloc);
+        const refs = try alloc.dupe(algebraic_ir.TensorProgramRef, step.inputs);
+        owned.* = .{ .expr = expr, .inputs = refs };
+        step_count += 1;
+    }
+    const outputs = try alloc.dupe(algebraic_ir.TensorProgramRef, program.outputs);
+    errdefer alloc.free(outputs);
+    const id = try algebraic_ir.tensorProgramIdAlloc(alloc, program);
+    errdefer alloc.free(id);
+    const result = OwnedAlgebraicTensorProgramEnvelope{ .program_id = id, .inputs = inputs, .steps = steps, .output = program.output, .outputs = outputs };
+    try validateAlgebraicTensorProgramEnvelopeStructure(result);
+    return result;
+}
+
+fn cloneTensorExprEnvelopeAlloc(alloc: std.mem.Allocator, expr: algebraic_ir.TensorExpr) !OwnedAlgebraicTensorExprEnvelope {
+    var result = OwnedAlgebraicTensorExprEnvelope{
+        .expr_id = &.{},
+        .fragment = expr.fragment,
+        .input_dims = &.{},
+        .output_dims = &.{},
+        .semantic_id = null,
+        .owner = null,
+        .layout = expr.layout,
+        .dictionary = null,
+        .law_id = expr.law_id,
+        .metadata = null,
+    };
+    errdefer result.deinit(alloc);
+    result.expr_id = try algebraic_ir.tensorExprIdAlloc(alloc, expr);
+    result.input_dims = try alloc.dupe(algebraic_ir.Dimension, expr.input_dims);
+    result.output_dims = try alloc.dupe(algebraic_ir.Dimension, expr.output_dims);
+    if (expr.semantic_id) |v| result.semantic_id = try alloc.dupe(u8, v);
+    if (expr.owner) |v| result.owner = try alloc.dupe(u8, v);
+    if (expr.metadata) |v| result.metadata = try alloc.dupe(u8, v);
+    if (expr.dictionary) |d| {
+        var owned = OwnedAlgebraicDictionaryIdentity{ .scope = &.{}, .field_or_path = &.{}, .label_kind = d.label_kind, .analyzer_or_canonicalization = &.{}, .value_kind = &.{}, .coercion_policy = &.{} };
+        errdefer owned.deinit(alloc);
+        owned.scope = try alloc.dupe(u8, d.scope);
+        owned.field_or_path = try alloc.dupe(u8, d.field_or_path);
+        owned.analyzer_or_canonicalization = try alloc.dupe(u8, d.analyzer_or_canonicalization);
+        owned.value_kind = try alloc.dupe(u8, d.value_kind);
+        owned.coercion_policy = try alloc.dupe(u8, d.coercion_policy);
+        result.dictionary = owned;
+    }
+    return result;
+}
+
 pub fn parseAlgebraicTensorProgramEnvelopeAlloc(
     alloc: std.mem.Allocator,
     body: []const u8,
 ) !OwnedAlgebraicTensorProgramEnvelope {
-    var parsed = std.json.parseFromSlice(AlgebraicTensorProgramEnvelopeInput, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    var parsed = std.json.parseFromSlice(AlgebraicTensorProgramEnvelopeInput, alloc, body, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     defer parsed.deinit();
     return try parseAlgebraicTensorProgramEnvelopeInputAlloc(alloc, parsed.value);
 }
@@ -1289,7 +1389,7 @@ pub fn parseAlgebraicVectorWorkerRequestEnvelopeAlloc(
     alloc: std.mem.Allocator,
     body: []const u8,
 ) !OwnedAlgebraicVectorWorkerRequestEnvelope {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     defer parsed.deinit();
     const root = parsed.value;
     if (root != .object) return error.InvalidQueryRequest;
@@ -1416,6 +1516,10 @@ fn appendAlgebraicVectorWorkerRequestOptions(
     if (options.require_algebraic_filter_resolution) try appendJsonFieldBool(alloc, out, &first, "require_algebraic_filter_resolution", true);
     if (!options.include_all_fields) try appendJsonFieldBool(alloc, out, &first, "include_all_fields", false);
     if (options.defer_stored_projection) try appendJsonFieldBool(alloc, out, &first, "defer_stored_projection", true);
+    if (options.document_authority_mode != .none) {
+        try appendJsonFieldString(alloc, out, &first, "document_authority_mode", @tagName(options.document_authority_mode));
+        try appendJsonFieldU64(alloc, out, &first, "document_authority_group", options.document_authority_group);
+    }
     try appendJsonFieldUsize(alloc, out, &first, "limit", options.limit);
     if (options.offset != 0) try appendJsonFieldUsize(alloc, out, &first, "offset", options.offset);
     if (options.count_only) try appendJsonFieldBool(alloc, out, &first, "count_only", true);
@@ -1498,11 +1602,11 @@ fn parseAlgebraicVectorWorkerRequestOptions(alloc: std.mem.Allocator, value: std
         @constCast((&[_][]const u8{})[0..]);
     errdefer freeOwnedStringSlice(alloc, hierarchy_unit_fields);
     if (filter_query_json.len > 0) {
-        var parsed_filter = std.json.parseFromSlice(std.json.Value, alloc, filter_query_json, .{}) catch return error.InvalidQueryRequest;
+        var parsed_filter = std.json.parseFromSlice(std.json.Value, alloc, filter_query_json, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
         parsed_filter.deinit();
     }
     if (exclusion_query_json.len > 0) {
-        var parsed_exclusion = std.json.parseFromSlice(std.json.Value, alloc, exclusion_query_json, .{}) catch return error.InvalidQueryRequest;
+        var parsed_exclusion = std.json.parseFromSlice(std.json.Value, alloc, exclusion_query_json, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
         parsed_exclusion.deinit();
     }
     const require_algebraic_filter_resolution = try parseOptionalBoolJson(value.object.get("require_algebraic_filter_resolution"), false);
@@ -1529,6 +1633,8 @@ fn parseAlgebraicVectorWorkerRequestOptions(alloc: std.mem.Allocator, value: std
         .require_algebraic_filter_resolution = require_algebraic_filter_resolution,
         .include_all_fields = try parseOptionalBoolJson(value.object.get("include_all_fields"), true),
         .defer_stored_projection = try parseOptionalBoolJson(value.object.get("defer_stored_projection"), false),
+        .document_authority_mode = if (value.object.get("document_authority_mode")) |mode| if (mode == .string) std.meta.stringToEnum(db_mod.types.document_authority.Mode, mode.string) orelse return error.InvalidQueryRequest else return error.InvalidQueryRequest else .none,
+        .document_authority_group = if (value.object.get("document_authority_group")) |group| std.json.parseFromValueLeaky(u64, alloc, group, .{}) catch return error.InvalidQueryRequest else 0,
         .limit = try parseOptionalU32Json(value.object.get("limit"), 10),
         .offset = try parseOptionalU32Json(value.object.get("offset"), 0),
         .count_only = try parseOptionalBoolJson(value.object.get("count_only"), false),
@@ -1864,6 +1970,8 @@ pub fn searchRequestFromVectorWorkerEnvelope(envelope: *const OwnedAlgebraicVect
             .require_algebraic_filter_resolution = envelope.options.require_algebraic_filter_resolution,
             .include_all_fields = envelope.options.include_all_fields,
             .defer_stored_projection = envelope.options.defer_stored_projection,
+            .document_authority_mode = envelope.options.document_authority_mode,
+            .document_authority_group = envelope.options.document_authority_group,
             .search_effort = envelope.options.search_effort,
             .distance_over = envelope.options.distance_over,
             .distance_under = envelope.options.distance_under,
@@ -1902,6 +2010,8 @@ pub fn searchRequestFromVectorWorkerEnvelope(envelope: *const OwnedAlgebraicVect
             .require_algebraic_filter_resolution = envelope.options.require_algebraic_filter_resolution,
             .include_all_fields = envelope.options.include_all_fields,
             .defer_stored_projection = envelope.options.defer_stored_projection,
+            .document_authority_mode = envelope.options.document_authority_mode,
+            .document_authority_group = envelope.options.document_authority_group,
             .search_effort = envelope.options.search_effort,
             .distance_over = envelope.options.distance_over,
             .distance_under = envelope.options.distance_under,
@@ -2062,7 +2172,7 @@ pub fn parseNativeDocIdConstraintEnvelopeAlloc(
     alloc: std.mem.Allocator,
     body: []const u8,
 ) !OwnedNativeDocIdConstraintEnvelope {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     defer parsed.deinit();
     return parseNativeDocIdConstraintEnvelopeValueAlloc(alloc, parsed.value);
 }
@@ -2432,7 +2542,7 @@ fn freeClonedJsonValues(alloc: std.mem.Allocator, values: []const std.json.Value
 }
 
 fn parseQueryTimeoutMs(alloc: std.mem.Allocator, body: []const u8) !?u64 {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
     const value = parsed.value.object.get("timeout_ms") orelse return null;
@@ -2615,7 +2725,7 @@ fn validateRawGraphWhereAlloc(
 }
 
 fn queryBodyContractFields(alloc: std.mem.Allocator, body: []const u8) !QueryBodyContractFields {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
     try validateRawGraphQueriesValueAlloc(alloc, parsed.value);
@@ -2697,6 +2807,19 @@ pub fn parseQueryRequestWithDeadline(
             owned.native_cut = try std.json.parseFromValue(@typeInfo(@FieldType(db_mod.types.SearchRequest, "native_query_cut")).optional.child, alloc, value, .{ .allocate = .alloc_always });
             try owned.native_cut.?.value.validate(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
             owned.req.native_query_cut = owned.native_cut.?.value;
+        };
+    }
+    if (std.mem.indexOf(u8, body, "_document_authority") != null or std.mem.indexOfScalar(u8, body, '\\') != null) {
+        var raw = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+        defer raw.deinit();
+        if (raw.value == .object) if (raw.value.object.get("_document_authority")) |value| {
+            var control = try std.json.parseFromValue(struct { mode: db_mod.types.document_authority.Mode, group: u64, defer_stored_projection: bool = false }, alloc, value, .{});
+            defer control.deinit();
+            if (control.value.mode == .none or control.value.group == 0) return error.InvalidQueryRequest;
+            owned.req.include_stored = false;
+            owned.req.document_authority_mode = control.value.mode;
+            owned.req.document_authority_group = control.value.group;
+            owned.req.defer_stored_projection = control.value.defer_stored_projection;
         };
     }
     return owned;
@@ -2878,7 +3001,7 @@ pub fn validateStoragePublicQueryRequest(alloc: std.mem.Allocator, body: []const
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const root = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), body, .{}) catch |err| {
-        return if (err == error.OutOfMemory) err else error.InvalidQueryRequest;
+        return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     };
     try validatePublicQueryEnvelopeValueAlloc(arena.allocator(), root);
     if (root.object.get("evaluate")) |stage| {
@@ -4007,7 +4130,7 @@ pub fn encodeQueryResponsesWithDelivery(
     else
         null;
 
-    const profile = if (req.profile) try buildProfileValue(arena, req, meta, result) else null;
+    const profile = if (req.profile or result.document_authority_version != 0) try buildProfileValue(arena, req, meta, result) else null;
     const graph_metric_results = if (result.graph_metric_results.len > 0)
         try buildGraphMetricResults(arena, result.graph_metric_results)
     else
@@ -4097,13 +4220,19 @@ fn toOpenApiHit(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: 
         ._distance = if (hit.distance) |distance| finiteScoreOrZero(distance) else null,
         ._index_scores = try indexScoresJsonValue(alloc, hit.index_scores),
         ._sort = if (hit.sort_values.len > 0) hit.sort_values else null,
-        ._source = if (hit.source_value) |value|
+        ._source = if (req.document_authority_mode != .none and hit.document_authority != null) private: {
+            const envelope = try db_mod.types.document_authority.encode(alloc, hit.document_authority.?.*, hit.stored_data);
+            defer alloc.free(envelope);
+            break :private try takeOpenApiObjectMap(alloc, try parseStoredSourceValue(alloc, envelope));
+        } else if (hit.source_value) |value|
             (if (req.include_stored) try takeOpenApiObjectMap(alloc, try projectPublicSourceView(alloc, value, .{
                 .fields = req.fields,
                 .include_all_fields = req.include_all_fields,
             })) else null)
         else if (hit.stored_data) |stored_data|
-            try takeOpenApiObjectMap(alloc, if (req.defer_hierarchy_child_hydration and req.hierarchy_group_level == .unit)
+            try takeOpenApiObjectMap(alloc, if (req.document_authority_mode != .none)
+                try parseStoredSourceValue(alloc, stored_data)
+            else if (req.defer_hierarchy_child_hydration and req.hierarchy_group_level == .unit)
                 // Deferred unit grouping uses `_source` as a private shard-to-
                 // coordinator revision envelope. Projecting it by public unit
                 // fields would turn it into `{}` and defeat revision binding.
@@ -6530,6 +6659,7 @@ fn buildProfileValue(
         if (parsed.value != .object) return error.InvalidQueryRequest;
         try parsed.value.object.put(alloc, "sort", try buildSortProfileValue(alloc, req, sort_profile));
     }
+    if (result.document_authority_version != 0) try parsed.value.object.put(alloc, "document_authority_version", .{ .integer = result.document_authority_version });
     return parsed.value;
 }
 
@@ -9531,7 +9661,7 @@ fn parseGraphMetricQueriesAlloc(
     alloc: std.mem.Allocator,
     body: []const u8,
 ) ![]const db_mod.types.NamedGraphMetricQuery {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
     if (parsed.value.object.get("_graph_metric_queries")) |internal_queries| {
@@ -9738,7 +9868,7 @@ fn parseGraphMetricRerankPersonalizationAlloc(
     freshness: db_mod.types.GraphMetricFreshness,
 ) !ParsedGraphMetricPersonalization {
     if (body.len == 0) return .{};
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
     const rerank_value = parsed.value.object.get("graph_metric_rerank") orelse return .{};
@@ -9887,7 +10017,7 @@ fn parseLegacyPatternSteps(
         graph_query_mod.validateEdgeTypes(requested_edge_types) catch return error.InvalidQueryRequest;
         const edge_types = try cloneFields(alloc, requested_edge_types);
         errdefer freeOwnedStringSlice(alloc, edge_types);
-        const edge_filter = if (step.edge) |edge| if (edge.edge_filter) |predicate| relationship_filter.parsePublicAlloc(alloc, predicate) catch |err| return if (err == error.OutOfMemory) err else error.InvalidQueryRequest else relationship_filter.Filter{} else relationship_filter.Filter{};
+        const edge_filter = if (step.edge) |edge| if (edge.edge_filter) |predicate| relationship_filter.parsePublicAlloc(alloc, predicate) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest else relationship_filter.Filter{} else relationship_filter.Filter{};
         errdefer edge_filter.deinit(alloc);
         steps[i] = .{
             .alias = try alloc.dupe(u8, step.alias orelse ""),
@@ -9948,7 +10078,7 @@ fn parseLegacyGraphQueryParams(
     graph_query_mod.validateEdgeTypes(requested_edge_types) catch return error.InvalidQueryRequest;
     const edge_types = try cloneFields(alloc, requested_edge_types);
     errdefer freeOwnedStringSlice(alloc, edge_types);
-    const edge_filter = if (value.edge_filter) |predicate| relationship_filter.parsePublicAlloc(alloc, predicate) catch |err| return if (err == error.OutOfMemory) err else error.InvalidQueryRequest else relationship_filter.Filter{};
+    const edge_filter = if (value.edge_filter) |predicate| relationship_filter.parsePublicAlloc(alloc, predicate) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest else relationship_filter.Filter{};
     errdefer edge_filter.deinit(alloc);
     return .{
         .edge_types = edge_types,
@@ -9987,7 +10117,7 @@ fn parseGraphTraverseQuery(alloc: std.mem.Allocator, value: indexes_openapi.Grap
     graph_query_mod.validateEdgeTypes(requested_edge_types) catch return error.InvalidQueryRequest;
     const edge_types = try cloneFields(alloc, requested_edge_types);
     errdefer freeOwnedStringSlice(alloc, edge_types);
-    const edge_filter = if (traversal.edge_filter) |predicate| relationship_filter.parsePublicAlloc(alloc, predicate) catch |err| return if (err == error.OutOfMemory) err else error.InvalidQueryRequest else relationship_filter.Filter{};
+    const edge_filter = if (traversal.edge_filter) |predicate| relationship_filter.parsePublicAlloc(alloc, predicate) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest else relationship_filter.Filter{};
     errdefer edge_filter.deinit(alloc);
     const filter = try parseGraphFilterValue(alloc, traversal.filter);
     errdefer freePatternNodeFilter(alloc, filter);
@@ -10062,7 +10192,7 @@ fn parseGraphPathQuery(
     graph_query_mod.validateEdgeTypes(requested_edge_types) catch return error.InvalidQueryRequest;
     const edge_types = try cloneFields(alloc, requested_edge_types);
     errdefer freeOwnedStringSlice(alloc, edge_types);
-    const edge_filter = if (path.edge_filter) |predicate| relationship_filter.parsePublicAlloc(alloc, predicate) catch |err| return if (err == error.OutOfMemory) err else error.InvalidQueryRequest else relationship_filter.Filter{};
+    const edge_filter = if (path.edge_filter) |predicate| relationship_filter.parsePublicAlloc(alloc, predicate) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest else relationship_filter.Filter{};
     errdefer edge_filter.deinit(alloc);
     const filter = try parseGraphFilterValue(alloc, path.filter);
     errdefer freePatternNodeFilter(alloc, filter);
@@ -10282,7 +10412,7 @@ fn parseGraphMatchEdges(alloc: std.mem.Allocator, value: []const indexes_openapi
         graph_query_mod.validateEdgeTypes(requested_types) catch return error.InvalidQueryRequest;
         const types = try cloneFields(alloc, requested_types);
         errdefer freeOwnedStringSlice(alloc, types);
-        const edge_filter = if (edge.edge_filter) |predicate| relationship_filter.parsePublicAlloc(alloc, predicate) catch |err| return if (err == error.OutOfMemory) err else error.InvalidQueryRequest else relationship_filter.Filter{};
+        const edge_filter = if (edge.edge_filter) |predicate| relationship_filter.parsePublicAlloc(alloc, predicate) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest else relationship_filter.Filter{};
         errdefer edge_filter.deinit(alloc);
         edges[i] = .{
             .from = from,
@@ -11088,7 +11218,7 @@ fn freeNamedDocFilterBindings(alloc: std.mem.Allocator, bindings: []const db_mod
 }
 
 fn queryBodyHasPublicDocFilterBindings(alloc: std.mem.Allocator, body: []const u8) !bool {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
     return parsed.value.object.get("with") != null;
@@ -11778,7 +11908,7 @@ fn maybeExpandPublicDocFilterBindingsWithLimitAlloc(
     deadline_ns: ?u64,
 ) !?[]u8 {
     if (max_expanded_bytes == 0) return error.InvalidQueryRequest;
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{ .parse_numbers = false }) catch return error.InvalidQueryRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{ .parse_numbers = false }) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     defer parsed.deinit();
     try ensureQueryDeadline(deadline_ns);
     if (parsed.value != .object) return error.InvalidQueryRequest;
@@ -11921,7 +12051,7 @@ fn maybeExpandPublicDocFilterBindingsWithLimitAlloc(
 }
 
 fn queryBodyHasForbiddenDocIdentityControlFields(alloc: std.mem.Allocator, body: []const u8) !bool {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
     return parsed.value.object.get("identity_read_generation") != null or
@@ -11929,14 +12059,14 @@ fn queryBodyHasForbiddenDocIdentityControlFields(alloc: std.mem.Allocator, body:
 }
 
 fn queryBodyHasForbiddenPublicDocIdentityControlFields(alloc: std.mem.Allocator, body: []const u8) !bool {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
     return objectHasForbiddenPublicQueryField(parsed.value.object);
 }
 
 fn queryBodyHasInternalShardFields(alloc: std.mem.Allocator, body: []const u8) !bool {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
     return objectHasInternalShardField(parsed.value.object);
@@ -11957,7 +12087,7 @@ fn queryBodyForGeneratedContractAlloc(
 ) !?[]u8 {
     if (!options.strip_internal_shard_fields and !options.strip_public_doc_filter_bindings and !options.strip_public_hierarchy_controls and !options.strip_query_timeout and !options.strip_graph_metric) return null;
 
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{ .parse_numbers = false }) catch return error.InvalidQueryRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{ .parse_numbers = false }) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
 
@@ -11988,6 +12118,7 @@ fn isInternalShardFieldName(name: []const u8) bool {
         "_exclusion_query_json",
         "_identity_read_generation",
         "_native_cut",
+        "_document_authority",
         "_index_name",
         "_primary_text_index_name",
         "_embedding_limits",
@@ -12024,7 +12155,7 @@ fn objectHasNonNullField(object: std.json.ObjectMap, name: []const u8) bool {
 }
 
 fn queryBodyHasPublicHierarchyControls(alloc: std.mem.Allocator, body: []const u8) !bool {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
     return objectHasNonNullField(parsed.value.object, "hierarchy");
@@ -12037,7 +12168,7 @@ fn applyPublicHierarchyControls(
 ) !void {
     if (!(try queryBodyHasPublicHierarchyControls(alloc, body))) return;
 
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
     const hierarchy = parsed.value.object.get("hierarchy") orelse return;
@@ -12331,6 +12462,7 @@ fn removeInternalShardFields(object: *std.json.ObjectMap) void {
         "_exclusion_query_json",
         "_identity_read_generation",
         "_native_cut",
+        "_document_authority",
         "_index_name",
         "_primary_text_index_name",
         "_embedding_limits",
@@ -12356,7 +12488,7 @@ fn parsePublicDocFilterBindingsAlloc(
 
     var deadline = QueryDeadlinePoller{ .deadline_ns = deadline_ns };
     try deadline.check();
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     defer parsed.deinit();
     try deadline.check();
     if (parsed.value != .object) return error.InvalidQueryRequest;
@@ -12651,7 +12783,7 @@ fn parseInternalFilterQueryJsonAlloc(
     body: []const u8,
     req: *db_mod.types.SearchRequest,
 ) !void {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
     if (parsed.value.object.get("_filter_query_json") == null and
@@ -12698,7 +12830,7 @@ fn mergeInternalFilterJsonAlloc(
 
 fn parseInternalFilterJsonStringAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
     if (value != .string) return error.InvalidQueryRequest;
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value.string, .{}) catch return error.InvalidQueryRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value.string, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidQueryRequest;
     parsed.deinit();
     return try alloc.dupe(u8, value.string);
 }
@@ -17364,9 +17496,16 @@ fn consumerTests() type {
             try std.testing.expectEqualStrings("$legacy", owned.req.graph_queries[0].name);
         }
 
+        test "canonical graph contract preserves non-deduplicating traversal" {
+            const alloc = std.testing.allocator;
+            var owned = try parsePublicQueryRequest(alloc, null, "docs", "{\"graph_queries\":{\"walk\":{\"index\":\"g\",\"traverse\":{\"start\":{\"keys\":[\"a\"]},\"deduplicate_nodes\":false}}}}");
+            defer owned.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 1), owned.req.graph_queries.len);
+            try std.testing.expect(!owned.req.graph_queries[0].query.params.deduplicate);
+        }
+
         test "canonical graph contract rejects modes without exact public execution" {
             const cases = [_][]const u8{
-                "{\"graph_queries\":{\"walk\":{\"index\":\"g\",\"traverse\":{\"start\":{\"keys\":[\"a\"]},\"deduplicate_nodes\":false}}}}",
                 "{\"graph_queries\":{\"walk\":{\"index\":\"g\",\"traverse\":{\"start\":{\"result_ref\":\"$graph_results.\"}}}}}",
                 "{\"graph_queries\":{\"walk\":{\"index\":\"g\",\"traverse\":{\"start\":{\"result_ref\":\"$graph_results.bad\u{200b}name\"}}}}}",
                 "{\"graph_queries\":{\"walk\":{\"index\":\"g\",\"traverse\":{\"start\":{\"result_ref\":\"$graph_results.*\"}}}}}",
@@ -19373,4 +19512,115 @@ test "public graph metric borrowed wire preserves projected documents paths and 
     };
     try Runner.run(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "api query contract bounded graph allocation sparse selection" {
+    const a = std.testing.allocator;
+    var counter = @import("../storage/lite/test_allocator.zig").BudgetAllocator{ .backing = a };
+    const n = 50_000;
+    const q = graph_query_mod.GraphQuery{ .query_type = .neighbors, .index_name = "g", .start_nodes = .{ .keys = &.{} }, .metrics = &.{.{ .name = "rank" }}, .where_metric = &.{.{ .name = "rank", .op = .gte, .value = 49_999 }}, .params = .{ .max_results = 0 } };
+    var work = try graph_query_mod.GraphQueryEngine.MetricStageWorkspace.init(counter.allocator(), try graph_query_mod.MetricReadPlan.init(q), n);
+    const values = try counter.allocator().alloc(f64, n);
+    for (values, 0..) |*v, row| v.* = @floatFromInt(row);
+    work.groups[0] = .{ .references = 1 };
+    work.columns[0] = .{ .source = .{ .decoded = values }, .group = 0 };
+    const before = counter.live;
+    const calls = counter.alloc_calls;
+    try work.select(q, false, &.{"rank"}, &.{"rank"}, &.{});
+    try std.testing.expectEqual(@as(usize, 1), work.rowCount());
+    try std.testing.expectEqual(@as(usize, n - 1), work.rowAt(0));
+    std.debug.print("FRESH_SPARSE input={d} selected=1 extra_peak={d} allocations={d} retained={d}\n", .{ n, counter.peak - before, counter.alloc_calls - calls, counter.live });
+    try std.testing.expect(counter.peak - before < 1024);
+    work.deinit();
+    try std.testing.expectEqual(@as(usize, 0), counter.live);
+}
+
+test "api query contract bounded graph allocation decoder hint amplification" {
+    const a = std.testing.allocator;
+    const local_graph = @import("graph.zig");
+    const decoder = @import("graph_expand_decode.zig");
+    const long_id = try a.alloc(u8, 512 * 1024);
+    defer a.free(long_id);
+    @memset(long_id, 'x');
+    @memcpy(long_id[0..9], "{\"body\":\"");
+    @memcpy(long_id[long_id.len - 2 ..], "\"}");
+    var name_buffers: [16][8]u8 = undefined;
+    var names: [16][]u8 = undefined;
+    var scores: [16]f64 = undefined;
+    for (&names, &scores, &name_buffers, 0..) |*name, *score, *buffer, i| {
+        name.* = try std.fmt.bufPrint(buffer, "m{d}", .{i});
+        score.* = @floatFromInt(i);
+    }
+    var cols = graph_query_mod.GraphMetricColumns{ .names = &names, .scores = &scores, .rows = 1 };
+    const nodes = [_]graph_query_mod.GraphResultNode{.{ .key = "a", .depth = 1, .distance = 1, .metric_columns = &cols }};
+    const hits = [_]db_mod.types.SearchHit{.{ .id = @constCast("a"), .score = 1, .stored_data = long_id }};
+    var reference_peak: ?usize = null;
+    for ([_]u32{ 1, 50_000 }) |total| {
+        const wire = try std.json.Stringify.valueAlloc(a, local_graph.GraphExpandResponseJson{ .expansions = &.{.{ .frontier_id = 0, .frontier_key = "s", .name = "g", .total = total, .nodes = &nodes, .hits = &hits }} }, .{ .emit_null_optional_fields = false });
+        defer a.free(wire);
+        var counter = @import("../storage/lite/test_allocator.zig").BudgetAllocator{ .backing = a };
+        var parsed = try decoder.parse(counter.allocator(), wire);
+        errdefer parsed.deinit(counter.allocator());
+        try std.testing.expectEqual(@as(usize, 1), parsed.expansions[0].graph_result.nodes.len);
+        try std.testing.expectEqualStrings(long_id, parsed.expansions[0].graph_result.hits[0].stored_data.?);
+        std.debug.print("FRESH_HINT total={d} nodes=1 wire={d} peak={d} retained={d}\n", .{ total, wire.len, counter.peak, counter.live });
+        // Arena remapping may change the allocator's transient high-water mark.
+        // An unrelated total must not add a row-sized reservation.
+        if (reference_peak) |peak| try std.testing.expect(@max(peak, counter.peak) - @min(peak, counter.peak) < 16 * 1024) else reference_peak = counter.peak;
+        try std.testing.expect(counter.peak < 2 * 1024 * 1024);
+        parsed.deinit(counter.allocator());
+        try std.testing.expectEqual(@as(usize, 0), counter.live);
+    }
+}
+
+test "api query contract bounded graph allocation tensor construction" {
+    const a = std.testing.allocator;
+    const local_graph = @import("graph.zig");
+    var direct = @import("../storage/lite/test_allocator.zig").BudgetAllocator{ .backing = a };
+    var plan = (try db_mod.algebraic.planner.planGraphEdgesTensorProgramAlloc(direct.allocator(), "graph_idx")).?;
+    std.debug.print("FRESH_TENSOR_PLAN allocs={d} peak={d} retained={d}\n", .{ direct.alloc_calls, direct.peak, direct.live });
+    plan.deinit(direct.allocator());
+    try std.testing.expectEqual(@as(usize, 0), direct.live);
+    var serialized = @import("../storage/lite/test_allocator.zig").BudgetAllocator{ .backing = a };
+    var envelope = try local_graph.graphEdgesTensorProgramEnvelopeAlloc(serialized.allocator(), "graph_idx");
+    std.debug.print("FRESH_TENSOR_ENVELOPE allocs={d} peak={d} retained={d}\n", .{ serialized.alloc_calls, serialized.peak, serialized.live });
+    envelope.deinit(serialized.allocator());
+    try std.testing.expectEqual(@as(usize, 0), serialized.live);
+}
+
+test "api query contract typed tensor envelope cloning preserves the wire and ownership" {
+    const dims = [_]algebraic_ir.Dimension{.src};
+    const source = algebraic_ir.TensorExpr{ .fragment = .graph_traverse, .layout = .graph_edges, .owner = "g", .output_dims = &dims, .semantic_id = "semantic", .metadata = "opaque", .law_id = .provenance_semiring };
+    const program = algebraic_ir.TensorProgram{ .inputs = &.{source}, .steps = &.{.{ .expr = source, .inputs = &.{.{ .input = 0 }} }}, .output = .{ .step = 0 }, .outputs = &.{ .{ .step = 0 }, .{ .input = 0 } } };
+    const Runner = struct {
+        fn run(a: std.mem.Allocator, original: algebraic_ir.TensorProgram) !void {
+            var owned = try cloneAlgebraicTensorProgramEnvelopeAlloc(a, original);
+            defer owned.deinit(a);
+            const expected = try encodeAlgebraicTensorProgramEnvelopeAlloc(a, original);
+            defer a.free(expected);
+            const actual = try std.json.Stringify.valueAlloc(a, owned, .{ .emit_null_optional_fields = false });
+            defer a.free(actual);
+            try std.testing.expectEqualStrings(expected, actual);
+        }
+    };
+    try Runner.run(std.testing.allocator, program);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{program});
+    const malformed = algebraic_ir.TensorProgram{ .steps = &.{.{ .expr = source, .inputs = &.{.{ .step = 0 }} }}, .output = .{ .step = 0 } };
+    try std.testing.expectError(error.InvalidQueryRequest, cloneAlgebraicTensorProgramEnvelopeAlloc(std.testing.allocator, malformed));
+}
+
+test "public graph metric borrowed wire vector document authority supports full width owner identities" {
+    const a = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, "{\"document_authority_mode\":\"candidates\",\"document_authority_group\":18446744073709551615}", .{});
+    defer parsed.deinit();
+    const options = try parseAlgebraicVectorWorkerRequestOptions(a, parsed.value);
+    defer {
+        freeOwnedStringSlice(a, options.fields);
+        if (options.filter_prefix.len != 0) a.free(options.filter_prefix);
+        a.free(options.filter_ids);
+        a.free(options.exclude_ids);
+        freeOwnedStringSlice(a, options.hierarchy_match_fields);
+    }
+    try std.testing.expectEqual(db_mod.types.document_authority.Mode.candidates, options.document_authority_mode);
+    try std.testing.expectEqual(std.math.maxInt(u64), options.document_authority_group);
 }

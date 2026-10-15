@@ -1448,6 +1448,7 @@ pub const AntflyApiHandler = struct {
         try server.post(table_prefix ++ routes.graph_expand_suffix, httpx.Handler.bind(self, internalGraphExpand));
         try server.post(table_prefix ++ routes.graph_hydrate_suffix, httpx.Handler.bind(self, internalGraphHydrate));
         try server.post(table_prefix ++ routes.graph_edges_suffix, httpx.Handler.bind(self, internalGraphEdges));
+        try server.post(table_prefix ++ routes.graph_edges_batch_suffix, httpx.Handler.bind(self, internalGraphEdges));
         try server.post(table_prefix ++ routes.graph_metric_maintenance_suffix, httpx.Handler.bind(self, internalGraphMetricMaintenance));
         try server.post(table_prefix ++ routes.text_stats_suffix, httpx.Handler.bind(self, internalTextStats));
         try server.post(table_prefix ++ routes.algebraic_partials_suffix, httpx.Handler.bind(self, internalAlgebraicPartials));
@@ -2309,6 +2310,10 @@ pub const AntflyApiHandler = struct {
             error.HierarchyCursorStale => .{
                 .status = 409,
                 .message = "HierarchyCursorStale",
+            },
+            error.DocumentArtifactPublicationFailed => .{
+                .status = 409,
+                .message = "DocumentArtifactPublicationFailed",
             },
             else => null,
         };
@@ -10335,6 +10340,9 @@ test "typed internal HTTP errors preserve conflict semantics" {
     const stale_cursor = AntflyApiHandler.sharedInternalHttpErrorSpec(error.HierarchyCursorStale).?;
     try std.testing.expectEqual(@as(u16, 409), stale_cursor.status);
     try std.testing.expectEqualStrings("HierarchyCursorStale", stale_cursor.message);
+    const failed_publication = AntflyApiHandler.sharedInternalHttpErrorSpec(error.DocumentArtifactPublicationFailed).?;
+    try std.testing.expectEqual(@as(u16, 409), failed_publication.status);
+    try std.testing.expectEqualStrings("DocumentArtifactPublicationFailed", failed_publication.message);
     try std.testing.expect(AntflyApiHandler.sharedInternalHttpErrorSpec(error.NotFound) == null);
 }
 
@@ -11311,7 +11319,23 @@ test "httpx internal control routes call typed operations directly" {
                 .scan = scan,
                 .query = query,
                 .lookup_group_local = groupLookup,
+                .graph_edges_group_local = groupEdges,
             } };
+        }
+
+        fn groupEdges(_: *anyopaque, inner_alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: distributed_graph.GraphEdgesRequest, consistency: raft_mod.ReadConsistency) !?distributed_graph.GraphEdgesResponse {
+            try std.testing.expectEqual(@as(u64, 7), group_id);
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency);
+            try std.testing.expectEqual(@as(usize, 2), req.keys.len);
+            try std.testing.expectEqualStrings("doc:b", req.keys[1]);
+            try std.testing.expectEqual(@as(?u64, 42), req.identity_read_generation);
+            try std.testing.expect(req.cancellation != null);
+            const offsets = try inner_alloc.alloc(u32, 3);
+            errdefer inner_alloc.free(offsets);
+            @memset(offsets, 0);
+            const scans = try inner_alloc.dupe(u32, &.{ 4, 1 });
+            return .{ .edges = &.{}, .key_offsets = offsets, .key_scanned_rows = scans, .scanned_rows = 5 };
         }
 
         fn shardDb() @import("../metadata/domain.zig").ShardDbAdapter {
@@ -11477,6 +11501,7 @@ test "httpx internal control routes call typed operations directly" {
         .{ "graph-expand", "invalid graph expand request" },
         .{ "graph-hydrate", "invalid graph hydrate request" },
         .{ "graph-edges", "invalid graph edges request" },
+        .{ "graph-edges-batch", "invalid graph edges request" },
     }) |case| {
         const url = try std.fmt.allocPrint(alloc, "{s}/internal/v1/groups/7/tables/docs/{s}", .{ base_url, case[0] });
         defer alloc.free(url);
@@ -11484,6 +11509,25 @@ test "httpx internal control routes call typed operations directly" {
         defer response.deinit();
         try std.testing.expectEqual(@as(u16, 400), response.status.code);
         try std.testing.expectEqualStrings(case[1], response.body.?);
+    }
+
+    // The new route preserves typed prefix metadata across the HTTP hop.
+    {
+        const graph_api = @import("antfly_local_sources").api_local_graph;
+        var program = try graph_api.graphEdgesTensorProgramEnvelopeAlloc(alloc, "g");
+        defer program.deinit(alloc);
+        const body = try std.json.Stringify.valueAlloc(alloc, .{ .index_name = "g", .key = "doc:a", .keys = @as([]const []const u8, &.{ "doc:a", "doc:b" }), .direction = "out", .tensor_access_path = graph_api.algebraic_ir.graphEdgeAccessPath("g"), .tensor_program = program, .ttl_now_ns = @as(u64, 1), .max_scanned_rows = @as(u32, 100), .identity_read_generation = @as(u64, 42) }, .{ .emit_null_optional_fields = false });
+        defer alloc.free(body);
+        const url = try std.fmt.allocPrint(alloc, "{s}/internal/v1/groups/7/tables/docs/graph-edges-batch", .{base_url});
+        defer alloc.free(url);
+        var response = try requestWithRetry(&client, client_io.io(), .POST, url, body, &headers, 20);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        var parsed = try distributed_graph.parseGraphEdgesResponse(alloc, response.body.?);
+        defer parsed.deinit(alloc);
+        try std.testing.expectEqualSlices(u32, &.{ 0, 0, 0 }, parsed.key_offsets);
+        try std.testing.expectEqualSlices(u32, &.{ 4, 1 }, parsed.key_scanned_rows);
+        try std.testing.expectEqual(@as(u32, 5), parsed.scanned_rows);
     }
 
     inline for (.{
@@ -15549,9 +15593,9 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             try std.testing.expectEqual(@as(usize, 1), page.result.rowCount());
             const streamed_cell = try page.result.cell(array_alloc, 0, 0);
             try std.testing.expect(!streamed_cell.sql_null);
-            var streamed = try sources.sql_array_wire.decode(alloc, .int64, streamed_cell.value, .{});
-            defer streamed.deinit();
-            try std.testing.expectEqual(std.math.Order.eq, try source_array.value.compare(streamed.value, &work));
+            const streamed = streamed_cell.array orelse return error.ExpectedNativeArrayCell;
+            try std.testing.expect(!streamed_cell.sql_null and streamed_cell.value == .null);
+            try std.testing.expectEqual(std.math.Order.eq, try source_array.value.compare(streamed.*, &work));
         };
         {
             const stream = (try wire_backend.vtable.open_stream.?(wire_backend.context, alloc, credential, request)) orelse return error.ExpectedReadStream;

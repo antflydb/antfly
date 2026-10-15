@@ -105,45 +105,44 @@ const supports_pressure_wait = builtin.os.tag != .freestanding and
     builtin.link_libc and
     @hasDecl(std.c, "pthread_cond_wait");
 
-const PressureChange = if (supports_pressure_wait)
-    struct {
-        mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
-        cond: std.c.pthread_cond_t = std.c.PTHREAD_COND_INITIALIZER,
-        epoch: @import("antfly_platform").atomic.Value(u64) = .init(0),
+const PressureChange = if (supports_pressure_wait) WaitingPressureChange else PollingPressureChange;
+const WaitingPressureChange = struct {
+    mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
+    cond: std.c.pthread_cond_t = std.c.PTHREAD_COND_INITIALIZER,
+    epoch: @import("antfly_platform").atomic.Value(u64) = .init(0),
 
-        fn snapshot(self: *@This()) u64 {
-            return self.epoch.load(.acquire);
-        }
+    fn snapshot(self: *@This()) u64 {
+        return self.epoch.load(.acquire);
+    }
 
-        fn waitForChange(self: *@This(), observed: u64) void {
-            if (std.c.pthread_mutex_lock(&self.mutex) != .SUCCESS) unreachable;
-            defer if (std.c.pthread_mutex_unlock(&self.mutex) != .SUCCESS) unreachable;
-            while (self.epoch.load(.acquire) == observed) {
-                if (std.c.pthread_cond_wait(&self.cond, &self.mutex) != .SUCCESS) unreachable;
-            }
-        }
-
-        fn advance(self: *@This()) void {
-            if (std.c.pthread_mutex_lock(&self.mutex) != .SUCCESS) unreachable;
-            _ = self.epoch.fetchAdd(1, .release);
-            if (std.c.pthread_cond_broadcast(&self.cond) != .SUCCESS) unreachable;
-            if (std.c.pthread_mutex_unlock(&self.mutex) != .SUCCESS) unreachable;
+    fn waitForChange(self: *@This(), observed: u64) void {
+        if (std.c.pthread_mutex_lock(&self.mutex) != .SUCCESS) unreachable;
+        defer if (std.c.pthread_mutex_unlock(&self.mutex) != .SUCCESS) unreachable;
+        while (self.epoch.load(.acquire) == observed) {
+            if (std.c.pthread_cond_wait(&self.cond, &self.mutex) != .SUCCESS) unreachable;
         }
     }
-else
-    struct {
-        epoch: @import("antfly_platform").atomic.Value(u64) = .init(0),
 
-        fn snapshot(self: *@This()) u64 {
-            return self.epoch.load(.acquire);
-        }
+    fn advance(self: *@This()) void {
+        if (std.c.pthread_mutex_lock(&self.mutex) != .SUCCESS) unreachable;
+        _ = self.epoch.fetchAdd(1, .release);
+        if (std.c.pthread_cond_broadcast(&self.cond) != .SUCCESS) unreachable;
+        if (std.c.pthread_mutex_unlock(&self.mutex) != .SUCCESS) unreachable;
+    }
+};
+const PollingPressureChange = struct {
+    epoch: @import("antfly_platform").atomic.Value(u64) = .init(0),
 
-        fn waitForChange(_: *@This(), _: u64) void {}
+    fn snapshot(self: *@This()) u64 {
+        return self.epoch.load(.acquire);
+    }
 
-        fn advance(self: *@This()) void {
-            _ = self.epoch.fetchAdd(1, .release);
-        }
-    };
+    fn waitForChange(_: *@This(), _: u64) void {}
+
+    fn advance(self: *@This()) void {
+        _ = self.epoch.fetchAdd(1, .release);
+    }
+};
 const default_disk_safety_floor_bytes: u64 = 1024 * MiB;
 const default_disk_safety_floor_divisor: u64 = 20;
 // Percentage-only reserves strand tens or hundreds of GiB on large volumes
@@ -585,10 +584,11 @@ pub const DenseSearchAdmissionLease = struct {
     }
 };
 
-const DenseSearchWaiters = admission.Fifo(struct {
+const DenseSearchWaiterPayload = struct {
     bytes: u64,
     enqueued_ns: u64,
-});
+};
+const DenseSearchWaiters = admission.Fifo(DenseSearchWaiterPayload);
 const DenseSearchWaiter = DenseSearchWaiters.Waiter;
 
 pub const MemoryStats = struct {
@@ -628,12 +628,16 @@ pub const CapacityObservation = struct {
 };
 
 pub const CapacitySource = struct {
+    const NativeCallbacks = struct { observe: @FieldType(CapacitySource, "observe") };
+    const NativeBoundary = @import("named_callback.zig").Boundary(NativeCallbacks);
+    callback_dispatch: @import("named_callback.zig").Dispatch = NativeBoundary.local_dispatch,
+
     ptr: *anyopaque,
     domain_id: CapacityDomainId,
     observe: *const fn (ptr: *anyopaque) anyerror!CapacityObservation,
 
     pub fn current(self: @This()) !CapacityObservation {
-        return try self.observe(self.ptr);
+        return try NativeBoundary.call("observe", self.callback_dispatch, self.observe, .{self.ptr});
     }
 };
 
@@ -1183,6 +1187,14 @@ pub const ResourceManager = struct {
                 .policy = options.policies[i],
             };
         }
+        // Whole source documents are buffered in this slice before parsing, so
+        // the default caps ingestible remote documents at roughly 256 MiB.
+        // Operators ingesting larger sources can raise it explicitly.
+        const extraction_hard = @import("antfly_platform").env.getenvU64("ANTFLY_DOCUMENT_EXTRACTION_WORKING_SET_BYTES") orelse 0;
+        if (extraction_hard > 0) slices[sliceIndex(.document_extraction_working_set)].budget = .{
+            .soft_limit_bytes = extraction_hard / 4 * 3,
+            .hard_limit_bytes = extraction_hard,
+        };
         const high_sequences = options.derived_backlog_high_sequences;
         return .{
             .memory = .{ .budget = options.memory_budget },
