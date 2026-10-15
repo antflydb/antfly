@@ -1073,17 +1073,28 @@ pub const PreparedInstall = struct {
     prefix_len: usize = 0,
 
     pub fn init(alloc: Allocator, core: *@import("core.zig").DBCore, command: validation.InstallCommand, context: RequestContext) !@This() {
-        try context.ensureActive();
         try command.validate();
+        return initMode(alloc, core, command.intent(), command, context);
+    }
+    /// Receivers pass metadata's logical decision/validation identity only.
+    /// Physical schema and activation hashes are derived locally, never chosen
+    /// by the RPC caller. This does not replace current-root authorization.
+    pub fn initIntent(alloc: Allocator, core: *@import("core.zig").DBCore, intent: validation.InstallIntent, context: RequestContext) !@This() {
+        return initMode(alloc, core, intent, null, context);
+    }
+    fn initMode(alloc: Allocator, core: *@import("core.zig").DBCore, intent: validation.InstallIntent, expected: ?validation.InstallCommand, context: RequestContext) !@This() {
+        try context.ensureActive();
+        try intent.validate();
         var read = try core.store.beginReadTxn();
         defer read.abort();
-        const binding = command.validation.command.binding;
+        const binding = intent.validation.command.binding;
         if (try validation.Installed.load(alloc, &read, binding)) |installed| {
-            if (!std.meta.eql(installed.command, command)) return error.InvalidPrivateIndexNativeReceipt;
+            if (!std.meta.eql(installed.command.intent(), intent)) return error.InvalidPrivateIndexNativeReceipt;
+            if (expected) |command| if (!std.meta.eql(installed.command, command)) return error.InvalidPrivateIndexNativeReceipt;
             try installed.requireCurrent(alloc, &read);
-            return .{ .alloc = alloc, .command = command, .context = context };
+            return .{ .alloc = alloc, .command = installed.command, .context = context };
         }
-        try command.validateBefore(alloc, &read);
+        try intent.validateBefore(alloc, &read);
         var candidate = try jobs.reopenCandidate(alloc, &read, binding);
         defer candidate.deinit();
         const view = try inputs.decode(candidate.inputs.bytes);
@@ -1098,6 +1109,15 @@ pub const PreparedInstall = struct {
         const metadata = [_]@import("../docstore.zig").KVPair{ .{ .key = "\x00\x00__metadata__:schema_json", .value = json }, .{ .key = version_key, .value = json } };
         var prepared = try core.prepareSchemaMetadataReservedIndex(runtime, &metadata, .{ .binding = binding, .candidate = &candidate });
         errdefer prepared.deinit();
+        const activation = prepared.reserved_activation orelse return error.PrivateIndexTargetValidationRequired;
+        const command: validation.InstallCommand = .{
+            .validation = intent.validation,
+            .metadata_decision = intent.metadata_decision,
+            .schema_digest = inputs.digest(prepared.encoded),
+            .activation_digest = inputs.digest(activation.value),
+        };
+        try command.validate();
+        if (expected) |supplied| if (!std.meta.eql(command, supplied)) return error.InvalidPrivateIndexNativeReceipt;
         try context.ensureActive();
         return .{ .alloc = alloc, .command = command, .context = context, .schema_data = .{ .prepared = prepared, .json = json, .version_key = version_key } };
     }

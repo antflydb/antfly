@@ -333,15 +333,13 @@ pub const Seal = struct {
 /// Stable logical installation identity. The receiving owner must obtain the
 /// metadata decision independently; a digest supplied to these storage
 /// primitives is not permission to install or adopt a different physical root.
-pub const InstallCommand = struct {
+pub const InstallIntent = struct {
     validation: Seal,
     metadata_decision: Digest,
-    schema_digest: Digest,
-    activation_digest: Digest,
 
     pub fn validate(self: @This()) !void {
         _ = try self.validation.command.receipt(self.validation.position);
-        if (!nonzero(self.metadata_decision) or !nonzero(self.schema_digest) or !nonzero(self.activation_digest)) return error.InvalidPrivateIndexNativeReceipt;
+        if (!nonzero(self.metadata_decision)) return error.InvalidPrivateIndexNativeReceipt;
     }
 
     pub fn validateBefore(self: @This(), alloc: Allocator, txn: anytype) !void {
@@ -351,6 +349,25 @@ pub const InstallCommand = struct {
         const actual = try SealCommand.prepare(alloc, txn, binding, self.validation.command.expected);
         if (!std.meta.eql(actual, self.validation.command) or
             !std.meta.eql((try Seal.load(alloc, txn, binding)) orelse return error.PrivateIndexTargetValidationRequired, self.validation)) return error.InvalidRelationalIndexValidation;
+    }
+};
+
+pub const InstallCommand = struct {
+    validation: Seal,
+    metadata_decision: Digest,
+    schema_digest: Digest,
+    activation_digest: Digest,
+
+    pub fn intent(self: @This()) InstallIntent {
+        return .{ .validation = self.validation, .metadata_decision = self.metadata_decision };
+    }
+    pub fn validate(self: @This()) !void {
+        try self.intent().validate();
+        if (!nonzero(self.schema_digest) or !nonzero(self.activation_digest)) return error.InvalidPrivateIndexNativeReceipt;
+    }
+    pub fn validateBefore(self: @This(), alloc: Allocator, txn: anytype) !void {
+        try self.validate();
+        try self.intent().validateBefore(alloc, txn);
     }
 
     pub fn evidenceDigest(self: @This()) !Digest {

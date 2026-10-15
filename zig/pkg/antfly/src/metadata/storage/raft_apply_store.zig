@@ -4978,6 +4978,15 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
             defer permission.deinit();
             try permission.value.requireRequest(lookup);
             const grant = permission.value.native_install orelse return error.TestMissingNativeInstallGrant;
+            const intent = try permission.value.nativeInstallationIntent(lookup, grant.validation.command.binding);
+            try std.testing.expectEqualDeep(grant.validation, intent.validation);
+            try std.testing.expectEqual(grant.decision_digest, intent.metadata_decision);
+            var wrong_binding = grant.validation.command.binding;
+            wrong_binding.inputs_digest[0] ^= 1;
+            try std.testing.expectError(error.PrivateIndexOwnerJobChanged, permission.value.nativeInstallationIntent(lookup, wrong_binding));
+            wrong_binding = grant.validation.command.binding;
+            wrong_binding.phase = .fencing;
+            try std.testing.expectError(error.PrivateIndexOwnerJobChanged, permission.value.nativeInstallationIntent(lookup, wrong_binding));
             try std.testing.expectEqual(index_progress.Phase.installing, permission.value.head.phase);
             try std.testing.expectEqual(permission.value.head.completion_revision, grant.validation.command.expected.completion_revision);
             var missing = permission.value;

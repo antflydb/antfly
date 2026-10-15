@@ -7902,3 +7902,39 @@ inventory, formatting and diff checks passed. The authenticated native install
 receiver/C-ABI bridge, current-root audits, installed ACK delivery and release
 coordination remain unfinished; no public SQL activation or original-case credit
 is claimed.
+
+### Storage-derived installation commands
+
+The receiver-facing storage preparation accepts a logical install intent: the
+metadata-derived validation seal and irreversible decision identity. Storage
+derives the physical native-schema and activation hashes from its own immutable
+candidate, exact manifest JSON and seal-bound activation preparation. RPC callers
+do not select these physical identities. Complete replication commands use the
+same preparation and must match the locally derived result before applying.
+
+Already-installed intent preparation checks the actual successor and original
+intent, then reuses the committed command/cut without compiling or publishing
+another schema. Metadata constructs intent only after binding permission to the
+independently observed reserved or installed job. Another immutable input digest
+or an incomplete fencing-phase job is not interchangeable with the accepted
+validation binding. This remains logical preparation, not current-root audit,
+transport authentication or physical-root adoption permission.
+
+The install receiver/C-ABI bridge, installed-state physical audit support,
+installed ACK/release coordination and full distributed activation remain
+unfinished. No public producer or original-case credit is enabled by this entry
+point. Native install wire format remains envelope 29; no parallel physical
+command format or legacy fallback is introduced.
+
+Qualification: `/private/tmp/antfly-index-install-intent-final-debug.log` passed
+159/159 Debug build steps after a clean rebuild. Metadata tests reject a changed
+observed manifest binding and a fencing-phase job. The native primary fixture
+derives the same complete command from logical intent, rejects substituted
+schema/activation hashes during preparation, and recovers an installed intent
+without another publication. Existing outbox failure/restart, standby replay,
+schema-history, C-ABI, ACK, publication and runtime tests passed. Boundary,
+license, inventory, formatting and diff checks passed. An earlier native run
+was interrupted by disappearing cache/SDK artifacts, not a reported code/test
+regression; it was rerun from the worktree-local cache without skipping gates.
+No native receiver/root-audit qualification, throughput result or original-case
+credit is claimed.

@@ -710,6 +710,18 @@ pub const OwnerDecision = struct {
         try expected.requireBinding(observed);
         return expected;
     }
+    pub fn nativeInstallationIntent(self: OwnerDecision, request: OwnerRequest, observed: local.storage_db_relational_index_owner_job.Binding) !local.storage_db_relational_index_validation.InstallIntent {
+        if (request.operation != .install) return error.InvalidGenerationPublication;
+        try self.requireNativeBinding(request, observed);
+        if (observed.phase != .reserved and observed.phase != .installed) return error.PrivateIndexOwnerJobChanged;
+        var reserved = observed;
+        reserved.phase = .reserved;
+        const grant = self.native_install orelse return error.InvalidCatalogRecord;
+        if (!std.meta.eql(reserved, grant.validation.command.binding)) return error.PrivateIndexOwnerJobChanged;
+        const intent: local.storage_db_relational_index_validation.InstallIntent = .{ .validation = grant.validation, .metadata_decision = grant.decision_digest };
+        try intent.validate();
+        return intent;
+    }
     pub fn nativeInventoryValidation(self: OwnerDecision, request: OwnerRequest, observed: local.storage_db_relational_index_owner_job.Binding, budget: local.storage_db_relational_index_jobs.Budget) !native_control.BuildRequest {
         const expected = try self.nativeTargetExpectation(request, observed);
         var result = try native_control.BuildRequest.init(try self.nativeExecutionIdentity(request), observed, budget);

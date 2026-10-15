@@ -2410,9 +2410,22 @@ test "relational index build pages identity dispatch caches immutable candidates
                         install_primary.local_execution.replication_async_batch_mirror = null;
                     };
                     install_primary.local_execution.replication_async_batch_mirror = install_publisher.asMirror();
+                    const InstallPreparationChecks = struct {
+                        fn run(database: *db_mod.DB, proposed: Verification.InstallCommand) !void {
+                            var owned = try database.prepareNativeIndexOwnerInstallation(proposed, .{});
+                            defer owned.deinit();
+                        }
+                    };
+                    var mismatched_command = install_command;
+                    mismatched_command.schema_digest[0] ^= 1;
+                    try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, InstallPreparationChecks.run(&install_primary, mismatched_command));
+                    mismatched_command = install_command;
+                    mismatched_command.activation_digest[0] ^= 1;
+                    try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, InstallPreparationChecks.run(&install_primary, mismatched_command));
                     const pending_install = pending_install: {
-                        var primary_prepared = try install_primary.prepareNativeIndexOwnerInstallation(install_command, .{});
+                        var primary_prepared = try install_primary.prepareNativeIndexOwnerInstallationIntent(install_command.intent(), .{});
                         defer primary_prepared.deinit();
+                        try std.testing.expectEqualDeep(install_command, primary_prepared.command);
                         break :pending_install try install_primary.applyPreparedNativeIndexOwnerInstallation(&primary_prepared, null);
                     };
                     try pending_install.validate();
@@ -2450,8 +2463,10 @@ test "relational index build pages identity dispatch caches immutable candidates
                     }
                     const primary_catalog_generation = install_primary.core.table_catalog.generation;
                     {
-                        var recovered_install = try install_primary.prepareNativeIndexOwnerInstallation(install_command, .{});
+                        var recovered_install = try install_primary.prepareNativeIndexOwnerInstallationIntent(install_command.intent(), .{});
                         defer recovered_install.deinit();
+                        try std.testing.expect(!recovered_install.requiresSchemaCommit());
+                        try std.testing.expectEqualDeep(install_command, recovered_install.command);
                         const recovered_outcome = try install_primary.applyPreparedNativeIndexOwnerInstallation(&recovered_install, null);
                         try recovered_outcome.validate();
                         try std.testing.expect(recovered_outcome.duplicate and !recovered_outcome.replication_pending);

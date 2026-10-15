@@ -8511,6 +8511,10 @@ pub const DB = struct {
         return native_index_control.PreparedInstall.init(self.alloc, self.core, command, context);
     }
 
+    pub fn prepareNativeIndexOwnerInstallationIntent(self: *DB, intent: @import("relational_index_validation.zig").InstallIntent, context: @import("../../api/operation.zig").RequestContext) !native_index_control.PreparedInstall {
+        return native_index_control.PreparedInstall.initIntent(self.alloc, self.core, intent, context);
+    }
+
     pub fn applyPreparedNativeIndexOwnerInstallation(self: *DB, prepared: *native_index_control.PreparedInstall, replay: ?NativeIndexReplay) !native_index_control.InstallOutcome {
         return self.applyPreparedNativeIndexEffect(prepared, replay);
     }
