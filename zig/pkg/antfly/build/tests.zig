@@ -6498,6 +6498,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.lookup_key_scratch.",
             "storage.db.document_read_scratch.",
             "storage.db.config.",
+            "storage.db.native_query_reuse.",
+            "storage.db.runtime_callbacks.",
             "storage.db.apply_receipts.",
             "storage.db.durable_outbox.",
             "storage.db.durable_outbox_store.",
@@ -6736,6 +6738,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "Run the storage portion of the default antfly-unit-test target in bounded codegen shards",
     );
     unit_storage_sharded_test_step.dependOn(&run_unit_server_db_tests.step);
+    // Ordinals are a separately configured module; importing their sources in
+    // the storage manifest would give each file two module owners.
+    unit_storage_sharded_test_step.dependOn(&b.top_level_steps.get("storage-ordinal-core-test").?.step);
+    unit_test_step.dependOn(&b.top_level_steps.get("storage-ordinal-core-test").?.step);
     const unit_storage_shard_audit = b.addSystemCommand(&.{"python3"});
     unit_storage_shard_audit.addFileArg2(b.path("tools/audit_storage_test_shards.py"), .{ .make_absolute = true });
     unit_storage_shard_audit.addArg("--root");
@@ -6758,6 +6764,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     for ([_][]const u8{ "server_db_integration_test.zig", "server_transaction_recovery.zig", "artifact_upload_recovery.zig", "server_coordinated_ttl.zig", "server_query_visibility.zig", "server_document_child_range.zig", "server_group_metadata.zig" }) |source| {
         unit_storage_shard_audit.addArg("--dedicated");
         unit_storage_shard_audit.addFileArg2(b.path(b.fmt("pkg/antfly/src/storage/{s}", .{source})), .{ .make_absolute = true });
+    }
+    for ([_][]const u8{ "ordinals/root.zig", "ordinals/operations.zig" }) |source| {
+        unit_storage_shard_audit.addArg("--local-dedicated");
+        unit_storage_shard_audit.addFileArg2(b.path(b.fmt("pkg/antfly-embedded/src/storage/{s}", .{source})), .{ .make_absolute = true });
     }
     unit_storage_shard_audit.addArg("--runtime-partition-source");
     unit_storage_shard_audit.addFileArg(b.path("pkg/antfly-embedded/src/storage/db/db.zig"));

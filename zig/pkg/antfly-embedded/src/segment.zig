@@ -10376,7 +10376,10 @@ test "fused authentication shares native cached reads without duplicate slabs" {
             const self: *@This() = @ptrCast(@alignCast(raw));
             return self.file.checksumIndexValue(self.value, offset, length, self.checkpoint);
         }
-        fn visit(raw: *anyopaque, offset: u64, length: u64, context: *anyopaque, visitor: *const fn (*anyopaque, u64, []const u8) anyerror!void) !void {
+        fn visit(raw: *anyopaque, offset: u64, length: u64, visitor_port: @import("segment_source.zig").SourceVisitor) !void {
+            var receiving_visitor = visitor_port;
+            const context: *anyopaque = &receiving_visitor;
+            const visitor = @import("segment_source.zig").SourceVisitor.consume;
             const self: *@This() = @ptrCast(@alignCast(raw));
             return self.file.visitIndexValue(self.value, offset, length, self.checkpoint, context, visitor);
         }
@@ -10447,7 +10450,10 @@ test "authenticated cache stream covers partial blocks and preserves cache fill 
             @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
             if (self.fail) return error.TestReadFailure;
         }
-        fn visit(raw: *anyopaque, offset: u64, length: u64, context: *anyopaque, consume: *const fn (*anyopaque, u64, []const u8) anyerror!void) !void {
+        fn visit(raw: *anyopaque, offset: u64, length: u64, visitor_port: @import("segment_source.zig").SourceVisitor) !void {
+            var receiving_visitor = visitor_port;
+            const context: *anyopaque = &receiving_visitor;
+            const consume = @import("segment_source.zig").SourceVisitor.consume;
             const self: *@This() = @ptrCast(@alignCast(raw));
             var position: u64 = 0;
             while (position < length) {
@@ -11858,7 +11864,10 @@ test "borrowed typed ranges preserve native logical cache and coalesce cold read
             const self: *@This() = @ptrCast(@alignCast(raw));
             try self.cache.?.readAuthenticated(offset, length, within, out, expected);
         }
-        fn visit(raw: *anyopaque, offset: u64, length: u64, context: *anyopaque, consume: *const fn (*anyopaque, u64, []const u8) anyerror!void) !void {
+        fn visit(raw: *anyopaque, offset: u64, length: u64, visitor_port: @import("segment_source.zig").SourceVisitor) !void {
+            var receiving_visitor = visitor_port;
+            const context: *anyopaque = &receiving_visitor;
+            const consume = @import("segment_source.zig").SourceVisitor.consume;
             const self: *@This() = @ptrCast(@alignCast(raw));
             try self.file.visitIndexValue(self.value, offset, length, self.checkpoint, context, consume);
         }
@@ -11942,7 +11951,10 @@ test "segment.cold multi-page borrowing amortizes native traversal" {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try self.cache.?.readAuthenticated(offset, length, within, out, expected);
         }
-        fn visit(raw: *anyopaque, offset: u64, length: u64, context: *anyopaque, consume: *const fn (*anyopaque, u64, []const u8) anyerror!void) !void {
+        fn visit(raw: *anyopaque, offset: u64, length: u64, visitor_port: @import("segment_source.zig").SourceVisitor) !void {
+            var receiving_visitor = visitor_port;
+            const context: *anyopaque = &receiving_visitor;
+            const consume = @import("segment_source.zig").SourceVisitor.consume;
             const self: *@This() = @ptrCast(@alignCast(raw));
             try self.file.visitIndexValue(self.value, offset, length, self.checkpoint, context, consume);
         }
