@@ -1562,6 +1562,9 @@ fn locatorKey(buf: []u8, doc_id: []const u8) []const u8 {
     @memcpy(buf[1..][0..doc_id.len], doc_id);
     return buf[0 .. doc_id.len + 1];
 }
+const locator_batch_max_entries = 256;
+const locator_batch_max_bytes = 1024 * 1024;
+
 fn locatorKeyWithScratch(a: Allocator, scratch: []u8, doc_id: []const u8) ![]const u8 {
     if (doc_id.len < scratch.len) return locatorKey(scratch, doc_id);
     const key = try a.alloc(u8, try std.math.add(usize, doc_id.len, 1));
@@ -3490,6 +3493,7 @@ pub const SparseIndex = struct {
             };
             if (!std.mem.eql(u8, active, root)) return;
             var count: usize = 0;
+            var bytes: u64 = 0;
             while (next) |entry| {
                 if (entry.key.len != 17 or !std.mem.eql(u8, entry.key[0..9], prefix[0..9])) {
                     next = null;
@@ -3499,6 +3503,10 @@ pub const SparseIndex = struct {
                 if (entry.value.len < 4) return error.InvalidSparseDocMapSegment;
                 const len = std.mem.readInt(u32, entry.value[0..4], .little);
                 if (len > entry.value.len - 4) return error.InvalidSparseDocMapSegment;
+                const entry_bytes = @as(u64, len) + 37;
+                // Leave the next entry for a fresh transaction before its key
+                // is allocated. One oversized identity must still make progress.
+                if (bytes != 0 and bytes + entry_bytes > locator_batch_max_bytes) break;
                 {
                     var epoch_key: [17]u8 = undefined;
                     const wanted = segmentIncarnationKey(&epoch_key, id, doc, true);
@@ -3524,8 +3532,9 @@ pub const SparseIndex = struct {
                     }
                 }
                 count += 1;
+                bytes += entry_bytes;
                 next = try cursor.next();
-                if (count == 256) break;
+                if (count == locator_batch_max_entries) break;
             }
             try updates.commit();
             updates_open = false;
@@ -3802,7 +3811,7 @@ pub const SparseIndex = struct {
             }
             fn visit(self_: *@This(), entry: DocMapLookup) !bool {
                 const bytes = try std.math.add(u64, entry.doc_id.len, 37);
-                if (self_.bytes != 0 and self_.bytes +| bytes > 1024 * 1024) try self_.flush();
+                if (self_.bytes != 0 and self_.bytes +| bytes > locator_batch_max_bytes) try self_.flush();
                 // Charge staged key/value bytes, metadata, and the transient
                 // long-key copy before allocation. No corpus-sized reservation.
                 if (self_.index.resource_manager) |manager|
@@ -3812,7 +3821,7 @@ pub const SparseIndex = struct {
                 self_.count += 1;
                 self_.bytes += bytes;
                 self_.index.write_profile.locator_backfill_entries += 1;
-                if (self_.count == 256) try self_.flush();
+                if (self_.count == locator_batch_max_entries) try self_.flush();
                 return false;
             }
         };
@@ -7393,6 +7402,97 @@ test "sparse locator completeness upgrades legacy proof before long IDs" {
     var point = NoDocMapRead{ .read = &read };
     try std.testing.expect((try index.docNumForDocIdTxn(&point, &id)) != null);
     try std.testing.expect((try index.docNumForDocIdTxn(&point, "short")) != null);
+}
+
+test "sparse locator refresh bounds bytes and rows and isolates oversized identities" {
+    const a = std.testing.allocator;
+    var index = try SparseIndex.open(a, "unused", .{ .backend = .mem });
+    defer index.close();
+    const segment = 7;
+    var ids: [392][]u8 = undefined;
+    var initialized: usize = 0;
+    defer for (ids[0..initialized]) |id| a.free(id);
+    {
+        var txn = try index.beginBatchTxn(.{});
+        errdefer txn.abort();
+        var root: [16]u8 = undefined;
+        @memcpy(root[0..8], paged_docmap_magic);
+        std.mem.writeInt(u32, root[8..12], SEGMENT_FORMAT_VERSION, .little);
+        std.mem.writeInt(u32, root[12..16], ids.len, .little);
+        var root_key: [16]u8 = undefined;
+        try txn.put(docMapSegmentKey(&root_key, segment), &root);
+        for (&ids, 0..) |*id, i| {
+            const length: usize = if (i < 260 or i == ids.len - 1) 64 else if (i == ids.len - 2) locator_batch_max_bytes + 1 else 8192;
+            id.* = try a.alloc(u8, length);
+            initialized += 1;
+            @memset(id.*, 'x');
+            std.mem.writeInt(u64, id.*[0..8], i, .big);
+            const epoch = try advanceIncarnation(&txn, i);
+            try putSegmentIncarnation(&txn, segment, i, epoch, true);
+            const forward = try encodeFwdEntry(a, i, &.{1}, &.{2});
+            defer a.free(forward);
+            const value = try a.alloc(u8, 4 + length + forward.len);
+            defer a.free(value);
+            std.mem.writeInt(u32, value[0..4], @intCast(length), .little);
+            @memcpy(value[4..][0..length], id.*);
+            @memcpy(value[4 + length ..], forward);
+            try txn.put(&docMapEntryKey(segment, i), value);
+        }
+        try txn.commit();
+    }
+    // Measure actual staged keys at each commit, independently of the refresh
+    // loop's counters. The same generic path serves compaction and recovery.
+    const Writer = struct {
+        const Self = @This();
+        index: *SparseIndex,
+        batches: usize = 0,
+        rows: [5]usize = @splat(0),
+        alloc: Allocator,
+        const Batch = struct {
+            owner: *Self,
+            inner: backend_erased.Batch,
+            bytes: usize = 0,
+            rows: usize = 0,
+            fn get(self: *@This(), key: []const u8) ![]const u8 {
+                return self.inner.get(key);
+            }
+            fn put(self: *@This(), key: []const u8, value: []const u8) !void {
+                try self.inner.put(key, value);
+                self.bytes += key.len + value.len;
+                self.rows += 1;
+            }
+            fn abort(self: *@This()) void {
+                self.inner.abort();
+            }
+            fn commit(self: *@This()) !void {
+                try std.testing.expect(self.rows <= locator_batch_max_entries);
+                try std.testing.expect(self.bytes <= locator_batch_max_bytes or self.rows == 1);
+                try std.testing.expect(self.owner.batches < self.owner.rows.len);
+                try self.inner.commit();
+                self.owner.rows[self.owner.batches] = self.rows;
+                self.owner.batches += 1;
+            }
+        };
+        fn beginReadTxn(self: *@This()) !backend_erased.ReadTxn {
+            return self.index.beginReadTxn();
+        }
+        fn beginBatchTxn(self: *@This(), options: backend_types.BatchOptions) !Batch {
+            return .{ .owner = self, .inner = try self.index.beginBatchTxn(options) };
+        }
+    };
+    var writer = Writer{ .index = &index, .alloc = a };
+    try SparseIndex.refreshPagedLocators(&writer, segment, null);
+    try std.testing.expectEqual(@as(usize, 5), writer.batches);
+    try std.testing.expectEqualSlices(usize, &.{ 256, 131, 3, 1, 1 }, &writer.rows);
+    var read = try index.beginReadTxn();
+    defer read.abort();
+    for (ids, 0..) |id, i| {
+        const locator = (try readLocator(a, &read, id)).?;
+        try std.testing.expectEqual(@as(u64, i), locator.num);
+        try std.testing.expectEqual(@as(u64, segment), locator.segment);
+        const forward = (try locatedForwardBytes(a, &read, id)).?;
+        try std.testing.expectEqual(@as(u64, i), try decodeFwdDocNum(forward));
+    }
 }
 
 test "sparse locator backfill bounds encoded bytes for oversized identities" {
