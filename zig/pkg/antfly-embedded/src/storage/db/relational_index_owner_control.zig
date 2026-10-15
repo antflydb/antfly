@@ -779,6 +779,24 @@ pub const AuditOutcome = struct {
         try request.requireBinding(self.binding);
         if (!std.mem.eql(u8, &try self.expected.digest(), &try (request.target_expectation orelse return error.InvalidPrivateIndexNativeReceipt).digest())) return error.InvalidPrivateIndexNativeReceipt;
         try self.audit.validateFor(self.expected, self.audit.root_incarnation);
+        if (self.audit.canonical_position) |position| if (!position.namespace.eql(self.binding.fence.namespace)) return error.InvalidPrivateIndexNativeReceipt;
+    }
+    /// Physical witness identity only, deliberately distinct from a logical
+    /// publication receipt. It changes when the physical DB is replaced.
+    pub fn readyDigest(self: @This()) !integrity.Digest {
+        try self.expected.requireBinding(self.binding);
+        try self.audit.validateFor(self.expected, self.audit.root_incarnation);
+        if (self.audit.inventory.phase != .ready or self.audit.generation == null or self.audit.generation.?.phase != .ready) return error.PrivateIndexTargetValidationRequired;
+        if (!self.audit.canonical_position.?.namespace.eql(self.binding.fence.namespace)) return error.InvalidPrivateIndexNativeReceipt;
+        var buffer: [16 * 1024]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buffer);
+        std.json.Stringify.value(self, .{}, &writer) catch return error.InvalidPrivateIndexNativeReceipt;
+        var digest = std.crypto.hash.Blake3.init(.{});
+        digest.update("antfly/private-index-complete-physical-audit/v1");
+        digest.update(buffer[0..writer.end]);
+        var result: integrity.Digest = undefined;
+        digest.final(&result);
+        return result;
     }
 };
 

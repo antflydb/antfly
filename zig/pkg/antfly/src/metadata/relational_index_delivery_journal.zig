@@ -592,7 +592,11 @@ fn requireRetainedBinding(alloc: std.mem.Allocator, reader: anytype, group: u64,
 
 /// O(1) final-input projection. EOF completion freezes metadata acceptance;
 /// it does not prove physical claims, close target writers or publish a schema.
+pub const FrozenTarget = struct { expected: jobs.private_claims.TargetExpectation, source_members: u64, source_position: positions.Native };
 pub fn targetExpectation(alloc: std.mem.Allocator, reader: anytype, group: u64, head: progress.Head, owner: progress.OwnerState, incarnation: Digest) !jobs.private_claims.TargetExpectation {
+    return (try frozenTarget(alloc, reader, group, head, owner, incarnation)).expected;
+}
+pub fn frozenTarget(alloc: std.mem.Allocator, reader: anytype, group: u64, head: progress.Head, owner: progress.OwnerState, incarnation: Digest) !FrozenTarget {
     try head.validate();
     try owner.validate();
     if (head.phase != .building or head.completed_sources != head.owner_count or head.completion_revision == 0) return error.GenerationPublicationChanged;
@@ -630,7 +634,7 @@ pub fn targetExpectation(alloc: std.mem.Allocator, reader: anytype, group: u64, 
         result.provenance = target.inventory.provenance;
     }
     try result.requireBinding(prefix_.binding);
-    return result;
+    return .{ .expected = result, .source_members = complete.rows, .source_position = complete.position };
 }
 fn requireEnrollment(alloc: std.mem.Allocator, reader: anytype, group: u64, proof: publication.RootProof, incarnation: Digest) !void {
     const enrollment = @import("store_root_enrollment.zig");

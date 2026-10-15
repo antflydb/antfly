@@ -4577,7 +4577,7 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
         eof.position.sequence = 10;
         eof.proof = try proof.sign(root, try eof.digest());
         const completion: index_delivery.CompletionRequest = .{ .query = index_delivery.Query.from(.{ .signed = next_signed }), .consumed = eof };
-        try testDurableSourceCompletion(store.alloc, group, initial_snapshot, .{ .signed = signed }, .{ .signed = next_signed, .consumed = consumed }, completion);
+        try testDurableSourceCompletion(store.alloc, group, initial_snapshot, .{ .signed = signed }, .{ .signed = next_signed, .consumed = consumed }, completion, root);
         var sealed = try index_delivery.prepareCompletion(store.alloc, txn, group, completion, RaftApplyStore.SourceDeliveryAuthority{ .store = store });
         defer sealed.deinit();
         try sealed.stage(txn, group);
@@ -4591,7 +4591,7 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
         // the separate clone above exercises committed acceptance and reopen.
     }
 
-    fn testDurableSourceCompletion(alloc: std.mem.Allocator, group: u64, initial: []const u8, first: index_delivery.Request, second: index_delivery.Request, request: index_delivery.CompletionRequest) !void {
+    fn testDurableSourceCompletion(alloc: std.mem.Allocator, group: u64, initial: []const u8, first: index_delivery.Request, second: index_delivery.Request, request: index_delivery.CompletionRequest, signing_root: @import("antfly_local_sources").storage_db_root_signing_identity.State) !void {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/source-completion", .{tmp.sub_path});
@@ -4719,6 +4719,25 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
         }
         var reopened = try RaftApplyStore.init(alloc, .{ .root_dir = path });
         defer reopened.deinit();
+        const canonical_sequence = request.consumed.position.sequence + 1;
+        {
+            var update = try reopened.store.beginWriteTxn();
+            errdefer update.abort();
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const current = (try reopened.loadStoreHeaderTxn(&update, group, request.consumed.proof.identity.store_id)).?;
+            defer metadata_table_manager.freeStore(alloc, current);
+            const address = try RaftApplyStore.ReportAddress.active(a, &update, group, current.store_id);
+            const report = (try RaftApplyStore.readStoreGroupReportTxn(a, &update, group, address, second.signed.data.source.fence.owner_group_id, true)).?;
+            const runtimes = try a.dupe(@TypeOf(report.runtime_statuses[0]), report.runtime_statuses);
+            runtimes[0].source_authority.?.sequence = canonical_sequence;
+            var refreshed = current;
+            refreshed.runtime_statuses = runtimes;
+            refreshed.group_statuses = report.group_statuses;
+            _ = try reopened.updateListingStoreTxn(&update, group, current.store_id, refreshed);
+            try update.commit();
+        }
         const reply = try reopened.relationalIndexSourceAcceptanceStatusJson(alloc, group, request.query);
         defer alloc.free(reply);
         var status = try std.json.parseFromSlice(index_delivery.Status, alloc, reply, .{});
@@ -4737,6 +4756,53 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
         try std.testing.expectEqualSlices(u8, &try request.consumed.digest(), &expected.source_consumption_digest);
         try std.testing.expectEqualSlices(u8, &second.signed.data.header.progressDigest(), &expected.source_progress_digest);
         try expected.requireBinding(second.signed.data.source);
+        {
+            // Synthetic physical evidence qualifies the actual metadata read
+            // set, not scans. Real LSM/C-ABI tests qualify physical production.
+            const local = @import("antfly_local_sources");
+            const Integrity = local.storage_db_relational_integrity_contract;
+            const claim = try Integrity.Address.init(expected.generation, "logical-tuple-2");
+            const outcome: local.storage_db_relational_index_owner_control.AuditOutcome = .{
+                .binding = second.signed.data.source,
+                .expected = expected,
+                .audit = .{ .root_incarnation = signing_root.root_incarnation, .physical_root_incarnation = 9, .expectation_digest = try expected.digest(), .inventory = .{ .phase = .ready, .rows = expected.rows, .inventory_xor = expected.inventory_xor, .claim_rows = expected.rows, .claim_xor = expected.inventory_xor, .claim_cursor = claim.claimKey(), .cursor = local.storage_db_relational_index_owner_job.private_claims.inventoryKey(claim), .chain = @splat(7) }, .generation = .{ .phase = .ready, .counts = @splat(request.consumed.rows), .chain = @splat(7), .cursor_digest = Integrity.hash("") }, .generation_canonical_digest = @splat(8), .source_members = request.consumed.rows, .canonical_position = .{ .namespace = second.signed.data.source.fence.namespace, .sequence = canonical_sequence }, .checkpoint_digest = @splat(6) },
+            };
+            const digest_ = try outcome.readyDigest();
+            const signed: index_publication.SignedAudit = .{ .outcome_digest = digest_, .proof = try request.consumed.proof.sign(signing_root, digest_) };
+            const before_head = try head.encode();
+            const before_owner = try owner.encode();
+            try std.testing.expectEqual(try signed.commitment(outcome), try reopened.verifyRelationalIndexAuditTxn(&txn, group, signed, outcome));
+            for (0..2) |fault| {
+                var stale = signed;
+                if (fault == 0) stale.proof.root_generation += 1 else stale.proof.reporter_incarnation += 1;
+                stale.proof = try stale.proof.sign(signing_root, digest_);
+                try std.testing.expectError(error.IndexOwnerReceiptChanged, reopened.verifyRelationalIndexAuditTxn(&txn, group, stale, outcome));
+            }
+            var changed = outcome;
+            changed.audit.physical_root_incarnation += 1;
+            try std.testing.expectError(error.InvalidIndexOwnerReceipt, reopened.verifyRelationalIndexAuditTxn(&txn, group, signed, changed));
+            for (0..3) |fault| {
+                changed = outcome;
+                switch (fault) {
+                    0 => {
+                        changed.expected.provenance[0] ^= 1;
+                        changed.audit.expectation_digest = try changed.expected.digest();
+                    },
+                    1 => {
+                        changed.audit.source_members.? += 1;
+                        changed.audit.generation.?.counts = @splat(changed.audit.source_members.?);
+                    },
+                    2 => changed.audit.canonical_position.?.sequence = request.consumed.position.sequence,
+                    else => unreachable,
+                }
+                const changed_digest = try changed.readyDigest();
+                const forged: index_publication.SignedAudit = .{ .outcome_digest = changed_digest, .proof = try signed.proof.sign(signing_root, changed_digest) };
+                try std.testing.expectError(error.IndexOwnerReceiptChanged, reopened.verifyRelationalIndexAuditTxn(&txn, group, forged, changed));
+            }
+            try std.testing.expectEqualSlices(u8, &before_head, try txn.get(try index_publication.headKey(&buf, group, head.table_id)));
+            try std.testing.expectEqualSlices(u8, &before_owner, try txn.get(try index_publication.ownerKey(&buf, group, head.table_id, owner.owner.ordinal)));
+            try std.testing.expect(std.mem.allEqual(u8, &owner.receipts[@backingInt(index_progress.Action.validated)], 0));
+        }
         var incomplete = head;
         incomplete.completed_sources = 0;
         incomplete.completion_revision = 0;
@@ -16916,6 +16982,22 @@ pub const RaftApplyStore = struct {
                     return error.IndexOwnerReceiptChanged;
             },
         }
+    }
+
+    /// Join a complete physical witness with the frozen source/target ledger
+    /// and current root authority in one read set. This stages no writes; any
+    /// accepting publication transaction must repeat this exact verification.
+    pub fn verifyRelationalIndexAuditTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, signed: index_publication.SignedAudit, outcome: @import("antfly_local_sources").storage_db_relational_index_owner_control.AuditOutcome) ![32]u8 {
+        const audit_digest = try signed.verifiedDigest(outcome);
+        const current = try self.currentIndexBuildOwnerTxn(txn, group_id, outcome.binding, null);
+        var buf: [192]u8 = undefined;
+        const owner = try index_progress.OwnerState.decode(try txn.get(try index_publication.ownerKey(&buf, group_id, current.head.table_id, outcome.binding.ordinal)));
+        const frozen = try index_delivery.frozenTarget(self.alloc, txn, group_id, current.head, owner, signed.proof.identity.metadata_incarnation);
+        if (!std.mem.eql(u8, &try frozen.expected.digest(), &try outcome.expected.digest()) or
+            outcome.audit.source_members.? != frozen.source_members or
+            outcome.audit.canonical_position.?.sequence <= frozen.source_position.sequence) return error.IndexOwnerReceiptChanged;
+        try self.requireIndexOwnerRootProofTxn(txn, group_id, current.owner, .{ .native = outcome.audit.canonical_position.? }, signed.proof, current.head.reader_requirements, false);
+        return signed.proof.commitment(audit_digest);
     }
 
     /// Verify one exact target partition against a single current metadata

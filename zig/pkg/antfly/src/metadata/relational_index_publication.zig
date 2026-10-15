@@ -42,6 +42,26 @@ pub const Id = progress.Id;
 pub const Digest = progress.Digest;
 pub const RootProof = @import("relational_index_root_attestation.zig").Proof;
 
+/// Compact physical witness. The outcome is carried once in the enclosing
+/// progress reply; the signature binds every field through its ready digest.
+/// This is not a logical validation ACK or an installation/publication grant.
+pub const SignedAudit = struct {
+    outcome_digest: Digest,
+    proof: RootProof,
+    pub fn verifiedDigest(self: @This(), outcome: native_control.AuditOutcome) !Digest {
+        const actual = try outcome.readyDigest();
+        if (self.proof.authority != .native or !std.mem.eql(u8, &actual, &self.outcome_digest) or
+            self.proof.identity.root_incarnation != outcome.audit.root_incarnation or
+            !std.mem.eql(u8, &self.proof.identity.metadata_incarnation, &outcome.expected.metadata_incarnation)) return error.InvalidIndexOwnerReceipt;
+        try (NativeSigningView{ .identity = self.proof.identity, .reporter_incarnation = self.proof.reporter_incarnation, .binding_digest = self.proof.authority.native }).validate(outcome.expected.metadata_incarnation);
+        self.proof.verify(actual) catch return error.InvalidIndexOwnerReceipt;
+        return actual;
+    }
+    pub fn commitment(self: @This(), outcome: native_control.AuditOutcome) !Digest {
+        return self.proof.commitment(try self.verifiedDigest(outcome));
+    }
+};
+
 test {
     _ = @import("relational_index_work.zig");
     _ = @import("relational_index_worker.zig");

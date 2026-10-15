@@ -322,8 +322,12 @@ const Job = struct {
                         if (value.audit.generation) |fields| switch (fields.phase) {
                             .failed => return error.PrivateIndexGenerationValidationFailed,
                             .ready => {
-                                // Still unsigned physical progress. Joining
-                                // authenticated metadata proofs is separate.
+                                if (response.value.building.signed_audit == null) {
+                                    owner.retry_at_ns = now_ns +| retry_ns;
+                                    return;
+                                }
+                                // An authenticated physical witness is still
+                                // not a transactionally joined metadata ACK.
                                 self.retireOwner(index);
                                 self.retry_at_ns = now_ns +| std.time.ns_per_s;
                             },

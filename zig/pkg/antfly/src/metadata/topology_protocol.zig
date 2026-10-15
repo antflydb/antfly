@@ -95,9 +95,11 @@ const std = @import("std");
 /// physical progress, not authenticated native publication capability.
 /// Version 46 decodes bounded root-local audit progress on native validation
 /// replies. This still grants no authenticated publication/install capability.
-pub const current_version: u16 = 46;
-pub const index_publication_head_version: u16 = 46;
-pub const index_delivery_version: u16 = 46;
+/// Version 47 decodes authenticated complete-audit witnesses. These are not
+/// logical validation ACKs and do not enable installation or publication.
+pub const current_version: u16 = 47;
+pub const index_publication_head_version: u16 = 47;
+pub const index_delivery_version: u16 = 47;
 pub const schema_reader_publication_version: u16 = 39;
 pub const schema_reader_floor_version: u16 = 38;
 pub const schema_reader_capability_version: u16 = 37;

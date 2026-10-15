@@ -7302,3 +7302,64 @@ prerequisites. Counts overlap and are not independent SQL coverage. Boundary,
 license, original inventory, generated control-catalog, formatting and diff
 checks passed. Runtime qualification here is macOS Debug; Linux's directory
 open/sync requirement is additionally checked against the std.Io implementation.
+
+### Authenticated physical-audit witness and frozen-ledger join
+
+A complete native audit can now be signed using the existing post-commit root
+decoration path. Partial/failed audits are not signable. The compact witness
+contains the complete outcome digest and applying-root proof; the outcome is
+carried only once in its enclosing reply. Its domain-separated digest binds
+the job/target, source cardinality, signing authority, physical incarnation,
+canonical validation cut, canonical generation seal and root-local checkpoint.
+The leased generation is retained from the actual compiled call, not reread
+after its lease is released. Signing failure preserves completed physical
+progress and exposes the failure without fabricating an ACK. Workers retry
+complete but unsigned results rather than retiring them as authenticated work.
+
+The physical witness identity deliberately changes across DB replacement. It
+is not a logical publication receipt digest: eventual logical re-attestation
+must preserve the same committed logical stage while refreshing its physical
+root witness. No validated/install/release native effect is added here.
+
+Metadata verification joins the signature to the complete frozen source/target
+ledger and current ownership in one transaction's read set. The projection
+returns target expectation, consumed local source rows and source cut together
+without decoding partition bodies or scanning a cohort. Target counts are not
+substituted for source counts. Verification compares the exact frozen target,
+the independent source count, a canonical cut strictly after source consumption,
+active job/lifecycle/catalog/range authority, enrolled key/current reporter,
+standalone writer binding and the current runtime root generation/native cut.
+This method stages no writes. The eventual accepting metadata transaction must
+call it itself; a successful service preflight is not an authorization token.
+
+Private ABI 84 and coordinated decoder floor 47 cover the new bounded witness
+and canonical-cut projection. These remain audit capabilities, not full native
+validation/installation/publication activation. AFRIA v2 is unchanged: the
+canonical cut already resides in the stored generation progress.
+
+The metadata fixture accepts the correctly signed witness and rejects unsigned
+physical changes, validly re-signed target/count/cut mismatches and stale
+reporter/root-generation evidence. It checks unchanged head/owner bytes and
+absence of a validated receipt. Synthetic physical evidence qualifies these
+metadata reads, not a physical scan. Existing real LSM/C-ABI fixtures separately
+qualify physical production. Scheduling tests refuse partial signing and check
+that signing failure retains the exact completed outcome before a successful
+signature is produced.
+
+Still unfinished are the durable logical validation effect/outbox and atomic
+accepting ACK integration, separate full native capability barrier, actual
+restore/adoption enforcement, install/release, durable terminal failure,
+missing-root repair, actual data-Raft execution, terminal catalog publication
+and complete distributed faults. Public UNIQUE activation remains guarded.
+Original dispositions remain 483 implemented / 862 unresolved.
+
+The focused metadata gate in
+`/private/tmp/antfly-signed-audit-metadata-debug-v3.log` passed 60/60 Debug
+steps. The final aggregate gate in
+`/private/tmp/antfly-signed-audit-full-debug.log` passed 159/159 Debug steps,
+including ten native-page, 48 publication, four ACK, three leased-owner,
+six C-ABI, 46 runtime-contract and 104 standalone tests. Counts overlap and
+are not original SQL coverage. Boundary, license, inventory, generated
+control-catalog, formatting and diff checks passed. These are macOS Debug
+executions; no additional distributed restore or Linux runtime qualification
+is claimed.
