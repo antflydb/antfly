@@ -245,6 +245,23 @@ pub fn validateReadablePayloadFeatures(manifest: Manifest) !void {
     }
 }
 
+/// Bound both the materialized object inventory and the included payload
+/// stream. Extraction writes included blobs even when no object references
+/// them, while deduplicated blobs can materialize into several objects.
+pub fn validatePreparationSizeLimit(manifest: Manifest, limit: u64) !void {
+    var object_bytes: u64 = 0;
+    for (manifest.objects) |object| {
+        if (object.size_bytes > limit -| object_bytes) return error.BackupExpansionLimitExceeded;
+        object_bytes += object.size_bytes;
+    }
+    var blob_bytes: u64 = 0;
+    for (manifest.blobs) |blob| {
+        if (!blob.included) continue;
+        if (blob.logical_size_bytes > limit -| blob_bytes) return error.BackupExpansionLimitExceeded;
+        blob_bytes += blob.logical_size_bytes;
+    }
+}
+
 pub fn validateSha256(value: []const u8) !void {
     if (value.len != std.crypto.hash.sha2.Sha256.digest_length * 2)
         return error.InvalidBackupDigest;
@@ -482,6 +499,45 @@ test "AFB2 manifest separates representation from snapshot mode" {
     try std.testing.expectEqual(Representation.native, parsed.value.representation);
     try std.testing.expectEqual(SnapshotMode.delta, parsed.value.mode);
     try std.testing.expectEqual(@as(usize, 1), parsed.value.objects.len);
+}
+
+test "AFB2 preparation limit includes unreferenced blobs and deduplicated objects" {
+    const first = "0000000000000000000000000000000000000000000000000000000000000000";
+    const second = "1111111111111111111111111111111111111111111111111111111111111111";
+    const manifest: Manifest = .{
+        .representation = .native,
+        .objects = &.{.{ .logical_path = "backup/MANIFEST.json", .role = "manifest", .size_bytes = 16, .sha256 = first }},
+        .blobs = &.{
+            .{ .sha256 = first, .logical_size_bytes = 16, .stored_size_bytes = 16 },
+            .{ .sha256 = second, .logical_size_bytes = 4 * 1024 * 1024, .stored_size_bytes = 4 * 1024 * 1024 },
+        },
+    };
+    try validateManifest(manifest);
+    try validateReadablePayloadFeatures(manifest);
+    try std.testing.expectError(error.BackupExpansionLimitExceeded, validatePreparationSizeLimit(manifest, 1024 * 1024));
+    try validatePreparationSizeLimit(manifest, 4 * 1024 * 1024 + 16);
+    try std.testing.expectError(error.BackupExpansionLimitExceeded, validatePreparationSizeLimit(manifest, 4 * 1024 * 1024 + 15));
+
+    const deduplicated: Manifest = .{
+        .representation = .native,
+        .objects = &.{
+            .{ .logical_path = "a", .role = "native_file", .size_bytes = 16, .sha256 = first },
+            .{ .logical_path = "b", .role = "native_file", .size_bytes = 16, .sha256 = first },
+        },
+        .blobs = manifest.blobs[0..1],
+    };
+    try validateManifest(deduplicated);
+    try std.testing.expectError(error.BackupExpansionLimitExceeded, validatePreparationSizeLimit(deduplicated, 31));
+    try validatePreparationSizeLimit(deduplicated, 32);
+
+    var oversized = manifest;
+    oversized.objects = &.{.{ .logical_path = "large", .role = "native_file", .size_bytes = std.math.maxInt(u64), .sha256 = first }};
+    oversized.blobs = &.{
+        .{ .sha256 = first, .logical_size_bytes = std.math.maxInt(u64), .stored_size_bytes = std.math.maxInt(u64) },
+        .{ .sha256 = second, .logical_size_bytes = 1, .stored_size_bytes = 1 },
+    };
+    try validateManifest(oversized);
+    try std.testing.expectError(error.BackupExpansionLimitExceeded, validatePreparationSizeLimit(oversized, std.math.maxInt(u64)));
 }
 
 test "AFB2 manifest rejects ambiguous delta and traversal paths" {

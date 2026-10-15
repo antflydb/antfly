@@ -27,7 +27,7 @@ const direct_impl = if (use_direct_implementation)
 else
     struct {};
 
-pub const max_afb_file_bytes: usize = 16 * 1024 * 1024 * 1024;
+pub const max_afb_file_bytes: usize = 64 * 1024 * 1024 * 1024;
 
 pub const Status = struct {
     pub const ok: c_int = 0;
@@ -91,6 +91,8 @@ pub fn defaultBackupIdAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u
     const base = std.fs.path.basename(path);
     const stem = if (std.mem.endsWith(u8, base, ".aflite"))
         base[0 .. base.len - ".aflite".len]
+    else if (std.mem.endsWith(u8, base, ".afb2"))
+        base[0 .. base.len - ".afb2".len]
     else if (std.mem.endsWith(u8, base, ".afb"))
         base[0 .. base.len - ".afb".len]
     else
