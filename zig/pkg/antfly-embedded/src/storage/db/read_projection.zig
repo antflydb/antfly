@@ -115,74 +115,155 @@ pub fn openEmbeddingStreamTxn(self: Source, alloc: Allocator, doc_key: []const u
     if (read_txn == null) state.owned_txn = try self.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
     errdefer if (state.owned_txn) |*txn| txn.abort();
     const txn = read_txn orelse &state.owned_txn.?;
-    state.cursor = try txn.openCursor();
-    errdefer state.cursor.?.close();
     const a = backing;
     const prefix = try internal_keys.artifactTypePrefixAlloc(a, doc_key, "embedding");
     defer a.free(prefix);
-    var next = try state.cursor.?.seekAtOrAfter(prefix);
-    while (next) |entry| : (next = try state.cursor.?.next()) {
-        if (!std.mem.startsWith(u8, entry.key, prefix)) break;
-        if (!internal_keys.isInternalUserKey(entry.key)) continue;
-        try state.resetScratch();
-        const temporary = state.scratch.allocator();
-        var identity = (try decodeArtifactRefIfKnownAlloc(temporary, entry.key)) orelse continue;
-        defer identity.deinit(temporary);
-        if (identity.kind != .embedding or identity.source != null) continue;
-        _ = enrichment_artifact_codec.decodeDenseEmbeddingDims(entry.value) catch continue;
-        // Keep the original field insertion order and the last valid artifact,
-        // matching compact-map replacement even for legacy duplicate identities.
-        const owned_key = try a.dupe(u8, entry.key);
-        errdefer a.free(owned_key);
-        if (state.keys.getPtr(identity.name)) |previous| {
-            a.free(previous.*);
-            previous.* = owned_key;
-        } else {
-            const name = try a.dupe(u8, identity.name);
-            errdefer a.free(name);
-            try state.keys.put(a, name, owned_key);
+    {
+        // Retire the inventory cursor before admitting the value cursor; their
+        // decoded pages and payload arenas must not overlap at row boundaries.
+        var keys_cursor = try txn.openPhysicalKeyCursorAdapter();
+        defer keys_cursor.close();
+        var next = try keys_cursor.seekAtOrAfter(prefix);
+        var adjacent = false;
+        while (next) |entry| : (next = try keys_cursor.next()) {
+            const contiguous = adjacent;
+            adjacent = false;
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            if (!internal_keys.isInternalUserKey(entry.key)) continue;
+            try state.resetScratch();
+            const temporary = state.scratch.allocator();
+            var identity = (try decodeArtifactRefIfKnownAlloc(temporary, entry.key)) orelse continue;
+            defer identity.deinit(temporary);
+            if (identity.kind != .embedding or identity.source != null) continue;
+            adjacent = true;
+            // Keys alone identify modern fields. Duplicate historical identities
+            // use the validated compatibility inventory below.
+            const owned_key = try a.dupe(u8, entry.key);
+            errdefer a.free(owned_key);
+            if (state.keys.getPtr(identity.name)) |previous| {
+                state.legacy_duplicates = true;
+                a.free(previous.key);
+                previous.* = .{ .key = owned_key, .contiguous = contiguous };
+            } else {
+                const name = try a.dupe(u8, identity.name);
+                errdefer a.free(name);
+                try state.keys.put(a, name, .{ .key = owned_key, .contiguous = contiguous });
+            }
         }
     }
-    if (state.keys.count() == 0) {
+    state.cursor = try txn.openCursor();
+    errdefer state.cursor.?.close();
+    if (state.legacy_duplicates) try state.validateLegacyOrder(prefix);
+    // Prime one valid value without replaying it during the first write. A
+    // completely invalid/empty artifact set must still fall back to primary.
+    state.primed = try state.readNext();
+    if (state.primed == null) {
         state.close();
         return null;
     }
-    return .{ .ctx = state, .next_fn = EmbeddingStreamState.next, .reset_fn = EmbeddingStreamState.reset, .close_fn = EmbeddingStreamState.closeErased };
+    return .{ .ctx = state, .next_fn = EmbeddingStreamState.next, .reset_fn = EmbeddingStreamState.reset, .field_fn = EmbeddingStreamState.field, .close_fn = EmbeddingStreamState.closeErased };
 }
 
 const EmbeddingStreamState = struct {
+    const Candidate = struct { key: []const u8, contiguous: bool = false };
     backing: Allocator,
     scratch: std.heap.ArenaAllocator,
-    keys: std.StringArrayHashMapUnmanaged([]const u8) = .empty,
+    keys: std.StringArrayHashMapUnmanaged(Candidate) = .empty,
+    primed: ?db_query_projection.EmbeddingStream.Field = null,
+    legacy_duplicates: bool = false,
+    resolved_index: ?usize = null,
     owned_txn: ?docstore_mod.DocStore.Txn = null,
     cursor: ?docstore_mod.DocStore.Txn.CursorAdapter = null,
     index: usize = 0,
     fn next(ctx: *anyopaque) anyerror!?db_query_projection.EmbeddingStream.Field {
         const self: *@This() = @ptrCast(@alignCast(ctx));
-        if (self.index == self.keys.count()) return null;
+        if (self.primed) |primed| {
+            self.primed = null;
+            return primed;
+        }
+        return self.readNext();
+    }
+    fn readNext(self: *@This()) !?db_query_projection.EmbeddingStream.Field {
+        while (self.index < self.keys.count()) {
+            const i = self.index;
+            self.index += 1;
+            if (try self.resolve(i)) |vector| return .{ .name = self.keys.keys()[i], .vector = vector };
+        }
+        return null;
+    }
+    fn validateLegacyOrder(self: *@This(), prefix: []const u8) !void {
+        // Historical identities can name the same field more than once. Their
+        // order is first *valid* occurrence, their value last valid occurrence.
+        // Only this compatibility path needs a value inventory pass.
+        self.freeKeys();
+        self.keys = .empty;
+        var row = try self.cursor.?.seekAtOrAfter(prefix);
+        while (row) |entry| : (row = try self.cursor.?.next()) {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            if (!internal_keys.isInternalUserKey(entry.key)) continue;
+            try self.resetScratch();
+            var identity = (try decodeArtifactRefIfKnownAlloc(self.scratch.allocator(), entry.key)) orelse continue;
+            defer identity.deinit(self.scratch.allocator());
+            if (identity.kind != .embedding or identity.source != null) continue;
+            _ = enrichment_artifact_codec.decodeDenseEmbeddingDims(entry.value) catch continue;
+            const key = try self.backing.dupe(u8, entry.key);
+            errdefer self.backing.free(key);
+            if (self.keys.getPtr(identity.name)) |old| {
+                self.backing.free(old.key);
+                old.* = .{ .key = key };
+            } else {
+                const name = try self.backing.dupe(u8, identity.name);
+                errdefer self.backing.free(name);
+                try self.keys.put(self.backing, name, .{ .key = key });
+            }
+        }
+    }
+    fn resolve(self: *@This(), i: usize) !?[]const f32 {
+        const current = &self.keys.values()[i];
         try self.resetScratch();
-        const i = self.index;
-        const entry = (try self.cursor.?.seekAtOrAfter(self.keys.values()[i])) orelse return error.InvalidEmbeddingSnapshot;
-        if (!std.mem.eql(u8, entry.key, self.keys.values()[i])) return error.InvalidEmbeddingSnapshot;
-        const vector = (try enrichment_artifact_codec.denseEmbeddingVectorView(entry.value)) orelse try enrichment_artifact_codec.decodeDenseEmbeddingAlloc(self.scratch.allocator(), entry.value);
-        self.index += 1;
-        return .{ .name = self.keys.keys()[i], .vector = vector };
+        var row = if (!self.legacy_duplicates and current.contiguous and self.resolved_index != null and self.resolved_index.? + 1 == i)
+            try self.cursor.?.next()
+        else
+            try self.cursor.?.seekAtOrAfter(current.key);
+        self.resolved_index = i;
+        while (row) |entry| {
+            if (std.mem.order(u8, entry.key, current.key) != .lt) break;
+            row = try self.cursor.?.next();
+        }
+        const entry = row orelse return error.InvalidEmbeddingSnapshot;
+        if (!std.mem.eql(u8, entry.key, current.key)) return error.InvalidEmbeddingSnapshot;
+        _ = enrichment_artifact_codec.decodeDenseEmbeddingDims(entry.value) catch return null;
+        return (try enrichment_artifact_codec.denseEmbeddingVectorView(entry.value)) orelse try enrichment_artifact_codec.decodeDenseEmbeddingAlloc(self.scratch.allocator(), entry.value);
+    }
+
+    fn field(ctx: *anyopaque, name: []const u8) anyerror!?[]const f32 {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        const i = self.keys.getIndex(name) orelse return null;
+        if (self.primed) |primed| {
+            if (std.mem.eql(u8, name, primed.name)) return primed.vector;
+            // Resolving another field invalidates the primed borrow.
+            self.primed = null;
+        }
+        return self.resolve(i);
     }
     fn resetScratch(self: *@This()) !void {
         if (!self.scratch.reset(if (self.scratch.queryCapacity() > 16 * 1024) .free_all else .retain_capacity)) return error.OutOfMemory;
     }
     fn reset(ctx: *anyopaque) anyerror!void {
         const self: *@This() = @ptrCast(@alignCast(ctx));
-        self.index = 0;
+        if (self.primed == null) {
+            self.index = 0;
+            self.resolved_index = null;
+        }
     }
     fn closeErased(ctx: *anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(ctx));
         self.close();
     }
     fn freeKeys(self: *@This()) void {
-        for (self.keys.keys(), self.keys.values()) |name, key| {
+        for (self.keys.keys(), self.keys.values()) |name, first| {
             self.backing.free(name);
-            self.backing.free(key);
+            self.backing.free(first.key);
         }
         self.keys.deinit(self.backing);
     }
@@ -699,13 +780,18 @@ test "public graph metric borrowed wire compact embedding cursor owns values bey
         fn run(failing: Allocator, txn: *docstore_mod.DocStore.Txn) !void {
             var stream = (try openEmbeddingStreamTxn(.{ .core = undefined }, failing, "doc", txn)).?;
             defer stream.deinit();
+            const selected = (try stream.getField(failing, "dense")).?;
+            try std.testing.expectEqualSlices(f32, &.{ 0.1, -0.0, 1.25 }, selected);
+            try std.testing.expect(try stream.getField(failing, "invalid") == null);
+            try std.testing.expect(try stream.getField(failing, "missing") == null);
             var writer: std.Io.Writer.Allocating = .init(failing);
             defer writer.deinit();
             stream.write(&writer.writer) catch |err| return if (err == error.WriteFailed) error.OutOfMemory else err;
             const first = try failing.dupe(u8, writer.written());
             defer failing.free(first);
             const loaded = try stream.fields(failing);
-            try std.testing.expectEqualSlices(f32, &.{ 0.1, -0.0, 1.25 }, loaded.values.get("dense").?);
+            try std.testing.expectEqual(selected.ptr, loaded.values.get("dense").?.ptr);
+            try std.testing.expectEqualSlices(f32, &.{ 0.1, -0.0, 1.25 }, selected);
             writer.clearRetainingCapacity();
             stream.write(&writer.writer) catch |err| return if (err == error.WriteFailed) error.OutOfMemory else err;
             try std.testing.expectEqualStrings(first, writer.written());
@@ -755,6 +841,58 @@ test "public graph metric borrowed wire streamed embedding physical loader bound
             return loadEmbeddingFieldsFromTxn(alloc, key, txn);
         }
     };
+    // Count operations at the production payload cursor, after its first
+    // value has been primed. A whole response must not replay that value or
+    // turn every subsequent field into a point seek.
+    {
+        const Cursor = docstore_mod.DocStore.Txn.CursorAdapter;
+        const Entry = @import("../backend_erased.zig").Entry;
+        const Counts = struct { seeks: usize = 0, advances: usize = 0 };
+        const Trace = struct {
+            inner: Cursor,
+            counts: *Counts,
+            pub fn close(self: *@This()) void {
+                self.inner.close();
+            }
+            pub fn first(self: *@This()) !?Entry {
+                return self.inner.first();
+            }
+            pub fn last(self: *@This()) !?Entry {
+                return self.inner.last();
+            }
+            pub fn prev(self: *@This()) !?Entry {
+                return self.inner.prev();
+            }
+            pub fn next(self: *@This()) !?Entry {
+                self.counts.advances += 1;
+                return self.inner.next();
+            }
+            pub fn seekAtOrAfter(self: *@This(), key: []const u8) !?Entry {
+                self.counts.seeks += 1;
+                return self.inner.seekAtOrAfter(key);
+            }
+            pub fn seekAtOrBefore(self: *@This(), key: []const u8) !?Entry {
+                return self.inner.seekAtOrBefore(key);
+            }
+        };
+        var stream = (try openEmbeddingStreamTxn(.{ .core = undefined }, a, "doc", &read)).?;
+        defer stream.deinit();
+        const state: *EmbeddingStreamState = @ptrCast(@alignCast(stream.ctx));
+        var counts: Counts = .{};
+        state.cursor = try @import("../backend_erased.zig").cursorFrom(a, Trace{ .inner = state.cursor.?, .counts = &counts });
+        var writer = std.Io.Writer.Allocating.init(a);
+        defer writer.deinit();
+        try stream.write(&writer.writer);
+        try std.testing.expectEqual(@as(usize, 0), counts.seeks);
+        try std.testing.expectEqual(@as(usize, 63), counts.advances);
+        const first = try a.dupe(u8, writer.written());
+        defer a.free(first);
+        writer.clearRetainingCapacity();
+        try stream.write(&writer.writer);
+        try std.testing.expectEqualStrings(first, writer.written());
+        try std.testing.expectEqual(@as(usize, 1), counts.seeks);
+        try std.testing.expectEqual(@as(usize, 126), counts.advances);
+    }
     const Counter = @import("../lite/test_allocator.zig").BudgetAllocator;
     var expected: ?[]u8 = null;
     defer if (expected) |body| a.free(body);
@@ -770,5 +908,72 @@ test "public graph metric borrowed wire streamed embedding physical loader bound
         }
         try std.testing.expectEqual(@as(usize, 0), budget.live);
         std.debug.print("PHYSICAL_EMBEDDINGS mode={d} scratch_peak={d} elapsed_ns={d} bytes={d}\n", .{ mode, budget.peak, elapsed, body.len });
+    }
+}
+
+test "public graph metric borrowed wire selected embeddings retain only selected vector slabs" {
+    const a = std.testing.allocator;
+    const Lite = @import("../lite/docstore.zig");
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/selected-embeddings.aflite", .{directory.sub_path});
+    defer a.free(path);
+    var lite = try Lite.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true });
+    defer lite.close();
+    var store = try docstore_mod.DocStore.openRuntime(a, try lite.runtimeStore(a));
+    defer store.close();
+    var vector: [1536]f32 = undefined;
+    for (&vector, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i)) / 1536;
+    const payload = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(a, null, &vector);
+    defer a.free(payload);
+    for (0..64) |i| {
+        const name = try std.fmt.allocPrint(a, "v{d}", .{i});
+        defer a.free(name);
+        const key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(a, "doc", name);
+        defer a.free(key);
+        try store.put(key, payload);
+    }
+    const bad = try internal_keys.embeddingArtifactKeyForDocumentAlloc(a, "doc", "invalid");
+    defer a.free(bad);
+    try store.put(bad, "not a dense vector");
+    var read = try store.beginReadTxn();
+    defer read.abort();
+    const cases = [_][]const []const u8{
+        &.{"_embeddings.v63.0"},                                            &.{"_embeddings.v63"},
+        &.{ "_embeddings.v63.1", "_embeddings.v0.2", "_embeddings.v63.3" }, &.{"_embeddings.invalid"},
+        &.{"_embeddings.missing"},                                          &.{ "_embeddings", "_embeddings.v63.0" },
+    };
+    for (cases, 0..) |fields, c| {
+        var peaks: [2]usize = undefined;
+        var expected: ?[]u8 = null;
+        defer if (expected) |body| a.free(body);
+        for (0..2) |mode| {
+            var budget: @import("../lite/test_allocator.zig").BudgetAllocator = .{ .backing = a, .limit = 1024 * 1024 };
+            var compact = if (mode == 0) try loadEmbeddingFieldsFromTxn(budget.allocator(), "doc", &read) else null;
+            defer if (compact) |*owner| owner.deinit(budget.allocator());
+            var stream = if (mode == 1) try openEmbeddingStreamTxn(.{ .core = undefined }, budget.allocator(), "doc", &read) else null;
+            defer if (stream) |*owner| owner.deinit();
+            const query = @import("document_query.zig");
+            var plan = (try query.SpanProjectionPlan.init(a, .{ .fields = fields, .include_all_fields = false })).?;
+            defer plan.deinit();
+            const sources = [_]query.ProjectionSource{.{ .name = "_embeddings", .embeddings = if (compact) |*owner| owner else null, .embedding_stream = if (stream) |*owner| owner else null }};
+            const body = (try query.lookupJsonWithSources(budget.allocator(), a, "{}", &plan, &sources)).json;
+            if (mode == 0) expected = body else {
+                defer a.free(body);
+                try std.testing.expectEqualStrings(expected.?, body);
+            }
+            peaks[mode] = budget.peak;
+            if (compact) |*owner| {
+                owner.deinit(budget.allocator());
+                compact = null;
+            }
+            if (stream) |*owner| {
+                owner.deinit();
+                stream = null;
+            }
+            try std.testing.expectEqual(@as(usize, 0), budget.live);
+        }
+        std.debug.print("SELECTED_EMBEDDINGS case={d} compact_peak={d} lazy_peak={d}\n", .{ c, peaks[0], peaks[1] });
+        try std.testing.expect(peaks[1] < peaks[0] / 4);
     }
 }

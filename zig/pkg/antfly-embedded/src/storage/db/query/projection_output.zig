@@ -45,7 +45,7 @@ pub const Source = union(enum) {
     }
     fn field(self: Source, alloc: Allocator, name: []const u8) !?Source {
         return switch (self) {
-            .embedding_stream => |stream| if ((try stream.fields(alloc)).values.get(name)) |v| .{ .vector = v } else null,
+            .embedding_stream => |stream| if (try stream.getField(alloc, name)) |v| .{ .vector = v } else null,
             .embeddings => |fields| if (fields.values.get(name)) |v| .{ .vector = v } else null,
             .vector, .component => null,
             .span => |s| if (try s.view.fieldSparse(s.node, name)) |node| .{ .span = .{ .view = s.view, .node = node } } else null,
@@ -335,8 +335,13 @@ pub const Output = union(enum) {
         switch (overlay.base) {
             .vector, .component => unreachable,
             .embedding_stream => |stream| {
-                const fields = try stream.fields(context.work);
-                for (fields.values.keys(), fields.values.values()) |name, vector| try writeBaseMember(context, writer, overlay, emitted, &count, name, .{ .vector = vector });
+                if (stream.cached_complete) {
+                    const fields = &stream.cached.?;
+                    for (fields.values.keys(), fields.values.values()) |name, vector| try writeBaseMember(context, writer, overlay, emitted, &count, name, .{ .vector = vector });
+                } else {
+                    try stream.reset_fn(stream.ctx);
+                    while (try stream.next_fn(stream.ctx)) |field| try writeBaseMember(context, writer, overlay, emitted, &count, field.name, .{ .vector = field.vector });
+                }
             },
             .embeddings => |fields| for (fields.values.keys(), fields.values.values()) |name, vector| try writeBaseMember(context, writer, overlay, emitted, &count, name, .{ .vector = vector }),
             .logical => |value| for (value.object.keys(), value.object.values()) |name, *child| {

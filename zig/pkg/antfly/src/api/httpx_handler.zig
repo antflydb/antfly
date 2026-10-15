@@ -3275,11 +3275,7 @@ pub const AntflyApiHandler = struct {
     }
 
     fn internalQueryResponse(ctx: *httpx.Context, result: *query_api.QueryResponse) !httpx.Response {
-        var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
-        defer arena_impl.deinit();
-        _ = try std.json.parseFromSliceLeaky(metadata_openapi.QueryResponses, arena_impl.allocator(), result.json, .{
-            .allocate = .alloc_always,
-        });
+        try @import("query_response_validation.zig").validate(ctx.allocator, result.json);
         if (result.identity_read_generation) |generation| {
             var buf: [32]u8 = undefined;
             const value = try std.fmt.bufPrint(&buf, "{d}", .{generation});

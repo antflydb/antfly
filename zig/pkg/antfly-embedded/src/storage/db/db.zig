@@ -40064,9 +40064,19 @@ pub const DB = struct {
             }
             if (!projection_scratch.reset(.{ .retain_with_limit = 64 * 1024 })) _ = projection_scratch.reset(.free_all);
             var projected: ?types.LookupResult = if (req.document_authority_mode == .hydrate or eager)
-                try self.lookupPrimarySnapshotWithPreparedProjection(projection_scratch.allocator(), body_allocator, hit.id, lookup_opts, &read.?, schema_view, raw_primary, version, &plans)
+                try self.lookupPrimarySnapshotWithPreparedProjection(projection_scratch.allocator(), if (req.document_output_exact) @import("antfly_platform").allocator.reclaimingScratch(projection_scratch.allocator()) else body_allocator, hit.id, lookup_opts, &read.?, schema_view, raw_primary, version, &plans)
             else
                 null;
+            if (req.document_output_exact) if (projected) |*document| {
+                const scratch_owner = @import("antfly_platform").allocator.reclaimingScratch(projection_scratch.allocator());
+                var value = document.*;
+                const temporary = value.json;
+                // Clear ownership before a potentially failing publication.
+                projected = null;
+                defer scratch_owner.free(temporary);
+                value.json = try body_allocator.dupe(u8, temporary);
+                projected = value;
+            };
             if (req.document_authority_mode == .candidates) if (projected) |*document| {
                 // Charge actual projected JSON, including native rows whose
                 // compact storage bytes can expand during serialization.
@@ -137767,6 +137777,83 @@ test "public graph metric borrowed wire compact embedding physical loader matche
         var expected = try @import("document_query.zig").lookupJsonWithSources(scratch.allocator(), a, "{}", &plan, &expected_source);
         defer expected.deinit(a);
         try std.testing.expectEqualStrings(expected.json, actual.json);
+        var streamed = (try read_projection.openEmbeddingStreamTxn(.{ .core = db.core }, a, "doc", txn)).?;
+        defer streamed.deinit();
+        const stream_source = [_]@import("document_query.zig").ProjectionSource{.{ .name = "_embeddings", .embedding_stream = &streamed }};
+        var streamed_result = try @import("document_query.zig").lookupJsonWithSources(scratch.allocator(), a, "{}", &plan, &stream_source);
+        defer streamed_result.deinit(a);
+        try std.testing.expectEqualStrings(expected.json, streamed_result.json);
         try std.testing.expectEqual(@as(usize, 1), compact.values.count());
+    }
+}
+
+test "public graph metric borrowed wire hydration preserves exact output policy through opaque allocators" {
+    const a = std.testing.allocator;
+    const counters = @import("../lite/test_allocator.zig");
+    var directory = try TestDirectory.init("hydration-output-policy");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtimes = false, .start_independent_maintenance = false });
+    defer db.close();
+    var input = std.Io.Writer.Allocating.init(a);
+    defer input.deinit();
+    try input.writer.writeAll("{\"items\":[");
+    for (0..4096) |i| {
+        if (i != 0) try input.writer.writeByte(',');
+        try input.writer.writeAll("0.123456789");
+    }
+    try input.writer.writeAll("]}");
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = input.written() }} });
+    var peaks: [2]usize = undefined;
+    var expected: ?[]u8 = null;
+    defer if (expected) |body| a.free(body);
+    for (0..2) |mode| {
+        var counted: counters.BudgetAllocator = .{ .backing = a };
+        var output = std.heap.ArenaAllocator.init(counted.allocator());
+        defer output.deinit();
+        // Force the growth behavior of overlapping writers, even in this
+        // deterministic serial fixture. The opaque wrapper cannot be unwrapped.
+        var wrapped: counters.NoResizeAllocator = .{ .backing = output.allocator() };
+        const owner = wrapped.allocator();
+        const hits = try a.alloc(types.SearchHit, 32);
+        @memset(hits, .{ .id = &.{} });
+        var result: types.SearchResult = .{ .alloc = a, .hits = hits, .total_hits = 32 };
+        defer result.deinit();
+        for (hits) |*hit| hit.id = try a.dupe(u8, "doc");
+        try db.attachDistributedDocumentAuthorityAtSnapshot(a, .{
+            .include_stored = false,
+            .fields = &.{"items"},
+            .include_all_fields = false,
+            .document_authority_mode = .hydrate,
+            .document_authority_group = 11,
+            .document_output_allocator = owner,
+            .document_output_exact = mode == 1,
+        }, &result, null, null);
+        for (hits) |hit| {
+            if (expected == null) expected = try a.dupe(u8, hit.stored_data.?);
+            try std.testing.expectEqualStrings(expected.?, hit.stored_data.?);
+        }
+        peaks[mode] = counted.peak;
+        std.debug.print("HYDRATION_OUTPUT exact={} body_bytes={d} retained={d}\n", .{ mode == 1, expected.?.len * hits.len, counted.live });
+    }
+    try std.testing.expect(peaks[1] < peaks[0] * 3 / 4);
+    // Refusing the publication copy must retire the temporary encoding while
+    // preserving ownership of bodies already attached to earlier hits.
+    for ([_]usize{ 0, 3 }) |fail_index| {
+        var refused = std.testing.FailingAllocator.init(a, .{ .fail_index = fail_index });
+        const hits = try a.alloc(types.SearchHit, 8);
+        @memset(hits, .{ .id = &.{} });
+        var result: types.SearchResult = .{ .alloc = a, .hits = hits, .total_hits = 8 };
+        defer result.deinit();
+        for (hits) |*hit| hit.id = try a.dupe(u8, "doc");
+        try std.testing.expectError(error.OutOfMemory, db.attachDistributedDocumentAuthorityAtSnapshot(a, .{
+            .include_stored = false,
+            .fields = &.{"items"},
+            .include_all_fields = false,
+            .document_authority_mode = .hydrate,
+            .document_authority_group = 11,
+            .document_output_allocator = refused.allocator(),
+            .document_output_exact = true,
+        }, &result, null, null));
+        for (hits, 0..) |hit, i| try std.testing.expectEqual(i < fail_index, hit.stored_data != null);
     }
 }

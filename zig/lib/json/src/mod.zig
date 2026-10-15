@@ -34,6 +34,7 @@ pub const testing = @import("testing.zig");
 test {
     _ = testing;
     _ = raw_mod;
+    _ = @import("validate_typed.zig");
 }
 
 const Allocator = std.mem.Allocator;
@@ -48,6 +49,7 @@ pub const max_raw_nesting = raw_mod.max_raw_nesting;
 
 pub const Scanner = std.json.Scanner;
 pub const validate = std.json.validate;
+pub const validateTyped = @import("validate_typed.zig").validateTyped;
 pub const Error = std.json.Error;
 pub const default_buffer_size = std.json.default_buffer_size;
 pub const Token = std.json.Token;

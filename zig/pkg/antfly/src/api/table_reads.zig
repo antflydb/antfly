@@ -8849,10 +8849,11 @@ const HydrationOutputAllocator = struct {
     }
 };
 
-fn executeDistributedHydrationBatch(source: anytype, alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, table_name: []const u8, consistency: raft_mod.ReadConsistency, owner: u64, ordinal: usize, keys: []const []const u8, generations: []const ?u64, routes: ?[]const table_router.GroupRoute, body_allocator: ?std.mem.Allocator) !db_mod.types.SearchResult {
+fn executeDistributedHydrationBatch(source: anytype, alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, table_name: []const u8, consistency: raft_mod.ReadConsistency, owner: u64, ordinal: usize, keys: []const []const u8, generations: []const ?u64, routes: ?[]const table_router.GroupRoute, body_allocator: ?std.mem.Allocator, exact_output: bool) !db_mod.types.SearchResult {
     var hydration = distributedSearchShardRequest(req, &.{}, true);
     hydration.document_authority_mode = .hydrate;
     hydration.document_output_allocator = body_allocator;
+    hydration.document_output_exact = exact_output;
     hydration.document_authority_group = owner;
     hydration.include_stored = false;
     hydration.query = .{ .match_all = {} };
@@ -8906,6 +8907,7 @@ fn hydrateDistributedDocumentWindow(source: anytype, alloc: std.mem.Allocator, r
         arena: std.heap.ArenaAllocator,
         live: bool = true,
         body_allocator: ?std.mem.Allocator = null,
+        exact_output: bool = false,
         budget: @import("antfly_local_sources").graph_work_budget.WorkBudget = undefined,
         tracked: @import("antfly_local_sources").graph_work_budget.RetainedAllocator = undefined,
         output_allocator: ?std.mem.Allocator = null,
@@ -8923,7 +8925,7 @@ fn hydrateDistributedDocumentWindow(source: anytype, alloc: std.mem.Allocator, r
             self.live = false;
         }
         fn run(self: *@This(), input: @TypeOf(source), request: db_mod.types.SearchRequest, table: []const u8, read_consistency: raft_mod.ReadConsistency, versions: []const ?u64, locations: ?[]const table_router.GroupRoute) void {
-            self.result = executeDistributedHydrationBatch(input, self.output_allocator orelse self.arena.allocator(), request, table, read_consistency, self.owner, self.ordinal, self.keys[0 .. self.end - self.begin], versions, locations, self.body_allocator) catch |err| {
+            self.result = executeDistributedHydrationBatch(input, self.output_allocator orelse self.arena.allocator(), request, table, read_consistency, self.owner, self.ordinal, self.keys[0 .. self.end - self.begin], versions, locations, self.body_allocator, self.exact_output) catch |err| {
                 self.err = err;
                 return;
             };
@@ -8950,7 +8952,13 @@ fn hydrateDistributedDocumentWindow(source: anytype, alloc: std.mem.Allocator, r
             slot.budget = .initWithLimits(.{ .max_retained_state_bytes = 64 * 1024 * 1024 });
             slot.tracked = .{ .backing = if (width > 1) std.heap.page_allocator else @import("antfly_platform").allocator.reclaimingScratch(alloc), .budget = if (width > 1) &slot.budget else null };
             slot.arena = .init(slot.tracked.allocator());
-            if (width <= 1) slot.output_allocator = alloc else slot.body_allocator = synchronized_output.allocator();
+            if (width <= 1) {
+                slot.output_allocator = alloc;
+            } else {
+                slot.body_allocator = synchronized_output.allocator();
+                const reclaimable = @import("antfly_platform").allocator.reclaimingScratch(alloc);
+                slot.exact_output = reclaimable.ptr != alloc.ptr or reclaimable.vtable != alloc.vtable;
+            }
             slot.ordinal = for (groups, 0..) |group, i| {
                 if (group == slot.owner) break i;
             } else return error.InvalidRemoteResponse;
@@ -27387,6 +27395,7 @@ pub const document_hydration_tests = if (builtin.is_test) struct {
             changed: bool,
             oversized: bool,
             mixed: bool = false,
+            arena_owner: bool = false,
             scratch_budgets: [8]?*@import("antfly_local_sources").graph_work_budget.WorkBudget = @splat(null),
             retired_retry_checks: usize = 0,
             body_pointers: [8]usize = @splat(0),
@@ -27394,6 +27403,7 @@ pub const document_hydration_tests = if (builtin.is_test) struct {
                 return self;
             }
             fn searchResultGroupLocal(self: *@This(), a: std.mem.Allocator, owner: u64, _: []const u8, req: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?db_mod.types.SearchResult {
+                if (req.document_output_allocator != null) try std.testing.expectEqual(self.arena_owner, req.document_output_exact);
                 const live = self.active.fetchAdd(1, .acq_rel) + 1;
                 defer _ = self.active.fetchSub(1, .acq_rel);
                 _ = self.peak.fetchMax(live, .monotonic);
@@ -27430,16 +27440,18 @@ pub const document_hydration_tests = if (builtin.is_test) struct {
                 return result;
             }
         };
-        const a = std.testing.allocator;
         const groups = [_]u64{ 1, 2, 3, 4, 5, 6, 7, 8 };
         const generations: [8]?u64 = @splat(9);
-        const Cases = struct { limit: usize, changed: bool = false, oversized: bool = false, mixed: bool = false };
-        for ([_]Cases{ .{ .limit = 4 }, .{ .limit = 4, .changed = true }, .{ .limit = 1 }, .{ .limit = 1, .changed = true }, .{ .limit = 0 }, .{ .limit = 0, .changed = true }, .{ .limit = 4, .oversized = true }, .{ .limit = 4, .oversized = true, .mixed = true } }) |case| {
+        const Cases = struct { limit: usize, changed: bool = false, oversized: bool = false, mixed: bool = false, arena_owner: bool = false };
+        for ([_]Cases{ .{ .limit = 4 }, .{ .limit = 4, .arena_owner = true }, .{ .limit = 4, .arena_owner = true, .changed = true }, .{ .limit = 4, .changed = true }, .{ .limit = 1 }, .{ .limit = 1, .changed = true }, .{ .limit = 0 }, .{ .limit = 0, .changed = true }, .{ .limit = 4, .oversized = true }, .{ .limit = 4, .oversized = true, .mixed = true } }) |case| {
+            var output_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer output_arena.deinit();
+            const a = if (case.arena_owner) output_arena.allocator() else std.testing.allocator;
             const limit = case.limit;
             const changed = case.changed;
-            var io = std.Io.Threaded.init(a, .{ .async_limit = .limited(limit) });
+            var io = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .limited(limit) });
             defer io.deinit();
-            var fixture = Fixture{ .io_impl = .fromThreaded(&io), .changed = changed, .oversized = case.oversized, .mixed = case.mixed };
+            var fixture = Fixture{ .io_impl = .fromThreaded(&io), .changed = changed, .oversized = case.oversized, .mixed = case.mixed, .arena_owner = case.arena_owner };
             const hits = try a.alloc(db_mod.types.SearchHit, groups.len);
             var initialized: usize = 0;
             defer {

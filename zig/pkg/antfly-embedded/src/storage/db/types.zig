@@ -1875,6 +1875,9 @@ pub const SearchRequest = struct {
     /// Synchronous native hydration output owner. Never serialized or parsed.
     /// Keep it alive until the returned bodies are moved or the result retires.
     document_output_allocator: ?Allocator = null,
+    /// Allocation policy captured before synchronization obscures the owner.
+    /// Exact bodies use reclaimable encoding scratch; never serialized.
+    document_output_exact: bool = false,
     /// Immutable local projection borrowed until synchronous search completion.
     /// Never serialized or populated by a public request.
     document_projection_plan: ?@import("document_query.zig").BorrowedSpanProjection = null,
@@ -2059,6 +2062,7 @@ const hierarchy_children_supported_internal_fields = [_][]const u8{
     "document_authority_mode",
     "document_authority_group",
     "document_output_allocator",
+    "document_output_exact",
     "document_projection_plan",
     "response_table_name",
     "prepared_read_table_id",
