@@ -26,12 +26,13 @@ pub const Source = union(enum) {
     span: struct { view: *View, node: *View.Node },
     logical: *const Value,
     embeddings: *const EmbeddingFields,
+    embedding_stream: *@import("embedding_fields.zig").EmbeddingStream,
     vector: []const f32,
     component: f32,
 
     fn kind(self: Source) u8 {
         return switch (self) {
-            .embeddings => '{',
+            .embeddings, .embedding_stream => '{',
             .vector => '[',
             .component => 0,
             .span => |s| s.node.kind(),
@@ -42,8 +43,9 @@ pub const Source = union(enum) {
             },
         };
     }
-    fn field(self: Source, name: []const u8) !?Source {
+    fn field(self: Source, alloc: Allocator, name: []const u8) !?Source {
         return switch (self) {
+            .embedding_stream => |stream| if ((try stream.fields(alloc)).values.get(name)) |v| .{ .vector = v } else null,
             .embeddings => |fields| if (fields.values.get(name)) |v| .{ .vector = v } else null,
             .vector, .component => null,
             .span => |s| if (try s.view.fieldSparse(s.node, name)) |node| .{ .span = .{ .view = s.view, .node = node } } else null,
@@ -53,7 +55,7 @@ pub const Source = union(enum) {
     fn element(self: Source, index: usize) !?Source {
         return switch (self) {
             .vector => |v| if (index < v.len) .{ .component = v[index] } else null,
-            .embeddings, .component => null,
+            .embeddings, .embedding_stream, .component => null,
             .span => |s| if (try s.view.element(s.node, index)) |node| .{ .span = .{ .view = s.view, .node = node } } else null,
             .logical => |v| if (v.* == .array and index < v.array.items.len) .{ .logical = &v.array.items[index] } else null,
         };
@@ -65,8 +67,14 @@ pub const Output = union(enum) {
     object: Object,
     overlay: *Overlay,
     array: std.ArrayListUnmanaged(Output),
-    fanout: *const Fanout,
-    const Fanout = struct { source: Source, path: []const []const u8, selector: ?*const @import("json_projection_plan.zig").Selector = null };
+    fanout: *Fanout,
+    const Fanout = struct {
+        source: Source,
+        path: []const []const u8,
+        selector: ?*const @import("json_projection_plan.zig").Selector = null,
+        prepared: ?*FanoutRows = null,
+        first: ?Object = null,
+    };
     pub const Object = std.StringArrayHashMapUnmanaged(Output);
     // Keep this behind a pointer: ordinary fanout entries must not pay for a
     // base source plus an override map when no copy-on-write is needed.
@@ -96,6 +104,7 @@ pub const Output = union(enum) {
 
     fn copyObject(a: Allocator, dst: *Object, source: Source) !void {
         switch (source) {
+            .embedding_stream => |stream| try copyObject(a, dst, .{ .embeddings = try stream.fields(a) }),
             .embeddings => |fields| for (fields.values.keys(), fields.values.values()) |name, vector| try put(a, dst, name, .{ .borrowed = .{ .vector = vector } }),
             .vector, .component => unreachable,
             .logical => |v| for (v.object.keys(), v.object.values()) |name, *value| {
@@ -125,11 +134,11 @@ pub const Output = union(enum) {
     }
     fn includeWithBase(a: Allocator, target: Target, name: []const u8, source: Source, path: []const []const u8) anyerror!void {
         const dst = target.map;
-        if (path.len == 0) return put(a, dst, name, .{ .borrowed = source });
+        if (path.len == 0 or (source == .embedding_stream and path.len == 1 and std.mem.eql(u8, path[0], "*"))) return put(a, dst, name, .{ .borrowed = source });
         switch (source.kind()) {
             '{' => {
                 if (!dst.contains(name)) {
-                    const previous = if (target.base) |base| try base.field(name) else null;
+                    const previous = if (target.base) |base| try base.field(a, name) else null;
                     try put(a, dst, name, if (previous) |child| .{ .borrowed = child } else .{ .object = .empty });
                 }
                 const nested = try dst.getPtr(name).?.objectTarget(a);
@@ -137,7 +146,7 @@ pub const Output = union(enum) {
                     var all: Object = .empty;
                     try copyObject(a, &all, source);
                     for (all.keys(), all.values()) |key, child| try includeWithBase(a, nested, key, child.borrowed, path[1..]);
-                } else if (try source.field(path[0])) |child| try includeWithBase(a, nested, path[0], child, path[1..]);
+                } else if (try source.field(a, path[0])) |child| try includeWithBase(a, nested, path[0], child, path[1..]);
             },
             '[' => {
                 var result: std.ArrayListUnmanaged(Output) = .empty;
@@ -151,14 +160,18 @@ pub const Output = union(enum) {
                         if (object.count() != 0) try result.append(a, .{ .object = object });
                     }
                 } else {
-                    // Establish whether this selector replaces the previous
-                    // array, then retain only its immutable source and path.
-                    // A selector with no surviving items must leave it alone.
+                    // Keep the primed cursor at a stable address. All of its
+                    // allocations belong to the enclosing row arena, including
+                    // abandoned/replaced selectors and failed preparations.
+                    // Serialization resumes it instead of replaying nested
+                    // survival checks. No-survivor selectors leave dst alone.
                     const fanout = try a.create(Fanout);
                     fanout.* = .{ .source = source, .path = path, .selector = if (source == .span and path.len > 1) try @import("json_projection_plan.zig").compile(a, &.{.{ .parts = path }}) else null };
-                    var rows = FanoutRows.init(a, fanout.*);
-                    defer rows.deinit();
-                    if (try rows.next() != null) {
+                    const rows = try a.create(FanoutRows);
+                    rows.* = FanoutRows.initOwned(a, fanout.*);
+                    if (try rows.next()) |first| {
+                        fanout.prepared = rows;
+                        fanout.first = first;
                         try put(a, dst, name, .{ .fanout = fanout });
                     }
                     return;
@@ -173,7 +186,7 @@ pub const Output = union(enum) {
             var all: Object = .empty;
             try copyObject(a, &all, source);
             for (all.keys(), all.values()) |name, value| try include(a, dst, name, value.borrowed, path[1..]);
-        } else if (try source.field(path[0])) |child| try include(a, dst, path[0], child, path[1..]);
+        } else if (try source.field(a, path[0])) |child| try include(a, dst, path[0], child, path[1..]);
     }
 
     pub fn includeRoot(a: Allocator, dst: *Object, view: *View, path: []const []const u8) !void {
@@ -227,6 +240,7 @@ pub const Output = union(enum) {
     fn write(self: Output, context: *StreamContext, writer: *std.Io.Writer) anyerror!void {
         switch (self) {
             .borrowed => |source| switch (source) {
+                .embedding_stream => |stream| try stream.write(writer),
                 .span => |s| try context.writeSpan(writer, s.node.raw, s.view.parse_numbers),
                 .logical => |v| try std.json.Stringify.value(v.*, .{}, writer),
                 .component => |v| try std.json.Stringify.value(@as(f64, v), .{}, writer),
@@ -254,10 +268,24 @@ pub const Output = union(enum) {
                 try writer.writeByte('}');
             },
             .fanout => |fanout| {
-                var rows = FanoutRows.init(context.work, fanout.*);
+                var fallback = FanoutRows.init(context.work, fanout.*);
+                const rows = fanout.prepared orelse &fallback;
+                // Detach before writing: errors and repeated writes must never
+                // reuse a partially consumed cursor or its retired first row.
+                const first = fanout.first;
+                fanout.prepared = null;
+                fanout.first = null;
                 defer rows.deinit();
                 try writer.writeByte('[');
                 var count: usize = 0;
+                if (first) |object| {
+                    try (Output{ .object = object }).write(context, writer);
+                    count = 1;
+                    // Only the primed row uses its enclosing arena. Subsequent
+                    // siblings share independently reclaimable bounded scratch.
+                    rows.arena.deinit();
+                    rows.arena = .init(context.work);
+                }
                 while (try rows.next()) |object| {
                     if (count != 0) try writer.writeByte(',');
                     try (Output{ .object = object }).write(context, writer);
@@ -306,6 +334,10 @@ pub const Output = union(enum) {
         try writer.writeByte('{');
         switch (overlay.base) {
             .vector, .component => unreachable,
+            .embedding_stream => |stream| {
+                const fields = try stream.fields(context.work);
+                for (fields.values.keys(), fields.values.values()) |name, vector| try writeBaseMember(context, writer, overlay, emitted, &count, name, .{ .vector = vector });
+            },
             .embeddings => |fields| for (fields.values.keys(), fields.values.values()) |name, vector| try writeBaseMember(context, writer, overlay, emitted, &count, name, .{ .vector = vector }),
             .logical => |value| for (value.object.keys(), value.object.values()) |name, *child| {
                 try writeBaseMember(context, writer, overlay, emitted, &count, name, .{ .logical = child });
@@ -469,10 +501,12 @@ const FanoutRows = struct {
     index: usize = 0,
     view: View = undefined,
     fn init(a: Allocator, fanout: Output.Fanout) FanoutRows {
-        const work = @import("antfly_platform").allocator.reclaimingScratch(a);
+        return initOwned(@import("antfly_platform").allocator.reclaimingScratch(a), fanout);
+    }
+    fn initOwned(work: Allocator, fanout: Output.Fanout) FanoutRows {
         return .{ .source = fanout.source, .path = fanout.path, .selector = fanout.selector, .arena = .init(work), .scanner = switch (fanout.source) {
             .span => |span| std.json.Scanner.initCompleteInput(work, span.node.raw),
-            .logical, .embeddings, .vector, .component => null,
+            .logical, .embeddings, .embedding_stream, .vector, .component => null,
         } };
     }
     fn deinit(self: *FanoutRows) void {
@@ -485,7 +519,7 @@ const FanoutRows = struct {
             const a = self.arena.allocator();
             const item: Source = switch (self.source) {
                 .vector => return null,
-                .embeddings, .component => unreachable,
+                .embeddings, .embedding_stream, .component => unreachable,
                 .logical => |value| blk: {
                     if (self.index == value.array.items.len) return null;
                     const item = &value.array.items[self.index];
@@ -924,4 +958,37 @@ test "public graph metric borrowed wire multi component fanout reuses item prepa
     try std.testing.expect(budget.alloc_calls < 128);
     try std.testing.expectEqual(@as(usize, 0), budget.live);
     std.debug.print("PREPARED_FANOUT count=8000 allocations={d} peak={d}\n", .{ budget.alloc_calls, budget.peak });
+}
+
+test "public graph metric borrowed wire primed nested fanout survives replacement failures and repeated output" {
+    const Fixture = struct {
+        fn run(a: Allocator) !void {
+            var arena: std.heap.ArenaAllocator = .init(a);
+            defer arena.deinit();
+            const scratch = arena.allocator();
+            const raw = "[{\"x\":[{\"x\":[{\"leaf\":[1,2,3]},{\"other\":1}]}]},{\"x\":[{\"x\":[{\"leaf\":[4]}]}]}]";
+            var view: View = .init(scratch, raw);
+            var root: Output.Object = .empty;
+            const source: Source = .{ .span = .{ .view = &view, .node = &view.root } };
+            try Output.include(scratch, &root, "items", source, &.{ "x", "x", "leaf" });
+            // Abandon a live prepared chain, then preserve its replacement when
+            // a later selector produces no surviving objects.
+            try Output.include(scratch, &root, "items", source, &.{ "x", "x", "leaf" });
+            try Output.include(scratch, &root, "items", source, &.{"absent"});
+            const output: Output = .{ .object = root };
+            var storage: [32]u8 = undefined;
+            var failed: std.Io.Writer = .fixed(&storage);
+            if (output.writeTo(scratch, &failed)) |_| return error.ExpectedWriteFailure else |err| {
+                if (err == error.OutOfMemory) return err;
+                try std.testing.expect(err == error.WriteFailed);
+            }
+            for (0..2) |_| {
+                const bytes = try output.serialize(scratch, a);
+                defer a.free(bytes);
+                try std.testing.expectEqualStrings("{\"items\":[{\"x\":[{\"x\":[{\"leaf\":[1,2,3]}]}]},{\"x\":[{\"x\":[{\"leaf\":[4]}]}]}]}", bytes);
+            }
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }

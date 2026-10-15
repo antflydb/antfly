@@ -32,7 +32,9 @@ pub const FieldSelectionPlan = struct {
 };
 
 pub const EmbeddingFields = @import("embedding_fields.zig").EmbeddingFields;
+pub const EmbeddingStream = @import("embedding_fields.zig").EmbeddingStream;
 pub const SpecialFieldLoader = struct {
+    open_embeddings: ?*const fn (?*anyopaque, Allocator, []const u8) anyerror!?EmbeddingStream = null,
     load_embeddings_compact: ?*const fn (?*anyopaque, Allocator, []const u8) anyerror!?EmbeddingFields = null,
     ctx: ?*anyopaque,
     load_chunks: *const fn (
@@ -239,11 +241,15 @@ fn projectWithSelectionAndOutput(alloc: Allocator, output: Allocator, doc_key: [
     const names = [_][]const u8{ "_artifacts", "_chunks", "_embeddings" };
     if (selection.special.all_artifacts) values[0] = try loader.load_artifacts(loader.ctx, alloc, doc_key);
     if (selection.special.all_chunks) values[1] = try loader.load_chunks(loader.ctx, alloc, doc_key);
+    var stream: ?EmbeddingStream = null;
+    defer if (stream) |*fields| fields.deinit();
     var compact: ?EmbeddingFields = null;
     defer if (compact) |*fields| fields.deinit(alloc);
     // Unsupported legacy selectors keep the established DOM contract.
     if (selection.special.all_embeddings) {
-        if (loader.load_embeddings_compact != null and document_query.spanProjectionSupported(selection.projection.fields)) {
+        if (loader.open_embeddings != null and document_query.spanProjectionSupported(selection.projection.fields)) {
+            stream = try loader.open_embeddings.?(loader.ctx, alloc, doc_key);
+        } else if (loader.load_embeddings_compact != null and document_query.spanProjectionSupported(selection.projection.fields)) {
             compact = try loader.load_embeddings_compact.?(loader.ctx, alloc, doc_key);
         } else values[2] = try loader.load_embeddings(loader.ctx, alloc, doc_key);
     }
@@ -254,6 +260,10 @@ fn projectWithSelectionAndOutput(alloc: Allocator, output: Allocator, doc_key: [
         sources[count] = .{ .name = name, .value = logical };
         count += 1;
     };
+    if (stream) |*fields| {
+        sources[count] = .{ .name = "_embeddings", .embedding_stream = fields };
+        count += 1;
+    }
     if (compact) |*fields| {
         sources[count] = .{ .name = "_embeddings", .embeddings = fields };
         count += 1;
@@ -558,4 +568,95 @@ test "public graph metric borrowed wire compact embeddings bound numeric scratch
     defer a.free(result);
     try std.testing.expectEqual(@as(usize, 0), budget.live);
     std.debug.print("COMPACT_EMBEDDINGS output_bytes={d} scratch_peak={d}\n", .{ result.len, budget.peak });
+}
+
+test "public graph metric borrowed wire streamed embeddings bound slabs and preserve ordered fallback" {
+    const Fixture = struct {
+        owner: Allocator,
+        index: usize = 0,
+        field_count: usize = 64,
+        vector: [1536]f32 = undefined,
+        name: [32]u8 = undefined,
+        fn none(_: ?*anyopaque, _: Allocator, _: []const u8) !?std.json.Value {
+            return null;
+        }
+        fn open(_: ?*anyopaque, a: Allocator, _: []const u8) !?EmbeddingStream {
+            const owner = @import("antfly_platform").allocator.reclaimingScratch(a);
+            const state = try owner.create(@This());
+            state.* = .{ .owner = owner };
+            return .{ .ctx = state, .next_fn = next, .reset_fn = reset, .close_fn = close };
+        }
+        fn next(ctx: *anyopaque) anyerror!?EmbeddingStream.Field {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.index == self.field_count) return null;
+            const name = try std.fmt.bufPrint(&self.name, "v{d}", .{self.index});
+            for (&self.vector, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i)) / 1536;
+            self.index += 1;
+            return .{ .name = name, .vector = &self.vector };
+        }
+        fn reset(ctx: *anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.index = 0;
+        }
+        fn close(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.owner.destroy(self);
+        }
+        fn compact(ctx: ?*anyopaque, a: Allocator, key: []const u8) !?EmbeddingFields {
+            var stream = (try open(ctx, a, key)).?;
+            defer stream.deinit();
+            var result = (try stream.fields(a)).*;
+            stream.cached = null;
+            errdefer result.deinit(@import("antfly_platform").allocator.reclaimingScratch(a));
+            return result;
+        }
+        fn run(a: Allocator) !void {
+            const loader: SpecialFieldLoader = .{ .ctx = null, .load_embeddings = none, .load_chunks = none, .load_artifacts = none, .open_embeddings = open };
+            var eager = loader;
+            eager.open_embeddings = null;
+            eager.load_embeddings_compact = compact;
+            for ([_][]const []const u8{
+                &.{"_embeddings"},                   &.{"_embeddings.*"},          &.{ "_embeddings", "_embeddings.v0.2" },
+                &.{ "_embeddings", "-_embeddings" }, &.{ "_embeddings", "title" }, &.{ "_embeddings", "*" },
+            }) |fields| {
+                const opts: types.LookupOptions = .{ .fields = fields, .include_all_fields = false };
+                const raw = "{\"title\":1,\"_embeddings\":{\"old\":[]}}";
+                const expected = try projectLookupStoredBytesWithOutput(a, a, "doc", raw, opts, eager);
+                defer a.free(expected);
+                const actual = try projectLookupStoredBytesWithOutput(a, a, "doc", raw, opts, loader);
+                defer a.free(actual);
+                try std.testing.expectEqualStrings(expected, actual);
+            }
+        }
+        fn failure(a: Allocator) !void {
+            const body = try projectLookupStoredBytesWithOutput(a, a, "doc", "{}", .{ .fields = &.{ "_embeddings", "_embeddings.v0.2" }, .include_all_fields = false }, .{ .ctx = null, .load_embeddings = none, .load_chunks = none, .load_artifacts = none, .open_embeddings = open });
+            defer a.free(body);
+        }
+    };
+    const a = std.testing.allocator;
+    try Fixture.run(a);
+    // Keep fault enumeration small while still exercising post-navigation
+    // cache ownership after the short-lived projection arena has been retired.
+    const Small = struct {
+        fn run(failing: Allocator) !void {
+            var stream = (try Fixture.open(null, failing, "doc")).?;
+            defer stream.deinit();
+            const state: *Fixture = @ptrCast(@alignCast(stream.ctx));
+            state.field_count = 2;
+            var arena: std.heap.ArenaAllocator = .init(failing);
+            _ = stream.fields(arena.allocator()) catch |err| {
+                arena.deinit();
+                return err;
+            };
+            arena.deinit();
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Small.run, .{});
+    const Counter = @import("../../lite/test_allocator.zig").BudgetAllocator;
+    var budget: Counter = .{ .backing = a, .limit = 64 * 1024 };
+    const body = try projectLookupStoredBytesWithOutput(budget.allocator(), a, "doc", "{}", .{ .fields = &.{"_embeddings"}, .include_all_fields = false }, .{ .ctx = null, .load_embeddings = Fixture.none, .load_chunks = Fixture.none, .load_artifacts = Fixture.none, .open_embeddings = Fixture.open });
+    defer a.free(body);
+    try std.testing.expectEqual(@as(usize, 1609735), body.len);
+    try std.testing.expectEqual(@as(usize, 0), budget.live);
+    std.debug.print("STREAMED_EMBEDDINGS output_bytes={d} scratch_peak={d}\n", .{ body.len, budget.peak });
 }

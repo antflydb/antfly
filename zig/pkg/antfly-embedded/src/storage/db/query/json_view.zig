@@ -33,12 +33,14 @@ pub const View = struct {
         name: []const u8,
         value: Value = .null,
         embeddings: ?*const @import("embedding_fields.zig").EmbeddingFields = null,
+        embedding_stream: ?*@import("embedding_fields.zig").EmbeddingStream = null,
         pub fn outputSource(self: *const @This()) @import("projection_output.zig").Source {
+            if (self.embedding_stream) |stream| return .{ .embedding_stream = stream };
             return if (self.embeddings) |fields| .{ .embeddings = fields } else .{ .logical = &self.value };
         }
         fn include(self: @This(), alloc: Allocator, dst: *std.json.ObjectMap, path: []const []const u8) !void {
             var source = std.json.ObjectMap.empty;
-            try source.put(alloc, self.name, if (self.embeddings) |fields| try fields.materialize(alloc) else self.value);
+            try source.put(alloc, self.name, if (self.embedding_stream) |stream| try (try stream.fields(alloc)).materialize(alloc) else if (self.embeddings) |fields| try fields.materialize(alloc) else self.value);
             try @import("../document_query.zig").applyIncludeBorrowedPath(alloc, source, dst, path);
         }
     };

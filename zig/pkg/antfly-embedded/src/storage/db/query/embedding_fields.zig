@@ -53,3 +53,62 @@ pub const EmbeddingFields = struct {
         return object;
     }
 };
+
+/// Synchronous, restartable typed fields. Each vector is borrowed only until
+/// next/reset/close; serialization completes before the DB lease is released.
+pub const EmbeddingStream = struct {
+    ctx: *anyopaque,
+    next_fn: *const fn (*anyopaque) anyerror!?Field,
+    reset_fn: *const fn (*anyopaque) anyerror!void,
+    close_fn: *const fn (*anyopaque) void,
+    cached: ?EmbeddingFields = null,
+    cache_allocator: ?std.mem.Allocator = null,
+    pub const Field = struct { name: []const u8, vector: []const f32 };
+
+    pub fn deinit(self: *@This()) void {
+        if (self.cached) |*cached| cached.deinit(self.cache_allocator.?);
+        self.close_fn(self.ctx);
+    }
+    /// Ordered selectors that modify the synthetic object use the established
+    /// compact representation. Whole-field output never collects vector slabs.
+    pub fn fields(self: *@This(), alloc: std.mem.Allocator) !*const EmbeddingFields {
+        if (self.cached == null) {
+            const owner = @import("antfly_platform").allocator.reclaimingScratch(alloc);
+            var result: EmbeddingFields = .{};
+            errdefer result.deinit(owner);
+            try self.reset_fn(self.ctx);
+            while (try self.next_fn(self.ctx)) |field| {
+                const vector = try owner.dupe(f32, field.vector);
+                errdefer owner.free(vector);
+                try result.putOwned(owner, field.name, vector);
+            }
+            self.cached = result;
+            self.cache_allocator = owner;
+        }
+        return &self.cached.?;
+    }
+    pub fn write(self: *@This(), writer: *std.Io.Writer) !void {
+        try writer.writeByte('{');
+        var count: usize = 0;
+        if (self.cached) |*cached| {
+            for (cached.values.keys(), cached.values.values()) |name, vector| {
+                try writeField(writer, &count, .{ .name = name, .vector = vector });
+            }
+        } else {
+            try self.reset_fn(self.ctx);
+            while (try self.next_fn(self.ctx)) |field| try writeField(writer, &count, field);
+        }
+        try writer.writeByte('}');
+    }
+    fn writeField(writer: *std.Io.Writer, count: *usize, field: Field) !void {
+        if (count.* != 0) try writer.writeByte(',');
+        try std.json.Stringify.value(field.name, .{}, writer);
+        try writer.writeAll(":[");
+        for (field.vector, 0..) |component, i| {
+            if (i != 0) try writer.writeByte(',');
+            try std.json.Stringify.value(@as(f64, component), .{}, writer);
+        }
+        try writer.writeByte(']');
+        count.* += 1;
+    }
+};

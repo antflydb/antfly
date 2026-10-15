@@ -102,6 +102,100 @@ pub fn loadChunkFieldValueTxn(self: Source, alloc: Allocator, doc_key: []const u
     return .{ .object = chunks_obj };
 }
 
+/// Retain only field identities while the immutable snapshot is pinned. Values
+/// are resolved one at a time; payload cursors and decode scratch retire each
+/// field before the next. No database owner escapes projection serialization.
+pub fn openEmbeddingStreamTxn(self: Source, alloc: Allocator, doc_key: []const u8, read_txn: ?*docstore_mod.DocStore.Txn) !?db_query_projection.EmbeddingStream {
+    const backing = @import("antfly_platform").allocator.reclaimingScratch(alloc);
+    const state = try backing.create(EmbeddingStreamState);
+    errdefer backing.destroy(state);
+    state.* = .{ .backing = backing, .scratch = .init(backing) };
+    errdefer state.freeKeys();
+    errdefer state.scratch.deinit();
+    if (read_txn == null) state.owned_txn = try self.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
+    errdefer if (state.owned_txn) |*txn| txn.abort();
+    const txn = read_txn orelse &state.owned_txn.?;
+    state.cursor = try txn.openCursor();
+    errdefer state.cursor.?.close();
+    const a = backing;
+    const prefix = try internal_keys.artifactTypePrefixAlloc(a, doc_key, "embedding");
+    defer a.free(prefix);
+    var next = try state.cursor.?.seekAtOrAfter(prefix);
+    while (next) |entry| : (next = try state.cursor.?.next()) {
+        if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+        if (!internal_keys.isInternalUserKey(entry.key)) continue;
+        try state.resetScratch();
+        const temporary = state.scratch.allocator();
+        var identity = (try decodeArtifactRefIfKnownAlloc(temporary, entry.key)) orelse continue;
+        defer identity.deinit(temporary);
+        if (identity.kind != .embedding or identity.source != null) continue;
+        _ = enrichment_artifact_codec.decodeDenseEmbeddingDims(entry.value) catch continue;
+        // Keep the original field insertion order and the last valid artifact,
+        // matching compact-map replacement even for legacy duplicate identities.
+        const owned_key = try a.dupe(u8, entry.key);
+        errdefer a.free(owned_key);
+        if (state.keys.getPtr(identity.name)) |previous| {
+            a.free(previous.*);
+            previous.* = owned_key;
+        } else {
+            const name = try a.dupe(u8, identity.name);
+            errdefer a.free(name);
+            try state.keys.put(a, name, owned_key);
+        }
+    }
+    if (state.keys.count() == 0) {
+        state.close();
+        return null;
+    }
+    return .{ .ctx = state, .next_fn = EmbeddingStreamState.next, .reset_fn = EmbeddingStreamState.reset, .close_fn = EmbeddingStreamState.closeErased };
+}
+
+const EmbeddingStreamState = struct {
+    backing: Allocator,
+    scratch: std.heap.ArenaAllocator,
+    keys: std.StringArrayHashMapUnmanaged([]const u8) = .empty,
+    owned_txn: ?docstore_mod.DocStore.Txn = null,
+    cursor: ?docstore_mod.DocStore.Txn.CursorAdapter = null,
+    index: usize = 0,
+    fn next(ctx: *anyopaque) anyerror!?db_query_projection.EmbeddingStream.Field {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        if (self.index == self.keys.count()) return null;
+        try self.resetScratch();
+        const i = self.index;
+        const entry = (try self.cursor.?.seekAtOrAfter(self.keys.values()[i])) orelse return error.InvalidEmbeddingSnapshot;
+        if (!std.mem.eql(u8, entry.key, self.keys.values()[i])) return error.InvalidEmbeddingSnapshot;
+        const vector = (try enrichment_artifact_codec.denseEmbeddingVectorView(entry.value)) orelse try enrichment_artifact_codec.decodeDenseEmbeddingAlloc(self.scratch.allocator(), entry.value);
+        self.index += 1;
+        return .{ .name = self.keys.keys()[i], .vector = vector };
+    }
+    fn resetScratch(self: *@This()) !void {
+        if (!self.scratch.reset(if (self.scratch.queryCapacity() > 16 * 1024) .free_all else .retain_capacity)) return error.OutOfMemory;
+    }
+    fn reset(ctx: *anyopaque) anyerror!void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.index = 0;
+    }
+    fn closeErased(ctx: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.close();
+    }
+    fn freeKeys(self: *@This()) void {
+        for (self.keys.keys(), self.keys.values()) |name, key| {
+            self.backing.free(name);
+            self.backing.free(key);
+        }
+        self.keys.deinit(self.backing);
+    }
+    fn close(self: *@This()) void {
+        self.cursor.?.close();
+        if (self.owned_txn) |*txn| txn.abort();
+        self.scratch.deinit();
+        self.freeKeys();
+        const backing = self.backing;
+        backing.destroy(self);
+    }
+};
+
 /// Compact ownership for response projection. Scan results are retired before
 /// returning; only dense f32 slabs and field names survive the read scope.
 pub fn loadEmbeddingFieldsTxn(self: Source, alloc: Allocator, doc_key: []const u8, read_txn: ?*docstore_mod.DocStore.Txn) !?db_query_projection.EmbeddingFields {
@@ -433,6 +527,11 @@ pub fn loadChunkFieldValueTxnCallback(
     return try loadChunkFieldValueTxn(projection.source, alloc, doc_key, projection.read_txn);
 }
 
+pub fn openEmbeddingStreamTxnCallback(ctx: ?*anyopaque, alloc: Allocator, doc_key: []const u8) anyerror!?db_query_projection.EmbeddingStream {
+    const projection: *TransactionProjectionContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+    return openEmbeddingStreamTxn(projection.source, alloc, doc_key, projection.read_txn);
+}
+
 pub fn loadEmbeddingFieldsTxnCallback(ctx: ?*anyopaque, alloc: Allocator, doc_key: []const u8) anyerror!?db_query_projection.EmbeddingFields {
     const projection: *TransactionProjectionContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
     return loadEmbeddingFieldsTxn(projection.source, alloc, doc_key, projection.read_txn);
@@ -489,6 +588,7 @@ pub fn projectLookupStoredBytesTxn(
         .ctx = context,
         .load_chunks = loadChunkFieldValueTxnCallback,
         .load_embeddings = loadEmbeddingFieldValueTxnCallback,
+        .open_embeddings = openEmbeddingStreamTxnCallback,
         .load_embeddings_compact = loadEmbeddingFieldsTxnCallback,
         .load_artifacts = loadArtifactFieldValueTxnCallback,
     });
@@ -595,4 +695,80 @@ test "public graph metric borrowed wire compact embedding cursor owns values bey
     var pinned = try store.beginReadTxn();
     defer pinned.abort();
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Fixture.run, .{&pinned});
+    const StreamFixture = struct {
+        fn run(failing: Allocator, txn: *docstore_mod.DocStore.Txn) !void {
+            var stream = (try openEmbeddingStreamTxn(.{ .core = undefined }, failing, "doc", txn)).?;
+            defer stream.deinit();
+            var writer: std.Io.Writer.Allocating = .init(failing);
+            defer writer.deinit();
+            stream.write(&writer.writer) catch |err| return if (err == error.WriteFailed) error.OutOfMemory else err;
+            const first = try failing.dupe(u8, writer.written());
+            defer failing.free(first);
+            const loaded = try stream.fields(failing);
+            try std.testing.expectEqualSlices(f32, &.{ 0.1, -0.0, 1.25 }, loaded.values.get("dense").?);
+            writer.clearRetainingCapacity();
+            stream.write(&writer.writer) catch |err| return if (err == error.WriteFailed) error.OutOfMemory else err;
+            try std.testing.expectEqualStrings(first, writer.written());
+            var missing = try openEmbeddingStreamTxn(.{ .core = undefined }, failing, "absent", txn);
+            defer if (missing) |*value| value.deinit();
+            try std.testing.expect(missing == null);
+        }
+    };
+    try StreamFixture.run(a, &pinned);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, StreamFixture.run, .{&pinned});
+}
+
+test "public graph metric borrowed wire streamed embedding physical loader bounds vector memory" {
+    const a = std.testing.allocator;
+    const Lite = @import("../lite/docstore.zig");
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/streamed-embeddings.aflite", .{directory.sub_path});
+    defer a.free(path);
+    var lite = try Lite.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true });
+    defer lite.close();
+    var store = try docstore_mod.DocStore.openRuntime(a, try lite.runtimeStore(a));
+    defer store.close();
+    var vector: [1536]f32 = undefined;
+    for (&vector, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i)) / 1536;
+    const payload = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(a, null, &vector);
+    defer a.free(payload);
+    for (0..64) |i| {
+        const name = try std.fmt.allocPrint(a, "v{d}", .{i});
+        defer a.free(name);
+        const key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(a, "doc", name);
+        defer a.free(key);
+        try store.put(key, payload);
+    }
+    var read = try store.beginReadTxn();
+    defer read.abort();
+    const Fixture = struct {
+        fn none(_: ?*anyopaque, _: Allocator, _: []const u8) !?std.json.Value {
+            return null;
+        }
+        fn open(ctx: ?*anyopaque, alloc: Allocator, key: []const u8) !?db_query_projection.EmbeddingStream {
+            const txn: *docstore_mod.DocStore.Txn = @ptrCast(@alignCast(ctx.?));
+            return openEmbeddingStreamTxn(.{ .core = undefined }, alloc, key, txn);
+        }
+        fn compact(ctx: ?*anyopaque, alloc: Allocator, key: []const u8) !?db_query_projection.EmbeddingFields {
+            const txn: *docstore_mod.DocStore.Txn = @ptrCast(@alignCast(ctx.?));
+            return loadEmbeddingFieldsFromTxn(alloc, key, txn);
+        }
+    };
+    const Counter = @import("../lite/test_allocator.zig").BudgetAllocator;
+    var expected: ?[]u8 = null;
+    defer if (expected) |body| a.free(body);
+    for (0..2) |mode| {
+        var budget: Counter = .{ .backing = a, .limit = 1024 * 1024 };
+        const start = @import("antfly_platform").time.monotonicNs();
+        const body = try db_query_projection.projectLookupStoredBytesWithOutput(budget.allocator(), a, "doc", "{}", .{ .fields = &.{"_embeddings"}, .include_all_fields = false }, .{ .ctx = &read, .load_embeddings = Fixture.none, .load_chunks = Fixture.none, .load_artifacts = Fixture.none, .load_embeddings_compact = Fixture.compact, .open_embeddings = if (mode == 1) Fixture.open else null });
+        const elapsed = @import("antfly_platform").time.monotonicNs() - start;
+        if (mode == 0) expected = body else {
+            defer a.free(body);
+            try std.testing.expectEqualStrings(expected.?, body);
+            try std.testing.expect(budget.peak < 64 * 1024);
+        }
+        try std.testing.expectEqual(@as(usize, 0), budget.live);
+        std.debug.print("PHYSICAL_EMBEDDINGS mode={d} scratch_peak={d} elapsed_ns={d} bytes={d}\n", .{ mode, budget.peak, elapsed, body.len });
+    }
 }

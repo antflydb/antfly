@@ -18610,6 +18610,7 @@ pub const DB = struct {
                 .ctx = self,
                 .load_chunks = loadChunkFieldValueCallback,
                 .load_embeddings = loadEmbeddingFieldValueCallback,
+                .open_embeddings = openEmbeddingStreamCallback,
                 .load_embeddings_compact = loadEmbeddingFieldsCallback,
                 .load_artifacts = loadArtifactFieldValueCallback,
             }, if (prepared) |plans| try plans.getPlain() else null);
@@ -45110,6 +45111,7 @@ fn projectLookupStoredBytes(self: *DB, alloc: Allocator, doc_key: []const u8, ra
         .ctx = self,
         .load_chunks = loadChunkFieldValueCallback,
         .load_embeddings = loadEmbeddingFieldValueCallback,
+        .open_embeddings = openEmbeddingStreamCallback,
         .load_embeddings_compact = loadEmbeddingFieldsCallback,
         .load_artifacts = loadArtifactFieldValueCallback,
     });
@@ -45123,6 +45125,7 @@ fn projectStoredBytesForSearch(self: *DB, alloc: Allocator, req: types.SearchReq
         .ctx = self,
         .load_chunks = loadChunkFieldValueCallback,
         .load_embeddings = loadEmbeddingFieldValueCallback,
+        .open_embeddings = openEmbeddingStreamCallback,
         .load_embeddings_compact = loadEmbeddingFieldsCallback,
         .load_artifacts = loadArtifactFieldValueCallback,
     });
@@ -45136,6 +45139,7 @@ fn projectOwnedStoredBytesForSearch(self: *DB, alloc: Allocator, req: types.Sear
         .ctx = self,
         .load_chunks = loadChunkFieldValueCallback,
         .load_embeddings = loadEmbeddingFieldValueCallback,
+        .open_embeddings = openEmbeddingStreamCallback,
         .load_embeddings_compact = loadEmbeddingFieldsCallback,
         .load_artifacts = loadArtifactFieldValueCallback,
     });
@@ -45417,6 +45421,11 @@ fn loadChunkFieldValueCallback(
 ) anyerror!?std.json.Value {
     const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
     return try loadChunkFieldValue(self, alloc, doc_key);
+}
+
+fn openEmbeddingStreamCallback(ctx: ?*anyopaque, alloc: Allocator, doc_key: []const u8) anyerror!?db_query_projection.EmbeddingStream {
+    const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+    return read_projection.openEmbeddingStreamTxn(.{ .core = self.core }, alloc, doc_key, null);
 }
 
 fn loadEmbeddingFieldsCallback(ctx: ?*anyopaque, alloc: Allocator, doc_key: []const u8) anyerror!?db_query_projection.EmbeddingFields {
