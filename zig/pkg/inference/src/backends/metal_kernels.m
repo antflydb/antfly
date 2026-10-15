@@ -1168,6 +1168,8 @@ typedef struct termite_metal_decode_runtime {
     id<MTLComputePipelineState> bias_add_layer_norm_rows_pipeline;
     id<MTLComputePipelineState> layer_norm_bwd_dx_pipeline;
     id<MTLComputePipelineState> layer_norm_bwd_dgdb_pipeline;
+    id<MTLComputePipelineState> layer_norm_bwd_dgdb_partial_pipeline;
+    id<MTLComputePipelineState> layer_norm_bwd_dgdb_reduce_pipeline;
     id<MTLComputePipelineState> dense_qkv_split_pipeline;
     id<MTLComputePipelineState> dense_pair_split_pipeline;
     id<MTLComputePipelineState> dense_qkv_split_bias_pipeline;
@@ -8211,7 +8213,20 @@ static NSString *termite_metal_shader_source(void) {
 	           "    for (uint r = 0u; r < p.rows; ++r) { float mean = stats[r * 2u]; float inv_std = stats[r * 2u + 1u]; uint idx = r * p.hidden_size + gid; float xhat = (input[idx] - mean) * inv_std; float gy = dy[idx]; dg += gy * xhat; db += gy; }\n"
 	           "    output[p.rows * p.hidden_size + gid] = dg; output[(p.rows + 1u) * p.hidden_size + gid] = db;\n"
 	           "}\n"
-	           "kernel void termite_apply_add_layer_norm_1x(device const float *a [[buffer(0)]], device const float *b [[buffer(1)]], device const float *gamma [[buffer(2)]], device const float *beta [[buffer(3)]], device float *output [[buffer(4)]], constant termite_metal_apply_layer_norm_params &p [[buffer(5)]], uint gid [[thread_position_in_grid]]) {\n"
+	                      // Two-stage dgamma/dbeta for many rows: partial sums over 64-row
+           // chunks across a (column, chunk) grid, then one ordered sum per
+           // column, instead of one thread walking every row of its column.
+           "kernel void termite_layer_norm_bwd_dgdb_partial(device const float *input [[buffer(0)]], device const float *dy [[buffer(1)]], device const float *stats [[buffer(2)]], device float *partial [[buffer(3)]], constant termite_metal_layer_norm_bwd_params &p [[buffer(4)]], uint2 gid [[thread_position_in_grid]]) {\n"
+           "    uint col = gid.x; uint chunk = gid.y; if (col >= p.hidden_size) return; uint r0 = chunk * 64u; uint r1 = min(p.rows, r0 + 64u); float dg = 0.0f; float db = 0.0f;\n"
+           "    for (uint r = r0; r < r1; ++r) { float mean = stats[r * 2u]; float inv_std = stats[r * 2u + 1u]; uint idx = r * p.hidden_size + col; float gy = dy[idx]; dg += gy * ((input[idx] - mean) * inv_std); db += gy; }\n"
+           "    partial[(chunk * 2u) * p.hidden_size + col] = dg; partial[(chunk * 2u + 1u) * p.hidden_size + col] = db;\n"
+           "}\n"
+           "kernel void termite_layer_norm_bwd_dgdb_reduce(device const float *partial [[buffer(0)]], device float *output [[buffer(1)]], constant termite_metal_layer_norm_bwd_params &p [[buffer(2)]], constant uint &chunks [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
+           "    if (gid >= p.hidden_size) return; float dg = 0.0f; float db = 0.0f;\n"
+           "    for (uint c = 0u; c < chunks; ++c) { dg += partial[(c * 2u) * p.hidden_size + gid]; db += partial[(c * 2u + 1u) * p.hidden_size + gid]; }\n"
+           "    output[p.rows * p.hidden_size + gid] = dg; output[(p.rows + 1u) * p.hidden_size + gid] = db;\n"
+           "}\n"
+"kernel void termite_apply_add_layer_norm_1x(device const float *a [[buffer(0)]], device const float *b [[buffer(1)]], device const float *gamma [[buffer(2)]], device const float *beta [[buffer(3)]], device float *output [[buffer(4)]], constant termite_metal_apply_layer_norm_params &p [[buffer(5)]], uint gid [[thread_position_in_grid]]) {\n"
 	           "    if (p.hidden_size == 0) return;\n"
 	           "    uint row_base = gid * p.hidden_size;\n"
 	           "    float mean = 0.0f;\n"
@@ -28359,6 +28374,8 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         runtime->training_sumsq_pipeline = termite_metal_make_pipeline(device, library, @"termite_training_sumsq_f32");
         runtime->layer_norm_bwd_dx_pipeline = termite_metal_make_pipeline(device, library, @"termite_layer_norm_bwd_dx");
         runtime->layer_norm_bwd_dgdb_pipeline = termite_metal_make_pipeline(device, library, @"termite_layer_norm_bwd_dgdb");
+        runtime->layer_norm_bwd_dgdb_partial_pipeline = termite_metal_make_pipeline(device, library, @"termite_layer_norm_bwd_dgdb_partial");
+        runtime->layer_norm_bwd_dgdb_reduce_pipeline = termite_metal_make_pipeline(device, library, @"termite_layer_norm_bwd_dgdb_reduce");
         runtime->subtract_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_subtract_1x");
         runtime->divide_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_divide_1x");
         runtime->less_than_pipeline = termite_metal_make_pipeline(device, library, @"termite_apply_less_than_1x");
@@ -29301,6 +29318,8 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->training_sumsq_pipeline = nil;
     runtime->layer_norm_bwd_dx_pipeline = nil;
     runtime->layer_norm_bwd_dgdb_pipeline = nil;
+    runtime->layer_norm_bwd_dgdb_partial_pipeline = nil;
+    runtime->layer_norm_bwd_dgdb_reduce_pipeline = nil;
     runtime->subtract_pipeline = nil;
     runtime->divide_pipeline = nil;
     runtime->less_than_pipeline = nil;
@@ -51939,13 +51958,35 @@ int termite_metal_decode_runtime_layer_norm_backward_f32(
 
         [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-        [encoder setComputePipelineState:runtime->layer_norm_bwd_dgdb_pipeline];
-        [encoder setBuffer:input_buffer offset:input_offset atIndex:0];
-        [encoder setBuffer:dy_buffer offset:dy_offset atIndex:1];
-        [encoder setBuffer:stats offset:0 atIndex:2];
-        [encoder setBuffer:output_buffer offset:output_offset atIndex:3];
-        [encoder setBytes:&params length:sizeof(params) atIndex:4];
-        [encoder dispatchThreads:MTLSizeMake(hidden_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(width, 1, 1)];
+        const uint32_t chunks = (uint32_t)((rows + 63u) / 64u);
+        id<MTLBuffer> partial = chunks > 4u && runtime->layer_norm_bwd_dgdb_partial_pipeline != nil &&
+                runtime->layer_norm_bwd_dgdb_reduce_pipeline != nil
+            ? [runtime->device newBufferWithLength:(size_t)chunks * 2u * hidden_size * sizeof(float) options:MTLResourceStorageModePrivate]
+            : nil;
+        if (partial != nil) {
+            [encoder setComputePipelineState:runtime->layer_norm_bwd_dgdb_partial_pipeline];
+            [encoder setBuffer:input_buffer offset:input_offset atIndex:0];
+            [encoder setBuffer:dy_buffer offset:dy_offset atIndex:1];
+            [encoder setBuffer:stats offset:0 atIndex:2];
+            [encoder setBuffer:partial offset:0 atIndex:3];
+            [encoder setBytes:&params length:sizeof(params) atIndex:4];
+            [encoder dispatchThreads:MTLSizeMake(hidden_size, chunks, 1) threadsPerThreadgroup:MTLSizeMake(width, 1, 1)];
+            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            [encoder setComputePipelineState:runtime->layer_norm_bwd_dgdb_reduce_pipeline];
+            [encoder setBuffer:partial offset:0 atIndex:0];
+            [encoder setBuffer:output_buffer offset:output_offset atIndex:1];
+            [encoder setBytes:&params length:sizeof(params) atIndex:2];
+            [encoder setBytes:&chunks length:sizeof(chunks) atIndex:3];
+            [encoder dispatchThreads:MTLSizeMake(hidden_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(width, 1, 1)];
+        } else {
+            [encoder setComputePipelineState:runtime->layer_norm_bwd_dgdb_pipeline];
+            [encoder setBuffer:input_buffer offset:input_offset atIndex:0];
+            [encoder setBuffer:dy_buffer offset:dy_offset atIndex:1];
+            [encoder setBuffer:stats offset:0 atIndex:2];
+            [encoder setBuffer:output_buffer offset:output_offset atIndex:3];
+            [encoder setBytes:&params length:sizeof(params) atIndex:4];
+            [encoder dispatchThreads:MTLSizeMake(hidden_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(width, 1, 1)];
+        }
 
         [encoder endEncoding];
         return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -10);
