@@ -549,7 +549,14 @@ pub fn execute(
     snap: *const index_mod.IndexSnapshot,
     request: SearchRequest,
 ) !SearchResult {
-    var result = if (request.sort == null and (request.search_after != null or request.minimum_competitive_score != null or request.text_navigation_plan != null) and request.aggregations.len == 0 and canStreamBool(request.query, 0))
+    // Pure patterns have constant scores and a dedicated bounded bitmap
+    // collector. Cursor/preparation metadata must not route them through the
+    // general Boolean arena; mixed Boolean trees still use streaming lowering.
+    const pure_pattern = switch (request.query) {
+        .prefix, .wildcard, .regexp, .fuzzy => true,
+        else => false,
+    };
+    var result = if (!pure_pattern and request.sort == null and (request.search_after != null or request.minimum_competitive_score != null or request.text_navigation_plan != null) and request.aggregations.len == 0 and canStreamBool(request.query, 0))
         (try executeStreamingTextBool(alloc, snap, if (request.query == .bool_query) request.query.bool_query else .{ .should = &.{request.query}, .min_should = 1, .pure_should_optional = true }, request, .{})).?
     else if (request.sort != null)
         try executeSort(alloc, snap, request)
