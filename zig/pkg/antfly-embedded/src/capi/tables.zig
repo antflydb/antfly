@@ -18,7 +18,7 @@
 const h = @import("handles.zig");
 const api = @import("db.zig");
 const std = h.std;
-const catalog_key = "\x00antfly/embedded/tables/v1";
+pub const catalog_key = "\x00antfly/embedded/tables/v1";
 const Record = struct { name: []const u8, id: u64 };
 const Catalog = struct { next_id: u64 = 2, tables: []const Record = &.{} };
 pub const Table = struct { name: []u8, id: u64, namespace: []u8, db: h.db_mod.DB };
@@ -179,6 +179,15 @@ pub fn noteReaderVersion(handle: *h.Handle) !void {
 pub fn requireDatabase(handle: *h.Handle) !void {
     if (handle.parent_id != null) return error.InvalidArgument;
     if (handle.storage_owner_context != null or handle.storage_owner_path != null or handle.storage_owner_group_id != 0 or handle.readable_lease_hook != null) return error.UnsupportedSqlExecution;
+}
+
+/// Borrow the physical namespace while the database/table handle is pinned.
+pub fn storageName(handle: *h.Handle, name: []const u8) ![]const u8 {
+    _ = try get(handle, name);
+    if (std.mem.eql(u8, name, "default")) return "embedded/tables/1";
+    handle.embedded_table_open_mutex.lockUncancelable(h.handleLockIo());
+    defer handle.embedded_table_open_mutex.unlock(h.handleLockIo());
+    return handle.embedded_tables.get(name).?.namespace;
 }
 
 pub fn get(handle: *h.Handle, name: []const u8) !*h.db_mod.DB {

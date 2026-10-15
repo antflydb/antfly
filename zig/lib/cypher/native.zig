@@ -26,6 +26,8 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
         const Self = @This();
         pub const Table = struct {
             name: []const u8,
+            /// Immutable namespace captured with this logical table binding.
+            storage_name: ?[]const u8 = null,
             db: *DB,
             /// Only for bounded materialization while the exact owner's
             /// primary/replay capture fences are held. Never retain this
@@ -65,6 +67,13 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
         fn selected(self: *Self, name: []const u8) !*DB {
             for (self.tables) |table| if (std.mem.eql(u8, table.name, name)) return table.db;
             return error.UndefinedGraphTable;
+        }
+        fn matchesStorageTable(self: *Self, logical: []const u8, actual: []const u8) bool {
+            if (std.mem.eql(u8, logical, actual)) return true;
+            for (self.tables) |table| if (std.mem.eql(u8, table.name, logical)) {
+                return if (table.storage_name) |physical| std.mem.eql(u8, physical, actual) else false;
+            };
+            return false;
         }
         fn cast(ptr: *anyopaque) *Self {
             return @ptrCast(@alignCast(ptr));
@@ -189,8 +198,8 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                 if (metadata != .map) return error.CypherInvalidRelationshipMetadata;
                 const actual_source = metadata.property("source_table");
                 const actual_target = metadata.property("target_table");
-                if (actual_source != .null and (actual_source != .string or !std.mem.eql(u8, actual_source.string, source_table))) continue;
-                if (actual_target != .null and (actual_target != .string or !std.mem.eql(u8, actual_target.string, target_table))) continue;
+                if (actual_source != .null and (actual_source != .string or !self.matchesStorageTable(source_table, actual_source.string))) continue;
+                if (actual_target != .null and (actual_target != .string or !self.matchesStorageTable(target_table, actual_target.string))) continue;
                 const source: v.Identity = .{ .table = source_table, .key = edge.source };
                 const target: v.Identity = .{ .table = target_table, .key = edge.target };
                 if (!(if (position.incoming) target else source).eql(identity)) continue;

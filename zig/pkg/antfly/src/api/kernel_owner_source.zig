@@ -1662,7 +1662,10 @@ pub const ProvisionedKernelOwnerSource = struct {
         // checkpoint. Yield admission conflicts to it immediately: waiting for
         // another owner lease here stalls unrelated groups and can deadlock a
         // maintenance callback waiting for this same progress driver.
-        const needs_index_catalog = req.graph_writes.len != 0 or req.graph_deletes.len != 0;
+        // Document postimages and prepared intents derive field edges too.
+        // Their pinned graph write plan must exist before ordered apply.
+        const needs_index_catalog = req.graph_writes.len != 0 or req.graph_deletes.len != 0 or
+            req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or req.transaction != null;
         var lease = if (!@import("builtin").is_test or self.apply_control_started.load(.acquire))
             try self.acquireApplyOnlyWithCatalog(group_id, table_name, descriptor, needs_index_catalog)
         else blk: {
@@ -3769,14 +3772,13 @@ pub const ProvisionedKernelOwnerSource = struct {
         group_id: u64,
         table_name: []const u8,
     ) !?Lease {
-        return self.acquireResidentObservation(group_id, table_name, true);
+        return self.acquireResidentObservation(group_id, table_name);
     }
 
     fn acquireResidentObservation(
         self: *ProvisionedKernelOwnerSource,
         group_id: u64,
         table_name: []const u8,
-        require_catalog_match: bool,
     ) !?Lease {
         var descriptor = try self.loadDescriptor(self.alloc, group_id, table_name);
         defer descriptor.deinit(self.alloc);
@@ -3784,17 +3786,17 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer self.mutex.unlock();
         for (self.entries.items) |entry| {
             if (entry.group_id != group_id or !std.mem.eql(u8, entry.table_name, table_name)) continue;
-            if (!residentObservationMatches(entry, &descriptor, require_catalog_match)) return null;
+            if (!residentObservationMatches(entry, &descriptor)) return null;
             return try self.borrowEntryLocked(entry);
         }
         return null;
     }
 
-    fn residentObservationMatches(entry: *const Entry, descriptor: *const LoadedDescriptor, require_catalog_match: bool) bool {
-        return !entry.retired and entry.generation == descriptor.generation and
+    fn residentObservationMatches(entry: *const Entry, descriptor: *const LoadedDescriptor) bool {
+        return !entry.retired and !entry.opened_for_historical_apply and entry.generation == descriptor.generation and
             entry.identity.eql(descriptor.identity) and
-            (!require_catalog_match or (std.mem.eql(u8, entry.schema_json, descriptor.schema_json) and
-                std.mem.eql(u8, entry.indexes_json, descriptor.indexes_json))) and
+            std.mem.eql(u8, entry.schema_json, descriptor.schema_json) and
+            std.mem.eql(u8, entry.indexes_json, descriptor.indexes_json) and
             descriptor_contract.initialRangesEqual(entry.initial_range, descriptor.initial_range) and
             std.meta.eql(entry.table_storage, descriptor.table_storage);
     }
@@ -3990,9 +3992,9 @@ pub const ProvisionedKernelOwnerSource = struct {
         // before enqueueing; another control worker may have opened it meanwhile.
         const pending = ApplyOpen.init(self.alloc, self.replica_root_dir, group_id, table_name, descriptor) catch
             return error.RaftApplyWriterUnavailable;
-        // Graph mutations need physical indexes. Prepare the pinned catalog on
-        // the control executor before admitting apply; row-only catch-up keeps
-        // historical opens that cannot retire newer indexes.
+        // Prepare graph namespaces on the control executor before deriving
+        // document field edges or applying graph mutations. Historical opens
+        // keep newer schemas and sibling indexes intact.
         pending.prepare_graph_indexes = needs_index_catalog;
         var pending_owned = true;
         defer if (pending_owned) pending.deinit(self.alloc);
@@ -6139,12 +6141,10 @@ pub const ProvisionedKernelOwnerSource = struct {
         table_name: []const u8,
     ) !?runtime_status.LocalTableRuntimeStatus {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
-        // A historical replay owner can serve the current physical catalog
-        // while retaining an older pinned descriptor. Observe that writer's
-        // native, incarnation-stamped status instead of opening a disk reader
-        // that cannot see its unflushed replay/proofs. Cache publication checks
-        // each index incarnation against current metadata independently.
-        var lease = (try self.acquireResidentObservation(group_id, table_name, false)) orelse return null;
+        // Historical owners can retain obsolete runtime catalogs even when
+        // producer outputs are durable. Observe only the current descriptor;
+        // a cold status read preserves physical identity and completion proofs.
+        var lease = (try self.acquireResidentObservation(group_id, table_name)) orelse return null;
         defer lease.deinit();
         var response = try lease.owner().runtimeStatusJson(table_name);
         defer response.deinit();
@@ -7137,10 +7137,10 @@ test "source owner graph replay prepares its pinned index catalog" {
     defer source.deinit();
     var graph = old;
     graph.schema_json = "{\"version\":1}";
-    graph.indexes_json = "{\"links\":{\"type\":\"graph\"}}";
+    graph.indexes_json = "{\"links\":{\"type\":\"graph\",\"edge_types\":[{\"name\":\"link\",\"field\":\"ref\"}]}}";
     for (0..8) |_| {
         source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", graph, .{
-            .graph_writes = &.{.{ .index_name = "links", .source = "a", .target = "b", .edge_type = "link" }},
+            .writes = &.{.{ .key = "a", .value = "{\"ref\":\"b\"}" }},
         }, 1, 2) catch |err| switch (err) {
             error.StorageBusy => continue,
             else => return err,
@@ -7857,7 +7857,7 @@ test "source owner target fence always schedules a status observation" {
     try std.testing.expectEqual(@as(usize, 1), hook.calls);
 }
 
-test "source owner status observes historical catalogs only within the same physical identity" {
+test "source owner observations require current catalog and physical identity" {
     const Source = ProvisionedKernelOwnerSource;
     var entry: Source.Entry = .{
         .group_id = 1,
@@ -7878,22 +7878,26 @@ test "source owner status observes historical catalogs only within the same phys
         .schema_json = @constCast("{\"version\":2}"),
         .indexes_json = @constCast("{\"links\":{\"type\":\"graph\"}}"),
     };
-    try std.testing.expect(!Source.residentObservationMatches(&entry, &descriptor, true));
-    try std.testing.expect(Source.residentObservationMatches(&entry, &descriptor, false));
+    try std.testing.expect(!Source.residentObservationMatches(&entry, &descriptor));
+    descriptor.schema_json = entry.schema_json;
+    descriptor.indexes_json = entry.indexes_json;
+    try std.testing.expect(!Source.residentObservationMatches(&entry, &descriptor));
+    entry.opened_for_historical_apply = false;
+    try std.testing.expect(Source.residentObservationMatches(&entry, &descriptor));
     descriptor.generation += 1;
-    try std.testing.expect(!Source.residentObservationMatches(&entry, &descriptor, false));
+    try std.testing.expect(!Source.residentObservationMatches(&entry, &descriptor));
     descriptor.generation = entry.generation;
     descriptor.identity.table_id += 1;
-    try std.testing.expect(!Source.residentObservationMatches(&entry, &descriptor, false));
+    try std.testing.expect(!Source.residentObservationMatches(&entry, &descriptor));
     descriptor.identity = entry.identity;
     descriptor.initial_range = .{ .start = "a", .end = "z" };
-    try std.testing.expect(!Source.residentObservationMatches(&entry, &descriptor, false));
+    try std.testing.expect(!Source.residentObservationMatches(&entry, &descriptor));
     descriptor.initial_range = null;
     descriptor.table_storage = .{ .dense_embeddings = .vector_store };
-    try std.testing.expect(!Source.residentObservationMatches(&entry, &descriptor, false));
+    try std.testing.expect(!Source.residentObservationMatches(&entry, &descriptor));
     descriptor.table_storage = null;
     entry.retired = true;
-    try std.testing.expect(!Source.residentObservationMatches(&entry, &descriptor, false));
+    try std.testing.expect(!Source.residentObservationMatches(&entry, &descriptor));
 }
 
 test "candidate callback bridge retains batch binding bulk reads and release ownership" {

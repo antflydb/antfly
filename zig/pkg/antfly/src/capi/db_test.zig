@@ -6053,3 +6053,68 @@ test "capi SQL idle native maintenance avoids runtime construction and resumes w
     try std.testing.expectEqual(@as(usize, 1), result.hits.len);
     try std.testing.expectEqualStrings("doc", result.hits[0].id);
 }
+
+test "capi SQL detached index publication rejects a recreated table namespace" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("capi-named-publication-fence");
+    defer directory.cleanup();
+    const path = try tempTestAflitePath(a, directory.path(), "database");
+    defer a.free(path);
+    defer cleanupTestFile(path);
+    var options: capi.OpenOptions = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
+    options.storage_kind = capi.storage_kind_lite;
+    options.profile = capi.profile_native;
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
+    defer antfly_db_close(handle);
+    const owner = blk: {
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        break :blk guard.connection.?.owner;
+    };
+    owner.stopping.store(true, .release);
+    owner.wake.set(shared.handleLockIo());
+    owner.worker.?.join();
+    owner.worker = null;
+    owner.stopping.store(false, .release);
+    try sqlFkRecoveryStatement(handle, "CREATE TABLE docs (body TEXT)");
+    {
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        const table = &guard.handle.embedded_tables.get("docs").?.db;
+        try table.addIndex(.{ .name = "body_text", .kind = .full_text, .config_json = "{\"field\":\"body\"}" });
+    }
+    const Probe = struct {
+        handle: ?*anyopaque,
+        failure: ?anyerror = null,
+        rejected: bool = false,
+        fn notify(ptr: *anyopaque, root: *shared.Handle) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.check(root) catch |err| {
+                self.failure = err;
+            };
+        }
+        fn check(self: *@This(), root: *shared.Handle) !void {
+            const table = &root.embedded_tables.get("docs").?.db;
+            const file = try std.fmt.allocPrint(std.testing.allocator, "{s}/body_text/prepared.bin", .{table.core.index_manager.base_path});
+            defer std.testing.allocator.free(file);
+            try sqlFkRecoveryStatement(self.handle, "DROP TABLE docs");
+            try sqlFkRecoveryStatement(self.handle, "CREATE TABLE docs (body TEXT)");
+            table.core.index_manager.text_lsm_storage.?.writeFileAbsolute(file, "old namespace") catch |err| {
+                try std.testing.expect(err == error.EnrichmentWaitCanceled);
+                self.rejected = true;
+                return;
+            };
+            return error.TestUnexpectedResult;
+        }
+    };
+    var probe: Probe = .{ .handle = handle };
+    owner.test_after_capture = .{ .ptr = &probe, .notify = Probe.notify };
+    defer owner.test_after_capture = null;
+    owner.maintenance_table_cursor = 1;
+    owner.maintenance_pending = true;
+    _ = try owner.maintenanceTurnForTest();
+    if (probe.failure) |err| return err;
+    try std.testing.expect(probe.rejected);
+}

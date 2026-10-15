@@ -746,11 +746,15 @@ and promotion consumers at the durable replay boundary; background candidate
 reads carry bounded deadlines so owner transitions can make progress. Committed
 graph writes prepare missing physical graph indexes on the independent owner
 control worker, preserving newer durable schemas and sibling indexes during
-historical replay. Read-only status loads the existing physical root identity
+historical replay. Document writes and prepared transaction intents prepare the
+same pinned graph write plan before deriving field edges. This requires installed
+physical namespaces, while query readiness continues to wait for backfill;
+ordered apply cannot wait for publications queued behind its own entry.
+Read-only status loads the existing physical root identity
 and derives direct source names from catalog configuration, retaining completion
-proofs after a live owner retires. Status observes resident historical owners
-under physical-root, table identity, range, and storage fences; query admission
-still requires current catalog metadata. Cached index detail and lifecycle status
+proofs after a live owner retires. Resident status requires a current initialized
+catalog as well as physical-root, table identity, range, and storage fences;
+historical apply owners fall back to a fresh read-only status snapshot. Cached index detail and lifecycle status
 refresh incomplete producer observations until native completion is visible,
 then resume the cache fast path. Metadata registration, heartbeats, and cached
 capability summaries require framed runtime-status transport for producer
@@ -763,7 +767,23 @@ and mention edges prefer those identities, including after public-name rebinding
 Bulk callback scratch space is bounded while complete candidate sets remain
 supported. Ordered transaction resolution publishes durable effects without
 waiting for producer output through the same Raft progress driver; the proposing
-request enforces its visibility barrier after apply confirmation. Resolver catalog hashing accepts the same versioned envelope
+request enforces its visibility barrier after apply confirmation. Captured embedded
+opens defer derived replay to the independent maintenance owner, so large pending
+full-text work cannot strand healthy SQL reads or mutations. Background turns
+reserve replacement progress before replay, sample one finite cutoff, and retain
+remaining debt for later turns under steady writes; explicit idle calls still
+prove complete coverage. Native index publication validates captured schema and
+producer catalog bytes and the embedded table registry under the writer lease
+without reopening the foreground runtime for each mutation. Each bounded graph
+replacement page shares one publication lease, then yields to queued foreground
+writers. Repair and replacement shadow managers share the
+source schema registry so encoded relational rows use the same layouts. Mixed graph repair
+projects field contribution provenance from current authoritative rows under the
+writer fence directly into the candidate. Repair never mutates Raft-owned source
+artifacts outside ordered publication. Contribution reconciliation recovers
+missing field assertions from authoritative rows with a target cache per apply
+window, preserving linear work for high fan-out fields; replay catches concurrent
+mutations before cutover. Resolver catalog hashing accepts the same versioned envelope
 as the resolver reader. SQL `GRAPH_TABLE` consumes normalized staged postimages,
 including encoded rows, without applying defaults or generated expressions again.
 

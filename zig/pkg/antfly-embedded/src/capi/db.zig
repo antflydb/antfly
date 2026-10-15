@@ -2664,6 +2664,7 @@ pub fn openLiteHandleAllocWithRuntime(
         opts.start_optional_runtime_workers = false;
         opts.start_resolver_workers = false;
         opts.defer_index_backfill_on_open = true;
+        opts.defer_derived_replay_on_open = true;
     }
     try backend.configureDbOpenOptions(&opts);
 

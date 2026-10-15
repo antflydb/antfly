@@ -573,9 +573,7 @@ fn replaySequence(handle: *h.Handle) u128 {
 
 fn boundTable(ptr: *anyopaque, name: []const u8) anyerror!?[]const u8 {
     const handle: *h.Handle = @ptrCast(@alignCast(ptr));
-    _ = try tables.get(handle, name);
-    if (std.mem.eql(u8, name, "default")) return "embedded/tables/1";
-    return handle.embedded_tables.get(name).?.namespace;
+    return try tables.storageName(handle, name);
 }
 
 fn candidateGet(ptr: *anyopaque, a: std.mem.Allocator, name: []const u8, key: []const u8) anyerror!?[]u8 {

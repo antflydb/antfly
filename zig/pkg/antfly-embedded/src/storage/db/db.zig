@@ -580,6 +580,9 @@ pub const OpenOptions = struct {
 
     /// External owners drive historical index work outside their capture fence.
     defer_index_backfill_on_open: bool = false,
+    /// Captured native handles leave replay to their independent maintenance
+    /// owner; opening a namespace must not rebuild an unrelated projection.
+    defer_derived_replay_on_open: bool = false,
     table_storage: ?table_storage_mod.Settings = null,
     open_mode: OpenOptions.OpenMode = .writer,
     /// An authenticated restore decoder needs rows and schema layouts, never
@@ -2948,6 +2951,16 @@ const GraphRestoreParseCache = execution_resources.GraphRestoreParseCache;
 /// recovery. This owner has one lifetime and one set of locks; a borrowed
 /// execution view cannot snapshot or retire any of these resources.
 const LocalExecutionState = execution_resources.LocalExecutionState;
+const GraphReplacementAdmissionCallbacks = struct {
+    enter: *const fn (*anyopaque) anyerror!void,
+};
+const GraphReplacementAdmissionBoundary = @import("../named_callback.zig").Boundary(GraphReplacementAdmissionCallbacks);
+pub const GraphReplacementAdmission = struct {
+    ptr: *anyopaque,
+    enter: *const fn (*anyopaque) anyerror!void,
+    leave: *const fn (*anyopaque) void,
+    dispatch: @import("../named_callback.zig").Dispatch = GraphReplacementAdmissionBoundary.local_dispatch,
+};
 
 // A narrowly scoped secret reader can serve a provider without access to the
 // row-policy signing authority. Denial leaves that authority unavailable;
@@ -3031,6 +3044,9 @@ pub const DB = struct {
     graph_replacement_manager: ?*index_manager_mod.IndexManager = null,
     graph_replacement_catalog_generation: u64 = 0,
     graph_replacement_progress: ?GraphReplacementProgress = null,
+    /// A native owner may keep one writer lease across a bounded replacement
+    /// page, avoiding allocator validation between its individual mutations.
+    graph_replacement_admission: ?GraphReplacementAdmission = null,
     index_backends: db_config.IndexBackendOptions,
     core: *db_core.DBCore,
     /// Immutable physical root identity, initialized before workers bind.
@@ -4258,7 +4274,7 @@ pub const DB = struct {
                     try db.core.store.delete(graph_edge_ttl_due_rebuild_marker);
                 }
             }
-            if (opts.open_mode.allowsReplay()) {
+            if (opts.open_mode.allowsReplay() and !opts.defer_derived_replay_on_open) {
                 const replay_started_ns = monotonicTimeNs();
                 replayPendingDerivedBatches(&db, null, null, .{}) catch |err| switch (err) {
                     error.ArtifactRepairRequired => {},
@@ -16758,6 +16774,7 @@ pub const DB = struct {
         // Repair candidates share the table's immutable source owner too.
         // Otherwise their native base build silently recreates payload copies.
         shadow_manager.source_payload_store = self.core.index_manager.source_payload_store;
+        shadow_manager.setSchemaRegistry(self.core.schema_registry);
         shadow_manager.setIo(self.backend_runtime.io());
         shadow_manager.setAppliedSequenceCheckpointPath(shadow_checkpoint_path);
         shadow_manager.registerReplacementIndex(self.core.store, cfg) catch |err| {
@@ -28697,7 +28714,13 @@ pub const DB = struct {
                 try self.core.index_manager.saveGraphReplacementBuild(self.core.store, saved);
             }
             if (saved.retry_after_ns > retry_now) continue;
-            return self.advanceGraphReplacementOnce(deadline, saved) catch |err| {
+            const pending = blk: {
+                const admission = self.graph_replacement_admission;
+                if (admission) |lease| try GraphReplacementAdmissionBoundary.call("enter", lease.dispatch, lease.enter, .{lease.ptr});
+                defer if (admission) |lease| lease.leave(lease.ptr);
+                break :blk self.advanceGraphReplacementOnce(deadline, saved);
+            };
+            return pending catch |err| {
                 if (err == error.Canceled or err == error.Cancelled) {
                     // Interrupting this owner is not cancelling the durable
                     // job. Discard volatile work and preserve its checkpoint.
@@ -28815,6 +28838,7 @@ pub const DB = struct {
             // runs accumulating without limit during a long build.
             manager.graph_reverse_lsm_options.foreground_soft_compaction = true;
             manager.source_payload_store = self.core.index_manager.source_payload_store;
+            manager.setSchemaRegistry(self.core.schema_registry);
             manager.setIo(self.backend_runtime.io());
             try manager.registerReplacementIndex(self.core.store, cfg);
             self.graph_replacement_manager = manager;
@@ -30921,6 +30945,9 @@ pub const DB = struct {
         wait_for_enrichment_retries: bool = false,
         cancellation: types.CancellationToken = .none,
         max_windows_per_index: usize = 0,
+        /// Background owners yield after their sampled replay cut instead of
+        /// following a continuously moving foreground target.
+        follow_new_targets: bool = true,
         deadline_ns: ?u64 = null,
         /// Explicit idle calls drain all relational work. A borrowed writer
         /// advances one fair page and returns its remaining debt to its owner.
@@ -30948,7 +30975,8 @@ pub const DB = struct {
 
     fn runDerivedUntilWithOptions(self: *DB, sequence: u64, options: ReplayDrainOptions) !void {
         if (sequence == 0) return;
-        if (options.cancellation.ptr != null) {
+        try ensureSnapshotActive(options.cancellation);
+        if (options.cancellation.ptr != null and options.follow_new_targets) {
             return try self.runDerivedUntilWithVisibilityWait(sequence, .{
                 .cancellation = options.cancellation,
             });
@@ -30958,6 +30986,7 @@ pub const DB = struct {
             return;
         }
         self.executor.notifySequence(sequence);
+        if (!options.follow_new_targets) return;
         if (options.no_progress_timeout_ns != 0) {
             // The threaded executor's waitForAll has no deadline, and the
             // post-wait stall check (checkTargetAdvanceNoProgress in
@@ -31120,7 +31149,9 @@ pub const DB = struct {
 
     fn runEnrichmentUntilForDrain(self: *DB, sequence: u64, options: ReplayDrainOptions) !void {
         while (true) {
-            const outcome = if (options.unbounded_enrichment_wait and options.cancellation.ptr == null)
+            const outcome = if (!options.follow_new_targets)
+                self.runEnrichmentUntilWithVisibilityDeadline(sequence, options.cancellation, options.deadline_ns)
+            else if (options.unbounded_enrichment_wait and options.cancellation.ptr == null)
                 self.runEnrichmentUntilForDrainUnbounded(sequence)
             else
                 self.runEnrichmentUntilWithCancellation(sequence, options.cancellation);
@@ -31166,6 +31197,7 @@ pub const DB = struct {
             // the complete revision and can advance from durable evidence.
             try self.runEnrichmentUntilForDrain(stable_target, options);
             try self.runDerivedUntilWithOptions(stable_target, options);
+            if (!options.follow_new_targets) return;
             if (options.no_progress_timeout_ns != 0) try self.checkTargetAdvanceNoProgress(options.no_progress_timeout_ns);
 
             const next_target = self.core.nextDerivedSequence();
@@ -31431,7 +31463,7 @@ pub const DB = struct {
                 runtime.stats().applied_sequence > starting_promotion_applied
             else
                 false;
-            if (self.core.nextDerivedSequence() <= starting_sequence and !resolution_advanced and !promotion_advanced) return;
+            if (!options.follow_new_targets or (self.core.nextDerivedSequence() <= starting_sequence and !resolution_advanced and !promotion_advanced)) return;
         }
         return error.RunUntilIdleDidNotConverge;
     }
@@ -32453,12 +32485,15 @@ pub const DB = struct {
 
     fn runUntilIdleWithReplayDrainOptions(self: *DB, options: ReplayDrainOptions) !void {
         _ = try self.retryPortableRuntimeActivationIfNeeded();
+        // Reserve a replacement quantum before replay can exhaust a borrowed
+        // turn. Explicit drains still complete every stage before returning.
+        if (!options.drain_relational_indexes) _ = try self.advanceGraphReplacement();
         try self.drainReplayStagesUntilStableWithOptions(options);
         if (options.drain_relational_indexes) {
             while (try self.advanceGraphReplacement()) {
                 try ensureSnapshotActive(options.cancellation);
             }
-        } else _ = try self.advanceGraphReplacement();
+        }
         _ = try self.evaluateAlgebraicAdaptiveCandidates();
         while (try self.runAlgebraicAdaptiveWork() != 0) {}
         try self.flushAppliedSequencesForIdle();
@@ -32957,8 +32992,22 @@ pub const DB = struct {
     /// before another turn; explicit runUntilIdle still proves full coverage.
     pub fn runBackgroundMaintenanceWithCancellation(self: *DB, cancellation: types.CancellationToken) !bool {
         if (comptime storage_engine.enabled) return storage_engine.call("runBackgroundMaintenanceWithCancellation", .{ self, cancellation });
-        try self.runUntilIdleWithReplayDrainOptions(.{ .cancellation = cancellation, .drain_relational_indexes = false });
-        return self.hasPendingGraphReplacements() or self.local_execution.relational_index_maintenance_sweep.isPending();
+        try self.runUntilIdleWithReplayDrainOptions(.{
+            .cancellation = cancellation,
+            .drain_relational_indexes = false,
+            .follow_new_targets = false,
+            .max_windows_per_index = 1,
+            .deadline_ns = monotonicTimeNs() +| 250 * std.time.ns_per_ms,
+        });
+        if (self.hasPendingGraphReplacements() or self.local_execution.relational_index_maintenance_sweep.isPending() or self.resolverReplayNeedsDrain()) return true;
+        if (self.enrichment_runtime) |runtime| if (self.core.hasGeneratedEnrichmentTargets() and runtime.stats().applied_sequence < self.core.nextEnrichmentSequence()) return true;
+        const debts = try self.listDerivedReplayDebt(self.alloc);
+        defer {
+            for (debts) |*debt| debt.deinit(self.alloc);
+            self.alloc.free(debts);
+        }
+        for (debts) |debt| if (debt.catch_up_required) return true;
+        return false;
     }
 
     pub fn rebuildDenseIndexesForTargetCoverage(self: *DB, alloc: Allocator) !usize {
@@ -56350,6 +56399,41 @@ fn rebuildGraphReplacementDocumentsWithRead(ctx: *AsyncContext, name: []const u8
     try applyDerivedBatchToIndexContextProfiled(ctx, .{ .changed_artifact_keys = changed_keys.items }, .{ .name = name, .kind = .graph }, null, false, null);
 }
 
+/// Rebuild field provenance in the candidate from the current authoritative row.
+/// Repair never writes source artifacts: Raft sources admit those changes only
+/// through ordered publication. Subsequent source replay catches up this shadow.
+fn projectGraphFieldContributionsForRepair(ctx: *AsyncContext, index_name: []const u8, doc_key: []const u8) !usize {
+    const graph = ctx.index_manager.graphIndex(index_name) orelse return error.IndexNotFound;
+    const has_fields = for (graph.index.edge_type_configs) |edge_type| {
+        if (edge_type.field_name != null) break true;
+    } else false;
+    if (!has_fields) return 0;
+    try lockApplyForPortableRuntimeAsync(ctx);
+    defer ctx.apply_mutex.unlockExclusive();
+    var arena = std.heap.ArenaAllocator.init(ctx.alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var read = try ctx.store.beginReadTxn();
+    defer read.abort();
+    const stored_key = if (ctx.relational_base_rows) try internal_keys.relationalRowKeyAlloc(a, doc_key) else try internal_keys.documentKeyAlloc(a, doc_key);
+    const raw = read.get(stored_key) catch |err| switch (err) {
+        error.NotFound => return 0,
+        else => return err,
+    };
+    const json = try ctx.index_manager.materializeStoredValueAlloc(a, stored_key, raw);
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{});
+    var extracted = try mapper.extractWrite(a, doc_key, json);
+    var plan = try ctx.index_manager.writePlanSnapshotAlloc(a);
+    defer plan.deinit();
+    try local_mutation.augmentExtractedWriteWithGraphFieldEdgesFromSnapshotParsed(plan, a, doc_key, root, &extracted);
+    try ctx.index_manager.applyGraphMutationsByName(index_name, extracted.graph_writes, &.{});
+    var count: usize = 0;
+    for (extracted.graph_writes) |edge| if (std.mem.eql(u8, edge.index_name, index_name)) {
+        count += 1;
+    };
+    return count;
+}
+
 fn applySplitGraphArtifactsForIndexStreamingContext(
     ctx: *AsyncContext,
     index_name: []const u8,
@@ -56416,6 +56500,12 @@ fn applySplitGraphArtifactsForIndexStreamingContext(
 
         fn scanEntry(scan_ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
             const state: *@This() = @ptrCast(@alignCast(scan_ctx orelse return error.InvalidArgument));
+            if (internal_keys.isStoredDocumentRowKey(key)) {
+                const doc_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(state.ctx.alloc, key)) orelse return .@"continue";
+                defer state.ctx.alloc.free(doc_key);
+                try checkAsyncRepairCancelled(state.ctx);
+                state.mutation_count += try projectGraphFieldContributionsForRepair(state.ctx, state.index_name, doc_key);
+            }
             if (!internal_keys.isGraphEdgeArtifactKey(key)) return .@"continue";
             try checkAsyncRepairCancelled(state.ctx);
             const parsed = (try internal_keys.parseGraphEdgeArtifactKeyAlloc(state.ctx.alloc, key)) orelse return .@"continue";
@@ -138069,4 +138159,86 @@ test "db graph endpoint cleanup resolver scheduling hints never admit producer e
     invalid.sequence = 1;
     try std.testing.expectError(error.InvalidBatchRequest, requireResolutionSchedulingHintsOnly(invalid));
     try std.testing.expectError(error.InvalidBatchRequest, requireResolutionSchedulingHintsOnly(.{}));
+}
+
+test "db graph repair backfills field contributions without resurrecting deletions" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("graph-field-backfill");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false });
+    defer db.close();
+    try db.batch(.{ .writes = &.{ .{ .key = "a", .value = "{\"ref\":\"b\"}" }, .{ .key = "b", .value = "{}" } } });
+    try db.addEnrichment(.{ .name = "kg", .kind = .asset, .field = "kg", .content_type = "application/json" });
+    try db.addIndex(.{ .name = "mixed", .kind = .graph, .config_json = "{\"edge_types\":[{\"name\":\"link\",\"field\":\"ref\"}],\"sources\":[{\"artifact\":\"kg\",\"format\":\"extraction_graph\"}]}" });
+    _ = try projectGraphFieldContributionsForRepair(db.async_context, "mixed", "a");
+    const graph = db.core.index_manager.graphIndex("mixed").?;
+    {
+        var page = try graph.index.getCypherEdgesByTypesPageAt(a, "a", &.{"link"}, .out, null, .{ .max_edges = 16, .max_scanned_rows = 128, .max_owned_bytes = 4096 }, currentTimeNs());
+        defer page.deinit(a);
+        try std.testing.expectEqual(@as(usize, 1), page.edges.len);
+        try std.testing.expect(page.edges[0].field_derived);
+        try std.testing.expectEqualStrings("b", page.edges[0].target);
+    }
+    try std.testing.expectEqual(@as(usize, 1), try projectGraphFieldContributionsForRepair(db.async_context, "mixed", "a"));
+    try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"ref\":null}" }}, .sync_level = .full_index });
+    try std.testing.expectEqual(@as(usize, 0), try projectGraphFieldContributionsForRepair(db.async_context, "mixed", "a"));
+    var page = try graph.index.getCypherEdgesByTypesPageAt(a, "a", &.{"link"}, .out, null, .{ .max_edges = 16, .max_scanned_rows = 128, .max_owned_bytes = 4096 }, currentTimeNs());
+    defer page.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), page.edges.len);
+}
+
+test "db graph repair backfills field contributions from relational rows through shadow manager" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("graph-relational-repair");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false });
+    defer db.close();
+    const columns = [_]schema_mod.RelationalColumn{
+        .{ .name = "id", .path = "id", .column_type = .string, .required = true },
+        .{ .name = "ref", .path = "ref", .column_type = .string },
+    };
+    try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+    try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"id\":\"a\",\"ref\":\"b\"}" }} });
+    try db.addEnrichment(.{ .name = "kg", .kind = .asset, .field = "kg", .content_type = "application/json" });
+    try db.addIndex(.{ .name = "mixed", .kind = .graph, .config_json = "{\"edge_types\":[{\"name\":\"link\",\"field\":\"ref\"}],\"sources\":[{\"artifact\":\"kg\",\"format\":\"extraction_graph\"}]}" });
+    var repair = try db.repairArtifactIssuesWithRequestOptions(a, .{
+        .target = .index,
+        .artifact_kind = .graph,
+        .index_name = "mixed",
+        .limit = 1,
+        .force = true,
+    }, repair_completion_test_options);
+    defer repair.deinit(a);
+    try std.testing.expectEqual(@as(u64, 0), repair.failed);
+    try std.testing.expectEqual(@as(u64, 1), repair.indexes_rebuilt);
+    const edges = try db.getEdges(a, "mixed", "a", "link", .out);
+    defer graph_mod.GraphIndex.freeEdges(a, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqualStrings("b", edges[0].target);
+}
+
+test "db graph repair backfills field contributions beside existing direct state" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("graph-field-existing-direct");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"ref\":\"b\"}" }} });
+    try db.addEnrichment(.{ .name = "kg", .kind = .asset, .field = "kg", .content_type = "application/json" });
+    try db.addIndex(.{ .name = "mixed", .kind = .graph, .config_json = "{\"edge_types\":[{\"name\":\"link\",\"field\":\"ref\"}],\"sources\":[{\"artifact\":\"kg\",\"format\":\"extraction_graph\"}]}" });
+    try db.batch(.{ .graph_writes = &.{.{ .index_name = "mixed", .source = "a", .target = "manual", .edge_type = "link" }}, .sync_level = .full_index });
+    var repair = try db.repairArtifactIssuesWithRequestOptions(a, .{ .target = .index, .artifact_kind = .graph, .index_name = "mixed", .limit = 1, .force = true }, repair_completion_test_options);
+    defer repair.deinit(a);
+    try std.testing.expectEqual(@as(u64, 0), repair.failed);
+    const graph = db.core.index_manager.graphIndex("mixed").?;
+    {
+        var page = try graph.index.getCypherEdgesByTypesPageAt(a, "a", &.{"link"}, .out, null, .{ .max_edges = 16, .max_scanned_rows = 128, .max_owned_bytes = 4096 }, currentTimeNs());
+        defer page.deinit(a);
+        try std.testing.expectEqual(@as(usize, 2), page.edges.len);
+    }
+    // Full row replacement withdraws document-owned direct assertions too.
+    try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"ref\":null}" }}, .sync_level = .full_index });
+    var page = try graph.index.getCypherEdgesByTypesPageAt(a, "a", &.{"link"}, .out, null, .{ .max_edges = 16, .max_scanned_rows = 128, .max_owned_bytes = 4096 }, currentTimeNs());
+    defer page.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), page.edges.len);
 }

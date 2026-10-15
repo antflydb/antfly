@@ -46,6 +46,21 @@ def main():
             ):
                 time.sleep(0.25)
                 continue
+            # Producer publication may invalidate a newly captured read cut.
+            # Restart only this complete, stateless read; never a write/page.
+            if (
+                code == 409
+                and attempt < 39
+                and status is None
+                and path == "/sql"
+                and body is not None
+                and "session_id" not in body
+                and body.get("statement", "").lstrip().upper().startswith("SELECT ")
+                and json.loads(content).get("code") == "40001"
+                and json.loads(content).get("retryable") is True
+            ):
+                time.sleep(0.1)
+                continue
             break
         assert (200 <= code < 300) if status is None else code == status, (
             path,

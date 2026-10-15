@@ -26608,8 +26608,10 @@ pub const IndexManager = struct {
                 if (edge.generation != state.entry.config.coverage_generation) return .@"continue";
                 try migrateLegacyDirectGraphContribution(alloc, state.primary, state.entry, parsed.doc_key, key, value);
                 var snapshots = std.ArrayListUnmanaged(graph_mod.ContributionSnapshot).empty;
-                try appendGraphContributionSnapshot(
+                var field_cache: GraphFieldSnapshotCache = .{};
+                try state.manager.appendGraphContributionSnapshot(
                     alloc,
+                    &field_cache,
                     state.primary,
                     state.entry,
                     parsed.source_node orelse parsed.doc_key,
@@ -26746,8 +26748,9 @@ pub const IndexManager = struct {
             defer arena_state.deinit();
             const arena = arena_state.allocator();
             var snapshots = std.ArrayListUnmanaged(graph_mod.ContributionSnapshot).empty;
+            var field_cache: GraphFieldSnapshotCache = .{};
             for (batch_writes.items) |write| {
-                try appendGraphContributionSnapshot(arena, primary, entry, write.source, write.edge_type, write.target, write.owner, write.edge_id, write.owner_document, &snapshots);
+                try self.appendGraphContributionSnapshot(arena, &field_cache, primary, entry, write.source, write.edge_type, write.target, write.owner, write.edge_id, write.owner_document, &snapshots);
             }
             for (batch_deletes.items) |delete| {
                 if (snapshot_mode == .retire_owner) {
@@ -26761,15 +26764,65 @@ pub const IndexManager = struct {
                         .contributions = &.{},
                     });
                 } else {
-                    try appendGraphContributionSnapshot(arena, primary, entry, delete.source, delete.edge_type, delete.target, delete.owner, delete.edge_id, delete.owner_document, &snapshots);
+                    try self.appendGraphContributionSnapshot(arena, &field_cache, primary, entry, delete.source, delete.edge_type, delete.target, delete.owner, delete.edge_id, delete.owner_document, &snapshots);
                 }
             }
             try entry.index.replaceContributionSnapshots(snapshots.items);
         }
     }
 
+    const GraphFieldSnapshot = struct {
+        targets: std.StringHashMapUnmanaged(void) = .empty,
+        ttl_created_ns: u64 = 0,
+    };
+    const GraphFieldSnapshotCache = std.StringHashMapUnmanaged(GraphFieldSnapshot);
+
+    /// A field mapping is authoritative even before its first ordered row
+    /// mutation creates a direct-state manifest. Cache each row/field once per
+    /// apply window so high fan-out reconstruction stays linear.
+    fn graphFieldSnapshot(self: *IndexManager, alloc: Allocator, cache: *GraphFieldSnapshotCache, primary: *docstore_mod.DocStore, entry: *GraphIndex, source: []const u8, edge_type: []const u8) !*const GraphFieldSnapshot {
+        const cache_key = try std.json.Stringify.valueAlloc(alloc, .{ source, edge_type }, .{});
+        const result = try cache.getOrPut(alloc, cache_key);
+        if (result.found_existing) return result.value_ptr;
+        result.value_ptr.* = .{};
+        const field = for (entry.edge_type_configs) |edge| {
+            if (std.mem.eql(u8, edge.name, edge_type)) break edge.field_name;
+        } else null;
+        const field_name = field orelse return result.value_ptr;
+        var row_key = try internal_keys.documentKeyAlloc(alloc, source);
+        const raw = primary.get(alloc, row_key) catch |err| switch (err) {
+            error.NotFound => blk: {
+                row_key = try internal_keys.relationalRowKeyAlloc(alloc, source);
+                break :blk primary.get(alloc, row_key) catch |inner| if (inner == error.NotFound) return result.value_ptr else return inner;
+            },
+            else => return err,
+        };
+        const json = try self.materializeStoredValueAlloc(alloc, row_key, raw);
+        const root = try std.json.parseFromSliceLeaky(std.json.Value, alloc, json, .{});
+        if (root != .object) return result.value_ptr;
+        const value = root.object.get(field_name) orelse return result.value_ptr;
+        switch (value) {
+            .string => try result.value_ptr.targets.put(alloc, value.string, {}),
+            .array => for (value.array.items) |item| {
+                if (item != .string) return error.InvalidGraphEdges;
+                try result.value_ptr.targets.put(alloc, item.string, {});
+            },
+            .null => {},
+            else => return error.InvalidGraphEdges,
+        }
+        if (entry.ttl_duration_ns != 0 and result.value_ptr.targets.count() != 0) {
+            const timestamp_key = try internal_keys.ttlKeyAlloc(alloc, source);
+            const timestamp = primary.get(alloc, timestamp_key) catch |err| if (err == error.NotFound) return error.GraphEdgeTtlMigrationRequired else return err;
+            if (timestamp.len != 8) return error.GraphEdgeTtlMigrationRequired;
+            result.value_ptr.ttl_created_ns = std.mem.readInt(u64, timestamp[0..8], .little);
+        }
+        return result.value_ptr;
+    }
+
     fn appendGraphContributionSnapshot(
+        self: *IndexManager,
         alloc: Allocator,
+        field_cache: *GraphFieldSnapshotCache,
         primary: *docstore_mod.DocStore,
         entry: *GraphIndex,
         source: []const u8,
@@ -26820,6 +26873,16 @@ pub const IndexManager = struct {
                         .metadata_json = edge.metadata_json,
                     });
                 }
+            }
+        }
+        const has_field = for (contributors.items) |contribution| {
+            if (contribution.source_priority == std.math.maxInt(u64)) break true;
+        } else false;
+        if (!has_field and edge_id.len == 0 and owner_document.len == 0 and (owner.len == 0 or std.mem.eql(u8, owner, source))) {
+            const field = try self.graphFieldSnapshot(alloc, field_cache, primary, entry, source, edge_type);
+            if (field.targets.contains(target)) {
+                const field_state = try internal_keys.graphDirectStateKeyAlloc(alloc, source, entry.config.name);
+                try contributors.append(alloc, .{ .state_key = field_state, .source_priority = std.math.maxInt(u64), .weight = 1, .created_at = 0, .updated_at = 0, .ttl_created_ns = field.ttl_created_ns, .metadata_json = "" });
             }
         }
         try snapshots.append(alloc, .{

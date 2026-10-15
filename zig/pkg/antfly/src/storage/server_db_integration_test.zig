@@ -4469,6 +4469,7 @@ test "server Cypher ordered transaction resolution bypasses retrying producer vi
     });
     defer db.close();
     try db.addEnrichment(.{ .name = "kg", .kind = .asset, .field = "body", .content_type = "application/json" });
+    try db.addIndex(.{ .name = "links", .kind = .graph, .config_json = "{\"sources\":[{\"artifact\":\"kg\",\"format\":\"extraction_graph\"}]}" });
     const txn_id: transactions_mod.TxnId = @splat(0x71);
     const participant = try @import("antfly_local_sources").api_local_transaction_contract.participantIdForGroupScoped(alloc, "table:receipts", 7, null, null);
     defer alloc.free(participant);
@@ -4478,6 +4479,7 @@ test "server Cypher ordered transaction resolution bypasses retrying producer vi
     const runtime = db.enrichment_runtime.?;
     runtime.mutex.lockUncancelable(db.backend_runtime.io().?);
     runtime.retrying = true;
+    runtime.next_retry_at_ms = std.math.maxInt(u64);
     runtime.mutex.unlock(db.backend_runtime.io().?);
     const entry: OrderedApplyReceipt = .{ .term = 1, .index = 3 };
     try @import("server_transaction_dispatch.zig").applyReplicatedTransactionMutationAtRaftEntry(alloc, &db, "table:receipts", 7, .{
@@ -4486,5 +4488,5 @@ test "server Cypher ordered transaction resolution bypasses retrying producer vi
     }, entry);
     try std.testing.expectEqualDeep(entry, (try db.orderedApplyReceipt()).?);
     try std.testing.expectEqual(transactions_mod.TxnStatus.committed, try db.getTransactionStatus(txn_id));
-    try std.testing.expectError(error.EnrichmentRetryInProgress, db.waitForCurrentSyncLevel(.full_index));
+    try std.testing.expectError(error.EnrichmentRetryInProgress, db.runEnrichmentUntil(db.core.nextDerivedSequence()));
 }

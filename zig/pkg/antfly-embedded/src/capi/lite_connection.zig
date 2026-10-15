@@ -81,6 +81,7 @@ pub const PreparedPublication = struct {
     snapshot_root: *h.Handle,
     snapshot_database: *h.db_mod.DB,
     source_read: ?*SourceRead,
+    root_catalog_read: ?*SourceRead = null,
     relational_rows: bool,
     index_inputs_changed: bool = false,
 
@@ -170,6 +171,36 @@ pub const PreparedPublication = struct {
                 };
             } else self.index_inputs_changed = true;
         } else self.index_inputs_changed = true;
+    }
+
+    /// Index publication needs current catalog bytes, not a complete foreground
+    /// runtime reopen for every native mutation. The path lease pins these raw
+    /// observations through commit; primary producer publication still uses current().
+    fn requireCurrentCatalog(self: *@This()) !void {
+        const captured = self.source_read orelse return error.EnrichmentWaitCanceled;
+        var expected = try captured.openReadScope(alloc);
+        defer expected.close();
+        var live = try self.snapshot_database.core.store.runtime_store.beginRead();
+        defer live.abort();
+        var actual = try live.openReadScope(alloc);
+        defer actual.close();
+        const inventory = @import("../storage/db/artifact_inventory.zig");
+        for ([_][]const u8{
+            "\x00\x00__metadata__:schema_json",
+            @import("../storage/db/table_catalog.zig").key,
+            inventory.index_key,
+            inventory.enrichment_key,
+            inventory.resolver_key,
+            &keys.identity_namespace_key,
+        }) |key| try sameValue(&expected, &actual, key);
+        const root_capture = self.root_catalog_read orelse return error.EnrichmentWaitCanceled;
+        var root_expected = try root_capture.openReadScope(alloc);
+        defer root_expected.close();
+        var root_live = try self.snapshot_root.db.core.store.runtime_store.beginRead();
+        defer root_live.abort();
+        var root_actual = try root_live.openReadScope(alloc);
+        defer root_actual.close();
+        try sameValue(&root_expected, &root_actual, @import("tables.zig").catalog_key);
     }
 
     fn guardDocument(self: *@This(), database: *h.db_mod.DB, doc_key: []const u8) !void {
@@ -579,6 +610,10 @@ pub const Owner = struct {
     // Primary transactions and index publications join the fair writer queue.
     // Their DB/index locks belong to the detached runtime; foreground refresh
     // opens a separate runtime. Reclamation admission yields on contention.
+    fn enterReplacementWriter(ptr: *anyopaque) !void {
+        try enterMaintenanceWriter(ptr, .index);
+    }
+
     fn enterMaintenanceWriter(ptr: *anyopaque, scope: PublicationScope) !void {
         const root: *h.Handle = @ptrCast(@alignCast(ptr));
         const self = root.maintenance_owner.?;
@@ -594,6 +629,7 @@ pub const Owner = struct {
         if (self.stopping.load(.acquire)) return error.Canceled;
         self.publication_stats.attempts +|= 1;
         errdefer self.publication_stats.refused +|= 1;
+        if (scope != .reclamation and root.maintenance_publication == null) return error.Canceled;
         if (scope != .reclamation) if (root.maintenance_publication) |p| if (p.index_inputs_changed) return error.EnrichmentWaitCanceled;
         if (self.current) |current| if (needsOutcomeReconciliation(current)) return error.EnrichmentWaitCanceled;
         var lease = native.lockWriterPathWithIo(alloc, h.handleLockIo(), self.path) catch |err| switch (err) {
@@ -608,7 +644,6 @@ pub const Owner = struct {
         if (!std.meta.eql(probe.header, file.header)) {
             if (scope == .reclamation) return error.EnrichmentWaitCanceled;
             const publication = root.maintenance_publication orelse return error.EnrichmentWaitCanceled;
-            _ = try publication.current();
             // Rebase before opening a primary transaction as well as before
             // publishing immutable index bytes. Lease acquisition and replay
             // checkpoints must not require a quiet interval between capture
@@ -623,6 +658,13 @@ pub const Owner = struct {
             }
             try root.owned_lite_backend.?.native_docstore.?.refreshIndexPublicationCheckpoint(latest.header);
             self.publication_stats.rebased +|= 1;
+        }
+        if (scope != .reclamation) {
+            const publication = root.maintenance_publication orelse return error.Canceled;
+            publication.requireCurrentCatalog() catch |err| {
+                publication.index_inputs_changed = true;
+                return err;
+            };
         }
         root.maintenance_writer_lease = lease;
         root.maintenance_writer_references = 1;
@@ -778,7 +820,9 @@ pub const Owner = struct {
         defer alloc.free(index_prefix);
         var source_read = if (run_database) try database.core.store.runtime_store.beginRead() else null;
         defer if (source_read) |*read| read.abort();
-        var publication: PreparedPublication = .{ .owner = self, .name = publication_name, .identity = database.core.identity_namespace, .incarnation = database.root_incarnation, .catalog = if (run_database) try catalogStamp(database) else @splat(0), .index_prefix = index_prefix, .snapshot_root = root, .snapshot_database = database, .source_read = if (source_read) |*read| read else null, .relational_rows = if (database.enrichment_runtime) |runtime| runtime.config.relational_base_rows else false };
+        var root_catalog_read = if (run_database) try root.db.core.store.runtime_store.beginRead() else null;
+        defer if (root_catalog_read) |*read| read.abort();
+        var publication: PreparedPublication = .{ .owner = self, .name = publication_name, .identity = database.core.identity_namespace, .incarnation = database.root_incarnation, .catalog = if (run_database) try catalogStamp(database) else @splat(0), .index_prefix = index_prefix, .snapshot_root = root, .snapshot_database = database, .source_read = if (source_read) |*read| read else null, .root_catalog_read = if (root_catalog_read) |*read| read else null, .relational_rows = if (database.enrichment_runtime) |runtime| runtime.config.relational_base_rows else false };
         root.maintenance_references += 1;
         root.maintenance_owner = self;
         root.maintenance_publication = &publication;
@@ -797,7 +841,9 @@ pub const Owner = struct {
 
         if (comptime h.builtin.is_test) if (self.test_after_capture) |hook| hook.notify(hook.ptr, root);
         const cancellation = h.db_mod.types.CancellationToken.fromAtomic(&self.stopping);
+        if (run_database) database.graph_replacement_admission = .{ .ptr = root, .enter = enterReplacementWriter, .leave = leaveMaintenanceWriter };
         var pending = if (run_database) database.runBackgroundMaintenanceWithCancellation(cancellation) catch true else false;
+        if (run_database) database.graph_replacement_admission = null;
         if (run_database) if (database.enrichment_runtime) |runtime| {
             runtime.dense_result_cache = null;
             runtime.generated_publication = null;
@@ -806,6 +852,8 @@ pub const Owner = struct {
         root.maintenance_publication = null;
         if (source_read) |*read| read.abort();
         source_read = null;
+        if (root_catalog_read) |*read| read.abort();
+        root_catalog_read = null;
         if (independent and root.db_live) {
             // End the input fences before reclamation. Keeping them in an
             // idle runtime would needlessly prevent in-place page service.

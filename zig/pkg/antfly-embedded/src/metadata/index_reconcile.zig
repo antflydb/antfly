@@ -324,19 +324,24 @@ pub fn ensureGraphReplayIndexes(alloc: std.mem.Allocator, db: *db_mod.DB, indexe
         for (items) |item| {
             if (try parseIndexKind(item) != .graph) continue;
             const name = try indexDefinitionName(item);
-            if (findIndexConfig(current, name) != null) continue;
-            try ensureIndexDefinition(alloc, db, current, &summary, name, .graph, indexDefinitionConfigValue(item), true);
+            if (findIndexConfig(current, name) == null)
+                try ensureIndexDefinition(alloc, db, current, &summary, name, .graph, indexDefinitionConfigValue(item), true);
+            if (db.core.index_manager.graphIndex(name) == null) return error.StorageBusy;
         }
     } else {
         var it = object.iterator();
         while (it.next()) |entry| {
             if (indexes_api.isReservedIndexMetadataEntry(entry.key_ptr.*)) continue;
-            if (try parseIndexKind(entry.value_ptr.*) != .graph or findIndexConfig(current, entry.key_ptr.*) != null) continue;
-            try ensureIndexDefinition(alloc, db, current, &summary, entry.key_ptr.*, .graph, entry.value_ptr.*, false);
+            if (try parseIndexKind(entry.value_ptr.*) != .graph) continue;
+            if (findIndexConfig(current, entry.key_ptr.*) == null)
+                try ensureIndexDefinition(alloc, db, current, &summary, entry.key_ptr.*, .graph, entry.value_ptr.*, false);
+            if (db.core.index_manager.graphIndex(entry.key_ptr.*) == null) return error.StorageBusy;
         }
     }
     if (summary.added != 0) try db.syncIndexes(true);
-    if (summary.pending != 0) return error.StorageBusy;
+    // Apply needs the write plan, not a queryable rebuilt projection. Waiting
+    // for backfill here can deadlock the producer publications behind this entry.
+
 }
 
 pub fn ensureIndexDefinition(

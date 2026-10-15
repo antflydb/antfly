@@ -6052,6 +6052,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const graph_runtime_filters = [_][]const u8{
         "graph endpoint cleanup bulk retirement mask releases ownership on decoding failure",
         "db graph endpoint cleanup",
+        "db graph repair backfills field contributions",
         "db graph owner revival",
         "db graph qualified cleanup",
         "db graph fact",

@@ -136,7 +136,7 @@ pub const Read = struct {
                 if (owner == db) break i;
             } else return error.CatalogGenerationChanged;
             if (index >= fences.len or fences[index].source != db) return error.CypherSnapshotRequired;
-            table.* = .{ .name = label.table, .db = db, .capture_fence = &fences[index] };
+            table.* = .{ .name = label.table, .storage_name = try @import("tables.zig").storageName(self.handle, label.table), .db = db, .capture_fence = &fences[index] };
         }
         self.adapter = .{ .tables = self.tables, .ttl_now_ns = @import("antfly_platform").time.realtimeNs(), .authority = .{ .ptr = self, .bind = Read.bind, .checkpoint = Read.checkpoint, .project = Read.project, .project_relationship = Read.projectRelationship } };
         self.snapshot = try cypher.snapshot.Materialized.create(backing, self.adapter.backend(), self.graph, limits);
