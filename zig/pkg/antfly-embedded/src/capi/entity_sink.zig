@@ -1752,7 +1752,10 @@ test "capi resolver reader version is checked before opening catalog" {
     defer a.free(path);
     const handle = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .native, .externally_locked = true }, true, null, null);
     const id = try api.publishHandle(handle);
-    try handle.db.core.store.put(@import("../storage/db/catalog/resolver_catalog.zig").minimum_reader_key, "3");
+    const catalog = @import("../storage/db/catalog/resolver_catalog.zig");
+    var version_buffer: [20]u8 = undefined;
+    const unsupported_version = try std.fmt.bufPrint(&version_buffer, "{d}", .{catalog.supported_reader_version + 1});
+    try handle.db.core.store.put(catalog.minimum_reader_key, unsupported_version);
     api.antfly_db_close(id);
     try std.testing.expectError(error.UnsupportedDatabaseReaderVersion, api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .native, .externally_locked = true }, false, null, null));
 }
