@@ -787,7 +787,11 @@ const FanoutRows = struct {
                                 else => {},
                             }
                             const value_start = scanner.cursor;
-                            if (span.view.validated_ranges == null or !try span.view.validated_ranges.?.skip(scanner, false)) try scanner.skipValue();
+                            const reused = if (span.view.validated_ranges) |ranges| try ranges.skip(scanner, false) else false;
+                            if (!reused) {
+                                try scanner.skipValue();
+                                if (scanner.cursor - value_start >= 256) if (span.view.validated_ranges) |ranges| ranges.refill(span.node.raw[value_start..scanner.cursor]);
+                            }
                             if (std.mem.eql(u8, key, self.path[0])) selected = span.node.raw[value_start..scanner.cursor];
                         }
                         _ = try scanner.next();

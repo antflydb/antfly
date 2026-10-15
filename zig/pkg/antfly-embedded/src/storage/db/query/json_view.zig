@@ -29,7 +29,7 @@ pub const View = struct {
     materialized_values: usize = 0,
     parse_numbers: bool = false,
     root_sources: []const RootSource = &.{},
-    validated_ranges: ?*const ValidatedRanges = null,
+    validated_ranges: ?*const ValidatedRanges.Ref = null,
     pub const ValidatedRanges = @import("validated_ranges.zig").ValidatedRanges;
     pub const RootSource = struct {
         name: []const u8,
@@ -352,7 +352,7 @@ pub const View = struct {
     pub fn prepareProjectionWithOptions(view: *View, selector: *const Selector, policy: DuplicatePolicy, root_mode: RootMode, options: PreparationOptions) !void {
         const raw = view.root.raw;
         view.validated_ranges = null;
-        if (options.ranges) |ranges| ranges.begin(raw.len);
+        if (options.ranges) |ranges| ranges.reserveFor(raw.len);
         errdefer {
             view.root.raw = raw;
             view.invalidatePreparation();
@@ -362,8 +362,7 @@ pub const View = struct {
         try view.prepareProjectionValue(selector, policy, root_mode, options, &scanner, raw, @import("antfly_platform").allocator.reclaimingScratch(view.alloc));
         if (try scanner.next() != .end_of_document) return error.SyntaxError;
         if (options.ranges) |ranges| {
-            ranges.seal(policy == .all);
-            view.validated_ranges = ranges;
+            view.validated_ranges = try ranges.publish(raw, policy == .all);
         }
     }
 
@@ -536,8 +535,11 @@ pub const View = struct {
                 if ((frame.object and frame.key and token == .object_end) or (!frame.object and token == .array_end)) {
                     _ = try scanner.next();
                     if (options.ranges) |ranges| {
-                        if (!frame.object and frame.node == null and frame.selected != null and frame.selected.?.fanout != null)
+                        if (policy == .all and !frame.object and frame.node == null and frame.selected != null and frame.selected.?.fanout != null)
                             try ranges.remember(raw[frame.container_start..scanner.cursor]);
+                    }
+                    if (view.validated_ranges) |ranges| {
+                        if (!frame.object and frame.selected != null and frame.selected.?.fanout != null) ranges.refill(raw[frame.container_start..scanner.cursor]);
                     }
                     try frame.finishContainer(alloc);
                     try keys.finishFrame(depth - 1);
@@ -596,10 +598,12 @@ pub const View = struct {
             } else {
                 if (token == .object_end or token == .array_end or token == .end_of_document) return error.SyntaxError;
                 const start = scanner.cursor;
-                if (view.validated_ranges == null or !try view.validated_ranges.?.skip(scanner, false)) try scanner.skipValue();
+                const reused = if (view.validated_ranges) |ranges| try ranges.skip(scanner, false) else false;
+                if (!reused) try scanner.skipValue();
                 if (options.ranges) |ranges| {
                     if (scanner.cursor - start >= 256 and depth != 0 and frames.items[depth - 1].state.inside_fanout) try ranges.remember(raw[start..scanner.cursor]);
                 }
+                if (!reused and scanner.cursor - start >= 256) if (view.validated_ranges) |ranges| ranges.refill(raw[start..scanner.cursor]);
                 if (depth != 0) try frames.items[depth - 1].state.finishValue(alloc, raw, scanner.cursor);
             }
         }
@@ -1188,14 +1192,13 @@ test "public graph metric borrowed wire validated ranges publish only after comp
     const raw = "{\"items\":[{\"x\":[{\"m\":1,\"ignored\":{\"d\":0,\"d\":1}}]}]}";
     var view = View.init(alloc, raw);
     try view.prepareProjectionWithOptions(selector, .visited, .object_only, .{ .defer_fanout = true, .ranges = &ranges });
-    try std.testing.expect(ranges.complete);
-    try std.testing.expect(!ranges.all_keys);
+    // The visited pass records no structural extents for this scalar-only fixture.
+    try std.testing.expect(view.validated_ranges == null);
     // A previous visited pass cannot authorize skipping duplicate checks in
     // a stronger pass, and failed validation cannot leave a usable certificate.
     try std.testing.expectError(error.DuplicateField, view.prepareProjectionWithOptions(selector, .all, .object_only, .{ .defer_fanout = true, .ranges = &ranges }));
-    try std.testing.expect(!ranges.complete);
     try std.testing.expect(view.validated_ranges == null);
     view = View.init(alloc, "{\"items\":[{\"x\":[{\"m\":1}]}]}");
     try view.prepareProjectionWithOptions(selector, .all, .object_only, .{ .defer_fanout = true, .ranges = &ranges });
-    try std.testing.expect(ranges.complete and ranges.all_keys);
+    try std.testing.expect(view.validated_ranges.?.proof.all_keys);
 }

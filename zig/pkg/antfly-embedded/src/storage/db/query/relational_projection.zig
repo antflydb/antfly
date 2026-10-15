@@ -116,9 +116,6 @@ pub const Plan = struct {
     }
     pub fn projectSourcesPolicy(self: Plan, alloc: std.mem.Allocator, scratch: std.mem.Allocator, source: Sources, exact: bool) ![]u8 {
         const Projection = @import("projection_output.zig").Output;
-        var projection_owner = @import("projection_output.zig").Owner.init(scratch);
-        defer projection_owner.deinit();
-        var result: Projection.Object = .empty;
         if (self.paths.len == 0) {
             var output = std.Io.Writer.Allocating.init(scratch);
             defer output.deinit();
@@ -137,22 +134,48 @@ pub const Plan = struct {
             }
             output.writer.writeByte('}') catch return error.OutOfMemory;
             return alloc.dupe(u8, output.written());
-        } else {
-            if (self.selectors) |selectors| for (source.keys(), source.values()) |name, value| {
-                if (value == .json) if (selectors.fields.get(name)) |selected| {
-                    if (selected.fields.count() != 0) try value.json.prepareProjectionWithOptions(selected, .visited, .any_container, .{ .defer_fanout = true });
-                };
-            };
-            for (self.paths, self.path_selectors) |parts, selected| {
-                if (parts.len == 0) continue;
-                const value = source.getPtr(parts[0]) orelse continue;
-                switch (value.*) {
-                    .json => |view| try Projection.includePlanned(&projection_owner, &result, parts[0], .{ .span = .{ .view = view, .node = &view.root } }, parts[1..], if (selected) |s| s.fields.get(parts[0]) else null),
-                    .logical => |*logical| try Projection.includePlanned(&projection_owner, &result, parts[0], .{ .logical = logical }, parts[1..], null),
+        }
+        // Navigation belongs to this response, never to a retained page view.
+        // Logical-only projections keep their existing allocator fast path.
+        var navigation = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(scratch));
+        defer navigation.deinit();
+        var ranges = JsonView.ValidatedRanges.init(scratch);
+        defer ranges.deinit();
+        var row_alloc = scratch;
+        var prepared: []?*JsonView = &.{};
+        if (self.selectors) |selectors| for (source.keys(), source.values(), 0..) |name, value, i| {
+            if (value == .json) if (selectors.fields.get(name)) |selected| {
+                if (selected.fields.count() != 0) {
+                    if (prepared.len == 0) {
+                        row_alloc = navigation.allocator();
+                        prepared = try row_alloc.alloc(?*JsonView, source.count());
+                        @memset(prepared, null);
+                    }
+                    const view = try row_alloc.create(JsonView);
+                    view.* = .init(row_alloc, value.json.root.raw);
+                    view.parse_numbers = value.json.parse_numbers;
+                    view.root_sources = value.json.root_sources;
+                    try view.prepareProjectionWithOptions(selected, .visited, .any_container, .{ .defer_fanout = true, .ranges = &ranges });
+                    prepared[i] = view;
                 }
+            };
+        };
+        var projection_owner = @import("projection_output.zig").Owner.init(row_alloc);
+        defer projection_owner.deinit();
+        var result: Projection.Object = .empty;
+        for (self.paths, self.path_selectors) |parts, selected| {
+            if (parts.len == 0) continue;
+            const i = source.getIndex(parts[0]) orelse continue;
+            const value = &source.values()[i];
+            switch (value.*) {
+                .json => |original| {
+                    const view = if (prepared.len != 0) prepared[i] orelse original else original;
+                    try Projection.includePlanned(&projection_owner, &result, parts[0], .{ .span = .{ .view = view, .node = &view.root } }, parts[1..], if (selected) |s| s.fields.get(parts[0]) else null);
+                },
+                .logical => |*logical| try Projection.includePlanned(&projection_owner, &result, parts[0], .{ .logical = logical }, parts[1..], null),
             }
         }
-        return (Projection{ .object = result }).serializeWithPolicy(scratch, alloc, exact);
+        return (Projection{ .object = result }).serializeWithPolicy(row_alloc, alloc, exact);
     }
 };
 
@@ -273,8 +296,9 @@ test "public graph metric borrowed wire native JSON copy on write keeps output n
         const bytes = try plan.projectSources(a, row_arena.allocator(), sources);
         defer a.free(bytes);
         try std.testing.expectEqualStrings("{\"payload\":{\"a\":{\"x\":1,\"y\":2},\"other\":3}}", bytes);
-        // The caller's page-owned view still contains only the selected field.
-        try std.testing.expectEqual(@as(usize, 1), view.root.children.?.len);
+        // Temporary projection navigation never enters the page-owned view.
+        try std.testing.expect(view.root.children == null);
+        try std.testing.expect(view.validated_ranges == null);
     }
     var values: std.ArrayListUnmanaged(std.json.Value) = .empty;
     try view.collect(&.{ "a", "y" }, false, &values);
@@ -313,9 +337,9 @@ test "public graph metric borrowed wire streaming native fanout leaves page navi
             defer a.free(bytes);
             try std.testing.expectEqualStrings("{\"payload\":", bytes[0..11]);
             try std.testing.expectEqualStrings(input.written(), bytes[11 .. bytes.len - 1]);
-            const items = (try view.field(&view.root, "items")).?;
-            try std.testing.expect(items.children == null);
-            try std.testing.expectEqual(@as(usize, 0), items.array_index.count());
+            try std.testing.expect(view.root.children == null);
+            try std.testing.expect(view.validated_ranges == null);
+            try std.testing.expectEqual(@as(usize, 0), owner.queryCapacity());
         }
     }
     try std.testing.expectEqual(@as(usize, 0), budget.live);
@@ -327,4 +351,46 @@ test "public graph metric borrowed wire streaming native fanout leaves page navi
     var source: Plan.Sources = .empty;
     try source.put(owner.allocator(), "payload", .{ .json = &view });
     try std.testing.expectError(error.DuplicateField, plan.projectSources(a, owner.allocator(), source));
+}
+
+test "public graph metric borrowed wire native columns share bounded cache without retaining response state" {
+    const a = std.testing.allocator;
+    const columns = [_]schema.RelationalColumn{
+        .{ .name = "first", .path = "first", .column_type = .json, .is_json = true, .json_kind = .any },
+        .{ .name = "second", .path = "second", .column_type = .json, .is_json = true, .json_kind = .any },
+    };
+    const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &columns };
+    var layout = try codec.PhysicalLayout.init(a, table);
+    defer layout.deinit();
+    var plan = try Plan.init(a, table, &layout, &.{ "first.items.x.m", "second.items.x.m" });
+    defer plan.deinit();
+    var input = std.Io.Writer.Allocating.init(a);
+    defer input.deinit();
+    try input.writer.writeAll("{\"items\":[{\"x\":{\"m\":1e2,\"skip\":\"");
+    try input.writer.splatByteAll('z', 16384);
+    try input.writer.writeAll("\"}}],\"ignored\":{\"a\":1,\"a\":2}}");
+    var owner = std.heap.ArenaAllocator.init(a);
+    defer owner.deinit();
+    var first = JsonView.init(owner.allocator(), input.written());
+    var second = JsonView.init(owner.allocator(), "{\"items\":[{\"x\":{\"m\":2e2}}]}");
+    var sources: Plan.Sources = .empty;
+    defer sources.deinit(a);
+    try sources.put(a, "first", .{ .json = &first });
+    try sources.put(a, "second", .{ .json = &second });
+    const Check = struct {
+        fn run(scratch: std.mem.Allocator, output: std.mem.Allocator, p: Plan, src: Plan.Sources) !void {
+            const result = try p.projectSourcesPolicy(output, scratch, src, true);
+            defer output.free(result);
+            try std.testing.expectEqualStrings("{\"first\":{\"items\":[{\"x\":{\"m\":1e2}}]},\"second\":{\"items\":[{\"x\":{\"m\":2e2}}]}}", result);
+        }
+    };
+    for (0..100) |_| try Check.run(a, a, plan, sources);
+    try std.testing.checkAllAllocationFailures(a, Check.run, .{ a, plan, sources });
+    var quota: @import("../../lite/test_allocator.zig").BudgetAllocator = .{ .backing = a, .limit = 1024 };
+    try std.testing.expectError(error.OutOfMemory, Check.run(quota.allocator(), a, plan, sources));
+    try std.testing.expectEqual(@as(usize, 0), quota.live);
+    try std.testing.expect(first.root.children == null);
+    try std.testing.expect(second.root.children == null);
+    try std.testing.expect(first.validated_ranges == null and second.validated_ranges == null);
+    try std.testing.expectEqual(@as(usize, 0), owner.queryCapacity());
 }
