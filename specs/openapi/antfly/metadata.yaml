@@ -2326,15 +2326,34 @@ components:
           type: boolean
           enum: [true]
           description: Retrying the complete query against fresh topology may succeed.
+    DocumentArtifactPublicationFailedError:
+      type: object
+      additionalProperties: false
+      description: The requested source artifact failed publication and requires inspection and reprocessing.
+      required: [code, error, message, retryable]
+      properties:
+        code:
+          type: string
+          enum: [document_artifact_publication_failed]
+        error:
+          type: string
+          enum: [document_artifact_publication_failed]
+        message:
+          type: string
+        retryable:
+          type: boolean
+          enum: [false]
     QueryConflictError:
       oneOf:
         - $ref: '#/components/schemas/HierarchyCursorStaleError'
         - $ref: '#/components/schemas/TopologyChangedError'
+        - $ref: '#/components/schemas/DocumentArtifactPublicationFailedError'
       discriminator:
         propertyName: error
         mapping:
           hierarchy_cursor_stale: '#/components/schemas/HierarchyCursorStaleError'
           topology_changed: '#/components/schemas/TopologyChangedError'
+          document_artifact_publication_failed: '#/components/schemas/DocumentArtifactPublicationFailedError'
     UnsupportedHierarchyGroupingError:
       type: object
       additionalProperties: false
@@ -3577,6 +3596,7 @@ components:
             $ref: "#/components/schemas/TableRepairIssue"
     RepairIssueListRequest:
       type: object
+      additionalProperties: false
       description: Bounded request to list table repair issues.
       properties:
         target:
@@ -3600,6 +3620,7 @@ components:
           description: Maximum repair records to return.
     RepairRunRequest:
       type: object
+      additionalProperties: false
       description: Bounded request to run a table repair pass.
       properties:
         target:
@@ -11950,7 +11971,7 @@ components:
           schema:
             $ref: "#/components/schemas/HierarchyCursorStaleError"
     QueryConflict:
-      description: The query's pinned hierarchy or table topology changed while it was running
+      description: The query's pinned hierarchy or table topology changed, or a requested source artifact failed publication
       content:
         application/json:
           schema:
@@ -17298,6 +17319,8 @@ paths:
                 $ref: "#/components/schemas/QueryResponses"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/QueryConflict"
         "404":
           $ref: "#/components/responses/NotFound"
         "500":

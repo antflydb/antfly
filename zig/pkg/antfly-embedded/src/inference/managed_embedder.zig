@@ -635,12 +635,17 @@ pub const ManagedEmbeddingEntry = struct {
         return null;
     }
 
-    fn requestOverlay(self: *const ManagedEmbeddingEntry) ManagedEmbeddingEntry {
+    fn requestOverlay(self: *const ManagedEmbeddingEntry, alloc: std.mem.Allocator) ManagedEmbeddingEntry {
         var overlay = self.*;
         // A request overlay may replace cancellation and credential caches,
         // but it must borrow the configured entry's synchronization owner.
+        // Its authorization cache belongs to the request allocator and must
+        // be deinitialized before that allocator's lifetime ends.
         overlay.shared_remote_capability_cache = self.capabilityCache();
         overlay.remote_capability_cache = null;
+        overlay.alloc = alloc;
+        overlay.owns_bedrock_credentials = false;
+        overlay.auth_header_cache = .{};
         return overlay;
     }
 
@@ -720,7 +725,7 @@ test "managed embedding request overlays borrow capability cache synchronization
     };
     defer entry.remote_capability_cache.?.deinit();
 
-    const overlay = entry.requestOverlay();
+    const overlay = entry.requestOverlay(std.testing.allocator);
     try std.testing.expect(overlay.remote_capability_cache == null);
     try std.testing.expect(overlay.shared_remote_capability_cache.? == &entry.remote_capability_cache.?);
 }
@@ -1370,9 +1375,7 @@ pub const ManagedEmbedder = struct {
         cancellation: CancellationToken,
     ) ![]f32 {
         const configured_entry = self.findQueryEntry(index_name) orelse return error.EmbeddingIndexNotFound;
-        var request_entry = configured_entry.requestOverlay();
-        request_entry.owns_bedrock_credentials = false;
-        request_entry.auth_header_cache = .{};
+        var request_entry = configured_entry.requestOverlay(alloc);
         defer request_entry.auth_header_cache.deinit(alloc);
         request_entry.cancellation = cancellation;
         return try embedWithEntryForTask(alloc, &request_entry, text, request_entry.dimensions, .retrieval_query);
@@ -1448,9 +1451,7 @@ pub const ManagedEmbedder = struct {
         cancellation: CancellationToken,
     ) ![]f32 {
         const configured_entry = self.findQueryEntry(index_name) orelse return error.EmbeddingIndexNotFound;
-        var request_entry = configured_entry.requestOverlay();
-        request_entry.owns_bedrock_credentials = false;
-        request_entry.auth_header_cache = .{};
+        var request_entry = configured_entry.requestOverlay(alloc);
         defer request_entry.auth_header_cache.deinit(alloc);
         request_entry.cancellation = cancellation;
         const rendered = try renderQueryTemplateWithEntry(alloc, embedding_template, text, &request_entry);
@@ -1587,7 +1588,8 @@ pub const ManagedEmbedder = struct {
         const configured = self.findArtifactEntry(embedding_name) orelse return error.EmbeddingIndexNotFound;
         if (configured.sparse) return error.UnsupportedEmbeddingProvider;
         var cancellation = CombinedCancellation.init(configured.cancellation, context.cancellation);
-        var entry = configured.*;
+        var entry = configured.requestOverlay(alloc);
+        defer entry.auth_header_cache.deinit(alloc);
         applyRequestContext(&entry, context, &cancellation);
         return try embedWithEntry(alloc, &entry, text, dims);
     }
@@ -1617,7 +1619,8 @@ pub const ManagedEmbedder = struct {
         const configured = self.findArtifactEntry(embedding_name) orelse return error.EmbeddingIndexNotFound;
         if (configured.sparse) return error.UnsupportedEmbeddingProvider;
         var cancellation = CombinedCancellation.init(configured.cancellation, context.cancellation);
-        var entry = configured.*;
+        var entry = configured.requestOverlay(alloc);
+        defer entry.auth_header_cache.deinit(alloc);
         applyRequestContext(&entry, context, &cancellation);
         return try embedBatchWithEntry(alloc, &entry, texts, dims);
     }
@@ -1671,9 +1674,7 @@ pub const ManagedEmbedder = struct {
     ) ![]const []const f32 {
         const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
         const configured = self.findArtifactEntry(embedding_name) orelse return error.EmbeddingIndexNotFound;
-        var local_entry = configured.requestOverlay();
-        local_entry.alloc = alloc;
-        local_entry.auth_header_cache = .{};
+        var local_entry = configured.requestOverlay(alloc);
         defer local_entry.auth_header_cache.deinit(alloc);
         var cancellation = CombinedCancellation.init(configured.cancellation, if (context) |value| value.cancellation else null);
         if (context) |value| {
@@ -1759,9 +1760,7 @@ pub const ManagedEmbedder = struct {
     ) ![]const []const f32 {
         const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
         const configured = self.findArtifactEntry(embedding_name) orelse return error.EmbeddingIndexNotFound;
-        var local_entry = configured.requestOverlay();
-        local_entry.alloc = alloc;
-        local_entry.auth_header_cache = .{};
+        var local_entry = configured.requestOverlay(alloc);
         defer local_entry.auth_header_cache.deinit(alloc);
         var cancellation = CombinedCancellation.init(configured.cancellation, if (context) |value| value.cancellation else null);
         if (context) |value| {
@@ -1800,7 +1799,8 @@ pub const ManagedEmbedder = struct {
         const configured = self.findArtifactEntry(embedding_name) orelse return error.EmbeddingIndexNotFound;
         if (configured.sparse) return error.UnsupportedEmbeddingProvider;
         var cancellation = CombinedCancellation.init(configured.cancellation, context.cancellation);
-        var entry = configured.*;
+        var entry = configured.requestOverlay(alloc);
+        defer entry.auth_header_cache.deinit(alloc);
         applyRequestContext(&entry, context, &cancellation);
         return try embedWithEntryParts(alloc, &entry, parts, dims);
     }
@@ -1922,9 +1922,7 @@ pub const ManagedEmbedder = struct {
         try context.check();
         const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
         const configured = self.findArtifactEntry(name) orelse return error.EmbeddingIndexNotFound;
-        var entry = configured.requestOverlay();
-        entry.alloc = alloc;
-        entry.auth_header_cache = .{};
+        var entry = configured.requestOverlay(alloc);
         defer entry.auth_header_cache.deinit(alloc);
         var cancellation = CombinedCancellation.init(configured.cancellation, context.cancellation);
         applyRequestContext(&entry, context, &cancellation);
@@ -1947,9 +1945,7 @@ pub const ManagedEmbedder = struct {
     fn resolveDensePartLease(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, context: ?RequestContext) !inference_work.CapabilityLease {
         const self: *ManagedEmbedder = @ptrCast(@alignCast(ptr));
         const configured = self.findArtifactEntry(name) orelse return error.EmbeddingIndexNotFound;
-        var entry = configured.requestOverlay();
-        entry.alloc = alloc;
-        entry.auth_header_cache = .{};
+        var entry = configured.requestOverlay(alloc);
         defer entry.auth_header_cache.deinit(alloc);
         var cancellation = CombinedCancellation.init(configured.cancellation, if (context) |value| value.cancellation else null);
         if (context) |value| {
@@ -2071,7 +2067,8 @@ pub const ManagedEmbedder = struct {
         const configured = self.findArtifactEntry(embedding_name) orelse return error.EmbeddingIndexNotFound;
         if (!configured.sparse) return error.UnsupportedEmbeddingProvider;
         var cancellation = CombinedCancellation.init(configured.cancellation, context.cancellation);
-        var entry = configured.*;
+        var entry = configured.requestOverlay(alloc);
+        defer entry.auth_header_cache.deinit(alloc);
         applyRequestContext(&entry, context, &cancellation);
         return try embedSparseWithEntry(alloc, &entry, text);
     }
@@ -2099,7 +2096,8 @@ pub const ManagedEmbedder = struct {
         const configured = self.findArtifactEntry(embedding_name) orelse return error.EmbeddingIndexNotFound;
         if (!configured.sparse) return error.UnsupportedEmbeddingProvider;
         var cancellation = CombinedCancellation.init(configured.cancellation, context.cancellation);
-        var entry = configured.*;
+        var entry = configured.requestOverlay(alloc);
+        defer entry.auth_header_cache.deinit(alloc);
         applyRequestContext(&entry, context, &cancellation);
         return try embedSparseBatchWithEntry(alloc, &entry, texts);
     }
@@ -5607,6 +5605,16 @@ fn embedWithEntryPartsForTask(
     dims: u32,
     task_type: EmbeddingTaskType,
 ) ![]f32 {
+    return withQueryEmbeddingRetry([]f32, alloc, entry, embedWithEntryPartsForTaskOnce, .{ parts, dims, task_type }, task_type);
+}
+
+fn embedWithEntryPartsForTaskOnce(
+    alloc: std.mem.Allocator,
+    entry: *const ManagedEmbeddingEntry,
+    parts: []const template_mod.ContentPart,
+    dims: u32,
+    task_type: EmbeddingTaskType,
+) ![]f32 {
     try embeddingRequestContext(entry, task_type).request.updateDetail(
         if (entry.provider == .antfly) .loading_model else .executing,
         0,
@@ -5727,7 +5735,10 @@ fn embedWithEntryPartsForTask(
 
     const flattened = try flattenContentPartsToText(alloc, parts);
     defer alloc.free(flattened);
-    return try embedWithEntryForTask(alloc, entry, flattened, dims, task_type);
+    // The enclosing parts invocation owns query retries. Calling the text
+    // retry wrapper here would multiply attempts for a text-only template.
+    const vectors = try embedBatchWithEntryForTaskOnce(alloc, entry, &.{flattened}, dims, task_type);
+    return singleDenseVectorAlloc(alloc, vectors);
 }
 
 fn modalityForContentType(content_type: []const u8) !inference_work.Modalities {
@@ -6532,12 +6543,14 @@ fn embedWithEntryForTask(
     task_type: EmbeddingTaskType,
 ) ![]f32 {
     const vectors = try embedBatchWithEntryForTask(alloc, entry, &.{text}, dims, task_type);
-    errdefer db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
-    if (vectors.len == 0) return error.EmptyEmbeddingResponse;
+    return singleDenseVectorAlloc(alloc, vectors);
+}
 
-    const vector = try alloc.dupe(f32, vectors[0]);
-    db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
-    return vector;
+fn singleDenseVectorAlloc(alloc: std.mem.Allocator, vectors: []const []const f32) ![]f32 {
+    defer db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
+    if (vectors.len == 0) return error.EmptyEmbeddingResponse;
+    if (vectors.len != 1) return error.InvalidEmbeddingResponse;
+    return alloc.dupe(f32, vectors[0]);
 }
 
 fn embedBatchWithEntry(
@@ -6621,19 +6634,21 @@ fn embedBatchWithEntryForTask(
     dims: u32,
     task_type: EmbeddingTaskType,
 ) ![]const []const f32 {
-    if (task_type != .retrieval_query) return embedBatchWithEntryForTaskOnce(alloc, entry, texts, dims, task_type);
+    return withQueryEmbeddingRetry([]const []const f32, alloc, entry, embedBatchWithEntryForTaskOnce, .{ texts, dims, task_type }, task_type);
+}
+
+fn withQueryEmbeddingRetry(comptime Result: type, alloc: std.mem.Allocator, entry: *const ManagedEmbeddingEntry, comptime invoke: anytype, args: anytype, task_type: EmbeddingTaskType) !Result {
+    if (task_type != .retrieval_query) return @call(.auto, invoke, .{ alloc, entry } ++ args);
     // A foreground query shares inference capacity with backfill. Keep one
     // deadline across retries, and yield the executor during bounded waits.
     var attempt: usize = 0;
     const deadline = embeddingOperationDeadline(entry);
-    var bounded = entry.requestOverlay();
+    var bounded = entry.requestOverlay(alloc);
     bounded.deadline_ns = deadline;
-    bounded.owns_bedrock_credentials = false;
-    bounded.auth_header_cache = .{};
     defer bounded.auth_header_cache.deinit(alloc);
     while (true) : (attempt += 1) {
         try ensureEntryDeadline(&bounded);
-        return embedBatchWithEntryForTaskOnce(alloc, &bounded, texts, dims, task_type) catch |err| {
+        return @call(.auto, invoke, .{ alloc, &bounded } ++ args) catch |err| {
             if (err != error.EmbedTransientFailure or attempt >= 3) return err;
             try waitQueryEmbeddingRetry(&bounded, deadline);
             continue;
@@ -8597,7 +8612,7 @@ test "managed embedder openrouter defaults and credential identity stay separate
     try std.testing.expectEqualStrings("team.router", custom.api_key.?.secret_ref);
     const identity = managedEmbeddingEndpointIdentity(custom);
     try std.testing.expectEqual(provider_limits.Provider.openrouter, identity.provider);
-    var openai_entry = custom.requestOverlay();
+    var openai_entry = custom.requestOverlay(alloc);
     openai_entry.provider = .openai;
     const router_key = try managed.queryCacheKey("custom", .principal, "alice", "same query");
     const openai = ManagedEmbedder{ .alloc = alloc, .entries = (&openai_entry)[0..1] };
@@ -8871,7 +8886,7 @@ pub fn testFileBackedApiKeyRotation() !void {
     const AuthCaptureApp = struct {
         alloc: std.mem.Allocator,
         mutex: std.atomic.Mutex = .unlocked,
-        headers: [2]?[]u8 = .{ null, null },
+        headers: [5]?[]u8 = @splat(null),
         count: usize = 0,
 
         pub fn deinit(self: *@This()) void {
@@ -9003,6 +9018,9 @@ pub fn testFileBackedApiKeyRotation() !void {
     const first = try managed.embedQuery(alloc, "semantic_idx", "alpha concept");
     defer alloc.free(first);
     try app.expectHeader(0, "Bearer first-key");
+    const documents = try managed.denseInterface().embedDenseBatch(alloc, "semantic_idx", &.{"document"}, 3);
+    defer db_embedder.freeDenseEmbeddingBatch(alloc, documents);
+    try app.expectHeader(1, "Bearer first-key");
 
     try std.Io.Dir.cwd().writeFile(io_impl.io(), .{
         .sub_path = store_path,
@@ -9022,7 +9040,88 @@ pub fn testFileBackedApiKeyRotation() !void {
 
     const second = try managed.embedQuery(alloc, "semantic_idx", "beta concept");
     defer alloc.free(second);
-    try app.expectHeader(1, "Bearer second-key-longer");
+    try app.expectHeader(2, "Bearer second-key-longer");
+
+    // Context callbacks must not copy the owner's cached header or mutex.
+    // A different request allocator also proves cache allocation and cleanup
+    // stay in the same ownership domain across credential rotation.
+    var request_arena = std.heap.ArenaAllocator.init(alloc);
+    defer request_arena.deinit();
+    const request_alloc = request_arena.allocator();
+    const context: RequestContext = .{ .io = io_impl.io(), .deadline_ns = null, .cancellation = null };
+    const batch = try managed.denseInterface().embedDenseBatchWithContext(request_alloc, "semantic_idx", &.{"updated document"}, 3, context);
+    defer db_embedder.freeDenseEmbeddingBatch(request_alloc, batch);
+    try app.expectHeader(3, "Bearer second-key-longer");
+    const single = try managed.denseInterface().embedDenseWithContext(request_alloc, "semantic_idx", "another document", 3, context);
+    defer request_alloc.free(single);
+    try app.expectHeader(4, "Bearer second-key-longer");
+    try std.testing.expectEqualStrings("Bearer first-key", managed.entries[0].auth_header_cache.header.?);
+}
+
+test "managed query templates retry media capacity and do not multiply text retries" {
+    const Harness = struct {
+        parts_calls: usize = 0,
+        text_calls: usize = 0,
+        fn texts(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) ![][]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.text_calls += 1;
+            return error.ResourceTemporarilyUnavailable;
+        }
+        fn sparse(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) ![]db_embedder.SparseEmbedding {
+            return error.TestUnexpectedResult;
+        }
+        fn legacyParts(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const template_mod.ContentPart) ![][]f32 {
+            return error.TestUnexpectedResult;
+        }
+        fn parts(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const template_mod.ContentPart, context: EmbeddingRequestContext) ![][]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try context.check();
+            self.parts_calls += 1;
+            if (self.parts_calls == 1) return error.ResourceTemporarilyUnavailable;
+            const out = try alloc.alloc([]f32, 1);
+            errdefer alloc.free(out);
+            out[0] = try alloc.dupe(f32, &.{ 0.125, 0.25, 0.5 });
+            return out;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var harness = Harness{};
+    var entries = [_]ManagedEmbeddingEntry{.{
+        .alloc = alloc,
+        .index_name = @constCast("semantic"),
+        .provider = .antfly,
+        .model = @constCast("model"),
+        .base_url = @constCast("antfly:embedded"),
+        .dimensions = 3,
+        .io = std.testing.io,
+        .deadline_ns = monotonicNowNs() + 8 * std.time.ns_per_s,
+        .declared_inputs = .{ .text = true, .image = true },
+        .antfly_provider = .{
+            .ptr = &harness,
+            .embed_dense_texts = Harness.texts,
+            .embed_sparse_texts = Harness.sparse,
+            .embed_dense_parts = Harness.legacyParts,
+            .embed_dense_parts_with_context = Harness.parts,
+        },
+    }};
+    const managed = ManagedEmbedder{ .alloc = alloc, .entries = &entries };
+    const vector = try managed.embedQueryWithTemplate(alloc, "semantic", "ignored", "Maxwell");
+    defer alloc.free(vector);
+    try std.testing.expectEqualSlices(f32, &.{ 0.125, 0.25, 0.5 }, vector);
+    try std.testing.expectEqual(@as(usize, 2), harness.parts_calls);
+    try std.testing.expectEqual(@as(usize, 0), harness.text_calls);
+    entries[0].declared_inputs = null;
+    entries[0].deadline_ns = monotonicNowNs() + 8 * std.time.ns_per_s;
+    try std.testing.expectError(error.EmbedTransientFailure, managed.embedQueryWithTemplate(alloc, "semantic", "ignored", "Maxwell"));
+    try std.testing.expectEqual(@as(usize, 4), harness.text_calls);
+}
+
+test "single query embeddings reject surplus vectors and release the response" {
+    const alloc = std.testing.allocator;
+    const vectors = try alloc.alloc([]const f32, 2);
+    vectors[0] = try alloc.dupe(f32, &.{ 1, 2, 3 });
+    vectors[1] = try alloc.dupe(f32, &.{ 4, 5, 6 });
+    try std.testing.expectError(error.InvalidEmbeddingResponse, singleDenseVectorAlloc(alloc, vectors));
 }
 
 test "managed embedder surfaces rate-limited openai compatible responses as retryable" {
@@ -9096,7 +9195,7 @@ test "managed embedder retries query model capacity and keeps cancellation and d
     defer alloc.free(vector);
     try std.testing.expectEqualSlices(f32, &.{ 0.125, 0.25, 0.5 }, vector);
     try std.testing.expectEqual(@as(usize, 2), app.calls.load(.acquire));
-    var entry = managed.entries[0].requestOverlay();
+    var entry = managed.entries[0].requestOverlay(alloc);
     entry.deadline_ns = monotonicNowNs();
     try std.testing.expectError(error.Timeout, waitQueryEmbeddingRetry(&entry, entry.deadline_ns.?));
     var canceled = std.atomic.Value(bool).init(true);

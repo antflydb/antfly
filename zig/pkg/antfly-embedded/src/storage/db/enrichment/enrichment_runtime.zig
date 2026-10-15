@@ -3671,32 +3671,33 @@ fn embedDenseBatchAttempt(dense_embedder: embedder_mod.DenseEmbedder, runtime: *
 }
 
 fn parallelDenseBatchWithCapacityFallback(alloc: Allocator, io: Io, provider: embedder_mod.DenseEmbedder, name: []const u8, texts: []const []const u8, dims: u32, context: inference_request_context.RequestContext, parallelism: usize) ![]const []const f32 {
-    return parallelDenseBatch(alloc, io, provider, name, texts, dims, context, parallelism) catch |err| switch (err) {
-        // All concurrent calls have drained. Providers with only one available
-        // execution slot must still progress instead of retrying an equally
-        // wide wave indefinitely. Retain the same cancellation and deadline.
-        error.EmbedTransientFailure, error.ResourceTemporarilyUnavailable => {
-            try context.check();
-            return provider.embedDenseBatchWithContext(alloc, name, texts, dims, context);
-        },
-        else => return err,
-    };
+    return parallelDenseBatch(alloc, io, provider, name, texts, dims, context, parallelism, true);
+}
+
+fn denseBatchCapacityFailure(err: anyerror) bool {
+    return err == error.EmbedTransientFailure or err == error.ResourceTemporarilyUnavailable;
 }
 
 fn noteDenseBatchFailure(failure: *?anyerror, err: anyerror) void {
     if (failure.*) |previous| {
         // A busy sibling must not hide cancellation, permanent rejection or
         // rate limiting and trigger an immediate extra provider invocation.
-        if (inferenceControlFailure(previous)) return;
-        if (!inferenceControlFailure(err) and
-            !(isRetryableEnrichmentError(previous) and !isRetryableEnrichmentError(err)) and
-            !(err == error.EmbedRateLimited and (previous == error.EmbedTransientFailure or previous == error.ResourceTemporarilyUnavailable))) return;
+        if (denseBatchFailurePriority(previous) >= denseBatchFailurePriority(err)) return;
     }
     failure.* = err;
 }
 
-fn parallelDenseBatch(alloc: Allocator, io: Io, provider: embedder_mod.DenseEmbedder, name: []const u8, texts: []const []const u8, dims: u32, context: inference_request_context.RequestContext, parallelism: usize) ![]const []const f32 {
+fn denseBatchFailurePriority(err: anyerror) u8 {
+    if (inferenceControlFailure(err)) return 4;
+    if (denseBatchCapacityFailure(err)) return 0;
+    if (!isRetryableEnrichmentError(err)) return 3;
+    if (err == error.EmbedRateLimited) return 2;
+    return 1;
+}
+
+fn parallelDenseBatch(alloc: Allocator, io: Io, provider: embedder_mod.DenseEmbedder, name: []const u8, texts: []const []const u8, dims: u32, context: inference_request_context.RequestContext, parallelism: usize, allow_capacity_fallback: bool) ![]const []const f32 {
     std.debug.assert(parallelism >= 1 and parallelism <= 4 and parallelism <= texts.len);
+    try context.check();
     const Task = struct {
         provider: embedder_mod.DenseEmbedder,
         alloc: Allocator,
@@ -3709,9 +3710,13 @@ fn parallelDenseBatch(alloc: Allocator, io: Io, provider: embedder_mod.DenseEmbe
         }
     };
     const vectors = try alloc.alloc([]const f32, texts.len);
-    var initialized: usize = 0;
+    var ready: [4]bool = @splat(false);
     errdefer {
-        for (vectors[0..initialized]) |vector| alloc.free(vector);
+        for (0..parallelism) |index| {
+            if (ready[index]) {
+                for (vectors[texts.len * index / parallelism .. texts.len * (index + 1) / parallelism]) |vector| alloc.free(vector);
+            }
+        }
         alloc.free(vectors);
     }
     var tasks: [4]Task = undefined;
@@ -3737,10 +3742,28 @@ fn parallelDenseBatch(alloc: Allocator, io: Io, provider: embedder_mod.DenseEmbe
             noteDenseBatchFailure(&failure, error.InvalidEmbeddingResponse);
             continue;
         }
-        @memcpy(vectors[initialized..][0..batch.len], batch);
-        initialized += batch.len;
+        @memcpy(vectors[texts.len * index / parallelism ..][0..batch.len], batch);
+        ready[index] = true;
     }
-    if (failure) |err| return err;
+    if (failure) |err| {
+        if (!allow_capacity_fallback or !denseBatchCapacityFailure(err)) return err;
+        // All submitted calls have drained. Retain successful slices and use
+        // one execution slot for the failed slices, without re-embedding work
+        // already completed by a sibling or widening the original deadline.
+        for (0..parallelism) |index| {
+            if (ready[index]) continue;
+            try context.check();
+            const batch = try Task.run(&tasks[index]);
+            defer alloc.free(batch);
+            if (batch.len != tasks[index].texts.len) {
+                for (batch) |vector| alloc.free(vector);
+                return error.InvalidEmbeddingResponse;
+            }
+            @memcpy(vectors[texts.len * index / parallelism ..][0..batch.len], batch);
+            ready[index] = true;
+        }
+    }
+    try context.check();
     return vectors;
 }
 
@@ -3749,6 +3772,7 @@ test "parallel dense inference preserves order drains failures and bounds provid
         active: std.atomic.Value(usize) = .init(0),
         peak: std.atomic.Value(usize) = .init(0),
         completed: std.atomic.Value(usize) = .init(0),
+        successful_items: std.atomic.Value(usize) = .init(0),
         fail: bool = false,
         busy_when_parallel: bool = false,
         mixed_failure: ?anyerror = null,
@@ -3778,6 +3802,7 @@ test "parallel dense inference preserves order drains failures and bounds provid
                 initialized += 1;
                 @constCast(vector.*)[0] = @floatFromInt(try std.fmt.parseUnsigned(u32, text, 10));
             }
+            _ = self.successful_items.fetchAdd(texts.len, .acq_rel);
             return out;
         }
     };
@@ -3787,12 +3812,12 @@ test "parallel dense inference preserves order drains failures and bounds provid
     const io = std.testing.io;
     const alloc = std.testing.allocator;
     const context: inference_request_context.RequestContext = .{ .io = io, .deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s };
-    const vectors = try parallelDenseBatch(alloc, io, provider, "model", &texts, 1, context, 2);
+    const vectors = try parallelDenseBatch(alloc, io, provider, "model", &texts, 1, context, 2, false);
     defer embedder_mod.freeDenseEmbeddingBatch(alloc, vectors);
     for (vectors, 0..) |vector, index| try std.testing.expectEqual(@as(f32, @floatFromInt(index)), vector[0]);
     try std.testing.expectEqual(@as(usize, 2), harness.peak.load(.acquire));
     harness.fail = true;
-    try std.testing.expectError(error.EmbedRateLimited, parallelDenseBatch(alloc, io, provider, "model", &texts, 1, context, 2));
+    try std.testing.expectError(error.EmbedRateLimited, parallelDenseBatch(alloc, io, provider, "model", &texts, 1, context, 2, false));
     try std.testing.expectEqual(@as(usize, 0), harness.active.load(.acquire));
     try std.testing.expectEqual(@as(usize, 4), harness.completed.load(.acquire));
     harness.fail = false;
@@ -3802,6 +3827,7 @@ test "parallel dense inference preserves order drains failures and bounds provid
     for (fallback, 0..) |vector, index| try std.testing.expectEqual(@as(f32, @floatFromInt(index)), vector[0]);
     try std.testing.expectEqual(@as(usize, 0), harness.active.load(.acquire));
     try std.testing.expectEqual(@as(usize, 7), harness.completed.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 20), harness.successful_items.load(.acquire));
     harness.busy_when_parallel = false;
     harness.peak.store(0, .release);
     var serial_provider = provider;
@@ -3825,7 +3851,7 @@ test "parallel dense inference preserves order drains failures and bounds provid
     defer embedder_mod.freeDenseEmbeddingBatch(alloc, serial);
     try std.testing.expectEqual(@as(usize, 1), harness.peak.load(.acquire));
     try std.testing.expectEqual(@as(usize, 8), harness.completed.load(.acquire));
-    for ([_]anyerror{ error.EmbedRateLimited, error.EmbedRequestFailed, error.Cancelled }, 0..) |err, index| {
+    for ([_]anyerror{ error.EmbedRateLimited, error.EmbedRequestFailed, error.UnexpectedProviderFailure, error.Cancelled }, 0..) |err, index| {
         harness.mixed_failure = err;
         try std.testing.expectError(err, parallelDenseBatchWithCapacityFallback(alloc, io, provider, "model", &texts, 1, context, 2));
         try std.testing.expectEqual(@as(usize, 0), harness.active.load(.acquire));

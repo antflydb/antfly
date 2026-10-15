@@ -919,7 +919,7 @@ fn executeFilterQuery(
     request: SearchRequest,
     boost: f32,
 ) !SearchResult {
-    if (request.sort == null and request.search_after == null and request.aggregations.len == 0) {
+    if (request.sort == null and request.aggregations.len == 0) {
         // Expansion queries have constant scores. Keep exact membership in a
         // bitmap and retain only the requested page prefix, rather than one
         // document-ID array plus one ScoredHit for every matching document.
@@ -927,16 +927,37 @@ fn executeFilterQuery(
         defer matches.deinit();
         var scored = std.ArrayListUnmanaged(scorer_mod.ScoredHit).empty;
         defer scored.deinit(alloc);
-        const keep = effectiveK(request, snap);
+        const keep = @min(snap.liveDocCount(), request.k +| request.offset);
         var total: u32 = 0;
+        var visited: usize = 0;
         var iterator = matches.iterator();
-        while (iterator.next()) |doc_id| {
-            if (total % 256 == 0) try request.control.check();
-            if (!requestAllowsDocNum(request, doc_id)) continue;
-            total = try std.math.add(u32, total, 1);
+        const constrained = requestHasDocNumConstraints(request);
+        var scan_page = true;
+        if (!constrained) {
+            try request.control.check();
+            total = std.math.cast(u32, matches.cardinality()) orelse return error.CountOverflow;
+            if (request.search_after) |cursor| {
+                if (boost == cursor.score) {
+                    if (cursor.doc_id == std.math.maxInt(u32)) scan_page = false else iterator.seek(cursor.doc_id + 1);
+                } else scan_page = boost < cursor.score;
+            }
+        }
+        while (scan_page) {
+            if (!constrained and scored.items.len >= keep) break;
+            const doc_id = iterator.next() orelse break;
+            if (visited % 256 == 0) try request.control.check();
+            visited += 1;
+            if (constrained) {
+                if (!requestAllowsDocNum(request, doc_id)) continue;
+                total = try std.math.add(u32, total, 1);
+            }
+            if (request.search_after) |cursor| {
+                if (!(boost < cursor.score or (boost == cursor.score and doc_id > cursor.doc_id))) continue;
+            }
             if (scored.items.len < keep) try scored.append(alloc, .{ .doc_id = doc_id, .score = boost });
         }
         var bounded = request;
+        bounded.search_after = null;
         bounded.filter_doc_bitmap = null;
         bounded.exclude_doc_bitmap = null;
         bounded.filter_doc_nums = &.{};
@@ -6126,6 +6147,93 @@ test "match_all applies native doc number constraints (#931)" {
     try std.testing.expectEqual(@as(u32, 2), paged.total_hits);
     try std.testing.expectEqual(@as(usize, 1), paged.hits.len);
     try std.testing.expectEqual(@as(u32, 2), paged.hits[0].doc_id);
+}
+
+test "constant score pages remain bounded after a cursor and cancel while excluding candidates" {
+    const alloc = std.testing.allocator;
+    var title = inverted.InvertedIndexBuilder.init(alloc, .{});
+    defer title.deinit();
+    var segment = segment_mod.SegmentWriter.init(alloc);
+    defer segment.deinit();
+    var doc_nums: [16384]u32 = undefined;
+    for (&doc_nums, 0..) |*doc_num, i| {
+        doc_num.* = @intCast(i);
+        var id: [32]u8 = undefined;
+        try segment.addStoredDoc(try std.fmt.bufPrint(&id, "row-{d}", .{i}), "{}");
+        try title.addDocument(doc_num.*, &.{.{ .term = "common", .freq = 1, .norm = 10 }});
+    }
+    const title_bytes = try title.build();
+    defer alloc.free(title_bytes);
+    try segment.addSection(try segment.addField("title"), .inverted_text, title_bytes);
+    const bytes = try segment.build();
+    defer alloc.free(bytes);
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+
+    const Cancel = struct {
+        calls: usize = 0,
+        fn check(ptr: *const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(ptr)));
+            self.calls += 1;
+            return self.calls >= 2;
+        }
+    };
+    var cancel = Cancel{};
+    try std.testing.expectError(error.Canceled, execute(alloc, writer.snapshot(), .{
+        .query = .{ .doc_num = .{ .ids = &doc_nums } },
+        .k = 1,
+        .include_stored = false,
+        .filter_doc_nums = &.{0},
+        .filter_doc_nums_positive = true,
+        .control = .{ .cancellation = .{ .ptr = &cancel, .is_cancelled_fn = Cancel.check } },
+    }));
+    try std.testing.expectEqual(@as(usize, 2), cancel.calls);
+
+    const allowed = [_]u32{ 0, 100, 1000, 2002, 2004, 2006, 2008, 2010, 4094 };
+    var scratch: [64 * 1024]u8 = undefined;
+    var bounded = std.heap.FixedBufferAllocator.init(&scratch);
+    var request: SearchRequest = .{
+        .query = .{ .prefix = .{ .field = "title", .prefix = "com", .boost = 2.5 } },
+        .k = 3,
+        .offset = 2,
+        .include_stored = false,
+        .filter_doc_nums = &allowed,
+        .filter_doc_nums_positive = true,
+        .search_after = .{ .score = 2.5, .doc_id = 2000 },
+    };
+    var page = try execute(bounded.allocator(), writer.snapshot(), request);
+    try std.testing.expectEqual(@as(u32, allowed.len), page.total_hits);
+    try std.testing.expectEqual(TotalHitsRelation.exact, page.total_hits_relation);
+    try std.testing.expectEqual(@as(usize, 3), page.hits.len);
+    for (page.hits, [_]u32{ 2006, 2008, 2010 }) |hit, expected| try std.testing.expectEqual(expected, hit.doc_id);
+    request.search_after = page.cursor;
+    request.offset = 0;
+    page.deinit();
+    bounded.reset();
+    var next = try execute(bounded.allocator(), writer.snapshot(), request);
+    try std.testing.expectEqual(@as(u32, allowed.len), next.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), next.hits.len);
+    try std.testing.expectEqual(@as(u32, 4094), next.hits[0].doc_id);
+    next.deinit();
+    for ([_]f32{ 2.4, 2.6 }) |score| {
+        bounded.reset();
+        request.search_after = .{ .score = score, .doc_id = 2000 };
+        var result = try execute(bounded.allocator(), writer.snapshot(), request);
+        defer result.deinit();
+        try std.testing.expectEqual(@as(u32, allowed.len), result.total_hits);
+        try std.testing.expectEqual(@as(usize, if (score < 2.5) 0 else 3), result.hits.len);
+        if (score > 2.5) try std.testing.expectEqual(@as(u32, 0), result.hits[0].doc_id);
+    }
+    bounded.reset();
+    request.filter_doc_nums = &.{};
+    request.filter_doc_nums_positive = false;
+    request.search_after = .{ .score = 2.5, .doc_id = 15000 };
+    var deep_page = try execute(bounded.allocator(), writer.snapshot(), request);
+    defer deep_page.deinit();
+    try std.testing.expectEqual(@as(u32, doc_nums.len), deep_page.total_hits);
+    try std.testing.expectEqual(@as(usize, 3), deep_page.hits.len);
+    for (deep_page.hits, [_]u32{ 15001, 15002, 15003 }) |hit, expected| try std.testing.expectEqual(expected, hit.doc_id);
 }
 
 test "exact inclusive term range preserves prefix constant scores" {

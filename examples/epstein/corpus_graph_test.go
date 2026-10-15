@@ -18,6 +18,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -201,6 +202,39 @@ func TestCorpusGraphRetriesTransientCoordinatorFailure(t *testing.T) {
 	_, _, unchanged, err := reconcileCorpusGraphSourceWithRetry(f.server.Client(), f.server.URL+"/tables/test", f.record)
 	if err != nil || !unchanged {
 		t.Fatalf("reconciliation after retry: unchanged=%v err=%v", unchanged, err)
+	}
+}
+
+type graphLostCommitResponse struct {
+	base    http.RoundTripper
+	dropped bool
+}
+
+func (transport *graphLostCommitResponse) RoundTrip(request *http.Request) (*http.Response, error) {
+	response, err := transport.base.RoundTrip(request)
+	if err == nil && !transport.dropped && request.Method == http.MethodPost && strings.HasSuffix(request.URL.Path, "/transactions/commit") {
+		_, readErr := io.Copy(io.Discard, response.Body)
+		response.Body.Close()
+		if readErr != nil {
+			return nil, readErr
+		}
+		transport.dropped = true
+		return nil, io.ErrUnexpectedEOF
+	}
+	return response, err
+}
+
+func TestCorpusGraphReconcilesAfterLostCommittedResponse(t *testing.T) {
+	f := newGraphFixture(t)
+	transport := &graphLostCommitResponse{base: f.server.Client().Transport}
+	client := &http.Client{Transport: transport}
+	submitted, _, _, err := reconcileCorpusGraphSourceWithRetry(client, f.server.URL+"/tables/test", f.record)
+	if err != nil || submitted != 2 || !transport.dropped {
+		t.Fatalf("reconcile lost commit: submitted=%d dropped=%v err=%v", submitted, transport.dropped, err)
+	}
+	_, _, unchanged, err := reconcileCorpusGraphSourceWithRetry(client, f.server.URL+"/tables/test", f.record)
+	if err != nil || !unchanged {
+		t.Fatalf("reconciliation after lost commit: unchanged=%v err=%v", unchanged, err)
 	}
 }
 func (f *graphFixture) run() error {

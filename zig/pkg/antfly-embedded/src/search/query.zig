@@ -78,6 +78,7 @@ pub const Filter = union(enum) {
             .fuzzy => |*f| f.control = control,
             .wildcard => |*f| f.control = control,
             .regexp => |*f| f.control = control,
+            .term_range => |*f| f.control = control,
             else => {},
         }
         return result;
@@ -760,6 +761,7 @@ pub const RegexpFilter = struct {
 /// Lexicographic term range filter: matches docs containing any term in [min, max].
 /// Unlike RangeFilter (numeric on doc values), this operates on FST term strings.
 pub const TermRangeFilter = struct {
+    control: ExecutionControl = .{},
     field: []const u8,
     min: ?[]const u8 = null,
     max: ?[]const u8 = null,
@@ -788,6 +790,7 @@ pub const TermRangeFilter = struct {
         } else null;
 
         var term_iter = try inv_reader.rangeTermIterator(start, end);
+        term_iter.setControl(self.control);
         defer term_iter.deinit();
 
         var result = roaring.RoaringBitmap.init(alloc);
@@ -800,14 +803,7 @@ pub const TermRangeFilter = struct {
                     if (std.mem.eql(u8, entry.term, m)) continue;
                 }
             }
-            switch (entry.result) {
-                .postings => |p| {
-                    var bm = try p.docBitmap(alloc);
-                    defer bm.deinit();
-                    try result.orWith(&bm);
-                },
-                .one_hit => |h| try result.add(h.doc_num),
-            }
+            try unionTermEntry(alloc, &result, entry, self.control);
         }
 
         return result;
@@ -2971,6 +2967,7 @@ test "dictionary expansion cancels during nonmatching scans and nested boolean e
         .{ .regexp = .{ .field = "body", .pattern = ".*never-present" } },
         .{ .prefix = .{ .field = "body", .prefix = "catalog" } },
         .{ .fuzzy = .{ .field = "body", .term = "catalog-00000", .max_edits = 2 } },
+        .{ .term_range = .{ .field = "body", .min = "catalog" } },
     };
     for (filters) |filter| {
         var cancel = Cancel{};

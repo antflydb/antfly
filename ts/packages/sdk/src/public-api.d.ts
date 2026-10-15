@@ -5328,7 +5328,20 @@ export interface components {
              */
             retryable: true;
         };
-        QueryConflictError: components["schemas"]["HierarchyCursorStaleError"] | components["schemas"]["TopologyChangedError"];
+        /** @description The requested source artifact failed publication and requires inspection and reprocessing. */
+        DocumentArtifactPublicationFailedError: {
+            /** @enum {string} */
+            code: "document_artifact_publication_failed";
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            error: "document_artifact_publication_failed";
+            message: string;
+            /** @enum {boolean} */
+            retryable: false;
+        };
+        QueryConflictError: components["schemas"]["HierarchyCursorStaleError"] | components["schemas"]["TopologyChangedError"] | components["schemas"]["DocumentArtifactPublicationFailedError"];
         /** @description A requested hierarchy grouping level cannot represent every member because at least one selected source lacks durable document-unit identity. */
         UnsupportedHierarchyGroupingError: {
             /**
@@ -21558,7 +21571,7 @@ export interface components {
                 "application/json": components["schemas"]["HierarchyCursorStaleError"];
             };
         };
-        /** @description The query's pinned hierarchy or table topology changed while it was running */
+        /** @description The query's pinned hierarchy or table topology changed, or a requested source artifact failed publication */
         QueryConflict: {
             headers: {
                 [name: string]: unknown;
@@ -26891,6 +26904,7 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
+            409: components["responses"]["QueryConflict"];
             500: components["responses"]["InternalServerError"];
             /** @description Catalog target cannot be delegated to legacy table storage unambiguously. */
             501: {
