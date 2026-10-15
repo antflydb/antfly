@@ -386,10 +386,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn acquireTransactionSchemaView(self: anytype, alloc: Allocator, binding: ?transactions_mod.SchemaBinding) !?schema_registry_mod.SchemaView {
             if (binding) |pinned| return if (pinned.version) |version|
-                try self.core.acquireSchemaVersionWriteView(alloc, version)
+                try S.ownerField(self, "core").*.acquireSchemaVersionWriteView(alloc, version)
             else
                 null;
-            return self.core.acquireSchemaView();
+            return S.ownerField(self, "core").*.acquireSchemaView();
         }
 
         pub fn appendDenseArtifactCounterBootstrapWrite(
@@ -768,9 +768,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn artifactMaterializationsReady(self: anytype, txn: anytype, catalogs: @import("artifact_inventory.zig").Catalogs) !bool {
-            if (!try self.core.index_manager.matchesArtifactInventory(catalogs)) return false;
-            const prefix = try internal_keys.indexArtifactCleanupRootPrefixAlloc(self.alloc);
-            defer self.alloc.free(prefix);
+            if (!try S.ownerField(self, "core").*.index_manager.matchesArtifactInventory(catalogs)) return false;
+            const prefix = try internal_keys.indexArtifactCleanupRootPrefixAlloc(S.ownerField(self, "alloc").*);
+            defer S.ownerField(self, "alloc").*.free(prefix);
             var cursor = try txn.openCursor();
             defer cursor.close();
             const first = try cursor.seekAtOrAfter(prefix) orelse return true;
@@ -781,7 +781,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const Read = struct {
                 fn get(ptr: *anyopaque, alloc: Allocator, key: []const u8) !?[]u8 {
                     const owner: @TypeOf(self) = @ptrCast(@alignCast(ptr));
-                    return owner.core.getStoreValue(alloc, key);
+                    return S.ownerField(owner, "core").*.getStoreValue(alloc, key);
                 }
             };
             return .{ .ptr = self, .get = Read.get };
@@ -837,10 +837,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer if (replication_mutation) |*lease| lease.release();
             try self.enforceReplicationWriteGate();
             try self.lockApplyForPortableRuntime();
-            defer self.core.unlockApply();
+            defer S.ownerField(self, "core").*.unlockApply();
             try self.enforceReplicationWriteGate();
             const deletes = [_][]const u8{key};
-            try self.core.store.putBatch(&.{}, deletes[0..]);
+            try S.ownerField(self, "core").*.store.putBatch(&.{}, deletes[0..]);
         }
 
         pub fn denseArtifactCounterBootstrapKeyAlloc(alloc: Allocator, index_name: []const u8) ![]u8 {
@@ -856,8 +856,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn denseRepairWriteBackpressured(self: anytype) bool {
-            if (!self.async_context.index_repair_replay_pinned.load(.acquire)) return false;
-            const manager = self.core.index_manager.resource_manager orelse return false;
+            if (!S.ownerField(self, "async_context").*.index_repair_replay_pinned.load(.acquire)) return false;
+            const manager = S.ownerField(self, "core").*.index_manager.resource_manager orelse return false;
             return manager.denseRepairReplayPressureIsHard();
         }
 
@@ -872,14 +872,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         pub fn derivedCoverageAppliesToIndex(self: anytype, kind: types.IndexKind, index_name: []const u8) bool {
             return switch (kind) {
                 .graph => blk: {
-                    for (self.core.graphIndexes()) |entry| {
+                    for (S.ownerField(self, "core").*.graphIndexes()) |entry| {
                         if (std.mem.eql(u8, entry.config.name, index_name))
                             break :blk entry.artifact_sources.len > 0;
                     }
                     break :blk false;
                 },
                 .full_text => blk: {
-                    for (self.core.index_manager.text_indexes.items) |entry| {
+                    for (S.ownerField(self, "core").*.index_manager.text_indexes.items) |entry| {
                         if (std.mem.eql(u8, entry.config.name, index_name))
                             break :blk entry.chunk_name != null or entry.source_artifact_names.len > 0;
                     }
@@ -903,21 +903,21 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             limit: usize,
             root: ?*@import("antfly_runtime_abi").mutation_barrier.MutationBarrier.RootSharedLease,
         ) anyerror!DocumentArtifactChildRangeOutboxDrainResult {
-            if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+            if (openModeRequiresReadOnlyBackends(S.ownerField(self, "open_mode").*)) return error.ReadOnly;
             var replication_mutation = try @import("mutation_admission.zig").acquireReplicationMutationSharedScoped(self, null, root);
             defer if (replication_mutation) |*lease| lease.release();
             try self.enforceReplicationWriteGate();
 
-            const prefix = try internal_keys.documentChildRangeOutboxRootPrefixAlloc(self.alloc);
-            defer self.alloc.free(prefix);
+            const prefix = try internal_keys.documentChildRangeOutboxRootPrefixAlloc(S.ownerField(self, "alloc").*);
+            defer S.ownerField(self, "alloc").*.free(prefix);
 
             try self.lockApplyForPortableRuntime();
             var apply_mutex_held = true;
-            errdefer if (apply_mutex_held) self.core.unlockApply();
-            const scanned = try self.core.scanStorePrefix(self.alloc, prefix);
-            self.core.unlockApply();
+            errdefer if (apply_mutex_held) S.ownerField(self, "core").*.unlockApply();
+            const scanned = try S.ownerField(self, "core").*.scanStorePrefix(S.ownerField(self, "alloc").*, prefix);
+            S.ownerField(self, "core").*.unlockApply();
             apply_mutex_held = false;
-            defer docstore_mod.DocStore.freeResults(self.alloc, scanned);
+            defer docstore_mod.DocStore.freeResults(S.ownerField(self, "alloc").*, scanned);
 
             const Removal = struct {
                 owner: @TypeOf(self),
@@ -928,7 +928,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
             };
             var removal: Removal = .{ .owner = self, .root = root };
-            return document_child_range_outbox.drainWithRetirement(self.alloc, scanned, dispatcher, limit, &removal, Removal.remove, .{ .current = &replication_mutation });
+            return document_child_range_outbox.drainWithRetirement(S.ownerField(self, "alloc").*, scanned, dispatcher, limit, &removal, Removal.remove, .{ .current = &replication_mutation });
         }
 
         pub fn encodeDenseArtifactCounterBootstrap(value: DenseArtifactCounterBootstrap, out: *[dense_artifact_counter_bootstrap_encoded_len]u8) void {
@@ -951,7 +951,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn hasConfiguredResolvers(self: anytype) bool {
-            return self.core.index_manager.resolvers.items.len > 0;
+            return S.ownerField(self, "core").*.index_manager.resolvers.items.len > 0;
         }
 
         pub fn loadDenseArtifactCounterBootstrap(
@@ -1546,7 +1546,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             try appendOwnedKey(alloc, artifact_delete_keys, manifest_key);
             const state_key = try assetStateKeyAlloc(alloc, doc_key, artifact_name);
             errdefer alloc.free(state_key);
-            const existing_state = db.core.getStoreValue(alloc, state_key) catch |err| switch (err) {
+            const existing_state = S.ownerField(db, "core").*.getStoreValue(alloc, state_key) catch |err| switch (err) {
                 error.NotFound => null,
                 else => return err,
             };
@@ -1717,7 +1717,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         ) !void {
             const summary_key = try internal_keys.documentUnitNavigationSummaryKeyAlloc(alloc, doc_key, artifact_name);
             defer alloc.free(summary_key);
-            const existing_summary = try db.core.getStoreValue(alloc, summary_key);
+            const existing_summary = try S.ownerField(db, "core").*.getStoreValue(alloc, summary_key);
             defer if (existing_summary) |value| alloc.free(value);
             if (existing_summary) |summary| {
                 if (try hierarchy_navigation.indexMetadataMatches(alloc, state, summary, generation)) return;
@@ -1743,7 +1743,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     return error.InvalidDocumentExtractionState;
                 }
                 if (descriptor.fingerprint.len == 0) {
-                    const stored = try db.core.getStoreValue(alloc, descriptor.key) orelse
+                    const stored = try S.ownerField(db, "core").*.getStoreValue(alloc, descriptor.key) orelse
                         return error.InvalidDocumentExtractionState;
                     defer alloc.free(stored);
                     descriptor.fingerprint = try documentExtractionStoredUnitFingerprintAlloc(alloc, stored);
@@ -1913,7 +1913,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     sparse_pending.deinit(alloc);
                 }
                 try collectPendingDocumentUnitSparseChunkEmbeddings(alloc, db, &entry, &sparse_pending);
-                const runtime = db.enrichment_runtime;
+                const runtime = S.ownerField(db, "enrichment_runtime").*;
                 const dense_embedder = if (runtime) |rt| rt.config.dense_embedder else null;
                 const sparse_embedder = if (runtime) |rt| rt.config.sparse_embedder else null;
 
@@ -2253,11 +2253,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 group_positions: std.StringHashMapUnmanaged(usize) = .empty,
 
                 fn group(self: *@This(), owner: []const u8, index: *index_manager_mod.IndexManager.GraphIndex) !*Group {
-                    const key = try internal_keys.graphEdgeContenderCountKeyAlloc(self.alloc, owner, index.config.name);
-                    const pos = try self.group_positions.getOrPut(self.alloc, key);
+                    const key = try internal_keys.graphEdgeContenderCountKeyAlloc(S.ownerField(self, "alloc").*, owner, index.config.name);
+                    const pos = try self.group_positions.getOrPut(S.ownerField(self, "alloc").*, key);
                     if (!pos.found_existing) {
                         pos.value_ptr.* = self.groups.items.len;
-                        try self.groups.append(self.alloc, .{ .owner = try self.alloc.dupe(u8, owner), .index = index });
+                        try self.groups.append(S.ownerField(self, "alloc").*, .{ .owner = try S.ownerField(self, "alloc").*.dupe(u8, owner), .index = index });
                     }
                     return &self.groups.items[pos.value_ptr.*];
                 }
@@ -2295,22 +2295,22 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     } else false;
                     const g = try self.group(owner, index);
                     if (suppressed) {
-                        try appendGraphContenderChange(self.alloc, &g.changes, try self.alloc.dupe(u8, view.edge_key), try self.alloc.dupe(u8, view.state_key), view.source_priority, null);
-                        try g.extra_deletes.append(self.alloc, try self.alloc.dupe(u8, lifetime_key));
+                        try appendGraphContenderChange(S.ownerField(self, "alloc").*, &g.changes, try S.ownerField(self, "alloc").*.dupe(u8, view.edge_key), try S.ownerField(self, "alloc").*.dupe(u8, view.state_key), view.source_priority, null);
+                        try g.extra_deletes.append(S.ownerField(self, "alloc").*, try S.ownerField(self, "alloc").*.dupe(u8, lifetime_key));
                         return;
                     }
                     // A changed revision retires an obsolete imported tombstone too.
-                    if (tomb_raw != null) try g.extra_deletes.append(self.alloc, try self.alloc.dupe(u8, tomb_key));
-                    var payload = try self.alloc.dupe(u8, view.payload);
+                    if (tomb_raw != null) try g.extra_deletes.append(S.ownerField(self, "alloc").*, try S.ownerField(self, "alloc").*.dupe(u8, tomb_key));
+                    var payload = try S.ownerField(self, "alloc").*.dupe(u8, view.payload);
                     if (state) |row| if (internal_keys.isGraphEdgeTtlLifetimeKey(row.key)) {
                         if (row.value.len != 8) return error.InvalidGraphEdgeTtlLifetime;
                         const timestamp = std.mem.readInt(u64, row.value[0..8], .big);
                         if (timestamp == 0) return error.InvalidGraphEdgeTtlLifetime;
                         var edge = try enrichment_artifact_codec.decodeGraphEdgeAlloc(probe, payload);
                         defer edge.deinit(probe);
-                        payload = try enrichment_artifact_codec.encodeGraphEdgeWithTtlAlloc(self.alloc, null, index.config.coverage_generation, edge.weight, edge.created_at, edge.updated_at, timestamp, edge.metadata_json);
+                        payload = try enrichment_artifact_codec.encodeGraphEdgeWithTtlAlloc(S.ownerField(self, "alloc").*, null, index.config.coverage_generation, edge.weight, edge.created_at, edge.updated_at, timestamp, edge.metadata_json);
                     };
-                    try appendGraphContenderChange(self.alloc, &g.changes, try self.alloc.dupe(u8, view.edge_key), try self.alloc.dupe(u8, view.state_key), view.source_priority, payload);
+                    try appendGraphContenderChange(S.ownerField(self, "alloc").*, &g.changes, try S.ownerField(self, "alloc").*.dupe(u8, view.edge_key), try S.ownerField(self, "alloc").*.dupe(u8, view.state_key), view.source_priority, payload);
                 }
             };
             var positions = StoreWritePositions.empty;
@@ -2596,28 +2596,28 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
                 fn add(self: *@This(), edge_key: []const u8, payload: ?[]const u8) !void {
                     if (!internal_keys.isGraphEdgeArtifactKey(edge_key)) return;
-                    const parsed = (try internal_keys.parseGraphEdgeArtifactKeyAlloc(self.alloc, edge_key)) orelse return error.InvalidGraphEdgeArtifact;
+                    const parsed = (try internal_keys.parseGraphEdgeArtifactKeyAlloc(S.ownerField(self, "alloc").*, edge_key)) orelse return error.InvalidGraphEdgeArtifact;
                     defer {
-                        self.alloc.free(parsed.doc_key);
-                        self.alloc.free(parsed.index_name);
-                        self.alloc.free(parsed.edge_type);
-                        self.alloc.free(parsed.target_doc_key);
-                        self.alloc.free(parsed.edge_id);
-                        self.alloc.free(parsed.logical_source);
+                        S.ownerField(self, "alloc").*.free(parsed.doc_key);
+                        S.ownerField(self, "alloc").*.free(parsed.index_name);
+                        S.ownerField(self, "alloc").*.free(parsed.edge_type);
+                        S.ownerField(self, "alloc").*.free(parsed.target_doc_key);
+                        S.ownerField(self, "alloc").*.free(parsed.edge_id);
+                        S.ownerField(self, "alloc").*.free(parsed.logical_source);
                     }
                     const entry = self.index_manager.graphIndex(parsed.index_name) orelse return;
                     if (self.index_manager.graphArtifactSources(parsed.index_name).len == 0) return;
-                    const state_key = try internal_keys.graphDirectStateKeyAlloc(self.alloc, parsed.doc_key, parsed.index_name);
+                    const state_key = try internal_keys.graphDirectStateKeyAlloc(S.ownerField(self, "alloc").*, parsed.doc_key, parsed.index_name);
                     var state_key_owned = true;
-                    defer if (state_key_owned) self.alloc.free(state_key);
-                    const gop = try self.positions.getOrPut(self.alloc, state_key);
+                    defer if (state_key_owned) S.ownerField(self, "alloc").*.free(state_key);
+                    const gop = try self.positions.getOrPut(S.ownerField(self, "alloc").*, state_key);
                     if (!gop.found_existing) {
-                        const doc_key = try self.alloc.dupe(u8, parsed.doc_key);
-                        errdefer self.alloc.free(doc_key);
-                        const index_name = try self.alloc.dupe(u8, parsed.index_name);
-                        errdefer self.alloc.free(index_name);
+                        const doc_key = try S.ownerField(self, "alloc").*.dupe(u8, parsed.doc_key);
+                        errdefer S.ownerField(self, "alloc").*.free(doc_key);
+                        const index_name = try S.ownerField(self, "alloc").*.dupe(u8, parsed.index_name);
+                        errdefer S.ownerField(self, "alloc").*.free(index_name);
                         gop.value_ptr.* = self.groups.items.len;
-                        try self.groups.append(self.alloc, .{
+                        try self.groups.append(S.ownerField(self, "alloc").*, .{
                             .doc_key = doc_key,
                             .index_name = index_name,
                             .state_key = state_key,
@@ -2628,7 +2628,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         state_key_owned = false;
                     }
                     const group = &self.groups.items[gop.value_ptr.*];
-                    try appendGraphContenderChange(self.alloc, &group.changes, edge_key, group.state_key, @intCast(graph_mod.direct_source_priority), payload);
+                    try appendGraphContenderChange(S.ownerField(self, "alloc").*, &group.changes, edge_key, group.state_key, @intCast(graph_mod.direct_source_priority), payload);
                 }
             };
             var groups = std.ArrayListUnmanaged(Group).empty;
@@ -2778,13 +2778,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // across chunking, rendering, or model inference -- instead of reading
             // those arrays while a concurrent catalog publish could replace or free
             // them.
-            var pinned = try db.core.index_manager.acquireWritePlanSnapshot();
+            var pinned = try S.ownerField(db, "core").*.index_manager.acquireWritePlanSnapshot();
             defer pinned.release();
             const requirements = if (pinned.plan().completion_plan) |*value| value else return error.ArtifactCatalogDrift;
             _ = requirements.providerFor(request) catch return error.EnrichmentSourceChanged;
-            db.core.index_manager.catalog_mutex.lockShared();
-            defer db.core.index_manager.catalog_mutex.unlockShared();
-            const consumers = try db.core.index_manager.indexesDependingOnArtifact(alloc, requestArtifactName(request));
+            S.ownerField(db, "core").*.index_manager.catalog_mutex.lockShared();
+            defer S.ownerField(db, "core").*.index_manager.catalog_mutex.unlockShared();
+            const consumers = try S.ownerField(db, "core").*.index_manager.indexesDependingOnArtifact(alloc, requestArtifactName(request));
             defer {
                 for (consumers) |name| alloc.free(name);
                 alloc.free(consumers);
@@ -2806,7 +2806,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     .outcome = outcome,
                 });
                 const readiness = @import("artifact_producer_readiness.zig");
-                const sources = try db.core.index_manager.artifactSourceNamesForIndexAlloc(alloc, index_name);
+                const sources = try S.ownerField(db, "core").*.index_manager.artifactSourceNamesForIndexAlloc(alloc, index_name);
                 defer {
                     for (sources) |source| alloc.free(source);
                     alloc.free(sources);
@@ -3201,7 +3201,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var cursor: ?[]u8 = null;
             defer if (cursor) |key| alloc.free(key);
             while (true) {
-                const existing = try db.core.store.scanPrefixKeysPage(alloc, prefix, cursor, 256);
+                const existing = try S.ownerField(db, "core").*.store.scanPrefixKeysPage(alloc, prefix, cursor, 256);
                 defer freeOwnedKeySlice(alloc, existing);
                 if (existing.len == 0) break;
                 for (existing) |entry| {
@@ -3383,10 +3383,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         pub fn applyDerivedBatchProfiled(self: anytype, batch: derived_types.DerivedBatch, profile: ?*BatchProfile) !void {
             var ctx = self.batchContext();
             try applyDerivedBatchContextProfiled(&ctx, batch, profile);
-            if (self.text_merge_runtime) |runtime| {
+            if (S.ownerField(self, "text_merge_runtime").*) |runtime| {
                 runtime.notify();
             }
-            if (self.sparse_compaction_runtime) |runtime| runtime.notify();
+            if (S.ownerField(self, "sparse_compaction_runtime").*) |runtime| runtime.notify();
         }
 
         fn acquireBatchReplayAdmission(ctx: *const BatchExecutionContext) !?snapshot_admission_mod.SnapshotAdmission.MutationLease {
@@ -3453,10 +3453,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         pub fn applyDerivedBatchTargetsProfiled(self: anytype, batch: derived_types.DerivedBatch, index_names: []const []const u8, profile: ?*BatchProfile) !void {
             var ctx = self.batchContext();
             try applyDerivedBatchTargetsContextProfiled(&ctx, batch, index_names, profile);
-            if (self.text_merge_runtime) |runtime| {
+            if (S.ownerField(self, "text_merge_runtime").*) |runtime| {
                 runtime.notify();
             }
-            if (self.sparse_compaction_runtime) |runtime| runtime.notify();
+            if (S.ownerField(self, "sparse_compaction_runtime").*) |runtime| runtime.notify();
         }
 
         pub fn applyDerivedBatchToIndexContext(ctx: *const AsyncContext, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef) !void {
@@ -4504,15 +4504,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             db: anytype,
             artifact_name: []const u8,
         ) !DocumentExtractionCatalogView {
-            db.core.index_manager.catalog_mutex.lockShared();
-            defer db.core.index_manager.catalog_mutex.unlockShared();
+            S.ownerField(db, "core").*.index_manager.catalog_mutex.lockShared();
+            defer S.ownerField(db, "core").*.index_manager.catalog_mutex.unlockShared();
 
             var chunks = std.ArrayListUnmanaged(DocumentExtractionChunkView).empty;
             errdefer {
                 for (chunks.items) |*chunk| chunk.deinit(alloc);
                 chunks.deinit(alloc);
             }
-            for (db.core.index_manager.enrichments.items) |entry| {
+            for (S.ownerField(db, "core").*.index_manager.enrichments.items) |entry| {
                 if (entry.kind != .chunk) continue;
                 if (!std.mem.eql(u8, entry.source_artifact_name, artifact_name)) continue;
 
@@ -4525,7 +4525,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 chunk.chunk_overlap = entry.chunk_overlap;
                 const include_default_full_text = entry.full_text_index or
                     try chunking_types_mod.parseHasFullTextIndexFromSlice(alloc, entry.chunker_json);
-                chunk.text_indexes = try db.core.index_manager.textIndexesForChunk(alloc, entry.name, include_default_full_text);
+                chunk.text_indexes = try S.ownerField(db, "core").*.index_manager.textIndexesForChunk(alloc, entry.name, include_default_full_text);
 
                 var dense = std.ArrayListUnmanaged(DocumentExtractionEmbeddingView).empty;
                 defer {
@@ -4554,16 +4554,16 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             dense: *std.ArrayListUnmanaged(DocumentExtractionEmbeddingView),
             sparse: *std.ArrayListUnmanaged(DocumentExtractionEmbeddingView),
         ) !void {
-            for (db.core.index_manager.enrichments.items) |entry| {
+            for (S.ownerField(db, "core").*.index_manager.enrichments.items) |entry| {
                 if (entry.kind != .embedding) continue;
                 if (!std.mem.eql(u8, entry.source_artifact_name, chunk_artifact_name)) continue;
                 // cloneFromEnrichment takes ownership only on success. End the
                 // consumer cleanup scope before the view becomes the sole owner.
                 var view = blk: {
                     const consumers = if (entry.expected_dims > 0)
-                        try db.core.index_manager.denseIndexesForEmbedding(alloc, entry.name, entry.expected_dims)
+                        try S.ownerField(db, "core").*.index_manager.denseIndexesForEmbedding(alloc, entry.name, entry.expected_dims)
                     else
-                        try db.core.index_manager.sparseIndexesForEmbedding(alloc, entry.name);
+                        try S.ownerField(db, "core").*.index_manager.sparseIndexesForEmbedding(alloc, entry.name);
                     errdefer {
                         for (consumers) |name| alloc.free(name);
                         alloc.free(consumers);
@@ -5107,21 +5107,21 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         ) ![][]u8 {
             _ = extracted;
             const vector_effects = artifact_effects;
-            if (!self.core.hasArtifactCleanupMaybe() and vector_effects.len == 0) return try self.alloc.alloc([]u8, 0);
+            if (!S.ownerField(self, "core").*.hasArtifactCleanupMaybe() and vector_effects.len == 0) return try S.ownerField(self, "alloc").*.alloc([]u8, 0);
 
             var deleted = std.ArrayListUnmanaged([]u8).empty;
-            errdefer deleted.deinit(self.alloc);
+            errdefer deleted.deinit(S.ownerField(self, "alloc").*);
             var seen_docs = std.StringHashMapUnmanaged(void).empty;
-            defer seen_docs.deinit(self.alloc);
+            defer seen_docs.deinit(S.ownerField(self, "alloc").*);
             var selected_artifacts = std.StringHashMapUnmanaged(void).empty;
-            defer selected_artifacts.deinit(self.alloc);
+            defer selected_artifacts.deinit(S.ownerField(self, "alloc").*);
 
             for (req.deletes) |key| {
-                const gop = try seen_docs.getOrPut(self.alloc, key);
+                const gop = try seen_docs.getOrPut(S.ownerField(self, "alloc").*, key);
                 if (gop.found_existing) continue;
                 try collectEnrichmentArtifactDeleteKeysForDocContext(
-                    self.alloc,
-                    self.core.store,
+                    S.ownerField(self, "alloc").*,
+                    S.ownerField(self, "core").*.store,
                     key,
                     delete_keys,
                     owned_delete_keys,
@@ -5133,20 +5133,20 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // insertion is not materialized yet. Do not count the same deletion twice
             // when this fragment also deletes its primary document.
             var seen_artifacts = std.StringHashMapUnmanaged(void).empty;
-            defer seen_artifacts.deinit(self.alloc);
-            for (deleted.items) |key| try seen_artifacts.put(self.alloc, key, {});
+            defer seen_artifacts.deinit(S.ownerField(self, "alloc").*);
+            for (deleted.items) |key| try seen_artifacts.put(S.ownerField(self, "alloc").*, key, {});
             for (vector_effects) |effect| if (effect.value == null) {
-                const gop = try seen_artifacts.getOrPut(self.alloc, effect.key);
+                const gop = try seen_artifacts.getOrPut(S.ownerField(self, "alloc").*, effect.key);
                 if (gop.found_existing) continue;
-                const owned_key = try self.alloc.dupe(u8, effect.key);
-                owned_delete_keys.append(self.alloc, owned_key) catch |err| {
-                    self.alloc.free(owned_key);
+                const owned_key = try S.ownerField(self, "alloc").*.dupe(u8, effect.key);
+                owned_delete_keys.append(S.ownerField(self, "alloc").*, owned_key) catch |err| {
+                    S.ownerField(self, "alloc").*.free(owned_key);
                     return err;
                 };
-                try delete_keys.append(self.alloc, owned_key);
-                try deleted.append(self.alloc, owned_key);
+                try delete_keys.append(S.ownerField(self, "alloc").*, owned_key);
+                try deleted.append(S.ownerField(self, "alloc").*, owned_key);
             };
-            return try deleted.toOwnedSlice(self.alloc);
+            return try deleted.toOwnedSlice(S.ownerField(self, "alloc").*);
         }
 
         pub fn collectGraphArtifactsForDocIndex(
@@ -5603,7 +5603,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             chunk_view: *const DocumentExtractionChunkView,
             out: *std.ArrayListUnmanaged(PendingDocumentUnitDenseChunkEmbedding),
         ) !void {
-            const runtime = db.enrichment_runtime orelse return;
+            const runtime = S.ownerField(db, "enrichment_runtime").* orelse return;
             if (runtime.config.dense_embedder == null) return;
             for (chunk_view.dense_embeddings) |embed_entry| {
                 if (embed_entry.consumer_indexes.len == 0) continue;
@@ -5634,7 +5634,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             chunk_view: *const DocumentExtractionChunkView,
             out: *std.ArrayListUnmanaged(PendingDocumentUnitSparseChunkEmbedding),
         ) !void {
-            const runtime = db.enrichment_runtime orelse return;
+            const runtime = S.ownerField(db, "enrichment_runtime").* orelse return;
             if (runtime.config.sparse_embedder == null) return;
             for (chunk_view.sparse_embeddings) |embed_entry| {
                 if (embed_entry.consumer_indexes.len == 0) continue;
@@ -5811,7 +5811,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 for (artifact_delete_keys.items) |delete_key| {
                     if (std.mem.eql(u8, delete_key, upstream_key)) break :blk null;
                 }
-                break :blk try db.core.getStoreValue(alloc, upstream_key);
+                break :blk try S.ownerField(db, "core").*.getStoreValue(alloc, upstream_key);
             } else try extractAssetSourceValue(alloc, db, doc_value, request);
             if (source_text == null or source_text.?.len == 0) {
                 if (source_text) |s| alloc.free(s);
@@ -5857,7 +5857,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     selected_manifest = write.value;
                     break;
                 }
-                const retained_manifest = if (selected_manifest == null) try db.core.getStoreValue(alloc, key) else null;
+                const retained_manifest = if (selected_manifest == null) try S.ownerField(db, "core").*.getStoreValue(alloc, key) else null;
                 defer if (retained_manifest) |value| alloc.free(value);
                 if (selected_manifest orelse retained_manifest) |manifest| {
                     const failed = try documentExtractionManifestHasLastError(alloc, manifest) or
@@ -5884,10 +5884,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 null;
             defer if (state_value) |value| alloc.free(value);
             if (!force_reprocess and state_key != null and state_value != null) {
-                const existing_state = try db.core.getStoreValue(alloc, state_key.?);
+                const existing_state = try S.ownerField(db, "core").*.getStoreValue(alloc, state_key.?);
                 defer if (existing_state) |value| alloc.free(value);
                 if (existing_state != null and std.mem.eql(u8, existing_state.?, state_value.?)) {
-                    const existing_asset = try db.core.getStoreValue(alloc, key);
+                    const existing_asset = try S.ownerField(db, "core").*.getStoreValue(alloc, key);
                     defer if (existing_asset) |value| alloc.free(value);
                     if (existing_asset) |value| {
                         try artifact_writes.append(alloc, .{
@@ -5934,7 +5934,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
 
             const value = if (producer_cfg.type == .copy) source_text.? else blk: {
-                const runtime = db.enrichment_runtime orelse return error.MissingAssetProducer;
+                const runtime = S.ownerField(db, "enrichment_runtime").* orelse return error.MissingAssetProducer;
                 const producer = runtime.config.asset_producer orelse return error.MissingAssetProducer;
                 break :blk try producer.produce(alloc, .{
                     .producer_type = producer_cfg.type,
@@ -6140,7 +6140,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     return;
                 }
             };
-            const runtime = db.enrichment_runtime orelse return error.MissingDenseEmbedder;
+            const runtime = S.ownerField(db, "enrichment_runtime").* orelse return error.MissingDenseEmbedder;
             const dense_embedder = runtime.config.dense_embedder orelse return error.MissingDenseEmbedder;
 
             const embedding_name = requestEmbeddingName(request);
@@ -6318,12 +6318,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
             const state_key = try assetStateKeyAlloc(alloc, request.doc_key, artifact_name);
             defer alloc.free(state_key);
-            const existing_state = db.core.getStoreValue(alloc, state_key) catch |err| switch (err) {
+            const existing_state = S.ownerField(db, "core").*.getStoreValue(alloc, state_key) catch |err| switch (err) {
                 error.NotFound => null,
                 else => return err,
             };
             defer if (existing_state) |value| alloc.free(value);
-            const existing_manifest = db.core.getStoreValue(alloc, manifest_key) catch |err| switch (err) {
+            const existing_manifest = S.ownerField(db, "core").*.getStoreValue(alloc, manifest_key) catch |err| switch (err) {
                 error.NotFound => null,
                 else => return err,
             };
@@ -6380,15 +6380,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
             }
 
-            const extraction_resource_manager = if (db.enrichment_runtime) |runtime|
+            const extraction_resource_manager = if (S.ownerField(db, "enrichment_runtime").*) |runtime|
                 runtime.config.resource_manager orelse runtime.index_manager.resource_manager
             else
-                db.core.index_manager.resource_manager;
+                S.ownerField(db, "core").*.index_manager.resource_manager;
             // Whole source documents are buffered here. Back the budget with the
             // long-lived DB allocator so source bytes are charged only to the
             // document extraction budget, not also to the request's fixed
             // preparation budget (which rejected large sources).
-            const extraction_backing = if (@hasField(@TypeOf(db.*), "alloc")) db.alloc else alloc;
+            const extraction_backing = if (@hasField(@TypeOf(db.*), "alloc")) S.ownerField(db, "alloc").* else alloc;
             var extraction_budgeted: ?resource_manager_mod.BudgetedAllocator = if (extraction_resource_manager) |manager|
                 resource_manager_mod.BudgetedAllocator.initReclaiming(manager, .document_extraction_working_set, extraction_backing, 1)
             else
@@ -6455,7 +6455,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 },
             };
             defer extraction.deinit(document_extraction_alloc);
-            if (db.enrichment_runtime) |runtime| {
+            if (S.ownerField(db, "enrichment_runtime").*) |runtime| {
                 try enrichment_runtime_mod.completeDocumentExtractionGeneratedTextForRequestWithMemory(
                     if (document_execution) |execution| &execution.runtime else runtime,
                     document_extraction_alloc,
@@ -6521,7 +6521,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer alloc.free(new_state);
             const navigation_summary_key = try internal_keys.documentUnitNavigationSummaryKeyAlloc(alloc, request.doc_key, artifact_name);
             defer alloc.free(navigation_summary_key);
-            const existing_navigation_summary = try db.core.getStoreValue(alloc, navigation_summary_key);
+            const existing_navigation_summary = try S.ownerField(db, "core").*.getStoreValue(alloc, navigation_summary_key);
             defer if (existing_navigation_summary) |value| alloc.free(value);
 
             var previous_state = DocumentExtractionPreviousState{};
@@ -6802,7 +6802,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     return;
                 }
             };
-            const runtime = db.enrichment_runtime orelse return error.MissingSparseEmbedder;
+            const runtime = S.ownerField(db, "enrichment_runtime").* orelse return error.MissingSparseEmbedder;
             const sparse_embedder = runtime.config.sparse_embedder orelse return error.MissingSparseEmbedder;
 
             const embedding_name = requestEmbeddingName(request);
@@ -8001,7 +8001,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     defer _ = arena_state.reset(.retain_capacity);
                     const chunk_key = try internal_keys.documentUnitChunkArtifactKeyAlloc(scratch, doc_key, entry.name, unit.unit_id, @intCast(chunk.chunk_id));
                     const chunk_key_index = documentExtractionKeyIndex(desired_chunk_keys, chunk_key) orelse return false;
-                    const stored = (db.core.getStoreValue(scratch, chunk_key) catch |err| switch (err) {
+                    const stored = (S.ownerField(db, "core").*.getStoreValue(scratch, chunk_key) catch |err| switch (err) {
                         error.NotFound => return false,
                         else => return err,
                     }) orelse return false;
@@ -8021,7 +8021,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             chunk_view: *const DocumentExtractionChunkView,
             chunk_key: []const u8,
         ) !bool {
-            const runtime = db.enrichment_runtime;
+            const runtime = S.ownerField(db, "enrichment_runtime").*;
             for (chunk_view.dense_embeddings) |entry| {
                 if (entry.consumer_indexes.len == 0 or runtime == null or runtime.?.config.dense_embedder == null) continue;
                 const artifact_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, chunk_key, entry.name);
@@ -8264,7 +8264,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     else => return null,
                 };
                 errdefer alloc.free(rendered);
-                try document_extraction_mod.validateInlineSourceSize(db.remote_content, rendered);
+                try document_extraction_mod.validateInlineSourceSize(S.ownerField(db, "remote_content").*, rendered);
                 return @constCast(rendered);
             }
 
@@ -8275,13 +8275,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             return switch (source) {
                 .null => null,
                 .string => |value| blk: {
-                    try document_extraction_mod.validateInlineSourceSize(db.remote_content, value);
+                    try document_extraction_mod.validateInlineSourceSize(S.ownerField(db, "remote_content").*, value);
                     break :blk try alloc.dupe(u8, value);
                 },
                 else => blk: {
                     const rendered = try std.json.Stringify.valueAlloc(alloc, source, .{});
                     errdefer alloc.free(rendered);
-                    try document_extraction_mod.validateInlineSourceSize(db.remote_content, rendered);
+                    try document_extraction_mod.validateInlineSourceSize(S.ownerField(db, "remote_content").*, rendered);
                     break :blk rendered;
                 },
             };
@@ -8630,7 +8630,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (items.items.len == 0) return;
             defer clearPrecomputeAssetProducerBatchItems(alloc, items);
 
-            const runtime = db.enrichment_runtime orelse return error.MissingAssetProducer;
+            const runtime = S.ownerField(db, "enrichment_runtime").* orelse return error.MissingAssetProducer;
             const producer = runtime.config.asset_producer orelse return error.MissingAssetProducer;
             const requests = try alloc.alloc(asset_producer_mod.Request, items.items.len);
             defer alloc.free(requests);
@@ -10434,7 +10434,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
             }
             if (manifest == null) {
-                owned_manifest = db.core.store.get(alloc, manifest_key) catch |err| switch (err) {
+                owned_manifest = S.ownerField(db, "core").*.store.get(alloc, manifest_key) catch |err| switch (err) {
                     error.NotFound => return null,
                     else => return err,
                 };
@@ -11337,7 +11337,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn relationalColumns(self: anytype) ?[]const schema_mod.RelationalColumn {
-            const schema = self.core.schema orelse return null;
+            const schema = S.ownerField(self, "core").*.schema orelse return null;
             if (schema.storage_mode != .relational) return null;
             return schema.relational_columns;
         }
@@ -11774,7 +11774,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             const unit_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "asset", artifact_name);
             defer alloc.free(unit_prefix);
-            const unit_rows = try db.core.store.scanPrefix(alloc, unit_prefix);
+            const unit_rows = try S.ownerField(db, "core").*.store.scanPrefix(alloc, unit_prefix);
             defer docstore_mod.DocStore.freeResults(alloc, unit_rows);
             for (unit_rows) |entry| {
                 if (std.mem.eql(u8, entry.key, unit_prefix)) continue;
@@ -11790,7 +11790,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             for (view.chunks) |entry| {
                 const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "chunk", entry.name);
                 defer alloc.free(chunk_prefix);
-                const chunk_rows = try db.core.store.scanPrefix(alloc, chunk_prefix);
+                const chunk_rows = try S.ownerField(db, "core").*.store.scanPrefix(alloc, chunk_prefix);
                 defer docstore_mod.DocStore.freeResults(alloc, chunk_rows);
                 for (chunk_rows) |row| {
                     if (!internal_keys.isChunkArtifactRecordKey(row.key)) continue;
@@ -11865,7 +11865,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .max_batch_items = max_batch_items,
                 .max_batch_bytes = max_batch_bytes,
             };
-            try db.core.store.scanWithContext(lower, upper_bound, .{}, &scan_ctx, ScanCtx.consume);
+            try S.ownerField(db, "core").*.store.scanWithContext(lower, upper_bound, .{}, &scan_ctx, ScanCtx.consume);
             if (scan_ctx.stopped_key) |key| {
                 defer alloc.free(key);
                 return try keyAfterAlloc(alloc, key);
@@ -12063,7 +12063,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn storeKeyExists(alloc: Allocator, db: anytype, key: []const u8) !bool {
-            const value = db.core.getStoreValue(alloc, key) catch |err| switch (err) {
+            const value = S.ownerField(db, "core").*.getStoreValue(alloc, key) catch |err| switch (err) {
                 error.NotFound => return false,
                 else => return err,
             };
@@ -12091,7 +12091,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     return enrichment_artifact_codec.sourceHash(value) catch null;
                 }
             }
-            const metadata = db.core.store.getArtifactMetadata(artifact_key) catch |err| switch (err) {
+            const metadata = S.ownerField(db, "core").*.store.getArtifactMetadata(artifact_key) catch |err| switch (err) {
                 error.NotFound,
                 error.InvalidArtifactHeader,
                 error.InvalidArtifactMagic,
@@ -12260,10 +12260,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn validateDocumentExtractionInlineSources(db: anytype, doc_value: []const u8) !void {
             var has_document_extraction_asset = false;
-            for (db.core.index_manager.enrichments.items) |entry| {
+            for (S.ownerField(db, "core").*.index_manager.enrichments.items) |entry| {
                 if (entry.kind != .asset) continue;
-                var producer_cfg = asset_producer_mod.parseProducerConfig(db.alloc, entry.producer_json) catch continue;
-                defer producer_cfg.deinit(db.alloc);
+                var producer_cfg = asset_producer_mod.parseProducerConfig(S.ownerField(db, "alloc").*, entry.producer_json) catch continue;
+                defer producer_cfg.deinit(S.ownerField(db, "alloc").*);
                 if (producer_cfg.type == .document_extraction) {
                     has_document_extraction_asset = true;
                     break;
@@ -12271,7 +12271,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             if (!has_document_extraction_asset) return;
 
-            const parsed = try std.json.parseFromSlice(std.json.Value, db.alloc, doc_value, .{});
+            const parsed = try std.json.parseFromSlice(std.json.Value, S.ownerField(db, "alloc").*, doc_value, .{});
             defer parsed.deinit();
             return try validateDocumentExtractionInlineSourcesParsed(db, parsed.value, doc_value);
         }
@@ -12283,25 +12283,25 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         ) !void {
             if (value != .object) return;
 
-            for (db.core.index_manager.enrichments.items) |entry| {
+            for (S.ownerField(db, "core").*.index_manager.enrichments.items) |entry| {
                 if (entry.kind != .asset) continue;
-                var producer_cfg = asset_producer_mod.parseProducerConfig(db.alloc, entry.producer_json) catch continue;
-                defer producer_cfg.deinit(db.alloc);
+                var producer_cfg = asset_producer_mod.parseProducerConfig(S.ownerField(db, "alloc").*, entry.producer_json) catch continue;
+                defer producer_cfg.deinit(S.ownerField(db, "alloc").*);
                 if (producer_cfg.type != .document_extraction) continue;
 
                 if (entry.source_template.len > 0) {
-                    const rendered = renderSourceTemplateText(db.alloc, db, entry.source_template, doc_value) catch |err| switch (err) {
+                    const rendered = renderSourceTemplateText(S.ownerField(db, "alloc").*, db, entry.source_template, doc_value) catch |err| switch (err) {
                         error.PermanentPromptFailure, error.TransientPromptFailure => return err,
                         else => continue,
                     };
-                    defer db.alloc.free(rendered);
-                    try document_extraction_mod.validateInlineSourceSize(db.remote_content, rendered);
+                    defer S.ownerField(db, "alloc").*.free(rendered);
+                    try document_extraction_mod.validateInlineSourceSize(S.ownerField(db, "remote_content").*, rendered);
                     continue;
                 }
 
                 const source = value.object.get(entry.source_field) orelse continue;
                 if (source != .string) continue;
-                try document_extraction_mod.validateInlineSourceSize(db.remote_content, source.string);
+                try document_extraction_mod.validateInlineSourceSize(S.ownerField(db, "remote_content").*, source.string);
             }
         }
 
@@ -12325,12 +12325,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         else => continue,
                     };
                     defer alloc.free(rendered);
-                    try document_extraction_mod.validateInlineSourceSize(db.remote_content, rendered);
+                    try document_extraction_mod.validateInlineSourceSize(S.ownerField(db, "remote_content").*, rendered);
                     continue;
                 }
                 const source = value.object.get(request.source_field) orelse continue;
                 if (source != .string) continue;
-                try document_extraction_mod.validateInlineSourceSize(db.remote_content, source.string);
+                try document_extraction_mod.validateInlineSourceSize(S.ownerField(db, "remote_content").*, source.string);
             }
         }
 

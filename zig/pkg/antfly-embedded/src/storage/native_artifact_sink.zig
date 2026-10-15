@@ -30,12 +30,16 @@ pub const Sink = struct {
         sha256: [Sha256.digest_length]u8,
     ) anyerror!void,
 
+    callback_dispatch: @import("named_callback.zig").Dispatch = NativeBoundary.local_dispatch,
+    const NativeCallbacks = struct { record: @FieldType(Sink, "record_fn") };
+    const NativeBoundary = @import("named_callback.zig").Boundary(NativeCallbacks);
+
     pub fn record(
         self: Sink,
         path: []const u8,
         size_bytes: u64,
         sha256: [Sha256.digest_length]u8,
     ) !void {
-        try self.record_fn(self.ptr, path, size_bytes, sha256);
+        try NativeBoundary.call("record", self.callback_dispatch, self.record_fn, .{ self.ptr, path, size_bytes, sha256 });
     }
 };

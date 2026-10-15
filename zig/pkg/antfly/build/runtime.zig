@@ -52,43 +52,11 @@ comptime {
 }
 
 pub fn setStripRecursively(module: *std.Build.Module, visited: *std.AutoHashMap(*std.Build.Module, void)) void {
-    const result = visited.getOrPut(module) catch @panic("OOM");
-    if (result.found_existing) return;
-
-    module.strip = true;
-    // Zig test roots otherwise retain error tracing while stripped provider
-    // archives disable it. Io futures contain trace-dependent native state;
-    // make that ABI choice explicit for every participant in this profile.
-    module.error_tracing = false;
-    for (module.import_table.values()) |imported_module| {
-        setStripRecursively(imported_module, visited);
-    }
+    @import("../../../build_support/embedded/shared_library.zig").setStripRecursively(module, visited);
 }
 
-/// Shared imports must use the same debug-information profile as every
-/// consumer. LLVM can crash when an unstripped test references declarations
-/// from a module stripped by a production archive in the same build graph.
 pub fn stripBuildGraph(b: *std.Build) void {
-    var steps = std.AutoHashMap(*std.Build.Step, void).init(b.allocator);
-    defer steps.deinit();
-    var modules = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
-    defer modules.deinit();
-    for (b.top_level_steps.values()) |root| stripStep(&root.step, &steps, &modules);
-}
-
-fn stripStep(step: *std.Build.Step, steps: *std.AutoHashMap(*std.Build.Step, void), modules: *std.AutoHashMap(*std.Build.Module, void)) void {
-    if ((steps.getOrPut(step) catch @panic("OOM")).found_existing) return;
-    if (step.cast(std.Build.Step.Compile)) |artifact| {
-        setStripRecursively(artifact.root_module, modules);
-        // Library dependencies are added by Build.Serialize after build()
-        // returns. Follow the authored links now so their roots receive the
-        // same profile as the consumer rather than retaining debug tracing.
-        for (artifact.root_module.getGraph().modules) |module| {
-            for (module.link_objects.items) |link| if (link == .other_step)
-                stripStep(&link.other_step.step, steps, modules);
-        }
-    }
-    for (step.dependencies.items) |dependency| stripStep(dependency, steps, modules);
+    @import("../../../build_support/embedded/shared_library.zig").stripBuildGraph(b);
 }
 const addMacosSdkPaths = @import("antfly_platform").addMacosSdkPaths;
 
@@ -106,6 +74,7 @@ pub const AddRuntimeOptions = struct {
     production_antfly_imports: AntflyRootImports,
     antfly_client_pkg_mod: *std.Build.Module,
     capi_mod: *std.Build.Module,
+    native_storage: ?*std.Build.Step.Compile,
     native_enrichment: *std.Build.Step.Compile,
     native_inference: *std.Build.Step.Compile,
 };
@@ -226,8 +195,8 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
         }
 
         // Both products consume the same three coarse compute exports. The
-        // Apache owner is already PIC and storage-free. Sanitized server
-        // profiles retain their separately instrumented owner.
+        // Apache owner is already PIC and storage-free, and receives the
+        // same sanitizer setting as the server.
         const compile_max_rss = if (unit == .inference and production_antfly_imports.shared_inference_core) 4 * 1024 * 1024 * 1024 else runtimeCompileMaxRss(unit, .{
             .host = b.graph.host.result,
             .target = target.result,
@@ -236,8 +205,9 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
             .cpu_inference = options.cpu_inference,
             .sanitize_thread = sanitize_thread,
             .macos_metal_blas_release = production_antfly_imports.darwin_release_memory,
+            .macos_shared_storage_sdk27 = production_antfly_imports.darwin_shared_storage_sdk27,
         });
-        const role_artifact = if (unit == .enrichment_compute and !sanitize_thread) blk: {
+        const role_artifact = if (unit == .enrichment_compute) blk: {
             // Reuse the implementation without replacing the runtime's
             // measured profile reservation with the embedded default.
             options.native_enrichment.step.max_rss = compile_max_rss;
@@ -258,6 +228,11 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
             b.fmt("Build only the {s} runtime library unit", .{@tagName(unit)}),
         );
         runtime_unit_step.dependOn(&role_artifact.step);
+        if (unit == .storage_kernel and options.native_storage != null)
+            b.step("runtime-unit-storage-adapter", "Compile only the server storage adapter without waiting for shared engine emission").dependOn(&role_artifact.step);
+        if (unit == .storage_kernel) {
+            if (options.native_storage) |owner| runtime_unit_step.dependOn(&owner.step);
+        }
         runtime_library_artifacts[@backingInt(unit)] = role_artifact;
         if (unit == .storage_kernel) {
             // The executable and C ABI libraries share this one optimized
@@ -275,6 +250,30 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
             defer visited.deinit();
             setStripRecursively(role_mod, &visited);
         }
+    }
+
+    if (options.native_storage) |owner| antfly_main.root_module.linkLibrary(owner);
+    if (options.native_storage) |owner| {
+        // Exercise the server's production build/source options against the
+        // independently compiled Apache owner, not just the embedded profile.
+        const client = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/public_capi_root.zig"), .target = target, .optimize = optimize });
+        production_antfly_imports.configureStorage(b, client, link_libc);
+        production_antfly_imports.storage_boundary.configureProfile(client, false, true, .all);
+        const capi_options = b.addOptions();
+        capi_options.addOption(bool, "linked_storage", true);
+        capi_options.addOption(bool, "inference_enabled", true);
+        client.addOptions("capi_build_options", capi_options);
+        client.addImport("antfly_storage_root", client);
+        const probe_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/storage_owner_linkage_probe.zig"), .target = target, .optimize = optimize });
+        probe_mod.addImport("storage_client", @import("../../../build_support/embedded/shared_library.zig").storageConsumerModule(b, client));
+        probe_mod.linkLibrary(owner);
+        production_antfly_imports.build_info.link(probe_mod);
+        probe_mod.linkLibrary(options.native_inference);
+        probe_mod.linkLibrary(options.native_enrichment);
+        const run = @import("../../../build_support/embedded/shared_library.zig").addStorageProbe(b, probe_mod, "storage-server-owner-linkage-probe");
+        _ = run.addOutputDirectoryArg("storage-server-owner-linkage");
+        run.has_side_effects = true;
+        b.top_level_steps.get("storage-owner-linkage-test").?.step.dependOn(&run.step);
     }
 
     // Exercise the real production archive boundary for encoded-image reads.

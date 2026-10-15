@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const ordinal_core = @import("storage_ordinals");
 const builtin = @import("builtin");
 const is_hostless = builtin.os.tag == .freestanding or builtin.os.tag == .wasi;
 const storage_build_options = @import("build_options");
@@ -1319,6 +1320,11 @@ const SplitSide = enum {
     right,
 };
 
+pub const GraphMetricNotify = struct {
+    ptr: *anyopaque,
+    notify: *const fn (*anyopaque) void,
+};
+
 pub const IndexManager = struct {
     pub fn tryAcquireCatalogRead(self: *IndexManager) bool {
         const closed: u32 = @as(u32, 1) << 31;
@@ -1466,10 +1472,7 @@ pub const IndexManager = struct {
     graph_indexes: std.ArrayListUnmanaged(GraphIndex),
     /// The DB-owned lazy metric runtime is notified only after a graph metric
     /// configuration is installed. The callback must not take catalog_mutex.
-    graph_metric_notify: ?struct {
-        ptr: *anyopaque,
-        notify: *const fn (*anyopaque) void,
-    } = null,
+    graph_metric_notify: ?GraphMetricNotify = null,
     graph_ownership_cleanup_cursor: usize = 0,
     /// Lock-free cursors give bounded scheduler sweeps stable round-robin
     /// fairness while the catalog shared lock keeps the indexed slices stable.
@@ -3946,7 +3949,7 @@ pub const IndexManager = struct {
                 for (refs.embedding_names) |name| try hashes.append(self.alloc, internal_keys.embeddingArtifactScopeHashForName(name));
             } else try hashes.append(self.alloc, internal_keys.embeddingArtifactScopeHashForName(refs.embedding_name orelse cfg.name));
         }
-        std.mem.sortUnstable(u64, hashes.items, {}, std.sort.asc(u64));
+        ordinal_core.sort(u64, hashes.items);
         return hashes.toOwnedSlice(self.alloc);
     }
 
@@ -3964,7 +3967,7 @@ pub const IndexManager = struct {
                 offset += 1;
             }
         }
-        std.mem.sortUnstable(u64, hashes, {}, std.sort.asc(u64));
+        ordinal_core.sort(u64, hashes);
         var unique_count: usize = 0;
         for (hashes) |hash| {
             if (unique_count != 0 and hashes[unique_count - 1] == hash) continue;
@@ -24809,7 +24812,7 @@ pub const IndexManager = struct {
         }
 
         const candidate_vector_ids = vector_ids_storage[0..filled];
-        std.mem.sortUnstable(u64, candidate_vector_ids, {}, std.sort.asc(u64));
+        ordinal_core.sort(u64, candidate_vector_ids);
         var unique_count: usize = 0;
         var previous: ?u64 = null;
         for (candidate_vector_ids) |vector_id| {
@@ -26474,7 +26477,7 @@ pub const IndexManager = struct {
 
         const sorted_ordinals = try alloc.dupe(doc_identity.DocOrdinal, ordinals);
         defer alloc.free(sorted_ordinals);
-        std.mem.sortUnstable(doc_identity.DocOrdinal, sorted_ordinals, {}, docOrdinalLessThan);
+        ordinal_core.sort(doc_identity.DocOrdinal, sorted_ordinals);
 
         const IdentityOrdinalKey = @TypeOf(internal_keys.identityOrdinalToDocKey(0));
         var key_storage = try alloc.alloc(IdentityOrdinalKey, sorted_ordinals.len);
@@ -30952,7 +30955,7 @@ pub const IndexManager = struct {
 
         var sorted_ordinals = try alloc.dupe(doc_identity.DocOrdinal, ordinals);
         defer alloc.free(sorted_ordinals);
-        std.mem.sortUnstable(doc_identity.DocOrdinal, sorted_ordinals, {}, docOrdinalLessThan);
+        ordinal_core.sort(doc_identity.DocOrdinal, sorted_ordinals);
         const unique_ordinals = sorted_ordinals[0..uniqueSortedDocOrdinals(sorted_ordinals)];
 
         var out = try std.ArrayListUnmanaged(u64).initCapacity(alloc, unique_ordinals.len);
@@ -30979,7 +30982,7 @@ pub const IndexManager = struct {
 
         var sorted_ordinals = try alloc.dupe(doc_identity.DocOrdinal, ordinals);
         defer alloc.free(sorted_ordinals);
-        std.mem.sortUnstable(doc_identity.DocOrdinal, sorted_ordinals, {}, docOrdinalLessThan);
+        ordinal_core.sort(doc_identity.DocOrdinal, sorted_ordinals);
         const unique_ordinals = sorted_ordinals[0..uniqueSortedDocOrdinals(sorted_ordinals)];
 
         var cached_out = std.ArrayListUnmanaged(u64).empty;
@@ -35541,16 +35544,7 @@ fn docOrdinalLessThan(_: void, lhs: doc_identity.DocOrdinal, rhs: doc_identity.D
 }
 
 fn uniqueSortedDocOrdinals(items: []doc_identity.DocOrdinal) usize {
-    if (items.len == 0) return 0;
-    var write: usize = 1;
-    var previous = items[0];
-    for (items[1..]) |item| {
-        if (item == previous) continue;
-        items[write] = item;
-        write += 1;
-        previous = item;
-    }
-    return write;
+    return ordinal_core.unique(items);
 }
 
 fn uniqueSortedU64(items: []u64) usize {

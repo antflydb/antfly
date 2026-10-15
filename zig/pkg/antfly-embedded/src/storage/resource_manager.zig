@@ -106,61 +106,60 @@ const supports_pressure_wait = builtin.os.tag != .freestanding and
     builtin.link_libc and
     @hasDecl(std.c, "pthread_cond_wait");
 
-const PressureChange = if (supports_pressure_wait)
-    struct {
-        mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
-        cond: std.c.pthread_cond_t = std.c.PTHREAD_COND_INITIALIZER,
-        epoch: @import("antfly_platform").atomic.Value(u64) = .init(0),
+const PressureChange = if (supports_pressure_wait) WaitingPressureChange else PollingPressureChange;
+const WaitingPressureChange = struct {
+    mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
+    cond: std.c.pthread_cond_t = std.c.PTHREAD_COND_INITIALIZER,
+    epoch: @import("antfly_platform").atomic.Value(u64) = .init(0),
 
-        fn snapshot(self: *@This()) u64 {
-            return self.epoch.load(.acquire);
-        }
+    fn snapshot(self: *@This()) u64 {
+        return self.epoch.load(.acquire);
+    }
 
-        fn waitForChange(self: *@This(), observed: u64) void {
-            if (std.c.pthread_mutex_lock(&self.mutex) != .SUCCESS) unreachable;
-            defer if (std.c.pthread_mutex_unlock(&self.mutex) != .SUCCESS) unreachable;
-            while (self.epoch.load(.acquire) == observed) {
-                if (std.c.pthread_cond_wait(&self.cond, &self.mutex) != .SUCCESS) unreachable;
-            }
-        }
-
-        fn tryLock(self: *@This()) bool {
-            return std.c.pthread_mutex_trylock(&self.mutex) == .SUCCESS;
-        }
-        fn unlock(self: *@This()) void {
-            if (std.c.pthread_mutex_unlock(&self.mutex) != .SUCCESS) unreachable;
-        }
-        fn advanceLocked(self: *@This()) void {
-            _ = self.epoch.fetchAdd(1, .release);
-            if (std.c.pthread_cond_broadcast(&self.cond) != .SUCCESS) unreachable;
-        }
-        fn advance(self: *@This()) void {
-            if (std.c.pthread_mutex_lock(&self.mutex) != .SUCCESS) unreachable;
-            defer self.unlock();
-            self.advanceLocked();
+    fn waitForChange(self: *@This(), observed: u64) void {
+        if (std.c.pthread_mutex_lock(&self.mutex) != .SUCCESS) unreachable;
+        defer if (std.c.pthread_mutex_unlock(&self.mutex) != .SUCCESS) unreachable;
+        while (self.epoch.load(.acquire) == observed) {
+            if (std.c.pthread_cond_wait(&self.cond, &self.mutex) != .SUCCESS) unreachable;
         }
     }
-else
-    struct {
-        epoch: @import("antfly_platform").atomic.Value(u64) = .init(0),
 
-        fn snapshot(self: *@This()) u64 {
-            return self.epoch.load(.acquire);
-        }
+    fn tryLock(self: *@This()) bool {
+        return std.c.pthread_mutex_trylock(&self.mutex) == .SUCCESS;
+    }
+    fn unlock(self: *@This()) void {
+        if (std.c.pthread_mutex_unlock(&self.mutex) != .SUCCESS) unreachable;
+    }
+    fn advanceLocked(self: *@This()) void {
+        _ = self.epoch.fetchAdd(1, .release);
+        if (std.c.pthread_cond_broadcast(&self.cond) != .SUCCESS) unreachable;
+    }
+    fn advance(self: *@This()) void {
+        if (std.c.pthread_mutex_lock(&self.mutex) != .SUCCESS) unreachable;
+        defer self.unlock();
+        self.advanceLocked();
+    }
+};
+const PollingPressureChange = struct {
+    epoch: @import("antfly_platform").atomic.Value(u64) = .init(0),
 
-        fn waitForChange(_: *@This(), _: u64) void {}
+    fn snapshot(self: *@This()) u64 {
+        return self.epoch.load(.acquire);
+    }
 
-        fn tryLock(_: *@This()) bool {
-            return true;
-        }
-        fn unlock(_: *@This()) void {}
-        fn advanceLocked(self: *@This()) void {
-            self.advance();
-        }
-        fn advance(self: *@This()) void {
-            _ = self.epoch.fetchAdd(1, .release);
-        }
-    };
+    fn waitForChange(_: *@This(), _: u64) void {}
+
+    fn tryLock(_: *@This()) bool {
+        return true;
+    }
+    fn unlock(_: *@This()) void {}
+    fn advanceLocked(self: *@This()) void {
+        self.advance();
+    }
+    fn advance(self: *@This()) void {
+        _ = self.epoch.fetchAdd(1, .release);
+    }
+};
 const default_disk_safety_floor_bytes: u64 = 1024 * MiB;
 const default_disk_safety_floor_divisor: u64 = 20;
 // Percentage-only reserves strand tens or hundreds of GiB on large volumes

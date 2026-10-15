@@ -144,11 +144,15 @@ pub const ReplicationWriteGate = replication_contract.WriteGate;
 pub const DocumentArtifactChildRangeDispatcher = document_child_range_outbox.DocumentArtifactChildRangeDispatcher;
 
 pub const CommittedBatchEffectsObserver = struct {
+    const NativeCallbacks = struct { apply: @FieldType(CommittedBatchEffectsObserver, "apply") };
+    const NativeBoundary = @import("../named_callback.zig").Boundary(NativeCallbacks);
+    callback_dispatch: @import("../named_callback.zig").Dispatch = NativeBoundary.local_dispatch,
+
     ptr: *anyopaque,
     apply: *const fn (ptr: *anyopaque, replay_payload: []const u8) anyerror!void,
 
     pub fn observe(self: CommittedBatchEffectsObserver, replay_payload: []const u8) !void {
-        return try self.apply(self.ptr, replay_payload);
+        return try NativeBoundary.call("apply", self.callback_dispatch, self.apply, .{ self.ptr, replay_payload });
     }
 };
 
@@ -823,6 +827,14 @@ pub const PreparedRowAllocator = struct {
     child: Allocator,
     io: std.Io,
     mutex: std.Io.Mutex = .init,
+    io_receiver: ?@import("antfly_runtime_abi").io_abi.Receiver = null,
+
+    pub fn captureIoDomain(self: *@This()) void {
+        if (self.io_receiver == null) self.io_receiver = @import("antfly_runtime_abi").io_abi.Borrow.init(&self.io).receive() catch unreachable;
+    }
+    fn operationIo(self: *@This()) std.Io {
+        return if (self.io_receiver) |*receiver| receiver.io() else self.io;
+    }
 
     pub fn allocator(self: *@This()) Allocator {
         return .{ .ptr = self, .vtable = &vtable };
@@ -837,29 +849,29 @@ pub const PreparedRowAllocator = struct {
 
     pub fn allocFn(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
         const self: *@This() = @ptrCast(@alignCast(ctx));
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.mutex.lockUncancelable(self.operationIo());
+        defer self.mutex.unlock(self.operationIo());
         return self.child.rawAlloc(len, alignment, ret_addr);
     }
 
     pub fn resizeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
         const self: *@This() = @ptrCast(@alignCast(ctx));
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.mutex.lockUncancelable(self.operationIo());
+        defer self.mutex.unlock(self.operationIo());
         return self.child.rawResize(memory, alignment, new_len, ret_addr);
     }
 
     pub fn remapFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
         const self: *@This() = @ptrCast(@alignCast(ctx));
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.mutex.lockUncancelable(self.operationIo());
+        defer self.mutex.unlock(self.operationIo());
         return self.child.rawRemap(memory, alignment, new_len, ret_addr);
     }
 
     pub fn freeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
         const self: *@This() = @ptrCast(@alignCast(ctx));
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+        self.mutex.lockUncancelable(self.operationIo());
+        defer self.mutex.unlock(self.operationIo());
         self.child.rawFree(memory, alignment, ret_addr);
     }
 };
