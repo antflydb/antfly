@@ -7700,7 +7700,27 @@ pub fn decoderRuntimeModernBertTrainingAttentionV1Device(
         .backward = @intFromBool(backward),
         .scale = 1 / @sqrt(@as(f32, @floatFromInt(attrs.head_dim))),
     };
-    const rc = termite_metal_decode_runtime_modernbert_training_attention_v1(
+    // The tiled kernels hold a block's K/V (or Q/dO) in simdgroup registers
+    // instead of rereading them per query, which matters at the 512-token
+    // rows Laya trains on; they only cover head_dim multiples of 8 up to 64
+    // (ModernBERT and head layers both use 64). TERMITE_METAL_DISABLE_FLASH_TRAINING_ATTENTION
+    // forces the serial kernels back on for bisecting.
+    const flash_eligible = attrs.head_dim % 8 == 0 and attrs.head_dim <= 64 and
+        !getenvFlagEnabled("TERMITE_METAL_DISABLE_FLASH_TRAINING_ATTENTION");
+    const rc = if (flash_eligible) termite_metal_decode_runtime_modernbert_training_attention_flash_v1(
+        runtime,
+        qkv.deviceHandle(),
+        qkv.deviceByteOffset(),
+        control_tensor.deviceHandle(),
+        control_tensor.deviceByteOffset(),
+        if (d_out) |upstream| upstream.deviceHandle() else null,
+        if (d_out) |upstream| upstream.deviceByteOffset() else 0,
+        storage.deviceHandle(),
+        storage.deviceByteOffset(),
+        storage.deviceHandle(),
+        storage.deviceByteOffset() + output_bytes,
+        &params,
+    ) else termite_metal_decode_runtime_modernbert_training_attention_v1(
         runtime,
         qkv.deviceHandle(),
         qkv.deviceByteOffset(),
@@ -7718,6 +7738,7 @@ pub fn decoderRuntimeModernBertTrainingAttentionV1Device(
         0 => {},
         -1 => return error.InvalidModernBertTrainingAttentionShape,
         -2 => return error.UnsupportedModernBertTrainingAttentionProfile,
+        -3 => return error.UnsupportedModernBertTrainingAttentionProfile,
         -5 => return error.MetalEncoderAllocationFailed,
         else => return error.MetalModernBertTrainingAttentionFailed,
     }
@@ -20079,6 +20100,20 @@ pub extern fn termite_metal_decode_runtime_apply_rope_device(
     output_offset: usize,
 ) c_int;
 pub extern fn termite_metal_decode_runtime_modernbert_training_attention_v1(
+    runtime: ?*RawMetalDecodeRuntime,
+    qkv_handle: ?*anyopaque,
+    qkv_offset: usize,
+    control_handle: ?*anyopaque,
+    control_offset: usize,
+    dout_handle: ?*anyopaque,
+    dout_offset: usize,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+    scratch_handle: ?*anyopaque,
+    scratch_offset: usize,
+    params: *const ModernBertTrainingAttentionParams,
+) c_int;
+pub extern fn termite_metal_decode_runtime_modernbert_training_attention_flash_v1(
     runtime: ?*RawMetalDecodeRuntime,
     qkv_handle: ?*anyopaque,
     qkv_offset: usize,
