@@ -1427,3 +1427,9 @@ stopped before completion to qualify the reviewed revision instead. Their
 elapsed times are not completed build measurements. GitHub's Apache boundary
 check passed for the merged revision; the draft PR CI gate deliberately keeps
 test runners idle, so its action-required status is not a test failure.
+
+The final review build scripts pass both pinned Zig 17 graph-only help checks
+with `-Dstrip=true`, including independent embedded composition; retired flags
+are absent from both. The current complete Apache audit verifies 2,050 source
+files, and all 35 boundary-checker regressions pass. Temporary local graph-check
+caches were removed. Wolfspider release execution remains in progress.
