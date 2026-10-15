@@ -274,6 +274,10 @@ func corpusPrepareCmd(args []string) error {
 				e = fmt.Errorf("PDF has no pages")
 			}
 			if e != nil {
+				var ioFailure *os.PathError
+				if errors.As(e, &ioFailure) {
+					return fmt.Errorf("count pages %s: %w", entry.ID, e)
+				}
 				// An unreadable source (e.g. a corrupt archive entry) must not
 				// abort a full-corpus preparation; record it and move on.
 				if e = recordSkippedSource(filepath.Join(*state, "skipped.ndjson"), entry.ID, e); e != nil {

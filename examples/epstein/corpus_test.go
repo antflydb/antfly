@@ -556,6 +556,51 @@ func TestCorpusPreparedPageWindowsSurviveRestartAndValidateSource(t *testing.T) 
 	}
 }
 
+func TestCorpusPrepareRetainsSourceAfterTemporaryStorageFailure(t *testing.T) {
+	dir := t.TempDir()
+	state := filepath.Join(dir, "state")
+	source := filepath.Join(dir, "source.zip")
+	var archive bytes.Buffer
+	zw := zip.NewWriter(&archive)
+	entry, err := zw.Create("EFTA00000001.pdf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := entry.Write(createMultiPagePDF(2)); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	writeCorpusFixture(t, source, archive.Bytes())
+	missingTemp := filepath.Join(dir, "missing-temp")
+	t.Setenv("TMPDIR", missingTemp)
+	args := []string{"--state", state, "--source", "test=" + source}
+	err = corpusPrepareCmd(args)
+	var ioFailure *os.PathError
+	if !errors.As(err, &ioFailure) || filepath.Dir(ioFailure.Path) != missingTemp {
+		t.Fatalf("expected temporary storage failure, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(state, "skipped.ndjson")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("filesystem failure was recorded as a skipped source: %v", err)
+	}
+	var progress corpusProgress
+	if err := readCorpusJSON(filepath.Join(state, "prepare.json"), &progress); err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatal(err)
+	}
+	if progress.Complete || progress.InputOffset != 0 || len(testCorpusRecords(t, state)) != 0 {
+		t.Fatalf("preparation advanced past the failed source: %+v", progress)
+	}
+	// Fixing the filesystem must let the same checkpoint publish the source.
+	t.Setenv("TMPDIR", dir)
+	if err := corpusPrepareCmd([]string{"--state", state, "--resume"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(testCorpusRecords(t, state)); got != 1 {
+		t.Fatalf("records after recovery=%d", got)
+	}
+}
+
 func TestCorpusPrepareSkipsPDFRejectedAfterPageCounting(t *testing.T) {
 	dir := t.TempDir()
 	source, state := filepath.Join(dir, "sources"), filepath.Join(dir, "state")
