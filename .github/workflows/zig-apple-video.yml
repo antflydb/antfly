@@ -55,7 +55,7 @@ jobs:
           system_profiler SPHardwareDataType > .benchmark-results/apple-video/hardware.txt
           zig version > .benchmark-results/apple-video/zig.txt
           zig build --build-file zig/lib/video/build.zig test-video -Dvideo-test-filter='Apple WebM' -Doptimize=ReleaseSafe -Dtarget=aarch64-macos.15.0 --summary all 2>&1 | tee .benchmark-results/apple-video/video.log
-          zig build --build-file zig/pkg/inference/build.zig test-video-model -Dmetal=false -Doptimize=ReleaseSafe -Dtarget=aarch64-macos.15.0 --summary all 2>&1 | tee .benchmark-results/apple-video/model.log
+          zig build --build-file zig/pkg/inference/build.zig test-video-model test-media-chunking -Dmetal=false -Doptimize=ReleaseSafe -Dtarget=aarch64-macos.15.0 --summary all 2>&1 | tee .benchmark-results/apple-video/model.log
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
@@ -109,4 +109,4 @@ jobs:
           test "$(uname -m)" = arm64
           sw_vers
           zig build --build-file zig/lib/video/build.zig test-video -Doptimize=ReleaseSafe -Dtarget=aarch64-macos.15.0 --summary all
-          zig build --build-file zig/pkg/inference/build.zig test-video-model -Dmetal=true -Doptimize=ReleaseSafe -Dtarget=aarch64-macos.15.0 --summary all
+          zig build --build-file zig/pkg/inference/build.zig test-video-model test-media-chunking -Dmetal=true -Doptimize=ReleaseSafe -Dtarget=aarch64-macos.15.0 --summary all

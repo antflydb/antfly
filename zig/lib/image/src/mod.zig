@@ -56,8 +56,8 @@ pub const RasterFormat = enum {
 /// A synchronous borrowed view of a decoded raster plus stable work identity.
 /// The producer owns `bytes` and every identity slice for the complete
 /// invocation; consumers must not retain any pointer after returning. Rows may
-/// contain padding, but the buffer itself is exact: no trailing unaccounted
-/// storage is accepted.
+/// contain padding. A buffer ends either after the last pixel or its complete
+/// padded row, allowing borrowed crop views without copying unrelated pixels.
 ///
 /// This physical ABI is task-neutral. Reader, generator, embedder, reranker,
 /// and extractor adapters may use it only after their resolved local executor
@@ -88,7 +88,9 @@ pub const BorrowedRasterAttachment = struct {
             self.stride_bytes,
             @as(usize, self.height),
         ) catch return error.InvalidRasterDimensions;
-        if (self.bytes.len != required) return error.InvalidRasterBuffer;
+        const minimum = std.math.add(usize, required - self.stride_bytes, row_bytes) catch
+            return error.InvalidRasterDimensions;
+        if (self.bytes.len != required and self.bytes.len != minimum) return error.InvalidRasterBuffer;
     }
 
     pub fn pixels(self: BorrowedRasterAttachment) !u64 {

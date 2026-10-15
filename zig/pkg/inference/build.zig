@@ -1120,24 +1120,7 @@ pub fn build(b: *std.Build) void {
         b.step("build-pdf-ocr-comparison", "Build Gemma4 versus Apple Vision corpus benchmark").dependOn(&b.addInstallArtifact(pdf_ocr_bench, .{}).step);
     }
 
-    // Standalone PDF benchmark shares image/hash identity with inference.
-    // Font data belongs only to this tool, not the production inference graph.
-    const pdf_fonts_files = b.addWriteFiles();
-    _ = pdf_fonts_files.addCopyFile(b.path(b.fmt("{s}/lib/pdf/fonts/roboto/Roboto-Regular.ttf", .{shared_lib_root})), "lib/pdf/fonts/roboto/Roboto-Regular.ttf");
-    _ = pdf_fonts_files.addCopyFile(b.path(b.fmt("{s}/lib/pdf/fonts/roboto/Roboto-Bold.ttf", .{shared_lib_root})), "lib/pdf/fonts/roboto/Roboto-Bold.ttf");
-    const pdf_fonts = b.createModule(.{ .root_source_file = pdf_fonts_files.addCopyFile(b.path(b.fmt("{s}/pdf_standard_fonts.zig", .{shared_lib_root})), "pdf_standard_fonts.zig"), .target = target, .optimize = optimize });
-    const pdf_font = b.createModule(.{ .root_source_file = b.path(b.fmt("{s}/lib/font/src/mod.zig", .{shared_lib_root})), .target = target, .optimize = optimize });
-    const pdf_module = b.createModule(.{ .root_source_file = b.path(b.fmt("{s}/lib/pdf/src/mod.zig", .{shared_lib_root})), .target = target, .optimize = optimize });
-    pdf_module.addImport("antfly_image", antfly_image_mod);
-    pdf_module.addImport("antfly_hash", antfly_image_mod.import_table.get("antfly_hash").?);
-    pdf_module.addImport("antfly_font", pdf_font);
-    pdf_module.addImport("pdf_standard_fonts", pdf_fonts);
-    pdf_module.addImport("antfly_platform", configured_platform_mod);
-    if (target.result.os.tag == .macos) {
-        addMacosSdkPaths(b, pdf_module, target);
-        pdf_module.linkFramework("CoreFoundation", .{});
-        pdf_module.linkFramework("CoreGraphics", .{});
-    }
+    const pdf_module = inference_internal_mod.import_table.get("antfly_pdf").?;
     const gemma4_pdf_bench = b.addExecutable(.{ .name = "antfly-gemma4-pdf-bench", .root_module = b.createModule(.{ .root_source_file = b.path("src/bench/gemma4_pdf.zig"), .target = target, .optimize = optimize }) });
     gemma4_pdf_bench.root_module.addImport("build_options", build_options_mod);
     gemma4_pdf_bench.root_module.addImport("inference_internal", inference_internal_mod);
@@ -1620,6 +1603,26 @@ pub fn build(b: *std.Build) void {
     const video_model_tests = b.addTest(.{ .root_module = video_model_root, .filters = &.{ "embeddinggemma2 video", "embeddinggemma2 Metal video", "embeddinggemma2 model VFR", "metal native embeddinggemma2 BF16 and F32 shared" } });
     b.step("check-video-model", "Compile video model qualification for cross-platform checks").dependOn(&video_model_tests.step);
     b.step("install-video-model-tests", "Install native video model policy/lifetime tests for another host").dependOn(&b.addInstallArtifact(video_model_tests, .{ .dest_sub_path = "video-model-tests" }).step);
+    const media_chunk_tests = b.addTest(.{ .root_module = video_model_root, .filters = &.{"model aware media"} });
+    const media_chunk_step = b.step("test-media-chunking", "Qualify model-aware chunk coverage, source coordinates and cancellation");
+    media_chunk_step.dependOn(&b.addRunArtifact(media_chunk_tests).step);
+    const chunk_audio_root = b.createModule(.{ .root_source_file = b.path(b.fmt("{s}/lib/audio/audio_module_test_root.zig", .{shared_lib_root})), .target = target, .optimize = optimize });
+    @import("antfly_media").support.attach(b, chunk_audio_root, b.path(b.fmt("{s}/lib/media", .{shared_lib_root})));
+    chunk_audio_root.link_libc = link_libc;
+    const chunk_audio_tests = b.addTest(.{ .root_module = chunk_audio_root, .filters = &.{"bounded audio cancellation"} });
+    media_chunk_step.dependOn(&b.addRunArtifact(chunk_audio_tests).step);
+    const chunk_planning_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path(b.fmt("{s}/lib/chunker/src/planning.zig", .{shared_lib_root})), .target = target, .optimize = optimize }) });
+    media_chunk_step.dependOn(&b.addRunArtifact(chunk_planning_tests).step);
+    const chunk_sampling_root = b.createModule(.{ .root_source_file = b.path(b.fmt("{s}/lib/video/src/sampling.zig", .{shared_lib_root})), .target = target, .optimize = optimize });
+    chunk_sampling_root.addImport("antfly_media", inference_audio_mod.import_table.get("antfly_media").?);
+    const chunk_sampling_tests = b.addTest(.{ .root_module = chunk_sampling_root });
+    media_chunk_step.dependOn(&b.addRunArtifact(chunk_sampling_tests).step);
+    b.step("check-media-chunking", "Compile model-aware media qualification").dependOn(&media_chunk_tests.step);
+    const install_media_chunks = b.step("install-media-chunking-tests", "Install portable model-aware media qualification");
+    install_media_chunks.dependOn(&b.addInstallArtifact(media_chunk_tests, .{ .dest_sub_path = "media-chunking-tests" }).step);
+    install_media_chunks.dependOn(&b.addInstallArtifact(chunk_audio_tests, .{ .dest_sub_path = "media-chunk-audio-tests" }).step);
+    install_media_chunks.dependOn(&b.addInstallArtifact(chunk_planning_tests, .{ .dest_sub_path = "media-chunk-planning-tests" }).step);
+    install_media_chunks.dependOn(&b.addInstallArtifact(chunk_sampling_tests, .{ .dest_sub_path = "media-chunk-sampling-tests" }).step);
     const run_video_model_tests = b.addRunArtifact(video_model_tests);
     // Device availability and producer/consumer lifetimes must be checked on
     // each qualification run, even when the executable itself is cached.

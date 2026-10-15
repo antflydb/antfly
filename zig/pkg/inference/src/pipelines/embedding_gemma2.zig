@@ -60,8 +60,8 @@ fn admitReclaimingVisionCache(session: Session, request: @import("../backends/se
         return denied;
     };
 }
-pub const SampledVideo = struct { bytes: []const u8 = &.{}, reader: ?*const @import("antfly_media").mp4.Reader = null, selection: ?*const @import("embedding_gemma2_video.zig").ReaderSelection = null, sampling: @import("embedding_gemma2_video.zig").Sampling };
-pub const Part = union(enum) { text: []const u8, image: []const u8, audio: []const u8, video: []const u8, sampled_video: SampledVideo, raster: @import("antfly_image").BorrowedRasterAttachment };
+pub const SampledVideo = struct { webm: ?@import("embedding_gemma2_video.zig").WebmInput = null, bytes: []const u8 = &.{}, reader: ?*const @import("antfly_media").mp4.Reader = null, selection: ?*const @import("embedding_gemma2_video.zig").ReaderSelection = null, sampling: @import("embedding_gemma2_video.zig").Sampling };
+pub const Part = union(enum) { text: []const u8, image: []const u8, audio: []const u8, pcm: @import("audio.zig").PcmAudio, video: []const u8, sampled_video: SampledVideo, raster: @import("antfly_image").BorrowedRasterAttachment };
 
 /// Final response materialization; normalization already completed on device.
 fn readNormalizedVector(cb: *const @import("../ops/ops.zig").ComputeBackend, a: std.mem.Allocator, pooled: @import("../ops/ops.zig").CT, dimensions: usize) ![]f32 {
@@ -80,6 +80,7 @@ fn readNormalizedVector(cb: *const @import("../ops/ops.zig").ComputeBackend, a: 
 fn partBytes(part: Part) []const u8 {
     return switch (part) {
         .raster => |raster| raster.bytes,
+        .pcm => |pcm| std.mem.sliceAsBytes(pcm.samples),
         .sampled_video => |value| if (value.reader) |reader| switch (reader.input.storage) {
             .borrowed => |bytes| bytes,
             .range => &.{},
@@ -235,7 +236,7 @@ fn embedScoped(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, gro
         switch (part) {
             .text => {},
             .image, .raster, .video, .sampled_video => if (!cfg.vision) return error.NoVisionSession,
-            .audio => if (!cfg.audio) return error.NoAudioSession,
+            .audio, .pcm => if (!cfg.audio) return error.NoAudioSession,
         }
     }
     const effective = control orelse Control{};
@@ -256,7 +257,7 @@ fn embedScoped(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, gro
                 const packet_reader = if (@TypeOf(payload) == SampledVideo) payload.reader else null;
                 const selection = if (@TypeOf(payload) == SampledVideo) payload.selection else null;
                 if (selection != null and packet_reader == null) return error.InvalidVideoReaderSelection;
-                const plan = try @import("embedding_gemma2_video.zig").inspectConfiguredPlan(a, bytes, packet_reader, effective, .{ .sampling = sampling, .pool = &host_budget, .selection = selection, .decoder = options.video_decoder }, session.backend() == .metal);
+                const plan = try @import("embedding_gemma2_video.zig").inspectConfiguredPlan(a, bytes, packet_reader, effective, .{ .sampling = sampling, .pool = &host_budget, .selection = selection, .webm = if (@TypeOf(payload) == SampledVideo) payload.webm else null, .decoder = options.video_decoder }, session.backend() == .metal);
                 device_bytes = @max(device_bytes, try plan.deviceBytes());
                 command_slots = @max(command_slots, plan.commands);
             },
@@ -286,7 +287,7 @@ fn embedScoped(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, gro
                     const sampling: @import("embedding_gemma2_video.zig").Sampling = if (@TypeOf(payload) == SampledVideo) payload.sampling else .reference;
                     const packet_reader = if (@TypeOf(payload) == SampledVideo) payload.reader else null;
                     const selection = if (@TypeOf(payload) == SampledVideo) payload.selection else null;
-                    prefetched = try @import("embedding_gemma2_video.zig").Prefetch.startConfigured(a, io, context.device, bytes, packet_reader, effective, .{ .sampling = sampling, .pool = &video_budget, .selection = selection, .cache = cache, .decoder = options.video_decoder });
+                    prefetched = try @import("embedding_gemma2_video.zig").Prefetch.startConfigured(a, io, context.device, bytes, packet_reader, effective, .{ .sampling = sampling, .pool = &video_budget, .selection = selection, .webm = if (@TypeOf(payload) == SampledVideo) payload.webm else null, .cache = cache, .decoder = options.video_decoder });
                     break;
                 },
                 else => {},
@@ -394,7 +395,7 @@ fn prepareGroupCombined(a: std.mem.Allocator, cb: *const ComputeBackend, tokeniz
                 const encoded = if (!used_prefetch and prefetched != null) blk: {
                     used_prefetch = true;
                     break :blk try prefetched.?.encode(cb);
-                } else try @import("embedding_gemma2_video.zig").encodeConfigured(a, cb, bytes, if (@TypeOf(payload) == SampledVideo) payload.reader else null, effective, .{ .sampling = sampling, .pool = video_budget, .selection = if (@TypeOf(payload) == SampledVideo) payload.selection else null, .cache = cache, .decoder = options.video_decoder });
+                } else try @import("embedding_gemma2_video.zig").encodeConfigured(a, cb, bytes, if (@TypeOf(payload) == SampledVideo) payload.reader else null, effective, .{ .sampling = sampling, .pool = video_budget, .selection = if (@TypeOf(payload) == SampledVideo) payload.selection else null, .webm = if (@TypeOf(payload) == SampledVideo) payload.webm else null, .cache = cache, .decoder = options.video_decoder });
                 defer a.free(encoded.frame_tokens);
                 var owned = true;
                 errdefer if (owned) {
@@ -416,10 +417,10 @@ fn prepareGroupCombined(a: std.mem.Allocator, cb: *const ComputeBackend, tokeniz
                 try media.append(a, .{ .id = 258884, .embeddings = encoded.embeddings, .tokens = count_video, .tensor = encoded.tensor });
                 owned = false;
             },
-            .image, .audio, .raster => {
+            .image, .audio, .raster, .pcm => {
                 const bytes = partBytes(part);
-                const is_image = part != .audio;
-                if (!is_image and preprojected == null) {
+                const is_image = part == .image or part == .raster;
+                if (part == .audio and preprojected == null) {
                     var decoded = try @import("audio.zig").decodeBounded(a, bytes, .{}, 64 * 1024 * 1024);
                     defer decoded.deinit();
                     if (decoded.sample_rate == 0 or @as(u64, decoded.samples.len) * 16000 > @as(u64, decoded.sample_rate) * 480000) return error.AudioTooLong;
@@ -436,7 +437,7 @@ fn prepareGroupCombined(a: std.mem.Allocator, cb: *const ComputeBackend, tokeniz
                         if (group.content.len != 1 or part != .audio or p.id != 258881) return error.InvalidInputShape;
                         break :blk SoftTokens{ .id = p.id, .embeddings = try a.dupe(f32, p.embeddings), .tokens = p.tokens };
                     }
-                    const p = try projector.encodeEmbeddingGemma2Audio(cb, a, bytes);
+                    const p = if (part == .pcm) try projector.encodeEmbeddingGemma2Pcm(cb, a, part.pcm) else try projector.encodeEmbeddingGemma2Audio(cb, a, bytes);
                     break :blk SoftTokens{ .id = 258881, .embeddings = p.embeddings, .tokens = p.tokens };
                 };
                 errdefer a.free(projected.embeddings);
@@ -685,9 +686,8 @@ pub fn embedAudios(out: std.mem.Allocator, session: Session, tokenizer: Tokenize
     errdefer out.free(token_counts);
     if (!options.resident_audio or (session.backend() != .metal and session.backend() != .cuda)) {
         for (clips, 0..) |clip, index| {
-            const encoded = if (clip.pcm) |pcm| try @import("audio.zig").wav.encodeInterleaved(out, pcm.samples, 1, .{ .audio_format = 3, .sample_rate = pcm.sample_rate, .bits_per_sample = 32 }) else null;
-            defer if (encoded) |bytes| out.free(bytes);
-            const result = embed(out, session, tokenizer, .{ .content = &.{.{ .audio = encoded orelse clip.bytes }} }, options, lock, control) catch |err| {
+            const part: Part = if (clip.pcm) |pcm| .{ .pcm = pcm } else .{ .audio = clip.bytes };
+            const result = embed(out, session, tokenizer, .{ .content = &.{part} }, options, lock, control) catch |err| {
                 if (errors) |items| {
                     if (prep.abort(err)) return err;
                     items[index] = err;
@@ -1557,16 +1557,25 @@ pub fn validateGroup(group: Group, options: Options) !void {
                 .timestamps, .source_timestamps => |policy| try policy.validate(),
                 .reference => {},
             }
+            if (part.sampled_video.webm) |input| {
+                if (part.sampled_video.reader != null or part.sampled_video.selection != null or part.sampled_video.bytes.len != 0 or input.index.reader != input.reader or input.index.pictures.len == 0) return error.InvalidEmbeddingGroup;
+            }
             if (part.sampled_video.reader) |reader| {
                 if (part.sampled_video.bytes.len != 0) return error.InvalidEmbeddingGroup;
                 _ = try @import("embedding_gemma2_video.zig").packetBytes(reader);
             }
         }
+        if (part == .pcm) {
+            const pcm = part.pcm;
+            if (pcm.sample_rate == 0 or pcm.sample_rate > 192000 or pcm.samples.len == 0) return error.UnsupportedAudioFormat;
+            if (@as(u128, pcm.samples.len) * 16000 > @as(u128, pcm.sample_rate) * 480000) return error.AudioTooLong;
+            for (pcm.samples) |sample| if (!std.math.isFinite(sample)) return error.UnsupportedAudioFormat;
+        }
         if (part == .raster) {
             try part.raster.validate();
             try @import("image.zig").DecodeLimits.inference_default.validate(part.raster.width, part.raster.height);
         }
-        if (value.len == 0) return error.EmptyEmbeddingInput;
+        if (value.len == 0 and !(part == .sampled_video and part.sampled_video.webm != null)) return error.EmptyEmbeddingInput;
         if (part == .raster) raster_bytes = std.math.add(usize, raster_bytes, value.len) catch return error.ResourceLimitExceeded else bytes = std.math.add(usize, bytes, value.len) catch return error.ResourceLimitExceeded;
         if (part == .text) {
             has_text = true;

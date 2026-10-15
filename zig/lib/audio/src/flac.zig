@@ -102,6 +102,7 @@ pub fn decodeInterleaved(allocator: std.mem.Allocator, bytes: []const u8) !Decod
     defer samples.deinit(allocator);
 
     while (cursor < bytes.len) {
+        try @import("work_control.zig").check();
         const frame = try decodeFrameAlloc(allocator, parsed.stream_info, bytes[cursor..]);
         defer {
             var owned = frame;

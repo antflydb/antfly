@@ -54,6 +54,8 @@ jobs:
           zig build --build-file zig/lib/video/build.zig test-video -Doptimize=ReleaseSafe --summary all
           zig build --build-file zig/lib/media/build.zig test-media test-media-http -Doptimize=ReleaseSafe --summary all
           python -m unittest discover -s tools/embeddinggemma2 -p 'test_*.py'
+          zig build --build-file zig/pkg/inference/build.zig test-media-chunking -Dmetal=false -Doptimize=ReleaseSafe --summary all
+          zig build --build-file zig/build.zig antfly-media-chunking-test lib-chunking-test lib-scraping-test -Doptimize=ReleaseSafe --summary all
       - name: Build native inference
         working-directory: zig/pkg/inference
         run: zig build -Dmetal=false -Dcuda=false -Doptimize=ReleaseSafe -Dinference-compile-memory-mb=8192 -j1 --prefix ../../../.benchmark-results/video-linux/install --summary all
@@ -61,6 +63,13 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: python tools/embeddinggemma2/reference.py acquire .benchmark-assets/video-linux/model
+      - name: Qualify all model-aware media chunks and streaming provenance
+        run: |
+          python zig/pkg/inference/scripts/qualify_media_chunks.py \
+            --binary .benchmark-results/video-linux/install/bin/antfly-inference \
+            --model-dir .benchmark-assets/video-linux/model --model model \
+            --backend native --repeat 2 --stream \
+            --output .benchmark-results/video-linux/media-chunks.json
       - name: Qualify pretrained cases and capacity retry
         run: |
           python tools/embeddinggemma2/video_http_oracle.py \

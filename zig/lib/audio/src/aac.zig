@@ -3183,6 +3183,7 @@ fn decodeChannelPairPcmSequenceWithExpectedLayoutAllocAndShapeMaybeTrailingInfos
     defer scratch.deinit();
 
     for (access_units, 0..) |unit, unit_index| {
+        try @import("work_control.zig").check();
         const unit_decode_started = perfNowNs();
         const block = try decodeChannelPairPcmBlockWithExpectedLayoutAndPredictorsAllocWithShape(
             allocator,
@@ -3311,6 +3312,7 @@ fn decodeFirstChannelPcmSequenceWithExpectedLayoutAllocAndShapeMaybeTrailingInfo
     defer scratch.deinit();
 
     for (access_units, 0..) |unit, unit_index| {
+        try @import("work_control.zig").check();
         const unit_decode_started = perfNowNs();
         const block = try decodeSingleChannelPcmBlockWithExpectedLayoutAndPredictorsAllocWithShape(
             allocator,
@@ -4466,6 +4468,7 @@ fn accessUnitsTrailingInfosAlloc(
     const infos = try allocator.alloc(TrailingElementInfo, access_units.len);
     errdefer allocator.free(infos);
     for (access_units, 0..) |unit, index| {
+        try @import("work_control.zig").check();
         infos[index] = try scanAccessUnitTrailingInfoAlloc(allocator, sample_rate, unit);
     }
     return infos;

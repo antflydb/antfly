@@ -640,6 +640,7 @@ pub fn demuxPacketsAlloc(allocator: std.mem.Allocator, packets: []const ogg.Pack
     var granule_base_decoded: u64 = 0;
 
     for (source_audio_packets) |packet| {
+        try @import("work_control.zig").check();
         const header = parseAudioPacketHeader(packet.bytes, headers) catch continue;
         const decoded_sample_count: u16 = if (previous_blocksize) |prev_blocksize|
             @intCast((@as(u32, prev_blocksize) + header.blocksize) / 4)
@@ -824,6 +825,7 @@ pub fn decodeDemuxedInterleavedAlloc(allocator: std.mem.Allocator, demuxed: Demu
     defer scratch.deinit();
 
     for (demuxed.audio_packets, 0..) |packet, packet_index| {
+        try @import("work_control.zig").check();
         const block = try decodeAudioPacketBlockAlloc(
             allocator,
             &scratch,

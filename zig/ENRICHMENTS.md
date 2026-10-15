@@ -17,12 +17,15 @@ The shared direction is:
 
 ## Artifact Identity And Lookup
 
-The proposed [model-aware media chunking](../docs/plans/model-aware-media-chunking.md)
-operation returns chunk provenance and optional embeddings together. It would
-map into existing chunk and embedding artifact families, retaining source version,
+The [model-aware media chunking](../docs/plans/model-aware-media-chunking.md)
+operation returns chunk provenance and optional embeddings together. It maps
+into existing chunk and embedding artifact families, retaining source version,
 coordinates and plan identity. Fusing inference does not bypass leader ownership,
 durable publication or readiness checks; an inference completion record alone
-does not certify database coverage. This extension is not implemented yet.
+does not certify database coverage. Compatible vectors enter the existing result
+cache; ordered media replay binds the retained source, model and plan before the
+normal guarded embedding publication. Chunk descriptors remain in `_chunk`
+metadata; vectors remain separate embedding artifacts.
 
 This repo has two artifact identity layers:
 

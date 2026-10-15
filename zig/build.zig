@@ -725,6 +725,18 @@ pub fn create(b: *std.Build) ?Artifacts {
         .run_raft_library_tests = run_raft_library_tests,
     });
     const antfly_test_mod = owner_tests.antfly_test_mod;
+    const model_chunk_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "model aware media", "model chunk artifact" },
+    });
+    const model_chunk_step = b.step("antfly-media-chunking-test", "Qualify typed chunk provider ownership, artifact recipes and incomplete coverage");
+    model_chunk_step.dependOn(&b.addRunArtifact(model_chunk_tests).step);
+    const chunk_capability_tests = b.addTest(.{
+        .root_module = antfly_test_mod.import_table.get("antfly_inference_remote_capabilities").?,
+        .filters = &.{"model aware media remote capability"},
+    });
+    model_chunk_step.dependOn(&b.addRunArtifact(chunk_capability_tests).step);
+
     const run_antfly_embedded_pkg_tests = owner_tests.run_antfly_embedded_pkg_tests;
     const run_lite_native_tests = owner_tests.run_lite_native_tests;
     const run_lite_cmd_tests = owner_tests.run_lite_cmd_tests;

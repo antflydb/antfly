@@ -384,6 +384,12 @@ pub const Chunk = struct {
 
 pub const ChunkConfig = antfly_chunking_api_openapi.InferenceChunkConfig;
 
+pub const ChunkEmbeddingContext = antfly_chunking_api_openapi.ChunkEmbeddingContext;
+
+pub const ChunkEmbeddingResponse = antfly_chunking_api_openapi.ChunkEmbeddingResponse;
+
+pub const ChunkEmbeddingTarget = antfly_chunking_api_openapi.ChunkEmbeddingTarget;
+
 /// A chunk result object. Text chunks have mime_type text/plain.
 pub const ChunkObject = struct {
     /// The chunk text content
@@ -484,6 +490,8 @@ pub const ChunkObject = struct {
     }
 };
 
+pub const ChunkOperationResponse = std.json.Value;
+
 pub const ChunkRequest = antfly_chunking_api_openapi.InferenceChunkRequest;
 
 pub const ChunkResponse = struct {
@@ -497,6 +505,8 @@ pub const ChunkResponse = struct {
     /// Whether result was served from cache
     cache_hit: bool,
 };
+
+pub const ChunkSourceReference = antfly_chunking_api_openapi.ChunkSourceReference;
 
 pub const Config = struct {
     /// Deprecated compatibility alias for `admission.inference.max_concurrent_requests`. New configurations should use the process-level admission setting. If both spellings are supplied, they must have the same value.
@@ -2719,6 +2729,8 @@ pub const Level = enum {
     }
 };
 
+pub const MediaChunkPolicy = antfly_chunking_api_openapi.MediaChunkPolicy;
+
 pub const MediaContentPart = antfly_generating_openapi.MediaContentPart;
 
 /// Optional backend preference for model loading or request execution. `auto` keeps the node default behavior. `xla` selects the PJRT/XLA backend and may require a PJRT plugin path via `ANTFLY_INFERENCE_XLA_PLUGIN`, `ANTFLY_INFERENCE_PJRT_PLUGIN`, `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`. `webgpu` selects the Wasm/WebGPU backend in Wasm builds; pair it with `mode: "compiled"` on generation requests to request WebGPU graph partition execution.
@@ -2796,6 +2808,8 @@ pub const ModelFormat = enum {
 
 /// Information about a model including its capabilities
 pub const ModelInfo = struct {
+    /// Immutable resolved embedding generation, returned for scoped model/task discovery without loading weights.
+    model_revision: ?[]const u8 = null,
     /// Pull-time qualified request profiles for this exact artifact, including backend, supported features and min/max geometry. Runtime admission revalidates artifact identity and resource limits. Omitted for artifacts without a qualification receipt.
     qualified_limits: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// List of capabilities this model supports (omitted when empty). For rerankers, `late_interaction` or `colbert` selects native MaxSim token scoring.
@@ -2805,6 +2819,7 @@ pub const ModelInfo = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "model_revision", "model_revision", true },
         .{ "qualified_limits", "qualified_limits", true },
         .{ "capabilities", "capabilities", true },
         .{ "inputs", "inputs", true },
@@ -2820,6 +2835,10 @@ pub const ModelInfo = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.model_revision) |value| {
+            try jw.objectField("model_revision");
+            try jw.write(value);
+        }
         if (self.qualified_limits) |value| {
             try jw.objectField("qualified_limits");
             try jw.write(value);

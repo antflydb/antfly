@@ -298,7 +298,9 @@ pub const EncodedFormat = enum {
     webm,
 };
 
+pub const work_control = @import("work_control.zig");
 pub const DecodeOptions = struct {
+    control: work_control.Control = .{},
     format_hint: ?EncodedFormat = null,
     mime_hint: ?[]const u8 = null,
     file_name_hint: ?[]const u8 = null,
@@ -506,6 +508,9 @@ pub fn decodeBounded(
     options: DecodeOptions,
     max_working_bytes: usize,
 ) !Audio {
+    const scope = work_control.Scope.enter(options.control);
+    defer scope.deinit();
+    try work_control.check();
     var limiter = DecodeMemoryLimiter.init(allocator, max_working_bytes);
     var decoded = decodeInterleaved(limiter.allocator(), audio_bytes, options) catch |err| {
         if (limiter.limit_exceeded) return error.AudioTooLarge;
@@ -523,6 +528,7 @@ pub fn decodeBounded(
         return error.AudioTooLarge;
     if (mono_bytes > limiter.remaining()) return error.AudioTooLarge;
 
+    try work_control.check();
     const mono = try downmixToMono(allocator, decoded.samples, decoded.channels);
     return .{
         .samples = mono,
@@ -548,6 +554,9 @@ pub fn decodeInterleaved(
     audio_bytes: []const u8,
     options: DecodeOptions,
 ) !AudioInterleaved {
+    const scope = work_control.Scope.enter(options.control);
+    defer scope.deinit();
+    try work_control.check();
     const format = detectFormatWithOptions(audio_bytes, options) orelse
         return error.UnsupportedAudioFormat;
     var decoded = try switch (format) {
@@ -564,6 +573,7 @@ pub fn decodeInterleaved(
         .webm => decodeInterleavedWebm(allocator, audio_bytes),
     };
     errdefer decoded.deinit();
+    try work_control.check();
     normalizePcmInPlace(decoded.samples);
     return decoded;
 }
@@ -3151,4 +3161,21 @@ test "mp3 fixture remains close to wav fixture after alignment" {
     try std.testing.expect(metrics.compared >= 12000);
     try std.testing.expect(metrics.correlation > 0.999);
     try std.testing.expect(metrics.mean_abs_error < 0.01);
+}
+
+test "bounded audio cancellation interrupts compressed packets and restores caller control" {
+    const Harness = struct {
+        checks: usize = 0,
+        fn check(raw: ?*const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw.?)));
+            self.checks += 1;
+            if (self.checks >= 4) return error.Cancelled;
+        }
+    };
+    var harness = Harness{};
+    try std.testing.expectError(error.Cancelled, decodeBounded(std.testing.allocator, tone_mp3_bytes, .{ .control = .{ .context = &harness, .check_fn = Harness.check } }, 16 * 1024 * 1024));
+    try std.testing.expectEqual(@as(usize, 4), harness.checks);
+    var recovered = try decodeBounded(std.testing.allocator, tone_mp3_bytes, .{}, 16 * 1024 * 1024);
+    defer recovered.deinit();
+    try std.testing.expect(recovered.samples.len > 0);
 }

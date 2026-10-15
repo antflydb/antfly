@@ -2427,7 +2427,55 @@ pub fn modelIdentity(a: std.mem.Allocator, io: std.Io, model_dir: []const u8, ma
     return resolutionModelRevision(a, io, manifest);
 }
 
+const ChunkPlanningSnapshot = struct { digest: [32]u8, signature: [32]u8 };
+fn chunkPlanningPaths(manifest: manifest_mod.ModelManifest, out: *[9][]const u8) []const []const u8 {
+    var count: usize = 0;
+    inline for (.{ "config_path", "tokenizer_json_path", "vocab_txt_path", "tokenizer_config_path", "special_tokens_map_path", "preprocessor_config_path", "processor_config_path" }) |name| if (@field(manifest, name)) |path| {
+        out[count] = path;
+        count += 1;
+    };
+    if (manifest.tokenizer_json_path == null and manifest.vocab_txt_path == null) if (manifest.gguf_path) |path| {
+        out[count] = path;
+        count += 1;
+    };
+    return out[0..count];
+}
+fn chunkPlanningSnapshot(a: std.mem.Allocator, io: std.Io, manifest: manifest_mod.ModelManifest, fallback: [32]u8) !ChunkPlanningSnapshot {
+    var storage: [9][]const u8 = undefined;
+    const paths = chunkPlanningPaths(manifest, &storage);
+    const signature = try componentDependencySignature(io, paths);
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("antfly-model-chunk-planning-v1");
+    const recipe = try std.json.Stringify.valueAlloc(a, .{ .style = manifest.embedding_style, .tokenizer = manifest.tokenizer_type, .context = manifest.maxTextSequenceLength() }, .{});
+    defer a.free(recipe);
+    hash.update(recipe);
+    if (manifest.tokenizer_json_path == null and manifest.vocab_txt_path == null) hash.update(&fallback);
+    for (paths) |path| {
+        // GGUF may own its tokenizer. The fallback digest already pins that
+        // immutable artifact; never stream gigabytes of weights for planning.
+        if (manifest.gguf_path) |gguf| if (std.mem.eql(u8, path, gguf)) continue;
+        hash.update(std.fs.path.basename(path));
+        hash.update(&.{0});
+        var file = try std.Io.Dir.cwd().openFile(io, path, .{});
+        defer file.close(io);
+        var file_hash = std.crypto.hash.sha2.Sha256.init(.{});
+        var buffer: [64 * 1024]u8 = undefined;
+        while (true) {
+            const count = file.readStreaming(io, &.{&buffer}) catch |err| switch (err) {
+                error.EndOfStream => 0,
+                else => return err,
+            };
+            if (count == 0) break;
+            file_hash.update(buffer[0..count]);
+        }
+        hash.update(&file_hash.finalResult());
+    }
+    if (!std.mem.eql(u8, &signature, &try componentDependencySignature(io, paths))) return error.ModelArtifactsChanging;
+    return .{ .digest = hash.finalResult(), .signature = signature };
+}
+
 pub const LoadedModel = struct {
+    chunk_planning: ?ChunkPlanningSnapshot = null,
     resolution_revision: ?[32]u8 = null,
     embedding_identity: ?[64]u8 = null,
     embedding_asset_signature: ?[32]u8 = null,
@@ -2513,6 +2561,14 @@ pub const LoadedModel = struct {
     /// fault. Existing handles may finish unwinding; the last one destroys the
     /// retired model while new requests load a fresh session.
     retired: bool = false,
+
+    pub fn chunkPlanningIdentity(self: *LoadedModel) ![32]u8 {
+        const snapshot = self.chunk_planning orelse return self.resolution_revision orelse error.InvalidEmbeddingIdentity;
+        var paths: [9][]const u8 = undefined;
+        const signature = try componentDependencySignature(self.executor_io orelse std.Options.debug_io, chunkPlanningPaths(self.manifest, &paths));
+        if (!std.mem.eql(u8, &signature, &snapshot.signature)) return error.ModelArtifactsChanging;
+        return snapshot.digest;
+    }
 
     pub fn verifyEmbeddingIdentity(self: *const LoadedModel) !void {
         const expected = self.embedding_asset_signature orelse return;
@@ -7762,6 +7818,7 @@ pub const ModelManager = struct {
         if (embedding_snapshot) |snapshot| if (!std.mem.eql(u8, &snapshot.signature, &try eg2_identity.signature(self.allocator, sm.io orelse std.Options.debug_io, model_dir, man.safetensors_path.?))) return error.ModelArtifactsChanging;
         if (!std.mem.eql(u8, &resolution_file_revision, &try resolutionModelRevision(self.allocator, sm.io orelse std.Options.debug_io, man))) return error.ModelArtifactsChanging;
         model.* = .{
+            .chunk_planning = try chunkPlanningSnapshot(self.allocator, sm.io orelse std.Options.debug_io, man, resolution_revision),
             .resolution_revision = resolution_revision,
             .embedding_identity = if (embedding_snapshot) |snapshot| snapshot.digest else null,
             .embedding_asset_signature = if (embedding_snapshot) |snapshot| snapshot.signature else null,

@@ -20,6 +20,8 @@ class InferenceModelInfo:
     """Information about a model including its capabilities
 
     Attributes:
+        model_revision (str | Unset): Immutable resolved embedding generation, returned for scoped model/task discovery
+            without loading weights.
         qualified_limits (InferenceModelInfoQualifiedLimits | Unset): Pull-time qualified request profiles for this
             exact artifact,
             including backend, supported features and min/max geometry.
@@ -30,12 +32,15 @@ class InferenceModelInfo:
         inputs (list[str] | Unset): List of input modalities this model accepts, such as `text`, `image`, or `audio`
     """
 
+    model_revision: str | Unset = UNSET
     qualified_limits: InferenceModelInfoQualifiedLimits | Unset = UNSET
     capabilities: list[str] | Unset = UNSET
     inputs: list[str] | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        model_revision = self.model_revision
+
         qualified_limits: dict[str, Any] | Unset = UNSET
         if not isinstance(self.qualified_limits, Unset):
             qualified_limits = self.qualified_limits.to_dict()
@@ -51,6 +56,8 @@ class InferenceModelInfo:
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
+        if model_revision is not UNSET:
+            field_dict["model_revision"] = model_revision
         if qualified_limits is not UNSET:
             field_dict["qualified_limits"] = qualified_limits
         if capabilities is not UNSET:
@@ -65,6 +72,8 @@ class InferenceModelInfo:
         from ..models.inference_model_info_qualified_limits import InferenceModelInfoQualifiedLimits
 
         d = dict(src_dict)
+        model_revision = d.pop("model_revision", UNSET)
+
         _qualified_limits = d.pop("qualified_limits", UNSET)
         qualified_limits: InferenceModelInfoQualifiedLimits | Unset
         if isinstance(_qualified_limits, Unset):
@@ -77,6 +86,7 @@ class InferenceModelInfo:
         inputs = cast(list[str], d.pop("inputs", UNSET))
 
         inference_model_info = cls(
+            model_revision=model_revision,
             qualified_limits=qualified_limits,
             capabilities=capabilities,
             inputs=inputs,

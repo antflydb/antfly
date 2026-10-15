@@ -92,6 +92,8 @@ pub const TimestampPolicy = struct {
     step_ns: u64 = 1_000_000_000,
     max_frames: usize = 32,
     overflow: Overflow = .uniform,
+    /// Select the picture displayed at each target, retaining VFR holds.
+    hold: bool = false,
     pub fn validate(self: TimestampPolicy) !void {
         if (self.start_ns < 0 or self.step_ns == 0 or self.max_frames == 0 or self.max_frames > 32 or (self.end_ns != null and self.end_ns.? <= self.start_ns)) return error.InvalidSamplingPolicy;
     }
@@ -144,6 +146,18 @@ fn cappedAtOrigin(a: std.mem.Allocator, pictures: []const TimedPicture, timescal
         const ordinal: u128 = if (policy.overflow == .uniform and count > 1 and candidates > count) @as(u128, i) * (candidates - 1) / (count - 1) else i;
         const target: i128 = policy.start_ns + @as(i128, @intCast(ordinal * policy.step_ns));
         var chosen: ?usize = null;
+        if (policy.hold) for (pictures, 0..) |picture, id| {
+            if (id % 256 == 0) try control.check();
+            const time = (@as(i128, picture.pts) - first) * 1_000_000_000;
+            const stop: ?i128 = if (picture.duration) |duration| time + @as(i128, duration) * 1_000_000_000 else null;
+            if (time > target * timescale or (stop != null and stop.? <= target * timescale)) continue;
+            if (chosen == null or picture.pts > pictures[chosen.?].pts) chosen = id;
+        };
+        if (chosen != null) {
+            const id = chosen.?;
+            if (output.items.len == 0 or output.items[output.items.len - 1] != id) try output.append(a, id);
+            continue;
+        }
         for (pictures, 0..) |picture, id| {
             if (id % 256 == 0) try control.check();
             const time = (@as(i128, picture.pts) - first) * 1_000_000_000;
@@ -292,4 +306,16 @@ test "source timestamp sampling retains rational VFR boundaries across preroll e
     defer a.free(tail);
     try std.testing.expectEqualSlices(usize, &.{2}, all);
     try std.testing.expectEqualSlices(usize, &.{1}, tail);
+}
+
+test "model aware media VFR sampling retains displayed pictures across window boundaries" {
+    const a = std.testing.allocator;
+    const pictures = [_]TimedPicture{ .{ .pts = 0, .duration = 60 }, .{ .pts = 60, .duration = 2 } };
+    const held = try cappedTimestamps(a, &pictures, 1, .{ .start_ns = 30_000_000_000, .end_ns = 32_000_000_000, .hold = true }, .{});
+    defer a.free(held);
+    try std.testing.expectEqualSlices(usize, &.{0}, held);
+    try std.testing.expectError(error.EmptyVideoWindow, cappedTimestamps(a, &pictures, 1, .{ .start_ns = 30_000_000_000, .end_ns = 32_000_000_000 }, .{}));
+    const boundary = try cappedTimestamps(a, &pictures, 1, .{ .start_ns = 59_000_000_000, .end_ns = 61_000_000_000, .hold = true }, .{});
+    defer a.free(boundary);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1 }, boundary);
 }

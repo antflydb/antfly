@@ -48,6 +48,7 @@ pub const server = struct {
 };
 pub const pipelines = struct {
     pub const image = @import("pipelines/image.zig");
+    pub const media_chunking = @import("pipelines/media_chunking.zig");
     pub const embedding_gemma2 = @import("pipelines/embedding_gemma2.zig");
     pub const embedding_gemma2_video = @import("pipelines/embedding_gemma2_video.zig");
     pub const audio = @import("pipelines/audio.zig");
@@ -164,4 +165,12 @@ test "embeddinggemma2 video module declarations" {
 test "GLiNER Decide artifact test reachability" {
     _ = models.gliner_decide_qualification;
     _ = models.tensor_store;
+}
+
+test "model aware media module declarations" {
+    _ = pipelines.media_chunking;
+}
+
+test "model aware media audio projector declarations" {
+    _ = @import("architectures/gemma4_projector.zig");
 }

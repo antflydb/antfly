@@ -107,6 +107,7 @@ pub fn decodeInterleavedPacketizedAlloc(
     defer samples.deinit(allocator);
 
     for (access_units, 0..) |packet, packet_index| {
+        try @import("work_control.zig").check();
         _ = packet_index;
         const decoded = try decodeFrameAlloc(allocator, cookie, packet);
         defer allocator.free(decoded);

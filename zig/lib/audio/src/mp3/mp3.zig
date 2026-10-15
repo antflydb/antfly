@@ -327,6 +327,7 @@ pub fn decodeInterleavedSupportedPrefix(
     var unsupported_table: ?u8 = null;
 
     for (plans) |plan| {
+        try @import("../work_control.zig").check();
         const channel_count = @as(usize, plan.side_info.channel_count);
         const granule_count = @as(usize, plan.side_info.granule_count);
         var previous_scalefactors = [_]?requantize.BandScalefactors{ null, null };
@@ -547,6 +548,7 @@ pub fn collectFramePayloads(allocator: std.mem.Allocator, mp3_bytes: []const u8)
 
     var frame_index: usize = 0;
     frames: while (true) {
+        try @import("../work_control.zig").check();
         const frame = frames.next() catch |err| switch (err) {
             error.Mp3TruncatedFrame => if (payloads.items.len > 0) break else return err,
             else => return err,

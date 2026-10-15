@@ -16,6 +16,7 @@
 // HTTP API server for Antfly inference.
 // Uses generated types and server router from openapi-zig.
 
+pub const chunk_response = @import("chunk_response.zig");
 const std = @import("std");
 const builtin = @import("builtin");
 const build_info = @import("build_info");
@@ -11532,6 +11533,297 @@ pub const Node = struct {
         }
     }
 
+    /// Native chunk/embedding execution shares descriptors and delivery semantics
+    /// with HTTP. The caller retains the input source and acknowledges in sink.
+    pub fn chunkAndEmbedDirect(self: *Node, a: std.mem.Allocator, io: std.Io, supplied: InferenceExecutionControl, request: @import("../pipelines/media_chunking.zig").Request, target: @import("chunk_response.zig").Target, sink: @import("../pipelines/media_chunking.zig").Sink) anyerror!@import("chunk_response.zig").Execution {
+        try self.acquireAdmissionUnits(1);
+        defer self.releaseAdmission();
+        return self.chunkAndEmbedAdmitted(a, io, supplied, request, target, sink);
+    }
+
+    pub fn chunkModelInputDirect(self: *Node, a: std.mem.Allocator, io: std.Io, supplied: InferenceExecutionControl, request: @import("../pipelines/media_chunking.zig").Request, target: @import("chunk_response.zig").Target) ![]lib_chunker.Chunk {
+        const wire = @import("chunk_response.zig");
+        var collector = wire.NativeCollector{ .allocator = a };
+        defer collector.deinit();
+        const execution = try self.chunkAndEmbedDirect(a, io, supplied, request, target, .{ .context = &collector, .accept = wire.NativeCollector.accept });
+        return collector.finish(request, target, execution);
+    }
+
+    /// Replay one already-enumerated source/plan member. Database publication
+    /// still requires its existing generation and source-version authority.
+    pub fn replayModelChunkDirect(self: *Node, a: std.mem.Allocator, io: std.Io, control: InferenceExecutionControl, supplied: @import("../pipelines/media_chunking.zig").Request, target: chunk_response.Target, plan: []const u8, fingerprint: []const u8, ordinal: u64) ![]lib_chunker.Chunk {
+        var request = supplied;
+        const cursor = try std.fmt.allocPrint(a, "{s}:{d}", .{ plan, ordinal });
+        defer a.free(cursor);
+        request.continuation = cursor;
+        request.max_chunks = 1;
+        var collector = chunk_response.NativeCollector{ .allocator = a };
+        defer collector.deinit();
+        const execution = try self.chunkAndEmbedDirect(a, io, control, request, target, .{ .context = &collector, .accept = chunk_response.NativeCollector.accept });
+        if (execution.failure) |err| return err;
+        const actual_source = std.fmt.bytesToHex(execution.summary.identity.source, .lower);
+        if (!std.mem.eql(u8, fingerprint, &actual_source) or collector.chunks.items.len != 1 or execution.summary.next_ordinal != ordinal + 1 or execution.summary.failed != 0) return error.InvalidChunkReplay;
+        return collector.finishAcknowledged(request, target, execution);
+    }
+
+    fn chunkAndEmbedAdmitted(self: *Node, a: std.mem.Allocator, io: std.Io, supplied: InferenceExecutionControl, request: @import("../pipelines/media_chunking.zig").Request, target: @import("chunk_response.zig").Target, sink: @import("../pipelines/media_chunking.zig").Sink) anyerror!@import("chunk_response.zig").Execution {
+        const chunks = @import("../pipelines/media_chunking.zig");
+        const grouped = @import("../pipelines/embedding_gemma2.zig");
+        const control = self.bindExecutionControl(io, supplied);
+        try control.check();
+        if (request.input == .source) {
+            const reference = request.input.source;
+            if (request.source_version.len != 0 and !std.mem.eql(u8, request.source_version, reference.version)) return error.SourceVersionChanged;
+            const media = @import("antfly_media");
+            var security = effectiveRequestContentSecurity(self);
+            const download_context = InferenceDownloadRequestContext{ .io = io, .control = control };
+            const remote = try scraping.PinnedRange.create(std.heap.smp_allocator, try inferenceDownloadContext(&download_context), reference.uri, reference.version, if (reference.version_kind == .strong_etag) .strong_etag else .s3_version_id, reference.length, &security, if (self.config.s3_credentials) |*credentials| credentials else null, &.{});
+            defer remote.destroy();
+            const Range = struct {
+                fn read(raw: *anyopaque, offset: u64, out: []u8, check: media.source.Control) !usize {
+                    try check.check();
+                    const provider: *scraping.PinnedRange = @ptrCast(@alignCast(raw));
+                    return provider.readAt(offset, out);
+                }
+            };
+            const maximum = security.max_download_size_bytes orelse 100 * 1024 * 1024;
+            var cache = media.remote.ReadAhead{ .allocator = std.heap.smp_allocator, .upstream = .{ .context = remote, .read_at = Range.read, .length = reference.length }, .window_bytes = @intCast(@min(maximum, 256 * 1024)), .max_bytes = maximum };
+            defer cache.deinit();
+            var identity_hash = std.crypto.hash.sha2.Sha256.init(.{});
+            identity_hash.update("antfly-pinned-range-resource-v1");
+            var identity_length: [8]u8 = undefined;
+            std.mem.writeInt(u64, &identity_length, remote.identity.len, .little);
+            identity_hash.update(&identity_length);
+            identity_hash.update(remote.identity);
+            identity_hash.update(reference.version);
+            const source_identity = std.fmt.bytesToHex(identity_hash.finalResult(), .lower);
+            var source = media.source.Source{ .allocator = std.heap.smp_allocator, .identity = &source_identity, .storage = .{ .range = cache.range() }, .limits = .{ .max_total_bytes = maximum } };
+            var resolved = request;
+            resolved.input = .{ .binary = .{ .mime_type = reference.mime_type, .data = &.{} } };
+            resolved.native_source = &source;
+            resolved.native_transport_bytes = 32 * 1024 * 1024 + cache.window_bytes;
+            resolved.source_version = reference.version;
+            return self.chunkAndEmbedAdmitted(a, io, control, resolved, target, sink);
+        }
+        if (target.model.len == 0 or (target.dimensions != null and target.dimensions.? == 0)) return error.InvalidChunkModel;
+        const task = parseEmbeddingTaskType(target.task_type) orelse return error.UnsupportedEmbeddingTask;
+        const path = try self.resolveRequestModelPath(a, io, target.model, "embedders");
+        defer a.free(path);
+        var handle = try self.model_manager.acquireFromDirWithControl(path, control);
+        defer handle.release();
+        const loaded = handle.get();
+        if (loaded.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
+        try loaded.verifyEmbeddingIdentity();
+        const contract = try resolvedInferenceExecutorContract(self, "embed", &loaded.manifest);
+        const capacity = @min(loaded.manifest.maxTextSequenceLength(), contract.batch.max_input_tokens_per_item orelse std.math.maxInt(usize));
+        if (capacity == 0) return error.InvalidChunkModel;
+        const identity: [64]u8 = if (loaded.embedding_identity) |digest| digest else std.fmt.bytesToHex(loaded.resolution_revision orelse return error.InvalidEmbeddingIdentity, .lower);
+        if (target.model_identity) |expected| if (!std.mem.eql(u8, expected, &identity)) return error.EmbeddingIdentityMismatch;
+        var pipeline = loaded.embeddingPipeline(a);
+        const owned_prefix = try applyDenseEmbeddingRequestOptions(a, &pipeline, &loaded.manifest, .{ .model = target.model, .input = .null, .encoding_format = null, .dimensions = if (target.dimensions) |d| @intCast(d) else null, .task_type = task });
+        defer if (owned_prefix) |prefix| a.free(prefix);
+        const planning_digest = std.fmt.bytesToHex(try loaded.chunkPlanningIdentity(), .lower);
+        const planning_identity = try std.fmt.allocPrint(a, "antfly-media-chunk-model-v1:{s}:{s}:{s}:{?d}", .{ planning_digest, @tagName(loaded.manifest.embedding_style), pipeline.config.text_prefix, pipeline.config.ensure_trailing_eos_id });
+        defer a.free(planning_identity);
+        const dimensions = target.dimensions orelse if (loaded.manifest.embedding_style == .embedding_gemma2) @as(usize, 768) else loaded.manifest.hidden_size;
+        if (loaded.manifest.embedding_style == .embedding_gemma2 and !@import("../architectures/embedding_gemma2.zig").validDimension(dimensions)) return error.InvalidEmbeddingDimensions;
+        var frame_cache = grouped.FrameCache{ .allocator = grouped.workspaceBackingAllocator(loaded.session.backend()), .session = loaded.session, .control = control };
+        defer frame_cache.deinit();
+        const Adapter = struct {
+            model: *model_manager_mod.LoadedModel,
+            name: []const u8,
+            identity: [64]u8,
+            a: std.mem.Allocator,
+            control: InferenceExecutionControl,
+            task: EmbeddingTaskType,
+            dimensions: usize,
+            requested_dimensions: ?usize,
+            capacity: usize,
+            prefix: []const u8,
+            trailing_eos: ?i32,
+            cache: *grouped.FrameCache,
+            contract: ResolvedInferenceExecutorContract,
+            fn describe(raw: *anyopaque) chunks.EmbeddingContext {
+                const adapter: *@This() = @ptrCast(@alignCast(raw));
+                return .{ .model = adapter.name, .model_identity = adapter.identity, .model_revision = std.fmt.bytesToHex(adapter.model.resolution_revision.?, .lower), .task_type = @tagName(adapter.task) };
+            }
+            fn count(raw: *anyopaque, text: []const u8) !usize {
+                const adapter: *@This() = @ptrCast(@alignCast(raw));
+                try adapter.control.check();
+                const rendered = try std.fmt.allocPrint(adapter.a, "{s}{s}", .{ adapter.prefix, text });
+                defer adapter.a.free(rendered);
+                var tokens = try adapter.model.getTokenizer().encodeForModel(adapter.a, rendered, adapter.capacity + 1);
+                defer tokens.deinit();
+                var count_tokens: usize = 0;
+                var last: i32 = -1;
+                for (tokens.attention_mask, tokens.ids) |mask, id| if (mask != 0) {
+                    count_tokens += 1;
+                    last = id;
+                };
+                if (adapter.trailing_eos) |eos| if (last != eos) {
+                    count_tokens += 1;
+                };
+                return count_tokens;
+            }
+            fn overlap(raw: *anyopaque, text: []const u8) !usize {
+                const wrapped = try count(raw, text);
+                const overhead = try count(raw, "");
+                return wrapped -| overhead;
+            }
+            fn audioTokens(raw: *anyopaque, samples: usize, rate: u32) !usize {
+                const adapter: *@This() = @ptrCast(@alignCast(raw));
+                try adapter.control.check();
+                try validateInferenceExecutorInvocation(adapter.contract, .{ .has_audio = true, .media_parts_per_item = 1 });
+                return if (adapter.model.manifest.embedding_style == .embedding_gemma2) try @import("../architectures/gemma4_projector.zig").embeddingGemma2PcmSequenceLength(samples, rate) else 0;
+            }
+            fn preflight(raw: *anyopaque, payload: chunks.Payload) !chunks.Preflight {
+                const adapter: *@This() = @ptrCast(@alignCast(raw));
+                try adapter.control.check();
+                var shape = InferenceExecutorInvocationShape{};
+                switch (payload) {
+                    .text => |text| {
+                        shape.has_text = true;
+                        shape.text_bytes_per_item = text.len;
+                        shape.input_tokens_per_item = try count(raw, text);
+                    },
+                    .raster => |raster| {
+                        shape.has_image = true;
+                        shape.decoded_pixels = @as(u64, raster.width) * raster.height;
+                        shape.media_parts_per_item = 1;
+                    },
+                    .pcm => {
+                        shape.has_audio = true;
+                        shape.media_parts_per_item = 1;
+                    },
+                    .video => {
+                        shape.has_image = true;
+                        shape.media_parts_per_item = 1;
+                    },
+                }
+                try validateInferenceExecutorInvocation(adapter.contract, shape);
+                if (payload == .text) return .{ .input_tokens = shape.input_tokens_per_item };
+                if (adapter.model.manifest.embedding_style != .embedding_gemma2) {
+                    if (payload == .video) return error.ModelDoesNotSupportVideoInput;
+                    return .{ .input_tokens = 0 };
+                }
+                const projector = @import("../architectures/gemma4_projector.zig");
+                return switch (payload) {
+                    .raster => |raster| .{ .input_tokens = try projector.embeddingGemma2RasterSequenceLength(raster) },
+                    .pcm => |pcm| .{ .input_tokens = try projector.embeddingGemma2PcmSequenceLength(pcm.samples.len, pcm.sample_rate) },
+                    .video => |movie| blk: {
+                        const plan = try @import("../pipelines/embedding_gemma2_video.zig").inspectConfiguredPlan(adapter.a, movie.bytes, movie.reader, adapter.control, .{ .sampling = if (movie.source_timestamps) .{ .source_timestamps = movie.policy } else .{ .timestamps = movie.policy }, .selection = movie.selection, .webm = movie.webm }, adapter.model.session.backend() == .metal);
+                        var indexes = plan.picture_indexes;
+                        for (indexes[0..plan.pictures]) |*index| index.* = try std.math.add(u64, index.*, movie.packet_base);
+                        break :blk .{ .input_tokens = plan.sequence_tokens, .picture_count = @intCast(plan.pictures), .selected_pictures = try adapter.a.dupe(u64, indexes[0..plan.pictures]), .picture_basis = if (movie.webm != null) .logical else if (movie.reader != null or movie.bytes.len < 4 or !std.mem.eql(u8, movie.bytes[0..4], "\x1a\x45\xdf\xa3")) .packet_assembly else .logical };
+                    },
+                    .text => unreachable,
+                };
+            }
+            fn embed(raw: *anyopaque, out: std.mem.Allocator, payload: chunks.Payload) !chunks.Output {
+                const adapter: *@This() = @ptrCast(@alignCast(raw));
+                try adapter.control.check();
+                try adapter.model.verifyEmbeddingIdentity();
+                const options = grouped.Options{ .task_type = @tagName(adapter.task), .dimensions = adapter.dimensions };
+                var vector: []f32 = undefined;
+                var input_tokens: usize = 0;
+                if (adapter.model.manifest.embedding_style == .embedding_gemma2) {
+                    switch (payload) {
+                        .pcm => |pcm| {
+                            const batch = try grouped.embedAudios(out, adapter.model.session, adapter.model.getTokenizer(), &.{.{ .pcm = pcm }}, options, adapter.model.embeddingExecutionLock(), adapter.control, null);
+                            defer out.free(batch.vectors);
+                            defer out.free(batch.input_tokens);
+                            vector = batch.vectors[0];
+                            input_tokens = batch.input_tokens[0];
+                        },
+                        else => {
+                            const part: grouped.Part = switch (payload) {
+                                .text => |text| .{ .text = text },
+                                .raster => |raster| .{ .raster = raster },
+                                .video => |movie| .{ .sampled_video = .{ .bytes = if (movie.reader != null) &.{} else movie.bytes, .reader = movie.reader, .sampling = if (movie.source_timestamps) .{ .source_timestamps = movie.policy } else .{ .timestamps = movie.policy }, .selection = movie.selection, .webm = movie.webm } },
+                                .pcm => unreachable,
+                            };
+                            const group = grouped.Group{ .content = &.{part} };
+                            try grouped.validateGroup(group, options);
+                            const result = try grouped.embedCached(out, adapter.model.session, adapter.model.getTokenizer(), group, options, adapter.model.embeddingExecutionLock(), adapter.control, adapter.cache);
+                            vector = result.vector;
+                            input_tokens = result.input_tokens;
+                        },
+                    }
+                } else {
+                    var lease = adapter.model.acquireEmbeddingAssetLease(false);
+                    defer lease.release();
+                    var embedding_pipeline = blk: {
+                        try adapter.model.lockEmbeddingAssetsWithControl(adapter.control);
+                        defer adapter.model.unlockEmbeddingAssets();
+                        try adapter.model.ensureEmbeddingAssetsLockedWithControl(payload == .text, payload == .raster, payload == .pcm, adapter.control);
+                        break :blk adapter.model.embeddingPipelineLocked(out);
+                    };
+                    embedding_pipeline.config.text_prefix = adapter.prefix;
+                    embedding_pipeline.config.reject_truncation = true;
+                    embedding_pipeline.execution_control = adapter.control;
+                    const vectors = switch (payload) {
+                        .text => |text| blk: {
+                            input_tokens = try count(adapter, text);
+                            break :blk try embedding_pipeline.embed(&.{text});
+                        },
+                        .raster => |raster| try embedding_pipeline.embedBorrowedRasters(&.{raster}),
+                        .pcm => |pcm| try embedding_pipeline.embedAudioPcm(&.{pcm}),
+                        .video => return error.ModelDoesNotSupportVideoInput,
+                    };
+                    defer out.free(vectors);
+                    if (vectors.len != 1) {
+                        for (vectors) |v| out.free(v);
+                        return error.InvalidEmbeddingOutput;
+                    }
+                    vector = vectors[0];
+                }
+                errdefer out.free(vector);
+                if (adapter.requested_dimensions) |expected| if (vector.len != expected) return error.InvalidEmbeddingDimensions;
+                adapter.dimensions = vector.len;
+                try adapter.model.verifyEmbeddingIdentity();
+                try adapter.control.check();
+                return .{ .vector = vector, .input_tokens = input_tokens };
+            }
+        };
+        const source_budget = if (request.input == .text) @min(request.max_working_bytes, @max(@as(usize, 16 * 1024 * 1024), try std.math.mul(usize, request.policy.max_text_bytes, 16))) else request.max_working_bytes;
+        var bounded_source = @import("../runtime/bounded_allocator.zig").BoundedAllocator{ .backing = std.heap.smp_allocator, .limit = source_budget };
+        var adapter = Adapter{ .model = loaded, .name = target.model, .identity = identity, .a = bounded_source.allocator(), .control = control, .task = task, .dimensions = dimensions, .requested_dimensions = target.dimensions, .capacity = capacity, .prefix = pipeline.config.text_prefix, .trailing_eos = pipeline.config.ensure_trailing_eos_id, .cache = &frame_cache, .contract = contract };
+        // Source/extraction ownership survives each model call. Its reservation
+        // is separate from per-window model scratch and buffered result ownership.
+        var source_permit = try loaded.session.admitHostPreprocess(try std.math.add(usize, try std.math.add(usize, source_budget, request.native_transport_bytes), 100 * 1024 * 1024));
+        defer source_permit.deinit();
+        var runner = try chunks.Runner.init(bounded_source.allocator(), request, .{ .context = &adapter, .model = .{ .planning_identity = planning_identity, .context_tokens = capacity, .max_text_bytes = contract.batch.max_text_bytes_per_item orelse 16 * 1024 * 1024, .min_audio_ns = if (loaded.manifest.embedding_style == .embedding_gemma2) 11 * std.time.ns_per_ms else 0 }, .describe = Adapter.describe, .count_text = Adapter.count, .count_overlap = Adapter.overlap, .audio_tokens = Adapter.audioTokens, .preflight = Adapter.preflight, .embed = Adapter.embed }, control, sink);
+        var failure: ?anyerror = null;
+        const summary = runner.run() catch |err| blk: {
+            failure = err;
+            break :blk runner.summary;
+        };
+        _ = try loaded.chunkPlanningIdentity();
+        return .{ .summary = summary, .model_identity = identity, .model_revision = std.fmt.bytesToHex(loaded.resolution_revision orelse return error.InvalidEmbeddingIdentity, .lower), .dimensions = adapter.dimensions, .failure = failure };
+    }
+
+    fn chunkModelAwareHttp(self: *Node, ctx: *httpx.Context, body: api.ChunkRequest, input: lib_chunker.Input, config: lib_chunker.FixedChunkConfig) !httpx.Response {
+        const wire = @import("chunk_response.zig");
+        const options = body.embedding.?;
+        const policy = wire.parsePolicy(body.policy) catch return ctx.status(400).json(.{ .@"error" = "INVALID_CHUNK_POLICY", .message = "invalid model-aware chunk policy" });
+        const target = wire.Target{ .model = options.model, .model_identity = options.model_identity, .task_type = options.task_type orelse "RETRIEVAL_DOCUMENT", .dimensions = if (options.dimensions) |n| std.math.cast(usize, n) orelse return ctx.status(400).json(.{ .@"error" = "INVALID_DIMENSIONS", .message = "dimensions must be positive" }) else null };
+        const request = @import("../pipelines/media_chunking.zig").Request{ .input = input, .policy = policy, .source_id = body.source_id, .source_version = body.source_version orelse "", .continuation = body.continuation, .execute = options.execute orelse true, .include_content = body.include_content orelse false, .allow_partial = options.allow_partial orelse false, .max_chunks = config.max_chunks };
+        var results = wire.Collector{ .allocator = ctx.allocator, .request = request };
+        if (body.stream orelse false) results.writer = try ctx.streamResponseWithContentType(200, "application/x-ndjson");
+        const execution = self.chunkAndEmbedAdmitted(ctx.allocator, ctx.io, httpInferenceExecutionControl(self, ctx), request, target, .{ .context = &results, .accept = wire.Collector.accept }) catch |err| {
+            if (results.writer) |*writer| {
+                const json = try std.json.Stringify.valueAlloc(ctx.allocator, .{ .object = "chunk.embedding.error", .code = @errorName(err) }, .{});
+                defer ctx.allocator.free(json);
+                writer.write(json) catch {};
+                writer.write("\n") catch {};
+                writer.close() catch {};
+                return ctx.response.build();
+            }
+            return ctx.status(if (err == error.StaleChunkContinuation or err == error.EmbeddingIdentityMismatch or err == error.SourceVersionChanged) @as(u16, 409) else if (err == error.MemoryBudgetExceeded or err == error.ResourceTemporarilyUnavailable) @as(u16, 503) else @as(u16, 400)).json(.{ .@"error" = @errorName(err), .message = "model-aware chunk request could not be initialized" });
+        };
+        return results.finish(ctx, try results.response(request, target, execution));
+    }
+
     pub fn chunkText(self: *Node, ctx: *httpx.Context) !httpx.Response {
         const uses_attachment_envelope = requestUsesAttachmentEnvelope(ctx);
         var attachment_envelope: ?httpx.attachment_envelope.Envelope = null;
@@ -11576,6 +11868,9 @@ pub const Node = struct {
             applyFixedChunkConfig(&config, cfg) catch |err|
                 return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = fixedChunkConfigErrorMessage(err) });
         }
+
+        if (body.embedding != null) return self.chunkModelAwareHttp(ctx, body, input.value, config);
+        if (body.policy != null or body.continuation != null or (body.stream orelse false)) return ctx.status(400).json(.{ .@"error" = "EMBEDDING_TARGET_REQUIRED", .message = "model-aware chunk options require an embedding target" });
 
         const chunk_admission = chunkInputWorkingAdmission(self, input, config, admission_units) catch
             return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "chunk media is malformed or exceeds image limits" });
@@ -11639,7 +11934,7 @@ pub const Node = struct {
         // whitespace word count undercounts unspaced scripts such as CJK.
         const prompt_tokens = switch (input.value) {
             .text => |text| lib_chunker.fixed_text.countTextTokens(ctx.allocator, text) catch estimateTextTokens(text),
-            .binary => 0,
+            .binary, .source => 0,
         };
 
         return ctx.json(api.ChunkResponse{
@@ -20189,6 +20484,26 @@ pub const Node = struct {
     pub fn listModels(self: *Node, ctx: *httpx.Context) !httpx.Response {
         const json_body = try self.listModelsJsonAlloc(ctx.allocator, ctx.io);
         defer ctx.allocator.free(json_body);
+        // Scoped discovery may pin one embedding generation without loading its
+        // weights. Avoid fingerprinting every model in an unscoped catalog.
+        if (try ctx.queryDecoded("model")) |name| if (ctx.query("task")) |task| if (std.mem.eql(u8, task, "embed")) {
+            var catalog = try std.json.parseFromSlice(std.json.Value, ctx.allocator, json_body, .{});
+            defer catalog.deinit();
+            if (catalog.value == .object) if (catalog.value.object.getPtr("embedders")) |models| if (models.* == .object) if (models.object.getPtr(name)) |info| if (info.* == .object) {
+                const path = try self.resolveRequestModelPath(ctx.allocator, ctx.io, name, "embedders");
+                defer ctx.allocator.free(path);
+                var manifest = try manifest_mod.loadFromDir(ctx.allocator, path);
+                defer manifest.deinit();
+                const revision = if (self.model_manager.acquireLoadedModel(path)) |cached| loaded: {
+                    var handle = cached;
+                    defer handle.release();
+                    break :loaded handle.get().resolution_revision orelse return error.InvalidEmbeddingIdentity;
+                } else try self.model_manager.modelIdentityForManifest(path, manifest);
+                const hex = std.fmt.bytesToHex(revision, .lower);
+                try info.object.put(ctx.allocator, "model_revision", .{ .string = &hex });
+                return ctx.json(catalog.value);
+            };
+        };
         try ctx.setHeader("content-type", "application/json");
         _ = ctx.response.body(json_body);
         return ctx.response.build();
@@ -23539,6 +23854,8 @@ fn appendResolvedInferenceCapabilities(
         std.mem.eql(u8, resolved_task, "chunk") or
         std.mem.eql(u8, resolved_task, "transcribe") or
         std.mem.eql(u8, resolved_task, "rerank")) "true" else "false");
+    try buf.appendSlice(allocator, ",\"model_aware_chunking_v1\":");
+    try buf.appendSlice(allocator, if (std.mem.eql(u8, resolved_task, "embed")) "true" else "false");
     try buf.appendSlice(allocator, ",\"numeric_responses_v1\":");
     try buf.appendSlice(allocator, if (std.mem.eql(u8, resolved_task, "embed") or std.mem.eql(u8, resolved_task, "rerank")) "true" else "false");
     // `/rerank` accepts `documents` (strings or content parts). Older servers
@@ -30637,7 +30954,7 @@ const ParsedChunkRequestInput = struct {
     pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
         if (self.owns_binary) switch (self.value) {
             .binary => |binary| allocator.free(binary.data),
-            .text => {},
+            .text, .source => {},
         };
         self.* = undefined;
     }
@@ -30655,6 +30972,7 @@ fn chunkInputWorkingAdmission(
     base_units: usize,
 ) !ChunkInputAdmission {
     const binary = switch (input.value) {
+        .source => return error.ModelAwareChunkProviderRequired,
         .text => return .{
             .units = base_units,
             .max_owned_output_bytes = lib_chunker.default_max_chunk_owned_output_bytes,
@@ -30752,6 +31070,20 @@ fn parseChunkRequestInputWithAttachments(
                 if (text_val != .string or text_val.string.len == 0) return error.ChunkTextContentPartMissingText;
                 if (attachments.len != 0) return error.AttachmentReferenceRequired;
                 break :blk .{ .value = .{ .text = text_val.string } };
+            }
+            if (std.mem.eql(u8, type_val.string, "source")) {
+                if (attachments.len != 0) return error.AttachmentReferenceRequired;
+                const uri = obj.get("uri") orelse return error.InvalidSourceReference;
+                const mime = obj.get("mime_type") orelse return error.InvalidSourceReference;
+                const version = obj.get("version") orelse return error.InvalidSourceReference;
+                const length = obj.get("length") orelse return error.InvalidSourceReference;
+                if (uri != .string or mime != .string or version != .string or length != .integer or length.integer <= 0 or mime.string.len == 0) return error.InvalidSourceReference;
+                var reference = lib_chunker.SourceReference{ .uri = uri.string, .mime_type = mime.string, .version = version.string, .length = @intCast(length.integer) };
+                if (obj.get("version_kind")) |kind| {
+                    if (kind != .string) return error.InvalidSourceReference;
+                    reference.version_kind = std.meta.stringToEnum(@TypeOf(reference.version_kind), kind.string) orelse return error.InvalidSourceReference;
+                }
+                break :blk .{ .value = .{ .source = reference } };
             }
             if (!std.mem.eql(u8, type_val.string, "media")) return error.UnsupportedChunkInputContentPartType;
 
@@ -32027,6 +32359,11 @@ fn validateEmbeddingGroupContract(node: *Node, contract: ResolvedInferenceExecut
             has_image = true;
             pixels += try @import("../pipelines/embedding_gemma2_video.zig").inspectPixelsWithSampling(bytes, control, sampling);
         },
+        .pcm => |pcm| {
+            media_parts += 1;
+            media_bytes = try std.math.add(usize, media_bytes, try std.math.mul(usize, pcm.samples.len, @sizeOf(f32)));
+            has_audio = true;
+        },
         .audio => |bytes| {
             media_parts += 1;
             media_bytes += bytes.len;
@@ -32049,6 +32386,11 @@ fn parseVideoSampling(value: std.json.Value) !@import("../pipelines/embedding_ge
     for (value.object.keys()) |key| {
         if (std.mem.eql(u8, key, "policy")) continue;
         const field = value.object.get(key).?;
+        if (std.mem.eql(u8, key, "hold")) {
+            if (field != .bool) return error.InvalidSamplingPolicy;
+            policy.hold = field.bool;
+            continue;
+        }
         if (std.mem.eql(u8, key, "overflow")) {
             if (field != .string) return error.InvalidSamplingPolicy;
             policy.overflow = if (std.mem.eql(u8, field.string, "uniform")) .uniform else if (std.mem.eql(u8, field.string, "truncate")) .truncate else return error.InvalidSamplingPolicy;

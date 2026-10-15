@@ -513,6 +513,15 @@ pub fn encodeEmbeddingGemma2Audio(cb: *const ComputeBackend, allocator: std.mem.
     return encodeSingleAudio(cb, allocator, &weights, embeddingGemma2AudioConfig(), bytes);
 }
 
+/// Native PCM goes directly to preparation; no intermediate WAV allocation.
+pub fn encodeEmbeddingGemma2Pcm(cb: *const ComputeBackend, a: std.mem.Allocator, pcm: audio.PcmAudio) !EncodedAudio {
+    var prepared = try prepareAudioPcm(a, pcm, 128, true, !audioHostOps().features and supportsGemma4LogMel(cb));
+    defer prepared.deinit();
+    const result = try encodePreparedEmbeddingGemma2AudioResident(cb, a, &prepared);
+    defer cb.free(result.embeddings);
+    return .{ .embeddings = try cb.toFloat32(result.embeddings, a), .tokens = result.tokens };
+}
+
 pub const ResidentEncodedAudio = struct { embeddings: CT, tokens: usize };
 pub fn encodePreparedEmbeddingGemma2AudioResident(cb: *const ComputeBackend, allocator: std.mem.Allocator, prepared: *const PreparedAudio) !ResidentEncodedAudio {
     var weights = ProjectorWeights.initHuggingFace(cb, allocator);
@@ -1070,6 +1079,17 @@ fn prepareAudioCpu(allocator: std.mem.Allocator, audio_bytes: []const u8, decode
     defer decoded.deinit();
     return prepareAudioPcm(allocator, .{ .samples = decoded.samples, .sample_rate = decoded.sample_rate }, mel_bins, strict, pack_gpu);
 }
+/// Matches resampling and the every-fourth-row feature mask without allocating
+/// FFT/filterbank state. Used before admitting model-sized audio windows.
+pub fn embeddingGemma2PcmSequenceLength(samples: usize, sample_rate: u32) !usize {
+    if (sample_rate == 0 or sample_rate > 192000 or samples == 0) return error.UnsupportedAudioFormat;
+    if (@as(u128, samples) * 16000 > @as(u128, sample_rate) * 480000) return error.AudioTooLong;
+    const ratio = @as(f64, @floatFromInt(sample_rate)) / 16000.0;
+    const real: usize = @intFromFloat(@as(f64, @floatFromInt(samples)) / ratio);
+    if (real <= 160) return error.EmptyEmbeddingInput;
+    return (real - 161) / 640 + 1 + 4;
+}
+
 pub fn prepareEmbeddingGemma2AudioPcm(allocator: std.mem.Allocator, pcm: audio.PcmAudio) !PreparedAudio {
     if (pcm.sample_rate == 0 or pcm.sample_rate > 192000 or pcm.samples.len == 0) return error.UnsupportedAudioFormat;
     for (pcm.samples) |sample| if (!std.math.isFinite(sample)) return error.UnsupportedAudioFormat;
@@ -5204,4 +5224,19 @@ fn checkVisionViewLifetime(cb: ComputeBackend, reference: ComputeBackend) !void 
 
 test "embeddinggemma2 Metal video vision layers retire completed MPS views and preserve external frame ownership" {
     try @import("../ops/media_residency_test.zig").onMetal(populateVisionViewLifetimeWeights, checkVisionViewLifetime);
+}
+
+test "model aware media audio preflight matches independently prepared feature masks" {
+    const a = std.testing.allocator;
+    for ([_]u32{ 8000, 16000, 44100, 48000 }) |rate| {
+        for ([_]usize{ 11, 41, 97, 1000 }) |milliseconds| {
+            const samples = try a.alloc(f32, @as(usize, rate) * milliseconds / 1000);
+            defer a.free(samples);
+            @memset(samples, 0.125);
+            var prepared = try prepareAudioPcm(a, .{ .samples = samples, .sample_rate = rate }, 128, true, false);
+            defer prepared.deinit();
+            try std.testing.expectEqual(prepared.tokenCount() + 4, try embeddingGemma2PcmSequenceLength(samples.len, rate));
+        }
+    }
+    try std.testing.expectError(error.AudioTooLong, embeddingGemma2PcmSequenceLength(480001, 16000));
 }

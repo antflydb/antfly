@@ -277,3 +277,16 @@ Conformance rules:
   validate against.
 - No browser-side encoded-codec decode in Zig before there is a concrete reason
   to replace `AudioContext`.
+
+
+## Model-aware windows and cancellation
+
+`DecodeOptions.control` supplies a borrowed cancellation/deadline check for
+synchronous decoding. Packet/frame loops in MP3, AAC, ALAC, FLAC, Opus and Vorbis
+check it between coded units; the scope restores the prior caller control on
+success or failure. The callback must outlive the decode and must not suspend.
+The model-aware runner also checks cancellation between model windows and source
+reads. WAV inputs can decode exact sample ranges without retaining full PCM;
+other codecs currently use the shared bounded decode allocation before windowing.
+See [model-aware chunking](../../../docs/plans/model-aware-media-chunking.md) for
+sample clocks, duration/token budgets, pause boundaries and coverage metadata.

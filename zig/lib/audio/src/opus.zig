@@ -405,6 +405,7 @@ pub fn decodeInterleavedPacketStreamAlloc(
 
     var cursor: usize = 0;
     while (cursor < packet_stream_bytes.len) {
+        try @import("work_control.zig").check();
         if (packet_stream_bytes.len - cursor < 8) return error.UnsupportedAudioFormat;
         const packet_len = readBeU32(packet_stream_bytes[cursor .. cursor + 4]);
         cursor += 4;
@@ -457,6 +458,7 @@ pub fn decodeInterleavedPacketsAlloc(
     defer samples.deinit(allocator);
 
     for (packets, packet_tocs) |packet, toc| {
+        try @import("work_control.zig").check();
         var split = try splitFramesAlloc(allocator, packet);
         defer split.deinit();
 

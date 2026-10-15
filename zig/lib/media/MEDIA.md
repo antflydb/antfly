@@ -7,11 +7,14 @@ and PCM behavior. Model sampling, tokens and inference belong to model adapters.
 The optional object-store adapter supplies authenticated transport without
 introducing that dependency into portable container consumers.
 
-Proposed [model-aware chunking](../../../docs/plans/model-aware-media-chunking.md)
-will share one version-pinned source/index owner across model windows and return
-source-coordinate descriptors with optional embeddings. Media supplies leases,
-clocks and admission; model adapters supply token budgets. This API is not yet
-implemented, and container packet boundaries are not searchable chunk boundaries.
+[Model-aware chunking](../../../docs/plans/model-aware-media-chunking.md) shares
+version-pinned source/index ownership across model windows and returns source
+coordinates with optional embeddings through `/ai/v1/chunk`. MP4 snapshots bounded
+coded windows; WebM retains its logical index; WAV ranges decode selected samples.
+HTTP/S3 references enforce immutable versions and exact range responses through
+configured scraping security/credentials. Media supplies leases, clocks and
+admission; model adapters supply token budgets. Container packets remain distinct
+from searchable chunks. The design documents contiguous-decoder and read budgets.
 
 See [qualification and reproduction](../../../docs/plans/native-video-noncuda-audit.md)
 for measured results and platform limitations. Historical run logs and progress
