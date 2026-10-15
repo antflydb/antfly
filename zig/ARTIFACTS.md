@@ -177,6 +177,12 @@ is joined in when `_artifacts` is projected. For lookup projection:
 
 ## Artifact Identity
 
+Proposed [model-aware chunk/embedding responses](../docs/plans/model-aware-media-chunking.md)
+keep descriptors and vectors associated by chunk identity even when payloads are
+omitted. Database integration must preserve existing `ArtifactRef` parent/source
+links and semantic invalidation; inference chunk IDs never expose storage keys
+or replace database artifact IDs. This proposal does not activate new API behavior.
+
 `ArtifactRef` remains the structured identity. `artifact_id` remains the opaque,
 round-trippable convenience token for search hits, links, and APIs that cannot
 carry structured refs.

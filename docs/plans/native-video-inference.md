@@ -70,6 +70,12 @@ end-user task relevance.
 
 ## CPU and Metal execution
 
+Automatic retrieval chunks and combined chunk/embedding responses are proposed
+in [model-aware media chunking](model-aware-media-chunking.md). Existing sampling
+and live windows do not implement automatic database chunk publication. The plan
+adds source-coordinate descriptors, model-budget planning and shared source,
+decode and projection ownership, preserving one vector per `/embed` group.
+
 CPU supplies portable decoding/preparation and an independent native arithmetic
 route. Metal can import eligible VideoToolbox surfaces or stage native integer
 planes without first materializing host RGB. Geometry coefficients and declared

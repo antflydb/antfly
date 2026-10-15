@@ -174,6 +174,14 @@ bounded to the reference inputs, not arbitrary HDR content.
 
 ## Inference, admission and telemetry
 
+Automatic long-video retrieval chunks are proposed in
+[model-aware media chunking](../../../docs/plans/model-aware-media-chunking.md).
+Current explicit sampling/windows do not automatically fan one `/embed` group
+into timestamped vectors. The proposed chunk operation preserves cadence within
+model-budgeted windows, returns source descriptors with optional vectors, and
+shares decoding/projections across windows. Overview sampling remains distinct
+from retrieval coverage; audio inclusion stays opt-in.
+
 `pipelines/embedding_gemma2_video.zig` connects logical MP4/WebM/normalized TS
 pictures to the pinned default 1 FPS, uniform 32-frame policy and explicit sampled
 windows. Video uses 140 pooled 16x16/3x3 soft tokens per frame, distinct from image
