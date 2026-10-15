@@ -45,9 +45,13 @@ pub const EnrichmentConfig = struct {
     /// Empty means the producer input carries no graph adjacency sample.
     neighbor_context_json: []const u8 = "",
     execution_json: []const u8 = "",
+    /// Graph shorthand owns this producer until explicitly upserted. Only
+    /// unreferenced producers with this provenance may be removed with a graph.
+    graph_inline_managed: ?bool = null,
 
     pub fn clone(alloc: Allocator, cfg: EnrichmentConfig) !EnrichmentConfig {
         return .{
+            .graph_inline_managed = cfg.graph_inline_managed,
             .name = try alloc.dupe(u8, cfg.name),
             .kind = cfg.kind,
             .source_field = try alloc.dupe(u8, cfg.source_field),
@@ -83,7 +87,7 @@ pub const EnrichmentConfig = struct {
 };
 
 pub fn serializeCatalog(alloc: Allocator, enrichments: []const EnrichmentConfig) ![]u8 {
-    return try std.json.Stringify.valueAlloc(alloc, enrichments, .{});
+    return try std.json.Stringify.valueAlloc(alloc, enrichments, .{ .emit_null_optional_fields = false });
 }
 
 pub fn deserializeCatalog(alloc: Allocator, data: []const u8) ![]EnrichmentConfig {
