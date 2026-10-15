@@ -25,6 +25,7 @@ test {
     _ = @import("metadata/fk_generation_publication.zig");
     _ = @import("metadata/relational_index_candidate.zig");
     _ = @import("metadata/relational_index_publication.zig");
+    _ = @import("metadata/relational_index_worker.zig");
     _ = @import("metadata/relational_index_delivery_journal.zig");
     _ = @import("api/relational_index_owner_execution.zig");
     _ = @import("api/relational_index_claim_delivery_test.zig");

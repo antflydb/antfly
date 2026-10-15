@@ -8130,3 +8130,50 @@ This component is not connected to fence lifting yet. Atomic release, recovery,
 replication/outbox, bounded job retirement, receiver/metadata release permission
 and root-continuity qualification remain required. No original SQL credit or
 public activation is claimed.
+
+### Native release, bounded retirement and cancellation dispatch checkpoint
+
+The later release milestones supersede the disconnected-component status above.
+Native release now commits the exact installed-fence lift, historical terminal
+record, native clock, fixed build-slot retirement, transport marker and durable
+outbox atomically. Signed release acknowledgments are reconstructed from retained
+installation evidence; metadata retires the exact lifecycle lock with the final
+acknowledgment. The bounded worker resumes this path after lost replies and
+volatile restarts. Replacement-root adoption remains guarded, not implemented.
+
+Obsolete source-batch and inventory companions are retired through canonical,
+replicated pages (128 records / 2 MiB / 5 ms preparation slice), not cancellation
+GC of live UNIQUE claims. A durable objective prevents the single terminal slot
+from being overwritten by a later build until retirement completes. Qualification
+includes per-write abort faults, pending mirror recovery, duplicate standby replay,
+reopen, admission barriers and unchanged live claims/user postimages. The combined
+Debug gate passed 159/159 build steps in
+`/private/tmp/antfly-native-release-companion-gc-full-debug.log`.
+
+Pre-publication cancellation now has an exact durable reason/revision decision,
+typed replicated command, bounded authenticated catalog calls and readonly status.
+Metadata leadership and standalone use the existing authority, capability and
+hot-standby mutation gates. Post-proposal uncertainty is resolved against the exact
+job; outstanding replication withholds confirmation. This dispatch checkpoint
+passed 111/111 Debug steps in
+`/private/tmp/antfly-native-index-cancellation-dispatch-debug-3.log`.
+
+Failure-driven worker cancellation is now qualified in the focused Debug gate: validated build
+and pre-decision inventory/generation failures select an exact cancellation CAS;
+pending native replication does not select one. Lost mutation replies use status
+reads, and losing CAS attempts refresh authoritative progress. Installation audit
+failures cannot undo an irreversible publication decision. Decision confirmation
+is admission to cleanup, not a canceled-owner acknowledgment or fence release.
+The publication/ACK gate passed 69/69 steps in
+`/private/tmp/antfly-index-failure-cancellation-debug.log` (55 publication/storage,
+four ACK/read-identity and one capability test). It selects all three scheduler
+tests explicitly through the metadata test root, including uncertain decision
+faults; the receiver fixture exercises failed-build scheduling, pending native
+replication and zero source delivery/install/release effects. The earlier
+storage-owner-source filter selected no tests and is not validation evidence.
+
+Remaining activation work includes cancellation cleanup/final signed acknowledgments
+and cohort release, mounted public online-index admission/status, later-stage
+replacement-root recovery, hosted/Raft execution and broader index candidates.
+No original-case dispositions change: 483 implemented / 862 unresolved. Component
+qualification does not substitute for unchanged-source public SQL evidence.

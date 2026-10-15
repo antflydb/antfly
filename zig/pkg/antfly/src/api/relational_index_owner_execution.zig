@@ -1332,6 +1332,8 @@ const TestDriver = struct {
     produce_receipt: bool = false,
     pending: bool = false,
     build_pages: usize = 0,
+    build_failed: bool = false,
+    cancellation_requests: usize = 0,
     inventory_pages: usize = 0,
     generation_pages: usize = 0,
     audit_pages: usize = 0,
@@ -1376,6 +1378,15 @@ const TestDriver = struct {
 
     pub fn systemCatalog(self: *TestDriver, alloc: std.mem.Allocator, context: operation.RequestContext, call: calls.Call) ![]u8 {
         try std.testing.expect(context.index_publication_authority);
+        if (call == .relational_index_cancel or call == .relational_index_cancel_status) {
+            const request = if (call == .relational_index_cancel) call.relational_index_cancel else call.relational_index_cancel_status;
+            try request.validate();
+            if (call == .relational_index_cancel) {
+                self.cancellation_requests += 1;
+                self.value.head = try self.value.head.cancel(request.expected_revision, request.failure);
+            }
+            return std.json.Stringify.valueAlloc(alloc, publication.CancellationStatus{ .head = self.value.head }, .{});
+        }
         if (call == .relational_index_publish_decide or call == .relational_index_publish_status) {
             const request = if (call == .relational_index_publish_decide) call.relational_index_publish_decide else call.relational_index_publish_status;
             try request.validate();
@@ -1654,6 +1665,16 @@ const TestDriver = struct {
             return .{ .root_generation = self.root_generation, .outcome = try parsed(native.BuildResponse, alloc, .{ .inventory = .{ .binding = binding, .record = .{ .expected = expected, .fields = .{ .phase = .ready, .rows = 1, .inventory_xor = expected.inventory_xor, .claim_rows = 1, .claim_xor = expected.inventory_xor, .claim_cursor = address.claimKey(), .chain = @splat(7), .cursor = jobs.private_claims.inventoryKey(address) }, .position = position, .page_digest = @splat(8) }, .position = position, .duplicate = false } }) };
         }
         self.build_pages += 1;
+        if (self.build_failed) return .{ .root_generation = self.root_generation, .outcome = try parsed(native.BuildResponse, alloc, .{ .complete = .{
+            .binding = binding,
+            .state = .failed,
+            .failure = .invalid_row,
+            .rows_scanned = 1,
+            .progress_digest = @splat(9),
+            .position = .{ .namespace = binding.fence.namespace, .sequence = 4 },
+            .replication_pending = self.pending,
+            .error_name = if (self.pending) "ReplicationOutboxPending" else null,
+        } }) };
         if (self.cancel_after_commit) |signal| signal.store(true, .release);
         return .{ .root_generation = self.root_generation, .outcome = try parsed(native.BuildResponse, alloc, .{ .advanced = .{ .binding = binding, .page_digest = @splat(9), .position = .{ .namespace = binding.fence.namespace, .sequence = 4 }, .duplicate = false, .replication_pending = self.pending, .error_name = if (self.pending) "ReplicationOutboxPending" else null } }) };
     }
@@ -1935,6 +1956,42 @@ const TestSchedulerHost = struct {
         return self.driver.systemCatalog(alloc, context, call);
     }
 };
+
+fn testSchedulerFailedBuild(alloc: std.mem.Allocator, permission: publication.OwnerDecision, binding: jobs.Binding, root: local.storage_db_root_signing_identity.State) !void {
+    const worker = @import("../metadata/relational_index_worker.zig");
+    var driver: TestDriver = .{ .value = permission, .binding = binding, .build_failed = true, .pending = true };
+    var host: TestSchedulerHost = .{ .driver = &driver };
+    var sender: TestDeliveryTransport = .{ .driver = &driver, .root = root };
+    var transport = sender.localTransport();
+    var coordinator: worker.Coordinator = .{};
+    defer coordinator.deinit(std.testing.io);
+    var now = @import("antfly_platform").time.monotonicNs();
+    // A local failure with an outstanding durable-mirror obligation must not
+    // become a metadata decision or start reading/delivering source claims.
+    for (0..20) |_| {
+        _ = try coordinator.step(std.testing.io, alloc, null, &host, &transport, now);
+        now += 300 * std.time.ns_per_ms;
+    }
+    try std.testing.expect(driver.build_pages != 0);
+    try std.testing.expectEqual(@as(usize, 0), driver.cancellation_requests);
+    driver.pending = false;
+    for (0..20) |_| {
+        const before = sender.calls;
+        _ = try coordinator.step(std.testing.io, alloc, null, &host, &transport, now);
+        try std.testing.expect(sender.calls - before <= 1);
+        now += 300 * std.time.ns_per_ms;
+        if (driver.cancellation_requests != 0) break;
+    }
+    try std.testing.expectEqual(@as(usize, 1), driver.cancellation_requests);
+    try std.testing.expectEqual(.canceling, driver.value.head.phase);
+    try std.testing.expectEqual(.invalid_candidate, driver.value.head.failure);
+    try std.testing.expectEqual(@as(usize, 0), driver.source_reads);
+    try std.testing.expectEqual(@as(usize, 0), driver.claim_batches);
+    try std.testing.expectEqual(@as(usize, 0), driver.installation_calls);
+    try std.testing.expectEqual(@as(usize, 0), driver.release_calls);
+    try std.testing.expectEqual(@as(u16, 0), driver.value.head.counts[5]);
+    try std.testing.expectEqual(@as(u16, 0), driver.value.head.counts[6]);
+}
 
 fn testSchedulerDelivery(alloc: std.mem.Allocator, permission: publication.OwnerDecision, binding: jobs.Binding, root: local.storage_db_root_signing_identity.State) !void {
     return testSchedulerDeliveryFault(alloc, permission, binding, root, false, .none);
@@ -2560,6 +2617,7 @@ test "relational index publication claim receiver binds fresh build permission w
         try testSchedulerDeliveryBeforeCommit(alloc, permission, binding.?, root);
         try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, testSchedulerDeliveryBeforeCommit, .{ permission, binding.?, root });
         try testSchedulerValidationFaults(alloc, permission, binding.?, root);
+        try testSchedulerFailedBuild(alloc, permission, binding.?, root);
         {
             var cohort = try jobs.private_claims.delivery.Cohort.init(alloc, &.{.{ .owner = permission.owner.owner, .start = "", .end = "" }});
             defer cohort.deinit();

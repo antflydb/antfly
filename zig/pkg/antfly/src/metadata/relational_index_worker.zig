@@ -39,19 +39,73 @@ const idle_lifetime_ns = 60 * std.time.ns_per_s;
 const max_job_quanta = 4096;
 
 pub const Authority = struct { metadata_incarnation: [32]u8, binding_digest: [32]u8, writer_generation: u64 };
-const Stage = enum { refresh, control, acknowledge, resolve_ack, decide, resolve_decision, build, deliver, inventory, install, release };
+const Stage = enum { refresh, control, acknowledge, resolve_ack, decide, resolve_decision, cancel, resolve_cancel, build, deliver, inventory, install, release };
 const Owner = struct {
     ordinal: u16,
     stage: Stage = .refresh,
     head: ?progress.Head = null,
     ack: ?publication.Ack = null,
     decision: ?publication.DecidePublish = null,
+    cancellation: ?publication.CancelDecision = null,
     stream: ?producer.Producer = null,
     deadline_ns: u64,
     retry_at_ns: u64 = 0,
     fn deinit(self: *Owner) void {
         if (self.stream) |*stream| stream.deinit();
         self.* = undefined;
+    }
+
+    /// Only a validated, durable pre-publication failure may request this CAS.
+    /// Transient transport/storage errors and post-decision audits must not
+    /// turn into cancellation or weaken the irreversible installation barrier.
+    fn requestCancellation(self: *Owner, failure: progress.Failure) !void {
+        const head = self.head orelse return error.InvalidCatalogRecord;
+        try head.validate();
+        if (head.phase != .building or failure == .none) return error.GenerationPublicationChanged;
+        const request: publication.CancelDecision = .{ .table_id = head.table_id, .id = head.plan_id, .expected_revision = head.revision, .failure = failure };
+        try request.validate();
+        self.cancellation = request;
+        self.stage = .cancel;
+    }
+
+    /// One metadata operation per quantum. A committed decision is admission
+    /// to cleanup, NOT evidence that artifacts, claims or fences are retired.
+    fn cancelStep(self: *Owner, host: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, now_ns: u64) !bool {
+        try context.ensureActive();
+        if (self.stage != .cancel and self.stage != .resolve_cancel) return error.InvalidCatalogRecord;
+        const request = self.cancellation orelse return error.InvalidCatalogRecord;
+        const call: calls.Call = if (self.stage == .cancel) .{ .relational_index_cancel = request } else .{ .relational_index_cancel_status = request };
+        const bytes = host.systemCatalog(alloc, context, call) catch |err| switch (@as(anyerror, err)) {
+            error.MetadataMutationOutcomeUnknown, error.Timeout => {
+                self.stage = .resolve_cancel;
+                self.retry_at_ns = now_ns +| retry_ns;
+                return false;
+            },
+            error.GenerationPublicationChanged, error.MetadataReplicationPending => {
+                self.cancellation = null;
+                self.stage = .refresh;
+                self.retry_at_ns = now_ns +| retry_ns;
+                return false;
+            },
+            else => return err,
+        };
+        defer alloc.free(bytes);
+        if (bytes.len == 0 or bytes.len > publication.CancellationStatus.max_wire_bytes) return error.InvalidCatalogRecord;
+        var response = try std.json.parseFromSlice(publication.CancellationStatus, alloc, bytes, .{ .ignore_unknown_fields = false });
+        defer response.deinit();
+        const canceled = try response.value.isCanceled(request);
+        if (response.value.replication_pending) {
+            self.stage = .resolve_cancel;
+            self.retry_at_ns = now_ns +| retry_ns;
+            return false;
+        }
+        if (canceled) return true;
+        // The proposal may never have committed. Reobserve authoritative
+        // progress and the durable failure before choosing another CAS cut.
+        self.cancellation = null;
+        self.stage = .refresh;
+        self.retry_at_ns = now_ns +| retry_ns;
+        return false;
     }
 };
 
@@ -186,6 +240,9 @@ const Job = struct {
         const context_ = self.context(owner.deadline_ns);
         try context_.ensureActive();
         switch (owner.stage) {
+            .cancel, .resolve_cancel => {
+                if (try owner.cancelStep(host, alloc, context_, now_ns)) self.retireOwner(index);
+            },
             .refresh => {
                 var response = try self.read(host, .{ .head = self.identity });
                 defer response.deinit();
@@ -324,7 +381,11 @@ const Job = struct {
                         .inventory, .generation, .audit, .validated => return error.InvalidPrivateIndexNativeReceipt,
                         .advanced => |value| value.replication_pending,
                         .complete => |value| blk: {
-                            if (value.state == .failed) return error.PrivateIndexBuildFailed;
+                            if (value.replication_pending) break :blk true;
+                            if (value.state == .failed) {
+                                try owner.requestCancellation(.invalid_candidate);
+                                return;
+                            }
                             break :blk value.replication_pending;
                         },
                     };
@@ -443,19 +504,22 @@ const Job = struct {
                         owner.stage = .acknowledge;
                     },
                     .inventory => |value| if (value.record.fields.phase == .failed) {
-                        return error.PrivateIndexTargetInventoryMismatch;
+                        try owner.requestCancellation(.invalid_candidate);
                     },
                     .generation => |value| switch (value.record.fields.phase) {
                         .primary, .forward, .ownership => {},
-                        .failed => return error.PrivateIndexGenerationValidationFailed,
+                        .failed => try owner.requestCancellation(.invalid_candidate),
                         // The next validation turn must re-audit this root;
                         // canonical readiness is not local physical evidence.
                         .ready => {},
                     },
                     .audit => |value| {
-                        if (value.audit.inventory.phase == .failed) return error.PrivateIndexTargetInventoryMismatch;
+                        if (value.audit.inventory.phase == .failed) {
+                            try owner.requestCancellation(.invalid_candidate);
+                            return;
+                        }
                         if (value.audit.generation) |fields| switch (fields.phase) {
-                            .failed => return error.PrivateIndexGenerationValidationFailed,
+                            .failed => try owner.requestCancellation(.invalid_candidate),
                             .ready => {
                                 if (response.value.building.signed_audit == null) {
                                     owner.retry_at_ns = now_ns +| retry_ns;
@@ -618,6 +682,92 @@ pub const Coordinator = struct {
         return false;
     }
 };
+
+test "relational index publication scheduler resolves failure cancellation without replaying uncertain mutations" {
+    const Host = struct {
+        head: progress.Head,
+        fault: enum { none, before_commit, lost_reply, pending, stale, foreign } = .none,
+        mutations: usize = 0,
+        reads: usize = 0,
+        pub fn systemCatalog(self: *@This(), alloc: std.mem.Allocator, context: operation.RequestContext, call: calls.Call) ![]u8 {
+            try context.ensureActive();
+            try std.testing.expect(context.index_publication_authority);
+            const request = switch (call) {
+                .relational_index_cancel => |request| blk: {
+                    self.mutations += 1;
+                    if (self.fault == .before_commit) return error.Timeout;
+                    if (self.fault == .stale) return error.GenerationPublicationChanged;
+                    self.head = try self.head.cancel(request.expected_revision, request.failure);
+                    if (self.fault == .lost_reply) return error.MetadataMutationOutcomeUnknown;
+                    break :blk request;
+                },
+                .relational_index_cancel_status => |request| blk: {
+                    self.reads += 1;
+                    break :blk request;
+                },
+                else => return error.UnexpectedTestOperation,
+            };
+            try request.validate();
+            var status: publication.CancellationStatus = .{ .head = self.head, .replication_pending = self.fault == .pending };
+            if (self.fault == .foreign) status.head.plan_id = @splat(9);
+            return std.json.Stringify.valueAlloc(alloc, status, .{});
+        }
+    };
+    const a = std.testing.allocator;
+    const head: progress.Head = .{ .table_id = 9, .plan_id = @splat(1), .plan_digest = @splat(2), .candidate_digest = @splat(3), .reservation_digest = @splat(4), .owner_count = 1, .counts = .{ 1, 1, 0, 0, 0, 0, 0 }, .phase = .building, .revision = 3 };
+    const context: operation.RequestContext = .{ .index_publication_authority = true };
+    for (std.enums.values(@FieldType(Host, "fault"))) |fault| {
+        var host: Host = .{ .head = head, .fault = fault };
+        var owner: Owner = .{ .ordinal = 0, .head = head, .deadline_ns = std.math.maxInt(u64) };
+        defer owner.deinit();
+        try owner.requestCancellation(.invalid_candidate);
+        try std.testing.expectEqual(Stage.cancel, owner.stage);
+        if (fault == .foreign) {
+            try std.testing.expectError(error.GenerationPublicationChanged, owner.cancelStep(&host, a, context, 1));
+            continue;
+        }
+        const done = try owner.cancelStep(&host, a, context, 1);
+        try std.testing.expectEqual(@as(usize, 1), host.mutations);
+        if (fault == .none) {
+            try std.testing.expect(done);
+        } else if (fault == .stale) {
+            try std.testing.expect(!done);
+            try std.testing.expectEqual(Stage.refresh, owner.stage);
+            try std.testing.expectEqual(@as(?publication.CancelDecision, null), owner.cancellation);
+        } else {
+            try std.testing.expect(!done);
+            try std.testing.expectEqual(Stage.resolve_cancel, owner.stage);
+            // A pending replicated decision must stay unresolved; it does not
+            // authorize cleanup, fence release or another mutation proposal.
+            if (fault == .pending) {
+                try std.testing.expect(!try owner.cancelStep(&host, a, context, 2));
+                try std.testing.expectEqual(Stage.resolve_cancel, owner.stage);
+            }
+            host.fault = .none;
+            const resolved = try owner.cancelStep(&host, a, context, 3);
+            try std.testing.expectEqual(fault != .before_commit, resolved);
+            try std.testing.expectEqual(@as(usize, 1), host.mutations);
+            try std.testing.expect(host.reads != 0);
+            if (fault == .before_commit) try std.testing.expectEqual(Stage.refresh, owner.stage);
+        }
+        // Decision admission is not terminal cleanup or a released fence.
+        try std.testing.expect(host.head.phase == .building or host.head.phase == .canceling);
+        try std.testing.expectEqual(@as(u16, 0), host.head.counts[5]);
+        try std.testing.expectEqual(@as(u16, 0), host.head.counts[6]);
+    }
+    var invalid: Owner = .{ .ordinal = 0, .head = head, .deadline_ns = 1 };
+    try std.testing.expectError(error.GenerationPublicationChanged, invalid.requestCancellation(.none));
+    invalid.head.?.counts[2] = 1;
+    invalid.head = try invalid.head.?.decidePublish(head.revision);
+    try std.testing.expectError(error.GenerationPublicationChanged, invalid.requestCancellation(.invalid_candidate));
+    try std.testing.expectEqual(@as(?publication.CancelDecision, null), invalid.cancellation);
+    var expired: Owner = .{ .ordinal = 0, .head = head, .deadline_ns = 0 };
+    var unused: Host = .{ .head = head };
+    try expired.requestCancellation(.invalid_candidate);
+    try std.testing.expectError(error.DeadlineExceeded, expired.cancelStep(&unused, a, .{ .deadline_ns = 0, .index_publication_authority = true }, 1));
+    try std.testing.expectEqual(@as(usize, 0), unused.mutations);
+    try std.testing.expectEqual(@as(usize, 0), unused.reads);
+}
 
 test "relational index publication scheduler admits distinct owners and rotates blocked lanes" {
     const alloc = std.testing.allocator;
