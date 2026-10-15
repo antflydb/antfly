@@ -26,6 +26,7 @@ pub const Cache = struct {
     decoded: @import("lake_decoded_cache.zig").Cache,
     /// Manifest decoding has separate admission from snapshot construction.
     manifests: @import("lake_decoded_cache.zig").Cache,
+    inventory_chunks: @import("lake_decoded_cache.zig").Cache,
     /// In-flight physical reads share owned results even when residency is denied.
     physical: @import("lake_decoded_cache.zig").Cache,
     mutex: std.atomic.Mutex = .unlocked,
@@ -263,7 +264,7 @@ pub const Cache = struct {
         return initWithMemoryLimit(alloc, 64 * 1024 * 1024);
     }
     pub fn initWithMemoryLimit(alloc: Allocator, maximum: usize) Cache {
-        return .{ .alloc = alloc, .decoded = .{ .a = alloc }, .manifests = .{ .a = alloc }, .physical = .{ .a = alloc, .max_bytes = 0, .max_entries = 0 }, .max_bytes = maximum };
+        return .{ .alloc = alloc, .decoded = .{ .a = alloc }, .manifests = .{ .a = alloc }, .inventory_chunks = .{ .a = alloc }, .physical = .{ .a = alloc, .max_bytes = 0, .max_entries = 0 }, .max_bytes = maximum };
     }
     pub fn deinit(self: *Cache) void {
         // Request/status callers are quiescent. Cancel and join restoration
@@ -277,6 +278,7 @@ pub const Cache = struct {
         self.mappings.deinit(self.alloc);
         if (self.persistent) |*disk| disk.deinit();
         self.decoded.deinit();
+        self.inventory_chunks.deinit();
         self.manifests.deinit();
         self.physical.deinit();
         std.debug.assert(self.flights.count() == 0);

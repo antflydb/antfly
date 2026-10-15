@@ -514,6 +514,12 @@ pub const Predicate = struct {
         try owner.read_context.ensureActive();
         return owner.reader.containsPhysical(ref, owner.predicate_lower, owner.predicate_upper);
     }
+    pub fn intersectsPhysical(self: *Predicate, first: local.storage_rowsource_types.RowRef, last: local.storage_rowsource_types.RowRef) !?bool {
+        if (self.scan) return null;
+        const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
+        try owner.read_context.ensureActive();
+        return owner.reader.intersectsPhysical(first, last, owner.predicate_lower, owner.predicate_upper);
+    }
     pub fn hasBlocks(self: Predicate) bool {
         if (self.scan) return false;
         const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));

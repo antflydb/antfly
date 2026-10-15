@@ -672,8 +672,66 @@ pub const MatchAllCandidateCollector = struct {
     ) anyerror!?doc_set.DocOrdinal = null,
 };
 
+pub const ComposedComponent = struct {
+    request: types.SearchRequest,
+    query: union(enum) { text: types.TextQuery, default_text, dense: types.DenseKnnQuery, sparse: types.SparseKnnQuery },
+};
+pub const ComposedComponentBatch = struct {
+    alloc: Allocator,
+    results: []?types.SearchResult,
+    position: usize = 0,
+    pub fn deinit(self: *@This()) void {
+        for (self.results) |*result| if (result.*) |*owned| owned.deinit();
+        self.alloc.free(self.results);
+    }
+    fn take(self: *@This()) !types.SearchResult {
+        if (self.position >= self.results.len) return error.InvalidQueryRequest;
+        const result = self.results[self.position] orelse return error.InvalidQueryRequest;
+        self.results[self.position] = null;
+        self.position += 1;
+        return result;
+    }
+};
+fn composedComponents(a: Allocator, req: types.SearchRequest) ![]ComposedComponent {
+    var components: std.ArrayList(ComposedComponent) = .empty;
+    errdefer components.deinit(a);
+    if (req.full_text_queries.len == 0) {
+        if (req.full_text) |text| try components.append(a, .{ .request = req, .query = .{ .text = text } }) else if (!isDefaultMatchAll(req.query) and isTextQuery(req.query)) try components.append(a, .{ .request = req, .query = .default_text });
+    } else {
+        for (req.full_text_queries) |named| {
+            var child = req;
+            child.index_name = named.index_name;
+            try components.append(a, .{ .request = child, .query = .{ .text = named.query } });
+        }
+    }
+    var vectors = req;
+    vectors.full_text = null;
+    if (vectors.dense_queries.len == 0 and vectors.dense != null) {
+        try components.append(a, .{ .request = vectors, .query = .{ .dense = vectors.dense.? } });
+    } else {
+        for (vectors.dense_queries) |named| {
+            var child = vectors;
+            child.index_name = named.index_name;
+            try components.append(a, .{ .request = child, .query = .{ .dense = named.query } });
+        }
+    }
+    if (vectors.sparse_queries.len == 0 and vectors.sparse != null) {
+        try components.append(a, .{ .request = vectors, .query = .{ .sparse = vectors.sparse.? } });
+    } else {
+        for (vectors.sparse_queries) |named| {
+            var child = vectors;
+            child.index_name = named.index_name;
+            try components.append(a, .{ .request = child, .query = .{ .sparse = named.query } });
+        }
+    }
+    return components.toOwnedSlice(a);
+}
+
 pub const ComposedSearchExecutor = struct {
     ctx: ?*anyopaque,
+    /// Optional independent component executions. Results must retain input
+    /// order; fusion, graph dependencies and transforms remain on the caller.
+    search_components: ?*const fn (?*anyopaque, Allocator, []const ComposedComponent) anyerror!ComposedComponentBatch = null,
     resolve_structured_doc_filter: ?*const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -972,10 +1030,22 @@ pub fn searchComposed(
         shared_req.profile = true;
     }
 
+    var component_batch: ?ComposedComponentBatch = null;
+    defer if (component_batch) |*batch| batch.deinit();
+    if (executor.search_components) |run| {
+        // The optional single-dense profile sink is caller-owned mutable state.
+        // Its existing serial executor remains authoritative when enabled.
+        if (executor.search_dense_profiled == null or executor.dense_profile_sink == null) {
+            const components = try composedComponents(alloc, shared_req);
+            defer alloc.free(components);
+            if (components.len > 1) component_batch = try run(executor.ctx, alloc, components);
+        }
+    }
+
     if (shared_req.full_text_queries.len == 0) {
         if (shared_req.full_text) |text| {
             const phase_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
-            const text_result = try executor.search_text_query(executor.ctx, alloc, shared_req, text);
+            const text_result = if (component_batch) |*batch| try batch.take() else try executor.search_text_query(executor.ctx, alloc, shared_req, text);
             owned_results.appendAssumeCapacity(text_result);
             if (bench_query_profile) text_ns += platform_time.monotonicNs() - phase_start_ns;
             composed_candidate_count += text_result.hits.len;
@@ -993,7 +1063,7 @@ pub fn searchComposed(
             });
         } else if (!isDefaultMatchAll(shared_req.query) and isTextQuery(shared_req.query)) {
             const phase_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
-            const text_result = try executor.search_text(executor.ctx, alloc, shared_req);
+            const text_result = if (component_batch) |*batch| try batch.take() else try executor.search_text(executor.ctx, alloc, shared_req);
             owned_results.appendAssumeCapacity(text_result);
             if (bench_query_profile) text_ns += platform_time.monotonicNs() - phase_start_ns;
             composed_candidate_count += text_result.hits.len;
@@ -1015,7 +1085,7 @@ pub fn searchComposed(
             var text_req = shared_req;
             text_req.index_name = full_text_query.index_name;
             const phase_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
-            const text_result = try executor.search_text_query(executor.ctx, alloc, text_req, full_text_query.query);
+            const text_result = if (component_batch) |*batch| try batch.take() else try executor.search_text_query(executor.ctx, alloc, text_req, full_text_query.query);
             owned_results.appendAssumeCapacity(text_result);
             if (bench_query_profile) text_ns += platform_time.monotonicNs() - phase_start_ns;
             composed_candidate_count += text_result.hits.len;
@@ -1046,7 +1116,7 @@ pub fn searchComposed(
 
     if (vector_req.dense_queries.len == 0 and vector_req.dense != null) {
         const phase_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
-        const dense_result = try searchComposedDenseComponent(
+        const dense_result = if (component_batch) |*batch| try batch.take() else try searchComposedDenseComponent(
             alloc,
             vector_req,
             vector_req.dense.?,
@@ -1069,7 +1139,7 @@ pub fn searchComposed(
             var dense_req = vector_req;
             dense_req.index_name = dense_query.index_name;
             const phase_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
-            const dense_result = try searchComposedDenseComponent(
+            const dense_result = if (component_batch) |*batch| try batch.take() else try searchComposedDenseComponent(
                 alloc,
                 dense_req,
                 dense_query.query,
@@ -1092,7 +1162,7 @@ pub fn searchComposed(
 
     if (vector_req.sparse_queries.len == 0 and vector_req.sparse != null) {
         const phase_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
-        const sparse_result = try executor.search_sparse(executor.ctx, alloc, vector_req, vector_req.sparse.?);
+        const sparse_result = if (component_batch) |*batch| try batch.take() else try executor.search_sparse(executor.ctx, alloc, vector_req, vector_req.sparse.?);
         owned_results.appendAssumeCapacity(sparse_result);
         if (bench_query_profile) sparse_ns += platform_time.monotonicNs() - phase_start_ns;
         composed_candidate_count += sparse_result.hits.len;
@@ -1109,7 +1179,7 @@ pub fn searchComposed(
             var sparse_req = vector_req;
             sparse_req.index_name = sparse_query.index_name;
             const phase_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
-            const sparse_result = try executor.search_sparse(executor.ctx, alloc, sparse_req, sparse_query.query);
+            const sparse_result = if (component_batch) |*batch| try batch.take() else try executor.search_sparse(executor.ctx, alloc, sparse_req, sparse_query.query);
             owned_results.appendAssumeCapacity(sparse_result);
             if (bench_query_profile) sparse_ns += platform_time.monotonicNs() - phase_start_ns;
             composed_candidate_count += sparse_result.hits.len;
@@ -33065,4 +33135,55 @@ test "external lake metadata navigation prepared highlights own lazy regex alloc
     }
     _ = scratch.reset(.free_all);
     try std.testing.expectEqualDeep(hits[0].highlights, hits[1].highlights);
+}
+
+test "external lake metadata navigation composed batches preserve component semantics and fusion order" {
+    const a = std.testing.allocator;
+    const Harness = struct {
+        fn text(_: ?*anyopaque, _: Allocator, _: types.SearchRequest, _: types.TextQuery) !types.SearchResult {
+            return error.UnexpectedSerialComponent;
+        }
+        fn defaultText(_: ?*anyopaque, _: Allocator, _: types.SearchRequest) !types.SearchResult {
+            return error.UnexpectedSerialComponent;
+        }
+        fn dense(_: ?*anyopaque, _: Allocator, _: types.SearchRequest, _: types.DenseKnnQuery) !types.SearchResult {
+            return error.UnexpectedSerialComponent;
+        }
+        fn sparse(_: ?*anyopaque, _: Allocator, _: types.SearchRequest, _: types.SparseKnnQuery) !types.SearchResult {
+            return error.UnexpectedSerialComponent;
+        }
+        fn clone(_: ?*anyopaque, alloc: Allocator, set: graph_exec.NamedResultSet, stored: bool) !types.SearchResult {
+            return graph_exec.cloneNamedSetAsResult(alloc, set, stored);
+        }
+        fn fuse(_: ?*anyopaque, alloc: Allocator, _: types.SearchRequest, sets: []const graph_exec.NamedResultSet) !types.SearchResult {
+            try std.testing.expectEqual(@as(usize, 2), sets.len);
+            try std.testing.expectEqualStrings("$full_text_results", sets[0].name);
+            try std.testing.expectEqualStrings("$embeddings_results", sets[1].name);
+            try std.testing.expectEqualStrings("component-0", sets[0].hits[0].id);
+            try std.testing.expectEqualStrings("component-1", sets[1].hits[0].id);
+            return graph_exec.cloneNamedSetAsResult(alloc, sets[0], false);
+        }
+        fn graph(_: ?*anyopaque, _: Allocator, _: types.SearchRequest, _: *types.SearchResult, _: []const graph_exec.NamedResultSet) !void {
+            return error.UnexpectedGraphAttachment;
+        }
+        fn batch(_: ?*anyopaque, alloc: Allocator, components: []const ComposedComponent) !ComposedComponentBatch {
+            try std.testing.expectEqual(@as(usize, 2), components.len);
+            try std.testing.expect(components[0].query == .text and components[1].query == .dense);
+            try std.testing.expect(components[0].request.full_text != null and components[1].request.full_text == null);
+            for (components) |component| try std.testing.expectEqualStrings("filter", component.request.filter_query_json);
+            var out: ComposedComponentBatch = .{ .alloc = alloc, .results = try alloc.alloc(?types.SearchResult, 2) };
+            @memset(out.results, null);
+            errdefer out.deinit();
+            for (out.results, 0..) |*result, i| {
+                const hits = try alloc.alloc(types.SearchHit, 1);
+                errdefer alloc.free(hits);
+                hits[0] = .{ .id = try std.fmt.allocPrint(alloc, "component-{d}", .{i}), .score = 1 };
+                result.* = .{ .alloc = alloc, .hits = hits, .total_hits = 1 };
+            }
+            return out;
+        }
+    };
+    var result = try searchComposed(a, .{ .full_text = .{ .term = .{ .field = "body", .term = "common" } }, .dense = .{ .vector = &.{ 1, 0 }, .k = 2 }, .filter_query_json = "filter", .include_stored = false }, .{ .ctx = null, .search_components = Harness.batch, .search_text_query = Harness.text, .search_text = Harness.defaultText, .search_dense = Harness.dense, .search_sparse = Harness.sparse, .clone_named_set = Harness.clone, .fuse_named_sets = Harness.fuse, .attach_graph_results = Harness.graph });
+    defer result.deinit();
+    try std.testing.expectEqualStrings("component-0", result.hits[0].id);
 }

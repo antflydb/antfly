@@ -136,7 +136,9 @@ pub const ReverseBuilder = struct {
         const self = try a.create(ReverseBuilder);
         self.* = .{ .a = a, .pages = undefined, .builder = undefined };
         self.pages = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &self.reads, .remaining_write_bytes = &self.writes, .streaming = true };
-        self.builder = .{ .alloc = a, .store = self.pages.store() };
+        var storage = self.pages.store();
+        storage.reduce = @import("lake_index_predicate_ranges.zig").reduce;
+        self.builder = .{ .alloc = a, .store = storage };
         return self;
     }
     pub fn add(self: *ReverseBuilder, key: []const u8) !void {
@@ -159,6 +161,8 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
     var read_bytes: u64 = 256 * 1024 * 1024;
     var write_bytes: u64 = 512 * 1024 * 1024;
     var pages: page_store.PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &read_bytes, .remaining_write_bytes = &write_bytes, .streaming = true, .io = sort.manager.io };
+    var reverse_storage = pages.store();
+    reverse_storage.reduce = @import("lake_index_predicate_ranges.zig").reduce;
     var predicates = predicate_blocks.Builder.init(a, sort.manager);
     defer predicates.deinit();
     var reverse_sort = local.sql_spill.Sort.init(a, sort.manager, &.{.{}}, 512 * 1024);
@@ -326,7 +330,7 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
                 if (forward_changes.items.len == 0) break;
                 ties = try tie_directory.apply(a, pages.store(), ties, forward_changes.items);
                 page = try applyChanges(a, pages.store(), page, forward_changes.items);
-                reverse = try applyChanges(a, pages.store(), reverse, reverse_changes.items);
+                reverse = try applyChanges(a, reverse_storage, reverse, reverse_changes.items);
             }
         }
         var batch_arena = std.heap.ArenaAllocator.init(a);
@@ -350,7 +354,7 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
             if (forward_changes.items.len == 0) break;
             ties = try tie_directory.apply(a, pages.store(), ties, forward_changes.items);
             page = try applyChanges(a, pages.store(), page, forward_changes.items);
-            reverse = try applyChanges(a, pages.store(), reverse, reverse_changes.items);
+            reverse = try applyChanges(a, reverse_storage, reverse, reverse_changes.items);
         }
     } else {
         // Initial and legacy roots get a streaming reverse tree once.
@@ -395,7 +399,7 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
             }
         };
         var reverse_source: ReverseSource = .{ .sorted = &reverse_sorted };
-        reverse = if (delta.run_only) null else if (delta.reverse_built) delta.built_reverse else try tree.buildSortedWithOptions(a, pages.store(), &reverse_source, .{ .target_bytes = tree.bulk_target_page_bytes });
+        reverse = if (delta.run_only) null else if (delta.reverse_built) delta.built_reverse else try tree.buildSortedWithOptions(a, reverse_storage, &reverse_source, .{ .target_bytes = tree.bulk_target_page_bytes });
         if (!delta.run_only and delta.reverse_built and (page != null) != (reverse != null)) return error.InvalidNativeLakeRowIndex;
     }
     const predicate_root = if (delta.run_only) null else try predicates.publish(pages.store(), if (has_delta) delta.previous.?.predicates else null);
@@ -695,6 +699,9 @@ pub const Reader = struct {
     physical_cursor: ?tree.Cursor = null,
     membership_arena: ?std.heap.ArenaAllocator = null,
     membership_reads: u64 = 8 * 1024 * 1024,
+    range_reads: u64 = 256 * 1024 * 1024,
+    range_pages: page_store.PageStore = undefined,
+    range_cache: ?tree.Cache = null,
     predicate_cursor: ?tree.Cursor = null,
     root: Root,
     pages: page_store.PageStore,
@@ -731,6 +738,8 @@ pub const Reader = struct {
         return artifacts.readArtifact(a, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, cancellation, self.cached);
     }
     pub fn deinit(self: *Reader) void {
+        if (self.range_cache) |*cache| cache.deinit();
+        self.range_cache = null;
         if (self.membership_arena) |*arena| arena.deinit();
         self.membership_arena = null;
         if (self.cursor) |*cursor| cursor.deinit();
@@ -791,6 +800,39 @@ pub const Reader = struct {
         if (record.key.len < 32 or !std.mem.eql(u8, record.key[record.key.len - 16 ..], &physical)) return error.InvalidNativeLakeRowIndex;
         const key = record.key[16..];
         return std.mem.order(u8, key, lower) != .lt and (upper == null or std.mem.order(u8, key, upper.?) == .lt);
+    }
+    pub fn intersectsPhysical(self: *Reader, first: rows.RowRef, last: rows.RowRef, lower: []const u8, upper: ?[]const u8) !?bool {
+        if (first != .external or last != .external or !std.mem.eql(u8, first.external.file_id, last.external.file_id)) return error.InvalidNativeLakeRowIndex;
+        const row = first.external;
+        if (!std.mem.eql(u8, row.source_id, self.root.source) or !std.mem.eql(u8, row.snapshot_id, self.root.snapshot) or
+            !std.mem.eql(u8, last.external.source_id, self.root.source) or !std.mem.eql(u8, last.external.snapshot_id, self.root.snapshot)) return error.ExternalLakeSnapshotMismatch;
+        if (self.root.reverse == null or self.range_reads == 0) return null;
+        var slot: ?u32 = null;
+        if (self.root.file_slots.len != 0) {
+            var lo: usize = 0;
+            var hi = self.root.file_slots.len;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                if (std.mem.order(u8, self.root.file_slots[mid].file, row.file_id) == .lt) lo = mid + 1 else hi = mid;
+            }
+            if (lo < self.root.file_slots.len and std.mem.eql(u8, self.root.file_slots[lo].file, row.file_id)) slot = self.root.file_slots[lo].slot;
+        } else {
+            for (self.root.files, 0..) |file, i| {
+                if (std.mem.eql(u8, file, row.file_id)) {
+                    slot = @intCast(i);
+                    break;
+                }
+            }
+        }
+        const selected = slot orelse return error.ExternalLakeSnapshotMismatch;
+        if (self.membership_arena == null) self.membership_arena = .init(self.cursor.?.alloc);
+        _ = self.membership_arena.?.reset(.retain_capacity);
+        if (self.range_cache == null) {
+            self.range_pages = self.pages;
+            self.range_pages.remaining_read_bytes = &self.range_reads;
+            self.range_cache = .{ .alloc = self.cursor.?.alloc, .underlying = self.range_pages.store(), .max_bytes = 1024 * 1024 };
+        }
+        return @import("lake_index_predicate_ranges.zig").intersects(self.membership_arena.?.allocator(), self.range_cache.?.store(), self.root.reverse, coordinate(selected, row), coordinate(selected, last.external), lower, upper);
     }
     /// Reverse-tree order is physical file/group/row order. Test the stored
     /// tuple against the exact seek bounds without opening Parquet columns.
@@ -930,7 +972,12 @@ test "external lake ordered deltas retain untouched pages and delete only one fi
     const materialization_reads = predicate_reader.remaining_reads;
     try std.testing.expect(try predicate_reader.containsPhysical(Probe.row(101), &lower_key, &upper_key));
     try std.testing.expectEqual(materialization_reads, predicate_reader.remaining_reads);
+    try std.testing.expectEqual(@as(?bool, true), try predicate_reader.intersectsPhysical(Probe.row(90), Probe.row(110), &lower_key, &upper_key));
+    try std.testing.expectEqual(@as(?bool, false), try predicate_reader.intersectsPhysical(Probe.row(500), Probe.row(16000), &lower_key, &upper_key));
+    try std.testing.expectError(error.ExternalLakeSnapshotMismatch, predicate_reader.intersectsPhysical(Probe.row(90), wrong, &lower_key, &upper_key));
     predicate_reader.membership_reads = 0;
+    predicate_reader.range_reads = 0;
+    try std.testing.expect((try predicate_reader.intersectsPhysical(Probe.row(90), Probe.row(110), &lower_key, &upper_key)) == null);
     try std.testing.expect(!predicate_reader.canProbeMembership());
     const physical_matches = try predicate_reader.nextPhysical(ca, 1024, &lower_key, &upper_key);
     try std.testing.expectEqual(@as(usize, 3), physical_matches.len);

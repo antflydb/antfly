@@ -490,7 +490,7 @@ pub const ServingSource = struct {
                     @import("lake_prepared_deletes.zig").Prepared.hashObjectVersion(&hash, uri, metadata_bytes, binding.snapshot_mode.pinnedSnapshotId() orelse "");
                     const key = hash.finalResult();
                     plan_identity = key;
-                    var loader: SnapshotPlanLoader = .{ .client = client, .source = binding.table_id, .uri = uri, .snapshot = binding.snapshot_mode.pinnedSnapshotId(), .metadata = metadata_bytes, .manifests = if (binding.object_mutability == .immutable) &shared.manifests else null, .scope = scope, .context = context };
+                    var loader: SnapshotPlanLoader = .{ .client = client, .source = binding.table_id, .uri = uri, .snapshot = binding.snapshot_mode.pinnedSnapshotId(), .metadata = metadata_bytes, .manifests = if (binding.object_mutability == .immutable) &shared.manifests else null, .chunks = if (binding.object_mutability == .immutable) &shared.inventory_chunks else null, .scope = scope, .context = context };
                     // Coalesce cold manifest discovery as well as warm residency.
                     // Waiters retain their own authority, cancellation and lease;
                     // the cache owns only the immutable inventory/delete plan.
@@ -566,11 +566,13 @@ pub const ServingSource = struct {
         snapshot: ?[]const u8,
         metadata: []const u8,
         manifests: ?*@import("lake_decoded_cache.zig").Cache = null,
+        chunks: ?*@import("lake_decoded_cache.zig").Cache = null,
         scope: [32]u8 = @splat(0),
         context: @import("lake_read_context.zig").Context = .{},
         fn load(raw: *anyopaque, item: *@import("lake_decoded_cache.zig").Item) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            item.payload = .{ .snapshot = try @import("lake_iceberg_snapshot.zig").planSnapshotInventoryAndDeletePlanFromMetadataAlloc(item.budget.allocator(), .{ .client = self.client, .source_id = self.source, .metadata_uri = self.uri, .requested_snapshot_id = self.snapshot, .manifests = self.manifests, .manifest_scope = self.scope, .context = self.context }, self.metadata) };
+            item.payload = .{ .snapshot = try @import("lake_iceberg_snapshot.zig").planSnapshotInventoryAndDeletePlanFromMetadataAlloc(item.budget.allocator(), .{ .client = self.client, .source_id = self.source, .metadata_uri = self.uri, .requested_snapshot_id = self.snapshot, .manifests = self.manifests, .inventory_chunks = self.chunks, .manifest_scope = self.scope, .context = self.context }, self.metadata) };
+            for (item.payload.snapshot.file_leases) |lease| item.foreign_bytes +|= lease.item.budget.live;
             try prepareCachedPlan(item);
         }
     };

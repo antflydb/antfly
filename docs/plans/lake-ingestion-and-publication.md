@@ -930,3 +930,49 @@ construction coordinator prevents nested snapshot-cache admission deadlocks.
 Sequence inheritance, schema and delete applicability are recomputed from the
 fresh snapshot metadata/list. Mutable attachments do not use URI-only manifest
 reuse. Inventory assembly remains linear in its entries.
+
+
+#### Lazy physical admission and independent composed execution
+
+Necessary metadata predicates with more than 4,096 estimated matches can lead
+admission through physical-range probes instead of a complete pack census.
+Reverse row-index pages optionally retain authenticated tuple minima/maxima;
+new publications write these reductions and old pages keep a bounded leaf-walk
+fallback. A text-competitive serving pack supplies its physical source ranges.
+Only a completed negative proof excludes the pack. Unknown, memory pressure,
+and exhausted optional read/work budgets retain it for final row filtering.
+Tiny sets keep the existing complete compressed/spillable routing proof.
+Range probes own a 1 MiB page cache and a 256 MiB cumulative read allowance,
+independent of point membership's accounting. Their owner is bounded to 16 MiB.
+
+Patterns compile one query-owned matcher per distinct clause. Broad patterns
+visit the lexical field/prefix range of the existing authenticated term directory
+and reject child pages whose pack envelopes cannot intersect the current hash
+range. They do not rebuild a vocabulary union or compile an automaton for every
+range. Bounded unsuccessful walks remain unknown, never evidence of absence.
+No new publication root or provider authority is introduced.
+
+Exact BM25 score ceilings evaluate the supported integer frequency domain
+(up to 256) under the scorer's actual floating-point arithmetic at authenticated
+norm minima. The same proof covers scored phrase frequency using its first
+term and combined phrase IDF. Large/escaped domains retain conservative bounds.
+A bounded query cache reuses ceilings across range probes. Boolean bounds include
+the canonical baseline before child accumulation and boost multiplication.
+
+Immutable Iceberg data manifests also own reusable derived file chunks. Keys
+bind credential/backend scope, format version and manifest-list inheritance
+inputs. Fresh snapshots merge sorted chunk views, own their snapshot-qualified
+version strings, and pin borrowed paths, partitions and metrics through explicit
+leases. Manifest/chunk construction uses separate cache admission from snapshot
+construction and bounded shared scheduling. Deletes still use the freshly
+selected schema and manifest list. The flat file view and snapshot-qualified
+canonical row ordering remain proportional to the inventory; this design does
+not claim constant-time discovery of an arbitrarily large new snapshot.
+
+Native composed text/dense/sparse components run under independent executions,
+source version maps, membership cursors, allocators and runtime pins. At most
+three lanes participate in a pass using the shared scheduler; saturation runs
+on the caller, cancellation drains pending lanes, and a lane that exhausts its
+16 MiB workspace retries serially under the ordinary request allocation policy.
+Owned results return in declaration order. Fusion, graph dependencies,
+highlights, transforms and final source delivery remain coordinator-owned.

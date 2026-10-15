@@ -4476,3 +4476,32 @@ Compiler-local native error generation, Zig/Python formatting and lint,
 whitespace, license checks and the Apache product boundary passed (2,052 source
 files). Provider retention qualification and archive-scale performance
 benchmarks remain deferred.
+
+
+### Lazy physical probes, shared snapshot chunks and composed scheduling
+
+The frontier now includes negative-only Boolean baseline scores, including
+boosted nested clauses admitted through a positive sibling. Regressions compare
+canonical scorer scores with bounds and real Parquet ranked pages with an all-row
+request that cannot establish an early competitive cutoff.
+
+Broad metadata admission has a lazy physical-range path backed by optional
+reverse-index tuple reductions. Its query-owned cache/read quota is independent
+of point-membership quota; unknown/legacy/budget-limited proofs retain packs.
+Small predicates retain complete compressed/spillable admission. Broad patterns
+reuse compiled matchers and traverse authenticated lexical term subtrees, using
+pack envelopes to avoid unrelated child reads. Exact repeated-frequency and
+phrase ceilings enumerate a bounded frequency domain under both canonical
+f32 scorer formulas and cache repeated envelopes. Escaped/large domains keep
+conservative margins.
+
+Iceberg snapshot plans can pin shared immutable derived manifest chunks, merge
+ordered file views and regenerate only snapshot-qualified version strings.
+Manifest-list inheritance inputs participate in chunk identity. Credential
+changes, mutable attachments and fresh delete applicability retain their existing
+contracts. Snapshot flat views and public row-ID ordering still require work
+proportional to file count. Native composed retrieval overlaps independent text,
+dense and sparse executions through the shared scheduler; private mutable state,
+serial saturation/quota fallback, cancellation draining and declaration-order
+fusion are explicit. Provider retention qualification and archive-scale latency /
+RSS benchmarks remain deferred; no throughput multiplier is claimed.

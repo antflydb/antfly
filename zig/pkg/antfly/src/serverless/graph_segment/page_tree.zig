@@ -1194,6 +1194,27 @@ pub fn countSortedRanges(alloc: Allocator, store: Store, root: ?Ref, source: any
 pub fn reduceRange(alloc: Allocator, store: Store, root: ?Ref, lower: []const u8, upper: ?[]const u8, visitor: anytype) !void {
     if (root) |ref| try reduceInner(alloc, store, ref, lower, upper, null, null, visitor);
 }
+/// Visit leaves in a key range, rejecting children from authenticated summaries.
+/// Legacy children without summaries remain eligible for an exact leaf walk.
+pub fn visitRange(alloc: Allocator, store: Store, root: ?Ref, lower: []const u8, upper: ?[]const u8, visitor: anytype) !void {
+    if (root) |ref| try visitInner(alloc, store, ref, lower, upper, null, null, visitor);
+}
+fn visitInner(alloc: Allocator, store: Store, ref: Ref, lower: []const u8, upper: ?[]const u8, first: ?[]const u8, end: ?[]const u8, visitor: anytype) anyerror!void {
+    try store.check(store.ptr);
+    var page = try load(alloc, store, ref);
+    defer page.deinit(alloc);
+    if (first) |key| if (!std.mem.eql(u8, key, page.entries[0].key)) return error.InvalidGraphPage;
+    if (end) |key| if (!less(page.entries[page.entries.len - 1].key, key)) return error.InvalidGraphPage;
+    for (page.entries, 0..) |entry, i| {
+        if (upper) |bound| if (!less(entry.key, bound)) break;
+        const child_end = if (i + 1 < page.entries.len) page.entries[i + 1].key else end;
+        if (child_end) |bound| if (!less(lower, bound)) continue;
+        if (entry.child) |child| {
+            if (!try visitor.descend(entry.aggregate, child.records)) continue;
+            try visitInner(alloc, store, child, lower, upper, entry.key, child_end, visitor);
+        } else if (!less(entry.key, lower)) try visitor.record(entry.key, entry.value);
+    }
+}
 fn reduceInner(alloc: Allocator, store: Store, ref: Ref, lower: []const u8, upper: ?[]const u8, first: ?[]const u8, end: ?[]const u8, visitor: anytype) anyerror!void {
     var page = try load(alloc, store, ref);
     defer page.deinit(alloc);

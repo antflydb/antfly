@@ -300,7 +300,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     var result = blk: {
         defer server.lake_query_metrics.record(.ranking, started);
         break :blk if (execution_req.full_text_queries.len != 0 or execution_req.sparse_queries.len != 0 or execution_req.dense_queries.len != 0)
-            try search.searchComposed(a, execution_req, .{ .ctx = &owner, .search_text_query = Execution.searchText, .search_text = Execution.dispatchText, .search_dense = Execution.searchDense, .search_sparse = Execution.searchSparse, .clone_named_set = Execution.cloneSet, .fuse_named_sets = Execution.fuseSets, .attach_graph_results = Execution.attachGraph })
+            try search.searchComposed(a, execution_req, .{ .ctx = &owner, .search_components = Execution.searchComponents, .search_text_query = Execution.searchText, .search_text = Execution.dispatchText, .search_dense = Execution.searchDense, .search_sparse = Execution.searchSparse, .clone_named_set = Execution.cloneSet, .fuse_named_sets = Execution.fuseSets, .attach_graph_results = Execution.attachGraph })
         else if (execution_req.dense) |dense| try Execution.searchDense(&owner, a, execution_req, dense) else if (execution_req.sparse) |sparse| try Execution.searchSparse(&owner, a, execution_req, sparse) else if (execution_req.full_text) |text| try Execution.searchText(&owner, a, execution_req, text) else try Execution.dispatchText(&owner, a, execution_req);
     };
     defer result.deinit();
@@ -1440,10 +1440,17 @@ const Execution = struct {
         const pack_proof_mod = @import("lake_index_pack_proof.zig");
         var pack_proof: ?*pack_proof_mod = null;
         defer if (pack_proof) |proof| proof.deinit();
+        const pack_probe_mod = @import("lake_index_pack_probe.zig");
+        var pack_probe: ?*pack_probe_mod = null;
+        defer if (pack_probe) |probe| probe.deinit();
         const stream_predicate = req.filter_query_json.len != 0 and scoreFrontierEligible(req, if (ordering) |*order| order else null);
         if (stream_predicate) {
             const resolver: @import("lake_index_text_predicate.zig").PhysicalResolver = .{ .server = self.server, .table = self.table, .source = self.source, .context = self.request, .store = self.store.artifactStore(), .store_identity = self.store.identity, .read_context = self.context, .pinned = .{ .artifacts = self.store.artifactStore(), .store_identity = self.store.identity, .domain = self.domain, .declarations = self.declarations, .read_context = self.context } };
-            pack_proof = pack_proof_mod.create(root, self.store.artifactStore(), cached, resolver, req.filter_query_json, cancellation) catch |err| switch (err) {
+            pack_probe = pack_probe_mod.create(root, cached, resolver, req.filter_query_json, cancellation) catch |err| switch (err) {
+                error.OutOfMemory, error.ArtifactReadBudgetExceeded, error.QueryCandidateBudgetExceeded => null,
+                else => return err,
+            };
+            if (pack_probe == null) pack_proof = pack_proof_mod.create(root, self.store.artifactStore(), cached, resolver, req.filter_query_json, cancellation) catch |err| switch (err) {
                 error.OutOfMemory, error.ArtifactReadBudgetExceeded, error.QueryCandidateBudgetExceeded, error.SqlProgramLimitExceeded => null,
                 else => return err,
             };
@@ -1455,7 +1462,7 @@ const Execution = struct {
             }
         else
             null;
-        if (root.segment_count == 0 or (pack_proof == null and predicate_selection == null and root.segment_count <= window_config.admission_window_segments and planning_bytes <= window_config.admission_window_bytes)) return null;
+        if (root.segment_count == 0 or (pack_proof == null and pack_probe == null and predicate_selection == null and root.segment_count <= window_config.admission_window_segments and planning_bytes <= window_config.admission_window_bytes)) return null;
         if (ordering) |order| {
             // An ordered row index can stop after the winning prefix. Retain
             // that global seek instead of scanning every window's doc values.
@@ -1514,6 +1521,7 @@ const Execution = struct {
         }
         defer if (frontier) |value| value.deinit();
         if (frontier) |value| {
+            if (pack_probe) |probe| value.predicate_probe = .{ .ptr = probe, .allows = pack_probe_mod.allows };
             // Optional admission must not make a valid query fail on its own quota.
             // Rebuild ordinary navigation if proof attachment exhausts the frontier.
             if (pack_proof) |proof| {
@@ -1694,7 +1702,7 @@ const Execution = struct {
             result.sort_profile_storage = profiled.sort_profile_storage;
             profiled.sort_profile = null;
             profiled.sort_profile_storage = null;
-            result.sort_profile.?.selection_reason = if (predicate_selection != null or (frontier != null and pack_proof != null)) "indexed_predicate_text_admission" else if (frontier != null) "bounded_global_text_frontier" else "bounded_text_routing_windows";
+            result.sort_profile.?.selection_reason = if (predicate_selection != null or (frontier != null and (pack_proof != null or pack_probe != null))) "indexed_predicate_text_admission" else if (frontier != null) "bounded_global_text_frontier" else "bounded_text_routing_windows";
             result.sort_profile.?.selected_count = result.hits.len;
             result.sort_profile.?.window_capacity = winners.limit;
             result.sort_profile.?.collector_heap_peak = winners.peak;
@@ -1889,6 +1897,122 @@ const Execution = struct {
     }
     // Independent executions own every mutable map, runtime pin and allocator.
     // Results retain scheduler admission until joined; no private pool is used.
+    fn searchComponents(raw: ?*anyopaque, a: A, components: []const local.storage_db_query_search_exec.ComposedComponent) !local.storage_db_query_search_exec.ComposedComponentBatch {
+        const self = from(raw);
+        const scheduler = local.sql_parallel_scheduler;
+        try self.resolveOverlayPhysical();
+        // Final source highlighting is coordinator-owned. Component-local
+        // stored-highlight locations cannot be shared across private lanes.
+        if (components.len != 0) try self.planHighlights(components[0].request);
+        self.use_stored_highlights = false;
+        var batch: local.storage_db_query_search_exec.ComposedComponentBatch = .{ .alloc = a, .results = try a.alloc(?types.SearchResult, components.len) };
+        @memset(batch.results, null);
+        errdefer batch.deinit();
+        const Worker = struct {
+            budget: local.sql_memory_budget,
+            arena: std.heap.ArenaAllocator = undefined,
+            execution: Execution = undefined,
+            source: local.serverless_query_lake_serving.ServingSource = undefined,
+            parent: *local.serverless_query_lake_serving.ServingSource,
+            component: local.storage_db_query_search_exec.ComposedComponent,
+            result: ?types.SearchResult = null,
+            task: ?scheduler.Task(anyerror!void) = null,
+            failure: ?anyerror = null,
+            done: std.Io.Event = .unset,
+            fn create(base: *Execution, component: local.storage_db_query_search_exec.ComposedComponent, backing: A, limit: usize) !*@This() {
+                const owner = try std.heap.page_allocator.create(@This());
+                owner.* = .{ .budget = .{ .backing = backing, .limit = limit }, .parent = base.source, .component = component };
+                errdefer std.heap.page_allocator.destroy(owner);
+                owner.arena = .init(owner.budget.allocator());
+                errdefer owner.arena.deinit();
+                owner.source = try base.source.parallelView(owner.budget.allocator());
+                owner.execution = .{ .server = base.server, .overlay = base.overlay, .table = base.table, .source = &owner.source, .store = base.store, .domain = base.domain, .declarations = base.declarations, .context = base.context, .request = base.request, .schema_json = base.schema_json, .hydration_fields = base.hydration_fields, .vector_filter = base.vector_filter, .vector_exclusion = base.vector_exclusion, .recent_runs = base.recent_runs, .recent_declarations = base.recent_declarations, .recent_cloud = base.recent_cloud, .cloud_generations = base.cloud_generations, .typed_delivery = base.typed_delivery, .navigation = base.navigation, .files = base.files, .private_files = base.private_files, .private_digests = base.private_digests, .arena = owner.arena.allocator(), .result_allocator = owner.budget.allocator() };
+                return owner;
+            }
+            fn run(owner: *@This()) anyerror!void {
+                defer if (owner.execution.context.io) |io| owner.done.set(io);
+                const execution = &owner.execution;
+                try execution.context.ensureActive();
+                const req = owner.component.request;
+                if (owner.component.query == .dense or owner.component.query == .sparse) {
+                    const resolver: @import("lake_index_text_predicate.zig").PhysicalResolver = .{ .server = execution.server, .table = execution.table, .source = execution.source, .context = execution.request, .store = execution.store.artifactStore(), .store_identity = execution.store.identity, .read_context = execution.context, .pinned = .{ .artifacts = execution.store.artifactStore(), .store_identity = execution.store.identity, .domain = execution.domain, .declarations = execution.declarations, .read_context = execution.context } };
+                    if (req.filter_query_json.len != 0) execution.vector_include_provider = try resolver.openMembership(owner.budget.allocator(), req.filter_query_json);
+                    if (req.exclusion_query_json.len != 0) execution.vector_exclude_provider = try resolver.openMembership(owner.budget.allocator(), req.exclusion_query_json);
+                }
+                owner.result = try switch (owner.component.query) {
+                    .text => |text| searchText(execution, owner.budget.allocator(), req, text),
+                    .default_text => dispatchText(execution, owner.budget.allocator(), req),
+                    .dense => |dense| searchDense(execution, owner.budget.allocator(), req, dense),
+                    .sparse => |sparse| searchSparse(execution, owner.budget.allocator(), req, sparse),
+                };
+            }
+            fn close(owner: *@This()) void {
+                std.debug.assert(owner.task == null);
+                if (owner.result) |*result| result.deinit();
+                owner.execution.deinit();
+                owner.source.closeParallelView(owner.parent);
+                owner.arena.deinit();
+                std.debug.assert(owner.budget.live == 0);
+                std.heap.page_allocator.destroy(owner);
+            }
+        };
+        var first: usize = 0;
+        while (first < components.len) {
+            var workers: [3]?*Worker = @splat(null);
+            defer for (&workers) |*slot| if (slot.*) |worker| {
+                if (worker.task) |task| {
+                    var running = task;
+                    worker.task = null;
+                    _ = running.cancel(self.context.io.?) catch {};
+                }
+                worker.close();
+            };
+            const count = @min(3, components.len - first);
+            for (components[first..][0..count], 0..) |component, i| {
+                const worker = try Worker.create(self, component, @import("antfly_platform").allocator.processAllocator(std.heap.page_allocator), 16 * 1024 * 1024);
+                workers[i] = worker;
+                if (self.context.io) |io| worker.task = scheduler.global().submitIo(io, 16 * 1024 * 1024, Worker.run, .{worker});
+                if (worker.task == null) Worker.run(worker) catch |err| {
+                    if (err != error.OutOfMemory or !worker.budget.isExhausted()) return err;
+                    worker.failure = err;
+                };
+            }
+            for (workers[0..count], 0..) |*slot, i| {
+                var worker = slot.*.?;
+                if (worker.task) |task| {
+                    try worker.done.wait(self.context.io.?);
+                    var running = task;
+                    worker.task = null;
+                    running.await(self.context.io.?) catch |err| {
+                        worker.failure = err;
+                    };
+                }
+                if (worker.failure) |err| {
+                    if (err != error.OutOfMemory or !worker.budget.isExhausted()) return err;
+                    worker.close();
+                    slot.* = null;
+                    worker = try Worker.create(self, components[first + i], a, std.math.maxInt(usize));
+                    slot.* = worker;
+                    try Worker.run(worker);
+                }
+                const result = worker.result.?;
+                // Component results contain hits/profile only; graph attachment
+                // and fusion run after all independent components have joined.
+                std.debug.assert(result.graph_results.len == 0 and result.graph_metric_results.len == 0 and result.graph_metric_rerank_status == null and result.shard_identity_read_generations.len == 0);
+                var owned = try cloneSet(null, a, .{ .name = "", .hits = result.hits, .total_hits = result.total_hits, .total_hits_relation = result.total_hits_relation }, true);
+                errdefer owned.deinit();
+                owned.document_authority_version = result.document_authority_version;
+                owned.identity_read_generation = result.identity_read_generation;
+                owned.ordered_window_complete = result.ordered_window_complete;
+                if (result.sort_profile) |profile| try owned.setOwnedSortProfile(profile);
+                batch.results[first + i] = owned;
+                worker.close();
+                slot.* = null;
+            }
+            first += count;
+        }
+        return batch;
+    }
     fn searchRecentParts(self: *Execution, a: A, req: types.SearchRequest, query: anytype, comptime part: anytype, combined: *types.SearchResult, scheduling: *local.sql_parallel_scheduler.Scheduler) !void {
         return self.searchVectorParts(a, req, query, part, combined, scheduling, false);
     }

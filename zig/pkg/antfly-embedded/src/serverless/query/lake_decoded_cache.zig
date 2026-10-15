@@ -19,6 +19,7 @@ const std = @import("std");
 const Budget = @import("../../sql/memory_budget.zig");
 const A = std.mem.Allocator;
 pub const Payload = union(enum) {
+    iceberg_chunk: @import("../external_source/types.zig").Inventory,
     iceberg_manifest: @import("../external_source/iceberg_avro.zig").DataManifest,
     /// Layer-owned immutable metadata. The type-domain is included in the key;
     /// values and every referenced byte must belong to this item's arena.
@@ -69,6 +70,7 @@ pub const Item = struct {
         if (self.payload == .page_directory) self.payload.page_directory.deinit();
         if (self.payload == .prepared) self.payload.prepared.destroy(self.budget.allocator());
         if (self.payload == .snapshot) self.payload.snapshot.deinit(self.budget.allocator());
+        if (self.payload == .iceberg_chunk) self.payload.iceberg_chunk.deinit(self.budget.allocator());
         if (self.payload == .iceberg_manifest) self.payload.iceberg_manifest.deinit(self.budget.allocator());
         self.file_by_id.deinit(self.budget.allocator());
         if (self.file_rank) |rank| self.budget.allocator().free(rank);

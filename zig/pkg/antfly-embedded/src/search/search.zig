@@ -3532,8 +3532,20 @@ pub const TextNavigationPlan = struct {
                 }
                 possible = possible and node.groups.len != 0;
                 upper = if (!node.scored) node.boost else if (first) |summary| summary.tf_upper * idf * node.boost else 0;
+                if (possible and node.scored) if (source.score) |score| {
+                    const term = node.groups[0][0];
+                    const stats = try @constCast(&self.stats).get(node.field, term);
+                    if (try score(source.ptr, node.field, term, stats.average, self.config, idf, true)) |ceiling| {
+                        upper = ceiling * node.boost;
+                        exact = true;
+                    }
+                };
             },
             .boolean => {
+                // Negative-only Boolean children score their canonical baseline.
+                // A positive sibling may route the parent, so this contribution
+                // must survive metadata lowering as well as posting scoring.
+                upper = node.baseline orelse 0;
                 for (node.must) |child| {
                     const value = try self.nodeBound(child, source);
                     possible = possible and value.possible;
@@ -10763,6 +10775,8 @@ test "external lake metadata navigation shares scorer lowering and conservative 
         .{ .bool_query = .{ .should = &.{ common, rare }, .must_not = &.{rare} } },
         .{ .term_phrase = .{ .field = "title", .terms = &.{ "common", "rare" }, .boost = 3 } },
         .{ .bool_query = .{ .must = &.{common}, .boost = -1 } },
+        .{ .bool_query = .{ .must = &.{ common, .{ .bool_query = .{ .must_not = &.{missing}, .boost = 3 } } } } },
+        .{ .bool_query = .{ .must = &.{common}, .should = &.{.{ .bool_query = .{ .must_not = &.{rare}, .boost = 3 } }} } },
         // An unexpanded broad clause cannot erase a required term proof.
         .{ .bool_query = .{ .must = &.{ rare, .{ .prefix = .{ .field = "title", .prefix = "co" } } } } },
         .{ .bool_query = .{ .must = &.{rare}, .should = &.{.{ .prefix = .{ .field = "title", .prefix = "" } }} } },

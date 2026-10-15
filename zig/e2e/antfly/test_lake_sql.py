@@ -4784,8 +4784,8 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(
         }
 
         def full_admission(query):
-            # A zero-score baseline cannot be term-routed. The independent
-            # planner retains every segment, while adding exactly zero to scores.
+            # Exercise alternate Boolean lowering without changing scores.
+            # The all-row regression below independently verifies global cuts.
             baseline = {
                 "bool": {
                     "must_not": [{"term": "neverpresentoracle", "field": "body"}],
@@ -4872,6 +4872,44 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(
                     (h["_score"], h["_source"]["amount"])
                     for h in complete["hits"]["hits"]
                 ]
+            # The global upper bound must include nested negative-only scores.
+            # Fetching all rows establishes an independent page oracle without
+            # allowing a competitive global cutoff to prune any pack.
+            for positive in (
+                {"match": "quasar", "field": "body"},
+                {"prefix": "vocab", "field": "body"},
+                {"match_phrase": "quasar quasar", "field": "body"},
+            ):
+                nested = {
+                    "bool": {
+                        "must": [
+                            positive,
+                            {
+                                "bool": {
+                                    "must_not": [
+                                        {
+                                            "term": "neverpresentbaseline",
+                                            "field": "body",
+                                        }
+                                    ],
+                                    "boost": 3,
+                                }
+                            },
+                        ]
+                    }
+                }
+                all_rows = call(
+                    "POST",
+                    "/tables/profile_text/query",
+                    dict(direct, full_text_search=nested, offset=0, limit=row_count),
+                )["hits"]["hits"]
+                for offset in (0, 61):
+                    page = call(
+                        "POST",
+                        "/tables/profile_text/query",
+                        dict(direct, full_text_search=nested, offset=offset, limit=19),
+                    )["hits"]["hits"]
+                    assert page == all_rows[offset : offset + 19]
             filtered_query = dict(
                 direct,
                 offset=0,
