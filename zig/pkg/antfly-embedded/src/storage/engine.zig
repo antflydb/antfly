@@ -34,6 +34,13 @@ pub const Outcome = @import("native_outcome.zig").Outcome;
 pub const ReplayCallbacks = struct { progress: db.ReplayProgressHook };
 pub const ReplayBoundary = @import("named_callback.zig").Boundary(ReplayCallbacks);
 pub const BackupPlan = struct { value: @import("../api/backup_contract.zig").TableBackupPlan, io: ?native.IoBorrow };
+/// Restore owns a disposable generation; keep its record loops and errors in
+/// the physical storage unit. Callbacks here return no Zig error values.
+pub const PortableRestoreImportOptions = struct {
+    identity_namespace: ?@import("db/doc_identity.zig").Namespace = null,
+    embedding_source_fields: []const @import("portable_backup.zig").ImportOptions.EmbeddingSourceField = &.{},
+    cancellation: types.CancellationToken = .none,
+};
 pub const WriterBorrow = @import("native_writer.zig").Borrow;
 pub const PortableExportOptions = struct {
     value: @import("portable_backup.zig").ExportOptions,
@@ -143,6 +150,7 @@ pub const VTable = struct {
     prepareRestoreStagingIndexesStep: *const fn (self: *DB, alloc: std.mem.Allocator, scope: [32]u8) Outcome(bool),
     beginRestoreStaging: *const fn (self: *DB, alloc: std.mem.Allocator, scope: @import("db/restore_staging.zig").Scope) Outcome(void),
     finishRestoreStaging: *const fn (self: *DB, alloc: std.mem.Allocator, scope: @import("db/restore_staging.zig").Digest, phase: @import("db/restore_staging.zig").Phase) Outcome(@import("db/restore_staging.zig").Digest),
+    importPortableRestoreFileIntoUnpublishedEmpty: *const fn (self: *DB, alloc: std.mem.Allocator, io: native.IoBorrow, file: std.Io.File, file_size: u64, options: PortableRestoreImportOptions) Outcome(void),
     importPortableFileIntoUnpublishedEmpty: *const fn (self: *DB, alloc: std.mem.Allocator, io: native.IoBorrow, file: std.Io.File, file_size: u64, target_identity: @import("db/doc_identity.zig").Namespace) Outcome(void),
     importCohortPortableFileIntoUnpublishedEmpty: *const fn (self: *DB, alloc: std.mem.Allocator, io: native.IoBorrow, file: std.Io.File, file_size: u64, proof: @import("portable_backup.zig").CohortProof, cancellation: types.CancellationToken) Outcome(void),
     openRelationalReadSession: *const fn (self: *DB, alloc: std.mem.Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions) Outcome(*DB.RelationalReadSession),

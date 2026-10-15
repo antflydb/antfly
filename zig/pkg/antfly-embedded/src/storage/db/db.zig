@@ -37255,6 +37255,35 @@ pub const DB = struct {
     /// File-backed variant for CLI restore paths. Portable decoding uses
     /// bounded positional reads over a locked source generation, so archive
     /// size does not become resident memory.
+    /// Restore decoding and complete-image validation must use the store's
+    /// compilation-local callbacks. A foreign caller borrows only its executor.
+    pub fn importPortableRestoreFileIntoUnpublishedEmpty(
+        self: *DB,
+        alloc: Allocator,
+        io: Io,
+        file: std.Io.File,
+        file_size: u64,
+        options: storage_engine.PortableRestoreImportOptions,
+    ) !void {
+        if (comptime storage_engine.enabled) return storage_engine.call("importPortableRestoreFileIntoUnpublishedEmpty", .{ self, alloc, io, file, file_size, options });
+        if (self.open_mode == .status_only or self.open_mode == .query_readonly) return error.UnsupportedOperation;
+        lockApply(self);
+        defer self.core.unlockApply();
+        if (!(try self.portableImportTargetEmptyLocked(alloc))) return error.LiteImportTargetNotEmpty;
+        try portable_backup.importPortableFileWithOptions(alloc, self.core.store, io, file, file_size, .{
+            .identity_namespace = options.identity_namespace,
+            .prefer_existing_identity_namespace = true,
+            .import_derived_indexes = true,
+            .embedding_source_fields = options.embedding_source_fields,
+            .unpublished_staging = true,
+            .cancellation = options.cancellation,
+        });
+        portable_backup.validateCompleteDatabaseImageAlloc(alloc, self.core.store) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidBackupRequest,
+        };
+    }
+
     pub fn importPortableFileIntoUnpublishedEmpty(
         self: *DB,
         alloc: Allocator,

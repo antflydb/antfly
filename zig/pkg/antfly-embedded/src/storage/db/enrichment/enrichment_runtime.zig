@@ -4191,7 +4191,9 @@ const ChunkedDenseWindowItem = struct {
 };
 
 const ChunkEmbeddingSource = struct {
-    metadata: ?*const @import("inference_chunker").types.ModelMetadata = null,
+    /// Borrowed from the worker's owned chunk cache; deferred vectors stay
+    /// there until every pending batch has finished consuming the chunks.
+    metadata: ?*@import("inference_chunker").types.ModelMetadata = null,
     key: []u8,
     text: []u8,
     source_record_digest: ?[32]u8 = null,
@@ -23471,7 +23473,7 @@ fn storedModelChunkVector(runtime: *EnrichmentRuntime, a: Allocator, provider: e
     const chunk_mod = @import("../../../chunking/chunk.zig");
     const metadata = try chunk_mod.modelMetadataAlloc(a, payload) orelse return null;
     defer metadata.deinit(a);
-    const compatible = try compatibleModelChunkVector(runtime.alloc, provider, request, metadata) != null;
+    const compatible = try modelChunkTargetCompatible(runtime.alloc, provider, request, metadata);
     const key = try chunk_mod.modelMemoKey(a, metadata.*);
     if (compatible and request.reprocess_generation == 0) if (runtime.dense_result_cache) |memo| if (try memo.lookup(memo.ptr, a, key)) |cached| return cached;
     // Text payloads already contain the exact rendered unit. Keep them on the
@@ -23489,12 +23491,18 @@ fn storedModelChunkVector(runtime: *EnrichmentRuntime, a: Allocator, provider: e
     if (raw.value != .object) return error.InvalidChunkSource;
     const field = raw.value.object.get("_source_field") orelse return error.InvalidChunkSource;
     if (field != .string) return error.InvalidChunkSource;
+    return try replayModelChunkVector(runtime, a, request, metadata, field.string);
+}
+
+fn replayModelChunkVector(runtime: *EnrichmentRuntime, a: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, metadata: *const @import("inference_chunker").types.ModelMetadata, source_field: []const u8) ![]f32 {
+    const key = try @import("../../../chunking/chunk.zig").modelMemoKey(a, metadata.*);
+    if (request.reprocess_generation == 0) if (runtime.dense_result_cache) |memo| if (try memo.lookup(memo.ptr, a, key)) |cached| return cached;
     const parent_key = try documentSourceStoreKeyAlloc(runtime, request.doc_key);
     defer runtime.alloc.free(parent_key);
     const parent = try storeGetOptionalDocumentAllocWithRetry(runtime, parent_key) orelse return error.EnrichmentSourceChanged;
     defer runtime.alloc.free(parent);
     var source_request = request;
-    source_request.source_field = field.string;
+    source_request.source_field = source_field;
     source_request.source_template = "";
     var source = try extractModelChunkSource(a, runtime.config, parent, source_request);
     defer source.deinit(a);
@@ -23541,32 +23549,38 @@ fn modelChunkEmbeddingSourceHash(a: Allocator, source: ChunkEmbeddingSource, req
     defer a.free(recipe);
     return enrichment_artifact_codec.hashEmbeddingSourceForGeneration(recipe, request.producer_json, request.reprocess_generation);
 }
-fn compatibleModelChunkVector(a: Allocator, provider: embedder_mod.DenseEmbedder, request: enrichment_types.GeneratedEnrichmentRequest, metadata: *const @import("inference_chunker").types.ModelMetadata) !?[]const f32 {
-    const vector = metadata.embedding orelse &.{};
-    if (metadata.dimensions != request.expected_dims or (metadata.embedding != null and vector.len != request.expected_dims) or metadata.model_identity.len != 64 or metadata.model_revision.len != 64) return null;
-    if (!std.mem.eql(u8, provider.recoveryIdentity(requestEmbeddingName(request)).model, metadata.model)) return null;
+/// Recipe eligibility is independent of whether the producer executed a vector.
+fn modelChunkTargetCompatible(a: Allocator, provider: embedder_mod.DenseEmbedder, request: enrichment_types.GeneratedEnrichmentRequest, metadata: *const @import("inference_chunker").types.ModelMetadata) !bool {
+    if (metadata.dimensions != request.expected_dims or metadata.model_identity.len != 64 or metadata.model_revision.len != 64) return false;
+    if (!std.mem.eql(u8, provider.recoveryIdentity(requestEmbeddingName(request)).model, metadata.model)) return false;
     var parsed = try std.json.parseFromSlice(std.json.Value, a, request.producer_json, .{});
     defer parsed.deinit();
     var config = parsed.value;
     if (config == .object) if (config.object.get("config")) |nested| {
         config = nested;
     };
-    if (config != .object) return null;
-    const kind = config.object.get("provider") orelse return null;
-    if (kind != .string or !std.mem.eql(u8, kind.string, "antfly")) return null;
-    inline for (.{ "instruction", "query_instruction", "document_input_type" }) |name| if (config.object.get(name)) |value| if (value != .null) return null;
-    if (config.object.get("model_identity")) |expected| if (expected != .string or !std.mem.eql(u8, expected.string, metadata.model_identity)) return null;
+    if (config != .object) return false;
+    const kind = config.object.get("provider") orelse return false;
+    if (kind != .string or !std.mem.eql(u8, kind.string, "antfly")) return false;
+    inline for (.{ "instruction", "query_instruction", "document_input_type" }) |name| if (config.object.get(name)) |value| if (value != .null) return false;
+    if (config.object.get("model_identity")) |expected| if (expected != .string or !std.mem.eql(u8, expected.string, metadata.model_identity)) return false;
     const task: std.json.Value = config.object.get("task_type") orelse .{ .string = "RETRIEVAL_DOCUMENT" };
-    if (task != .string or !std.mem.eql(u8, task.string, metadata.task_type)) return null;
+    if (task != .string or !std.mem.eql(u8, task.string, metadata.task_type)) return false;
     // Capability authority pins the requested provider generation. Alias names
     // alone cannot authorize reuse after weights or remote routing change.
     const capabilities = provider.capabilities(a, requestEmbeddingName(request)) catch |err| {
-        if (err == error.EmbeddingCapabilitiesUnavailable) return null;
+        if (err == error.EmbeddingCapabilitiesUnavailable) return false;
         return err;
     };
-    const revision = capabilities.model_revision orelse return null;
+    const revision = capabilities.model_revision orelse return false;
     const expected_revision = std.fmt.bytesToHex(revision, .lower);
-    if (!std.mem.eql(u8, &expected_revision, metadata.model_revision)) return null;
+    if (!std.mem.eql(u8, &expected_revision, metadata.model_revision)) return false;
+    return true;
+}
+fn compatibleModelChunkVector(a: Allocator, provider: embedder_mod.DenseEmbedder, request: enrichment_types.GeneratedEnrichmentRequest, metadata: *const @import("inference_chunker").types.ModelMetadata) !?[]const f32 {
+    if (!try modelChunkTargetCompatible(a, provider, request, metadata)) return null;
+    const vector = metadata.embedding orelse return null;
+    if (vector.len != request.expected_dims) return null;
     for (vector) |v| if (!std.math.isFinite(v)) return error.InvalidEmbeddingResponse;
     return vector;
 }
@@ -24991,8 +25005,12 @@ fn processChunkedDenseWindow(
             source_loop: for (source_set.sources) |*source| {
                 if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
                 const source_hash = try modelChunkEmbeddingSourceHash(runtime.alloc, source.*, request);
-                const precomputed = if (source.metadata) |metadata| try compatibleModelChunkVector(runtime.alloc, dense_embedder, request, metadata) else null;
-                if (source.text.len == 0 and precomputed == null) return error.IncompatibleChunkEmbeddingTarget;
+                var precomputed = if (source.metadata) |metadata| try compatibleModelChunkVector(runtime.alloc, dense_embedder, request, metadata) else null;
+                const needs_media_replay = source.text.len == 0 and precomputed == null;
+                if (needs_media_replay) {
+                    const metadata = source.metadata orelse return error.IncompatibleChunkEmbeddingTarget;
+                    if (!try modelChunkTargetCompatible(runtime.alloc, dense_embedder, request, metadata)) return error.IncompatibleChunkEmbeddingTarget;
+                }
                 const embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(runtime.alloc, source.key, embedding_artifact_name);
                 defer runtime.alloc.free(embedding_key);
                 if (try shouldSkipEmbeddingArtifact(runtime, embedding_key, source_hash)) {
@@ -25001,6 +25019,15 @@ fn processChunkedDenseWindow(
                     }
                     try flushGeneratedReplayWindowIfNeededWithIdentity(runtime, window, max_window_items, scope.completedFingerprint());
                     continue;
+                }
+                if (needs_media_replay) {
+                    const metadata = source.metadata.?;
+                    // The request chunk cache owns this vector through pending
+                    // batch publication, just like an eagerly fused result.
+                    const vector = try replayModelChunkVector(runtime, runtime.alloc, request, metadata, request.source_field);
+                    if (metadata.embedding) |previous| runtime.alloc.free(previous);
+                    metadata.embedding = vector;
+                    precomputed = vector;
                 }
                 if (chunk_items.items.len > 0 and
                     (chunk_items.items.len >= max_batch_items or batch_source_bytes + source.text.len > max_batch_bytes))
@@ -35626,6 +35653,9 @@ test "model aware media fused reuse rejects a changed provider generation with t
     defer std.testing.allocator.free(media_payload);
     try std.testing.expectError(error.IncompatibleChunkEmbeddingTarget, storedModelChunkVector(&runtime, std.testing.allocator, provider, request, media_payload));
     harness.generation = 0x11;
+    metadata.embedding = null;
+    try std.testing.expect(try modelChunkTargetCompatible(std.testing.allocator, provider, request, &metadata));
+    try std.testing.expect((try compatibleModelChunkVector(std.testing.allocator, provider, request, &metadata)) == null);
     metadata.dimensions = 3;
     try std.testing.expect((try compatibleModelChunkVector(std.testing.allocator, provider, request, &metadata)) == null);
 }

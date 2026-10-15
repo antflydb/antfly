@@ -236,8 +236,13 @@ remain in the existing embedding artifact family. Compatible fused vectors enter
 the normal result cache and guarded publication path. Ordered artifact replay
 can reconstruct a missing media vector from the retained parent and pinned plan;
 text payloads retain normal batched embedding, including rendered templates and
-extracted units. Capability revision and model identity gate reuse. A result-cache
+extracted units. Planning-only recipes never stand in for computed vectors:
+text keeps that batched path and deferred media uses pinned recipe replay. Capability revision and model identity gate reuse. A result-cache
 hit confers no publication authority and cannot bypass source/readiness fencing.
+Native failures retain semantic identities across runtime units through named
+worker replies and checked callback statuses. The generated registry and callback
+round-trip tests preserve coverage, continuation and source-version failures;
+the registry is checked with the other generated contracts.
 
 ## Reproduction
 

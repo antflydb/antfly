@@ -736,6 +736,42 @@ pub fn create(b: *std.Build) ?Artifacts {
         .filters = &.{"model aware media remote capability"},
     });
     model_chunk_step.dependOn(&b.addRunArtifact(chunk_capability_tests).step);
+    const chunk_error_tests = b.addTest(.{
+        .root_module = antfly_test_mod.import_table.get("storage_engine_errors").?,
+    });
+    const chunk_error_run = b.addRunArtifact(chunk_error_tests);
+    model_chunk_step.dependOn(&chunk_error_run.step);
+    const error_identity_step = b.step("runtime-error-identities-test", "Validate native error names and model-aware chunk failure transport");
+    error_identity_step.dependOn(&chunk_error_run.step);
+    const error_provider = b.addLibrary(.{ .name = "chunk-error-test-provider", .root_module = b.createModule(.{
+        .root_source_file = b.path("lib/runtime/src/runtime_chunk_error_roundtrip_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = link_libc,
+    }) });
+    const error_consumer = b.createModule(.{
+        .root_source_file = b.path("lib/runtime/src/runtime_chunk_error_roundtrip_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = link_libc,
+    });
+    error_consumer.addImport("storage_engine_errors", antfly_test_mod.import_table.get("storage_engine_errors").?);
+    error_consumer.addImport("antfly_test_error_logs", antfly_test_mod.import_table.get("antfly_test_error_logs").?);
+    error_consumer.linkLibrary(error_provider);
+    const error_roundtrip = b.addRunArtifact(b.addTest(.{
+        .root_module = error_consumer,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    }));
+    error_identity_step.dependOn(&error_roundtrip.step);
+    model_chunk_step.dependOn(&error_roundtrip.step);
+    const error_status_run = b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("lib/runtime/src/runtime_error_abi.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = link_libc,
+    }) }));
+    error_identity_step.dependOn(&error_status_run.step);
+    model_chunk_step.dependOn(&error_status_run.step);
 
     const run_antfly_embedded_pkg_tests = owner_tests.run_antfly_embedded_pkg_tests;
     const run_lite_native_tests = owner_tests.run_lite_native_tests;
