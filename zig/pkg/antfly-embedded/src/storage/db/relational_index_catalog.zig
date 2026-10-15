@@ -766,6 +766,75 @@ fn testSchemaParticipant(comptime Backend: type) !void {
     const encoded = try schema.serializeSchema(alloc, next_schema);
     defer alloc.free(encoded);
     const outbox = "\x00\x00__metadata__:test_schema_index_outbox";
+    const admission = "\x00\x00__metadata__:test_schema_admission";
+    const receipt = "\x00\x00__metadata__:test_schema_receipt";
+    const marker = "\x00\x00__metadata__:test_schema_replay_marker";
+    const predecessor = try schema.serializeSchema(alloc, test_schema);
+    defer alloc.free(predecessor);
+    try store.put(admission, "fenced");
+    var before_calls: usize = 0;
+    var stage_calls: usize = 0;
+    const WithPredecessor = struct {
+        metadata: *const Prepared,
+        before_schema: []const u8,
+        after_schema: []const u8,
+        before_calls: *usize,
+        stage_calls: *usize,
+        fail_before: bool = false,
+        fail_after: bool = false,
+
+        pub fn validateBefore(self: @This(), txn: anytype) !void {
+            self.before_calls.* += 1;
+            try std.testing.expectEqualSlices(u8, self.before_schema, try txn.get(schema.schema_key));
+            try std.testing.expect(self.metadata.expected.?.eql(try Head.decode(try txn.get(head_key))));
+            try std.testing.expectEqualStrings("fenced", try txn.get(admission));
+            try std.testing.expectError(error.NotFound, txn.get(outbox));
+            try std.testing.expectError(error.NotFound, txn.get(receipt));
+            try std.testing.expectError(error.NotFound, txn.get(marker));
+            if (self.fail_before) return error.InjectedSchemaCatalogFailure;
+        }
+
+        pub fn stage(self: @This(), txn: anytype) !void {
+            self.stage_calls.* += 1;
+            try std.testing.expectEqualSlices(u8, self.after_schema, try txn.get(schema.schema_key));
+            try std.testing.expectError(error.NotFound, txn.get(admission));
+            try std.testing.expectEqualStrings("pending", try txn.get(outbox));
+            _ = try self.metadata.stage(txn);
+            try txn.put(receipt, "installed");
+            try txn.put(marker, "1");
+            if (self.fail_after) return error.InjectedSchemaCatalogFailure;
+        }
+    };
+    var participant = WithPredecessor{ .metadata = &candidate.metadata, .before_schema = predecessor, .after_schema = encoded, .before_calls = &before_calls, .stage_calls = &stage_calls };
+    for ([_]bool{ true, false }) |before_failure| {
+        participant.fail_before = before_failure;
+        participant.fail_after = !before_failure;
+        try std.testing.expectError(error.InjectedSchemaCatalogFailure, schema.saveEncodedSchemaWithMetadataAndStage(
+            &store,
+            alloc,
+            next_schema.version,
+            encoded,
+            &.{.{ .key = outbox, .value = "pending" }},
+            &.{admission},
+            participant,
+        ));
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        try std.testing.expectEqualSlices(u8, predecessor, try txn.get(schema.schema_key));
+        try std.testing.expectEqualStrings("fenced", try txn.get(admission));
+        try std.testing.expect(initial.metadata.head.eql(try Head.decode(try txn.get(head_key))));
+        try std.testing.expectError(error.NotFound, txn.get(outbox));
+        try std.testing.expectError(error.NotFound, txn.get(receipt));
+        try std.testing.expectError(error.NotFound, txn.get(marker));
+        const next_version_key = try schema.schemaVersionKeyAlloc(alloc, next_schema.version);
+        defer alloc.free(next_version_key);
+        try std.testing.expectError(error.NotFound, txn.get(next_version_key));
+        try std.testing.expect(controller.isCurrent(pinned));
+    }
+    try std.testing.expectEqual(@as(usize, 2), before_calls);
+    try std.testing.expectEqual(@as(usize, 1), stage_calls);
+    participant.fail_before = false;
+    participant.fail_after = false;
     const FailAfterStage = struct {
         metadata: *const Prepared,
         pub fn stage(self: @This(), txn: anytype) !bool {
@@ -800,9 +869,20 @@ fn testSchemaParticipant(comptime Backend: type) !void {
         next_schema.version,
         encoded,
         &.{.{ .key = outbox, .value = "pending" }},
-        &.{},
-        &candidate.metadata,
+        &.{admission},
+        &participant,
     ));
+    try std.testing.expectEqual(@as(usize, 3), before_calls);
+    try std.testing.expectEqual(@as(usize, 2), stage_calls);
+    try std.testing.expect(controller.isCurrent(pinned));
+    {
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.NotFound, txn.get(admission));
+        try std.testing.expectEqualStrings("installed", try txn.get(receipt));
+        try std.testing.expectEqualStrings("1", try txn.get(marker));
+        try std.testing.expectEqualStrings("pending", try txn.get(outbox));
+    }
     controller.publishCommitted(&candidate);
     try std.testing.expect(!controller.isCurrent(pinned));
     var current = controller.acquire().?;

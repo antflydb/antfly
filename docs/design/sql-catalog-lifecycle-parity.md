@@ -7613,3 +7613,35 @@ owned catalog/plan transfer and proves that neither durable nor runtime heads
 are selected. This is preparation/ownership evidence, not an installed native
 effect, a distributed publication fault gate or original-case credit. Boundary,
 license, inventory, generated control-catalog, formatting and diff checks passed.
+
+### Schema predecessor admission in the atomic publication transaction
+
+The shared schema writer supports an optional `validateBefore` participant
+phase inside its write transaction, before any schema history, metadata put or
+metadata delete. The existing post-write `stage` phase still joins dependent
+effects to that transaction; runtime objects are published only after commit.
+Both value and pointer participants work, and existing stage-only participants
+retain their behavior. Exact read-only rehydration still compares effects
+without granting new mutation admission.
+
+Core lifecycle admission now checks the predecessor before mutations, and
+retains the post-mutation guard against extras introducing a new incompatible
+state. Previously the guard ran only after metadata changes, so deleting an
+active topology fence in schema extras could make ordinary DDL inspect an
+unfenced proposed state rather than the fenced durable predecessor. A real LSM
+reserved-index regression now rejects that attempted deletion and preserves
+the reserved catalogs, schema and native clock.
+
+`/private/tmp/antfly-schema-predecessor-debug.log` passed 59/59 Debug build steps
+(ten native lifecycle/page, 14 candidate, 15 catalog and 46 runtime-contract
+tests). Memory and LSM transaction fixtures observe old schema/catalog/admission
+in the pre-write phase and new schema/catalog plus an outbox in the stage phase.
+Failures in either phase preserve the old schema, historical-version absence,
+catalog, admission key and runtime snapshot, with no receipt, replay marker or
+outbox committed. Successful commit persists the whole cut before explicit
+runtime publication. Those fixture receipt/marker values are synthetic: this
+is shared atomic-boundary qualification, not native install execution or a
+metadata publication decision. Boundary, license, inventory, generated
+control-catalog, formatting and diff checks passed. Original dispositions remain
+483 implemented / 862 unresolved; native install/release and full public index
+activation remain unfinished.

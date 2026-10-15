@@ -1662,7 +1662,7 @@ pub const DBCore = struct {
             namespace: doc_identity.Namespace,
             child_fence: ?@import("relational_integrity_topology_contract.zig").Fence,
 
-            pub fn stage(participants: @This(), txn: anytype) !void {
+            pub fn validateBefore(participants: @This(), txn: anytype) !void {
                 // A retained source uses the immutable layouts/validator set
                 // captured at admission. Schema changes must wait for its
                 // terminal receipt; exact rehydration uses stageChanges and
@@ -1689,11 +1689,18 @@ pub const DBCore = struct {
                         );
                 } else try topology.requireUnfenced(txn);
                 try @import("online_integrity_shadow.zig").requireCatalogMutable(txn);
+            }
+
+            pub fn stage(participants: @This(), txn: anytype) !void {
+                // Check both cuts: metadata extras must neither erase a
+                // predecessor guard nor install a new guard behind admission.
+                // validateBefore was also called before *any* schema writes.
+                try participants.validateBefore(txn);
                 try participants.stageChanges(txn);
                 if (participants.child_fence) |expected| {
                     if (expected.role == .child_generation_dual)
                         try txn.delete(@import("relational_integrity_generation_admission.zig").dual_acknowledged_fence_key);
-                    try topology.stageRelease(txn, expected);
+                    try @import("relational_integrity_topology.zig").stageRelease(txn, expected);
                 }
             }
 

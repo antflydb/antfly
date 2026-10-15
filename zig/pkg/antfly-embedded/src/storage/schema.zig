@@ -1886,6 +1886,11 @@ pub fn encodedSchemaMetadataUnchanged(
     return true;
 }
 
+/// Optional validateBefore(txn) observes the durable predecessor inside the
+/// SAME write transaction, before schema/metadata puts or deletes. stage(txn)
+/// then observes the proposed schema and stages dependent effects. Both are
+/// fallible; every failure aborts all effects, including version-history puts.
+/// Runtime publication remains the caller's non-fallible post-commit step.
 pub fn saveEncodedSchemaWithMetadataAndStage(
     store: anytype,
     alloc: Allocator,
@@ -1947,6 +1952,13 @@ pub fn saveEncodedSchemaWithMetadataAndStage(
 
     var txn = try runtime.store.beginWrite();
     errdefer txn.abort();
+    if (comptime @TypeOf(participant) != @TypeOf(null)) {
+        const Participant = switch (@typeInfo(@TypeOf(participant))) {
+            .pointer => |pointer| pointer.child,
+            else => @TypeOf(participant),
+        };
+        if (comptime @hasDecl(Participant, "validateBefore")) try participant.validateBefore(&txn);
+    }
     if (schema_changed) {
         if (previous_versioned_data) |encoded| {
             const previous_versioned_key = try schemaVersionKeyAlloc(alloc, previous_version.?);

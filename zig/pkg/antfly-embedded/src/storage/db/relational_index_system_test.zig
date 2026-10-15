@@ -416,6 +416,16 @@ test "relational index build pages native owner control preserves committed cuts
         const inconsistent = [_]docstore.KVPair{ writes[0], .{ .key = versioned, .value = before } };
         try std.testing.expectError(error.InvalidPrivateIndexInputs, primary.core.prepareSchemaMetadataReservedIndex(runtime, &inconsistent, .{ .binding = reserved, .candidate = &candidate }));
         try std.testing.expectError(error.PrivateIndexOwnerJobChanged, primary.core.prepareSchemaMetadataReservedIndex(runtime, &writes, .{ .binding = stale, .candidate = &candidate }));
+        // Ordinary schema metadata must not delete its own admission fence
+        // before the transaction participant checks the durable predecessor.
+        var ordinary = try primary.core.prepareSchemaMetadata(runtime, &writes);
+        defer ordinary.deinit();
+        try std.testing.expectError(error.IntegrityTopologyBusy, primary.core.commitPreparedSchemaMetadata(&ordinary, &writes, &.{@import("relational_integrity_topology.zig").fence_key}, null));
+        var read = try primary.core.store.beginReadTxn();
+        defer read.abort();
+        try jobs.requireReserved(&read, reserved);
+        try std.testing.expectEqualSlices(u8, candidate.reservation.value, try read.get(catalog.key));
+        try std.testing.expectEqual(@as(u64, 3), (try authority.load(&read)).?.sequence);
     }
     // Every bounded page (including EOF) is ordered progress, not UNIQUE
     // validation. Replay the prepared boundary, never another timed scan.
