@@ -175,6 +175,9 @@ def test_issue_1141_fk_insert_subquery_delete_commit(require_native, aflite_path
                 (f"p{i}",),
             )
             connection.commit()
+            # Bound unrelated text-index debt between committed transactions.
+            if (i + 1) % 16 == 0:
+                connection._database.run_until_idle()
         connection.autocommit = True
         cursor.execute("SELECT COUNT(*) FROM child")
         assert cursor.fetchall() == [(400,)]
