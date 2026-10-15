@@ -52,6 +52,13 @@ pub const Config = struct {
     /// batches, cut into batches, and the batch order shuffled again, all
     /// from the epoch seed (resume replays the same order).
     length_bucketed: bool = false,
+    /// Form batches by padded tokens rather than by count: records sorted by
+    /// length fill each batch while its bucketed `batch * sequence` stays
+    /// within this budget, up to `batch_size` records. Short records then
+    /// share large batches and long ones small batches. Batch membership is
+    /// fixed for the run; each epoch shuffles the batch order. Admission
+    /// checks the batches actually formed.
+    max_batch_tokens: ?u32 = null,
     gradient_accumulation: u32 = 1,
     encoder_lr: f32 = 2.5e-5,
     head_lr: f32 = 1e-4,
@@ -156,6 +163,7 @@ fn resolveLora(spec: ?Lora) !?architecture.Lora {
 }
 
 pub fn validate(c: Config) !void {
+    if (c.max_batch_tokens) |budget| if (budget == 0) return error.InvalidLayaTrainingConfig;
     if (c.version != 1 or c.epochs == 0 or c.epochs > 10000 or c.batch_size == 0 or c.batch_size > 128 or
         c.gradient_accumulation == 0 or c.gradient_accumulation > 65536 or c.group_size < 2 or c.group_size > 64 or
         c.checkpoint_every_steps == 0 or c.max_host_bytes < 64 * 1024 * 1024 or c.max_host_bytes > 128 * 1024 * 1024 * 1024 or
@@ -447,6 +455,56 @@ fn exportModel(a: std.mem.Allocator, io: std.Io, c: Config, config_json: std.jso
     try publication.syncDirectory(io, c.output_dir);
 }
 
+/// Batches formed under `Config.max_batch_tokens`: `order` sorted by
+/// length, batch i is order[starts[i]..][0..counts[i]].
+const TokenBatches = struct {
+    order: []usize,
+    starts: []usize,
+    counts: []usize,
+
+    fn init(a: std.mem.Allocator, examples: []const training.Example, budget: u32, cap: u32, seed: u64) !TokenBatches {
+        const order = try a.alloc(usize, examples.len);
+        for (order, 0..) |*index, i| index.* = i;
+        // Equal lengths keep a seeded shuffle's order, not file order.
+        var random = std.Random.DefaultPrng.init(seed);
+        random.random().shuffle(usize, order);
+        const rank = try a.alloc(usize, examples.len);
+        defer a.free(rank);
+        for (order, 0..) |index, i| rank[index] = i;
+        const Context = struct {
+            examples: []const training.Example,
+            rank: []const usize,
+            fn less(self: @This(), x: usize, y: usize) bool {
+                const lx = self.examples[x].ids.len;
+                const ly = self.examples[y].ids.len;
+                return lx < ly or (lx == ly and self.rank[x] < self.rank[y]);
+            }
+        };
+        std.mem.sort(usize, order, Context{ .examples = examples, .rank = rank }, Context.less);
+        var starts: std.ArrayListUnmanaged(usize) = .empty;
+        var counts: std.ArrayListUnmanaged(usize) = .empty;
+        var start: usize = 0;
+        while (start < order.len) {
+            // Sorted by length, so the newest record sets the padded length,
+            // bucketed to 64 tokens as `training.bucketedLayout` does.
+            var count: usize = 1;
+            while (start + count < order.len and count < cap) : (count += 1) {
+                const sequence = std.mem.alignForward(usize, examples[order[start + count]].ids.len, 64);
+                if ((count + 1) * sequence > budget) break;
+            }
+            try starts.append(a, start);
+            try counts.append(a, count);
+            start += count;
+        }
+        return .{ .order = order, .starts = try starts.toOwnedSlice(a), .counts = try counts.toOwnedSlice(a) };
+    }
+
+    fn batch(self: TokenBatches, examples: []const training.Example, index: usize, out: []training.Example) []training.Example {
+        for (out[0..self.counts[index]], self.order[self.starts[index]..][0..self.counts[index]]) |*e, i| e.* = examples[i];
+        return out[0..self.counts[index]];
+    }
+};
+
 /// Sorts `order` by sequence length within windows of 64 batches (ties by
 /// position, so the result depends only on the shuffle), then shuffles the
 /// batch order into `batch_order`. Only the last batch can be short, as
@@ -526,23 +584,22 @@ fn weightStateBytes(trainable_elements: usize, frozen_elements: usize) !usize {
     return addBytes(peak_trainable, try mulBytes(frozen_elements, 4));
 }
 
-/// Rough upper bound on retained forward/backward activations for one packed
-/// row at `layout`. The training graph materializes dense (non-segment)
-/// attention and keeps no gradient checkpoint, so every layer's forward
-/// tensors are live until its backward pass runs. Per encoder layer this
-/// counts about twelve hidden-width buffers (QKV, attention output, two
-/// layer norms, residual, and their cotangents), two intermediate-width GeGLU
-/// buffers, and eight dense `[batch, heads, seq, seq]` tensors (three
-/// tree/padding biases, forward scores and softmax probabilities, and their
-/// backward cotangents); each is individually bounded by `graph.validate`'s
-/// 64M-element admission, but their sum across layers is not, which is what
-/// this estimate is for. Frozen layers still execute forward (`freeze_layers` in
-/// LAYA.md); only unfrozen layers additionally retain backward state. This is
-/// an admission bound, not a measured footprint: it excludes the decision
-/// head, RoPE tables, and dropout masks, which the fixed overhead below folds
-/// in from measurement instead of modeling directly.
-/// With fused segment attention (roadmap 2c) no `[seq, seq]` tensor exists;
-/// the op keeps two floats per query and head, folded into the hidden term.
+/// Rough upper bound on live activations for one step at `layout`. A step
+/// runs the gradient graph once (`training.step`): every trainable layer's
+/// forward values stay live until its backward node consumes them, and the
+/// backward then works through one layer at a time. Per retained layer this
+/// counts eight hidden-width buffers (norm inputs and outputs, QKV, attention
+/// output, residuals), two intermediate-width GeGLU buffers, and, for dense
+/// attention, three `[batch*heads, seq, seq]` tensors (scores, biased scores,
+/// softmax probabilities). One layer's backward adds twelve hidden-width, two
+/// intermediate-width and eight dense attention buffers, and the three dense
+/// bias inputs are shared by every layer. Frozen layers run forward without
+/// retaining values (`freeze_layers` in LAYA.md), so they cost one layer's
+/// working set. This is an admission bound, not a measured footprint: it
+/// excludes the decision head, RoPE tables, and dropout masks, which the
+/// fixed overhead below folds in from measurement. Fused segment attention
+/// (roadmap 2c) keeps two floats per query and head instead of `[seq, seq]`
+/// tensors, folded into the hidden term.
 fn activationBytes(cfg: modern.Config, l: architecture.Layout, freeze_layers: u32, use_fused_attention: bool) !usize {
     const batch: usize = @intCast(l.batch);
     const sequence: usize = @intCast(l.sequence);
@@ -550,20 +607,16 @@ fn activationBytes(cfg: modern.Config, l: architecture.Layout, freeze_layers: u3
     const intermediate: usize = @intCast(cfg.intermediate_size);
     const heads: usize = @max(@as(usize, @intCast(cfg.num_attention_heads)), hidden / 64);
     const tokens = try mulBytes(batch, sequence);
-    const hidden_bytes = try mulBytes(try mulBytes(tokens, hidden), 12 * 4);
-    const mlp_bytes = try mulBytes(try mulBytes(tokens, intermediate), 2 * 4);
-    const attn_elements = try mulBytes(try mulBytes(batch, try mulBytes(sequence, sequence)), heads);
-    // Eight buffers of this size: three dense biases (encoder_bias, local_bias,
-    // head_bias in `architecture.Inputs`), forward scores and softmax
-    // probabilities, and their backward cotangents.
-    const attn_bytes = if (use_fused_attention) 0 else try mulBytes(attn_elements, 8 * 4);
-    const per_layer = try addBytes(try addBytes(hidden_bytes, mlp_bytes), attn_bytes);
-    const forward_layers: usize = @intCast(cfg.num_hidden_layers);
+    const hidden_buffer = try mulBytes(try mulBytes(tokens, hidden), 4);
+    const mlp_buffer = try mulBytes(try mulBytes(tokens, intermediate), 4);
+    const attn_buffer = if (use_fused_attention) 0 else try mulBytes(try mulBytes(try mulBytes(batch, try mulBytes(sequence, sequence)), heads), 4);
+    const retained = try addBytes(try addBytes(try mulBytes(hidden_buffer, 8), try mulBytes(mlp_buffer, 2)), try mulBytes(attn_buffer, 3));
+    const working = try addBytes(try addBytes(try mulBytes(hidden_buffer, 12), try mulBytes(mlp_buffer, 2)), try mulBytes(attn_buffer, 8));
     const backward_layers: usize = @intCast(cfg.num_hidden_layers - @min(freeze_layers, cfg.num_hidden_layers));
     // Per-question upper layers add the three upper dense biases.
     const fused = if (cfg.laya) |lc| lc.packing.fuse_layers > 0 else false;
-    const upper_biases = if (fused and !use_fused_attention) try mulBytes(attn_elements, 3 * 4) else 0;
-    return addBytes(try mulBytes(per_layer, try addBytes(forward_layers, backward_layers)), upper_biases);
+    const biases = try mulBytes(attn_buffer, if (fused) 6 else 3);
+    return addBytes(try addBytes(try mulBytes(retained, backward_layers), working), biases);
 }
 
 /// Fixed device overhead observed on the Apple M4 Max release trainer beyond
@@ -709,12 +762,29 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config, admission: *memory
     // measurably slower than the on-device dense path (models/laya/LAYA.md).
     // Only select it when a split's layout actually needs it (exceeds the
     // dense `batch*L^2*heads` bound) or the caller explicitly asks.
-    const use_fused_attention = c.force_fused_attention or
-        try exceedsDenseAttentionBound(encoder, train.examples, c.batch_size, c.head_dropout) or
+    const token_batches: ?TokenBatches = if (c.max_batch_tokens) |token_budget|
+        try TokenBatches.init(permanent, train.examples, token_budget, c.batch_size, c.seed)
+    else
+        null;
+    // Every formed batch's layout under a token budget; otherwise the
+    // worst case a shuffled batch of `batch_size` can reach.
+    const train_layouts = if (token_batches) |tb| blk: {
+        const layouts = try permanent.alloc(architecture.Layout, tb.counts.len);
+        const scratch = try a.alloc(training.Example, c.batch_size);
+        defer a.free(scratch);
+        for (layouts, 0..) |*l, i| l.* = try training.bucketedLayout(tb.batch(train.examples, i, scratch), encoder);
+        break :blk layouts;
+    } else try permanent.dupe(architecture.Layout, &.{try combinedLayout(encoder, train.examples, c.batch_size)});
+    const train_dense_exceeded = for (train_layouts) |l| {
+        architecture.validate(encoder, l, c.head_dropout, null, false) catch |err| switch (err) {
+            error.LayaTrainingAttentionLimitExceeded => break true,
+            else => return err,
+        };
+    } else false;
+    const use_fused_attention = c.force_fused_attention or train_dense_exceeded or
         try exceedsDenseAttentionBound(encoder, eval.examples, 1, c.head_dropout) or
         (if (calibration) |calib| try exceedsDenseAttentionBound(encoder, calib.examples, 1, c.head_dropout) else false);
-    const train_layout = try combinedLayout(encoder, train.examples, c.batch_size);
-    try architecture.validate(encoder, train_layout, c.head_dropout, lora, use_fused_attention);
+    for (train_layouts) |l| try architecture.validate(encoder, l, c.head_dropout, lora, use_fused_attention);
     const eval_layout = try combinedLayout(encoder, eval.examples, 1);
     try architecture.validate(encoder, eval_layout, c.head_dropout, lora, use_fused_attention);
     const calib_layout = if (calibration) |calib| try combinedLayout(encoder, calib.examples, 1) else null;
@@ -736,7 +806,12 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config, admission: *memory
         source_check.decision_head = source_laya.decision_head;
         try @import("../../models/laya.zig").validateReader(&source, source_check, encoder);
         if (source.header.tensors.get("temperature")) |meta| if (!std.mem.eql(i64, meta.shape, &.{3})) return error.InvalidLayaWeights;
-        const initial = try cache.get(train.examples[0..@min(train.examples.len, c.batch_size)]);
+        // Any admitted batch serves to name the parameters; under a token
+        // budget, an arbitrary `batch_size` records could exceed the bounds.
+        const first_scratch = try a.alloc(training.Example, c.batch_size);
+        defer a.free(first_scratch);
+        const first = if (token_batches) |tb| tb.batch(train.examples, 0, first_scratch) else train.examples[0..@min(train.examples.len, c.batch_size)];
+        const initial = try cache.get(first);
         const selected = try training.parameters(permanent, &initial.graph, &source, freeze, lora, c.seed);
         const export_tensors = try exportInputs(permanent, &source, selected);
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
@@ -765,16 +840,13 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config, admission: *memory
     for (admitted.export_tensors) |t| {
         if (training.frozen(t.name, freeze, lora)) frozen_elements = try addBytes(frozen_elements, t.data.len);
     }
-    var layouts: [3]architecture.Layout = undefined;
-    var layout_count: usize = 2;
-    layouts[0] = train_layout;
-    layouts[1] = eval_layout;
-    if (calib_layout) |cl| {
-        layouts[2] = cl;
-        layout_count = 3;
-    }
+    var layouts: std.ArrayListUnmanaged(architecture.Layout) = .empty;
+    defer layouts.deinit(a);
+    try layouts.appendSlice(a, train_layouts);
+    try layouts.append(a, eval_layout);
+    if (calib_layout) |cl| try layouts.append(a, cl);
     const backend_estimate: usize = if (c.backend == .metal)
-        try estimateBackendBytes(encoder, selected, frozen_elements, layouts[0..layout_count], freeze, use_fused_attention)
+        try estimateBackendBytes(encoder, selected, frozen_elements, layouts.items, freeze, use_fused_attention)
     else
         0;
     if (c.backend == .metal and backend_estimate > c.max_backend_bytes) {
@@ -829,7 +901,7 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config, admission: *memory
         try frozen.append(a, .{ .name = t.name, .value = value });
     };
     cache.frozen = frozen.items;
-    const batches = std.math.divCeil(usize, train.examples.len, c.batch_size) catch unreachable;
+    const batches = if (token_batches) |tb| tb.counts.len else std.math.divCeil(usize, train.examples.len, c.batch_size) catch unreachable;
     const updates = std.math.divCeil(usize, batches, c.gradient_accumulation) catch unreachable;
     const steps = std.math.cast(u32, updates * c.epochs) orelse return error.InvalidLayaJob;
     const trainer_config = training.controller.Config{
@@ -877,14 +949,24 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config, admission: *memory
         for (order, 0..) |*index, i| index.* = i;
         var random = std.Random.DefaultPrng.init(c.seed +% epoch);
         random.random().shuffle(usize, order);
-        if (c.length_bucketed and c.batch_size > 1) lengthBucket(order, batch_order, train.examples, c.batch_size, random.random());
+        if (token_batches != null) {
+            for (batch_order, 0..) |*index, i| index.* = i;
+            random.random().shuffle(usize, batch_order);
+        } else if (c.length_bucketed and c.batch_size > 1) lengthBucket(order, batch_order, train.examples, c.batch_size, random.random());
         for (0..batches) |batch_index| {
             const microbatch = epoch * batches + batch_index;
             if (microbatch < completed) continue;
-            const start = (if (c.length_bucketed and c.batch_size > 1) batch_order[batch_index] else batch_index) * c.batch_size;
-            const count = @min(c.batch_size, order.len - start);
+            // Under a token budget the batch is a fixed range of the
+            // length-sorted order; otherwise a slice of this epoch's order.
+            const members = if (token_batches) |tb|
+                tb.order[tb.starts[batch_order[batch_index]]..][0..tb.counts[batch_order[batch_index]]]
+            else blk: {
+                const start = (if (c.length_bucketed and c.batch_size > 1) batch_order[batch_index] else batch_index) * c.batch_size;
+                break :blk order[start..][0..@min(c.batch_size, order.len - start)];
+            };
+            const count = members.len;
             batch_ids.clearRetainingCapacity();
-            for (batch[0..count], order[start..][0..count]) |*e, index| {
+            for (batch[0..count], members) |*e, index| {
                 e.* = train.examples[index];
                 try batch_ids.appendSlice(permanent, example_records[index].items);
             }
