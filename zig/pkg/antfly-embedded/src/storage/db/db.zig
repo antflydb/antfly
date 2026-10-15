@@ -3808,6 +3808,13 @@ pub const DB = struct {
                 &opened_primary.store,
                 openModeRequiresReadOnlyBackends(opts.open_mode),
             );
+            // Identity images written before the live directory existed
+            // (released v0.2.x servers) store a namespace without its ALD1
+            // marker. A writable owner builds the directory once, before range
+            // initialization or core open read the namespace; read-only opens
+            // keep failing closed.
+            if (!openModeRequiresReadOnlyBackends(opts.open_mode))
+                try doc_identity.upgradeImportedLiveDirectoryAlloc(alloc, &opened_primary.store, .none);
             if (opts.initial_owner_range) |initial| try range_state_mod.initializeOwnerRange(alloc, &opened_primary.store, initial);
             profile.primary_store_ns = elapsedSince(open_primary_started_ns);
             const core_resources_started_ns = monotonicTimeNs();
@@ -68727,15 +68734,21 @@ test "db writable reopen builds the live identity directory for a legacy identit
 
         // Reproduce an image written before ALD1 existed: the namespace and
         // ordinal records are present, the live directory and marker are not.
+        // Dropping the persisted range makes the reopen's owner-range
+        // initialization read the namespace before core open, as on
+        // server-owned opens.
         const live_a = try internal_keys.identityLiveDocToOrdinalKeyAlloc(alloc, "doc:a");
         defer alloc.free(live_a);
         const live_b = try internal_keys.identityLiveDocToOrdinalKeyAlloc(alloc, "doc:b");
         defer alloc.free(live_b);
-        try db.core.store.putBatch(&.{}, &.{ live_a, live_b, &internal_keys.identity_live_directory_manifest_key });
+        try db.core.store.putBatch(&.{}, &.{ live_a, live_b, &internal_keys.identity_live_directory_manifest_key, range_state_mod.range_key });
         try std.testing.expectError(error.InvalidDocIdentity, doc_identity.loadNamespaceFromStore(db.core.store));
     }
 
-    var reopened = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .initial_owner_range = .{ .range = .{ .start = "", .end = "" }, .namespace = doc_identity.default_namespace },
+    });
     defer reopened.close();
     // Validation requires the rebuilt directory to match every live ordinal and
     // exclude the deleted document.
