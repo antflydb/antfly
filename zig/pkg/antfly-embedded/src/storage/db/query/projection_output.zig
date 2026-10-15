@@ -26,15 +26,152 @@ pub const Owner = struct {
     alloc: Allocator,
     work: Allocator,
     cursors: ?*FanoutRows = null,
+    resources: ?*Resources = null,
+    owns_resources: bool = false,
 
     pub fn init(alloc: Allocator) Owner {
         return .{ .alloc = alloc, .work = @import("antfly_platform").allocator.reclaimingScratch(alloc) };
     }
-    pub fn deinit(self: *Owner) void {
+    fn borrowed(alloc: Allocator, resources: *Resources) Owner {
+        return .{ .alloc = alloc, .work = resources.work, .resources = resources };
+    }
+    fn scratch(self: *Owner) !*Resources {
+        if (self.resources) |resources| return resources;
+        const resources = try self.work.create(Resources);
+        resources.* = .init(self.work);
+        self.resources = resources;
+        self.owns_resources = true;
+        return resources;
+    }
+    fn retireCursors(self: *Owner) void {
         while (self.cursors) |rows| {
             self.cursors = rows.next_owned;
             rows.deinit();
         }
+    }
+    pub fn deinit(self: *Owner) void {
+        self.retireCursors();
+        if (self.owns_resources) {
+            self.resources.?.deinit();
+            self.work.destroy(self.resources.?);
+            self.resources = null;
+            self.owns_resources = false;
+        }
+    }
+};
+
+/// All preparation calls are synchronous and finish before child fanouts are
+/// primed. One bounded workspace can therefore serve the entire projection.
+/// Cursor records never enter this pool: their active bit belongs to the row,
+/// so an old record cannot return storage leased to a subsequent cursor.
+const Resources = struct {
+    work: Allocator,
+    preparation: View.PreparationWorkspace,
+    idle: ?*CursorScratch = null,
+    idle_bytes: usize = 0,
+    active: usize = 0,
+    const reuse_limit = 256 * 1024;
+
+    fn init(work: Allocator) Resources {
+        return .{ .work = work, .preparation = .init(work) };
+    }
+    fn acquire(self: *Resources) !*CursorScratch {
+        const slot = if (self.idle) |slot| reused: {
+            self.idle = slot.next;
+            self.idle_bytes -= slot.retainedBytes();
+            break :reused slot;
+        } else fresh: {
+            const slot = try self.work.create(CursorScratch);
+            slot.* = .{ .accounting = .{ .backing = self.work }, .arena = undefined, .scan_arena = undefined, .owner = .borrowed(self.work, self) };
+            slot.arena = .init(slot.accounting.allocator());
+            slot.scan_arena = .init(slot.accounting.allocator());
+            break :fresh slot;
+        };
+        errdefer self.destroy(slot);
+        try resetScratch(&slot.arena);
+        try resetScratch(&slot.scan_arena);
+        slot.owner = .borrowed(slot.arena.allocator(), self);
+        slot.next = null;
+        self.active += 1;
+        return slot;
+    }
+    fn release(self: *Resources, slot: *CursorScratch) void {
+        slot.owner.retireCursors();
+        // Cleanup must not allocate to consolidate or shrink an arena.
+        if (slot.accounting.bytes > 16 * 1024) {
+            _ = slot.arena.reset(.free_all);
+            _ = slot.scan_arena.reset(.free_all);
+        }
+        std.debug.assert(self.active != 0);
+        self.active -= 1;
+        const bytes = slot.retainedBytes();
+        if (bytes > reuse_limit - self.idle_bytes) return self.destroy(slot);
+        slot.next = self.idle;
+        self.idle = slot;
+        self.idle_bytes += bytes;
+    }
+    fn destroy(self: *Resources, slot: *CursorScratch) void {
+        std.debug.assert(slot.owner.cursors == null);
+        slot.arena.deinit();
+        slot.scan_arena.deinit();
+        std.debug.assert(slot.accounting.bytes == 0);
+        self.work.destroy(slot);
+    }
+    fn deinit(self: *Resources) void {
+        std.debug.assert(self.active == 0);
+        while (self.idle) |slot| {
+            self.idle = slot.next;
+            self.destroy(slot);
+        }
+        self.idle_bytes = 0;
+        self.preparation.deinit();
+    }
+};
+
+const CursorScratch = struct {
+    next: ?*CursorScratch = null,
+    accounting: ArenaAccounting,
+    arena: std.heap.ArenaAllocator,
+    // Scanner state spans rows, so it cannot share the row-reset arena.
+    scan_arena: std.heap.ArenaAllocator,
+    owner: Owner,
+    view: View = undefined,
+
+    fn retainedBytes(self: *const CursorScratch) usize {
+        return @sizeOf(CursorScratch) + self.accounting.bytes;
+    }
+};
+
+/// Account complete backing blocks, including arena headers. This adapter is
+/// embedded in a stable heap slot and never bypasses the caller's quota.
+const ArenaAccounting = struct {
+    backing: Allocator,
+    bytes: usize = 0,
+    fn allocator(self: *ArenaAccounting) Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *ArenaAccounting = @ptrCast(@alignCast(ctx));
+        const result = self.backing.rawAlloc(len, alignment, ra) orelse return null;
+        self.bytes += len;
+        return result;
+    }
+    fn resize(ctx: *anyopaque, buffer: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) bool {
+        const self: *ArenaAccounting = @ptrCast(@alignCast(ctx));
+        if (!self.backing.rawResize(buffer, alignment, len, ra)) return false;
+        self.bytes = self.bytes - buffer.len + len;
+        return true;
+    }
+    fn remap(ctx: *anyopaque, buffer: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) ?[*]u8 {
+        const self: *ArenaAccounting = @ptrCast(@alignCast(ctx));
+        const result = self.backing.rawRemap(buffer, alignment, len, ra) orelse return null;
+        self.bytes = self.bytes - buffer.len + len;
+        return result;
+    }
+    fn free(ctx: *anyopaque, buffer: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *ArenaAccounting = @ptrCast(@alignCast(ctx));
+        self.backing.rawFree(buffer, alignment, ra);
+        self.bytes -= buffer.len;
     }
 };
 
@@ -112,13 +249,36 @@ pub const Output = union(enum) {
             },
             else => {},
         }
+        self.retire();
         self.* = .{ .object = .empty };
         return .{ .map = &self.object };
     }
 
     fn put(a: Allocator, object: *Object, name: []const u8, value: Output) !void {
+        if (object.getPtr(name)) |previous| {
+            previous.retire();
+            previous.* = value;
+            return;
+        }
         if (object.entries.capacity == 0) try object.entries.setCapacity(a, 1);
         try object.put(a, name, value);
+    }
+
+    /// Builders uniquely own their mutable output containers. A winning
+    /// replacement retires the displaced cursor tree immediately; row-owner
+    /// cleanup later sees closed records, even if their buffers were reused.
+    fn retire(self: Output) void {
+        switch (self) {
+            .fanout => |fanout| {
+                if (fanout.prepared) |rows| rows.deinit();
+                fanout.prepared = null;
+                fanout.first = null;
+            },
+            .object => |object| for (object.values()) |child| child.retire(),
+            .overlay => |overlay| for (overlay.changed.values()) |child| child.retire(),
+            .array => |array| for (array.items) |child| child.retire(),
+            .borrowed => {},
+        }
     }
 
     fn copyObject(a: Allocator, dst: *Object, source: Source) !void {
@@ -191,7 +351,7 @@ pub const Output = union(enum) {
                     const fanout = try a.create(Fanout);
                     fanout.* = .{ .source = source, .path = path, .selector = if (path.len > 1) selected else null };
                     const rows = try a.create(FanoutRows);
-                    rows.* = FanoutRows.initOwned(owner.work, fanout.*);
+                    rows.* = FanoutRows.init(try owner.scratch(), fanout.*);
                     rows.next_owned = owner.cursors;
                     owner.cursors = rows;
                     if (try rows.next()) |first| {
@@ -304,7 +464,7 @@ pub const Output = union(enum) {
                 try writer.writeByte('}');
             },
             .fanout => |fanout| {
-                var fallback = FanoutRows.init(context.work, fanout.*);
+                var fallback = FanoutRows.init(&context.resources, fanout.*);
                 const rows = fanout.prepared orelse &fallback;
                 // Detach before writing: errors and repeated writes must never
                 // reuse a partially consumed cursor or its retired first row.
@@ -442,12 +602,14 @@ const StreamContext = struct {
     tokens: std.heap.ArenaAllocator,
     scanners: std.heap.ArenaAllocator,
     keys: @import("antfly-json").ObjectKeyWorkspace(FrameState),
+    resources: Resources,
     const FrameState = struct { object: bool, key: bool = true, count: usize = 0 };
     fn init(scratch: Allocator) StreamContext {
         const work = @import("antfly_platform").allocator.reclaimingScratch(scratch);
-        return .{ .work = work, .tokens = .init(work), .scanners = .init(work), .keys = .init(work) };
+        return .{ .work = work, .tokens = .init(work), .scanners = .init(work), .keys = .init(work), .resources = .init(work) };
     }
     fn deinit(self: *StreamContext) void {
+        self.resources.deinit();
         self.keys.deinit();
         self.tokens.deinit();
         self.scanners.deinit();
@@ -536,36 +698,39 @@ const FanoutRows = struct {
     source: Source,
     path: []const []const u8,
     selector: ?*const @import("json_projection_plan.zig").Selector,
-    arena: std.heap.ArenaAllocator,
-    owner: Owner,
-    preparation: View.PreparationWorkspace,
+    resources: *Resources,
+    scratch: ?*CursorScratch = null,
     scanner: ?std.json.Scanner = null,
     started: bool = false,
     index: usize = 0,
-    view: View = undefined,
-    fn init(a: Allocator, fanout: Output.Fanout) FanoutRows {
-        return initOwned(@import("antfly_platform").allocator.reclaimingScratch(a), fanout);
-    }
-    fn initOwned(work: Allocator, fanout: Output.Fanout) FanoutRows {
-        return .{ .source = fanout.source, .path = fanout.path, .selector = fanout.selector, .arena = .init(work), .owner = .init(work), .preparation = .init(work), .scanner = switch (fanout.source) {
-            .span => |span| std.json.Scanner.initCompleteInput(work, span.node.raw),
-            .logical, .embeddings, .embedding_stream, .vector, .component => null,
-        } };
+    fn init(resources: *Resources, fanout: Output.Fanout) FanoutRows {
+        return .{ .source = fanout.source, .path = fanout.path, .selector = fanout.selector, .resources = resources };
     }
     fn deinit(self: *FanoutRows) void {
         if (!self.active) return;
         self.active = false;
-        self.owner.deinit();
         if (self.scanner) |*scanner| scanner.deinit();
-        self.preparation.deinit();
-        self.arena.deinit();
+        if (self.scratch) |slot| self.resources.release(slot);
+        self.scratch = null;
     }
     fn next(self: *FanoutRows) anyerror!?Output.Object {
+        if (self.source == .vector) return null;
+        var retire_row = self.scratch != null;
+        const slot = self.scratch orelse acquired: {
+            const slot = try self.resources.acquire();
+            self.scratch = slot;
+            break :acquired slot;
+        };
+        if (self.scanner == null and self.source == .span) self.scanner = std.json.Scanner.initCompleteInput(slot.scan_arena.allocator(), self.source.span.node.raw);
         while (true) {
-            self.owner.deinit();
-            try resetScratch(&self.arena);
-            const a = self.arena.allocator();
-            self.owner = .init(a);
+            // acquire() has already reset a fresh lease. Later rows retire
+            // their child cursors before resetting the same backing buffers.
+            if (retire_row) {
+                slot.owner.retireCursors();
+                try resetScratch(&slot.arena);
+            }
+            retire_row = true;
+            const a = slot.arena.allocator();
             const item: Source = switch (self.source) {
                 .vector => return null,
                 .embeddings, .embedding_stream, .component => unreachable,
@@ -593,8 +758,8 @@ const FanoutRows = struct {
                         // Bound navigation to this item. Preparing the complete
                         // selected path once avoids rescanning every ancestor's
                         // remaining subtree for a deep field selection.
-                        self.view = .init(a, span.node.raw[start..]);
-                        try self.view.prepareProjectionValueWithWorkspace(self.selector.?, .visited, .object_only, .{ .defer_fanout = true }, scanner, span.node.raw, &self.preparation);
+                        slot.view = .init(a, span.node.raw[start..]);
+                        try slot.view.prepareProjectionValueWithWorkspace(self.selector.?, .visited, .object_only, .{ .defer_fanout = true }, scanner, span.node.raw, &self.resources.preparation);
                     } else if (token == .object_begin and !std.mem.eql(u8, self.path[0], "*")) {
                         // Discover the selected root member while advancing
                         // the array scanner, avoiding a second scan per item.
@@ -616,18 +781,18 @@ const FanoutRows = struct {
                             if (std.mem.eql(u8, key, self.path[0])) selected = span.node.raw[value_start..scanner.cursor];
                         }
                         _ = try scanner.next();
-                        self.view = try View.initProjectedObject(a, span.node.raw[start..scanner.cursor], self.path[0], selected);
+                        slot.view = try View.initProjectedObject(a, span.node.raw[start..scanner.cursor], self.path[0], selected);
                     } else {
                         try scanner.skipValue();
-                        self.view = .init(a, span.node.raw[start..scanner.cursor]);
+                        slot.view = .init(a, span.node.raw[start..scanner.cursor]);
                     }
-                    self.view.parse_numbers = span.view.parse_numbers;
-                    break :blk .{ .span = .{ .view = &self.view, .node = &self.view.root } };
+                    slot.view.parse_numbers = span.view.parse_numbers;
+                    break :blk .{ .span = .{ .view = &slot.view, .node = &slot.view.root } };
                 },
             };
             if (item.kind() != '{') continue;
             var object: Output.Object = .empty;
-            try Output.includeObjectPath(&self.owner, &object, item, self.path, self.selector);
+            try Output.includeObjectPath(&slot.owner, &object, item, self.path, self.selector);
             if (object.count() != 0) return object;
         }
     }
@@ -1088,6 +1253,139 @@ test "public graph metric borrowed wire nested fanout ownership bounds priming a
             std.debug.print("NESTED_PRIMING survives={} count={d} peak={d} allocations={d}\n", .{ survives, count, budget.peak, budget.alloc_calls });
         }
     }
+}
+
+test "public graph metric borrowed wire replaced fanouts retire scratch under row quota" {
+    const a = std.testing.allocator;
+    const query = @import("../document_query.zig");
+    const counters = @import("../../lite/test_allocator.zig");
+    var input: std.Io.Writer.Allocating = .init(a);
+    defer input.deinit();
+    try input.writer.writeAll("{\"items\":[{\"x\":{\"m\":1");
+    for (0..64) |i| try input.writer.print(",\"m{d}\":1", .{i});
+    for (0..2000) |i| try input.writer.print(",\"key{d}\":0", .{i});
+    try input.writer.writeAll("}}]}");
+    var names: std.heap.ArenaAllocator = .init(a);
+    defer names.deinit();
+    var fields: [64][]const u8 = undefined;
+    for (&fields, 0..) |*field, i| field.* = try std.fmt.allocPrint(names.allocator(), "items.x.m{d}", .{i});
+    for ([_]usize{ 1, 16, 64 }) |count| {
+        var plan = (try query.SpanProjectionPlan.init(a, .{ .fields = fields[0..count], .include_all_fields = false })).?;
+        defer plan.deinit();
+        var no_resize: counters.NoResizeAllocator = .{ .backing = a };
+        var budget: counters.BudgetAllocator = .{ .backing = no_resize.allocator(), .limit = 1024 * 1024 };
+        var result = try query.lookupJsonWithPlan(budget.allocator(), a, input.written(), &plan);
+        defer result.deinit(a);
+        const expected = try std.fmt.allocPrint(a, "{{\"items\":[{{\"x\":{{\"m{d}\":1}}}}]}}", .{count - 1});
+        defer a.free(expected);
+        try std.testing.expectEqualStrings(expected, result.json);
+        try std.testing.expectEqual(@as(usize, 0), budget.live);
+        try std.testing.expect(budget.peak < 256 * 1024);
+        std.debug.print("RETIRED_FANOUT selectors={d} peak={d} allocations={d}\n", .{ count, budget.peak, budget.alloc_calls });
+    }
+}
+
+test "public graph metric borrowed wire nested cursor arenas reuse across parent rows" {
+    const a = std.testing.allocator;
+    const query = @import("../document_query.zig");
+    const counters = @import("../../lite/test_allocator.zig");
+    const fields: []const []const u8 = &.{"items.x.x.x.m"};
+    var plan = (try query.SpanProjectionPlan.init(a, .{ .fields = fields, .include_all_fields = false })).?;
+    defer plan.deinit();
+    var warm_calls: ?usize = null;
+    for ([_]usize{ 1, 100, 1000 }) |count| {
+        var input: std.Io.Writer.Allocating = .init(a);
+        defer input.deinit();
+        try input.writer.writeAll("{\"items\":[");
+        for (0..count) |i| {
+            if (i != 0) try input.writer.writeByte(',');
+            try input.writer.writeAll("{\"x\":[{\"x\":[{\"x\":[{");
+            try input.writer.print("\"{s}\":{d}", .{ if (i % 3 == 0) "missing" else "m", i });
+            try input.writer.writeAll("}]}]}]}");
+        }
+        try input.writer.writeAll("]}");
+        var no_resize: counters.NoResizeAllocator = .{ .backing = a };
+        var budget: counters.BudgetAllocator = .{ .backing = no_resize.allocator(), .limit = 512 * 1024 };
+        var actual = try query.lookupJsonWithPlan(budget.allocator(), a, input.written(), &plan);
+        defer actual.deinit(a);
+        var expected = try query.lookupJson(a, input.written(), .{ .fields = fields, .include_all_fields = false });
+        defer expected.deinit(a);
+        try std.testing.expectEqualStrings(expected.json, actual.json);
+        try std.testing.expectEqual(@as(usize, 0), budget.live);
+        std.debug.print("POOLED_FANOUT rows={d} peak={d} allocations={d}\n", .{ count, budget.peak, budget.alloc_calls });
+        try std.testing.expect(budget.alloc_calls < 128);
+        if (count >= 100) {
+            if (warm_calls) |calls| try std.testing.expectEqual(calls, budget.alloc_calls);
+            warm_calls = budget.alloc_calls;
+        }
+    }
+}
+
+test "public graph metric borrowed wire cursor pool accounts physical bytes and retires without allocation" {
+    const a = std.testing.allocator;
+    const counters = @import("../../lite/test_allocator.zig");
+    var no_resize: counters.NoResizeAllocator = .{ .backing = a };
+    var budget: counters.BudgetAllocator = .{ .backing = no_resize.allocator(), .limit = 4 * 1024 * 1024 };
+    var resources: Resources = .init(budget.allocator());
+    defer resources.deinit();
+    var slots: [64]*CursorScratch = undefined;
+    var live: usize = 0;
+    errdefer for (slots[0..live]) |slot| resources.release(slot);
+    for (&slots) |*slot| {
+        slot.* = try resources.acquire();
+        live += 1;
+        const buffer = try slot.*.arena.allocator().alloc(u8, 8192);
+        @memset(buffer, 17);
+    }
+    for (slots) |slot| resources.release(slot);
+    live = 0;
+    try std.testing.expectEqual(@as(usize, 0), resources.active);
+    try std.testing.expect(resources.idle_bytes <= Resources.reuse_limit);
+    try std.testing.expectEqual(budget.live, resources.idle_bytes);
+    const warm = try resources.acquire();
+    resources.release(warm);
+    const calls = budget.alloc_calls;
+    for (0..16) |_| {
+        const slot = try resources.acquire();
+        resources.release(slot);
+    }
+    try std.testing.expectEqual(calls, budget.alloc_calls);
+    const wide = try resources.acquire();
+    var wide_live = true;
+    defer if (wide_live) resources.release(wide);
+    _ = try wide.arena.allocator().alloc(u8, 512 * 1024);
+    const attempts = budget.alloc_attempts;
+    budget.limit = 0;
+    resources.release(wide);
+    wide_live = false;
+    try std.testing.expectEqual(wide, resources.idle.?);
+    try std.testing.expectEqual(@as(usize, 0), wide.accounting.bytes);
+    try std.testing.expectEqual(attempts, budget.alloc_attempts);
+    try std.testing.expectEqual(budget.live, resources.idle_bytes);
+    resources.deinit();
+    try std.testing.expectEqual(@as(usize, 0), budget.live);
+}
+
+test "public graph metric borrowed wire retired cursor cannot close a reused arena lease" {
+    const a = std.testing.allocator;
+    var resources: Resources = .init(a);
+    defer resources.deinit();
+    var first_view: View = .init(a, "[{\"x\":1}]");
+    var second_view: View = .init(a, "[{\"x\":2}]");
+    var first = FanoutRows.init(&resources, .{ .source = .{ .span = .{ .view = &first_view, .node = &first_view.root } }, .path = &.{"x"} });
+    defer first.deinit();
+    _ = (try first.next()).?;
+    const slot = first.scratch.?;
+    first.deinit();
+    var second = FanoutRows.init(&resources, .{ .source = .{ .span = .{ .view = &second_view, .node = &second_view.root } }, .path = &.{"x"} });
+    defer second.deinit();
+    const row = (try second.next()).?;
+    try std.testing.expectEqual(slot, second.scratch.?);
+    first.deinit();
+    try std.testing.expectEqual(@as(usize, 1), resources.active);
+    const bytes = try (Output{ .object = row }).serialize(a, a);
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("{\"x\":2}", bytes);
 }
 
 test "public graph metric borrowed wire streaming writer reuses wide escaped key tables" {
