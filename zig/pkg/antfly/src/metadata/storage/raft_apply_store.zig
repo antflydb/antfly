@@ -4823,10 +4823,10 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
         var recovered = try std.json.parseFromSlice(index_publication.AckStatus, alloc, accepted_status, .{});
         defer recovered.deinit();
         try std.testing.expect(try recovered.value.isAcknowledged(accepted));
-        try testNativePublicationDecision(alloc, &reopened, group, recovered.value.head);
+        try testNativePublicationDecision(alloc, &reopened, group, recovered.value.head, signing_root);
     }
 
-    fn testNativePublicationDecision(alloc: std.mem.Allocator, source: *RaftApplyStore, group: u64, head: index_progress.Head) !void {
+    fn testNativePublicationDecision(alloc: std.mem.Allocator, source: *RaftApplyStore, group: u64, head: index_progress.Head, signing_root: @import("antfly_local_sources").storage_db_root_signing_identity.State) !void {
         const snapshot = try source.snapshotBuilder().buildSnapshot(alloc, group);
         defer alloc.free(snapshot);
         var tmp = std.testing.tmpDir(.{});
@@ -4857,8 +4857,15 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
                 }
             } else |_| {}
         }
-        try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, clone.validateRelationalIndexPublicationDecision(group, decision));
         var activation = (try clone.topologyActivation(group)).?;
+        // Fault-inject a lowered persisted decoder floor. Valid snapshots with
+        // the current paired-proof format already require the current floor.
+        activation.version = topology_protocol.index_publication_decision_version - 1;
+        const lowered_floor = try std.json.Stringify.valueAlloc(alloc, activation, .{});
+        defer alloc.free(lowered_floor);
+        var activation_key_buf: [192]u8 = undefined;
+        try clone.store.put(try RaftApplyStore.topologyActivationKeyForGroup(&activation_key_buf, group), lowered_floor);
+        try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, clone.validateRelationalIndexPublicationDecision(group, decision));
         activation.version = topology_protocol.index_publication_decision_version;
         const floor = try std.json.Stringify.valueAlloc(alloc, activation, .{});
         defer alloc.free(floor);
@@ -5001,6 +5008,7 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
             changed = permission.value;
             changed.head.revision += 1;
             try changed.requireRequest(lookup); // ACK revisions do not change the immutable decision identity.
+            try testNativeInstallationAck(alloc, &clone, group, lookup, signing_root);
         }
         {
             var txn = try clone.store.beginWriteTxn();
@@ -5026,7 +5034,7 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
         defer alloc.free(duplicate);
         try std.testing.expectEqualSlices(u8, committed, duplicate);
         // The retained irreversible decision prevents decoder downgrade.
-        activation.version = topology_protocol.index_publication_head_version;
+        activation.version = topology_protocol.index_publication_decision_version - 1;
         const downgrade = try std.json.Stringify.valueAlloc(alloc, activation, .{});
         defer alloc.free(downgrade);
         try clone.applyStandaloneCommand(group, .{ .activate_topology_protocol = downgrade });
@@ -5038,6 +5046,135 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
             // irreversible decided head under the pre-decision decoder floor.
             try txn.put(try RaftApplyStore.topologyActivationKeyForGroup(&buf, group), downgrade);
             try std.testing.expectError(error.InvalidMetadataSnapshot, clone.buildMetadataSnapshotTxn(alloc, &txn, group, null));
+        }
+    }
+
+    fn testNativeInstallationAck(alloc: std.mem.Allocator, source: *RaftApplyStore, group: u64, lookup: index_publication.OwnerRequest, root: @import("antfly_local_sources").storage_db_root_signing_identity.State) !void {
+        const snapshot = try source.snapshotBuilder().buildSnapshot(alloc, group);
+        defer alloc.free(snapshot);
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/installed-ack", .{tmp.sub_path});
+        defer alloc.free(path);
+        var store = try RaftApplyStore.init(alloc, .{ .root_dir = path });
+        var opened = true;
+        defer if (opened) store.deinit();
+        try std.testing.expect(try store.snapshotBuilder().installSnapshot(alloc, group, 100, snapshot));
+        const reply = try store.relationalIndexOwnerDecisionJson(alloc, group, lookup);
+        defer alloc.free(reply);
+        var permission = try std.json.parseFromSlice(index_publication.OwnerDecision, alloc, reply, .{});
+        defer permission.deinit();
+        const grant = permission.value.native_install.?;
+        const ordinal = permission.value.owner.owner.ordinal;
+        var buf: [192]u8 = undefined;
+        const retained = retained: {
+            var read = try store.store.beginReadTxn();
+            defer read.abort();
+            break :retained try index_publication.storedProof(alloc, try read.get(try index_publication.proofKey(&buf, group, lookup.table_id, ordinal, .validated)), permission.value.head, permission.value.owner, .validated);
+        };
+        const physical = retained.validation.?;
+        const command: @import("antfly_local_sources").storage_db_relational_index_validation.InstallCommand = .{ .validation = grant.validation, .metadata_decision = grant.decision_digest, .schema_digest = @splat(3), .activation_digest = @splat(4) };
+        var position = grant.validation.position;
+        position.sequence += 1;
+        const receipt = try command.receipt(position);
+        const ack: index_publication.Ack = .{ .table_id = lookup.table_id, .expected_revision = permission.value.head.revision, .signed = .{ .receipt = receipt, .proof = try physical.signed.proof.sign(root, try receipt.digest()) }, .installation = .{ .outcome = physical.outcome, .command = command, .signed = physical.signed } };
+        try ack.validate();
+        const bytes = try std.json.Stringify.valueAlloc(alloc, ack, .{});
+        defer alloc.free(bytes);
+        // The original validation clock is not evidence of an installed cut.
+        try std.testing.expectError(error.IndexOwnerReceiptChanged, store.validateRelationalIndexOwnerAck(group, bytes));
+        {
+            var txn = try store.store.beginWriteTxn();
+            errdefer txn.abort();
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const current = (try store.loadStoreHeaderTxn(&txn, group, ack.signed.proof.identity.store_id)).?;
+            defer metadata_table_manager.freeStore(alloc, current);
+            const address = try RaftApplyStore.ReportAddress.active(a, &txn, group, current.store_id);
+            const report = (try RaftApplyStore.readStoreGroupReportTxn(a, &txn, group, address, lookup.group_id, true)).?;
+            const runtimes = try a.dupe(@TypeOf(report.runtime_statuses[0]), report.runtime_statuses);
+            runtimes[0].source_authority.?.sequence = position.sequence;
+            var refreshed = current;
+            refreshed.runtime_statuses = runtimes;
+            refreshed.group_statuses = report.group_statuses;
+            _ = try store.updateListingStoreTxn(&txn, group, current.store_id, refreshed);
+            try txn.commit();
+        }
+        try store.validateRelationalIndexOwnerAck(group, bytes);
+        {
+            // A valid owner signature cannot substitute another decision.
+            var forged = ack;
+            forged.installation.?.command.metadata_decision[0] ^= 1;
+            forged.signed.receipt = try forged.installation.?.command.receipt(position);
+            forged.signed.proof = try forged.signed.proof.sign(root, try forged.signed.receipt.digest());
+            try forged.validate();
+            const rejected = try std.json.Stringify.valueAlloc(alloc, forged, .{});
+            defer alloc.free(rejected);
+            try std.testing.expectError(error.IndexOwnerReceiptChanged, store.validateRelationalIndexOwnerAck(group, rejected));
+        }
+        const Fault = struct {
+            txn: *docstore.DocStore.Txn,
+            fail_at: usize,
+            after: bool,
+            writes: usize = 0,
+            pub fn put(self: *@This(), key: []const u8, value: []const u8) !void {
+                const fail = self.writes + 1 == self.fail_at;
+                if (fail and !self.after) return error.TestInstallationWriteFailed;
+                try self.txn.put(key, value);
+                self.writes += 1;
+                if (fail) return error.TestInstallationWriteFailed;
+            }
+            pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+                return self.txn.get(key);
+            }
+        };
+        for (1..4) |fail_at| for ([_]bool{ false, true }) |after| {
+            var expected_head: [index_progress.Head.encoded_len]u8 = undefined;
+            var expected_owner: [index_progress.OwnerState.encoded_len]u8 = undefined;
+            {
+                var txn = try store.store.beginWriteTxn();
+                defer txn.abort();
+                const prepared = try store.prepareRelationalIndexOwnerAckTxn(&txn, group, bytes);
+                expected_head = prepared.update.expected_head;
+                expected_owner = prepared.update.expected_owner;
+                var fault: Fault = .{ .txn = &txn, .fail_at = fail_at, .after = after };
+                try std.testing.expectError(error.TestInstallationWriteFailed, prepared.stage(&fault, group));
+                try std.testing.expectEqual(if (after) fail_at else fail_at - 1, fault.writes);
+            }
+            var read = try store.store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectEqualSlices(u8, &expected_head, try read.get(try index_publication.headKey(&buf, group, lookup.table_id)));
+            try std.testing.expectEqualSlices(u8, &expected_owner, try read.get(try index_publication.ownerKey(&buf, group, lookup.table_id, ordinal)));
+            try std.testing.expectError(error.NotFound, read.get(try index_publication.proofKey(&buf, group, lookup.table_id, ordinal, .installed)));
+        };
+        try store.applyStandaloneCommand(group, .{ .ack_relational_index_publication = bytes });
+        opened = false;
+        store.deinit();
+        store = try RaftApplyStore.init(alloc, .{ .root_dir = path });
+        opened = true;
+        try verifyRelationRecoveryForTest(&store, alloc, group);
+        const status_json = try store.relationalIndexOwnerAckStatusJson(alloc, group, ack);
+        defer alloc.free(status_json);
+        var status = try std.json.parseFromSlice(index_publication.AckStatus, alloc, status_json, .{});
+        defer status.deinit();
+        try std.testing.expectEqual(index_progress.Phase.releasing, status.value.head.phase);
+        try std.testing.expect(try status.value.isAcknowledged(ack));
+        try std.testing.expectEqual(ack.installation.?.signed.outcome_digest, status.value.installation_digest.?);
+        var duplicate = ack;
+        duplicate.expected_revision = status.value.head.revision;
+        const duplicate_json = try std.json.Stringify.valueAlloc(alloc, duplicate, .{});
+        defer alloc.free(duplicate_json);
+        try store.validateRelationalIndexOwnerAck(group, duplicate_json);
+        try store.applyStandaloneCommand(group, .{ .ack_relational_index_publication = duplicate_json });
+        {
+            try store.store.put(RaftApplyStore.metadata_hot_standby.outbox_key, "pending-installed-ack");
+            defer store.store.delete(RaftApplyStore.metadata_hot_standby.outbox_key) catch unreachable;
+            const pending_json = try store.relationalIndexOwnerAckStatusJson(alloc, group, ack);
+            defer alloc.free(pending_json);
+            var pending = try std.json.parseFromSlice(index_publication.AckStatus, alloc, pending_json, .{});
+            defer pending.deinit();
+            try std.testing.expect(!try pending.value.isAcknowledged(ack));
         }
     }
 
@@ -17242,19 +17379,23 @@ pub const RaftApplyStore = struct {
         const logical_present = !std.mem.allEqual(u8, &previous_owner.receipts[action_index], 0);
         if (logical_present != !std.mem.allEqual(u8, &previous_root, 0)) return error.InvalidCatalogRecord;
         const retained = try stagingGet(txn, try index_publication.proofKey(&buf, group_id, ack.table_id, ordinal, action));
-        var previous_validation: ?index_publication.ValidationWitness = null;
+        var previous_evidence: ?index_publication.AuditEvidence = null;
         if (logical_present) {
-            previous_validation = (try index_publication.storedProof(self.alloc, retained orelse return error.InvalidCatalogRecord, head, previous_owner, action)).validation;
+            const previous = try index_publication.storedProof(self.alloc, retained orelse return error.InvalidCatalogRecord, head, previous_owner, action);
+            if (previous.validation) |witness| previous_evidence = .{ .outcome = witness.outcome, .signed = witness.signed };
+            if (previous.installation) |witness| previous_evidence = .{ .outcome = witness.outcome, .signed = witness.signed };
         } else if (retained != null) return error.InvalidCatalogRecord;
         try self.requireIndexOwnerRootReceiptTxn(txn, group_id, ack.signed, head.reader_requirements);
         if (ack.validation) |witness| _ = try self.verifyRelationalIndexAuditTxn(txn, group_id, witness.signed, witness.outcome);
+        if (ack.installation) |witness| try self.verifyRelationalIndexInstallationTxn(txn, group_id, witness);
         const root = try ack.signed.commitment();
-        if (previous_validation) |previous| {
+        if (previous_evidence) |previous| {
             const old_grant = previous.signed.proof;
-            const new_grant = ack.validation.?.signed.proof;
+            const next_evidence = ack.auditEvidence() orelse return error.InvalidIndexOwnerReceipt;
+            const new_grant = next_evidence.signed.proof;
             if (std.meta.eql(old_grant.identity, new_grant.identity) and std.meta.eql(old_grant.authority, new_grant.authority) and
                 old_grant.root_generation == new_grant.root_generation and old_grant.reporter_incarnation == new_grant.reporter_incarnation and
-                !std.mem.eql(u8, &previous.signed.outcome_digest, &ack.validation.?.signed.outcome_digest)) return error.IndexOwnerReceiptChanged;
+                !std.mem.eql(u8, &previous.signed.outcome_digest, &next_evidence.signed.outcome_digest)) return error.IndexOwnerReceiptChanged;
         }
         if (!std.mem.eql(u8, &root, &previous_root)) {
             if (!update.changed) {
@@ -17270,7 +17411,7 @@ pub const RaftApplyStore = struct {
             next_owner.attestations[action_index] = root;
             update.next_owner = try next_owner.encode();
         }
-        return .{ .table_id = ack.table_id, .ordinal = ordinal, .update = update, .action = action, .proof_bytes = if (update.changed) try index_publication.StoredProof.encode(ack.signed, ack.validation) else undefined };
+        return .{ .table_id = ack.table_id, .ordinal = ordinal, .update = update, .action = action, .proof_bytes = if (update.changed) try index_publication.StoredProof.encode(ack.signed, ack.validation, ack.installation) else undefined };
     }
 
     fn ackRelationalIndexPublicationTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, bytes: []const u8) !void {
@@ -17373,11 +17514,31 @@ pub const RaftApplyStore = struct {
     /// and current root authority in one read set. This stages no writes; any
     /// accepting publication transaction must repeat this exact verification.
     pub fn verifyRelationalIndexAuditTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, signed: index_publication.SignedAudit, outcome: @import("antfly_local_sources").storage_db_relational_index_owner_control.AuditOutcome) ![32]u8 {
+        return self.verifyRelationalIndexAuditModeTxn(txn, group_id, signed, outcome, .validation);
+    }
+
+    fn verifyRelationalIndexInstallationTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, witness: index_publication.InstallationWitness) !void {
+        _ = try self.standbyRelationActivationTxn(txn, group_id, topology_protocol.index_publication_installation_version);
+        _ = try self.verifyRelationalIndexAuditModeTxn(txn, group_id, witness.signed, witness.outcome, .installation);
+        const table_id = witness.outcome.binding.fence.namespace.table_id;
+        const ordinal = witness.outcome.binding.ordinal;
+        var buf: [192]u8 = undefined;
+        const head = try index_progress.Head.decode(try txn.get(try index_publication.headKey(&buf, group_id, table_id)));
+        const owner = try index_progress.OwnerState.decode(try txn.get(try index_publication.ownerKey(&buf, group_id, table_id, ordinal)));
+        const accepted = try index_publication.storedProof(self.alloc, try txn.get(try index_publication.proofKey(&buf, group_id, table_id, ordinal, .validated)), head, owner, .validated);
+        const validation_witness = accepted.validation orelse return error.InvalidCatalogRecord;
+        const expected_seal: @import("antfly_local_sources").storage_db_relational_index_validation.Seal = .{ .command = try validation_witness.outcome.logicalCommand(), .position = accepted.signed.receipt.position.native };
+        const incarnation = (try decodeMetadataIncarnationRecord(try txn.get(try metadataIncarnationKeyForGroup(&buf, group_id)))).incarnation;
+        if (!std.meta.eql(witness.command.validation, expected_seal) or
+            !std.mem.eql(u8, &witness.command.metadata_decision, &try index_publication.NativeInstallGrant.decisionDigest(group_id, incarnation, head))) return error.IndexOwnerReceiptChanged;
+    }
+
+    fn verifyRelationalIndexAuditModeTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, signed: index_publication.SignedAudit, outcome: @import("antfly_local_sources").storage_db_relational_index_owner_control.AuditOutcome, comptime mode: enum { validation, installation }) ![32]u8 {
         const audit_digest = try signed.verifiedDigest(outcome);
-        const current = try self.currentIndexBuildOwnerTxnImpl(txn, group_id, outcome.binding, null, .validation);
+        const current = try self.currentIndexBuildOwnerTxnImpl(txn, group_id, outcome.binding, null, if (mode == .validation) .validation else .installation);
         var buf: [192]u8 = undefined;
         const owner = try index_progress.OwnerState.decode(try txn.get(try index_publication.ownerKey(&buf, group_id, current.head.table_id, outcome.binding.ordinal)));
-        const frozen = try index_delivery.frozenTarget(self.alloc, txn, group_id, current.head, owner, signed.proof.identity.metadata_incarnation);
+        const frozen = if (mode == .validation) try index_delivery.frozenTarget(self.alloc, txn, group_id, current.head, owner, signed.proof.identity.metadata_incarnation) else try index_delivery.frozenTargetForRecovery(self.alloc, txn, group_id, current.head, owner, signed.proof.identity.metadata_incarnation);
         if (!std.mem.eql(u8, &try frozen.expected.digest(), &try outcome.expected.digest()) or
             outcome.audit.source_members.? != frozen.source_members or
             outcome.audit.canonical_position.?.sequence <= frozen.source_position.sequence) return error.IndexOwnerReceiptChanged;
@@ -17548,7 +17709,7 @@ pub const RaftApplyStore = struct {
     fn currentIndexBuildOwnerTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, binding: @import("antfly_local_sources").storage_db_relational_index_owner_job.Binding, table_name: ?[]const u8) !CurrentIndexBuildOwner {
         return self.currentIndexBuildOwnerTxnImpl(txn, group_id, binding, table_name, .source);
     }
-    fn currentIndexBuildOwnerTxnImpl(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, binding: @import("antfly_local_sources").storage_db_relational_index_owner_job.Binding, table_name: ?[]const u8, comptime mode: enum { source, validation }) !CurrentIndexBuildOwner {
+    fn currentIndexBuildOwnerTxnImpl(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, binding: @import("antfly_local_sources").storage_db_relational_index_owner_job.Binding, table_name: ?[]const u8, comptime mode: enum { source, validation, installation }) !CurrentIndexBuildOwner {
         _ = try self.standbyRelationActivationTxn(txn, group_id, topology_protocol.index_publication_head_version);
         const table_id = binding.fence.namespace.table_id;
         const owner_group = binding.fence.owner_group_id;
@@ -17566,8 +17727,9 @@ pub const RaftApplyStore = struct {
         if (table_name) |name| if (!std.mem.eql(u8, name, d.table_name)) return error.PrivateIndexOwnerJobChanged;
         const incarnation = (try decodeMetadataIncarnationRecord(try txn.get(try metadataIncarnationKeyForGroup(&buf, group_id)))).incarnation;
         const decision: index_publication.OwnerDecision = .{ .metadata_group_id = group_id, .metadata_incarnation = incarnation, .head = head, .owner = owner, .disposition = .execute, .dispatch = d };
-        if (mode == .validation) {
-            if (head.phase != .building or std.mem.allEqual(u8, &owner.receipts[@backingInt(index_progress.Action.reserved)], 0)) return error.GenerationPublicationChanged;
+        if (mode == .validation or mode == .installation) {
+            const permitted_phase = if (mode == .validation) head.phase == .building else head.phase == .installing or head.phase == .releasing;
+            if (!permitted_phase or std.mem.allEqual(u8, &owner.receipts[@backingInt(index_progress.Action.reserved)], 0)) return error.GenerationPublicationChanged;
             try decision.requireRetainedNativeBinding(binding);
         } else _ = try decision.nativeBuild(.{ .table_id = table_id, .group_id = owner_group, .id = binding.id, .operation = .build }, binding, .{});
         const range = try decodeRangeRecord(self.alloc, try txn.get(try rangeKeyForGroup(&buf, group_id, owner_group)));
@@ -17577,8 +17739,10 @@ pub const RaftApplyStore = struct {
         var live = (try relation_reconciliation.LiveStore(docstore.DocStore.Txn).open(txn, group_id)) orelse return error.CatalogPublicationProofPending;
         if (live.root.coverage != .constraint_names) return error.CatalogOccupancyNotReady;
         const claim = (try live.getClaim(.{ .namespace_id = d.namespace_id, .name = d.table_guard.logical_table })) orelse return error.GenerationPublicationChanged;
+        const schema_version = if (mode == .installation) d.successor_schema_version else d.table_guard.owner.schema_version;
+        const schema_digest = if (mode == .installation) d.successor_schema_digest else d.table_guard.owner.schema_digest;
         if (claim.kind != .table or claim.phase != .active or claim.table_id != table_id or
-            claim.schema_version != d.table_guard.owner.schema_version or !std.mem.eql(u8, &claim.schema_digest, &d.table_guard.owner.schema_digest)) return error.GenerationPublicationChanged;
+            claim.schema_version != schema_version or !std.mem.eql(u8, &claim.schema_digest, &schema_digest)) return error.GenerationPublicationChanged;
         return .{ .head = head, .owner = owner.owner };
     }
 
@@ -17605,6 +17769,10 @@ pub const RaftApplyStore = struct {
         if (request.validation != null and !std.mem.allEqual(u8, &owner.receipts[@backingInt(index_progress.Action.validated)], 0)) {
             const retained = try index_publication.storedProof(self.alloc, try txn.get(try index_publication.proofKey(&buf, group_id, request.table_id, ordinal, .validated)), head, owner, .validated);
             status.validation_digest = (retained.validation orelse return error.InvalidCatalogRecord).signed.outcome_digest;
+        }
+        if (request.installation != null and !std.mem.allEqual(u8, &owner.receipts[@backingInt(index_progress.Action.installed)], 0)) {
+            const retained = try index_publication.storedProof(self.alloc, try txn.get(try index_publication.proofKey(&buf, group_id, request.table_id, ordinal, .installed)), head, owner, .installed);
+            status.installation_digest = (retained.installation orelse return error.InvalidCatalogRecord).signed.outcome_digest;
         }
         _ = try status.isAcknowledged(request);
         return std.json.Stringify.valueAlloc(alloc, status, .{});

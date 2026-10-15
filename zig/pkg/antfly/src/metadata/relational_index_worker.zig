@@ -39,7 +39,7 @@ const idle_lifetime_ns = 60 * std.time.ns_per_s;
 const max_job_quanta = 4096;
 
 pub const Authority = struct { metadata_incarnation: [32]u8, binding_digest: [32]u8, writer_generation: u64 };
-const Stage = enum { refresh, control, acknowledge, resolve_ack, build, deliver, inventory };
+const Stage = enum { refresh, control, acknowledge, resolve_ack, build, deliver, inventory, install };
 const Owner = struct {
     ordinal: u16,
     stage: Stage = .refresh,
@@ -198,8 +198,9 @@ const Job = struct {
                 owner.stage = switch (response.value.head.phase) {
                     .fencing, .reserving => .control,
                     .building => .build,
+                    .installing => .install,
                     else => {
-                        // Seals/install/release need their own real native
+                        // Release needs its own real native
                         // evidence, never a synthesized "ready" response.
                         self.retireOwner(index);
                         self.retry_at_ns = now_ns +| std.time.ns_per_s;
@@ -309,6 +310,36 @@ const Job = struct {
                 if (result == .pending) {
                     if (owner.stream.?.phase == prior) owner.retry_at_ns = now_ns +| retry_ns;
                 } else self.retireOwner(index);
+            },
+            .install => {
+                const request: execution.Request = .{ .table_id = self.identity.table_id, .group_id = identity.group_id, .id = self.identity.id, .operation = .install, .build_budget = .{ .records = 128, .bytes = 16 * 1024 * 1024 } };
+                var response = transport.control(alloc, self.table_name.?, request, context_) catch |err| switch (@as(anyerror, err)) {
+                    error.MetadataReplicationPending => {
+                        owner.retry_at_ns = now_ns +| retry_ns;
+                        return;
+                    },
+                    else => return err,
+                };
+                defer response.deinit();
+                try response.value.validate(request);
+                if (response.value == .acknowledged) {
+                    self.retireOwner(index);
+                    return;
+                }
+                if (response.value != .installing) return error.InvalidPrivateIndexNativeReceipt;
+                const outcome = response.value.installing.outcome;
+                if (outcome == .audit) {
+                    if (outcome.audit.audit.inventory.phase == .failed) return error.PrivateIndexTargetInventoryMismatch;
+                    if (outcome.audit.audit.generation) |fields| if (fields.phase == .failed) return error.PrivateIndexGenerationValidationFailed;
+                    return;
+                }
+                const ack = (try response.value.installationAck(request)) orelse {
+                    owner.retry_at_ns = now_ns +| retry_ns;
+                    return;
+                };
+                if (!std.meta.eql(ack.signed.receipt.owner, identity)) return error.InvalidIndexOwnerReceipt;
+                owner.ack = ack;
+                owner.stage = .acknowledge;
             },
             .inventory => {
                 const request: execution.Request = .{ .table_id = self.identity.table_id, .group_id = identity.group_id, .id = self.identity.id, .operation = .validate, .build_budget = .{ .records = 128, .bytes = 16 * 1024 * 1024 } };

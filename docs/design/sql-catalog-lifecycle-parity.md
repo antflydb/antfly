@@ -8040,3 +8040,35 @@ boundary, licensing, inventory, formatting and control-catalog checks pass.
 Authenticated receiver dispatch, installed witness
 acceptance/retention, release coordination and full public/distributed SQL
 qualification remain unfinished; no original-case dispositions change.
+
+### Authenticated install dispatch and retained installed acknowledgments
+
+The existing authenticated control port now accepts logical install requests.
+Each receiver obtains fresh metadata permission and a bounded install grant,
+then invokes the leased kernel path without using reserved-only inspection for
+installed retries. Signing pairs the complete physical audit with the committed
+installed receipt, under one captured root generation; pending replication and
+partial audits produce no installation ACK. Both signatures publish together.
+
+Protocol floor 52 covers the new private paired-proof envelope. Native installed
+ACKs require a physical witness and exact install command; bare installed
+receipts are invalid. Metadata joins the current successor catalog/range/name
+authority, frozen source/target provenance, retained accepted validation seal,
+durable publication decision and observed installed native clock in the same
+accepting transaction. Head, owner and witness persist atomically. ACK status
+checks the retained physical digest and withholds acceptance while metadata
+publication is pending. The decision identity remains stable through release.
+
+The bounded scheduler handles already-decided installing owners through the
+existing ACK/status resolution state machine. The focused Debug gate passed
+75/75 steps in `/private/tmp/antfly-installed-ack-debug-v2.log`: paired-signature
+tampering/pending cases; metadata commit/reopen and duplicate ACKs; stale clock
+and forged decision rejection; rollback before/after each of the three writes;
+lost replies, pending publication, stale revisions and volatile scheduler
+restarts. The broader Debug gate is pending. These component/fault fixtures do
+not claim end-to-end distributed SQL qualification or another original case.
+
+Automatic publication-decision dispatch, durable native release/retirement,
+latest-stage replacement-root adoption and full distributed/public producer
+qualification remain unfinished. Original accounting is unchanged at
+483 implemented / 862 unresolved.

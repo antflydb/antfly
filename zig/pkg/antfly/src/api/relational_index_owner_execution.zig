@@ -46,12 +46,12 @@ pub const Request = struct {
     table_id: u64,
     group_id: u64,
     id: [16]u8,
-    operation: enum { fence, reserve, build, source, validate },
+    operation: enum { fence, reserve, build, source, validate, install },
     build_budget: ?local.storage_db_relational_index_jobs.Budget = null,
 
     pub fn validate(self: Request, group_id: u64) !void {
         if (self.group_id != group_id) return error.GenerationPublicationChanged;
-        if (self.operation != .build and self.operation != .validate and self.build_budget != null) return error.InvalidGenerationPublication;
+        if (self.operation != .build and self.operation != .validate and self.operation != .install and self.build_budget != null) return error.InvalidGenerationPublication;
         if (self.build_budget) |budget| try budget.validate();
         try self.lookup(.permission).validate();
     }
@@ -66,6 +66,7 @@ pub const Request = struct {
                 .reserve => .reserve,
                 .build, .source => .build,
                 .validate => .validate,
+                .install => .install,
             },
             .projection = projection,
         };
@@ -99,6 +100,7 @@ pub const Result = union(enum) {
         signing_failure: ?SigningFailure = null,
     },
     source: SourceResult,
+    installing: InstallationResult,
 
     pub fn deinit(self: *Result) void {
         switch (self.*) {
@@ -108,6 +110,7 @@ pub const Result = union(enum) {
             .controlled => |value| value.outcome.deinit(),
             .building => |value| value.outcome.deinit(),
             .source => |*value| value.deinit(),
+            .installing => |*value| value.outcome.deinit(),
         }
         self.* = undefined;
     }
@@ -115,7 +118,7 @@ pub const Result = union(enum) {
     /// Borrowed until deinit; copying an outcome does not own error_name.
     pub fn outcome(self: *const Result) ?native.Outcome {
         return switch (self.*) {
-            .acknowledged, .building, .source => null,
+            .acknowledged, .building, .source, .installing => null,
             .recovered => |value| value.outcome.value,
             .applied => |value| value.value,
             .controlled => |value| value.outcome.value,
@@ -130,6 +133,7 @@ pub const Result = union(enum) {
             .controlled => |value| value.root_generation,
             .building => |value| value.root_generation,
             .source => |value| value.root_generation,
+            .installing => |value| value.root_generation,
             .acknowledged, .applied => null,
         };
     }
@@ -138,11 +142,12 @@ pub const Result = union(enum) {
         return switch (self.*) {
             .controlled => |*value| &value.signing,
             .recovered => |*value| &value.signing,
-            .acknowledged, .applied, .building, .source => null,
+            .acknowledged, .applied, .building, .source, .installing => null,
         };
     }
 
     pub fn needsSigning(self: *Result) bool {
+        if (self.* == .installing) return self.installing.needsSigning();
         if (self.* == .source) return self.source.needsSigning();
         if (self.* == .building) {
             const value = self.building;
@@ -161,6 +166,7 @@ pub const Result = union(enum) {
     /// Signing is post-commit decoration, never another physical effect. The
     /// caller must preserve the outcome if the local identity is unavailable.
     pub fn signNative(self: *Result, root: local.storage_db_root_signing_identity.State, node_id: u64, store_id: u64, reporter_incarnation: u64) !void {
+        if (self.* == .installing) return self.installing.signNative(root, node_id, store_id, reporter_incarnation);
         if (self.* == .source) return self.source.signNative(root, node_id, store_id, reporter_incarnation);
         if (self.* == .building) {
             const value = &self.building;
@@ -213,6 +219,10 @@ pub const Result = union(enum) {
     }
 
     pub fn signingFailed(self: *Result, failure: SigningFailure) void {
+        if (self.* == .installing) {
+            if (self.installing.signed_receipt == null) self.installing.signing_failure = failure;
+            return;
+        }
         if (self.* == .building) {
             if (self.building.signed_audit == null and self.building.signed_receipt == null) self.building.signing_failure = failure;
             return;
@@ -235,12 +245,84 @@ pub const Result = union(enum) {
             .recovered => |value| .{ .recovered = .{ .root_generation = value.root_generation, .outcome = value.outcome.value orelse return error.InvalidPrivateIndexNativeReceipt, .signed_ack = value.signing.ack, .signing_failure = value.signing.failure } },
             .building => |value| .{ .building = .{ .root_generation = value.root_generation, .expected_revision = value.expected_revision, .outcome = value.outcome.value, .signed_audit = value.signed_audit, .signed_receipt = value.signed_receipt, .signing_failure = value.signing_failure } },
             .source => |*value| .{ .source = value.response() },
+            .installing => |*value| .{ .installing = value.response() },
         };
     }
 };
 
 pub const control_remaining_ms_header = "X-Antfly-Index-Control-Remaining-Ms";
 pub const max_control_request_bytes = 4096;
+
+pub const InstallationControlResponse = struct {
+    root_generation: u64,
+    expected_revision: u64,
+    outcome: native.InstallationResponse,
+    signed_audit: ?publication.SignedAudit = null,
+    signed_receipt: ?publication.SignedReceipt = null,
+    signing_failure: ?SigningFailure = null,
+
+    pub fn validate(self: @This(), request: Request) !void {
+        if (request.operation != .install or self.root_generation == 0 or self.expected_revision == 0 or self.expected_revision == std.math.maxInt(u64)) return error.InvalidPrivateIndexNativeReceipt;
+        const physical = self.outcome.physicalAudit();
+        const binding = physical.binding;
+        if (binding.fence.namespace.table_id != request.table_id) return error.InvalidPrivateIndexNativeReceipt;
+        var build = try native.BuildRequest.init(.{ .id = request.id, .plan_digest = binding.plan_digest, .owner_digest = binding.owner_digest, .ordinal = binding.ordinal, .namespace = binding.fence.namespace, .owner_group_id = request.group_id }, binding, request.build_budget orelse .{});
+        build.target_expectation = physical.expected;
+        try physical.validateFor(build);
+        if (self.outcome == .installed) try self.outcome.validateFor(.{ .intent = self.outcome.installed.logical.command.intent(), .budget = build.budget });
+        if ((self.signed_audit != null) != (self.signed_receipt != null)) return error.InvalidPrivateIndexNativeReceipt;
+        if (self.signing_failure != null and (self.signed_audit != null or self.outcome != .installed or self.outcome.installed.logical.receipt == null)) return error.InvalidPrivateIndexNativeReceipt;
+        if (self.signed_receipt) |signed| {
+            if (self.outcome != .installed or signed.proof.root_generation != self.root_generation or
+                !std.meta.eql(self.outcome.installed.logical.receipt orelse return error.InvalidPrivateIndexNativeReceipt, signed.receipt)) return error.InvalidPrivateIndexNativeReceipt;
+            try (publication.InstallationWitness{ .outcome = physical, .command = self.outcome.installed.logical.command, .signed = self.signed_audit.? }).verifyFor(signed);
+        }
+    }
+
+    pub fn ack(self: @This(), request: Request) !?publication.Ack {
+        try self.validate(request);
+        const signed = self.signed_receipt orelse return null;
+        const value = self.outcome.installed;
+        const result: publication.Ack = .{ .table_id = request.table_id, .expected_revision = self.expected_revision, .signed = signed, .installation = .{ .outcome = value.physical, .command = value.logical.command, .signed = self.signed_audit.? } };
+        try result.validate();
+        return result;
+    }
+};
+
+const InstallationResult = struct {
+    root_generation: u64,
+    expected_revision: u64,
+    outcome: std.json.Parsed(native.InstallationResponse),
+    signing: publication.NativeSigningView,
+    signed_audit: ?publication.SignedAudit = null,
+    signed_receipt: ?publication.SignedReceipt = null,
+    signing_failure: ?SigningFailure = null,
+
+    fn response(self: *const @This()) InstallationControlResponse {
+        return .{ .root_generation = self.root_generation, .expected_revision = self.expected_revision, .outcome = self.outcome.value, .signed_audit = self.signed_audit, .signed_receipt = self.signed_receipt, .signing_failure = self.signing_failure };
+    }
+    fn needsSigning(self: *const @This()) bool {
+        return self.outcome.value == .installed and self.outcome.value.installed.logical.receipt != null and self.signed_audit == null and self.signed_receipt == null and self.signing_failure == null;
+    }
+    fn signNative(self: *@This(), root: local.storage_db_root_signing_identity.State, node_id: u64, store_id: u64, reporter_incarnation: u64) !void {
+        if (!self.needsSigning() or self.root_generation == 0 or self.expected_revision == 0 or self.expected_revision == std.math.maxInt(u64)) return error.NativeIndexSigningUnavailable;
+        const value = self.outcome.value.installed;
+        const view = self.signing;
+        try view.validate(value.physical.expected.metadata_incarnation);
+        if (node_id != view.identity.node_id or store_id != view.identity.store_id or reporter_incarnation != view.reporter_incarnation or
+            value.physical.audit.root_incarnation != view.identity.root_incarnation) return error.IndexOwnerReceiptChanged;
+        try self.outcome.value.validateFor(.{ .intent = value.logical.command.intent(), .budget = .{} });
+        const template: publication.RootProof = .{ .identity = view.identity, .reporter_incarnation = reporter_incarnation, .authority = .{ .native = view.binding_digest }, .root_generation = self.root_generation, .signature = undefined };
+        const digest = try value.physical.readyDigest();
+        const signed_audit: publication.SignedAudit = .{ .outcome_digest = digest, .proof = try template.sign(root, digest) };
+        const receipt = value.logical.receipt orelse return error.NativeIndexSigningUnavailable;
+        const signed_receipt: publication.SignedReceipt = .{ .receipt = receipt, .proof = try template.sign(root, try receipt.digest()) };
+        try (publication.InstallationWitness{ .outcome = value.physical, .command = value.logical.command, .signed = signed_audit }).verifyFor(signed_receipt);
+        self.signed_audit = signed_audit;
+        self.signed_receipt = signed_receipt;
+        self.signing_failure = null;
+    }
+};
 
 /// Internal progress only. Neither the applying-root generation nor an unsigned
 /// logical receipt grants metadata publication authority to a remote caller.
@@ -251,6 +333,13 @@ pub const ControlResponse = union(enum) {
     recovered: RootedOutcome,
     building: struct { root_generation: u64, expected_revision: u64 = 0, outcome: native.BuildResponse, signed_audit: ?publication.SignedAudit = null, signed_receipt: ?publication.SignedReceipt = null, signing_failure: ?SigningFailure = null },
     source: SourceResponse,
+    installing: InstallationControlResponse,
+
+    pub fn installationAck(self: @This(), request: Request) !?publication.Ack {
+        try self.validate(request);
+        if (self != .installing) return null;
+        return self.installing.ack(request);
+    }
 
     /// A captured metadata revision is a CAS hint, never authority. The
     /// accepting metadata transaction rechecks scope, signatures and liveness.
@@ -277,6 +366,7 @@ pub const ControlResponse = union(enum) {
         const outcome: native.Outcome = switch (self) {
             .acknowledged => return,
             .source => |value| return value.validate(request),
+            .installing => |value| return value.validate(request),
             .building => |value| {
                 if ((request.operation != .build and request.operation != .validate) or value.root_generation == 0) return error.InvalidPrivateIndexNativeReceipt;
                 const binding = switch (value.outcome) {
@@ -343,7 +433,7 @@ pub const ControlResponse = union(enum) {
             .effect = switch (request.operation) {
                 .fence => .fenced,
                 .reserve => .reserved,
-                .build, .source, .validate => return error.InvalidPrivateIndexNativeReceipt,
+                .build, .source, .validate, .install => return error.InvalidPrivateIndexNativeReceipt,
             },
         });
         if (binding.fence.namespace.table_id != request.table_id) return error.InvalidPrivateIndexNativeReceipt;
@@ -1041,7 +1131,7 @@ pub fn step(alloc: std.mem.Allocator, source: anytype, metadata: anytype, table_
         const receipt_request: native.ReceiptRequest = .{ .identity = grant.identity, .effect = switch (request.operation) {
             .fence => .fenced,
             .reserve => .reserved,
-            .build, .source, .validate => return error.InvalidGenerationPublication,
+            .build, .source, .validate, .install => return error.InvalidGenerationPublication,
         } };
         var recovered = try source.nativeIndexOwnerReceiptAtRoot(alloc, request.group_id, table_name, receipt_request, context);
         errdefer recovered.deinit();
@@ -1057,6 +1147,19 @@ pub fn step(alloc: std.mem.Allocator, source: anytype, metadata: anytype, table_
     const identity = try permission.value.nativeExecutionIdentity(hot_request);
     try requireTable(permission.value, table_name);
     const signing: SigningState = .{ .context = if (permission.value.native_signing) |view| .{ .view = view, .expected_revision = permission.value.head.revision, .request = request } else null };
+    if (request.operation == .install) {
+        const view = permission.value.native_signing orelse return error.NativeIndexSigningUnavailable;
+        const grant = permission.value.native_install orelse return error.InvalidCatalogRecord;
+        // Metadata supplies the desired immutable binding. The kernel checks
+        // the real reserved/installed job on the applying root; old inspection
+        // APIs deliberately cannot manufacture an installed retry observation.
+        const installation: native.InstallationRequest = .{ .intent = try permission.value.nativeInstallationIntent(hot_request, grant.validation.command.binding), .budget = request.build_budget orelse .{} };
+        var rooted = try source.stepNativeIndexOwnerInstallationAtRoot(alloc, request.group_id, table_name, installation, view.identity.root_incarnation, context);
+        errdefer rooted.outcome.deinit();
+        try rooted.outcome.value.validateFor(installation);
+        if (rooted.root_generation == 0 or rooted.outcome.value.physicalAudit().audit.root_incarnation != view.identity.root_incarnation) return error.InvalidPrivateIndexNativeReceipt;
+        return .{ .installing = .{ .root_generation = rooted.root_generation, .expected_revision = permission.value.head.revision, .outcome = rooted.outcome, .signing = view } };
+    }
     if (request.operation == .source) {
         var rooted = try source.readNativeIndexClaimSourceAtRoot(alloc, request.group_id, table_name, identity, context);
         errdefer rooted.deinit();
@@ -1082,7 +1185,7 @@ pub fn step(alloc: std.mem.Allocator, source: anytype, metadata: anytype, table_
         const effect: @FieldType(native.ReceiptRequest, "effect") = switch (request.operation) {
             .fence => .fenced,
             .reserve => .reserved,
-            .build, .source, .validate => return error.InvalidGenerationPublication,
+            .build, .source, .validate, .install => return error.InvalidGenerationPublication,
         };
         var recovered = try source.nativeIndexOwnerReceiptAtRoot(alloc, request.group_id, table_name, native.ReceiptRequest{ .identity = identity, .effect = effect }, context);
         if (recovered.outcome.value) |value| {
@@ -1153,6 +1256,11 @@ const TestDriver = struct {
     validation_pending_checks: usize = 0,
     validation_digest: ?publication.Digest = null,
     validation_seal_effects: usize = 0,
+    installation_response: ?native.InstallationResponse = null,
+    installation_calls: usize = 0,
+    installation_ack_requests: usize = 0,
+    installation_acks: usize = 0,
+    installation_digest: ?publication.Digest = null,
     inventory_finished: bool = false,
     source_reads: usize = 0,
     source_failed: bool = false,
@@ -1173,9 +1281,10 @@ const TestDriver = struct {
         if (call == .relational_index_owner_ack or call == .relational_index_owner_ack_status) {
             const request = if (call == .relational_index_owner_ack) call.relational_index_owner_ack else call.relational_index_owner_ack_status;
             try request.validate();
-            try std.testing.expect(request.signed.receipt.action == .validated and request.validation != null);
+            const installed_ack = request.signed.receipt.action == .installed;
+            try std.testing.expect(if (installed_ack) request.installation != null else request.signed.receipt.action == .validated and request.validation != null);
             if (call == .relational_index_owner_ack) {
-                self.validation_ack_requests += 1;
+                if (installed_ack) self.installation_ack_requests += 1 else self.validation_ack_requests += 1;
                 if (self.validation_fault == .stale_revision) {
                     self.validation_fault = .none;
                     self.value.head.revision += 1;
@@ -1189,8 +1298,13 @@ const TestDriver = struct {
                 self.value.head = update.head;
                 self.value.owner = update.owner;
                 self.value.owner.attestations[@backingInt(request.signed.receipt.action)] = try request.signed.commitment();
-                self.validation_digest = request.validation.?.signed.outcome_digest;
-                self.validation_acks += 1;
+                if (installed_ack) {
+                    self.installation_digest = request.installation.?.signed.outcome_digest;
+                    self.installation_acks += 1;
+                } else {
+                    self.validation_digest = request.validation.?.signed.outcome_digest;
+                    self.validation_acks += 1;
+                }
                 if (self.validation_fault == .lost_reply or self.validation_fault == .pending or self.validation_fault == .restart_committed) {
                     if (self.validation_fault == .pending) self.validation_pending_checks = 3;
                     self.validation_fault = .none;
@@ -1199,7 +1313,7 @@ const TestDriver = struct {
             } else self.validation_status_calls += 1;
             const pending = self.validation_pending_checks != 0;
             if (pending) self.validation_pending_checks -= 1;
-            return std.json.Stringify.valueAlloc(alloc, publication.AckStatus{ .head = self.value.head, .owner = self.value.owner, .validation_digest = self.validation_digest, .replication_pending = pending }, .{});
+            return std.json.Stringify.valueAlloc(alloc, publication.AckStatus{ .head = self.value.head, .owner = self.value.owner, .validation_digest = self.validation_digest, .installation_digest = self.installation_digest, .replication_pending = pending }, .{});
         }
         if (call == .relational_index_source_accept_status) return std.json.Stringify.valueAlloc(alloc, delivery_journal.Status{ .query = call.relational_index_source_accept_status, .head = self.acceptance_head, .completed = self.completed }, .{});
         if (call == .relational_index_source_complete) {
@@ -1231,7 +1345,14 @@ const TestDriver = struct {
         }
         const request = call.relational_index_owner_decision;
         var value = self.value;
-        if (self.validation_acks != 0 and (request.operation == .validate or request.operation == .build)) {
+        if (self.installation_acks != 0 and request.operation == .install) {
+            value.disposition = .acknowledged;
+            value.dispatch = null;
+            value.inputs = null;
+            value.native_signing = null;
+            value.native_install = null;
+            value.target_expectation = null;
+        } else if (self.validation_acks != 0 and (request.operation == .validate or request.operation == .build)) {
             self.validation_permission_acks += 1;
             value.disposition = .acknowledged;
             value.dispatch = null;
@@ -1320,6 +1441,15 @@ const TestDriver = struct {
         }
         self.consumption_calls += 1;
         return .{ .root_generation = self.root_generation, .outcome = try parsed(native.ConsumeOutcome, alloc, .{ .binding = command.binding, .accepted = command.accepted, .record = self.consumed_record, .position = self.consumed_record.?.position, .duplicate = duplicate }) };
+    }
+
+    pub fn stepNativeIndexOwnerInstallationAtRoot(self: *TestDriver, alloc: std.mem.Allocator, _: u64, _: []const u8, request: native.InstallationRequest, audit_root_incarnation: u128, context: operation.RequestContext) !struct { root_generation: u64, outcome: std.json.Parsed(native.InstallationResponse) } {
+        try context.ensureActive();
+        const value = self.installation_response orelse return error.TestMissingInstallationResponse;
+        try value.validateFor(request);
+        if (value.physicalAudit().audit.root_incarnation != audit_root_incarnation) return error.PrivateIndexAuditScopeChanged;
+        self.installation_calls += 1;
+        return .{ .root_generation = self.root_generation, .outcome = try parsed(native.InstallationResponse, alloc, value) };
     }
 
     pub fn stepNativeIndexOwnerBuildAtRoot(self: *TestDriver, alloc: std.mem.Allocator, _: u64, _: []const u8, request: native.BuildRequest, audit_root_incarnation: ?u128, context: operation.RequestContext) !@FieldType(Result, "building") {
@@ -2286,6 +2416,148 @@ test "relational index publication claim receiver binds fresh build permission w
         try std.testing.expect(pending_source.source.outcome.batch == null);
         try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, (try pending_source.response()).source.decodeSigned(alloc, source_request));
     }
+}
+
+fn testSchedulerInstallationFaults(alloc: std.mem.Allocator, permission: publication.OwnerDecision, binding: jobs.Binding, root: local.storage_db_root_signing_identity.State, outcome: native.InstallationResponse) !void {
+    const worker = @import("../metadata/relational_index_worker.zig");
+    for ([_]TestDriver.ValidationFault{ .before_commit, .lost_reply, .pending, .stale_revision, .restart, .restart_committed }) |fault| {
+        var driver: TestDriver = .{ .value = permission, .binding = binding, .installation_response = outcome, .validation_fault = fault };
+        var host: TestSchedulerHost = .{ .driver = &driver };
+        var sender: TestDeliveryTransport = .{ .driver = &driver, .root = root };
+        var transport = sender.localTransport();
+        var coordinator: worker.Coordinator = .{};
+        defer coordinator.deinit(std.testing.io);
+        var now = @import("antfly_platform").time.monotonicNs();
+        var restarted = false;
+        for (0..60) |_| {
+            const before = sender.calls;
+            _ = try coordinator.step(std.testing.io, alloc, null, &host, &transport, now);
+            try std.testing.expect(sender.calls - before <= 1);
+            if (!restarted and (fault == .restart or fault == .restart_committed)) {
+                var cut = false;
+                for (coordinator.jobs) |job| if (job) |active| {
+                    for (active.owners) |owner| if (owner) |value| {
+                        if (value.ack != null and driver.installation_acks == @as(usize, if (fault == .restart_committed) 1 else 0)) cut = true;
+                    };
+                };
+                if (cut) {
+                    coordinator.deinit(std.testing.io);
+                    coordinator = .{};
+                    restarted = true;
+                    now += 300 * std.time.ns_per_ms;
+                    continue;
+                }
+            }
+            var resident = false;
+            for (coordinator.jobs) |job| if (job) |active| {
+                for (active.owners) |owner| if (owner != null) {
+                    resident = true;
+                };
+            };
+            if (driver.installation_acks == 1 and !resident) break;
+            now += 300 * std.time.ns_per_ms;
+        }
+        try std.testing.expectEqual(@as(usize, 1), driver.installation_acks);
+        try std.testing.expectEqual(@as(usize, if (fault == .before_commit or fault == .stale_revision) 2 else 1), driver.installation_ack_requests);
+        try std.testing.expectEqual(local.storage_db_relational_index_publication_progress.Phase.releasing, driver.value.head.phase);
+        try std.testing.expect(driver.installation_calls != 0);
+        if (fault == .restart or fault == .restart_committed) try std.testing.expect(restarted);
+    }
+}
+
+test "relational index publication installed receiver binds fresh decision and retains paired physical witnesses" {
+    const alloc = std.testing.allocator;
+    const progress = local.storage_db_relational_index_publication_progress;
+    const integrity = local.storage_db_relational_integrity_contract;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const plan = try publication.testing.plan(arena.allocator());
+    @constCast(plan.owners)[0].receipt_authority = .native;
+    var prepared = try plan.prepare(alloc);
+    defer prepared.deinit();
+    var dispatch = try std.json.parseFromSlice(publication.Dispatch, alloc, prepared.dispatch[0], .{});
+    defer dispatch.deinit();
+    var inputs = try std.json.parseFromSlice(publication.Inputs, alloc, prepared.inputs, .{});
+    defer inputs.deinit();
+    var driver: TestDriver = .{ .value = .{ .metadata_group_id = 13, .metadata_incarnation = @splat('1'), .head = prepared.head, .owner = prepared.owners[0], .disposition = .execute, .dispatch = dispatch.value, .inputs = inputs.value } };
+    const admission = try driver.value.nativeAdmission();
+    var admitted = try driver.admitNativeIndexOwner(alloc, plan.owners[0].range.group_id, plan.before.name, admission, "synthetic", .{});
+    defer admitted.deinit();
+    driver.binding.?.phase = .reserved;
+    const binding = driver.binding.?;
+    inline for (.{ progress.Action.fenced, progress.Action.reserved }, 1..) |action, sequence| {
+        const next = try progress.acknowledge(driver.value.head, driver.value.owner, driver.value.head.revision, .{ .owner = driver.value.owner.owner, .action = action, .position = .{ .native = .{ .namespace = binding.fence.namespace, .sequence = sequence } }, .candidate_digest = prepared.head.candidate_digest, .reservation_digest = prepared.head.reservation_digest, .evidence_digest = @splat(9) });
+        driver.value.head = next.head;
+        driver.value.owner = next.owner;
+    }
+    driver.value.head.completed_sources = 1;
+    driver.value.head.completion_revision = 1;
+    driver.value.owner.source_completed = true;
+    driver.value.owner.source_delivery = @splat(9);
+    var build = try native.BuildRequest.init(try driver.value.nativeExecutionIdentity(.{ .table_id = plan.before.table_id, .group_id = plan.owners[0].range.group_id, .id = plan.id, .operation = .build }), binding, .{});
+    build.target_expectation = .{ .metadata_incarnation = @splat('1'), .binding_digest = integrity.hash(&try binding.encode()), .generation = @splat(2), .completion_revision = 1, .source_consumption_digest = @splat(3), .source_progress_digest = @splat(4), .table_name_digest = integrity.hash(plan.before.name), .rows = 1, .inventory_xor = @splat(5), .provenance = @splat(6) };
+    driver.inventory_finished = true;
+    driver.generation_pages = 1;
+    driver.audit_pages = 1;
+    var built = try driver.stepNativeIndexOwnerBuildAtRoot(alloc, plan.owners[0].range.group_id, plan.before.name, build, 7, .{});
+    defer built.outcome.deinit();
+    try built.outcome.value.validateFor(build);
+    const validated = built.outcome.value.validated;
+    const acknowledged = try progress.acknowledge(driver.value.head, driver.value.owner, driver.value.head.revision, validated.logical.receipt.?);
+    driver.value.head = try acknowledged.head.decidePublish(acknowledged.head.revision);
+    driver.value.owner = acknowledged.owner;
+    driver.value.native_install = .{ .validation = .{ .command = validated.logical.command, .position = validated.logical.position }, .decision_digest = try publication.NativeInstallGrant.decisionDigest(13, driver.value.metadata_incarnation, driver.value.head) };
+    const seed: [32]u8 = @splat(9);
+    const pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
+    const root: local.storage_db_root_signing_identity.State = .{ .seed = seed, .public_key = pair.public_key.toBytes(), .root_incarnation = 7 };
+    const owner_binding: @import("../metadata/standalone_native_owner.zig").Binding = .{ .metadata_incarnation = @splat('1'), .node_id = 2, .store_id = 3, .root_incarnation = 7 };
+    driver.value.native_signing = .{ .identity = .{ .metadata_incarnation = @splat('1'), .node_id = 2, .store_id = 3, .root_incarnation = 7, .public_key = root.public_key }, .reporter_incarnation = 4, .binding_digest = try owner_binding.digest() };
+    const command: local.storage_db_relational_index_validation.InstallCommand = .{ .validation = driver.value.native_install.?.validation, .metadata_decision = driver.value.native_install.?.decision_digest, .schema_digest = @splat(3), .activation_digest = @splat(4) };
+    const position: local.storage_db_receipt_position.Native = .{ .namespace = binding.fence.namespace, .sequence = 9 };
+    driver.installation_response = .{ .installed = .{ .physical = validated.physical, .logical = .{ .command = command, .position = position, .duplicate = false, .receipt = try command.receipt(position) } } };
+    const signing_view = driver.value.native_signing.?;
+    for ([_]progress.Action{ .fenced, .reserved, .validated }, [_]u64{ 1, 2, 8 }) |action, sequence| {
+        const receipt: progress.Receipt = if (action == .validated) try validated.logical.command.receipt(validated.logical.position) else .{ .owner = driver.value.owner.owner, .action = action, .position = .{ .native = .{ .namespace = binding.fence.namespace, .sequence = sequence } }, .candidate_digest = prepared.head.candidate_digest, .reservation_digest = prepared.head.reservation_digest, .evidence_digest = @splat(9) };
+        const proof = try (publication.RootProof{ .identity = signing_view.identity, .reporter_incarnation = signing_view.reporter_incarnation, .authority = .{ .native = signing_view.binding_digest }, .root_generation = driver.root_generation, .signature = undefined }).sign(root, try receipt.digest());
+        driver.value.owner.attestations[@backingInt(action)] = try proof.commitment(try receipt.digest());
+    }
+    try testSchedulerInstallationFaults(alloc, driver.value, binding, root, driver.installation_response.?);
+    const request: Request = .{ .table_id = plan.before.table_id, .group_id = plan.owners[0].range.group_id, .id = plan.id, .operation = .install };
+    var result = try step(alloc, &driver, &driver, plan.before.name, request, .{});
+    defer result.deinit();
+    try std.testing.expect(result == .installing and result.needsSigning());
+    try std.testing.expectEqual(@as(usize, 1), driver.installation_calls);
+    try std.testing.expectEqual(@as(usize, 0), driver.inspections);
+    try std.testing.expectEqual(@as(usize, 0), driver.admission_reads);
+    driver.root_generation += 1;
+    try std.testing.expectEqual(@as(u64, 9), result.rootGeneration().?);
+    try std.testing.expectError(error.IndexOwnerReceiptChanged, result.signNative(root, 2, 3, 5));
+    try result.signNative(root, 2, 3, 4);
+    const response = try result.response();
+    const ack = (try response.installationAck(request)).?;
+    try std.testing.expect(ack.validation == null and ack.installation != null);
+    var bare = ack;
+    bare.installation = null;
+    try std.testing.expectError(error.InvalidIndexOwnerReceipt, bare.validate());
+    const encoded = try publication.StoredProof.encode(ack.signed, ack.validation, ack.installation);
+    const decoded = try publication.StoredProof.decode(alloc, encoded.slice());
+    try std.testing.expectEqualDeep(ack.installation.?, decoded.installation.?);
+    const fixed = try ack.signed.encode();
+    try std.testing.expectError(error.InvalidCatalogRecord, publication.StoredProof.decode(alloc, &fixed));
+    var substituted = ack;
+    substituted.installation.?.command.metadata_decision[0] ^= 1;
+    try std.testing.expectError(error.InvalidIndexOwnerReceipt, substituted.validate());
+    var incomplete = response;
+    incomplete.installing.signed_audit = null;
+    try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, incomplete.validate(request));
+    driver.installation_response.?.installed.logical.replication_pending = true;
+    driver.installation_response.?.installed.logical.error_name = "ReplicationOutboxPending";
+    driver.installation_response.?.installed.logical.receipt = null;
+    var pending = try step(alloc, &driver, &driver, plan.before.name, request, .{});
+    defer pending.deinit();
+    try std.testing.expect(!pending.needsSigning());
+    try std.testing.expectError(error.NativeIndexSigningUnavailable, pending.signNative(root, 2, 3, 4));
+    try std.testing.expect(try (try pending.response()).installationAck(request) == null);
 }
 
 test "relational index publication native receiver signs pinned authority and preserves progress on signing failure" {

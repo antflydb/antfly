@@ -290,42 +290,78 @@ pub const ValidationWitness = struct {
         return self.verifyPhysicalAndScope(receipt);
     }
     fn verifyPhysicalAndScope(self: @This(), receipt: SignedReceipt) !void {
-        _ = try self.signed.verifiedDigest(self.outcome);
         const command = try self.outcome.logicalCommand();
-        if (!std.meta.eql(try command.receipt(receipt.receipt.position.native), receipt.receipt) or
-            !std.meta.eql(self.signed.proof.identity, receipt.proof.identity) or
+        if (!std.meta.eql(try command.receipt(receipt.receipt.position.native), receipt.receipt)) return error.InvalidIndexOwnerReceipt;
+        try (AuditEvidence{ .outcome = self.outcome, .signed = self.signed }).verifyScope(receipt);
+    }
+};
+
+pub const AuditEvidence = struct {
+    outcome: native_control.AuditOutcome,
+    signed: SignedAudit,
+
+    fn verifyScope(self: @This(), receipt: SignedReceipt) !void {
+        _ = try self.signed.verifiedDigest(self.outcome);
+        if (!std.meta.eql(self.signed.proof.identity, receipt.proof.identity) or
             !std.meta.eql(self.signed.proof.authority, receipt.proof.authority) or
             self.signed.proof.reporter_incarnation != receipt.proof.reporter_incarnation or
             self.signed.proof.root_generation != receipt.proof.root_generation) return error.InvalidIndexOwnerReceipt;
     }
 };
 
+/// The installed logical cut is distinct from the original generation audit.
+/// Metadata must additionally join this command to its retained validation and
+/// durable publication decision, under the successor catalog's ownership.
+pub const InstallationWitness = struct {
+    outcome: native_control.AuditOutcome,
+    command: local.storage_db_relational_index_validation.InstallCommand,
+    signed: SignedAudit,
+
+    pub fn verifyFor(self: @This(), receipt: SignedReceipt) !void {
+        if (receipt.receipt.action != .installed or receipt.receipt.position != .native) return error.InvalidIndexOwnerReceipt;
+        try receipt.verifySignature();
+        try self.verifyPhysicalAndScope(receipt);
+    }
+    fn verifyPhysicalAndScope(self: @This(), receipt: SignedReceipt) !void {
+        try self.command.validate();
+        if (!std.meta.eql(self.command.validation.command, try self.outcome.logicalCommand()) or
+            !std.meta.eql(try self.command.receipt(receipt.receipt.position.native), receipt.receipt)) return error.InvalidIndexOwnerReceipt;
+        try (AuditEvidence{ .outcome = self.outcome, .signed = self.signed }).verifyScope(receipt);
+    }
+};
+
+fn requireWitnesses(signed: SignedReceipt, validation: ?ValidationWitness, installation: ?InstallationWitness) !void {
+    const is_native = signed.receipt.owner.authority == .native;
+    if ((is_native and signed.receipt.action == .validated) != (validation != null) or
+        (is_native and signed.receipt.action == .installed) != (installation != null)) return error.InvalidIndexOwnerReceipt;
+}
+
 /// One retained stage record, not a second independently committed journal.
-/// Existing non-validation receipts retain their fixed codec. Native validation
-/// has a mandatory bounded witness; no bare/legacy validation record is accepted.
+/// Native validation/installation retain mandatory bounded physical witnesses;
+/// neither bare receipts nor older private witness formats are accepted.
 pub const StoredProof = struct {
-    const magic = "AIVP\x01\x00\x00\x00";
+    const magic = "AIVP\x02\x00\x00\x00";
     bytes: [max_ack_bytes]u8,
     len: usize,
-    pub const Decoded = struct { signed: SignedReceipt, validation: ?ValidationWitness };
+    const Witnesses = struct { validation: ?ValidationWitness, installation: ?InstallationWitness };
+    pub const Decoded = struct { signed: SignedReceipt, validation: ?ValidationWitness, installation: ?InstallationWitness = null };
 
     pub fn slice(self: *const @This()) []const u8 {
         return self.bytes[0..self.len];
     }
-    pub fn encode(signed: SignedReceipt, validation: ?ValidationWitness) !@This() {
-        const required = signed.receipt.owner.authority == .native and signed.receipt.action == .validated;
-        if (required != (validation != null)) return error.InvalidIndexOwnerReceipt;
-        if (validation) |witness| try witness.verifyFor(signed) else try signed.verifySignature();
-        return encodeCanonical(signed, validation);
+    pub fn encode(signed: SignedReceipt, validation: ?ValidationWitness, installation: ?InstallationWitness) !@This() {
+        try requireWitnesses(signed, validation, installation);
+        if (validation) |witness| try witness.verifyFor(signed) else if (installation) |witness| try witness.verifyFor(signed) else try signed.verifySignature();
+        return encodeCanonical(signed, validation, installation);
     }
-    fn encodeCanonical(signed: SignedReceipt, validation: ?ValidationWitness) !StoredProof {
+    fn encodeCanonical(signed: SignedReceipt, validation: ?ValidationWitness, installation: ?InstallationWitness) !StoredProof {
         var result: @This() = .{ .bytes = undefined, .len = 0 };
         const fixed = try signed.encode();
-        if (validation) |witness| {
+        if (validation != null or installation != null) {
             @memcpy(result.bytes[0..8], magic);
             @memcpy(result.bytes[8..][0..SignedReceipt.encoded_len], &fixed);
             var writer = std.Io.Writer.fixed(result.bytes[8 + SignedReceipt.encoded_len ..]);
-            std.json.Stringify.value(witness, .{}, &writer) catch return error.InvalidIndexOwnerReceipt;
+            std.json.Stringify.value(Witnesses{ .validation = validation, .installation = installation }, .{}, &writer) catch return error.InvalidIndexOwnerReceipt;
             result.len = 8 + SignedReceipt.encoded_len + writer.end;
         } else {
             @memcpy(result.bytes[0..SignedReceipt.encoded_len], &fixed);
@@ -336,22 +372,24 @@ pub const StoredProof = struct {
     pub fn decode(alloc: Allocator, raw: []const u8) !Decoded {
         if (raw.len == SignedReceipt.encoded_len) {
             const signed = try SignedReceipt.decode(raw);
-            if (signed.receipt.owner.authority == .native and signed.receipt.action == .validated) return error.InvalidCatalogRecord;
+            requireWitnesses(signed, null, null) catch return error.InvalidCatalogRecord;
             return .{ .signed = signed, .validation = null };
         }
         if (raw.len <= 8 + SignedReceipt.encoded_len or raw.len > max_ack_bytes or !std.mem.eql(u8, raw[0..8], magic)) return error.InvalidCatalogRecord;
         const signed = try SignedReceipt.decode(raw[8..][0..SignedReceipt.encoded_len]);
-        if (signed.receipt.owner.authority != .native or signed.receipt.action != .validated) return error.InvalidCatalogRecord;
-        var parsed = std.json.parseFromSlice(ValidationWitness, alloc, raw[8 + SignedReceipt.encoded_len ..], .{ .ignore_unknown_fields = false, .max_value_len = 128 }) catch |err| switch (err) {
+        var parsed = std.json.parseFromSlice(Witnesses, alloc, raw[8 + SignedReceipt.encoded_len ..], .{ .ignore_unknown_fields = false, .max_value_len = 128 }) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return error.InvalidCatalogRecord,
         };
         defer parsed.deinit();
         // The fixed receipt decoder already verified its logical signature.
-        parsed.value.verifyPhysicalAndScope(signed) catch return error.InvalidCatalogRecord;
-        const canonical = try encodeCanonical(signed, parsed.value);
+        const witnesses = parsed.value;
+        requireWitnesses(signed, witnesses.validation, witnesses.installation) catch return error.InvalidCatalogRecord;
+        if (witnesses.validation) |witness| witness.verifyPhysicalAndScope(signed) catch return error.InvalidCatalogRecord;
+        if (witnesses.installation) |witness| witness.verifyPhysicalAndScope(signed) catch return error.InvalidCatalogRecord;
+        const canonical = try encodeCanonical(signed, witnesses.validation, witnesses.installation);
         if (!std.mem.eql(u8, raw, canonical.slice())) return error.InvalidCatalogRecord;
-        return .{ .signed = signed, .validation = parsed.value };
+        return .{ .signed = signed, .validation = witnesses.validation, .installation = witnesses.installation };
     }
 };
 pub const max_ack_status_bytes = 8192;
@@ -375,14 +413,20 @@ pub const Ack = struct {
     expected_revision: u64,
     signed: SignedReceipt,
     validation: ?ValidationWitness = null,
+    installation: ?InstallationWitness = null,
 
     pub fn validate(self: Ack) !void {
         if (self.table_id == 0 or self.signed.receipt.owner.namespace.table_id != self.table_id or
             self.expected_revision == 0 or self.expected_revision == std.math.maxInt(u64)) return error.InvalidGenerationPublication;
         try (progress.OwnerState{ .owner = self.signed.receipt.owner }).validate();
-        const required = self.signed.receipt.owner.authority == .native and self.signed.receipt.action == .validated;
-        if (required != (self.validation != null)) return error.InvalidIndexOwnerReceipt;
-        if (self.validation) |witness| try witness.verifyFor(self.signed) else try self.signed.verifySignature();
+        try requireWitnesses(self.signed, self.validation, self.installation);
+        if (self.validation) |witness| try witness.verifyFor(self.signed) else if (self.installation) |witness| try witness.verifyFor(self.signed) else try self.signed.verifySignature();
+    }
+
+    pub fn auditEvidence(self: @This()) ?AuditEvidence {
+        if (self.validation) |witness| return .{ .outcome = witness.outcome, .signed = witness.signed };
+        if (self.installation) |witness| return .{ .outcome = witness.outcome, .signed = witness.signed };
+        return null;
     }
 };
 
@@ -392,6 +436,7 @@ pub const AckStatus = struct {
     head: progress.Head,
     owner: progress.OwnerState,
     validation_digest: ?Digest = null,
+    installation_digest: ?Digest = null,
     replication_pending: bool = false,
 
     pub fn isAcknowledged(self: AckStatus, request: Ack) !bool {
@@ -419,6 +464,10 @@ pub const AckStatus = struct {
         if (std.mem.allEqual(u8, &root, 0)) return error.InvalidCatalogRecord;
         if (request.validation) |witness| {
             const retained = self.validation_digest orelse return error.InvalidCatalogRecord;
+            if (!std.mem.eql(u8, &retained, &witness.signed.outcome_digest)) return false;
+        }
+        if (request.installation) |witness| {
+            const retained = self.installation_digest orelse return error.InvalidCatalogRecord;
             if (!std.mem.eql(u8, &retained, &witness.signed.outcome_digest)) return false;
         }
         return !self.replication_pending and std.mem.eql(u8, &root, &try request.signed.commitment());
@@ -528,7 +577,8 @@ pub const NativeInstallGrant = struct {
 
     pub fn decisionDigest(group: u64, incarnation: local.metadata_incarnation.MetadataClusterIncarnation, head: progress.Head) !Digest {
         try head.validate();
-        if (group == 0 or !local.metadata_incarnation.isValid(incarnation) or head.phase != .installing) return error.InvalidCatalogRecord;
+        if (group == 0 or !local.metadata_incarnation.isValid(incarnation) or
+            (head.phase != .installing and head.phase != .releasing and head.phase != .published)) return error.InvalidCatalogRecord;
         var state = std.crypto.hash.Blake3.init(.{});
         state.update("antfly/native-index-install-decision/v1");
         state.update(&incarnation);
