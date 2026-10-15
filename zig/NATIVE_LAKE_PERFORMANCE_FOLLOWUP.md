@@ -4505,3 +4505,19 @@ dense and sparse executions through the shared scheduler; private mutable state,
 serial saturation/quota fallback, cancellation draining and declaration-order
 fusion are explicit. Provider retention qualification and archive-scale latency /
 RSS benchmarks remain deferred; no throughput multiplier is claimed.
+
+
+Final qualification after merging origin/main `89df7aff46` (#1140): the Debug
+CLI rebuilt; all 476 lake integration tests passed (175 shared-engine and 301
+server), all 72 focused tests passed (14 shared-engine and 58 server), and all 46
+real Parquet/Iceberg E2Es passed in 311.75 seconds. The large indexed-predicate
+fixture asserts native predicate admission; the multi-pack fixture compares
+boosted negative-only Boolean and repeated-term phrase pages with an all-row
+request. Nested vector scheduling regressions cover serial execution under the
+enclosing lane, cancellation, and enclosing workspace exhaustion. Reverse tuple
+reductions use conservative bounded prefixes within the 256-byte page format;
+long-key publication, legacy children, and saturated prefixes retain safe
+fallbacks. Compiler-local native error generation, Zig/Python formatting and
+lint, whitespace, all 100 changed source license headers, and the Apache product
+boundary passed (2,053 source files). Live-provider retention qualification and
+archive-scale latency/RSS benchmarks remain deferred.
