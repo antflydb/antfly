@@ -2033,7 +2033,7 @@ fn familyCheckpointParity(comptime expected: FamilyCheckpoint) !void {
         }
     }
 }
-fn publishedCheckpointParity(comptime variant: []const u8, comptime environment: [:0]const u8, comptime fixture_name: []const u8) !void {
+fn publishedCheckpointParity(comptime variant: []const u8, comptime environment: [:0]const u8, comptime fixture_name: []const u8, comptime transformers_wrapper: bool) !void {
     const directory = @import("antfly_platform").env.getenv(environment) orelse return error.SkipZigTest;
     const fixtures = @import("../architectures/gliner/boundary_parity_test.zig");
     const safetensors = @import("../models/safetensors.zig");
@@ -2066,8 +2066,15 @@ fn publishedCheckpointParity(comptime variant: []const u8, comptime environment:
     try std.testing.expectEqualStrings(fixture.value.tokenizer_sha256, fixture.value.model_files.@"tokenizer.json".sha256);
     const tokenizer = try @import("inference_hf_tokenizer").HfTokenizer.loadFromBytes(a, tokenizer_bytes);
     defer tokenizer.tokenizer().deinitTokenizer();
-    const config_bytes = try readPinnedFile(a, directory, "config.json", fixture.value.model_files.@"config.json");
+    const config_bytes = if (transformers_wrapper)
+        try fixtures.fixtureBytes(a, "models/base/config_transformers.json")
+    else
+        try readPinnedFile(a, directory, "config.json", fixture.value.model_files.@"config.json");
     defer a.free(config_bytes);
+    if (transformers_wrapper) {
+        const identity = @import("../models/gliner_boundary_qualification.zig").fastino_gliner25_base_v1_transformers;
+        try expectPinnedBytes(.{ .sha256 = &identity.sidecars[0].sha256, .size_bytes = identity.sidecars[0].size_bytes }, config_bytes);
+    }
     const encoder_bytes = try readPinnedFile(a, directory, "encoder_config/config.json", fixture.value.model_files.@"encoder_config/config.json");
     defer a.free(encoder_bytes);
     const tokenizer_config = try readPinnedFile(a, directory, "tokenizer_config.json", fixture.value.model_files.@"tokenizer_config.json");
@@ -2096,13 +2103,13 @@ fn publishedCheckpointParity(comptime variant: []const u8, comptime environment:
 }
 
 test "gliner boundary pipeline Python parity pinned small checkpoint all inference tasks" {
-    try publishedCheckpointParity("small", "ANTFLY_GLINER25_SMALL_MODEL_DIR", "pipeline_cases.json");
+    try publishedCheckpointParity("small", "ANTFLY_GLINER25_SMALL_MODEL_DIR", "pipeline_cases.json", false);
 }
 test "gliner boundary pipeline Python parity pinned base checkpoint all inference tasks" {
-    try publishedCheckpointParity("base", "ANTFLY_GLINER25_BASE_MODEL_DIR", "pipeline_cases_base.json");
+    try publishedCheckpointParity("base", "ANTFLY_GLINER25_BASE_MODEL_DIR", "pipeline_cases_base.json", false);
 }
 test "gliner boundary pipeline Python parity pinned multi checkpoint all inference tasks" {
-    try publishedCheckpointParity("multi", "ANTFLY_GLINER25_MULTI_MODEL_DIR", "pipeline_cases_multi.json");
+    try publishedCheckpointParity("multi", "ANTFLY_GLINER25_MULTI_MODEL_DIR", "pipeline_cases_multi.json", false);
 }
 test "gliner boundary pipeline pinned multilingual v1 family reference" {
     try familyCheckpointParity(multilingual_family_checkpoints[0]);
@@ -2642,4 +2649,8 @@ test "gliner boundary pipeline attribute labels consume the shared value budget"
             try std.testing.expectEqual(@as(usize, 2), groups[0].values[0].attributes[0].labels.len);
         }
     }
+}
+
+test "gliner boundary pipeline Python parity Transformers base wrapper all inference tasks" {
+    try publishedCheckpointParity("base", "ANTFLY_GLINER25_BASE_MODEL_DIR", "pipeline_cases_base.json", true);
 }

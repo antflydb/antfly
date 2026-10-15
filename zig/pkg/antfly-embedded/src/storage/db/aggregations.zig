@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const storage_engine = @import("../engine_selection.zig");
 const Allocator = std.mem.Allocator;
 pub const contract = @import("aggregations_contract.zig");
 const types = @import("types.zig");
@@ -166,6 +167,7 @@ pub fn computeSearchAggregations(
     result: types.SearchResult,
     ctx: Context,
 ) anyerror![]SearchAggregationResult {
+    if (comptime storage_engine.enabled) return @import("../aggregation_engine.zig").compute(alloc, requests, result, ctx);
     if (result.hits.len > max_aggregation_source_hits) return error.QueryCandidateBudgetExceeded;
     return try computeSearchAggregationsAtDepth(alloc, requests, result, ctx, true);
 }

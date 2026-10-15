@@ -41,7 +41,9 @@ fn describePrepared(handle: *h.Handle, request_json: []const u8, alloc: std.mem.
     defer description.deinit();
     return api.stringifyJson(.{ .columns = description.binding.columns, .parameter_types = description.binding.parameter_types });
 }
-pub export fn antfly_db_sql_describe_json(ptr: ?*anyopaque, request: h.capi.Slice, out: *h.capi.Buffer) h.capi.ErrorCode {
+pub fn antfly_db_sql_describe_json(ptr: ?*anyopaque, request: h.capi.Slice, out: *h.capi.Buffer) callconv(.c) h.capi.ErrorCode {
+    if (comptime @import("../storage/engine_selection.zig").enabled)
+        return @call(.auto, @extern(*const @TypeOf(antfly_db_sql_describe_json), .{ .name = "antfly_db_sql_describe_json" }), .{ ptr, request, out });
     h.capi.clearLastError();
     out.* = .{};
     const guard = api.enterHandle(ptr, .exclusive) orelse return h.capi.recordError(.invalid_argument, @src().fn_name ++ ": invalid or closed database handle");
@@ -53,4 +55,10 @@ pub export fn antfly_db_sql_describe_json(ptr: ?*anyopaque, request: h.capi.Slic
     if (guard.handle.parent_id != null) return h.capi.recordError(.invalid_argument, @src().fn_name ++ ": operation requires a root database handle");
     out.* = describe(guard.handle, request.bytes()) catch |err| return @import("sql_cursor.zig").diagnostic(err, out);
     return .ok;
+}
+
+comptime {
+    @import("exports.zig").publish(@This(), &.{
+        "antfly_db_sql_describe_json",
+    });
 }

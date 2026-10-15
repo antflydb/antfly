@@ -84,6 +84,7 @@ pub const local_test_sources = if (@import("builtin").is_test) @import("local_te
 test {
     _ = @import("api/lake_sql_cursor.zig");
     _ = @import("api/native_query_repository.zig");
+    _ = @import("api/lake_query_metrics.zig");
     _ = @import("api/lake_index_native_text.zig");
     _ = @import("api/lake_index_text_query.zig");
     _ = @import("api/lake_index_ordered_rows.zig");

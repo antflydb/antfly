@@ -193,7 +193,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const revisions = GeneratedWriteReadSnapshot.revisions;
             const entries = try alloc.alloc(GeneratedWriteReadSnapshot.Entry, writes.len);
             errdefer alloc.free(entries);
-            var txn = try self.core.store.beginReadTxn();
+            var txn = try S.ownerField(self, "core").*.store.beginReadTxn();
             defer txn.abort();
             for (writes, entries) |write, *entry| {
                 const key = revisions.keyForPhysical(write.key) orelse try revisions.keyForDocumentAlloc(alloc, write.key);
@@ -234,9 +234,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // Read values and version timestamps from the same MVCC snapshot. This
             // replaces two point transactions per transform and allows transform
             // parsing/expansion to proceed without holding the DB-wide apply lock.
-            var read_txn = try self.core.store.beginReadTxn();
+            var read_txn = try S.ownerField(self, "core").*.store.beginReadTxn();
             defer read_txn.abort();
-            var schema_view = self.core.acquireSchemaView();
+            var schema_view = S.ownerField(self, "core").*.acquireSchemaView();
             defer if (schema_view) |*view| view.release();
             const entries = try alloc.alloc(TransformReadSnapshot.Entry, keys.items.len);
             var initialized: usize = 0;
@@ -258,7 +258,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         break :blk try alloc.dupe(u8, stored);
                     const version = try relational_store.rowSchemaVersion(stored);
                     if (schema_view) |view| if (view.version() == version) {
-                        const row = if (self.core.store.valuesAreAuthenticated())
+                        const row = if (S.ownerField(self, "core").*.store.valuesAreAuthenticated())
                             try relational_row_codec.ordinalRowViewTrusted(
                                 stored,
                                 view.tableSchema().*,
@@ -272,10 +272,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             );
                         break :blk try row.reconstructValueAlloc(alloc);
                     };
-                    var historical = (try self.core.acquireSchemaVersionView(version)) orelse
+                    var historical = (try S.ownerField(self, "core").*.acquireSchemaVersionView(version)) orelse
                         return error.UnknownSchemaVersion;
                     defer historical.release();
-                    const row = if (self.core.store.valuesAreAuthenticated())
+                    const row = if (S.ownerField(self, "core").*.store.valuesAreAuthenticated())
                         try relational_row_codec.ordinalRowViewTrusted(
                             stored,
                             historical.tableSchema().*,
@@ -389,7 +389,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     if (transform_snapshot) |read_snapshot| break :blk read_snapshot.valueFor(transform.key);
                     // Borrowed mutation execution always supplies a pinned read
                     // set; it has no foreground lookup capability to fall back to.
-                    if (comptime @TypeOf(self) == *Execution) return error.PreparedReadSetChanged;
+                    if (S.isRecoveryExecution(self)) return error.PreparedReadSetChanged;
                     break :blk try self.get(alloc, transform.key);
                 };
                 defer if (maybe_index == null and transform_snapshot == null) {
@@ -553,7 +553,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             } else false;
             if (!has_graph) return unchanged;
             if (page.source.artifact_catalog == null or page.source.artifact_catalog.?.effect_protocol != 15) return error.InvalidMergePage;
-            var txn = try self.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
+            var txn = try S.ownerField(self, "core").*.store.beginReadTxnWithBlockCacheAdmission(.transient);
             defer txn.abort();
             const raw_state = txn.get(merge_state_mod.key) catch |err| switch (err) {
                 error.NotFound => return unchanged,
@@ -571,12 +571,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (!progress.value.matches(req.merge_replication.?) or !progress.value.source.eql(page.source)) return unchanged;
             // Replays must remain marker-only even after catalog removal/rebuild.
             if (try pages.plan(progress.value, req) == .replay) return unchanged;
-            const observed = try inventory.status(alloc, &txn, @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace));
+            const observed = try inventory.status(alloc, &txn, @import("online_source_contract.zig").namespaceBytes(S.ownerField(self, "core").*.identity_namespace));
             if (!observed.ready or observed.ordered == null) return error.ArtifactCatalogDrift;
-            const io = self.backend_runtime.io() orelse std.Options.debug_io;
-            try self.local_execution.merge_artifact_layout_mutex.lock(io);
-            defer self.local_execution.merge_artifact_layout_mutex.unlock(io);
-            const layout = try self.local_execution.merge_artifact_layout.get(self.alloc, &txn, progress.value, observed.ordered.?, try inventory.catalogs(&txn));
+            const io = S.ownerField(self, "backend_runtime").*.io() orelse std.Options.debug_io;
+            try S.ownerField(self, "local_execution").*.merge_artifact_layout_mutex.lock(io);
+            defer S.ownerField(self, "local_execution").*.merge_artifact_layout_mutex.unlock(io);
+            const layout = try S.ownerField(self, "local_execution").*.merge_artifact_layout.get(S.ownerField(self, "alloc").*, &txn, progress.value, observed.ordered.?, try inventory.catalogs(&txn));
             var arena = std.heap.ArenaAllocator.init(alloc);
             errdefer arena.deinit();
             const owned = arena.allocator();
@@ -706,7 +706,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn validateGeneratedWriteReadSnapshot(self: anytype, read_snapshot: GeneratedWriteReadSnapshot) !void {
             if (read_snapshot.entries.len == 0) return;
-            var txn = try self.core.store.beginProbeTxn();
+            var txn = try S.ownerField(self, "core").*.store.beginProbeTxn();
             defer txn.abort();
             for (read_snapshot.entries) |entry| {
                 if (try GeneratedWriteReadSnapshot.revisions.load(&txn, entry.key) != entry.revision)
@@ -716,9 +716,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn validatePreparedSchemaViewLocked(self: anytype, prepared: ?schema_registry_mod.SchemaView) !void {
             if (prepared) |view| {
-                if (!self.core.isSchemaViewCurrent(view)) return error.PreparedGenerationChanged;
+                if (!S.ownerField(self, "core").*.isSchemaViewCurrent(view)) return error.PreparedGenerationChanged;
             } else {
-                var current = self.core.acquireSchemaView();
+                var current = S.ownerField(self, "core").*.acquireSchemaView();
                 defer if (current) |*view| view.release();
                 if (current != null) return error.PreparedGenerationChanged;
             }
@@ -726,13 +726,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn validateTransformReadSnapshot(self: anytype, read_snapshot: TransformReadSnapshot) !void {
             if (read_snapshot.entries.len == 0) return;
-            const predicates = try self.alloc.alloc(transactions_mod.VersionPredicate, read_snapshot.entries.len);
-            defer self.alloc.free(predicates);
+            const predicates = try S.ownerField(self, "alloc").*.alloc(transactions_mod.VersionPredicate, read_snapshot.entries.len);
+            defer S.ownerField(self, "alloc").*.free(predicates);
             for (read_snapshot.entries, predicates) |entry, *predicate| predicate.* = .{
                 .key = entry.key,
                 .expected_version = entry.expected_version,
             };
-            self.core.checkVersionPredicates(predicates, null) catch |err| switch (err) {
+            S.ownerField(self, "core").*.checkVersionPredicates(predicates, null) catch |err| switch (err) {
                 error.VersionConflict => return error.PreparedReadSetChanged,
                 else => return err,
             };
@@ -789,7 +789,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             doc_value: []const u8,
             extracted: *mapper.ExtractedWrite,
         ) !void {
-            if (!self.core.hasGraphIndexes() or !extracted.hasDocument()) return;
+            if (!S.ownerField(self, "core").*.hasGraphIndexes() or !extracted.hasDocument()) return;
 
             var parsed = try std.json.parseFromSlice(std.json.Value, alloc, doc_value, .{});
             defer parsed.deinit();
@@ -801,7 +801,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn augmentExtractedWriteWithGraphFieldEdgesParsed(self: anytype, alloc: Allocator, key: []const u8, root: std.json.Value, extracted: *mapper.ExtractedWrite) !void {
-            return @import("graph_field_plan.zig").fromCatalog(self.core, alloc, key, root, extracted);
+            return @import("graph_field_plan.zig").fromCatalog(S.ownerField(self, "core").*, alloc, key, root, extracted);
         }
 
         pub fn buildOverwrittenDocKeys(
@@ -938,7 +938,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         ) !void {
             if (jobs.items.len == 0) return;
             defer clearGeneratedDenseMemoJobs(memo.alloc, jobs);
-            const runtime = self.enrichment_runtime orelse return;
+            const runtime = S.ownerField(self, "enrichment_runtime").* orelse return;
             const embedder = runtime.config.dense_embedder orelse return;
             const texts = try memo.alloc.alloc([]const u8, jobs.items.len);
             defer memo.alloc.free(texts);
@@ -1040,7 +1040,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         ) !void {
             if (jobs.items.len == 0) return;
             defer clearGeneratedSparseMemoJobs(memo.alloc, jobs);
-            const runtime = self.enrichment_runtime orelse return;
+            const runtime = S.ownerField(self, "enrichment_runtime").* orelse return;
             const embedder = runtime.config.sparse_embedder orelse return;
             const texts = try memo.alloc.alloc([]const u8, jobs.items.len);
             defer memo.alloc.free(texts);
@@ -1134,10 +1134,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             preplanned: ?*const GeneratedBatchWritePlan,
             generated_memo: ?*GeneratedEmbeddingMemo,
         ) !PrecomputedGeneratedBatch {
-            if (preplanned == null and !self.core.hasGeneratedEnrichmentTargets()) return .{};
+            if (preplanned == null and !S.ownerField(self, "core").*.hasGeneratedEnrichmentTargets()) return .{};
             if (preplanned) |plan| if (plan.rows.len != req.writes.len) return error.InvalidArgument;
             var fallback_write_plan = if (preplanned == null)
-                try self.core.index_manager.acquireWritePlanSnapshot()
+                try S.ownerField(self, "core").*.index_manager.acquireWritePlanSnapshot()
             else
                 null;
             defer if (fallback_write_plan) |*view| view.release();
@@ -1232,7 +1232,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 var inline_embedding_cleanup = InlineChunkEmbeddingCleanup{};
                 defer inline_embedding_cleanup.deinit(alloc);
 
-                const document_execution: ?*enrichment_runtime_mod.PrecommitDocumentExecution = if (self.enrichment_runtime) |runtime|
+                const document_execution: ?*enrichment_runtime_mod.PrecommitDocumentExecution = if (S.ownerField(self, "enrichment_runtime").*) |runtime|
                     if (precompute_mode == .all and enrichment_runtime_mod.PrecommitDocumentExecution.useful(generated)) try enrichment_runtime_mod.PrecommitDocumentExecution.create(runtime, generated, (try extracted[i].logicalJson()).?) else null
                 else
                     null;
@@ -1247,7 +1247,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                                 const intent = @import("artifact_reprocess_intent.zig");
                                 const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "asset", requestArtifactName(request));
                                 defer alloc.free(manifest_key);
-                                const manifest = self.core.store.get(alloc, manifest_key) catch |err| switch (err) {
+                                const manifest = S.ownerField(self, "core").*.store.get(alloc, manifest_key) catch |err| switch (err) {
                                     error.NotFound => null,
                                     else => return err,
                                 };
@@ -1446,7 +1446,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     var seen = std.StringHashMapUnmanaged(void).empty;
                     defer seen.deinit(alloc);
                     try collectChunkEmbeddingSourcesFromWrites(alloc, &sources, &seen, pending_writes.chunkWritesForDoc(request.doc_key), request.doc_key, requestArtifactName(request), request.source_field);
-                    try collectChunkEmbeddingSourcesFromStore(alloc, db.core.store, &sources, &seen, request.doc_key, requestArtifactName(request), request.source_field, &pending_writes.values, pending_deletes);
+                    try collectChunkEmbeddingSourcesFromStore(alloc, S.ownerField(db, "core").*.store, &sources, &seen, request.doc_key, requestArtifactName(request), request.source_field, &pending_writes.values, pending_deletes);
                 } else {
                     var chunks_created: usize = 0;
                     sources = .fromOwnedSlice(try chunkEmbeddingSourcesForRequest(alloc, db, doc_value, request, cache, &chunks_created));
@@ -1470,7 +1470,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             for (sources.items) |source| {
                 const artifact_key = try embeddingArtifactKeyForBaseAlloc(alloc, source.key, requestEmbeddingName(request));
                 defer alloc.free(artifact_key);
-                const metadata = db.core.store.getArtifactMetadata(artifact_key) catch |err| switch (err) {
+                const metadata = S.ownerField(db, "core").*.store.getArtifactMetadata(artifact_key) catch |err| switch (err) {
                     error.NotFound => return null,
                     else => return err,
                 };
@@ -1491,7 +1491,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             plan: *const GeneratedBatchWritePlan,
             memo: *GeneratedEmbeddingMemo,
         ) !void {
-            const runtime = self.enrichment_runtime orelse return;
+            const runtime = S.ownerField(self, "enrichment_runtime").* orelse return;
             const embedder = runtime.config.dense_embedder orelse return;
             var jobs = std.ArrayListUnmanaged(GeneratedDenseMemoJob).empty;
             defer {
@@ -1581,7 +1581,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (!memo.reuse_stored_artifacts) return false;
             const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(memo.alloc, request.doc_key, requestEmbeddingName(request));
             defer memo.alloc.free(artifact_key);
-            const raw = self.core.store.get(memo.alloc, artifact_key) catch |err| switch (err) {
+            const raw = S.ownerField(self, "core").*.store.get(memo.alloc, artifact_key) catch |err| switch (err) {
                 error.NotFound => return false,
                 else => return err,
             };
@@ -1626,7 +1626,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             plan: *const GeneratedBatchWritePlan,
             memo: *GeneratedEmbeddingMemo,
         ) !void {
-            if (self.enrichment_runtime == null or self.enrichment_runtime.?.config.sparse_embedder == null) return;
+            if (S.ownerField(self, "enrichment_runtime").* == null or S.ownerField(self, "enrichment_runtime").*.?.config.sparse_embedder == null) return;
             var jobs = std.ArrayListUnmanaged(GeneratedSparseMemoJob).empty;
             defer {
                 clearGeneratedSparseMemoJobs(memo.alloc, &jobs);
@@ -1750,14 +1750,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn resolveWriteTimestampFromValue(self: anytype, fallback_timestamp_ns: u64, value: std.json.Value) !u64 {
-            const schema = self.core.schema orelse return fallback_timestamp_ns;
+            const schema = S.ownerField(self, "core").*.schema orelse return fallback_timestamp_ns;
             return try resolveWriteTimestampForSchemaValue(schema, fallback_timestamp_ns, value);
         }
 
         pub fn resolveWriteTimestampNs(self: anytype, fallback_timestamp_ns: u64, value_json: []const u8) !u64 {
-            const schema = self.core.schema orelse return fallback_timestamp_ns;
+            const schema = S.ownerField(self, "core").*.schema orelse return fallback_timestamp_ns;
             if (schema.ttl_duration_ns == 0) return fallback_timestamp_ns;
-            return (try ttlTimestampNsFromDocumentValue(self.alloc, schema, value_json)) orelse fallback_timestamp_ns;
+            return (try ttlTimestampNsFromDocumentValue(S.ownerField(self, "alloc").*, schema, value_json)) orelse fallback_timestamp_ns;
         }
 
         pub fn retainPreparedTextRoots(sync_level: types.SyncLevel, has_text_consumers: bool, split_shadow: bool) bool {
@@ -1859,13 +1859,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             };
             const maybe_db: ?*Database = db;
             var owner: ?RelationalPreparationOwner = if (maybe_db) |receiver| .{
-                .alloc = receiver.alloc,
-                .core = receiver.core,
-                .backend_runtime = receiver.backend_runtime,
-                .secret_store = &receiver.secret_store,
-                .remote_content = &receiver.remote_content,
-                .shadow = &receiver.shadow,
-                .transaction_recovery_local_context = &receiver.transaction_recovery_local_context,
+                .alloc = S.ownerField(receiver, "alloc").*,
+                .core = S.ownerField(receiver, "core").*,
+                .backend_runtime = S.ownerField(receiver, "backend_runtime").*,
+                .secret_store = &S.ownerField(receiver, "secret_store").*,
+                .remote_content = &S.ownerField(receiver, "remote_content").*,
+                .shadow = &S.ownerField(receiver, "shadow").*,
+                .transaction_recovery_local_context = &S.ownerField(receiver, "transaction_recovery_local_context").*,
             } else null;
             return prepareRelationalRowsOwned(allocator_guard, io, if (owner) |*view| view else null, writes, validator, table_schema, physical_layout, write_plan, retain_text_roots, preparation_timestamp_ns, rows, durable_rows, restore_timestamps, preserve_logical_values);
         }
@@ -1883,14 +1883,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             transaction_recovery_local_context: *const @FieldType(Execution, "transaction_recovery_local_context"),
 
             fn requiresLogicalRoot(self: *const @This()) bool {
-                const shadow = if (self.transaction_recovery_local_context.*) |context| context.split_shadow else self.shadow.*;
+                const shadow = if (S.ownerField(self, "transaction_recovery_local_context").*.*) |context| context.split_shadow else S.ownerField(self, "shadow").*.*;
                 if (shadow == null) return false;
-                const state = self.core.splitState() orelse return false;
+                const state = S.ownerField(self, "core").*.splitState() orelse return false;
                 return state.phase == .splitting;
             }
 
             fn validateInlineSources(self: *const @This(), alloc: Allocator, plan: index_manager_mod.IndexManager.WritePlanSnapshot, value: std.json.Value, document: mapper.ExtractedWrite) !void {
-                const render_owner = .{ .secret_store = self.secret_store.*, .remote_content = self.remote_content.*, .backend_runtime = self.backend_runtime };
+                const render_owner = .{ .secret_store = S.ownerField(self, "secret_store").*.*, .remote_content = S.ownerField(self, "remote_content").*.*, .backend_runtime = S.ownerField(self, "backend_runtime").* };
                 try validateDocumentExtractionInlineSourcesSnapshotParsed(alloc, &render_owner, plan, value, document);
             }
         };

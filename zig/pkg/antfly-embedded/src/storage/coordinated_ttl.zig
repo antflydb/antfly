@@ -32,9 +32,13 @@ pub const Request = struct {
     candidates: []const Candidate,
 };
 pub const Port = struct {
+    const NativeCallbacks = struct { expire_fn: @FieldType(Port, "expire_fn") };
+    const NativeBoundary = @import("named_callback.zig").Boundary(NativeCallbacks);
+    callback_dispatch: @import("named_callback.zig").Dispatch = NativeBoundary.local_dispatch,
+
     ptr: *anyopaque,
     expire_fn: *const fn (*anyopaque, Request) anyerror!u32,
     pub fn expire(self: Port, request: Request) !u32 {
-        return self.expire_fn(self.ptr, request);
+        return NativeBoundary.call("expire_fn", self.callback_dispatch, self.expire_fn, .{ self.ptr, request });
     }
 };

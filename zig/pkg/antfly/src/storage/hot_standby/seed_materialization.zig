@@ -248,15 +248,7 @@ pub fn materialize(alloc: Allocator, request: MaterializeRequest) !MaterializeRe
                 .start_optional_runtimes = false,
             });
             defer verified.close();
-            var probe = try verified.core.store.beginReadTxn();
-            defer probe.abort();
-            if (try hidden.load(&probe)) |record| {
-                if (!expected.matches(record) or record.row_count != 0) return error.SeedReplicaIdentityMismatch;
-            } else {
-                const hidden_catalog = probe.get(@import("antfly_local_sources").storage_db_relational_integrity_catalog.key) catch null;
-                const schema_json = probe.get("\x00\x00__metadata__:schema_json") catch null;
-                if (hidden_catalog != null or schema_json != null) return error.SeedReplicaIdentityMismatch;
-            }
+            try verified.verifyColdInitialChildSeed(expected);
         }
         var native_hot_standby_owner = false;
         for (native_owners) |owner| {

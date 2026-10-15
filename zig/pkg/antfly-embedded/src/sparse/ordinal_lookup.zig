@@ -18,10 +18,18 @@ const Bitmap = @import("../encoding/roaring.zig").RoaringBitmap;
 /// Same-transaction native identity resolution. A missing block proof requests
 /// the legacy point-lookup path; it must never be interpreted as an empty set.
 pub const KeyFilter = struct {
+    const NativeBoundary = @import("../storage/named_callback.zig").Boundary(struct { allows: @FieldType(KeyFilter, "allows") });
+    callback_dispatch: @import("../storage/named_callback.zig").Dispatch = NativeBoundary.local_dispatch,
     ptr: *anyopaque,
     allows: *const fn (*anyopaque, []const u8) anyerror!bool,
+    pub fn allowsKey(self: KeyFilter, key: []const u8) !bool {
+        return NativeBoundary.call("allows", self.callback_dispatch, self.allows, .{ self.ptr, key });
+    }
 };
 pub const Lookup = struct {
+    const NativeBoundary = @import("../storage/named_callback.zig").Boundary(struct { one: @FieldType(Lookup, "one"), native_range: @FieldType(Lookup, "native_range"), bounded_block: @FieldType(Lookup, "bounded_block"), block: @FieldType(Lookup, "block") });
+    callback_dispatch: @import("../storage/named_callback.zig").Dispatch = NativeBoundary.local_dispatch,
+
     ptr: *anyopaque,
     one: *const fn (*anyopaque, []const u8) anyerror!?u32,
     /// Sequential native identity window in the same pinned read transaction.
@@ -30,6 +38,18 @@ pub const Lookup = struct {
     /// Bounded directory translation, when supported by this generation.
     bounded_block: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, u32, *const Bitmap, *Bitmap, *WorkBudget) anyerror!bool = null,
     block: *const fn (*anyopaque, std.mem.Allocator, []const u8, u32, *const Bitmap, *Bitmap) anyerror!bool,
+    pub fn lookupOne(self: Lookup, key: []const u8) !?u32 {
+        return NativeBoundary.call("one", self.callback_dispatch, self.one, .{ self.ptr, key });
+    }
+    pub fn nativeRange(self: Lookup, alloc: std.mem.Allocator, first: u32, last: u32, filter: KeyFilter, result: *Bitmap) !bool {
+        return NativeBoundary.call("native_range", self.callback_dispatch, self.native_range.?, .{ self.ptr, alloc, first, last, filter, result });
+    }
+    pub fn boundedBlock(self: Lookup, alloc: std.mem.Allocator, prefix: []const u8, high: u32, selection: *const Bitmap, result: *Bitmap, work: *WorkBudget) !bool {
+        return NativeBoundary.call("bounded_block", self.callback_dispatch, self.bounded_block.?, .{ self.ptr, alloc, prefix, high, selection, result, work });
+    }
+    pub fn lookupBlock(self: Lookup, alloc: std.mem.Allocator, prefix: []const u8, high: u32, selection: *const Bitmap, result: *Bitmap) !bool {
+        return NativeBoundary.call("block", self.callback_dispatch, self.block, .{ self.ptr, alloc, prefix, high, selection, result });
+    }
 };
 
 /// Optional planning may spend at most this many authenticated physical

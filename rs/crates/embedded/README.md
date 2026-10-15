@@ -349,7 +349,10 @@ cargo test -p antfly-embedded --release --features libantfly,sqlx \
 prepare/describe, and SQLSTATE database errors use native SQL sessions.
 Native work runs on a dedicated worker with the required native stack,
 keeping FFI calls off Tokio executor threads. File owners are shared across
-pooled connections. Integer bindings and decoding preserve signed 64-bit
+pooled connections. Idle pool health checks inspect the worker lifetime without
+entering the native database fence. Pending rollback cleanup still completes
+before reuse, so the default `test_before_acquire(true)` remains safe.
+Integer bindings and decoding preserve signed 64-bit
 values. Byte parameters represent UTF-8 text; JSON uses `serde_json::Value`.
 The upstream `query!` macro does not register custom database drivers; use
 runtime queries and the driver's describe support.

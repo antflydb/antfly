@@ -41,6 +41,8 @@ pub const Cache = struct {
     persistent_mutex: std.Io.Mutex = .init,
     persistent_retry_after_ns: i96 = 0,
     persistent_ready: std.atomic.Value(bool) = .init(false),
+    persistent_startup: std.Io.Group = .init,
+    persistent_startup_io: ?std.Io = null,
 
     const Mapping = struct {
         cache: *Cache,
@@ -76,13 +78,51 @@ pub const Cache = struct {
         if (!self.persistent_mutex.tryLock()) return;
         defer self.persistent_mutex.unlock(io);
         if (self.persistent_ready.load(.acquire) or now < self.persistent_retry_after_ns) return;
+        try self.initializePersistent(io, root, policy, resources, now);
+    }
+
+    /// Schedule inventory restoration once, without borrowing request memory or
+    /// waiting for filesystem work. Until publication, reads use RAM/source.
+    /// The caller's Io and resource manager must outlive this cache.
+    pub fn startPersistent(self: *Cache, io: std.Io, root: []const u8, policy: parquet.PersistentObjectRangeCachePolicy, resources: parquet.PersistentObjectRangeCacheResources) !void {
+        try policy.validate();
+        if (root.len == 0) return error.InvalidPersistentObjectRangeCachePolicy;
+        if (self.persistentReady() or !self.persistent_mutex.tryLock()) return;
+        var handed_off = false;
+        defer if (!handed_off) self.persistent_mutex.unlock(io);
+        const now = std.Io.Clock.now(.awake, io).nanoseconds;
+        if (self.persistentReady() or now < self.persistent_retry_after_ns) return;
+        const owned = self.alloc.dupe(u8, root) catch |err| {
+            self.recordDiskUnavailable(err);
+            self.persistent_retry_after_ns = now +| 30 * std.time.ns_per_s;
+            return;
+        };
+        defer if (!handed_off) self.alloc.free(owned);
+        self.persistent_startup_io = io;
+        self.persistent_startup.concurrent(io, restorePersistent, .{ self, io, owned, policy, resources }) catch |err| {
+            self.recordDiskUnavailable(err);
+            self.persistent_retry_after_ns = now +| 30 * std.time.ns_per_s;
+            return;
+        };
+        handed_off = true;
+    }
+
+    fn restorePersistent(self: *Cache, io: std.Io, root: []u8, policy: parquet.PersistentObjectRangeCachePolicy, resources: parquet.PersistentObjectRangeCacheResources) std.Io.Cancelable!void {
+        defer self.persistent_mutex.unlock(io);
+        defer self.alloc.free(root);
+        try self.initializePersistent(io, root, policy, resources, std.Io.Clock.now(.awake, io).nanoseconds);
+    }
+
+    /// Requires the startup mutex, which remains held by the background owner
+    /// until publication or failure. No cache-memory lock covers inventory I/O.
+    fn initializePersistent(self: *Cache, io: std.Io, root: []const u8, policy: parquet.PersistentObjectRangeCachePolicy, resources: parquet.PersistentObjectRangeCacheResources, now: i96) std.Io.Cancelable!void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         self.stats.disk_init_attempts +|= 1;
         self.mutex.unlock();
         var coordinated = resources;
         coordinated.reclaim_idle = .{ .ptr = self, .reclaim_one = reclaimIdleMapping };
         const disk = parquet.PersistentObjectRangeCache.initWithPolicyAndResources(io, root, policy, coordinated) catch |err| {
-            if (err == error.Canceled) return err;
+            if (err == error.Canceled) return error.Canceled;
             // Local cache availability is never source/readiness authority.
             // Retry transient ownership, worker, or filesystem failures without
             // repeating startup inventory I/O or warnings for every request.
@@ -224,6 +264,9 @@ pub const Cache = struct {
         return .{ .alloc = alloc, .decoded = .{ .a = alloc }, .physical = .{ .a = alloc, .max_bytes = 0, .max_entries = 0 }, .max_bytes = maximum };
     }
     pub fn deinit(self: *Cache) void {
+        // Request/status callers are quiescent. Cancel and join restoration
+        // before destroying its cache, callback owner or filesystem Io.
+        if (self.persistent_startup_io) |io| self.persistent_startup.cancel(io);
         // Readers are quiescent. Join accepted writes before destroying the
         // mapping table borrowed by the worker's pressure callback.
         if (self.persistent) |*disk| disk.flush();
@@ -460,16 +503,21 @@ pub const Cache = struct {
     fn reclaimIdleMapping(raw: *anyopaque) bool {
         const self: *Cache = @ptrCast(@alignCast(raw));
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
-        defer self.mutex.unlock();
         var victim: ?*Mapping = null;
         var entries = self.mappings.valueIterator();
         while (entries.next()) |entry| {
             if (entry.*.refs != 0) continue;
             if (victim == null or entry.*.touched < victim.?.touched) victim = entry.*;
         }
-        const retired = victim orelse return false;
+        const retired = victim orelse {
+            self.mutex.unlock();
+            return false;
+        };
         _ = self.mappings.remove(retired.key);
         self.mapped_bytes -= retired.value.mapping.len;
+        self.mutex.unlock();
+        // munmap and the disk owner's lease release may block under paging.
+        // Detach first so unrelated readers can use the cache meanwhile.
         retired.destroy();
         return true;
     }
@@ -477,41 +525,56 @@ pub const Cache = struct {
     // atomic; pins keep the original mapping and disk eviction lease alive.
     // Large contiguous artifacts keep their separate disk-first lifetime.
     fn admitMapping(self: *Cache, key: []const u8, value: parquet.PersistentObjectRangeCache.MappedEntry) ImmutableLease {
-        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
-        defer self.mutex.unlock();
-        if (self.mappings.get(key)) |existing| {
-            existing.refs += 1;
-            var redundant = value;
-            redundant.deinit();
-            return .{ .mapping = existing };
-        }
-        if (value.mapping.len > self.max_mapped_bytes or self.max_mappings == 0) return .{ .mapped = value };
-        while (value.mapping.len > self.max_mapped_bytes -| self.mapped_bytes or self.mappings.count() >= self.max_mappings) {
-            var victim: ?*Mapping = null;
-            var entries = self.mappings.valueIterator();
-            while (entries.next()) |entry| {
-                if (entry.*.refs != 0) continue;
-                if (victim == null or entry.*.touched < victim.?.touched) victim = entry.*;
+        var reclaimed: usize = 0;
+        while (true) {
+            while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+            var locked = true;
+            defer if (locked) self.mutex.unlock();
+            if (self.mappings.get(key)) |existing| {
+                existing.refs += 1;
+                self.mutex.unlock();
+                locked = false;
+                var redundant = value;
+                redundant.deinit();
+                return .{ .mapping = existing };
             }
-            const retired = victim orelse return .{ .mapped = value };
-            _ = self.mappings.remove(retired.key);
-            self.mapped_bytes -= retired.value.mapping.len;
-            retired.destroy();
+            if (value.mapping.len > self.max_mapped_bytes or self.max_mappings == 0) return .{ .mapped = value };
+            if (value.mapping.len > self.max_mapped_bytes -| self.mapped_bytes or self.mappings.count() >= self.max_mappings) {
+                // Admission is optional. Bound retries when other readers keep
+                // consuming capacity while cleanup runs outside the lock.
+                if (reclaimed >= self.max_mappings) return .{ .mapped = value };
+                var victim: ?*Mapping = null;
+                var entries = self.mappings.valueIterator();
+                while (entries.next()) |entry| {
+                    if (entry.*.refs != 0) continue;
+                    if (victim == null or entry.*.touched < victim.?.touched) victim = entry.*;
+                }
+                const retired = victim orelse return .{ .mapped = value };
+                _ = self.mappings.remove(retired.key);
+                self.mapped_bytes -= retired.value.mapping.len;
+                self.mutex.unlock();
+                locked = false;
+                retired.destroy();
+                reclaimed += 1;
+                // Another reader may have populated this key or used the freed
+                // capacity. Recheck identity and both limits after cleanup.
+                continue;
+            }
+            const mapping = self.alloc.create(Mapping) catch return .{ .mapped = value };
+            const owned = self.alloc.dupe(u8, key) catch {
+                self.alloc.destroy(mapping);
+                return .{ .mapped = value };
+            };
+            self.tick +|= 1;
+            mapping.* = .{ .cache = self, .key = owned, .value = value, .touched = self.tick };
+            self.mappings.put(self.alloc, owned, mapping) catch {
+                self.alloc.free(owned);
+                self.alloc.destroy(mapping);
+                return .{ .mapped = value };
+            };
+            self.mapped_bytes += value.mapping.len;
+            return .{ .mapping = mapping };
         }
-        const mapping = self.alloc.create(Mapping) catch return .{ .mapped = value };
-        const owned = self.alloc.dupe(u8, key) catch {
-            self.alloc.destroy(mapping);
-            return .{ .mapped = value };
-        };
-        self.tick +|= 1;
-        mapping.* = .{ .cache = self, .key = owned, .value = value, .touched = self.tick };
-        self.mappings.put(self.alloc, owned, mapping) catch {
-            self.alloc.free(owned);
-            self.alloc.destroy(mapping);
-            return .{ .mapped = value };
-        };
-        self.mapped_bytes += value.mapping.len;
-        return .{ .mapping = mapping };
     }
 
     fn readImmutableKeyAlloc(self: *Cache, a: Allocator, key: []const u8, length: usize, digest: [32]u8, context: Context, loader: ImmutableLoader) ![]u8 {
@@ -1438,6 +1501,128 @@ test "external lake disk cache initialization failure preserves source reads and
     try std.testing.expectEqual(.enqueued, cache.persistent.?.enqueueWrite("recovered", "data"));
     cache.persistent.?.flush();
     try std.testing.expectEqual(@as(usize, 1), cache.persistentStats().?.writes_completed);
+}
+
+const InventoryGate = struct {
+    var base: std.Io = undefined;
+    var entered: std.Io.Event = .unset;
+    var release: std.Io.Event = .unset;
+    fn stat(raw: ?*anyopaque, dir: std.Io.Dir, path: []const u8, options: std.Io.Dir.StatFileOptions) std.Io.Dir.StatFileError!std.Io.File.Stat {
+        entered.set(base);
+        try release.wait(base);
+        return base.vtable.dirStatFile(raw, dir, path, options);
+    }
+    fn read(raw: ?*anyopaque, file: std.Io.File, data: []const []u8, offset: u64) std.Io.File.ReadPositionalError!usize {
+        entered.set(base);
+        try release.wait(base);
+        return base.vtable.fileReadPositional(raw, file, data, offset);
+    }
+};
+
+test "external lake background inventory does not block reads and retains restart hits" {
+    if (comptime @import("builtin").os.tag == .freestanding or @import("builtin").os.tag == .wasi or @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(a, .{ .async_limit = .nothing, .concurrent_limit = .limited(2) });
+    defer io_impl.deinit();
+    const base = io_impl.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/background", .{tmp.sub_path});
+    defer a.free(root);
+    const policy: parquet.PersistentObjectRangeCachePolicy = .{ .max_entries = 1, .max_total_bytes = 1024 };
+    // Use the actual payload digest in the authenticated key and read below.
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("data", &digest, .{});
+    const authenticated_key = try Cache.immutableKey(a, @splat(1), "segment", 4, digest);
+    defer a.free(authenticated_key);
+    {
+        var disk = try parquet.PersistentObjectRangeCache.initWithPolicy(base, root, policy);
+        defer disk.deinit();
+        try std.testing.expectEqual(.enqueued, disk.enqueueWrite(authenticated_key, "data"));
+        disk.flush();
+    }
+    InventoryGate.base = base;
+    InventoryGate.entered = .unset;
+    InventoryGate.release = .unset;
+    var vtable = base.vtable.*;
+    vtable.dirStatFile = InventoryGate.stat;
+    const io: std.Io = .{ .userdata = base.userdata, .vtable = &vtable };
+    var cache = Cache.initWithMemoryLimit(a, 0);
+    defer cache.deinit();
+    defer InventoryGate.release.set(base);
+    const borrowed = try a.dupe(u8, root);
+    try cache.startPersistent(io, borrowed, policy, .{});
+    a.free(borrowed);
+    try InventoryGate.entered.wait(base);
+    try std.testing.expect(!cache.persistentReady());
+    try std.testing.expect(cache.persistentStats() == null);
+    // A second request neither waits on inventory nor starts a second owner.
+    try cache.startPersistent(io, root, policy, .{});
+    try std.testing.expectEqual(@as(u64, 1), cache.snapshot().disk_init_attempts);
+    const Provider = struct {
+        calls: usize = 0,
+        fn load(raw: *anyopaque, alloc: Allocator) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return alloc.dupe(u8, "data");
+        }
+    };
+    var provider: Provider = .{};
+    const loader: Cache.ImmutableLoader = .{ .ptr = &provider, .load = Provider.load };
+    var first = try cache.readImmutableLease(a, @splat(1), "segment", 4, digest, .{ .io = base }, loader);
+    first.deinit();
+    try std.testing.expectEqual(@as(usize, 1), provider.calls);
+    InventoryGate.release.set(base);
+    try cache.persistent_startup.await(io);
+    try std.testing.expect(cache.persistentReady());
+    var restarted = try cache.readImmutableLease(a, @splat(1), "segment", 4, digest, .{ .io = base }, loader);
+    defer restarted.deinit();
+    try std.testing.expectEqualStrings("data", restarted.bytes());
+    try std.testing.expectEqual(@as(usize, 1), provider.calls);
+    try std.testing.expectEqual(@as(usize, 1), cache.persistentStats().?.entries);
+    try std.testing.expect(cache.persistentStats().?.stored_bytes <= policy.max_total_bytes);
+}
+
+test "external lake shutdown cancels and joins blocked inventory restoration" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(a, .{ .async_limit = .nothing, .concurrent_limit = .limited(2) });
+    defer io_impl.deinit();
+    const base = io_impl.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/cancel", .{tmp.sub_path});
+    defer a.free(root);
+    {
+        var disk = try parquet.PersistentObjectRangeCache.init(base, root);
+        defer disk.deinit();
+        try std.testing.expectEqual(.enqueued, disk.enqueueWrite("key", "data"));
+        disk.flush();
+    }
+    for ([_]bool{ false, true }) |header_read| {
+        InventoryGate.base = base;
+        InventoryGate.entered = .unset;
+        InventoryGate.release = .unset;
+        var vtable = base.vtable.*;
+        if (header_read) vtable.fileReadPositional = InventoryGate.read else vtable.dirStatFile = InventoryGate.stat;
+        const io: std.Io = .{ .userdata = base.userdata, .vtable = &vtable };
+        var cache = Cache.init(a);
+        var closed = false;
+        defer if (!closed) cache.deinit();
+        try cache.startPersistent(io, root, .{}, .{});
+        try InventoryGate.entered.wait(base);
+        if (header_read) {
+            cache.persistent_startup.cancel(io);
+            // Provenance recovery must propagate cancellation, never publish a
+            // partially restored cache after treating Canceled as an unprotected key.
+            try std.testing.expect(!cache.persistentReady());
+        }
+        cache.deinit();
+        closed = true;
+        // The canceled owner must release OWNER.lock and all inventoried memory.
+        var disk = try parquet.PersistentObjectRangeCache.init(base, root);
+        defer disk.deinit();
+        try std.testing.expectEqual(@as(usize, 1), disk.statsSnapshot().entries);
+    }
 }
 
 test "external lake query phase counters retain nested hydration and saturate" {

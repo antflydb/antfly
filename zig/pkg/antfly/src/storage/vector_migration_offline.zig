@@ -310,7 +310,7 @@ pub fn run(alloc: Allocator, io: std.Io, root: []const u8, request: contract.Req
             steps += 1;
         }
         try target.syncIndexes(true);
-        try target.core.store.runtime_store.sync(true);
+        try target.syncPrimaryStore();
         try boundary(.candidate_complete);
     }
     try staged.seal();

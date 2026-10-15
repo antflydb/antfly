@@ -24,3 +24,5 @@ pub const local_write = @import("antfly_local_sources").storage_local_write;
 
 /// Server fixtures retain this compilation root's source and type identity.
 pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};
+
+pub const storage_engine = @import("antfly_local_sources").storage_engine;

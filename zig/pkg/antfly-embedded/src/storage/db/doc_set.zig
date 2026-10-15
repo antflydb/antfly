@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const ordinal_core = @import("storage_ordinals");
 const roaring = @import("../../encoding/roaring.zig");
 
 pub const DocOrdinal = u32;
@@ -89,7 +90,7 @@ pub fn fromOrdinalsWithPolicyAlloc(alloc: Allocator, ordinals_in: []const DocOrd
 
     const ordinals = try alloc.dupe(DocOrdinal, ordinals_in);
     errdefer alloc.free(ordinals);
-    std.mem.sort(DocOrdinal, ordinals, {}, ordinalLessThan);
+    ordinal_core.sort(DocOrdinal, ordinals);
     const unique_len = uniqueSortedOrdinals(ordinals);
 
     if (!shouldUseBitmapStatsWithPolicy(unique_len, ordinalSpan(ordinals[0..unique_len]), policy)) {
@@ -371,53 +372,21 @@ fn approximateBitmapSpan(bitmap: *const roaring.RoaringBitmap) usize {
 fn unionSortedOrdinalsAlloc(alloc: Allocator, left: []const DocOrdinal, right: []const DocOrdinal) !ResolvedDocSet {
     var out = try std.ArrayListUnmanaged(DocOrdinal).initCapacity(alloc, left.len + right.len);
     errdefer out.deinit(alloc);
-    var i: usize = 0;
-    var j: usize = 0;
-    while (i < left.len or j < right.len) {
-        if (j >= right.len or (i < left.len and left[i] < right[j])) {
-            out.appendAssumeCapacity(left[i]);
-            i += 1;
-        } else if (i >= left.len or right[j] < left[i]) {
-            out.appendAssumeCapacity(right[j]);
-            j += 1;
-        } else {
-            out.appendAssumeCapacity(left[i]);
-            i += 1;
-            j += 1;
-        }
-    }
+    out.items.len = ordinal_core.merge(.union_set, left, right, out.allocatedSlice());
     return try sortedOrdinalSetFromOwnedAlloc(alloc, try out.toOwnedSlice(alloc));
 }
 
 fn intersectSortedOrdinalsAlloc(alloc: Allocator, left: []const DocOrdinal, right: []const DocOrdinal) !ResolvedDocSet {
     var out = try std.ArrayListUnmanaged(DocOrdinal).initCapacity(alloc, @min(left.len, right.len));
     errdefer out.deinit(alloc);
-    var i: usize = 0;
-    var j: usize = 0;
-    while (i < left.len and j < right.len) {
-        if (left[i] < right[j]) {
-            i += 1;
-        } else if (right[j] < left[i]) {
-            j += 1;
-        } else {
-            out.appendAssumeCapacity(left[i]);
-            i += 1;
-            j += 1;
-        }
-    }
+    out.items.len = ordinal_core.merge(.intersection, left, right, out.allocatedSlice());
     return try sortedOrdinalSetFromOwnedAlloc(alloc, try out.toOwnedSlice(alloc));
 }
 
 fn differenceSortedOrdinalsAlloc(alloc: Allocator, left: []const DocOrdinal, right: []const DocOrdinal) !ResolvedDocSet {
     var out = try std.ArrayListUnmanaged(DocOrdinal).initCapacity(alloc, left.len);
     errdefer out.deinit(alloc);
-    var i: usize = 0;
-    var j: usize = 0;
-    while (i < left.len) {
-        while (j < right.len and right[j] < left[i]) j += 1;
-        if (j >= right.len or left[i] != right[j]) out.appendAssumeCapacity(left[i]);
-        i += 1;
-    }
+    out.items.len = ordinal_core.merge(.difference, left, right, out.allocatedSlice());
     return try sortedOrdinalSetFromOwnedAlloc(alloc, try out.toOwnedSlice(alloc));
 }
 
@@ -545,14 +514,7 @@ test "doc filter intersection intersects includes and unions excludes" {
 }
 
 fn uniqueSortedOrdinals(ordinals: []DocOrdinal) usize {
-    if (ordinals.len == 0) return 0;
-    var write: usize = 1;
-    for (ordinals[1..]) |ordinal| {
-        if (ordinal == ordinals[write - 1]) continue;
-        ordinals[write] = ordinal;
-        write += 1;
-    }
-    return write;
+    return ordinal_core.unique(ordinals);
 }
 
 fn ordinalLessThan(_: void, lhs: DocOrdinal, rhs: DocOrdinal) bool {

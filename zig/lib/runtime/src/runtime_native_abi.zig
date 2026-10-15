@@ -196,10 +196,17 @@ fn hashInteger(hash: *u64, comptime value: anytype) void {
 pub fn assertUniqueMethodIds(comptime VTable: type) void {
     @setEvalBranchQuota(1_000_000);
     const fields = @typeInfo(VTable).@"struct".field_names;
-    inline for (fields, 0..) |left, left_index| {
-        inline for (fields[left_index + 1 ..]) |right| {
-            if (stableId(left) == stableId(right))
-                @compileError("native ABI method-id collision between " ++ left ++ " and " ++ right);
+    // Hash once per method. Re-hashing both names for every pair makes
+    // large coarse-operation contracts spend their evaluation budget on names.
+    const ids = comptime blk: {
+        var values: [fields.len]u64 = undefined;
+        for (fields, 0..) |name, index| values[index] = stableId(name);
+        break :blk values;
+    };
+    inline for (ids, 0..) |left, left_index| {
+        inline for (ids[left_index + 1 ..], left_index + 1..) |right, right_index| {
+            if (left == right)
+                @compileError("native ABI method-id collision between " ++ fields[left_index] ++ " and " ++ fields[right_index]);
         }
     }
 }

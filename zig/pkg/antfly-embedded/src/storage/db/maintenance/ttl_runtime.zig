@@ -64,7 +64,9 @@ pub const GraphExpireFn = *const fn (ctx_ptr: *anyopaque, candidates: []const gr
 
 pub const default_lease_key = "\x00\x00__metadata__:ttl_cleanup_lease";
 
-pub const TtlRuntime = if (builtin.os.tag == .freestanding) struct {
+// Named branches keep native ABI identities stable across LLVM owners.
+pub const TtlRuntime = if (builtin.os.tag == .freestanding) UnsupportedTtlRuntime else PlatformTtlRuntime;
+const UnsupportedTtlRuntime = struct {
     config: Config,
     defer_flag: ?*const std.atomic.Value(bool),
     stats_value: types.TTLCleanupStats = .{},
@@ -125,7 +127,8 @@ pub const TtlRuntime = if (builtin.os.tag == .freestanding) struct {
     pub fn stats(self: *@This()) types.TTLCleanupStats {
         return self.stats_value;
     }
-} else struct {
+};
+const PlatformTtlRuntime = struct {
     alloc: Allocator,
     /// Borrowed backend-neutral executor. Its implementation is owned by the
     /// BackendRuntime and may be Threaded or VoprIo.

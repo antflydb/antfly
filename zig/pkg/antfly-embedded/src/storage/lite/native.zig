@@ -34,6 +34,67 @@ const CompleteScoreSink = @import("../backend_types.zig").CompleteScoreSink;
 const ReadIdentity = struct { canonical: u64, namespace: []const u8 };
 const Allocator = std.mem.Allocator;
 
+test "lite index prefix comparison scales past 4096 records and detects mutations" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "index-prefix-comparison.aflite");
+    defer a.free(path);
+    var writer = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+    defer writer.close();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const mutations = try arena.allocator().alloc(CatalogMutation, 5000);
+    for (mutations, 0..) |*mutation, i| mutation.* = .{
+        .key = try std.fmt.allocPrint(arena.allocator(), "/scope/{d:0>8}", .{i}),
+        .value = "immutable",
+    };
+    try writer.putIndexCatalogBatch(mutations);
+    var captured = try NativeFile.openWithIo(a, std.testing.io, path, .{ .read_only = true });
+    defer captured.close();
+    try writer.putDocument("primary", "unrelated");
+    try writer.putIndexCatalogRecord("/unrelated/entry", "outside the captured prefix");
+    const before_reads = writer.test_page_reads.load(.monotonic) + captured.test_page_reads.load(.monotonic);
+    try std.testing.expect(try captured.indexCatalogPrefixUnchanged(&writer, "/scope/"));
+    const reads = writer.test_page_reads.load(.monotonic) + captured.test_page_reads.load(.monotonic) - before_reads;
+    // Comparing unchanged subtrees should read tree paths, not 5,000 records.
+    try std.testing.expect(reads < 32);
+    try std.testing.expect(try captured.indexCatalogPrefixUnchanged(&writer, "/absent/"));
+    try writer.putIndexCatalogRecord("/scope/00002500", "new bytes");
+    try std.testing.expect(!try captured.indexCatalogPrefixUnchanged(&writer, "/scope/"));
+    try std.testing.expect(try captured.indexCatalogPrefixUnchanged(&writer, "/scope/00000"));
+    try writer.deleteIndexCatalogRecord("/scope/00000001");
+    try std.testing.expect(!try captured.indexCatalogPrefixUnchanged(&writer, "/scope/00000"));
+    try writer.putIndexCatalogRecord("/absent/new", "inserted");
+    try std.testing.expect(!try captured.indexCatalogPrefixUnchanged(&writer, "/absent/"));
+}
+
+test "lite index checkpoint adoption discards physical page caches" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "index-adoption-caches.aflite");
+    defer a.free(path);
+    var captured = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true });
+    defer captured.close();
+    try captured.putDocument("doc", "original");
+    const original = (try captured.getDocumentAlloc(a, "doc")).?;
+    a.free(original);
+    try std.testing.expect(captured.page_cache.pages.count() != 0);
+    var writer = try NativeFile.openWithIo(a, std.testing.io, path, .{ .externally_locked = true });
+    defer writer.close();
+    try writer.putDocument("doc", "updated");
+    captured.free_pages_verified = true;
+    try captured.adoptIndexPublicationHeader(writer.header);
+    try std.testing.expectEqual(@as(usize, 0), captured.page_cache.pages.count());
+    try std.testing.expect(!captured.free_pages_verified);
+    const updated = (try captured.getDocumentAlloc(a, "doc")).?;
+    defer a.free(updated);
+    try std.testing.expectEqualStrings("updated", updated);
+    try captured.putDocument("next", "after adoption");
+    try std.testing.expect((try captured.check()).valid);
+}
+
 test "lite allocator v4 small checkpoints bound counter and queue boundary growth" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -876,6 +937,29 @@ pub const DocumentIndexCursor = struct {
             self.depth -= 1;
         }
         return null;
+    }
+
+    fn subtreePage(self: *DocumentIndexCursor, depth: usize) u64 {
+        return if (depth == 0) self.checkpoint.document_index_root_page else blk: {
+            const parent = self.path.frames.items[depth - 1];
+            break :blk parent.pointer(parent.position);
+        };
+    }
+
+    // Advance to a sibling without opening it. Paired cursors can skip equal
+    // immutable sibling references without an I/O for every leaf in the range.
+    fn nextSubtree(self: *DocumentIndexCursor, depth: usize) !u64 {
+        self.depth = depth;
+        while (self.depth > 0) {
+            const parent = self.path.frames.items[self.depth - 1];
+            if (parent.kind != .internal) return error.InvalidDocumentIndex;
+            if (parent.position + 1 < parent.pointerCount()) {
+                parent.position += 1;
+                return parent.pointer(parent.position);
+            }
+            self.depth -= 1;
+        }
+        return 0;
     }
 
     pub fn prev(self: *DocumentIndexCursor) !?DocumentIndexEntry {
@@ -3426,6 +3510,23 @@ pub const NativeFile = struct {
         return self.header.checkpoints[self.header.active_checkpoint];
     }
 
+    /// Rebind a borrowed index writer after its owner has verified the inode,
+    /// catalog epoch and unchanged immutable index inputs under a writer lease.
+    /// The newest allocator state must accompany the newest primary roots.
+    pub fn adoptIndexPublicationHeader(self: *NativeFile, header: Header) !void {
+        if (self.transaction_header != null or self.durable_header != null or self.checkpoint_publication_uncertain or
+            self.header.page_size != header.page_size or self.header.indexed_reclamation != header.indexed_reclamation) return error.EnrichmentWaitCanceled;
+        self.invalidateLedger();
+        self.page_cache.clear(self.allocator);
+        if (self.secondary_page_cache) |cache| cache.clear(self.allocator);
+        self.free_pages_verified = false;
+        self.namespace_directory_cache_root = std.math.maxInt(u64);
+        self.namespace_directory_delta_depth = 0;
+        deinitNamespaceDirectory(self.allocator, &self.namespace_directory_cache);
+        self.namespace_directory_cache = .empty;
+        self.header = header;
+    }
+
     fn invalidateLedger(self: *NativeFile) void {
         if (self.ledger) |state| {
             state.deinit();
@@ -5139,6 +5240,63 @@ pub const NativeFile = struct {
 
     pub fn indexCatalogCursor(self: *NativeFile, checkpoint: CheckpointSlot, prefix: []const u8) !CatalogCursor {
         return try self.catalogCursor(checkpoint, .index, prefix);
+    }
+
+    /// Compare a physical index read set between pinned checkpoints of the
+    /// same inode. Copy-on-write subtree references prove equality without
+    /// enumerating unchanged records. Splits/heights may differ; fall back to
+    /// comparing leaf keys and immutable record references in changed paths.
+    /// The caller fences page reuse and generation replacement for both roots.
+    pub fn indexCatalogPrefixUnchanged(self: *NativeFile, latest: *NativeFile, prefix: []const u8) !bool {
+        var before = try self.indexCatalogCursor(self.activeCheckpoint(), prefix);
+        defer before.deinit();
+        var after = try latest.indexCatalogCursor(latest.activeCheckpoint(), prefix);
+        defer after.deinit();
+        var lhs = try before.index.seekAtOrAfter(prefix, false);
+        defer if (lhs) |*entry| entry.deinit(self.allocator);
+        var rhs = try after.index.seekAtOrAfter(prefix, false);
+        defer if (rhs) |*entry| entry.deinit(latest.allocator);
+        while (true) {
+            const left_in_range = if (lhs) |entry| std.mem.startsWith(u8, entry.key, prefix) else false;
+            const right_in_range = if (rhs) |entry| std.mem.startsWith(u8, entry.key, prefix) else false;
+            if (!left_in_range or !right_in_range) return left_in_range == right_in_range;
+            if (!std.mem.eql(u8, lhs.?.key, rhs.?.key) or lhs.?.document_page_id != rhs.?.document_page_id) return false;
+            // Find the largest common subtree on the two cursor paths. A
+            // shared page can occur at different depths after a root split.
+            var shared: ?struct { left: usize, right: usize } = null;
+            outer: for (0..before.index.depth) |i| {
+                const left_page = before.index.subtreePage(i);
+                for (0..after.index.depth) |j| {
+                    if (left_page == after.index.subtreePage(j)) {
+                        shared = .{ .left = i, .right = j };
+                        break :outer;
+                    }
+                }
+            }
+            lhs.?.deinit(self.allocator);
+            lhs = null;
+            rhs.?.deinit(latest.allocator);
+            rhs = null;
+            if (shared) |node| {
+                var left_page = try before.index.nextSubtree(node.left);
+                var right_page = try after.index.nextSubtree(node.right);
+                while (left_page != 0 and left_page == right_page) {
+                    left_page = try before.index.nextSubtree(before.index.depth);
+                    right_page = try after.index.nextSubtree(after.index.depth);
+                }
+                if (left_page != 0) {
+                    try before.index.descendExtreme(left_page, true);
+                    lhs = try before.index.currentEntry();
+                }
+                if (right_page != 0) {
+                    try after.index.descendExtreme(right_page, true);
+                    rhs = try after.index.currentEntry();
+                }
+            } else {
+                lhs = try before.index.next();
+                rhs = try after.index.next();
+            }
+        }
     }
 
     /// Requires canonical file keys with no empty path components. The

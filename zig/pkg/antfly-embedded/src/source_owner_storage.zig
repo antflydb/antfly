@@ -19,3 +19,5 @@ pub const local_query = @import("storage/query.zig");
 pub const local_write = @import("storage/write.zig");
 pub const table_reads = struct {};
 pub const table_writes = struct {};
+
+pub const storage_engine = @import("storage/engine.zig");

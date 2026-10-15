@@ -43,13 +43,17 @@ pub const DocumentArtifactChildRangeOutboxRecord = struct {
 };
 
 pub const DocumentArtifactChildRangeDispatcher = struct {
+    const NativeCallbacks = struct { apply: @FieldType(DocumentArtifactChildRangeDispatcher, "apply") };
+    const NativeBoundary = @import("../named_callback.zig").Boundary(NativeCallbacks);
+    callback_dispatch: @import("../named_callback.zig").Dispatch = NativeBoundary.local_dispatch,
+
     ptr: *anyopaque,
     /// Pure, bounded destination selection; called under the local apply fence.
     select_destination: *const fn (*anyopaque, types.DocumentArtifactChildRange) ?u64,
     apply: *const fn (ptr: *anyopaque, alloc: Allocator, dispatch: DocumentArtifactChildRangeDispatch) anyerror!void,
 
     pub fn applyDispatch(self: DocumentArtifactChildRangeDispatcher, alloc: Allocator, dispatch: DocumentArtifactChildRangeDispatch) !void {
-        return try self.apply(self.ptr, alloc, dispatch);
+        return try NativeBoundary.call("apply", self.callback_dispatch, self.apply, .{ self.ptr, alloc, dispatch });
     }
 };
 

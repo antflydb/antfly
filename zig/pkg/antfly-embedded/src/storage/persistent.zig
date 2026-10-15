@@ -366,6 +366,7 @@ const SegmentFileStore = struct {
 
     fn delete(self: *SegmentFileStore, seg_id: u64) void {
         self.deleteChecked(seg_id) catch |err| {
+            if (err == error.EnrichmentWaitCanceled or err == error.Canceled) return;
             if (builtin.os.tag != .freestanding) {
                 std.log.warn("text segment cleanup failed segment={d}: {s}", .{ seg_id, @errorName(err) });
             }

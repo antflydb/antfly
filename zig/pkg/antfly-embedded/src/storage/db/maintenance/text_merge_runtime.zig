@@ -69,7 +69,9 @@ pub var test_producer_shutdown_wait_entered: std.atomic.Value(bool) = .init(fals
 /// Test-only outcome: 1 means shutdown wake, 2 means ordinary deadline.
 pub var test_producer_shutdown_wait_outcome: std.atomic.Value(u8) = .init(0);
 
-pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
+// Named branches keep native ABI identities stable across LLVM owners.
+pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) UnsupportedTextMergeRuntime else PlatformTextMergeRuntime;
+const UnsupportedTextMergeRuntime = struct {
     config: Config,
 
     pub fn init(
@@ -151,7 +153,8 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
         snapshot.max_pending_segments = self.config.max_pending_segments;
         snapshot.max_pending_bytes = self.config.max_pending_bytes;
     }
-} else struct {
+};
+const PlatformTextMergeRuntime = struct {
     const ProducerAdmissionWaiter = struct {
         previous: ?*ProducerAdmissionWaiter = null,
         next: ?*ProducerAdmissionWaiter = null,

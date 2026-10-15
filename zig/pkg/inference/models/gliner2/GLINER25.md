@@ -25,19 +25,55 @@ backend limits, and reproducible family checks.
 | `fastino/gliner2.5-multi-v1` (rev `2ca71aafb3446d9014e1c55c7ff51c9bc7209c47`) | multi | fp32 | native, metal | Qualified measured single-window family profiles; see [family record](GLINER25_FAMILY.md) |
 | `fastino/GLiNER2.5-multi-Decide` (rev `a35a0cd3b7a0f00f2effc576f454cd48fa98aa5f`) | multi | fp32 | native, metal | Qualified measured single-window extraction and public Decide profiles; see [family record](GLINER25_FAMILY.md) |
 | `fastino/gliner2.5-base-v1` (converted via `gliner25-convert`, same rev) | base | fp16_encoder | native, metal | Qualified (single-window -- section 15) and Qualified (long-document, up to the same 182,000-byte bound as fp32 -- section 15 follow-up); root-caused as fp16 weight-rounding noise (no code defect), plus a real (also root-caused, not a defect) cross-window merge-tie-break effect for long documents. Reviewed tolerances: `7.5e-4` (single-window), `2.5e-3` (long-document). **fp32 remains the default**: on Metal, fp16 is measured ~2.9x SLOWER than fp32 for the corpus-shaped long-document workload (0.94 vs 2.72 sections/s, section 15 follow-up) (root cause: fp16 is excluded from the Metal resident-weight `optimized_v2` fast path by design) |
+| `fastino/gliner2.5-base-v1` (rev `54785d51df8d86a0d8f2eb212fec15871aad2c4d`) | base | fp32 (safetensors) | native, metal | Same six fp32 profiles as the original revision; see [wrapper evidence](#transformers-configuration-wrapper-2026-10-08) |
 | Any other digest, revision, or precision of `gliner2.5-base-v1` | base | any | any | Not reviewed |
 
 `gliner_boundary.runtime_available` is now `true`, and
 `gliner_boundary_qualification.zig`'s production table carries the eight
-base rows (fp32 and fp16_encoder, each single-window and long-document,
+original base rows (fp32 and fp16_encoder, each single-window and long-document,
 each reviewed for native and Metal -- section 15), plus separate exact-byte
-multilingual profiles recorded in [GLINER25_FAMILY.md](GLINER25_FAMILY.md).
+multilingual profiles recorded in [GLINER25_FAMILY.md](GLINER25_FAMILY.md),
+and six fp32 rows for the Transformers wrapper described below.
 Everything else --
 including a re-downloaded `gliner2.5-base-v1` whose upstream revision
 changes, or a quantized/GGUF conversion of it -- still fails closed with
 `error.UnsupportedGlinerBoundaryRuntime` at request time, and pull-time
 manifest synthesis still withholds the `extract` task for it (see
 "Two-tier gate" below).
+
+### Transformers configuration wrapper (2026-10-08)
+
+Revision `54785d51df8d86a0d8f2eb212fec15871aad2c4d` of
+`fastino/gliner2.5-base-v1` is also admitted with the same native and Metal
+fp32 profiles, including single-window, long-document and composed-window
+extraction. It changes only `config.json`: `model_type` is `gliner2`,
+`architectures` is `["Gliner2ForSchemaExtraction"]`, and `encoder_config`
+is an inline copy of `encoder_config/config.json`. The parser requires the
+inline declaration to match the sidecar, independently of object key order
+and equivalent numeric encodings such as `0` and `0.0`. Comparison rejects
+nesting deeper than 64 levels so unreviewed metadata cannot exhaust the
+process stack.
+The new config is 4,103 bytes with SHA-256
+`d6b515c21ae2100c12267fb42a3f02c1e99ad87580366aebedb161efd74441c7`.
+
+The weight and other three sidecar identities are unchanged. The checked-in
+`testdata/gliner25/models/base/config_transformers.json` fixture produces
+exactly the same typed execution config as the original. The test
+`gliner boundary pipeline Python parity Transformers base wrapper all inference tasks`
+runs the ten existing pinned Python reference cases with this wrapper and
+the unchanged real weights (`ANTFLY_GLINER25_BASE_MODEL_DIR`). From `zig/`,
+run `zig build inference-test -Doptimize=ReleaseFast -Dtest-filter=boundary`
+with that variable pointing to the original reviewed model directory. Qualification
+adds an exact artifact identity and preserves every original profile's
+backend, features and length bounds. Future config or weight changes remain
+unqualified until reviewed; this is not a wildcard for Transformers models.
+
+For a reproducible pull of this wrapper, use:
+
+```sh
+antfly inference pull "fastino/gliner2.5-base-v1:safetensors@54785d51df8d86a0d8f2eb212fec15871aad2c4d"
+```
+The original `72ac19b486cd4557424c8d61114e7530c243e9b0` revision remains supported.
 
 ## Two-tier gate
 

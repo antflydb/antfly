@@ -119,12 +119,7 @@ fn ensureSource(alloc: std.mem.Allocator, env: Environment, input: Request, owne
         {
             defer decoder.close();
             if (program) |compiled| {
-                var scratch = std.heap.ArenaAllocator.init(alloc);
-                defer scratch.deinit();
-                var read = try decoder.core.store.beginReadTxn();
-                defer read.abort();
-                const manifest = try @import("antfly_local_sources").storage_db_relational_rewrite_manifest.read(scratch.allocator(), &read, context.cancellation);
-                try compiled.requireSourceManifest(alloc, manifest, try read.get("\x00\x00__metadata__:schema_json"));
+                try decoder.requireRewriteSourceManifest(alloc, compiled, context.cancellation);
             }
         }
         const portable_marker = try std.fmt.allocPrint(alloc, "{s}/restore-source.scope", .{files});

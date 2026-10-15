@@ -14,7 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
-const agl_data = @import("agl_data.zig");
+const pdf_assets = @import("pdf_standard_fonts");
 
 const Allocator = std.mem.Allocator;
 
@@ -212,20 +212,7 @@ pub fn decodeTableAlloc(alloc: Allocator, table: *const [256]u21, bytes: []const
     return try out.toOwnedSlice(alloc);
 }
 
-fn adobeGlyphCodepoints(name: []const u8) ?[]const u21 {
-    var low: usize = 0;
-    var high: usize = agl_data.entries.len;
-    while (low < high) {
-        const mid = low + (high - low) / 2;
-        const order = std.mem.order(u8, agl_data.entries[mid].name, name);
-        switch (order) {
-            .lt => low = mid + 1,
-            .gt => high = mid,
-            .eq => return agl_data.entries[mid].codepoints,
-        }
-    }
-    return null;
-}
+const adobeGlyphCodepoints = pdf_assets.glyphCodepoints;
 
 fn parseUnicodeScalarHex(bytes: []const u8) ?u21 {
     const value = std.fmt.parseInt(u21, bytes, 16) catch return null;

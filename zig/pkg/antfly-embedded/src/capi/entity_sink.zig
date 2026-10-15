@@ -1344,7 +1344,7 @@ test "capi Lite models_dir loads a real extractor for graph enrichment" {
     defer api.antfly_buffer_free(&table_query);
     const text_request = "{\"text\":\"Apple CEO Tim Cook announced iPhone 15 in Cupertino yesterday.\"}";
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_resolve_query_json(readonly_table, .fromSlice("concepts"), .fromSlice(text_request), &table_query));
-    const child, const slot = api.handle_registry.enter(readonly_table).?;
+    const child, const slot = api.handleRegistry().enter(readonly_table).?;
     try std.testing.expect(child.query_producer == null);
     try std.testing.expect(child.parent_handle.?.query_producer != null);
     api.HandleRegistry.leave(slot);

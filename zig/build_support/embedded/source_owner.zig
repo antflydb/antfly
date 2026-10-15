@@ -16,6 +16,11 @@
 const std = @import("std");
 const Binding = struct { consumer: *std.Build.Module, local: *std.Build.Module };
 var bindings: std.ArrayList(Binding) = .empty;
+var storage_provider: ?*std.Build.Step.Compile = null;
+
+pub fn registerStorageProvider(provider: *std.Build.Step.Compile) void {
+    storage_provider = provider;
+}
 
 /// One local source owner per consumer profile. Source files are never copied
 /// into a server root; source selection remains explicit at the module boundary.
@@ -60,6 +65,12 @@ pub fn finalize(b: *std.Build) void {
         binding.local.link_libc = binding.consumer.link_libc;
     }
     @import("../antfly/test_partitions.zig").add(b);
+    // Static consumers compile with unresolved engine calls. Provider code is
+    // a final-link input, never a prerequisite for their LLVM object emission.
+    if (storage_provider) |provider| {
+        var steps: std.AutoHashMap(*std.Build.Step, void) = .init(b.allocator);
+        for (b.top_level_steps.values()) |root| attachStorageFinalLinks(b, &root.step, provider, &steps);
+    }
 }
 
 /// Cloned consumer graphs retain their own late-bound source configuration.
@@ -72,4 +83,40 @@ pub fn adopt(consumer: *std.Build.Module) void {
 pub fn localFor(consumer: *std.Build.Module) ?*std.Build.Module {
     for (bindings.items) |binding| if (binding.consumer == consumer) return binding.local;
     return null;
+}
+
+fn attachStorageFinalLinks(b: *std.Build, step: *std.Build.Step, provider: *std.Build.Step.Compile, seen: *std.AutoHashMap(*std.Build.Step, void)) void {
+    if ((seen.getOrPut(step) catch @panic("OOM")).found_existing) return;
+    if (step.cast(std.Build.Step.Compile)) |artifact| {
+        if (artifact.kind == .exe or artifact.kind == .@"test" or (artifact.kind == .lib and artifact.linkage == .dynamic)) {
+            var linked = false;
+            for (artifact.root_module.link_objects.items) |input| if (input == .other_step and input.other_step == provider) {
+                linked = true;
+            };
+            if (!linked) {
+                var modules: std.AutoHashMap(*std.Build.Module, void) = .init(b.allocator);
+                if (needsStorageProvider(b, artifact.root_module, provider, artifact.kind == .@"test", &modules)) artifact.root_module.linkLibrary(provider);
+            }
+        }
+    }
+    for (step.dependencies.items) |dependency| attachStorageFinalLinks(b, dependency, provider, seen);
+}
+
+fn needsStorageProvider(b: *std.Build, module: *std.Build.Module, provider: *std.Build.Step.Compile, testing: bool, seen: *std.AutoHashMap(*std.Build.Module, void)) bool {
+    if (module == provider.root_module or (seen.getOrPut(module) catch @panic("OOM")).found_existing) return false;
+    if (!testing) if (module.root_source_file) |root| {
+        if (@import("../antfly/source_paths.zig").authored(b, root)) |path| {
+            if (module.import_table.contains("storage_engine_options") and
+                std.mem.indexOf(u8, path, "pkg/antfly-embedded/src/") != null and
+                !std.mem.endsWith(u8, path, "source_catalog_control.zig")) return true;
+        }
+    };
+    for (module.link_objects.items) |input| if (input == .other_step) {
+        if (input.other_step == provider) continue;
+        if (std.mem.eql(u8, input.other_step.name, "antfly-storage-kernel")) return true;
+        if (needsStorageProvider(b, input.other_step.root_module, provider, testing, seen)) return true;
+    };
+    var imports = module.import_table.iterator();
+    while (imports.next()) |entry| if (needsStorageProvider(b, entry.value_ptr.*, provider, testing, seen)) return true;
+    return false;
 }

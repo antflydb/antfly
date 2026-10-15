@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const storage_engine = @import("../storage/engine_selection.zig");
 
 pub const Slice = extern struct {
     pub fn fromSlice(value: []const u8) Slice {
@@ -308,15 +309,18 @@ threadlocal var last_error_code: ErrorCode = .ok;
 threadlocal var last_error_detail: [:0]const u8 = "";
 
 pub fn clearLastError() void {
+    if (comptime storage_engine.enabled) return antfly_storage_error_clear_v1();
     last_error_code = .ok;
     last_error_detail = "";
 }
 
 pub fn lastErrorDetail() [*:0]const u8 {
+    if (comptime storage_engine.enabled) return antfly_storage_error_detail_v1();
     return last_error_detail.ptr;
 }
 
 pub fn lastErrorCode() ErrorCode {
+    if (comptime storage_engine.enabled) return antfly_storage_error_code_v1();
     return last_error_code;
 }
 
@@ -324,6 +328,10 @@ threadlocal var last_error_buffer: [2048]u8 = undefined;
 
 /// Copy a diagnostic before temporary request/SQL storage is released.
 pub fn recordError(code: ErrorCode, detail: []const u8) ErrorCode {
+    if (comptime storage_engine.enabled) {
+        antfly_storage_error_set_v1(code, detail.ptr, detail.len);
+        return code;
+    }
     last_error_code = code;
     const count = @min(detail.len, last_error_buffer.len - 1);
     if (detail.ptr != last_error_buffer[0..].ptr) @memcpy(last_error_buffer[0..count], detail[0..count]);
@@ -337,7 +345,7 @@ pub fn ensureError(code: ErrorCode, context: []const u8) ErrorCode {
         clearLastError();
         return code;
     }
-    if (last_error_code == code and last_error_detail.len != 0) return code;
+    if (lastErrorCode() == code and std.mem.span(lastErrorDetail()).len != 0) return code;
     return recordError(code, context);
 }
 
@@ -348,9 +356,11 @@ pub fn mapErrorContext(err: anyerror, context: []const u8) ErrorCode {
 }
 
 pub fn mapError(err: anyerror) ErrorCode {
+    const code = classifyError(err);
+    if (comptime storage_engine.enabled) return recordError(code, @errorName(err));
     last_error_detail = @errorName(err);
-    last_error_code = classifyError(err);
-    return last_error_code;
+    last_error_code = code;
+    return code;
 }
 
 fn classifyError(err: anyerror) ErrorCode {
@@ -597,3 +607,9 @@ test "capi resolver replacement preconditions have distinct ABI codes" {
     try std.testing.expectEqual(ErrorCode.replacement_pending, mapError(error.IndexReplacementPending));
     try std.testing.expectEqual(ErrorCode.replacement_configuration_mismatch, mapError(error.IndexReplacementConfigurationMismatch));
 }
+
+// C-layout-only error state calls keep physical DB declarations out of control roots.
+extern fn antfly_storage_error_clear_v1() callconv(.c) void;
+extern fn antfly_storage_error_code_v1() callconv(.c) ErrorCode;
+extern fn antfly_storage_error_detail_v1() callconv(.c) [*:0]const u8;
+extern fn antfly_storage_error_set_v1(ErrorCode, [*]const u8, usize) callconv(.c) void;

@@ -181,32 +181,50 @@ document-size bound and feature coverage. A request outside the reviewed
 bound, or for a task combination not yet measured with windowing, still fails
 closed instead of silently truncating or misbehaving.
 
-### Selecting a reduced-precision GLiNER2.5 checkpoint
-
-`antfly inference pull fastino/gliner2.5-base-v1` always produces the
-published fp32 checkpoint (there is no upstream fp16 artifact to pull) and
-that remains the default: it is the only precision qualified for both
-single-window and long-document requests. A reviewed `fp16_encoder`
-conversion (encoder matrices narrowed to F16; every bias, normalization
-parameter, and the extraction head stay FP32) is qualified for
-**single-window requests only** -- see GLINER25.md's fp16-encoder
-qualification section for the root-cause analysis, tolerance evidence, and
-why long-document is not yet qualified for it. To produce and select it:
+For a reproducible fp32 pull, pin the reviewed Transformers-wrapper revision:
 
 ```sh
+antfly inference pull "fastino/gliner2.5-base-v1:safetensors@54785d51df8d86a0d8f2eb212fec15871aad2c4d"
+```
+
+An explicit revision installs a separate variant: use the complete pinned name
+in extraction requests. The plain model name also works while upstream
+resolves to these reviewed bytes. Reduced-precision conversion uses the
+original reviewed revision as described below.
+See [the qualification record](pkg/inference/models/gliner2/GLINER25.md) for
+supported revisions and runtime bounds.
+
+### Selecting a reduced-precision GLiNER2.5 checkpoint
+
+The published checkpoint is fp32. A reviewed `fp16_encoder` conversion
+narrows encoder matrices to F16 and retains biases, normalization parameters,
+and the extraction head in FP32. It is qualified on native and Metal for
+single-window and long-document requests within its reviewed profiles.
+**fp32 remains recommended**; see the [qualification record](pkg/inference/models/gliner2/GLINER25.md)
+for tolerances, task coverage, and measured performance.
+
+The qualified conversion requires the **original revision
+`72ac19b486cd4557424c8d61114e7530c243e9b0`**, including its original
+`config.json`. Converting the new Transformers wrapper copies its different
+config digest into the bundle, which is not qualified for fp16 extraction.
+Use a dedicated source directory containing only the following pinned pull;
+the directory glob below selects that explicit variant's installation:
+
+```sh
+antfly inference pull \
+  "fastino/gliner2.5-base-v1:safetensors@72ac19b486cd4557424c8d61114e7530c243e9b0" \
+  --models-dir ./gliner25-reviewed-source
+
 antfly-inference-gliner25-convert \
-  --model-dir ~/.antfly/inference/models/fastino/gliner2.5-base-v1 \
+  --model-dir ./gliner25-reviewed-source/fastino/gliner2.5-base-v1*/ \
   --output-dir ~/.antfly/inference/models/fastino/gliner2.5-base-v1-fp16 \
   --precision fp16_encoder
 ```
 
 Conversion writes its own `model_manifest.json` as part of the same atomic
-publish (gated on the same reviewed-identity check `pull` uses), so the
-resulting directory is immediately selectable as
-`fastino/gliner2.5-base-v1-fp16` wherever a model name is accepted -- no
-separate `pull` or manifest-authoring step. A request against it outside
-the single-window bound (or for `long_document`) fails closed with
-`error.UnsupportedGlinerBoundaryRuntime`, the same fail-closed behavior as
-any other unreviewed request shape. Converting to any other precision
+publication, using the reviewed identity gate applied by `pull`. The
+converted directory is selectable as `fastino/gliner2.5-base-v1-fp16`.
+Requests outside its reviewed feature or geometry profiles still fail closed.
+Converting to any other precision
 (`q8_0`, `q4_k`, `q4_0`) produces a normal, byte-verified bundle with an
 empty `tasks` list until a future reviewer qualifies it the same way.

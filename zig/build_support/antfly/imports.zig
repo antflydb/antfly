@@ -53,6 +53,7 @@ pub const AntflyRootImports = struct {
     inference_engine: *std.Build.Module,
     shared_inference_core: bool = false,
     darwin_release_memory: bool = false,
+    darwin_shared_storage_sdk27: bool = false,
     sanitize_thread: bool = false,
     boundary_profile: @import("../embedded/storage_boundary.zig").Profile = .all,
     build_info: @import("../../lib/build_info/build_support.zig").BuildInfo,
@@ -389,7 +390,10 @@ pub const AntflyRootImports = struct {
         mod.addOptions("build_options", options);
         // Document/media compute has no physical storage handle, including in
         // the independently compiled public embedded enrichment archive.
-        self.storage_boundary.configureProfile(mod, true, false, self.boundary_profile);
+        // This constructor also builds the shared embedded compute archive,
+        // whose caller may carry the default full storage profile. Declare
+        // only compute contracts so storage ABI edits cannot invalidate it.
+        self.storage_boundary.configureProfile(mod, true, false, .enrichment);
         mod.addImport("antfly_platform", self.platform);
         mod.addImport("antfly_cancellation", self.cancellation);
         mod.addImport("antfly_template_content", self.template_content);
@@ -410,6 +414,7 @@ pub const AntflyRootImports = struct {
     }
 
     pub fn configureServerless(self: @This(), b: *std.Build, mod: *std.Build.Module, link_libc: bool) void {
+        mod.addImport("antfly_resolver", self.resolver);
         self.configureDatabase(mod, link_libc);
         mod.addImport("antfly_provision_contract", self.provision_contract);
         inline for (object_runtime_imports) |field| self.addImport(mod, field);

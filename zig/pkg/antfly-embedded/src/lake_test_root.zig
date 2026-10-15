@@ -22,6 +22,8 @@ test {
     _ = @import("serverless/external_source/mod.zig");
     _ = @import("serverless/lake_host.zig");
     _ = @import("storage/rowsource/identity.zig");
+    _ = @import("storage/db/native_query_warming.zig");
+    _ = @import("storage/db/native_query_reuse.zig");
     _ = @import("sql/lake_cursor.zig");
     _ = @import("sql/lake_values.zig");
 }

@@ -94,6 +94,7 @@ pub fn publish(adapter: anytype, alloc: std.mem.Allocator, target: []const u8, v
     var digest: [32]u8 = undefined;
     std.crypto.hash.Blake3.hash(serialized, &digest, .{});
     const job: Job = .{ .table_id = adapter.db.core.identity_namespace.table_id, .version = version, .target = target, .generations = removed.items, .digest = digest };
+    invalidate(adapter.handle.?);
     try store(adapter.db, alloc, job);
     finishJob(adapter, job) catch return error.SqlDdlPending;
     return true;
@@ -173,11 +174,24 @@ fn finishJob(adapter: anytype, job: Job) !void {
     return error.SqlDdlPending;
 }
 
+/// Call before admission, including attempts whose durable outcome is unknown.
+/// Table handles share their owning database's recovery state.
+pub fn invalidate(handle: *h.Handle) void {
+    const root = handle.parent_handle orelse handle;
+    root.sql_ddl_recovery_needed = true;
+}
+
 pub fn recover(handle: *h.Handle) !void {
+    if (!handle.sql_ddl_recovery_needed) return;
+    if (h.builtin.is_test) handle.sql_ddl_recovery_scans +%= 1;
+    try @import("tables.zig").loadAvailable(handle);
     try @import("sql_fk.zig").recover(handle);
-    try recoverTable(handle, &handle.db, "default");
+    var complete = try recoverTable(handle, &handle.db, "default");
     var iterator = handle.embedded_tables.valueIterator();
-    while (iterator.next()) |table| try recoverTable(handle, &table.*.db, table.*.name);
+    while (iterator.next()) |table| {
+        if (!try recoverTable(handle, &table.*.db, table.*.name)) complete = false;
+    }
+    handle.sql_ddl_recovery_needed = !complete or handle.embedded_table_errors.count() != 0;
 }
 
 /// Native schema publication creates durable activation progress. Reuse the
@@ -226,7 +240,7 @@ pub fn activate(adapter: anytype, version: u32) !void {
     return error.SqlDdlPending;
 }
 
-fn recoverTable(handle: *h.Handle, db: *h.db_mod.DB, name: []const u8) !void {
+fn recoverTable(handle: *h.Handle, db: *h.db_mod.DB, name: []const u8) !bool {
     var adapter = sql.Adapter(h.antfly){ .handle = handle, .db = db, .table_name = name };
     if (try db.core.getStoreValue(handle.alloc, key)) |bytes| {
         defer handle.alloc.free(bytes);
@@ -235,20 +249,29 @@ fn recoverTable(handle: *h.Handle, db: *h.db_mod.DB, name: []const u8) !void {
         defer job.deinit();
         try finishJob(&adapter, job.value);
     }
-    if (!h.liteOpenModeCanWrite(handle.open_mode)) return;
-    const schema = (try db.getSchemaJson(handle.alloc)) orelse return;
+    if (!h.liteOpenModeCanWrite(handle.open_mode)) return true;
+    const schema = (try db.getSchemaJson(handle.alloc)) orelse return true;
     defer handle.alloc.free(schema);
-    if (!try d.api_relational_integrity_commit.requiresActivation(handle.alloc, schema)) return;
+    if (!try d.api_relational_integrity_commit.requiresActivation(handle.alloc, schema)) return true;
     if (try db.lookup(handle.alloc, "", .{ .relational_activation_json = "{}" })) |response| {
         defer handle.alloc.free(response.json);
         var state = try std.json.parseFromSlice(struct { state: activation.State }, handle.alloc, response.json, .{ .ignore_unknown_fields = true });
         defer state.deinit();
-        if (state.value.state != .validating) return;
+        if (state.value.state != .validating) return true;
     }
     var view = db.core.acquireSchemaView() orelse return error.PreparedGenerationChanged;
     defer view.release();
     activate(&adapter, view.version()) catch |err| switch (err) {
-        error.SqlDdlPending => return,
+        error.SqlDdlPending => return false,
         else => return err,
     };
+    // The worker can yield without error on a parent dependency or a guarded
+    // repair. Only durable terminal state makes this generation clean.
+    if (try db.lookup(handle.alloc, "", .{ .relational_activation_json = "{}" })) |response| {
+        defer handle.alloc.free(response.json);
+        var state = try std.json.parseFromSlice(struct { state: activation.State }, handle.alloc, response.json, .{ .ignore_unknown_fields = true });
+        defer state.deinit();
+        return state.value.state != .validating;
+    }
+    return false;
 }

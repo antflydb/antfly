@@ -165,6 +165,43 @@ pub const QueryEmbeddingCache = struct {
         return target_now +| (deadline -| platform_time.monotonicNs());
     }
 
+    /// Reuse an already completed computation without opening a new flight.
+    /// Background batch producers probe first, then compute only their misses.
+    pub fn lookup(self: *QueryEmbeddingCache, budget: *cache_budget.CacheBudget, caller_alloc: std.mem.Allocator, key: Key) !?[]f32 {
+        if (!self.config.enabled) return null;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const entry = self.entries.get(key) orelse {
+            self.counters.misses +|= 1;
+            return null;
+        };
+        const now = self.nowNs();
+        if (now >= entry.expires_at_ns) {
+            self.removeEntryLocked(entry, budget, true);
+            self.counters.misses +|= 1;
+            return null;
+        }
+        const copied = try caller_alloc.dupe(f32, entry.vector);
+        self.touchLocked(entry, now);
+        self.counters.hits +|= 1;
+        return copied;
+    }
+
+    /// Retain pure provider output under the same hard budget and eviction
+    /// policy as query embeddings. Cache pressure never fails publication.
+    pub fn remember(self: *QueryEmbeddingCache, budget: *cache_budget.CacheBudget, key: Key, vector: []const f32) void {
+        if (!self.config.enabled) return;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.entries.get(key)) |entry| {
+            if (self.nowNs() < entry.expires_at_ns) return;
+            self.removeEntryLocked(entry, budget, true);
+        }
+        self.admitLocked(key, vector, budget) catch {
+            self.counters.rejected_admissions +|= 1;
+        };
+    }
+
     /// deadline_ns belongs to this cache's std.Io .awake clock.
     pub fn getOrCompute(
         self: *QueryEmbeddingCache,
@@ -590,6 +627,29 @@ test "query embedding cache translates native query deadlines" {
     try std.testing.expect(cache.deadlineFromNative(null) == null);
     io.monotonic_ns += std.time.ns_per_s;
     try std.testing.expectError(error.Timeout, cache.getOrCompute(&budget, std.testing.allocator, @as([32]u8, @splat(7)), deadline, &compute, TestCompute.run));
+}
+
+test "embedding completed results obey ownership and byte bounds" {
+    const a = std.testing.allocator;
+    const charge = QueryEmbeddingCache.entryChargeBytes(3);
+    var budget = cache_budget.CacheBudget.init(charge);
+    var cache = QueryEmbeddingCache.init(a, std.testing.io, .{ .max_bytes = charge });
+    defer cache.deinit(&budget);
+    const first: Key = @splat(1);
+    const second: Key = @splat(2);
+    cache.remember(&budget, first, &.{ 1, 2, 3 });
+    const owned = (try cache.lookup(&budget, a, first)).?;
+    defer a.free(owned);
+    owned[0] = 99;
+    cache.remember(&budget, second, &.{ 4, 5, 6 });
+    try std.testing.expect(try cache.lookup(&budget, a, first) == null);
+    const retained = (try cache.lookup(&budget, a, second)).?;
+    defer a.free(retained);
+    try std.testing.expectEqualSlices(f32, &.{ 4, 5, 6 }, retained);
+    try std.testing.expectEqual(charge, budget.stats().used_bytes);
+    cache.remember(&budget, first, &.{ 1, 2, 3, 4 });
+    try std.testing.expect(try cache.lookup(&budget, a, first) == null);
+    try std.testing.expectEqual(charge, budget.stats().used_bytes);
 }
 
 pub fn testOwnedValuesAndHits() !void {

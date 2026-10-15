@@ -262,16 +262,26 @@ Read-only snapshots without a lock sidecar also open from read-only directories
 or media. Their calls use a shared inode fence when sidecar creation is denied;
 every sidecar creator takes the exclusive inode fence before installing it.
 Reopened native writers discover pending generated enrichment in the durable
-journals of all tables and resume it under their connection lease.
+journals of all tables and resume it through their shared maintenance owner.
 
 After an external commit or atomic file replacement, the shared owner reopens
 its cached runtime before the next operation. An in-process handoff between
 compatible connections reuses the live runtime. Streaming SQL cursors retain the
 runtime and immutable pages they originally pinned; retiring that runtime
 releases caches without flushing them over a newer generation. Read-only
-connections observe new commits at operation boundaries. Automatic enrichment,
-TTL, and reclamation maintenance run under the same file gate and kernel lease.
-Foreground refresh defers reclamation to that owner. Lease-scoped publication
+connections observe new commits at operation boundaries. Background enrichment and index builds capture one table at a time under the
+file gate, then compute outside it. Generated artifacts, private staging, and progress writes reacquire the
+kernel writer lease and publish through the current namespace. Source digests,
+document incarnations, catalog identity, and lease tenure fence acceptance.
+Index file publications may adopt a newer primary checkpoint only while their
+immutable index inputs and inode remain unchanged; changes to those inputs
+cancel the prepared work. A bounded owner cache retains only
+pure embedding results with matching model revision, credentials, task, input and
+dimensions, allowing retries without publishing stale artifacts. Native capture
+runtimes use inode-fenced immutable inputs and release them before reclamation.
+TTL retains its short publication fence. Reclamation scans and copies outside
+the gate and validates before adoption. Foreground refresh defers allocator
+conversion, reclamation, and historical index backfill to that owner. Lease-scoped publication
 fences new read pins until page reuse and checkpoint publication finish; temporary
 lock contention reports `ANTFLY_BUSY` and SQLSTATE `55P03`.
 
@@ -402,7 +412,7 @@ indexes. MATCH PARTIAL FK publication requires ready parent support indexes;
 a readiness deadline expires before any FK publication decision is admitted.
 Admission builds only the selected witness indexes; unrelated builds and
 reclamation do not consume its deadline. Lite background maintenance advances
-one relational index page per table and releases the writer lease between
+one table per turn, including one relational index page, and releases the writer lease between
 turns, retaining pending work for subsequent turns.
 
 Failed UNIQUE coverage admits constraint-checked UPDATE/DELETE repairs under

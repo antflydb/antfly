@@ -57,6 +57,7 @@ pub fn merge(comptime Entry: type, alloc: std.mem.Allocator, input: []const Entr
         } else if (!entry.mutation.predicate_only) {
             const prior = &result.items[position.value_ptr.*];
             prior.mutation.row = entry.mutation.row;
+            if (@hasField(Entry, "encoded_row")) prior.encoded_row = entry.encoded_row;
             prior.mutation.json_null_fields = entry.mutation.json_null_fields;
             prior.mutation.predicate_only = false;
         }

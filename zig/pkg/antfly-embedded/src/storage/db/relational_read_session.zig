@@ -16,6 +16,7 @@
 //! Retained local relational read session. DB acquires the admitted snapshot;
 //! this owner holds its reader, policy lease, cancellation and output cleanup.
 const std = @import("std");
+const storage_engine = @import("../engine_selection.zig");
 const Allocator = std.mem.Allocator;
 const types = @import("types.zig");
 const mapper = @import("document_mapper.zig");
@@ -35,6 +36,7 @@ pub const Session = struct {
     deadline_ns: ?u64,
 
     pub fn deinit(session: *Session) void {
+        if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("relationalSessionDeinit", .{session}) catch @panic("incompatible storage owner");
         if (session.range_proofs) |proofs| session.alloc.free(proofs);
         session.reader.deinit();
         if (session.filter_context) |filter| session.destroy_filter.?(session.alloc, filter);
@@ -44,16 +46,19 @@ pub const Session = struct {
     }
 
     pub fn checkpoint(session: *const Session) !void {
+        if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("relationalSessionCheckpoint", .{session});
         if (session.cancellation) |cancellation| try cancellation.check();
         if (session.deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.DeadlineExceeded;
         if (session.row_policy_lease) |*lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
     }
     pub fn rangeProofs(session: *Session, alloc: Allocator) ![]@import("../range_protection.zig").Proof {
+        if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("relationalSessionRangeProofs", .{ session, alloc });
         try session.checkpoint();
         return alloc.dupe(@import("../range_protection.zig").Proof, session.range_proofs orelse return error.SqlRangeTrackingRequired);
     }
 
     pub fn nextTypedPage(session: *Session, alloc: Allocator, io: ?std.Io, budget: RelationalRows.Budget) !RelationalRows.Page {
+        if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("relationalSessionNextTypedPage", .{ session, alloc, io, budget });
         try session.checkpoint();
         var bounded = budget;
         bounded.target_bytes = @min(bounded.output_bytes, if (bounded.target_bytes == 0) session.page_bytes else @min(bounded.target_bytes, session.page_bytes));
@@ -68,6 +73,7 @@ pub const Session = struct {
     /// SQL staging uses the same defaults/generated/CHECK pipeline as commit.
     /// Each returned key/value and the outer slice belong to alloc.
     pub fn normalizeRows(session: *Session, alloc: Allocator, writes: []const types.BatchWrite) ![]types.BatchWrite {
+        if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("relationalSessionNormalizeRows", .{ session, alloc, writes });
         if (writes.len > 4096) return error.InvalidArgument;
         try session.checkpoint();
         const view = session.reader.active;

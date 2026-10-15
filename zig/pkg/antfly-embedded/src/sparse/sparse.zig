@@ -4880,7 +4880,7 @@ pub const SparseIndex = struct {
                     const ordinal = std.mem.readInt(u64, entry.key[1..9], .big);
                     if (ordinal > last) break;
                     if (ordinal < first) return error.InvalidSparsePhysicalMap;
-                    if (try filter.allows(filter.ptr, entry.value)) try result.add(@intCast(ordinal));
+                    if (try filter.allowsKey(entry.value)) try result.add(@intCast(ordinal));
                     next = try cursor.next();
                 }
                 return true;
@@ -7331,7 +7331,7 @@ test "sparse physical ordinal selection uses canonical scoring and intersects di
             const self: *@This() = @ptrCast(@alignCast(raw));
             var result = @import("../encoding/roaring.zig").RoaringBitmap.init(alloc);
             errdefer result.deinit();
-            if (try lookup.one(lookup.ptr, self.key)) |num| try result.add(num);
+            if (try lookup.lookupOne(self.key)) |num| try result.add(num);
             return result;
         }
     };
@@ -8357,12 +8357,12 @@ test "sparse exclusion masks retain bounded scoring without reverse key callback
             result.exclude = .init(alloc);
             for (0..300) |i| {
                 var key: [32]u8 = undefined;
-                if (try lookup.one(lookup.ptr, try std.fmt.bufPrint(&key, "doc-{d}", .{i}))) |num| try result.exclude.?.add(num);
+                if (try lookup.lookupOne(try std.fmt.bufPrint(&key, "doc-{d}", .{i}))) |num| try result.exclude.?.add(num);
             }
             if (self.mode != .exclude) result.include = .init(alloc);
             if (self.mode == .both) for (400..450) |i| {
                 var key: [32]u8 = undefined;
-                if (try lookup.one(lookup.ptr, try std.fmt.bufPrint(&key, "doc-{d}", .{i}))) |num| try result.include.?.add(num);
+                if (try lookup.lookupOne(try std.fmt.bufPrint(&key, "doc-{d}", .{i}))) |num| try result.include.?.add(num);
             };
             return result;
         }
@@ -8436,7 +8436,7 @@ test "sparse adaptive ordinal constraints seek on upfront and mid query completi
             if (!self.complete) return .{ .residual = true };
             var selected: @import("ordinal_lookup.zig").Selection = .{ .include = .init(alloc) };
             errdefer selected.deinit();
-            try selected.include.?.add((try lookup.one(lookup.ptr, "doc-9999")).?);
+            try selected.include.?.add((try lookup.lookupOne("doc-9999")).?);
             return selected;
         }
     };
@@ -8482,7 +8482,7 @@ test "sparse broad physical masks seek through the bounded native directory" {
             defer rows.deinit();
             try rows.addRange(5000, 10000);
             var work: ordinals.WorkBudget = .{};
-            try std.testing.expect(try lookup.bounded_block.?(lookup.ptr, selected.allocator(), prefix, 0, &rows, &selected.include.?, &work));
+            try std.testing.expect(try lookup.boundedBlock(selected.allocator(), prefix, 0, &rows, &selected.include.?, &work));
             self.blocks = 4096 - work.blocks;
             try selected.prepareRead();
             try std.testing.expect(selected.budget.?.live < 64 * 1024);
@@ -8560,11 +8560,11 @@ test "sparse lazy native windows intersect reached postings and preserve spill l
             self.ranges += 1;
             var result: ordinals.Selection = .{ .include = Bitmap.init(alloc) };
             errdefer result.deinit();
-            const translate = lookup.native_range orelse {
+            _ = lookup.native_range orelse {
                 result.deinit();
                 return null;
             };
-            if (!try translate(lookup.ptr, alloc, first, last, .{ .ptr = self, .allows = windowKey }, &result.include.?)) {
+            if (!try lookup.nativeRange(alloc, first, last, .{ .ptr = self, .allows = windowKey }, &result.include.?)) {
                 result.deinit();
                 return null;
             }

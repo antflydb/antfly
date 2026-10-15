@@ -405,6 +405,35 @@ class RuntimeCacheTest(unittest.TestCase):
                         self.build(target, settings=settings, succeeds=False),
                     )
 
+    def test_compute_owner_ignores_storage_abi_changes(self):
+        contract = self.own("zig/pkg/antfly-embedded/src/storage/kernel_owner_abi.zig")
+        self.assert_compile(
+            self.build("runtime-unit-enrichment_compute"),
+            "enrichment_compute",
+            "success",
+        )
+        self.assert_compile(
+            self.build("runtime-unit-enrichment_compute"),
+            "enrichment_compute",
+            "cached",
+        )
+        contract.write_bytes(
+            contract.read_bytes() + b"\n// storage ABI cache regression\n"
+        )
+        self.assert_compile(
+            self.build("runtime-unit-enrichment_compute"),
+            "enrichment_compute",
+            "cached",
+        )
+        # Compute must remain buildable without declaring this storage-only
+        # contract, rather than merely avoiding semantic use of its types.
+        contract.unlink()
+        self.assert_compile(
+            self.build("runtime-unit-enrichment_compute"),
+            "enrichment_compute",
+            "cached",
+        )
+
     def test_runtime_owner_dependencies(self):
         owners = (
             ("zig/lib/mcp/src/root.zig", ("api_kernel",)),
