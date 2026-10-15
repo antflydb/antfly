@@ -4885,6 +4885,7 @@ test "capi SQL background embedding releases the file gate and fences stale resu
             break :blk guard.connection.?.owner;
         };
         var captured_runtime: std.meta.Child(@FieldType(db_mod.DB, "enrichment_runtime")) = undefined;
+        var captured_database: *db_mod.DB = undefined;
         {
             const guard = public.enterHandle(handle, .exclusive).?;
             defer guard.leave();
@@ -4898,6 +4899,7 @@ test "capi SQL background embedding releases the file gate and fences stale resu
             });
             try guard.handle.db.reconfigureEnrichmentRuntimePaused(.{ .dense_embedder = gate.interface() });
             captured_runtime = guard.handle.db.enrichment_runtime.?;
+            captured_database = &guard.handle.db;
             try guard.handle.db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"original\"}" }}, .sync_level = .write });
             connection.maintenance_pending = true;
         }
@@ -4952,9 +4954,38 @@ test "capi SQL background embedding releases the file gate and fences stale resu
             defer staging.release(staging.ptr);
             const artifact = try @import("antfly_local_sources").storage_internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "body_dense");
             defer alloc.free(artifact);
+            const before = connection.publication_stats.generated_refused;
             if (source_changed) {
                 try std.testing.expectError(error.EnrichmentWaitCanceled, staging.guard_key(staging.ptr, artifact));
-            } else try staging.guard_key(staging.ptr, artifact);
+                try std.testing.expectEqual(before + 1, connection.publication_stats.generated_refused);
+                // Multiple guards in one refused store lease count once.
+                try std.testing.expectError(error.EnrichmentWaitCanceled, staging.guard_key(staging.ptr, artifact));
+                try std.testing.expectEqual(before + 1, connection.publication_stats.generated_refused);
+            } else {
+                try staging.guard_key(staging.ptr, artifact);
+                try std.testing.expectEqual(before, connection.publication_stats.generated_refused);
+            }
+        }
+        if (source_changed) {
+            // Projection-only effects do not appear in changed_doc_keys, but
+            // they still must reject a source replaced since capture.
+            try std.testing.expectError(error.EnrichmentWaitCanceled, captured_database.derivedAsyncAppendDerivedBatchRecord(.{
+                .documents = &.{.{ .key = "doc", .action = .preserve_base_document }},
+            }));
+            const guard = public.enterHandle(handle, .read).?;
+            defer guard.leave();
+            try std.testing.expectEqual(@as(u64, 1), connection.publication_stats.replay_refused);
+        }
+        {
+            const port = captured_runtime.generated_publication.?;
+            // A missing lease rejects both the staging and final commit ports.
+            try std.testing.expectError(error.EnrichmentLeaseFenceLost, port.acquire_store(port.ptr, .{ .lease_key = "__antfly_test_missing_lease", .owner_id = "review", .epoch = 1 }, 0));
+            try std.testing.expectError(error.EnrichmentWaitCanceled, port.commit(port.ptr, .{}, &.{}, &.{}, &.{}, .{ .lease_key = "__antfly_test_missing_lease", .owner_id = "review", .epoch = 1 }));
+            const guard = public.enterHandle(handle, .read).?;
+            defer guard.leave();
+            const expected_refusals: u64 = if (source_changed) 3 else 2;
+            try std.testing.expectEqual(expected_refusals, connection.publication_stats.generated_refused);
+            try std.testing.expect(connection.publication_stats.refused >= expected_refusals);
         }
         gate.allowed.set(shared.handleLockIo());
         background.join();
@@ -5336,6 +5367,7 @@ test "capi SQL index publication accepts unrelated primary commits and fences ch
             fn notify(ptr: *anyopaque, root: *shared.Handle) void {
                 const self: *@This() = @ptrCast(@alignCast(ptr));
                 if (self.entered.swap(true, .acq_rel)) return;
+                _ = root.db.core.nextDerivedAppendSequence(); // Prime the detached allocator.
                 self.started.set(shared.handleLockIo());
                 self.allowed.waitTimeout(shared.handleLockIo(), .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } }) catch |err| {
                     self.publication_error = err;
@@ -5362,8 +5394,28 @@ test "capi SQL index publication accepts unrelated primary commits and fences ch
                 // storage port used by full-text segments, after foreground
                 // commits have moved the primary checkpoint.
                 root.db.core.index_manager.text_lsm_storage.?.writeFileAbsolute("__antfly_lite/indexes/body_text/prepared.bin", "prepared index bytes") catch |err| {
+                    std.debug.print("detached index bytes failed: {s}\n", .{@errorName(err)});
                     self.publication_error = err;
+                    return;
                 };
+                // Reserving on the detached cache used to fail after the
+                // foreground commits. Both generic and resolver producers must
+                // allocate through the current coordinator instead.
+                const sequence = root.db.derivedAsyncAppendDerivedBatchRecord(.{}) catch |err| {
+                    std.debug.print("detached generic append failed: {s}\n", .{@errorName(err)});
+                    self.publication_error = err;
+                    return;
+                };
+                const runtime = root.db.resolution_runtime.?;
+                const resolved = runtime.write_fn(runtime.write_ctx, .{ .batch = .{}, .artifact_writes = &.{.{ .key = "__antfly_test_resolver_artifact", .value = "resolver" }}, .target_hints = &.{} }) catch |err| {
+                    std.debug.print("detached resolver append failed: {s}\n", .{@errorName(err)});
+                    self.publication_error = err;
+                    return;
+                };
+                if (resolved <= sequence or root.db.core.nextDerivedSequence() < resolved) {
+                    self.publication_error = error.TestExpectedIncreasingSequence;
+                    return;
+                }
             }
         };
         var gate: Gate = .{};
@@ -5463,6 +5515,11 @@ test "capi SQL index publication accepts unrelated primary commits and fences ch
             defer alloc.free(progress);
             try std.testing.expectEqualStrings("progress", progress);
             try std.testing.expect(owner.publication_stats.rebased > 0);
+            const resolved = (try guard.handle.db.core.getStoreValue(alloc, "__antfly_test_resolver_artifact")) orelse return error.TestExpectedResolverArtifact;
+            defer alloc.free(resolved);
+            try std.testing.expectEqualStrings("resolver", resolved);
+            try std.testing.expect(owner.publication_stats.replay_attempts >= 2);
+            try std.testing.expectEqual(@as(u64, 0), owner.publication_stats.replay_refused);
         }
         for (0..64) |_| {
             if (!try owner.maintenanceTurnForTest()) break;

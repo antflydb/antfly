@@ -160,7 +160,21 @@ const IndexTargetVisibility = @import("query_visibility.zig").IndexTargetVisibil
 
 const IndexRepairSchedulerDirectory = @import("index_repair_scheduler.zig").Directory;
 
+/// Detached producers deliver prepared replay effects to a live writer. The
+/// callback owns only storage work; inference stays outside this boundary.
+pub const ReplayPublication = struct {
+    ptr: *anyopaque,
+    publish: *const fn (
+        *anyopaque,
+        derived_types.DerivedBatch,
+        []const []const u8,
+        *anyopaque,
+        *const fn (*anyopaque, *anyopaque) anyerror!u64,
+    ) anyerror!u64,
+};
+
 pub const AsyncContext = struct {
+    replay_publication: ?ReplayPublication = null,
     alloc: Allocator,
     io: ?std.Io = null,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,

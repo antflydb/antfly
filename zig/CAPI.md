@@ -422,13 +422,24 @@ commits do not force a retry. Inference and segment construction run outside
 the writer gate; changed index inputs or file replacement still cancel stale
 publication. Reclamation continues to yield on contention.
 
+Replay-producing maintenance delivers its prepared effects to the current
+coordinator under that writer lease. It validates captured documents and
+artifact keys, reserves the replay sequence on the live runtime, and advances
+the detached replay watermark after a successful commit. Resolver primary
+effects and their replay record commit together; derived projection work runs
+outside the owner gate.
+
 `antfly_db_pending_work_stats_json` includes `index_replay_debt` per namespace:
 each index reports its `applied_sequence`, `target_sequence`, and
 `catch_up_required`. Their sequence difference measures replay lag, rather
 than elapsed time or a count of documents. Lite connections also expose
 `background_publications` with owner-lifetime `attempts`, `refused` admission
-counts (including admission errors), and successful checkpoint `rebased`
-counts. These totals survive foreground runtime refreshes and reset on closing
+counts (including publication errors and source/fence rejection), and successful
+checkpoint `rebased` counts. `generated_attempts` / `generated_refused` cover
+generated-result commits and store acquisition, including source validation
+(one refusal per acquired store lease). `replay_attempts` / `replay_refused`
+cover detached replay-producing publication. All these paths contribute to
+the total `attempts` / `refused` counts. These totals survive foreground runtime refreshes and reset on closing
 the last compatible connection. Root results include per-table debt in `tables`.
 
 Failed UNIQUE coverage admits constraint-checked UPDATE/DELETE repairs under
