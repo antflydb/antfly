@@ -18,6 +18,7 @@ comptime {
     _ = @import("sql_describe.zig");
 }
 const handles = @import("handles.zig");
+pub const testMaintenanceCaptureAdmission = @import("lite_connection.zig").testMaintenanceCaptureAdmission;
 pub const std = handles.std;
 pub const builtin = handles.builtin;
 pub const local_write = handles.local_write;

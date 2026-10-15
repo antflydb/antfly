@@ -5483,3 +5483,7 @@ test "capi SQL missing namespace forces coordinated catalog validation" {
     try std.testing.expect(adapter.localRequiresCoordination());
     try std.testing.expectError(error.IntegrityCatalogUnavailable, adapter.localCatalog(alloc, 1));
 }
+
+test "capi SQL maintenance capture queues after bounded foreground contention" {
+    try public.testMaintenanceCaptureAdmission();
+}

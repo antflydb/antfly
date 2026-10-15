@@ -126,9 +126,8 @@ pub const PreparedPublication = struct {
                 const same_inode = live_stat != null and captured_stat != null and live_stat.?.inode == captured_stat.?.inode;
                 if (same_inode) {
                     if (snapshot.file.activeCheckpoint().index_catalog_root_page != file.activeCheckpoint().index_catalog_root_page) {
-                        const before = Owner.indexFingerprint(&snapshot.file, p.index_prefix) catch null;
-                        const after = Owner.indexFingerprint(file, p.index_prefix) catch null;
-                        if (before == null or after == null or !std.mem.eql(u8, &before.?, &after.?)) p.index_inputs_changed = true;
+                        const unchanged = snapshot.file.indexCatalogPrefixUnchanged(file, p.index_prefix) catch false;
+                        if (!unchanged) p.index_inputs_changed = true;
                     }
                     snapshot.refreshIndexPublicationCheckpoint(file.header) catch {
                         p.index_inputs_changed = true;
@@ -239,6 +238,56 @@ const QueuedMutex = struct {
     }
 };
 
+fn acquireMaintenanceCapture(gate: *QueuedMutex, misses: *u8) bool {
+    if (!gate.tryLock()) {
+        misses.* +|= 1;
+        if (misses.* < 3) return false;
+        gate.lockUncancelable(h.handleLockIo());
+    }
+    misses.* = 0;
+    return true;
+}
+
+pub fn testMaintenanceCaptureAdmission() !void {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const io = h.handleLockIo();
+    var gate: QueuedMutex = .{};
+    var misses: u8 = 0;
+    gate.lockUncancelable(io);
+    var held = true;
+    defer if (held) gate.unlock(io);
+    try std.testing.expect(!acquireMaintenanceCapture(&gate, &misses));
+    try std.testing.expect(!acquireMaintenanceCapture(&gate, &misses));
+    const Background = struct {
+        acquired: std.Io.Event = .unset,
+        fn run(self: *@This(), mutex: *QueuedMutex, count: *u8) void {
+            if (acquireMaintenanceCapture(mutex, count)) {
+                self.acquired.set(h.handleLockIo());
+                mutex.unlock(h.handleLockIo());
+            }
+        }
+    };
+    var background: Background = .{};
+    const thread = try std.Thread.spawn(.{}, Background.run, .{ &background, &gate, &misses });
+    defer thread.join();
+    // Observe the queued ticket, rather than relying on a timing sleep. Keep
+    // the initial caller active until maintenance has joined its queue.
+    while (true) {
+        gate.state.lockUncancelable(io);
+        const queued = gate.next == 2;
+        gate.state.unlock(io);
+        if (queued) break;
+        std.Thread.yield() catch {};
+    }
+    gate.unlock(io);
+    held = false;
+    // An immediately reentering foreground caller must follow maintenance.
+    gate.lockUncancelable(io);
+    defer gate.unlock(io);
+    try std.testing.expect(background.acquired.isSet());
+    try std.testing.expectEqual(@as(u8, 0), misses);
+}
+
 // Connections in one process queue on a canonical file gate. The kernel
 // sidecar remains the authority between processes and with CLI/server owners.
 const PathGate = struct {
@@ -299,6 +348,7 @@ pub const Owner = struct {
     maintenance_snapshot: ?*h.Handle = null,
     maintenance_table_cursor: usize = 0,
     maintenance_round_pending: bool = false,
+    maintenance_capture_misses: u8 = 0,
     embedding_memo: ?memo_mod.QueryEmbeddingCache = null,
     embedding_memo_budget: cache_budget.CacheBudget = .init(embedding_memo_bytes),
     test_after_capture: if (h.builtin.is_test) ?struct { ptr: *anyopaque, notify: *const fn (*anyopaque, *h.Handle) void } else void = if (h.builtin.is_test) null else {},
@@ -400,25 +450,6 @@ pub const Owner = struct {
             runtime.stats().applied_sequence < database.core.nextEnrichmentSequence();
     }
 
-    fn indexFingerprint(file: *native.NativeFile, prefix: []const u8) ![32]u8 {
-        var cursor = try file.indexCatalogCursor(file.activeCheckpoint(), prefix);
-        defer cursor.deinit();
-        var hash = std.crypto.hash.Blake3.init(.{});
-        var count: usize = 0;
-        while (try cursor.next()) |record| {
-            defer file.allocator.free(record.key);
-            count += 1;
-            if (count > 4096) return error.ResourceLimitExceeded;
-            const length: u64 = record.key.len;
-            hash.update(std.mem.asBytes(&length));
-            hash.update(record.key);
-            hash.update(std.mem.asBytes(&record.page_id));
-        }
-        var digest: [32]u8 = undefined;
-        hash.final(&digest);
-        return digest;
-    }
-
     fn lookupEmbedding(ptr: *anyopaque, a: std.mem.Allocator, key: [32]u8) !?[]f32 {
         const self: *Owner = @ptrCast(@alignCast(ptr));
         return self.embedding_memo.?.lookup(&self.embedding_memo_budget, a, key);
@@ -429,9 +460,9 @@ pub const Owner = struct {
         self.embedding_memo.?.remember(&self.embedding_memo_budget, key, vector);
     }
 
-    // Admission never waits while a storage operation owns DB/index locks.
-    // A foreground owner can therefore refresh its own runtime and publish
-    // without a lock-order cycle with detached maintenance.
+    // Index publications queue behind foreground operations. Their DB/index
+    // locks belong to the detached runtime; foreground refresh opens a separate
+    // runtime. Primary/reclamation admission yields on contention.
     fn enterMaintenanceWriter(ptr: *anyopaque, scope: PublicationScope) !void {
         const root: *h.Handle = @ptrCast(@alignCast(ptr));
         const self = root.maintenance_owner.?;
@@ -465,9 +496,7 @@ pub const Owner = struct {
             defer latest.close();
             if ((try latest.file.stat(latest.runtime())).inode != (try file.file.stat(file.runtime())).inode) return error.EnrichmentWaitCanceled;
             if (file.activeCheckpoint().index_catalog_root_page != latest.activeCheckpoint().index_catalog_root_page) {
-                const expected = try indexFingerprint(file, publication.index_prefix);
-                const actual = try indexFingerprint(&latest, publication.index_prefix);
-                if (!std.mem.eql(u8, &expected, &actual)) return error.EnrichmentWaitCanceled;
+                if (!try file.indexCatalogPrefixUnchanged(&latest, publication.index_prefix)) return error.EnrichmentWaitCanceled;
             }
             try root.owned_lite_backend.?.native_docstore.?.refreshIndexPublicationCheckpoint(latest.header);
         }
@@ -550,7 +579,9 @@ pub const Owner = struct {
     fn maintenanceTurn(self: *Owner) !bool {
         const io = h.handleLockIo();
         if (self.stopping.load(.acquire)) return false;
-        if (!self.gate.mutex.tryLock()) return true;
+        // Yield briefly to foreground work, then join the fair queue. Capture
+        // stays short; queued traffic must not indefinitely postpone replay/TTL.
+        if (!acquireMaintenanceCapture(&self.gate.mutex, &self.maintenance_capture_misses)) return true;
         var gate_locked = true;
         defer if (gate_locked) self.gate.mutex.unlock(io);
         var lease = try native.lockWriterPathWithIo(alloc, io, self.path);
