@@ -8106,3 +8106,27 @@ gate for this revision remains pending.
 Durable native release/retirement, latest-stage replacement-root adoption and
 full distributed/public producer qualification remain unfinished. No original
 SQL dispositions or throughput claims change.
+
+Full automatic-decision qualification subsequently passed 159/159 Debug steps
+in `/private/tmp/antfly-auto-index-decision-full-debug.log`.
+
+### Native release intent and terminal record
+
+The release intent binds the complete installed command and its actual native
+position to a distinct metadata release decision. Its released receipt must use
+the same namespace and a strictly later native position. Before first execution,
+the installed command/position must match the real durable installation slot
+and its guarded successor; possession of a checksum is not permission.
+
+The terminal record owns its fixed-size data, uses allocation-free bounded
+encoding, and rejects corrupt or noncanonical bytes. Loading checks the durable
+native clock even for a different retained intent. Its meaning is historical
+release evidence, not a claim that mutable rows still match a prior build audit
+or authority to adopt a replacement root. The existing configured page gate
+includes its semantic, tampering, canonical-byte and exhaustive allocation-failure
+tests; `/private/tmp/antfly-index-release-codec-debug.log` passed 56/56 Debug steps.
+
+This component is not connected to fence lifting yet. Atomic release, recovery,
+replication/outbox, bounded job retirement, receiver/metadata release permission
+and root-continuity qualification remain required. No original SQL credit or
+public activation is claimed.

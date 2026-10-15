@@ -28,6 +28,10 @@ const time = @import("antfly_platform").time;
 const alloc = std.testing.allocator;
 const docstore = @import("../docstore.zig");
 
+test {
+    _ = @import("relational_index_release.zig");
+}
+
 /// Synthetic metadata decision for storage-engine qualification only. Public
 /// receivers must fetch real durable acceptance from independent metadata.
 fn sourceDecision(binding: @import("relational_index_owner_job.zig").Binding, header: @import("relational_index_private_claims.zig").SourceStream.Header, previous: ?@import("relational_index_private_claims.zig").SourceStream.Accepted, logical_digest: [32]u8) !@import("relational_index_private_claims.zig").SourceStream.Accepted {
