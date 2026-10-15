@@ -101643,6 +101643,69 @@ test "db document _embeddings external vector coverage survives updates deletes 
     }
 }
 
+test "db document _embeddings external indexes ignore source vector fields and isolate sibling mutations" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |sparse| {
+        var path_tmp = try TestDirectory.init("db");
+        defer path_tmp.cleanup();
+        const path = path_tmp.path().ptr;
+        defer cleanupTempDir(path);
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+        for ([_][]const u8{ "a", "b" }) |name| try db.addIndex(.{
+            .name = name,
+            .kind = if (sparse) .sparse_vector else .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+        });
+        var plan = try db.core.index_manager.acquireWritePlanSnapshot();
+        defer plan.release();
+        try std.testing.expectEqual(@as(usize, 0), plan.plan().dense_fields.len);
+        try std.testing.expectEqual(@as(usize, 0), plan.plan().sparse_fields.len);
+        const a_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc", "a");
+        defer alloc.free(a_key);
+        const b_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc", "b");
+        defer alloc.free(b_key);
+        try db.batch(.{ .writes = &.{.{ .key = "doc", .value = if (sparse)
+            "{\"title\":\"initial\",\"_embeddings\":{\"a\":{\"indices\":[7],\"values\":[1]},\"b\":{\"indices\":[7],\"values\":[2]}}}"
+        else
+            "{\"title\":\"initial\",\"_embeddings\":{\"a\":[1,0,0],\"b\":[0,1,0]}}" }}, .sync_level = .full_index });
+        const a_before = try db.core.store.get(alloc, a_key);
+        defer alloc.free(a_before);
+        const b_before = try db.core.store.get(alloc, b_key);
+        defer alloc.free(b_before);
+        const source = if (sparse) "{\"embedding\":{\"indices\":[7],\"values\":[9]}}" else "{\"embedding\":[0,0,9]}";
+        try db.batch(.{ .writes = &.{.{ .key = "doc", .value = source }}, .sync_level = .full_index });
+        const a_after = try db.core.store.get(alloc, a_key);
+        defer alloc.free(a_after);
+        const b_after = try db.core.store.get(alloc, b_key);
+        defer alloc.free(b_after);
+        try std.testing.expectEqualStrings(a_before, a_after);
+        try std.testing.expectEqualStrings(b_before, b_after);
+        const stored = (try db.get(alloc, "doc")).?;
+        defer alloc.free(stored);
+        try std.testing.expectEqualStrings(source, stored);
+        // A source field must not conflict with the explicit deletion, and
+        // omitting the sibling index must preserve its exact artifact payload.
+        try db.batch(.{ .writes = &.{.{ .key = "doc", .value = if (sparse)
+            "{\"embedding\":{\"indices\":[7],\"values\":[8]},\"_embeddings\":{\"a\":null}}"
+        else
+            "{\"embedding\":[0,0,8],\"_embeddings\":{\"a\":null}}" }}, .sync_level = .full_index });
+        try std.testing.expectError(error.NotFound, db.core.store.get(alloc, a_key));
+        const b_retained = try db.core.store.get(alloc, b_key);
+        defer alloc.free(b_retained);
+        try std.testing.expectEqualStrings(b_before, b_retained);
+        const stats = try db.stats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        for (stats.indexes) |index| {
+            const expected: u64 = if (std.mem.eql(u8, index.name, "a")) 0 else 1;
+            try std.testing.expectEqual(expected, index.doc_count);
+            try std.testing.expectEqual(expected, index.coverage_produced_count);
+        }
+        // Ordinary application data need not be parseable as a vector.
+        try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"embedding\":\"application data\"}" }}, .sync_level = .full_index });
+    }
+}
+
 test "db coverage status reports partial counter tuples without scanning markers" {
     const alloc = std.testing.allocator;
     var path_tmp = try TestDirectory.init("db");
