@@ -23630,6 +23630,7 @@ fn driveOrderedChunkVectorCensus(runtime: *EnrichmentRuntime, alloc: Allocator, 
         var read = try runtime.store.beginRead();
         defer read.abort();
         if (try ordered_publication.authority(&read) == null) return false;
+        try @import("../artifact_reprocess_intent.zig").requireEmbeddingGeneration(alloc, &read, request.doc_key, requestEmbeddingName(request), request.producer_json, request.reprocess_generation);
         if (runtime.config.root_incarnation == 0) return error.DurableRootIncarnationUnavailable;
         const fence = try requiredRuntimeStoreWriteFence(runtime);
         try validateRuntimeStoreWriteFenceTxn(runtime, &read, fence);
@@ -23689,6 +23690,7 @@ fn processOrderedChunkVectorWithAllocator(runtime: *EnrichmentRuntime, alloc: Al
                 if (after != null) return error.ArtifactCatalogDrift;
                 return false;
             }
+            try @import("../artifact_reprocess_intent.zig").requireEmbeddingGeneration(alloc, &read, request.doc_key, requestEmbeddingName(request), request.producer_json, request.reprocess_generation);
             const fence = try requiredRuntimeStoreWriteFence(runtime);
             try validateRuntimeStoreWriteFenceTxn(runtime, &read, fence);
             var plan = try runtime.index_manager.acquireWritePlanSnapshot();

@@ -30,6 +30,21 @@ pub fn embeddingKeyAlloc(alloc: std.mem.Allocator, document: []const u8, produce
     return keyForKindAlloc(alloc, document, producer, keys.embedding_reprocess_intent_kind);
 }
 
+/// Bind provider execution to the generation in its exact input snapshot.
+/// Catalog templates deliberately omit this document-owned execution state.
+pub fn requireEmbeddingGeneration(alloc: std.mem.Allocator, txn: anytype, document: []const u8, producer: []const u8, config: []const u8, expected: u64) !void {
+    const key = try embeddingKeyAlloc(alloc, document, producer);
+    defer alloc.free(key);
+    const raw = txn.get(key) catch |err| switch (err) {
+        error.NotFound => {
+            if (expected != 0) return error.EnrichmentSourceChanged;
+            return;
+        },
+        else => return err,
+    };
+    if (try generationForConfig(raw, config) != expected) return error.EnrichmentSourceChanged;
+}
+
 fn keyForKindAlloc(alloc: std.mem.Allocator, document: []const u8, producer: []const u8, record_kind: u8) ![]u8 {
     var result: std.ArrayList(u8) = .empty;
     defer result.deinit(alloc);

@@ -364,6 +364,9 @@ entering the provider; coverage and repair issues expose its eventual outcome.
 Forced generations bypass the optional dense computation memo and refresh it
 with newly computed vectors. Ordinary maintenance can still reuse memoized
 results, and completed artifact hashes prevent repeating fulfilled work.
+Ordered provider execution rechecks the requested generation in the same read
+snapshot as its source input and chunk-stream checkpoint. A newer reprocess
+invalidates an older queued request before it can capture newer input authority.
 Repair operations that explicitly wait for completion retain full-index sync.
 PDF page image embeddings use
 the page renderer and staged generation path, including for full-index sync;

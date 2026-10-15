@@ -226,6 +226,7 @@ pub fn capture(
     materializer: ?Materializer,
 ) !?Token {
     const authorized = (try authorizeDocument(alloc, txn, request, plan)) orelse return null;
+    try @import("artifact_reprocess_intent.zig").requireEmbeddingGeneration(alloc, txn, request.doc_key, requests.requestEmbeddingName(request), request.producer_json, request.reprocess_generation);
     if (root == 0) return error.DurableRootIncarnationUnavailable;
     const authority = authorized.authority;
     const producer_generation = authorized.generation;
