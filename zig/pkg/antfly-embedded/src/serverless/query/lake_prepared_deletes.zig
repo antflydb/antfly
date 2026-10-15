@@ -95,6 +95,9 @@ pub const Prepared = struct {
         return createCached(a, request, null, @splat(0), .{});
     }
     pub fn createCached(a: A, request: iceberg.DeleteRowRefsReadRequest, cache: ?*@import("lake_decoded_cache.zig").Cache, scope: [32]u8, context: @import("lake_read_context.zig").Context) !*Prepared {
+        return createQualified(a, request, cache, scope, context, null);
+    }
+    pub fn createQualified(a: A, request: iceberg.DeleteRowRefsReadRequest, cache: ?*@import("lake_decoded_cache.zig").Cache, scope: [32]u8, context: @import("lake_read_context.zig").Context, qualification: ?*const @import("lake_delete_qualification.zig").Qualification.Data) !*Prepared {
         const self = try a.create(Prepared);
         errdefer a.destroy(self);
         self.* = .{ .arena = .init(a), .delete_files = &.{}, .equality = &.{}, .columns = &.{} };
@@ -113,9 +116,35 @@ pub const Prepared = struct {
             if (!slot.found_existing) slot.value_ptr.* = i;
         };
         var versions = std.crypto.hash.sha2.Sha256.init(.{});
-        for (request.delete_plan.files, 0..) |file, file_index| {
-            var inventory = try iceberg.singleDeleteFileInventoryAlloc(a, request.data_inventory, file, request.client, if (file.content == .equality_deletes) "iceberg-equality-delete" else "iceberg-position-delete");
+        if (qualification) |qualified| if (qualified.versions.len != request.delete_plan.files.len) return error.InvalidIcebergDeleteManifest;
+        const narrowed = if (qualification) |qualified| try qualified.candidates(a, request.data_inventory.files) else null;
+        const indices = narrowed orelse all: {
+            const result = try a.alloc(usize, request.delete_plan.files.len);
+            for (result, 0..) |*index, i| index.* = i;
+            break :all result;
+        };
+        defer a.free(indices);
+        const used_files = try a.alloc(iceberg.IcebergDeleteFile, indices.len);
+        defer a.free(used_files);
+        for (indices, 0..) |original_index, file_index| {
+            const file = request.delete_plan.files[original_index];
+            used_files[file_index] = file;
+            var inventory = try iceberg.singleDeleteFileInventoryAlloc(a, request.data_inventory, file, if (qualification != null) null else request.client, if (file.content == .equality_deletes) "iceberg-equality-delete" else "iceberg-position-delete");
             defer inventory.deinit(a);
+            if (qualification) |qualified| {
+                const evidence = qualified.versions[original_index];
+                const entry = &inventory.files[0];
+                const etag = try a.dupe(u8, evidence.etag);
+                errdefer a.free(etag);
+                const version = if (evidence.etag.len == 0 and evidence.version.len == 0)
+                    try std.fmt.allocPrint(a, "object-stat:v1:uri={s}:len={d}", .{ file.file_path, file.file_size_in_bytes })
+                else
+                    try a.dupe(u8, evidence.version);
+                a.free(entry.etag);
+                a.free(entry.version_id);
+                entry.etag = etag;
+                entry.version_id = version;
+            }
             var file_versions = std.crypto.hash.sha2.Sha256.init(.{});
             const recipe = try std.json.Stringify.valueAlloc(a, file, .{});
             defer a.free(recipe);
@@ -244,7 +273,7 @@ pub const Prepared = struct {
         for (request.data_inventory.files, 0..) |file, index| {
             var applicable: std.ArrayList(usize) = .empty;
             for (self.equality, 0..) |entry, equality_index| {
-                if (try iceberg.equalityDeleteAppliesToFile(file, request.delete_plan.files[entry.file])) try applicable.append(owned, equality_index);
+                if (try iceberg.equalityDeleteAppliesToFile(file, used_files[entry.file])) try applicable.append(owned, equality_index);
             }
             var empty: PositionSet = .{};
             // Empty sets allocate no blocks; the prefix preserves v1 identities.
@@ -255,9 +284,9 @@ pub const Prepared = struct {
         }
         // Cached indexes retain only immutable, owned metadata. Provider and
         // request cancellation handles must never escape source admission.
-        const bytes = try std.json.Stringify.valueAlloc(a, request.delete_plan.files, .{});
+        const bytes = try std.json.Stringify.valueAlloc(a, used_files, .{});
         defer a.free(bytes);
-        self.object_versions = versions.finalResult();
+        self.object_versions = if (qualification) |qualified| qualified.digest else versions.finalResult();
         self.delete_files = try std.json.parseFromSliceLeaky([]iceberg.IcebergDeleteFile, owned, bytes, .{ .allocate = .alloc_always });
         return self;
     }
@@ -522,4 +551,30 @@ test "external lake metadata navigation shares immutable delete files across sel
     defer replaced.destroy(a);
     try std.testing.expect(replaced.positions.contains(.{ .file = 0, .ordinal = 0 }));
     try std.testing.expect(replaced.file_leases.items[0].item != second.file_leases.items[0].item);
+    var partition_a = [_]external.PartitionValue{.{ .column_id = @constCast("day"), .string_value = @constCast("a") }};
+    var partition_b = [_]external.PartitionValue{.{ .column_id = @constCast("day"), .string_value = @constCast("b") }};
+    var scoped_files = [_]iceberg.IcebergDeleteFile{ delete_files[0], delete_files[0] };
+    scoped_files[0].partition_field_count = 1;
+    scoped_files[0].partition_values = &partition_a;
+    scoped_files[1].partition_field_count = 1;
+    scoped_files[1].partition_values = &partition_b;
+    files[1].partition_field_count = 1;
+    files[1].partition_values = &partition_b;
+    request.delete_plan.files = &scoped_files;
+    const qualification = try @import("lake_delete_qualification.zig").Qualification.create(a);
+    defer qualification.destroy();
+    const evidence = (try qualification.acquire(client, request.delete_plan, .{})).?;
+    const narrowed = try Prepared.createQualified(a, request, &cache, @splat(1), .{}, evidence);
+    defer narrowed.destroy(a);
+    const full = try Prepared.createCached(a, request, &cache, @splat(1), .{});
+    defer full.destroy(a);
+    try std.testing.expectEqual(@as(usize, 1), narrowed.delete_files.len);
+    try std.testing.expectEqual(@as(usize, 1), narrowed.file_leases.items.len);
+    try std.testing.expectEqual(@as(usize, 2), full.file_leases.items.len);
+    try std.testing.expectEqual(try full.fileFingerprint(files[1].file_id), try narrowed.fileFingerprint(files[1].file_id));
+    files[1].data_sequence_number = 8;
+    const newer = try Prepared.createQualified(a, request, &cache, @splat(1), .{}, evidence);
+    defer newer.destroy(a);
+    try std.testing.expectEqual(@as(usize, 0), newer.file_leases.items.len);
+    try std.testing.expectEqual(Prepared.emptyFileFingerprint(), try newer.fileFingerprint(files[1].file_id));
 }

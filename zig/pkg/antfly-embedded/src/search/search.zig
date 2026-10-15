@@ -3927,6 +3927,7 @@ const LoweredText = struct {
 };
 
 const StreamingBoolBuilder = struct {
+    control: query_mod.ExecutionControl = .{},
     a: Allocator,
     snap: *const index_mod.IndexSnapshot,
     segment: *const index_mod.SegmentEntry,
@@ -4233,7 +4234,7 @@ const StreamingBoolBuilder = struct {
             value.segment_upper = std.math.inf(f32);
             return value;
         }
-        var local = try filter.executeWithOffset(self.a, self.segment, self.offset);
+        var local = try filter.withControl(self.control).executeWithOffset(self.a, self.segment, self.offset);
         defer local.deinit();
         const bitmap = try self.a.create(roaring.RoaringBitmap);
         bitmap.* = try local.addOffset(self.offset);
@@ -4414,7 +4415,7 @@ const StreamingBoolPrepared = struct {
         };
         self.segment_lease = segment_lease;
         const segment = segment_lease.entry;
-        self.builder = .{ .a = self.arena.allocator(), .snap = cache.snap, .segment = segment, .offset = plan.doc_offset, .config = cache.request.bm25_config, .stats = cache.stats, .constrained = requestHasDocNumConstraints(cache.request) or cache.producers.present(), .planning = true, .compute_bounds = false, .shared_readers = true, .shared_cache_allocator = self.locked.allocator() };
+        self.builder = .{ .a = self.arena.allocator(), .snap = cache.snap, .segment = segment, .offset = plan.doc_offset, .config = cache.request.bm25_config, .control = cache.request.control, .stats = cache.stats, .constrained = requestHasDocNumConstraints(cache.request) or cache.producers.present(), .planning = true, .compute_bounds = false, .shared_readers = true, .shared_cache_allocator = self.locked.allocator() };
         segment.beginAccess();
         defer segment.endAccess();
         self.prepare(cache.bq) catch |err| {
@@ -4613,7 +4614,7 @@ const StreamingBoolPlanning = struct {
             if (segment.reader.doc_count == 0) continue;
             _ = arena.reset(.free_all);
             var diagnostics: SearchDiagnostics = .{};
-            var builder: StreamingBoolBuilder = .{ .a = arena.allocator(), .snap = self.cache.snap, .segment = segment, .offset = plan.doc_offset, .config = self.cache.request.bm25_config, .stats = self.cache.stats, .constrained = requestHasDocNumConstraints(self.cache.request) or self.cache.producers.present(), .planning = true, .summaries_only = true, .diagnostics = &diagnostics };
+            var builder: StreamingBoolBuilder = .{ .a = arena.allocator(), .snap = self.cache.snap, .segment = segment, .offset = plan.doc_offset, .config = self.cache.request.bm25_config, .control = self.cache.request.control, .stats = self.cache.stats, .constrained = requestHasDocNumConstraints(self.cache.request) or self.cache.producers.present(), .planning = true, .summaries_only = true, .diagnostics = &diagnostics };
             defer builder.deinit();
             segment.beginAccess();
             defer segment.endAccess();
@@ -4670,7 +4671,7 @@ fn planStreamingBoolSegmentsSelected(a: Allocator, scratch: *std.heap.ArenaAlloc
             segment.beginAccess();
             defer segment.endAccess();
             _ = scratch.reset(.retain_capacity);
-            var builder: StreamingBoolBuilder = .{ .a = scratch.allocator(), .snap = snap, .segment = segment, .offset = offset, .config = request.bm25_config, .stats = stats, .constrained = requestHasDocNumConstraints(request) or producers.present(), .planning = true, .summaries_only = true, .diagnostics = request.diagnostics };
+            var builder: StreamingBoolBuilder = .{ .a = scratch.allocator(), .snap = snap, .segment = segment, .offset = offset, .config = request.bm25_config, .control = request.control, .stats = stats, .constrained = requestHasDocNumConstraints(request) or producers.present(), .planning = true, .summaries_only = true, .diagnostics = request.diagnostics };
             defer builder.deinit();
             upper = try (try builder.buildRequest(bq)).segmentBound();
         }
@@ -4716,7 +4717,7 @@ fn scoreStreamingBoolRange(snap: *const index_mod.IndexSnapshot, bq: BoolQuery, 
     return scoreStreamingBoolRangeCached(snap, bq, request, stats, producers, work, arena, collector, shared, if (shared) |owner| owner.prepared else null);
 }
 fn exactStreamingBoolBound(snap: *const index_mod.IndexSnapshot, bq: BoolQuery, request: SearchRequest, stats: *StreamingBoolStats, producers: ProducerConstraints, plan: index_mod.IndexSnapshot.TextSegmentPlan, a: Allocator) !f32 {
-    var refinement: StreamingBoolBuilder = .{ .a = a, .snap = snap, .segment = &snap.segments[plan.segment_idx], .offset = plan.doc_offset, .config = request.bm25_config, .stats = stats, .constrained = requestHasDocNumConstraints(request) or producers.present(), .planning = true, .summaries_only = true, .exact_summaries = true };
+    var refinement: StreamingBoolBuilder = .{ .a = a, .snap = snap, .segment = &snap.segments[plan.segment_idx], .offset = plan.doc_offset, .config = request.bm25_config, .control = request.control, .stats = stats, .constrained = requestHasDocNumConstraints(request) or producers.present(), .planning = true, .summaries_only = true, .exact_summaries = true };
     defer refinement.deinit();
     return (try refinement.buildRequest(bq)).segmentBound();
 }
@@ -4756,7 +4757,7 @@ fn scoreStreamingBoolRangeCached(snap: *const index_mod.IndexSnapshot, bq: BoolQ
     _ = arena.reset(.retain_capacity);
     var lease = if (cache) |prepared| try prepared.get(plan) else null;
     defer if (lease) |*selected| selected.release();
-    var builder: StreamingBoolBuilder = .{ .a = arena.allocator(), .snap = snap, .segment = segment, .offset = offset, .config = request.bm25_config, .stats = stats, .constrained = requestHasDocNumConstraints(request) or producers.present(), .diagnostics = request.diagnostics };
+    var builder: StreamingBoolBuilder = .{ .a = arena.allocator(), .snap = snap, .segment = segment, .offset = offset, .config = request.bm25_config, .control = request.control, .stats = stats, .constrained = requestHasDocNumConstraints(request) or producers.present(), .diagnostics = request.diagnostics };
     defer builder.deinit();
     const root = if (lease) |selected| try builder.instantiate(selected.owner.root) else try builder.buildRequest(bq);
     if (request.diagnostics) |diagnostics| {
@@ -5037,7 +5038,7 @@ const StreamingBoolRangePlanner = struct {
         const reader = self.snap.text_statistics.?;
         const ordinal = reader.routing[first].segment_idx;
         if (ordinal >= self.snap.segments.len) return error.InvalidArgument;
-        var builder: StreamingBoolBuilder = .{ .a = self.scratch.allocator(), .snap = self.snap, .segment = &self.snap.segments[ordinal], .offset = 0, .config = self.request.bm25_config, .stats = self.stats, .constrained = requestHasDocNumConstraints(self.request) or self.producers.present(), .planning = true, .summaries_only = true, .summary_range = .{ .first = first, .end = end } };
+        var builder: StreamingBoolBuilder = .{ .a = self.scratch.allocator(), .snap = self.snap, .segment = &self.snap.segments[ordinal], .offset = 0, .config = self.request.bm25_config, .control = self.request.control, .stats = self.stats, .constrained = requestHasDocNumConstraints(self.request) or self.producers.present(), .planning = true, .summaries_only = true, .summary_range = .{ .first = first, .end = end } };
         defer builder.deinit();
         return (try builder.buildRequest(self.bq)).segmentBound();
     }

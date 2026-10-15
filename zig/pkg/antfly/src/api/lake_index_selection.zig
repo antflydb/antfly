@@ -104,7 +104,7 @@ fn selectVerified(a: A, table: sql.Table, source: *local.serverless_query_lake_s
         const data = if (immutable_proof) root.coverage.?.data else coverage.dataDigest(try coverage.pinData(source, context, null, null));
         // Delete object versions are always freshly qualified, including when
         // the data census is inherited from an identical immutable plan.
-        const pinned = try coverage.finishDigest(source, context, data);
+        const pinned = try coverage.finishReadDigest(source, context, data);
         if (!std.mem.eql(u8, &published.signature.source, &pinned.source)) return error.ExternalLakeIndexSourceChanged;
         pinned_delete_objects = pinned.delete_objects;
         if (immutable_proof) try @import("lake_verified_file_selector.zig").install(source, store, published, root, cached.?, reader.?);
@@ -136,7 +136,7 @@ fn selectVerified(a: A, table: sql.Table, source: *local.serverless_query_lake_s
             @as(*const coverage.DataProof, @ptrCast(@alignCast(lease.item.payload.extension))).*
         else
             try coverage.pinData(source, context, inventory, &metadata.by_id);
-        const pinned = if (published.reader_protocol < 47) try coverage.finishLegacy(source, context, data) else try coverage.finish(source, context, data);
+        const pinned = if (published.reader_protocol < 47) try coverage.finishLegacy(source, context, data) else try coverage.finishReadDigest(source, context, coverage.dataDigest(data));
         if (!std.mem.eql(u8, &published.signature.source, &pinned.source)) return error.ExternalLakeIndexSourceChanged;
         if (proof_lease == null) {
             if (inventory.files.len != source.inventory.files.len) return error.InvalidExternalLakeIndexCoverage;

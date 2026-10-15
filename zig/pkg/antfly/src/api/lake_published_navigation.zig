@@ -53,8 +53,15 @@ const Factory = struct {
     lease: *Lease,
     cache: *local.serverless_query_lake_serving_cache.Cache,
     table_id: u64,
+    required: bool,
     fn resolve(raw: *anyopaque, a: A, plans: Source.SnapshotPlans, header: local.serverless_external_source_types.Inventory, context: Context) !?Source.FileNavigation {
         const self: *@This() = @ptrCast(@alignCast(raw));
+        return self.resolveVerified(a, plans, header, context) catch |err| {
+            try optionalAdmission(context, self.required, err);
+            return null;
+        };
+    }
+    fn resolveVerified(self: *@This(), a: A, plans: Source.SnapshotPlans, header: local.serverless_external_source_types.Inventory, context: Context) !?Source.FileNavigation {
         const ref = self.publication.source_navigation orelse return null;
         const held_context = self.lease.readContext();
         const token: @import("antfly_cancellation").CancellationToken = if (held_context.cancellation) |value| .{ .ptr = value.ptr, .is_cancelled_fn = value.is_cancelled_fn } else .none;
@@ -91,6 +98,12 @@ const Factory = struct {
         return .{ .ptr = owner, .count = root.count, .plan = root.coverage.?.plan.?, .lookup = Owner.lookup, .close = Owner.close };
     }
 };
+// Before navigation is adopted, an automatic SQL scan owes no native-index
+// availability. Required readers retain their existing authority/error contract.
+fn optionalAdmission(context: Context, required: bool, err: anyerror) !void {
+    try context.ensureActive();
+    if (required or err == error.OutOfMemory or err == error.MetadataMutationOutcomeUnknown) return err;
+}
 /// One entry point for native search and SQL. Fallback source contexts never
 /// borrow the temporary native lease; adopted navigation owns an independent pin.
 pub fn open(a: A, server: *@import("http_server.zig").ApiHttpServer, table_id: u64, catalog_json: []const u8, schema: local.storage_schema.TableSchema, options: anytype, context: Context, request: local.api_operation.RequestContext, reader: ?*Lease) !Source {
@@ -103,12 +116,18 @@ pub fn open(a: A, server: *@import("http_server.zig").ApiHttpServer, table_id: u
     if (publication.reader_protocol < 47 or publication.source_navigation == null)
         return Source.openLazyCached(a, schema, options, context, &server.lake_read_cache);
     const authority = server.source.lakeIndexLifecycleAuthority(request) orelse return Source.openLazyCached(a, schema, options, context, &server.lake_read_cache);
-    var store = try Store.openNative(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir);
+    var store = Store.openNative(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir) catch |err| {
+        try optionalAdmission(context, reader != null, err);
+        return Source.openLazyCached(a, schema, options, context, &server.lake_read_cache);
+    };
     defer store.deinit();
     if (!std.mem.eql(u8, &store.identity, &publication.signature.store)) return Source.openLazyCached(a, schema, options, context, &server.lake_read_cache);
     store.implementation.cloud_io = context.io;
-    const lease = reader orelse try server.lake_reader_leases.acquireRetained(server.embedding_provider_runtime.io, authority, table_id, publication.generation, context, null);
+    const lease = reader orelse server.lake_reader_leases.acquireRetained(server.embedding_provider_runtime.io, authority, table_id, publication.generation, context, null) catch |err| {
+        try optionalAdmission(context, false, err);
+        return Source.openLazyCached(a, schema, options, context, &server.lake_read_cache);
+    };
     defer if (reader == null) lease.deinit();
-    var factory: Factory = .{ .store = &store, .publication = publication, .lease = lease, .cache = &server.lake_read_cache, .table_id = table_id };
+    var factory: Factory = .{ .store = &store, .publication = publication, .lease = lease, .cache = &server.lake_read_cache, .table_id = table_id, .required = reader != null };
     return Source.openLazyNavigated(a, schema, options, context, &server.lake_read_cache, .{ .ptr = &factory, .resolve = Factory.resolve });
 }

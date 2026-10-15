@@ -12251,7 +12251,7 @@ pub fn searchTextQuery(
                 const selected = try arena_alloc.alloc(u32, out.hits.len);
                 for (out.hits, selected) |hit, *doc| doc.* = hit.native_text_doc_id orelse return error.InvalidData;
                 std.mem.sort(u32, selected, {}, std.sort.asc(u32));
-                var scored = try search_mod.execute(alloc, snapshot, .{ .query = search_query, .control = .{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns }, .k = @intCast(selected.len), .include_stored = false, .filter_doc_nums = selected, .filter_doc_nums_positive = true, .distributed_text_stats = effective_req.distributed_text_stats });
+                var scored = try search_mod.execute(alloc, snapshot, .{ .query = search_query, .control = .{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns, .pattern_cache = effective_req.text_pattern_membership }, .k = @intCast(selected.len), .include_stored = false, .filter_doc_nums = selected, .filter_doc_nums_positive = true, .distributed_text_stats = effective_req.distributed_text_stats });
                 defer scored.deinit();
                 var scores: std.AutoHashMapUnmanaged(u32, f32) = .empty;
                 defer scores.deinit(alloc);
@@ -12340,7 +12340,7 @@ pub fn searchTextQuery(
         else
             try search_mod.execute(alloc, snapshot, .{
                 .query = search_query,
-                .control = .{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns },
+                .control = .{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns, .pattern_cache = effective_req.text_pattern_membership },
                 .k = if (collect_window_candidates) candidate_limit else paging.limit,
                 .offset = if (collect_window_candidates) 0 else paging.offset,
                 .include_stored = load_stored_in_search_engine,

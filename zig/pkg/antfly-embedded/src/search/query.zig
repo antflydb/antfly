@@ -88,6 +88,10 @@ pub const Filter = union(enum) {
     pub fn execute(self: Filter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
         seg.beginAccess();
         defer seg.endAccess();
+        switch (self) {
+            inline .prefix, .wildcard, .regexp, .fuzzy => |filter| if (filter.control.pattern_cache) |cache| return cache.execute(alloc, self, seg, filter.control),
+            else => {},
+        }
         return switch (self) {
             .term => |f| f.execute(alloc, seg),
             .bool_filter => |f| f.execute(alloc, seg),
@@ -131,6 +135,101 @@ pub const Filter = union(enum) {
             try bm.add(@intCast(i));
         }
         return bm;
+    }
+};
+
+/// Bounded query-owned pattern leaves for one immutable corpus/pack. Keys own
+/// only digests; encoded segments and request syntax are never retained. Each
+/// caller receives a private bitmap, so parallel scoring cannot mutate cached
+/// membership or retain a pointer across eviction.
+pub const PatternMembership = struct {
+    const Bitmap = roaring.RoaringBitmap;
+    const Entry = struct { key: [32]u8, bitmap: Bitmap, age: u64 };
+    budget: @import("../sql/memory_budget.zig"),
+    entries: [32]?Entry = @splat(null),
+    mutex: std.atomic.Mutex = .unlocked,
+    tick: u64 = 0,
+    hits: usize = 0,
+    builds: usize = 0,
+    pub fn init(a: Allocator, bytes: usize) PatternMembership {
+        return .{ .budget = .{ .backing = a, .limit = bytes } };
+    }
+    fn lock(self: *@This()) void {
+        @import("antfly_platform").sync.lockYielding(&self.mutex);
+    }
+    fn evict(self: *@This()) bool {
+        var oldest: ?usize = null;
+        for (self.entries, 0..) |entry, i| if (entry) |held| {
+            if (oldest == null or held.age < self.entries[oldest.?].?.age) oldest = i;
+        };
+        const index = oldest orelse return false;
+        self.entries[index].?.bitmap.deinit();
+        self.entries[index] = null;
+        return true;
+    }
+    pub fn deinit(self: *@This()) void {
+        while (self.evict()) {}
+        std.debug.assert(self.budget.live == 0);
+    }
+    fn identity(filter: Filter, seg: *const index_mod.SegmentEntry) [32]u8 {
+        var buffer: [1024]u8 = undefined;
+        var writer: std.Io.Writer.Hashing(std.crypto.hash.sha2.Sha256) = .init(&buffer);
+        std.json.Stringify.value(.{ seg.id, seg.reader.doc_count, @tagName(filter) }, .{}, &writer.writer) catch unreachable;
+        switch (filter) {
+            inline .prefix, .wildcard, .regexp, .fuzzy => |value| inline for (@typeInfo(@TypeOf(value)).@"struct".field_names) |name| {
+                if (comptime !std.mem.eql(u8, name, "control")) {
+                    std.json.Stringify.value(@field(value, name), .{}, &writer.writer) catch unreachable;
+                    writer.writer.writeByte(0) catch unreachable;
+                }
+            },
+            else => unreachable,
+        }
+        writer.writer.flush() catch unreachable;
+        var digest: [32]u8 = undefined;
+        writer.hasher.final(&digest);
+        return digest;
+    }
+    fn execute(self: *@This(), a: Allocator, filter: Filter, seg: *const index_mod.SegmentEntry, control: ExecutionControl) !Bitmap {
+        try control.check();
+        const key = identity(filter, seg);
+        self.lock();
+        self.tick +%= 1;
+        for (&self.entries) |*entry| if (entry.*) |*held| if (std.mem.eql(u8, &held.key, &key)) {
+            held.age = self.tick;
+            const result = held.bitmap.clone(a);
+            self.hits += 1;
+            self.mutex.unlock();
+            var owned = try result;
+            errdefer owned.deinit();
+            try control.check();
+            return owned;
+        };
+        self.mutex.unlock();
+        var uncached = control;
+        uncached.pattern_cache = null;
+        var result = try filter.withControl(uncached).execute(a, seg);
+        errdefer result.deinit();
+        try control.check();
+        self.lock();
+        defer self.mutex.unlock();
+        self.builds += 1;
+        while (true) {
+            var free: ?usize = null;
+            for (self.entries, 0..) |entry, i| if (entry == null) {
+                free = i;
+                break;
+            };
+            if (free == null) {
+                _ = self.evict();
+                continue;
+            }
+            const copy = result.clone(self.budget.allocator()) catch {
+                if (!self.evict()) return result;
+                continue;
+            };
+            self.entries[free.?] = .{ .key = key, .bitmap = copy, .age = self.tick };
+            return result;
+        }
     }
 };
 
@@ -3870,4 +3969,59 @@ test "external lake metadata navigation term filter keeps synonym membership com
         }
     };
     try testing.checkAllAllocationFailures(alloc, Checked.run, .{seg});
+}
+
+test "external lake metadata navigation pattern leaves reuse immutable membership and honor controls" {
+    const a = testing.allocator;
+    const bytes = try buildTestSegmentWithTerms(a, &.{
+        .{ .terms = &.{ .{ .term = "alpine", .freq = 1, .norm = 2 }, .{ .term = "common", .freq = 1, .norm = 2 } } },
+        .{ .terms = &.{.{ .term = "beta", .freq = 1, .norm = 1 }} },
+    });
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    const segment = &writer.snapshot().segments[0];
+    var memo = PatternMembership.init(a, 1024 * 1024);
+    defer memo.deinit();
+    const leaves = [_]Filter{
+        .{ .prefix = .{ .field = "body", .prefix = "alp" } },
+        .{ .wildcard = .{ .field = "body", .pattern = "alp*" } },
+        .{ .regexp = .{ .field = "body", .pattern = "alp.*" } },
+        .{ .fuzzy = .{ .field = "body", .term = "alpine" } },
+    };
+    for (leaves) |leaf| {
+        const filter = leaf.withControl(.{ .pattern_cache = &memo });
+        var first = try filter.execute(a, segment);
+        defer first.deinit();
+        try first.remove(0);
+        var second = try filter.execute(a, segment);
+        defer second.deinit();
+        try testing.expectEqual(@as(usize, 1), second.cardinality());
+        try testing.expect(second.contains(0));
+        try testing.expectError(error.Timeout, leaf.withControl(.{ .pattern_cache = &memo, .deadline_ns = 0 }).execute(a, segment));
+    }
+    try testing.expectEqual(@as(usize, 4), memo.builds);
+    try testing.expectEqual(@as(usize, 4), memo.hits);
+    var pressure = PatternMembership.init(a, 1);
+    defer pressure.deinit();
+    for (0..2) |_| {
+        var result = try leaves[0].withControl(.{ .pattern_cache = &pressure }).execute(a, segment);
+        defer result.deinit();
+        try testing.expect(result.contains(0));
+    }
+    try testing.expectEqual(@as(usize, 2), pressure.builds);
+    try testing.expectEqual(@as(usize, 0), pressure.budget.live);
+    const Failure = struct {
+        fn run(alloc: Allocator, seg: *const index_mod.SegmentEntry, leaf: Filter) !void {
+            var local = PatternMembership.init(alloc, 1024 * 1024);
+            defer local.deinit();
+            for (0..2) |_| {
+                var matches = try leaf.withControl(.{ .pattern_cache = &local }).execute(alloc, seg);
+                defer matches.deinit();
+                try testing.expect(matches.contains(0));
+            }
+        }
+    };
+    try testing.checkAllAllocationFailures(a, Failure.run, .{ segment, leaves[0] });
 }

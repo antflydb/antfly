@@ -986,6 +986,7 @@ pub const Stream = struct {
                     .coalesce_options = self.source.scanner.coalesce_options,
                     .materialization_limits = .{ .max_struct_allocation_bytes = self.limits.max_decoded_bytes, .max_input_bytes = self.limits.max_input_bytes, .max_decoded_bytes = self.limits.max_decoded_bytes },
                 };
+                const qualified = try self.source.qualifiedDeletes(self.context);
                 if (self.source.scanner.shared_reader) |reader| {
                     var hash = std.crypto.hash.sha2.Sha256.init(.{});
                     hash.update(&reader.scope);
@@ -999,13 +1000,15 @@ pub const Stream = struct {
                     var versions = std.crypto.hash.sha2.Sha256.init(.{});
                     const index_identity = if (self.source.plan_identity) |plan_key|
                         try std.json.Stringify.valueAlloc(self.alloc, plan_key, .{})
+                    else if (qualified) |evidence|
+                        try std.json.Stringify.valueAlloc(self.alloc, .{ .delete_recipe = evidence.recipe, .inventory = self.source.inventory }, .{})
                     else
                         try std.json.Stringify.valueAlloc(self.alloc, .{ .deletes = delete_plan, .inventory = self.source.inventory }, .{});
                     defer self.alloc.free(index_identity);
                     hash.update(index_identity);
                     var cacheable = true;
                     var delete_client = request.client.?;
-                    for (delete_plan.files) |file| {
+                    if (qualified) |evidence| cacheable = evidence.cacheable else for (delete_plan.files) |file| {
                         const location = try @import("lake_range_io.zig").objectLocationForUri(file.file_path);
                         var meta = try delete_client.statObject(location.bucket, location.key);
                         defer meta.deinit(request.client.?.allocator);
@@ -1014,14 +1017,14 @@ pub const Stream = struct {
                         // An unversioned provider cannot safely reuse an index.
                         if (meta.etag == null and meta.version_id == null) cacheable = false;
                     }
-                    const version_key = versions.finalResult();
+                    const version_key = if (qualified) |evidence| evidence.digest else versions.finalResult();
                     hash.update(&version_key);
                     const key = hash.finalResult();
                     const cached = if (cacheable) reader.cache.decoded.lookup(key) else null;
                     const lease = cached orelse blk: {
                         const owned = try reader.cache.decoded.create(64 * 1024 * 1024);
                         errdefer owned.release();
-                        const decoded = try @import("lake_prepared_deletes.zig").Prepared.createCached(owned.item.budget.allocator(), request, &reader.cache.delete_files, reader.scope, self.context);
+                        const decoded = try @import("lake_prepared_deletes.zig").Prepared.createQualified(owned.item.budget.allocator(), request, &reader.cache.delete_files, reader.scope, self.context, qualified);
                         owned.item.payload = .{ .prepared = decoded };
                         owned.item.foreign_bytes = owned.item.payload.prepared.foreignBytes();
                         try self.context.ensureActive();
@@ -1030,7 +1033,7 @@ pub const Stream = struct {
                     };
                     self.source.delete_lease = lease;
                     self.source.prepared_deletes = lease.item.payload.prepared;
-                } else self.source.prepared_deletes = try @import("lake_prepared_deletes.zig").Prepared.create(self.source.alloc, request);
+                } else self.source.prepared_deletes = try @import("lake_prepared_deletes.zig").Prepared.createQualified(self.source.alloc, request, null, @splat(0), self.context, qualified);
             }
         }
     }

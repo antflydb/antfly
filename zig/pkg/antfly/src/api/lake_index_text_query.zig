@@ -1719,26 +1719,33 @@ const Execution = struct {
     /// provider callbacks never enter this memo. Four entries share 8 MiB.
     const OrderedMembership = struct {
         const Bitmap = local.encoding_roaring.RoaringBitmap;
-        const Entry = struct { id: [32]u8, bitmap: Bitmap, used: u64 };
+        const Patterns = local.search_query.PatternMembership;
+        const Entry = struct { id: [32]u8, bitmap: ?Bitmap = null, patterns: *Patterns, used: u64 };
         budget: local.sql_memory_budget = .{ .backing = @import("antfly_platform").allocator.processAllocator(std.heap.page_allocator), .limit = 8 * 1024 * 1024 },
         entries: [4]?Entry = @splat(null),
         tick: u64 = 0,
         hits: usize = 0,
         builds: usize = 0,
         fn evict(self: *@This()) bool {
+            return self.evictExcept(null);
+        }
+        fn evictExcept(self: *@This(), skip: ?usize) bool {
             var oldest: ?usize = null;
             for (self.entries, 0..) |entry, i| if (entry) |held| {
+                if (skip == i) continue;
                 if (oldest == null or held.used < self.entries[oldest.?].?.used) oldest = i;
             };
             const index = oldest orelse return false;
-            self.entries[index].?.bitmap.deinit();
+            if (self.entries[index].?.bitmap) |*bitmap| bitmap.deinit();
+            self.entries[index].?.patterns.deinit();
+            self.budget.allocator().destroy(self.entries[index].?.patterns);
             self.entries[index] = null;
             return true;
         }
         fn deinit(self: *@This()) void {
             while (self.evict()) {}
         }
-        fn build(self: *@This(), snapshot: *const local.index.IndexSnapshot, plan: *const local.search_search.TextNavigationPlan, token: @import("antfly_cancellation").CancellationToken) !Bitmap {
+        fn build(self: *@This(), snapshot: *const local.index.IndexSnapshot, plan: *const local.search_search.TextNavigationPlan, token: @import("antfly_cancellation").CancellationToken, patterns: *Patterns) !Bitmap {
             const a = self.budget.allocator();
             var result = Bitmap.init(a);
             errdefer result.deinit();
@@ -1748,7 +1755,7 @@ const Execution = struct {
                 var lease = try snapshot.leaseSegment(i);
                 defer lease.deinit();
                 const segment = lease.entry;
-                var matches = try plan.membership.withControl(.{ .cancellation = token }).executeWithOffset(a, segment, offset);
+                var matches = try plan.membership.withControl(.{ .cancellation = token, .pattern_cache = patterns }).executeWithOffset(a, segment, offset);
                 defer matches.deinit();
                 {
                     segment.shared.lockDeletionShared();
@@ -1768,7 +1775,7 @@ const Execution = struct {
             for (&self.entries) |*entry| if (entry.*) |*held| if (std.mem.eql(u8, &held.id, &id)) {
                 held.used = self.tick;
                 self.hits += 1;
-                return &held.bitmap;
+                return if (held.bitmap) |*bitmap| bitmap else null;
             };
             while (true) {
                 var free: ?usize = null;
@@ -1780,15 +1787,28 @@ const Execution = struct {
                     _ = self.evict();
                     continue;
                 }
-                const bitmap = self.build(snapshot, plan, token) catch |err| {
-                    if (err != error.OutOfMemory) return err;
+                const patterns = self.budget.allocator().create(Patterns) catch {
                     if (!self.evict()) return null;
                     continue;
                 };
-                self.entries[free.?] = .{ .id = id, .bitmap = bitmap, .used = self.tick };
-                self.builds += 1;
-                return &self.entries[free.?].?.bitmap;
+                patterns.* = Patterns.init(self.budget.allocator(), 8 * 1024 * 1024);
+                const index = free.?;
+                self.entries[index] = .{ .id = id, .patterns = patterns, .used = self.tick };
+                while (true) {
+                    const bitmap = self.build(snapshot, plan, token, patterns) catch |err| {
+                        if (err != error.OutOfMemory) return err;
+                        if (!self.evictExcept(index)) return null;
+                        continue;
+                    };
+                    self.entries[index].?.bitmap = bitmap;
+                    self.builds += 1;
+                    return &self.entries[index].?.bitmap.?;
+                }
             }
+        }
+        fn patternCache(self: *@This(), id: [32]u8) ?*Patterns {
+            for (self.entries) |entry| if (entry) |held| if (std.mem.eql(u8, &held.id, &id)) return held.patterns;
+            return null;
         }
     };
     fn orderedPagedText(self: *Execution, a: A, req: types.SearchRequest, text: types.TextQuery, root: corpus.Root, name: []const u8, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, token: @import("antfly_cancellation").CancellationToken, ordering: local.storage_db_query_search_exec.SearchHitOrder, scan: local.sql_catalog.Scan) !?types.SearchResult {
@@ -1919,6 +1939,7 @@ const Execution = struct {
             defer live.deinit(a);
             const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store.identity, .context = self.context };
             const membership = if (self.ordered_membership) |memo| if (req.text_navigation_plan) |plan| try memo.get(self.forced_selection.?[0], candidate_pin.?.snapshot, plan, .{ .ptr = self, .is_cancelled_fn = canceled }) else null else null;
+            if (self.ordered_membership) |memo| effective.text_pattern_membership = memo.patternCache(self.forced_selection.?[0]);
             for (rows) |row| if (try identities.ordinal(a, &live, self.store.artifactStore(), cached, row)) |number| {
                 if (membership == null or membership.?.contains(number)) try numbers.append(a, number);
             };
@@ -4106,4 +4127,24 @@ test "external lake metadata navigation ordered pages share text membership and 
     try std.testing.expect((try memo.get(@splat(2), pin.snapshot, prepared, .none)) == null);
     memo.budget.limit = 8 * 1024 * 1024;
     try std.testing.expectEqual(@as(usize, 1), (try memo.get(@splat(2), pin.snapshot, prepared, .none)).?.cardinality());
+    // Membership prefiltering and ordinary mixed-Boolean scoring share the
+    // same pattern leaf. Repeated ordered pages must not expand it again.
+    const patterned: local.search_search.SearchQuery = .{ .bool_query = .{ .must = &.{.{ .prefix = .{ .field = "body", .prefix = "ra", .boost = 2 } }}, .should = &.{.{ .term = .{ .field = "body", .term = "common" } }} } };
+    const pattern_plan = (try local.search_search.TextNavigationPlan.prepare(a, patterned, .{ .ptr = pin.snapshot, .count = pin.snapshot.scoringDocCount(), .average = Stats.average, .frequencies = Stats.frequencies }, .{})).?;
+    defer pattern_plan.deinit();
+    var pages: Execution.OrderedMembership = .{};
+    defer pages.deinit();
+    try std.testing.expectEqual(@as(usize, 1), (try pages.get(@splat(3), pin.snapshot, pattern_plan, .none)).?.cardinality());
+    const patterns = pages.patternCache(@splat(3)).?;
+    try std.testing.expectEqual(pin.snapshot.segments.len, patterns.builds);
+    var baseline = try local.search_search.execute(a, pin.snapshot, .{ .query = patterned, .text_navigation_plan = pattern_plan, .k = 2, .include_stored = false });
+    defer baseline.deinit();
+    for (0..3) |_| {
+        var scored = try local.search_search.execute(a, pin.snapshot, .{ .query = patterned, .text_navigation_plan = pattern_plan, .control = .{ .pattern_cache = patterns }, .k = 2, .include_stored = false, .filter_doc_nums = &.{0}, .filter_doc_nums_positive = true });
+        defer scored.deinit();
+        try std.testing.expectEqual(@as(usize, 1), scored.hits.len);
+        try std.testing.expectEqual(baseline.hits[0].score, scored.hits[0].score);
+    }
+    try std.testing.expectEqual(pin.snapshot.segments.len, patterns.builds);
+    try std.testing.expect(patterns.hits >= 3);
 }

@@ -4659,3 +4659,44 @@ Pinned-compiler error metadata, Zig/Python formatting and lint, whitespace, all
 109 changed source license headers, and the Apache boundary passed (2,064 source
 files). Live-provider retention qualification and representative archive-scale
 latency/RSS benchmarks remain deferred; no archive speedup multiplier is claimed.
+
+
+### Shared full-scan plans, ordered pattern leaves, and delete qualification
+
+Automatic navigation admission now preserves ordinary Iceberg SQL fallback when
+the native artifact store or reader pool is unavailable. Required/retained reads,
+request cancellation, OOM and ambiguous mutation outcomes retain their errors.
+Full scans lease one frozen flat inventory, qualified version strings and
+canonical plan through the bounded decoded cache. Selective reads keep their
+publication navigation and fresh metadata checks.
+
+Ordered pack membership and scoring share bounded pattern-leaf bitmaps under the
+existing four-pack/8 MiB query budget. Scoring owns private copies, so parallel
+mutation and eviction cannot change a winner. Delete qualification is query-owned
+and singleflight: eight bounded stat lanes populate a 16 MiB partition/sequence
+index, then selected views decode and retain only candidate delete files. Serving
+coverage and hydration share that evidence; build verification still freshly
+checks providers before and after publication. Incomplete scopes and quota denial
+preserve the authoritative fallback paths.
+
+Regressions cover unavailable native storage through real Iceberg SQL, warm full
+scans with data manifests unavailable, shared empty-plan ownership and allocation
+failures, pattern reuse across ordered prefilter/scoring batches, private bitmap
+mutation, cancellation and pressure, and delete partition/sequence pruning with
+provider replacement and unchanged fingerprints. Representative archive-scale
+latency/RSS and live-provider retention qualification remain deferred.
+
+
+Final qualification after merging origin/main `a900887124` (#1153): Debug CLI
+built; all 488 lake integration tests passed (183 shared-engine and 305 server),
+all 84 focused tests passed (22 and 62), and all 47 real Parquet/Iceberg E2Es
+passed in 620.91 seconds. Qualification covers unavailable optional native
+storage, warm full scans with data manifests unavailable, shared-plan ownership
+and allocation failures, pattern reuse during prefiltering and scoring, and
+partition/sequence delete routing with unchanged fingerprints. Provider
+replacement, equality/position sequence boundaries, cancellation, quota denial
+and qualifier allocation failures pass. Compiler-local error metadata, Zig and
+Python formatting/lint, whitespace, staged source licenses and the Apache
+boundary passed (2,065 source files). Live-provider retention and representative
+archive-scale latency/RSS qualification remain deferred. These E2E timings were
+collected during builds and are functional qualification, not benchmarks.

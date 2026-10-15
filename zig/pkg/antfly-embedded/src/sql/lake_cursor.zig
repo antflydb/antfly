@@ -565,6 +565,9 @@ const Owner = struct {
         a.free(source.pinned_files);
     }
     fn splitChildren(self: *Owner, a: Allocator, count: usize, ordered_files: bool) ![]catalog.Cursor {
+        // Publish one query-owned qualifier before independent lanes borrow
+        // source state, including manually supplied embedded source owners.
+        _ = try self.stream.source.qualifiedDeletes(self.stream.context);
         const cursors = try a.alloc(catalog.Cursor, count);
         errdefer a.free(cursors);
         var opened: usize = 0;
@@ -573,6 +576,7 @@ const Owner = struct {
             const source = try a.create(serving.ServingSource);
             errdefer a.destroy(source);
             source.* = self.stream.source.*;
+            source.delete_qualification_owned = false;
             if (ordered_files) try cloneVersionState(a, source);
             errdefer if (ordered_files) freeVersionState(a, source);
             const parent_reader = source.scanner.shared_reader.?;
@@ -773,6 +777,7 @@ const TestLake = struct {
         self.source = .{ .alloc = alloc, .store = .{ .alloc = alloc, .client = client, .owns_client = false, .bucket = @constCast("bucket"), .prefix = @constCast("events") }, .inventory = self.inventory, .scanner = serving.PinnedExternalObjectStorageLakeRowsScanner.init(self.inventory, self.meter.client()) };
     }
     fn deinit(self: *TestLake, alloc: Allocator) void {
+        if (self.source.delete_qualification_owned) if (self.source.delete_qualification) |qualification| qualification.destroy();
         if (self.source.delete_lease) |lease| lease.release() else if (self.source.prepared_deletes) |prepared| prepared.destroy(alloc);
         if (self.source.scanner.shared_reader) |reader| alloc.destroy(reader);
         self.inventory.deinit(alloc);

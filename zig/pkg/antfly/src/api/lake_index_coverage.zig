@@ -211,6 +211,26 @@ pub fn finishDigest(source: *Source, context: Context, data: [32]u8) !Coverage {
     hash.update(&data);
     return finishHash(source, context, hash, data);
 }
+/// A serving statement pins delete evidence once, before admitting native
+/// coverage, and shares that exact evidence with selected hydration views.
+/// Build/publication verification continues to use finish()/finishDigest(),
+/// which deliberately re-stat objects before and after construction.
+pub fn finishReadDigest(source: *Source, context: Context, data: [32]u8) !Coverage {
+    const qualified = (try source.qualifiedDeletes(context)) orelse return finishDigest(source, context, data);
+    var hash = Hash.init(.{});
+    part(&hash, "native-lake-source-coverage-v2");
+    hash.update(&data);
+    const plan = source.scanner.iceberg_delete_plan.?;
+    if (plan.files.len != qualified.versions.len) return error.InvalidExternalLakeIndexCoverage;
+    for (plan.files, qualified.versions) |file, version| {
+        try context.ensureActive();
+        if (!versionIsStrong(version.etag, version.version)) return error.InvalidExternalLakeIndexCoverage;
+        try jsonPart(source.alloc, &hash, file);
+        part(&hash, version.etag);
+        part(&hash, version.version);
+    }
+    return .{ .source = hash.finalResult(), .delete_objects = qualified.digest, .data = data };
+}
 pub fn finishLegacy(source: *Source, context: Context, data: DataProof) !Coverage {
     return finishHash(source, context, data, dataDigest(data));
 }
@@ -358,4 +378,13 @@ test "external lake immutable object contract avoids data HEAD while mutable cov
     const serial = try pin(&source, .{});
     try std.testing.expectEqual(parallel, serial);
     try std.testing.expectEqual(@as(usize, 4), spy.heads.load(.acquire));
+    const read_data = dataDigest(try pinData(&source, .{}, null, null));
+    const pinned_read = try finishReadDigest(&source, .{ .io = std.testing.io }, read_data);
+    try std.testing.expectEqual(serial, pinned_read);
+    try std.testing.expectEqual(@as(usize, 6), spy.heads.load(.acquire));
+    try std.testing.expectEqual(pinned_read, try finishReadDigest(&source, .{}, read_data));
+    try std.testing.expectEqual(@as(usize, 6), spy.heads.load(.acquire));
+    // Publication still freshly checks objects even after serving qualification.
+    try std.testing.expectEqual(serial, try finishDigest(&source, .{}, read_data));
+    try std.testing.expectEqual(@as(usize, 8), spy.heads.load(.acquire));
 }

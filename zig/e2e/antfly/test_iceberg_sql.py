@@ -1726,12 +1726,68 @@ def test_cold_indexed_iceberg_queries_use_publication_file_navigation(tmp_path):
             {"statement": "SELECT amount FROM cold_navigation WHERE amount = 101"},
         )["rows"] == [["101"]]
         # Full scans explicitly rediscover ordinary source metadata.
+        data_manifests = [path for path, _ in hidden]
         for path, unavailable in hidden:
             unavailable.rename(path)
         hidden.clear()
         assert call(
             "POST", "/sql", {"statement": "SELECT COUNT(*) FROM cold_navigation"}
         )["rows"] == [["200"]]
+        assert (
+            len(
+                call(
+                    "POST",
+                    "/sql",
+                    {"statement": "SELECT label FROM cold_navigation LIMIT 2"},
+                )["rows"]
+            )
+            == 2
+        )
+        # Warm full scans borrow the same frozen inventory and ordering plan;
+        # neither a new query nor a different projection rediscovers manifests.
+        for path in data_manifests:
+            unavailable = path.with_suffix(".avro.unavailable")
+            path.rename(unavailable)
+            hidden.append((path, unavailable))
+        assert call(
+            "POST", "/sql", {"statement": "SELECT COUNT(*) FROM cold_navigation"}
+        )["rows"] == [["200"]]
+        assert (
+            len(
+                call(
+                    "POST",
+                    "/sql",
+                    {"statement": "SELECT label FROM cold_navigation LIMIT 2"},
+                )["rows"]
+            )
+            == 2
+        )
+        for path, unavailable in hidden:
+            unavailable.rename(path)
+        hidden.clear()
+        # Index-store admission is optional for automatic source scans. A
+        # disposable unavailable store cannot make readable source data fail.
+        artifact_root = server.root / "artifacts"
+        held_artifacts = server.root / "held-artifacts"
+        artifact_root.rename(held_artifacts)
+        artifact_root.write_text("unavailable native store")
+        try:
+            assert (
+                len(
+                    call(
+                        "POST",
+                        "/sql",
+                        {"statement": "SELECT label FROM cold_navigation LIMIT 2"},
+                    )["rows"]
+                )
+                == 2
+            )
+            assert call(
+                "POST", "/sql", {"statement": "SELECT COUNT(*) FROM cold_navigation"}
+            )["rows"] == [["200"]]
+        finally:
+            artifact_root.unlink()
+            held_artifacts.rename(artifact_root)
         failed = False
     finally:
         for path, unavailable in hidden:

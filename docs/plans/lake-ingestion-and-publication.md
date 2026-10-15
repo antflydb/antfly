@@ -411,6 +411,41 @@ and ordering, continuation tokens, delimiter grouping and symbolic-link behavior
 retain the bucket-listing contract. Listing a cursor namespace must not traverse
 unrelated archive artifacts.
 
+Automatic Iceberg source opening treats publication navigation as optional until
+it is adopted. Unavailable native stores or reader admission leave ordinary SQL
+source scans usable; cancellation, allocation failure, ambiguous metadata outcomes
+and explicitly required native reader errors still propagate. Retained/native
+reads continue to validate their own authority. Once navigation is adopted, its
+file lookups retain the independent publication reader pin.
+
+Full scans over an authenticated immutable snapshot share a separate flat plan
+keyed by the frozen metadata, requested snapshot and credential scope. The plan
+owns its qualified version strings, manifest-chunk leases, file map and canonical
+ordering. Queries borrow it through the bounded decoded cache and keep version
+changes in private maps. A new metadata selection creates a new key; neither
+snapshot labels nor TTLs establish freshness. Selective reads still defer data
+manifests, and full scans build this view only on demand.
+
+Selected Iceberg views share query-owned delete qualification under a 16 MiB
+workspace. At most eight provider stats run concurrently on the shared scheduler;
+only owned version strings and partition/sequence routes survive admission.
+Native coverage validation and hydration use the same pinned evidence. Complete
+partition tuples route candidate delete files, and sequence seeks exclude older
+deletes before decoding. Incomplete scopes preserve authoritative applicability
+checks. Only relevant recipes and decoded membership leases enter each prepared
+view. New source admissions revalidate provider versions; publication retains its
+independent fresh checks before and after construction. Workspace denial keeps
+the bounded original path. None of this authority becomes a resident cache entry.
+
+Ordered text batches share pattern leaves between membership prefiltering and
+ordinary scoring. Prefix, wildcard, regex and fuzzy bitmaps are keyed by immutable
+pack/segment and complete filter semantics. Four packs share the existing 8 MiB
+query quota, with at most 32 pattern leaves per pack. Parallel scoring receives
+private bitmap copies, checks current cancellation/deadlines and joins before
+memo teardown. Cache denial or eviction recomputes authoritative membership;
+BM25, Boolean boosts, deletions, totals, tie ordering and cursors retain shared
+engine semantics.
+
 Cold-query qualification must distinguish local execution, process restart,
 empty Antfly serving caches, and fully remote reads. A restart with a retained
 filesystem cache does not establish object-store cold latency. Compare prebuilt
