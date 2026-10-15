@@ -61,3 +61,12 @@ with zero late-slice copy bytes on this clip and identical CPU patch hashes.
 Measured warm p50/p95 are 28.328/29.928 seconds for copying and 27.820/27.903
 seconds for sharing. These small shared-host samples establish copy avoidance
 and output preservation, not a statistically qualified speedup.
+
+## Current Linux runtime follow-up
+
+The [current Linux library gate](../current-linux-validation/README.md) now
+executes all three shared-reference regressions on actual ARM64 Linux: transactional
+detach, exhaustive allocation failure and copying/shared progressive output.
+The complete current suite passes 252 cases with 29 platform skips and zero
+failures. Its source-bound receipt closes the runtime follow-up described above;
+the earlier Sintel benchmark and timing measurements retain their original scope.
