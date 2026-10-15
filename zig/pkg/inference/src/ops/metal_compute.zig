@@ -4509,7 +4509,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         storage.setDeviceWriteHook(metal_storage.deviceWriteHook());
     }
 
-    const SegmentControlCache = struct { raw: []i32, batch: u32, seq_len: u32, apply_dropout: bool, device: CT };
+    const SegmentControlCache = struct { raw: []i32, batch: u32, seq_len: u32, apply_dropout: bool, dropout_seed: u64, device: CT };
 
     pub fn deinit(self: *MetalCompute) void {
         if (self.segment_control_cache) |cached| {
@@ -7368,7 +7368,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             },
             .fused_modernbert_training_attention_v1, .fused_modernbert_training_attention_backward_v1 => |attrs| {
                 const backward = instruction.op == .fused_modernbert_training_attention_backward_v1;
-                return self.modernBertTrainingAttention(tensors[0], inputs[1], if (backward) tensors[2] else null, attrs, control);
+                return self.modernBertTrainingAttention(tensors[0], inputs[1], if (backward) tensors[2] else null, attrs, control, 0, 0);
             },
             .reshape, .stop_gradient, .convert_dtype => return self.residentTrainingReshape(inputs[0], shape, limits.primitive, false),
             .gather => {
@@ -7538,12 +7538,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return self.exportCtFromHostNative(&native_ctx, n_grad, null);
     }
 
-    /// Segment attention without active dropout is the ModernBERT training
-    /// attention (same visibility, window, scale and empty-row contract) with
-    /// row-relative ranges, so it runs on those device kernels. Returns null,
-    /// leaving the host bridge to run it, when dropout applies, the control
-    /// has no retained host copy, or its ranges overlap (the ModernBERT
-    /// kernels require disjoint ranges; the segment kernels do not).
+    /// Segment attention is the ModernBERT training attention (same
+    /// visibility, window, scale and empty-row contract) with row-relative
+    /// ranges and an optional attention-probability dropout mask, so it runs
+    /// on those device kernels. Dropout only has a device-side mask in the
+    /// flash kernels (`modernBertFlashTrainingAttentionEligible`); when it
+    /// applies and the shape is not flash-eligible this returns null and the
+    /// host bridge runs it instead. Also returns null when the control has
+    /// no retained host copy, or its ranges overlap (the ModernBERT kernels
+    /// require disjoint ranges; the segment kernels do not).
     fn segmentAttentionOnDevice(self: *MetalCompute, qkv_ct: CT, control_ct: CT, d_out_ct: ?CT, attrs: @import("ml").graph.SegmentTrainingAttentionAttrs, control: ?@import("../execution_control.zig").InferenceExecutionControl) !?CT {
         const segment = @import("segment_training_attention.zig");
         const modernbert = @import("modernbert_training_attention.zig");
@@ -7553,11 +7556,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (self.segment_control_cache) |cached| if (cached.batch == attrs.batch and cached.seq_len == attrs.seq_len and
             std.mem.eql(i32, cached.raw, storage.values))
         {
-            if (cached.apply_dropout and attrs.dropout_probability > 0) return null;
-            return try self.segmentAttentionWithControl(qkv_ct, cached.device, d_out_ct, attrs, control);
+            const probability: f32 = if (cached.apply_dropout) attrs.dropout_probability else 0;
+            if (probability > 0 and !metal_runtime.modernBertFlashTrainingAttentionEligible(attrs.head_dim)) return null;
+            return try self.segmentAttentionWithControl(qkv_ct, cached.device, d_out_ct, attrs, control, probability, cached.dropout_seed);
         };
         const view = try segment.validateControl(attrs, storage.values, .{ .control = control });
-        if (view.apply_dropout and attrs.dropout_probability > 0) return null;
+        const probability: f32 = if (view.apply_dropout) attrs.dropout_probability else 0;
+        if (probability > 0 and !metal_runtime.modernBertFlashTrainingAttentionEligible(attrs.head_dim)) return null;
+        const dropout_seed = segment.dropoutSeed(attrs, view.replay);
         const device_attrs: @import("ml").graph.ModernBertTrainingAttentionAttrs = .{
             .batch = attrs.batch,
             .seq_len = attrs.seq_len,
@@ -7585,11 +7591,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             freeOp(self, previous.device);
             self.allocator.free(previous.raw);
         }
-        self.segment_control_cache = .{ .raw = raw, .batch = attrs.batch, .seq_len = attrs.seq_len, .apply_dropout = view.apply_dropout, .device = device_control };
-        return try self.segmentAttentionWithControl(qkv_ct, device_control, d_out_ct, attrs, control);
+        self.segment_control_cache = .{ .raw = raw, .batch = attrs.batch, .seq_len = attrs.seq_len, .apply_dropout = view.apply_dropout, .dropout_seed = dropout_seed, .device = device_control };
+        return try self.segmentAttentionWithControl(qkv_ct, device_control, d_out_ct, attrs, control, probability, dropout_seed);
     }
 
-    fn segmentAttentionWithControl(self: *MetalCompute, qkv_ct: CT, device_control: CT, d_out_ct: ?CT, attrs: @import("ml").graph.SegmentTrainingAttentionAttrs, control: ?@import("../execution_control.zig").InferenceExecutionControl) !CT {
+    fn segmentAttentionWithControl(self: *MetalCompute, qkv_ct: CT, device_control: CT, d_out_ct: ?CT, attrs: @import("ml").graph.SegmentTrainingAttentionAttrs, control: ?@import("../execution_control.zig").InferenceExecutionControl, dropout_probability: f32, dropout_seed: u64) !CT {
         const device_attrs: @import("ml").graph.ModernBertTrainingAttentionAttrs = .{
             .batch = attrs.batch,
             .seq_len = attrs.seq_len,
@@ -7601,7 +7607,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer qkv.deinit();
         var d_out: ?MetalTensor = if (d_out_ct) |value| try self.ownedDeviceMetalTensorFromCt(value) else null;
         defer if (d_out) |*value| value.deinit();
-        return try self.modernBertTrainingAttention(qkv, device_control, d_out, device_attrs, control);
+        return try self.modernBertTrainingAttention(qkv, device_control, d_out, device_attrs, control, dropout_probability, dropout_seed);
     }
 
     /// ModernBERT training attention on device. The control's retained host
@@ -7609,13 +7615,16 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     /// inside its row before a kernel reads it. Unlike the strict resident
     /// instructions this may join an active command frame (Laya's framed
     /// trainer); the output view keeps the kernel scratch alive.
-    fn modernBertTrainingAttention(self: *MetalCompute, qkv: MetalTensor, control_ct: CT, d_out: ?MetalTensor, attrs: @import("ml").graph.ModernBertTrainingAttentionAttrs, control: ?@import("../execution_control.zig").InferenceExecutionControl) !CT {
+    /// `dropout_probability > 0` is only ever nonzero from segment training
+    /// attention's head layers (`segmentAttentionWithControl`); the
+    /// ModernBERT trunk ops below always pass `0, 0`.
+    fn modernBertTrainingAttention(self: *MetalCompute, qkv: MetalTensor, control_ct: CT, d_out: ?MetalTensor, attrs: @import("ml").graph.ModernBertTrainingAttentionAttrs, control: ?@import("../execution_control.zig").InferenceExecutionControl, dropout_probability: f32, dropout_seed: u64) !CT {
         if (control) |active| try active.check();
         const control_buf = toBuf(control_ct);
         const storage = control_buf.resident_index_storage orelse return error.UnsupportedResidentTrainingIndexProof;
         _ = try @import("modernbert_training_attention.zig").validateControl(attrs, storage.values);
         const control_tensor = control_buf.metal_tensor orelse return error.ResidentTrainingRequiresDeviceTensor;
-        const output = try metal_runtime.decoderRuntimeModernBertTrainingAttentionV1Device(self.provider_impl, qkv, control_tensor, d_out, attrs, control);
+        const output = try metal_runtime.decoderRuntimeModernBertTrainingAttentionV1Device(self.provider_impl, qkv, control_tensor, d_out, attrs, control, dropout_probability, dropout_seed);
         return self.boundaryOwnedTensor(output);
     }
 
@@ -7623,7 +7632,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         var qkv = try self.ownedDeviceMetalTensorFromCt(qkv_ct);
         defer qkv.deinit();
-        return self.modernBertTrainingAttention(qkv, control_i32, null, attrs, control);
+        return self.modernBertTrainingAttention(qkv, control_i32, null, attrs, control, 0, 0);
     }
 
     fn modernBertTrainingAttentionBackwardV1Op(ctx: *anyopaque, qkv_ct: CT, control_i32: CT, d_out_ct: CT, attrs: @import("ml").graph.ModernBertTrainingAttentionAttrs, control: ?@import("../execution_control.zig").InferenceExecutionControl) anyerror!CT {
@@ -7632,7 +7641,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer qkv.deinit();
         var d_out = try self.ownedDeviceMetalTensorFromCt(d_out_ct);
         defer d_out.deinit();
-        return self.modernBertTrainingAttention(qkv, control_i32, d_out, attrs, control);
+        return self.modernBertTrainingAttention(qkv, control_i32, d_out, attrs, control, 0, 0);
     }
 
     fn residentTrainingPrimitiveOp(ctx: *anyopaque, request: *const ops.resident_training.Request, limits: ops.resident_training.Limits, control: ?@import("../execution_control.zig").InferenceExecutionControl) anyerror!CT {

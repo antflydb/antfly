@@ -7654,17 +7654,37 @@ const ModernBertTrainingAttentionParams = extern struct {
     window: u32,
     backward: u32,
     scale: f32,
-    reserved0: u32 = 0,
+    /// Attention-probability dropout (segment training attention's head
+    /// layers only; the ModernBERT trunk never sets this). `probability`
+    /// disables when `<= 0`; `seed` is `segment_training_attention.dropoutSeed`,
+    /// mixed with the flat (batch, head, query, key) index exactly like
+    /// `linalg.segmentAttentionDropoutKeep` so the device and host paths
+    /// agree bit for bit.
+    dropout_probability: f32 = 0,
+    dropout_seed: u64 = 0,
 };
 comptime {
-    if (@sizeOf(ModernBertTrainingAttentionParams) != 32) @compileError("ModernBERT training attention Metal ABI mismatch");
+    if (@sizeOf(ModernBertTrainingAttentionParams) != 40) @compileError("ModernBERT training attention Metal ABI mismatch");
+}
+
+/// The tiled kernels hold a block's K/V (or Q/dO) in simdgroup registers
+/// instead of rereading them per query, which matters at the 512-token rows
+/// Laya trains on; they only cover head_dim multiples of 8 up to 64
+/// (ModernBERT and head layers both use 64), and that's also the only shape
+/// the flash kernels' dropout mask is wired into. TERMITE_METAL_DISABLE_FLASH_TRAINING_ATTENTION
+/// forces the serial kernels back on for bisecting.
+pub fn modernBertFlashTrainingAttentionEligible(head_dim: u32) bool {
+    return head_dim % 8 == 0 and head_dim <= 64 and
+        !getenvFlagEnabled("TERMITE_METAL_DISABLE_FLASH_TRAINING_ATTENTION");
 }
 
 /// ModernBERT training attention over device-resident packed [Q;K;V] and an
 /// i32 control the caller has validated (disjoint in-row ranges). Returns the
 /// output rows, or packed [dQ;dK;dV] when `d_out` is given. Output and scratch
 /// share one allocation and the result views it, so the scratch outlives any
-/// command frame the dispatch was encoded into.
+/// command frame the dispatch was encoded into. `dropout_probability > 0`
+/// (segment training attention's head layers) requires the flash kernels;
+/// callers must have already checked `modernBertFlashTrainingAttentionEligible`.
 pub fn decoderRuntimeModernBertTrainingAttentionV1Device(
     self: anytype,
     qkv: MetalTensor,
@@ -7672,6 +7692,8 @@ pub fn decoderRuntimeModernBertTrainingAttentionV1Device(
     d_out: ?MetalTensor,
     attrs: modernbert_training_attention.Attrs,
     control: ?TrainingAttentionControl,
+    dropout_probability: f32,
+    dropout_seed: u64,
 ) !MetalTensor {
     if (!build_options.enable_metal) return error.UnsupportedModernBertTrainingAttentionProfile;
     try trainingAttentionCheck(control);
@@ -7691,6 +7713,7 @@ pub fn decoderRuntimeModernBertTrainingAttentionV1Device(
     const storage_shape = [_]i32{@intCast(total_bytes / @sizeOf(f32))};
     var storage = try MetalTensor.deviceAllocate(runtime, total_bytes, .private, &storage_shape);
     defer storage.deinit();
+    if (dropout_probability > 0 and !modernBertFlashTrainingAttentionEligible(attrs.head_dim)) return error.UnsupportedModernBertTrainingAttentionProfile;
     const params = ModernBertTrainingAttentionParams{
         .tokens = @intCast(tokens),
         .seq_len = attrs.seq_len,
@@ -7699,14 +7722,10 @@ pub fn decoderRuntimeModernBertTrainingAttentionV1Device(
         .window = attrs.window,
         .backward = @intFromBool(backward),
         .scale = 1 / @sqrt(@as(f32, @floatFromInt(attrs.head_dim))),
+        .dropout_probability = dropout_probability,
+        .dropout_seed = dropout_seed,
     };
-    // The tiled kernels hold a block's K/V (or Q/dO) in simdgroup registers
-    // instead of rereading them per query, which matters at the 512-token
-    // rows Laya trains on; they only cover head_dim multiples of 8 up to 64
-    // (ModernBERT and head layers both use 64). TERMITE_METAL_DISABLE_FLASH_TRAINING_ATTENTION
-    // forces the serial kernels back on for bisecting.
-    const flash_eligible = attrs.head_dim % 8 == 0 and attrs.head_dim <= 64 and
-        !getenvFlagEnabled("TERMITE_METAL_DISABLE_FLASH_TRAINING_ATTENTION");
+    const flash_eligible = modernBertFlashTrainingAttentionEligible(attrs.head_dim);
     const rc = if (flash_eligible) termite_metal_decode_runtime_modernbert_training_attention_flash_v1(
         runtime,
         qkv.deviceHandle(),
