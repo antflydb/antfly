@@ -328,6 +328,9 @@ var host_fallback_warned = [_]std.atomic.Value(bool){
     std.atomic.Value(bool).init(false),
     std.atomic.Value(bool).init(false),
     std.atomic.Value(bool).init(false),
+    std.atomic.Value(bool).init(false),
+    std.atomic.Value(bool).init(false),
+    std.atomic.Value(bool).init(false),
 };
 
 fn warnHostFallbackOnce(comptime index: usize, comptime what: []const u8) void {
@@ -15558,6 +15561,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         // Read them directly instead.
         if (device_fast_path_enabled and (gamma_buf.mutable_state or beta_buf.mutable_state)) {
             if (try self.layerNormDirect(input, gamma, beta, dim, eps)) |tensor| return tensor;
+            warnHostFallbackOnce(2, "layer norm");
         }
         if (device_fast_path_enabled and !gamma_buf.mutable_state and !beta_buf.mutable_state) {
             if (input_buf.metal_tensor) |*input_metal| {
@@ -15600,6 +15604,29 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return denseBuf(self.allocator, output, true, shape_i32);
     }
 
+    /// `input` as a device f32 tensor of exactly `count` elements. Pooled and
+    /// view buffers can be longer than their elements; boundary kernels need
+    /// exact lengths, so those are copied on the device. Null when the value
+    /// is not a device f32 tensor of `count` elements.
+    fn exactDeviceF32(self: *MetalCompute, input: CT, count: usize) !?MetalTensor {
+        var tensor = self.ownedDeviceMetalTensorFromCt(input) catch return null;
+        errdefer tensor.deinit();
+        if (!tensor.isDevice() or tensor.dtype != .f32 or tensor.elemCount() != count) {
+            tensor.deinit();
+            return null;
+        }
+        if (tensor.deviceByteLen() == count * 4) return tensor;
+        const runtime = self.provider_impl.raw_decode_runtime orelse {
+            tensor.deinit();
+            return null;
+        };
+        var copy = try MetalTensor.deviceAllocateFresh(@ptrCast(runtime), count * 4, .private, &.{@intCast(count)});
+        errdefer copy.deinit();
+        try tensor.copyInto(&copy);
+        tensor.deinit();
+        return copy;
+    }
+
     /// Runs one boundary kernel on device-resident f32 operands into a new
     /// `shape` tensor. Null when an operand is not device-resident f32.
     fn boundaryKernelDevice(self: *MetalCompute, request: ops.gliner_boundary_device.Kernel, inputs: []const CT, shape: []const i32) !?CT {
@@ -15611,12 +15638,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer for (tensors[0..held]) |*tensor| tensor.deinit();
         var sources: [ops.gliner_boundary_device.max_inputs]?MetalTensor = @splat(null);
         for (inputs, 0..) |input, i| {
-            tensors[i] = self.ownedDeviceMetalTensorFromCt(input) catch return null;
+            tensors[i] = (try self.exactDeviceF32(input, layout.input_elements[i])) orelse return null;
             held += 1;
-            const tensor = tensors[i];
-            if (!tensor.isDevice() or tensor.dtype != .f32 or tensor.elemCount() != layout.input_elements[i] or
-                tensor.deviceByteLen() != tensor.elemCount() * 4) return null;
-            sources[i] = tensor;
+            sources[i] = tensors[i];
         }
         var output = try MetalTensor.deviceAllocate(runtime, layout.output_elements * @sizeOf(f32), .private, shape);
         errdefer output.deinit();
@@ -15637,6 +15661,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         request.dims[0] = @intCast(rows);
         request.dims[1] = @intCast(width);
         if (try self.boundaryKernelDevice(request, &.{input}, &shape)) |tensor| return tensor;
+        warnHostFallbackOnce(3, "geglu");
         const x = try toFloat32Op(ctx, input, self.allocator);
         defer self.allocator.free(x);
         const output = try self.allocator.alloc(f32, x.len / 2);
@@ -15655,6 +15680,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         request.dims[0] = @intCast(rows);
         request.dims[1] = @intCast(width);
         if (try self.boundaryKernelDevice(request, &.{ input, dout }, &shape)) |tensor| return tensor;
+        warnHostFallbackOnce(4, "geglu backward");
         const x = try toFloat32Op(ctx, input, self.allocator);
         defer self.allocator.free(x);
         const g = try toFloat32Op(ctx, dout, self.allocator);
@@ -15669,6 +15695,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (try self.ropeTableDevice(input, cos, sin, width, head_dim, inverse)) |tensor| return tensor;
         // Host fallback for operands that are not device-resident f32.
+        warnHostFallbackOnce(5, "rope table");
         const x = try toFloat32Op(ctx, input, self.allocator);
         defer self.allocator.free(x);
         const c = try toFloat32Op(ctx, cos, self.allocator);
@@ -15683,74 +15710,33 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     fn ropeTableDevice(self: *MetalCompute, input: CT, cos: CT, sin: CT, width: usize, head_dim: usize, inverse: bool) !?CT {
-        const runtime = self.provider_impl.raw_decode_runtime orelse return null;
-        metal_runtime.requireGlinerBoundaryReady(runtime) catch return null;
-        var x_mt = self.ownedDeviceMetalTensorFromCt(input) catch return null;
-        defer x_mt.deinit();
-        var cos_mt = self.ownedDeviceMetalTensorFromCt(cos) catch return null;
-        defer cos_mt.deinit();
-        var sin_mt = self.ownedDeviceMetalTensorFromCt(sin) catch return null;
-        defer sin_mt.deinit();
-        for ([_]MetalTensor{ x_mt, cos_mt, sin_mt }) |tensor|
-            if (!tensor.isDevice() or tensor.dtype != .f32 or tensor.deviceByteLen() != tensor.elemCount() * 4) return null;
-        const rows = ops.rope_table.validate(x_mt.elemCount(), cos_mt.elemCount(), width, head_dim) catch return null;
-        if (sin_mt.elemCount() != cos_mt.elemCount() or rows > std.math.maxInt(u32) or width > std.math.maxInt(u32)) return null;
-        const shape = [_]i32{ @intCast(rows), @intCast(width) };
-        var output = try MetalTensor.deviceAllocate(runtime, x_mt.elemCount() * @sizeOf(f32), .private, &shape);
-        errdefer output.deinit();
+        const count = bufElemCount(toBuf(input));
+        const rows = ops.rope_table.validate(count, bufElemCount(toBuf(cos)), width, head_dim) catch return null;
+        if (bufElemCount(toBuf(sin)) != bufElemCount(toBuf(cos)) or rows > std.math.maxInt(u32) or width > std.math.maxInt(u32)) return null;
         var request = ops.gliner_boundary_device.Kernel{ .kind = .rope_table };
         request.dims[0] = @intCast(rows);
         request.dims[1] = @intCast(width);
         request.dims[2] = @intCast(head_dim);
         request.dims[3] = @intFromBool(inverse);
-        var sources: [ops.gliner_boundary_device.max_inputs]?MetalTensor = @splat(null);
-        sources[0] = x_mt;
-        sources[1] = cos_mt;
-        sources[2] = sin_mt;
-        if (!try metal_runtime.decoderRuntimeGlinerBoundaryIntoDevice(self.provider_impl, request, sources, output)) {
-            output.deinit();
-            return null;
-        }
-        return try self.ctFromOwnedMetalTensor(output);
+        const shape = [_]i32{ @intCast(rows), @intCast(width) };
+        return self.boundaryKernelDevice(request, &.{ input, cos, sin }, &shape);
     }
 
     /// LayerNorm over rows of `dim`, reading gamma and beta from their own
     /// buffers rather than a prepared slot. Null when the operands are not
     /// device-resident f32 or the shape is outside the kernel's range.
     fn layerNormDirect(self: *MetalCompute, input: CT, gamma: CT, beta: CT, dim: usize, eps: f32) !?CT {
-        const runtime = self.provider_impl.raw_decode_runtime orelse return null;
-        metal_runtime.requireGlinerBoundaryReady(runtime) catch return null;
         if (dim == 0 or dim > 4096 or !(eps > 0)) return null;
-        var input_mt = self.ownedDeviceMetalTensorFromCt(input) catch return null;
-        defer input_mt.deinit();
-        var gamma_mt = self.ownedDeviceMetalTensorFromCt(gamma) catch return null;
-        defer gamma_mt.deinit();
-        var beta_mt = self.ownedDeviceMetalTensorFromCt(beta) catch return null;
-        defer beta_mt.deinit();
-        if (!input_mt.isDevice() or !gamma_mt.isDevice() or !beta_mt.isDevice() or input_mt.dtype != .f32 or
-            gamma_mt.dtype != .f32 or beta_mt.dtype != .f32 or input_mt.elemCount() % dim != 0 or
-            gamma_mt.elemCount() != dim or beta_mt.elemCount() != dim or input_mt.deviceByteLen() != input_mt.elemCount() * 4)
-            return null;
-        const rows = input_mt.elemCount() / dim;
-        if (rows == 0 or rows > std.math.maxInt(u32)) return null;
+        const count = bufElemCount(toBuf(input));
+        if (count == 0 or count % dim != 0 or count / dim > std.math.maxInt(u32)) return null;
         const logical = toBuf(input).logical_shape orelse return null;
         const shape = try self.i32ShapeFromI64(logical);
         defer self.allocator.free(shape);
-        var output = try MetalTensor.deviceAllocate(runtime, rows * dim * @sizeOf(f32), .private, shape);
-        errdefer output.deinit();
         var request = ops.gliner_boundary_device.Kernel{ .kind = .norm };
-        request.dims[0] = @intCast(rows);
+        request.dims[0] = @intCast(count / dim);
         request.dims[1] = @intCast(dim);
         request.scalars[0] = eps;
-        var sources: [ops.gliner_boundary_device.max_inputs]?MetalTensor = @splat(null);
-        sources[0] = input_mt;
-        sources[1] = gamma_mt;
-        sources[2] = beta_mt;
-        if (!try metal_runtime.decoderRuntimeGlinerBoundaryIntoDevice(self.provider_impl, request, sources, output)) {
-            output.deinit();
-            return null;
-        }
-        return try self.ctFromOwnedMetalTensor(output);
+        return self.boundaryKernelDevice(request, &.{ input, gamma, beta }, shape);
     }
 
     fn addLayerNormOp(ctx: *anyopaque, a: CT, b: CT, gamma: CT, beta: CT, dim: usize, eps: f32) anyerror!?CT {
