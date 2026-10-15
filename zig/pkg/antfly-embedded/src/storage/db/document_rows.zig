@@ -16,6 +16,7 @@
 //! Retained document SQL read view. Shares docstore snapshot, schema epoch,
 //! owner-prefix traversal, TTL and authorization machinery with native reads.
 const std = @import("std");
+const storage_engine = @import("../engine_selection.zig");
 const store_mod = @import("../docstore.zig");
 const registry = @import("schema_registry.zig");
 const types = @import("types.zig");
@@ -136,6 +137,7 @@ pub const Session = struct {
     }
 
     pub fn deinit(self: *Session) void {
+        if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("documentSessionDeinit", .{self}) catch @panic("incompatible storage owner");
         if (self.row_policy_lease) |*lease| lease.release();
         self.txn.abort();
         if (self.schema) |*schema| schema.release();
@@ -146,6 +148,7 @@ pub const Session = struct {
     }
 
     pub fn rangeProofs(self: *Session, alloc: std.mem.Allocator) ![]@import("../range_protection.zig").Proof {
+        if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("documentSessionRangeProofs", .{ self, alloc });
         try self.checkpoint();
         return alloc.dupe(@import("../range_protection.zig").Proof, self.range_proofs orelse return error.SqlRangeTrackingRequired);
     }
@@ -161,6 +164,7 @@ pub const Session = struct {
     /// does not implement a second defaults/coercion/generated-value engine.
     /// All output belongs to the bounded caller arena.
     pub fn normalizeRows(self: *Session, alloc: std.mem.Allocator, writes: []const types.BatchWrite) ![]types.BatchWrite {
+        if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("documentSessionNormalizeRows", .{ self, alloc, writes });
         if (writes.len > 4096) return error.InvalidArgument;
         const result = try alloc.alloc(types.BatchWrite, writes.len);
         // Parse/validator scratch is row-local, not retained for the batch.
@@ -199,6 +203,7 @@ pub const Session = struct {
     }
 
     pub fn next(self: *Session, alloc: std.mem.Allocator, limit: u32) !View.Page {
+        if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("documentSessionNext", .{ self, alloc, limit });
         if (limit == 0 or limit > 4096) return error.InvalidRelationalRowsBudget;
         try self.checkpoint();
         errdefer self.failed = true;
