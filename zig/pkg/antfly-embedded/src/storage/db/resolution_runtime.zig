@@ -197,7 +197,7 @@ pub fn siblingClaimedLabelsAlloc(
     var claimed = std.ArrayListUnmanaged([]const u8).empty;
     errdefer claimed.deinit(gpa);
     for (resolvers) |*sibling| {
-        if (sibling == cfg) continue;
+        if (sibling == cfg or !cfg.sharesRoutingDomain(sibling.*)) continue;
         if (!std.mem.eql(u8, sibling.source_artifact, cfg.source_artifact)) continue;
         if (!sibling.source_artifact_kind.overlaps(cfg.source_artifact_kind)) continue;
         for (sibling.labels) |label| try claimed.append(gpa, label);
@@ -357,7 +357,7 @@ fn siblingResolutionsJsonAlloc(
 
     var map: std.json.ObjectMap = .empty;
     for (resolvers) |*sibling| {
-        if (sibling == cfg) continue;
+        if (sibling == cfg or !cfg.sharesRoutingDomain(sibling.*)) continue;
         if (!resolverMatchesArtifact(sibling, parsed.source_artifact_kind, parsed.artifact_name)) continue;
         const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(a, parsed.resolution_scope_key, sibling.resolution_artifact);
         const raw: ?[]const u8 = overlay: {
@@ -423,7 +423,7 @@ pub fn resolveQueryExtractionAlloc(
     // Resolve siblings first so identity templates can refer to their entities,
     // while retaining the durable catalog's label-routing rules.
     for (resolvers) |*sibling| {
-        if (std.mem.eql(u8, sibling.name, cfg.name)) continue;
+        if (std.mem.eql(u8, sibling.name, cfg.name) or !cfg.sharesRoutingDomain(sibling.*)) continue;
         const outcome = (try processChangedExtractionWithConfigOptions(gpa, resolvers, sibling, store, null, key, candidate_source, embedder, .deferred, overlay.items, false)) orelse continue;
         if (outcome.resolution_value) |value| {
             overlay.append(gpa, .{ .key = outcome.resolution_key, .value = value }) catch |err| {
@@ -5419,4 +5419,60 @@ test "inline resolver replacement backfill bounds stale marker rows without jour
     }
     try testing.expectEqual(@as(usize, 3), windows);
     try testing.expectEqual(@as(u64, 0), writer.calls);
+}
+
+test "inline resolver replacement isolates sibling labels query routing and canonical dependencies" {
+    const a = std.testing.allocator;
+    const configs = [_]ResolverConfig{
+        .{ .name = "public", .table = "entities", .source_artifact = "kg", .resolution_artifact = "public_resolved", .key_template = "public/{{ slug _entity.text }}", .promote = false },
+        .{ .name = "private_catchall", .table = "entities", .source_artifact = "kg", .resolution_artifact = "private_resolved", .key_template = "private/{{ slug _entity.text }}", .replacement_index = "new", .promote = false },
+        .{ .name = "private_people", .table = "entities", .source_artifact = "kg", .resolution_artifact = "people_resolved", .key_template = "people/{{ slug _entity.text }}", .labels = &.{"person"}, .replacement_index = "new", .promote = false },
+        .{ .name = "foreign_people", .table = "entities", .source_artifact = "kg", .resolution_artifact = "foreign_resolved", .key_template = "foreign/{{ slug _entity.text }}", .labels = &.{"person"}, .replacement_index = "other", .promote = false },
+        .{ .name = "retired_people", .table = "entities", .source_artifact = "kg", .resolution_artifact = "retired_resolved", .key_template = "retired/{{ slug _entity.text }}", .labels = &.{"person"}, .retired = true, .promote = false },
+    };
+    // Model a legacy catalog predating the new admission fence as well. Its
+    // private streams must not affect serving even before the job is rejected.
+    const labels = try siblingClaimedLabelsAlloc(a, &configs, &configs[0]);
+    defer freeSiblingClaimedLabels(a, labels);
+    try testing.expectEqual(@as(usize, 0), labels.len);
+    const private_labels = try siblingClaimedLabelsAlloc(a, &configs, &configs[1]);
+    defer freeSiblingClaimedLabels(a, private_labels);
+    try testing.expectEqual(@as(usize, 1), private_labels.len);
+    try testing.expectEqualStrings("person", private_labels[0]);
+    const extraction = "{\"entities\":[{\"id\":\"a\",\"text\":\"Ada\",\"label\":\"person\"}]}";
+    const output = (try resolveExtraction(a, &configs, "kg", extraction, &.{})).?;
+    defer a.free(output.bytes);
+    var parsed_output = try std.json.parseFromSlice(std.json.Value, a, output.bytes, .{});
+    defer parsed_output.deinit();
+    try testing.expectEqual(@as(usize, 1), parsed_output.value.object.get("entities").?.array.items.len);
+    const query = try resolveQueryExtractionAlloc(a, &configs, &configs[0], extraction, null, null);
+    defer a.free(query);
+    var parsed_query = try std.json.parseFromSlice(std.json.Value, a, query, .{});
+    defer parsed_query.deinit();
+    try testing.expectEqual(@as(usize, 1), parsed_query.value.object.get("entities").?.array.items.len);
+    var map = MapStore{ .alloc = a };
+    defer map.deinit();
+    const key = try internal_keys.artifactNamedPrefixAlloc(a, "doc", "asset", "kg");
+    defer a.free(key);
+    var source = (try parseSourceArtifactKeyAlloc(a, key)).?;
+    defer source.deinit(a);
+    for (configs, 0..) |cfg, i| {
+        const raw = try std.fmt.allocPrint(a, "{{\"entities\":[{{\"id\":\"id_{d}\",\"text\":\"Ada\",\"label\":\"person\"}}]}}", .{i});
+        defer a.free(raw);
+        // Generate each fixture independently, so all cross-domain artifacts
+        // exist and the visibility check cannot pass merely because of misses.
+        const value = (try resolveExtraction(a, &.{cfg}, "kg", raw, &.{})).?;
+        defer a.free(value.bytes);
+        const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(a, "doc", cfg.resolution_artifact);
+        defer a.free(resolution_key);
+        try map.store().put(resolution_key, value.bytes);
+    }
+    const serving = try siblingResolutionsJsonAlloc(a, &configs, &configs[0], map.store(), source, &.{});
+    try testing.expect(serving == null);
+    const private = (try siblingResolutionsJsonAlloc(a, &configs, &configs[1], map.store(), source, &.{})).?;
+    defer a.free(private);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, private, .{});
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 1), parsed.value.object.count());
+    try testing.expect(parsed.value.object.contains("id_2"));
 }

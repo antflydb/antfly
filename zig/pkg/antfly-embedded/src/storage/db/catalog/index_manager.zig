@@ -12094,6 +12094,7 @@ pub const IndexManager = struct {
             }
             if (std.mem.startsWith(u8, next.name, "__antfly_replacement/")) return error.InvalidResolverConfig;
             try next.validate();
+            try self.requirePrivateResolverSource(next, cfg.name);
             if (self.resolverResolutionArtifactInUse(next.resolution_artifact, null)) return error.ResolverArtifactAlreadyExists;
             if (self.resolverLabelRoutingConflicts(next)) return error.ResolverLabelRoutingConflict;
             const internal_name = try std.fmt.allocPrint(self.alloc, "__antfly_replacement/{s}/{d}/{s}", .{ cfg.name, cfg.coverage_generation, next.name });
@@ -12109,9 +12110,39 @@ pub const IndexManager = struct {
         }
     }
 
+    /// A private stream may be shared by siblings within one reservation, but
+    /// cannot borrow serving sibling decisions or interfere with another job.
+    /// Compare subscriptions without allocating or parsing artifact bytes.
+    fn requirePrivateResolverSource(self: *const IndexManager, cfg: ResolverConfig, replacement: []const u8) !void {
+        for (self.resolvers.items) |other| {
+            if (other.retired or !cfg.source_artifact_kind.overlaps(other.source_artifact_kind) or
+                !std.mem.eql(u8, cfg.source_artifact, other.source_artifact)) continue;
+            if (std.mem.eql(u8, other.replacement_index, replacement)) continue;
+            return error.ResolverReplacementRequiresFreshArtifacts;
+        }
+    }
+
+    fn resolverSourceMask(kind: resolver_catalog.ResolverSourceArtifactKind) u8 {
+        return switch (kind) {
+            .asset => 1,
+            .chunk => 2,
+            .any => 3,
+        };
+    }
+
+    fn requireResolverSourceNotStaged(self: *const IndexManager, cfg: ResolverConfig) !void {
+        for (self.resolvers.items) |other| {
+            if (other.replacement_index.len == 0 or other.retired) continue;
+            if (cfg.source_artifact_kind.overlaps(other.source_artifact_kind) and
+                std.mem.eql(u8, cfg.source_artifact, other.source_artifact)) return error.IndexReplacementPending;
+        }
+    }
+
     pub fn requireResolverNotReplacing(self: *const IndexManager, name: []const u8) !void {
-        for (self.resolvers.items) |cfg| if (std.mem.eql(u8, cfg.replacement_resolver, name))
-            return error.IndexReplacementPending;
+        for (self.resolvers.items) |cfg| {
+            if (std.mem.eql(u8, cfg.replacement_resolver, name) or
+                (cfg.replacement_index.len > 0 and std.mem.eql(u8, cfg.name, name))) return error.IndexReplacementPending;
+        }
     }
 
     fn resolverHasOtherGraphOwner(self: *const IndexManager, name: []const u8, excluded: []const u8) !bool {
@@ -12318,6 +12349,7 @@ pub const IndexManager = struct {
                     // admitted by an older writer before ownership was fenced.
                     if (pending_owners == null) pending_owners = try self.graphReplacementBuildsAlloc(store, self.alloc);
                     try self.requireExclusiveResolverOwner(resolver.replacement_resolver, replaces orelse return error.InvalidIndexConfig, cfg.name, pending_owners.?.value);
+                    try self.requirePrivateResolverSource(resolver, cfg.name);
                 } else if (try self.indexDeclaresResolver(cfg.config_json, resolver.replacement_resolver)) {
                     return error.IndexReplacementPending;
                 }
@@ -12743,6 +12775,7 @@ pub const IndexManager = struct {
         if (std.mem.startsWith(u8, cfg.name, "__antfly_replacement/")) return error.InvalidResolverConfig;
         cfg.replacement_index = "";
         cfg.replacement_resolver = "";
+        try self.requireResolverSourceNotStaged(cfg);
         if (self.getResolver(cfg.name) != null) return error.ResolverAlreadyExists;
         for (self.retired_resolvers.items) |entry| if (std.mem.eql(u8, entry.name, cfg.name)) return error.ResolverAlreadyExists;
         if (self.resolverResolutionArtifactInUse(cfg.resolution_artifact, null)) return error.ResolverArtifactAlreadyExists;
@@ -12789,6 +12822,7 @@ pub const IndexManager = struct {
             }
             return error.NotFound;
         }
+        try self.requireResolverSourceNotStaged(cfg);
         // Reactivation uses the retained namespace and merges through the same
         // admission checks as an active definition. Restore ownership on failure.
         var reactivated: ?usize = null;
@@ -12883,6 +12917,7 @@ pub const IndexManager = struct {
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
         try self.requireResolverNotReplacing(name);
+        if (std.mem.startsWith(u8, name, "__antfly_replacement/")) return error.InvalidResolverConfig;
         if (retired_only and self.getResolver(name) != null) return error.ResolverIdentityActive;
         for ([_]*std.ArrayListUnmanaged(ResolverConfig){ &self.resolvers, &self.retired_resolvers }) |definitions| {
             for (definitions.items, 0..) |entry, i| {
@@ -22568,16 +22603,6 @@ pub const IndexManager = struct {
         return retiring.toOwnedSlice(alloc);
     }
 
-    fn routingChangedByRetirement(self: *const IndexManager, cfg: ResolverConfig, retiring: []const []const u8) bool {
-        if (cfg.labels.len != 0) return false;
-        for (retiring) |name| {
-            const removed = self.getResolver(name) orelse continue;
-            if (removed.labels.len > 0 and removed.source_artifact_kind.overlaps(cfg.source_artifact_kind) and
-                std.mem.eql(u8, removed.source_artifact, cfg.source_artifact)) return true;
-        }
-        return false;
-    }
-
     fn persistCatalogExcludingWithAtomicMutation(
         self: *IndexManager,
         store: anytype,
@@ -22740,6 +22765,8 @@ pub const IndexManager = struct {
         try self.retired_resolvers.ensureUnusedCapacity(self.alloc, retiring.len);
         const definitions = try self.resolverDefinitionsAlloc(self.alloc);
         defer self.alloc.free(definitions);
+        var retired_serving_sources: std.StringHashMapUnmanaged(u8) = .empty;
+        defer retired_serving_sources.deinit(self.alloc);
         var next_definition: usize = 0;
         for (self.resolvers.items) |cfg| {
             var retire = false;
@@ -22748,10 +22775,7 @@ pub const IndexManager = struct {
                 break;
             };
             if (!retire) {
-                var next = cfg;
-                if (self.routingChangedByRetirement(cfg, retiring))
-                    next.resolution_generation = try std.math.add(u64, cfg.effectiveGeneration(), 1);
-                definitions[next_definition] = next;
+                definitions[next_definition] = cfg;
                 next_definition += 1;
             }
         }
@@ -22761,6 +22785,9 @@ pub const IndexManager = struct {
         }
         for (retiring) |resolver_name| {
             var cfg = self.getResolver(resolver_name).?.*;
+            const source = try retired_serving_sources.getOrPut(self.alloc, cfg.source_artifact);
+            if (!source.found_existing) source.value_ptr.* = 0;
+            source.value_ptr.* |= resolverSourceMask(cfg.source_artifact_kind);
             cfg.retired = true;
             cfg.inline_managed = true;
             definitions[next_definition] = cfg;
@@ -22770,11 +22797,16 @@ pub const IndexManager = struct {
         // graph. Preserve the predecessor as a nonexecuting parse contract for
         // old resolution records still present in the shared artifact store.
         var promotion_released = false;
+        var retired_private_sources: std.StringHashMapUnmanaged(u8) = .empty;
+        defer retired_private_sources.deinit(self.alloc);
         for (definitions) |*next| {
             if (next.replacement_index.len == 0) continue;
             if (self.get(next.replacement_index) != null and !std.mem.eql(u8, next.replacement_index, excluded_name)) {
                 for (definitions) |*previous| {
                     if (!std.mem.eql(u8, previous.name, next.replacement_resolver)) continue;
+                    const source = try retired_serving_sources.getOrPut(self.alloc, previous.source_artifact);
+                    if (!source.found_existing) source.value_ptr.* = 0;
+                    source.value_ptr.* |= resolverSourceMask(previous.source_artifact_kind);
                     previous.name = next.name;
                     previous.replacement_resolver = next.replacement_resolver;
                     previous.retired = true;
@@ -22795,10 +22827,38 @@ pub const IndexManager = struct {
                     if (std.mem.eql(u8, job.old, excluded_name) and std.mem.eql(u8, job.name, next.replacement_index)) break true;
                 } else false;
                 if (cancelled) {
+                    const source = try retired_private_sources.getOrPut(self.alloc, next.source_artifact);
+                    if (!source.found_existing) source.value_ptr.* = 0;
+                    source.value_ptr.* |= resolverSourceMask(next.source_artifact_kind);
                     next.retired = true;
                     next.replacement_index = "";
                 }
             }
+        }
+        // Track the source contracts leaving the serving view, not just
+        // public names: a handoff preserves a name while changing its source.
+        // Hashing each affected subscription once keeps retirement linear in
+        // the catalog size rather than comparing every sibling pair. Invalidate
+        // both catch-alls (labels) and labeled siblings (canonical-key inputs).
+        var routing_changed = false;
+        for (definitions) |*cfg| {
+            if (cfg.retired or cfg.replacement_index.len > 0) continue;
+            const mask = retired_serving_sources.get(cfg.source_artifact) orelse continue;
+            if (mask & resolverSourceMask(cfg.source_artifact_kind) == 0) continue;
+            cfg.resolution_generation = try std.math.add(u64, cfg.effectiveGeneration(), 1);
+            routing_changed = true;
+        }
+        // Old writers could admit overlapping public/private subscriptions.
+        // Their cached serving decisions may include private labels or keys.
+        // Cancellation/failure repairs those decisions in the same transaction
+        // as retirement. Fresh reservations have no affected serving sources.
+        var legacy_routing_repaired = false;
+        for (definitions) |*cfg| {
+            if (cfg.retired or cfg.replacement_index.len > 0) continue;
+            const mask = retired_private_sources.get(cfg.source_artifact) orelse continue;
+            if (mask & resolverSourceMask(cfg.source_artifact_kind) == 0) continue;
+            cfg.resolution_generation = try std.math.add(u64, cfg.effectiveGeneration(), 1);
+            legacy_routing_repaired = true;
         }
         const retained_producers = try self.enrichmentsAfterIndexRemovalAlloc(excluded_name, definitions, jobs.value);
         defer self.alloc.free(retained_producers);
@@ -22837,12 +22897,9 @@ pub const IndexManager = struct {
         try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, resolver_catalog.merge_catalog_key, merge_data);
         try txn.put(resolver_catalog.merge_catalog_key, merge_data);
         // Revisions and durable replay cursors publish with ownership removal.
-        for (definitions) |cfg| {
-            if (promotion_released or !cfg.retired and self.routingChangedByRetirement(cfg, retiring)) {
-                try txn.put(resolver_catalog.reresolve_resume_key, "");
-                try txn.put(resolver_catalog.reresolve_repair_resume_key, "");
-                break;
-            }
+        if (promotion_released or legacy_routing_repaired or routing_changed) {
+            try txn.put(resolver_catalog.reresolve_resume_key, "");
+            try txn.put(resolver_catalog.reresolve_repair_resume_key, "");
         }
         try @import("../artifact_inventory.zig").refresh(&txn);
         if (atomic_mutation) |mutation| switch (mutation) {
@@ -23147,7 +23204,7 @@ pub const IndexManager = struct {
         var labels: std.ArrayList([]const u8) = .empty;
         defer labels.deinit(a);
         for (configs) |sibling| {
-            if (sibling.retired or std.mem.eql(u8, sibling.name, cfg.name) or !sibling.source_artifact_kind.overlaps(cfg.source_artifact_kind) or
+            if (!cfg.sharesRoutingDomain(sibling) or std.mem.eql(u8, sibling.name, cfg.name) or !sibling.source_artifact_kind.overlaps(cfg.source_artifact_kind) or
                 !std.mem.eql(u8, sibling.source_artifact, cfg.source_artifact)) continue;
             try labels.appendSlice(a, sibling.labels);
         }
@@ -48258,13 +48315,14 @@ test "capi resolver routing dependencies include overlapping artifact scopes" {
             };
             try manager.resolvers.append(alloc, try ResolverConfig.clone(alloc, owner));
             const expected = owner_kind == catchall_kind or owner_kind == .any or catchall_kind == .any;
-            try std.testing.expectEqual(expected, manager.routingChangedByRetirement(catchall, &.{"people"}));
             const labels = try IndexManager.resolverRoutingLabelsAlloc(alloc, manager.resolvers.items, catchall);
             defer alloc.free(labels);
             try std.testing.expectEqualStrings(if (expected) "[\"person\"]" else "[]", labels);
             var unrelated = catchall;
             unrelated.source_artifact = "other";
-            try std.testing.expect(!manager.routingChangedByRetirement(unrelated, &.{"people"}));
+            const unrelated_labels = try IndexManager.resolverRoutingLabelsAlloc(alloc, manager.resolvers.items, unrelated);
+            defer alloc.free(unrelated_labels);
+            try std.testing.expectEqualStrings("[]", unrelated_labels);
         }
     }
 }
@@ -48528,4 +48586,78 @@ test "inline resolver replacement staging owns every clone across allocation fai
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Check.run, .{&manager});
+}
+
+test "inline resolver replacement reserves source subscriptions in both admission orders" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}", .{tmp.sub_path}, 0);
+    defer a.free(path);
+    var store = try docstore_mod.DocStore.open(a, path, .{});
+    defer store.close();
+    var manager = try IndexManager.init(a, path);
+    defer manager.deinit();
+    try manager.add(&store, .{ .name = "old", .kind = .graph, .config_json = "{\"resolvers\":[{\"name\":\"concepts\"}]}" });
+    _ = try manager.upsertResolver(&store, .{ .name = "concepts", .table = "entities", .source_artifact = "kg_v1", .resolution_artifact = "resolved_v1", .key_template = "entity/{{ slug _entity.text }}", .inline_managed = true, .promote = false });
+    const serving: ResolverConfig = .{ .name = "serving", .table = "entities", .source_artifact = "kg_v2", .resolution_artifact = "serving_resolved", .key_template = "entity/{{ slug _entity.text }}", .promote = false };
+    try manager.addResolver(&store, serving);
+    const next: types.IndexConfig = .{ .name = "new", .kind = .graph, .config_json = "{\"resolvers\":[{\"name\":\"concepts\",\"table\":\"entities\",\"source_artifact\":\"kg_v2\",\"resolution_artifact\":\"resolved_v2\",\"key_template\":\"entity/{{ slug _entity.text }}\",\"labels\":[\"person\"],\"promote\":false},{\"name\":\"events\",\"table\":\"entities\",\"source_artifact\":\"kg_v2\",\"resolution_artifact\":\"events_v2\",\"key_template\":\"event/{{ slug _entity.text }}\",\"labels\":[\"event\"],\"promote\":false}]}" };
+    // Formerly accepted: the staged label stole person mentions from serving.
+    try std.testing.expectError(error.ResolverReplacementRequiresFreshArtifacts, manager.prepareGraphReplacementConfig(&store, "old", next, 0));
+    try std.testing.expectEqual(@as(usize, 2), manager.resolvers.items.len);
+    const none = try manager.graphReplacementBuildsAlloc(&store, a);
+    defer none.deinit();
+    try std.testing.expectEqual(@as(usize, 0), none.value.len);
+    try std.testing.expect(try manager.removeResolver(&store, "serving"));
+    var reserved = try manager.prepareGraphReplacementConfig(&store, "old", next, 0);
+    defer reserved.deinit(a);
+    // Siblings from one reservation share a private input and remain composable.
+    try std.testing.expectEqual(@as(usize, 3), manager.resolvers.items.len);
+    for (manager.resolvers.items) |cfg| {
+        if (cfg.replacement_index.len > 0)
+            try std.testing.expectError(error.IndexReplacementPending, manager.removeResolver(&store, cfg.name));
+    }
+    try std.testing.expectError(error.IndexReplacementPending, manager.upsertResolver(&store, serving));
+    var join = serving;
+    join.name = "joining";
+    join.resolution_artifact = "joining_resolved";
+    try std.testing.expectError(error.IndexReplacementPending, manager.addResolver(&store, join));
+    try std.testing.expectError(error.IndexReplacementPending, manager.upsertResolver(&store, join));
+    // Nonoverlapping asset/chunk subscriptions do not reserve one another.
+    join.source_artifact_kind = .chunk;
+    try manager.addResolver(&store, join);
+    join.source_artifact_kind = .any;
+    join.name = "any_join";
+    try std.testing.expectError(error.IndexReplacementPending, manager.addResolver(&store, join));
+    try manager.add(&store, .{ .name = "other", .kind = .graph, .config_json = "{}" });
+    var other = next;
+    other.name = "other_new";
+    // Public names differ so this specifically checks the shared source fence.
+    other.config_json = "{\"resolvers\":[{\"name\":\"foreign\",\"table\":\"entities\",\"source_artifact\":\"kg_v2\",\"resolution_artifact\":\"foreign_v2\",\"key_template\":\"entity/{{ slug _entity.text }}\",\"promote\":false}]}";
+    try std.testing.expectError(error.ResolverReplacementRequiresFreshArtifacts, manager.prepareGraphReplacementConfig(&store, "other", other, 0));
+    var legacy = serving;
+    legacy.name = "legacy";
+    legacy.resolution_artifact = "legacy_resolved";
+    // Trusted restore bypasses admission, modeling a reservation made before
+    // source fencing. Publication must reject it and retirement must repair it.
+    try manager.restoreResolverIdentity(&store, legacy);
+    const prior = manager.getResolver("legacy").?.effectiveGeneration();
+    for (manager.resolvers.items) |cfg| {
+        if (std.mem.eql(u8, cfg.replacement_index, "new"))
+            try std.testing.expectError(error.ResolverReplacementRequiresFreshArtifacts, manager.requirePrivateResolverSource(cfg, "new"));
+    }
+    try std.testing.expect(try manager.cancelGraphReplacement(&store, "new"));
+    try std.testing.expect(manager.getResolver("legacy").?.effectiveGeneration() > prior);
+    for (manager.retired_resolvers.items) |cfg| {
+        if (std.mem.startsWith(u8, cfg.name, "__antfly_replacement/"))
+            try std.testing.expectError(error.InvalidResolverConfig, manager.dropRetiredResolverIdentity(&store, cfg.name));
+    }
+    var runtime_store = try initRuntimeStore(a, &store);
+    defer runtime_store.deinit();
+    var read = try runtime_store.store.beginRead();
+    defer read.abort();
+    _ = try read.get(resolver_catalog.reresolve_resume_key);
+    _ = try manager.upsertResolver(&store, serving);
+    try std.testing.expect(manager.getResolver("serving") != null);
 }

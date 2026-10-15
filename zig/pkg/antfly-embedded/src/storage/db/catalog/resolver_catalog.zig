@@ -294,6 +294,13 @@ pub const ResolverConfig = struct {
         return out;
     }
 
+    /// Serving resolvers and each private replacement have separate sibling
+    /// routing/identity views. A reservation name is exclusive while active;
+    /// its generation is already fenced by catalog admission.
+    pub fn sharesRoutingDomain(self: ResolverConfig, other: ResolverConfig) bool {
+        return !self.retired and !other.retired and std.mem.eql(u8, self.replacement_index, other.replacement_index);
+    }
+
     pub fn clone(alloc: Allocator, cfg: ResolverConfig) !ResolverConfig {
         var owned = cfg;
         // Establish an empty cleanup owner before the first allocation. Keep

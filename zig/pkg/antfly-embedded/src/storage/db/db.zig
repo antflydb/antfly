@@ -139318,3 +139318,81 @@ test "inline resolver replacement named scheduler rejects a reused reservation g
     try std.testing.expectEqual(@as(u64, 0), jobs.value[0].scanned);
     try db.waitGraphReplacement("new", current, 30_000);
 }
+
+test "inline resolver replacement preserves serving sibling routing until durable cutover" {
+    const a = std.testing.allocator;
+    for ([_]bool{ true, false }) |cancel| {
+        var directory = try TestDirectory.init("replacement-routing-cutover");
+        defer directory.cleanup();
+        var host = try background_runtime_mod.BackendRuntimeHandle.init(a, .{ .backend = .manual, .borrowed_io = .{ .general = std.testing.io } });
+        defer host.deinit();
+        const options: OpenOptions = .{ .backend_runtime = host.ptr(), .executor = .{ .backend = .manual }, .start_optional_runtimes = false, .start_independent_maintenance = false };
+        const old = "{\"artifact\":{\"name\":\"kg_v1\",\"kind\":\"asset\",\"source\":{\"type\":\"field\",\"value\":\"kg\"},\"content_type\":\"application/json\"},\"source\":{\"artifact\":\"kg_v1\",\"format\":\"extraction_graph\",\"mention_edge_type\":\"mentions\"},\"edge_types\":[{\"name\":\"mentions\"}],\"resolvers\":[{\"name\":\"concepts\",\"table\":\"entities\",\"source_artifact\":\"kg_v1\",\"resolution_artifact\":\"resolved_v1\",\"key_template\":\"entity/{{ slug _entity.text }}\",\"labels\":[\"person\"],\"promote\":false}]}";
+        const next = "{\"artifact\":{\"name\":\"kg_v2\",\"kind\":\"asset\",\"source\":{\"type\":\"field\",\"value\":\"kg\"},\"content_type\":\"application/json\"},\"source\":{\"artifact\":\"kg_v2\",\"format\":\"extraction_graph\",\"mention_edge_type\":\"mentions\"},\"edge_types\":[{\"name\":\"mentions\"}],\"resolvers\":[{\"name\":\"concepts\",\"table\":\"entities\",\"source_artifact\":\"kg_v2\",\"resolution_artifact\":\"resolved_v2\",\"key_template\":\"entity/{{ slug _entity.text }}\",\"labels\":[\"person\"],\"promote\":false}]}";
+        const Check = struct {
+            fn count(database: *DB, expected: usize) !void {
+                const alloc = std.testing.allocator;
+                const key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc", "fallback_resolved");
+                defer alloc.free(key);
+                const raw = try database.core.store.get(alloc, key);
+                defer alloc.free(raw);
+                var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+                defer parsed.deinit();
+                try std.testing.expectEqual(expected, parsed.value.object.get("entities").?.array.items.len);
+            }
+        };
+        var before: u64 = 0;
+        var event_before: u64 = 0;
+        {
+            var db = try DB.open(a, directory.path(), options);
+            defer db.close();
+            try db.initResolutionRuntime();
+            try db.initPromotionRuntime();
+            var enrichment: enrichment_runtime_mod.Config = .{ .enable_without_producers = true };
+            try db.initOptionalEnrichmentRuntime(&enrichment);
+            try db.addIndex(.{ .name = "old", .kind = .graph, .config_json = old });
+            _ = try db.upsertResolverWithResultOptions(.{ .name = "concepts", .table = "entities", .source_artifact = "kg_v1", .resolution_artifact = "resolved_v1", .key_template = "entity/{{ slug _entity.text }}", .labels = &.{"person"}, .inline_managed = true, .promote = false }, .{ .drain_backfill = false });
+            _ = try db.upsertResolverWithResultOptions(.{ .name = "fallback", .table = "entities", .source_artifact = "kg_v1", .resolution_artifact = "fallback_resolved", .key_template = "fallback/{{ slug _entity.text }}", .promote = false }, .{ .drain_backfill = false });
+            _ = try db.upsertResolverWithResultOptions(.{ .name = "events", .table = "entities", .source_artifact = "kg_v1", .resolution_artifact = "events_resolved", .key_template = "event/{{ hash _entity.event_identity }}", .labels = &.{"event"}, .promote = false }, .{ .drain_backfill = false });
+            try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"kg\":{\"entities\":[{\"id\":\"a\",\"text\":\"Ada\",\"label\":\"person\"},{\"id\":\"b\",\"text\":\"Antfly\",\"label\":\"org\"}]}}" }} });
+            try db.runUntilIdle();
+            try Check.count(&db, 1);
+            before = db.core.index_manager.getResolver("fallback").?.effectiveGeneration();
+            event_before = db.core.index_manager.getResolver("events").?.effectiveGeneration();
+            _ = try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = next });
+            _ = try db.advanceGraphReplacement();
+            try db.drainReplayStagesUntilStableWithOptions(.{});
+            try Check.count(&db, 1);
+            try std.testing.expectEqual(before, db.core.index_manager.getResolver("fallback").?.effectiveGeneration());
+            if (cancel) {
+                try std.testing.expect(try db.cancelReplacement("new"));
+                try std.testing.expectEqual(before, db.core.index_manager.getResolver("fallback").?.effectiveGeneration());
+                try std.testing.expectEqual(event_before, db.core.index_manager.getResolver("events").?.effectiveGeneration());
+            } else {
+                for (0..128) |_| {
+                    if (db.indexGeneration("new") != null) break;
+                    try db.drainReplayStagesUntilStableWithOptions(.{});
+                    _ = try db.advanceGraphReplacement();
+                }
+                try std.testing.expect(db.indexGeneration("new") != null);
+                try std.testing.expect(db.core.index_manager.getResolver("fallback").?.effectiveGeneration() > before);
+                try std.testing.expect(db.core.index_manager.getResolver("events").?.effectiveGeneration() > event_before);
+                // The revision and pending replay must survive without a
+                // post-activation drain or a subsequent foreground write.
+                var probe = try db.core.store.beginProbeTxn();
+                defer probe.abort();
+                _ = try probe.get(@import("catalog/resolver_catalog.zig").reresolve_resume_key);
+                try Check.count(&db, 1);
+            }
+        }
+        {
+            var db = try DB.open(a, directory.path(), options);
+            defer db.close();
+            try std.testing.expectEqual(cancel, db.core.index_manager.getResolver("fallback").?.effectiveGeneration() == before);
+            try std.testing.expectEqual(cancel, db.core.index_manager.getResolver("events").?.effectiveGeneration() == event_before);
+            try db.runUntilIdle();
+            try Check.count(&db, if (cancel) 1 else 2);
+            try std.testing.expect(db.indexGeneration(if (cancel) "old" else "new") != null);
+        }
+    }
+}

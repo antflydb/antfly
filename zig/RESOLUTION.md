@@ -1312,7 +1312,13 @@ all bindings expose replacement cancellation.
 
 Embedded `add_index` with `replaces` can transfer an inline resolver to a new
 graph version without changing its public resolver name. A changed resolver must
-use fresh extraction **and** resolution artifact names. Admission stages a
+use fresh extraction **and** resolution artifact names. An overlapping extraction
+subscription cannot already belong to a serving resolver or another pending
+replacement. Siblings within one replacement may share their private source;
+asset and chunk subscriptions remain disjoint unless either uses `any`. Ordinary
+resolver admission and reactivation cannot join a reserved private source until
+that replacement finishes or is cancelled. Publication revalidates this rule for
+reservations from older writers. Admission stages a
 separate execution contract alongside the serving resolver, records it with the
 durable shadow reservation, and resets the existing bounded resolution replay
 cursors. Inline extraction producers are admitted in that transaction too;
@@ -1323,7 +1329,13 @@ graphs with absent or unchanged resolvers and staged resolver sources that are
 not direct graph sources. A missing enrichment runtime is
 created on demand, including after reopen; manual owners retain synchronous
 execution without starting background workers. The old graph and public resolver
-remain authoritative during the build. Explicit waits drive manual enrichment
+remain authoritative during the build. Label exclusions, query routing, and
+sibling canonical-key dependencies use separate serving and per-replacement
+views, including for legacy reservations with shared input streams. Cancellation of fresh reservations
+never changes serving sibling revisions. Cancelling or failing a legacy shared-source
+reservation invalidates any potentially contaminated serving decisions durably. Cutover durably invalidates source-sharing
+siblings affected by retiring the predecessor, including canonical-key dependencies and resets their replay cursors in
+the catalog transaction. Explicit waits drive manual enrichment
 with the remaining caller deadline, without enabling background workers or
 resuming deliberately paused background owners. A named wait advances its own
 reservation and rechecks its generation under scheduler ownership, so an earlier
