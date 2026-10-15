@@ -5083,6 +5083,34 @@ test "capi SQL refreshed generations retain complete FK catalogs and unqualified
         try std.testing.expectEqual(@as(usize, 1), guard.handle.embedded_tables.count());
         try std.testing.expectEqual(@as(u64, 0), guard.handle.sql_ddl_recovery_scans);
     }
+    // A transient namespace-open failure must not poison a hosted handle's
+    // discovery cache. Hosted handles have no background worker to retry it.
+    {
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        const root = guard.handle;
+        const child = &root.embedded_tables.get("child").?.db;
+        var view = child.core.acquireSchemaView().?;
+        defer view.release();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var adapter = @import("antfly_local_sources").capi_sql.Adapter(antfly){ .handle = root, .db = child, .table_name = "child" };
+        // Preserve diagnostic capacity so only the parent's open fails.
+        try root.embedded_table_errors.ensureTotalCapacity(root.alloc, 2);
+        const original_alloc = root.alloc;
+        {
+            var failing = std.testing.FailingAllocator.init(original_alloc, .{ .fail_index = 0 });
+            root.alloc = failing.allocator();
+            defer root.alloc = original_alloc;
+            try std.testing.expectError(error.IntegrityCatalogUnavailable, adapter.localCatalog(arena.allocator(), view.version()));
+            try std.testing.expectEqual(@as(usize, 1), root.embedded_table_errors.count());
+        }
+        const recovered = try adapter.localCatalog(arena.allocator(), view.version());
+        try std.testing.expectEqual(@as(usize, 2), recovered.table.len);
+        try std.testing.expectEqual(@as(usize, 0), root.embedded_table_errors.count());
+        try std.testing.expect(root.embedded_tables_discovered);
+        try std.testing.expectEqual(@as(u64, 0), root.sql_ddl_recovery_scans);
+    }
     try sqlRefreshCleanGeneration(handle);
     // Inbound FK owners must be discovered even before the child is referenced
     // in this generation. The cascade must be staged, then committed.

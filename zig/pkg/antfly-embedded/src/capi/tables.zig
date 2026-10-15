@@ -133,7 +133,9 @@ pub fn loadAvailable(handle: *h.Handle) !void {
             continue;
         };
     }
-    handle.embedded_tables_discovered = true;
+    // Keep unavailable namespaces retryable on hosted handles too: they may
+    // have no maintenance worker to retry a transient open failure for us.
+    handle.embedded_tables_discovered = handle.embedded_table_errors.count() == 0;
 }
 
 fn persist(handle: *h.Handle) !void {

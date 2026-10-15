@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import json
+import os
 import subprocess
 import sys
 from contextlib import closing
@@ -159,13 +160,17 @@ def test_multi_table_stable_snapshot(require_native, aflite_path, tmp_path):
 
 @pytest.mark.parametrize("delete_action", ["", " ON DELETE CASCADE"])
 def test_issue_1141_fk_insert_subquery_delete_commit(require_native, aflite_path, delete_action):
+    # The native regression forces the refresh race without background timing.
+    # Keep the complete reported stress workload available without slowing every
+    # binding test lane or accumulating hundreds of MiB of maintenance output.
+    iterations = 400 if os.environ.get("ANTFLY_EMBEDDED_SQL_STRESS") == "1" else 32
     with closing(dbapi.connect(aflite_path, autocommit=True)) as connection:
         cursor = connection.cursor()
         cursor.execute("CREATE TABLE parent (id TEXT PRIMARY KEY)")
         cursor.execute(
             f"CREATE TABLE child (id TEXT PRIMARY KEY, parent_id TEXT NOT NULL REFERENCES parent (id){delete_action})"
         )
-        for i in range(400):
+        for i in range(iterations):
             connection.autocommit = True
             cursor.execute("INSERT INTO parent (id) VALUES ($1)", (f"p{i}",))
             connection.autocommit = False
@@ -180,7 +185,7 @@ def test_issue_1141_fk_insert_subquery_delete_commit(require_native, aflite_path
                 connection._database.run_until_idle()
         connection.autocommit = True
         cursor.execute("SELECT COUNT(*) FROM child")
-        assert cursor.fetchall() == [(400,)]
+        assert cursor.fetchall() == [(iterations,)]
 
 
 def test_cross_table_foreign_keys_and_failed_transaction(require_native, aflite_path):
