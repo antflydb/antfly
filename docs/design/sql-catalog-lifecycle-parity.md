@@ -6799,3 +6799,60 @@ reported. Boundary, license, inventory, control-catalog, formatting and diff
 checks passed. GC was preview-only and deleted nothing. This milestone is not
 original SQL qualification, a throughput benchmark, automatic activation or a
 push.
+
+### Bounded work discovery, paged cohorts and typed local delivery
+
+The compiled metadata facade now exposes non-mutating work discovery, current
+head lookup and paged immutable owner routes. Discovery walks the shared live
+table-lifecycle lock directory, not retained terminal heads or user tables. That
+directory remains authoritative through installing/releasing, when the pending
+namespace pointer is already absent. Each turn visits at most 16 lock records;
+unrelated live lifecycle kinds consume that same budget. The cursor is an opaque
+position in canonical decimal-key order, not a numeric table-ID ordering. A lock
+whose index head is missing, terminal or bound to another job is corruption, not
+permission to proceed. Point head/route reads verify lifecycle and pending-pointer
+state; receiving mutation ports still independently obtain fresh permission.
+
+Cohort capture performs at most 16 owner/dispatch point pairs per page, checks
+the durable owner-group directory and admits at most 4 MiB of raw route data in a
+page. The wire cap is 32 MiB to accommodate escaped maximum-length keys without
+silently shrinking supported key sizes. Capture owns copied table/range strings,
+pins plan identity rather than mutable progress revision, caps the complete
+cohort at 8 MiB, and validates complete disjoint coverage before use. All 4,096
+supported owners can be captured across short read transactions. Duplicate pages,
+replaced jobs and incomplete captures fail closed. No new durable work index,
+terminal-history scan, schema-input clone or public route was introduced.
+
+In-process delivery now calls the same receiving ControlPort/ClaimPort with
+owned typed responses. It transfers the already decoded source batch and signed
+closure allocations rather than serializing and reparsing them as local JSON.
+Ownership transfer verifies the actual owned proof and generation and clears the
+old owner's allocation before teardown. HTTP still decodes its wire response,
+then retains only copied fixed closure parts, not its entire parsed JSON arena.
+The producer's acceptance/retry protocol is unchanged.
+
+Qualifications include maximum-owner capture, exhaustive small-capture allocation
+failures, replaced/duplicate pages, real metadata-store discovery in both native
+and Raft-authority fixtures, and bounded discovery through unrelated locks with
+1,000 retained terminal heads left unread. Synthetic nonempty producer tests run
+both wire and typed-local transport with allocation failures; the actual leased
+compiled-owner restart/uncertain-acceptance scenario uses the local receiving
+ports. The metadata decision in that native fixture remains explicitly synthetic;
+these tests are not original SQL or complete distributed activation evidence.
+
+Still required: leader-fenced scheduler execution/pooling and automatic service
+wiring, bounded parallel target fanout, EOF/inventory seals, missing-root repair,
+actual data-Raft execution, terminal schema/catalog activation and full distributed
+fault qualification. This work provides discovery and local transport, not an
+automatically running scheduler. Public UNIQUE activation remains guarded;
+original SQL dispositions remain 483 implemented / 862 unresolved.
+
+Final qualification in `/private/tmp/antfly-index-work-local-full-debug.log`
+passed 129/129 Debug steps: 46 publication, four service/ACK, eight native page,
+six C-ABI, three leased-owner, 14 candidate-prerequisite and 46 runtime-contract
+tests plus the decoder barrier. Counts overlap; no failures or leaks were
+reported. Boundary, license, original-inventory, control-catalog, formatting and
+diff checks passed. The discovery regression includes the shared lifecycle
+directory rather than a terminal-head scan. GC was preview-only; nothing was
+deleted. No original SQL case, throughput benchmark, service activation or push
+is claimed by this milestone.

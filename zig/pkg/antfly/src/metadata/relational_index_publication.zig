@@ -42,6 +42,10 @@ pub const Id = progress.Id;
 pub const Digest = progress.Digest;
 pub const RootProof = @import("relational_index_root_attestation.zig").Proof;
 
+test {
+    _ = @import("relational_index_work.zig");
+}
+
 /// Provenance for one actual canonical source batch. This is not a source ACK,
 /// complete-stream seal, or current placement/enrollment authority.
 pub const SignedSourceBatch = struct {

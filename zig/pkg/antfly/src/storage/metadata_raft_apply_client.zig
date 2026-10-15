@@ -565,6 +565,10 @@ pub const RaftApplyStore = struct {
         const valid = try self.catalogProjection(bool, self.alloc, group_id, .{ .relational_index_owner_ack_preflight = bytes });
         if (!valid) return error.InvalidIndexOwnerReceipt;
     }
+    pub fn relationalIndexWorkJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/relational_index_work.zig").Query) ![]u8 {
+        try request.validate();
+        return self.catalogProjection([]u8, alloc, group_id, .{ .relational_index_work = request });
+    }
     pub fn relationalIndexSourceAcceptanceStatusJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../metadata/relational_index_delivery_journal.zig").Query) ![]u8 {
         try request.validate();
         return self.catalogProjection([]u8, alloc, group_id, .{ .relational_index_source_accept_status = request });

@@ -1965,6 +1965,10 @@ pub fn metadataApplyStoreProjection(
                     handle.store.validateRelationalIndexSourceAcceptance(group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, true);
                 },
+                .relational_index_work => |input| {
+                    const value = handle.store.relationalIndexWorkJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
                 .fk_initial_create_prepare => |input| {
                     const value = handle.store.fkInitialCreatePrepareJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);

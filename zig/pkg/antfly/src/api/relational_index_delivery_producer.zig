@@ -29,6 +29,15 @@ const native = local.storage_db_relational_index_owner_control;
 const operation = local.api_operation;
 const calls = @import("../system_catalog/server_call.zig");
 
+pub const SignedClosure = struct {
+    owned: closure.Owned,
+    proof: @import("../metadata/relational_index_publication.zig").RootProof,
+    pub fn deinit(self: *SignedClosure) void {
+        self.owned.deinit();
+        self.* = undefined;
+    }
+};
+
 pub const Phase = enum { status, consume_prefix, source, target, close, accept, resolve_accept, consume_batch, done };
 pub const Result = union(enum) {
     pending: Phase,
@@ -51,7 +60,7 @@ pub const Producer = struct {
     plan: ?*delivery.Plan = null,
     delivered: ?[]closure.Delivered = null,
     next_target: usize = 0,
-    closed: ?std.json.Parsed(execution.ClaimResponse) = null,
+    closed: ?SignedClosure = null,
     result: ?Result = null,
 
     pub fn init(alloc: std.mem.Allocator, cohort: *const delivery.Cohort, table_name: []const u8, request: execution.Request, context: operation.RequestContext) !Producer {
@@ -85,7 +94,7 @@ pub const Producer = struct {
         self.delivered = null;
     }
     fn releaseClosure(self: *Producer) void {
-        if (self.closed) |value| value.deinit();
+        if (self.closed) |*value| value.deinit();
         self.closed = null;
     }
     fn query(self: *const Producer) journal.Query {
@@ -121,8 +130,8 @@ pub const Producer = struct {
         return consumed;
     }
     fn acceptance(self: *const Producer) journal.Request {
-        const value = self.closed.?.value.closed;
-        return .{ .signed = .{ .data = value.data, .proof = value.proof.? }, .consumed = self.prefix };
+        const value = self.closed.?;
+        return .{ .signed = .{ .data = value.owned.data, .proof = value.proof }, .consumed = self.prefix };
     }
     fn observeAcceptance(self: *Producer, status: journal.Status) !void {
         if (status.replication_pending) {
@@ -184,7 +193,7 @@ pub const Producer = struct {
                 }
                 if (value.observation.header.?.bytes[184] == @backingInt(jobs.private_claims.SourceStream.State.failed)) return error.InvalidPrivateIndexBuildPage;
                 if (value.signed_source == null) return .{ .pending = self.phase };
-                self.read = try value.decodeSigned(self.alloc, self.request);
+                self.read = if (comptime @hasDecl(@TypeOf(response), "takeSource")) try response.takeSource(self.request) else try value.decodeSigned(self.alloc, self.request);
                 const batch = &self.read.?.batch.?;
                 const ordinal = std.mem.readInt(u64, batch.header.bytes[104..112], .little);
                 if (self.head) |head| {
@@ -215,15 +224,20 @@ pub const Producer = struct {
                 const batch = self.read.?.batch.?;
                 const request: execution.ClaimRequest = .{ .table_id = self.request.table_id, .group_id = self.request.group_id, .id = self.request.id, .closure = .{ .ordinal = std.mem.readInt(u64, batch.header.bytes[104..112], .little), .batch_digest = batch.header.digest(), .targets = .{ .items = self.delivered.? } } };
                 var response = try transport.claims(self.alloc, self.table_name, request, self.context);
-                errdefer response.deinit();
+                defer response.deinit();
                 try response.value.validate(request);
                 if (response.value == .acknowledged or (response.value == .closed and response.value.closed.proof == null)) {
-                    response.deinit();
                     return .{ .pending = self.phase };
                 }
                 if (response.value != .closed or !std.mem.eql(u8, &try response.value.closed.data.source.encode(), &try self.read.?.binding.encode()) or
                     !std.mem.eql(u8, &response.value.closed.data.header.bytes, &batch.header.bytes)) return error.InvalidPrivateIndexClaimReceipt;
-                self.closed = response;
+                self.closed = if (comptime @hasDecl(@TypeOf(response), "takeClosed")) try response.takeClosed() else blk: {
+                    var data = response.value.closed.data;
+                    // Validated parts contain fixed values and null error names.
+                    // Do not retain the remote JSON arena or borrowed row data.
+                    data.parts.items = try self.alloc.dupe(closure.Part, data.parts.items);
+                    break :blk .{ .owned = .{ .alloc = self.alloc, .data = data }, .proof = response.value.closed.proof.? };
+                };
                 // The compact signed closure owns all subsequent authority.
                 // Drop decoded rows and target reply storage before proposing.
                 self.releaseBatch();

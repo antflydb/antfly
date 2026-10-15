@@ -1321,29 +1321,54 @@ const TestDeliveryTransport = struct {
     driver: *TestDriver,
     root: local.storage_db_root_signing_identity.State,
     calls: usize = 0,
-    pub fn control(self: *@This(), alloc: std.mem.Allocator, table: []const u8, request: Request, context: operation.RequestContext) !std.json.Parsed(ControlResponse) {
+    fn localTransport(self: *@This()) @import("relational_index_local_delivery.zig").Transport {
+        return .{ .control_port = .{ .ptr = self, .execute_fn = controlDirect }, .claim_port = .{ .ptr = self, .execute_fn = claimsDirect } };
+    }
+    fn controlDirect(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, group: u64, request: Request, context: operation.RequestContext) !Result {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        try request.validate(group);
         self.calls += 1;
         var result = try step(alloc, self.driver, self.driver, table, request, context);
-        defer result.deinit();
+        errdefer result.deinit();
         if (result.needsSigning()) try result.signNative(self.root, 2, 3, 4);
+        return result;
+    }
+    fn claimsDirect(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, group: u64, request: ClaimRequest, context: operation.RequestContext) !ClaimResult {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        try request.validate(group);
+        self.calls += 1;
+        var result = try claimStep(alloc, self.driver, self.driver, table, request, context);
+        errdefer result.deinit();
+        if (result.needsSigning()) try result.signNative(self.root, 2, 3, 4);
+        return result;
+    }
+    pub fn control(self: *@This(), alloc: std.mem.Allocator, table: []const u8, request: Request, context: operation.RequestContext) !std.json.Parsed(ControlResponse) {
+        var result = try controlDirect(self, alloc, table, request.group_id, request, context);
+        defer result.deinit();
         return TestDriver.parsed(ControlResponse, alloc, try result.response());
     }
     pub fn claims(self: *@This(), alloc: std.mem.Allocator, table: []const u8, request: ClaimRequest, context: operation.RequestContext) !std.json.Parsed(ClaimResponse) {
-        self.calls += 1;
-        var result = try claimStep(alloc, self.driver, self.driver, table, request, context);
+        var result = try claimsDirect(self, alloc, table, request.group_id, request, context);
         defer result.deinit();
-        if (result.needsSigning()) try result.signNative(self.root, 2, 3, 4);
         return TestDriver.parsed(ClaimResponse, alloc, result.response());
     }
 };
 
 fn testDeliveryProducer(alloc: std.mem.Allocator, permission: publication.OwnerDecision, binding: jobs.Binding, root: local.storage_db_root_signing_identity.State) !void {
+    return testDeliveryProducerMode(alloc, permission, binding, root, false);
+}
+fn testDeliveryProducerLocal(alloc: std.mem.Allocator, permission: publication.OwnerDecision, binding: jobs.Binding, root: local.storage_db_root_signing_identity.State) !void {
+    return testDeliveryProducerMode(alloc, permission, binding, root, true);
+}
+fn testDeliveryProducerMode(alloc: std.mem.Allocator, permission: publication.OwnerDecision, binding: jobs.Binding, root: local.storage_db_root_signing_identity.State, comptime local_mode: bool) !void {
     const producer_module = @import("relational_index_delivery_producer.zig");
     const table = permission.dispatch.?.table_name;
     var cohort = try jobs.private_claims.delivery.Cohort.init(alloc, &.{.{ .owner = permission.owner.owner, .start = "", .end = "" }});
     defer cohort.deinit();
     var driver: TestDriver = .{ .value = permission, .binding = binding, .lose_acceptance_reply = true };
-    var transport: TestDeliveryTransport = .{ .driver = &driver, .root = root };
+    var sender: TestDeliveryTransport = .{ .driver = &driver, .root = root };
+    var local_transport = sender.localTransport();
+    const transport = if (local_mode) &local_transport else &sender;
     const request: Request = .{ .table_id = binding.fence.namespace.table_id, .group_id = binding.fence.owner_group_id, .id = binding.id, .operation = .source };
     var canceled = std.atomic.Value(bool).init(false);
     const context: operation.RequestContext = .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() + 60 * std.time.ns_per_s, .cancellation = .fromAtomic(&canceled) };
@@ -1355,9 +1380,9 @@ fn testDeliveryProducer(alloc: std.mem.Allocator, permission: publication.OwnerD
     for (0..16) |_| {
         const phase = producer.phase;
         if (phase == .target and !pending_target) driver.pending = true;
-        const before = transport.calls;
-        observed = try producer.step(&transport, &driver);
-        try std.testing.expect(transport.calls - before <= 1);
+        const before = sender.calls;
+        observed = try producer.step(transport, &driver);
+        try std.testing.expect(sender.calls - before <= 1);
         if (phase == .target and driver.pending) {
             try std.testing.expectEqual(producer_module.Phase.target, producer.phase);
             try std.testing.expectEqual(@as(usize, 0), driver.acceptance_calls);
@@ -1380,9 +1405,9 @@ fn testDeliveryProducer(alloc: std.mem.Allocator, permission: publication.OwnerD
     try std.testing.expectEqual(@as(usize, 1), driver.acceptance_calls);
     try std.testing.expectEqual(@as(usize, 1), driver.consumption_calls);
     canceled.store(true, .release);
-    const before = transport.calls;
-    _ = try producer.step(&transport, &driver);
-    try std.testing.expectEqual(before, transport.calls);
+    const before = sender.calls;
+    _ = try producer.step(transport, &driver);
+    try std.testing.expectEqual(before, sender.calls);
 }
 
 test "relational index publication native cancellation receiver resumes one bounded effect and never acknowledges physical GC" {
@@ -1846,6 +1871,8 @@ test "relational index publication claim receiver binds fresh build permission w
         }
         try testDeliveryProducer(alloc, permission, binding.?, root);
         try std.testing.checkAllAllocationFailures(alloc, testDeliveryProducer, .{ permission, binding.?, root });
+        try testDeliveryProducerLocal(alloc, permission, binding.?, root);
+        try std.testing.checkAllAllocationFailures(alloc, testDeliveryProducerLocal, .{ permission, binding.?, root });
         {
             var cohort = try jobs.private_claims.delivery.Cohort.init(alloc, &.{.{ .owner = permission.owner.owner, .start = "", .end = "" }});
             defer cohort.deinit();

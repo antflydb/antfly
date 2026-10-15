@@ -4719,6 +4719,35 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
                 defer prepared.deinit();
                 const owner_request: index_publication.OwnerRequest = .{ .table_id = plan.before.table_id, .group_id = owners[0].range.group_id, .id = plan.id, .operation = .fence, .projection = .admission };
                 {
+                    const work = @import("../relational_index_work.zig");
+                    const discovered = try store.relationalIndexWorkJson(a, group, .{ .discover = 0 });
+                    defer a.free(discovered);
+                    var page = try std.json.parseFromSlice(work.Response, a, discovered, .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
+                    defer page.deinit();
+                    try std.testing.expect(page.value == .discovered and page.value.discovered.head != null);
+                    try std.testing.expectEqual(plan.before.table_id, page.value.discovered.after_table);
+                    const head = page.value.discovered.head.?;
+                    var capture = try work.Capture.init(a, head);
+                    defer capture.deinit();
+                    const routes_bytes = try store.relationalIndexWorkJson(a, group, try capture.request());
+                    defer a.free(routes_bytes);
+                    var routes_page = try std.json.parseFromSlice(work.Response, a, routes_bytes, .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
+                    defer routes_page.deinit();
+                    try capture.append(routes_page.value.routes);
+                    var cohort = try capture.finish(a);
+                    defer cohort.deinit();
+                    try std.testing.expectEqual(authority, cohort.targets[0].owner.authority);
+                    try std.testing.expectEqualStrings(plan.before.name, capture.table_name.?);
+                    const ended = try store.relationalIndexWorkJson(a, group, .{ .discover = head.table_id });
+                    defer a.free(ended);
+                    var end = try std.json.parseFromSlice(work.Response, a, ended, .{});
+                    defer end.deinit();
+                    try std.testing.expect(end.value.discovered.exhausted and end.value.discovered.head == null);
+                    var old = capture.identity;
+                    old.id[0] ^= 1;
+                    try std.testing.expectError(error.GenerationPublicationChanged, store.relationalIndexWorkJson(a, group, .{ .head = old }));
+                }
+                {
                     const reply = try store.relationalIndexOwnerDecisionJson(a, group, owner_request);
                     defer a.free(reply);
                     var decision = try std.json.parseFromSlice(index_publication.OwnerDecision, a, reply, .{});
@@ -16930,6 +16959,14 @@ pub const RaftApplyStore = struct {
             else => return err,
         };
         return view;
+    }
+
+    pub fn relationalIndexWorkJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../relational_index_work.zig").Query) ![]u8 {
+        try request.validate();
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        _ = try self.standbyRelationActivationTxn(&txn, group_id, topology_protocol.index_publication_head_version);
+        return @import("../relational_index_work.zig").readJson(alloc, &txn, group_id, request);
     }
 
     pub fn relationalIndexOwnerDecisionJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: index_publication.OwnerRequest) ![]u8 {

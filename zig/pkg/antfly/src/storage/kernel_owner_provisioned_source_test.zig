@@ -200,6 +200,27 @@ test "native index owner adapter executes fresh permission stages and recovers r
         metadata: *Metadata,
         signing_root: local.storage_db_root_signing_identity.State,
         calls: usize = 0,
+        fn localTransport(self: *@This()) @import("../api/relational_index_local_delivery.zig").Transport {
+            return .{ .control_port = .{ .ptr = self, .execute_fn = controlDirect }, .claim_port = .{ .ptr = self, .execute_fn = claimsDirect } };
+        }
+        fn controlDirect(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, owner_group: u64, value: execution.Request, context: local.api_operation.RequestContext) !execution.Result {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try value.validate(owner_group);
+            self.calls += 1;
+            var result = try execution.step(a, self.owners, self.metadata, table, value, context);
+            errdefer result.deinit();
+            if (result.needsSigning()) try result.signNative(self.signing_root, 2, 3, 4);
+            return result;
+        }
+        fn claimsDirect(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, owner_group: u64, value: execution.ClaimRequest, context: local.api_operation.RequestContext) !execution.ClaimResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try value.validate(owner_group);
+            self.calls += 1;
+            var result = try execution.claimStep(a, self.owners, self.metadata, table, value, context);
+            errdefer result.deinit();
+            if (result.needsSigning()) try result.signNative(self.signing_root, 2, 3, 4);
+            return result;
+        }
         fn parsed(comptime T: type, a: std.mem.Allocator, value: T) !std.json.Parsed(T) {
             const bytes = try std.json.Stringify.valueAlloc(a, value, .{});
             defer a.free(bytes);
@@ -463,6 +484,7 @@ test "native index owner adapter executes fresh permission stages and recovers r
         var cohort = try local.storage_db_relational_index_owner_job.private_claims.delivery.Cohort.init(alloc, &.{.{ .owner = metadata.value.owner.owner, .start = "", .end = "" }});
         defer cohort.deinit();
         var transport: Transport = .{ .owners = &owners, .metadata = &metadata, .signing_root = signing_root };
+        var local_transport = transport.localTransport();
         const producer_context: local.api_operation.RequestContext = .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() + 60 * std.time.ns_per_s };
         metadata.acceptance = null;
         metadata.lose_acceptance_reply = true;
@@ -471,7 +493,7 @@ test "native index owner adapter executes fresh permission stages and recovers r
             defer producer.deinit();
             for (0..8) |_| {
                 const before_calls = transport.calls;
-                _ = try producer.step(&transport, &metadata);
+                _ = try producer.step(&local_transport, &metadata);
                 try std.testing.expect(transport.calls - before_calls <= 1);
                 if (producer.phase == .resolve_accept) break;
             }
@@ -488,7 +510,7 @@ test "native index owner adapter executes fresh permission stages and recovers r
         var producer_result: producer_module.Result = .{ .pending = .status };
         for (0..8) |_| {
             const before_calls = transport.calls;
-            producer_result = try resumed.step(&transport, &metadata);
+            producer_result = try resumed.step(&local_transport, &metadata);
             try std.testing.expect(transport.calls - before_calls <= 1);
             if (producer_result == .advanced) break;
         }
@@ -497,7 +519,7 @@ test "native index owner adapter executes fresh permission stages and recovers r
         try std.testing.expectEqual(accepted.decision_digest, producer_result.advanced.consumed.decision_digest);
         try std.testing.expectEqual(@as(usize, 1), metadata.acceptance_writes);
         const finished_calls = transport.calls;
-        _ = try resumed.step(&transport, &metadata);
+        _ = try resumed.step(&local_transport, &metadata);
         try std.testing.expectEqual(finished_calls, transport.calls);
         var consumed_result = try execution.claimStep(alloc, &owners, &metadata, plan.before.name, consume_request, .{});
         defer consumed_result.deinit();
