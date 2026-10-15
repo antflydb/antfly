@@ -145,8 +145,41 @@ pub const Record = struct {
         return record;
     }
 
+    /// The single terminal slot owns unfinished companion retirement. Do not
+    /// admit a later build that could replace it before bounded GC completes.
+    pub fn requireRetirementClear(txn: anytype) !void {
+        const bytes = txn.get(retirement_pending_key) catch |err| switch (err) {
+            error.NotFound => return,
+            else => return err,
+        };
+        const position = try positions.Position.decode(bytes);
+        if (position != .native) return error.InvalidPrivateIndexNativeReceipt;
+        return error.GenerationRetirementPending;
+    }
+
+    pub fn pending(alloc: std.mem.Allocator, txn: anytype) !?@This() {
+        const bytes = txn.get(retirement_pending_key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        const position = try positions.Position.decode(bytes);
+        const record = (try loadRaw(alloc, txn)) orelse return error.InvalidPrivateIndexNativeReceipt;
+        if (position != .native or !std.meta.eql(position.native, record.position)) return error.InvalidPrivateIndexNativeReceipt;
+        try verifyRecovery(alloc, txn);
+        return record;
+    }
+
     pub fn verifyRecovery(alloc: std.mem.Allocator, txn: anytype) !void {
         const maybe_record = try loadRaw(alloc, txn);
+        const marker = txn.get(retirement_pending_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (marker) |bytes| {
+            const position = try positions.Position.decode(bytes);
+            const retained = maybe_record orelse return error.InvalidPrivateIndexNativeReceipt;
+            if (position != .native or !std.meta.eql(position.native, retained.position)) return error.InvalidPrivateIndexNativeReceipt;
+        }
         const topology = @import("relational_integrity_topology.zig");
         const bytes = txn.get(topology.receipt_key) catch |err| switch (err) {
             error.NotFound => {
@@ -212,6 +245,176 @@ pub const Record = struct {
         if (!std.mem.eql(u8, &binding.physical_reserved.blob_digest, &binding.physical_candidate.blob_digest)) try txn.delete(&physical.blobKey(binding.physical_reserved.blob_digest));
         return .{ .record = record, .duplicate = false };
     }
+};
+
+/// Canonical bounded retirement commands are mirrored with their clock and
+/// outbox. Standbys replay the same deletes before a later build is admitted.
+/// Never use cancellation GC: installed UNIQUE claims remain live user data.
+pub const Gc = struct {
+    const claims = @import("relational_index_private_claims.zig");
+    pub const max_records = 128;
+    pub const max_bytes = 2 * 1024 * 1024;
+    pub const max_wire_bytes = 256 * 1024;
+    const max_key_bytes = 256;
+    const Key = struct {
+        bytes: [max_key_bytes]u8 = undefined,
+        len: usize,
+        fn slice(self: *const @This()) []const u8 {
+            return self.bytes[0..self.len];
+        }
+    };
+    pub const Entry = struct {
+        key_b64: []const u8,
+        value_digest: Digest,
+        value_bytes: u32,
+
+        fn decodedKey(self: @This()) !Key {
+            const len = std.base64.standard.Decoder.calcSizeForSlice(self.key_b64) catch return error.InvalidPrivateIndexNativeReceipt;
+            if (len == 0 or len > max_key_bytes) return error.InvalidPrivateIndexNativeReceipt;
+            var result: Key = .{ .len = len };
+            std.base64.standard.Decoder.decode(result.bytes[0..len], self.key_b64) catch return error.InvalidPrivateIndexNativeReceipt;
+            var canonical: [std.base64.standard.Encoder.calcSize(max_key_bytes)]u8 = undefined;
+            const encoded = std.base64.standard.Encoder.encode(&canonical, result.slice());
+            if (!std.mem.eql(u8, encoded, self.key_b64)) return error.InvalidPrivateIndexNativeReceipt;
+            return result;
+        }
+    };
+    const Prefixes = struct {
+        inventory: [claims.prefix.len + 16]u8,
+        source: [claims.SourceStream.batch_prefix.len + 16]u8,
+        fn init(record: Record) @This() {
+            var result: @This() = undefined;
+            @memcpy(result.inventory[0..claims.prefix.len], claims.prefix);
+            @memcpy(result.inventory[claims.prefix.len..], &record.intent.installed.command.validation.command.expected.generation);
+            @memcpy(result.source[0..claims.SourceStream.batch_prefix.len], claims.SourceStream.batch_prefix);
+            @memcpy(result.source[claims.SourceStream.batch_prefix.len..], &record.intent.installed.command.validation.command.binding.id);
+            return result;
+        }
+        fn contains(self: *const @This(), key_: []const u8) bool {
+            return (key_.len == self.inventory.len + 64 and std.mem.startsWith(u8, key_, &self.inventory)) or
+                (key_.len == self.source.len + 9 and std.mem.startsWith(u8, key_, &self.source) and key_[key_.len - 1] <= 1);
+        }
+        fn empty(self: *const @This(), txn: anytype) !bool {
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            for ([_][]const u8{ &self.inventory, &self.source }) |prefix| {
+                if (try cursor.seekAtOrAfter(prefix)) |entry| if (std.mem.startsWith(u8, entry.key, prefix)) return false;
+            }
+            return true;
+        }
+    };
+
+    pub const Outcome = struct {
+        released: positions.Native,
+        position: positions.Native,
+        records: usize = 0,
+        bytes: usize = 0,
+        retired: bool = false,
+        duplicate: bool = false,
+        replication_pending: bool = false,
+        error_name: ?[]const u8 = null,
+    };
+
+    pub const Command = struct {
+        record: Record,
+        entries: []const Entry,
+
+        pub fn validate(self: @This()) !void {
+            _ = try self.record.intent.receipt(self.record.position);
+            if (self.entries.len > max_records) return error.InvalidPrivateIndexNativeReceipt;
+            var previous: ?Key = null;
+            var bytes: usize = 0;
+            for (self.entries) |entry| {
+                const decoded = try entry.decodedKey();
+                if (previous) |prior| if (std.mem.order(u8, prior.slice(), decoded.slice()) != .lt) return error.InvalidPrivateIndexNativeReceipt;
+                bytes = std.math.add(usize, bytes, decoded.len + @as(usize, entry.value_bytes)) catch return error.InvalidPrivateIndexNativeReceipt;
+                if (bytes > max_bytes) return error.InvalidPrivateIndexNativeReceipt;
+                previous = decoded;
+            }
+        }
+
+        pub fn stage(self: @This(), _: std.mem.Allocator, txn: anytype, replay: ?positions.Native) !Outcome {
+            try self.validate();
+            const marker = txn.get(Record.retirement_pending_key) catch |err| switch (err) {
+                error.NotFound => return error.VersionConflict,
+                else => return err,
+            };
+            const pending_position = try positions.Position.decode(marker);
+            if (pending_position != .native or !std.meta.eql(pending_position.native, self.record.position)) return error.InvalidPrivateIndexNativeReceipt;
+            const encoded = try self.record.encode();
+            if (!std.mem.eql(u8, encoded.slice(), try txn.get(Record.key))) return error.VersionConflict;
+            if ((try owner.load(txn)) != null) return error.PrivateIndexOwnerJobChanged;
+            const namespace = @import("online_source_contract.zig").namespaceBytes(self.record.position.namespace);
+            const source = try authority.require(txn, .native, namespace);
+            if (source.sequence < self.record.position.sequence) return error.InvalidPrivateIndexNativeReceipt;
+            const prefixes = Prefixes.init(self.record);
+            var bytes: usize = 0;
+            for (self.entries) |entry| {
+                const decoded = try entry.decodedKey();
+                if (!prefixes.contains(decoded.slice())) return error.InvalidPrivateIndexNativeReceipt;
+                const current = txn.get(decoded.slice()) catch |err| switch (err) {
+                    error.NotFound => return error.VersionConflict,
+                    else => return err,
+                };
+                if (current.len != entry.value_bytes or !std.mem.eql(u8, &hash(current), &entry.value_digest)) return error.VersionConflict;
+                bytes += decoded.len + current.len;
+            }
+            for (self.entries) |entry| {
+                const decoded = try entry.decodedKey();
+                try txn.delete(decoded.slice());
+            }
+            const retired = try prefixes.empty(txn);
+            if (!retired and self.entries.len == 0) return error.InvalidPrivateIndexNativeReceipt;
+            if (retired) try txn.delete(Record.retirement_pending_key);
+            const sequence = try authority.advance(txn, namespace, if (replay) |position| blk: {
+                if (!position.namespace.eql(self.record.position.namespace)) return error.IdentityNamespaceMismatch;
+                break :blk position.sequence;
+            } else null);
+            return .{ .released = self.record.position, .position = .{ .namespace = self.record.position.namespace, .sequence = sequence }, .records = self.entries.len, .bytes = bytes, .retired = retired };
+        }
+    };
+
+    pub const Page = struct {
+        arena: std.heap.ArenaAllocator,
+        command: Command,
+
+        pub fn deinit(self: *@This()) void {
+            self.arena.deinit();
+            self.* = undefined;
+        }
+        pub fn prepare(alloc: std.mem.Allocator, io: ?std.Io, txn: anytype) !?@This() {
+            const record = (try Record.pending(alloc, txn)) orelse return null;
+            const prefixes = Prefixes.init(record);
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            errdefer arena.deinit();
+            const owned = arena.allocator();
+            var entries: std.ArrayList(Entry) = .empty;
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            const time = @import("antfly_platform").time;
+            const started = time.monotonicNs();
+            var bytes: usize = 0;
+            scan: for ([_][]const u8{ &prefixes.inventory, &prefixes.source }) |prefix| {
+                var next = try cursor.seekAtOrAfter(prefix);
+                while (next) |entry| : (next = try cursor.next()) {
+                    if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+                    if (io) |runtime| try runtime.checkCancel();
+                    if (!prefixes.contains(entry.key)) return error.InvalidPrivateIndexNativeReceipt;
+                    const size = std.math.add(usize, entry.key.len, entry.value.len) catch return error.InvalidPrivateIndexNativeReceipt;
+                    if (size > max_bytes) return error.InvalidPrivateIndexNativeReceipt;
+                    if (entries.items.len == max_records or size > max_bytes - bytes) break :scan;
+                    const encoded = try owned.alloc(u8, std.base64.standard.Encoder.calcSize(entry.key.len));
+                    _ = std.base64.standard.Encoder.encode(encoded, entry.key);
+                    try entries.append(owned, .{ .key_b64 = encoded, .value_digest = hash(entry.value), .value_bytes = @intCast(entry.value.len) });
+                    bytes += size;
+                    if (time.monotonicNs() -| started >= 5 * std.time.ns_per_ms) break :scan;
+                }
+            }
+            const command: Command = .{ .record = record, .entries = entries.items };
+            try command.validate();
+            return .{ .arena = arena, .command = command };
+        }
+    };
 };
 
 fn testIntent() !Intent {

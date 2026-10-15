@@ -777,6 +777,7 @@ fn stageBeginImpl(txn: anytype, binding: Binding, inputs: *const inputs_mod.Prep
         if (replay != null) try requireReplay(try requireNativeCut(txn, binding, .admitted), replay);
         return false;
     }
+    try @import("relational_index_release.zig").Record.requireRetirementClear(txn);
     const integrity = (try optional(txn, integrity_catalog.key)) orelse return error.IntegrityCatalogChanged;
     if (!std.mem.eql(u8, &digest(integrity), &binding.integrity_before)) return error.IntegrityCatalogChanged;
     const physical = if (try optional(txn, physical_catalog.head_key)) |bytes| try physical_catalog.Head.decode(bytes) else null;

@@ -1046,7 +1046,7 @@ fn testNativeIndexRelease(source: *db_mod.DB, installed: @import("relational_ind
     const authority = @import("../source_authority.zig");
     const binding = installed.command.validation.command.binding;
     const intent: release_mod.Intent = .{ .installed = installed, .metadata_decision = @splat(11) };
-    const options: db_mod.OpenOptions = .{ .start_optional_runtimes = false, .primary_backend = .{ .lsm = .{} }, .online_source_authority = .native, .identity_namespace = binding.fence.namespace };
+    const options: db_mod.OpenOptions = .{ .start_optional_runtimes = false, .start_index_workers = false, .primary_backend = .{ .lsm = .{} }, .online_source_authority = .native, .identity_namespace = binding.fence.namespace };
     var primary_dir = try @import("../../common/test_directory.zig").TestDirectory.init("native-index-release-primary");
     defer primary_dir.cleanup();
     var primary = try db_mod.DB.open(alloc, primary_dir.path(), options);
@@ -1151,6 +1151,20 @@ fn testNativeIndexRelease(source: *db_mod.DB, installed: @import("relational_ind
     try std.testing.expect(recovered.duplicate and !recovered.replication_pending);
     try std.testing.expectEqualDeep(try intent.receipt(pending.position), recovered.receipt.?);
     primary.local_execution.replication_async_batch_mirror = null;
+    {
+        var original_inputs = original: {
+            var read = try source.core.store.beginReadTxn();
+            defer read.abort();
+            break :original try @import("relational_index_inputs.zig").Prepared.load(alloc, &read, intent.installed.command.validation.command.binding.inputs_digest);
+        };
+        defer original_inputs.deinit();
+        var attempted_binding = intent.installed.command.validation.command.binding;
+        attempted_binding.phase = .fencing;
+        var txn = try primary.core.store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.GenerationRetirementPending, jobs.stageBegin(&txn, attempted_binding, &original_inputs));
+        try release_mod.Record.verifyRecovery(alloc, &txn);
+    }
     try std.testing.expectError(error.ForeignKeyCoordinationRequired, primary.batch(.{ .writes = &.{.{ .key = "after-release", .value = "{\"id\":99,\"email\":\"after-release@example.com\"}" }} }));
     const catalog = @import("relational_integrity_catalog.zig");
     const integrity = @import("relational_integrity.zig");
@@ -1233,6 +1247,207 @@ fn testNativeIndexRelease(source: *db_mod.DB, installed: @import("relational_ind
         try release_mod.Record.verifyRecovery(alloc, &read);
         try std.testing.expect(try jobs.load(&read) == null and try topology.current(&read) == null);
         try std.testing.expectEqual(pending.position.sequence, (try authority.load(&read)).?.sequence);
+    }
+    try testReleasedIndexCompanionGc(&primary, try integrity.Address.init(generation, tuple.items));
+}
+
+fn testReleasedIndexGcAllocations(allocator: std.mem.Allocator, database: *db_mod.DB) !void {
+    var read = try database.core.store.beginReadTxn();
+    defer read.abort();
+    var page = (try @import("relational_index_release.zig").Gc.Page.prepare(allocator, database.backend_runtime.io(), &read)).?;
+    defer page.deinit();
+    var prepared: @import("relational_index_owner_control.zig").PreparedReleaseGc = .{ .alloc = allocator, .command = page.command };
+    defer prepared.deinit();
+    try prepared.preparePayload();
+}
+
+/// Real released LSM/claims plus extra obsolete private source companions to
+/// force multiple bounded pages. Logical KV seeding is interface qualification,
+/// not restore adoption or independent metadata authorization.
+fn testReleasedIndexCompanionGc(source: *db_mod.DB, live_address: @import("relational_integrity.zig").Address) !void {
+    const release_mod = @import("relational_index_release.zig");
+    const native = @import("relational_index_owner_control.zig");
+    const authority = @import("../source_authority.zig");
+    var primary_dir = try @import("../../common/test_directory.zig").TestDirectory.init("native-index-release-gc-primary");
+    defer primary_dir.cleanup();
+    var standby_dir = try @import("../../common/test_directory.zig").TestDirectory.init("native-index-release-gc-standby");
+    defer standby_dir.cleanup();
+    const options: db_mod.OpenOptions = .{ .start_optional_runtimes = false, .start_index_workers = false, .primary_backend = .{ .lsm = .{} }, .online_source_authority = .native, .identity_namespace = source.core.identity_namespace };
+    var primary = try db_mod.DB.open(alloc, primary_dir.path(), options);
+    var primary_open = true;
+    defer if (primary_open) primary.close();
+    var standby = try db_mod.DB.open(alloc, standby_dir.path(), options);
+    var standby_open = true;
+    defer if (standby_open) standby.close();
+    try seedNativeIndexFixture(source, &primary);
+    try seedNativeIndexFixture(source, &standby);
+    const terminal = terminal: {
+        var read = try primary.core.store.beginReadTxn();
+        defer read.abort();
+        break :terminal (try release_mod.Record.pending(alloc, &read)).?;
+    };
+    const owner_id = terminal.intent.installed.command.validation.command.binding.id;
+    for ([_]*db_mod.DB{ &primary, &standby }) |db| {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        for (0..300) |ordinal| try txn.put(&@import("relational_index_private_claims.zig").SourceStream.key(owner_id, @intCast(1000 + ordinal), false), "obsolete source companion");
+        try txn.commit();
+    }
+    primary.close();
+    primary_open = false;
+    primary = try db_mod.DB.open(alloc, primary_dir.path(), options);
+    primary_open = true;
+    standby.close();
+    standby_open = false;
+    standby = try db_mod.DB.open(alloc, standby_dir.path(), options);
+    standby_open = true;
+    const live_key = live_address.claimKey();
+    const live_bytes = (try source.core.getStoreValue(alloc, &live_key)).?;
+    defer alloc.free(live_bytes);
+    const row_bytes = (try source.get(alloc, "after-release")).?;
+    defer alloc.free(row_bytes);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, testReleasedIndexGcAllocations, .{&primary});
+    {
+        var txn = try primary.core.store.beginWriteTxn();
+        defer txn.abort();
+        var wrong_cut = terminal.position;
+        wrong_cut.sequence += 1;
+        try txn.put(release_mod.Record.retirement_pending_key, &try (@import("receipt_position.zig").Position{ .native = wrong_cut }).encode());
+        try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, release_mod.Record.verifyRecovery(alloc, &txn));
+        try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, release_mod.Gc.Page.prepare(alloc, primary.backend_runtime.io(), &txn));
+    }
+    const Fault = struct {
+        txn: *docstore.DocStore.Txn,
+        fail_at: ?usize = null,
+        after: bool = false,
+        writes: usize = 0,
+        fn before(self: *@This()) !void {
+            if (self.fail_at == self.writes + 1 and !self.after) return error.TestReleaseGcWriteFailed;
+        }
+        fn completed(self: *@This()) !void {
+            self.writes += 1;
+            if (self.fail_at == self.writes and self.after) return error.TestReleaseGcWriteFailed;
+        }
+        pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+            return self.txn.get(key);
+        }
+        pub fn put(self: *@This(), key: []const u8, value: []const u8) !void {
+            try self.before();
+            try self.txn.put(key, value);
+            try self.completed();
+        }
+        pub fn delete(self: *@This(), key: []const u8) !void {
+            try self.before();
+            try self.txn.delete(key);
+            try self.completed();
+        }
+        pub fn openCursor(self: *@This()) !docstore.DocStore.Txn.CursorAdapter {
+            return self.txn.openCursor();
+        }
+    };
+    {
+        var page = page: {
+            var read = try primary.core.store.beginReadTxn();
+            defer read.abort();
+            break :page (try release_mod.Gc.Page.prepare(alloc, primary.backend_runtime.io(), &read)).?;
+        };
+        defer page.deinit();
+        try std.testing.expect(page.command.entries.len <= release_mod.Gc.max_records);
+        const writes = count: {
+            var txn = try primary.core.store.beginWriteTxn();
+            defer txn.abort();
+            var fault: Fault = .{ .txn = &txn };
+            _ = try page.command.stage(alloc, &fault, null);
+            break :count fault.writes;
+        };
+        for (1..writes + 1) |fail_at| for ([_]bool{ false, true }) |after| {
+            var txn = try primary.core.store.beginWriteTxn();
+            defer txn.abort();
+            var fault: Fault = .{ .txn = &txn, .fail_at = fail_at, .after = after };
+            try std.testing.expectError(error.TestReleaseGcWriteFailed, page.command.stage(alloc, &fault, null));
+            try std.testing.expectEqual(if (after) fail_at else fail_at - 1, fault.writes);
+        };
+        var encoded_key: [std.base64.standard.Encoder.calcSize(live_key.len)]u8 = undefined;
+        const entry: release_mod.Gc.Entry = .{ .key_b64 = std.base64.standard.Encoder.encode(&encoded_key, &live_key), .value_digest = @import("relational_integrity_contract.zig").hash(live_bytes), .value_bytes = @intCast(live_bytes.len) };
+        var txn = try primary.core.store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, (release_mod.Gc.Command{ .record = terminal, .entries = &.{entry} }).stage(alloc, &txn, null));
+    }
+    const baseline_lsn = try standby.replicationAppliedSequence();
+    var pages: u64 = 0;
+    var deleted: usize = 0;
+    var finished = false;
+    while (pages < 32) {
+        var barrier: @import("antfly_runtime_abi").mutation_barrier.MutationBarrier = .{};
+        var publisher: TestNativeIndexPublisher = .{ .barrier = &barrier, .lsn = baseline_lsn + pages + 1 };
+        defer if (publisher.payload) |bytes| alloc.free(bytes);
+        defer if (primary_open) {
+            primary.local_execution.replication_async_batch_mirror = null;
+        };
+        primary.local_execution.replication_async_batch_mirror = publisher.asMirror();
+        const outcome = (try primary.collectReleasedNativeIndexCompanionsStep()).?;
+        try std.testing.expect(!outcome.duplicate and outcome.replication_pending);
+        try std.testing.expectEqualStrings("TestPublicationUnavailable", outcome.error_name.?);
+        try std.testing.expect(outcome.records <= release_mod.Gc.max_records and outcome.bytes <= release_mod.Gc.max_bytes);
+        deleted += outcome.records;
+        primary.local_execution.replication_async_batch_mirror = null;
+        primary.close();
+        primary_open = false;
+        primary = try db_mod.DB.open(alloc, primary_dir.path(), options);
+        primary_open = true;
+        publisher.fail = false;
+        primary.local_execution.replication_async_batch_mirror = publisher.asMirror();
+        try primary.flushDurableReplicationOutboxes();
+        try std.testing.expectEqual(@as(usize, 2), publisher.attempts);
+        try std.testing.expectEqual(@as(usize, 1), publisher.completed);
+        primary.local_execution.replication_async_batch_mirror = null;
+        const frame: @import("replication_record.zig").Record = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = baseline_lsn + pages + 1, .previous_lsn = baseline_lsn + pages, .payload = publisher.payload.? };
+        try replication_ingress.applyRecord(&standby, frame);
+        try replication_ingress.applyRecord(&standby, frame);
+        for ([_]*db_mod.DB{ &primary, &standby }) |db| {
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectEqualSlices(u8, live_bytes, try read.get(&live_key));
+            try std.testing.expectEqual(outcome.position.sequence, (try authority.load(&read)).?.sequence);
+            try std.testing.expectEqual(!outcome.retired, try release_mod.Record.pending(alloc, &read) != null);
+            const row = (try db.get(alloc, "after-release")).?;
+            defer alloc.free(row);
+            try std.testing.expectEqualStrings(row_bytes, row);
+        }
+        pages += 1;
+        if (outcome.retired) {
+            finished = true;
+            break;
+        }
+    }
+    try std.testing.expect(finished and pages >= 3 and deleted >= 300);
+    try std.testing.expect(try primary.collectReleasedNativeIndexCompanionsStep() == null);
+    {
+        var read = try primary.core.store.beginReadTxn();
+        defer read.abort();
+        try release_mod.Record.requireRetirementClear(&read);
+    }
+    var retry: native.PreparedRelease = try primary.prepareNativeIndexOwnerRelease(terminal.intent, .{});
+    defer retry.deinit();
+    const outcome = try primary.applyPreparedNativeIndexOwnerRelease(&retry, null);
+    try std.testing.expect(outcome.duplicate);
+    try std.testing.expectEqualDeep(try terminal.intent.receipt(terminal.position), outcome.receipt.?);
+    var scheduled_dir = try @import("../../common/test_directory.zig").TestDirectory.init("native-index-release-gc-scheduled");
+    defer scheduled_dir.cleanup();
+    var scheduled = try db_mod.DB.open(alloc, scheduled_dir.path(), options);
+    var scheduled_open = true;
+    defer if (scheduled_open) scheduled.close();
+    try seedNativeIndexFixture(source, &scheduled);
+    scheduled.close();
+    scheduled_open = false;
+    scheduled = try db_mod.DB.open(alloc, scheduled_dir.path(), options);
+    scheduled_open = true;
+    try std.testing.expect(try scheduled.runRelationalIndexMaintenancePass());
+    {
+        var read = try scheduled.core.store.beginReadTxn();
+        defer read.abort();
+        try release_mod.Record.requireRetirementClear(&read);
+        try std.testing.expectEqualSlices(u8, live_bytes, try read.get(&live_key));
     }
 }
 

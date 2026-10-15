@@ -8016,6 +8016,11 @@ pub const DB = struct {
                     defer prepared.deinit();
                     _ = try self.applyPreparedNativeIndexOwnerRelease(&prepared, .{ .position = frame.position, .lsn = sequence });
                 },
+                .release_gc => |command| {
+                    var prepared: native_index_control.PreparedReleaseGc = .{ .alloc = self.alloc, .command = command };
+                    defer prepared.deinit();
+                    _ = try self.applyPreparedNativeIndexEffect(&prepared, .{ .position = frame.position, .lsn = sequence });
+                },
                 .control => |command| {
                     var prepared = self.prepareNativeIndexOwnerControl(command) catch |err| {
                         // Another replay may retire inputs during preparation.
@@ -8611,6 +8616,32 @@ pub const DB = struct {
         const outcome = try self.applyPreparedNativeIndexEffect(prepared, replay);
         if (self.backend_runtime.io()) |io| self.native_index_build_cache.evict(io);
         return outcome;
+    }
+
+    /// Canonical private-companion retirement, using the same transaction,
+    /// clock, replay marker and outbox path as the terminal release itself.
+    /// Standbys only replay these commands; they never choose cleanup pages.
+    pub fn collectReleasedNativeIndexCompanionsStep(self: *DB) !?@import("relational_index_release.zig").Gc.Outcome {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        const release_mod = @import("relational_index_release.zig");
+        var budget = if (self.core.index_manager.resource_manager) |manager| resource_manager_mod.BudgetedAllocator.initReclaiming(manager, .relational_preparation_working_set, self.alloc, 1) else null;
+        defer if (budget) |*value| value.deinit();
+        const alloc = if (budget) |*value| value.allocator() else self.alloc;
+        var page = blk: {
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            break :blk (release_mod.Gc.Page.prepare(alloc, self.backend_runtime.io(), &read) catch |err| {
+                if (budget) |value| if (value.denied()) return error.ResourceBudgetExceeded;
+                return err;
+            }) orelse return null;
+        };
+        defer page.deinit();
+        var prepared: native_index_control.PreparedReleaseGc = .{ .alloc = alloc, .command = page.command };
+        defer prepared.deinit();
+        return self.applyPreparedNativeIndexEffect(&prepared, null) catch |err| {
+            if (budget) |value| if (value.denied()) return error.ResourceBudgetExceeded;
+            return err;
+        };
     }
 
     /// Host-only bounded installation step, including exact installed retries.
@@ -32101,13 +32132,14 @@ pub const DB = struct {
             sweep.failed();
             self.local_execution.relational_index_retry_after_ns.store(platform_time.monotonicNs() +| artifact_repair_metadata_poll_ns, .release);
         }
+        const release_collected = (try self.collectReleasedNativeIndexCompanionsStep()) != null;
         const validated = try self.validateConstraintsStep(.{});
         var pinned = self.core.relational_indexes.acquire() orelse {
-            sweep.empty(validated);
-            return validated;
+            sweep.empty(validated or release_collected);
+            return validated or release_collected;
         };
         defer pinned.deinit();
-        const collected = try self.collectRelationalIndexGarbageStep();
+        const collected = (try self.collectRelationalIndexGarbageStep()) or release_collected;
         const indexes = pinned.plan.boundIndexes();
         sweep.begin(pinned.head, self.core.schemaNamespaceGeneration(), indexes.len);
         if (indexes.len == 0) {
@@ -32124,7 +32156,7 @@ pub const DB = struct {
             }
             if (platform_time.monotonicNs() -| started >= 5 * std.time.ns_per_ms) {
                 sweep.finish(collected or validated);
-                return false;
+                return collected or validated;
             }
         }
         sweep.finish(collected or validated);

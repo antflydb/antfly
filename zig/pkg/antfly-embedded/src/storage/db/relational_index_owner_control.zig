@@ -34,7 +34,7 @@ const release = @import("relational_index_release.zig");
 const resources = @import("../resource_manager.zig");
 const RequestContext = @import("../../api/operation.zig").RequestContext;
 const Waiters = @import("../admission_waiter.zig").Fifo(void);
-pub const envelope_version = 30;
+pub const envelope_version = 31;
 pub const max_response_bytes = 32 * 1024;
 pub const max_cancellation_wire_bytes = 32 * 1024;
 pub const max_encoded_inputs = std.base64.standard.Encoder.calcSize(inputs.max_bytes);
@@ -318,6 +318,7 @@ pub const Effect = union(enum) {
     validation_seal: validation.SealCommand,
     install: validation.InstallCommand,
     release: release.Intent,
+    release_gc: release.Gc.Command,
 
     pub fn namespace(self: Effect) @FieldType(Native, "namespace") {
         return switch (self) {
@@ -329,6 +330,7 @@ pub const Effect = union(enum) {
             .validation_seal => |value| value.binding.fence.namespace,
             .install => |value| value.validation.command.binding.fence.namespace,
             .release => |value| value.installed.position.namespace,
+            .release_gc => |value| value.record.position.namespace,
             .build => |value| value.binding.fence.namespace,
             .cancel_intent => |value| value.fence.namespace,
             .cancel_cleanup => |value| value.fence.namespace,
@@ -345,6 +347,7 @@ pub const Effect = union(enum) {
             .validation_seal => |value| try value.validate(),
             .install => |value| try value.validate(),
             .release => |value| try value.validate(),
+            .release_gc => |value| try value.validate(),
             .build => |value| try value.validate(),
             .cancel_intent => |value| try value.validate(),
             .cancel_cleanup => |value| {
@@ -364,6 +367,7 @@ pub const Effect = union(enum) {
             .validation_seal => validation.Seal.max_wire_bytes,
             .install => validation.Installed.max_wire_bytes,
             .release => release.Record.max_wire_bytes,
+            .release_gc => release.Gc.max_wire_bytes,
             else => max_cancellation_wire_bytes,
         };
     }
@@ -1151,6 +1155,49 @@ pub const PreparedRelease = struct {
     }
     pub fn preparePayload(self: *@This()) !void {
         try prepareNativePayload(self, "release", self.intent, release.Record.max_wire_bytes);
+    }
+    pub fn finalizePayload(self: *@This(), position: Native) ![]const u8 {
+        return finalizeNativePayload(self, position);
+    }
+};
+
+/// The page or decoded replay frame owns command strings through apply.
+pub const PreparedReleaseGc = struct {
+    pub const ApplyOutcome = release.Gc.Outcome;
+    alloc: Allocator,
+    command: release.Gc.Command,
+    context: RequestContext = .{},
+    payload: ?[]u8 = null,
+    prefix_len: usize = 0,
+
+    pub fn deinit(self: *@This()) void {
+        if (self.payload) |bytes| self.alloc.free(bytes);
+        self.* = undefined;
+    }
+    pub fn validate(self: *const @This()) !void {
+        try self.context.ensureActive();
+        try self.command.validate();
+    }
+    pub fn namespace(self: *const @This()) @FieldType(Native, "namespace") {
+        return self.command.record.position.namespace;
+    }
+    pub fn validateReplay(self: *const @This(), position: Native) !void {
+        try (Frame{ .effect = .{ .release_gc = self.command }, .position = position }).validate();
+        if (position.sequence <= self.command.record.position.sequence) return error.InvalidPrivateIndexNativeReceipt;
+    }
+    pub fn replayDuplicateOutcome(self: *const @This(), position: Native) ApplyOutcome {
+        return .{ .released = self.command.record.position, .position = position, .duplicate = true };
+    }
+    pub fn stage(self: *@This(), _: anytype, txn: anytype, position: ?Native) !ApplyOutcome {
+        try self.validate();
+        return self.command.stage(self.alloc, txn, position);
+    }
+    pub fn hasPublicationReceipt(_: *const @This()) bool {
+        return false;
+    }
+    pub fn populateReceipt(_: *const @This(), _: anytype, _: *ApplyOutcome) !void {}
+    pub fn preparePayload(self: *@This()) !void {
+        try prepareNativePayload(self, "release_gc", self.command, release.Gc.max_wire_bytes);
     }
     pub fn finalizePayload(self: *@This(), position: Native) ![]const u8 {
         return finalizeNativePayload(self, position);
