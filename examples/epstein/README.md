@@ -565,8 +565,9 @@ term. Other indexes retain their configured analyzers: wildcard and regexp
 operate on indexed terms and do not stem their expressions. Existing corpus
 indexes need rebuilding with the new analysis configuration; changing query
 text cannot recover terms discarded by an earlier analyzer.
-`corpus graph` retries transient coordinator failures by reconciling the source
-revision again, including any work committed before the failure.
+`corpus graph` retries transient coordinator failures, connection failures, and
+timeouts by reconciling the source revision again, including work committed
+before a response was lost.
 Preparation completes every page window for a PDF before writing that source's
 manifest rows. PDFs rejected during validation or splitting are recorded in
 `skipped.ndjson`; filesystem failures still stop preparation. Server warmup

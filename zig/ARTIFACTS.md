@@ -348,10 +348,11 @@ guarantee stay serial. Managed providers opt in; custom providers default to one
 concurrent batch through `DenseEmbedder.dense_batch_concurrency`.
 All calls drain before a retry or replay checkpoint, and their outputs retain
 source order. The existing item and byte budgets bound the complete batch.
-Capacity rejection drains the concurrent wave and retries serially within the
-same deadline, so providers with one available execution slot can still progress.
-Query embedding retries transient inference capacity errors within its original
-deadline and observes cancellation during the wait.
+Capacity rejection drains the concurrent wave, retains successful slices, and
+retries only failed slices serially within the same deadline. Providers with one
+available execution slot can progress without repeating successful inference.
+Text and multimodal query embedding retry transient inference capacity errors
+within the original deadline and observe cancellation during the wait.
 
 Embedding reprocess requests commit a config-fenced generation with the source
 mutation. Replay resolves it once per producer request, and text, sparse, and PDF

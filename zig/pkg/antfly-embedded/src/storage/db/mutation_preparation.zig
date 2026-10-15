@@ -1230,7 +1230,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     const intent = @import("artifact_reprocess_intent.zig");
                     const key = try intent.embeddingKeyAlloc(alloc, request.doc_key, requestEmbeddingName(request.*));
                     defer alloc.free(key);
-                    const old = self.core.store.get(alloc, key) catch |err| switch (err) {
+                    const old = self.core.*.store.get(alloc, key) catch |err| switch (err) {
                         error.NotFound => null,
                         else => return err,
                     };

@@ -636,7 +636,14 @@ pub const ManagedEmbeddingEntry = struct {
     }
 
     fn requestOverlay(self: *const ManagedEmbeddingEntry, alloc: std.mem.Allocator) ManagedEmbeddingEntry {
-        var overlay = self.*;
+        var overlay: ManagedEmbeddingEntry = undefined;
+        inline for (@typeInfo(ManagedEmbeddingEntry).@"struct".field_names) |name| {
+            // These caches may be changing under their owner locks. Even a
+            // discarded bitwise copy would read concurrently mutated state.
+            if (comptime std.mem.eql(u8, name, "auth_header_cache") or
+                std.mem.eql(u8, name, "remote_capability_cache")) continue;
+            @field(overlay, name) = @field(self.*, name);
+        }
         // A request overlay may replace cancellation and credential caches,
         // but it must borrow the configured entry's synchronization owner.
         // Its authorization cache belongs to the request allocator and must
@@ -9058,7 +9065,7 @@ pub fn testFileBackedApiKeyRotation() !void {
     try std.testing.expectEqualStrings("Bearer first-key", managed.entries[0].auth_header_cache.header.?);
 }
 
-test "managed query templates retry media capacity and do not multiply text retries" {
+test "managed embedder query templates retry media capacity and do not multiply text retries" {
     const Harness = struct {
         parts_calls: usize = 0,
         text_calls: usize = 0,
@@ -9116,7 +9123,7 @@ test "managed query templates retry media capacity and do not multiply text retr
     try std.testing.expectEqual(@as(usize, 4), harness.text_calls);
 }
 
-test "single query embeddings reject surplus vectors and release the response" {
+test "managed embedder single query embeddings reject surplus vectors and release the response" {
     const alloc = std.testing.allocator;
     const vectors = try alloc.alloc([]const f32, 2);
     vectors[0] = try alloc.dupe(f32, &.{ 1, 2, 3 });
