@@ -4635,7 +4635,8 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(
                 "body": "quasar " * (i % 4 + 1)
                 + "common " * (i % 3)
                 + ("beta " if i % 2 else "alpha ")
-                + ("navquasar " if i in (3, row_count - 2) else ""),
+                + ("navquasar " if i in (3, row_count - 2) else "")
+                + f"vocab{i} ",
                 "amount": i,
                 "sparse_native": '{"1":1}',
             }
@@ -4849,10 +4850,10 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(
                     "bounded_global_text_frontier"
                 ), found
             # Constant-score ties retain the independent full-admission order.
-            for offset in (0, 61):
+            for prefix, offset in (("qu", 0), ("qu", 61), ("vocab", 0), ("vocab", 61)):
                 tied = dict(
                     direct,
-                    full_text_search={"prefix": "qu", "field": "body"},
+                    full_text_search={"prefix": prefix, "field": "body"},
                     offset=offset,
                     limit=19,
                 )
@@ -5062,6 +5063,7 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(
                             + "common " * (amount % 3)
                             + ("beta " if amount % 2 else "alpha ")
                             + ("navquasar " if amount in (3, row_count - 2) else "")
+                            + f"vocab{amount} "
                         )
                 if "reranker" in shape:
                     assert (

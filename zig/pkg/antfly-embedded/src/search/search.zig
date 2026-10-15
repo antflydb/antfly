@@ -3222,10 +3222,13 @@ pub const TextNavigationPlan = struct {
         frequencies: *const fn (*anyopaque, Allocator, []const u8, []const []const u8, []u32) anyerror!void,
         /// null means incomplete expansion. An empty slice proves absence.
         patterns: ?*const fn (*anyopaque, Allocator, SearchQuery) anyerror!?[]const TermQuery = null,
+        range_patterns: bool = false,
     };
     pub const Summaries = struct {
         ptr: *anyopaque,
         read: *const fn (*anyopaque, []const u8, []const u8, f32, inverted.BM25Config) anyerror!index_mod.IndexSnapshot.TextTermSummary,
+        pattern: ?*const fn (*anyopaque, SearchQuery) anyerror!RangeBound = null,
+        score: ?*const fn (*anyopaque, []const u8, []const u8, f32, inverted.BM25Config, f32, bool) anyerror!?f32 = null,
     };
     a: Allocator,
     arena: std.heap.ArenaAllocator,
@@ -3259,7 +3262,7 @@ pub const TextNavigationPlan = struct {
         self.root = try lowerer.lower(query);
         lowerer.constrained = true;
         self.constrained_root = try lowerer.lower(query);
-        if (routed and (!restricted(self.root) or !restricted(self.constrained_root))) {
+        if (routed and (!restricted(self.root, source.range_patterns) or !restricted(self.constrained_root, source.range_patterns))) {
             self.deinit();
             return null;
         }
@@ -3313,16 +3316,17 @@ pub const TextNavigationPlan = struct {
         return if (constrained) self.scoring_constrained_root else self.scoring_root;
     }
     // A baseline can match documents absent from every positive term.
-    fn restricted(node: *const LoweredText) bool {
+    fn restricted(node: *const LoweredText, range_patterns: bool) bool {
         switch (node.kind) {
             .all, .bitmap => return false,
-            .filter => return node.pattern_terms != null,
+            .filter => return node.pattern_terms != null or range_patterns,
             .none, .term, .phrase => return true,
             .boolean => {
-                if (node.baseline != null) return false;
-                for (node.must) |child| if (!restricted(child)) return false;
-                for (node.should) |child| if (!restricted(child)) return false;
-                return true;
+                for (node.must) |child| if (restricted(child, range_patterns)) return true;
+                if (node.baseline != null or node.minimum == 0) return false;
+                var unrestricted: usize = 0;
+                for (node.should) |child| unrestricted += @intFromBool(!restricted(child, range_patterns));
+                return unrestricted < node.minimum;
             },
         }
     }
@@ -3363,7 +3367,10 @@ pub const TextNavigationPlan = struct {
             .none => possible = false,
             .all, .bitmap => return .{ .upper = std.math.inf(f32), .possible = true },
             .filter => {
-                const terms = node.pattern_terms orelse return .{ .upper = std.math.inf(f32), .possible = true };
+                const terms = node.pattern_terms orelse {
+                    if (source.pattern) |pattern| return pattern(source.ptr, node.pattern_query.?);
+                    return .{ .upper = if (node.boost >= 0 and std.math.isFinite(node.boost)) node.boost else std.math.inf(f32), .possible = true, .exact = node.boost >= 0 and std.math.isFinite(node.boost) };
+                };
                 possible = false;
                 for (terms) |term| {
                     const summary = try source.read(source.ptr, term.field, term.term, 1, self.config);
@@ -3380,6 +3387,10 @@ pub const TextNavigationPlan = struct {
                 const summary = try source.read(source.ptr, term.field, term.term, stats.average, self.config);
                 possible = summary.frequency != 0;
                 if (possible) upper = summary.tf_upper * inverted.bm25Idf(self.stats.count, @min(self.stats.count, stats.frequency)) * term.boost;
+                if (possible) if (source.score) |score| if (try score(source.ptr, term.field, term.term, stats.average, self.config, inverted.bm25Idf(self.stats.count, @min(self.stats.count, stats.frequency)), node.legacy_norm)) |ceiling| {
+                    upper = ceiling * term.boost;
+                    exact = true;
+                };
                 if (term.boost < 0 or !std.math.isFinite(term.boost)) upper = std.math.inf(f32);
             },
             .phrase => {
@@ -3581,6 +3592,7 @@ const LoweredText = struct {
     kind: enum { none, all, term, bitmap, boolean, phrase, filter } = .none,
     filter: ?query_mod.Filter = null,
     pattern_terms: ?[]const TermQuery = null,
+    pattern_query: ?SearchQuery = null,
     term: ?TermQuery = null,
     bitmap: ?*const roaring.RoaringBitmap = null,
     must: []const *const LoweredText = &.{},
@@ -3740,7 +3752,7 @@ const LoweredText = struct {
         }
         fn lower(self: *@This(), query: SearchQuery) anyerror!*const LoweredText {
             switch (query) {
-                inline .prefix, .wildcard, .regexp, .fuzzy => |q| return self.node(.{ .kind = .filter, .filter = try searchQueryToFilterArena(self.a, query), .pattern_terms = try self.stats.patternTerms(query), .boost = q.boost }),
+                inline .prefix, .wildcard, .regexp, .fuzzy => |q| return self.node(.{ .kind = .filter, .filter = try searchQueryToFilterArena(self.a, query), .pattern_terms = try self.stats.patternTerms(query), .pattern_query = query, .boost = q.boost }),
                 .match_none => return self.node(.{}),
                 .match_all => return self.node(.{ .kind = .all }),
                 .doc_num => |d| return self.node(.{ .kind = if (d.bitmap != null) .bitmap else .none, .bitmap = d.bitmap, .boost = d.boost }),
@@ -10453,6 +10465,10 @@ test "external lake metadata navigation shares scorer lowering and conservative 
         .{ .bool_query = .{ .should = &.{ common, rare }, .must_not = &.{rare} } },
         .{ .term_phrase = .{ .field = "title", .terms = &.{ "common", "rare" }, .boost = 3 } },
         .{ .bool_query = .{ .must = &.{common}, .boost = -1 } },
+        // An unexpanded broad clause cannot erase a required term proof.
+        .{ .bool_query = .{ .must = &.{ rare, .{ .prefix = .{ .field = "title", .prefix = "co" } } } } },
+        .{ .bool_query = .{ .must = &.{rare}, .should = &.{.{ .prefix = .{ .field = "title", .prefix = "" } }} } },
+        .{ .bool_query = .{ .should = &.{ common, .{ .prefix = .{ .field = "title", .prefix = "ra" } } }, .min_should = 2 } },
     };
     for (queries) |query| {
         const plan = (try TextNavigationPlan.create(a, query, .{ .ptr = &source, .count = source.snapshot.scoringDocCount(), .average = Source.average, .frequencies = Source.frequencies }, .{})).?;

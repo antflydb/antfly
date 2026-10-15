@@ -50,12 +50,14 @@ pub const LiveRowsCache = struct {
         used: u64 = 0,
         byte_len: u64 = 0,
     };
+    /// Stable cache owner; callers may use a different scratch arena per seek.
+    backing: ?A = null,
     files: [4]FileSlot = @splat(.{}),
     slots: [4]Slot = @splat(.{}),
     clock: u64 = 0,
     pub fn deinit(self: *@This(), a: A) void {
         for (&self.files) |*entry| entry.clear();
-        for (&self.slots) |*slot| if (slot.buffer) |buffer| a.free(buffer);
+        for (&self.slots) |*slot| if (slot.buffer) |buffer| (self.backing orelse a).free(buffer);
         self.* = .{};
     }
     fn file(self: *@This(), store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, ref: local.serverless_manifest_artifact_ref.ArtifactRef) !*const FileSlot {
@@ -98,7 +100,11 @@ pub const LiveRowsCache = struct {
             }
             if (slot.used < victim.used) victim = slot;
         }
-        if (victim.buffer == null) victim.buffer = try a.alloc(u8, slot_bytes);
+        if (victim.buffer == null) {
+            const backing = self.backing orelse a;
+            victim.buffer = try backing.alloc(u8, slot_bytes);
+            self.backing = backing;
+        }
         victim.fixed = .init(victim.buffer.?);
         victim.bitmap = null;
         victim.used = 0;
@@ -366,7 +372,7 @@ pub const Identities = struct {
     pub fn bitmapForPhysical(self: Identities, a: A, selected: *const @import("lake_index_physical_set.zig").Set, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead) !Bitmap {
         var result = Bitmap.init(a);
         errdefer result.deinit();
-        var cache: LiveRowsCache = .{};
+        var cache: LiveRowsCache = .{ .backing = a };
         defer cache.deinit(a);
         var file_it = self.files.iterator();
         while (file_it.next()) |entry| {
@@ -449,26 +455,40 @@ pub const Identities = struct {
         const span: Span = .{ .lower = 0, .upper = count, .rows = &.{}, .manifest = .{ .kind = .text_segment, .metadata_version = corpus.metadata_version, .artifact_id = physical.artifact_id, .checksum = physical.checksum, .byte_len = physical.byte_len }, .expected_rows = count };
         const chosen = selected.files.getPtr(file_id) orelse return null;
         var bounds: ?SourceBounds = null;
-        for (try span.blocks(cache, store, cached, file_id)) |block| {
-            try cached.context.ensureActive();
-            const base = block.high << corpus.physical.shift;
-            const bitmap = chosen.getPtr(.{ .group = block.group, .high = @intCast(base >> 32) }) orelse continue;
-            const offset: u32 = @truncate(base);
-            try bitmap.prepareRead();
-            const first = bitmap.rank(offset + block.lower);
-            const last = bitmap.rank(@intCast(@as(u64, offset) + (1 << corpus.physical.shift) - 1)) + @intFromBool(bitmap.contains(@intCast(@as(u64, offset) + (1 << corpus.physical.shift) - 1)));
-            if (first == last) continue;
-            const low = bitmap.read_rank.?.select(first).? - offset;
-            const high = bitmap.read_rank.?.select(last - 1).? - offset;
-            const ranks: SourceBounds = if (block.bitmap != null) deleted: {
-                const live = try liveRows(a, cache, store, cached, block);
-                break :deleted .{ .lower = block.base + @as(u32, @intCast(live.rank(low))), .upper = block.base + @as(u32, @intCast(live.rank(high + 1))) };
-            } else .{ .lower = block.base + @min(block.count, low - block.lower), .upper = block.base + @min(block.count, high - block.lower + 1) };
-            if (ranks.lower == ranks.upper) continue;
-            if (bounds) |*value| {
-                value.lower = @min(value.lower, ranks.lower);
-                value.upper = @max(value.upper, ranks.upper);
-            } else bounds = ranks;
+        const blocks = try span.blocks(cache, store, cached, file_id);
+        var selections = chosen.iterator();
+        while (selections.next()) |selection| {
+            const key = selection.key_ptr.*;
+            const first_high = @as(u64, key.high) << (32 - corpus.physical.shift);
+            const after_high = (@as(u64, key.high) + 1) << (32 - corpus.physical.shift);
+            var lower: usize = 0;
+            var upper = blocks.len;
+            while (lower < upper) {
+                const mid = lower + (upper - lower) / 2;
+                if (blocks[mid].group < key.group or (blocks[mid].group == key.group and blocks[mid].high < first_high)) lower = mid + 1 else upper = mid;
+            }
+            for (blocks[lower..]) |block| {
+                if (block.group != key.group or block.high >= after_high) break;
+                try cached.context.ensureActive();
+                const base = block.high << corpus.physical.shift;
+                const bitmap = selection.value_ptr;
+                const offset: u32 = @truncate(base);
+                try bitmap.prepareRead();
+                const first = bitmap.rank(offset + block.lower);
+                const last = bitmap.rank(@intCast(@as(u64, offset) + (1 << corpus.physical.shift) - 1)) + @intFromBool(bitmap.contains(@intCast(@as(u64, offset) + (1 << corpus.physical.shift) - 1)));
+                if (first == last) continue;
+                const low = bitmap.read_rank.?.select(first).? - offset;
+                const high = bitmap.read_rank.?.select(last - 1).? - offset;
+                const ranks: SourceBounds = if (block.bitmap != null) deleted: {
+                    const live = try liveRows(a, cache, store, cached, block);
+                    break :deleted .{ .lower = block.base + @as(u32, @intCast(live.rank(low))), .upper = block.base + @as(u32, @intCast(live.rank(high + 1))) };
+                } else .{ .lower = block.base + @min(block.count, low - block.lower), .upper = block.base + @min(block.count, high - block.lower + 1) };
+                if (ranks.lower == ranks.upper) continue;
+                if (bounds) |*value| {
+                    value.lower = @min(value.lower, ranks.lower);
+                    value.upper = @max(value.upper, ranks.upper);
+                } else bounds = ranks;
+            }
         }
         return bounds;
     }
@@ -478,7 +498,14 @@ pub const Identities = struct {
         const span: Span = .{ .lower = 0, .upper = count, .rows = &.{}, .manifest = .{ .kind = .text_segment, .metadata_version = corpus.metadata_version, .artifact_id = physical.artifact_id, .checksum = physical.checksum, .byte_len = physical.byte_len }, .expected_rows = count };
         const chosen = selected.files.getPtr(file_id) orelse return false;
         const upper = @as(u64, lower) + length;
-        for (try span.blocks(cache, store, cached, file_id)) |block| {
+        const blocks = try span.blocks(cache, store, cached, file_id);
+        var first_block: usize = 0;
+        var end_block = blocks.len;
+        while (first_block < end_block) {
+            const mid = first_block + (end_block - first_block) / 2;
+            if (@as(u64, blocks[mid].base) + blocks[mid].count <= lower) first_block = mid + 1 else end_block = mid;
+        }
+        for (blocks[first_block..]) |block| {
             try cached.context.ensureActive();
             if (work.* == 65536) return error.QueryCandidateBudgetExceeded;
             work.* += 1;
@@ -570,7 +597,7 @@ pub const Identities = struct {
     fn physicalSelection(self: Identities, a: A, selected: *const Bitmap, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead) !PhysicalSet {
         var result = PhysicalSet.init(a);
         errdefer result.deinit();
-        var cache: LiveRowsCache = .{};
+        var cache: LiveRowsCache = .{ .backing = a };
         defer cache.deinit(a);
         var files = self.files.iterator();
         while (files.next()) |file| {
@@ -790,7 +817,7 @@ fn PredicateResolver(comptime Set: type) type {
         /// serving packs even when the complete predicate needs a residual.
         /// Only native index walks participate. Broad proofs require compressed
         /// blocks; row-wise producers retain the selective bound.
-        pub fn selectiveCandidates(self: Self, a: A, json: []const u8, limit: usize) !?PhysicalSet {
+        pub fn selectivePredicate(self: Self, a: A, json: []const u8, limit: usize) !?rows.Predicate {
             if (Set != PhysicalSet) @compileError("physical admission requires physical coordinates");
             var scratch = std.heap.ArenaAllocator.init(a);
             defer scratch.deinit();
@@ -801,7 +828,7 @@ fn PredicateResolver(comptime Set: type) type {
             try requiredConditions(sa, compiled, &conditions, 0);
             if (conditions.items.len == 0 or conditions.items.len > 64) return null;
             var best: ?rows.Predicate = null;
-            defer if (best) |*predicate| predicate.deinit();
+            errdefer if (best) |*predicate| predicate.deinit();
             // Try a compound index first, then independent column indexes.
             // All these predicates are necessary; full membership is still
             // evaluated in the selected text windows, including OR/NOT.
@@ -825,8 +852,12 @@ fn PredicateResolver(comptime Set: type) type {
                     } else predicate.deinit();
                 }
             }
-            if (best == null) return null;
-            var result = try self.consume(a, &best.?);
+            return best;
+        }
+        pub fn selectiveCandidates(self: Self, a: A, json: []const u8, limit: usize) !?PhysicalSet {
+            var best = (try self.selectivePredicate(a, json, limit)) orelse return null;
+            defer best.deinit();
+            var result = try self.consume(a, &best);
             if (result.boundedCardinality(limit) == null) {
                 result.deinit();
                 return null;
@@ -1131,7 +1162,7 @@ fn PredicateResolver(comptime Set: type) type {
         fn consume(self: Self, a: A, predicate: *rows.Predicate) !Set {
             var result = Set.init(a);
             errdefer result.deinit();
-            var bitmap_cache: LiveRowsCache = .{};
+            var bitmap_cache: LiveRowsCache = .{ .backing = a };
             defer bitmap_cache.deinit(a);
             var window = std.heap.ArenaAllocator.init(a);
             defer window.deinit();
@@ -1215,7 +1246,7 @@ fn PredicateResolver(comptime Set: type) type {
             defer row_arena.deinit();
             var page_arena = std.heap.ArenaAllocator.init(a);
             defer page_arena.deinit();
-            var bitmap_cache: LiveRowsCache = .{};
+            var bitmap_cache: LiveRowsCache = .{ .backing = a };
             defer bitmap_cache.deinit(a);
             while (true) {
                 try self.context.ensureActive();
@@ -1661,7 +1692,7 @@ test "external lake large ordinal selections invert compressed extents and delet
     try identities.files.put(a, "selected", .{ .lower = 10, .upper = 200014, .rows = &blocks });
     try identities.files.put(a, "unselected", .{ .lower = 300000, .upper = 500004, .rows = &blocks });
     identities.spans = &.{ .{ .file = "selected", .span = identities.files.get("selected").? }, .{ .file = "unselected", .span = identities.files.get("unselected").? } };
-    var live_cache: LiveRowsCache = .{};
+    var live_cache: LiveRowsCache = .{ .backing = a };
     defer live_cache.deinit(a);
     for ([_]u32{ 10, 200010, 200011, 200012, 200013, 300000, 500003 }) |ordinal_value| {
         const row = try identities.physicalRow(a, &live_cache, store, cached, ordinal_value, "source", "snapshot");
@@ -1698,7 +1729,7 @@ test "external lake live row cache evicts within fixed backing storage and prepa
     const backing = try a.alloc(u8, 4 * LiveRowsCache.slot_bytes);
     defer a.free(backing);
     var fixed = std.heap.FixedBufferAllocator.init(backing);
-    var cache: LiveRowsCache = .{};
+    var cache: LiveRowsCache = .{ .backing = fixed.allocator() };
     defer cache.deinit(fixed.allocator());
     for (0..20) |i| {
         var live = Bitmap.init(a);
@@ -1744,7 +1775,7 @@ test "external lake selected segment predicates map ranges and bitmaps across fi
     try identities.files.put(a, "part", span);
     var result = Bitmap.init(a);
     defer result.deinit();
-    var cache: LiveRowsCache = .{};
+    var cache: LiveRowsCache = .{ .backing = a };
     defer cache.deinit(a);
     // No artifact access is necessary for contiguous physical rows.
     const store: @import("../serverless/artifacts/store.zig").ArtifactStore = undefined;

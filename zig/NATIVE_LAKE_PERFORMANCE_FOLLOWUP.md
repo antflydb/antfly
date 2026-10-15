@@ -4405,3 +4405,60 @@ and 62 focused tests passed, and all 46 real Parquet/Iceberg E2Es passed in 303.
 seconds. Generated error transport and the Apache source boundary checks passed;
 there are no unresolved merge conflicts. Provider retention qualification and
 archive-scale performance measurements remain deferred.
+
+### Streaming admission, exact single-occurrence ceilings and snapshot reuse
+
+Metadata predicate admission no longer needs a complete in-memory physical row
+set or a flat serving-pack list. A necessary native predicate streams compressed
+posting pages into inverse source routes. A bounded external merge deduplicates
+pack identities into a query-owned fixed-width disk index. The score frontier
+binary-seeks this index when clipping ranges. Construction has a 16 MiB resident
+budget and uses the statement spill manager's disk quota; exhausted optional
+planning falls back to authoritative row filtering. The legacy selective proof
+remains available for other ordering paths. No result-size limit is increased.
+Physical block seeks skip unrelated groups and rank ranges. Delete-bitmap caches
+explicitly own their backing allocator, independently of routing scratch arenas.
+
+Broad patterns retain range-local, constant-score admission even when the global
+vocabulary cannot fit the small expansion. Prefix, wildcard, regexp and fuzzy
+queries use the scorer's matcher. A range needs only one matching term witness;
+unsuccessful witness work is bounded, and unknown retains the entire range.
+Inventory cursors establish real pack endpoints before an unknown range is split.
+Only an exhausted vocabulary proves absence. Materialized prefix fields remain
+part of the conservative union. Required Boolean clauses can still route when an
+optional or other required clause has unknown membership. Final membership and
+scores remain the scorer's responsibility.
+
+BM25 envelopes whose maximum frequency is one prove a fixed frequency for every
+posting. Their norm minimum gives a monotone f32 ceiling under both canonical
+scoring formulas. These envelopes can use logical-position tie pruning without
+a rounding margin. Higher/unknown frequency envelopes and scored phrases retain
+the existing margin; this is not a claim that all BM25 arithmetic is monotone in
+frequency. Startup warming includes the authenticated logical tie tree.
+
+Archive and recent dense/sparse searches enter the same bounded scheduler pass.
+Each lane owns runtime pins, membership cursors, version maps and range-reader
+flights. Parent immutable inventory and reader authority remain pinned until all
+lanes join. Results merge in archive/run order; saturation runs on the caller,
+oversized lane work retries serially, and errors/cancellation drain every owner.
+Archive predicates reopen private membership cursors rather than sharing the
+parent's mutable cursor. Source views can adopt their own inventory without
+freeing the parent's pinned-file evidence.
+
+Immutable Iceberg manifests have a separate decoded-cache admission coordinator
+from complete snapshot plans. Fresh metadata and manifest-list selection remain
+mandatory. Unchanged manifest paths/lengths reuse parsed Avro under the current
+credential/backend scope; mutable attachments retain fresh reads. Inherited
+sequence numbers, partitions, summaries and schema are interpreted under the new
+manifest list and metadata, not cached from an older snapshot. Snapshot assembly
+uses a manifest hash directory rather than repeated linear manifest searches.
+The public inventory is still assembled linearly in its entries; this change
+avoids repeated manifest fetch/parse and quadratic manifest lookup, and does not
+claim constant-time cold planning for an arbitrarily large new snapshot.
+
+Regressions cover external pack proofs beyond 4096 entries, compressed routing
+through deleted holes, exact f32 ceilings, mixed Boolean admission, broad pattern
+scores/ties over real Parquet, archive/recent overlap with cancellation and quota
+pressure, source-view ownership, and immutable manifest reuse across freshly
+selected snapshots and credential scopes. Live-provider retention qualification
+and archive-scale latency/RSS benchmarking remain deferred.

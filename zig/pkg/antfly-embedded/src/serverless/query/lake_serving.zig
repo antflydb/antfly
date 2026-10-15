@@ -369,12 +369,53 @@ pub const ServingSource = struct {
     lazy_versions: bool = false,
     immutable_objects: bool = false,
     pinned_files: []bool = &.{},
+    pinned_files_owned: bool = true,
     // Only installed after a full coverage check against this immutable plan.
     verified_files: ?*const std.StringHashMapUnmanaged(*const external_source_api.FileEntry) = null,
     verified_inventory_lease: ?@import("lake_decoded_cache.zig").Lease = null,
     verified_selector: ?VerifiedSelector = null,
     context_store: ?*@import("lake_read_context.zig").Store = null,
     prepared_deletes: ?*@import("lake_prepared_deletes.zig").Prepared = null,
+
+    /// Parent remains pinned and quiescent until every view joins. Immutable
+    /// inventory/deletes/selector authority are borrowed; mutable version maps
+    /// and range-reader flights are private to the lane.
+    pub fn parallelView(self: *ServingSource, a: std.mem.Allocator) !ServingSource {
+        var view = self.*;
+        view.alloc = a;
+        view.inventory_owned = false;
+        view.pinned_files_owned = false;
+        view.attachment_uri = null;
+        view.versions = .empty;
+        view.delete_lease = if (self.delete_lease) |lease| lease.retain() else null;
+        view.scanner.shared_reader = null;
+        errdefer view.closeParallelView(self);
+        var entries = self.versions.iterator();
+        while (entries.next()) |entry| {
+            var file = entry.value_ptr.*;
+            file.etag = try a.dupe(u8, file.etag);
+            errdefer a.free(file.etag);
+            file.version_id = try a.dupe(u8, file.version_id);
+            errdefer a.free(file.version_id);
+            try view.versions.put(a, entry.key_ptr.*, file);
+        }
+        if (self.scanner.shared_reader) |reader| {
+            const owned = try a.create(@import("lake_serving_cache.zig").Reader);
+            owned.* = .{ .base = reader.base, .cache = reader.cache, .scope = reader.scope, .context = reader.context };
+            view.scanner.shared_reader = owned;
+        }
+        return view;
+    }
+    pub fn closeParallelView(self: *ServingSource, parent: *ServingSource) void {
+        if (self.scanner.shared_reader) |reader| {
+            reader.drain(true);
+            self.alloc.destroy(reader);
+        }
+        if (self.delete_lease) |lease| lease.release() else if (self.prepared_deletes != parent.prepared_deletes) if (self.prepared_deletes) |prepared| prepared.destroy(self.alloc);
+        self.clearVersions();
+        if (self.inventory_owned) self.inventory.deinit(self.alloc);
+        if (self.pinned_files_owned) self.alloc.free(self.pinned_files);
+    }
 
     pub fn open(alloc: std.mem.Allocator, schema: storage_schema.TableSchema, options: host_store.OpenOptions) !ServingSource {
         return openWithContext(alloc, schema, options, .{});
@@ -449,7 +490,7 @@ pub const ServingSource = struct {
                     @import("lake_prepared_deletes.zig").Prepared.hashObjectVersion(&hash, uri, metadata_bytes, binding.snapshot_mode.pinnedSnapshotId() orelse "");
                     const key = hash.finalResult();
                     plan_identity = key;
-                    var loader: SnapshotPlanLoader = .{ .client = client, .source = binding.table_id, .uri = uri, .snapshot = binding.snapshot_mode.pinnedSnapshotId(), .metadata = metadata_bytes };
+                    var loader: SnapshotPlanLoader = .{ .client = client, .source = binding.table_id, .uri = uri, .snapshot = binding.snapshot_mode.pinnedSnapshotId(), .metadata = metadata_bytes, .manifests = if (binding.object_mutability == .immutable) &shared.manifests else null, .scope = scope, .context = context };
                     // Coalesce cold manifest discovery as well as warm residency.
                     // Waiters retain their own authority, cancellation and lease;
                     // the cache owns only the immutable inventory/delete plan.
@@ -524,9 +565,12 @@ pub const ServingSource = struct {
         uri: []const u8,
         snapshot: ?[]const u8,
         metadata: []const u8,
+        manifests: ?*@import("lake_decoded_cache.zig").Cache = null,
+        scope: [32]u8 = @splat(0),
+        context: @import("lake_read_context.zig").Context = .{},
         fn load(raw: *anyopaque, item: *@import("lake_decoded_cache.zig").Item) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            item.payload = .{ .snapshot = try @import("lake_iceberg_snapshot.zig").planSnapshotInventoryAndDeletePlanFromMetadataAlloc(item.budget.allocator(), .{ .client = self.client, .source_id = self.source, .metadata_uri = self.uri, .requested_snapshot_id = self.snapshot }, self.metadata) };
+            item.payload = .{ .snapshot = try @import("lake_iceberg_snapshot.zig").planSnapshotInventoryAndDeletePlanFromMetadataAlloc(item.budget.allocator(), .{ .client = self.client, .source_id = self.source, .metadata_uri = self.uri, .requested_snapshot_id = self.snapshot, .manifests = self.manifests, .manifest_scope = self.scope, .context = self.context }, self.metadata) };
             try prepareCachedPlan(item);
         }
     };
@@ -576,8 +620,9 @@ pub const ServingSource = struct {
             pinned[entry.key_ptr.*] = true;
         }
         self.clearVersions();
-        self.alloc.free(self.pinned_files);
+        if (self.pinned_files_owned) self.alloc.free(self.pinned_files);
         self.pinned_files = pinned;
+        self.pinned_files_owned = true;
         if (self.attachment_uri) |uri| self.alloc.free(uri);
         self.attachment_uri = null;
         self.inventory = inventory;
@@ -717,7 +762,7 @@ pub const ServingSource = struct {
         if (self.iceberg_schema) |*value| value.deinit();
         self.clearVersions();
         if (self.local_plan) |*plan| plan.deinit(self.alloc);
-        self.alloc.free(self.pinned_files);
+        if (self.pinned_files_owned) self.alloc.free(self.pinned_files);
         if (self.inventory_owned) self.inventory.deinit(self.alloc);
         if (self.attachment_uri) |uri| self.alloc.free(uri);
         if (self.catalog_metadata) |*table| table.deinit(self.alloc);
@@ -864,4 +909,32 @@ test "external lake metadata navigation coalesces cold immutable snapshot discov
     try std.testing.expectEqualStrings("source", one.item.payload.snapshot.inventory.source_id);
     var canceled = std.atomic.Value(bool).init(true);
     try std.testing.expectError(error.Canceled, cache.acquire(@splat(8), 64 * 1024 * 1024, .{ .io = io, .cancellation = object_storage_api.CancellationToken.fromAtomic(&canceled) }, .{ .ptr = &state, .load = State.load }));
+}
+
+test "external lake metadata navigation parallel source views own version mutations and adopted inventories" {
+    const a = std.testing.allocator;
+    var memory = object_storage_api.MemoryObjectStorage.init(a);
+    defer memory.deinit();
+    var files = [_]external_source_api.FileEntry{.{ .file_id = @constCast("file"), .object_uri = @constCast("s3://bucket/data.parquet"), .etag = @constCast("base"), .version_id = @constCast("v0"), .byte_len = 100, .row_count = 1, .row_groups = &.{} }};
+    const inventory: external_source_api.Inventory = .{ .format = .parquet, .source_id = @constCast("table"), .source_uri = @constCast("s3://bucket"), .snapshot_id = @constCast("snapshot"), .schema_fingerprint = @constCast("schema"), .files = &files };
+    const pinned = try a.alloc(bool, 1);
+    defer a.free(pinned);
+    pinned[0] = true;
+    var parent: ServingSource = .{ .alloc = a, .store = undefined, .inventory = inventory, .scanner = PinnedExternalObjectStorageLakeRowsScanner.init(inventory, memory.client()), .inventory_owned = false, .pinned_files = pinned };
+    defer parent.clearVersions();
+    var file = files[0];
+    file.etag = try a.dupe(u8, "original");
+    file.version_id = try a.dupe(u8, "v1");
+    try parent.versions.put(a, 0, file);
+    var view = try parent.parallelView(a);
+    defer view.closeParallelView(&parent);
+    const selected = view.versions.getPtr(0).?;
+    a.free(selected.etag);
+    selected.etag = try a.dupe(u8, "changed");
+    try view.ownInventory();
+    try std.testing.expectEqualStrings("changed", view.inventory.files[0].etag);
+    try std.testing.expectEqualStrings("original", parent.versions.get(0).?.etag);
+    try std.testing.expectEqualStrings("base", parent.inventory.files[0].etag);
+    try std.testing.expect(parent.pinned_files[0]);
+    try std.testing.expect(view.pinned_files.ptr != parent.pinned_files.ptr);
 }

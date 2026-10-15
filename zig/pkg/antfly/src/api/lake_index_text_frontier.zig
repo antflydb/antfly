@@ -77,6 +77,13 @@ admitted: u64 = 0,
 summary_cache_hits: u64 = 0,
 pending: ?Pending = null,
 selection: ?[]const Id = null,
+proof: ?*@import("lake_index_pack_proof.zig") = null,
+pub fn restrictProof(self: *Self, proof: *@import("lake_index_pack_proof.zig")) !void {
+    std.debug.assert(self.admitted == 0 and self.pending == null);
+    self.proof = proof;
+    self.heap.clearRetainingCapacity();
+    if (try self.bound(@splat(0), @splat(255))) |node| try self.heap.push(self.budget.allocator(), node);
+}
 
 /// Intersect authenticated score ranges with a complete predicate admission
 /// proof. Own the small sorted set; residual row filtering stays in the scorer.
@@ -136,7 +143,7 @@ fn initialize(a: A, root: corpus.Root, store: stores.ArtifactStore, cached: arti
         self.root.collection = .{ .documents = try std.math.add(u32, collection.documents, snapshot.scoringDocCount()), .fields = fields.items };
     }
     const query = try local.storage_db_query_search_exec.textQueryToSearchQuery(self.syntax.allocator(), text, analysis, schema);
-    self.plan = if (routed) try Plan.create(ba, query, .{ .ptr = self, .count = self.root.collection.?.documents, .average = average, .frequencies = frequencies, .patterns = patternTerms }, .{}) else try Plan.prepare(ba, query, .{ .ptr = self, .count = self.root.collection.?.documents, .average = average, .frequencies = frequencies, .patterns = patternTerms }, .{});
+    self.plan = if (routed) try Plan.create(ba, query, .{ .ptr = self, .count = self.root.collection.?.documents, .average = average, .frequencies = frequencies, .patterns = patternTerms, .range_patterns = true }, .{}) else try Plan.prepare(ba, query, .{ .ptr = self, .count = self.root.collection.?.documents, .average = average, .frequencies = frequencies, .patterns = patternTerms, .range_patterns = true }, .{});
     if (self.plan == null) {
         self.deinit();
         return null;
@@ -264,9 +271,10 @@ const Range = struct {
     owner: *Self,
     first: Id,
     last: Id,
+    workspace: ?A = null,
     found_first: ?Id = null,
     found_last: Id = undefined,
-    summaries: std.StringHashMapUnmanaged(local.index.IndexSnapshot.TextTermSummary) = .empty,
+    summaries: std.StringHashMapUnmanaged(corpus.statistics.Summary) = .empty,
     fn summary(raw: *anyopaque, field: []const u8, term: []const u8, avg: f32, config: local.section_inverted.BM25Config) !local.index.IndexSnapshot.TextTermSummary {
         const self: *Range = @ptrCast(@alignCast(raw));
         const a = self.owner.scratch.allocator();
@@ -274,14 +282,114 @@ const Range = struct {
         // Repeated clauses and both canonical lowerings share each envelope.
         if (self.summaries.get(key)) |value| {
             self.owner.summary_cache_hits += 1;
-            return value;
+            return value.bound(avg, config);
         }
-        const value = try self.readSummary(key, avg, config);
+        const value = (try self.readSummary(key)) orelse return .{ .frequency = 0, .tf_upper = 0 };
         try self.summaries.put(a, key, value);
-        return value;
+        return value.bound(avg, config);
     }
-    fn readSummary(self: *Range, key: []const u8, avg: f32, config: local.section_inverted.BM25Config) !local.index.IndexSnapshot.TextTermSummary {
-        const a = self.owner.scratch.allocator();
+    // Fixed frequency makes both supported scorer formulas monotone in the
+    // encoded document length, including f32 rounding. Other envelopes retain
+    // their conservative margin; no real-number monotonicity assumption is made.
+    fn score(raw: *anyopaque, field: []const u8, term: []const u8, avg: f32, config: local.section_inverted.BM25Config, idf: f32, legacy: bool) !?f32 {
+        const self: *Range = @ptrCast(@alignCast(raw));
+        const key = try corpus.statistics.keyAlloc(self.owner.scratch.allocator(), field, term);
+        const envelope = self.summaries.get(key) orelse return null;
+        return envelope.fixedFrequencyScore(avg, config, idf, legacy);
+    }
+    fn whole(self: *Range) !bool {
+        const root = self.owner.root.tie_bounds orelse self.owner.root.directories.segments;
+        if (root) |inventory| {
+            const a = self.owner.scratch.allocator();
+            var upper: [33]u8 = undefined;
+            upper[0..32].* = self.last;
+            upper[32] = 255;
+            var forward = try tree.Cursor.init(a, self.owner.cache.store(), inventory, &self.first, &upper);
+            defer forward.deinit();
+            const first = (try forward.next()) orelse return false;
+            if (first.key.len != 36) return error.InvalidNativeLakeTextCorpus;
+            const first_id = first.key[0..32].*;
+            var reverse = try tree.Cursor.initReverse(a, self.owner.cache.store(), inventory, &self.first, &upper);
+            defer reverse.deinit();
+            const last = (try reverse.next()) orelse return error.InvalidNativeLakeTextCorpus;
+            if (last.key.len != 36) return error.InvalidNativeLakeTextCorpus;
+            self.found_first = first_id;
+            self.found_last = last.key[0..32].*;
+        } else {
+            self.found_first = self.first;
+            self.found_last = self.last;
+        }
+        return true;
+    }
+    /// Broad patterns prove presence for one hash range at a time. Stop at the
+    /// first witness and retain the whole input range: later matching terms may
+    /// occur outside that witness's envelope. No flat vocabulary union is built.
+    fn pattern(raw: *anyopaque, query: local.search_search.SearchQuery) !Plan.RangeBound {
+        const self: *Range = @ptrCast(@alignCast(raw));
+        const matcher = try local.search_search.TermPattern.create(self.owner.a, query);
+        defer matcher.deinit();
+        const boost = switch (query) {
+            inline .prefix, .wildcard, .regexp, .fuzzy => |q| q.boost,
+            else => unreachable,
+        };
+        var memory: local.sql_memory_budget = .{ .backing = self.owner.a, .limit = 2 * 1024 * 1024 };
+        const a = memory.allocator();
+        if (matcher.field().len +| matcher.prefix.len > tree.max_key_bytes - 4) return .{ .upper = 0, .possible = false, .exact = true };
+        const field = try corpus.statistics.keyAlloc(a, matcher.field(), "");
+        defer a.free(field);
+        if (matcher.filter == .prefix) if (matcher.filter.prefix.indexed_field) |indexed| {
+            const key = try corpus.statistics.keyAlloc(a, indexed, matcher.filter.prefix.prefix);
+            defer a.free(key);
+            if (try self.readSummary(key)) |_| {
+                const present = try self.whole();
+                return .{ .upper = if (boost >= 0 and std.math.isFinite(boost)) boost else std.math.inf(f32), .possible = present, .exact = boost >= 0 and std.math.isFinite(boost) };
+            }
+        };
+        const lower = try corpus.statistics.keyAlloc(a, matcher.field(), matcher.prefix);
+        defer a.free(lower);
+        var cursor = try tree.Cursor.init(a, self.owner.cache.store(), self.owner.root.term_statistics, lower, null);
+        defer cursor.deinit();
+        var examined: usize = 0;
+        var witnesses: usize = 0;
+        while (try cursor.next()) |entry| {
+            try self.owner.check();
+            if (!std.mem.startsWith(u8, entry.key, field)) break;
+            const term = entry.key[field.len..];
+            if (!std.mem.startsWith(u8, term, matcher.prefix)) break;
+            // Bound unsuccessful witness work independently for each range.
+            // Unknown retains the entire range and a finite constant-score
+            // ceiling; only an exhausted dictionary can establish absence.
+            if ((examined == 256 or witnesses == 16) and (self.owner.root.tie_bounds != null or self.owner.root.directories.segments != null)) {
+                const present = try self.whole();
+                return .{ .upper = if (boost >= 0 and std.math.isFinite(boost)) boost else std.math.inf(f32), .possible = present, .exact = boost >= 0 and std.math.isFinite(boost) };
+            }
+            examined += 1;
+            if (try matcher.matches(term)) {
+                witnesses += 1;
+                // Range-local temporary envelopes are reclaimed for every term.
+                // The outer range's summary cache and bounds stay independently owned.
+                var nested_arena = std.heap.ArenaAllocator.init(a);
+                defer nested_arena.deinit();
+                var probe: Range = .{ .owner = self.owner, .workspace = nested_arena.allocator(), .first = self.first, .last = self.last };
+                const value = try probe.readSummary(entry.key);
+                if (value != null) {
+                    const present = try self.whole();
+                    return .{ .upper = if (boost >= 0 and std.math.isFinite(boost)) boost else std.math.inf(f32), .possible = present, .exact = boost >= 0 and std.math.isFinite(boost) };
+                }
+            }
+            if (matcher.wildcard) |literal| if (literal.exact) break;
+            if (matcher.regex != null or matcher.fuzzy != null) {
+                const seek = (try matcher.seekAfter(a, term)) orelse break;
+                defer a.free(seek);
+                const key = try corpus.statistics.keyAlloc(a, matcher.field(), seek);
+                defer a.free(key);
+                try cursor.seekForward(key);
+            }
+        }
+        return .{ .upper = 0, .possible = false, .exact = true };
+    }
+    fn readSummary(self: *Range, key: []const u8) !?corpus.statistics.Summary {
+        const a = self.workspace orelse self.owner.scratch.allocator();
         const prefix = try corpus.term_directory.prefixAlloc(a, key);
         const lower = try std.mem.concat(a, u8, &.{ prefix, &self.first });
         const upper = try std.mem.concat(a, u8, &.{ prefix, &self.last, &.{0} });
@@ -315,9 +423,9 @@ const Range = struct {
                 self.found_first = value.first;
                 self.found_last = value.last;
             }
-            return value.envelope.bound(avg, config);
+            return value.envelope;
         }
-        return .{ .frequency = 0, .tf_upper = 0 };
+        return null;
     }
 };
 fn bound(self: *Self, input_first: Id, input_last: Id) !?Node {
@@ -341,9 +449,14 @@ fn bound(self: *Self, input_first: Id, input_last: Id) !?Node {
         first = ids[start];
         last = ids[lo - 1];
     }
+    if (self.proof) |proof| {
+        const clipped = (try @import("lake_index_pack_proof.zig").clip(proof, first, last)) orelse return null;
+        first = clipped.first;
+        last = clipped.last;
+    }
     _ = self.scratch.reset(.retain_capacity);
     var range: Range = .{ .owner = self, .first = first, .last = last };
-    const result = try self.plan.?.rangeBound(.{ .ptr = &range, .read = Range.summary });
+    const result = try self.plan.?.rangeBound(.{ .ptr = &range, .read = Range.summary, .score = Range.score, .pattern = Range.pattern });
     if (!result.possible) return null;
     if (range.found_first) |actual| {
         // BM25 rounding margins cannot establish an equal-score proof. Avoid
@@ -513,12 +626,7 @@ test "external lake global frontier reaches late competitive segments and comple
     const complete = (try create(a, root, store, cached, .none, .{ .term = .{ .field = "body", .term = "common" } }, .{}, .{})).?;
     defer complete.deinit();
     complete.frontier_limit = 1;
-    const Weak = struct {
-        fn summary(_: *anyopaque, _: []const u8, _: []const u8, avg: f32, config: local.section_inverted.BM25Config) !local.index.IndexSnapshot.TextTermSummary {
-            return (corpus.statistics.Summary{ .frequency = 1, .max_frequency = 1, .min_norm = 100 }).bound(avg, config);
-        }
-    };
-    const equal_cutoff = try complete.plan.?.bound(.{ .ptr = complete, .read = Weak.summary });
+    const equal_cutoff = local.section_inverted.BM25TermScorer.init(100, local.section_inverted.bm25Idf(8192, 8192), .{}).score(1, 100);
     var seen: [8192]bool = @splat(false);
     var count: usize = 0;
     while (try complete.next(equal_cutoff)) |id| {
@@ -647,8 +755,40 @@ test "external lake global frontier reaches late competitive segments and comple
     var many: ManyTerms = .{};
     var broad_root = root;
     broad_root.term_statistics = try tree.buildSorted(a, pages.store(), &many);
-    // Exhausting the proof bound must yield unknown, never a truncated union.
-    try std.testing.expect((try create(a, broad_root, store, cached, .none, .{ .prefix = .{ .field = "body", .prefix = "" } }, .{}, .{})) == null);
+    // A broad vocabulary uses range-local witnesses instead of a truncated union.
+    // This deliberately inconsistent vocabulary has no matching term envelopes.
+    const broad = (try create(a, broad_root, store, cached, .none, .{ .prefix = .{ .field = "body", .prefix = "" } }, .{}, .{})).?;
+    defer broad.deinit();
+    try std.testing.expect((try broad.next(null)) == null);
+    const Entries = struct {
+        records: []const tree.Cursor.Record,
+        position: usize = 0,
+        pub fn next(self: *@This()) !?tree.Cursor.Record {
+            if (self.position == self.records.len) return null;
+            defer self.position += 1;
+            return self.records[self.position];
+        }
+    };
+    var broad_buffer: [corpus.statistics.Summary.max_bytes]u8 = undefined;
+    const records = try sa.alloc(tree.Cursor.Record, 129);
+    for (records, 0..) |*record, i| {
+        var term: [4]u8 = undefined;
+        std.mem.writeInt(u32, &term, @intCast(i), .big);
+        const term_key = try corpus.statistics.keyAlloc(sa, "body", &term);
+        record.* = .{ .key = try std.mem.concat(sa, u8, &.{ try corpus.term_directory.prefixAlloc(sa, term_key), &last }), .value = try sa.dupe(u8, (corpus.statistics.Summary{ .frequency = 1, .max_frequency = 1, .min_norm = 100 }).encode(&broad_buffer)) };
+    }
+    var many_routes: Entries = .{ .records = records };
+    broad_root.term_directory.leaves = try tree.buildSorted(a, reduced, &many_routes);
+    const broad_present = (try create(a, broad_root, store, cached, .none, .{ .prefix = .{ .field = "body", .prefix = "" } }, .{}, .{})).?;
+    defer broad_present.deinit();
+    try std.testing.expectEqual(last, (try broad_present.next(null)).?);
+    try std.testing.expect((try broad_present.next(null)) == null);
+    const bm25_ties = (try create(a, tied_root, store, cached, .none, .{ .term = .{ .field = "body", .term = "rare" } }, .{}, .{})).?;
+    defer bm25_ties.deinit();
+    try std.testing.expectEqual(last, (try bm25_ties.next(null)).?);
+    const exact_score = local.section_inverted.BM25TermScorer.init(100, local.section_inverted.bm25Idf(8192, 3), .{}).score(1, 100);
+    try std.testing.expect((try bm25_ties.nextRanked(exact_score, .{ .file = @splat(0), .rank = 0 })) == null);
+    try std.testing.expectEqual(@as(u64, 1), bm25_ties.admitted);
     const absent = (try create(a, root, store, cached, .none, .{ .prefix = .{ .field = "body", .prefix = "missing" } }, .{}, .{})).?;
     defer absent.deinit();
     try std.testing.expect((try absent.next(null)) == null);

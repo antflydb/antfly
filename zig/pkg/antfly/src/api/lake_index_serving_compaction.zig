@@ -503,7 +503,7 @@ test "external lake global frontier cross file packs preserve coordinates ties r
             var route_pages: pages_mod.PageStore = .{ .domain = root_.domain, .artifacts = &route_store, .remaining_read_bytes = &route_reads, .remaining_write_bytes = &route_writes };
             var route_cache: tree.Cache = .{ .alloc = a_, .underlying = route_pages.store() };
             defer route_cache.deinit();
-            var physical: @import("lake_index_text_predicate.zig").LiveRowsCache = .{};
+            var physical: @import("lake_index_text_predicate.zig").LiveRowsCache = .{ .backing = a_ };
             defer physical.deinit(a_);
             for (0..expected) |i| {
                 const row = try identities.physicalRow(a_, &physical, store_, cached, @intCast(i), "source", "snapshot");

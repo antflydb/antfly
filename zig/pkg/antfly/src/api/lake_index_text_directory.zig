@@ -936,7 +936,7 @@ test "external lake exact segment admission skips missing unrelated descriptors 
     defer full_snapshot.release();
     const full_ids = try @import("lake_index_text_predicate.zig").Identities.init(ca, full, full_snapshot);
     try store.delete(group.physical_manifest.?.artifact_id);
-    var missing_rows: @import("lake_index_text_predicate.zig").LiveRowsCache = .{};
+    var missing_rows: @import("lake_index_text_predicate.zig").LiveRowsCache = .{ .backing = a };
     defer missing_rows.deinit(a);
     try std.testing.expectError(error.FileNotFound, full_ids.physicalRow(a, &missing_rows, store, cached, 8, "source", "snapshot"));
     // A precise seek needs neither a file catalog nor any maintenance manifest.
@@ -955,7 +955,7 @@ test "external lake exact segment admission skips missing unrelated descriptors 
     const snapshot = writer.acquireSnapshot();
     defer snapshot.release();
     const identities = try @import("lake_index_text_predicate.zig").Identities.init(ca, selected, snapshot);
-    var rows: @import("lake_index_text_predicate.zig").LiveRowsCache = .{};
+    var rows: @import("lake_index_text_predicate.zig").LiveRowsCache = .{ .backing = a };
     defer rows.deinit(a);
     for (0..9) |i| {
         const physical: local.storage_rowsource_types.RowRef = .{ .external = .{ .source_id = "source", .snapshot_id = "snapshot", .file_id = group.file.id, .row_group_ordinal = 0, .row_ordinal = 10 + i } };

@@ -104,6 +104,15 @@ pub const Summary = struct {
         }
         return result;
     }
+    /// An exact f32 ceiling for the common single-occurrence population.
+    /// Quantized maxima of one prove every posting has frequency one. Norm
+    /// minima remain conservative for both canonical scoring arithmetic paths.
+    pub fn fixedFrequencyScore(self: Summary, average: f32, config: inverted.BM25Config, idf: f32, legacy: bool) ?f32 {
+        if (!(average > 0) or !std.math.isFinite(average) or !std.math.isFinite(idf) or idf < 0 or
+            !std.math.isFinite(config.k1) or config.k1 < 0 or !std.math.isFinite(config.b) or config.b < 0 or config.b > 1 or self.max_frequency != 1) return null;
+        const value = if (legacy) inverted.bm25ScoreWithIdf(1, self.min_norm, average, idf, config) else inverted.BM25TermScorer.init(average, idf, config).score(1, self.min_norm);
+        return if (std.math.isFinite(value)) value else null;
+    }
     pub fn bound(self: Summary, average: f32, config: inverted.BM25Config) local.index.IndexSnapshot.TextTermSummary {
         const valid = std.math.isFinite(config.k1) and config.k1 >= 0 and std.math.isFinite(config.b) and config.b >= 0 and config.b <= 1 and std.math.isFinite(average) and average > 0;
         var upper: f32 = 0;
@@ -1371,4 +1380,19 @@ test "external lake text statistics durable deltas coalesce files and resume sig
     var old = try tree.Cursor.init(a, memory.store(), prior, "", null);
     defer old.deinit();
     try std.testing.expectEqual(@as(u64, 3), try decodeFrequency((try old.next()).?.value));
+}
+
+test "external lake global frontier exact frequency one ceilings cover canonical scorer arithmetic" {
+    const summary: Summary = .{ .frequency = 100, .max_frequency = 1, .min_norm = 3 };
+    for ([_]f32{ 0.125, 1, 100, 1000000 }) |average| for ([_]f32{ 0, 0.5, 1.2, 8 }) |k1| for ([_]f32{ 0, 0.75, 1 }) |b| for ([_]f32{ 0, 0.0001, 1, 100 }) |idf| for ([_]bool{ false, true }) |legacy| {
+        const config: inverted.BM25Config = .{ .k1 = k1, .b = b };
+        const bound_ = summary.fixedFrequencyScore(average, config, idf, legacy).?;
+        for ([_]u32{ 3, 4, 5, 255, 65535, std.math.maxInt(u32) }) |norm| {
+            const actual = if (legacy) inverted.bm25ScoreWithIdf(1, norm, average, idf, config) else inverted.BM25TermScorer.init(average, idf, config).score(1, norm);
+            try std.testing.expect(bound_ >= actual);
+        }
+    };
+    var uncertain = summary;
+    uncertain.max_frequency = 2;
+    try std.testing.expect(uncertain.fixedFrequencyScore(100, .{}, 1, false) == null);
 }

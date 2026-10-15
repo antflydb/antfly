@@ -74,7 +74,7 @@ pub fn select(a: A, storage: tree.Store, root: corpus.Root, store: stores.Artifa
     if (selected.files.count() > 256) return error.QueryCandidateBudgetExceeded;
     var scratch = std.heap.ArenaAllocator.init(a);
     defer scratch.deinit();
-    var live: predicates.LiveRowsCache = .{};
+    var live: predicates.LiveRowsCache = .{ .backing = a };
     defer live.deinit(a);
     var ids: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
     defer ids.deinit(a);
@@ -124,11 +124,52 @@ pub fn select(a: A, storage: tree.Store, root: corpus.Root, store: stores.Artifa
     }.less);
     return result;
 }
+/// Stream a compressed predicate page into an external pack-ID sort. The caller
+/// bounds page memory and disk; archive size does not impose a flat result cap.
+pub fn stream(a: A, storage: tree.Store, root: corpus.Root, store: stores.ArtifactStore, cached: artifacts.CachedRead, token: @import("antfly_cancellation").CancellationToken, selected: *const @import("lake_index_physical_set.zig").Set, visitor: anytype) !void {
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    var live: predicates.LiveRowsCache = .{ .backing = a };
+    defer live.deinit(a);
+    var work: usize = 0;
+    var files = selected.files.keyIterator();
+    while (files.next()) |file| {
+        _ = scratch.reset(.free_all);
+        const sa = scratch.allocator();
+        const prefix = corpus.term_directory.identity(file.*);
+        var start = try tree.Cursor.init(sa, storage, root.source_routes, &prefix, null);
+        defer start.deinit();
+        const initial = (try start.next()) orelse continue;
+        if (initial.key.len != 40 or !std.mem.eql(u8, initial.key[0..32], &prefix)) continue;
+        const first = try decode(sa, root, initial.key, initial.value, file.*);
+        const bounds = (try predicates.Identities.sourceBounds(sa, &live, store, cached, first.physical, first.file_rows, selected, file.*)) orelse continue;
+        var fence: [41]u8 = @splat(0);
+        fence[0..32].* = prefix;
+        std.mem.writeInt(u32, fence[32..36], bounds.lower, .big);
+        var predecessor = try tree.Cursor.initReverse(sa, storage, root.source_routes, &prefix, &fence);
+        defer predecessor.deinit();
+        const prior = (try predecessor.next()) orelse return error.InvalidNativeLakeTextCorpus;
+        const lower = try sa.dupe(u8, prior.key);
+        std.mem.writeInt(u32, fence[32..36], bounds.upper, .big);
+        var cursor = try tree.Cursor.init(sa, storage, root.source_routes, lower, fence[0..36]);
+        defer cursor.deinit();
+        while (try cursor.next()) |entry| {
+            try cached.context.ensureActive();
+            try token.check();
+            const route = try decode(sa, root, entry.key, entry.value, file.*);
+            if (route.file_rows != first.file_rows or !std.mem.eql(u8, route.physical.artifact_id, first.physical.artifact_id)) return error.InvalidNativeLakeTextCorpus;
+            work = 0;
+            if (!try predicates.Identities.sourceRangeSelected(sa, &live, store, cached, route.physical, route.file_rows, selected, file.*, route.file_lower, route.count, &work)) continue;
+            try visitor.add(route.segment);
+        }
+    }
+}
+
 fn selectPoints(a: A, storage: tree.Store, root: corpus.Root, store: stores.ArtifactStore, cached: artifacts.CachedRead, token: @import("antfly_cancellation").CancellationToken, selected: *const @import("lake_index_physical_set.zig").Set, source: []const u8, snapshot: []const u8) ![]const [32]u8 {
     if (selected.boundedCardinality(4096) == null) return error.QueryCandidateBudgetExceeded;
     var scratch = std.heap.ArenaAllocator.init(a);
     defer scratch.deinit();
-    var live: predicates.LiveRowsCache = .{};
+    var live: predicates.LiveRowsCache = .{ .backing = a };
     defer live.deinit(a);
     var ids: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
     defer ids.deinit(a);
@@ -220,5 +261,17 @@ test "external lake bounded WAL compressed predicate spans route broad rows acro
         try std.testing.expectEqual(corpus.term_directory.identity(refs[pack_count / 2].artifact_id), found[0]);
         try selected.addBlock(.{ .file = file.id, .group = 7, .base = @as(u64, 1) << 40, .selection = .{ .interval = .{ .lower = 0, .count = 50000 } } });
         try std.testing.expectError(error.QueryCandidateBudgetExceeded, select(ca, pages.store(), root, store, cached, .none, &selected, "source", "snapshot"));
+        const Sink = struct {
+            a: A,
+            ids: std.AutoHashMapUnmanaged([32]u8, void) = .empty,
+            pub fn add(self: *@This(), id: [32]u8) !void {
+                try self.ids.put(self.a, id, {});
+            }
+        };
+        var sink: Sink = .{ .a = a };
+        defer sink.ids.deinit(a);
+        try stream(a, pages.store(), root, store, cached, .none, &selected, &sink);
+        try std.testing.expectEqual(pack_count, sink.ids.count());
+        for (refs[0..pack_count]) |ref| try std.testing.expect(sink.ids.contains(corpus.term_directory.identity(ref.artifact_id)));
     };
 }

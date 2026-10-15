@@ -345,7 +345,7 @@ test "external lake cross file compaction preserves physical holes score ties re
     var merged = try corpus.loadWriter(a, store, expanded, .none, cached, null);
     defer merged.deinit();
     const identities = try @import("lake_index_text_predicate.zig").Identities.init(ca, expanded, merged.snapshot());
-    var live: @import("lake_index_text_predicate.zig").LiveRowsCache = .{};
+    var live: @import("lake_index_text_predicate.zig").LiveRowsCache = .{ .backing = a };
     defer live.deinit(a);
     for (0..32) |i| {
         const old_key = (try baseline.snapshot().storedIdScoped(a, @intCast(i))).?;

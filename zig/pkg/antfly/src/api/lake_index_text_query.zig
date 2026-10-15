@@ -629,6 +629,7 @@ const Execution = struct {
         if (self.overlay != null or self.active_recent) return null;
         const identities = self.text_identities.get(@intFromPtr(snapshot)) orelse return null;
         if (identities.spans.len == 0) return null;
+        self.ordinal_live_rows.backing = self.result_allocator;
         const row = try identities.physicalRow(a, &self.ordinal_live_rows, self.store.artifactStore(), .{ .cache = &self.server.lake_read_cache, .scope = self.domain, .context = self.context }, doc, self.source.inventory.source_id, self.source.inventory.snapshot_id);
         return try local.storage_rowsource_identity.allocId(a, row);
     }
@@ -896,7 +897,7 @@ const Execution = struct {
         const Winner = struct { index: usize, ordinal: u32 };
         const winners = try a.alloc(Winner, hits.len);
         defer a.free(winners);
-        var live: @import("lake_index_text_predicate.zig").LiveRowsCache = .{};
+        var live: @import("lake_index_text_predicate.zig").LiveRowsCache = .{ .backing = a };
         defer live.deinit(a);
         const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store.identity, .context = self.context };
         var input = std.heap.ArenaAllocator.init(a);
@@ -1431,19 +1432,30 @@ const Execution = struct {
         // Selective indexed metadata leads admission even for a common text
         // term. A one-row filter must not open every archive pack just because
         // its result count is smaller than K. Recent WAL rows remain separate.
-        const predicate_selection = if (req.filter_query_json.len != 0)
+        var ordering: ?local.storage_db_query_search_exec.SearchHitOrder = if (req.order_by.len != 0 or req.search_after.len != 0 or req.search_before.len != 0)
+            try .init(a, req, runtime)
+        else
+            null;
+        defer if (ordering) |*order| order.deinit(a);
+        const pack_proof_mod = @import("lake_index_pack_proof.zig");
+        var pack_proof: ?*pack_proof_mod = null;
+        defer if (pack_proof) |proof| proof.deinit();
+        const stream_predicate = req.filter_query_json.len != 0 and scoreFrontierEligible(req, if (ordering) |*order| order else null);
+        if (stream_predicate) {
+            const resolver: @import("lake_index_text_predicate.zig").PhysicalResolver = .{ .server = self.server, .table = self.table, .source = self.source, .context = self.request, .store = self.store.artifactStore(), .store_identity = self.store.identity, .read_context = self.context, .pinned = .{ .artifacts = self.store.artifactStore(), .store_identity = self.store.identity, .domain = self.domain, .declarations = self.declarations, .read_context = self.context } };
+            pack_proof = pack_proof_mod.create(root, self.store.artifactStore(), cached, resolver, req.filter_query_json, cancellation) catch |err| switch (err) {
+                error.OutOfMemory, error.ArtifactReadBudgetExceeded, error.QueryCandidateBudgetExceeded, error.SqlProgramLimitExceeded => null,
+                else => return err,
+            };
+        }
+        const predicate_selection = if (!stream_predicate and req.filter_query_json.len != 0)
             self.predicatePacks(root, cached, cancellation, req.filter_query_json) catch |err| switch (err) {
                 error.OutOfMemory, error.ArtifactReadBudgetExceeded, error.QueryCandidateBudgetExceeded => null,
                 else => return err,
             }
         else
             null;
-        if (root.segment_count == 0 or (predicate_selection == null and root.segment_count <= window_config.admission_window_segments and planning_bytes <= window_config.admission_window_bytes)) return null;
-        var ordering: ?local.storage_db_query_search_exec.SearchHitOrder = if (req.order_by.len != 0 or req.search_after.len != 0 or req.search_before.len != 0)
-            try .init(a, req, runtime)
-        else
-            null;
-        defer if (ordering) |*order| order.deinit(a);
+        if (root.segment_count == 0 or (pack_proof == null and predicate_selection == null and root.segment_count <= window_config.admission_window_segments and planning_bytes <= window_config.admission_window_bytes)) return null;
         if (ordering) |order| {
             // An ordered row index can stop after the winning prefix. Retain
             // that global seek instead of scanning every window's doc values.
@@ -1501,7 +1513,19 @@ const Execution = struct {
             };
         }
         defer if (frontier) |value| value.deinit();
-        if (frontier) |value| if (predicate_selection) |ids_| try value.restrict(ids_);
+        if (frontier) |value| {
+            // Optional admission must not make a valid query fail on its own quota.
+            // Rebuild ordinary navigation if proof attachment exhausts the frontier.
+            if (pack_proof) |proof| {
+                value.restrictProof(proof) catch |err| switch (err) {
+                    error.OutOfMemory, error.ArtifactReadBudgetExceeded => {
+                        value.deinit();
+                        frontier = null;
+                    },
+                    else => return err,
+                };
+            } else if (predicate_selection) |ids_| try value.restrict(ids_);
+        }
         var preparation: ?*frontier_mod = null;
         if (frontier == null and req.distributed_text_stats.len == 0) {
             _ = plan.reset(.retain_capacity);
@@ -1670,7 +1694,7 @@ const Execution = struct {
             result.sort_profile_storage = profiled.sort_profile_storage;
             profiled.sort_profile = null;
             profiled.sort_profile_storage = null;
-            result.sort_profile.?.selection_reason = if (predicate_selection != null) "indexed_predicate_text_admission" else if (frontier != null) "bounded_global_text_frontier" else "bounded_text_routing_windows";
+            result.sort_profile.?.selection_reason = if (predicate_selection != null or (frontier != null and pack_proof != null)) "indexed_predicate_text_admission" else if (frontier != null) "bounded_global_text_frontier" else "bounded_text_routing_windows";
             result.sort_profile.?.selected_count = result.hits.len;
             result.sort_profile.?.window_capacity = winners.limit;
             result.sort_profile.?.collector_heap_peak = winners.peak;
@@ -1692,7 +1716,7 @@ const Execution = struct {
         var budget: local.sql_memory_budget = .{ .backing = a, .limit = 16 * 1024 * 1024 };
         var scratch = std.heap.ArenaAllocator.init(budget.allocator());
         defer scratch.deinit();
-        var live: @import("lake_index_text_predicate.zig").LiveRowsCache = .{};
+        var live: @import("lake_index_text_predicate.zig").LiveRowsCache = .{ .backing = budget.allocator() };
         defer live.deinit(budget.allocator());
         const tree = @import("../serverless/graph_segment/page_tree.zig");
         var store = self.store.artifactStore();
@@ -1789,7 +1813,7 @@ const Execution = struct {
             candidate_pin = (try acquireForRanking(raw, req.index_name)) orelse return error.InvalidNativeLakeTextCorpus;
             self.forced_pin = &candidate_pin.?;
             const identities = self.text_identities.get(@intFromPtr(candidate_pin.?.snapshot)) orelse return error.InvalidNativeLakeTextCorpus;
-            var live: @import("lake_index_text_predicate.zig").LiveRowsCache = .{};
+            var live: @import("lake_index_text_predicate.zig").LiveRowsCache = .{ .backing = a };
             defer live.deinit(a);
             const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store.identity, .context = self.context };
             for (rows) |row| if (try identities.ordinal(a, &live, self.store.artifactStore(), cached, row)) |number| try numbers.append(a, number);
@@ -1866,34 +1890,54 @@ const Execution = struct {
     // Independent executions own every mutable map, runtime pin and allocator.
     // Results retain scheduler admission until joined; no private pool is used.
     fn searchRecentParts(self: *Execution, a: A, req: types.SearchRequest, query: anytype, comptime part: anytype, combined: *types.SearchResult, scheduling: *local.sql_parallel_scheduler.Scheduler) !void {
+        return self.searchVectorParts(a, req, query, part, combined, scheduling, false);
+    }
+    fn searchVectorParts(self: *Execution, a: A, req: types.SearchRequest, query: anytype, comptime part: anytype, combined: *types.SearchResult, scheduling: *local.sql_parallel_scheduler.Scheduler, comptime include_archive: bool) !void {
         const scheduler = local.sql_parallel_scheduler;
         const workspace = 16 * 1024 * 1024;
         const Worker = struct {
             budget: local.sql_memory_budget = .{ .backing = std.heap.page_allocator, .limit = workspace },
             arena: std.heap.ArenaAllocator,
             execution: Execution,
+            source_view: ?local.serverless_query_lake_serving.ServingSource = null,
+            parent_source: *local.serverless_query_lake_serving.ServingSource = undefined,
             result: ?types.SearchResult = null,
             task: ?scheduler.Task(anyerror!void) = null,
             failure: ?anyerror = null,
             done: std.Io.Event = .unset,
-            fn create(base: *Execution, selected_run: @import("lake_recent_vectors.zig").Run, limit: usize, backing: A) !*@This() {
+            fn create(base: *Execution, selected_run: ?@import("lake_recent_vectors.zig").Run, limit: usize, backing: A) !*@This() {
                 const owner = try std.heap.page_allocator.create(@This());
                 owner.* = .{ .arena = undefined, .execution = undefined };
                 owner.budget.limit = limit;
                 owner.budget.backing = backing;
                 owner.arena = .init(owner.budget.allocator());
-                owner.execution = .{ .server = base.server, .overlay = base.overlay, .table = base.table, .source = base.source, .store = base.store, .domain = base.domain, .declarations = base.declarations, .context = base.context, .request = base.request, .schema_json = base.schema_json, .hydration_fields = base.hydration_fields, .vector_filter = base.vector_filter, .vector_exclusion = base.vector_exclusion, .active_recent = true, .recent_run = selected_run, .recent_runs = base.recent_runs, .recent_declarations = base.recent_declarations, .recent_cloud = base.recent_cloud, .cloud_generations = base.cloud_generations, .typed_delivery = base.typed_delivery, .navigation = base.navigation, .files = base.files, .private_files = base.private_files, .private_digests = base.private_digests, .arena = owner.arena.allocator(), .result_allocator = owner.budget.allocator() };
+                errdefer {
+                    owner.arena.deinit();
+                    std.heap.page_allocator.destroy(owner);
+                }
+                owner.parent_source = base.source;
+                if (include_archive) owner.source_view = try base.source.parallelView(owner.budget.allocator());
+                owner.execution = .{ .server = base.server, .overlay = base.overlay, .table = base.table, .source = if (include_archive) &owner.source_view.? else base.source, .store = base.store, .domain = base.domain, .declarations = base.declarations, .context = base.context, .request = base.request, .schema_json = base.schema_json, .hydration_fields = base.hydration_fields, .vector_filter = base.vector_filter, .vector_exclusion = base.vector_exclusion, .active_recent = selected_run != null, .recent_run = selected_run, .recent_runs = base.recent_runs, .recent_declarations = base.recent_declarations, .recent_cloud = base.recent_cloud, .cloud_generations = base.cloud_generations, .typed_delivery = base.typed_delivery, .navigation = base.navigation, .files = base.files, .private_files = base.private_files, .private_digests = base.private_digests, .arena = owner.arena.allocator(), .result_allocator = owner.budget.allocator() };
                 return owner;
             }
             fn run(owner: *@This(), request: types.SearchRequest, q: @TypeOf(query)) anyerror!void {
                 defer if (owner.execution.context.io) |io| owner.done.set(io);
                 try owner.execution.context.ensureActive();
+                if (include_archive and !owner.execution.active_recent and (request.filter_query_json.len != 0 or request.exclusion_query_json.len != 0)) {
+                    // Membership cursors are mutable. Reopen them under this lane's
+                    // pinned source rather than copying or sharing the parent cursor.
+                    const execution = &owner.execution;
+                    const resolver: @import("lake_index_text_predicate.zig").PhysicalResolver = .{ .server = execution.server, .table = execution.table, .source = execution.source, .context = execution.request, .store = execution.store.artifactStore(), .store_identity = execution.store.identity, .read_context = execution.context, .pinned = .{ .artifacts = execution.store.artifactStore(), .store_identity = execution.store.identity, .domain = execution.domain, .declarations = execution.declarations, .read_context = execution.context } };
+                    if (request.filter_query_json.len != 0) execution.vector_include_provider = try resolver.openMembership(owner.budget.allocator(), request.filter_query_json);
+                    if (request.exclusion_query_json.len != 0) execution.vector_exclude_provider = try resolver.openMembership(owner.budget.allocator(), request.exclusion_query_json);
+                }
                 owner.result = try part(&owner.execution, owner.budget.allocator(), request, q);
             }
             fn close(owner: *@This()) void {
                 std.debug.assert(owner.task == null);
                 if (owner.result) |*result| result.deinit();
                 owner.execution.deinit();
+                if (owner.source_view) |*view| view.closeParallelView(owner.parent_source);
                 owner.arena.deinit();
                 std.debug.assert(owner.budget.live == 0);
                 std.heap.page_allocator.destroy(owner);
@@ -1902,7 +1946,8 @@ const Execution = struct {
         const legacy = [_]@import("lake_recent_vectors.zig").Run{.{ .prefix = 0, .digest = @splat(0), .declarations = self.recent_declarations, .cloud_generations = self.recent_cloud }};
         const runs = if (self.recent_runs.len != 0) self.recent_runs else &legacy;
         var first: usize = 0;
-        while (first < runs.len) {
+        const archive_count: usize = @intFromBool(include_archive);
+        while (first < runs.len + archive_count) {
             var workers: [3]?*Worker = @splat(null);
             defer {
                 for (&workers) |*slot| if (slot.*) |worker| {
@@ -1914,9 +1959,9 @@ const Execution = struct {
                     worker.close();
                 };
             }
-            const count = @min(workers.len, runs.len - first);
+            const count = @min(workers.len, runs.len + archive_count - first);
             for (workers[0..count], 0..) |*slot, i| {
-                const worker = try Worker.create(self, runs[first + i], workspace, @import("antfly_platform").allocator.processAllocator(std.heap.page_allocator));
+                const worker = try Worker.create(self, if (include_archive and first + i == 0) null else runs[first + i - archive_count], workspace, @import("antfly_platform").allocator.processAllocator(std.heap.page_allocator));
                 slot.* = worker;
                 if (self.context.io) |io| worker.task = scheduling.submitIo(io, workspace, Worker.run, .{ worker, req, query });
                 if (worker.task == null) Worker.run(worker, req, query) catch |err| {
@@ -1947,7 +1992,7 @@ const Execution = struct {
                     // allocation policy instead of inheriting a lane quota.
                     worker.close();
                     slot.* = null;
-                    worker = try Worker.create(self, runs[first + i], std.math.maxInt(usize), a);
+                    worker = try Worker.create(self, if (include_archive and first + i == 0) null else runs[first + i - archive_count], std.math.maxInt(usize), a);
                     slot.* = worker;
                     try Worker.run(worker, req, query);
                 }
@@ -1966,10 +2011,9 @@ const Execution = struct {
         var leaf = req;
         leaf.offset = 0;
         leaf.limit = std.math.add(u32, req.offset, req.limit) catch return error.QueryCandidateBudgetExceeded;
-        self.active_recent = false;
-        var combined = try searchDensePart(raw, a, leaf, query);
+        var combined: types.SearchResult = .{ .alloc = a, .hits = &.{}, .total_hits = 0 };
         defer combined.deinit();
-        try self.searchRecentParts(a, leaf, query, searchDensePart, &combined, local.sql_parallel_scheduler.global());
+        try self.searchVectorParts(a, leaf, query, searchDensePart, &combined, local.sql_parallel_scheduler.global(), true);
         return local.api_query.mergeSearchResults(a, req, &.{combined}, req.offset, req.limit);
     }
     fn searchDensePart(raw: ?*anyopaque, a: A, req: types.SearchRequest, dense: types.DenseKnnQuery) !types.SearchResult {
@@ -2040,10 +2084,9 @@ const Execution = struct {
         var leaf = req;
         leaf.offset = 0;
         leaf.limit = std.math.add(u32, req.offset, req.limit) catch return error.QueryCandidateBudgetExceeded;
-        self.active_recent = false;
-        var combined = try searchSparsePart(raw, a, leaf, query);
+        var combined: types.SearchResult = .{ .alloc = a, .hits = &.{}, .total_hits = 0 };
         defer combined.deinit();
-        try self.searchRecentParts(a, leaf, query, searchSparsePart, &combined, local.sql_parallel_scheduler.global());
+        try self.searchVectorParts(a, leaf, query, searchSparsePart, &combined, local.sql_parallel_scheduler.global(), true);
         return local.api_query.mergeSearchResults(a, req, &.{combined}, req.offset, req.limit);
     }
     fn searchSparsePart(raw: ?*anyopaque, a: A, req: types.SearchRequest, sparse: types.SparseKnnQuery) !types.SearchResult {
@@ -3642,26 +3685,34 @@ test "external lake bounded WAL vector lanes join cancel saturate and retry over
         active: std.atomic.Value(usize) = .init(0),
         peak: std.atomic.Value(usize) = .init(0),
         calls: std.atomic.Value(usize) = .init(0),
+        archive_active: std.atomic.Value(bool) = .init(false),
+        archive_overlap: std.atomic.Value(bool) = .init(false),
         fn part(raw: ?*anyopaque, alloc: A, _: types.SearchRequest, oversized: bool) !types.SearchResult {
             const execution = Execution.from(raw);
             const self: *@This() = @ptrCast(@alignCast(execution.server));
+            const prefix = if (execution.recent_run) |run_| run_.prefix else 0;
+            if (prefix == 0) self.archive_active.store(true, .release);
+            defer if (prefix == 0) {
+                self.archive_active.store(false, .release);
+            };
+            if (prefix != 0 and self.archive_active.load(.acquire)) self.archive_overlap.store(true, .release);
             const active = self.active.fetchAdd(1, .acq_rel) + 1;
             defer _ = self.active.fetchSub(1, .acq_rel);
             _ = self.calls.fetchAdd(1, .monotonic);
             _ = self.peak.fetchMax(active, .acq_rel);
             if (active >= 2) self.started.set(self.io);
             try self.gate.wait(self.io);
-            if (oversized and execution.recent_run.?.prefix == 1) {
+            if (oversized and prefix == 1) {
                 const bytes = try alloc.alloc(u8, 17 * 1024 * 1024);
                 alloc.free(bytes);
             }
             const hits = try alloc.alloc(types.SearchHit, 1);
             errdefer alloc.free(hits);
-            hits[0] = .{ .id = try std.fmt.allocPrint(alloc, "run-{d}", .{execution.recent_run.?.prefix}), .score = @floatFromInt(execution.recent_run.?.prefix) };
+            hits[0] = .{ .id = try std.fmt.allocPrint(alloc, "run-{d}", .{prefix}), .score = @floatFromInt(prefix) };
             return .{ .alloc = alloc, .hits = hits, .total_hits = 1 };
         }
         fn run(execution: *Execution, alloc: A, result: *types.SearchResult, scheduling: *local.sql_parallel_scheduler.Scheduler, oversized: bool) !void {
-            try execution.searchRecentParts(alloc, .{ .limit = 2, .full_text = .{ .term = .{ .field = "body", .term = "score" } } }, oversized, part, result, scheduling);
+            try execution.searchVectorParts(alloc, .{ .limit = 2, .full_text = .{ .term = .{ .field = "body", .term = "score" } } }, oversized, part, result, scheduling, true);
         }
     };
     for ([_]u8{ 0, 1, 2, 3 }) |mode| {
@@ -3671,7 +3722,9 @@ test "external lake bounded WAL vector lanes join cancel saturate and retry over
         if (mode == 1 or mode == 3) state.gate.set(io);
         var runs: [4]@import("lake_recent_vectors.zig").Run = undefined;
         for (&runs, 1..) |*run, i| run.* = .{ .prefix = @intCast(i), .digest = @splat(0), .declarations = &.{}, .cloud_generations = null };
-        var execution: Execution = .{ .server = @ptrCast(@alignCast(&state)), .table = undefined, .source = undefined, .store = undefined, .domain = @splat(0), .declarations = &.{}, .context = .{ .io = io }, .request = .{}, .schema_json = "{}", .arena = a, .result_allocator = a, .recent_runs = &runs };
+        var source: local.serverless_query_lake_serving.ServingSource = .{ .alloc = a, .store = undefined, .inventory = undefined, .scanner = undefined };
+        source.scanner.shared_reader = null;
+        var execution: Execution = .{ .server = @ptrCast(@alignCast(&state)), .table = undefined, .source = &source, .store = undefined, .domain = @splat(0), .declarations = &.{}, .context = .{ .io = io }, .request = .{}, .schema_json = "{}", .arena = a, .result_allocator = a, .recent_runs = &runs };
         defer execution.deinit();
         var result: types.SearchResult = .{ .alloc = a, .hits = &.{}, .total_hits = 0 };
         defer result.deinit();
@@ -3690,13 +3743,16 @@ test "external lake bounded WAL vector lanes join cancel saturate and retry over
         } else {
             state.gate.set(io);
             try future.await(io);
-            try std.testing.expectEqual(@as(u32, 4), result.total_hits);
+            try std.testing.expectEqual(@as(u32, 5), result.total_hits);
             try std.testing.expectEqual(@as(usize, 2), result.hits.len);
             try std.testing.expectEqualStrings("run-4", result.hits[0].id);
             try std.testing.expectEqualStrings("run-3", result.hits[1].id);
-            try std.testing.expectEqual(@as(usize, if (mode == 3) 5 else 4), state.calls.load(.acquire));
+            try std.testing.expectEqual(@as(usize, if (mode == 3) 6 else 5), state.calls.load(.acquire));
         }
-        if (mode == 0) try std.testing.expect(state.peak.load(.acquire) >= 2);
+        if (mode == 0) {
+            try std.testing.expect(state.peak.load(.acquire) >= 2);
+            try std.testing.expect(state.archive_overlap.load(.acquire));
+        }
         if (mode == 1) try std.testing.expectEqual(@as(usize, 1), state.peak.load(.acquire));
         try std.testing.expectEqual(@as(usize, 0), state.active.load(.acquire));
         try std.testing.expectEqual(@as(usize, 0), scheduling.bytes);

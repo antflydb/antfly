@@ -913,3 +913,20 @@ and borrow their decoded row values, so unchanged groups share indexes and key
 filters across cuts without reconstructing the entire overlay. Legacy cuts keep
 their existing compatibility path. Exact counts, typed tie ordering and recent
 row visibility preserve their conservative execution contracts.
+
+#### Query-local broad admission and immutable manifest reuse
+
+Broad native metadata predicates stream compressed index pages through inverse
+source routes into a quota-controlled temporary pack index. The text score
+frontier intersects ranges with that index without retaining all matching rows
+or pack IDs in memory. Broad patterns use bounded range-local membership proofs;
+unknown proofs retain candidates. Row filtering and text scoring still establish
+final correctness under the same publication and reader lease.
+
+Fresh Iceberg metadata and manifest lists govern every new snapshot plan.
+Immutable manifest Avro is reusable across snapshots under a credential/backend
+scoped cache key containing its path and declared length. A separate manifest
+construction coordinator prevents nested snapshot-cache admission deadlocks.
+Sequence inheritance, schema and delete applicability are recomputed from the
+fresh snapshot metadata/list. Mutable attachments do not use URI-only manifest
+reuse. Inventory assembly remains linear in its entries.

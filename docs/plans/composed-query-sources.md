@@ -598,3 +598,12 @@ horizon before conditionally publishing the manifest. Foreign authorities, parti
 views and extensions beyond the chunk horizon fail closed. Mutable host storage
 falls back to a coherent native capture. A new chunk-retention extension protocol
 would be needed to pin an immutable view beyond its existing protection horizon.
+
+Archive and accepted-WAL vector partitions share bounded parallel admission.
+Every lane owns mutable source-version maps, range-reader flights, index runtime
+pins and predicate cursors, while borrowing pinned immutable publication data.
+Merge order remains archive then recent-run order. All lanes join or cancel
+before their parent reader authority ends; saturation and oversized work retain
+serial execution. Native text admission uses streaming predicate pack proofs and
+range-local pattern proofs; fixed-frequency BM25 envelopes can also prove
+logical-order tie pruning using the scorer's actual f32 arithmetic.
