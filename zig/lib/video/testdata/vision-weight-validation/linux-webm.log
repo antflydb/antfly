@@ -1,0 +1,8 @@
+native query-pattern [11.350449588004267]
+native query-motion [0.7910095010010991]
+native query-scene [0.5203392919793259]
+native vp8-inter [29.03665234701475]
+native vp9-inter [37.61073909999686]
+native av1-inter [38.50197418499738]
+native vp9-sintel [49.921410481998464]
+native av1-sintel [50.47469223101507]

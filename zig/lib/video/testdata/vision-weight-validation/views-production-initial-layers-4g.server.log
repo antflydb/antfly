@@ -1,0 +1,11 @@
+antfly inference vdev
+backends: native=true onnx=true metal=true cuda=false
+ai models: /Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/native-video-design/.benchmark-assets/native-video
+ml models: /Users/ajroetker/.antfly/inference/ml
+{"ts":"+2026-10-15T02:53:47Z","level":"info","scope":"default","msg":"process memory policy operator_source=cli configured_limit_bytes=4294967296"}
+kernel jit: mode=off cache_mb=1024 preload_budget_ms=300000
+{"ts":"+2026-10-15T02:53:47Z","level":"info","scope":"default","msg":"inference resource policy ownership=local process_memory_limit_bytes=4294967296 process_memory_limit_provenance=explicit"}
+listening on 127.0.0.1:62325
+{"ts":"+2026-10-15T02:53:48Z","level":"info","scope":"default","msg":"trying backend metal for /Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/native-video-design/.benchmark-assets/native-video/model"}
+{"ts":"+2026-10-15T02:53:48Z","level":"info","scope":"default","msg":"selected backend metal for /Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/native-video-design/.benchmark-assets/native-video/model"}
+{"ts":"+2026-10-15T02:53:53Z","level":"warn","scope":"default","msg":"inference live-memory admission denied requested_bytes=2244401029 pending_bytes=0 available_bytes=2428105992 reserve_bytes=536870912 capacity_bytes=1891235080 basis=macos_memory_pressure policy=explicit_process_envelope process_rss_bytes=2044706816 process_anonymous_bytes=0 process_private_dirty_bytes=0"}

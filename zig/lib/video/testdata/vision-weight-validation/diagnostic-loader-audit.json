@@ -1,0 +1,7 @@
+{
+  "scope": "Diagnostic controls, not accepted production gates.",
+  "inactive_controls": "Shell-prefix DYLD_INSERT_LIBRARIES followed by the system python3 loses the loader variable before the Python process runs. Verified by inspecting presence only. Earlier malloc, wait-pool and allocation shell-launched probes did not establish hook activation and cannot support causal conclusions. Their production failures remain ordinary failed outcomes.",
+  "active_controls": "Set DYLD_INSERT_LIBRARIES inside the running Python process before spawning the owned inference server. allocation-probe loaded markers appear for both listener and model worker, and per-allocation stacks are present.",
+  "large_allocation_observation": "64 allocations of 28,753,920 bytes and 48 of 9,437,184 bytes in the small AV1 case. Stack includes maintained termite_metal_buffer_alloc; nearest stripped Zig symbol offsets are not precise function attribution.",
+  "source_finding": "Owned HF vision frames completed without retiring cached MPS activation views. Backbone layers already retire them. New code invokes the same retirement after an owned vision frame; external frame ownership is preserved. Numerical/device and production verification are required."
+}

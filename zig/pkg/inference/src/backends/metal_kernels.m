@@ -17345,6 +17345,35 @@ int termite_metal_decode_runtime_clear_linear_slot(termite_metal_decode_runtime 
     return 0;
 }
 
+// Pressure-only destruction of an exclusively owned, reconstructible F32
+// snapshot. The caller holds provider execution/residency locks. Never apply
+// this to checkpoint aliases, shared zero-bias storage or live frame resources.
+int termite_metal_decode_runtime_discard_owned_linear_slot(termite_metal_decode_runtime *runtime, size_t slot) {
+    if (runtime == NULL || slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY) return -1;
+    if (runtime->active_frame_cb != nil || runtime->submitted_frame_cb != nil) return -2;
+    // ARC teardown of MPS plans/views can create autoreleased objects. Drain
+    // them before the caller resamples physical memory and retries admission.
+    @autoreleasepool {
+        if (runtime->linear_slot_prepared[slot] == 0 ||
+            (runtime->linear_weight_dtypes[slot] != TERMITE_METAL_DENSE_LINEAR_DTYPE_F32 &&
+             runtime->linear_weight_dtypes[slot] != TERMITE_METAL_DENSE_LINEAR_DTYPE_F32_MPS)) return -3;
+        id<MTLBuffer> weight = runtime->linear_weight_buffers[slot];
+        if (weight == nil) return -3;
+        AntflyMetalBufferObservation *ownership = objc_getAssociatedObject(weight, &antfly_buffer_observation_key);
+        if (ownership == nil || ownership->alias) return -3;
+        for (size_t other = 0; other < TERMITE_METAL_LINEAR_SLOT_CAPACITY; ++other) {
+            if (other != slot && (runtime->linear_weight_buffers[other] == weight ||
+                runtime->quant_linear_weight_buffers[other] == weight)) return -4;
+        }
+        // Metal may retain freed allocations in its pool. Empty invalidates this
+        // snapshot's contents now, allowing live-memory admission to observe the
+        // released pages without inventing credits or waiting for a later request.
+        // Bias can be shared with unrelated slots and must remain untouched.
+        [weight setPurgeableState:MTLPurgeableStateEmpty];
+        return termite_metal_decode_runtime_clear_linear_slot(runtime, slot);
+    }
+}
+
 int termite_metal_decode_runtime_clear_layer_norm_slot(termite_metal_decode_runtime *runtime, size_t slot) {
     if (runtime == NULL) return -1;
     if (slot >= TERMITE_METAL_LAYER_NORM_SLOT_CAPACITY) return -2;
@@ -34860,9 +34889,12 @@ static int termite_metal_decode_runtime_prepare_linear_storage(
     const float *bias,
     size_t in_dim,
     size_t out_dim,
-    bool owned_shared_if_unified
+    bool owned_shared_if_unified,
+    const uint8_t *bf16_weight,
+    size_t bf16_bytes,
+    void (*widen_bf16)(const uint8_t *, float *, size_t)
 ) {
-    if (runtime == NULL || weight == NULL || bias == NULL) return -1;
+    if (runtime == NULL || bias == NULL || (weight == NULL && bf16_weight == NULL)) return -1;
     if (runtime->device == nil || runtime->queue == nil || runtime->library == nil) return -2;
     if (slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY || in_dim == 0 || out_dim == 0) return -3;
     size_t weight_bytes = 0;
@@ -34870,15 +34902,30 @@ static int termite_metal_decode_runtime_prepare_linear_storage(
     if (!termite_metal_size_mul3(in_dim, out_dim, sizeof(float), &weight_bytes) ||
         !termite_metal_size_mul(out_dim, sizeof(float), &bias_bytes) ||
         weight_bytes > runtime->device.maxBufferLength || bias_bytes > runtime->device.maxBufferLength) return -3;
+    if (bf16_weight != NULL && (widen_bf16 == NULL || bf16_bytes < weight_bytes / 2)) return -3;
     @autoreleasepool {
         const bool use_shared = owned_shared_if_unified && runtime->device.hasUnifiedMemory;
+        if (bf16_weight != NULL && !use_shared) return -2;
         // Both representations own a snapshot of the caller's bytes. Shared
         // storage avoids two upload command buffers for short-lived slots on
         // unified-memory devices; no source pointer escapes preparation.
-        id<MTLBuffer> weight_buffer = use_shared
-            ? antfly_observe_metal_buffer([runtime->device newBufferWithBytes:weight length:weight_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED)
-            : termite_metal_make_private_buffer_with_bytes(runtime->device, runtime->queue, weight, weight_bytes);
-        if (weight_buffer == nil) return -4;
+        id<MTLBuffer> weight_buffer;
+        if (bf16_weight != NULL) {
+            // The caller widens directly into the final owned snapshot. No
+            // full-size libc F32 staging allocation or second copy is needed.
+            weight_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithLength:weight_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
+            if (weight_buffer == nil || weight_buffer.contents == NULL) return -4;
+            widen_bf16(bf16_weight, (float *)weight_buffer.contents, weight_bytes / sizeof(float));
+            // Count these initialized Metal bytes just like constructor copies;
+            // changing the write mechanism must not erase initialization work.
+            termite_metal_telemetry_add(TERMITE_METAL_BUFFER_INITIALIZATION_BYTES, weight_bytes);
+            termite_metal_telemetry_add(TERMITE_METAL_BUFFER_INITIALIZATION_CALLS, 1);
+        } else {
+            weight_buffer = use_shared
+                ? antfly_observe_metal_buffer([runtime->device newBufferWithBytes:weight length:weight_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED)
+                : termite_metal_make_private_buffer_with_bytes(runtime->device, runtime->queue, weight, weight_bytes);
+            if (weight_buffer == nil) return -4;
+        }
         bool zero_bias = true;
         for (size_t i = 0; i < out_dim && zero_bias; ++i) zero_bias = bias[i] == 0.0f && !signbit(bias[i]);
         id<MTLBuffer> bias_buffer = zero_bias
@@ -34914,7 +34961,7 @@ int termite_metal_decode_runtime_prepare_linear(
     size_t in_dim,
     size_t out_dim
 ) {
-    return termite_metal_decode_runtime_prepare_linear_storage(runtime, slot, weight, bias, in_dim, out_dim, false);
+    return termite_metal_decode_runtime_prepare_linear_storage(runtime, slot, weight, bias, in_dim, out_dim, false, NULL, 0, NULL);
 }
 
 int termite_metal_decode_runtime_prepare_linear_owned_shared(
@@ -34925,7 +34972,20 @@ int termite_metal_decode_runtime_prepare_linear_owned_shared(
     size_t in_dim,
     size_t out_dim
 ) {
-    return termite_metal_decode_runtime_prepare_linear_storage(runtime, slot, weight, bias, in_dim, out_dim, true);
+    return termite_metal_decode_runtime_prepare_linear_storage(runtime, slot, weight, bias, in_dim, out_dim, true, NULL, 0, NULL);
+}
+
+// The callback is synchronous, nonallocating and cannot escape its writable
+// span. Both source bytes and callback remain owned by the caller until return.
+int termite_metal_decode_runtime_prepare_linear_bf16_owned_shared_f32(
+    termite_metal_decode_runtime *runtime, size_t slot,
+    const uint8_t *weight, size_t weight_bytes, const float *bias,
+    size_t in_dim, size_t out_dim,
+    void (*widen_bf16)(const uint8_t *, float *, size_t)
+) {
+    if (weight == NULL || widen_bf16 == NULL) return -1;
+    return termite_metal_decode_runtime_prepare_linear_storage(runtime, slot,
+        NULL, bias, in_dim, out_dim, true, weight, weight_bytes, widen_bf16);
 }
 
 int termite_metal_decode_runtime_prefer_linear_mps(

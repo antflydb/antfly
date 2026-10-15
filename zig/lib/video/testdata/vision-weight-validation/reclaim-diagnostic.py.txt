@@ -1,0 +1,34 @@
+import argparse,base64,hashlib,http.client,json,socket,sys,time,urllib.parse
+from pathlib import Path
+sys.path.insert(0,str(Path('tools/embeddinggemma2').resolve()))
+import video_compare as v,compare
+out=Path('/private/tmp/vision-cache-reclaim-probe.json')
+a=argparse.Namespace(url=None,output=out,binary=Path('zig/zig-out/bin/antfly-inference-bench-server'),model_dir=Path('.benchmark-assets/native-video/model'),backend='metal',process_memory_budget_mb=4096,verify_capacity_retry=False)
+c=v.corpus(Path('tools/embeddinggemma2/testdata/av1-layers/corpus.json'));ref=json.loads(Path('zig/lib/video/testdata/av1-layer-model-validation/pytorch-cpu.json').read_text())
+def body(row):return {'model':'model','input':[{'content':[{'type':'media','mime_type':'video/webm','data':base64.b64encode(Path(row['path']).read_bytes()).decode()}]}]}
+bodies=[body(r) for r in c['documents'][:2]];rows=[]
+def record(label,fn,url):
+ before=v.metal_telemetry_snapshot(url);start=time.monotonic()
+ try:result=fn();status='ok'
+ except Exception as e:result=v.failure_details(e);status='failed'
+ row={'label':label,'status':status,'result':result,'elapsed_seconds':time.monotonic()-start,'metrics':v.embedding_metrics(url),'telemetry':v.metal_telemetry_delta(before,v.metal_telemetry_snapshot(url))};rows.append(row)
+ print(label,status,str(result)[:650],flush=True);out.write_text(json.dumps({'scope':'Diagnostic sequence; not an official qualification gate or performance comparison','script_sha256':hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),'rows':rows},indent=2)+'\n')
+def regular(i,url):
+ r=compare.post(url+'/ai/v1','/embed',bodies[i],timeout=600);return compare.assert_agreement(r['data'][0]['embedding'],ref['cases'][c['documents'][i]['id']]['vector'])
+def half(url):
+ endpoint=urllib.parse.urlsplit(url);connection=http.client.HTTPConnection(endpoint.hostname,endpoint.port,timeout=600)
+ try:
+  connection.request('POST','/ai/v1/embed',json.dumps(bodies[0]),{'Content-Type':'application/json'});connection.sock.shutdown(socket.SHUT_WR);response=connection.getresponse();data=response.read(16*1024*1024)
+  if response.status!=200:return {'http_status':response.status,'body':data.decode()}
+  parsed=json.loads(data);return {'http_status':200,'agreement':compare.assert_agreement(parsed['data'][0]['embedding'],ref['cases'][c['documents'][0]['id']]['vector'])}
+ finally:connection.close()
+with v.server(a) as url:
+ record('regular_first',lambda:regular(0,url),url)
+ record('half_after_first',lambda:half(url),url)
+ record('regular_second_geometry',lambda:regular(1,url),url)
+ record('half_after_second',lambda:half(url),url)
+ record('reset_retry',lambda:v.disconnect_and_retry(url,bodies[0],ref['cases'][c['documents'][0]['id']]['vector'],request_timeout=600),url)
+ record('half_after_reset',lambda:half(url),url)
+ time.sleep(0.25)
+ record('half_after_quiet_250ms',lambda:half(url),url)
+ record('regular_after_half',lambda:regular(0,url),url)

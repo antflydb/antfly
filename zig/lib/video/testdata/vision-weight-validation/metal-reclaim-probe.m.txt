@@ -1,0 +1,26 @@
+#import <Foundation/Foundation.h>
+#import <Metal/Metal.h>
+#include <libproc.h>
+#include <sys/resource.h>
+#include <stdio.h>
+#include <unistd.h>
+static void sample(const char *label, id<MTLDevice> device) {
+ struct rusage_info_v4 r = {0}; proc_pid_rusage(getpid(), RUSAGE_INFO_V4, (rusage_info_t *)&r);
+ printf("%s rss=%llu footprint=%llu allocated=%llu\n",label,r.ri_resident_size,r.ri_phys_footprint,(unsigned long long)device.currentAllocatedSize); fflush(stdout);
+}
+int main(int argc, const char **argv) {
+ @autoreleasepool {
+ id<MTLDevice> device=MTLCreateSystemDefaultDevice();
+ NSMutableArray<id<MTLBuffer>> *buffers=[NSMutableArray new];
+ sample("start",device);
+ @autoreleasepool {
+ for(int i=0;i<114;i++) { id<MTLBuffer> b=[device newBufferWithLength:5341184 options:MTLResourceStorageModeShared]; if(!b) return 2; memset(b.contents,0x37,b.length); [buffers addObject:b]; }
+ sample("allocated",device);
+ if(argc>1) { for(id<MTLBuffer> b in buffers) [b setPurgeableState:MTLPurgeableStateEmpty]; sample("discarded",device); }
+ [buffers removeAllObjects]; sample("released_before_pool_drain",device);
+ }
+ sample("released_after_pool_drain",device);
+ usleep(100000);sample("after100ms",device);
+ }
+ return 0;
+}

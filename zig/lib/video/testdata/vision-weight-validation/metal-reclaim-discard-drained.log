@@ -1,0 +1,6 @@
+start rss=11927552 footprint=4440616 allocated=81920
+allocated rss=621019136 footprint=613843952 allocated=608976896
+discarded rss=12124160 footprint=4948976 allocated=608976896
+released_before_pool_drain rss=12124160 footprint=4948976 allocated=608976896
+released_after_pool_drain rss=12124160 footprint=4637224 allocated=81920
+after100ms rss=12124160 footprint=4637224 allocated=81920

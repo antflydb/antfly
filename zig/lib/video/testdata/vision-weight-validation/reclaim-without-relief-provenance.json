@@ -1,0 +1,13 @@
+{
+  "base_commit": "54e4cdfb93796b109a17513818411ae5e10d8931",
+  "binary_sha256": "0e48c1d51ea1642226889aa9ca7e7de83275b88a2db7ce98ff10840583f11b18",
+  "source_sha256": {
+    "zig/pkg/inference/src/models/embedding_gemma2_weight_cache.zig": "7bb328e79c38a6c9c7d4716cba316921f574f7e620f66ca3406ce7d0ff331cf9",
+    "zig/pkg/inference/src/backends/metal_native_provider.zig": "9379c3f3d5ae8d359487eb9f5f6a362cb2f7f49a64f3992489a3f234a07ffe06",
+    "zig/pkg/inference/src/ops/metal_compute.zig": "ba7463cc5a492d4112e84e50e9202257f1d2c6e4ab7247dc4be53e9187168b57",
+    "zig/pkg/inference/src/architectures/session_factory.zig": "fb7f63249ffc018d215df6a66ac5c032296826fe93086679f00d8ed436938acd",
+    "zig/pkg/inference/src/pipelines/embedding_gemma2.zig": "fb0b844ae7165fc28a36b2d990950356f99bccf94809dbb55d5eedc0a3f79827"
+  },
+  "patch_sha256": "78a20409aae453889051803dd9e53432df0e4001c7742a3e3f471b6a5cb78c92",
+  "scope": "Idle weight reclamation releases GPU objects, all12vectors+resetretry pass, halfclose503; no Darwin allocator relief yet"
+}

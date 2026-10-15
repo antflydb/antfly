@@ -1,0 +1,13 @@
+metal q0 [4.051869332999999]
+metal q1 [0.0666260000000003]
+metal q2 [0.11570429100000013]
+metal q3 [0.04938408399999972]
+metal sintel-52s [6.5234925]
+Traceback (most recent call last):
+  File "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/native-video-design/tools/embeddinggemma2/video_compare.py", line 1398, in <module>
+    main()
+  File "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/native-video-design/tools/embeddinggemma2/video_compare.py", line 1369, in main
+    (native if args.backend in ("native", "metal") else pytorch)(args, data, result)
+  File "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/native-video-design/tools/embeddinggemma2/video_compare.py", line 1131, in native
+    raise ValueError(
+ValueError: sustained workload did not complete every request and cleanup

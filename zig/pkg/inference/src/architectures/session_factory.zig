@@ -8453,6 +8453,28 @@ pub fn getEmbeddingGemma2Config(session: Session) ?embedding_gemma2_arch.Config 
     return if (self.arch_config == .embedding_gemma2) self.arch_config.embedding_gemma2 else null;
 }
 
+/// Called only after a relevant admission denial. The model/session remains
+/// retained, and native destruction has the same interruption protection as
+/// compute construction. Busy providers keep their weights and return zero.
+pub fn reclaimEmbeddingGemma2VisionWeights(session: Session, control: InferenceExecutionControl) !usize {
+    return reclaimEmbeddingGemma2Weights(session, control, .vision);
+}
+
+pub fn reclaimEmbeddingGemma2LanguageWeights(session: Session, control: InferenceExecutionControl) !usize {
+    return reclaimEmbeddingGemma2Weights(session, control, .language);
+}
+
+fn reclaimEmbeddingGemma2Weights(session: Session, control: InferenceExecutionControl, cache_class: @import("../models/embedding_gemma2_weight_cache.zig").MetalClass) !usize {
+    if (comptime !build_options.enable_metal) return 0;
+    if (session.vtable != &arch_vtable) return 0;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (self.backend_type != .metal or self.arch_config != .embedding_gemma2) return 0;
+    try control.check();
+    var guard = try control.enterUninterruptible(session.interruption());
+    defer guard.deinit();
+    return @import("../ops/metal_compute.zig").reclaimEmbeddingGemma2Weights(gpuBackendData(self), self.io, cache_class);
+}
+
 /// Preparation owns its own queue and never borrows mutable provider execution
 /// state. The loaded session handle must remain alive through producer cleanup;
 /// callers guard native driver work before querying/retaining this device.

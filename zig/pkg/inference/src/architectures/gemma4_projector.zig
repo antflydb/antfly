@@ -3575,6 +3575,10 @@ fn encoderBlockBatch(
     if (frame) {
         try cb.decoderRuntimeSubmitAndWaitFrame();
         frame = false;
+        // HF model-owned slots retain immutable weights, not each completed
+        // layer's activations. Retire MPS views at the same boundary as the
+        // backbone; otherwise every vision layer pins its large MLP buffers.
+        if (store.gguf == null) try @import("../ops/metal_compute.zig").MetalCompute.releaseEmbeddingGemma2ActivationViews(cb);
     }
     cb.free(res1);
     return res2;
@@ -5129,4 +5133,75 @@ fn singleGeometry(g: Geometry) Geometry {
     var single = g;
     single.batches = 1;
     return single;
+}
+
+fn populateVisionViewLifetimeWeights(store: *@import("../ops/native_compute.zig").WeightStore) !void {
+    const fixture = @import("../ops/media_residency_test.zig");
+    const a = store.allocator;
+    for (0..2) |layer| {
+        for ([_][]const u8{ "ln1", "ln2", "attn_post_norm", "ffn_post_norm", "attn_q_norm", "attn_k_norm", "attn_q", "attn_k", "attn_v", "attn_out", "ffn_gate", "ffn_up", "ffn_down" }) |suffix| {
+            const source = try std.fmt.allocPrint(a, "v.blk.{d}.{s}.weight", .{ layer, suffix });
+            defer a.free(source);
+            const mapped = try @import("embedding_gemma2_media_weights.zig").name(a, source);
+            defer a.free(mapped);
+            const head_norm = std.mem.eql(u8, suffix, "attn_q_norm") or std.mem.eql(u8, suffix, "attn_k_norm");
+            const norm = std.mem.indexOf(u8, suffix, "norm") != null or std.mem.startsWith(u8, suffix, "ln");
+            const shape: []const i64 = if (head_norm) &.{32} else if (norm) &.{64} else if (std.mem.eql(u8, suffix, "ffn_down")) &.{ 64, 128 } else if (std.mem.startsWith(u8, suffix, "ffn_")) &.{ 128, 64 } else &.{ 64, 64 };
+            try fixture.putWeight(store, mapped, shape, if (norm) @as(f32, 1) else null);
+        }
+    }
+}
+
+fn checkVisionViewLifetime(cb: ComputeBackend, reference: ComputeBackend) !void {
+    const a = std.testing.allocator;
+    const metal = @import("../ops/metal_compute.zig");
+    const runtime = @import("../backends/metal_runtime.zig");
+    const compute: *metal.MetalCompute = @ptrCast(@alignCast(cb.ptr));
+    compute.require_f32_linears = true;
+    const raw = compute.provider_impl.raw_decode_runtime;
+    const cfg = Config{ .text_hidden = 64, .vision_hidden = 64, .intermediate_size = 128, .block_count = 2, .head_count = 2, .image_size = 0, .patch_size = 2, .layer_norm_eps = 1e-6, .image_mean = .{ 0, 0, 0 }, .image_std = .{ 1, 1, 1 }, .position_embeddings_per_axis = 6, .spatial_merge_size = 2 };
+    const geometry = Geometry{ .width = 12, .height = 8, .grid_x = 6, .grid_y = 4, .pooled_x = 3, .pooled_y = 2 };
+    var values: [24 * 64]f32 = undefined;
+    for (&values, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 13) % 97)) - 48)) / 97;
+    var actual = try deviceResidentFromFloat32(&cb, &values, &.{ 24, 64 });
+    defer cb.free(actual);
+    var expected = try reference.fromFloat32Shape(&values, &.{ 24, 64 });
+    defer reference.free(expected);
+    var weights = ProjectorWeights.initHuggingFace(&cb, a);
+    defer weights.deinit();
+    var reference_weights = ProjectorWeights.initHuggingFace(&reference, a);
+    defer reference_weights.deinit();
+    for (0..2) |layer| {
+        const before = runtime.runtimeMemorySnapshot(raw);
+        const next = try encoderBlockBatch(&cb, a, &weights, cfg, actual, geometry, layer, 1);
+        cb.free(actual);
+        actual = next;
+        const reference_next = try encoderBlockBatch(&reference, a, &reference_weights, cfg, expected, geometry, layer, 1);
+        reference.free(expected);
+        expected = reference_next;
+        try std.testing.expect(runtime.runtimeMemorySnapshot(raw).mps_dense_linear_active_frame_calls >= before.mps_dense_linear_active_frame_calls + 7);
+        try std.testing.expectEqual(@as(u64, 0), runtime.termite_metal_decode_runtime_linear_view_bytes(raw, runtime.decoder_runtime_linear_slot_capacity));
+    }
+    // An external frame owns its completion boundary. Its views must remain
+    // valid through all queued consumers and may only retire after that wait.
+    try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+    errdefer cb.decoderRuntimeCancelFrame() catch {};
+    const external = try encoderBlockBatch(&cb, a, &weights, cfg, actual, geometry, 0, 1);
+    defer cb.free(external);
+    try std.testing.expect(cb.decoderRuntimeHasActiveFrame());
+    try std.testing.expect(runtime.termite_metal_decode_runtime_linear_view_bytes(raw, runtime.decoder_runtime_linear_slot_capacity) > 0);
+    try cb.decoderRuntimeSubmitAndWaitFrame();
+    try metal.MetalCompute.releaseEmbeddingGemma2ActivationViews(&cb);
+    const external_reference = try encoderBlockBatch(&reference, a, &reference_weights, cfg, expected, geometry, 0, 1);
+    defer reference.free(external_reference);
+    const got = try cb.toFloat32(external, a);
+    defer a.free(got);
+    const want = try reference.toFloat32(external_reference, a);
+    defer a.free(want);
+    try std.testing.expectEqual(want.len, got.len);
+    for (want, got) |x, y| try std.testing.expectApproxEqAbs(x, y, 2e-4);
+}
+
+test "embeddinggemma2 Metal video vision layers retire completed MPS views and preserve external frame ownership" {
+    try @import("../ops/media_residency_test.zig").onMetal(populateVisionViewLifetimeWeights, checkVisionViewLifetime);
 }

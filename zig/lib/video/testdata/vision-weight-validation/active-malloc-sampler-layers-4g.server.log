@@ -1,0 +1,29 @@
+allocator-sampler loaded pid=55200 thread_status=0
+allocator-sampler loaded pid=55203 thread_status=0
+antfly inference vdev
+backends: native=true onnx=true metal=true cuda=false
+ai models: /Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/native-video-design/.benchmark-assets/native-video
+ml models: /Users/ajroetker/.antfly/inference/ml
+{"ts":"+2026-10-15T03:00:15Z","level":"info","scope":"default","msg":"process memory policy operator_source=cli configured_limit_bytes=4294967296"}
+kernel jit: mode=off cache_mb=1024 preload_budget_ms=300000
+{"ts":"+2026-10-15T03:00:15Z","level":"info","scope":"default","msg":"inference resource policy ownership=local process_memory_limit_bytes=4294967296 process_memory_limit_provenance=explicit"}
+listening on 127.0.0.1:63422
+{"ts":"+2026-10-15T03:00:15Z","level":"info","scope":"default","msg":"trying backend metal for /Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/native-video-design/.benchmark-assets/native-video/model"}
+{"ts":"+2026-10-15T03:00:15Z","level":"info","scope":"default","msg":"selected backend metal for /Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/native-video-design/.benchmark-assets/native-video/model"}
+allocator-sampler pid=55203 released=0 footprint_before=1503398000 footprint_after=1503414384
+allocator-sampler pid=55203 released=0 footprint_before=1508837488 footprint_after=1508853872
+allocator-sampler pid=55203 released=0 footprint_before=1517668464 footprint_after=1517668464
+allocator-sampler pid=55203 released=0 footprint_before=1527171208 footprint_after=1527171208
+allocator-sampler pid=55203 released=0 footprint_before=1505593480 footprint_after=1505593480
+allocator-sampler pid=55203 released=0 footprint_before=1519962248 footprint_after=1519962248
+allocator-sampler pid=55203 released=0 footprint_before=1548732552 footprint_after=1548732552
+allocator-sampler pid=55203 released=0 footprint_before=1548732552 footprint_after=1548732552
+allocator-sampler pid=55203 released=0 footprint_before=1548732552 footprint_after=1548732552
+allocator-sampler pid=55203 released=0 footprint_before=1548732552 footprint_after=1548732552
+allocator-sampler pid=55203 released=0 footprint_before=1548732552 footprint_after=1548732552
+allocator-sampler pid=55203 released=0 footprint_before=1548732552 footprint_after=1548732552
+allocator-sampler pid=55203 released=0 footprint_before=1548732552 footprint_after=1548732552
+allocator-sampler pid=55203 released=0 footprint_before=1548732552 footprint_after=1548732552
+allocator-sampler pid=55203 released=0 footprint_before=1551124664 footprint_after=1551124664
+allocator-sampler pid=55203 released=0 footprint_before=1560725688 footprint_after=1560758456
+{"ts":"+2026-10-15T03:00:17Z","level":"warn","scope":"default","msg":"inference live-memory admission denied requested_bytes=2244401029 pending_bytes=0 available_bytes=2464167200 reserve_bytes=536870912 capacity_bytes=1927296288 basis=macos_memory_pressure policy=explicit_process_envelope process_rss_bytes=2222866432 process_anonymous_bytes=0 process_private_dirty_bytes=0"}

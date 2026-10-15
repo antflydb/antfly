@@ -1,0 +1,18 @@
+{
+  "base_commit": "a78f172921faac816b60eb27d282bb19506d25c8",
+  "source_sha256": {
+    "zig/pkg/inference/build.zig": "39b11e4780f7b99e3809e79ad8d01f1c4c18db7222652b86c9a5747ef2cc1d52",
+    "zig/pkg/inference/src/architectures/session_factory.zig": "fb7f63249ffc018d215df6a66ac5c032296826fe93086679f00d8ed436938acd",
+    "zig/pkg/inference/src/backends/metal_kernels.m": "a5b19c328fa6238f83ab63b1f5b00fa3bddbba0e0a78bb9bb180c3479a74ed23",
+    "zig/pkg/inference/src/backends/metal_native_provider.zig": "f61534d3d76d5dfb45830a6ce47304938907c530b831baaf4e0352ae2896b3a8",
+    "zig/pkg/inference/src/backends/metal_runtime.zig": "d477dac2152ab659cea3418ed003fb212f170af9356a7b260230e29bf2e4df62",
+    "zig/pkg/inference/src/models/embedding_gemma2_weight_cache.zig": "7bb328e79c38a6c9c7d4716cba316921f574f7e620f66ca3406ce7d0ff331cf9",
+    "zig/pkg/inference/src/ops/metal_compute.zig": "3ce9c9430ef4457d81881f140afaccb5fd0a192c69d3cb0c751895a9fb211e5f",
+    "zig/pkg/inference/src/pipelines/embedding_gemma2.zig": "fb0b844ae7165fc28a36b2d990950356f99bccf94809dbb55d5eedc0a3f79827",
+    "zig/pkg/inference/src/architectures/gemma4_projector.zig": "9ec1307421c691dd0bcd7cfd783fc0493d6e6bfd21f6d72196378ac603ddfa87"
+  },
+  "change_since_direct": "After an owned HF vision-layer frame completes, clear MPS activation views while retaining model weights and multiplication plans. Respect external-frame ownership. Add an independent native/Metal vision regression with MPS dispatch and view-memory assertions.",
+  "baseline": "direct production passed TS six windows CPU+Metal, failed both original4GiBAV1gates. Tests65 passed; newviews regression adds one.",
+  "stream_binary_sha256": "9bc7084410e900e7993ffee3ea005145b0320707049045366199a3c6d915f2df",
+  "scope": "Configured pretrained TS stream tests; functional qualification, no comparative timing claim. Production compiler may overlap."
+}

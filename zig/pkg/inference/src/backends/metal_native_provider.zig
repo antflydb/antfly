@@ -99,6 +99,7 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
     /// admission pointer belongs to the same drained model WeightStore.
     embeddinggemma2_linear_cache: std.StringHashMapUnmanaged(EmbeddingGemma2LinearCacheEntry) = .empty,
     embeddinggemma2_linear_cache_bytes: usize = 0,
+    embeddinggemma2_vision_linear_cache_bytes: usize = 0,
     embeddinggemma2_cache_admission: ?*tier_cache_mod.SharedCache = null,
     jit_mode: kernel_jit.Mode = .off,
     jit_scope: metal_runtime.MetalJitRouteScope = metal_runtime.MetalJitRouteScope.none(),
@@ -187,6 +188,41 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
         if (metal_runtime.termite_metal_decode_runtime_trim_embedding_workspace(self.raw_decode_runtime) != 0)
             return error.MetalWorkspaceBusy;
         self.releaseEmbeddingWorkspaceLeases();
+    }
+
+    /// Caller owns the shared provider execution lease and residency lock.
+    /// Optional immutable constants yield to admission by class. Retained
+    /// execution workspaces keep their existing ownership. No allocation occurs.
+    pub fn reclaimEmbeddingGemma2Weights(self: *MetalNativeProvider, cache_class: @import("../models/embedding_gemma2_weight_cache.zig").MetalClass) !usize {
+        if (metal_runtime.hasActiveFrame(self.raw_decode_runtime) or
+            metal_runtime.hasSubmittedFrame(self.raw_decode_runtime)) return error.MetalWorkspaceBusy;
+        const cache = self.embeddinggemma2_cache_admission orelse return 0;
+        const policy = @import("../models/embedding_gemma2_weight_cache.zig");
+        var reclaimed: usize = 0;
+        // Restart iteration after removal; never retain an invalidated iterator
+        // or allocate bookkeeping while recovering from memory pressure.
+        while (true) {
+            var it = self.embeddinggemma2_linear_cache.iterator();
+            const name = blk: {
+                while (it.next()) |entry| {
+                    if (policy.metalClass(entry.key_ptr.*) == cache_class) break :blk entry.key_ptr.*;
+                }
+                break :blk null;
+            } orelse break;
+            const candidate = self.embeddinggemma2_linear_cache.get(name).?;
+            // These slots were published only from owned F32 snapshots. The
+            // original checkpoint and shared canonical zero bias stay intact.
+            if (metal_runtime.termite_metal_decode_runtime_discard_owned_linear_slot(self.raw_decode_runtime, candidate.slot) != 0)
+                return error.MetalWorkspaceBusy;
+            const removed = self.embeddinggemma2_linear_cache.fetchRemove(name).?;
+            metal_runtime.clearRawLinearSlot(self, removed.value.slot);
+            self.embeddinggemma2_linear_cache_bytes -= removed.value.bytes;
+            if (cache_class == .vision) self.embeddinggemma2_vision_linear_cache_bytes -= removed.value.bytes;
+            cache.noteRelease(.backend, removed.value.bytes);
+            reclaimed += removed.value.bytes;
+            std.heap.c_allocator.free(removed.key);
+        }
+        return reclaimed;
     }
 
     fn releaseEmbeddingWorkspaceLeases(self: *MetalNativeProvider) void {
@@ -279,6 +315,7 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
         self.embeddinggemma2_linear_cache.deinit(std.heap.c_allocator);
         self.embeddinggemma2_linear_cache = .empty;
         self.embeddinggemma2_linear_cache_bytes = 0;
+        self.embeddinggemma2_vision_linear_cache_bytes = 0;
         for (0..decoder_runtime_layer_norm_slot_capacity) |slot| metal_runtime.releaseRawLayerNormSlot(self, slot);
         for (0..decoder_runtime_rms_norm_slot_capacity) |slot| metal_runtime.releaseRawRmsNormSlot(self, slot);
         metal_runtime.termite_metal_provider_destroy(self.raw_provider);

@@ -1,0 +1,10 @@
+{
+  "scope": "Standalone macOS ARM64 Metal experiment, not an inference parity or performance gate. Draining autorelease pools frees buffers; marking owned snapshots empty frees contents before object release. Does not independently prove the server cause.",
+  "source_sha256": "15d449248bff7d92953bab3848a39938a06fa39a5d8e2dc130ca5a0c0a83423b",
+  "commands": [
+    "clang -fobjc-arc -framework Foundation -framework Metal metal-reclaim-probe.m -o /private/tmp/video-metal-reclaim-probe",
+    "/private/tmp/video-metal-reclaim-probe",
+    "/private/tmp/video-metal-reclaim-probe discard"
+  ],
+  "api_reference": "https://developer.apple.com/documentation/metal/mtlresource/setpurgeablestate(_:)"
+}

@@ -3072,7 +3072,7 @@ unsupported.
 
 ### Runtime Metal buffer lifetime telemetry
 
-The inference bridge's `metal_kernels.m` now observes all 712 `newBufferWithLength`,
+The inference bridge's `metal_kernels.m` observes its maintained `newBufferWithLength`,
 `newBufferWithBytes` and `newBufferWithBytesNoCopy` expressions, including direct
 kernel convenience paths and temporary staging. Observation preserves retained
 ARC ownership. A token associated with the Metal object records its release;
@@ -3084,7 +3084,8 @@ bytes/peaks are separate gauges, alongside their owned total and object counts.
 No-copy buffers contribute logical mapped bytes/counts to separate alias gauges;
 overlapping mappings may name the same host pages. They are never added to owned
 bytes. Allocation/release byte and object counters are monotone. Successful
-`newBufferWithBytes` initialization has its own byte/call counters, separate from
+Owned-buffer initialization, including constructor copies and direct BF16
+widening, has its own byte/call counters, separate from
 existing explicit upload/download/copy API counts.
 
 Metrics are worker-process observations. Live gauges may decrease; peak gauges
@@ -3120,3 +3121,64 @@ three Big Buck Bunny scenes encoded as VP8/VP9/AV1. macOS ARM64 and actual
 offline Linux ARM64 match all 324 complete normalized pictures. A fresh
 generation reproduces all nine streams and picture hashes exactly; attribution,
 commands, binary/source hashes and raw outcomes are retained with the fixtures.
+
+### Model-owned vision constants under pressure
+
+EmbeddingGemma 2's Metal provider now retains checkpoint-named immutable F32
+vision/projector snapshots across cohorts and requests. The vision ceiling is
+640 MiB, independent of the existing language ceiling; both classes share the
+same model/process admission controller and combined 512-entry bound. The
+pinned checkpoint contributes 114 eligible matrices (608,556,032 payload bytes
+including zero biases). Position tables, norms, audio and request tensors remain
+outside this cache. CPU cache policy is unchanged.
+
+A relevant admission denial may reclaim idle optional vision snapshots and retry
+the exact original reservation. If relevant pressure remains, a second stage
+may yield optional Metal language snapshots and retry that same reservation.
+Each class is attempted at most once. Provider and residency locks are acquired
+without waiting; active/submitted frames prevent reclamation. Weight contents
+are discarded before slot teardown so physical release need not wait for a
+later autorelease-pool drain. Checkpoint aliases and weights shared by another
+slot are rejected, and canonical shared zero biases are preserved. Cancellation,
+forced denials and unrelated limits retain their original behavior. Destruction
+stays inside the session's native interruption guard.
+
+The final ReleaseFast Metal source passes both original 4096 MiB AV1 suites,
+including all vectors, rankings/top-k, cancellation/retry, half-close and load
+checks. Maximum coordinate error is 3.9023e-7. Full-clip, WebM and depth/chroma
+comparisons also pass, with maxima 8.7964e-7, 6.2213e-7 and 3.7626e-7. All 66
+device tests pass; actual Linux ARM64 passes 54 portable model tests with eight
+Metal skips. Configured streamed TS preserves six buffered vectors exactly on
+both CPU and Metal, including acknowledged-prefix retry. Original reservations,
+process caps, tolerances and the 16-retry limit are unchanged. The
+[vision-weight receipt](testdata/vision-weight-validation/README.md) binds final
+sources, binaries and raw reports while retaining earlier failures and their
+separate epochs.
+
+Warm 52-second clip initialization falls from 9,695,085,672 to 27,477,096 bytes
+per clip (99.72% less), with zero net live owned bytes/objects across four requests
+at concurrency two. Steady owned allocation increases from 632,222,724 to
+1,240,134,660 bytes. Constructor bytes are logical initialization, not bus traffic;
+object allocatedSize is not physical residency or all pipeline memory. Shared-host
+timings do not establish capacity or speedup.
+
+BF16 preparation for owned shared F32 snapshots on unified-memory devices now
+widens directly into the final Metal allocation through Zig's existing SIMD
+conversion. It avoids a full-size libc F32 temporary and subsequent copy.
+The conversion callback is synchronous, nonallocating and bounded by checked
+dimensions and source length. Publication remains transactional; private and
+non-unified storage keep the original fallback. Direct initialization still
+increments byte/call telemetry, preserving the meaning of the measurements.
+The final device and production gates above include this path.
+
+Completed HF vision-layer frames now retire cached MPS activation views, matching
+the existing backbone boundary. Prepared weights and multiplication plans remain
+resident; externally owned frames retain their own completion boundary. An
+independent CPU/Metal regression verifies numerical output, actual MPS dispatch,
+zero retained view bytes after each owned layer and valid views during an outer
+frame. The device gate passes 66 tests. On the identical first AV1 video, the
+production tracked-buffer peak falls from 3,250,624,996 to 1,429,726,980 bytes
+with a bit-identical vector; tracked private peak falls 86.8%. These are allocated
+resource observations, not physical residency. That isolated historical epoch still fails
+the complete 4 GiB admission gate; the final ordered optional-cache reclamation
+above closes both constrained production gates.

@@ -1,0 +1,16 @@
+[
+  {
+    "backend": "metal",
+    "exit_code": 0,
+    "seconds": 10.032457167,
+    "status": "pass",
+    "log": "/private/tmp/vision-cache-views-ts-streamed-metal.log"
+  },
+  {
+    "backend": "native",
+    "exit_code": 0,
+    "seconds": 53.470490083,
+    "status": "pass",
+    "log": "/private/tmp/vision-cache-views-ts-streamed-native.log"
+  }
+]

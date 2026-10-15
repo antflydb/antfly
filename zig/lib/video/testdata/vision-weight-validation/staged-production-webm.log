@@ -1,0 +1,8 @@
+metal query-pattern [1.199443875]
+metal query-motion [0.029941292000000175]
+metal query-scene [0.03256379200000037]
+metal vp8-inter [0.428808541]
+metal vp9-inter [0.34222237499999997]
+metal av1-inter [0.3246639579999999]
+metal vp9-sintel [0.390929125]
+metal av1-sintel [0.31538620900000014]

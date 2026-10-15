@@ -1617,7 +1617,7 @@ pub fn build(b: *std.Build) void {
     video_model_root.addImport("inference_internal", video_model_root);
     runtime_build.configureRuntimeLinks(b, video_model_root, target, runtime_config.backend, runtime_config.paths);
     video_model_root.link_libc = runtime_config.backend.link_libc;
-    const video_model_tests = b.addTest(.{ .root_module = video_model_root, .filters = &.{ "embeddinggemma2 video", "embeddinggemma2 Metal video", "embeddinggemma2 model VFR" } });
+    const video_model_tests = b.addTest(.{ .root_module = video_model_root, .filters = &.{ "embeddinggemma2 video", "embeddinggemma2 Metal video", "embeddinggemma2 model VFR", "metal native embeddinggemma2 BF16 and F32 shared" } });
     b.step("check-video-model", "Compile video model qualification for cross-platform checks").dependOn(&video_model_tests.step);
     b.step("install-video-model-tests", "Install native video model policy/lifetime tests for another host").dependOn(&b.addInstallArtifact(video_model_tests, .{ .dest_sub_path = "video-model-tests" }).step);
     const run_video_model_tests = b.addRunArtifact(video_model_tests);

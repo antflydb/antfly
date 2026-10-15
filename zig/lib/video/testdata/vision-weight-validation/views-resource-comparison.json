@@ -1,0 +1,11 @@
+{
+  "scope": "First identical AV1 video, production ReleaseFast, original4096MiB request. Both complete suites still fail overall admission. Logical resource peaks, not physical GPU residency or causal timing.",
+  "vector_exact_equal": true,
+  "before_owned_peak": 3250624996,
+  "after_owned_peak": 1429726980,
+  "before_private_peak": 2094855168,
+  "after_private_peak": 276395008,
+  "owned_peak_reduction_fraction": 0.5601685885762505,
+  "private_peak_reduction_fraction": 0.8680600872928701,
+  "packed_f32_sha256": "27088b19169a62f47e1ce8aa8f5d699edce2dc61d51453dddf08c5ac375c39d9"
+}

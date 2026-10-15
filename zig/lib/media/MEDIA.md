@@ -2287,3 +2287,27 @@ The [independent WebM corpus](../video/testdata/real-content/README.md) qualifie
 container-to-native-picture delivery for nine Big Buck Bunny streams. Both
 macOS and actual Linux match all 324 complete normalized pictures; the source,
 encoding commands and exact reproduction evidence are pinned separately.
+
+Model-owned Metal vision constants participate in the existing shared
+model/process admission controller. Language and vision each have a 640 MiB
+cache ceiling and share a combined 512-entry limit; neither ceiling creates
+additional process allowance. Relevant admission pressure can discard exclusively
+owned idle vision snapshots, then optional Metal language snapshots if the same
+request remains denied. Each class is attempted once. Nonblocking native locks
+never span admission; active/submitted frames, checkpoint aliases and shared
+weights cannot be discarded. Source checkpoint bytes and canonical zero biases
+remain valid. Cancellation, forced/permanent/unrelated denials, original request
+reservations and external retry limits preserve their behavior.
+
+The final ReleaseFast Metal source passes both original 4096 MiB AV1 suites,
+the full-clip/WebM/depth-chroma comparisons and all lifecycle/load gates. Native
+CPU and Metal streamed TS each preserve six buffered vectors exactly, including
+acknowledged-prefix retry. All 66 device tests and 54 actual Linux portable model
+tests pass (eight platform skips on Linux). Warm long-clip logical buffer
+initialization falls from 9,695,085,672 to 27,477,096 bytes per clip, with zero
+net live owned bytes/objects across four requests at concurrency two. This is
+allocated-resource evidence, not physical residency or measured bus traffic.
+See [vision-weight qualification](../video/testdata/vision-weight-validation/README.md)
+for source/binary hashes, exact Linux epochs, allocation tradeoffs and retained
+failed controls, and the [completion audit](../../../docs/plans/native-video-noncuda-audit.md)
+for the eight requested non-CUDA work groups.

@@ -1,0 +1,33 @@
+metal colour [1.2684577080000001]
+metal gray [0.04005366699999957]
+metal av1-c0-8 [0.4659872500000004]
+Traceback (most recent call last):
+  File "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/native-video-design/.benchmark-assets/native-video/run-injected-video-probe.py", line 10, in <module>
+    try:runpy.run_path(argv[0],run_name='__main__')
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/runpy.py", line 268, in run_path
+    return _run_module_code(code, init_globals, run_name,
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/runpy.py", line 97, in _run_module_code
+    _run_code(code, mod_globals, init_globals,
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/runpy.py", line 87, in _run_code
+    exec(code, run_globals)
+  File "tools/embeddinggemma2/video_compare.py", line 1398, in <module>
+    main()
+  File "tools/embeddinggemma2/video_compare.py", line 1369, in main
+    (native if args.backend in ("native", "metal") else pytorch)(args, data, result)
+  File "tools/embeddinggemma2/video_compare.py", line 1058, in native
+    response = compare.post(
+  File "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/native-video-design/tools/embeddinggemma2/compare.py", line 348, in post
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/urllib/request.py", line 214, in urlopen
+    return opener.open(url, data, timeout)
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/urllib/request.py", line 523, in open
+    response = meth(req, response)
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/urllib/request.py", line 632, in http_response
+    response = self.parent.error(
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/urllib/request.py", line 561, in error
+    return self._call_chain(*args)
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/urllib/request.py", line 494, in _call_chain
+    result = func(*args)
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/urllib/request.py", line 641, in http_error_default
+    raise HTTPError(req.full_url, code, msg, hdrs, fp)
+urllib.error.HTTPError: HTTP Error 503: Service Unavailable

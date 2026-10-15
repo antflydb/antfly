@@ -1,0 +1,293 @@
+allocation-probe loaded pid=32684
+allocation-probe loaded pid=32687
+antfly inference vdev
+backends: native=true onnx=true metal=true cuda=false
+ai models: /Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/native-video-design/.benchmark-assets/native-video
+ml models: /Users/ajroetker/.antfly/inference/ml
+{"ts":"+2026-10-15T02:39:32Z","level":"info","scope":"default","msg":"process memory policy operator_source=cli configured_limit_bytes=4294967296"}
+kernel jit: mode=off cache_mb=1024 preload_budget_ms=300000
+{"ts":"+2026-10-15T02:39:32Z","level":"info","scope":"default","msg":"inference resource policy ownership=local process_memory_limit_bytes=4294967296 process_memory_limit_provenance=explicit"}
+listening on 127.0.0.1:49676
+{"ts":"+2026-10-15T02:39:32Z","level":"info","scope":"default","msg":"trying backend metal for /Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/native-video-design/.benchmark-assets/native-video/model"}
+{"ts":"+2026-10-15T02:39:32Z","level":"info","scope":"default","msg":"selected backend metal for /Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/native-video-design/.benchmark-assets/native-video/model"}
+allocation-probe pid=32687 kind=length bytes=25165824
+allocation-probe pid=32687 kind=bytes bytes=62914560
+(
+	0   vision-metal-allocation-stack-probe 0x00000001061c8a80 report + 204
+	1   vision-metal-allocation-stack-probe 0x00000001061c8970 sampled_bytes + 112
+	2   antfly-inference-bench-server       0x00000001057b4308 termite_metal_make_private_buffer_with_bytes + 116
+	3   antfly-inference-bench-server       0x00000001057b6b7c termite_metal_decode_runtime_prepare_embedding_table + 168
+	4   antfly-inference-bench-server       0x0000000104fa48b8 antfly_av1_dav1d_open + 2744396
+	5   antfly-inference-bench-server       0x0000000104fa573c antfly_av1_dav1d_open + 2748112
+	6   antfly-inference-bench-server       0x0000000104c37768 main + 6000084
+	7   antfly-inference-bench-server       0x0000000104c38a64 main + 6004944
+	8   antfly-inference-bench-server       0x0000000104c3aecc main + 6014264
+	9   antfly-inference-bench-server       0x0000000104c49790 main + 6073852
+	10  antfly-inference-bench-server       0x0000000104c4ea58 main + 6095044
+	11  antfly-inference-bench-server       0x0000000104c53290 main + 6113532
+	12  antfly-inference-bench-server       0x0000000104c599d0 main + 6139964
+	13  antfly-inference-bench-server       0x0000000104c019bc main + 5779496
+	14  antfly-inference-bench-server       0x0000000104d58cb8 antfly_av1_dav1d_open + 336972
+	15  antfly-inference-bench-server       0x0000000104d785c4 antfly_av1_dav1d_open + 466264
+	16  antfly-inference-bench-server       0x0000000104d778c4 antfly_av1_dav1d_open + 462936
+	17  antfly-inference-bench-server       0x0000000104880f2c main + 2106776
+	18  antfly-inference-bench-server       0x000000010565708c antfly_av1_dav1d_open + 9766944
+	19  antfly-inference-bench-server       0x0000000105656250 antfly_av1_dav1d_open + 9763300
+	20  libsystem_pthread.dylib             0x0000000183a51d00 _pthread_start + 136
+	21  libsystem_pthread.dylib             0x0000000183a4ccec thread_start + 8
+)
+allocation-probe pid=32687 kind=length bytes=62914560
+(
+	0   vision-metal-allocation-stack-probe 0x00000001061c8a80 report + 204
+	1   vision-metal-allocation-stack-probe 0x00000001061c88c0 sampled_length + 100
+	2   antfly-inference-bench-server       0x00000001057b4330 termite_metal_make_private_buffer_with_bytes + 156
+	3   antfly-inference-bench-server       0x00000001057b6b7c termite_metal_decode_runtime_prepare_embedding_table + 168
+	4   antfly-inference-bench-server       0x0000000104fa48b8 antfly_av1_dav1d_open + 2744396
+	5   antfly-inference-bench-server       0x0000000104fa573c antfly_av1_dav1d_open + 2748112
+	6   antfly-inference-bench-server       0x0000000104c37768 main + 6000084
+	7   antfly-inference-bench-server       0x0000000104c38a64 main + 6004944
+	8   antfly-inference-bench-server       0x0000000104c3aecc main + 6014264
+	9   antfly-inference-bench-server       0x0000000104c49790 main + 6073852
+	10  antfly-inference-bench-server       0x0000000104c4ea58 main + 6095044
+	11  antfly-inference-bench-server       0x0000000104c53290 main + 6113532
+	12  antfly-inference-bench-server       0x0000000104c599d0 main + 6139964
+	13  antfly-inference-bench-server       0x0000000104c019bc main + 5779496
+	14  antfly-inference-bench-server       0x0000000104d58cb8 antfly_av1_dav1d_open + 336972
+	15  antfly-inference-bench-server       0x0000000104d785c4 antfly_av1_dav1d_open + 466264
+	16  antfly-inference-bench-server       0x0000000104d778c4 antfly_av1_dav1d_open + 462936
+	17  antfly-inference-bench-server       0x0000000104880f2c main + 2106776
+	18  antfly-inference-bench-server       0x000000010565708c antfly_av1_dav1d_open + 9766944
+	19  antfly-inference-bench-server       0x0000000105656250 antfly_av1_dav1d_open + 9763300
+	20  libsystem_pthread.dylib             0x0000000183a51d00 _pthread_start + 136
+	21  libsystem_pthread.dylib             0x0000000183a4ccec thread_start + 8
+)
+allocation-probe pid=32687 kind=length bytes=9437184
+allocation-probe pid=32687 kind=length bytes=28753920
+(
+	0   vision-metal-allocation-stack-probe 0x00000001061c8a80 report + 204
+	1   vision-metal-allocation-stack-probe 0x00000001061c88c0 sampled_length + 100
+	2   antfly-inference-bench-server       0x0000000105838d54 termite_metal_buffer_alloc + 440
+	3   antfly-inference-bench-server       0x00000001043fecf4 antfly_build_info_version + 1297564
+	4   antfly-inference-bench-server       0x0000000104447d04 antfly_build_info_version + 1596588
+	5   antfly-inference-bench-server       0x0000000104dd7d60 antfly_av1_dav1d_open + 857332
+	6   antfly-inference-bench-server       0x0000000104f8ae1c antfly_av1_dav1d_open + 2639280
+	7   antfly-inference-bench-server       0x0000000104f89ba4 antfly_av1_dav1d_open + 2634552
+	8   antfly-inference-bench-server       0x0000000105510c08 antfly_av1_dav1d_open + 8430492
+	9   antfly-inference-bench-server       0x00000001043514dc antfly_build_info_version + 586884
+	10  antfly-inference-bench-server       0x00000001043549bc antfly_build_info_version + 600420
+	11  antfly-inference-bench-server       0x0000000104355a1c antfly_build_info_version + 604612
+	12  antfly-inference-bench-server       0x0000000104c37d08 main + 6001524
+	13  antfly-inference-bench-server       0x0000000104c38a64 main + 6004944
+	14  antfly-inference-bench-server       0x0000000104c3aecc main + 6014264
+	15  antfly-inference-bench-server       0x0000000104c49790 main + 6073852
+	16  antfly-inference-bench-server       0x0000000104c4ea58 main + 6095044
+	17  antfly-inference-bench-server       0x0000000104c53290 main + 6113532
+	18  antfly-inference-bench-server       0x0000000104c599d0 main + 6139964
+	19  antfly-inference-bench-server       0x0000000104c019bc main + 5779496
+	20  antfly-inference-bench-server       0x0000000104d58cb8 antfly_av1_dav1d_open + 336972
+	21  antfly-inference-bench-server       0x0000000104d785c4 antfly_av1_dav1d_open + 466264
+	22  antfly-inference-bench-server       0x0000000104d778c4 antfly_av1_dav1d_open + 462936
+	23  antfly-inference-bench-server       0x0000000104880f2c main + 2106776
+	24  antfly-inference-bench-server       0x000000010565708c antfly_av1_dav1d_open + 9766944
+	25  antfly-inference-bench-server       0x0000000105656250 antfly_av1_dav1d_open + 9763300
+	26  libsystem_pthread.dylib             0x0000000183a51d00 _pthread_start + 136
+	27  libsystem_pthread.dylib             0x0000000183a4ccec thread_start + 8
+)
+allocation-probe pid=32687 kind=length bytes=9437184
+allocation-probe pid=32687 kind=length bytes=28753920
+(
+	0   vision-metal-allocation-stack-probe 0x00000001061c8a80 report + 204
+	1   vision-metal-allocation-stack-probe 0x00000001061c88c0 sampled_length + 100
+	2   antfly-inference-bench-server       0x0000000105838d54 termite_metal_buffer_alloc + 440
+	3   antfly-inference-bench-server       0x00000001043fecf4 antfly_build_info_version + 1297564
+	4   antfly-inference-bench-server       0x0000000104447d04 antfly_build_info_version + 1596588
+	5   antfly-inference-bench-server       0x0000000104dd7d60 antfly_av1_dav1d_open + 857332
+	6   antfly-inference-bench-server       0x0000000104f8ae1c antfly_av1_dav1d_open + 2639280
+	7   antfly-inference-bench-server       0x0000000104f89ba4 antfly_av1_dav1d_open + 2634552
+	8   antfly-inference-bench-server       0x0000000105510c08 antfly_av1_dav1d_open + 8430492
+	9   antfly-inference-bench-server       0x00000001043514dc antfly_build_info_version + 586884
+	10  antfly-inference-bench-server       0x0000000104354a04 antfly_build_info_version + 600492
+	11  antfly-inference-bench-server       0x0000000104355a1c antfly_build_info_version + 604612
+	12  antfly-inference-bench-server       0x0000000104c37d08 main + 6001524
+	13  antfly-inference-bench-server       0x0000000104c38a64 main + 6004944
+	14  antfly-inference-bench-server       0x0000000104c3aecc main + 6014264
+	15  antfly-inference-bench-server       0x0000000104c49790 main + 6073852
+	16  antfly-inference-bench-server       0x0000000104c4ea58 main + 6095044
+	17  antfly-inference-bench-server       0x0000000104c53290 main + 6113532
+	18  antfly-inference-bench-server       0x0000000104c599d0 main + 6139964
+	19  antfly-inference-bench-server       0x0000000104c019bc main + 5779496
+	20  antfly-inference-bench-server       0x0000000104d58cb8 antfly_av1_dav1d_open + 336972
+	21  antfly-inference-bench-server       0x0000000104d785c4 antfly_av1_dav1d_open + 466264
+	22  antfly-inference-bench-server       0x0000000104d778c4 antfly_av1_dav1d_open + 462936
+	23  antfly-inference-bench-server       0x0000000104880f2c main + 2106776
+	24  antfly-inference-bench-server       0x000000010565708c antfly_av1_dav1d_open + 9766944
+	25  antfly-inference-bench-server       0x0000000105656250 antfly_av1_dav1d_open + 9763300
+	26  libsystem_pthread.dylib             0x0000000183a51d00 _pthread_start + 136
+	27  libsystem_pthread.dylib             0x0000000183a4ccec thread_start + 8
+)
+allocation-probe pid=32687 kind=length bytes=28753920
+(
+	0   vision-metal-allocation-stack-probe 0x00000001061c8a80 report + 204
+	1   vision-metal-allocation-stack-probe 0x00000001061c88c0 sampled_length + 100
+	2   antfly-inference-bench-server       0x0000000105838d54 termite_metal_buffer_alloc + 440
+	3   antfly-inference-bench-server       0x00000001043fecf4 antfly_build_info_version + 1297564
+	4   antfly-inference-bench-server       0x0000000104dc94d4 antfly_av1_dav1d_open + 797800
+	5   antfly-inference-bench-server       0x0000000104f9d9f4 antfly_av1_dav1d_open + 2716040
+	6   antfly-inference-bench-server       0x0000000104fa0430 antfly_av1_dav1d_open + 2726852
+	7   antfly-inference-bench-server       0x0000000104354a24 antfly_build_info_version + 600524
+	8   antfly-inference-bench-server       0x0000000104355a1c antfly_build_info_version + 604612
+	9   antfly-inference-bench-server       0x0000000104c37d08 main + 6001524
+	10  antfly-inference-bench-server       0x0000000104c38a64 main + 6004944
+	11  antfly-inference-bench-server       0x0000000104c3aecc main + 6014264
+	12  antfly-inference-bench-server       0x0000000104c49790 main + 6073852
+	13  antfly-inference-bench-server       0x0000000104c4ea58 main + 6095044
+	14  antfly-inference-bench-server       0x0000000104c53290 main + 6113532
+	15  antfly-inference-bench-server       0x0000000104c599d0 main + 6139964
+	16  antfly-inference-bench-server       0x0000000104c019bc main + 5779496
+	17  antfly-inference-bench-server       0x0000000104d58cb8 antfly_av1_dav1d_open + 336972
+	18  antfly-inference-bench-server       0x0000000104d785c4 antfly_av1_dav1d_open + 466264
+	19  antfly-inference-bench-server       0x0000000104d778c4 antfly_av1_dav1d_open + 462936
+	20  antfly-inference-bench-server       0x0000000104880f2c main + 2106776
+	21  antfly-inference-bench-server       0x000000010565708c antfly_av1_dav1d_open + 9766944
+	22  antfly-inference-bench-server       0x0000000105656250 antfly_av1_dav1d_open + 9763300
+	23  libsystem_pthread.dylib             0x0000000183a51d00 _pthread_start + 136
+	24  libsystem_pthread.dylib             0x0000000183a4ccec thread_start + 8
+)
+allocation-probe pid=32687 kind=length bytes=28753920
+(
+	0   vision-metal-allocation-stack-probe 0x00000001061c8a80 report + 204
+	1   vision-metal-allocation-stack-probe 0x00000001061c88c0 sampled_length + 100
+	2   antfly-inference-bench-server       0x0000000105838d54 termite_metal_buffer_alloc + 440
+	3   antfly-inference-bench-server       0x00000001043fecf4 antfly_build_info_version + 1297564
+	4   antfly-inference-bench-server       0x00000001043fee94 antfly_build_info_version + 1297980
+	5   antfly-inference-bench-server       0x0000000104ed4e60 antfly_av1_dav1d_open + 1893876
+	6   antfly-inference-bench-server       0x0000000104ed62e0 antfly_av1_dav1d_open + 1899124
+	7   antfly-inference-bench-server       0x0000000104354a48 antfly_build_info_version + 600560
+	8   antfly-inference-bench-server       0x0000000104355a1c antfly_build_info_version + 604612
+	9   antfly-inference-bench-server       0x0000000104c37d08 main + 6001524
+	10  antfly-inference-bench-server       0x0000000104c38a64 main + 6004944
+	11  antfly-inference-bench-server       0x0000000104c3aecc main + 6014264
+	12  antfly-inference-bench-server       0x0000000104c49790 main + 6073852
+	13  antfly-inference-bench-server       0x0000000104c4ea58 main + 6095044
+	14  antfly-inference-bench-server       0x0000000104c53290 main + 6113532
+	15  antfly-inference-bench-server       0x0000000104c599d0 main + 6139964
+	16  antfly-inference-bench-server       0x0000000104c019bc main + 5779496
+	17  antfly-inference-bench-server       0x0000000104d58cb8 antfly_av1_dav1d_open + 336972
+	18  antfly-inference-bench-server       0x0000000104d785c4 antfly_av1_dav1d_open + 466264
+	19  antfly-inference-bench-server       0x0000000104d778c4 antfly_av1_dav1d_open + 462936
+	20  antfly-inference-bench-server       0x0000000104880f2c main + 2106776
+	21  antfly-inference-bench-server       0x000000010565708c antfly_av1_dav1d_open + 9766944
+	22  antfly-inference-bench-server       0x0000000105656250 antfly_av1_dav1d_open + 9763300
+	23  libsystem_pthread.dylib             0x0000000183a51d00 _pthread_start + 136
+	24  libsystem_pthread.dylib             0x0000000183a4ccec thread_start + 8
+)
+allocation-probe pid=32687 kind=length bytes=9437184
+allocation-probe pid=32687 kind=length bytes=9437184
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=9437184
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=9437184
+allocation-probe pid=32687 kind=length bytes=9437184
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=9437184
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=9437184
+allocation-probe pid=32687 kind=length bytes=9437184
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=9437184
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=9437184
+allocation-probe pid=32687 kind=length bytes=9437184
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=9437184
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=9437184
+allocation-probe pid=32687 kind=length bytes=9437184
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=9437184
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=9437184
+allocation-probe pid=32687 kind=length bytes=9437184
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=9437184
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=9437184
+allocation-probe pid=32687 kind=length bytes=9437184
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=9437184
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=9437184
+allocation-probe pid=32687 kind=length bytes=9437184
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=9437184
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=9437184
+allocation-probe pid=32687 kind=length bytes=9437184
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=9437184
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=9437184
+allocation-probe pid=32687 kind=length bytes=9437184
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=9437184
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=9437184
+allocation-probe pid=32687 kind=length bytes=9437184
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=9437184
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=9437184
+allocation-probe pid=32687 kind=length bytes=9437184
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=9437184
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=9437184
+allocation-probe pid=32687 kind=length bytes=9437184
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=9437184
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=9437184
+allocation-probe pid=32687 kind=length bytes=9437184
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=9437184
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=9437184
+allocation-probe pid=32687 kind=length bytes=9437184
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=9437184
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=28753920
+allocation-probe pid=32687 kind=length bytes=9437184
+allocation-probe pid=32687 kind=length bytes=13074432
+allocation-probe pid=32687 kind=length bytes=13074432
+allocation-probe pid=32687 kind=length bytes=13074432
+{"ts":"+2026-10-15T02:39:34Z","level":"warn","scope":"default","msg":"inference live-memory admission denied requested_bytes=2244401029 pending_bytes=0 available_bytes=1677505896 reserve_bytes=536870912 capacity_bytes=1140634984 basis=macos_memory_pressure policy=explicit_process_envelope process_rss_bytes=2225111040 process_anonymous_bytes=0 process_private_dirty_bytes=0"}

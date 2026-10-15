@@ -1,0 +1,11 @@
+{
+  "base_commit": "381fd9e9237b45ad6027a77c104981d08b33057c",
+  "binary_sha256": "ef5f3c3ad9f7c019a8dbf036bfd55314e8065b2d5d08d0b7aa7a362b01f8f42b",
+  "source_sha256": {
+    "zig/pkg/inference/src/models/embedding_gemma2_weight_cache.zig": "7bb328e79c38a6c9c7d4716cba316921f574f7e620f66ca3406ce7d0ff331cf9",
+    "zig/pkg/inference/src/backends/metal_native_provider.zig": "f92ec76f2fcb857f07cddc9fb8c6041b23c50e3cec8bbe4c695b5dadde1cb3f2",
+    "zig/pkg/inference/src/ops/metal_compute.zig": "aee3c1ed3de007e1260ebc01c00154aed5ff6b0ad35847001efdc540be7f1545"
+  },
+  "patch_sha256": "8bb3100c9f42985ff7418ab81bb618bddb1a48d8711216b5480bf14962f45c0c",
+  "scope": "114-matrix cache before pressure reclamation; fullclip pass but fixed4GiB AV1layers fail after first video; preserved as regression evidence"
+}

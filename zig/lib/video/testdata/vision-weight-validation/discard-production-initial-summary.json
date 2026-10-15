@@ -1,0 +1,51 @@
+{
+  "status": "failed",
+  "source_provenance_sha256": "477ba89965d0e1552513e7c69ac55442ffe9cda47bed574acf9c42b1f51f55c6",
+  "cases": [
+    {
+      "name": "full-clip",
+      "exit_code": 0,
+      "status": "pass",
+      "seconds": 38.754588916,
+      "report": "/private/tmp/vision-cache-discard-production-full-clip.json",
+      "log": "/private/tmp/vision-cache-discard-production-full-clip.log",
+      "max_abs": 8.796341717243195e-07
+    },
+    {
+      "name": "webm",
+      "exit_code": 0,
+      "status": "pass",
+      "seconds": 7.123307875000002,
+      "report": "/private/tmp/vision-cache-discard-production-webm.json",
+      "log": "/private/tmp/vision-cache-discard-production-webm.log",
+      "max_abs": 6.221234798431396e-07
+    },
+    {
+      "name": "gbr",
+      "exit_code": 0,
+      "status": "pass",
+      "seconds": 13.077072125,
+      "report": "/private/tmp/vision-cache-discard-production-gbr.json",
+      "log": "/private/tmp/vision-cache-discard-production-gbr.log",
+      "max_abs": 3.762543201446533e-07
+    },
+    {
+      "name": "layers-4g",
+      "exit_code": 1,
+      "status": "failed",
+      "seconds": 2.386480666000004,
+      "report": "/private/tmp/vision-cache-discard-production-layers-4g.json",
+      "log": "/private/tmp/vision-cache-discard-production-layers-4g.log",
+      "max_abs": null
+    },
+    {
+      "name": "formats-4g",
+      "exit_code": 1,
+      "status": "failed",
+      "seconds": 2.3980598340000014,
+      "report": "/private/tmp/vision-cache-discard-production-formats-4g.json",
+      "log": "/private/tmp/vision-cache-discard-production-formats-4g.log",
+      "max_abs": null
+    }
+  ]
+}

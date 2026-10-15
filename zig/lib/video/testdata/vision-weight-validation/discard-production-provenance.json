@@ -1,0 +1,15 @@
+{
+  "base_commit": "a78f172921faac816b60eb27d282bb19506d25c8",
+  "runtime_sources_sha256": {
+    "zig/pkg/inference/src/architectures/session_factory.zig": "fb7f63249ffc018d215df6a66ac5c032296826fe93086679f00d8ed436938acd",
+    "zig/pkg/inference/src/backends/metal_kernels.m": "4a4726a94be96400f08353be9bdd52d4d01d327f21196540e65cff4dafdaf0f0",
+    "zig/pkg/inference/src/backends/metal_native_provider.zig": "f61534d3d76d5dfb45830a6ce47304938907c530b831baaf4e0352ae2896b3a8",
+    "zig/pkg/inference/src/backends/metal_runtime.zig": "a27c7615116a8b188034445193102042bc653e2c2c71f1fb3ee44ef99218b12d",
+    "zig/pkg/inference/src/models/embedding_gemma2_weight_cache.zig": "7bb328e79c38a6c9c7d4716cba316921f574f7e620f66ca3406ce7d0ff331cf9",
+    "zig/pkg/inference/src/ops/metal_compute.zig": "3ce9c9430ef4457d81881f140afaccb5fd0a192c69d3cb0c751895a9fb211e5f",
+    "zig/pkg/inference/src/pipelines/embedding_gemma2.zig": "fb0b844ae7165fc28a36b2d990950356f99bccf94809dbb55d5eedc0a3f79827"
+  },
+  "patch_sha256": "75289da1deaf34483abd9953b46c02d4385af4c0d1dfe15d03c7144b6adc9d01",
+  "metal_binary_sha256": "b6a8789c4634faf9ce5103f5c0c09c45607574a42e89a02679ecb9727f37968e",
+  "source_scope": "Production builds started before a const-to-var correction confined to the Metal pressure test. All executable production statements are frozen; the attached patch includes the corrected test. No tolerance, retry or process budget changes."
+}

@@ -5572,7 +5572,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             (std.math.cast(usize, source.shape[0]) orelse return null) != out_dim or
             (std.math.cast(usize, source.shape[1]) orelse return null) != in_dim) return null;
         const name = entry.tensor_ref.name;
-        if (!policy.eligibleName(name)) return null;
+        const cache_class = policy.metalClass(name) orelse return null;
         // A general bias may be mutable or request-specific. Only the actual
         // zero-bias projection path can reuse a slot by checkpoint weight name.
         const bias_buf = toBuf(bias);
@@ -5596,7 +5596,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const elements = std.math.mul(usize, in_dim, out_dim) catch return null;
         const payload = std.math.add(usize, elements, out_dim) catch return null;
         const bytes = std.math.mul(usize, payload, @sizeOf(f32)) catch return null;
-        if (bytes == 0 or bytes > policy.max_bytes - provider.embeddinggemma2_linear_cache_bytes or
+        const class_bytes = if (cache_class == .vision)
+            provider.embeddinggemma2_vision_linear_cache_bytes
+        else
+            provider.embeddinggemma2_linear_cache_bytes - provider.embeddinggemma2_vision_linear_cache_bytes;
+        const class_limit = if (cache_class == .vision) policy.metal_vision_max_bytes else policy.max_bytes;
+        if (bytes == 0 or class_bytes > class_limit or bytes > class_limit - class_bytes or
             provider.embeddinggemma2_linear_cache.count() >= policy.max_entries) return null;
         const slot = self.nextFreeDynamicLinearSlot() orelse return null;
         cache.reserve(.backend, bytes) catch {
@@ -5628,6 +5633,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .bytes = bytes,
         });
         provider.embeddinggemma2_linear_cache_bytes += bytes;
+        if (cache_class == .vision) provider.embeddinggemma2_vision_linear_cache_bytes += bytes;
         committed = true;
         return slot;
     }
@@ -32847,6 +32853,27 @@ fn unlockSharedMetalData(data: *WeightStore, lock_io: std.Io) void {
     data.shared_metal_native_provider_lock.unlock(lock_io);
 }
 
+/// Reclaim only an idle model's optional vision weights. Admission must never
+/// park behind another request's native work or the prefetch worker.
+pub fn reclaimEmbeddingGemma2VisionWeights(data: *WeightStore, io: ?std.Io) !usize {
+    return reclaimEmbeddingGemma2Weights(data, io, .vision);
+}
+
+pub fn reclaimEmbeddingGemma2Weights(data: *WeightStore, io: ?std.Io, cache_class: @import("../models/embedding_gemma2_weight_cache.zig").MetalClass) !usize {
+    if (comptime !build_options.enable_metal) return 0;
+    const lock_io = lockSharedMetalData(data, io) catch |err| switch (err) {
+        error.QueueFull => return 0,
+    };
+    defer unlockSharedMetalData(data, lock_io);
+    const provider = data.shared_metal_native_provider orelse return 0;
+    const residency = data.prefetch.lockHandle();
+    if (!residency.mutex.tryLock()) return 0;
+    defer residency.unlock();
+    return provider.reclaimEmbeddingGemma2Weights(cache_class) catch |err| switch (err) {
+        error.MetalWorkspaceBusy => 0,
+    };
+}
+
 pub fn deinitSharedNativeProvider(data: *WeightStore) void {
     if (comptime !build_options.enable_metal) return;
     if (comptime false) return;
@@ -39978,12 +40005,22 @@ fn addLegacyGlinerMpsTestWeight(store: *WeightStore, name: []const u8, values: [
 }
 
 test "embeddinggemma2 Metal admitted projection cache survives requests cancellation and unload" {
+    try exerciseEmbeddingGemma2ProjectionCache("language_model.layers.0.self_attn.q_proj.weight", "vision_tower.encoder.layers.0.self_attn.q_proj.linear.weight");
+}
+
+test "embeddinggemma2 Metal video admitted vision and projector slots survive requests cancellation and unload" {
+    try exerciseEmbeddingGemma2ProjectionCache("vision_tower.encoder.layers.0.self_attn.q_proj.linear.weight", "language_model.layers.0.self_attn.q_proj.weight");
+    try exerciseEmbeddingGemma2ProjectionCache("embed_vision.embedding_projection.weight", "language_model.layers.0.self_attn.q_proj.weight");
+    try exerciseEmbeddingGemma2ProjectionCache("vision_tower.patch_embedder.input_proj.weight", "language_model.layers.0.self_attn.q_proj.weight");
+}
+
+fn exerciseEmbeddingGemma2ProjectionCache(name: []const u8, denied_name: []const u8) !void {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
     if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
     const a = std.testing.allocator;
     const dim = 64;
     const slot_bytes = (dim * dim + dim) * @sizeOf(f32);
-    const name = "language_model.layers.0.self_attn.q_proj.weight";
+    const vision = @import("../models/embedding_gemma2_weight_cache.zig").metalClass(name).? == .vision;
     var weights: [dim * dim]f32 = undefined;
     var bits: [dim * dim]u16 = undefined;
     for (&weights, &bits, 0..) |*value, *bf16, i| {
@@ -40017,15 +40054,22 @@ test "embeddinggemma2 Metal admitted projection cache survives requests cancella
         defer cb.free(weight);
         const bias = try compute.cachedZeroBiasBuf(dim);
         defer cb.free(bias);
+        const before_prepare = @import("../backends/metal_telemetry.zig").snapshot(true);
         const slot = (try compute.ensureDynamicLinearSlot(weight, bias, dim, dim)) orelse return error.ExpectedMetalLinear;
+        const after_prepare = @import("../backends/metal_telemetry.zig").snapshot(true);
+        if (iteration != 0) try std.testing.expectEqual(before_prepare[18], after_prepare[18]);
         if (cached_slot) |previous| try std.testing.expectEqual(previous, slot) else cached_slot = slot;
         try std.testing.expectEqual(@as(usize, 0), compute.dynamic_linear_slots.count());
         try std.testing.expectEqual(@as(usize, 1), compute.provider_impl.embeddinggemma2_linear_cache.count());
+        try std.testing.expectEqual(@as(usize, if (vision) slot_bytes else 0), compute.provider_impl.embeddinggemma2_vision_linear_cache_bytes);
+        // ProjectorWeights tears down request tensors after every cohort.
+        // A model-owned snapshot must survive that exact release path.
+        MetalCompute.releaseDynamicSlotsForTensor(&cb, weight);
         try std.testing.expectEqual(@as(usize, slot_bytes), store.tier_cache.?.backend_bytes);
         try std.testing.expectEqual(@as(usize, slot_bytes), controller.snapshot().backend_weight_bytes);
         // Additional immutable projections cannot grow past the admitted cap.
         var denied_entry = entry.*;
-        denied_entry.tensor_ref.name = "language_model.layers.1.self_attn.q_proj.weight";
+        denied_entry.tensor_ref.name = denied_name;
         var denied_buf = MetalCompute.toBuf(weight).*;
         denied_buf.lazy_entry = &denied_entry;
         const before_denial = metal_runtime_mod.runtimeMemorySnapshot(compute.provider_impl.raw_decode_runtime);
@@ -42569,4 +42613,122 @@ test "Metal OCR canonical quantized head frame matches singleton logits and supp
         try std.testing.expectEqual(before.frame_submit_count + 1, metal_runtime.runtimeMemorySnapshot(runtime).frame_submit_count);
         try std.testing.expect(!metal_runtime.hasActiveFrame(runtime));
     }
+}
+
+test "embeddinggemma2 Metal video pressure reclaims idle vision slots and preserves language and busy providers" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const dim = 64;
+    const slot_bytes = (dim * dim + dim) * @sizeOf(f32);
+    const language = "language_model.layers.0.self_attn.q_proj.weight";
+    const vision = "vision_tower.patch_embedder.input_proj.weight";
+    var values: [dim * dim]f32 = @splat(0.125);
+    var controller = runtime_root.tier.memory.AdmissionController{};
+    controller.configureSharedLimits(.{ .unified_limit_bytes = 2 * slot_bytes });
+    defer controller.deinit();
+    var store = testMetalWeightStoreInit(a);
+    store.tier_cache = runtime_root.tier.cache.SharedCache.init(.{ .backend_limit_bytes = 2 * slot_bytes });
+    defer store.tier_cache.?.deinitAdmission();
+    try store.tier_cache.?.configureAdmission(a, &controller, .gpu, .{ .backend_limit_bytes = 2 * slot_bytes, .combined_limit_bytes = 2 * slot_bytes }, .{});
+    defer store.lazy_weights.deinit(a);
+    try addLegacyGlinerMpsTestWeight(&store, language, &values, &.{ dim, dim });
+    try addLegacyGlinerMpsTestWeight(&store, vision, &values, &.{ dim, dim });
+    initPrefetchQueue(&store, a);
+    defer deinitPrefetchQueue(&store);
+    defer deinitSharedNativeProvider(&store);
+    var slots: [2]usize = undefined;
+    {
+        var compute = try MetalCompute.init(a, &store, null);
+        defer compute.deinit();
+        compute.require_f32_linears = true;
+        const cb = compute.computeBackend();
+        const bias = try compute.cachedZeroBiasBuf(dim);
+        defer cb.free(bias);
+        for ([_][]const u8{ language, vision }, &slots) |name, *slot| {
+            const weight = try cb.getWeight(name);
+            defer cb.free(weight);
+            slot.* = (try compute.ensureDynamicLinearSlot(weight, bias, dim, dim)) orelse return error.ExpectedMetalLinear;
+        }
+        // Holding even an idle request's execution lease prevents reclamation.
+        try std.testing.expectEqual(@as(usize, 0), try reclaimEmbeddingGemma2VisionWeights(&store, std.testing.io));
+    }
+    const provider = store.shared_metal_native_provider.?;
+    try std.testing.expectEqual(@as(usize, 2 * slot_bytes), controller.snapshot().backend_weight_bytes);
+    {
+        const residency = store.prefetch.lockHandle();
+        residency.lock();
+        defer residency.unlock();
+        try std.testing.expectEqual(@as(usize, 0), try reclaimEmbeddingGemma2VisionWeights(&store, std.testing.io));
+    }
+    try std.testing.expectEqual(@as(usize, slot_bytes), try reclaimEmbeddingGemma2VisionWeights(&store, std.testing.io));
+    try std.testing.expectEqual(@as(usize, 1), provider.embeddinggemma2_linear_cache.count());
+    try std.testing.expectEqual(@as(usize, slot_bytes), provider.embeddinggemma2_linear_cache_bytes);
+    try std.testing.expectEqual(@as(usize, 0), provider.embeddinggemma2_vision_linear_cache_bytes);
+    try std.testing.expectEqual(@as(usize, slot_bytes), controller.snapshot().backend_weight_bytes);
+    try std.testing.expect(metal_runtime_mod.decoderRuntimeLinearSlotPrepared(provider, slots[0], dim, dim));
+    try std.testing.expect(!metal_runtime_mod.decoderRuntimeLinearSlotPrepared(provider, slots[1], dim, dim));
+    try std.testing.expectEqual(@as(usize, 0), try reclaimEmbeddingGemma2VisionWeights(&store, std.testing.io));
+    {
+        var compute = try MetalCompute.init(a, &store, null);
+        defer compute.deinit();
+        compute.require_f32_linears = true;
+        var cb = compute.computeBackend();
+        const weight = try cb.getWeight(vision);
+        defer cb.free(weight);
+        const bias = try compute.cachedZeroBiasBuf(dim);
+        defer cb.free(bias);
+        slots[1] = (try compute.ensureDynamicLinearSlot(weight, bias, dim, dim)) orelse return error.ExpectedMetalLinear;
+        try std.testing.expectEqual(@as(usize, 2 * slot_bytes), controller.snapshot().backend_weight_bytes);
+        // Rebuilt vision weights, retained language weights and their shared
+        // zero bias must all remain numerically valid after destructive eviction.
+        var input_values: [dim]f32 = @splat(1);
+        const input = try auditDeviceTensor(&compute, &cb, &input_values, &.{ 1, dim });
+        defer cb.free(input);
+        try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+        try std.testing.expectEqual(@as(c_int, -2), metal_runtime_mod.termite_metal_decode_runtime_discard_owned_linear_slot(provider.raw_decode_runtime, slots[1]));
+        for (slots) |slot| {
+            const output = (try cb.decoderRuntimeApplyLinear(&.{ .slot = slot, .input = input, .in_dim = dim, .out_dim = dim })) orelse return error.ExpectedMetalLinear;
+            defer cb.free(output);
+            try cb.decoderRuntimeSubmitAndWaitFrame();
+            const result = try cb.toFloat32(output, a);
+            defer a.free(result);
+            for (result) |value| try std.testing.expectEqual(@as(f32, 8), value);
+            if (slot == slots[0]) try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+        }
+    }
+    // A later pressure stage can yield language constants without erasing
+    // remaining vision constants or their shared canonical zero bias.
+    try std.testing.expectEqual(@as(usize, slot_bytes), try reclaimEmbeddingGemma2Weights(&store, std.testing.io, .language));
+    try std.testing.expectEqual(@as(usize, 1), provider.embeddinggemma2_linear_cache.count());
+    try std.testing.expectEqual(@as(usize, slot_bytes), provider.embeddinggemma2_vision_linear_cache_bytes);
+    try std.testing.expectEqual(@as(usize, slot_bytes), controller.snapshot().backend_weight_bytes);
+    try std.testing.expect(!metal_runtime_mod.decoderRuntimeLinearSlotPrepared(provider, slots[0], dim, dim));
+    try std.testing.expect(metal_runtime_mod.decoderRuntimeLinearSlotPrepared(provider, slots[1], dim, dim));
+    {
+        var compute = try MetalCompute.init(a, &store, null);
+        defer compute.deinit();
+        compute.require_f32_linears = true;
+        var cb = compute.computeBackend();
+        const weight = try cb.getWeight(language);
+        defer cb.free(weight);
+        const bias = try compute.cachedZeroBiasBuf(dim);
+        defer cb.free(bias);
+        slots[0] = (try compute.ensureDynamicLinearSlot(weight, bias, dim, dim)) orelse return error.ExpectedMetalLinear;
+        var input_values: [dim]f32 = @splat(1);
+        const input = try auditDeviceTensor(&compute, &cb, &input_values, &.{ 1, dim });
+        defer cb.free(input);
+        for (slots) |slot| {
+            try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+            const output = (try cb.decoderRuntimeApplyLinear(&.{ .slot = slot, .input = input, .in_dim = dim, .out_dim = dim })) orelse return error.ExpectedMetalLinear;
+            defer cb.free(output);
+            try cb.decoderRuntimeSubmitAndWaitFrame();
+            const result = try cb.toFloat32(output, a);
+            defer a.free(result);
+            for (result) |value| try std.testing.expectEqual(@as(f32, 8), value);
+        }
+        try std.testing.expectEqual(@as(usize, 2 * slot_bytes), controller.snapshot().backend_weight_bytes);
+    }
+    deinitSharedNativeProvider(&store);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_weight_bytes);
 }

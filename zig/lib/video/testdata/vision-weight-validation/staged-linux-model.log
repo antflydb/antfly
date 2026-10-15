@@ -1,0 +1,63 @@
+1/62 inference_internal.test.embeddinggemma2 video module declarations...OK
+2/62 pipelines.embedding_gemma2.test.embeddinggemma2 video rows preserve image audio and frame ordering...OK
+3/62 pipelines.embedding_gemma2.test_0...OK
+4/62 pipelines.embedding_gemma2.test.embeddinggemma2 video live window validates sampling before entering a model session...OK
+5/62 pipelines.embedding_gemma2.test.embeddinggemma2 video live pump checks cancellation before entering model admission...OK
+6/62 pipelines.embedding_gemma2.test.embeddinggemma2 video streaming output copies retain independent normalized vectors...OK
+7/62 pipelines.embedding_gemma2.test.embeddinggemma2 video streaming cancellation precedes model and Reader access...OK
+8/62 pipelines.embedding_gemma2.test_1...OK
+9/62 pipelines.embedding_gemma2.test.embeddinggemma2 video cache admission reclaims ordered classes without weakening bounds cancellation or forced denial...OK
+10/62 pipelines.embedding_gemma2_video.test.embeddinggemma2 video sampling maps presentation order and uniform long clips...OK
+11/62 pipelines.embedding_gemma2_video.test.embeddinggemma2 video repeated samples reuse projection and validate color declarations...OK
+12/62 pipelines.embedding_gemma2_video.test.embeddinggemma2 model VFR qualification preserves pinned average FPS indices and compressed pixels...OK
+13/62 pipelines.embedding_gemma2_video.test.embeddinggemma2 video HDR rendering requires consistent gamut and transfer...OK
+14/62 pipelines.embedding_gemma2_video.test.embeddinggemma2 video WebM inspection uses decoded visible picture sampling...OK
+15/62 pipelines.embedding_gemma2_video.test.embeddinggemma2 video logical field partition selection and timestamp windows...OK
+16/62 pipelines.embedding_gemma2_video.test.embeddinggemma2 video admission rejects all container paths before model execution...OK
+17/62 pipelines.embedding_gemma2_video.test.embeddinggemma2 video preflight bounds temporary owners and plans geometry instead of maximum slots...OK
+18/62 pipelines.embedding_gemma2_video.test.embeddinggemma2 video preflight allocation failures release metadata decoder and admission owners...OK
+19/62 pipelines.embedding_gemma2_video.test.embeddinggemma2 video producer prepares before model gate and drains an abandoned full queue...OK
+20/62 pipelines.embedding_gemma2_video.test.embeddinggemma2 video producer failure preserves error and releases partial owners...OK
+21/62 pipelines.embedding_gemma2_video.test.embeddinggemma2 video producer allocation failure drains metadata and prepared patches...OK
+22/62 pipelines.embedding_gemma2_video.test.embeddinggemma2 video cancellation before consumer entry joins and drains producer...OK
+23/62 pipelines.embedding_gemma2_video.test.embeddinggemma2 video WebM presentation and container colour reach model preparation...OK
+24/62 pipelines.embedding_gemma2_video.test.embeddinggemma2 video native TS sampling and preflight preserve MP4 pictures...OK
+25/62 pipelines.embedding_gemma2_video.test.embeddinggemma2 video TS producer preserves prepared MP4 patches and drains owners...OK
+26/62 pipelines.embedding_gemma2_video.test.embeddinggemma2 video cache producer skips fully cached decode and preparation for every container...OK
+27/62 pipelines.embedding_gemma2_video.test.embeddinggemma2 video cache abandoned producer restores borrowed entries under backpressure...OK
+28/62 pipelines.embedding_gemma2_video.test.embeddinggemma2 video borrowed packet preparation matches container and leaves caller read state untouched...OK
+29/62 pipelines.embedding_gemma2_video.test.embeddinggemma2 Metal video borrowed reader preparation matches container on completed device work...SKIP
+30/62 pipelines.embedding_gemma2_video.test.embeddinggemma2 video source sampling preserves VFR picture identity after preroll eviction...OK
+31/62 pipelines.embedding_gemma2_video.test.embeddinggemma2 video source sampling excludes unfinished future fields...OK
+32/62 pipelines.embedding_gemma2_video.test.embeddinggemma2 video bound selection reuses logical metadata without decoder admission...OK
+33/62 pipelines.embedding_gemma2_video.test.embeddinggemma2 video bound selection rejects payload timing geometry and policy changes...OK
+34/62 pipelines.embedding_gemma2_video.test.embeddinggemma2 video source bound preparation preserves native field patches...OK
+35/62 pipelines.embedding_gemma2_video.test.embeddinggemma2 Metal video source bound preparation preserves field patches...SKIP
+36/62 pipelines.embedding_gemma2_video.test.embeddinggemma2 video source bound selection releases admission on allocation failure...OK
+37/62 pipelines.embedding_gemma2_video.test.embeddinggemma2 video reader projection prefixes survive append and bind field completion...OK
+38/62 pipelines.embedding_gemma2_video.test.embeddinggemma2 video projection keys survive IDR preroll eviction and payload relocation...OK
+39/62 pipelines.embedding_gemma2_video.test.embeddinggemma2 video projection reset requires complete metadata without crossing assemblies...OK
+40/62 pipelines.embedding_gemma2_video.test.embeddinggemma2 video cached borrowed reader producer skips native reconstruction and restores tickets...OK
+41/62 pipelines.embedding_gemma2_video.test.embeddinggemma2 video preflight includes native chroma reconstruction scratch...OK
+42/62 pipelines.embedding_gemma2_video.test.embeddinggemma2 video scalable AV1 sampling uses highest spatial presentation layer...OK
+43/62 pipelines.embedding_gemma2_video.test.embeddinggemma2 video identity GBR declarations select native RGB compatibility...OK
+44/62 architectures.gemma4_projector.test.embeddinggemma2 Metal video vision layers retire completed MPS views and preserve external frame ownership...SKIP
+45/62 pipelines.embedding_gemma2_video_cache.test.embeddinggemma2 video cache borrows survive eviction pressure and preserve exact ownership...OK
+46/62 pipelines.embedding_gemma2_video_cache.test.embeddinggemma2 video cache shared admission denies additional request owners...OK
+47/62 pipelines.embedding_gemma2_video_cache.test.embeddinggemma2 video cache allocation denial returns the retained lease...OK
+48/62 pipelines.embedding_gemma2_video_cache.test.embeddinggemma2 Metal video cache survives compute wrappers without intermediate downloads...SKIP
+49/62 backends.backends.test_0...OK
+50/62 ops.native_compute.test.embeddinggemma2 video full F32 vision fallback preserves independent unmasked native cohorts...OK
+51/62 runtime.root.test_0...OK
+52/62 runtime.tier.root.test_0...OK
+53/62 runtime.moe.root.test_0...OK
+54/62 runtime.kv.root.test_0...OK
+55/62 gguf.root.test_0...OK
+56/62 models.embedding_gemma2_weight_cache.test.embeddinggemma2 video Metal cache admits only checkpoint vision linears and projector...OK
+57/62 runtime.scheduler.root.test_0...OK
+58/62 ops.metal_compute.test.embeddinggemma2 Metal video admitted vision and projector slots survive requests cancellation and unload...SKIP
+59/62 ops.metal_compute.test.embeddinggemma2 Metal video buffer survives producer destruction and enters resident linear...SKIP
+60/62 ops.metal_compute.test.embeddinggemma2 Metal video producer prepares while compute lease is held and drains on abandonment...SKIP
+61/62 ops.metal_compute.test.embeddinggemma2 Metal video pressure reclaims idle vision slots and preserves language and busy providers...SKIP
+62/62 pipelines.embedding_gemma2_live_stream.test.embeddinggemma2 video streaming output acknowledgement survives cancellation during real window commit...OK
+54 passed; 8 skipped; 0 failed.

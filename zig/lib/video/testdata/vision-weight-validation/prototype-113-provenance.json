@@ -1,0 +1,11 @@
+{
+  "binary_sha256": "ade34c52674bd3a9845a3ed157b6e5f24c47de5188c7460966e7299a07cd7ed6",
+  "base_commit": "381fd9e9237b45ad6027a77c104981d08b33057c",
+  "source_sha256": {
+    "zig/pkg/inference/src/models/embedding_gemma2_weight_cache.zig": "2be60ff9598a7d8c84e915aa27e45511f0924cfea5c96e18d7f2df2928ed9f4f",
+    "zig/pkg/inference/src/backends/metal_native_provider.zig": "f92ec76f2fcb857f07cddc9fb8c6041b23c50e3cec8bbe4c695b5dadde1cb3f2",
+    "zig/pkg/inference/src/ops/metal_compute.zig": "0caccb1562f5dc4a3d918f430d19266f53c6b334b23fdaa86d64d240d63ca2ab"
+  },
+  "patch_sha256": "086c16b49e85e8ae9f0ee6fc1aed4dee0a96ea0283bc297fb1bec17e4687da52",
+  "scope": "Prototype caches 113 block/projector matrices; final adds separately named input projection. All runtime statements frozen during prototype build."
+}

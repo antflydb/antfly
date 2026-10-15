@@ -1,0 +1,13 @@
+import contextlib,json,os,runpy,sys,traceback
+from pathlib import Path
+library,tag=sys.argv[1:]
+case=next(x for x in json.loads(Path('zig/lib/video/testdata/vision-weight-validation/production-commands.json').read_text())['cases'] if x['name']=='layers-4g')
+argv=case['argv'][1:];output=Path('/private/tmp/'+tag+'.json');argv[argv.index('--output')+1]=str(output)
+os.environ['DYLD_INSERT_LIBRARIES']=library
+sys.path.insert(0,str(Path('tools/embeddinggemma2').resolve()));sys.argv=argv
+exit_code=0
+with output.with_suffix('.log').open('w') as log,contextlib.redirect_stdout(log),contextlib.redirect_stderr(log):
+ try:runpy.run_path(argv[0],run_name='__main__')
+ except BaseException as error:
+  traceback.print_exc();exit_code=error.code if isinstance(error,SystemExit) else 1
+raise SystemExit(exit_code)

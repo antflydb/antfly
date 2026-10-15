@@ -1,0 +1,47 @@
+{
+  "status": "failed",
+  "diagnostic_injection_absent": true,
+  "source_provenance_sha256": "428c51a745edd51f2ada4a31d5d489e7983746aa1ad334e2b09e5896462fccd9",
+  "cases": [
+    {
+      "name": "layers-4g",
+      "exit_code": 1,
+      "status": "failed",
+      "seconds": 6.658764166,
+      "report": "/private/tmp/vision-cache-views-production-layers-4g.json",
+      "max_abs": null
+    },
+    {
+      "name": "formats-4g",
+      "exit_code": 1,
+      "status": "failed",
+      "seconds": 3.5182358749999993,
+      "report": "/private/tmp/vision-cache-views-production-formats-4g.json",
+      "max_abs": null
+    },
+    {
+      "name": "full-clip",
+      "exit_code": 0,
+      "status": "pass",
+      "seconds": 41.538807166,
+      "report": "/private/tmp/vision-cache-views-production-full-clip.json",
+      "max_abs": 8.796341717243195e-07
+    },
+    {
+      "name": "webm",
+      "exit_code": 0,
+      "status": "pass",
+      "seconds": 7.471701750000001,
+      "report": "/private/tmp/vision-cache-views-production-webm.json",
+      "max_abs": 6.221234798431396e-07
+    },
+    {
+      "name": "gbr",
+      "exit_code": 0,
+      "status": "pass",
+      "seconds": 14.074585583000001,
+      "report": "/private/tmp/vision-cache-views-production-gbr.json",
+      "max_abs": 3.762543201446533e-07
+    }
+  ]
+}

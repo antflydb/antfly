@@ -1,0 +1,24 @@
+#include <libproc.h>
+#include <malloc/malloc.h>
+#include <dlfcn.h>
+#include <stdio.h>
+#include <unistd.h>
+static _Thread_local int inside;
+static int sampled_rusage(int pid, int flavor, rusage_info_t *buffer) {
+ static int (*original)(int,int,rusage_info_t *);
+ if(!original) original=dlsym(RTLD_NEXT,"proc_pid_rusage");
+ int result=original(pid,flavor,buffer);
+ if(result==0 && pid==getpid() && !inside && (flavor==4 || flavor==6)) {
+  struct rusage_info_v0 *info=(void *)buffer;
+  if(info->ri_phys_footprint>1500000000ULL) {
+   inside=1;
+   unsigned long long before=info->ri_phys_footprint;
+   size_t released=malloc_zone_pressure_relief(NULL,0);
+   result=original(pid,flavor,buffer);
+   if(released) fprintf(stderr,"malloc-relief-probe pid=%d released=%zu footprint_before=%llu footprint_after=%llu\n",pid,released,before,info->ri_phys_footprint);
+   inside=0;
+  }
+ }
+ return result;
+}
+__attribute__((used)) static struct { const void *replacement; const void *replacee; } interpose __attribute__((section("__DATA,__interpose"))) = {sampled_rusage,proc_pid_rusage};

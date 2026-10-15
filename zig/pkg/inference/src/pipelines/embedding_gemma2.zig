@@ -23,6 +23,43 @@ const Tokenizer = @import("inference_tokenizer").Tokenizer;
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 const media_admission = @import("antfly_media").admission;
 const scoring = @import("antfly_decisions").scoring;
+
+fn visionCacheCanRelieve(pressure: @import("../runtime/tier/memory.zig").AdmissionPressure) bool {
+    return switch (pressure) {
+        .shared_unified, .external_budget, .live_host => true,
+        .domain_backend, .domain_combined => |backend| backend == .gpu,
+        else => false,
+    };
+}
+
+fn admitWithVisionCacheReclaim(session: Session, request: @import("../backends/session.zig").RunRequest, control: Control) !@import("../backends/session.zig").RunPermit {
+    return admitReclaimingVisionCache(session, request, control, session, factory.reclaimEmbeddingGemma2VisionWeights, factory.reclaimEmbeddingGemma2LanguageWeights);
+}
+
+/// Optional caches cannot starve an unchanged request reservation. Prefer
+/// vision reclamation; yield language constants only if pressure persists.
+/// Each class is attempted once, with no waiting or native locks across admit.
+fn admitReclaimingVisionCache(session: Session, request: @import("../backends/session.zig").RunRequest, control: Control, context: anytype, comptime reclaim_vision: anytype, comptime reclaim_language: anytype) !@import("../backends/session.zig").RunPermit {
+    try control.check();
+    var pressure: ?@import("../runtime/tier/memory.zig").AdmissionPressure = null;
+    return session.admitWithPressure(request, &pressure) catch |err| blk: {
+        var denied: anyerror = err;
+        inline for (.{ reclaim_vision, reclaim_language }) |reclaim| {
+            const reason = pressure orelse return denied;
+            if (!visionCacheCanRelieve(reason)) return denied;
+            try control.check();
+            const bytes = try reclaim(context, control);
+            try control.check();
+            if (bytes != 0) {
+                pressure = null;
+                if (session.admitWithPressure(request, &pressure)) |permit| {
+                    break :blk permit;
+                } else |failure| denied = failure;
+            }
+        }
+        return denied;
+    };
+}
 pub const SampledVideo = struct { bytes: []const u8 = &.{}, reader: ?*const @import("antfly_media").mp4.Reader = null, selection: ?*const @import("embedding_gemma2_video.zig").ReaderSelection = null, sampling: @import("embedding_gemma2_video.zig").Sampling };
 pub const Part = union(enum) { text: []const u8, image: []const u8, audio: []const u8, video: []const u8, sampled_video: SampledVideo, raster: @import("antfly_image").BorrowedRasterAttachment };
 
@@ -229,7 +266,7 @@ fn embedScoped(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, gro
         try std.math.add(usize, (if (has_video) @as(usize, 1536) else 768) * 1024 * 1024, device_bytes)
     else
         512 * 1024 * 1024;
-    var permit = try session.admit(.{ .batch = 1, .sequence = 8192, .input_bytes = input_bytes, .host_preprocess_bytes = 512 * 1024 * 1024, .workspace_bytes = workspace, .output_bytes = 8192 * 768 * @sizeOf(f32) });
+    var permit = try admitWithVisionCacheReclaim(session, .{ .batch = 1, .sequence = 8192, .input_bytes = input_bytes, .host_preprocess_bytes = 512 * 1024 * 1024, .workspace_bytes = workspace, .output_bytes = 8192 * 768 * @sizeOf(f32) }, effective);
     defer permit.deinit();
     // Video parts execute sequentially; their transient preparation shares use
     // a maximum, while projected tokens stay in the model workspace.
@@ -721,12 +758,12 @@ fn consumePreparedAudios(out: std.mem.Allocator, slot: *@import("audio_preparati
     slot.bounded.limit = 512 * 1024 * 1024;
     const a = slot.allocator();
     const request = audioRunRequest(slot.session.backend(), slot.input_bytes, slot.retained_bytes, slot.retained);
-    var permit = slot.session.admit(request) catch |err| blk: {
+    var permit = admitWithVisionCacheReclaim(slot.session, request, slot.control) catch |err| blk: {
         const next = future orelse return err;
         if (!@import("audio_preparation.zig").pressure(err)) return err;
         next.deinit();
         next.failure = err;
-        break :blk try slot.session.admit(request);
+        break :blk try admitWithVisionCacheReclaim(slot.session, request, slot.control);
     };
     defer permit.deinit();
     var managed = try factory.getManagedComputeBackend(slot.session, a, null, slot.control);
@@ -1030,7 +1067,7 @@ fn consumePreparedMedia(slot: *PreparationSlot, tokenizer: Tokenizer, cfg: encod
     const vision_limit: usize = 2 * 1024 * 1024 * 1024;
     const vision_scratch = try projector.embeddingGemma2PreparedScratch(slot.pixels[0..slot.retained], vision_limit);
     const request = imageRunRequest(session.backend(), slot.input_bytes, slot.retained_bytes, slot.source.len(), vision_scratch);
-    var permit = session.admit(request) catch |err| blk: {
+    var permit = admitWithVisionCacheReclaim(session, request, control) catch |err| blk: {
         const future = lookahead orelse return err;
         if (!isPreparationPressure(err)) return err;
         // Speculation must not occupy the budget needed by the current wave.
@@ -1038,7 +1075,7 @@ fn consumePreparedMedia(slot: *PreparationSlot, tokenizer: Tokenizer, cfg: encod
         // that wave again after the current one has released its permit.
         future.deinit();
         future.failure = err;
-        break :blk try session.admit(request);
+        break :blk try admitWithVisionCacheReclaim(session, request, control);
     };
     defer permit.deinit();
     var managed = try factory.getManagedComputeBackend(session, a, null, control);
@@ -1130,7 +1167,7 @@ fn embedImageCohort(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer
     try host_permit.retainHostBytes(retained_bytes);
     if (lock) |mutex| try control.lock(mutex);
     defer if (lock) |mutex| mutex.unlock();
-    var permit = try session.admit(.{ .batch = images.len, .sequence = raster_max_sequence, .input_bytes = input_bytes, .pre_admitted_host_bytes = retained_bytes, .host_preprocess_bytes = 512 * 1024 * 1024, .workspace_bytes = vision_scratch + (if (session.backend() == .metal) @as(usize, 768 * 1024 * 1024) else @as(usize, 512 * 1024 * 1024)), .output_bytes = images.len * raster_max_sequence * 768 * 4 });
+    var permit = try admitWithVisionCacheReclaim(session, .{ .batch = images.len, .sequence = raster_max_sequence, .input_bytes = input_bytes, .pre_admitted_host_bytes = retained_bytes, .host_preprocess_bytes = 512 * 1024 * 1024, .workspace_bytes = vision_scratch + (if (session.backend() == .metal) @as(usize, 768 * 1024 * 1024) else @as(usize, 512 * 1024 * 1024)), .output_bytes = images.len * raster_max_sequence * 768 * 4 }, control);
     defer permit.deinit();
     var managed = try factory.getManagedComputeBackend(session, a, null, control);
     defer managed.deinit();
@@ -1188,7 +1225,7 @@ fn embedRasterCohort(a: std.mem.Allocator, session: Session, tokenizer: Tokenize
     defer host_permit.deinit();
     if (lock) |mutex| try control.lock(mutex);
     defer if (lock) |mutex| mutex.unlock();
-    var permit = try session.admit(.{ .batch = rasters.len, .sequence = raster_max_sequence, .input_bytes = input_bytes, .pre_admitted_host_bytes = input_bytes, .host_preprocess_bytes = 512 * 1024 * 1024, .workspace_bytes = vision_scratch + (if (session.backend() == .metal) @as(usize, 768 * 1024 * 1024) else @as(usize, 512 * 1024 * 1024)), .output_bytes = rasters.len * raster_max_sequence * 768 * @sizeOf(f32) });
+    var permit = try admitWithVisionCacheReclaim(session, .{ .batch = rasters.len, .sequence = raster_max_sequence, .input_bytes = input_bytes, .pre_admitted_host_bytes = input_bytes, .host_preprocess_bytes = 512 * 1024 * 1024, .workspace_bytes = vision_scratch + (if (session.backend() == .metal) @as(usize, 768 * 1024 * 1024) else @as(usize, 512 * 1024 * 1024)), .output_bytes = rasters.len * raster_max_sequence * 768 * @sizeOf(f32) }, control);
     defer permit.deinit();
     var managed = try factory.getManagedComputeBackend(session, a, null, control);
     defer managed.deinit();
@@ -1990,4 +2027,90 @@ test "embeddinggemma2 video streaming cancellation precedes model and Reader acc
 
 test {
     _ = @import("embedding_gemma2_live_stream.zig");
+}
+
+test "embeddinggemma2 video cache admission reclaims ordered classes without weakening bounds cancellation or forced denial" {
+    const memory = @import("../runtime/tier/memory.zig");
+    const tensor = @import("../backends/tensor.zig");
+    const Mode = enum { release, second_class, second_no_vision, busy, cancel, cancel_second, forced, permanent, insufficient, unrelated };
+    const Probe = struct {
+        held: ?memory.AdmissionLease = null,
+        mode: Mode,
+        calls: usize = 0,
+        language_calls: usize = 0,
+        cancelled: bool = false,
+        fn reclaim(self: *@This(), _: Control) !usize {
+            self.calls += 1;
+            if (self.mode == .busy or self.mode == .second_no_vision) return 0;
+            if (self.mode == .insufficient or self.mode == .second_class or self.mode == .cancel_second) {
+                try self.held.?.retain(.{ .backend_weight_bytes = 3 });
+                return 1;
+            }
+            self.held.?.release();
+            self.held = null;
+            if (self.mode == .cancel) self.cancelled = true;
+            return 4;
+        }
+        fn reclaimLanguage(self: *@This(), _: Control) !usize {
+            self.language_calls += 1;
+            std.debug.assert(self.calls == 1);
+            if (self.mode != .second_class and self.mode != .second_no_vision and self.mode != .cancel_second) return 0;
+            const bytes: usize = if (self.mode == .second_no_vision) 4 else 3;
+            self.held.?.release();
+            self.held = null;
+            if (self.mode == .cancel_second) self.cancelled = true;
+            return bytes;
+        }
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.cancelled) return error.Cancelled;
+        }
+        fn run(_: *anyopaque, _: []const tensor.Tensor, _: std.mem.Allocator) anyerror![]tensor.Tensor {
+            return error.UnexpectedModelRun;
+        }
+        fn info(_: *anyopaque) []const tensor.TensorInfo {
+            return &.{};
+        }
+        fn backend(_: *anyopaque) @import("../backends/backends.zig").BackendType {
+            return .native;
+        }
+        fn close(_: *anyopaque) void {}
+        const vtable = Session.VTable{ .run = run, .inputInfo = info, .outputInfo = info, .backend = backend, .close = close };
+    };
+    for (std.enums.values(Mode)) |mode| {
+        var controller = memory.AdmissionController{};
+        defer controller.deinit();
+        const limits = memory.Limits{ .backend_limit_bytes = if (mode == .unrelated) 16 else 8, .scratch_limit_bytes = if (mode == .unrelated) 8 else 0 };
+        var probe = Probe{ .mode = mode };
+        probe.held = try controller.tryAcquire(.gpu, limits, .{ .backend_weight_bytes = 4 }, false);
+        defer if (probe.held) |*held| held.release();
+        var other: ?memory.AdmissionLease = if (mode == .unrelated) try controller.tryAcquire(.gpu, limits, .{ .backend_scratch_bytes = 4 }, false) else null;
+        defer if (other) |*held| held.release();
+        if (mode == .forced) controller.configureForcedRunDenialsForTesting(1);
+        const session = Session{ .ptr = &probe, .vtable = &Probe.vtable, .run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = limits, .static_workspace_bytes = 0, .check_live_memory = false } };
+        const request = @import("../backends/session.zig").RunRequest{ .batch = 1, .sequence = 1, .workspace_bytes = if (mode == .permanent) 9 else 6 };
+        const control = Control{ .ptr = &probe, .check_fn = Probe.check };
+        switch (mode) {
+            .release, .second_class, .second_no_vision => {
+                var permit = try admitReclaimingVisionCache(session, request, control, &probe, Probe.reclaim, Probe.reclaimLanguage);
+                try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_weight_bytes);
+                try std.testing.expectEqual(@as(usize, 6), controller.snapshot().backend_scratch_bytes);
+                permit.deinit();
+                try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
+            },
+            .permanent => try std.testing.expectError(error.ResourceLimitExceeded, admitReclaimingVisionCache(session, request, control, &probe, Probe.reclaim, Probe.reclaimLanguage)),
+            .cancel, .cancel_second => {
+                try std.testing.expectError(error.Cancelled, admitReclaimingVisionCache(session, request, control, &probe, Probe.reclaim, Probe.reclaimLanguage));
+                try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
+            },
+            else => try std.testing.expectError(error.ResourceTemporarilyUnavailable, admitReclaimingVisionCache(session, request, control, &probe, Probe.reclaim, Probe.reclaimLanguage)),
+        }
+        const attempted = mode != .forced and mode != .permanent and mode != .unrelated;
+        try std.testing.expectEqual(@as(usize, @intFromBool(attempted)), probe.calls);
+        const language_attempted = mode == .second_class or mode == .second_no_vision or mode == .busy or mode == .cancel_second or mode == .insufficient;
+        try std.testing.expectEqual(@as(usize, @intFromBool(language_attempted)), probe.language_calls);
+    }
+    // A vision-weight lease cannot relieve host-only, KV or scratch quotas.
+    for ([_]memory.AdmissionPressure{ .shared_host, .{ .domain_host = .gpu }, .{ .domain_backend = .cpu }, .{ .domain_combined = .cpu }, .{ .domain_kv = .gpu }, .{ .domain_scratch = .gpu } }) |pressure|
+        try std.testing.expect(!visionCacheCanRelieve(pressure));
 }

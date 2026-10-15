@@ -10737,6 +10737,13 @@ pub fn decoderRuntimeApplyRmsNormLinear(self: anytype, request: anytype) !?Metal
 /// Physical placement for original F32 linear and normalization slot copies.
 /// Both alternatives own their bytes without changing numerical identity.
 /// The shared preference is used only by request-local immutable GLiNER heads.
+/// Invoked synchronously by the owned shared-slot constructor after checked
+/// allocation, while source bytes remain pinned. Conversion writes the final
+/// Metal storage directly and does not allocate a second host F32 matrix.
+fn widenBf16OwnedSnapshot(bytes: [*c]const u8, output: [*c]f32, elements: usize) callconv(.c) void {
+    @import("tensor.zig").widenBf16LittleEndian(bytes[0 .. elements * 2], output[0..elements]);
+}
+
 pub const OwnedF32SlotStorage = enum { private, owned_shared_if_unified };
 
 pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anytype) !bool {
@@ -11066,10 +11073,21 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
         // outruns the hand-written BF16 tiles on large encoder batches, at
         // twice the weight memory. Any failure falls back to dense BF16.
         if (prefer_f32_mps_fallback) f32_mps: {
+            const storage: OwnedF32SlotStorage = if (@hasField(@TypeOf(request), "dense_f32_slot_storage")) request.dense_f32_slot_storage else .private;
+            if (storage == .owned_shared_if_unified and
+                termite_metal_decode_runtime_prepare_linear_bf16_owned_shared_f32(runtime, request.slot, bytes.ptr, expected_bf16_bytes, bias_base, request.in_dim, request.out_dim, widenBf16OwnedSnapshot) == 0)
+            {
+                if (termite_metal_decode_runtime_prefer_linear_mps(runtime, request.slot) != 0) break :f32_mps;
+                stats.decoder_runtime_prepare_linear_calls += 1;
+                self.raw_linear_slot_kinds[request.slot] = .dense;
+                self.raw_linear_slots_prepared[request.slot] = true;
+                self.raw_linear_slot_in_dims[request.slot] = request.in_dim;
+                self.raw_linear_slot_out_dims[request.slot] = request.out_dim;
+                return true;
+            }
             const dense = std.heap.c_allocator.alloc(f32, expected_bytes) catch break :f32_mps;
             defer std.heap.c_allocator.free(dense);
             @import("tensor.zig").widenBf16LittleEndian(bytes[0..expected_bf16_bytes], dense);
-            const storage: OwnedF32SlotStorage = if (@hasField(@TypeOf(request), "dense_f32_slot_storage")) request.dense_f32_slot_storage else .private;
             const prepared = switch (storage) {
                 .private => termite_metal_decode_runtime_prepare_linear(runtime, request.slot, dense.ptr, bias_base, request.in_dim, request.out_dim),
                 .owned_shared_if_unified => termite_metal_decode_runtime_prepare_linear_owned_shared(runtime, request.slot, dense.ptr, bias_base, request.in_dim, request.out_dim),
@@ -20497,6 +20515,16 @@ pub extern fn termite_metal_decode_runtime_prefer_linear_mps(
     runtime: ?*RawMetalDecodeRuntime,
     slot: usize,
 ) c_int;
+pub extern fn termite_metal_decode_runtime_prepare_linear_bf16_owned_shared_f32(
+    runtime: ?*RawMetalDecodeRuntime,
+    slot: usize,
+    weight: [*c]const u8,
+    weight_bytes: usize,
+    bias: [*c]const f32,
+    in_dim: usize,
+    out_dim: usize,
+    widen_bf16: *const fn ([*c]const u8, [*c]f32, usize) callconv(.c) void,
+) c_int;
 pub extern fn termite_metal_decode_runtime_prepare_linear_owned_shared(
     runtime: ?*RawMetalDecodeRuntime,
     slot: usize,
@@ -20531,6 +20559,11 @@ pub extern fn termite_metal_decode_runtime_prepare_linear_bf16_no_copy(
     bias: [*c]const f32,
     in_dim: usize,
     out_dim: usize,
+) c_int;
+/// Only exclusively owned immutable snapshots, at an idle execution boundary.
+pub extern fn termite_metal_decode_runtime_discard_owned_linear_slot(
+    runtime: ?*RawMetalDecodeRuntime,
+    slot: usize,
 ) c_int;
 pub extern fn termite_metal_decode_runtime_clear_linear_slot(
     runtime: ?*RawMetalDecodeRuntime,
@@ -44071,6 +44104,28 @@ test "metal native embeddinggemma2 BF16 and F32 shared slots preserve copies can
     defer bias.deinit();
     var stats: ops.NativeQuantTimingStats = .{};
     defer for (0..4) |slot| clearRawLinearSlot(&provider, slot);
+    if (device.has_unified_memory != 0) {
+        const Probe = struct {
+            var calls: std.atomic.Value(usize) = .init(0);
+            fn widen(bytes: [*c]const u8, output: [*c]f32, elements: usize) callconv(.c) void {
+                _ = calls.fetchAdd(1, .monotonic);
+                widenBf16OwnedSnapshot(bytes, output, elements);
+            }
+        };
+        Probe.calls.store(0, .monotonic);
+        const encoded = std.mem.sliceAsBytes(&bf16_weights);
+        // Truncated input must not enter the conversion callback or publish a
+        // partial snapshot; a valid call must synchronously execute it once.
+        try std.testing.expectEqual(@as(c_int, -3), termite_metal_decode_runtime_prepare_linear_bf16_owned_shared_f32(runtime, 0, encoded.ptr, encoded.len - 1, &source_bias, dim, dim, Probe.widen));
+        try std.testing.expectEqual(@as(usize, 0), Probe.calls.load(.monotonic));
+        try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_prepare_linear_bf16_owned_shared_f32(runtime, 0, encoded.ptr, encoded.len, &source_bias, dim, dim, Probe.widen));
+        try std.testing.expectEqual(@as(usize, 1), Probe.calls.load(.monotonic));
+        const complete = runtimeMemorySnapshot(runtime);
+        try std.testing.expectEqual(@as(c_int, -3), termite_metal_decode_runtime_prepare_linear_bf16_owned_shared_f32(runtime, 0, encoded.ptr, encoded.len - 1, &source_bias, dim, dim, Probe.widen));
+        try std.testing.expectEqual(@as(usize, 1), Probe.calls.load(.monotonic));
+        try std.testing.expectEqual(complete.dense_linear_bytes, runtimeMemorySnapshot(runtime).dense_linear_bytes);
+        clearRawLinearSlot(&provider, 0);
+    }
     const baseline = runtimeMemorySnapshot(runtime);
     for ([_]OwnedF32SlotStorage{ .private, .owned_shared_if_unified, .private, .owned_shared_if_unified }, 0..) |storage, slot| {
         const before = runtimeMemorySnapshot(runtime);

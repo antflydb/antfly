@@ -1,0 +1,5 @@
+colour {'status': 'pass', 'dimensions': 768}
+gray {'status': 'pass', 'dimensions': 768}
+first_video {'status': 'pass', 'dimensions': 768}
+second_video {'status': 'pass', 'dimensions': 768}
+third_attempt {'type': 'HTTPError', 'message': 'HTTP Error 503: Service Unavailable', 'http_status': 503, 'response_body': '{"error":"MODEL_RESOURCE_BUSY","message":"insufficient inference capacity is currently available","reason":"inference_capacity","retryable":true,"retry_after_ms":1000}', 'response_body_truncated': False}
