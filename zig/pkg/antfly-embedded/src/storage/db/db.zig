@@ -8645,6 +8645,26 @@ pub const DB = struct {
             return true;
         }
 
+        fn acquireCatalogBarrierWithCancellation(self: *@This(), io: std.Io, cancellation: types.CancellationToken) !void {
+            std.debug.assert(self.active and !self.catalog_barrier_held);
+            const admission = &self.db.core.index_manager.published_dense_admission;
+            const previous = admission.fetchOr(published_dense_catalog_closed, .acq_rel);
+            if (previous & published_dense_catalog_closed != 0) return error.IndexRebuilding;
+            // A canceled acquisition has not changed catalog pointers. Reopen
+            // admission while retaining every reader pin; the successful
+            // mutation release still requires a completely drained barrier.
+            errdefer {
+                const aborted = admission.fetchAnd(published_dense_reader_mask, .release);
+                std.debug.assert(aborted & published_dense_catalog_closed != 0);
+            }
+            while (admission.load(.acquire) & published_dense_reader_mask != 0) {
+                try cancellation.check();
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
+            try cancellation.check();
+            self.catalog_barrier_held = true;
+        }
+
         fn releaseCatalogBarrier(self: *@This()) void {
             if (!self.catalog_barrier_held) return;
             self.db.endIndexCatalogBarrier();
@@ -19893,13 +19913,7 @@ pub const DB = struct {
                     .restart_text_merge = self.quiesceTextMergeForStructuralMutation(),
                     .restart_sparse_compaction = self.quiesceSparseCompactionForStructuralMutation(),
                 };
-                const previous = self.core.index_manager.published_dense_admission.fetchOr(published_dense_catalog_closed, .acq_rel);
-                if (previous & published_dense_catalog_closed != 0) return error.IndexRebuilding;
-                structural.?.catalog_barrier_held = true;
-                while (self.core.index_manager.published_dense_admission.load(.acquire) & published_dense_reader_mask != 0) {
-                    try cancellation.check();
-                    try io.sleep(.fromMilliseconds(1), .awake);
-                }
+                try structural.?.acquireCatalogBarrierWithCancellation(io, cancellation);
             } else {
                 structural = self.beginDrainedIndexStructuralMutationWithLease("native snapshot", "*", capture.borrowMutation());
                 if (!structural.?.acquireCatalogBarrierUntil(std.math.maxInt(u64))) unreachable;
@@ -69810,6 +69824,116 @@ test "db index catalog barrier and apply acquisition honor activation deadline" 
     db.core.lockApplyExclusive();
     defer db.core.unlockApplyExclusive();
     try std.testing.expect(!db.lockApplyUntil(monotonicTimeNs() + std.time.ns_per_ms));
+}
+
+test "db index catalog barrier canceled acquisition preserves reader pins and releases structural ownership" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    const Cancel = struct {
+        db: *DB,
+        failure: anyerror,
+        checks: usize = 0,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            try std.testing.expect(self.db.indexCatalogBarrierActive());
+            try std.testing.expectEqual(@as(u32, 1), self.db.publishedDenseSearchCount());
+            self.checks += 1;
+            return self.failure;
+        }
+    };
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded }) |failure| {
+        try std.testing.expect(db.beginPublishedDenseSearch());
+        var cancellation = Cancel{ .db = &db, .failure = failure };
+        var guard = db.beginDrainedIndexStructuralMutation("canceled query cut", "*");
+        try std.testing.expectError(failure, guard.acquireCatalogBarrierWithCancellation(
+            db.backend_runtime.filesystemIo().?,
+            .{ .ptr = &cancellation, .check_fn = Cancel.check },
+        ));
+        try std.testing.expectEqual(@as(usize, 1), cancellation.checks);
+        try std.testing.expect(!guard.catalog_barrier_held);
+        guard.release();
+        try std.testing.expect(!db.indexCatalogBarrierActive());
+        try std.testing.expectEqual(@as(u32, 1), db.publishedDenseSearchCount());
+        // New readers can enter and the canceled writer did not retire an old
+        // reader's pin. Its structural serialization is available to retry.
+        try std.testing.expect(db.beginPublishedDenseSearch());
+        db.endPublishedDenseSearch();
+        db.endPublishedDenseSearch();
+        var retry = db.beginDrainedIndexStructuralMutation("retry query cut", "*");
+        try retry.acquireCatalogBarrierWithCancellation(db.backend_runtime.filesystemIo().?, .{});
+        try std.testing.expect(retry.catalog_barrier_held);
+        try std.testing.expect(!db.beginPublishedDenseSearch());
+        retry.release();
+        try std.testing.expect(!db.indexCatalogBarrierActive());
+    }
+}
+
+test "db index catalog barrier canceled query capture unwinds staging and permits retry" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    const pins = try std.fmt.allocPrint(alloc, "{s}.query-pins", .{std.mem.span(path)});
+    defer alloc.free(pins);
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, pins) catch {};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 },
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    const Cancel = struct {
+        db: *DB,
+        failure: anyerror,
+        canceled: bool = false,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            // Let maintenance and capture admission finish, then cancel at
+            // exactly the catalog-reader drain which crashed the CI server.
+            self.canceled = self.canceled or self.db.indexCatalogBarrierActive();
+            if (self.canceled) return self.failure;
+        }
+    };
+    const id: [64]u8 = @splat('a');
+    const request: @import("native_query_cut.zig").Request = .{
+        .id = &id,
+        .table_id = 7,
+        .expires_ms = @import("native_query_cut.zig").nowMs() + 300_000,
+        .create = true,
+    };
+    const root = try @import("native_query_cut.zig").pathAlloc(alloc, std.mem.span(path), &id);
+    defer alloc.free(root);
+    const staging = try std.fmt.allocPrint(alloc, "{s}.staging", .{root});
+    defer alloc.free(staging);
+    const io = db.backend_runtime.filesystemIo().?;
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded }) |failure| {
+        try std.testing.expect(db.beginPublishedDenseSearch());
+        var cancellation = Cancel{ .db = &db, .failure = failure };
+        try std.testing.expectError(failure, db.captureQueryCut(request, .{ .ptr = &cancellation, .check_fn = Cancel.check }));
+        try std.testing.expect(cancellation.canceled);
+        try std.testing.expect(!db.indexCatalogBarrierActive());
+        try std.testing.expectEqual(@as(u32, 1), db.publishedDenseSearchCount());
+        try std.testing.expect(!try snapshotPathExists(io, root));
+        try std.testing.expect(!try snapshotPathExists(io, staging));
+        db.endPublishedDenseSearch();
+    }
+    // Exercise the full retry: structural, snapshot, replay, and file leases
+    // from both aborted attempts must have been released.
+    try db.captureQueryCut(request, .{});
+    try @import("native_query_cut.zig").validate(alloc, io, root, request, db.core.identity_namespace, .{});
+    try std.testing.expect(!db.indexCatalogBarrierActive());
 }
 
 test "db published dense admission cannot overflow into catalog closure" {
