@@ -50104,6 +50104,22 @@ fn requireProducerRequestsOnly(batch: derived_types.DerivedBatch) !void {
 }
 
 fn appendDerivedBatchRecordContextWithAdmissions(ctx: *const BatchExecutionContext, batch: derived_types.DerivedBatch, producer: bool, work: ?RequiredProducerDispatch, unit_work: ?RequiredUnitProducerDispatch) !u64 {
+    if (ctx.async_context) |async_ctx| if (async_ctx.replay_publication) |port| {
+        const Request = struct {
+            batch: derived_types.DerivedBatch,
+            producer: bool,
+            work: ?RequiredProducerDispatch,
+            unit_work: ?RequiredUnitProducerDispatch,
+            fn apply(ptr: *anyopaque, live: *anyopaque) anyerror!u64 {
+                const request: *@This() = @ptrCast(@alignCast(ptr));
+                const database: *DB = @ptrCast(@alignCast(live));
+                var current = database.batchContext();
+                return appendDerivedBatchRecordContextWithAdmissions(&current, request.batch, request.producer, request.work, request.unit_work);
+            }
+        };
+        var request: Request = .{ .batch = batch, .producer = producer, .work = work, .unit_work = unit_work };
+        return port.publish(port.ptr, batch, &.{}, null, &request, Request.apply);
+    };
     if (work != null and unit_work != null) return error.InvalidBatchRequest;
     var sync_targets = try collectManagedSyncTargets(ctx.alloc, ctx.index_manager, batch);
     defer sync_targets.deinit(ctx.alloc);
@@ -51716,8 +51732,50 @@ fn appendResolutionRecordWithHook(
     write: resolution_runtime_mod.RecordWrite,
     before_handoff_publish: anytype,
 ) !u64 {
+    return appendResolutionRecordWithProjection(ctx_ptr, write, before_handoff_publish, false);
+}
+
+fn appendResolutionRecordWithProjection(
+    ctx_ptr: *anyopaque,
+    write: resolution_runtime_mod.RecordWrite,
+    before_handoff_publish: anytype,
+    defer_projection: bool,
+) !u64 {
     const ctx: *EnrichmentAppendContext = @ptrCast(@alignCast(ctx_ptr));
+    if (ctx.async_context) |async_ctx| if (async_ctx.replay_publication) |port| {
+        const Request = struct {
+            write: resolution_runtime_mod.RecordWrite,
+            hook: @TypeOf(before_handoff_publish),
+            fn apply(ptr: *anyopaque, live: *anyopaque) anyerror!u64 {
+                const request: *@This() = @ptrCast(@alignCast(ptr));
+                const database: *DB = @ptrCast(@alignCast(live));
+                if (database.enrichment_append_context == null)
+                    try database.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true });
+                return appendResolutionRecordWithProjection(database.enrichment_append_context.?, request.write, request.hook, true);
+            }
+        };
+        var request: Request = .{ .write = write, .hook = before_handoff_publish };
+        var guarded_keys: std.ArrayList([]const u8) = .empty;
+        defer guarded_keys.deinit(ctx.alloc);
+        for (write.artifact_writes) |artifact| try guarded_keys.append(ctx.alloc, artifact.key);
+        try guarded_keys.appendSlice(ctx.alloc, write.artifact_deletes);
+        if (write.graph_reconciliation) |graph| try guarded_keys.appendSlice(ctx.alloc, graph.keys);
+        return port.publish(port.ptr, write.batch, guarded_keys.items, write.inputs, &request, Request.apply);
+    };
+    if (write.graphReconciliationWrite()) |graph| {
+        // The detached port above holds one live writer lease across both
+        // phases. Validate their common inputs once, before either commits.
+        // Ordinary callers retain the same ordered two-record behavior.
+        var primary = write;
+        primary.graph_reconciliation = null;
+        _ = try appendResolutionRecordWithProjection(ctx_ptr, primary, before_handoff_publish, defer_projection);
+        return appendResolutionRecordWithProjection(ctx_ptr, graph, before_handoff_publish, defer_projection);
+    }
     if (write.artifact_writes.len == 0 and write.artifact_deletes.len == 0 and write.target_hints == null) {
+        if (defer_projection) {
+            var current = ctx.batchContext();
+            return appendDerivedBatchRecordContextWithProducerFence(&current, write.batch, true);
+        }
         return appendDerivedBatchFromEnrichment(ctx_ptr, write.batch);
     }
 
@@ -51787,6 +51845,9 @@ fn appendResolutionRecordWithHook(
     before_handoff_publish.run();
     try publishResolutionHandoffContext(&batch_ctx, write);
     notifyResolverReplayRuntimesForCatalog(ctx.index_manager, ctx.resolution_runtime, ctx.promotion_runtime, sequence);
+    // Detached publication owns the live writer gate only for durable effects.
+    // Its caller's next derived drain builds projections outside that gate.
+    if (defer_projection) return sequence;
     if (ctx.executor.hasWorkers()) {
         ctx.executor.forceSequence(sequence);
         return sequence;
