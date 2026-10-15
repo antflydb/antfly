@@ -46,6 +46,12 @@ pub const Config = struct {
     backend: enum { cpu, metal } = .cpu,
     epochs: u32 = 4,
     batch_size: u32 = 1,
+    /// Group records of similar length into each batch, so a batch pads to
+    /// about its own length rather than to the longest of a random sample.
+    /// Each epoch's shuffle is sorted by length within windows of 64
+    /// batches, cut into batches, and the batch order shuffled again, all
+    /// from the epoch seed (resume replays the same order).
+    length_bucketed: bool = false,
     gradient_accumulation: u32 = 1,
     encoder_lr: f32 = 2.5e-5,
     head_lr: f32 = 1e-4,
@@ -213,21 +219,42 @@ const Cache = struct {
     /// or `Config.force_fused_attention` asks.
     use_fused_attention: bool = false,
     frozen: []const training.Frozen = &.{},
-    program: ?training.Program = null,
+    /// Programs by bucketed layout, least recently used first. Length-bucketed
+    /// batches arrive in shuffled order, so one entry would rebuild the
+    /// graph and its gradient on almost every step.
+    entries: std.ArrayListUnmanaged(Entry) = .empty,
     last: architecture.Layout = .{ .batch = 0, .sequence = 0, .options = 0, .questions = 0 },
+    const capacity = 32;
+    const Entry = struct { layout: architecture.Layout, program: *training.Program };
     fn get(self: *Cache, examples: []const training.Example) !*training.Program {
         const l = try training.bucketedLayout(examples, self.config);
-        if (self.program == null or !std.meta.eql(l, self.last)) {
-            if (self.program) |*p| p.deinit();
-            self.program = null;
-            self.program = try training.Program.initFrozenFused(self.allocator, self.config, l, self.dropout, self.freeze_layers, self.lora, self.use_fused_attention);
-            self.last = l;
+        self.last = l;
+        for (self.entries.items, 0..) |entry, i| if (std.meta.eql(entry.layout, l)) {
+            // Move to the most recently used end.
+            const hit = self.entries.orderedRemove(i);
+            self.entries.appendAssumeCapacity(hit);
+            hit.program.frozen = self.frozen;
+            return hit.program;
+        };
+        if (self.entries.items.len == capacity) {
+            const evicted = self.entries.orderedRemove(0);
+            evicted.program.deinit();
+            self.allocator.destroy(evicted.program);
         }
-        self.program.?.frozen = self.frozen;
-        return &self.program.?;
+        try self.entries.ensureTotalCapacity(self.allocator, capacity);
+        const program = try self.allocator.create(training.Program);
+        errdefer self.allocator.destroy(program);
+        program.* = try training.Program.initFrozenFused(self.allocator, self.config, l, self.dropout, self.freeze_layers, self.lora, self.use_fused_attention);
+        self.entries.appendAssumeCapacity(.{ .layout = l, .program = program });
+        program.frozen = self.frozen;
+        return program;
     }
     pub fn deinit(self: *Cache) void {
-        if (self.program) |*p| p.deinit();
+        for (self.entries.items) |entry| {
+            entry.program.deinit();
+            self.allocator.destroy(entry.program);
+        }
+        self.entries.deinit(self.allocator);
     }
 };
 
@@ -418,6 +445,30 @@ fn exportModel(a: std.mem.Allocator, io: std.Io, c: Config, config_json: std.jso
     try publication.syncDirectory(io, stage);
     try publication.publishDirectory(a, io, stage, try path(a, c.output_dir, "model"));
     try publication.syncDirectory(io, c.output_dir);
+}
+
+/// Sorts `order` by sequence length within windows of 64 batches (ties by
+/// position, so the result depends only on the shuffle), then shuffles the
+/// batch order into `batch_order`. Only the last batch can be short, as
+/// before: windows are whole batches except the last.
+fn lengthBucket(order: []usize, batch_order: []usize, examples: []const training.Example, batch_size: u32, random: std.Random) void {
+    const window = @as(usize, batch_size) * 64;
+    const Context = struct {
+        examples: []const training.Example,
+        fn less(self: @This(), a: usize, b: usize) bool {
+            const la = self.examples[a].ids.len;
+            const lb = self.examples[b].ids.len;
+            return la < lb or (la == lb and a < b);
+        }
+    };
+    var start: usize = 0;
+    while (start < order.len) : (start += window) {
+        std.mem.sort(usize, order[start..@min(order.len, start + window)], Context{ .examples = examples }, Context.less);
+    }
+    for (batch_order, 0..) |*index, i| index.* = i;
+    // Keep a short last batch last, so every other batch is full.
+    const full = if (order.len % batch_size == 0) batch_order.len else batch_order.len - 1;
+    random.shuffle(usize, batch_order[0..full]);
 }
 
 // A shuffled batch can combine the longest sequence with any other record.
@@ -814,6 +865,7 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config, admission: *memory
     try event(io, log, .{ .event = "initial_eval", .metrics = before });
     try event(io, std.Io.File.stdout(), .{ .event = "initial_eval", .metrics = before });
     const order = try permanent.alloc(usize, train.examples.len);
+    const batch_order = try permanent.alloc(usize, batches);
     const batch = try permanent.alloc(training.Example, c.batch_size);
     // Record ids per example; a packed example holds several records.
     const example_records = try permanent.alloc(std.ArrayListUnmanaged([]const u8), train.examples.len);
@@ -825,10 +877,11 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config, admission: *memory
         for (order, 0..) |*index, i| index.* = i;
         var random = std.Random.DefaultPrng.init(c.seed +% epoch);
         random.random().shuffle(usize, order);
+        if (c.length_bucketed and c.batch_size > 1) lengthBucket(order, batch_order, train.examples, c.batch_size, random.random());
         for (0..batches) |batch_index| {
             const microbatch = epoch * batches + batch_index;
             if (microbatch < completed) continue;
-            const start = batch_index * c.batch_size;
+            const start = (if (c.length_bucketed and c.batch_size > 1) batch_order[batch_index] else batch_index) * c.batch_size;
             const count = @min(c.batch_size, order.len - start);
             batch_ids.clearRetainingCapacity();
             for (batch[0..count], order[start..][0..count]) |*e, index| {
