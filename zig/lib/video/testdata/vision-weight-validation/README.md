@@ -97,3 +97,9 @@ Qualification covers the pinned corpora, checkpoint and recorded ARM64 hosts.
 It does not establish arbitrary codec/origin conformance, x86 hardware performance
 or end-user retrieval relevance. The requirement audit is in
 [the non-CUDA audit](../../../../../docs/plans/native-video-noncuda-audit.md).
+
+The latest main (`5fdb3ea392`) merges cleanly in `baea270013`. All nine bound
+build/runtime sources remain identical; the fresh post-merge Metal/model gate
+passes 66/66, and the Apache boundary gate passes 35 tests and scans 2,235
+sources. [Merge scope](main-merge-scope.json) records the exact changed files
+and raw checks. Production reports retain their earlier measured binary epoch.

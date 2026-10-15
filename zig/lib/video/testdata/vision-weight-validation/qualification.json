@@ -74,7 +74,7 @@
   },
   "constraints": "Original tolerances, request reservations, 4096 MiB constrained process budgets and maximum 16 external retries unchanged. Allocated buffer telemetry excludes preparation textures/buffers, decoder surfaces and opaque driver memory. Shared-host timing is diagnostic, not a speed/capacity claim. Reference preservation is not application relevance.",
   "artifacts_sha256": {
-    "README.md": "bca8c9940e62761e6629cb4052cb15b35206b0d86d221ac168ca3b088b3c1358",
+    "README.md": "a34d71c6ff805d34983f79d66dea1ae1e2a09a6c1dd422cc1a4a210139f4b8b1",
     "active-allocation-stack-probe.m.txt": "b8d8c94768a7827a3bacb497ab3504b4997afa1b005be8d07ed70338387cf591",
     "active-malloc-sampler-layers-4g.json": "adc9d2ff0802102fa7583f7d34eab93c7af8c6fda8ce9cbc22b2d07ce8788b67",
     "active-malloc-sampler-layers-4g.log": "0e507b4d68139291f3397cd14fa8a0aade0c967ce9ab68316bb5df895cee6fa1",
@@ -150,6 +150,7 @@
     "linux-webm.json": "bcc2b81d7204f7624bdf4ad6992fa60411c21054a1bda45878144fb84005178d",
     "linux-webm.log": "d7984497785cb2850527fb6c78b1aca3313ca0888ee4fa2d5f20e15dd2bb8075",
     "linux-webm.server.log": "a0f98a31e22456cea15b8a7888c3d4977f748b8ceacc40b0fbb9943470836d08",
+    "main-merge-scope.json": "263321167f299259e134c1a72eb963074c25e1332607eb0db0121e0e19012aa3",
     "malloc-pressure-interposer.c.txt": "d64bef3cc5d9fe9e39ef3daed5f116af048fabcdfa66892e116b82e75d412d49",
     "metal-reclaim-diagnostic.json": "2a5a526c74fb8efa7bb1fdd3fa6a03bf12c55c5915d0cc1798da948f946fefc4",
     "metal-reclaim-discard-drained.log": "c4b5c5b9d6b63b094c49375e37776b9c43e884cd5293a41d9cd63cd825b3098c",
@@ -165,6 +166,9 @@
     "pool-production-initial-layers-4g.server.log": "506658b812e00116dd6c2d86d5be571b7787b0d4c3403c3c45c41c29c55f60af",
     "pool-production-metal-build.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     "pool-production-provenance.json": "7f4434bee8bfd8a3b555321f27b4af6b8e040afda91cc86762505d4006a4c8ea",
+    "post-main-boundary-check.log": "5961db5db447d4fcc5e2d460f1efe4ec880b215c2488c3023094f4811ee0d5cb",
+    "post-main-boundary-tests.log": "934828433f8e50b9011eb6388c574b83eeb7a27118cfbba6e98beb6d491eadc7",
+    "post-main-device.log": "78970d0738645e01e7f70d2e8b84c6b2c3edc89c0408ac782c21f15c0ff226d8",
     "production-commands.json": "92ec88dc5e918bef54114280cdb243e0b4c81b958b42113ee2889fa728902228",
     "production-listener-probe.py.txt": "c6e325ff66acccf4f670cfd732791e01729a1e202ee8bdac6ca6e736ea640ea9",
     "production-worker-after.vmmap.txt": "2a724cdae7522502bb04c4917f820c668c78bfb1dd8f987f95515d304575a228",
@@ -253,5 +257,6 @@
     "vision-discard-production-worker-probe.json": "7751a4643dab0e808b0d86d469274fb371185db16e8dfda2403de414b3ae1214",
     "vision-discard-production-worker-probe.log": "d7916dd24fdbcd219ef3198730e6b531f228756d7637ba8dfef56057ed67bb6b",
     "vision-discard-production-worker-probe.server.log": "7395c149061fe0efc29165a2b5e9439418fff5094368e166ed8fedb3ff97f4ed"
-  }
+  },
+  "post_main_merge": "main-merge-scope.json"
 }

@@ -1,0 +1,65 @@
+{
+  "merge_commit": "baea270013ea9ba4ed40daa257687e43ef924b49",
+  "origin_main": "5fdb3ea392d7b602527d3fd93f0fa5c6234b8cd5",
+  "merge": "clean, no conflicts",
+  "production_epoch": "staged-production-provenance.json; production gates predate this merge and are not relabeled as new binaries",
+  "changed_files": [
+    "rs/crates/embedded/README.md",
+    "rs/crates/embedded/src/sqlx/connection.rs",
+    "scripts/bench/embedded_sql_import.py",
+    "zig/CAPI.md",
+    "zig/pkg/antfly-embedded/src/api/relational_integrity_commit.zig",
+    "zig/pkg/antfly-embedded/src/capi/db.zig",
+    "zig/pkg/antfly-embedded/src/capi/handles.zig",
+    "zig/pkg/antfly-embedded/src/capi/lite_connection.zig",
+    "zig/pkg/antfly-embedded/src/capi/sql.zig",
+    "zig/pkg/antfly-embedded/src/capi/sql_commit.zig",
+    "zig/pkg/antfly-embedded/src/capi/sql_cursor.zig",
+    "zig/pkg/antfly-embedded/src/capi/sql_ddl.zig",
+    "zig/pkg/antfly-embedded/src/capi/sql_fk.zig",
+    "zig/pkg/antfly-embedded/src/capi/sql_overlay.zig",
+    "zig/pkg/antfly-embedded/src/capi/sql_session.zig",
+    "zig/pkg/antfly-embedded/src/capi/tables.zig",
+    "zig/pkg/antfly-embedded/src/inference/managed_embedder.zig",
+    "zig/pkg/antfly-embedded/src/inference/providers/query_embedding_cache.zig",
+    "zig/pkg/antfly-embedded/src/sql/catalog.zig",
+    "zig/pkg/antfly-embedded/src/sql/conflict.zig",
+    "zig/pkg/antfly-embedded/src/sql/mutation_fold.zig",
+    "zig/pkg/antfly-embedded/src/storage/db/catalog/index_manager.zig",
+    "zig/pkg/antfly-embedded/src/storage/db/core.zig",
+    "zig/pkg/antfly-embedded/src/storage/db/db.zig",
+    "zig/pkg/antfly-embedded/src/storage/db/derived/derived_worker.zig",
+    "zig/pkg/antfly-embedded/src/storage/db/enrichment/embedder.zig",
+    "zig/pkg/antfly-embedded/src/storage/db/enrichment/enrichment_runtime.zig",
+    "zig/pkg/antfly-embedded/src/storage/lite/artifact_source.zig",
+    "zig/pkg/antfly-embedded/src/storage/lite/docstore.zig",
+    "zig/pkg/antfly-embedded/src/storage/lite/index_storage.zig",
+    "zig/pkg/antfly-embedded/src/storage/lite/native.zig",
+    "zig/pkg/antfly-embedded/src/storage/persistent.zig",
+    "zig/pkg/antfly/src/api/sql_execution.zig",
+    "zig/pkg/antfly/src/api/sql_pgwire.zig",
+    "zig/pkg/antfly/src/capi/db_test.zig",
+    "zig/pkg/antfly/src/sql/conflict_test.zig",
+    "zig/pkg/inference/src/host/host.zig",
+    "zig/pkg/inference/src/registry/registry.zig"
+  ],
+  "all_nine_bound_build_and_runtime_sources_unchanged": true,
+  "inference_changes": "host error-message module reference now goes through the public registry export; pull diagnostics export and explicit anyerror return for model pull. No decoder, preparation, sampling, cache, admission or model arithmetic change.",
+  "post_merge_checks": {
+    "actual_metal_device": {
+      "passed": 66,
+      "skipped": 0,
+      "failed": 0,
+      "log": "post-main-device.log"
+    },
+    "apache_boundary_unit": {
+      "passed": 35,
+      "log": "post-main-boundary-tests.log"
+    },
+    "apache_boundary_reachable_sources": {
+      "count": 2235,
+      "status": "pass",
+      "log": "post-main-boundary-check.log"
+    }
+  }
+}
