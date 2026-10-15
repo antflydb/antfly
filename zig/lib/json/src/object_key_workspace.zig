@@ -115,8 +115,8 @@ pub fn ObjectKeyWorkspace(comptime State: type) type {
             defer keys.child_allocator = self.allocator;
             return scanner.nextAllocMax(keys.allocator(), .alloc_if_needed, max_len);
         }
-        /// Writers decode tokens in short-lived scratch. Copy those names into
-        /// the frame so resetting token scratch cannot invalidate its key set.
+        /// Copy names from short-lived scratch into the owning frame when
+        /// requested, so resetting that scratch cannot invalidate the key set.
         /// Names passed without copying must remain valid until finishFrame.
         pub fn remember(self: *Self, depth: usize, name: []const u8, copy: bool) !void {
             var tables_counted: ScratchAllocator = .{ .backing = self.allocator, .bytes = &self.table_bytes, .frame_bytes = &self.stack.items[depth].bytes };
