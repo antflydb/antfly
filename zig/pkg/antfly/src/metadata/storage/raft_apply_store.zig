@@ -4859,6 +4859,10 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
         try std.testing.expectError(error.InvalidMetadataTransitionEncoding, decodeTransitionCommand(alloc, trailing));
         try clone.validateRelationalIndexCancellation(group, request);
         var stale = request;
+        stale.table_id += 1;
+        try std.testing.expectError(error.GenerationPublicationNotFound, clone.validateRelationalIndexCancellation(group, stale));
+        try std.testing.expectError(error.GenerationPublicationNotFound, clone.relationalIndexCancellationStatusJson(alloc, group, stale));
+        stale = request;
         stale.expected_revision -= 1;
         try std.testing.expectError(error.GenerationPublicationChanged, clone.validateRelationalIndexCancellation(group, stale));
         stale = request;
@@ -18303,7 +18307,10 @@ pub const RaftApplyStore = struct {
         if (!try relationWriterEnabledTxn(txn, group)) return error.CatalogOccupancyNotReady;
         if (try stagingGet(txn, metadata_hot_standby.outbox_key) != null) return error.MetadataReplicationPending;
         var buf: [192]u8 = undefined;
-        const head = try index_progress.Head.decode(try txn.get(try index_publication.headKey(&buf, group, request.table_id)));
+        const head = try index_progress.Head.decode(txn.get(try index_publication.headKey(&buf, group, request.table_id)) catch |err| switch (err) {
+            error.NotFound => return error.GenerationPublicationNotFound,
+            else => return err,
+        });
         if (head.table_id != request.table_id or !std.mem.eql(u8, &head.plan_id, &request.id)) return error.GenerationPublicationChanged;
         try index_publication.requireActivePointer(txn, group, head);
         if (head.phase == .canceling or head.phase == .cancel_releasing or head.phase == .canceled) {
@@ -18328,7 +18335,10 @@ pub const RaftApplyStore = struct {
         defer txn.abort();
         _ = try self.standbyRelationActivationTxn(&txn, group, topology_protocol.index_publication_head_version);
         var buf: [192]u8 = undefined;
-        const head = try index_progress.Head.decode(try txn.get(try index_publication.headKey(&buf, group, request.table_id)));
+        const head = try index_progress.Head.decode(txn.get(try index_publication.headKey(&buf, group, request.table_id)) catch |err| switch (err) {
+            error.NotFound => return error.GenerationPublicationNotFound,
+            else => return err,
+        });
         try index_publication.requireActivePointer(&txn, group, head);
         const status: index_publication.CancellationStatus = .{ .head = head, .replication_pending = try stagingGet(&txn, metadata_hot_standby.outbox_key) != null };
         _ = try status.isCanceled(request);

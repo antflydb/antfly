@@ -392,6 +392,25 @@ pub fn relationalIndexPublicationDecisionStatusJson(svc: anytype, alloc: std.mem
 }
 
 pub fn decideRelationalIndexPublication(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/relational_index_publication.zig").DecidePublish) ![]u8 {
+    return decideRelationalIndex(svc, alloc, context, request, false);
+}
+
+pub fn cancelRelationalIndexPublication(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/relational_index_publication.zig").CancelDecision) ![]u8 {
+    return decideRelationalIndex(svc, alloc, context, request, true);
+}
+
+pub fn relationalIndexCancellationStatusJson(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/relational_index_publication.zig").CancelDecision) ![]u8 {
+    if (!context.index_publication_authority) return error.Forbidden;
+    try context.ensureActive();
+    try request.validate();
+    try svc.ensureLinearizableReadWithContext(context);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    return store.relationalIndexCancellationStatusJson(alloc, svc.metadata_group_id, request);
+}
+
+/// Both irreversible publication and pre-publication cancellation share the
+/// same proposal/uncertainty boundary. Neither holds the gate while waiting.
+fn decideRelationalIndex(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: anytype, comptime cancel: bool) ![]u8 {
     if (!context.index_publication_authority) return error.Forbidden;
     try context.ensureActive();
     try request.validate();
@@ -402,18 +421,19 @@ pub fn decideRelationalIndexPublication(svc: anytype, alloc: std.mem.Allocator, 
     defer if (gate_held) svc.unlockCatalogMutation();
     try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
-    try store.validateRelationalIndexPublicationDecision(svc.metadata_group_id, request);
+    if (comptime cancel) try store.validateRelationalIndexCancellation(svc.metadata_group_id, request) else try store.validateRelationalIndexPublicationDecision(svc.metadata_group_id, request);
     try context.ensureActive();
-    const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .decide_relational_index_publication = request });
+    const receipt = try svc.proposeTransitionCommandWithReceipt(if (comptime cancel) .{ .cancel_relational_index_publication = request } else .{ .decide_relational_index_publication = request });
     svc.unlockCatalogMutation();
     gate_held = false;
     svc.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
     const publication = @import("../metadata/relational_index_publication.zig");
-    const observed = store.relationalIndexPublicationDecisionStatusJson(alloc, svc.metadata_group_id, request) catch return error.MetadataMutationOutcomeUnknown;
+    const observed = (if (comptime cancel) store.relationalIndexCancellationStatusJson(alloc, svc.metadata_group_id, request) else store.relationalIndexPublicationDecisionStatusJson(alloc, svc.metadata_group_id, request)) catch return error.MetadataMutationOutcomeUnknown;
     errdefer alloc.free(observed);
-    var parsed = std.json.parseFromSlice(publication.DecisionStatus, alloc, observed, .{}) catch return error.MetadataMutationOutcomeUnknown;
+    var parsed = std.json.parseFromSlice(if (cancel) publication.CancellationStatus else publication.DecisionStatus, alloc, observed, .{}) catch return error.MetadataMutationOutcomeUnknown;
     defer parsed.deinit();
-    if (!(parsed.value.isDecided(request) catch return error.MetadataMutationOutcomeUnknown)) return error.MetadataMutationOutcomeUnknown;
+    const confirmed = (if (comptime cancel) parsed.value.isCanceled(request) else parsed.value.isDecided(request)) catch return error.MetadataMutationOutcomeUnknown;
+    if (!confirmed) return error.MetadataMutationOutcomeUnknown;
     return observed;
 }
 
@@ -610,6 +630,86 @@ test "relational index publication decision dispatch preserves authority gates a
     var pending = try std.json.parseFromSlice(publication.DecisionStatus, std.testing.allocator, pending_json, .{});
     defer pending.deinit();
     try std.testing.expect(!try pending.value.isDecided(request));
+}
+
+test "relational index publication cancellation dispatch fences authority and preserves uncertain outcomes" {
+    const publication = @import("../metadata/relational_index_publication.zig");
+    const Mock = struct {
+        metadata_group_id: u64 = 13,
+        locked: bool = false,
+        proposals: usize = 0,
+        wait_failure: bool = false,
+        store: Store,
+        const Store = struct {
+            observed: publication.CancellationStatus,
+            reject: bool = false,
+            pub fn validateRelationalIndexCancellation(self: *@This(), _: u64, _: publication.CancelDecision) !void {
+                if (self.reject) return error.GenerationPublicationChanged;
+            }
+            pub fn relationalIndexCancellationStatusJson(self: *@This(), alloc: std.mem.Allocator, _: u64, _: publication.CancelDecision) ![]u8 {
+                return std.json.Stringify.valueAlloc(alloc, self.observed, .{});
+            }
+        };
+        pub fn ensureTableTopologyProtocolReadyWithContext(_: *@This(), _: operation.RequestContext, version: u16) !u16 {
+            try std.testing.expectEqual(protocol.index_publication_head_version, version);
+            return version;
+        }
+        pub fn ensureLinearizableReadWithContext(_: *@This(), _: operation.RequestContext) !void {}
+        pub fn validateTableTopologyProtocolReadinessWithContext(self: *@This(), _: operation.RequestContext, _: u16) !void {
+            try std.testing.expect(self.locked);
+        }
+        pub fn lockCatalogMutation(self: *@This()) void {
+            std.debug.assert(!self.locked);
+            self.locked = true;
+        }
+        pub fn unlockCatalogMutation(self: *@This()) void {
+            std.debug.assert(self.locked);
+            self.locked = false;
+        }
+        pub fn projectedStore(self: *@This()) ?*Store {
+            return &self.store;
+        }
+        pub fn proposeTransitionCommandWithReceipt(self: *@This(), command: storage.TransitionCommand) !u64 {
+            try std.testing.expect(self.locked);
+            try std.testing.expect(command == .cancel_relational_index_publication);
+            self.proposals += 1;
+            const request = command.cancel_relational_index_publication;
+            if (self.store.observed.head.phase == .fencing) self.store.observed.head = try self.store.observed.head.cancel(request.expected_revision, request.failure);
+            return 1;
+        }
+        pub fn waitForTransitionAppliedWithContext(self: *@This(), _: u64, _: operation.RequestContext) !void {
+            try std.testing.expect(!self.locked);
+            if (self.wait_failure) return error.Timeout;
+        }
+    };
+    const request: publication.CancelDecision = .{ .table_id = 9, .id = @splat(1), .expected_revision = 1, .failure = .duplicate_key };
+    var svc: Mock = .{ .store = .{ .observed = .{ .head = .{ .table_id = 9, .plan_id = request.id, .plan_digest = @splat(2), .candidate_digest = @splat(3), .reservation_digest = @splat(4), .owner_count = 1 } } } };
+    const context: operation.RequestContext = .{ .index_publication_authority = true };
+    try std.testing.expectError(error.Forbidden, cancelRelationalIndexPublication(&svc, std.testing.allocator, .{}, undefined));
+    try std.testing.expectError(error.Forbidden, relationalIndexCancellationStatusJson(&svc, std.testing.allocator, .{}, undefined));
+    try std.testing.expectError(error.DeadlineExceeded, cancelRelationalIndexPublication(&svc, std.testing.allocator, .{ .index_publication_authority = true, .deadline_ns = 0 }, undefined));
+    try std.testing.expectEqual(@as(usize, 0), svc.proposals);
+    const bytes = try cancelRelationalIndexPublication(&svc, std.testing.allocator, context, request);
+    defer std.testing.allocator.free(bytes);
+    var status = try std.json.parseFromSlice(publication.CancellationStatus, std.testing.allocator, bytes, .{});
+    defer status.deinit();
+    try std.testing.expect(try status.value.isCanceled(request));
+    try std.testing.expect(!svc.locked);
+    svc.store.reject = true;
+    try std.testing.expectError(error.GenerationPublicationChanged, cancelRelationalIndexPublication(&svc, std.testing.allocator, context, request));
+    try std.testing.expectEqual(@as(usize, 1), svc.proposals);
+    svc.store.reject = false;
+    svc.wait_failure = true;
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, cancelRelationalIndexPublication(&svc, std.testing.allocator, context, request));
+    try std.testing.expect(!svc.locked);
+    svc.wait_failure = false;
+    svc.store.observed.replication_pending = true;
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, cancelRelationalIndexPublication(&svc, std.testing.allocator, context, request));
+    const pending_bytes = try relationalIndexCancellationStatusJson(&svc, std.testing.allocator, context, request);
+    defer std.testing.allocator.free(pending_bytes);
+    var pending = try std.json.parseFromSlice(publication.CancellationStatus, std.testing.allocator, pending_bytes, .{});
+    defer pending.deinit();
+    try std.testing.expect(!try pending.value.isCanceled(request));
 }
 
 test "relational index publication ACK submission fences capabilities releases mutation gates and preserves ambiguous outcomes" {
@@ -899,6 +999,8 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
         .relational_index_owner_ack_status => |request| relationalIndexOwnerAckStatusJson(svc, alloc, context, request),
         .relational_index_publish_decide => |request| decideRelationalIndexPublication(svc, alloc, context, request),
         .relational_index_publish_status => |request| relationalIndexPublicationDecisionStatusJson(svc, alloc, context, request),
+        .relational_index_cancel => |request| cancelRelationalIndexPublication(svc, alloc, context, request),
+        .relational_index_cancel_status => |request| relationalIndexCancellationStatusJson(svc, alloc, context, request),
         .relational_index_source_accept => |request| acceptRelationalIndexSource(svc, alloc, context, request),
         .relational_index_source_complete => |request| completeRelationalIndexSource(svc, alloc, context, request),
         .relational_index_source_accept_status => |request| relationalIndexSourceAcceptanceStatusJson(svc, alloc, context, request),

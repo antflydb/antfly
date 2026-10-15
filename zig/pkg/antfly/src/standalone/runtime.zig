@@ -2558,7 +2558,7 @@ const LocalStandaloneMetadata = struct {
         }
         const shared_catalog_mutation = call == .mutate or call == .setting_mutate or call == .policy_definition_mutate or
             call == .policy_publication_begin or call == .policy_publication_mutate or
-            call == .fk_initial_create_begin or call == .fk_initial_create_mutate or call == .relational_index_owner_ack or call == .relational_index_publish_decide or call == .store_root_enroll;
+            call == .fk_initial_create_begin or call == .fk_initial_create_mutate or call == .relational_index_owner_ack or call == .relational_index_publish_decide or call == .relational_index_cancel or call == .store_root_enroll;
         if (shared_catalog_mutation) if (self.hot_standby_catalog_server) |server| {
             try server.hot_standby_public_gate_state.checkWrite(server.hot_standby_public_gate_state.currentGeneration());
         };
@@ -2637,6 +2637,30 @@ const LocalStandaloneMetadata = struct {
                 var parsed = std.json.parseFromSlice(journal.Status, alloc, observed, .{}) catch return error.MetadataMutationOutcomeUnknown;
                 defer parsed.deinit();
                 if (!(parsed.value.isCompleted(request) catch return error.MetadataMutationOutcomeUnknown)) return error.MetadataMutationOutcomeUnknown;
+                return observed;
+            },
+            .relational_index_cancel_status => |request| {
+                const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+                return store.relationalIndexCancellationStatusJson(alloc, group_ids.main_metadata_group_id, request);
+            },
+            .relational_index_cancel => |request| {
+                const publication = @import("../metadata/relational_index_publication.zig");
+                const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+                try request.validate();
+                try store.validateRelationalIndexCancellation(group_ids.main_metadata_group_id, request);
+                try context.ensureActive();
+                const previous = self.durable_revision;
+                store.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .cancel_relational_index_publication = request }) catch return error.MetadataMutationOutcomeUnknown;
+                const revision = store.standaloneRevision() catch return error.MetadataMutationOutcomeUnknown;
+                if (previous != 0 and previous != std.math.maxInt(u64) and revision == previous + 1) {
+                    self.epoch = revision;
+                    self.durable_revision = revision;
+                } else self.reloadLifecycleProjectionLocked() catch return error.MetadataMutationOutcomeUnknown;
+                const observed = store.relationalIndexCancellationStatusJson(alloc, group_ids.main_metadata_group_id, request) catch return error.MetadataMutationOutcomeUnknown;
+                errdefer alloc.free(observed);
+                var parsed = std.json.parseFromSlice(publication.CancellationStatus, alloc, observed, .{}) catch return error.MetadataMutationOutcomeUnknown;
+                defer parsed.deinit();
+                if (!(parsed.value.isCanceled(request) catch return error.MetadataMutationOutcomeUnknown)) return error.MetadataMutationOutcomeUnknown;
                 return observed;
             },
             .relational_index_publish_status => |request| {
@@ -13220,6 +13244,8 @@ test "standalone native index owner catalog calls preserve authority and capabil
         .{ .relational_index_owner_decision = .{ .table_id = ack.table_id, .group_id = ack.signed.receipt.owner.group_id, .id = ack.signed.receipt.owner.plan_id, .operation = .fence } },
         .{ .relational_index_owner_ack = ack },
         .{ .relational_index_owner_ack_status = ack },
+        .{ .relational_index_cancel = .{ .table_id = ack.table_id, .id = ack.signed.receipt.owner.plan_id, .expected_revision = 1, .failure = .requested } },
+        .{ .relational_index_cancel_status = .{ .table_id = ack.table_id, .id = ack.signed.receipt.owner.plan_id, .expected_revision = 1, .failure = .requested } },
         .{ .store_root_enroll = enrollment },
         .{ .store_root_enrollment_status = enrollment.identity },
     };
@@ -13285,6 +13311,50 @@ fn withOwnerCatalogForTest(store: *antfly.metadata.RaftApplyStore, request: anyt
     try check(&metadata, request, revision);
 }
 
+fn testIndexCancellationCatalog(source: *antfly.metadata.RaftApplyStore, ack: @import("../metadata/relational_index_publication.zig").Ack) !void {
+    const a = std.testing.allocator;
+    const publication = @import("../metadata/relational_index_publication.zig");
+    const group = group_ids.main_metadata_group_id;
+    const snapshot = try source.snapshotBuilder().buildSnapshot(a, group);
+    defer a.free(snapshot);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/standalone-index-cancel", .{tmp.sub_path});
+    defer a.free(path);
+    var store = try antfly.metadata.RaftApplyStore.init(a, .{ .root_dir = path });
+    defer store.deinit();
+    // Raft snapshots contain group state, not the standalone-local catalog
+    // header/revision. Model a real initialized standalone restore target.
+    try store.replaceStandaloneCatalog(group, 0, &.{}, &.{}, "{}");
+    try std.testing.expect(try store.snapshotBuilder().installSnapshot(a, group, 100, snapshot));
+    const bytes = try store.relationalIndexOwnerAckStatusJson(a, group, ack);
+    defer a.free(bytes);
+    var status = try std.json.parseFromSlice(publication.AckStatus, a, bytes, .{});
+    defer status.deinit();
+    const request: publication.CancelDecision = .{ .table_id = ack.table_id, .id = status.value.head.plan_id, .expected_revision = status.value.head.revision, .failure = .requested };
+    try withOwnerCatalogForTest(&store, request, struct {
+        fn run(metadata: *LocalStandaloneMetadata, decision: publication.CancelDecision, revision: u64) !void {
+            const alloc = std.testing.allocator;
+            const context: antfly.public_api.operation.RequestContext = .{ .index_publication_authority = true };
+            const reply = try LocalStandaloneMetadata.systemCatalog(metadata, alloc, context, .{ .relational_index_cancel = decision });
+            defer alloc.free(reply);
+            var confirmed = try std.json.parseFromSlice(publication.CancellationStatus, alloc, reply, .{});
+            defer confirmed.deinit();
+            try std.testing.expect(try confirmed.value.isCanceled(decision));
+            try std.testing.expectEqual(revision + 1, metadata.durable_revision);
+            try std.testing.expectEqual(revision + 1, metadata.epoch);
+            const observed = try LocalStandaloneMetadata.systemCatalog(metadata, alloc, context, .{ .relational_index_cancel_status = decision });
+            defer alloc.free(observed);
+            try std.testing.expectEqualStrings(reply, observed);
+            try std.testing.expectEqual(revision + 1, try metadata.lifecycle_store.?.standaloneRevision());
+            const retried = try LocalStandaloneMetadata.systemCatalog(metadata, alloc, context, .{ .relational_index_cancel = decision });
+            defer alloc.free(retried);
+            try std.testing.expectEqualStrings(reply, retried);
+            try std.testing.expectEqual(revision + 2, metadata.durable_revision);
+        }
+    }.run);
+}
+
 test "standalone native index owner catalog calls commit enrolled receipts and resolve lost replies" {
     try @import("../metadata/storage/raft_apply_store.zig").OwnerAckTestFixture.run(struct {
         pub fn enroll(store: *antfly.metadata.RaftApplyStore, request: @import("../metadata/store_root_enrollment.zig").Request) !void {
@@ -13324,6 +13394,7 @@ test "standalone native index owner catalog calls commit enrolled receipts and r
 
         pub fn apply(store: *antfly.metadata.RaftApplyStore, ack: @import("../metadata/relational_index_publication.zig").Ack, _: @import("../metadata/storage/raft_apply_store.zig").TransitionCommand) !void {
             try withOwnerCatalogForTest(store, ack, ackThroughCatalog);
+            if (ack.signed.receipt.action == .fenced) try testIndexCancellationCatalog(store, ack);
         }
 
         fn ackThroughCatalog(metadata: *LocalStandaloneMetadata, ack: @import("../metadata/relational_index_publication.zig").Ack, revision: u64) !void {
@@ -13581,6 +13652,7 @@ test "standalone standby catalog create rejects before contended locks" {
         // A receipt is also a durable catalog mutation, not a status read.
         // Reject the standby before inspecting its body or either held lock.
         try std.testing.expectError(error.HAReadOnlyStandby, LocalStandaloneMetadata.systemCatalog(&metadata, alloc, .{ .index_publication_authority = true }, .{ .relational_index_owner_ack = undefined }));
+        try std.testing.expectError(error.HAReadOnlyStandby, LocalStandaloneMetadata.systemCatalog(&metadata, alloc, .{ .index_publication_authority = true }, .{ .relational_index_cancel = undefined }));
         try std.testing.expectError(error.HAReadOnlyStandby, LocalStandaloneMetadata.systemCatalog(&metadata, alloc, .{ .setting_admin = true }, .{ .store_root_enroll = undefined }));
     }
 }
