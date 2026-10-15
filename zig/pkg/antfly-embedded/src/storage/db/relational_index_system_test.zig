@@ -970,6 +970,74 @@ test "relational index build pages native owner control preserves committed cuts
     }
 }
 
+fn testInstalledIndexHistoryAllocations(allocator: std.mem.Allocator, txn: *docstore.DocStore.Txn, binding: @import("relational_index_owner_job.zig").Binding) !void {
+    var history = try @import("relational_index_validation.zig").Installed.History.init(allocator, txn, binding);
+    defer history.deinit();
+    var view = history.reader(txn);
+    try @import("relational_index_owner_job.zig").requireReserved(&view, history.binding);
+}
+
+fn testInstalledIndexPhysicalAudit(database: *db_mod.DB) !void {
+    const verification = @import("relational_index_validation.zig");
+    const owner = @import("relational_index_owner_job.zig");
+    const claims = @import("relational_index_private_claims.zig");
+    var read = try database.core.store.beginReadTxn();
+    defer read.abort();
+    const binding = (try owner.load(&read)).?;
+    try std.testing.expectEqual(owner.Phase.installed, binding.phase);
+    try std.testing.expectError(error.PrivateIndexOwnerJobChanged, owner.requireReserved(&read, binding));
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, testInstalledIndexHistoryAllocations, .{ &read, binding });
+    var history = try verification.Installed.History.init(alloc, &read, binding);
+    defer history.deinit();
+    var view = history.reader(&read);
+    const expected = history.record.command.validation.command.expected;
+    var before_schema = (try database.core.acquireSchemaVersionView(binding.physical_reserved.schema_version)).?;
+    defer before_schema.release();
+    var after_schema = database.core.acquireSchemaView().?;
+    defer after_schema.release();
+    const inputs = try @import("relational_index_inputs.zig").decode(history.candidate.inputs.bytes);
+    var addition = try owner.reopenPhysical(alloc, &view, before_schema, after_schema, inputs.name);
+    defer addition.deinit();
+    const budget: @import("relational_index_jobs.zig").Budget = .{ .records = 4, .time_ns = std.time.ns_per_s };
+    var inventory: ?claims.InventoryValidation.Audit = null;
+    var turns: usize = 0;
+    while (inventory == null or inventory.?.fields.phase == .scanning or inventory.?.fields.phase == .claims) {
+        try std.testing.expect(turns < 128);
+        turns += 1;
+        inventory = try claims.InventoryValidation.auditPage(alloc, &view, history.binding, expected, database.root_incarnation, inventory, budget, .{});
+    }
+    try std.testing.expectEqual(claims.InventoryValidation.Phase.ready, inventory.?.fields.phase);
+    var generation: ?verification.Audit = null;
+    defer if (generation) |*value| value.deinit();
+    turns = 0;
+    while (generation == null or (generation.?.progress.summary.fields.phase != .ready and generation.?.progress.summary.fields.phase != .failed)) {
+        try std.testing.expect(turns < 128);
+        turns += 1;
+        const next = try verification.auditReadPage(alloc, database.core, &view, history.binding, expected, &addition, database.root_incarnation, inventory.?, if (generation) |*value| value else null, budget, .{});
+        if (generation) |*value| value.deinit();
+        generation = next;
+    }
+    try std.testing.expectEqual(verification.Phase.ready, generation.?.progress.summary.fields.phase);
+    {
+        // An aborting physical corruption is visible through the history
+        // reader: it cannot substitute canonical evidence for real row reads.
+        var corrupt_txn = try database.core.store.beginWriteTxn();
+        defer corrupt_txn.abort();
+        const primary_key = try internal.relationalRowKeyAlloc(alloc, "row000");
+        defer alloc.free(primary_key);
+        try corrupt_txn.put(primary_key, "corrupt");
+        var corrupt_history = try verification.Installed.History.init(alloc, &corrupt_txn, binding);
+        defer corrupt_history.deinit();
+        var corrupt_view = corrupt_history.reader(&corrupt_txn);
+        var failed = try verification.auditReadPage(alloc, database.core, &corrupt_view, history.binding, expected, &addition, database.root_incarnation, inventory.?, null, budget, .{});
+        defer failed.deinit();
+        try std.testing.expectEqual(verification.Phase.failed, failed.progress.summary.fields.phase);
+        try std.testing.expectEqual(verification.Failure.invalid_row, failed.progress.summary.fields.failure);
+    }
+    try std.testing.expectEqual(owner.Phase.installed, (try owner.load(&read)).?.phase);
+    try std.testing.expectEqual(history.record.position.sequence, (try @import("../source_authority.zig").load(&read)).?.sequence);
+}
+
 fn testNativeIndexActivationAllocations(allocator: std.mem.Allocator, txn: *docstore.DocStore.Txn, binding: @import("relational_index_owner_job.zig").Binding, candidate: *const @import("relational_index_candidate.zig").Candidate) !void {
     const activation = @import("relational_integrity_activation.zig");
     var publication = try @import("relational_integrity_catalog.zig").prepareIndexPublication(allocator, candidate.reservation.expected.?, candidate.reservation.value, candidate.next.value, "email_idx");
@@ -2542,6 +2610,7 @@ test "relational index build pages identity dispatch caches immutable candidates
                     install_record.payload = try install_packet.finalizePayload(wrong_position);
                     try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, replication_ingress.applyRecord(&installed_db, install_record));
                     try std.testing.expectEqual(@as(u64, 6), try installed_db.replicationAppliedSequence());
+                    try testInstalledIndexPhysicalAudit(&installed_db);
                     const installed_row = (try installed_db.get(alloc, "row000")).?;
                     defer alloc.free(installed_row);
                     const source_row = (try db.get(alloc, "row000")).?;

@@ -497,50 +497,74 @@ pub const Installed = struct {
         return .{ .record = record, .duplicate = false };
     }
 
-    /// Structural history verification only, never execution or physical-root
-    /// adoption. First check the REAL installed successor and cut. Then verify
-    /// the frozen pre-install proofs through a read-only historical metadata
-    /// view bound to retained immutable schema/catalog bytes. Physical records,
-    /// namespace, range, clocks and canonical validation data remain real reads.
-    pub fn verifyRecovery(alloc: Allocator, txn: anytype, binding: owner.Binding, active: ?*const catalog.Loaded) !void {
-        if (binding.phase != .installed) return error.InvalidPrivateIndexOwnerJob;
-        const record = (try Installed.load(alloc, txn, binding)) orelse return error.InvalidPrivateIndexNativeReceipt;
-        try record.requireSuccessor(alloc, txn);
-        const current = active orelse return error.MissingRelationalIndexDefinitions;
-        if (!current.head.eql(binding.physical_candidate) or !equal(current.schema_digest, record.command.schema_digest)) return error.RelationalIndexCatalogSchemaMismatch;
-        var candidate = try owner.reopenCandidate(alloc, txn, binding);
-        defer candidate.deinit();
-        const schema = @import("../schema.zig");
-        const before_key = try schema.schemaVersionKeyAlloc(alloc, binding.physical_reserved.schema_version);
-        defer alloc.free(before_key);
-        const before_schema = try alloc.dupe(u8, try txn.get(before_key));
-        defer alloc.free(before_schema);
-        if (!equal(hash(before_schema), binding.schema_before)) return error.RelationalIndexCatalogSchemaMismatch;
-        const historical = struct {
-            source: @TypeOf(txn),
-            job: [owner.Binding.encoded_len]u8,
-            head: @TypeOf(binding.physical_reserved.encode()),
-            schema_bytes: []const u8,
-            catalog_bytes: []const u8,
+    /// Owned immutable predecessor metadata for read-only proof verification
+    /// and physical auditing. Verify the REAL successor first. Never mask data,
+    /// range, namespace or clocks; expose no writes or commit operation.
+    pub const History = struct {
+        alloc: Allocator,
+        record: Installed,
+        binding: owner.Binding,
+        candidate: @import("relational_index_candidate.zig").Candidate,
+        before_schema: []u8,
+        before_catalog: catalog.Loaded,
+        job: [owner.Binding.encoded_len]u8,
+        head: @TypeOf(catalog.Head.encode(undefined)),
 
-            pub fn get(self: *@This(), key_: []const u8) ![]const u8 {
-                if (std.mem.eql(u8, key_, owner.key)) return &self.job;
-                if (std.mem.eql(u8, key_, catalog.head_key)) return &self.head;
-                if (std.mem.eql(u8, key_, schema.schema_key)) return self.schema_bytes;
-                if (std.mem.eql(u8, key_, @import("relational_integrity_catalog.zig").key)) return self.catalog_bytes;
-                return self.source.get(key_);
-            }
-            pub fn openCursor(self: *@This()) @TypeOf(self.source.openCursor()) {
-                return self.source.openCursor();
-            }
-        };
-        var before: historical = .{ .source = txn, .job = try reserved(binding).encode(), .head = binding.physical_reserved.encode(), .schema_bytes = before_schema, .catalog_bytes = candidate.reservation.value };
-        var previous = try catalog.decode(alloc, binding.physical_reserved, try txn.get(&catalog.blobKey(binding.physical_reserved.blob_digest)));
-        defer previous.deinit();
-        try owner.verifyUninstalledRecovery(alloc, &before, reserved(binding), &previous);
+        pub fn init(alloc: Allocator, txn: anytype, binding: owner.Binding) !History {
+            if (binding.phase != .installed) return error.InvalidPrivateIndexOwnerJob;
+            const record = (try Installed.load(alloc, txn, binding)) orelse return error.InvalidPrivateIndexNativeReceipt;
+            try record.requireCurrent(alloc, txn);
+            var candidate = try owner.reopenCandidate(alloc, txn, binding);
+            errdefer candidate.deinit();
+            const schema = @import("../schema.zig");
+            const before_key = try schema.schemaVersionKeyAlloc(alloc, binding.physical_reserved.schema_version);
+            defer alloc.free(before_key);
+            const before_schema = try alloc.dupe(u8, try txn.get(before_key));
+            errdefer alloc.free(before_schema);
+            if (!equal(hash(before_schema), binding.schema_before)) return error.RelationalIndexCatalogSchemaMismatch;
+            var before_catalog = try catalog.decode(alloc, binding.physical_reserved, try txn.get(&catalog.blobKey(binding.physical_reserved.blob_digest)));
+            errdefer before_catalog.deinit();
+            if (!equal(before_catalog.schema_digest, binding.schema_before)) return error.RelationalIndexCatalogSchemaMismatch;
+            return .{ .alloc = alloc, .record = record, .binding = Installed.reserved(binding), .candidate = candidate, .before_schema = before_schema, .before_catalog = before_catalog, .job = try Installed.reserved(binding).encode(), .head = binding.physical_reserved.encode() };
+        }
+        pub fn deinit(self: *History) void {
+            self.before_catalog.deinit();
+            self.alloc.free(self.before_schema);
+            self.candidate.deinit();
+            self.* = undefined;
+        }
+        pub fn Reader(comptime Source: type) type {
+            return struct {
+                history: *const History,
+                source: Source,
+                pub fn get(self: *@This(), key_: []const u8) ![]const u8 {
+                    if (std.mem.eql(u8, key_, owner.key)) return &self.history.job;
+                    if (std.mem.eql(u8, key_, catalog.head_key)) return &self.history.head;
+                    if (std.mem.eql(u8, key_, @import("../schema.zig").schema_key)) return self.history.before_schema;
+                    if (std.mem.eql(u8, key_, @import("relational_integrity_catalog.zig").key)) return self.history.candidate.reservation.value;
+                    return self.source.get(key_);
+                }
+                pub fn openCursor(self: *@This()) @TypeOf(self.source.openCursor()) {
+                    return self.source.openCursor();
+                }
+            };
+        }
+        pub fn reader(self: *const History, txn: anytype) Reader(@TypeOf(txn)) {
+            return .{ .history = self, .source = txn };
+        }
+    };
+
+    /// Structural recovery only, never physical-root adoption or execution.
+    pub fn verifyRecovery(alloc: Allocator, txn: anytype, binding: owner.Binding, active: ?*const catalog.Loaded) !void {
+        var history = try History.init(alloc, txn, binding);
+        defer history.deinit();
+        const current = active orelse return error.MissingRelationalIndexDefinitions;
+        if (!current.head.eql(binding.physical_candidate) or !equal(current.schema_digest, history.record.command.schema_digest)) return error.RelationalIndexCatalogSchemaMismatch;
+        var before = history.reader(txn);
+        try owner.verifyUninstalledRecovery(alloc, &before, history.binding, &history.before_catalog);
         const activation = @import("relational_integrity_activation.zig");
         const progress = try activation.Progress.decode(try txn.get(activation.key));
-        if (!progress.matches(candidate.next.catalog, try activation.ownership(txn))) return error.ConstraintActivationChanged;
+        if (!progress.matches(history.candidate.next.catalog, try activation.ownership(txn))) return error.ConstraintActivationChanged;
     }
 };
 
@@ -561,6 +585,14 @@ pub const Audit = struct {
 /// cursor. Requires this root's completed inventory audit; neither that audit
 /// nor this result grants permission to publish or attest the generation.
 pub fn auditPage(alloc: Allocator, core: anytype, binding: owner.Binding, expected: Expected, addition: *const catalog.PrivateAddition, root_incarnation: u128, inventory_audit: claims.InventoryValidation.Audit, previous: ?*const Audit, budget: jobs.Budget, context: Context) !Audit {
+    var read = try core.store.beginReadTxn();
+    defer read.abort();
+    return auditReadPage(alloc, core, &read, binding, expected, addition, root_incarnation, inventory_audit, previous, budget, context);
+}
+
+/// Read-only physical audit at a caller-pinned snapshot. Installed owners use
+/// a verified historical metadata view; data/cursors remain real store reads.
+pub fn auditReadPage(alloc: Allocator, core: anytype, read: anytype, binding: owner.Binding, expected: Expected, addition: *const catalog.PrivateAddition, root_incarnation: u128, inventory_audit: claims.InventoryValidation.Audit, previous: ?*const Audit, budget: jobs.Budget, context: Context) !Audit {
     try context.ensureActive();
     try budget.validate();
     try expected.requireBinding(binding);
@@ -577,11 +609,9 @@ pub fn auditPage(alloc: Allocator, core: anytype, binding: owner.Binding, expect
     const index = for (pinned.plan.boundIndexes()) |value| {
         if (value.id().mapKey() == binding.index.mapKey()) break value;
     } else return error.IndexNotFound;
-    var read = try core.store.beginReadTxn();
-    defer read.abort();
-    const frozen = try claims.InventoryValidation.requireReady(alloc, &read, binding, expected);
+    const frozen = try claims.InventoryValidation.requireReady(alloc, read, binding, expected);
     if (!equal(inventory_audit.canonical_digest, frozen.digest)) return error.PrivateIndexAuditScopeChanged;
-    var canonical = (try load(alloc, &read, binding)) orelse return error.PrivateIndexTargetValidationRequired;
+    var canonical = (try load(alloc, read, binding)) orelse return error.PrivateIndexTargetValidationRequired;
     defer canonical.deinit();
     if (!equal(try canonical.summary.expected.digest(), try expected.digest()) or
         !equal(canonical.summary.inventory_digest, frozen.digest) or canonical.summary.source_members != frozen.source_members or
@@ -603,7 +633,7 @@ pub fn auditPage(alloc: Allocator, core: anytype, binding: owner.Binding, expect
         }
         local = state.progress;
     }
-    var page = (try Prepared.preparePage(alloc, core, &read, binding, expected, pinned, index, core.schemaNamespaceGeneration(), frozen, local, budget, context, null)) orelse return error.InvalidRelationalIndexValidation;
+    var page = (try Prepared.preparePage(alloc, core, read, binding, expected, pinned, index, core.schemaNamespaceGeneration(), frozen, local, budget, context, null)) orelse return error.InvalidRelationalIndexValidation;
     defer page.deinit();
     var digest = std.crypto.hash.Blake3.init(.{});
     digest.update("antfly/private-index-generation-root-local-audit/v1");

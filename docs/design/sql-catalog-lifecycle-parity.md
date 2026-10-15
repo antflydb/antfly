@@ -7938,3 +7938,38 @@ was interrupted by disappearing cache/SDK artifacts, not a reported code/test
 regression; it was rerun from the worktree-local cache without skipping gates.
 No native receiver/root-audit qualification, throughput result or original-case
 credit is claimed.
+
+### Read-only installed-state physical audit primitives
+
+Installed recovery and physical auditing share an owned immutable history
+object. It first verifies the real installed successor, exact schema/catalog/
+activation and committed cut with the original fence held. It then owns and
+checks retained predecessor schema/physical definitions and reconstructs the
+hash-bound reserved integrity catalog from the admitted immutable manifest.
+
+Its read-only view overrides exactly four historical metadata keys; all data,
+cursors, range, namespace, native clocks and canonical proof records remain
+reads of the caller's real snapshot. It exposes no puts, deletes or commits.
+Recovery uses this same view, and generation auditing can now consume a
+caller-pinned read transaction without opening a second snapshot. This is not
+an execution capability, synthetic readiness flag or adoption permission.
+
+The real-LSM installed/reopened fixture physically rescans inventory and all
+generation passes with bounded pages, checks exhaustive history-allocation
+failure cleanup, and detects an aborting corrupt primary row even though its
+canonical metadata proof remains unchanged. Ordinary reserved-job admission
+continues rejecting the real installed job. Audits do not advance native time
+or change that committed phase. The focused Debug gate passed 56/56 steps.
+
+Root-checkpoint/receiver integration must reuse the immutable compiled plan
+across pages, open fresh snapshots and recheck the real installed successor;
+it is not implemented by these primitives. Authenticated receiver/C-ABI,
+installed ACK/release coordination, physical-root adoption and distributed
+fault qualification remain unfinished. No public activation or original-case
+credit is claimed.
+
+Full qualification: `/private/tmp/antfly-installed-history-final-debug.log`
+passed 159/159 Debug steps, including native lifecycle, candidate, standalone,
+domain, C-ABI, leased-owner, ACK, publication and runtime suites. Boundary,
+license, inventory, formatting, diff and generated control-catalog checks
+passed. No throughput improvement or complete receiver qualification is claimed.
