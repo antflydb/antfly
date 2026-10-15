@@ -68707,6 +68707,49 @@ test "db can reassign identity namespace for rebuild" {
     try std.testing.expectEqual(@as(u32, 1), ok.total_hits);
 }
 
+test "db writable reopen builds the live identity directory for a legacy identity image" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+        defer db.close();
+        try db.batch(.{ .writes = &.{
+            .{ .key = "doc:a", .value = "{\"name\":\"alpha\"}" },
+            .{ .key = "doc:b", .value = "{\"name\":\"beta\"}" },
+            .{ .key = "doc:c", .value = "{\"name\":\"gamma\"}" },
+        } });
+        try db.batch(.{ .deletes = &.{"doc:c"} });
+
+        // Reproduce an image written before ALD1 existed: the namespace and
+        // ordinal records are present, the live directory and marker are not.
+        const live_a = try internal_keys.identityLiveDocToOrdinalKeyAlloc(alloc, "doc:a");
+        defer alloc.free(live_a);
+        const live_b = try internal_keys.identityLiveDocToOrdinalKeyAlloc(alloc, "doc:b");
+        defer alloc.free(live_b);
+        try db.core.store.putBatch(&.{}, &.{ live_a, live_b, &internal_keys.identity_live_directory_manifest_key });
+        try std.testing.expectError(error.InvalidDocIdentity, doc_identity.loadNamespaceFromStore(db.core.store));
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer reopened.close();
+    // Validation requires the rebuilt directory to match every live ordinal and
+    // exclude the deleted document.
+    try doc_identity.validateStoreAlloc(alloc, reopened.core.store);
+    var filtered = try reopened.search(alloc, .{
+        .query = .{ .match_all = {} },
+        .filter_doc_ids = &.{ "doc:a", "doc:b", "doc:c" },
+        .filter_doc_ids_positive = true,
+        .limit = 10,
+    });
+    defer filtered.deinit();
+    try std.testing.expectEqual(@as(u32, 2), filtered.total_hits);
+}
+
 test "db strict namespace reopen recovers after identity reassignment repair" {
     const alloc = std.testing.allocator;
 

@@ -3128,6 +3128,11 @@ pub fn openCoreResourcesFromPrimaryStore(
     const persisted_range = try range_state_mod.loadRange(alloc, store);
     defer range_state_mod.freeRange(alloc, persisted_range);
     shard_manager.* = try shard_mod.ShardManager.init(alloc, store, persisted_range);
+    // Identity images written before the live directory existed (released
+    // v0.2.x servers) store a namespace without its ALD1 marker. A writable
+    // owner builds the directory once before loading the namespace; read-only
+    // opens keep failing closed.
+    if (!read_only) try doc_identity.upgradeImportedLiveDirectoryAlloc(alloc, store, .none);
     const identity_namespace = try doc_identity.loadOrInitNamespaceWithPolicy(
         store,
         configured_identity_namespace,
