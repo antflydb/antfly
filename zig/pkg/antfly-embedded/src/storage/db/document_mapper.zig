@@ -98,6 +98,8 @@ pub const ExtractedWrite = struct {
     mentioned_graph_indexes: [][]u8,
     dense_embeddings: []DenseEmbeddingWrite,
     sparse_embeddings: []SparseEmbeddingWrite,
+    /// Explicit null directives; omission leaves caller-owned vectors intact.
+    deleted_embedding_indexes: [][]u8 = &.{},
     /// Transient logical source for immediate full-text application. The tree
     /// borrows `prepared_region` and is deliberately never cloned or serialized;
     /// durable replay reconstructs the typed root from the committed AROW.
@@ -221,6 +223,17 @@ pub const ExtractedWrite = struct {
             out.mentioned_graph_indexes[i] = try alloc.dupe(u8, name);
             mentioned_initialized += 1;
         }
+        out.deleted_embedding_indexes = blk: {
+            const names = try alloc.alloc([]u8, self.deleted_embedding_indexes.len);
+            errdefer alloc.free(names);
+            var initialized: usize = 0;
+            errdefer for (names[0..initialized]) |name| alloc.free(name);
+            for (self.deleted_embedding_indexes, 0..) |name, i| {
+                names[i] = try alloc.dupe(u8, name);
+                initialized += 1;
+            }
+            break :blk names;
+        };
         out.dense_embeddings = try alloc.alloc(DenseEmbeddingWrite, self.dense_embeddings.len);
         var dense_initialized: usize = 0;
         errdefer out.dense_embeddings = out.dense_embeddings[0..dense_initialized];
@@ -306,6 +319,8 @@ pub const ExtractedWrite = struct {
         if (self.graph_writes.len > 0) alloc.free(self.graph_writes);
         for (self.mentioned_graph_indexes) |index_name| alloc.free(index_name);
         if (self.mentioned_graph_indexes.len > 0) alloc.free(self.mentioned_graph_indexes);
+        for (self.deleted_embedding_indexes) |name| alloc.free(name);
+        if (self.deleted_embedding_indexes.len > 0) alloc.free(self.deleted_embedding_indexes);
         for (self.dense_embeddings) |embedding| {
             alloc.free(embedding.index_name);
             alloc.free(embedding.doc_key);
@@ -2247,6 +2262,11 @@ fn extractWriteFromParsedPrepared(
         }
         graph_writes.deinit(alloc);
     }
+    var deleted_embedding_indexes = std.ArrayListUnmanaged([]u8).empty;
+    errdefer {
+        for (deleted_embedding_indexes.items) |name| alloc.free(name);
+        deleted_embedding_indexes.deinit(alloc);
+    }
     var dense_embeddings = std.ArrayListUnmanaged(DenseEmbeddingWrite).empty;
     errdefer {
         for (dense_embeddings.items) |embedding| {
@@ -2330,6 +2350,10 @@ fn extractWriteFromParsedPrepared(
             const index_name = emb_entry.key_ptr.*;
             const emb_value = emb_entry.value_ptr.*;
             switch (emb_value) {
+                .null => {
+                    try deleted_embedding_indexes.ensureUnusedCapacity(alloc, 1);
+                    deleted_embedding_indexes.appendAssumeCapacity(try alloc.dupe(u8, index_name));
+                },
                 .array, .string => {
                     const vector = try parseDenseEmbeddingValue(alloc, emb_value);
                     errdefer alloc.free(vector);
@@ -2387,6 +2411,7 @@ fn extractWriteFromParsedPrepared(
     errdefer result.deinit(alloc);
     result.graph_writes = try graph_writes.toOwnedSlice(alloc);
     result.mentioned_graph_indexes = try mentioned_indexes.toOwnedSlice(alloc);
+    result.deleted_embedding_indexes = try deleted_embedding_indexes.toOwnedSlice(alloc);
     result.dense_embeddings = try dense_embeddings.toOwnedSlice(alloc);
     result.sparse_embeddings = try sparse_embeddings.toOwnedSlice(alloc);
     return result;
@@ -6921,4 +6946,22 @@ test "default text projection retains empty primary identity without postings (#
     try builder.appendSourceDocForIndex(source, "body", false);
     try builder.appendSourceDocForIndex(source, null, false);
     try std.testing.expectEqual(@as(usize, 1), builder.text_docs.items.len);
+}
+
+test "document mapper explicit null embeddings own extraction and clone allocation failures" {
+    const Case = struct {
+        fn run(alloc: Allocator) !void {
+            var extracted = try extractWrite(alloc, "doc:a", "{\"title\":\"kept\",\"_embeddings\":{\"dense\":null,\"sparse\":null}}");
+            defer extracted.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 2), extracted.deleted_embedding_indexes.len);
+            try std.testing.expectEqual(@as(usize, 0), extracted.dense_embeddings.len);
+            try std.testing.expectEqual(@as(usize, 0), extracted.sparse_embeddings.len);
+            var cloned = try extracted.clone(alloc);
+            defer cloned.deinit(alloc);
+            try std.testing.expectEqualStrings("dense", cloned.deleted_embedding_indexes[0]);
+            try std.testing.expectEqualStrings("sparse", cloned.deleted_embedding_indexes[1]);
+            try std.testing.expect(std.mem.indexOf(u8, cloned.cleaned_value.?, "_embeddings") == null);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }

@@ -101540,59 +101540,106 @@ test "db dense and sparse field-backed vector indexes strip vector fields and pe
     try ExpectCoverage.run(&db, 4, 3, 1);
 }
 
-test "db external dense coverage tracks exact writes deletes and reopen" {
+test "db document _embeddings external vector coverage survives updates deletes and reopen" {
     const alloc = std.testing.allocator;
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-    defer cleanupTempDir(path);
+    for ([_]bool{ false, true }) |sparse| {
+        var path_tmp = try TestDirectory.init("db");
+        defer path_tmp.cleanup();
+        const path = path_tmp.path().ptr;
+        defer cleanupTempDir(path);
 
-    const ExpectCoverage = struct {
-        fn run(db_value: *DB, source: u64, produced: u64) !void {
-            const stats = try db_value.stats(std.testing.allocator);
-            defer types.freeDBStats(std.testing.allocator, stats);
-            try std.testing.expectEqual(source, stats.source_doc_count);
-            for (stats.indexes) |index_stats| {
-                if (!std.mem.eql(u8, index_stats.name, "external_v1")) continue;
-                try std.testing.expectEqual(produced, index_stats.coverage_produced_count);
-                try std.testing.expectEqual(@as(u64, 0), index_stats.coverage_skipped_count);
-                return;
+        const ExpectCoverage = struct {
+            fn run(db_value: *DB, source: u64, produced: u64, is_sparse: bool) !void {
+                const stats = try db_value.stats(std.testing.allocator);
+                defer types.freeDBStats(std.testing.allocator, stats);
+                try std.testing.expectEqual(source, stats.source_doc_count);
+                for (stats.indexes) |index_stats| {
+                    if (!std.mem.eql(u8, index_stats.name, "external_v1")) continue;
+                    try std.testing.expectEqual(produced, index_stats.doc_count);
+                    try std.testing.expectEqual(produced, index_stats.coverage_produced_count);
+                    try std.testing.expectEqual(@as(u64, 0), index_stats.coverage_skipped_count);
+                    var result = try db_value.search(std.testing.allocator, .{
+                        .index_name = "external_v1",
+                        .query = if (is_sparse) .{ .sparse_knn = .{ .indices = &.{7}, .values = &.{1}, .k = 10 } } else .{ .dense_knn = .{ .vector = &.{ 0, 0, 1 }, .k = 10 } },
+                        .limit = 10,
+                    });
+                    defer result.deinit();
+                    try std.testing.expectEqual(produced, result.hits.len);
+                    if (produced != 0) try std.testing.expectEqualStrings("doc:covered", result.hits[0].id);
+                    return;
+                }
+                return error.IndexNotFound;
             }
-            return error.IndexNotFound;
+        };
+
+        {
+            var db = try DB.open(alloc, std.mem.span(path), .{});
+            defer db.close();
+            try db.addIndex(.{
+                .name = "external_v1",
+                .kind = if (sparse) .sparse_vector else .dense_vector,
+                .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+            });
+            try std.testing.expect(if (sparse) db.core.index_manager.sparseIndexUsesExternalCoverage("external_v1") else db.core.index_manager.denseIndexUsesExternalCoverage("external_v1"));
+
+            // Source-only work must bypass vector replay, including journal
+            // catch-up, while real document deletion still targets the index.
+            const ref = index_manager_mod.ManagedIndexRef{ .name = "external_v1", .kind = if (sparse) .sparse_vector else .dense_vector };
+            try std.testing.expectEqual(ManagedIndexBatchApplicability.irrelevant, managedIndexBatchApplicability(db.core.index_manager, .{
+                .documents = &.{.{ .key = "doc:covered", .action = .upsert }},
+                .overwritten_doc_keys = &.{"doc:covered"},
+            }, ref));
+            try std.testing.expectEqual(ManagedIndexBatchApplicability.irrelevant, managedIndexRecordApplicability(db.core.index_manager, .{
+                .sequence = 1,
+                .changed_doc_keys = &.{"doc:covered"},
+                .overwritten_doc_keys = &.{"doc:covered"},
+            }, ref));
+            try std.testing.expectEqual(ManagedIndexBatchApplicability.relevant, managedIndexRecordApplicability(db.core.index_manager, .{
+                .sequence = 1,
+                .deleted_doc_keys = &.{"doc:covered"},
+            }, ref));
+
+            try db.batch(.{
+                .writes = &.{
+                    .{ .key = "doc:covered", .value = if (sparse) "{\"title\":\"covered\",\"_embeddings\":{\"external_v1\":{\"indices\":[7],\"values\":[1]}}}" else "{\"title\":\"covered\",\"_embeddings\":{\"external_v1\":[1,0,0]}}" },
+                    .{ .key = "doc:pending", .value = "{\"title\":\"pending\"}" },
+                },
+                .sync_level = .full_index,
+            });
+            try ExpectCoverage.run(&db, 2, 1, sparse);
+            const vector_id = if (sparse) null else try db.core.index_manager.lookupDenseVectorId(db.core.store, "external_v1", "doc:covered");
+
+            try db.batch(.{ .writes = &.{.{ .key = "doc:covered", .value = "{\"title\":\"vector retained\"}" }}, .sync_level = .full_index });
+            try ExpectCoverage.run(&db, 2, 1, sparse);
+            try db.batch(.{ .transforms = &.{.{ .key = "doc:covered", .operations = &.{.{ .op = .set, .path = "caption", .value_json = "\"captioned\"" }} }}, .sync_level = .full_index });
+            try ExpectCoverage.run(&db, 2, 1, sparse);
+            // An explicit replacement with changed source JSON must upsert the
+            // existing member, retaining its dense identity without a delete gap.
+            try db.batch(.{ .writes = &.{.{ .key = "doc:covered", .value = if (sparse) "{\"title\":\"replaced\",\"_embeddings\":{\"external_v1\":{\"indices\":[7],\"values\":[3]}}}" else "{\"title\":\"replaced\",\"_embeddings\":{\"external_v1\":[0,0,1]}}" }}, .sync_level = .full_index });
+            try ExpectCoverage.run(&db, 2, 1, sparse);
+            if (!sparse) try std.testing.expectEqual(vector_id, try db.core.index_manager.lookupDenseVectorId(db.core.store, "external_v1", "doc:covered"));
+            try db.batch(.{ .writes = &.{.{ .key = "doc:pending", .value = if (sparse) "{\"_embeddings\":{\"external_v1\":{\"indices\":[7],\"values\":[2]}}}" else "{\"_embeddings\":{\"external_v1\":[0,1,0]}}" }}, .sync_level = .full_index });
+            try ExpectCoverage.run(&db, 2, 2, sparse);
         }
-    };
 
-    {
-        var db = try DB.open(alloc, std.mem.span(path), .{});
-        defer db.close();
-        try db.addIndex(.{
-            .name = "external_v1",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
-        });
-        try std.testing.expect(db.core.index_manager.denseIndexUsesExternalCoverage("external_v1"));
-
-        try db.batch(.{
-            .writes = &.{
-                .{ .key = "doc:covered", .value = "{\"title\":\"covered\",\"_embeddings\":{\"external_v1\":[1,0,0]}}" },
-                .{ .key = "doc:pending", .value = "{\"title\":\"pending\"}" },
-            },
-            .sync_level = .full_index,
-        });
-        try ExpectCoverage.run(&db, 2, 1);
-
-        try db.batch(.{ .writes = &.{.{ .key = "doc:covered", .value = "{\"title\":\"vector removed\"}" }}, .sync_level = .full_index });
-        try ExpectCoverage.run(&db, 2, 0);
-        try db.batch(.{ .writes = &.{.{ .key = "doc:pending", .value = "{\"_embeddings\":{\"external_v1\":[0,1,0]}}" }}, .sync_level = .full_index });
-        try ExpectCoverage.run(&db, 2, 1);
-    }
-
-    {
-        var reopened = try DB.open(alloc, std.mem.span(path), .{});
-        defer reopened.close();
-        try ExpectCoverage.run(&reopened, 2, 1);
-        try reopened.batch(.{ .deletes = &.{"doc:pending"}, .sync_level = .full_index });
-        try ExpectCoverage.run(&reopened, 1, 0);
+        {
+            var reopened = try DB.open(alloc, std.mem.span(path), .{});
+            defer reopened.close();
+            try ExpectCoverage.run(&reopened, 2, 2, sparse);
+            try reopened.batch(.{ .deletes = &.{"doc:pending"}, .sync_level = .full_index });
+            try ExpectCoverage.run(&reopened, 1, 1, sparse);
+            // Exercise the thin durable replay lane as well as full_index.
+            try reopened.batch(.{ .writes = &.{.{ .key = "doc:covered", .value = "{\"_embeddings\":{\"external_v1\":null}}" }}, .sync_level = .write });
+            try reopened.runUntilIdle();
+            try ExpectCoverage.run(&reopened, 1, 0, sparse);
+            try reopened.batch(.{ .writes = &.{.{ .key = "doc:covered", .value = "{\"_embeddings\":{\"external_v1\":null}}" }}, .sync_level = .full_index });
+            try ExpectCoverage.run(&reopened, 1, 0, sparse);
+        }
+        {
+            var reopened = try DB.open(alloc, std.mem.span(path), .{});
+            defer reopened.close();
+            try ExpectCoverage.run(&reopened, 1, 0, sparse);
+        }
     }
 }
 
