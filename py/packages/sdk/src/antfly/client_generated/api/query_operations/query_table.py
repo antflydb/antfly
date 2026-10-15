@@ -6,6 +6,7 @@ import httpx
 
 from ... import errors
 from ...client import AuthenticatedClient, Client
+from ...models.document_artifact_publication_failed_error import DocumentArtifactPublicationFailedError
 from ...models.error import Error
 from ...models.exact_sort_error import ExactSortError
 from ...models.graph_anchor_filter_requires_index_error import GraphAnchorFilterRequiresIndexError
@@ -59,7 +60,10 @@ def _get_kwargs(
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
 ) -> (
-    Error
+    DocumentArtifactPublicationFailedError
+    | HierarchyCursorStaleError
+    | TopologyChangedError
+    | Error
     | Error
     | TableStorageUnreadableError
     | ExactSortError
@@ -75,8 +79,6 @@ def _parse_response(
     | RerankerCandidateLimitExceededError
     | UnsupportedHierarchyGroupingError
     | UnsupportedQueryError
-    | HierarchyCursorStaleError
-    | TopologyChangedError
     | QueryDependencyError
     | QueryTemporarilyUnavailableError
     | StatefulQueryResponses
@@ -99,7 +101,9 @@ def _parse_response(
 
     if response.status_code == 409:
 
-        def _parse_response_409(data: object) -> HierarchyCursorStaleError | TopologyChangedError:
+        def _parse_response_409(
+            data: object,
+        ) -> DocumentArtifactPublicationFailedError | HierarchyCursorStaleError | TopologyChangedError:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
@@ -108,11 +112,19 @@ def _parse_response(
                 return componentsschemas_query_conflict_error_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_query_conflict_error_type_1 = TopologyChangedError.from_dict(data)
+
+                return componentsschemas_query_conflict_error_type_1
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
             if not isinstance(data, dict):
                 raise TypeError()
-            componentsschemas_query_conflict_error_type_1 = TopologyChangedError.from_dict(data)
+            componentsschemas_query_conflict_error_type_2 = DocumentArtifactPublicationFailedError.from_dict(data)
 
-            return componentsschemas_query_conflict_error_type_1
+            return componentsschemas_query_conflict_error_type_2
 
         response_409 = _parse_response_409(response.json())
 
@@ -304,7 +316,10 @@ def _parse_response(
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
 ) -> Response[
-    Error
+    DocumentArtifactPublicationFailedError
+    | HierarchyCursorStaleError
+    | TopologyChangedError
+    | Error
     | Error
     | TableStorageUnreadableError
     | ExactSortError
@@ -320,8 +335,6 @@ def _build_response(
     | RerankerCandidateLimitExceededError
     | UnsupportedHierarchyGroupingError
     | UnsupportedQueryError
-    | HierarchyCursorStaleError
-    | TopologyChangedError
     | QueryDependencyError
     | QueryTemporarilyUnavailableError
     | StatefulQueryResponses
@@ -340,7 +353,10 @@ def sync_detailed(
     client: AuthenticatedClient,
     body: StatefulQueryRequest | File,
 ) -> Response[
-    Error
+    DocumentArtifactPublicationFailedError
+    | HierarchyCursorStaleError
+    | TopologyChangedError
+    | Error
     | Error
     | TableStorageUnreadableError
     | ExactSortError
@@ -356,8 +372,6 @@ def sync_detailed(
     | RerankerCandidateLimitExceededError
     | UnsupportedHierarchyGroupingError
     | UnsupportedQueryError
-    | HierarchyCursorStaleError
-    | TopologyChangedError
     | QueryDependencyError
     | QueryTemporarilyUnavailableError
     | StatefulQueryResponses
@@ -376,7 +390,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Error | Error | TableStorageUnreadableError | ExactSortError | GraphAnchorFilterRequiresIndexError | GraphDistinctBudgetExceededError | GraphMatchOperationLimitExceededError | GraphPathWeightDomainError | GraphQueryUnsupportedError | GraphWorkBudgetExceededError | QueryCandidateBudgetExceededError | QueryDependencyError | QueryFilterError | RerankerCandidateLimitExceededError | UnsupportedHierarchyGroupingError | UnsupportedQueryError | HierarchyCursorStaleError | TopologyChangedError | QueryDependencyError | QueryTemporarilyUnavailableError | StatefulQueryResponses]
+        Response[DocumentArtifactPublicationFailedError | HierarchyCursorStaleError | TopologyChangedError | Error | Error | TableStorageUnreadableError | ExactSortError | GraphAnchorFilterRequiresIndexError | GraphDistinctBudgetExceededError | GraphMatchOperationLimitExceededError | GraphPathWeightDomainError | GraphQueryUnsupportedError | GraphWorkBudgetExceededError | QueryCandidateBudgetExceededError | QueryDependencyError | QueryFilterError | RerankerCandidateLimitExceededError | UnsupportedHierarchyGroupingError | UnsupportedQueryError | QueryDependencyError | QueryTemporarilyUnavailableError | StatefulQueryResponses]
     """
 
     kwargs = _get_kwargs(
@@ -397,7 +411,10 @@ def sync(
     client: AuthenticatedClient,
     body: StatefulQueryRequest | File,
 ) -> (
-    Error
+    DocumentArtifactPublicationFailedError
+    | HierarchyCursorStaleError
+    | TopologyChangedError
+    | Error
     | Error
     | TableStorageUnreadableError
     | ExactSortError
@@ -413,8 +430,6 @@ def sync(
     | RerankerCandidateLimitExceededError
     | UnsupportedHierarchyGroupingError
     | UnsupportedQueryError
-    | HierarchyCursorStaleError
-    | TopologyChangedError
     | QueryDependencyError
     | QueryTemporarilyUnavailableError
     | StatefulQueryResponses
@@ -434,7 +449,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Error | Error | TableStorageUnreadableError | ExactSortError | GraphAnchorFilterRequiresIndexError | GraphDistinctBudgetExceededError | GraphMatchOperationLimitExceededError | GraphPathWeightDomainError | GraphQueryUnsupportedError | GraphWorkBudgetExceededError | QueryCandidateBudgetExceededError | QueryDependencyError | QueryFilterError | RerankerCandidateLimitExceededError | UnsupportedHierarchyGroupingError | UnsupportedQueryError | HierarchyCursorStaleError | TopologyChangedError | QueryDependencyError | QueryTemporarilyUnavailableError | StatefulQueryResponses
+        DocumentArtifactPublicationFailedError | HierarchyCursorStaleError | TopologyChangedError | Error | Error | TableStorageUnreadableError | ExactSortError | GraphAnchorFilterRequiresIndexError | GraphDistinctBudgetExceededError | GraphMatchOperationLimitExceededError | GraphPathWeightDomainError | GraphQueryUnsupportedError | GraphWorkBudgetExceededError | QueryCandidateBudgetExceededError | QueryDependencyError | QueryFilterError | RerankerCandidateLimitExceededError | UnsupportedHierarchyGroupingError | UnsupportedQueryError | QueryDependencyError | QueryTemporarilyUnavailableError | StatefulQueryResponses
     """
 
     return sync_detailed(
@@ -450,7 +465,10 @@ async def asyncio_detailed(
     client: AuthenticatedClient,
     body: StatefulQueryRequest | File,
 ) -> Response[
-    Error
+    DocumentArtifactPublicationFailedError
+    | HierarchyCursorStaleError
+    | TopologyChangedError
+    | Error
     | Error
     | TableStorageUnreadableError
     | ExactSortError
@@ -466,8 +484,6 @@ async def asyncio_detailed(
     | RerankerCandidateLimitExceededError
     | UnsupportedHierarchyGroupingError
     | UnsupportedQueryError
-    | HierarchyCursorStaleError
-    | TopologyChangedError
     | QueryDependencyError
     | QueryTemporarilyUnavailableError
     | StatefulQueryResponses
@@ -486,7 +502,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Error | Error | TableStorageUnreadableError | ExactSortError | GraphAnchorFilterRequiresIndexError | GraphDistinctBudgetExceededError | GraphMatchOperationLimitExceededError | GraphPathWeightDomainError | GraphQueryUnsupportedError | GraphWorkBudgetExceededError | QueryCandidateBudgetExceededError | QueryDependencyError | QueryFilterError | RerankerCandidateLimitExceededError | UnsupportedHierarchyGroupingError | UnsupportedQueryError | HierarchyCursorStaleError | TopologyChangedError | QueryDependencyError | QueryTemporarilyUnavailableError | StatefulQueryResponses]
+        Response[DocumentArtifactPublicationFailedError | HierarchyCursorStaleError | TopologyChangedError | Error | Error | TableStorageUnreadableError | ExactSortError | GraphAnchorFilterRequiresIndexError | GraphDistinctBudgetExceededError | GraphMatchOperationLimitExceededError | GraphPathWeightDomainError | GraphQueryUnsupportedError | GraphWorkBudgetExceededError | QueryCandidateBudgetExceededError | QueryDependencyError | QueryFilterError | RerankerCandidateLimitExceededError | UnsupportedHierarchyGroupingError | UnsupportedQueryError | QueryDependencyError | QueryTemporarilyUnavailableError | StatefulQueryResponses]
     """
 
     kwargs = _get_kwargs(
@@ -505,7 +521,10 @@ async def asyncio(
     client: AuthenticatedClient,
     body: StatefulQueryRequest | File,
 ) -> (
-    Error
+    DocumentArtifactPublicationFailedError
+    | HierarchyCursorStaleError
+    | TopologyChangedError
+    | Error
     | Error
     | TableStorageUnreadableError
     | ExactSortError
@@ -521,8 +540,6 @@ async def asyncio(
     | RerankerCandidateLimitExceededError
     | UnsupportedHierarchyGroupingError
     | UnsupportedQueryError
-    | HierarchyCursorStaleError
-    | TopologyChangedError
     | QueryDependencyError
     | QueryTemporarilyUnavailableError
     | StatefulQueryResponses
@@ -542,7 +559,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Error | Error | TableStorageUnreadableError | ExactSortError | GraphAnchorFilterRequiresIndexError | GraphDistinctBudgetExceededError | GraphMatchOperationLimitExceededError | GraphPathWeightDomainError | GraphQueryUnsupportedError | GraphWorkBudgetExceededError | QueryCandidateBudgetExceededError | QueryDependencyError | QueryFilterError | RerankerCandidateLimitExceededError | UnsupportedHierarchyGroupingError | UnsupportedQueryError | HierarchyCursorStaleError | TopologyChangedError | QueryDependencyError | QueryTemporarilyUnavailableError | StatefulQueryResponses
+        DocumentArtifactPublicationFailedError | HierarchyCursorStaleError | TopologyChangedError | Error | Error | TableStorageUnreadableError | ExactSortError | GraphAnchorFilterRequiresIndexError | GraphDistinctBudgetExceededError | GraphMatchOperationLimitExceededError | GraphPathWeightDomainError | GraphQueryUnsupportedError | GraphWorkBudgetExceededError | QueryCandidateBudgetExceededError | QueryDependencyError | QueryFilterError | RerankerCandidateLimitExceededError | UnsupportedHierarchyGroupingError | UnsupportedQueryError | QueryDependencyError | QueryTemporarilyUnavailableError | StatefulQueryResponses
     """
 
     return (

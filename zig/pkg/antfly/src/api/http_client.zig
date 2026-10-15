@@ -4114,6 +4114,7 @@ fn isDocIdentityNamespaceMismatchConflictMessage(body: []const u8) bool {
 }
 
 fn remoteGroupConflictError(body: []const u8) anyerror {
+    if (std.mem.eql(u8, body, "DocumentArtifactPublicationFailed")) return error.DocumentArtifactPublicationFailed;
     if (std.mem.eql(u8, body, "IndexGenerationMismatch")) return error.IndexGenerationMismatch;
     if (std.mem.eql(u8, body, "DecisionConflict") or std.mem.eql(u8, body, "decision conflict")) return error.DecisionConflict;
     if (transactions_api.isTopologyChangedConflictMessage(body)) return error.TopologyChanged;
@@ -4589,6 +4590,7 @@ fn consumerTests() type {
         test "api http client preserves stale hierarchy cursor conflicts" {
             try std.testing.expectEqual(error.HierarchyCursorStale, remoteGroupConflictError("HierarchyCursorStale"));
             try std.testing.expectEqual(error.HierarchyCursorStale, remoteGroupConflictError("hierarchy cursor stale"));
+            try std.testing.expectEqual(error.DocumentArtifactPublicationFailed, remoteGroupConflictError("DocumentArtifactPublicationFailed"));
         }
 
         test "api http client preserves remote storage read contention" {

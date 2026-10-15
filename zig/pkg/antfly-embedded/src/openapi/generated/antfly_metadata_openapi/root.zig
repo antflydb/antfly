@@ -80,6 +80,7 @@ pub const DistanceUnit = types.DistanceUnit;
 pub const DocumentArtifactChildRange = types.DocumentArtifactChildRange;
 pub const DocumentArtifactManifest = types.DocumentArtifactManifest;
 pub const DocumentArtifactManifestList = types.DocumentArtifactManifestList;
+pub const DocumentArtifactPublicationFailedError = types.DocumentArtifactPublicationFailedError;
 pub const DocumentArtifactReprocessFailure = types.DocumentArtifactReprocessFailure;
 pub const DocumentArtifactReprocessJob = types.DocumentArtifactReprocessJob;
 pub const DocumentArtifactReprocessJobStartRequest = types.DocumentArtifactReprocessJobStartRequest;
