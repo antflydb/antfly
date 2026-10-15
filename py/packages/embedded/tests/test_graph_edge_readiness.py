@@ -117,7 +117,7 @@ def test_index_readiness_visible_on_open_and_status_only_handles(aflite_path) ->
                 "inserts": {
                     "node:a": {
                         "name": "a",
-                        "embedding": [1, 0, 0, 0],
+                        "_embeddings": {"vec": [1, 0, 0, 0]},
                         "_edges": {"graph": {"KNOWS": [{"target": "node:b"}]}},
                     }
                 }

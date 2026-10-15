@@ -18678,7 +18678,7 @@ pub const DB = struct {
             // before capturing graph reads, honoring the admission deadline.
             while (true) {
                 try checkLookupOptionsActive(opts);
-                if (monotonicTimeNs() >= deadline) return error.DeadlineExceeded;
+                if (monotonicTimeNs() >= deadline) return error.Timeout;
                 if (!try self.drainStandaloneGraphEndpointCleanupWithOptions(.{}, 1)) break;
             }
             try self.runMaintenanceUntilWithCancellation(self.currentMaintenanceTargetSequence(), .{}, opts.cancellation orelse .none, deadline);
@@ -137661,7 +137661,7 @@ test "db graph endpoint cleanup pages Cypher preparation drains weak-sync hosted
     try db.writeTransaction(txn, .{ .deletes = &keys });
     try db.commitTransaction(txn, 101);
     try std.testing.expect(try db.core.store.hasGraphEndpointCleanup());
-    try std.testing.expectError(error.DeadlineExceeded, db.lookup(a, "", .{ .cypher_prepare = true, .execution_deadline_ns = monotonicTimeNs() -| 1 }));
+    try std.testing.expectError(error.Timeout, db.lookup(a, "", .{ .cypher_prepare = true, .execution_deadline_ns = monotonicTimeNs() -| 1 }));
     try std.testing.expect(try db.core.store.hasGraphEndpointCleanup());
     _ = try db.lookup(a, "", .{ .cypher_prepare = true });
     try std.testing.expect(!try db.core.store.hasGraphEndpointCleanup());

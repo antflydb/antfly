@@ -14,7 +14,8 @@
 // limitations.
 
 //! Allowlisted row execution failures shared by local and remote owner paths.
-pub const Error = @import("antfly_local_sources").schema_relational_expression_errors.Error || error{
+pub const PolicyError = error{ RowPolicyDenied, RowPolicyAuthenticationRequired, RowPolicyCatalogChanged };
+pub const Error = PolicyError || @import("antfly_local_sources").schema_relational_expression_errors.Error || error{
     RelationalIndexNotReady,
     PartialIndexPredicateNotImplied,
     InvalidRelationalIndexBound,
@@ -45,6 +46,8 @@ pub fn decode(bytes: []const u8) ?Error {
 
 pub fn status(err: Error) u16 {
     return switch (err) {
+        error.RowPolicyDenied, error.RowPolicyAuthenticationRequired => 403,
+        error.RowPolicyCatalogChanged => 409,
         error.RelationalIndexNotReady, error.PreparedGenerationChanged, error.PreparedSchemaChanged, error.SchemaVersionChanged, error.RelationalIndexColumnTypeMismatch, error.GeneratedColumnRewriteRequired => 409,
         error.RelationalRowsOutputBudgetExceeded, error.RelationalRowResultTooLarge, error.RelationalIndexKeyTooLarge => 413,
         error.IndexNotFound => 404,
@@ -66,5 +69,7 @@ test "relational row query errors preserve exact remote reasons and HTTP classes
     try testing.expectEqual(@as(u16, 400), status(error.RelationalExpressionDivisionByZero));
     try testing.expectEqual(@as(u16, 400), status(error.RelationalExpressionBudgetExceeded));
     try testing.expectEqual(@as(u16, 409), status(error.GeneratedColumnRewriteRequired));
+    try testing.expectEqual(@as(u16, 403), status(error.RowPolicyDenied));
+    try testing.expectEqual(@as(u16, 409), status(error.RowPolicyCatalogChanged));
     try testing.expect(classify(error.OutOfMemory) == null);
 }

@@ -19,6 +19,16 @@ const cypher = @import("cypher");
 const A = std.mem.Allocator;
 pub fn normalize(self: anytype, a: A, _: cypher.catalog.Graph, node: *const cypher.value.Node, apply_defaults: bool) !*const cypher.value.Node {
     try cypher.value.validatePropertyValue(.{ .map = node.properties });
+    var schema_view = self.core.acquireSchemaView();
+    defer if (schema_view) |*view| view.release();
+    // With no schema expressions the overlay already is the normalized
+    // postimage. Avoid a JSON round trip and another retained entity per row.
+    const expressions = if (schema_view) |view|
+        if (view.validator()) |validator| validator.execution.expressions else null
+    else
+        null;
+    const program = expressions orelse return node;
+    if (program.bindings.len == 0 and program.modifier_ordinals.len == 0) return node;
     // Only the normalized property values survive this callback. Keep schema
     // expression and JSON decode buffers out of the statement's retained arena,
     // while preserving its quota/failure allocator boundary.
@@ -26,11 +36,7 @@ pub fn normalize(self: anytype, a: A, _: cypher.catalog.Graph, node: *const cyph
     defer scratch.deinit();
     const temporary = scratch.allocator();
     var document = try std.json.parseFromSliceLeaky(std.json.Value, temporary, try std.json.Stringify.valueAlloc(temporary, cypher.value.Value{ .map = node.properties }, .{}), .{ .parse_numbers = false });
-    var schema_view = self.core.acquireSchemaView();
-    defer if (schema_view) |*view| view.release();
-    if (schema_view) |view| if (view.validator()) |validator| {
-        if (validator.execution.expressions) |expressions| try expressions.applyJsonWithPolicy(temporary, &document, if (apply_defaults) .apply_to_absent else .preserve_absence);
-    };
+    try program.applyJsonWithPolicy(temporary, &document, if (apply_defaults) .apply_to_absent else .preserve_absence);
     const value = try cypher.value.Value.fromJson(a, document);
     const result = try a.create(cypher.value.Node);
     result.* = .{ .identity = node.identity, .properties = try cypher.value.entityProperties(a, value.map) };

@@ -228,7 +228,8 @@ def test_authenticated_cypher_across_replicated_owner_nodes(
         "verify_cypher_postimage_policy.py",
     ]:
         qualification = subprocess.run(
-            [sys.executable, str(script.with_name(filename)), "--url", endpoint],
+            [sys.executable, str(script.with_name(filename)), "--url", endpoint]
+            + (["--distributed"] if filename == "verify_cypher_expressions.py" else []),
             env={
                 **os.environ,
                 "ANTFLY_CYPHER_TEST_AUTH": f"admin:{AUTH_BOOTSTRAP_PASSWORD}",

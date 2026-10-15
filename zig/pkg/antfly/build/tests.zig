@@ -2035,7 +2035,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-api-catalog-authority-test", "Run configured remote catalog publication authority regression")
         .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, catalog_authority_tests, &.{"unconfigured remote catalog authority skips background work without borrowing internal credentials"}).step);
-    const cypher_transport_filters = &.{ "api http client preserves group query capability errors", "typed internal query workers preserve identity generation validation", "row policy publication Raft codec carries immutable owner-fetched bytes privately" };
+    const cypher_transport_filters = &.{ "api http client preserves group query capability errors", "typed internal query workers preserve identity generation validation", "row policy publication Raft codec carries immutable owner-fetched bytes privately", "relational row query errors preserve exact remote reasons and HTTP classes", "relational row query remote transaction prepare preserves scalar validation failures", "distributed txn internal operations preserve every semantic participant rejection" };
     const cypher_transport_tests = b.addTest(.{
         .root_module = api_http_runtime_test_mod,
         .filters = cypher_transport_filters,

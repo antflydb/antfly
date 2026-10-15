@@ -1086,3 +1086,67 @@ def test_relationship_only_writes_preserve_sql_json_nulls(require_native, aflite
         assert (
             database.cypher_json("g", {"query": "MATCH ()-[r:LINK]->() RETURN count(r)"})["rows"][0][0]["value"] == "0"
         )
+
+
+def test_cypher_mutations_preserve_external_vectors_after_reopen(require_native, aflite_path):
+    def verify(table):
+        table.run_until_idle()
+        for index, vector in (("dv", [1.0, 0.0]), ("sv", {"indices": [7], "values": [1.0]})):
+            result = table.search({"embeddings": {index: vector}, "indexes": [index], "limit": 5})
+            assert [hit["_id"] for hit in result["responses"][0]["hits"]["hits"]] == ["a"]
+
+    with af.create_hosted(aflite_path) as database:
+        database.create_table("docs", {})
+        with database.open_table("docs") as table:
+            for name, kind, config in (
+                ("links", "graph", {}),
+                ("dv", "dense_vector", {"field": "embedding", "dims": 2, "metric": "l2_squared", "external": True}),
+                ("sv", "sparse_vector", {"field": "sparse_embedding", "external": True}),
+            ):
+                table.add_index({"name": name, "kind": kind, "config_json": json.dumps(config)})
+            table.batch(
+                [
+                    af.WriteIntent(
+                        key="a",
+                        value=json.dumps(
+                            {
+                                "id": "a",
+                                "title": "before",
+                                "_embeddings": {"dv": [1.0, 0.0], "sv": {"indices": [7], "values": [1.0]}},
+                            }
+                        ).encode(),
+                    ),
+                    af.WriteIntent(key="b", value=b'{"id":"b","title":"target"}'),
+                ],
+                timestamp=1,
+            )
+            verify(table)
+        database.graph_catalog_json(
+            {
+                "action": "put",
+                "name": "g",
+                "definition": {
+                    "labels": [{"name": "D", "table": "docs"}],
+                    "relationships": [
+                        {
+                            "name": "LINK",
+                            "index": "links",
+                            "source_label": "D",
+                            "target_label": "D",
+                            "stored_type": "link",
+                        }
+                    ],
+                },
+            }
+        )
+        for query in (
+            "CALL { MATCH (a:D {id:'a'}),(b:D {id:'b'}) CREATE (a)-[:LINK]->(b) }",
+            "CALL { MATCH (a:D {id:'a'}) SET a.title='after' }",
+            "CALL { MATCH ()-[r:LINK]->() DELETE r }",
+        ):
+            database.cypher_json("g", {"query": query})
+            with database.open_table("docs") as table:
+                verify(table)
+    with af.open_hosted(aflite_path) as database:
+        with database.open_table("docs") as table:
+            verify(table)

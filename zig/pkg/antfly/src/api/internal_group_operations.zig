@@ -1530,8 +1530,9 @@ fn consumerTests() type {
                 source.failure = @field(errors.Error, field);
                 try std.testing.expectError(source.failure, operations.txnPrepare(std.testing.allocator, .{}, 7, "rows", .{ .txn_id = @splat(7), .req = .{} }));
             }
-            inline for (@typeInfo(@import("antfly_local_sources").schema_relational_expression_errors.Error).error_set.error_names.?) |field| {
-                source.failure = @field(@import("antfly_local_sources").schema_relational_expression_errors.Error, field);
+            const execution_errors = @import("antfly_local_sources").schema_relational_expression_errors.Error || @import("relational_row_errors.zig").PolicyError;
+            inline for (@typeInfo(execution_errors).error_set.error_names.?) |field| {
+                source.failure = @field(execution_errors, field);
                 try std.testing.expectError(source.failure, operations.txnPrepare(std.testing.allocator, .{}, 7, "rows", .{ .txn_id = @splat(7), .req = .{} }));
             }
         }
@@ -2178,7 +2179,7 @@ fn consumerTests() type {
                 .shard_db_adapter = null,
             };
 
-            try std.testing.expectError(error.InvalidArgument, operations.query(
+            try std.testing.expectError(error.UnsupportedQueryRequest, operations.query(
                 std.testing.allocator,
                 .{},
                 17,

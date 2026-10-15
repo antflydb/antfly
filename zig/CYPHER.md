@@ -27,7 +27,7 @@ each MATCH scope and accepts explicit zero-hop bounds.
 | Native execution | DB.queryCypher over caller-retained immutable table cuts and authority callbacks; physical adjacency paging; node/relationship projection, revocation checkpoints | Signed owner-side row authority, borrowed cohort fences, immutable owner cuts and private authenticated distributed paging implemented; protected-table and real three-metadata/three-data-node integration qualified; public C/Lite catalog, text-query, write, and receipt bindings implemented and qualified; public Zig and WASM catalog/query/write/status interfaces use the portable single-source host and pass native and WASM smoke qualification |
 | JSON graph matching | Relationship-simple trails; parallel identities; node revisits; zero hops; conjunctive uniqueness; independent OPTIONAL scope | All deployment/cross-table paths and compatibility fixtures |
 | HTTP text queries | POST /graphs/{name}/query, scoped graph/table authorization, immutable owner cuts, EXPLAIN/PROFILE, strict request decoder, exact integer parameters and typed results | Authenticated three-metadata/three-data-node paging and mutations qualified; broader policy revocation and failure qualification remains |
-| SQL composition | Generated native GRAPH_TABLE MATCH/COLUMNS syntax; SQL token lowering into shared graph AST; positional parameters; graph-aware resolver contract | Native resolver and typed graph rows share one cut with ordinary SQL scans and multiple graph catalogs; prepared parameters, joins and rename behavior qualified through HTTP. Pgwire entities, prepared parameters, NULLs, and joins qualified through psql. Read-only and serializable transaction composition is qualified through psql. Staged SQL updates, inserts, deletes, joins, field-derived adjacency replacement and NULL removal, rollback, and policy-hidden postimages are qualified through psql. Staged explicit graph effects with their authenticated source-row intents and commits, and Cypher derived-adjacency read-your-writes are also qualified. Broader transaction fault qualification remains. |
+| SQL composition | Generated native GRAPH_TABLE MATCH/COLUMNS syntax; SQL token lowering into shared graph AST; positional parameters; graph-aware resolver contract | Native resolver and typed graph rows share one cut with ordinary SQL scans and multiple graph catalogs; prepared parameters, joins and rename behavior qualified through HTTP. Pgwire entities, prepared parameters, NULLs, and joins qualified through psql. Read-only and serializable transaction composition is qualified through psql. Staged SQL updates, inserts, deletes, joins, field-derived adjacency replacement and NULL removal, rollback, and policy-hidden postimages are qualified through psql. Staged explicit graph effects with their authenticated source dependencies and commits, and Cypher derived-adjacency read-your-writes are also qualified. Broader transaction fault qualification remains. |
 | Workbench | Graph selector/editor, exact typed parameters, Run/EXPLAIN/PROFILE/Cancel, SQL composition templates, table/graph/JSON/plan views, node/edge/path inspector, parallel edges/self loops, zoom/pan, bounded neighbor expansion, principal-scoped persisted write receipts, scoped catalog setup, schema property suggestions, text/semantic/hybrid templates, graph permission editing | Thirty-one workbench/catalog/SQL UI tests, application type checking, and production build qualified. Visual browser qualification remains. |
 
 Go, Python, Rust, TypeScript, and Zig generated clients carry the named graph
@@ -1020,3 +1020,13 @@ misrepresent the original query result.
 External documentation evolves; pin the chosen language baseline and conformance
 fixtures during implementation rather than treating current documentation URLs
 as a permanent version contract.
+
+Replicated policy rejections use the same typed row-execution error registry as
+participant transport. A denied PREPARE advances its Raft entry and returns a
+403 to the coordinator, which durably aborts and exposes `RowPolicyDenied` with
+an aborted write outcome. Catalog changes remain typed 409 rejections. These
+rejections never turn an already committed resolve into a rejected write.
+Normalization reuses validated overlay nodes when the schema has no expression
+bindings or numeric modifiers, avoiding JSON round trips for ordinary bulk
+updates while retaining normalization for defaults, generated columns, and
+numeric constraints.

@@ -42,7 +42,21 @@ def main():
         return json.loads(content) if content else None
 
     def sql(statement):
-        return call("/sql", {"statement": statement})
+        deadline = time.monotonic() + 90
+        while True:
+            result = call(
+                "/sql", {"statement": statement}, accepted=(200, 201, 202, 204, 409)
+            )
+            if result.get("code") != "40001":
+                assert "code" not in result, result
+                return result
+            # The SQL contract explicitly reports a noncommitted statement.
+            # Fresh replicated owners can need time for route admission.
+            assert (
+                result.get("retryable") and result.get("transaction_status") == "idle"
+            ), result
+            assert time.monotonic() < deadline, result
+            time.sleep(0.2)
 
     def query(statement, accepted=(200, 202)):
         return call(f"/graphs/{graph}/query", {"query": statement}, accepted=accepted)
@@ -112,9 +126,6 @@ def main():
         ):
             result = write(statement)
             assert result["rows"] == [] and not result["read_only"], result
-            assert sql(f"SELECT payload IS NULL FROM {table} WHERE id='a'")["rows"] == [
-                [False]
-            ]
         for statement in (
             "MATCH (a:D {id:'denied'}),(b:D {id:'b'}) CREATE (a)-[:LINK]->(b)",
             "MATCH (:D {id:'denied'})-[r:LINK]->() SET r.age=2",
@@ -126,6 +137,27 @@ def main():
         assert (
             query("MATCH ()-[r:LINK]->() RETURN count(r)")["rows"][0][0]["value"] == "1"
         )
+        # The metadata SQL endpoint fails closed on protected relational
+        # scans. Inspect durable SQL nulls after publishing policy disable;
+        # all graph mutations above execute with the policy enabled.
+        sql(f"ALTER TABLE {table} DISABLE ROW LEVEL SECURITY")
+        enabled = False
+        deadline = time.monotonic() + 90
+        while True:
+            durable = call(
+                "/sql",
+                {"statement": f"SELECT id,payload IS NULL FROM {table} ORDER BY id"},
+                accepted=(200, 403, 409, 503),
+            )
+            if durable.get("rows") == [
+                ["a", False],
+                ["b", False],
+                ["denied", True],
+                ["hidden", False],
+            ]:
+                break
+            assert time.monotonic() < deadline, durable
+            time.sleep(0.2)
         print(
             "8 authenticated edge-only SQL-null, unit-CALL and WITH CHECK checks passed"
         )

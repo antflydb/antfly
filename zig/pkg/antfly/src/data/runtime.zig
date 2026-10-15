@@ -1264,6 +1264,9 @@ const RaftTableApplyStateMachine = struct {
         ArtifactCatalogEpochChanged,
         ArtifactCatalogScopeChanged,
         RowPolicyTopologyUnsupported,
+        RowPolicyDenied,
+        RowPolicyAuthenticationRequired,
+        RowPolicyCatalogChanged,
         OnlineMergeArtifactTailsUnsupported,
         OnlineSourceScopeChanged,
         InvalidSourceSnapshot,
@@ -1350,6 +1353,9 @@ const RaftTableApplyStateMachine = struct {
                 error.ArtifactCatalogEpochChanged => .ArtifactCatalogEpochChanged,
                 error.ArtifactCatalogScopeChanged => .ArtifactCatalogScopeChanged,
                 error.RowPolicyTopologyUnsupported => .RowPolicyTopologyUnsupported,
+                error.RowPolicyDenied => .RowPolicyDenied,
+                error.RowPolicyAuthenticationRequired => .RowPolicyAuthenticationRequired,
+                error.RowPolicyCatalogChanged => .RowPolicyCatalogChanged,
                 error.OnlineMergeArtifactTailsUnsupported => .OnlineMergeArtifactTailsUnsupported,
                 error.InvalidMergePage => .InvalidMergePage,
                 error.MergePageSequenceGap => .MergePageSequenceGap,
@@ -1399,6 +1405,9 @@ const RaftTableApplyStateMachine = struct {
                 .ArtifactCatalogEpochChanged => error.ArtifactCatalogEpochChanged,
                 .ArtifactCatalogScopeChanged => error.ArtifactCatalogScopeChanged,
                 .RowPolicyTopologyUnsupported => error.RowPolicyTopologyUnsupported,
+                .RowPolicyDenied => error.RowPolicyDenied,
+                .RowPolicyAuthenticationRequired => error.RowPolicyAuthenticationRequired,
+                .RowPolicyCatalogChanged => error.RowPolicyCatalogChanged,
                 .OnlineMergeArtifactTailsUnsupported => error.OnlineMergeArtifactTailsUnsupported,
                 .InvalidMergePage => error.InvalidMergePage,
                 .MergePageSequenceGap => error.MergePageSequenceGap,
@@ -1428,6 +1437,11 @@ const RaftTableApplyStateMachine = struct {
             // during prepare, before the coordinator commits its decision.
             if (err == error.RetainedEffectsFull or err == error.GenerationRetired) if (req.transaction) |control| {
                 if (control == .resolve and control.resolve.status == .committed) return null;
+            };
+            if (req.transaction) |control| if (control == .resolve and control.resolve.status == .committed) {
+                inline for (@typeInfo(@import("../api/relational_row_errors.zig").PolicyError).error_set.error_names.?) |field| {
+                    if (err == @field(@import("../api/relational_row_errors.zig").PolicyError, field)) return null;
+                }
             };
             return fromError(err);
         }
@@ -24207,6 +24221,12 @@ const activation_admission_tests = if (@import("builtin").is_test and implementa
             const reason = @field(@import("antfly_local_sources").schema_relational_expression_errors.Error, field);
             const classified = Failure.fromError(reason) orelse return error.TestExpectedSemanticRejection;
             try std.testing.expectEqual(reason, classified.toError());
+        }
+        inline for (@typeInfo(@import("../api/relational_row_errors.zig").PolicyError).error_set.error_names.?) |field| {
+            const reason = @field(@import("../api/relational_row_errors.zig").PolicyError, field);
+            const classified = Failure.forRequest(reason, .{ .transaction = .{ .prepare = .{ .txn_id = @splat(1), .topology_epoch = 1 } } }) orelse return error.TestExpectedSemanticRejection;
+            try std.testing.expectEqual(reason, classified.toError());
+            try std.testing.expect(Failure.forRequest(reason, .{ .transaction = .{ .resolve = .{ .txn_id = @splat(1), .status = .committed, .commit_version = 2 } } }) == null);
         }
         inline for (.{ error.OutOfMemory, error.ResourceBudgetExceeded, error.Corrupted }) |reason|
             try std.testing.expectEqual(@as(?Failure, null), Failure.fromError(reason));

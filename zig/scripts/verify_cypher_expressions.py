@@ -14,6 +14,11 @@ import uuid
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", default="http://127.0.0.1:18591")
+    parser.add_argument(
+        "--distributed",
+        action="store_true",
+        help="Verify the metadata SQL endpoint, which has no interactive SQL sessions",
+    )
     args = parser.parse_args()
     authorization = (
         "Basic "
@@ -40,28 +45,37 @@ def main():
                 code, raw = response.status, response.read()
         except urllib.error.HTTPError as error:
             code, raw = error.code, error.read()
-        if retry_aborted and code == 409:
+
+        def retryable_setup(code, raw):
+            if code not in (409, 503):
+                return False
             failure = json.loads(raw)
-            # Only the explicit noncommit diagnostic permits fixture replay.
-            # An unknown outcome (40003) must never take this path.
-            if failure.get("code") == "40001" and "was not committed" in failure.get(
-                "message", ""
-            ):
-                for _ in range(30):
-                    time.sleep(0.2)
-                    try:
-                        return call(path, body, method=method, status=status)
-                    except AssertionError as retry_error:
-                        detail = retry_error.args[0]
-                        if not isinstance(detail, tuple) or detail[1] != 409:
-                            raise
-                        diagnostic = json.loads(detail[2])
-                        if diagnostic.get(
-                            "code"
-                        ) != "40001" or "was not committed" not in diagnostic.get(
-                            "message", ""
-                        ):
-                            raise
+            return (
+                failure.get("transaction_status") == "idle"
+                and failure.get("retryable") is True
+                and (
+                    failure.get("code") == "40001"
+                    and "was not committed" in failure.get("message", "")
+                    or failure.get("code") == "53300"
+                    and "statement read is temporarily unavailable"
+                    in failure.get("message", "")
+                )
+            )
+
+        if retry_aborted and retryable_setup(code, raw):
+            # Fixture setup can replay only explicit noncommit/preflight-read
+            # failures. Unknown write outcomes (40003) never enter this path.
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                time.sleep(0.2)
+                try:
+                    return call(path, body, method=method, status=status)
+                except AssertionError as retry_error:
+                    detail = retry_error.args[0]
+                    if not isinstance(detail, tuple) or not retryable_setup(
+                        detail[1], detail[2]
+                    ):
+                        raise
         assert (200 <= code < 300) if status is None else code == status, (
             path,
             code,
@@ -414,26 +428,38 @@ def main():
         assert strings(result) == [["1"]], result
         assert 1000 < result["stats"]["intermediate_states"] < 100000, result["stats"]
         checks += 2
-        session = call("/sql", {"statement": "BEGIN"})["session_id"]
-        try:
-            call(
+        if args.distributed:
+            unsupported = call("/sql", {"statement": "BEGIN"}, status=501)
+            assert unsupported["code"] == "0A000", unsupported
+            result = call(
                 "/sql",
                 {
-                    "statement": f"UPDATE {table} SET payload='{encoded}'::JSONB WHERE id='predicate'",
-                    "session_id": session,
+                    "statement": f"SELECT g.id FROM GRAPH_TABLE({filtered} MATCH (n IS D) COLUMNS(n.id AS id)) g"
                 },
             )
-            staged = call(
-                "/sql",
-                {
-                    "statement": f"SELECT g.id FROM GRAPH_TABLE({filtered} MATCH (n IS D) COLUMNS(n.id AS id)) g",
-                    "session_id": session,
-                },
-            )
-            assert staged["rows"] == [["predicate"]], staged
+            assert result["rows"] == [["predicate"]], result
             checks += 1
-        finally:
-            call("/sql", {"statement": "ROLLBACK", "session_id": session})
+        else:
+            session = call("/sql", {"statement": "BEGIN"})["session_id"]
+            try:
+                call(
+                    "/sql",
+                    {
+                        "statement": f"UPDATE {table} SET payload='{encoded}'::JSONB WHERE id='predicate'",
+                        "session_id": session,
+                    },
+                )
+                staged = call(
+                    "/sql",
+                    {
+                        "statement": f"SELECT g.id FROM GRAPH_TABLE({filtered} MATCH (n IS D) COLUMNS(n.id AS id)) g",
+                        "session_id": session,
+                    },
+                )
+                assert staged["rows"] == [["predicate"]], staged
+                checks += 1
+            finally:
+                call("/sql", {"statement": "ROLLBACK", "session_id": session})
         previous = 0
         for count in [100, 200, 400]:
             call(

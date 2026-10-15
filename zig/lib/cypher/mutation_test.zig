@@ -961,6 +961,67 @@ test "large retained delete keeps linear memory within the statement ceiling" {
     try std.testing.expect(result.stats.memory_bytes + snapshot.budget.live <= 64 << 20);
 }
 
+test "large normalized alias updates fit the shared capture and execution memory ceiling" {
+    const Host = struct {
+        overlay: *root.transaction.Overlay = undefined,
+        phase: usize = 0,
+        fn normalize(_: *anyopaque, a: A, node: *const v.Node, _: bool) !*const v.Node {
+            const properties = (try (v.Value{ .map = node.properties }).clone(a)).map;
+            const output = try a.create(v.Node);
+            output.* = .{ .identity = node.identity, .properties = try v.entityProperties(a, properties) };
+            return output;
+        }
+        fn relationships(_: *anyopaque, _: A, _: *const v.Node) ![]const *const v.Relationship {
+            return &.{};
+        }
+        fn commit(ptr: *anyopaque, a: A, _: []const b.Mutation) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.phase = 1;
+            const plans = try root.mutations.build(a, graph, self.overlay);
+            try std.testing.expectEqual(@as(usize, 8000), plans[0].writes.items.len);
+            self.phase = 2;
+        }
+    };
+    var fixture = Fixture.init();
+    defer fixture.arena.deinit();
+    const a = fixture.arena.allocator();
+    const nodes = try a.alloc(*const v.Node, 8000);
+    for (nodes, 0..) |*out, index| {
+        const node = try a.create(v.Node);
+        node.* = .{
+            .identity = .{ .table = "people", .key = try std.fmt.allocPrint(a, "cypher:{x:0>32}", .{index}) },
+            .properties = try a.dupe(v.Entry, &.{ .{ .name = "id", .value = .{ .string = try std.fmt.allocPrint(a, "{d}", .{index}) } }, .{ .name = "age", .value = .{ .integer = 1 } } }),
+        };
+        out.* = node;
+    }
+    fixture.nodes = nodes;
+    var vertices = graph;
+    vertices.relationships = &.{};
+    var fixed = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    const backing = fixed.allocator();
+    for ([_][]const u8{
+        "MATCH (n:Person) WITH n,[n,n] AS aliases SET n.age=1 RETURN sum(aliases[0].age)",
+        "MATCH (n:Person) WITH n,[n,n] AS aliases REMOVE n.age RETURN count(aliases[0].age)",
+    }, 0..) |query, mode| {
+        const snapshot = try root.snapshot.Materialized.create(backing, fixture.backend(), vertices, .{});
+        defer snapshot.deinit();
+        var host: Host = .{};
+        snapshot.postimages = .{ .ptr = &host, .normalize = Host.normalize, .relationships = Host.relationships };
+        var overlay: root.transaction.Overlay = .{ .base = snapshot.backend(), .host = .{ .ptr = &host, .new_identity = Fixture.identity, .commit = Host.commit } };
+        host.overlay = &overlay;
+        var diagnostic: root.compiler.Diagnostic = .{};
+        var compiled = try root.compiler.compile(std.testing.allocator, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        var result = root.runtime.execute(backing, overlay.backend(), vertices, &compiled, &.{}, snapshot.remainingLimits(.{})) catch |err| {
+            std.debug.print("normalized update mode={} commit phase={}\n", .{ mode, host.phase });
+            return err;
+        };
+        defer result.deinit();
+        try std.testing.expectEqual(@as(i64, if (mode == 0) 8000 else 0), result.rows[0][0].integer);
+        try std.testing.expect(result.stats.memory_bytes + snapshot.budget.live <= 64 << 20);
+    }
+}
+
 test "retained capture reclaims decode pages and owns values and cursors" {
     const Pages = struct {
         fn scan(_: *anyopaque, a: A, _: []const u8, after: ?[]const u8, _: usize) !b.Page(*const v.Node) {
