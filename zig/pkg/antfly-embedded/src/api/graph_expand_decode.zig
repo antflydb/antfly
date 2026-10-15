@@ -26,6 +26,9 @@ pub const NodeBuilder = struct {
     nodes: std.ArrayListUnmanaged(query.GraphResultNode) = .empty,
     owner: ?*query.GraphMetricColumns = null,
     total_rows: usize,
+    permutation: [query.graph_metric_projection_limit]usize = undefined,
+    permutation_valid: bool = false,
+    permutation_builds: usize = 0,
     values: std.ArrayListUnmanaged(query.GraphMetricValue) = .empty,
     counts: std.ArrayListUnmanaged(usize) = .empty,
     names: std.ArrayListUnmanaged([]u8) = .empty,
@@ -83,6 +86,7 @@ pub const NodeBuilder = struct {
         for (self.nodes.items) |*node| node.metric_columns = null;
         owner.deinit(self.a);
         self.owner = null;
+        self.permutation_valid = false;
     }
     fn resizeColumns(self: *@This(), rows: usize) !void {
         const owner = self.owner orelse return;
@@ -100,11 +104,38 @@ pub const NodeBuilder = struct {
         try self.nodes.ensureUnusedCapacity(self.a, 1);
         if (self.owner == null and self.nodes.items.len == 0) self.total_rows = self.nodes.capacity;
         if (self.nodes.items.len == 0 and source.metricCount() > 0 and source.metricCount() <= query.graph_metric_projection_limit) try self.initColumns(source);
+        var source_columns: [query.graph_metric_projection_limit]usize = undefined;
+        var remapped = false;
         if (self.owner) |owner| {
             var same = source.metricCount() == owner.names.len;
             if (same) for (owner.names, 0..) |name, column| {
                 same = same and std.mem.eql(u8, name, source.metricAt(column).name);
             };
+            if (!same and source.metricCount() == owner.names.len) remap: {
+                if (self.permutation_valid) {
+                    var matches = true;
+                    for (owner.names, 0..) |name, column| matches = matches and std.mem.eql(u8, name, source.metricAt(self.permutation[column]).name);
+                    if (matches) {
+                        source_columns = self.permutation;
+                        same = true;
+                        remapped = true;
+                        break :remap;
+                    }
+                }
+                var used: [query.graph_metric_projection_limit]bool = @splat(false);
+                for (owner.names, 0..) |name, column| {
+                    const ordinal = for (0..source.metricCount()) |index| {
+                        if (!used[index] and std.mem.eql(u8, name, source.metricAt(index).name)) break index;
+                    } else break :remap;
+                    used[ordinal] = true;
+                    source_columns[column] = ordinal;
+                }
+                self.permutation = source_columns;
+                self.permutation_valid = true;
+                self.permutation_builds += 1;
+                same = true;
+                remapped = true;
+            }
             if (!same) try self.promote();
         }
         var payload = source;
@@ -116,7 +147,11 @@ pub const NodeBuilder = struct {
         if (self.owner != null and self.nodes.items.len == self.total_rows) try self.resizeColumns(self.nodes.capacity);
         if (self.owner) |owner| {
             const row = self.nodes.items.len;
-            for (0..owner.names.len) |column| owner.scores[column * self.total_rows + row] = source.metricAt(column).score orelse std.math.nan(f64);
+            if (remapped) {
+                for (0..owner.names.len) |column| owner.scores[column * self.total_rows + row] = source.metricAt(source_columns[column]).score orelse std.math.nan(f64);
+            } else {
+                for (0..owner.names.len) |column| owner.scores[column * self.total_rows + row] = source.metricAt(column).score orelse std.math.nan(f64);
+            }
             node.metric_columns = owner;
             node.metric_row = @intCast(row);
         } else {
@@ -374,4 +409,30 @@ test "public graph metric borrowed wire decoder retires scratch after failed shr
     _ = try parser.scratch.allocator().alloc(u8, 32);
     parser.reset();
     try std.testing.expect(parser.scratch.queryCapacity() <= 256 * 1024);
+}
+
+test "public graph metric borrowed wire reordered dictionary retains compact columns" {
+    const Case = struct {
+        fn run(a: Allocator) !void {
+            var builder = NodeBuilder{ .a = a, .total_rows = 2 };
+            defer builder.deinit();
+            try builder.append(.{ .key = "a", .depth = 0, .distance = 0, .metrics = @constCast(&[_]query.GraphMetricValue{ .{ .name = "rank", .score = 1 }, .{ .name = "degree", .score = 2 } }) });
+            try builder.append(.{ .key = "b", .depth = 0, .distance = 0, .metrics = @constCast(&[_]query.GraphMetricValue{ .{ .name = "degree", .score = null }, .{ .name = "rank", .score = 3 } }) });
+            for (0..63) |_| try builder.append(.{ .key = "c", .depth = 0, .distance = 0, .metrics = @constCast(&[_]query.GraphMetricValue{ .{ .name = "degree", .score = 4 }, .{ .name = "rank", .score = 5 } }) });
+            try std.testing.expectEqual(@as(usize, 1), builder.permutation_builds);
+            // An ordered row does not invalidate the cached permutation.
+            try builder.append(.{ .key = "d", .depth = 0, .distance = 0, .metrics = @constCast(&[_]query.GraphMetricValue{ .{ .name = "rank", .score = 6 }, .{ .name = "degree", .score = 7 } }) });
+            try builder.append(.{ .key = "e", .depth = 0, .distance = 0, .metrics = @constCast(&[_]query.GraphMetricValue{ .{ .name = "degree", .score = 8 }, .{ .name = "rank", .score = 9 } }) });
+            try std.testing.expectEqual(@as(usize, 1), builder.permutation_builds);
+            var owned = try builder.finish();
+            defer owned.deinit(a);
+            try std.testing.expect(owned.metrics.columns != null);
+            try std.testing.expectEqual(@as(usize, 0), owned.metrics.values.len);
+            try std.testing.expectEqualStrings("rank", owned.nodes[1].metricAt(0).name);
+            try std.testing.expectEqual(@as(?f64, 3), owned.nodes[1].metricAt(0).score);
+            try std.testing.expect(owned.nodes[1].metricAt(1).score == null);
+        }
+    };
+    try Case.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }

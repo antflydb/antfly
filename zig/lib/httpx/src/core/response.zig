@@ -27,6 +27,7 @@ pub const Response = struct {
     headers: Headers,
     body: ?[]const u8 = null,
     body_owned: bool = false,
+    body_allocator: ?Allocator = null,
 
     const Self = @This();
 
@@ -42,11 +43,15 @@ pub const Response = struct {
     /// Releases all allocated memory.
     pub fn deinit(self: *Self) void {
         self.headers.deinit();
-        if (self.body_owned) {
-            if (self.body) |b| {
-                self.allocator.free(b);
-            }
-        }
+        self.releaseBody();
+    }
+
+    /// Release a transferred body through its original allocation domain.
+    pub fn releaseBody(self: *Self) void {
+        if (self.body_owned) if (self.body) |bytes| (self.body_allocator orelse self.allocator).free(bytes);
+        self.body = null;
+        self.body_owned = false;
+        self.body_allocator = null;
     }
 
     /// Returns true if the response indicates success (2xx).
@@ -178,6 +183,7 @@ pub const ResponseBuilder = struct {
     headers: Headers,
     body_data: ?[]const u8 = null,
     body_owned: bool = false,
+    body_allocator: ?Allocator = null,
 
     const Self = @This();
 
@@ -198,11 +204,12 @@ pub const ResponseBuilder = struct {
     fn freeOwnedBody(self: *Self) void {
         if (self.body_owned) {
             if (self.body_data) |b| {
-                self.allocator.free(b);
+                (self.body_allocator orelse self.allocator).free(b);
             }
             self.body_owned = false;
             self.body_data = null;
         }
+        self.body_allocator = null;
     }
 
     /// Sets the status code.
@@ -221,6 +228,16 @@ pub const ResponseBuilder = struct {
     pub fn body(self: *Self, data: []const u8) *Self {
         self.freeOwnedBody();
         self.body_data = data;
+        return self;
+    }
+
+    /// Consume an owned buffer without copying it. The allocator and buffer
+    /// must outlive the response; build failures still release it exactly once.
+    pub fn bodyOwned(self: *Self, owner: Allocator, data: []u8) *Self {
+        self.freeOwnedBody();
+        self.body_data = data;
+        self.body_owned = true;
+        self.body_allocator = owner;
         return self;
     }
 
@@ -277,6 +294,8 @@ pub const ResponseBuilder = struct {
             if (self.body_owned) {
                 // Transfer ownership instead of copying.
                 response.body = b;
+                response.body_allocator = self.body_allocator;
+                self.body_allocator = null;
                 self.body_data = null;
                 self.body_owned = false;
             } else {
@@ -447,4 +466,41 @@ test "ResponseBuilder body clears owned json body without leak" {
     defer response.deinit();
 
     try std.testing.expectEqualStrings("plain text", response.body.?);
+}
+
+test "owned response buffers transfer across allocators without a body copy" {
+    const a = std.testing.allocator;
+    var owner: std.testing.FailingAllocator = .init(a, .{});
+    var builder: ResponseBuilder = .init(a);
+    defer builder.deinit();
+    const bytes = try owner.allocator().alloc(u8, 1024 * 1024);
+    @memset(bytes, 'x');
+    _ = builder.bodyOwned(owner.allocator(), bytes);
+    var response = try builder.build();
+    defer response.deinit();
+    try std.testing.expectEqual(@intFromPtr(bytes.ptr), @intFromPtr(response.body.?.ptr));
+    try std.testing.expectEqual(@as(usize, 0), owner.freed_bytes);
+    try std.testing.expectEqual(@as(usize, 1024 * 1024), response.headers.getContentLength().?);
+    response.releaseBody();
+    try std.testing.expectEqual(owner.allocated_bytes, owner.freed_bytes);
+    response.releaseBody();
+}
+
+test "owned response buffer replacement and failed build release the original owner" {
+    const Fixture = struct {
+        fn run(a: Allocator) !void {
+            const backing = std.testing.allocator;
+            var owner: std.testing.FailingAllocator = .init(backing, .{});
+            defer std.debug.assert(owner.allocated_bytes == owner.freed_bytes);
+            var builder: ResponseBuilder = .init(a);
+            defer builder.deinit();
+            _ = builder.bodyOwned(owner.allocator(), try owner.allocator().dupe(u8, "first"));
+            _ = builder.bodyOwned(owner.allocator(), try owner.allocator().dupe(u8, "second"));
+            try std.testing.expectEqual(@as(usize, 5), owner.freed_bytes);
+            var response = try builder.build();
+            defer response.deinit();
+            try std.testing.expectEqualStrings("second", response.body.?);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }

@@ -5,7 +5,7 @@ queries, native SQL GRAPH_TABLE, coordinated writes/search, and the query
 workbench are implemented. The compatibility matrix records supported behavior,
 qualification, and explicit limits against the pinned Cypher baseline.
 Repository observations were checked against `origin/main` at
-`dc4e34c497`.
+`d0614ed7e5`.
 
 ## Implementation status
 
