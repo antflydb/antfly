@@ -12503,6 +12503,8 @@ static NSString *termite_metal_shader_source(void) {
            "    for (uint i = t; i < BK * D; i += 128u) { uint c = i / D, d = i % D; bool in = c < nk; kst[c * DM + d] = in ? k[(k0 + c) * hidden + h * D + d] : 0.0f; vst[c * DM + d] = in ? v[(k0 + c) * hidden + h * D + d] : 0.0f; }\n"
            "    if (t < BK) kp[t] = t < nk ? pos[k0 + t] : 0;\n"
            "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    int key_pmin = 2147483647, key_pmax = -2147483647 - 1;\n"
+           "    for (uint i = 0u; i < nk; ++i) { key_pmin = min(key_pmin, kp[i]); key_pmax = max(key_pmax, kp[i]); }\n"
            "    simdgroup_float8x8 km[8], vm[8], dk_acc[8], dv_acc[8];\n"
            "    TERMITE_FOR_UNROLL(uint dt = 0u; dt < 8u; ++dt) if (dt < nd) {\n"
            "        simdgroup_load(km[dt], kst + s8 * DM + dt * 8u, DM);\n"
@@ -12516,6 +12518,15 @@ static NSString *termite_metal_shader_source(void) {
            "        for (uint i = t; i < BQT * 6u; i += 128u) rg[i] = i / 6u < nqt ? ctrl[(q0t + i / 6u) * 6u + i % 6u] : 0;\n"
            "        if (t < BQT) { qp[t] = t < nqt ? pos[q0t + t] : 0; lrow[t] = t < nqt ? lse[(q0t + t) * p.num_heads + h] : neg; drow[t] = t < nqt ? delta[(q0t + t) * p.num_heads + h] : 0.0f; }\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "        uint tile_lo = 0xffffffffu, tile_hi = 0u;\n"
+           "        int qpmin = 2147483647, qpmax = -2147483647 - 1;\n"
+           "        for (uint i = 0u; i < nqt; ++i) {\n"
+           "            for (uint r = 0u; r < 3u; ++r) { int a = rg[i * 6u + 2u * r], b = rg[i * 6u + 2u * r + 1u]; if (a < b) { tile_lo = min(tile_lo, uint(a)); tile_hi = max(tile_hi, uint(b)); } }\n"
+           "            qpmin = min(qpmin, qp[i]); qpmax = max(qpmax, qp[i]);\n"
+           "        }\n"
+           "        bool range_hit = tile_lo < k0 + nk && tile_hi > k0;\n"
+           "        bool window_hit = p.window == 0xffffffffu || (key_pmin - int(p.window) <= qpmax && key_pmax + int(p.window) >= qpmin);\n"
+           "        if (!range_hit || !window_hit) continue;\n"
            "        for (uint i = t; i < BQT * D; i += 128u) { uint r = i / D, d = i % D; bool in = r < nqt; qst[r * DM + d] = in ? qkv[(q0t + r) * hidden + h * D + d] : 0.0f; dost[r * DM + d] = in ? dout[(q0t + r) * hidden + h * D + d] : 0.0f; }\n"
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "        TERMITE_FOR_UNROLL(uint ct = 0u; ct < 2u; ++ct) {\n"
@@ -48599,9 +48610,16 @@ int termite_metal_decode_runtime_modernbert_training_attention_flash_v1(
             access_count = 5;
         }
         if (termite_metal_decode_runtime_prepare_planned_compute_accesses(runtime, accesses, access_count, -9) != 0) return -9;
-        BOOL encoder_owned = YES;
-        id<MTLComputeCommandEncoder> encoder = termite_metal_scoped_compute_encoder_for(runtime, command_buffer, TERMITE_METAL_COMPUTE_SOURCE_ATTENTION, &encoder_owned);
-        if (encoder == nil) return -5;
+        // Three dispatches share one encoder scope (not three) to avoid
+        // per-encoder overhead on the hot path; set
+        // TERMITE_METAL_SPLIT_TRAINING_ATTENTION_ENCODERS=1 to give each
+        // kernel its own scope instead, so TERMITE_METAL_TRACE_ENCODER_TIMING
+        // -- which names an encoder by its first bound pipeline -- reports
+        // forward, dQ and dK/dV separately rather than folding backward's
+        // cost into forward's. Manual barriers below cover the dependency
+        // (dQ/dK-dV read what forward/dQ just wrote) when they instead share
+        // the one encoder.
+        const bool split_encoders = termite_metal_env_flag_enabled(getenv("TERMITE_METAL_SPLIT_TRAINING_ATTENTION_ENCODERS"));
         const size_t batch = tokens / params->seq_len;
         const size_t blocks_per_row = (params->seq_len + 31u) / 32u;
         const MTLSize groups = MTLSizeMake(batch * blocks_per_row, heads, 1);
@@ -48609,6 +48627,9 @@ int termite_metal_decode_runtime_modernbert_training_attention_flash_v1(
         // Forward writes the output (forward) or the replayed output
         // (backward), and the log-sum-exp after it in scratch.
         const size_t lse_at = params->backward != 0 ? scratch_offset + rows_bytes : scratch_offset;
+        BOOL encoder_owned = YES;
+        id<MTLComputeCommandEncoder> encoder = termite_metal_scoped_compute_encoder_for(runtime, command_buffer, TERMITE_METAL_COMPUTE_SOURCE_ATTENTION, &encoder_owned);
+        if (encoder == nil) return -5;
         [encoder setComputePipelineState:runtime->modernbert_training_attention_flash_forward_pipeline];
         [encoder setBuffer:qkv_buffer offset:qkv_offset atIndex:0];
         [encoder setBuffer:control_buffer offset:control_offset atIndex:1];
@@ -48618,8 +48639,14 @@ int termite_metal_decode_runtime_modernbert_training_attention_flash_v1(
         [encoder setBytes:params length:sizeof(*params) atIndex:4];
         [encoder dispatchThreadgroups:groups threadsPerThreadgroup:threads];
         if (params->backward != 0) {
-            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
             const size_t delta_at = lse_at + stats_bytes;
+            if (split_encoders) {
+                termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
+                encoder = termite_metal_scoped_compute_encoder_for(runtime, command_buffer, TERMITE_METAL_COMPUTE_SOURCE_ATTENTION, &encoder_owned);
+                if (encoder == nil) return -5;
+            } else {
+                [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            }
             [encoder setComputePipelineState:runtime->modernbert_training_attention_flash_dq_pipeline];
             [encoder setBuffer:qkv_buffer offset:qkv_offset atIndex:0];
             [encoder setBuffer:control_buffer offset:control_offset atIndex:1];
@@ -48630,7 +48657,13 @@ int termite_metal_decode_runtime_modernbert_training_attention_flash_v1(
             [encoder setBuffer:output_buffer offset:output_offset atIndex:6];
             [encoder setBytes:params length:sizeof(*params) atIndex:7];
             [encoder dispatchThreadgroups:groups threadsPerThreadgroup:threads];
-            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            if (split_encoders) {
+                termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
+                encoder = termite_metal_scoped_compute_encoder_for(runtime, command_buffer, TERMITE_METAL_COMPUTE_SOURCE_ATTENTION, &encoder_owned);
+                if (encoder == nil) return -5;
+            } else {
+                [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            }
             [encoder setComputePipelineState:runtime->modernbert_training_attention_flash_dkdv_pipeline];
             [encoder setBuffer:qkv_buffer offset:qkv_offset atIndex:0];
             [encoder setBuffer:control_buffer offset:control_offset atIndex:1];
