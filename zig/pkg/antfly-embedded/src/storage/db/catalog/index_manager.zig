@@ -17192,6 +17192,11 @@ pub const IndexManager = struct {
             self.ann.deinit();
             self.* = undefined;
         }
+        /// Only document proof/projection uses this handle. The vector loader
+        /// continues enforcing snapshot_native_only through its own accessor.
+        pub fn documentReadTxn(self: *@This()) !*docstore_mod.DocStore.Txn {
+            return if (self.source.read_txn) |*txn| txn else error.DenseSnapshotNeedsPrimary;
+        }
         pub fn lookupDocKey(self: *@This(), vector_id: u64) !?[]u8 {
             if (self.source.snapshot_native_only) return error.DenseSnapshotNeedsPrimary;
             return self.source.context.manager.lookupDenseDocKeyByVectorIdTxn(&self.source.read_txn.?, self.entry.config.name, vector_id);
@@ -17201,6 +17206,12 @@ pub const IndexManager = struct {
     /// Called under the DB apply read fence and an index catalog lease. Only
     /// a caught-up, authoritative float32 source can enter this fast path.
     pub fn captureDenseReadSnapshot(self: *IndexManager, entry: *DenseIndex, sequence: u64) !?DenseReadSnapshot {
+        return self.captureDenseReadSnapshotWithPrimary(entry, sequence, false);
+    }
+
+    /// Candidate authority requires the committed primary snapshot as part of
+    /// the generation bundle even when native vector reads need no primary IO.
+    pub fn captureDenseReadSnapshotWithPrimary(self: *IndexManager, entry: *DenseIndex, sequence: u64, require_primary: bool) !?DenseReadSnapshot {
         if (active_dense_vector_load_session != null) return null;
         const store = self.primary_store orelse return null;
         const context = entry.vector_loader_context orelse return null;
@@ -17214,14 +17225,16 @@ pub const IndexManager = struct {
         if (!vectorBlockGenerationExactAtSequence(generation, sequence) or
             generation.opened.scorePrecision() != .authoritative_float32) return null;
         const native_only = if (self.resource_manager) |rm| rm.dense_query_snapshot_native_only else false;
-        // The short probe proves the committed primary boundary without
-        // cloning a metadata view that a complete native query never reads.
-        // All source-dependent fallbacks are forbidden in this scope.
-        var txn = if (native_only) try store.beginProbeTxn() else try store.beginReadTxn();
+        const retain_primary = !native_only or require_primary;
+        // Proof metadata may retain a primary snapshot independently of the
+        // scoring policy. getTxn and lookupDocKey still forbid primary vector
+        // fallbacks in native-only mode. Ordinary native queries keep the
+        // short probe and never clone an unused primary metadata view.
+        var txn = if (retain_primary) try store.beginReadTxn() else try store.beginProbeTxn();
         var txn_owned = true;
         defer if (txn_owned) txn.abort();
         if (try store.lastReplaySequenceFromTxn(&txn, 0) != sequence) return null;
-        if (native_only) txn.abort();
+        if (!retain_primary) txn.abort();
         txn_owned = false;
         ann_owned = false;
         generation_owned = false;
@@ -17230,7 +17243,7 @@ pub const IndexManager = struct {
             .ann = ann,
             .source = .{
                 .context = context,
-                .read_txn = if (native_only) null else txn,
+                .read_txn = if (retain_primary) txn else null,
                 .read_txn_kind = .snapshot,
                 .snapshot_generation = generation,
                 .snapshot_native_only = native_only,
@@ -47422,11 +47435,16 @@ test "dense query bundle pins primary metadata and exact source through replacem
 }
 
 test "DB query snapshot activates for public single-dense request envelopes" {
-    try testPublicDenseSnapshot(false);
-    try testPublicDenseSnapshot(true);
+    try testPublicDenseSnapshot(false, false);
+    try testPublicDenseSnapshot(true, false);
 }
 
-fn testPublicDenseSnapshot(native_only: bool) !void {
+test "public graph metric borrowed wire document authority retains dense snapshot fast route" {
+    try testPublicDenseSnapshot(false, true);
+    try testPublicDenseSnapshot(true, true);
+}
+
+fn testPublicDenseSnapshot(native_only: bool, with_authority: bool) !void {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
     if (IndexManager.denseVectorBlockPreferredEncoding() != .float32) return error.SkipZigTest;
     const alloc = std.testing.allocator;
@@ -47483,24 +47501,34 @@ fn testPublicDenseSnapshot(native_only: bool) !void {
     }
     manager.installVectorBlockGeneration(try manager.createVectorBlockGeneration(try vector_block_store_mod.Store.openWithBlocks(alloc, memory.storage(), root)));
     const dense: types.DenseKnnQuery = .{ .vector = &.{ 1, 2 }, .k = 1 };
-    const req: types.SearchRequest = .{ .dense_queries = &.{.{ .name = "vec", .index_name = "dense_idx", .query = dense }}, .include_stored = false, .include_all_fields = false, .limit = 1 };
+    const req: types.SearchRequest = .{ .dense_queries = &.{.{ .name = "vec", .index_name = "dense_idx", .query = dense }}, .include_stored = false, .include_all_fields = false, .limit = 1, .document_authority_mode = if (with_authority) .candidates else .none, .document_authority_group = if (with_authority) 11 else 0 };
     {
         var result = try db.searchWithDenseProfile(alloc, req);
         defer result.result.deinit();
         try std.testing.expectEqualStrings(expected_route, result.dense_profile.?.search_route);
         try std.testing.expectEqual(@as(usize, 1), result.request.dense_queries.len);
         try std.testing.expectEqual(@as(u32, 1), result.result.total_hits);
+        if (with_authority) {
+            try std.testing.expectEqual(@as(u32, 1), result.result.document_authority_version);
+            try std.testing.expectEqual(@as(u64, 11), result.result.hits[0].document_authority.?.group);
+            try std.testing.expect(result.result.hits[0].stored_data != null);
+        }
     }
     {
         var result = try db.searchWithCapturedRequest(alloc, req);
         defer result.result.deinit();
         try std.testing.expectEqual(@as(usize, 1), result.request.dense_queries.len);
         try std.testing.expectEqual(@as(u32, 1), result.result.total_hits);
+        if (with_authority) {
+            try std.testing.expectEqual(@as(u32, 1), result.result.document_authority_version);
+            try std.testing.expectEqual(@as(u64, 11), result.result.hits[0].document_authority.?.group);
+            try std.testing.expect(result.result.hits[0].stored_data != null);
+        }
     }
     {
         // Profile adapters carry the vector separately after unpacking the
         // one-query envelope, leaving req.query as match_all.
-        var result = try db.searchDenseProfiledWithCapturedRequest(alloc, .{ .index_name = "dense_idx", .include_stored = false, .limit = 1 }, dense);
+        var result = try db.searchDenseProfiledWithCapturedRequest(alloc, .{ .index_name = "dense_idx", .include_stored = false, .limit = 1, .document_authority_mode = req.document_authority_mode, .document_authority_group = req.document_authority_group }, dense);
         defer result.profiled.result.deinit();
         try std.testing.expectEqualStrings(expected_route, result.profiled.profile.search_route);
     }
@@ -47510,6 +47538,15 @@ fn testPublicDenseSnapshot(native_only: bool) !void {
         try std.testing.expect(bundle.source.read_txn == null);
         try std.testing.expectError(error.DenseSnapshotNeedsPrimary, bundle.source.getTxn(primary));
         try std.testing.expectError(error.DenseSnapshotNeedsPrimary, bundle.lookupDocKey(1));
+        if (with_authority) {
+            var authority_bundle = (try manager.captureDenseReadSnapshotWithPrimary(entry, 1, true)).?;
+            defer authority_bundle.deinit();
+            try std.testing.expect(authority_bundle.source.snapshot_native_only);
+            try std.testing.expect(authority_bundle.source.read_txn != null);
+            _ = try authority_bundle.documentReadTxn();
+            try std.testing.expectError(error.DenseSnapshotNeedsPrimary, authority_bundle.source.getTxn(primary));
+            try std.testing.expectError(error.DenseSnapshotNeedsPrimary, authority_bundle.lookupDocKey(1));
+        }
     }
     // All public adapters checked admission before waiting for apply. A
     // portable publication can close that gate during the wait, even though
@@ -47579,6 +47616,11 @@ fn testPublicDenseSnapshot(native_only: bool) !void {
         var result = try db.searchWithDenseProfile(alloc, req);
         defer result.result.deinit();
         try std.testing.expectEqual(@as(u32, 1), result.result.total_hits);
+        if (with_authority) {
+            try std.testing.expectEqual(@as(u32, 1), result.result.document_authority_version);
+            try std.testing.expectEqual(@as(u64, 11), result.result.hits[0].document_authority.?.group);
+            try std.testing.expect(result.result.hits[0].stored_data != null);
+        }
         if (result.dense_profile) |profile| try std.testing.expect(!std.mem.startsWith(u8, profile.search_route, "hbc_snapshot"));
     }
     try db.batch(.{ .deletes = &.{"doc:a"} });

@@ -1165,8 +1165,8 @@ pub const IndexSnapshot = struct {
         if (entry.reader.postings_loader) |*loader| loader.context = context;
         if (entry.data == .native and entry.data.native == .ranges) {
             const range = entry.data.native.ranges;
-            if (range.bind_read_context) |bind| {
-                var source = try bind(range.ptr, self.alloc, context);
+            if (range.bind_read_context != null) {
+                var source = try entry.data.native.bindReadContext(self.alloc, context);
                 errdefer source.close();
                 const reader = try entry.reader.bindSource(self.alloc, source);
                 entry.query_base_reader = entry.reader;
@@ -1210,7 +1210,7 @@ pub const IndexSnapshot = struct {
     pub fn cachedTextTermSummary(self: *const IndexSnapshot, a: Allocator, segment: usize, field: []const u8, term: []const u8, average: f32, config: inverted.BM25Config) !?TextTermSummary {
         try self.checkScoringReadContext();
         if (self.read_context_check) |check| try check(self.read_context.?);
-        if (self.segments[segment].query_source) |source| if (source == .ranges) if (source.ranges.check_read_context) |check| try check(source.ranges.ptr);
+        if (self.segments[segment].query_source) |source| try source.checkReadContext();
         const key = try textSummaryKey(a, segment, field, term, average, config);
         defer a.free(key);
         const owner = self.scoringCache();
@@ -1222,7 +1222,7 @@ pub const IndexSnapshot = struct {
             const value = try reader.summary(reader.ptr, a, segment, field, term, average, config);
             try reader.check(reader.ptr);
             if (self.read_context_check) |check| try check(self.read_context.?);
-            if (self.segments[segment].query_source) |source| if (source == .ranges) if (source.ranges.check_read_context) |check| try check(source.ranges.ptr);
+            if (self.segments[segment].query_source) |source| try source.checkReadContext();
             try self.rememberTextTermSummary(segment, field, term, average, config, value);
             return value;
         }
@@ -1834,9 +1834,9 @@ pub const IndexSnapshot = struct {
             return;
         }
         var entries = mutable.bound_segments.valueIterator();
-        while (entries.next()) |entry| if (entry.*.query_source) |source| if (source == .ranges) if (source.ranges.check_read_context) |check| try check(source.ranges.ptr);
+        while (entries.next()) |entry| if (entry.*.query_source) |source| try source.checkReadContext();
         for (self.segments) |segment| if (segment.query_source) |source| if (source == .ranges) {
-            if (source.ranges.check_read_context) |check| try check(source.ranges.ptr);
+            try source.checkReadContext();
         };
     }
     fn cachedTermDocFreq(self: *const IndexSnapshot, field: []const u8, term: []const u8) ?u32 {
@@ -1919,7 +1919,7 @@ pub const IndexSnapshot = struct {
                     defer segment_lease.deinit();
                     const segment = segment_lease.entry;
                     if (segment.query_source) |source| if (source == .ranges) {
-                        if (source.ranges.check_read_context) |check| try check(source.ranges.ptr);
+                        try source.checkReadContext();
                     };
                     var reader = (try segment.reader.invertedIndexScoped(a, name)) orelse continue;
                     defer reader.deinit();
