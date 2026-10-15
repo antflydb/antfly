@@ -89,6 +89,155 @@ const PortableManifestMetadata = struct {
     }
 };
 
+pub const preflight = @import("backup_preflight.zig");
+
+/// Always returns a versioned report for source failures. Partial counts are
+/// explicitly incomplete, and no failed scan can produce a compatible verdict.
+pub fn inspectInputJsonAlloc(allocator: Allocator, input_path: []const u8, destination_json: ?[]const u8, options: preflight.Options) ![]u8 {
+    var report: preflight.Report = .{ .allocator = allocator };
+    defer report.deinit();
+    inspectInput(allocator, input_path, options, &report) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        report.analysis_complete = false;
+        report.failure_code = switch (err) {
+            error.Canceled => "cancelled",
+            error.BackupInputLimitExceeded, error.BackupExpansionLimitExceeded, error.PreflightLimitExceeded => "limit_exceeded",
+            error.SourceFileChanged => "source_changed",
+            error.WriterLocked => "source_busy",
+            error.BackupBaseRequired => "base_required",
+            else => "input_uninspectable",
+        };
+    };
+    return report.jsonAlloc(destination_json);
+}
+
+fn inspectInput(allocator: Allocator, input_path: []const u8, options: preflight.Options, report: *preflight.Report) !void {
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    try options.cancellation.check();
+    var source = try openInputFile(io, input_path);
+    defer source.close(io);
+    if (!try source.tryLock(io, .shared)) return error.WriterLocked;
+    defer source.unlock(io);
+    try checkInputLimit(io, source, options.max_input_bytes);
+    const initial = try source.stat(io);
+    report.source_bytes = initial.size;
+    const digest = try preflightFileDigest(io, source, initial.size, options);
+    var magic: [8]u8 = undefined;
+    if (try source.readPositionalAll(io, &magic, 0) != magic.len) return error.InvalidMagic;
+    if (std.mem.startsWith(u8, &magic, "AFLITE")) {
+        report.format = "lite";
+        report.format_version = magic[6];
+        var lite = try LiteDb.open(allocator, input_path, .query_readonly);
+        defer lite.close();
+        // The reopened path must still identify the descriptor hashed above.
+        var reopened = try openInputFile(io, input_path);
+        defer reopened.close(io);
+        if (!backups_api.localArtifactStatsEqual(initial, try reopened.stat(io))) return error.SourceFileChanged;
+        try inspectStore(allocator, io, lite.db.core.store, options, report, null);
+    } else if (backup_codec.isAfbFormat(&magic)) {
+        var framing = backup_codec.FileReader.init(io, source, initial.size);
+        const header = try framing.readHeader();
+        if (header.table_count != 1) return error.InvalidBackupRequest;
+        report.format_version = header.format_version;
+        var native = false;
+        if (header.format_version == backup_codec.format_version) {
+            var root = try backup_bundle_io.readManifestFromFile(allocator, io, source, initial.size);
+            defer root.deinit();
+            if (root.value.mode != .full) return error.BackupBaseRequired;
+            try backup_bundle.validateReadablePayloadFeatures(root.value);
+            // Native extraction can retain both blob and materialized copies;
+            // reserve half the budget for that overlap and portable scanning.
+            native = root.value.representation == .native;
+            try backup_bundle.validatePreparationSizeLimit(root.value, if (native) options.max_expanded_bytes / 2 else options.max_expanded_bytes);
+            if (native) {
+                report.format = "native";
+                const scratch = try temporaryPreparationPath(allocator, io, "antfly-inspect-", "");
+                defer allocator.free(scratch);
+                defer std.Io.Dir.cwd().deleteTree(io, scratch) catch {};
+                try backup_bundle_io.extractNativeFileToStagingDirectoryCancellable(allocator, io, source, initial.size, scratch, options.cancellation);
+                var manifest = try backups_api.readManifest(allocator, scratch, root.value.backup_id);
+                defer manifest.deinit(allocator);
+                if (manifest.format != .native or !std.mem.eql(u8, manifest.table_name, root.value.table_name)) return error.BackupArtifactFormatMismatch;
+                // The table manifest is executable metadata as well as the
+                // per-shard catalogs. Inspect it independently before all shards.
+                var inspector: preflight.Inspector = .{ .allocator = allocator, .report = report, .options = options };
+                defer inspector.deinit();
+                try inspector.metadataJson(manifest.indexes_json);
+                try inspector.metadataJson(manifest.replication_sources_json);
+                for (manifest.shards) |shard| {
+                    try options.cancellation.check();
+                    const canonical_path = try backups_api.shardSnapshotRelPath(allocator, manifest.backup_id, shard.group_id);
+                    defer allocator.free(canonical_path);
+                    if (!std.mem.eql(u8, canonical_path, shard.snapshot_path)) return error.InvalidBackupManifest;
+                    const path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ scratch, shard.snapshot_path }, 0);
+                    defer allocator.free(path);
+                    var store = try @import("../docstore.zig").DocStore.open(allocator, path, .{ .read_only = true });
+                    defer store.close();
+                    try inspectStore(allocator, io, &store, options, report, manifest.indexes_json);
+                }
+            }
+        }
+        if (!native) {
+            report.format = "portable";
+            try inspectPortable(allocator, io, source, options, report, null);
+        }
+    } else return error.InvalidMagic;
+    if (!backups_api.localArtifactStatsEqual(initial, try source.stat(io))) return error.SourceFileChanged;
+    const final_digest = try preflightFileDigest(io, source, initial.size, options);
+    if (!std.mem.eql(u8, &digest, &final_digest)) return error.SourceFileChanged;
+    // Path replacement is distinct from in-place descriptor mutation.
+    var final_source = try openInputFile(io, input_path);
+    defer final_source.close(io);
+    if (!backups_api.localArtifactStatsEqual(initial, try final_source.stat(io))) return error.SourceFileChanged;
+    report.source_sha256 = digest;
+    report.scan_complete = true;
+    report.counts_complete = report.analysis_complete;
+}
+
+fn preflightFileDigest(io: std.Io, source: std.Io.File, size: u64, options: preflight.Options) !preflight.Digest {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var buffer: [64 * 1024]u8 = undefined;
+    var offset: u64 = 0;
+    while (offset < size) {
+        try options.cancellation.check();
+        const want: usize = @intCast(@min(buffer.len, size - offset));
+        if (try source.readPositionalAll(io, buffer[0..want], offset) != want) return error.SourceFileChanged;
+        hasher.update(buffer[0..want]);
+        offset += want;
+    }
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    return std.fmt.bytesToHex(digest, .lower);
+}
+
+fn inspectStore(allocator: Allocator, io: std.Io, store: *@import("../docstore.zig").DocStore, options: preflight.Options, report: *preflight.Report, catalog: ?[]const u8) !void {
+    const scratch = try temporaryPortablePath(allocator, io);
+    defer allocator.free(scratch);
+    defer std.Io.Dir.cwd().deleteFile(io, scratch) catch {};
+    var file = try fs_paths.createFilePortable(io, scratch, .{ .read = true, .exclusive = true, .permissions = .fromMode(0o600) });
+    defer file.close(io);
+    var buffer: [64 * 1024]u8 = undefined;
+    var writer = file.writer(io, &buffer);
+    var limited = LimitedWriter.init(&writer.interface, options.max_expanded_bytes / 2);
+    portable_backup.exportPortableToWriterWithOptions(allocator, store, &limited.interface, .{ .cancellation = options.cancellation }) catch |err| {
+        if (limited.exceeded) return error.BackupExpansionLimitExceeded;
+        return err;
+    };
+    try writer.end();
+    var normalized = options;
+    normalized.max_input_bytes = options.max_expanded_bytes / 2;
+    try inspectPortable(allocator, io, file, normalized, report, catalog);
+}
+
+fn inspectPortable(allocator: Allocator, io: std.Io, file: std.Io.File, options: preflight.Options, report: *preflight.Report, catalog: ?[]const u8) !void {
+    var inspector: preflight.Inspector = .{ .allocator = allocator, .report = report, .options = options };
+    defer inspector.deinit();
+    if (catalog) |json| try inspector.metadataJson(json);
+    _ = try portable_backup.inspectPortableFileBlocks(allocator, io, file, .{ .metadata_first = true, .max_input_bytes = options.max_input_bytes, .max_logical_bytes = options.max_expanded_bytes, .cancellation = options.cancellation }, &inspector, preflight.Inspector.visit);
+}
+
 pub fn defaultBackupIdAlloc(allocator: Allocator, path: []const u8) ![]u8 {
     const base = std.fs.path.basename(path);
     const stem = if (std.mem.endsWith(u8, base, ".aflite"))
@@ -499,7 +648,7 @@ fn freeKeyValueEntries(allocator: Allocator, entries: []backup_codec.KeyValueEnt
     allocator.free(entries);
 }
 
-fn tableIndexesJsonFromPortableMetadata(
+pub fn tableIndexesJsonFromPortableMetadata(
     allocator: Allocator,
     raw_indexes_json: ?[]const u8,
     raw_enrichments_json: ?[]const u8,
@@ -2069,4 +2218,187 @@ test "lite restore staging inspector refuses an active archive writer" {
     var counter: InspectionCounter = .{};
     try std.testing.expectError(error.WriterLocked, portable_backup.inspectPortableFileBlocks(a, io, reader, .{}, &counter, InspectionCounter.visit));
     try std.testing.expectEqual(@as(usize, 0), counter.blocks);
+}
+
+test "backup preflight Lite and portable inspect all records without changing source" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const lite_path = try std.fs.path.join(a, &.{ root, "source.aflite" });
+    defer a.free(lite_path);
+    const portable_path = try std.fs.path.join(a, &.{ root, "source.bin" });
+    defer a.free(portable_path);
+    {
+        var lite = try LiteDb.createWithOptions(a, lite_path, true, .{ .fsync = false });
+        defer lite.close();
+        const key = try internal_keys.documentKeyAlloc(a, "last-document");
+        defer a.free(key);
+        try lite.db.core.store.put(key, "{\"body\":\"/private/incidental\"}");
+        var file = try tmp.dir.createFile(io, "source.bin", .{});
+        defer file.close(io);
+        var buffer: [4096]u8 = undefined;
+        var writer = file.writer(io, &buffer);
+        try portable_backup.exportPortableToWriter(a, lite.db.core.store, &writer.interface);
+        try writer.end();
+    }
+    for ([_][]const u8{ lite_path, portable_path }) |path| {
+        var file = try openInputFile(io, path);
+        defer file.close(io);
+        const before = try file.stat(io);
+        const digest = try preflightFileDigest(io, file, before.size, .{});
+        const json = try inspectInputJsonAlloc(a, path, null, .{});
+        defer a.free(json);
+        var p = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+        defer p.deinit();
+        try std.testing.expect(p.value.object.get("completeness").?.object.get("scan_complete").?.bool);
+        try std.testing.expectEqual(@as(i64, 1), p.value.object.get("inventory").?.object.get("documents").?.integer);
+        try std.testing.expectEqualStrings(&digest, p.value.object.get("source").?.object.get("sha256").?.string);
+        try std.testing.expect(backups_api.localArtifactStatsEqual(before, try file.stat(io)));
+        try std.testing.expectEqualStrings(&digest, &try preflightFileDigest(io, file, before.size, .{}));
+        const limited = try inspectInputJsonAlloc(a, path, null, .{ .max_input_bytes = 1 });
+        defer a.free(limited);
+        try std.testing.expect(std.mem.indexOf(u8, limited, "limit_exceeded") != null);
+        try std.testing.expect(std.mem.indexOf(u8, limited, "\"scan_complete\":false") != null);
+    }
+}
+
+test "backup preflight native multishard scans later shards and table producers" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const bundle_path = try std.fs.path.join(a, &.{ root, "native.afb2" });
+    defer a.free(bundle_path);
+    var shards: [2]backups_api.ShardSnapshot = undefined;
+    var initialized: usize = 0;
+    defer for (shards[0..initialized]) |shard| {
+        a.free(shard.snapshot_path);
+        a.free(shard.artifact_sha256);
+    };
+    for (&shards, 0..) |*shard, i| {
+        const path = try backups_api.shardSnapshotRelPath(a, "test", @intCast(i + 1));
+        const absolute = try std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ root, path }, 0);
+        defer a.free(absolute);
+        {
+            var store = try @import("../docstore.zig").DocStore.open(a, absolute, .{});
+            defer store.close();
+            const key = try internal_keys.documentKeyAlloc(a, if (i == 0) "a" else "z");
+            defer a.free(key);
+            try store.put(key, if (i == 0) "{\"media\":\"https://example.org/a.pdf\"}" else "{\"media\":\"file:///private/z.pdf\"}");
+        }
+        shard.* = .{ .group_id = @intCast(i + 1), .start_key = if (i == 0) "" else "m", .end_key = if (i == 0) "m" else null, .snapshot_path = path };
+        try backups_api.populateShardArtifactIntegrity(a, io, .native, absolute, shard);
+        initialized += 1;
+    }
+    const manifest: backups_api.TableBackupManifest = .{
+        .format = .native,
+        .backup_id = "test",
+        .table_name = "docs",
+        .description = "",
+        .schema_json = "{}",
+        .read_schema_json = "",
+        .replication_sources_json = "[]",
+        .indexes_json = "{\"enrichments\":[{\"name\":\"pdf\",\"kind\":\"asset\",\"field\":\"media\",\"producer\":{\"type\":\"reader\"}}]}",
+        .shards = &shards,
+    };
+    try backups_api.writeManifest(a, root, &manifest);
+    {
+        var file = try tmp.dir.createFile(io, "native.afb2", .{});
+        defer file.close(io);
+        var buffer: [4096]u8 = undefined;
+        var writer = file.writer(io, &buffer);
+        try backup_bundle_io.packNativePathsToWriter(a, io, root, &.{ "test-metadata.json", shards[0].snapshot_path, shards[1].snapshot_path }, &writer.interface, .{ .backup_id = "test", .table_name = "docs" });
+        try writer.end();
+    }
+    const json = try inspectInputJsonAlloc(a, bundle_path, null, .{});
+    defer a.free(json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("completeness").?.object.get("scan_complete").?.bool);
+    try std.testing.expectEqual(@as(i64, 2), parsed.value.object.get("inventory").?.object.get("documents").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), parsed.value.object.get("inventory").?.object.get("shards").?.integer);
+    try std.testing.expect(std.mem.indexOf(u8, json, "source_local") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"document_id\":\"z\"") != null);
+}
+
+test "backup preflight AFB1 corruption cancellation and missing capabilities cannot certify" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const path = try std.fs.path.join(a, &.{ root, "fixture.data" });
+    defer a.free(path);
+    const bytes = @embedFile("../testdata/cross_backend_v1.afb");
+    var file = try tmp.dir.createFile(io, "fixture.data", .{ .read = true });
+    defer file.close(io);
+    try file.writePositionalAll(io, bytes, 0);
+    const json = try inspectInputJsonAlloc(a, path, null, .{});
+    defer a.free(json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("completeness").?.object.get("scan_complete").?.bool);
+    try std.testing.expectEqual(@as(i64, 5), parsed.value.object.get("inventory").?.object.get("documents").?.integer);
+    try std.testing.expectEqualStrings("unknown", parsed.value.object.get("compatibility").?.object.get("verdict").?.string);
+    var cancelled = std.atomic.Value(bool).init(true);
+    const stopped = try inspectInputJsonAlloc(a, path, null, .{ .cancellation = .fromAtomic(&cancelled) });
+    defer a.free(stopped);
+    try std.testing.expect(std.mem.indexOf(u8, stopped, "cancelled") != null);
+    try file.writePositionalAll(io, &.{bytes[bytes.len - 1] ^ 1}, bytes.len - 1);
+    const corrupt = try inspectInputJsonAlloc(a, path, "{\"version\":1,\"configuration_id\":\"test\"}", .{});
+    defer a.free(corrupt);
+    try std.testing.expect(std.mem.indexOf(u8, corrupt, "\"scan_complete\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, corrupt, "\"verdict\":\"compatible\"") == null);
+}
+
+test "backup preflight relational rows use archived schema for active media fields" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const source = try std.fmt.allocPrintSentinel(a, "{s}/lsm", .{root}, 0);
+    defer a.free(source);
+    const path = try std.fs.path.join(a, &.{ root, "relational.afb2" });
+    defer a.free(path);
+    const schema_json = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"media\":{\"type\":\"keyword\"}},\"required\":[\"media\"],\"additionalProperties\":false}}}}";
+    var schema = try @import("../../schema/mod.zig").parseValidatedTableSchema(a, schema_json);
+    defer schema.deinit(a);
+    const runtime = try @import("../../schema/mod.zig").deriveRuntimeTableSchema(a, schema);
+    defer @import("../schema.zig").freeSchema(a, runtime);
+    const encoded = try @import("../schema.zig").serializeSchema(a, runtime);
+    defer a.free(encoded);
+    const row = try @import("../db/relational_store.zig").encodeValueForSchemaAlloc(a, "{\"media\":\"http://[0:0:0:0:0:0:0:1]:8888/source\"}", runtime);
+    defer a.free(row);
+    const key = try internal_keys.relationalRowKeyAlloc(a, "row:late");
+    defer a.free(key);
+    {
+        var store = try @import("../docstore.zig").DocStore.open(a, source, .{});
+        defer store.close();
+        try store.putBatch(&.{
+            .{ .key = key, .value = row },
+            .{ .key = "\x00\x00__metadata__:schema", .value = encoded },
+            .{ .key = "\x00\x00__metadata__:schema_v1", .value = encoded },
+            .{ .key = "\x00\x00__metadata__:schema_json", .value = schema_json },
+            .{ .key = "\x00\x00__metadata__:enrichments", .value = "[{\"name\":\"pdf\",\"kind\":\"asset\",\"source_field\":\"media\",\"producer_json\":\"{\\\"type\\\":\\\"reader\\\"}\"}]" },
+        }, &.{});
+        var file = try tmp.dir.createFile(io, "relational.afb2", .{});
+        defer file.close(io);
+        var buffer: [4096]u8 = undefined;
+        var writer = file.writer(io, &buffer);
+        try portable_backup.exportPortableToWriter(a, &store, &writer.interface);
+        try writer.end();
+    }
+    const json = try inspectInputJsonAlloc(a, path, null, .{});
+    defer a.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"scan_complete\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "source_local") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "row:late") != null);
 }
