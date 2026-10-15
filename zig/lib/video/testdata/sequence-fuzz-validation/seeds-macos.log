@@ -1,5 +1,0 @@
-Build Summary: 3/3 steps succeeded; 7/7 tests passed
-fuzz-video success
-+- run test 7 pass (7 total) 1s MaxRSS:10M
-   +- compile test debug native success 9s MaxRSS:753M
-

@@ -1,5 +1,0 @@
-Build Summary: 3/3 steps succeeded
-install-media-http-tests success
-+- install test success
-   +- compile test debug aarch64-linux-musl success 6s MaxRSS:600M
-

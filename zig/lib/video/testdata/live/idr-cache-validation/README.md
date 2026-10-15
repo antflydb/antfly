@@ -1,5 +1,10 @@
 # IDR-bound reader projection cache qualification
 
+Recorded run results and output filenames below describe the measured historical
+epoch. Generated reports/logs were removed from the current tree; see
+[qualification and historical recovery](../../../../../../docs/plans/native-video-noncuda-audit.md#artifact-policy-and-historical-evidence).
+Fixture inputs and independent reference oracles remain checked in.
+
 Antfly's maintained Zig path now preserves a selected picture's projection key
 when an earlier independent GOP is evicted or retained payloads are repacked.
 The hash starts at a completed single-packet IDR with static parameter sets,

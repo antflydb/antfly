@@ -1,4 +1,0 @@
-Build Summary: 3/3 steps succeeded; 77/77 tests passed
-test-media success
-+- run test 77 pass (77 total) 4s MaxRSS:31M
-   +- compile test debug native success 2s MaxRSS:406M

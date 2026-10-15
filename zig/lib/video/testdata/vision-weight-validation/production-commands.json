@@ -1,5 +1,5 @@
 {
-  "scope": "Accepted final ReleaseFast Metal runs, sequentially after owned compiler jobs completed; no injected libraries. Reports and exact source/binary provenance are retained alongside these commands.",
+  "scope": "Argument sets for the accepted historical ReleaseFast Metal gates. Supply the pinned checkpoint and binary; write generated reports under ignored .benchmark-results/video. Historical results remain at bf9d632d02.",
   "cases": [
     {
       "name": "full-clip",
@@ -32,7 +32,7 @@
         "--sustained-rounds",
         "4",
         "--output",
-        "/private/tmp/vision-cache-staged-production-full-clip.json"
+        ".benchmark-results/video/full-clip.json"
       ],
       "status": "pass",
       "required": "Overall report status=pass, including vectors, scores/rankings, lifecycle and sustained load; original tolerance and bounded retries unchanged."
@@ -68,7 +68,7 @@
         "--sustained-rounds",
         "2",
         "--output",
-        "/private/tmp/vision-cache-staged-production-webm.json"
+        ".benchmark-results/video/webm.json"
       ],
       "status": "pass",
       "required": "Overall report status=pass, including vectors, scores/rankings, lifecycle and sustained load; original tolerance and bounded retries unchanged."
@@ -104,7 +104,7 @@
         "--sustained-rounds",
         "2",
         "--output",
-        "/private/tmp/vision-cache-staged-production-gbr.json"
+        ".benchmark-results/video/gbr.json"
       ],
       "status": "pass",
       "required": "Overall report status=pass, including vectors, scores/rankings, lifecycle and sustained load; original tolerance and bounded retries unchanged."
@@ -140,7 +140,7 @@
         "--sustained-rounds",
         "1",
         "--output",
-        "/private/tmp/vision-cache-staged-production-layers-4g.json",
+        ".benchmark-results/video/layers-4g.json",
         "--process-memory-budget-mb",
         "4096"
       ],
@@ -178,7 +178,7 @@
         "--sustained-rounds",
         "1",
         "--output",
-        "/private/tmp/vision-cache-staged-production-formats-4g.json",
+        ".benchmark-results/video/formats-4g.json",
         "--process-memory-budget-mb",
         "4096"
       ],

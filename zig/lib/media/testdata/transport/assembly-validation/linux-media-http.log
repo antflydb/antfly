@@ -1,8 +1,0 @@
-1/7 http_live_test_root.test.production HTTP media client authenticates exact ranges and refuses redirects...OK
-2/7 http_live_test_root.test.production live HLS HTTP ingestion reloads configuration without invalidating held packets...OK
-3/7 http_live_test_root.test.production DASH inherited SegmentList selects representation with authenticated BaseURL transport...OK
-4/7 http_live_test_root.test.production live DASH template uses synchronized clock and authenticated fMP4 transport...OK
-5/7 http_live_test_root.test.production DASH multiple periods authenticate repeated initialization and expose exact presentation mapping...OK
-6/7 http_live_test_root.test.production HLS master selects authenticated alternate video and resolves relative initialization across reload...OK
-7/7 http_live_test_root.test.production HLS AES authenticates keys decrypts ranged media and rotates without losing old packets...OK
-All 7 tests passed.

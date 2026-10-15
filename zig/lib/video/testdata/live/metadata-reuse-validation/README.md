@@ -1,5 +1,10 @@
 # Live AVC validation metadata reuse
 
+Recorded run results and output filenames below describe the measured historical
+epoch. Generated reports/logs were removed from the current tree; see
+[qualification and historical recovery](../../../../../../docs/plans/native-video-noncuda-audit.md#artifact-policy-and-historical-evidence).
+Fixture inputs and independent reference oracles remain checked in.
+
 Successful append retains its native completed/pending picture walk. Prepare
 clones admitted scalar metadata rather than decoding again; commit uses that
 snapshot and performs the existing fallible IDR payload checks. Prefix eviction

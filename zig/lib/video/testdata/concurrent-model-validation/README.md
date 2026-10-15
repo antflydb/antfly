@@ -1,5 +1,10 @@
 # Completed concurrent pretrained video qualification
 
+Recorded run results and output filenames below describe the measured historical
+epoch. Generated reports/logs were removed from the current tree; see
+[qualification and historical recovery](../../../../../docs/plans/native-video-noncuda-audit.md#artifact-policy-and-historical-evidence).
+Fixture inputs and independent reference oracles remain checked in.
+
 The load harness now requires every request to complete with the same model
 identity and correct vector. It retries only declared capacity denials, keeps
 failed outcomes and their attempts, separates executor queue time from bounded
@@ -47,10 +52,10 @@ mounts.
 
 ## Evidence and reproduction
 
-[qualification.json](qualification.json) binds sources, checkpoint/corpus,
+[qualification.json](https://github.com/antflydb/antfly/blob/bf9d632d025a6b12837997f6aeb86e1a818ec831/zig/lib/video/testdata/concurrent-model-validation/qualification.json) binds sources, checkpoint/corpus,
 binaries, results and logs. Measurements use retained
-[measured_video_compare.py](measured_video_compare.py), before the final reporting
-correction. Raw reports remain unchanged. [accounting.json](accounting.json)
+[measured_video_compare.py](https://github.com/antflydb/antfly/blob/bf9d632d025a6b12837997f6aeb86e1a818ec831/zig/lib/video/testdata/concurrent-model-validation/measured_video_compare.py), before the final reporting
+correction. Raw reports remain unchanged. [accounting.json](https://github.com/antflydb/antfly/blob/bf9d632d025a6b12837997f6aeb86e1a818ec831/zig/lib/video/testdata/concurrent-model-validation/accounting.json)
 reanalyses their request rows with current `sustained_evidence`: it includes failed
 retry denials and separates quiescence from unacknowledged server completions.
 The correction does not change runtime measurements or pass/fail workload gates.

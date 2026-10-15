@@ -1,5 +1,10 @@
 # Completed video timing receipts
 
+Recorded run results and output filenames below describe the measured historical
+epoch. Generated reports/logs were removed from the current tree; see
+[qualification and historical recovery](../../../../../docs/plans/native-video-noncuda-audit.md#artifact-policy-and-historical-evidence).
+Fixture inputs and independent reference oracles remain checked in.
+
 These 2026-10-08 measurements use Zig 0.17.0 in ReleaseSafe. macOS ARM64
 (27.0.1) runs VideoToolbox/Metal natively. Linux ARM64 runs statically linked
 musl executables in a local Alpine 3.22 Docker VM on the same host. Linux results

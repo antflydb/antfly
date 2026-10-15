@@ -1,4 +1,0 @@
-1/5101 ops.metal_compute.test.metal_compute accepts a singleton rank-one embedding table...OK
-2/5101 ops.metal_compute.test.embeddinggemma2 BF16 row slice converts only the requested rows...OK
-3/5101 ops.metal_compute.test.metal_compute: embedding lookup reads a recycled activation table's current contents...OK
-3 selected; 3 passed; 0 skipped.

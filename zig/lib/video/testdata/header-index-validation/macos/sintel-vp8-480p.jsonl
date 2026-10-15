@@ -1,2 +1,0 @@
-{"kind":"index","codec":"vp8","mode":"index_compare","iteration":0,"container_ns":28421459,"completed_ns":3331417,"reconstruction_ns":30526081958,"visible_pictures":1253,"selected_pictures":32,"retained_metadata_bytes":40096,"process_peak_rss_bytes":10125312,"parity_checked":true}
-{"kind":"index","codec":"vp8","mode":"index_compare","iteration":1,"container_ns":28421459,"completed_ns":65845958,"reconstruction_ns":34506923208,"visible_pictures":1253,"selected_pictures":32,"retained_metadata_bytes":40096,"process_peak_rss_bytes":10125312,"parity_checked":true}

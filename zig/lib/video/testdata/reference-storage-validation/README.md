@@ -1,5 +1,10 @@
 # Progressive H.264 reference-storage qualification
 
+Recorded run results and output filenames below describe the measured historical
+epoch. Generated reports/logs were removed from the current tree; see
+[qualification and historical recovery](../../../../../docs/plans/native-video-noncuda-audit.md#artifact-policy-and-historical-evidence).
+Fixture inputs and independent reference oracles remain checked in.
+
 Completed progressive pictures share planar, motion and macroblock metadata
 storage with the DPB and snapshots. Normal workspace reuse allocates without
 copying old payloads; late-slice mutation first detaches with a copy. Allocation
@@ -64,7 +69,7 @@ and output preservation, not a statistically qualified speedup.
 
 ## Current Linux runtime follow-up
 
-The [current Linux library gate](../current-linux-validation/README.md) now
+The [current Linux library gate](https://github.com/antflydb/antfly/blob/bf9d632d025a6b12837997f6aeb86e1a818ec831/zig/lib/video/testdata/current-linux-validation/README.md) now
 executes all three shared-reference regressions on actual ARM64 Linux: transactional
 detach, exhaustive allocation failure and copying/shared progressive output.
 The complete current suite passes 252 cases with 29 platform skips and zero

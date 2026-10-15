@@ -1,5 +1,10 @@
 # Full-request Metal bridge telemetry
 
+Recorded run results and output filenames below describe the measured historical
+epoch. Generated reports/logs were removed from the current tree; see
+[qualification and historical recovery](../../../../../docs/plans/native-video-noncuda-audit.md#artifact-policy-and-historical-evidence).
+Fixture inputs and independent reference oracles remain checked in.
+
 The inference metrics route exposes ten worker-process counters for explicit
 buffer upload/download/copy bytes and calls, runtime command completion/failure,
 completed GPU nanoseconds and successful commands without usable timestamps.

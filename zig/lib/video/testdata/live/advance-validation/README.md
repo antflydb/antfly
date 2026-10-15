@@ -1,5 +1,10 @@
 # Rolling and sparse live-window advance
 
+Recorded run results and output filenames below describe the measured historical
+epoch. Generated reports/logs were removed from the current tree; see
+[qualification and historical recovery](../../../../../../docs/plans/native-video-noncuda-audit.md#artifact-policy-and-historical-evidence).
+Fixture inputs and independent reference oracles remain checked in.
+
 `Coordinator.Options.advance_ns` separates window advance from duration and frame
 sampling. Null preserves consecutive windows. A positive representable interval
 can be shorter than duration (overlap), equal (consecutive), or longer (sparse).

@@ -1,5 +1,10 @@
 # Codec-key replay and RGB24 row qualification
 
+Recorded run results and output filenames below describe the measured historical
+epoch. Generated reports/logs were removed from the current tree; see
+[qualification and historical recovery](../../../../../docs/plans/native-video-noncuda-audit.md#artifact-policy-and-historical-evidence).
+Fixture inputs and independent reference oracles remain checked in.
+
 Codec-verified restart points preserve logical IDs and raw samples while skipping
 unneeded prefix reconstruction. Six full-length 480p/1080p excerpts compare 32
 selected final-quarter pictures twice on macOS and actual Linux ARM64. Every

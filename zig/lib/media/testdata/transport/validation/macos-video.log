@@ -1,9 +1,0 @@
-Build Summary: 8/8 steps succeeded; 185/187 tests passed (2 skipped)
-test-transport-http success
-+- run test 1 pass (1 total) 41ms MaxRSS:10M
-   +- compile test debug native cached 89ms MaxRSS:32M
-      +- WriteFile video_prepare_shader.h cached
-test-video success
-+- run test 184 pass, 2 skip (186 total) 1m MaxRSS:308M
-   +- compile test debug native success 13s MaxRSS:1G
-      +- WriteFile video_prepare_shader.h cached

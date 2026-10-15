@@ -1,5 +1,10 @@
 # Reader-backed projection reuse
 
+Recorded run results and output filenames below describe the measured historical
+epoch. Generated reports/logs were removed from the current tree; see
+[qualification and historical recovery](../../../../../../docs/plans/native-video-noncuda-audit.md#artifact-policy-and-historical-evidence).
+Fixture inputs and independent reference oracles remain checked in.
+
 Validated AVC logical pictures record the packet that completes their fields,
 partitions or independent planes. Independently cloned indexes rebase both first
 and completion selectors. ReaderSelection owns admitted per-selection visual

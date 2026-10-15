@@ -1,5 +1,10 @@
 # Raw TS model qualification
 
+Recorded run results and output filenames below describe the measured historical
+epoch. Generated reports/logs were removed from the current tree; see
+[qualification and historical recovery](../../../../../../../docs/plans/native-video-noncuda-audit.md#artifact-policy-and-historical-evidence).
+Fixture inputs and independent reference oracles remain checked in.
+
 Two synthetic closed-GOP/reordered B-frame clips are pinned as original MP4 and
 native TS copy variants, plus two text queries. Native model tests compare
 logical sampling, preparation plans and exact queued F32 patch hashes. These

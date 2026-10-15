@@ -1,2 +1,0 @@
-1/5103 pipelines.embedding_gemma2.test.embeddinggemma2 Metal device composition preserves ordered tokens without downloads...OK
-1 selected; 1 passed; 0 skipped.

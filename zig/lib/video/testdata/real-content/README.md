@@ -1,5 +1,10 @@
 # Independently sourced real-content decoder qualification
 
+Recorded run results and output filenames below describe the measured historical
+epoch. Generated reports/logs were removed from the current tree; see
+[qualification and historical recovery](../../../../../docs/plans/native-video-noncuda-audit.md#artifact-policy-and-historical-evidence).
+Fixture inputs and independent reference oracles remain checked in.
+
 Big Buck Bunny: **(c) copyright 2008, Blender Foundation /
 www.bigbuckbunny.org**, licensed under [CC BY 3.0](https://creativecommons.org/licenses/by/3.0/).
 These excerpts retain that license. The generator is Apache-2.0 source code;

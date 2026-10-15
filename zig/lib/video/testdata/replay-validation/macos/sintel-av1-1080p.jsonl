@@ -1,2 +1,0 @@
-{"kind":"replay","codec":"av1","iteration":0,"pictures":288,"first_selected":216,"selected_count":32,"full_ns":3570417167,"seek_ns":1538449250,"full_packets":288,"seek_packets":96,"first_packet":192,"bootstrap_bytes":0,"parity_checked":true}
-{"kind":"replay","codec":"av1","iteration":1,"pictures":288,"first_selected":216,"selected_count":32,"full_ns":3556633250,"seek_ns":1525590542,"full_packets":288,"seek_packets":96,"first_packet":192,"bootstrap_bytes":0,"parity_checked":true}

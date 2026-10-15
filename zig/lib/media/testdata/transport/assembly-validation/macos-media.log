@@ -1,7 +1,0 @@
-Build Summary: 6/6 steps succeeded; 123/123 tests passed
-test-media-http success
-+- run test 7 pass (7 total) 283ms MaxRSS:6M
-   +- compile test debug native success 4s MaxRSS:633M
-test-media success
-+- run test 116 pass (116 total) 6s MaxRSS:22M
-   +- compile test debug native success 39s MaxRSS:363M

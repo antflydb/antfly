@@ -1,9 +1,0 @@
-{
-  "status": "pass",
-  "scope": "Fresh complete re-encoding and independent decode: all nine coded streams and all 324 picture hashes reproduce exactly",
-  "manifest_sha256": "9e0f82e68c5f7c929c1d6be4a6e099fb626bd8c0999d7fdc40dea06ebbfa5fb1",
-  "generator_sha256": "8e1aaf05e6bf5166d12fb6e72fb3a3555c7042c1b383b99387937975d8c68bc8",
-  "streams": 9,
-  "pictures": 324,
-  "encoder": "ffmpeg version 9.0.2 Copyright (c) 2000-2026 the FFmpeg developers"
-}

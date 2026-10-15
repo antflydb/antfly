@@ -1,5 +1,10 @@
 # Expanded native AV1 qualification
 
+Recorded run results and output filenames below describe the measured historical
+epoch. Generated reports/logs were removed from the current tree; see
+[qualification and historical recovery](../../../../../docs/plans/native-video-noncuda-audit.md#artifact-policy-and-historical-evidence).
+Fixture inputs and independent reference oracles remain checked in.
+
 Antfly's maintained pure Zig AV1 decoder now exposes profiles 0–2, 8/10/12-bit
 native samples, monochrome/4:2:0/4:2:2/4:4:4, Annex B and explicit operating-point
 selection. No runtime or native build dependency was added.

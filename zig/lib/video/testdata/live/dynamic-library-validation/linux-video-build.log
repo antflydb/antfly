@@ -1,8 +1,0 @@
-Build Summary: 6/6 steps succeeded
-install-live-window-tests success
-+- install test success
-   +- compile test safe aarch64-linux-musl success 13s MaxRSS:710M
-install-video-tests success
-+- install test success
-   +- compile test safe aarch64-linux-musl success 1m MaxRSS:2G
-

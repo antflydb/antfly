@@ -1,5 +1,10 @@
 # Scalable AV1 pretrained presentation preservation
 
+Recorded run results and output filenames below describe the measured historical
+epoch. Generated reports/logs were removed from the current tree; see
+[qualification and historical recovery](../../../../../docs/plans/native-video-noncuda-audit.md#artifact-policy-and-historical-evidence).
+Fixture inputs and independent reference oracles remain checked in.
+
 Model WebM planning and selected replay now share operating point zero with
 highest-spatial-layer presentation. Lower layers remain decoded as dependencies;
 they do not become extra model sampling pictures. Explicit all-layer output

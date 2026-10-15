@@ -1,8 +1,0 @@
-1/142 server.server.test.embeddinggemma2 pretrained video matches official F32 oracle...embeddinggemma2 video=mjpeg_video metal=true tokens=266 cosine=0.999999950 max_abs=0.000044053
-embeddinggemma2 video=h264_video metal=true tokens=266 cosine=0.999999940 max_abs=0.000039164
-embeddinggemma2 video=text_video metal=true tokens=277 cosine=0.999999963 max_abs=0.000030644
-embeddinggemma2 video=video_text metal=true tokens=278 cosine=0.999999967 max_abs=0.000029905
-embeddinggemma2 video=repeated_video metal=true tokens=530 cosine=0.999999943 max_abs=0.000045630
-embeddinggemma2 video=two_videos metal=true tokens=543 cosine=0.999999963 max_abs=0.000031928
-OK
-1 selected; 1 passed; 0 skipped.

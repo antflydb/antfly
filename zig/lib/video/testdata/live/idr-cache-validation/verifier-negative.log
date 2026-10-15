@@ -1,5 +1,0 @@
-live_cache_hits: rejected (rolling reuse/sparse cache isolation changed)
-ordinal: rejected (source interval, identity or token count changed)
-input_tokens: rejected (source interval, identity or token count changed)
-odd-window vector: rejected (cached live/complete-clip vector drift)
-historical zero-hit report: rejected (rolling reuse/sparse cache isolation changed)

@@ -1,5 +1,10 @@
 # Native VP9/AV1 reconstruction fixtures
 
+Recorded run results and output filenames below describe the measured historical
+epoch. Generated reports/logs were removed from the current tree; see
+[qualification and historical recovery](../../../../../docs/plans/native-video-noncuda-audit.md#artifact-policy-and-historical-evidence).
+Fixture inputs and independent reference oracles remain checked in.
+
 These are first-party synthetic test-pattern clips, each containing 12 visible
 pictures at 6 fps. They contain no downloaded media or model weights. IVF
 fixtures exercise native packet decoding; WebM remuxes exercise range-reader
@@ -39,7 +44,7 @@ reconstruction parity, rather than broad real-world conformance, coverage-guided
 fuzz qualification or a throughput claim. Actual Linux execution belongs to the
 Linux qualification workflow; local cross-compilation is not runtime evidence.
 
-[qualification.json](qualification.json) records the source hashes and local
+[qualification.json](https://github.com/antflydb/antfly/blob/bf9d632d025a6b12837997f6aeb86e1a818ec831/zig/lib/video/testdata/vpx-av1/qualification.json) records the source hashes and local
 receipts: 14/14 focused Debug tests, 136/138 ReleaseSafe video tests with two
 platform skips, actual decoded-frame CPU/Metal preparation parity, and Linux
 x86_64/ARM64 compile/link checks. Its referenced logs distinguish executed

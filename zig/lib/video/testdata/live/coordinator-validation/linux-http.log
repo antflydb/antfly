@@ -1,3 +1,0 @@
-1/2 transport_http_test_root.test.production HTTP split-PES TS HLS authenticates playlist and media then decodes native AVC...OK
-2/2 transport_http_test_root.test.production HTTP live coordinator reloads authenticated HLS and commits derived windows...OK
-All 2 tests passed.

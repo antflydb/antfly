@@ -1,5 +1,0 @@
-Build Summary: 3/3 steps succeeded; 10/10 tests passed
-test-media-http success
-+- run test 10 pass (10 total) 132ms MaxRSS:5M
-   +- compile test safe native success 21s MaxRSS:1G
-

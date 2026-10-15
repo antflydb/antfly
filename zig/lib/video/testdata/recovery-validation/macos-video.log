@@ -1,8 +1,0 @@
-Build Summary: 6/6 steps succeeded; 196/198 tests passed (2 skipped)
-install-video-tests success
-+- install test success
-   +- compile test debug native success 1m MaxRSS:1G
-      +- WriteFile video_prepare_shader.h cached
-test-video success
-+- run test 196 pass, 2 skip (198 total) 1m MaxRSS:312M
-   +- compile test debug native (+1 more reused dependencies)

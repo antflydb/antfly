@@ -1,3 +1,0 @@
-1/2 inference_deadline.test.inference caller deadline narrows existing budget and handles clock bounds...OK
-2/2 inference_deadline.test.inference caller deadline rejects malformed duplicate and unbounded metadata...OK
-All 2 tests passed.

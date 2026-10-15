@@ -1,5 +1,0 @@
-Build Summary: 3/3 steps succeeded
-install-video-tests success
-+- install test success
-   +- compile test safe aarch64-linux-musl success 29s MaxRSS:842M
-

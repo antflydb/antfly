@@ -1,5 +1,10 @@
 # Larger WebM codec measurements and qualification
 
+Recorded run results and output filenames below describe the measured historical
+epoch. Generated reports/logs were removed from the current tree; see
+[qualification and historical recovery](../../../../../../docs/plans/native-video-noncuda-audit.md#artifact-policy-and-historical-evidence).
+Fixture inputs and independent reference oracles remain checked in.
+
 Sintel copyright Blender Foundation / durian.blender.org, licensed under
 [CC BY 3.0](https://creativecommons.org/licenses/by/3.0/). The six pinned streams
 are derivatives of the original 480p trailer; `corpus/manifest.json` records

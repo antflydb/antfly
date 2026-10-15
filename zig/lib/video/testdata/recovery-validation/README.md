@@ -1,5 +1,10 @@
 # WebM entropy-corruption recovery qualification
 
+Recorded run results and output filenames below describe the measured historical
+epoch. Generated reports/logs were removed from the current tree; see
+[qualification and historical recovery](../../../../../docs/plans/native-video-noncuda-audit.md#artifact-policy-and-historical-evidence).
+Fixture inputs and independent reference oracles remain checked in.
+
 `walkRecoveringIndexed` is an opt-in library walker for callers that handle
 explicit missing-picture gaps. It recreates the decoder at the next parsed
 codec-key restart, retaining original picture IDs and clocks and AV1 sequence

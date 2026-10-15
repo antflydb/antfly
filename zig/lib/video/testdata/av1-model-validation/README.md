@@ -1,5 +1,10 @@
 # Expanded AV1 pretrained failures, macOS ARM64
 
+Recorded run results and output filenames below describe the measured historical
+epoch. Generated reports/logs were removed from the current tree; see
+[qualification and historical recovery](../../../../../docs/plans/native-video-noncuda-audit.md#artifact-policy-and-historical-evidence).
+Fixture inputs and independent reference oracles remain checked in.
+
 The reports qualify the production decoder/model path at runtime source commit
 `8f75e63df4d9e7eb834949bbc46047c6b10b4e39`, built in fresh ReleaseSafe caches
 (`server-build.log`). `qualification.json` binds the binary, tools, corpus and

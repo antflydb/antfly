@@ -1,5 +1,10 @@
 # Native identity RGB pretrained preservation
 
+Recorded run results and output filenames below describe the measured historical
+epoch. Generated reports/logs were removed from the current tree; see
+[qualification and historical recovery](../../../../../docs/plans/native-video-noncuda-audit.md#artifact-policy-and-historical-evidence).
+Fixture inputs and independent reference oracles remain checked in.
+
 Native video preparation now accepts full-range 4:4:4 identity-matrix planes in
 GBR order. CPU reorders 8-bit channels with portable SIMD; Metal performs color
 conversion on device from native integer textures. Ordinary preparation retains

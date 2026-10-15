@@ -1,5 +1,10 @@
 # Stateful VP8 sequence qualification
 
+Recorded run results and output filenames below describe the measured historical
+epoch. Generated reports/logs were removed from the current tree; see
+[qualification and historical recovery](../../../../../docs/plans/native-video-noncuda-audit.md#artifact-policy-and-historical-evidence).
+Fixture inputs and independent reference oracles remain checked in.
+
 The ordinary video CI and instrumented fuzz roots now import a VP8 sequence
 target. It decodes complete packet tapes through the maintained pure Zig
 `Vp8Decoder`, retains four independent padded picture outputs, checks their
@@ -17,7 +22,7 @@ commands, source/oracle hashes and CC BY 3.0 attribution.
 
 The updated sequence suite passes 13/13 on macOS ARM64, pinned Linux ARM64
 and Linux x86_64 under architecture emulation. The instrumented VP8 campaign
-is recorded separately in the [receipt](receipt.json); pending jobs are not qualified. The x86_64 Linux executable is statically linked
+is recorded separately in the [receipt](https://github.com/antflydb/antfly/blob/bf9d632d025a6b12837997f6aeb86e1a818ec831/zig/lib/video/testdata/vp8-sequence-validation/receipt.json); pending jobs are not qualified. The x86_64 Linux executable is statically linked
 and packaged in a scratch image; execution on this ARM64 host uses Docker's
 architecture emulation, not native x86 hardware performance qualification.
 
@@ -39,12 +44,12 @@ coverage. The complete non-CUDA objective remains active.
 The separate fresh-cache VP8 target completes **11,929 runs**, **185 unique
 inputs** and **1,486/22,157 instrumented edges** in its reported 151-minute
 shared-host run, with exit zero and no crash output. Three positive/setup tests
-also pass. [Final receipt](fuzz-final-vp8.json) and [raw report](fuzz-final-vp8.log)
+also pass. [Final receipt](https://github.com/antflydb/antfly/blob/bf9d632d025a6b12837997f6aeb86e1a818ec831/zig/lib/video/testdata/vp8-sequence-validation/fuzz-final-vp8.json) and [raw report](https://github.com/antflydb/antfly/blob/bf9d632d025a6b12837997f6aeb86e1a818ec831/zig/lib/video/testdata/vp8-sequence-validation/fuzz-final-vp8.log)
 retain the zero-origin counters and command. Every recorded code/seed hash matches
 measured commit `ad0679f7602db60b994a8fc00dbf05894b484451`; the existing measured
 harness snapshot also matches exactly. The nonruntime seed README was captured
 from preceding commit `fe0e1cc145cebb17f110da4554f5fc61cb4008ab` before the VP8
-provenance paragraph was added; [its exact snapshot](seed-readme.measured.md) and
+provenance paragraph was added; [its exact snapshot](https://github.com/antflydb/antfly/blob/bf9d632d025a6b12837997f6aeb86e1a818ec831/zig/lib/video/testdata/vp8-sequence-validation/seed-readme.measured.md) and
 per-path source version are retained. This campaign predates the main merge and
 qualifies that measured source state, not newly added runtime code or current
 whole-file identity. Its 6.71% edge count is not exhaustive codec/tool coverage.

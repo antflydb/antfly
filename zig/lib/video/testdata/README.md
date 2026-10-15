@@ -1,5 +1,10 @@
 # Frame-selection reference fixtures
 
+Recorded run results and output filenames below describe the measured historical
+epoch. Generated reports/logs were removed from the current tree; see
+[qualification and historical recovery](../../../../docs/plans/native-video-noncuda-audit.md#artifact-policy-and-historical-evidence).
+Fixture inputs and independent reference oracles remain checked in.
+
 `reference/hf_sample_frames.py` preserves the inspected Hugging Face Transformers
 EmbeddingGemma 2 `sample_frames` method (Apache-2.0, Hugging Face copyright).
 Its source URL and observation date are in the file. See the
@@ -241,7 +246,7 @@ For additional real-content profiles, run `scripts/qualify_h264_corpus.py` with
 `--source SOURCE --native zig-out/bin/video-qualification --output DIRECTORY`.
 It records exact FFmpeg/libx264 commands, content hashes and full-frame differential
 results for Baseline/Main/High10/High444. External corpus artifacts are not fetched
-or generated during normal tests. See [expansion validation](h264-expansion-validation.md).
+or generated during normal tests. See [expansion validation](https://github.com/antflydb/antfly/blob/bf9d632d025a6b12837997f6aeb86e1a818ec831/zig/lib/video/testdata/h264-expansion-validation.md).
 
 JM monochrome cases additionally qualify compressed CABAC 8-bit and CAVLC 10-bit I/P pictures. JM writes neutral 4:2:0 chroma for monochrome output; these receipts hash only each native Y plane without converting range/depth.
 

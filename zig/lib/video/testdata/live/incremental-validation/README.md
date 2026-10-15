@@ -1,5 +1,10 @@
 # Persistent static-AVC live reconstruction
 
+Recorded run results and output filenames below describe the measured historical
+epoch. Generated reports/logs were removed from the current tree; see
+[qualification and historical recovery](../../../../../../docs/plans/native-video-noncuda-audit.md#artifact-policy-and-historical-evidence).
+Fixture inputs and independent reference oracles remain checked in.
+
 The live coordinator defaults to persistent static-configuration AVC metadata
 reconstruction. Workspaces, reference pictures, unfinished fields and plane lanes
 remain in an admitted owner instead of replaying the retained GOP on every append.

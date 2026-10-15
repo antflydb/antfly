@@ -1,5 +1,0 @@
-Build Summary: 4/4 steps succeeded
-test-video success
-+- run test cached
-   +- compile test debug native cached 55ms MaxRSS:32M
-      +- WriteFile video_prepare_shader.h cached

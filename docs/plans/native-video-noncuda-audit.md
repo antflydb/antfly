@@ -1,84 +1,119 @@
-# Native video non-CUDA completion audit
+# Native video non-CUDA qualification
 
-The eight requested work groups are implemented and qualified within their
-documented codec, transport, fixture and platform contracts. This audit maps the
-original scope to reviewable evidence. Receipts bind the exact source/binary they
-measured; later unit tests do not silently refresh earlier performance or
-pretrained epochs. Application relevance belongs to Antfly users; these model
-gates preserve pinned reference vectors, cosine scores, rankings and top-k sets.
+The eight requested work groups are implemented within the declared contracts
+in [MEDIA.md](../../zig/lib/media/MEDIA.md) and
+[VIDEO.md](../../zig/lib/video/VIDEO.md). Runtime codecs are maintained in-tree;
+FFmpeg/PyTorch and reference codec tools are qualification-only. Application
+relevance belongs to Antfly users; model checks preserve reference vectors,
+cosine scores, rankings and top-k sets.
 
-| Requested work | Current implementation and evidence | Acceptance and scope |
-|---|---|---|
-| WebM model ingestion, sampling and pretrained CPU/Metal parity | `embedding_gemma2_video.zig` connects WebM logical indexing and native VP8/VP9/AV1 reconstruction to preparation, batched vision and the projector. [WebM evidence](../../zig/lib/video/testdata/webm-validation/README.md) includes eight vectors and three rankings on CPU/Metal/Linux. [Expanded formats](../../zig/lib/video/testdata/gbr-model-validation/README.md) include 12 video and two query vectors. | The refreshed full-F32 Metal gate passes for the five-video WebM corpus (eight vectors/three rankings) and twelve-video depth/chroma corpus (14 vectors/two rankings); retain historical and measured binary source scopes. |
-| Broader streams, sustained coverage-guided fuzzing and corruption recovery | [Sequence campaigns](../../zig/lib/video/testdata/sequence-fuzz-validation/README.md), [VP8 campaign](../../zig/lib/video/testdata/vp8-sequence-validation/README.md), H.264 real-picture differentials and [explicit restart recovery](../../zig/lib/video/testdata/recovery-validation/README.md) exist. The recovery walker reports gaps; model inference stays strict. | [Independent Big Buck Bunny content](../../zig/lib/video/testdata/real-content/README.md) adds three movie scenes across VP8/VP9/AV1. Both macOS and actual Linux match every sample of 324 pictures; all streams/hashes reproduce exactly. This broadens source diversity while retaining bounded campaign scopes. |
-| AV1 profiles, 12-bit, monochrome, 4:2:2/4:4:4, Annex B and scalable layers | The maintained Zig decoder exposes profiles 0–2, native-depth/chroma output, Annex B normalization and operating-point/layer selection. [Extended decoder goldens](../../zig/lib/video/testdata/av1-extended/README.md), [chroma model qualification](../../zig/lib/video/testdata/av1-chroma-model-validation/README.md) and [scalable presentation](../../zig/lib/video/testdata/av1-layer-model-validation/README.md) record independent decoded outputs and model preservation. | The twelve-video 8/10/12-bit GBR corpus passes the explicit full-F32 Metal gate (maximum error 3.7626e-7). The historical nine-video chroma and ten-video scalable-layer reports preserve vectors but fail the overall Metal retry gate under a 4 GiB process budget. The final [vision-weight gate](../../zig/lib/video/testdata/vision-weight-validation/README.md) closes both original 4096 MiB suites with unchanged numerical and lifecycle/load requirements. |
-| Realistic benchmarks, measured portable SIMD and less reference copying | [Large codec measurements](../../zig/lib/video/testdata/benchmarks/webm/README.md), [SIMD qualification](../../zig/lib/video/testdata/simd-validation/README.md), [reference sharing](../../zig/lib/video/testdata/reference-storage-validation/README.md), selected-output materialization and [attention measurements](../../zig/lib/video/testdata/attention-model-validation/README.md) exist. Runtime buffer lifetime/initialization telemetry now measures previously excluded allocations. | Bounded model-owned vision/projector reuse passes final production gates: warm clip initialization falls from 9.695 GB to 27.477 MB, with zero net live owned bytes/objects across four requests. The new F32 route passes the complete reference/load gate; shared-host measurements are diagnostic rather than a speed claim. |
-| Actual Linux decoder execution | Decoder/model policies run as static ARM64 Linux executables in the recorded offline VM; these are execution results, not cross-compilation claims. The complete decoder suite passes 252 tests (29 platform skips); final portable model/admission checks pass 54 (eight Metal skips). The separate pretrained WebM execution passes all eight vectors, three rankings and lifecycle/load gates. | Preserve the architecture scope: native x86 hardware performance is not proved by ARM64 execution or x86 emulation. Re-run affected pretrained gates when native arithmetic or preparation changes. |
-| Logical fields/partitions, timestamp sampling and long windows | Logical AVC/WebM picture indexes, `ReaderSelection`, timestamp/source-time policies, rolling windows and pending-field frontiers are integrated. [Frontier evidence](../../zig/lib/video/testdata/live/field-frontier-validation/README.md), [window coordinator](../../zig/lib/video/testdata/live/coordinator-validation/README.md) and later incremental/dynamic-source receipts qualify ownership, source clocks and commit boundaries. | The 52-second reference clip and final configured streamed TS checks exercise long-video and source-time paths; six streamed CPU/Metal vectors are byte-exact against buffered inference, including retained-output/prefix retry. Earlier field/partition policy receipts retain their source scopes. |
-| Device normalization and scheduling across requests | Metal token composition, backbone inputs and `maskedMeanNormalizedRows` keep the response boundary on device until final readback. Bounded preparation starts before the model gate and drains on cancellation/abandonment. [Concurrent attention/model evidence](../../zig/lib/video/testdata/attention-model-validation/README.md) and [cancellation evidence](../../zig/lib/video/testdata/cancellation-model-validation/README.md) cover shared admission and correct retry. | The fresh full-clip end-to-end numerical/load gate passes. Runtime-only buffer gauges exclude preparation textures/buffers, decoder surfaces and opaque driver storage; report that scope rather than a physical whole-pipeline peak. |
-| Inherited DASH addressing, periods/representations and broader live/HLS | Native DASH inheritance, templates, selected representations, stable period/live cursors, partial fMP4 growth and authenticated range transport are implemented. HLS includes master selection, delta/blocking reloads, native AES-CBC, fMP4 part/parent reconciliation and streamed normalized AVC TS. [Media design](../../zig/lib/media/MEDIA.md) links exact receipts; [TS model delivery](../../zig/lib/video/testdata/ts-http/README.md) preserves six streamed windows on CPU/Metal/Linux. | Keep source/origin and codec restrictions explicit. TS LL-HLS parts remain unsupported; current transport gates do not establish arbitrary origin interoperability. |
+## Results and scope
 
-## Final acceptance
+[The compact results record](../../zig/lib/video/testdata/qualification-summary.json)
+identifies the measured checkpoint, final gates, platforms and resource effects.
+These are historical measurements of the recorded sources, not a new performance
+claim for every subsequent commit.
 
-The [final Metal constants qualification](../../zig/lib/video/testdata/vision-weight-validation/README.md)
-closes the last constrained production failures. All seven final checks pass:
-both original 4096 MiB AV1 suites, full-clip/WebM/depth-chroma comparisons, and
-native CPU/Metal streamed TS. Numerical, rankings/top-k, cancellation, retry,
-half-close, concurrent completion and cleanup gates remain unchanged. All 66
-actual Metal device tests pass. Actual offline Linux ARM64 executes 54 final
-portable model tests with eight Metal skips. Source/binary fingerprints and raw
-logs are in `vision-weight-validation/qualification.json`.
+| Requested work | Implementation and qualification |
+|---|---|
+| WebM model integration | VP8/VP9/AV1 logical pictures feed batched vision/projector execution. Final Metal WebM checks pass eight vectors and three rankings; CPU and actual Linux reference-preservation runs have separate recorded epochs. |
+| Broader streams, fuzzing and recovery | Retained-frame coverage-guided campaigns, corruption/restart tests and independent H.264/VP8/VP9/AV1 goldens. Three Big Buck Bunny scenes across nine streams match all 324 pictures on macOS and Linux; regeneration is exact. Recovery reports gaps; ordinary inference stays strict. |
+| AV1 profiles/formats/layers | Profiles 0–2, 8/10/12-bit mono/4:2:0/4:2:2/4:4:4, Annex B and operating-point/layer policies have independent outputs. Both original constrained AV1 model suites pass complete numerical and lifecycle/load gates. |
+| Performance and reference ownership | Realistic 480p/1080p codec benchmarks, measured portable SIMD preparation, selected-output materialization and progressive AVC reference sharing. Warm long-clip initialized-buffer bytes fall 99.72%; this is not a shared-host throughput claim. |
+| Actual Linux execution | Offline ARM64 Linux executes the full decoder suite: 252 passes, 29 platform skips. Final portable model/admission suite: 54 passes, eight Metal skips. The separately scoped pretrained WebM run passes eight vectors, three rankings and lifecycle/load gates. |
+| Sampling/display/windows | Logical AVC fields/partitions/planes, WebM picture identities, VFR source-time selection, explicit windows, rotation/SAR and declared HDR rendering. The 52-second clip and six exact streamed-vs-buffered TS windows exercise long/source-time paths. |
+| Resident Metal and scheduling | Device token composition, backbone inputs, pooling/normalization; bounded batched preparation overlaps admitted execution. Shared admission, cancellation, retry and optional-constant reclamation pass device and production gates. |
+| Live transport | Inherited DASH addressing/templates/BaseURL, selected representations, periods/live cursors; authenticated HLS master/delta/blocking reload, native AES-CBC, fMP4 part/parent reconciliation and streamed normalized AVC TS. |
 
-EmbeddingGemma 2 uses full-F32 tiled vision attention, preserving float inputs and
-softmax probabilities. The 52-second clip's maximum coordinate error is
-8.7964e-7, with 256 dedicated tiled dispatches. Four requests at concurrency two
-return exact repeat vectors and release admission. WebM and depth/chroma maxima
-are 6.2213e-7 and 3.7626e-7; both original 4096 MiB suites pass at 3.9023e-7.
-No injected library or disabling precision override is used in accepted runs.
+All seven final production checks pass: AV1 layers and formats at their original
+4096 MiB budgets, the full clip, WebM, depth/chroma, and streamed native CPU/Metal
+TS. Maximum Metal coordinate errors are 3.9023e-7 for both constrained AV1 suites,
+8.7964e-7 for the full clip, 6.2213e-7 for WebM and 3.7626e-7 for depth/chroma.
+Score/ranking/top-k, cancellation/retry, half-close, concurrent completion and
+cleanup gates pass without larger reservations, looser tolerances or a change
+to the 16-retry limit. Streamed TS preserves all six buffered vectors exactly,
+including retained-output retry and verification of 12 acknowledged AUs.
 
-The Metal provider retains 114 immutable vision/projector matrices. Vision and
-language each have a 640 MiB ceiling, share the model/process controller and
-combined 512-entry cap. Relevant pressure reclaims idle vision slots first and
-language slots only if the unchanged request remains denied. Each class is
-attempted once with nonblocking native locks and cancellation checks. Exclusive
-owned weights are discarded and exact credits released; checkpoint aliases,
-shared zero biases and active frames stay valid. Unified-memory BF16 widens
-with portable Zig SIMD directly into the final shared allocation. Owned HF vision
-frames retire activation views after their existing wait; outer frame owners
-retain their completion boundary. No process cap, reservation, tolerance or
-external retry limit changes.
+The post-main-merge Metal/model suite passes 66/66 with no skips. The Apache
+boundary suite passes 35 checks and verifies 2,235 reachable sources. Final Metal
+[build/runtime fingerprints](../../zig/lib/video/testdata/vision-weight-validation/staged-production-provenance.json)
+remain separate from earlier Linux pretrained/full-decoder epochs. The latter
+source audit found one test-only fixture-path rewrite among 256 files; decoder
+runtime was unchanged. The executed Linux pretrained ELF had no interpreter or
+DT_NEEDED codec libraries. Linux ARM64 execution does not establish native x86
+hardware performance.
 
-First long-clip initialized bytes fall from 9,758,012,520 to 698,315,880; warm
-clips fall from 9,695,085,672 to 27,477,096 (99.72% less). Steady owned allocation
-increases from 632,222,724 to 1,240,134,660 bytes. Four warm requests have zero
-net live owned bytes/objects. Isolated vision-view retirement lowers the first
-AV1 tracked owned peak 56.0%, retaining a packed-F32-identical vector. These
-are logical initialization and runtime allocated-buffer observations, excluding
-preparation textures/buffers, decoder surfaces and opaque driver storage.
-They do not establish physical residency, bus traffic or shared-host speedup.
+Warm 52-second clip initialized bytes fall from 9,695,085,672 to 27,477,096.
+Steady owned runtime buffers increase from 632,222,724 to 1,240,134,660 bytes;
+four warm requests at concurrency two have zero net live owned bytes/objects.
+These observations exclude preparation textures/buffers, decoder surfaces and
+opaque driver storage. They do not establish physical residency, bus traffic,
+whole-pipeline memory or serving capacity. Earlier failed/control reports remain
+failed; no allocator-relief hook ships.
 
-## Evidence boundaries
+Qualification covers bounded corpora and supported subsets, not arbitrary codec
+conformance or origin interoperability. TS LL-HLS parts remain outside the
+streamed TS contract. HDR/display tests qualify the declared rendering policy,
+not every real-world mastering convention. CUDA is excluded.
 
-The complete actual Linux decoder receipt has 252 passes, 29 platform skips and
-zero failures. Its source audit matches 255 of 256 library files exactly; the
-sole difference moves unchanged fixture paths out of a test helper for license
-inspection. The full diff is retained; decoder runtime is unchanged. The Linux
-pretrained WebM server has its own earlier epoch, with eight vectors, three
-rankings and lifecycle/load gates passing at maximum error 7.8232e-7. Later
-Metal arithmetic does not execute on Linux; the final generic admission changes
-are covered by the fresh 54-pass Linux suite. The executed pretrained AArch64
-ELF has no interpreter or DT_NEEDED libraries. ARM64 execution does not establish
-native x86 hardware performance.
+## Reproduce
 
-Historical failed/control results remain failed, including the half-input
-precision regression, early cache variants and partial pressure fixes. Debug
-success does not qualify production. The final accepted source is explicitly
-bound separately. The diagnostic loader audit rejects inactive shell-injected
-controls; no Darwin allocator-relief hook ships.
+Use the repository-pinned Zig toolchain and the qualification environment pinned
+by `tools/embeddinggemma2/reference.py` and `linux-reference.Dockerfile`. From the
+repository root:
 
-Qualification covers bounded corpora, campaigns and declared supported subsets,
-not arbitrary codec conformance or origin interoperability. TS LL-HLS parts
-remain outside the declared streamed TS contract. CUDA is excluded. Reference
-preservation does not establish end-user application relevance. These limits
-are retained without treating them as unimplemented requirements of the eight
-requested work groups.
+```sh
+mkdir -p .benchmark-results/video
+zig build --build-file zig/lib/video/build.zig test-video test-live-windows -Doptimize=ReleaseSafe
+zig build --build-file zig/lib/media/build.zig test-media test-media-http -Doptimize=ReleaseSafe
+zig build --build-file zig/pkg/inference/build.zig test-video-model -Doptimize=ReleaseSafe
+python3 -m unittest discover -s tools/embeddinggemma2 -p 'test_*.py'
+```
+
+The Linux [qualification workflow](../../.github/workflows/zig-video-qualification.yml)
+acquires the pinned checkpoint, generates independent PyTorch references and
+runs native codec/model/recovery/display checks. Its generated reports go into
+`.benchmark-results/` and upload as CI artifacts. Cross-compilation alone does
+not count as actual Linux execution.
+
+For a local pretrained comparison, build the inference benchmark server, supply
+the verified checkpoint and use a checked-in independent oracle:
+
+```sh
+python3 tools/embeddinggemma2/video_compare.py --backend metal \
+  --binary zig/zig-out/bin/antfly-inference-bench-server \
+  --model-dir /path/to/verified/checkpoint \
+  --corpus tools/embeddinggemma2/testdata/retrieval/webm-corpus.json \
+  --reference zig/lib/video/testdata/webm-validation/pytorch-cpu.json \
+  --warmups 0 --iterations 1 --concurrency 2 --sustained-rounds 2 \
+  --collect-metal-telemetry --output .benchmark-results/video/webm-metal.json
+```
+
+The five final comparison argument sets are retained in
+[production-commands.json](../../zig/lib/video/testdata/vision-weight-validation/production-commands.json).
+Codec generators, corpus definitions, per-picture goldens, attribution and
+independent CPU/MPS references remain alongside the fixtures. Reproduce their
+pinned inputs before comparing a new implementation; source/binary epochs are
+part of the evidence, not interchangeable labels.
+
+## Artifact policy and historical evidence
+
+Track test inputs, fuzz regression seeds, independent reference oracles,
+generators, provenance/attribution and this concise summary. Generate measured
+backend vectors, replay outputs, run receipts and logs under ignored
+`.benchmark-results/`. Do not check in each run, source snapshot or diagnostic
+experiment. No release asset, LFS archive or history rewrite is required.
+
+The complete pre-cleanup evidence remains at
+[commit bf9d632d02](https://github.com/antflydb/antfly/tree/bf9d632d025a6b12837997f6aeb86e1a818ec831).
+For a specific historical file, recover it without changing the checkout:
+
+```sh
+git show bf9d632d02:zig/lib/video/testdata/vision-weight-validation/staged-production-full-clip.json \
+  > .benchmark-results/video/historical-full-clip.json
+```
+
+Historical fixture READMEs can describe their measured epoch and commands;
+removed output files are recovered from that commit or regenerated with their
+producer. Their old test counts, source fingerprints and failed outcomes are
+not promoted to current evidence by this cleanup.

@@ -1,7 +1,0 @@
-Build Summary: 6/6 steps succeeded
-install-video-tests success
-+- install test success
-   +- compile test safe aarch64-linux-musl success 49s MaxRSS:2G
-install-webm-benchmark success
-+- install webm-benchmark success
-   +- compile exe webm-benchmark safe aarch64-linux-musl success 27s MaxRSS:1G

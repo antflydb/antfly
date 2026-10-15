@@ -1,5 +1,10 @@
 # Logical-picture and timestamp-window qualification
 
+Recorded run results and output filenames below describe the measured historical
+epoch. Generated reports/logs were removed from the current tree; see
+[qualification and historical recovery](../../../../docs/plans/native-video-noncuda-audit.md#artifact-policy-and-historical-evidence).
+Fixture inputs and independent reference oracles remain checked in.
+
 This corpus compares reference preservation, with no application relevance labels.
 The eight video cases cover default and explicit VFR selection, completed PAFF
 field pairs, VP9/AV1 timestamp selection and two separate windows of the same
@@ -47,7 +52,7 @@ under shared build load are not isolated performance benchmarks.
 
 ## Executed results
 
-The [validation receipt](../../../../zig/lib/video/testdata/video-sampling-validation.md)
+The [validation receipt](https://github.com/antflydb/antfly/blob/bf9d632d025a6b12837997f6aeb86e1a818ec831/zig/lib/video/testdata/video-sampling-validation.md)
 records macOS CPU/Metal pretrained parity, actual Linux ARM64 portable execution,
 HTTP policy rejection/retry and separate window outputs. `qualification.json`
 contains source, artifact and clip hashes. `pytorch.json`, `native.json` and

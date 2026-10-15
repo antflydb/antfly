@@ -1,9 +1,0 @@
-======= FUZZING REPORT =======
-Step: run test
-Fuzz test: "src.hls.test.HLS date-range fuzz immutable history and admission cleanup" (162cb101d889f84c)
-Runs: 0 -> 100879
-Unique runs: 0 -> 877
-Coverage: 0/10830 -> 1111/10830 (10.26%)
-------------------------------
-Values are accumulated across multiple runs when preserving the cache.
-==============================

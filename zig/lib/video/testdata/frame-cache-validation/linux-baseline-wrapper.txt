@@ -1,6 +1,0 @@
-#!/usr/bin/env python3
-import os, sys
-args = sys.argv[1:]
-port = int(args[args.index('--port') + 1])
-command = ['docker', 'run', '--rm', '--init', '--pull', 'never', '--platform', 'linux/arm64', '-p', f'127.0.0.1:{port}:{port}', '-v', '/private/tmp/native-video-ts-model-linux/bin' + ':/qual:ro', '-v', '/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/native-video-design/.benchmark-assets/native-video' + ':' + '/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/native-video-design/.benchmark-assets/native-video' + ':ro', '-e', 'ANTFLY_INFERENCE_REQUIRED_BACKEND=native', 'ubuntu:24.04', '/qual/antfly-inference-bench-server'] + args + ['--host', '0.0.0.0', '--allow-insecure-public-bind']
-os.execvp(command[0], command)

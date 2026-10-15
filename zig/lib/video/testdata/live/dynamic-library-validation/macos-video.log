@@ -1,9 +1,0 @@
-Build Summary: 7/7 steps succeeded; 257/259 tests passed (2 skipped)
-test-live-windows success
-+- run test 20 pass (20 total) 732ms MaxRSS:5M
-   +- compile test safe native success 16s MaxRSS:682M
-test-video success
-+- run test 237 pass, 2 skip (239 total) 16s MaxRSS:106M
-   +- compile test safe native success 1m MaxRSS:2G
-      +- WriteFile video_prepare_shader.h cached
-

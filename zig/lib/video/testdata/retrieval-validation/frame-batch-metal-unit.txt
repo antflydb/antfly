@@ -1,2 +1,0 @@
-1/34 architectures.gemma4_projector.test.gemma4 video device normalization rope and pooling preserve host results without readback...OK
-1 selected; 1 passed; 0 skipped.

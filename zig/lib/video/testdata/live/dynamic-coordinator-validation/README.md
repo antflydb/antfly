@@ -1,5 +1,10 @@
 # Owned dynamic live checkpoint qualification
 
+Recorded run results and output filenames below describe the measured historical
+epoch. Generated reports/logs were removed from the current tree; see
+[qualification and historical recovery](../../../../../../docs/plans/native-video-noncuda-audit.md#artifact-policy-and-historical-evidence).
+Fixture inputs and independent reference oracles remain checked in.
+
 The default coordinator now uses the maintained Zig persistent decoder for avc3
 streams. Independently admitted parameter checkpoints survive decoder failure.
 Probe/prepared/canonical suffix readers own bootstrap NALs in their first payload;

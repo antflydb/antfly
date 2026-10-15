@@ -1,0 +1,84 @@
+{
+  "measured_commit": "bf9d632d025a6b12837997f6aeb86e1a818ec831",
+  "scope": "Historical qualification of pinned corpora and ARM64 hosts. Cleanup does not rerun or broaden these measurements. Complete reports and raw logs remain in this commit, not in the current tree.",
+  "checkpoint": {
+    "revision": "914f7f89142e33e77833254d9c9b90c3cef7303b",
+    "weights_sha256": "197a32965d4b1105faf060417baa899e193fb73cd401f42ec9295234d5553d79"
+  },
+  "final_metal_production": [
+    {
+      "name": "layers-4g",
+      "status": "pass",
+      "max_abs": 3.902241587638855e-07
+    },
+    {
+      "name": "formats-4g",
+      "status": "pass",
+      "max_abs": 3.902241587638855e-07
+    },
+    {
+      "name": "full-clip",
+      "status": "pass",
+      "max_abs": 8.796341717243195e-07
+    },
+    {
+      "name": "webm",
+      "status": "pass",
+      "max_abs": 6.221234798431396e-07
+    },
+    {
+      "name": "gbr",
+      "status": "pass",
+      "max_abs": 3.762543201446533e-07
+    },
+    {
+      "name": "ts-streamed-metal",
+      "status": "pass"
+    },
+    {
+      "name": "ts-streamed-native",
+      "status": "pass"
+    }
+  ],
+  "tests": {
+    "post_merge_metal": {
+      "passed": 66,
+      "skipped": 0,
+      "failed": 0
+    },
+    "linux_model": {
+      "passed": 54,
+      "skipped": 8,
+      "failed": 0
+    },
+    "linux_decoder": {
+      "passed": 252,
+      "skipped": 29,
+      "failed": 0
+    },
+    "apache_boundary": {
+      "passed": 35,
+      "reachable_sources": 2235
+    }
+  },
+  "independent_real_content": {
+    "source": "Big Buck Bunny, three scenes encoded as VP8/VP9/AV1",
+    "streams": 9,
+    "exact_pictures_macos_and_linux": 324
+  },
+  "resources": {
+    "warm_long_clip_initialized_bytes_before": 9695085672,
+    "warm_long_clip_initialized_bytes_after": 27477096,
+    "steady_owned_bytes_before": 632222724,
+    "steady_owned_bytes_after": 1240134660,
+    "four_warm_requests_net_owned_growth_bytes": 0
+  },
+  "constraints": [
+    "Both constrained AV1 suites retain original 4096 MiB budgets and 16 external retries.",
+    "Runtime buffer initialization and allocatedSize are not physical residency, bus traffic or whole-pipeline memory.",
+    "Shared-host timings are diagnostic; no capacity/speedup claim.",
+    "Reference preservation does not establish end-user relevance.",
+    "Linux pretrained and full-decoder execution retain their separate source epochs, recorded in the historical commit.",
+    "Earlier failed/control reports remain failed; no allocator-relief hook ships."
+  ]
+}

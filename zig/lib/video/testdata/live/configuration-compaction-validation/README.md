@@ -1,5 +1,10 @@
 # Live AVC configuration compaction
 
+Recorded run results and output filenames below describe the measured historical
+epoch. Generated reports/logs were removed from the current tree; see
+[qualification and historical recovery](../../../../../../docs/plans/native-video-noncuda-audit.md#artifact-policy-and-historical-evidence).
+Fixture inputs and independent reference oracles remain checked in.
+
 Rebasing the maintained Zig AVC registry frees unreachable configuration maps and
 AVCC payloads. It remaps retained selectors, epoch initialization entries and the
 active configuration together. Allocation and index validation precede mutation;

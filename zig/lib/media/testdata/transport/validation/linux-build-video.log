@@ -1,7 +1,0 @@
-Build Summary: 6/6 steps succeeded
-install-transport-http-tests success
-+- install test success
-   +- compile test safe aarch64-linux-musl success 24s MaxRSS:1G
-install-video-tests success
-+- install test success
-   +- compile test safe aarch64-linux-musl success 48s MaxRSS:2G

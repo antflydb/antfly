@@ -1,6 +1,0 @@
-Build Summary: 4/4 steps succeeded
-install success
-+- install video-qualification success
-   +- compile exe video-qualification safe native success 14s MaxRSS:590M
-      +- WriteFile video_prepare_shader.h cached
-

@@ -1,8 +1,0 @@
-{
-  "format": "ELF64 little-endian",
-  "machine": 183,
-  "binary_sha256": "b39b2d454783996e53e07c79bdb65372b5868e8112bdde60ef7ad0e4b884e629",
-  "interpreter_segment_present": false,
-  "DT_NEEDED_count": 0,
-  "scope": "Production Linux model server actually executed by discard-linux-webm.json; no ELF interpreter or dynamic-library dependencies. This is separate from offline Python/FFmpeg/reference-tool requirements."
-}

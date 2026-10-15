@@ -1,3 +1,0 @@
-1/2 metal_telemetry.test.disabled Metal telemetry is zero without platform linkage...OK
-2/2 metal_telemetry.test.Metal telemetry renders unsigned counters without losing integer precision...OK
-All 2 tests passed.

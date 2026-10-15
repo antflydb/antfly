@@ -1,4 +1,0 @@
-Build Summary: 3/3 steps succeeded
-check-video success
-+- compile test debug aarch64-linux-musl success 7s MaxRSS:579M
-+- compile test debug aarch64-linux-musl success 208ms MaxRSS:140M
