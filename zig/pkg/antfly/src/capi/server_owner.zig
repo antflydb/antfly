@@ -4123,18 +4123,12 @@ pub fn storageOwnerNativeIndexControlJson(
         // observation of ready progress can advance one root-local audit page.
         if (result == .generation and result.generation.duplicate and !result.generation.replication_pending and result.generation.record.fields.phase == .ready) {
             const root = root_scope.?.value;
-            const summary = handle.db.stepNativeIndexOwnerAudit(request.table_name.slice(), parsed.value, root.root_dir, root.root_incarnation, context) catch |err| return storageOwnerStatusFromError(switch (err) {
-                error.PrivateIndexAuditScopeChanged,
-                error.InvalidRelationalIndexValidation,
-                error.InvalidPrivateIndexClaimInventory,
-                error.InvalidRootSigningIdentity,
-                error.RootSigningIdentityRootChanged,
-                error.InsecureRootSigningIdentity,
-                error.FileNotFound,
-                => error.PrivateIndexRootRecoveryRequired,
-                else => err,
-            });
-            const outcome: native.BuildResponse = .{ .audit = .{ .binding = result.generation.binding, .expected = result.generation.record.expected, .audit = summary } };
+            const summary = handle.db.stepNativeIndexOwnerAudit(request.table_name.slice(), parsed.value, root.root_dir, root.root_incarnation, context) catch |err| return nativeIndexValidationStatus(err);
+            const physical: native.AuditOutcome = .{ .binding = result.generation.binding, .expected = result.generation.record.expected, .audit = summary };
+            // A complete root-local audit can seal one constant-sized logical
+            // cut. Pending mirroring/signing is reported with the committed
+            // outcome, never as an apparent rollback of that cut.
+            const outcome: native.BuildResponse = if (summary.generation != null and summary.generation.?.phase == .ready) .{ .validated = .{ .physical = physical, .logical = handle.db.sealNativeIndexOwnerValidationAudited(parsed.value, physical, context) catch |err| return nativeIndexValidationStatus(err) } } else .{ .audit = physical };
             outcome.validateFor(parsed.value) catch |err| return storageOwnerStatusFromError(err);
             return response.finish(outcome, out_response);
         }
@@ -4265,11 +4259,26 @@ pub fn storageOwnerNativeIndexControlJson(
 
 /// All bounded native-index mutation responses reserve ownership before commit.
 /// Serialization and transfer do not allocate after the durable mutation.
+fn nativeIndexValidationStatus(err: anyerror) kernel_owner_abi.Status {
+    return storageOwnerStatusFromError(switch (err) {
+        error.PrivateIndexAuditScopeChanged,
+        error.InvalidRelationalIndexValidation,
+        error.InvalidPrivateIndexClaimInventory,
+        error.InvalidPrivateIndexNativeReceipt,
+        error.InvalidRootSigningIdentity,
+        error.RootSigningIdentityRootChanged,
+        error.InsecureRootSigningIdentity,
+        error.FileNotFound,
+        => error.PrivateIndexRootRecoveryRequired,
+        else => err,
+    });
+}
+
 const NativeIndexResponse = struct {
     buffer: ?[]u8,
 
     fn init() !NativeIndexResponse {
-        return .{ .buffer = try std.heap.c_allocator.alloc(u8, 32 * 1024) };
+        return .{ .buffer = try std.heap.c_allocator.alloc(u8, @import("antfly_local_sources").storage_db_relational_index_owner_control.max_response_bytes) };
     }
 
     fn deinit(self: *NativeIndexResponse) void {

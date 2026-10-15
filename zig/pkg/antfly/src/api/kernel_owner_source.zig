@@ -3703,10 +3703,12 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer if (root_scope) |bytes| alloc.free(bytes);
         var response = try lease.owner().nativeIndexOwnerBuildScopedJson(table_name, encoded, root_scope orelse "", .{ .execution_deadline_ns = native_context.deadline_ns, .cancellation_ctx = &cancellation, .cancellation_fn = cancellationTokenRequested });
         defer response.deinit();
+        if (response.bytes().len > native_index_control.max_response_bytes) return error.InvalidPrivateIndexNativeReceipt;
         var result = try std.json.parseFromSlice(native_index_control.BuildResponse, alloc, response.bytes(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
         errdefer result.deinit();
         try result.value.validateFor(request);
         if (result.value == .audit and result.value.audit.audit.root_incarnation != audit_root_incarnation) return error.InvalidPrivateIndexNativeReceipt;
+        if (result.value == .validated and result.value.validated.physical.audit.root_incarnation != audit_root_incarnation) return error.InvalidPrivateIndexNativeReceipt;
         return .{ .root_generation = lease.entry.generation, .outcome = result };
     }
 

@@ -260,7 +260,7 @@ const Job = struct {
                     }
                     if (response.value != .building) return error.InvalidPrivateIndexNativeReceipt;
                     const pending = switch (response.value.building.outcome) {
-                        .inventory, .generation, .audit => return error.InvalidPrivateIndexNativeReceipt,
+                        .inventory, .generation, .audit, .validated => return error.InvalidPrivateIndexNativeReceipt,
                         .advanced => |value| value.replication_pending,
                         .complete => |value| blk: {
                             if (value.state == .failed) return error.PrivateIndexBuildFailed;
@@ -300,6 +300,7 @@ const Job = struct {
                     .inventory => |value| value.replication_pending,
                     .generation => |value| value.replication_pending,
                     .audit => false,
+                    .validated => |value| value.logical.replication_pending,
                     else => return error.InvalidPrivateIndexNativeReceipt,
                 };
                 if (pending) {
@@ -307,6 +308,16 @@ const Job = struct {
                     return;
                 }
                 switch (outcome) {
+                    .validated => {
+                        if (response.value.building.signed_audit == null or response.value.building.signed_receipt == null) {
+                            owner.retry_at_ns = now_ns +| retry_ns;
+                            return;
+                        }
+                        // Paired proofs complete only volatile physical work.
+                        // Atomic metadata acceptance/publication is separate.
+                        self.retireOwner(index);
+                        self.retry_at_ns = now_ns +| std.time.ns_per_s;
+                    },
                     .inventory => |value| if (value.record.fields.phase == .failed) {
                         return error.PrivateIndexTargetInventoryMismatch;
                     },

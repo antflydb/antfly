@@ -8352,6 +8352,18 @@ pub const DB = struct {
     /// Receiving workers must independently authorize the frozen expectation;
     /// this durable receipt alone cannot activate an index or authorize restore.
     pub fn sealNativeIndexOwnerValidation(self: *DB, request: NativeIndexOwnerBuildRequest, context: @import("../../api/operation.zig").RequestContext) !native_index_control.ValidationSealOutcome {
+        return self.sealNativeIndexOwnerValidationImpl(request, null, context);
+    }
+
+    /// Pin the exact canonical records observed by this physical audit before
+    /// staging any effect. The stage rechecks them inside the commit transaction.
+    pub fn sealNativeIndexOwnerValidationAudited(self: *DB, request: NativeIndexOwnerBuildRequest, audit: native_index_control.AuditOutcome, context: @import("../../api/operation.zig").RequestContext) !native_index_control.ValidationSealOutcome {
+        try audit.validateFor(request);
+        if (audit.audit.physical_root_incarnation != self.root_incarnation) return error.PrivateIndexAuditScopeChanged;
+        return self.sealNativeIndexOwnerValidationImpl(request, try audit.logicalCommand(), context);
+    }
+
+    fn sealNativeIndexOwnerValidationImpl(self: *DB, request: NativeIndexOwnerBuildRequest, audited: ?@import("relational_index_validation.zig").SealCommand, context: @import("../../api/operation.zig").RequestContext) !native_index_control.ValidationSealOutcome {
         try context.ensureActive();
         try request.validate();
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
@@ -8362,7 +8374,7 @@ pub const DB = struct {
         var budget = if (self.core.index_manager.resource_manager) |manager| resource_manager_mod.BudgetedAllocator.initReclaiming(manager, .relational_preparation_working_set, self.alloc, 1) else null;
         defer if (budget) |*value| value.deinit();
         const alloc = if (budget) |*value| value.allocator() else self.alloc;
-        var prepared: native_index_control.PreparedValidationSeal = .{ .alloc = alloc, .command = command: {
+        var prepared: native_index_control.PreparedValidationSeal = .{ .alloc = alloc, .command = audited orelse command: {
             var read = try self.core.store.beginReadTxn();
             defer read.abort();
             break :command @import("relational_index_validation.zig").SealCommand.prepare(alloc, &read, binding, expected) catch |err| {

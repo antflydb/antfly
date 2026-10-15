@@ -94,6 +94,7 @@ pub const Result = union(enum) {
         outcome: std.json.Parsed(native.BuildResponse),
         audit_signing: ?publication.NativeSigningView = null,
         signed_audit: ?publication.SignedAudit = null,
+        signed_receipt: ?publication.SignedReceipt = null,
         signing_failure: ?SigningFailure = null,
     },
     source: SourceResult,
@@ -144,8 +145,10 @@ pub const Result = union(enum) {
         if (self.* == .source) return self.source.needsSigning();
         if (self.* == .building) {
             const value = self.building;
-            if (value.audit_signing == null or value.signed_audit != null or value.signing_failure != null or value.outcome.value != .audit) return false;
-            _ = value.outcome.value.audit.readyDigest() catch return false;
+            if (value.audit_signing == null or value.signed_audit != null or value.signed_receipt != null or value.signing_failure != null) return false;
+            const audit = value.outcome.value.physicalAudit() orelse return false;
+            _ = audit.readyDigest() catch return false;
+            if (value.outcome.value == .validated and value.outcome.value.validated.logical.receipt == null) return false;
             return true;
         }
         const state = self.signingState() orelse return false;
@@ -160,8 +163,8 @@ pub const Result = union(enum) {
         if (self.* == .building) {
             const value = &self.building;
             const view = value.audit_signing orelse return error.NativeIndexSigningUnavailable;
-            if (value.outcome.value != .audit or value.root_generation == 0) return error.NativeIndexSigningUnavailable;
-            const audit = value.outcome.value.audit;
+            if (value.root_generation == 0) return error.NativeIndexSigningUnavailable;
+            const audit = value.outcome.value.physicalAudit() orelse return error.NativeIndexSigningUnavailable;
             try view.validate(audit.expected.metadata_incarnation);
             if (node_id != view.identity.node_id or store_id != view.identity.store_id or reporter_incarnation != view.reporter_incarnation or
                 audit.audit.root_incarnation != view.identity.root_incarnation) return error.IndexOwnerReceiptChanged;
@@ -169,7 +172,19 @@ pub const Result = union(enum) {
             const proof = try (publication.RootProof{ .identity = view.identity, .reporter_incarnation = reporter_incarnation, .authority = .{ .native = view.binding_digest }, .root_generation = value.root_generation, .signature = undefined }).sign(root, digest);
             const signed: publication.SignedAudit = .{ .outcome_digest = digest, .proof = proof };
             _ = try signed.verifiedDigest(audit);
+            const logical: ?publication.SignedReceipt = if (value.outcome.value == .validated) receipt: {
+                const sealed = value.outcome.value.validated.logical;
+                try sealed.validate();
+                if (!std.meta.eql(sealed.command, try audit.logicalCommand())) return error.InvalidPrivateIndexNativeReceipt;
+                const committed = sealed.receipt orelse return error.NativeIndexSigningUnavailable;
+                const receipt_proof = try (publication.RootProof{ .identity = view.identity, .reporter_incarnation = reporter_incarnation, .authority = .{ .native = view.binding_digest }, .root_generation = value.root_generation, .signature = undefined }).sign(root, try committed.digest());
+                const signed_receipt: publication.SignedReceipt = .{ .receipt = committed, .proof = receipt_proof };
+                try signed_receipt.verifySignature();
+                break :receipt signed_receipt;
+            } else null;
+            // Publish both decorations only after both signatures succeed.
             value.signed_audit = signed;
+            value.signed_receipt = logical;
             value.signing_failure = null;
             return;
         }
@@ -196,7 +211,7 @@ pub const Result = union(enum) {
 
     pub fn signingFailed(self: *Result, failure: SigningFailure) void {
         if (self.* == .building) {
-            if (self.building.signed_audit == null) self.building.signing_failure = failure;
+            if (self.building.signed_audit == null and self.building.signed_receipt == null) self.building.signing_failure = failure;
             return;
         }
         if (self.* == .source) {
@@ -215,7 +230,7 @@ pub const Result = union(enum) {
             .applied => |value| .{ .admitted = value.value },
             .controlled => |value| .{ .controlled = .{ .root_generation = value.root_generation, .outcome = value.outcome.value, .signed_ack = value.signing.ack, .signing_failure = value.signing.failure } },
             .recovered => |value| .{ .recovered = .{ .root_generation = value.root_generation, .outcome = value.outcome.value orelse return error.InvalidPrivateIndexNativeReceipt, .signed_ack = value.signing.ack, .signing_failure = value.signing.failure } },
-            .building => |value| .{ .building = .{ .root_generation = value.root_generation, .outcome = value.outcome.value, .signed_audit = value.signed_audit, .signing_failure = value.signing_failure } },
+            .building => |value| .{ .building = .{ .root_generation = value.root_generation, .outcome = value.outcome.value, .signed_audit = value.signed_audit, .signed_receipt = value.signed_receipt, .signing_failure = value.signing_failure } },
             .source => |*value| .{ .source = value.response() },
         };
     }
@@ -231,7 +246,7 @@ pub const ControlResponse = union(enum) {
     admitted: native.Outcome,
     controlled: RootedOutcome,
     recovered: RootedOutcome,
-    building: struct { root_generation: u64, outcome: native.BuildResponse, signed_audit: ?publication.SignedAudit = null, signing_failure: ?SigningFailure = null },
+    building: struct { root_generation: u64, outcome: native.BuildResponse, signed_audit: ?publication.SignedAudit = null, signed_receipt: ?publication.SignedReceipt = null, signing_failure: ?SigningFailure = null },
     source: SourceResponse,
 
     pub const RootedOutcome = struct {
@@ -254,6 +269,7 @@ pub const ControlResponse = union(enum) {
                     .inventory => |item| item.binding,
                     .generation => |item| item.binding,
                     .audit => |item| item.binding,
+                    .validated => |item| item.physical.binding,
                 };
                 if (binding.fence.namespace.table_id != request.table_id) return error.InvalidPrivateIndexNativeReceipt;
                 var build = try native.BuildRequest.init(.{ .id = request.id, .plan_digest = binding.plan_digest, .owner_digest = binding.owner_digest, .ordinal = binding.ordinal, .namespace = binding.fence.namespace, .owner_group_id = request.group_id }, binding, request.build_budget orelse .{});
@@ -262,14 +278,26 @@ pub const ControlResponse = union(enum) {
                         .inventory => |item| item.record.expected,
                         .generation => |item| item.record.expected,
                         .audit => |item| item.expected,
+                        .validated => |item| item.physical.expected,
                         else => return error.InvalidPrivateIndexNativeReceipt,
                     };
-                } else if (value.outcome == .inventory or value.outcome == .generation or value.outcome == .audit) return error.InvalidPrivateIndexNativeReceipt;
+                } else if (value.outcome == .inventory or value.outcome == .generation or value.outcome.physicalAudit() != null) return error.InvalidPrivateIndexNativeReceipt;
                 try value.outcome.validateFor(build);
-                if ((value.signed_audit != null or value.signing_failure != null) and value.outcome != .audit) return error.InvalidPrivateIndexNativeReceipt;
+                if ((value.signed_audit != null or value.signed_receipt != null or value.signing_failure != null) and value.outcome.physicalAudit() == null) return error.InvalidPrivateIndexNativeReceipt;
                 if (value.signed_audit) |signed| {
                     if (value.signing_failure != null or signed.proof.root_generation != value.root_generation) return error.InvalidPrivateIndexNativeReceipt;
-                    _ = try signed.verifiedDigest(value.outcome.audit);
+                    _ = try signed.verifiedDigest(value.outcome.physicalAudit().?);
+                }
+                if (value.outcome == .validated and (value.signed_audit != null) != (value.signed_receipt != null)) return error.InvalidPrivateIndexNativeReceipt;
+                if (value.signed_receipt) |signed| {
+                    if (value.signing_failure != null or value.outcome != .validated or value.signed_audit == null or
+                        !std.meta.eql(value.outcome.validated.logical.receipt orelse return error.InvalidPrivateIndexNativeReceipt, signed.receipt)) return error.InvalidPrivateIndexNativeReceipt;
+                    try signed.verifySignature();
+                    const physical_proof = value.signed_audit.?.proof;
+                    if (!std.meta.eql(signed.proof.identity, physical_proof.identity) or
+                        !std.meta.eql(signed.proof.authority, physical_proof.authority) or
+                        signed.proof.reporter_incarnation != physical_proof.reporter_incarnation or
+                        signed.proof.root_generation != physical_proof.root_generation) return error.InvalidPrivateIndexNativeReceipt;
                 }
                 return;
             },
@@ -1242,8 +1270,14 @@ const TestDriver = struct {
                     // Scheduling only: physical durability and signatures are
                     // separately exercised by the real LSM/root fixtures.
                     const fields: local.storage_db_relational_index_validation.Fields = .{ .phase = if (self.audit_pages == 1) .primary else .ready, .counts = @splat(@as(u64, if (self.audit_pages == 1) 0 else 1)), .chain = @splat(7), .cursor_digest = local.storage_db_relational_integrity_contract.hash("") };
-                    const audit_summary: local.storage_db_relational_index_audit_checkpoint.Summary = .{ .root_incarnation = audit_root_incarnation orelse 7, .physical_root_incarnation = 11, .expectation_digest = try expected.digest(), .inventory = .{ .phase = .ready, .rows = 1, .inventory_xor = expected.inventory_xor, .claim_rows = 1, .claim_xor = expected.inventory_xor, .claim_cursor = address.claimKey(), .chain = @splat(7), .cursor = jobs.private_claims.inventoryKey(address) }, .generation = fields, .generation_canonical_digest = @splat(8), .source_members = 1, .canonical_position = .{ .namespace = binding.fence.namespace, .sequence = 7 }, .checkpoint_digest = @splat(9) };
-                    return .{ .root_generation = self.root_generation, .outcome = try parsed(native.BuildResponse, alloc, .{ .audit = .{ .binding = binding, .expected = expected, .audit = audit_summary } }) };
+                    const audit_summary: local.storage_db_relational_index_audit_checkpoint.Summary = .{ .root_incarnation = audit_root_incarnation orelse 7, .physical_root_incarnation = 11, .expectation_digest = try expected.digest(), .inventory = .{ .phase = .ready, .rows = 1, .inventory_xor = expected.inventory_xor, .claim_rows = 1, .claim_xor = expected.inventory_xor, .claim_cursor = address.claimKey(), .chain = @splat(7), .cursor = jobs.private_claims.inventoryKey(address) }, .generation = fields, .inventory_canonical_digest = @splat(9), .generation_canonical_digest = @splat(8), .source_members = 1, .canonical_position = .{ .namespace = binding.fence.namespace, .sequence = 7 }, .checkpoint_digest = @splat(9) };
+                    const physical: native.AuditOutcome = .{ .binding = binding, .expected = expected, .audit = audit_summary };
+                    if (fields.phase == .ready) {
+                        const command = try physical.logicalCommand();
+                        const position: local.storage_db_receipt_position.Native = .{ .namespace = binding.fence.namespace, .sequence = 8 };
+                        return .{ .root_generation = self.root_generation, .outcome = try parsed(native.BuildResponse, alloc, .{ .validated = .{ .physical = physical, .logical = .{ .command = command, .position = position, .duplicate = self.audit_pages > 2, .receipt = try command.receipt(position) } } }) };
+                    }
+                    return .{ .root_generation = self.root_generation, .outcome = try parsed(native.BuildResponse, alloc, .{ .audit = physical }) };
                 }
                 self.generation_pages += 1;
                 const position: local.storage_db_receipt_position.Native = .{ .namespace = binding.fence.namespace, .sequence = 7 };
@@ -1447,19 +1481,39 @@ const TestDeliveryTransport = struct {
             try std.testing.expect(!result.needsSigning());
         }
         if (result == .building and result.needsSigning()) {
-            const before = try result.building.outcome.value.audit.readyDigest();
+            const before = try result.building.outcome.value.physicalAudit().?.readyDigest();
             try std.testing.expectError(error.IndexOwnerReceiptChanged, result.signNative(self.root, 2, 3, 5));
             result.signingFailed(.identity_unavailable);
             const preserved = try result.response();
             try preserved.validate(request);
-            try std.testing.expect(preserved.building.signed_audit == null and preserved.building.signing_failure == .identity_unavailable);
-            try std.testing.expectEqual(before, try preserved.building.outcome.audit.readyDigest());
+            try std.testing.expect(preserved.building.signed_audit == null and preserved.building.signed_receipt == null and preserved.building.signing_failure == .identity_unavailable);
+            try std.testing.expectEqual(before, try preserved.building.outcome.physicalAudit().?.readyDigest());
             result.building.signing_failure = null;
         }
         if (result.needsSigning()) try result.signNative(self.root, 2, 3, 4);
         if (result == .building and result.building.signed_audit != null) {
             self.signed_audits += 1;
-            _ = try result.building.signed_audit.?.verifiedDigest(result.building.outcome.value.audit);
+            _ = try result.building.signed_audit.?.verifiedDigest(result.building.outcome.value.physicalAudit().?);
+            if (result.building.outcome.value == .validated) {
+                try std.testing.expect(result.building.signed_receipt != null);
+                try result.building.signed_receipt.?.verifySignature();
+                const response = try result.response();
+                try response.validate(request);
+                var mismatched = response;
+                const logical = &mismatched.building.signed_receipt.?;
+                logical.proof.root_generation += 1;
+                logical.proof = try logical.proof.sign(self.root, try logical.receipt.digest());
+                try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, mismatched.validate(request));
+                var pending_value = result.building.outcome.value;
+                pending_value.validated.logical.replication_pending = true;
+                pending_value.validated.logical.error_name = "ReplicationOutboxPending";
+                pending_value.validated.logical.receipt = null;
+                var pending: Result = .{ .building = .{ .root_generation = result.building.root_generation, .outcome = try TestDriver.parsed(native.BuildResponse, alloc, pending_value), .audit_signing = result.building.audit_signing } };
+                defer pending.deinit();
+                try std.testing.expect(!pending.needsSigning());
+                try std.testing.expectError(error.NativeIndexSigningUnavailable, pending.signNative(self.root, 2, 3, 4));
+                try (try pending.response()).validate(request);
+            }
         }
         return result;
     }
@@ -2088,9 +2142,9 @@ test "relational index publication claim receiver binds fresh build permission w
         try testDeliveryProducerLocal(alloc, permission, binding.?, root);
         try std.testing.checkAllAllocationFailures(alloc, testDeliveryProducerLocal, .{ permission, binding.?, root });
         try testSchedulerDelivery(alloc, permission, binding.?, root);
-        try std.testing.checkAllAllocationFailures(alloc, testSchedulerDelivery, .{ permission, binding.?, root });
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, testSchedulerDelivery, .{ permission, binding.?, root });
         try testSchedulerDeliveryBeforeCommit(alloc, permission, binding.?, root);
-        try std.testing.checkAllAllocationFailures(alloc, testSchedulerDeliveryBeforeCommit, .{ permission, binding.?, root });
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, testSchedulerDeliveryBeforeCommit, .{ permission, binding.?, root });
         {
             var cohort = try jobs.private_claims.delivery.Cohort.init(alloc, &.{.{ .owner = permission.owner.owner, .start = "", .end = "" }});
             defer cohort.deinit();

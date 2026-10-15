@@ -97,9 +97,11 @@ const std = @import("std");
 /// replies. This still grants no authenticated publication/install capability.
 /// Version 47 decodes authenticated complete-audit witnesses. These are not
 /// logical validation ACKs and do not enable installation or publication.
-pub const current_version: u16 = 47;
-pub const index_publication_head_version: u16 = 47;
-pub const index_delivery_version: u16 = 47;
+/// Version 48 decodes paired durable validation cuts and physical witnesses.
+/// It does not advertise the complete native install/release protocol.
+pub const current_version: u16 = 48;
+pub const index_publication_head_version: u16 = 48;
+pub const index_delivery_version: u16 = 48;
 pub const schema_reader_publication_version: u16 = 39;
 pub const schema_reader_floor_version: u16 = 38;
 pub const schema_reader_capability_version: u16 = 37;

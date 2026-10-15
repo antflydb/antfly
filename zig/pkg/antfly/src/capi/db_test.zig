@@ -1565,6 +1565,8 @@ test "storage owner native index raw admission and bounded controls preserve loc
         validate_request.manifest = .fromSlice(root_json);
         var canonical_ready = false;
         var audited = false;
+        var logical_receipt: ?local.storage_db_relational_index_publication_progress.Receipt = null;
+        var physical_digest: ?[32]u8 = null;
         for (0..32) |_| {
             try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &validate_request, &validated));
             const buffer = validated;
@@ -1602,19 +1604,43 @@ test "storage owner native index raw admission and bounded controls preserve loc
                     try std.testing.expectEqual(build_position.sequence, (try local.storage_source_authority.load(&read)).?.sequence);
                     if (value.audit.generation) |fields| {
                         try std.testing.expect(fields.phase != .failed);
-                        if (fields.phase == .ready) {
-                            try std.testing.expectEqual(@as(u64, 1), value.audit.inventory.rows);
-                            try std.testing.expectEqual(@as(?u64, 0), value.audit.source_members);
-                            try std.testing.expectEqualDeep(@as([3]u64, @splat(0)), fields.counts);
-                            audited = true;
-                            break;
-                        }
+                        try std.testing.expect(fields.phase != .ready);
                     }
+                },
+                .validated => |value| {
+                    try std.testing.expect(canonical_ready);
+                    try std.testing.expectEqual(handle.db.root_incarnation, value.physical.audit.physical_root_incarnation);
+                    try std.testing.expectEqual(@as(u64, 1), value.physical.audit.inventory.rows);
+                    try std.testing.expectEqual(@as(?u64, 0), value.physical.audit.source_members);
+                    try std.testing.expectEqualDeep(@as([3]u64, @splat(0)), value.physical.audit.generation.?.counts);
+                    try std.testing.expect(!value.logical.duplicate);
+                    try std.testing.expect(value.logical.receipt != null);
+                    try std.testing.expect(value.logical.position.sequence > build_position.sequence);
+                    logical_receipt = value.logical.receipt;
+                    physical_digest = try value.physical.readyDigest();
+                    build_position = value.logical.position;
+                    var changed = value.physical;
+                    changed.audit.inventory_canonical_digest[0] ^= 1;
+                    try std.testing.expectError(error.InvalidRelationalIndexValidation, handle.db.sealNativeIndexOwnerValidationAudited(validation, changed, .{}));
+                    changed = value.physical;
+                    changed.audit.physical_root_incarnation ^= 1;
+                    try std.testing.expectError(error.PrivateIndexAuditScopeChanged, handle.db.sealNativeIndexOwnerValidationAudited(validation, changed, .{}));
+                    audited = true;
+                    break;
                 },
                 else => return error.TestUnexpectedResult,
             }
         }
         try std.testing.expect(audited);
+        {
+            try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &validate_request, &validated));
+            defer freeRawBuffer(validated.ptr, validated.len);
+            var duplicate = try std.json.parseFromSlice(native.BuildResponse, a, validated.slice(), .{});
+            defer duplicate.deinit();
+            try duplicate.value.validateFor(validation);
+            try std.testing.expect(duplicate.value == .validated and duplicate.value.validated.logical.duplicate);
+            try std.testing.expectEqualDeep(logical_receipt.?, duplicate.value.validated.logical.receipt.?);
+        }
         {
             // Privileged physical-incarnation replacement, not a snapshot
             // import test. Keep the primary/canonical bytes and parent key,
@@ -1646,9 +1672,31 @@ test "storage owner native index raw admission and bounded controls preserve loc
             try std.testing.expectEqual(.scanning, fresh.value.audit.audit.inventory.phase);
             try std.testing.expectEqual(@as(u64, 0), fresh.value.audit.audit.inventory.rows);
             try std.testing.expect(fresh.value.audit.audit.generation == null);
-            var read = try handle.db.core.store.beginReadTxn();
-            defer read.abort();
-            try std.testing.expectEqual(build_position.sequence, (try local.storage_source_authority.load(&read)).?.sequence);
+            {
+                var read = try handle.db.core.store.beginReadTxn();
+                defer read.abort();
+                try std.testing.expectEqual(build_position.sequence, (try local.storage_source_authority.load(&read)).?.sequence);
+            }
+            var renewed = false;
+            for (0..32) |_| {
+                var output: kernel_owner_abi.OwnedBytes = .{};
+                try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &validate_request, &output));
+                defer freeRawBuffer(output.ptr, output.len);
+                var result = try std.json.parseFromSlice(native.BuildResponse, a, output.slice(), .{});
+                defer result.deinit();
+                try result.value.validateFor(validation);
+                if (result.value == .validated) {
+                    const value = result.value.validated;
+                    try std.testing.expect(value.logical.duplicate);
+                    try std.testing.expectEqualDeep(logical_receipt.?, value.logical.receipt.?);
+                    try std.testing.expectEqual(next.incarnation, value.physical.audit.physical_root_incarnation);
+                    try std.testing.expect(!std.mem.eql(u8, &physical_digest.?, &try value.physical.readyDigest()));
+                    renewed = true;
+                    break;
+                }
+                try std.testing.expect(result.value == .audit);
+            }
+            try std.testing.expect(renewed);
         }
     }
     request.operation = .cancel_intent;

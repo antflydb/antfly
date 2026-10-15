@@ -976,7 +976,7 @@ test "relational index build pages identity dispatch caches immutable candidates
         const result = try db.stepNativeIndexOwnerBuild("items", request, .{});
         try result.validateFor(request);
         switch (result) {
-            .inventory, .generation, .audit => return error.UnexpectedInventoryValidation,
+            .inventory, .generation, .audit, .validated => return error.UnexpectedInventoryValidation,
             .advanced => |value| {
                 pages += 1;
                 try std.testing.expect(pages <= 9);

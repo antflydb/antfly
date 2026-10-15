@@ -34,6 +34,7 @@ const resources = @import("../resource_manager.zig");
 const RequestContext = @import("../../api/operation.zig").RequestContext;
 const Waiters = @import("../admission_waiter.zig").Fifo(void);
 pub const envelope_version = 28;
+pub const max_response_bytes = 32 * 1024;
 pub const max_cancellation_wire_bytes = 32 * 1024;
 pub const max_encoded_inputs = std.base64.standard.Encoder.calcSize(inputs.max_bytes);
 pub const max_claim_wire_bytes = 6 * private_claims.max_bytes + 128 * 1024;
@@ -729,9 +730,19 @@ pub const BuildResponse = union(enum) {
     inventory: InventoryOutcome,
     generation: GenerationOutcome,
     audit: AuditOutcome,
+    validated: ValidatedOutcome,
+
+    pub fn physicalAudit(self: @This()) ?AuditOutcome {
+        return switch (self) {
+            .audit => |value| value,
+            .validated => |value| value.physical,
+            else => null,
+        };
+    }
 
     pub fn validateFor(self: BuildResponse, request: BuildRequest) !void {
         switch (self) {
+            .validated => |value| try value.validateFor(request),
             .audit => |value| try value.validateFor(request),
             .inventory => |value| try value.validateFor(request),
             .generation => |value| try value.validateFor(request),
@@ -779,6 +790,10 @@ pub const AuditOutcome = struct {
     binding: jobs.Binding,
     expected: private_claims.TargetExpectation,
     audit: @import("relational_index_audit_checkpoint.zig").Summary,
+    pub fn logicalCommand(self: @This()) !validation.SealCommand {
+        _ = try self.readyDigest();
+        return .{ .binding = self.binding, .expected = self.expected, .generation_digest = self.audit.generation_canonical_digest.?, .inventory_digest = self.audit.inventory_canonical_digest, .source_members = self.audit.source_members.?, .generation_position = self.audit.canonical_position.? };
+    }
     pub fn validateFor(self: @This(), request: BuildRequest) !void {
         try request.requireBinding(self.binding);
         if (!std.mem.eql(u8, &try self.expected.digest(), &try (request.target_expectation orelse return error.InvalidPrivateIndexNativeReceipt).digest())) return error.InvalidPrivateIndexNativeReceipt;
@@ -796,11 +811,25 @@ pub const AuditOutcome = struct {
         var writer: std.Io.Writer = .fixed(&buffer);
         std.json.Stringify.value(self, .{}, &writer) catch return error.InvalidPrivateIndexNativeReceipt;
         var digest = std.crypto.hash.Blake3.init(.{});
-        digest.update("antfly/private-index-complete-physical-audit/v1");
+        digest.update("antfly/private-index-complete-physical-audit/v2");
         digest.update(buffer[0..writer.end]);
         var result: integrity.Digest = undefined;
         digest.final(&result);
         return result;
+    }
+};
+
+/// The stable logical cut and replaceable physical witness travel together,
+/// but are authenticated in distinct domains. Neither is a metadata ACK.
+pub const ValidatedOutcome = struct {
+    physical: AuditOutcome,
+    logical: ValidationSealOutcome,
+
+    pub fn validateFor(self: @This(), request: BuildRequest) !void {
+        try self.physical.validateFor(request);
+        _ = try self.physical.readyDigest();
+        try self.logical.validate();
+        if (!std.meta.eql(self.logical.command, try self.physical.logicalCommand())) return error.InvalidPrivateIndexNativeReceipt;
     }
 };
 
@@ -950,6 +979,14 @@ pub const ValidationSealOutcome = struct {
     replication_pending: bool = false,
     error_name: ?[]const u8 = null,
     receipt: ?@import("relational_index_publication_progress.zig").Receipt = null,
+
+    pub fn validate(self: @This()) !void {
+        const expected = try self.command.receipt(self.position);
+        if (self.replication_pending and self.error_name == null) return error.InvalidPrivateIndexNativeReceipt;
+        if (self.receipt) |value| {
+            if (self.replication_pending or self.error_name != null or !std.meta.eql(value, expected)) return error.InvalidPrivateIndexNativeReceipt;
+        } else if (!self.replication_pending and self.error_name == null) return error.InvalidPrivateIndexNativeReceipt;
+    }
 };
 
 pub const PreparedValidationSeal = struct {

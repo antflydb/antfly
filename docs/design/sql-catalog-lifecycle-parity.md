@@ -7412,3 +7412,58 @@ Boundary, license, inventory, generated control-catalog, formatting and diff
 checks passed. These are macOS Debug results, not original SQL case credit.
 Seal-specific outbox-failure, staged-restore and distributed failover injection
 remain unqualified; the private seal does not enable a public producer.
+
+### Paired native validation production and captured-root signing
+
+The existing private native validation route now returns a paired result after
+its root-local inventory and generation audits complete. The physical summary
+includes the canonical inventory digest, allowing a complete logical seal
+command to be reconstructed without decoding row data. Before committing,
+the DB checks the actual physical incarnation and rechecks the audit's exact
+canonical commitments inside the native transaction. Partial audits remain
+receipt-free; completed seals retain their original cut on duplicate requests.
+
+The leased provider bounds response bytes before parsing and retains the actual
+applying generation. Host signing produces a logical receipt signature and a
+separate physical-audit signature with that same root context. Both decorations
+are installed only after both succeed. Responses reject mixed root identities,
+writer bindings, reporter incarnations or generations. Replication-pending or
+post-commit recovery outcomes retain the cut without a signing/publication
+certificate. The worker understands paired progress but retires only volatile
+physical work; the metadata head remains building until atomic acceptance is
+implemented.
+
+Private ABI 86 and coordinated decoder floor 48 cover paired replies and the
+complete inventory commitment in the physical witness. Its digest domain is
+`antfly/private-index-complete-physical-audit/v2`; the durable logical seal and
+canonical envelope 28 are unchanged. AFRIA v2 already retained the canonical
+inventory digest, so its checkpoint encoding is unchanged. Decoder floor 48
+still does not advertise complete native install/release activation.
+
+Still unfinished are atomic accepting ACK integration and retained validation
+evidence, latest-stage re-attestation, the full native capability barrier,
+restore/adoption enforcement, install/release, durable terminal failure,
+missing-root repair, actual data-Raft execution, terminal catalog publication
+and complete distributed faults. Public UNIQUE activation remains guarded.
+Original dispositions remain 483 implemented / 862 unresolved; paired private
+production/signing does not qualify an original SQL case by itself.
+
+Qualification: `/private/tmp/antfly-validation-pair-full-debug-v2.log` passed
+159/159 Debug steps, including six C-ABI, ten native-page, 48 publication,
+four ACK, three leased-owner, 46 runtime-contract and 104 standalone tests.
+The real C-ABI fixture retains different source/target cardinalities (zero
+local source members, one target claim), rejects changed canonical/physical
+audit scopes before sealing, recovers duplicate receipts, and forces a fresh
+audit after replacing the closed DB's physical identity. The renewed witness
+changes while the logical receipt and cut remain identical. This qualifies a
+fenced unpublished generation and privileged physical-identity replacement,
+not staged restore or published-table adoption.
+
+Signing fixtures reject a validly re-signed logical proof paired with another
+generation's physical proof, retain completed progress on signing failure and
+refuse to sign replication-pending receipts. Scheduler OOM enumeration uses the
+existing stable backing-allocator wrapper to eliminate remap-dependent counts;
+all failpoints and leak assertions remain exercised. Boundary, license,
+inventory, generated control-catalog, formatting and diff checks passed.
+These are macOS Debug results; no additional original SQL or distributed
+failover/restore qualification is claimed.

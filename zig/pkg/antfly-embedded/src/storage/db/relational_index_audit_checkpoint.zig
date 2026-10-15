@@ -57,6 +57,7 @@ pub const Summary = struct {
     root_incarnation: u128,
     physical_root_incarnation: u128,
     expectation_digest: Digest,
+    inventory_canonical_digest: Digest,
     inventory: claims.InventoryValidation.Fields,
     generation: ?generation.Fields,
     generation_canonical_digest: ?Digest,
@@ -66,7 +67,7 @@ pub const Summary = struct {
     pub fn validateFor(self: @This(), expected: claims.TargetExpectation, root_incarnation: u128) !void {
         try expected.validate();
         try self.inventory.validate(expected);
-        if (root_incarnation == 0 or self.root_incarnation != root_incarnation or self.physical_root_incarnation == 0 or !equal(self.expectation_digest, try expected.digest()) or !nonzero(self.checkpoint_digest)) return error.InvalidRelationalIndexValidation;
+        if (root_incarnation == 0 or self.root_incarnation != root_incarnation or self.physical_root_incarnation == 0 or !equal(self.expectation_digest, try expected.digest()) or !nonzero(self.inventory_canonical_digest) or !nonzero(self.checkpoint_digest)) return error.InvalidRelationalIndexValidation;
         if (self.generation) |fields| {
             if (self.inventory.phase != .ready or !nonzero(self.generation_canonical_digest orelse return error.InvalidRelationalIndexValidation)) return error.InvalidRelationalIndexValidation;
             try fields.validate(self.source_members orelse return error.InvalidRelationalIndexValidation);
@@ -233,7 +234,7 @@ pub const Guard = struct {
     }
     pub fn summary(self: *const @This(), state: State) !Summary {
         try state.validate(self.root, self.physical_incarnation, self.binding, self.expected);
-        return .{ .root_incarnation = self.root.root_incarnation, .physical_root_incarnation = self.physical_incarnation, .expectation_digest = state.inventory.expectation_digest, .inventory = state.inventory.fields, .generation = if (state.generation) |value| value.progress.summary.fields else null, .generation_canonical_digest = if (state.generation) |value| value.canonical_digest else null, .source_members = if (state.generation) |value| value.progress.summary.source_members else null, .canonical_position = if (state.generation) |value| value.progress.summary.position else null, .checkpoint_digest = self.checkpoint_digest orelse return error.PrivateIndexTargetValidationRequired };
+        return .{ .root_incarnation = self.root.root_incarnation, .physical_root_incarnation = self.physical_incarnation, .expectation_digest = state.inventory.expectation_digest, .inventory = state.inventory.fields, .generation = if (state.generation) |value| value.progress.summary.fields else null, .inventory_canonical_digest = state.inventory.canonical_digest, .generation_canonical_digest = if (state.generation) |value| value.canonical_digest else null, .source_members = if (state.generation) |value| value.progress.summary.source_members else null, .canonical_position = if (state.generation) |value| value.progress.summary.position else null, .checkpoint_digest = self.checkpoint_digest orelse return error.PrivateIndexTargetValidationRequired };
     }
 };
 
