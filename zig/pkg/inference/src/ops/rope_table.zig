@@ -51,6 +51,59 @@ pub fn apply(out: []f32, x: []const f32, cos: []const f32, sin: []const f32, wid
     };
 }
 
+/// `fused_qkv_rope_table`: forward takes `x` = [rows, 3*width] (Q | K | V per
+/// row) to planar [3, rows, width], rotating Q and K by the tables and copying
+/// V. Inverse takes planar [3, rows, width] back to [rows, 3*width] with the
+/// inverse rotation, which is the forward's VJP.
+pub fn applyQkv(out: []f32, x: []const f32, cos: []const f32, sin: []const f32, width: usize, head_dim: usize, inverse: bool) !void {
+    if (x.len % (3 * width) != 0 or out.len != x.len) return error.InvalidRopeTable;
+    const rows = try validate(x.len / 3, cos.len, width, head_dim);
+    if (sin.len != cos.len) return error.InvalidRopeTable;
+    const half = head_dim / 2;
+    const heads = width / head_dim;
+    for (0..3) |part| for (0..rows) |row| for (0..heads) |head| {
+        // Packed [rows, 3*width] and planar [3, rows, width] offsets of the
+        // same (part, row, head) block.
+        const packed_base = row * 3 * width + part * width + head * head_dim;
+        const planar_base = (part * rows + row) * width + head * head_dim;
+        const src = if (inverse) planar_base else packed_base;
+        const dst = if (inverse) packed_base else planar_base;
+        if (part == 2) {
+            @memcpy(out[dst..][0..head_dim], x[src..][0..head_dim]);
+            continue;
+        }
+        const table = (row * heads + head) * half;
+        for (0..half) |i| {
+            const lo = x[src + i];
+            const hi = x[src + half + i];
+            const c = cos[table + i];
+            const s = sin[table + i];
+            if (inverse) {
+                out[dst + i] = lo * c + hi * s;
+                out[dst + half + i] = hi * c - lo * s;
+            } else {
+                out[dst + i] = lo * c - hi * s;
+                out[dst + half + i] = lo * s + hi * c;
+            }
+        }
+    };
+}
+
+test "qkv rope table inverse restores the packed rows" {
+    // Two rows, one head of dimension 4: x is [2, 12], tables [2, 2].
+    var x: [24]f32 = undefined;
+    for (&x, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i)) * 0.25 - 2;
+    const cos = [_]f32{ 0.6, 1, -0.8, 0.28 };
+    const sin = [_]f32{ 0.8, 0, 0.6, 0.96 };
+    var planar: [24]f32 = undefined;
+    var restored: [24]f32 = undefined;
+    try applyQkv(&planar, &x, &cos, &sin, 4, 4, false);
+    try applyQkv(&restored, &planar, &cos, &sin, 4, 4, true);
+    for (x, restored) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-6);
+    // V of row 1 is copied unrotated into the third plane.
+    try std.testing.expectEqualSlices(f32, x[12 + 8 .. 12 + 12], planar[2 * 8 + 4 .. 2 * 8 + 8]);
+}
+
 test "rope table inverse undoes the forward rotation" {
     const x = [_]f32{ 1, 2, 3, 4, -1, 0.5, 2, -3 };
     // One row of two heads of dimension 4: tables are [2, 2].

@@ -1123,6 +1123,19 @@ fn applyVjp(
             try accumulate(b, adjoints, ins[0], grad);
         },
 
+        .fused_qkv_rope_table => |attrs| {
+            var inverse = attrs;
+            inverse.inverse = !attrs.inverse;
+            const grad = try b.graph.addNode(.{
+                .op = .{ .fused_qkv_rope_table = inverse },
+                .output_shape = g.node(ins[0]).output_shape,
+                .inputs = .{ adj, ins[1], ins[2], null_node },
+                .num_inputs = 3,
+                .vjp_alternate = null_node,
+            });
+            try accumulate(b, adjoints, ins[0], grad);
+        },
+
         .fused_geglu => |attrs| {
             const grad = try b.graph.addNode(.{
                 .op = .{ .fused_geglu_backward = attrs },

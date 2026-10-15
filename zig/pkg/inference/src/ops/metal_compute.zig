@@ -15695,6 +15695,34 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return try self.ctFromOwnedMetalTensor(output);
     }
 
+    fn qkvRopeTableOp(ctx: *anyopaque, input: CT, cos: CT, sin: CT, width: usize, head_dim: usize, inverse: bool) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const count = bufElemCount(toBuf(input));
+        if (width == 0 or count % (3 * width) != 0 or width > std.math.maxInt(u32)) return error.InvalidTensorShape;
+        const rows = count / (3 * width);
+        if (rows > std.math.maxInt(u32)) return error.InvalidTensorShape;
+        const forward_shape = [_]i32{ @intCast(3 * rows), @intCast(width) };
+        const inverse_shape = [_]i32{ @intCast(rows), @intCast(3 * width) };
+        const shape: []const i32 = if (inverse) &inverse_shape else &forward_shape;
+        var request = ops.gliner_boundary_device.Kernel{ .kind = .qkv_rope_table };
+        request.dims[0] = @intCast(rows);
+        request.dims[1] = @intCast(width);
+        request.dims[2] = @intCast(head_dim);
+        request.dims[3] = @intFromBool(inverse);
+        if (try self.boundaryKernelDevice(request, &.{ input, cos, sin }, shape)) |tensor| return tensor;
+        warnHostFallbackOnce(5, "qkv rope table");
+        const x = try toFloat32Op(ctx, input, self.allocator);
+        defer self.allocator.free(x);
+        const c = try toFloat32Op(ctx, cos, self.allocator);
+        defer self.allocator.free(c);
+        const s = try toFloat32Op(ctx, sin, self.allocator);
+        defer self.allocator.free(s);
+        const output = try self.allocator.alloc(f32, x.len);
+        errdefer self.allocator.free(output);
+        try ops.rope_table.applyQkv(output, x, c, s, width, head_dim, inverse);
+        return denseBuf(self.allocator, output, true, shape);
+    }
+
     fn gegluOp(ctx: *anyopaque, input: CT, width: usize) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const count = bufElemCount(toBuf(input));
@@ -32788,6 +32816,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.layerNormConsumeInput = null;
         vt.layerNormBackward = layerNormBackwardOp;
         vt.ropeTable = ropeTableOp;
+        vt.qkvRopeTable = qkvRopeTableOp;
         vt.geglu = gegluOp;
         vt.gegluBackward = gegluBackwardOp;
         vt.addLayerNorm = addLayerNormOp;

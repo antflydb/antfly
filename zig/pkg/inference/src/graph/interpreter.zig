@@ -2634,6 +2634,12 @@ pub fn executeNode(
             return cb.ropeTable(V.get(ins[0]), V.get(ins[1]), V.get(ins[2]), width, attrs.head_dim, attrs.inverse);
         },
 
+        .fused_qkv_rope_table => |attrs| {
+            const shape = graph.node(node_id).output_shape;
+            // Forward outputs planar [3*rows, width]; inverse [rows, 3*width].
+            const width: usize = @intCast(if (attrs.inverse) @divExact(shape.dim(1), 3) else shape.dim(1));
+            return cb.qkvRopeTable(V.get(ins[0]), V.get(ins[1]), V.get(ins[2]), width, attrs.head_dim, attrs.inverse);
+        },
         .fused_geglu => |attrs| return cb.geglu(V.get(ins[0]), attrs.width),
         .fused_geglu_backward => |attrs| return cb.gegluBackward(V.get(ins[0]), V.get(ins[1]), attrs.width),
 
