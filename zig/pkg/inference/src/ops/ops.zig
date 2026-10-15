@@ -2226,6 +2226,8 @@ pub const ComputeBackend = struct {
         layerNormBackward: ?*const fn (ctx: *anyopaque, input: CT, gamma: CT, beta: CT, dy: CT, dim: usize, eps: f32) anyerror!CT = null,
         /// `fused_rope_table`: x [rows, width] rotated by [rows*heads, head_dim/2] tables.
         ropeTable: ?*const fn (ctx: *anyopaque, input: CT, cos: CT, sin: CT, width: usize, head_dim: usize, inverse: bool) anyerror!CT = null,
+        /// `fused_qkv_rope_table`: `width` is one part's width (hidden size).
+        qkvRopeTable: ?*const fn (ctx: *anyopaque, input: CT, cos: CT, sin: CT, width: usize, head_dim: usize, inverse: bool) anyerror!CT = null,
         /// `fused_geglu` [rows, 2*width] -> [rows, width] and its backward.
         geglu: ?*const fn (ctx: *anyopaque, input: CT, width: usize) anyerror!CT = null,
         gegluBackward: ?*const fn (ctx: *anyopaque, input: CT, dout: CT, width: usize) anyerror!CT = null,
@@ -3867,6 +3869,11 @@ pub const ComputeBackend = struct {
 
     pub fn ropeTable(self: *const ComputeBackend, input: CT, cos: CT, sin: CT, width: usize, head_dim: usize, inverse: bool) !CT {
         const op = self.vtable.ropeTable orelse return error.UnsupportedPrimitiveOp;
+        return op(self.ptr, input, cos, sin, width, head_dim, inverse);
+    }
+
+    pub fn qkvRopeTable(self: *const ComputeBackend, input: CT, cos: CT, sin: CT, width: usize, head_dim: usize, inverse: bool) !CT {
+        const op = self.vtable.qkvRopeTable orelse return error.UnsupportedPrimitiveOp;
         return op(self.ptr, input, cos, sin, width, head_dim, inverse);
     }
 

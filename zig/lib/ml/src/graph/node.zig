@@ -863,6 +863,9 @@ pub const OpCode = union(enum) {
     fused_relative_position_bias: RelativePositionBiasAttrs,
     fused_rope: RopeAttrs,
     fused_rope_table: RopeTableAttrs,
+    /// [rows, 3*width] (Q | K | V) -> planar [3*rows, width] with Q and K
+    /// rotated by tables as `fused_rope_table`; `inverse` maps back.
+    fused_qkv_rope_table: RopeTableAttrs,
     fused_geglu: GegluAttrs,
     fused_geglu_backward: GegluAttrs,
     fused_conv1d: Conv1dAttrs,

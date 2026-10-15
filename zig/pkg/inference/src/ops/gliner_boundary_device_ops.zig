@@ -351,6 +351,9 @@ pub const Kind = enum(u32) {
     rope_table = 52,
     /// `fused_geglu_backward` (ops/geglu.zig): rows, width.
     geglu_backward = 53,
+    /// `fused_qkv_rope_table` (ops/rope_table.zig applyQkv): rows, width,
+    /// head_dim, inverse.
+    qkv_rope_table = 54,
 };
 
 pub const Params = extern struct {
@@ -412,6 +415,13 @@ pub fn layoutFor(kind: Kind, d: [8]u32, scalars: [4]f32) !Layout {
             r.input_elements[0] = r.output_elements;
             r.input_elements[1] = d[0];
             r.integer_inputs = 1 << 1;
+        },
+        .qkv_rope_table => { // rows, width, head_dim, inverse
+            if (d[2] == 0 or d[2] % 2 != 0 or d[1] == 0 or d[1] % d[2] != 0 or d[3] > 1) return error.InvalidBoundaryDeviceShape;
+            r.output_elements = try shape(&.{ d[0], d[1], 3 });
+            r.input_elements[0] = r.output_elements;
+            r.input_elements[1] = try shape(&.{ d[0], d[1] / 2 });
+            r.input_elements[2] = r.input_elements[1];
         },
         .geglu_backward => { // rows, width: x [rows, 2*width], dout [rows, width]
             r.output_elements = try shape(&.{ d[0], d[1], 2 });
