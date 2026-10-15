@@ -6735,3 +6735,67 @@ Boundary, license, inventory, control-catalog, formatting and diff checks passed
 GC was preview-only and deleted nothing. Original SQL dispositions remain
 483 implemented / 862 unresolved. No throughput improvement, full SQL release
 qualification or push is claimed.
+
+### Time-sliced source delivery producer and mounted transport
+
+The source producer now advances one remote operation per scheduling turn:
+read durable acceptance, recover signed consumption of that exact prefix, read
+and decode one signed source batch, deliver each deterministic target partition,
+obtain source-root-signed complete coverage, accept it durably, then consume.
+The scheduling owner must pin the immutable cohort, provide a bounded allocator
+and end-to-end deadline, and link leadership cancellation. No catalog/apply lock
+may span a turn's RPC. Uncaught errors seal the local attempt; replacement starts
+from durable status rather than a remembered target cursor or success boolean.
+
+Target mirror debt and absent signatures cannot advance the partition cursor.
+Decoded row buffers, the prepared plan and target response storage are released
+after the owned compact closure is captured, before metadata proposal. A lost
+acceptance reply enters read-only resolution. If acceptance committed, native
+consumption follows only that exact durable decision; if it did not, only the
+same logical closure may be retried. Discarding every volatile buffer after an
+unknown reply remains safe. Initial status can recover an already accepted batch
+without resending target claims or another acceptance mutation. A failed source
+build fails the attempt instead of masquerading as unavailable signing. Completed
+results remain readable after cancellation without another remote operation.
+
+The HTTP adapter uses a validated, bounded owner directory with binary lookup and
+the existing body-bound private routes/grants. One shared deadline/cancellation
+budget covers metadata and owner requests. Source acceptance/status responses
+are capped at 16 KiB at transport admission as well as before decoding. Controlled
+metadata forwarding preserves not-sent versus unknown-delivery classification.
+Actual client instantiation exposed and fixed two latent transport issues: source
+status incorrectly treated the owned `CatalogRead` envelope as raw bytes, and the
+runtime-dependent owner reply limit lacked an explicit `usize` type. Source status
+now releases the owned envelope and verifies its metadata incarnation.
+
+Nonempty synthetic component fixtures cover target debt, uncertain acceptance,
+read-only resolution, signed consumption, failure/cancellation, no-op completed
+retries and exhaustive allocation failures. The real leased compiled-owner fixture
+loses a committed *synthetic metadata* acceptance reply, verifies the actual source
+body remains, destroys local producer state, then resumes to actual native
+consumption and a signed drained prefix without another acceptance. Its bounded
+point-catalog capability is explicit; the production deadline guard against an
+unbounded admin fallback was not weakened. Mounted HTTP qualification exercises
+typed status ownership, request/grant transport and owner dispatch; it does not
+claim a live multi-service cluster or original PostgreSQL SQL parity.
+
+The focused qualification in `/private/tmp/antfly-delivery-producer-debug-v5.log`
+passed 106/106 Debug steps, including 43 publication, four service/ACK, three
+leased-owner and 46 runtime-contract tests plus the decoder barrier, with no
+failures or leaks. Broader qualification is recorded separately below.
+
+Still required: leader-fenced work discovery, bounded fair scheduling/pooling and
+automatic service wiring, bounded parallel target fanout, EOF/inventory seals,
+provenance-backed missing-root repair, actual data-Raft execution, terminal
+schema/catalog activation and complete distributed faults. The session and mounted
+transport do not activate themselves. Public UNIQUE activation remains guarded;
+original SQL dispositions remain 483 implemented / 862 unresolved.
+
+Broader qualification in `/private/tmp/antfly-delivery-producer-full-debug.log`
+passed 129/129 Debug steps: 43 publication, four service/ACK, eight native page,
+six C-ABI, three leased-owner, 14 candidate-prerequisite and 46 runtime-contract
+tests plus the decoder barrier. Counts overlap; no failures or leaks were
+reported. Boundary, license, inventory, control-catalog, formatting and diff
+checks passed. GC was preview-only and deleted nothing. This milestone is not
+original SQL qualification, a throughput benchmark, automatic activation or a
+push.

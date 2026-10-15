@@ -28,6 +28,12 @@ const source_delivery = @import("../metadata/relational_index_source_delivery.zi
 const delivery_journal = @import("../metadata/relational_index_delivery_journal.zig");
 const operation = local.api_operation;
 
+pub const DeliveryProducer = @import("relational_index_delivery_producer.zig").Producer;
+
+test {
+    _ = @import("http_client.zig");
+}
+
 pub const SigningFailure = enum { identity_unavailable, authority_changed, signing_failed };
 const SigningContext = struct { view: publication.NativeSigningView, expected_revision: u64, request: Request };
 const SigningState = struct {
@@ -1034,10 +1040,27 @@ const TestDriver = struct {
     pending: bool = false,
     build_pages: usize = 0,
     source_reads: usize = 0,
+    source_failed: bool = false,
+    acceptance_head: ?delivery_journal.Head = null,
+    acceptance_calls: usize = 0,
+    lose_acceptance_reply: bool = false,
+    consumption_calls: usize = 0,
+    consumed_record: ?jobs.private_claims.SourceStream.Consumption = null,
     cancel_after_commit: ?*std.atomic.Value(bool) = null,
 
     pub fn systemCatalog(self: *TestDriver, alloc: std.mem.Allocator, context: operation.RequestContext, call: calls.Call) ![]u8 {
         try std.testing.expect(context.index_publication_authority);
+        if (call == .relational_index_source_accept_status) return std.json.Stringify.valueAlloc(alloc, delivery_journal.Status{ .query = call.relational_index_source_accept_status, .head = self.acceptance_head }, .{});
+        if (call == .relational_index_source_accept) {
+            const request = call.relational_index_source_accept;
+            self.acceptance_head = try @import("relational_index_delivery_producer.zig").testing.acceptedHead(request, self.acceptance_head);
+            self.acceptance_calls += 1;
+            if (self.lose_acceptance_reply) {
+                self.lose_acceptance_reply = false;
+                return error.MetadataMutationOutcomeUnknown;
+            }
+            return std.json.Stringify.valueAlloc(alloc, delivery_journal.Status{ .query = delivery_journal.Query.from(request), .head = self.acceptance_head }, .{});
+        }
         const request = call.relational_index_owner_decision;
         var value = self.value;
         var routes: [source_delivery.max_parts]jobs.private_claims.delivery.Target = undefined;
@@ -1102,9 +1125,20 @@ const TestDriver = struct {
         }) };
     }
 
-    pub fn consumeNativeIndexSourceAtRoot(_: *TestDriver, _: std.mem.Allocator, _: u64, _: []const u8, _: native.ConsumeCommand, _: operation.RequestContext) !struct { root_generation: u64, outcome: std.json.Parsed(native.ConsumeOutcome) } {
-        // Consumption is qualified by the actual compiled-owner fixture.
-        return error.UnsupportedNativeIndexOwner;
+    pub fn consumeNativeIndexSourceAtRoot(self: *TestDriver, alloc: std.mem.Allocator, group: u64, table: []const u8, command: native.ConsumeCommand, context: operation.RequestContext) !struct { root_generation: u64, outcome: std.json.Parsed(native.ConsumeOutcome) } {
+        try context.ensureActive();
+        try command.validate();
+        const duplicate = self.consumed_record != null;
+        if (!duplicate) {
+            const binding = command.binding;
+            var source = try self.readNativeIndexClaimSourceAtRoot(alloc, group, table, .{ .id = binding.id, .plan_digest = binding.plan_digest, .owner_digest = binding.owner_digest, .ordinal = binding.ordinal, .namespace = binding.fence.namespace, .owner_group_id = group }, context);
+            defer source.deinit();
+            const header = source.outcome.batch.?.header;
+            try command.accepted.requireFor(binding, header);
+            self.consumed_record = .{ .accepted = command.accepted, .header = header, .position = .{ .namespace = binding.fence.namespace, .sequence = 5 }, .previous_digest = @splat(0) };
+        }
+        self.consumption_calls += 1;
+        return .{ .root_generation = self.root_generation, .outcome = try parsed(native.ConsumeOutcome, alloc, .{ .binding = command.binding, .accepted = command.accepted, .record = self.consumed_record, .position = self.consumed_record.?.position, .duplicate = duplicate }) };
     }
 
     pub fn stepNativeIndexOwnerBuildAtRoot(self: *TestDriver, alloc: std.mem.Allocator, _: u64, _: []const u8, request: native.BuildRequest, context: operation.RequestContext) !@FieldType(Result, "building") {
@@ -1120,8 +1154,13 @@ const TestDriver = struct {
         try context.ensureActive();
         const binding = self.binding orelse return error.PrivateIndexRootRecoveryRequired;
         self.source_reads += 1;
+        if (self.consumed_record) |record| {
+            var wire = try parsed(native.SourceWire, alloc, .{ .binding = binding, .header = null, .payload_b64 = null, .consumed = record });
+            errdefer wire.deinit();
+            return .{ .root_generation = self.root_generation, .outcome = try wire.value.decode(alloc, identity), .wire = wire };
+        }
         const Source = jobs.private_claims.SourceStream;
-        var prepared = try Source.PreparedSource.init(alloc, binding, .{ .table_name = table_name, .generation = @splat(1), .schema_version = binding.physical_candidate.schema_version, .tuple_fingerprint = @splat(2), .nulls_not_distinct = false }, @splat(9), .ready, &.{.{ .key = "row", .tuple = "logical\x00\xff\x80" }});
+        var prepared = try Source.PreparedSource.init(alloc, binding, .{ .table_name = table_name, .generation = @splat(1), .schema_version = binding.physical_candidate.schema_version, .tuple_fingerprint = @splat(2), .nulls_not_distinct = false }, @splat(9), if (self.source_failed) .failed else .ready, &.{.{ .key = "row", .tuple = "logical\x00\xff\x80" }});
         defer prepared.deinit();
         var header = prepared.header;
         std.mem.writeInt(u64, header[104..112], 1, .little);
@@ -1277,6 +1316,74 @@ const TestDriver = struct {
         }) };
     }
 };
+
+const TestDeliveryTransport = struct {
+    driver: *TestDriver,
+    root: local.storage_db_root_signing_identity.State,
+    calls: usize = 0,
+    pub fn control(self: *@This(), alloc: std.mem.Allocator, table: []const u8, request: Request, context: operation.RequestContext) !std.json.Parsed(ControlResponse) {
+        self.calls += 1;
+        var result = try step(alloc, self.driver, self.driver, table, request, context);
+        defer result.deinit();
+        if (result.needsSigning()) try result.signNative(self.root, 2, 3, 4);
+        return TestDriver.parsed(ControlResponse, alloc, try result.response());
+    }
+    pub fn claims(self: *@This(), alloc: std.mem.Allocator, table: []const u8, request: ClaimRequest, context: operation.RequestContext) !std.json.Parsed(ClaimResponse) {
+        self.calls += 1;
+        var result = try claimStep(alloc, self.driver, self.driver, table, request, context);
+        defer result.deinit();
+        if (result.needsSigning()) try result.signNative(self.root, 2, 3, 4);
+        return TestDriver.parsed(ClaimResponse, alloc, result.response());
+    }
+};
+
+fn testDeliveryProducer(alloc: std.mem.Allocator, permission: publication.OwnerDecision, binding: jobs.Binding, root: local.storage_db_root_signing_identity.State) !void {
+    const producer_module = @import("relational_index_delivery_producer.zig");
+    const table = permission.dispatch.?.table_name;
+    var cohort = try jobs.private_claims.delivery.Cohort.init(alloc, &.{.{ .owner = permission.owner.owner, .start = "", .end = "" }});
+    defer cohort.deinit();
+    var driver: TestDriver = .{ .value = permission, .binding = binding, .lose_acceptance_reply = true };
+    var transport: TestDeliveryTransport = .{ .driver = &driver, .root = root };
+    const request: Request = .{ .table_id = binding.fence.namespace.table_id, .group_id = binding.fence.owner_group_id, .id = binding.id, .operation = .source };
+    var canceled = std.atomic.Value(bool).init(false);
+    const context: operation.RequestContext = .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() + 60 * std.time.ns_per_s, .cancellation = .fromAtomic(&canceled) };
+    var producer = try DeliveryProducer.init(alloc, &cohort, table, request, context);
+    defer producer.deinit();
+    var observed: producer_module.Result = .{ .pending = .status };
+    var pending_target = false;
+    var resolved = false;
+    for (0..16) |_| {
+        const phase = producer.phase;
+        if (phase == .target and !pending_target) driver.pending = true;
+        const before = transport.calls;
+        observed = try producer.step(&transport, &driver);
+        try std.testing.expect(transport.calls - before <= 1);
+        if (phase == .target and driver.pending) {
+            try std.testing.expectEqual(producer_module.Phase.target, producer.phase);
+            try std.testing.expectEqual(@as(usize, 0), driver.acceptance_calls);
+            try std.testing.expectEqual(@as(usize, 0), driver.consumption_calls);
+            driver.pending = false;
+            pending_target = true;
+        }
+        if (producer.phase == .resolve_accept) {
+            resolved = true;
+            try std.testing.expectEqual(@as(usize, 0), driver.consumption_calls);
+            try std.testing.expect(producer.read == null and producer.plan == null and producer.delivered == null);
+        }
+        if (observed == .advanced) break;
+    }
+    try std.testing.expect(pending_target and resolved);
+    try std.testing.expect(observed == .advanced and observed.advanced.eof and !observed.advanced.drained);
+    try std.testing.expectEqual(@as(u64, 1), observed.advanced.consumed.rows);
+    try observed.advanced.consumed.verify();
+    try std.testing.expectEqual(@as(usize, 2), driver.claim_batches);
+    try std.testing.expectEqual(@as(usize, 1), driver.acceptance_calls);
+    try std.testing.expectEqual(@as(usize, 1), driver.consumption_calls);
+    canceled.store(true, .release);
+    const before = transport.calls;
+    _ = try producer.step(&transport, &driver);
+    try std.testing.expectEqual(before, transport.calls);
+}
 
 test "relational index publication native cancellation receiver resumes one bounded effect and never acknowledges physical GC" {
     const alloc = std.testing.allocator;
@@ -1736,6 +1843,26 @@ test "relational index publication claim receiver binds fresh build permission w
             var bad_close = close_request;
             bad_close.closure.?.batch_digest[0] ^= 1;
             try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, claimStep(alloc, &driver, &driver, plan.before.name, bad_close, .{}));
+        }
+        try testDeliveryProducer(alloc, permission, binding.?, root);
+        try std.testing.checkAllAllocationFailures(alloc, testDeliveryProducer, .{ permission, binding.?, root });
+        {
+            var cohort = try jobs.private_claims.delivery.Cohort.init(alloc, &.{.{ .owner = permission.owner.owner, .start = "", .end = "" }});
+            defer cohort.deinit();
+            var failed_driver: TestDriver = .{ .value = permission, .binding = binding, .source_failed = true };
+            var transport: TestDeliveryTransport = .{ .driver = &failed_driver, .root = root };
+            const producer_context: operation.RequestContext = .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() + 60 * std.time.ns_per_s };
+            var producer = try DeliveryProducer.init(alloc, &cohort, plan.before.name, source_request, producer_context);
+            defer producer.deinit();
+            _ = try producer.step(&transport, &failed_driver);
+            try std.testing.expectError(error.InvalidPrivateIndexBuildPage, producer.step(&transport, &failed_driver));
+            try std.testing.expectEqual(@as(usize, 0), failed_driver.claim_batches);
+            try std.testing.expectEqual(@as(usize, 0), failed_driver.acceptance_calls);
+            try std.testing.expectEqual(@as(usize, 0), failed_driver.consumption_calls);
+            try std.testing.expectError(error.PrivateIndexOwnerJobChanged, producer.step(&transport, &failed_driver));
+            var cancel_signal = std.atomic.Value(bool).init(true);
+            try std.testing.expectError(error.Canceled, DeliveryProducer.init(alloc, &cohort, plan.before.name, source_request, .{ .deadline_ns = producer_context.deadline_ns, .cancellation = .fromAtomic(&cancel_signal) }));
+            try std.testing.expectError(error.DeadlineExceeded, DeliveryProducer.init(alloc, &cohort, plan.before.name, source_request, .{ .deadline_ns = 0 }));
         }
         driver.pending = true;
         var pending_source = try step(alloc, &driver, &driver, plan.before.name, source_request, .{});

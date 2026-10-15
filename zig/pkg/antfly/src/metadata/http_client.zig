@@ -1147,10 +1147,14 @@ pub const MetadataHttpClient = struct {
     }
 
     pub fn acceptRelationalIndexSource(self: *MetadataHttpClient, base_uri: []const u8, request: @import("relational_index_delivery_journal.zig").Request, remaining_ms: u32) !@import("relational_index_delivery_journal.zig").Status {
+        return self.acceptRelationalIndexSourceControlled(base_uri, request, remaining_ms, null);
+    }
+    pub fn acceptRelationalIndexSourceControlled(self: *MetadataHttpClient, base_uri: []const u8, request: @import("relational_index_delivery_journal.zig").Request, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !@import("relational_index_delivery_journal.zig").Status {
         const journal = @import("relational_index_delivery_journal.zig");
+        if (cancellation) |value| if (value.isCancelled()) return error.Cancelled;
         if (remaining_ms == 0) return error.Timeout;
         try request.signed.verify();
-        const bytes = try self.forwardSystemCatalog(base_uri, .{ .relational_index_source_accept = request }, .{ .remaining_ms = remaining_ms, .forwards_remaining = 2, .campaign_allowed = true }, false);
+        const bytes = try self.forwardSystemCatalogControlled(base_uri, .{ .relational_index_source_accept = request }, .{ .remaining_ms = remaining_ms, .forwards_remaining = 2, .campaign_allowed = true }, false, cancellation);
         defer self.alloc.free(bytes);
         if (bytes.len == 0 or bytes.len > 16 * 1024) return error.MetadataMutationOutcomeUnknown;
         var parsed = std.json.parseFromSlice(journal.Status, self.alloc, bytes, .{}) catch return error.MetadataMutationOutcomeUnknown;
@@ -1162,13 +1166,16 @@ pub const MetadataHttpClient = struct {
         const journal = @import("relational_index_delivery_journal.zig");
         if (remaining_ms == 0) return error.Timeout;
         try query.validate();
-        const bytes = try self.readSystemCatalog(base_uri, .{ .relational_index_source_accept_status = query }, remaining_ms, cancellation);
-        defer self.alloc.free(bytes);
-        if (bytes.len == 0 or bytes.len > 16 * 1024) return error.MetadataMutationOutcomeUnknown;
-        var parsed = try std.json.parseFromSlice(journal.Status, self.alloc, bytes, .{});
+        const observed = try self.readSystemCatalog(base_uri, .{ .relational_index_source_accept_status = query }, remaining_ms, cancellation);
+        defer observed.deinit(self.alloc);
+        if (observed.body.len == 0 or observed.body.len > 16 * 1024) return error.MetadataMutationOutcomeUnknown;
+        var parsed = try std.json.parseFromSlice(journal.Status, self.alloc, observed.body, .{});
         defer parsed.deinit();
         if (!std.meta.eql(parsed.value.query, query)) return error.InvalidGenerationPublication;
-        if (parsed.value.head) |head| _ = try head.encode();
+        if (parsed.value.head) |head| {
+            if (!std.mem.eql(u8, &head.metadata_incarnation, &observed.metadata_incarnation)) return error.MetadataIncarnationMismatch;
+            _ = try head.encode();
+        }
         return parsed.value;
     }
 
@@ -1210,7 +1217,7 @@ pub const MetadataHttpClient = struct {
             .{ .name = routes.Routes.raft_mutation_campaign_allowed_header, .value = "false" },
             .{ .name = authority.header_name, .value = grant orelse "" },
         };
-        var response = try internal_service_auth.executeRequest(self.alloc, self.executor, .{ .method = .POST, .uri = uri, .headers = &headers, .body = body, .content_type = "application/json", .timeout_ms = @min(default_request_timeout_ms, remaining_ms), .cancellation = cancellation }, self.internal_service);
+        var response = try internal_service_auth.executeRequest(self.alloc, self.executor, .{ .method = .POST, .uri = uri, .headers = &headers, .body = body, .content_type = "application/json", .timeout_ms = @min(default_request_timeout_ms, remaining_ms), .cancellation = cancellation, .max_response_bytes = if (input == .relational_index_source_accept_status) 16 * 1024 else null }, self.internal_service);
         defer response.deinit(self.alloc);
         if ((input == .fk_initial_create_prepare or input == .constraint_name_prepare or input == .constraint_name_check) and response.status != 200) {
             if (system_catalog.definiteNamingError(response.status, response.body)) |err| return err;
@@ -1264,6 +1271,10 @@ pub const MetadataHttpClient = struct {
     }
 
     pub fn forwardSystemCatalog(self: *MetadataHttpClient, base_uri: []const u8, input: @import("../system_catalog/server_call.zig").Call, forwarding: raft_mutation_forwarding.Context, setting_admin: bool) ![]u8 {
+        return self.forwardSystemCatalogControlled(base_uri, input, forwarding, setting_admin, null);
+    }
+    pub fn forwardSystemCatalogControlled(self: *MetadataHttpClient, base_uri: []const u8, input: @import("../system_catalog/server_call.zig").Call, forwarding: raft_mutation_forwarding.Context, setting_admin: bool, cancellation: ?*const http_common.RequestCancellation) ![]u8 {
+        if (cancellation) |value| if (value.isCancelled()) return error.Cancelled;
         if (input.requiresAdministrativeGrant() != setting_admin) return error.Forbidden;
         const body = try std.json.Stringify.valueAlloc(self.alloc, input, .{});
         defer self.alloc.free(body);
@@ -1282,7 +1293,7 @@ pub const MetadataHttpClient = struct {
             .{ .name = authority.header_name, .value = grant orelse "" },
         };
         var delivery: http_common.RequestDeliveryTracker = .{};
-        var response = internal_service_auth.executeRequest(self.alloc, self.executor, .{ .method = .POST, .uri = uri, .headers = &headers, .body = body, .content_type = "application/json", .timeout_ms = @min(default_request_timeout_ms, forwarding.remaining_ms), .delivery_tracker = &delivery }, self.internal_service) catch |err| {
+        var response = internal_service_auth.executeRequest(self.alloc, self.executor, .{ .method = .POST, .uri = uri, .headers = &headers, .body = body, .content_type = "application/json", .timeout_ms = @min(default_request_timeout_ms, forwarding.remaining_ms), .delivery_tracker = &delivery, .cancellation = cancellation, .max_response_bytes = if (input == .relational_index_source_accept) 16 * 1024 else null }, self.internal_service) catch |err| {
             if (delivery.load() == .not_sent or (delivery.load() == .unknown and err == error.ConnectionRefused)) return error.RaftMutationRequestNotSent;
             return error.MetadataMutationOutcomeUnknown;
         };
@@ -4647,6 +4658,7 @@ test "relational index publication ACK client binds read grants and never retrie
             defer call.deinit();
             const mutation = call.value.isMutation();
             try std.testing.expect(call.value.isRelationalIndexOwnerCall());
+            if (call.value == .relational_index_source_accept_status or call.value == .relational_index_source_accept) try std.testing.expectEqual(@as(?usize, 16 * 1024), request.max_response_bytes);
             var response: http_common.HttpResponse = .{ .status = self.status, .body = try a.dupe(u8, self.body) };
             errdefer response.deinit(a);
             const headers = try a.alloc(http_common.Header, if (mutation) 1 else 2);
@@ -4694,6 +4706,33 @@ test "relational index publication ACK client binds read grants and never retrie
     executor.wrong_cluster = true;
     try std.testing.expectError(error.MetadataIncarnationMismatch, client.relationalIndexOwnerAckStatus("http://metadata.invalid", request, 25, null));
     try std.testing.expectEqual(@as(usize, 6), executor.calls);
+    // Synthetic accepted head qualifies transport ownership and cluster binding,
+    // not delivery authority or a durable metadata acceptance transaction.
+    const journal = @import("relational_index_delivery_journal.zig");
+    var accepted_head: journal.Head = .{ .metadata_incarnation = @splat('1'), .binding_digest = @splat(2), .scope_digest = @splat(3), .ordinal = 1, .rows = 0, .batch_rows = 0, .source_sequence = 4, .batch_digest = @splat(5), .logical_digest = @splat(6), .previous_decision = @splat(0), .decision_digest = @splat(0), .accepted_root = @splat(7), .provenance = @splat(0), .previous_rows = 0, .previous_provenance = @splat(0), .state = .ready };
+    accepted_head.decision_digest = accepted_head.accepted().computedDigest();
+    var provenance = std.crypto.hash.Blake3.init(.{});
+    provenance.update("antfly/private-unique-accepted-provenance/v1");
+    provenance.update(&accepted_head.previous_provenance);
+    provenance.update(&accepted_head.decision_digest);
+    provenance.update(&accepted_head.accepted_root);
+    provenance.final(&accepted_head.provenance);
+    _ = try accepted_head.encode();
+    const query: journal.Query = .{ .table_id = request.table_id, .group_id = request.signed.receipt.owner.group_id, .id = request.signed.receipt.owner.plan_id };
+    const status_bytes = try std.json.Stringify.valueAlloc(alloc, journal.Status{ .query = query, .head = accepted_head }, .{});
+    defer alloc.free(status_bytes);
+    executor.body = status_bytes;
+    executor.wrong_cluster = false;
+    const source_status = try client.relationalIndexSourceAcceptanceStatus("http://metadata.invalid", query, 25, null);
+    try std.testing.expectEqual(accepted_head.decision_digest, source_status.head.?.decision_digest);
+    executor.wrong_cluster = true;
+    try std.testing.expectError(error.MetadataIncarnationMismatch, client.relationalIndexSourceAcceptanceStatus("http://metadata.invalid", query, 25, null));
+    var canceled: http_common.RequestCancellation = .{};
+    canceled.cancel();
+    const before = executor.calls;
+    try std.testing.expectError(error.Cancelled, client.acceptRelationalIndexSourceControlled("http://metadata.invalid", undefined, 25, &canceled));
+    try std.testing.expectError(error.Cancelled, client.forwardSystemCatalogControlled("http://metadata.invalid", .{ .relational_index_source_accept = undefined }, .{ .remaining_ms = 25, .forwards_remaining = 2, .campaign_allowed = true }, false, &canceled));
+    try std.testing.expectEqual(before, executor.calls);
 }
 
 test "system catalog relation replacement preserves private grants and definitive ownership rejection" {

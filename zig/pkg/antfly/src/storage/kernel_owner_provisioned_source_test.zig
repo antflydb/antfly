@@ -122,6 +122,14 @@ test "native index owner adapter executes fresh permission stages and recovers r
     const Catalog = struct {
         tables: [1]metadata_table_manager.TableRecord,
         ranges: [1]metadata_table_manager.RangeRecord,
+        fn pointSnapshot(ptr: *anyopaque, table: []const u8, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings(self.tables[0].name, table);
+            // The fixture has exactly one table/range, including full schema.
+            // Declare its bounded point capability; do not weaken the serving
+            // guard against unbounded admin fallback under a deadline.
+            return table_catalog.TestAdminRoutingAdapter(snapshot, free).routingSnapshot(ptr, deadline_ns);
+        }
         fn snapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return .{
@@ -146,6 +154,7 @@ test "native index owner adapter executes fresh permission stages and recovers r
                 .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(snapshot, free).linearizableSnapshot,
                 .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(snapshot, free).freeRoutingSnapshot,
                 .validate_publication = validate,
+                .table_routing_snapshot = pointSnapshot,
             } };
         }
     };
@@ -155,8 +164,21 @@ test "native index owner adapter executes fresh permission stages and recovers r
         acceptance: ?@import("../metadata/relational_index_delivery_journal.zig").Head = null,
         acceptance_pending: bool = false,
         acceptance_reads: usize = 0,
+        acceptance_writes: usize = 0,
+        lose_acceptance_reply: bool = false,
         pub fn systemCatalog(self: *@This(), a: std.mem.Allocator, context: local.api_operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             try std.testing.expect(context.index_publication_authority);
+            if (call == .relational_index_source_accept) {
+                const journal = @import("../metadata/relational_index_delivery_journal.zig");
+                const request = call.relational_index_source_accept;
+                self.acceptance = try @import("../api/relational_index_delivery_producer.zig").testing.acceptedHead(request, self.acceptance);
+                self.acceptance_writes += 1;
+                if (self.lose_acceptance_reply) {
+                    self.lose_acceptance_reply = false;
+                    return error.MetadataMutationOutcomeUnknown;
+                }
+                return std.json.Stringify.valueAlloc(a, journal.Status{ .query = journal.Query.from(request), .head = self.acceptance }, .{});
+            }
             if (call == .relational_index_source_accept_status) {
                 self.acceptance_reads += 1;
                 return std.json.Stringify.valueAlloc(a, @import("../metadata/relational_index_delivery_journal.zig").Status{ .query = call.relational_index_source_accept_status, .head = self.acceptance, .replication_pending = self.acceptance_pending }, .{});
@@ -171,6 +193,31 @@ test "native index owner adapter executes fresh permission stages and recovers r
             else
                 self.admission_reads += 1;
             return std.json.Stringify.valueAlloc(a, value, .{});
+        }
+    };
+    const Transport = struct {
+        owners: *kernel_owner_source.ProvisionedKernelOwnerSource,
+        metadata: *Metadata,
+        signing_root: local.storage_db_root_signing_identity.State,
+        calls: usize = 0,
+        fn parsed(comptime T: type, a: std.mem.Allocator, value: T) !std.json.Parsed(T) {
+            const bytes = try std.json.Stringify.valueAlloc(a, value, .{});
+            defer a.free(bytes);
+            return std.json.parseFromSlice(T, a, bytes, .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
+        }
+        pub fn control(self: *@This(), a: std.mem.Allocator, table: []const u8, value: execution.Request, context: local.api_operation.RequestContext) !std.json.Parsed(execution.ControlResponse) {
+            self.calls += 1;
+            var result = try execution.step(a, self.owners, self.metadata, table, value, context);
+            defer result.deinit();
+            if (result.needsSigning()) try result.signNative(self.signing_root, 2, 3, 4);
+            return parsed(execution.ControlResponse, a, try result.response());
+        }
+        pub fn claims(self: *@This(), a: std.mem.Allocator, table: []const u8, value: execution.ClaimRequest, context: local.api_operation.RequestContext) !std.json.Parsed(execution.ClaimResponse) {
+            self.calls += 1;
+            var result = try execution.claimStep(a, self.owners, self.metadata, table, value, context);
+            defer result.deinit();
+            if (result.needsSigning()) try result.signNative(self.signing_root, 2, 3, 4);
+            return parsed(execution.ClaimResponse, a, result.response());
         }
     };
     var catalog: Catalog = .{ .tables = .{plan.before}, .ranges = .{plan.owners[0].range} };
@@ -409,12 +456,57 @@ test "native index owner adapter executes fresh permission stages and recovers r
         var wrong_batch = consume_request;
         wrong_batch.consume.?.batch_digest[0] ^= 1;
         try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, execution.claimStep(alloc, &owners, &metadata, plan.before.name, wrong_batch, .{}));
+        // Drive the actual compiled owner, with explicitly synthetic metadata
+        // acceptance. Lose the committed metadata reply, destroy all volatile
+        // producer state, and resume without reissuing delivery/acceptance.
+        const producer_module = @import("../api/relational_index_delivery_producer.zig");
+        var cohort = try local.storage_db_relational_index_owner_job.private_claims.delivery.Cohort.init(alloc, &.{.{ .owner = metadata.value.owner.owner, .start = "", .end = "" }});
+        defer cohort.deinit();
+        var transport: Transport = .{ .owners = &owners, .metadata = &metadata, .signing_root = signing_root };
+        const producer_context: local.api_operation.RequestContext = .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() + 60 * std.time.ns_per_s };
+        metadata.acceptance = null;
+        metadata.lose_acceptance_reply = true;
+        {
+            var producer = try execution.DeliveryProducer.init(alloc, &cohort, plan.before.name, source_request, producer_context);
+            defer producer.deinit();
+            for (0..8) |_| {
+                const before_calls = transport.calls;
+                _ = try producer.step(&transport, &metadata);
+                try std.testing.expect(transport.calls - before_calls <= 1);
+                if (producer.phase == .resolve_accept) break;
+            }
+            try std.testing.expectEqual(producer_module.Phase.resolve_accept, producer.phase);
+            try std.testing.expectEqual(@as(usize, 1), metadata.acceptance_writes);
+            try std.testing.expect(producer.read == null and producer.plan == null and producer.delivered == null);
+            try std.testing.expect(producer.closed != null);
+            var retained = try owners.readNativeIndexClaimSourceAtRoot(alloc, group, plan.before.name, .{ .id = consume_command.binding.id, .plan_digest = consume_command.binding.plan_digest, .owner_digest = consume_command.binding.owner_digest, .ordinal = consume_command.binding.ordinal, .namespace = consume_command.binding.fence.namespace, .owner_group_id = group }, .{});
+            defer retained.deinit();
+            try std.testing.expect(retained.outcome.batch != null and retained.outcome.consumed == null);
+        }
+        var resumed = try execution.DeliveryProducer.init(alloc, &cohort, plan.before.name, source_request, producer_context);
+        defer resumed.deinit();
+        var producer_result: producer_module.Result = .{ .pending = .status };
+        for (0..8) |_| {
+            const before_calls = transport.calls;
+            producer_result = try resumed.step(&transport, &metadata);
+            try std.testing.expect(transport.calls - before_calls <= 1);
+            if (producer_result == .advanced) break;
+        }
+        try std.testing.expect(producer_result == .advanced and producer_result.advanced.eof and producer_result.advanced.drained);
+        try producer_result.advanced.consumed.verify();
+        try std.testing.expectEqual(accepted.decision_digest, producer_result.advanced.consumed.decision_digest);
+        try std.testing.expectEqual(@as(usize, 1), metadata.acceptance_writes);
+        const finished_calls = transport.calls;
+        _ = try resumed.step(&transport, &metadata);
+        try std.testing.expectEqual(finished_calls, transport.calls);
         var consumed_result = try execution.claimStep(alloc, &owners, &metadata, plan.before.name, consume_request, .{});
         defer consumed_result.deinit();
         try std.testing.expect(consumed_result == .consumed and consumed_result.needsSigning());
         const consumed = consumed_result.consumed;
         try std.testing.expectEqual(root_generation, consumed.root_generation);
-        try std.testing.expect(!consumed.outcome.value.duplicate and !consumed.outcome.value.replication_pending);
+        // The resumed producer performed the first physical consumption.
+        try std.testing.expect(consumed.outcome.value.duplicate and !consumed.outcome.value.replication_pending);
+        try std.testing.expectEqual(producer_result.advanced.consumed.position, consumed.outcome.value.position);
         try std.testing.expect(consumed.outcome.value.position.sequence > accepted.source_sequence);
         try std.testing.expectError(error.InvalidPrivateIndexClaimReceipt, consumed_result.response().requireSignedConsumption(consume_request));
         consumed_result.consumed.outcome.value.replication_pending = true;

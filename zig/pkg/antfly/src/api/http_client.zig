@@ -397,6 +397,121 @@ test "private index control client authenticates scope bounds budgets and never 
     try std.testing.expectEqual(@as(usize, 7), fixture.calls);
 }
 
+/// Borrowed immutable routing for one delivery attempt. Metadata/owner receivers
+/// recheck authority; a cached URI is never a permission or a physical binding.
+pub const RelationalIndexDeliveryTransport = struct {
+    api: *ApiHttpClient,
+    metadata: *@import("../metadata/http_client.zig").MetadataHttpClient,
+    metadata_uri: []const u8,
+    endpoints: []const Endpoint,
+    pub const Endpoint = struct { group_id: u64, uri: []const u8 };
+
+    pub fn init(api: *ApiHttpClient, metadata: *@import("../metadata/http_client.zig").MetadataHttpClient, metadata_uri: []const u8, endpoints: []const Endpoint, cohort: *const @import("antfly_local_sources").storage_db_relational_index_owner_job.private_claims.delivery.Cohort) !RelationalIndexDeliveryTransport {
+        const result: RelationalIndexDeliveryTransport = .{ .api = api, .metadata = metadata, .metadata_uri = metadata_uri, .endpoints = endpoints };
+        try result.validate(cohort);
+        return result;
+    }
+
+    pub fn validate(self: RelationalIndexDeliveryTransport, cohort: *const @import("antfly_local_sources").storage_db_relational_index_owner_job.private_claims.delivery.Cohort) !void {
+        if (self.metadata_uri.len == 0 or self.metadata_uri.len > 8192 or self.endpoints.len != cohort.targets.len) return error.InvalidGenerationPublication;
+        var previous: u64 = 0;
+        for (self.endpoints) |entry| {
+            if (entry.group_id <= previous or entry.uri.len == 0 or entry.uri.len > 8192) return error.InvalidGenerationPublication;
+            previous = entry.group_id;
+        }
+        for (cohort.targets) |target| _ = try self.endpoint(target.owner.group_id);
+    }
+    fn endpoint(self: *const RelationalIndexDeliveryTransport, group: u64) ![]const u8 {
+        var lower: usize = 0;
+        var upper = self.endpoints.len;
+        while (lower < upper) {
+            const middle = lower + (upper - lower) / 2;
+            const value = self.endpoints[middle];
+            if (value.group_id == group) return value.uri;
+            if (value.group_id < group) lower = middle + 1 else upper = middle;
+        }
+        return error.PrivateIndexOwnerJobChanged;
+    }
+    pub fn control(self: *RelationalIndexDeliveryTransport, _: std.mem.Allocator, table: []const u8, request: @import("relational_index_owner_execution.zig").Request, context: @import("antfly_local_sources").api_operation.RequestContext) !std.json.Parsed(@import("relational_index_owner_execution.zig").ControlResponse) {
+        return self.api.fetchRelationalIndexControl(try self.endpoint(request.group_id), request.group_id, table, request, context);
+    }
+    pub fn claims(self: *RelationalIndexDeliveryTransport, _: std.mem.Allocator, table: []const u8, request: @import("relational_index_owner_execution.zig").ClaimRequest, context: @import("antfly_local_sources").api_operation.RequestContext) !std.json.Parsed(@import("relational_index_owner_execution.zig").ClaimResponse) {
+        return self.api.fetchRelationalIndexClaims(try self.endpoint(request.group_id), request.group_id, table, request, context);
+    }
+    pub fn systemCatalog(self: *RelationalIndexDeliveryTransport, alloc: std.mem.Allocator, input: @import("antfly_local_sources").api_operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+        const context = try input.platformDeadline();
+        try context.ensureActive();
+        if (!context.index_publication_authority) return error.Forbidden;
+        const control_budget: backup_contract.BackupOperationControl = .{ .deadline_ns = context.deadline_ns orelse return error.InvalidGenerationPublication, .cancellation = context.cancellation };
+        var cancellation = http_common.RequestCancellation{ .borrowed_context = context.cancellation.ptr, .borrowed_is_cancelled = context.cancellation.is_cancelled_fn };
+        const status = switch (call) {
+            .relational_index_source_accept_status => |query| try self.metadata.relationalIndexSourceAcceptanceStatus(self.metadata_uri, query, try control_budget.remainingTimeoutMs(), &cancellation),
+            .relational_index_source_accept => |request| try self.metadata.acceptRelationalIndexSourceControlled(self.metadata_uri, request, try control_budget.remainingTimeoutMs(), &cancellation),
+            else => return error.InvalidGenerationPublication,
+        };
+        return std.json.Stringify.valueAlloc(alloc, status, .{});
+    }
+};
+
+test "relational index publication delivery transport uses typed metadata status and bounded owner routing" {
+    const alloc = std.testing.allocator;
+    const journal = @import("../metadata/relational_index_delivery_journal.zig");
+    const Fixture = struct {
+        calls: usize = 0,
+        fn execute(ptr: *anyopaque, a: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expect(request.header(internal_service_auth.header_name) != null);
+            if (!std.mem.endsWith(u8, request.uri, "/internal/v1/system-catalog")) {
+                try std.testing.expect(std.mem.endsWith(u8, request.uri, "/groups/7/tables/items/relational-index-control"));
+                return .{ .status = 200, .body = try a.dupe(u8, "{\"acknowledged\":{}}") };
+            }
+            var call = try std.json.parseFromSlice(@import("../system_catalog/server_call.zig").Call, a, request.body, .{});
+            defer call.deinit();
+            try std.testing.expect(call.value == .relational_index_source_accept_status and !call.value.isMutation());
+            try std.testing.expectEqual(@as(?usize, 16 * 1024), request.max_response_bytes);
+            var response: http_common.HttpResponse = .{ .status = 200, .body = try std.json.Stringify.valueAlloc(a, journal.Status{ .query = call.value.relational_index_source_accept_status, .head = null }, .{}) };
+            errdefer response.deinit(a);
+            const headers = try a.alloc(http_common.Header, 2);
+            var initialized: usize = 0;
+            errdefer {
+                for (headers[0..initialized]) |*header| header.deinit(a);
+                a.free(headers);
+            }
+            const names = [_][]const u8{ "x-antfly-catalog-metadata-group", "x-antfly-catalog-metadata-incarnation" };
+            const values = [_][]const u8{ "13", "11111111111111111111111111111111" };
+            for (headers, names, values) |*header, name, value| {
+                const owned_name = try a.dupe(u8, name);
+                errdefer a.free(owned_name);
+                header.* = .{ .name = owned_name, .value = try a.dupe(u8, value) };
+                initialized += 1;
+            }
+            response.headers = headers;
+            return response;
+        }
+    };
+    var fixture: Fixture = .{};
+    const executor: http_common.RequestExecutor = .{ .ptr = &fixture, .vtable = &.{ .execute = Fixture.execute } };
+    var api = ApiHttpClient.init(alloc, executor);
+    _ = api.withInternalServiceAuth("0123456789abcdef0123456789abcdef", "delivery");
+    var metadata = @import("../metadata/http_client.zig").MetadataHttpClient.init(alloc, executor);
+    _ = metadata.withInternalServiceAuth("0123456789abcdef0123456789abcdef", "delivery");
+    _ = metadata.withSettingAuthority("delivery-read-secret", "delivery");
+    const jobs = @import("antfly_local_sources").storage_db_relational_index_owner_job;
+    var cohort = try jobs.private_claims.delivery.Cohort.init(alloc, &.{.{ .owner = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .ordinal = 0, .group_id = 7, .namespace = .{ .table_id = 101, .shard_id = 7, .range_id = 7 }, .authority = .native, .fence_digest = @splat(3) }, .start = "", .end = "" }});
+    defer cohort.deinit();
+    var transport = try RelationalIndexDeliveryTransport.init(&api, &metadata, "http://metadata", &.{.{ .group_id = 7, .uri = "http://owner" }}, &cohort);
+    try transport.validate(&cohort);
+    try std.testing.expectError(error.PrivateIndexOwnerJobChanged, transport.endpoint(8));
+    var producer = try @import("relational_index_delivery_producer.zig").Producer.init(alloc, &cohort, "items", .{ .table_id = 101, .group_id = 7, .id = @splat(1), .operation = .source }, .{ .deadline_ns = platform_time.monotonicNs() + 30 * std.time.ns_per_s });
+    defer producer.deinit();
+    _ = try producer.step(&transport, &transport);
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    const idle = try producer.step(&transport, &transport);
+    try std.testing.expect(idle == .idle);
+    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+}
+
 pub const ApiHttpClient = struct {
     alloc: std.mem.Allocator,
     executor: http_common.RequestExecutor,
@@ -967,7 +1082,7 @@ pub const ApiHttpClient = struct {
         var budget_buffer: [20]u8 = undefined;
         const budget = try std.fmt.bufPrint(&budget_buffer, "{d}", .{remaining_ms});
         var cancellation = http_common.RequestCancellation{ .borrowed_context = context.cancellation.ptr, .borrowed_is_cancelled = context.cancellation.is_cancelled_fn };
-        const max_response_bytes = if (claims) (if (request.closure != null) @import("../metadata/relational_index_source_delivery.zig").max_wire_bytes else 32 * 1024) else if (request.operation == .source) native.SourceWire.max_wire_bytes + 4096 else 32 * 1024;
+        const max_response_bytes: usize = if (claims) (if (request.closure != null) @import("../metadata/relational_index_source_delivery.zig").max_wire_bytes else 32 * 1024) else if (request.operation == .source) native.SourceWire.max_wire_bytes + 4096 else 32 * 1024;
         var response = self.executeRequest(.{ .method = .POST, .uri = uri, .content_type = "application/json", .body = body, .timeout_ms = remaining_ms, .cancellation = &cancellation, .max_response_bytes = max_response_bytes, .headers = &.{.{ .name = if (claims) execution.claim_remaining_ms_header else execution.control_remaining_ms_header, .value = budget }} }) catch |err| switch (err) {
             error.ResponseTooLarge => return invalid_receipt,
             else => return err,
