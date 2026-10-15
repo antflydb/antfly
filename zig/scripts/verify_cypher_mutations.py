@@ -234,7 +234,117 @@ def main():
                 )
         finally:
             call(f"/graphs/{filtered}", method="DELETE")
-        print("32 authenticated Cypher mutation semantics checks passed")
+        query(
+            "CREATE (a:Document {id:'short-a'})-[:LINK {weight:1}]->(b:Document {id:'short-b'}),"
+            "(a)-[:LINK {weight:2}]->(c:Document {id:'short-c'})-[:LINK {weight:2}]->(b),"
+            "(x:Document {id:'short-x',amount:2})"
+        )
+        for selector in ("shortestPath", "allShortestPaths"):
+            path = f"p={selector}((a:Document {{id:'short-a'}})-[:LINK*1..3 {{weight:x.amount}}]->(b:Document {{id:'short-b'}}))"
+            for patterns in (
+                f"{path},(x:Document {{id:'short-x'}})",
+                f"(x:Document {{id:'short-x'}}),{path}",
+            ):
+                assert query(f"MATCH {patterns} RETURN length(p)") == [
+                    [{"type": "integer", "value": "2"}]
+                ]
+        # Use a relational fixture for SQL writes; the earlier graph exercises
+        # dynamic document properties. Distributed transactions support READ
+        # COMMITTED, while bare BEGIN requests serializable range guards.
+        owned_table, owned_graph = table + "_owned", graph + "_owned"
+        call("/sql", {"statement": f"CREATE TABLE {owned_table} (id TEXT)"})
+        try:
+            call(
+                f"/tables/{owned_table}/indexes/links",
+                {"type": "graph", "edge_types": [{"name": "link"}]},
+            )
+            # Index creation is asynchronous. Establish the complete generation
+            # on its required owners before publishing raw graph effects.
+            ready_deadline = time.monotonic() + 60
+            while True:
+                index = call(f"/tables/{owned_table}/indexes/links", method="GET")
+                complete = (
+                    index.get("status", {}).get("milestones", {}).get("complete", {})
+                )
+                if complete.get("reached") is True and complete.get("blockers") == []:
+                    break
+                assert time.monotonic() < ready_deadline, index
+                time.sleep(0.2)
+            call(
+                f"/graphs/{owned_graph}",
+                {
+                    "labels": [{"name": "Document", "table": owned_table}],
+                    "relationships": [
+                        {
+                            "name": "LINK",
+                            "index": "links",
+                            "source_label": "Document",
+                            "target_label": "Document",
+                            "stored_type": "link",
+                        }
+                    ],
+                },
+            )
+            try:
+                call(
+                    f"/tables/{owned_table}/batch",
+                    {
+                        "inserts": {
+                            key: {"id": key}
+                            for key in (
+                                "owned-a",
+                                "owned-b",
+                                "owned-claim",
+                                "owned-other",
+                            )
+                        },
+                        "graph_writes": [
+                            {
+                                "index_name": "links",
+                                "source": "owned-a",
+                                "target": "owned-b",
+                                "edge_type": "link",
+                                "edge_id": "fact:1",
+                                "owner_document": owner,
+                            }
+                            for owner in ("owned-claim", "owned-other")
+                        ],
+                        "sync_level": "full_index",
+                    },
+                )
+                count = f"SELECT count(*) FROM GRAPH_TABLE({owned_graph} MATCH ()-[r IS LINK]->() COLUMNS(r AS edge)) g"
+                assert call("/sql", {"statement": count})["rows"] == [["2"]]
+                session = call(
+                    "/sql", {"statement": "BEGIN ISOLATION LEVEL READ COMMITTED"}
+                )["session_id"]
+                try:
+                    call(
+                        "/sql",
+                        {
+                            "statement": f"DELETE FROM {owned_table} WHERE _id='owned-claim'",
+                            "session_id": session,
+                        },
+                    )
+                    assert call("/sql", {"statement": count, "session_id": session})[
+                        "rows"
+                    ] == [["1"]]
+                finally:
+                    call("/sql", {"statement": "ROLLBACK", "session_id": session})
+                assert call("/sql", {"statement": count})["rows"] == [["2"]]
+                result = call(
+                    f"/graphs/{owned_graph}/query",
+                    {
+                        "query": "MATCH (n:Document {id:'owned-claim'}) DELETE n WITH 1 AS ignored MATCH ()-[r:LINK]->() RETURN count(r)"
+                    },
+                )
+                assert result["rows"] == [[{"type": "integer", "value": "1"}]], result
+            finally:
+                call(f"/graphs/{owned_graph}", method="DELETE")
+        finally:
+            call(f"/tables/{owned_table}", method="DELETE")
+        print(
+            "32 authenticated Cypher mutation semantics checks passed; producer postimages and deferred shortest paths passed"
+        )
     finally:
         if created_graph:
             call(f"/graphs/{graph}", method="DELETE")

@@ -236,14 +236,17 @@ pub const Overlay = struct {
             },
         }
     }
+    pub fn ownedBy(a: A, relationship: *const v.Relationship, identity: v.Identity) !bool {
+        if (relationship.ownership == .explicit or !std.mem.eql(u8, relationship.identity.table, identity.table)) return false;
+        const tuple = try std.json.parseFromSliceLeaky([]const []const u8, a, relationship.identity.key, .{});
+        if (tuple.len != 5) return error.CypherInvalidRelationship;
+        return std.mem.eql(u8, tuple[4], identity.key);
+    }
     fn refreshDocumentRelationships(self: *Overlay, a: A, node: *const v.Node) !void {
         const project = self.base.vtable.document_relationships orelse return;
         const relationships = try project(self.base.ptr, a, node);
         for (self.relationships.items) |*relationship| {
-            if (relationship.value.ownership != .document or !std.mem.eql(u8, relationship.value.identity.table, node.identity.table)) continue;
-            const tuple = try std.json.parseFromSliceLeaky([]const []const u8, a, relationship.value.identity.key, .{});
-            if (tuple.len != 5) return error.CypherInvalidRelationship;
-            if (std.mem.eql(u8, tuple[4], node.identity.key)) relationship.deleted = true;
+            if (try ownedBy(a, relationship.value, node.identity)) relationship.deleted = true;
         }
         for (relationships) |relationship| {
             try self.capacity();
@@ -298,7 +301,12 @@ pub const Overlay = struct {
             .delete_node => |deletion| {
                 const node = self.findNode(deletion.identity) orelse return error.CypherDeletedEntity;
                 for (self.relationships.items) |*relationship| {
-                    if (relationship.deleted or !(relationship.value.source.eql(deletion.identity) or relationship.value.target.eql(deletion.identity))) continue;
+                    if (relationship.deleted) continue;
+                    if (try ownedBy(a, relationship.value, deletion.identity) and !(relationship.value.source.eql(deletion.identity) or relationship.value.target.eql(deletion.identity))) {
+                        relationship.deleted = true;
+                        continue;
+                    }
+                    if (!(relationship.value.source.eql(deletion.identity) or relationship.value.target.eql(deletion.identity))) continue;
                     if (!deletion.detach) return error.CypherNodeHasRelationships;
                     relationship.deleted = true;
                 }

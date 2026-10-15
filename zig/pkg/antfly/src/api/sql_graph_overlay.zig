@@ -75,10 +75,7 @@ pub const View = struct {
             // A document owns its derived contributions even when an explicit
             // source override places their outgoing adjacency on another key.
             for (self.inner.relationships.items) |*relationship| {
-                if (relationship.value.ownership != .document or !std.mem.eql(u8, relationship.value.identity.table, row.identity.table)) continue;
-                const tuple = try std.json.parseFromSliceLeaky([]const []const u8, a, relationship.value.identity.key, .{});
-                if (tuple.len != 5) return error.CypherInvalidRelationship;
-                if (std.mem.eql(u8, tuple[4], row.identity.key)) relationship.deleted = true;
+                if (try cypher.transaction.Overlay.ownedBy(a, relationship.value, row.identity)) relationship.deleted = true;
             }
             for (projection.relationships) |relationship| {
                 try self.capacity();

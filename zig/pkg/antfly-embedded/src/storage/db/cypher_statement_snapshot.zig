@@ -201,7 +201,7 @@ pub fn Snapshot(comptime DB: type) type {
         }
         fn projectRelationship(ptr: *anyopaque, a: std.mem.Allocator, relationship: *const cypher.value.Relationship) !?*const cypher.value.Relationship {
             const self = cast(ptr);
-            if (relationship.ownership == .document) {
+            if (relationship.ownership != .explicit) {
                 const tuple = try std.json.parseFromSliceLeaky([]const []const u8, a, relationship.identity.key, .{});
                 if (tuple.len != 5 or tuple[4].len == 0 or !std.mem.eql(u8, relationship.identity.table, self.input.table)) return error.CypherInvalidRelationship;
                 // An artifact may override its source key. The producing row

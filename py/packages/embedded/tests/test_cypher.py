@@ -645,3 +645,185 @@ def test_union_inline_predicates_and_scalar_conversions_persist(require_native, 
         ]
         result = database.cypher_json("g", {"query": "MATCH (a:D {name:'row-7'})-[r:LINK]->(b) RETURN r.ok"})
         assert result["rows"] == [[{"type": "boolean", "value": True}]]
+
+
+def _put_link_graph(database):
+    database.graph_catalog_json(
+        {
+            "action": "put",
+            "name": "g",
+            "definition": {
+                "labels": [{"name": "D", "table": "docs"}],
+                "relationships": [
+                    {"name": "LINK", "index": "links", "source_label": "D", "target_label": "D", "stored_type": "link"}
+                ],
+            },
+        }
+    )
+
+
+def test_shortest_paths_resolve_later_pattern_dependencies(require_native, aflite_path):
+    with af.create_hosted(aflite_path) as database:
+        database.sql("CREATE TABLE docs (name TEXT,amount BIGINT)")
+        with database.open_table("docs") as table:
+            table.add_index({"name": "links", "kind": "graph", "config_json": "{}"})
+        _put_link_graph(database)
+        database.cypher_json(
+            "g",
+            {
+                "query": "CREATE (a:D {name:'a'})-[:LINK {weight:1}]->(b:D {name:'b'}),"
+                "(a)-[:LINK {weight:2}]->(c:D {name:'c'})-[:LINK {weight:2}]->(b),"
+                "(x:D {name:'x',amount:2})"
+            },
+        )
+        for selector in ("shortestPath", "allShortestPaths"):
+            path = f"p={selector}((a:D {{name:'a'}})-[:LINK*1..3 {{weight:x.amount}}]->(b:D {{name:'b'}}))"
+            for patterns in (f"{path},(x:D {{name:'x'}})", f"(x:D {{name:'x'}}),{path}"):
+                assert database.cypher_json("g", {"query": f"MATCH {patterns} RETURN length(p)"})["rows"] == [
+                    [{"type": "integer", "value": "2"}]
+                ]
+                assert database.cypher_json("g", {"query": f"OPTIONAL MATCH {patterns} RETURN length(p)"})["rows"] == [
+                    [{"type": "integer", "value": "2"}]
+                ]
+
+
+def test_nonincident_producer_deletion_updates_cypher_and_sql_views(require_native, aflite_path):
+    with af.create_hosted(aflite_path) as database:
+        database.sql("CREATE TABLE docs (name TEXT)")
+        database.sql("INSERT INTO docs (_id,name) VALUES ('a','a'),('b','b'),('claim','claim'),('other','other')")
+        with database.open_table("docs") as table:
+            table.add_index({"name": "links", "kind": "graph", "config_json": "{}"})
+            table.batch_json(
+                {
+                    "graph_writes": [
+                        {
+                            "index_name": "links",
+                            "source": "a",
+                            "target": "b",
+                            "edge_type": "link",
+                            "edge_id": "fact:1",
+                            "owner_document": owner,
+                        }
+                        for owner in ("claim", "other")
+                    ],
+                    "sync_level": "full_index",
+                }
+            )
+        _put_link_graph(database)
+        count = "SELECT count(*) FROM GRAPH_TABLE(g MATCH ()-[r IS LINK]->() COLUMNS(r AS edge)) g"
+        assert database.sql(count)["rows"] == [["2"]]
+        with closing(database.sql_session()) as session:
+            session.execute("BEGIN")
+            session.execute("DELETE FROM docs WHERE _id='claim'")
+            assert session.execute(count)["rows"] == [["1"]]
+            session.execute("ROLLBACK")
+        assert database.sql(count)["rows"] == [["2"]]
+        with pytest.raises(af.GraphError):
+            database.cypher_json("g", {"query": "MATCH (n:D {name:'claim'}) DELETE n RETURN 1/0"})
+        assert database.sql(count)["rows"] == [["2"]]
+        result = database.cypher_json(
+            "g",
+            {"query": "MATCH (n:D {name:'claim'}) DELETE n WITH 1 AS ignored MATCH ()-[r:LINK]->() RETURN count(r)"},
+        )
+        assert result["rows"] == [[{"type": "integer", "value": "1"}]]
+        with database.open_table("docs") as table:
+            table.run_until_idle()
+        assert database.sql(count)["rows"] == [["1"]]
+
+
+def test_artifact_assertions_preserve_ownership_and_producer_identity(require_native, aflite_path):
+    options = af.OpenOptions(profile=af.Profile.NATIVE, generated_enrichment_replay=True)
+    extraction = {
+        "entities": [{"id": "a", "label": "thing", "text": "A"}, {"id": "b", "label": "thing", "text": "B"}],
+        "relations": [{"type": "link", "source": "a", "target": "b"}],
+    }
+    with af.create_with_options(aflite_path, options) as database:
+        database.create_table("docs", {})
+        with database.open_table("docs") as table:
+            table.add_index(
+                {
+                    "name": "links",
+                    "type": "graph",
+                    "source": {"artifact": "kg", "format": "extraction_graph", "mention_edge_type": "mentions"},
+                    "artifact": {
+                        "name": "kg",
+                        "kind": "asset",
+                        "source": {"type": "field", "value": "kg"},
+                        "content_type": "application/json",
+                    },
+                    "edge_types": [{"name": "mentions"}, {"name": "link"}],
+                    "resolvers": [
+                        {
+                            "name": "entities",
+                            "table": "docs",
+                            "promote": False,
+                            "source_artifact": "kg",
+                            "resolution_artifact": "resolved",
+                            "key_template": "entity/{{ uslug _entity.text }}",
+                            "config_generation": 1,
+                        }
+                    ],
+                }
+            )
+            table.batch_json(
+                {
+                    "inserts": {
+                        "entity/a": {"name": "a"},
+                        "entity/b": {"name": "b"},
+                        "claim": {"name": "claim", "kg": extraction},
+                        "other": {"name": "other", "kg": extraction},
+                    }
+                }
+            )
+            table.run_until_idle()
+        _put_link_graph(database)
+        relationships = database.cypher_json("g", {"query": "MATCH ()-[r:LINK]->() RETURN r"})["rows"]
+        assert len(relationships) == 2
+        assert {row[0]["value"]["ownership"] for row in relationships} == {"artifact"}
+        assert len({row[0]["value"]["identity"]["key"] for row in relationships}) == 2
+        # A legacy direct contender shares tuple-level private contributor state;
+        # it must not provide a mutation path that erases the managed assertions.
+        with database.open_table("docs") as table:
+            table.batch_json(
+                {
+                    "graph_writes": [
+                        {"index_name": "links", "source": "entity/a", "target": "entity/b", "edge_type": "link"}
+                    ],
+                    "sync_level": "full_index",
+                }
+            )
+        relationships = database.cypher_json("g", {"query": "MATCH ()-[r:LINK]->() RETURN r"})["rows"]
+        assert len(relationships) == 3
+        assert {row[0]["value"]["ownership"] for row in relationships} == {"artifact"}
+        for action in ("SET r.test=1 RETURN r.test", "REMOVE r.test RETURN r", "DELETE r"):
+            with pytest.raises(af.GraphError) as derived:
+                database.cypher_json("g", {"query": f"MATCH ()-[r:LINK]->() {action}"})
+            assert derived.value.graph_code == "CypherDerivedRelationshipMutation"
+        # Explicit relationships can coexist in an artifact-backed index.
+        database.cypher_json(
+            "g",
+            {
+                "query": "MATCH (a:D {name:'a'}),(b:D {name:'b'}) CREATE (a)-[r:LINK {test:1}]->(b) SET r.test=2 RETURN r.test"
+            },
+        )
+        assert database.cypher_json("g", {"query": "MATCH ()-[r:LINK]->() WHERE r.test=2 RETURN r.test"})["rows"] == [
+            [{"type": "integer", "value": "2"}]
+        ]
+        with closing(database.sql_session()) as session:
+            session.execute("BEGIN")
+            session.execute("DELETE FROM docs WHERE _id='claim'")
+            assert session.execute("SELECT count(*) FROM GRAPH_TABLE(g MATCH ()-[r IS LINK]->() COLUMNS(r AS edge)) g")[
+                "rows"
+            ] == [["3"]]
+            session.execute("ROLLBACK")
+        result = database.cypher_json(
+            "g",
+            {"query": "MATCH (n:D {name:'claim'}) DELETE n WITH 1 AS ignored MATCH ()-[r:LINK]->() RETURN count(r)"},
+        )
+        assert result["rows"] == [[{"type": "integer", "value": "3"}]]
+        with database.open_table("docs") as table:
+            table.run_until_idle()
+        assert len(database.cypher_json("g", {"query": "MATCH ()-[r:LINK]->() RETURN r"})["rows"]) == 3
+    with af.open_with_options(aflite_path, options) as database:
+        relationships = database.cypher_json("g", {"query": "MATCH ()-[r:LINK]->() RETURN r"})["rows"]
+        assert {row[0]["value"]["ownership"] for row in relationships} == {"artifact", "explicit"}

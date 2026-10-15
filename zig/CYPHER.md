@@ -42,7 +42,9 @@ conversion, Java-compatible finite float text (including suffixes and hexadecima
 exponents), and string/scalar concatenation with list precedence. Inline MATCH
 properties can refer to node, relationship, and path aliases introduced in the
 same MATCH; predicates wait for their dependencies while retaining early filtering
-where possible. UNION deduplication compares bound column names independently of
+where possible. Shortest-path selectors run after the complete MATCH scope's
+inline predicates resolve, before MATCH WHERE, preserving other patterns' row
+multiplicity and all-shortest ties. UNION deduplication compares bound column names independently of
 wildcard binding order. Core and native regression cases cover these boundaries,
 including SQL GRAPH_TABLE scalar types and durable mutation postimages.
 
@@ -700,6 +702,18 @@ Distinguish explicit relationships from edges derived through document fields,
 enrichment artifacts, or other managed sources. A graph mutation must not edit a
 derived edge only to have the next index rebuild recreate it. Define whether
 such edits update the source document, create an explicit contribution, or fail.
+
+Cypher exposes legacy artifact assertions with producer-qualified relationship
+identities. Different documents asserting the same source/type/target are parallel
+managed relationships; multiple artifact contenders from one producer retain that
+producer's winning live value. Ordinary graph APIs keep their aggregate adjacency
+projection. A legacy direct contender sharing an artifact projection also remains
+managed, because tuple-level writes cannot isolate its private contributor state.
+Explicit stable-ID relationships can coexist in the same index and remain writable.
+Artifact and field-derived relationships reject direct `SET`, `REMOVE`,
+and `DELETE`. Deleting a producer withdraws its nonincident assertions immediately
+in Cypher and staged SQL `GRAPH_TABLE` views; other producers' assertions survive.
+Endpoint deletion still follows the normal `DELETE`/`DETACH DELETE` rules.
 
 Specify stable relationship IDs, parallel edges, uniqueness, concurrent `MERGE`,
 endpoint deletion, detach semantics, policy enforcement, and atomicity. Reuse

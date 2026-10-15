@@ -79,6 +79,32 @@ def test_authenticated_cypher_postimage_policy_on_replicated_owners(
     assert "4 authenticated Cypher postimage-policy checks passed" in result.stdout
 
 
+def test_authenticated_cypher_producer_postimages_on_replicated_owners(
+    three_by_three_backup_cluster,  # noqa: F811
+):
+    cluster = three_by_three_backup_cluster
+    leader = urlsplit(cluster.metadata_leader_public_url())
+    endpoint = f"{leader.scheme}://{leader.hostname}:{leader.port}"
+    script = (
+        Path(__file__).resolve().parents[2] / "scripts" / "verify_cypher_mutations.py"
+    )
+    result = subprocess.run(
+        [sys.executable, str(script), "--url", endpoint],
+        env={
+            **os.environ,
+            "ANTFLY_CYPHER_TEST_AUTH": f"admin:{AUTH_BOOTSTRAP_PASSWORD}",
+        },
+        capture_output=True,
+        text=True,
+        timeout=220,
+        check=False,
+    )
+    assert result.returncode == 0, (
+        result.stdout + result.stderr + "\n" + cluster.debug_logs()
+    )
+    assert "producer postimages and deferred shortest paths passed" in result.stdout
+
+
 def test_authenticated_cypher_across_replicated_owner_nodes(
     three_by_three_backup_cluster,
 ):
@@ -337,7 +363,11 @@ def test_authenticated_cypher_across_replicated_owner_nodes(
             call(f"/graphs/{graph}", method="DELETE")
         if created_table:
             call(f"/tables/{table}", method="DELETE")
-    cluster.restart_crashed_node(metadata=True, index=owner_index)
+    # Allow replay of this campaign's durable drop-repair backlog before
+    # readiness. The shared fixture keeps its shorter default for other tests.
+    cluster.restart_crashed_node(
+        metadata=True, index=owner_index, startup_timeout_s=120.0
+    )
     for base in cluster.metadata_admin_urls:
         receipt(base)
 

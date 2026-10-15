@@ -26730,7 +26730,7 @@ pub const DB = struct {
         try self.requireGraphEndpointCleanupReady();
         if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         const entry = self.core.graphIndex(index_name) orelse return error.IndexNotFound;
-        var result = try entry.index.getEdgesByTypesPageAt(alloc, key, edge_types, direction, cursor, limits, ttl_now_ns);
+        var result = try entry.index.getCypherEdgesByTypesPageAt(alloc, key, edge_types, direction, cursor, limits, ttl_now_ns);
         errdefer result.deinit(alloc);
         try row_policy_lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
         return result;

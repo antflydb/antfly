@@ -570,3 +570,32 @@ test "self-loop traversal validates the endpoint label selected by orientation" 
         try std.testing.expectEqual(@as(i64, 1), result.rows[0][0].integer);
     }
 }
+
+test "producer deletion withdraws only its nonincident managed assertions" {
+    const Host = struct {
+        fn commit(_: *anyopaque, _: A, _: []const b.Mutation) !void {}
+    };
+    for ([_]@FieldType(v.Relationship, "ownership"){ .document, .artifact }) |ownership| {
+        var fixture = Fixture.init();
+        defer fixture.arena.deinit();
+        var seeded = try fixture.run("CREATE (a:Person {name:'a'}),(b:Person {name:'b'}),(c:Person {name:'claim'}),(d:Person {name:'other'})");
+        seeded.deinit();
+        const a = fixture.arena.allocator();
+        const edges = try a.alloc(*const v.Relationship, 2);
+        for (edges, 0..) |*edge, index| {
+            const relationship = try a.create(v.Relationship);
+            relationship.* = .{ .identity = .{ .table = "people", .key = try std.json.Stringify.valueAlloc(a, .{ fixture.nodes[0].identity.key, fixture.nodes[1].identity.key, "knows", "", fixture.nodes[index + 2].identity.key }, .{}) }, .index = "links", .type = "KNOWS", .source = fixture.nodes[0].identity, .target = fixture.nodes[1].identity, .ownership = ownership };
+            edge.* = relationship;
+        }
+        fixture.relationships = edges;
+        var overlay: root.transaction.Overlay = .{ .base = fixture.backend(), .host = .{ .ptr = &fixture, .new_identity = Fixture.identity, .commit = Host.commit } };
+        var diagnostic: root.compiler.Diagnostic = .{};
+        var query = try root.compiler.compile(std.testing.allocator, "MATCH (n:Person {name:'claim'}) DELETE n WITH 1 AS ignored MATCH ()-[r:KNOWS]->() RETURN count(r)", .{}, &diagnostic);
+        defer query.deinit();
+        var result = try root.runtime.execute(std.testing.allocator, overlay.backend(), graph, &query, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(i64, 1), result.rows[0][0].integer);
+        try std.testing.expect(overlay.relationships.items[0].deleted);
+        try std.testing.expect(!overlay.relationships.items[1].deleted);
+    }
+}

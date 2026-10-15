@@ -571,3 +571,15 @@ test "inline nested patterns wait for outer MATCH aliases" {
 test "shortest paths evaluate resolved inline nested predicates before selection" {
     try check("MATCH p=shortestPath((a:Document {id:'a'})-[r:CITES*1..3 {weight:CASE WHEN EXISTS { MATCH (b) WHERE b.rank=2 } THEN 2 ELSE 1 END}]->(b)) RETURN b.id,length(p)", "[[\"b\",1]]");
 }
+
+test "shortest selectors resolve later MATCH predicates and preserve surrounding bags" {
+    const selected = "p=shortestPath((a:Document {id:'a'})-[:CITES*1..3]->(b:Document {id:'b',rank:CASE WHEN length(p)=x.rank THEN 2 ELSE 0 END}))";
+    try check("MATCH " ++ selected ++ ",(x:Document {rank:3}) RETURN length(p)", "[[3]]");
+    try check("MATCH (x:Document {rank:3})," ++ selected ++ " RETURN length(p)", "[[3]]");
+    try check("MATCH (x:Document {rank:3}) MATCH " ++ selected ++ " RETURN length(p)", "[[3]]");
+    try check("OPTIONAL MATCH " ++ selected ++ ",(x:Document {rank:3}) RETURN length(p)", "[[3]]");
+    try check("MATCH p=allShortestPaths((a:Document {id:'a'})-[:CITES*1..3]->(b:Document {id:'b',rank:CASE WHEN length(p)=x.rank THEN 2 ELSE 0 END})),(x:Document {rank:3}) RETURN length(p)", "[[3],[3]]");
+    try check("MATCH p=shortestPath((a:Document {id:'a'})-[:CITES*1..3]->(b:Document {id:'b'})),(:Document) RETURN count(*)", "[[3]]");
+    try check("UNWIND [1,1] AS x MATCH p=shortestPath((a:Document {id:'a'})-[:CITES*1..3]->(b:Document {id:'b'})),(:Document) RETURN count(*)", "[[6]]");
+    try check("MATCH p=shortestPath((a:Document {id:'a'})-[:CITES*1..3]->(b:Document {id:'b'})) WHERE length(p)=3 RETURN length(p)", "[]");
+}

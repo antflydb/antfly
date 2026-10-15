@@ -1506,7 +1506,9 @@ class ThreeByThreeBackupCluster:
                 f"cluster process exited: {', '.join(exited)}\n{self.debug_logs()}"
             )
 
-    def restart_crashed_node(self, *, metadata: bool, index: int) -> None:
+    def restart_crashed_node(
+        self, *, metadata: bool, index: int, startup_timeout_s: float = 30.0
+    ) -> None:
         """Reopen one killed process from its existing Raft/owner directories."""
         procs = self.metadata_procs if metadata else self.data_procs
         assert 0 <= index < len(procs)
@@ -1532,7 +1534,9 @@ class ThreeByThreeBackupCluster:
                 cwd=REPO_ROOT,
             ),
         )
-        assert wait_for_server(url, path=path, timeout=30.0), self.debug_logs()
+        assert wait_for_server(url, path=path, timeout=startup_timeout_s), (
+            self.debug_logs()
+        )
 
     def debug_logs(self) -> str:
         try:

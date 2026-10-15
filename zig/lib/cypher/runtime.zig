@@ -325,7 +325,46 @@ const Engine = struct {
         return true;
     }
     const Constraint = struct { actual: v.Value, expression: *const ast.Expr };
-    const MatchState = struct { row: Row, used: []const *const v.Relationship = &.{}, terminal: ?v.Identity = null, constraints: []const Constraint = &.{} };
+    const MatchState = struct { row: Row, used: []const *const v.Relationship = &.{}, paths: []const v.Path = &.{}, constraints: []const Constraint = &.{} };
+    fn samePath(a: v.Path, b: v.Path) bool {
+        return v.Value.eql(.{ .path = a }, .{ .path = b });
+    }
+    fn sameSelectionGroup(a: MatchState, b: MatchState, selected: usize) bool {
+        for (a.paths, b.paths, 0..) |left, right, index| {
+            if (index == selected) {
+                if (!left.nodes[0].identity.eql(right.nodes[0].identity) or !left.nodes[left.nodes.len - 1].identity.eql(right.nodes[right.nodes.len - 1].identity)) return false;
+            } else if (!samePath(left, right)) return false;
+        }
+        return true;
+    }
+    // Inline predicates belong to MATCH, including references to later comma
+    // patterns. Select only after all of them resolve, but before MATCH WHERE.
+    // Keep the other complete pattern matches in the group, including anonymous
+    // entities, so selecting one path preserves the surrounding row multiplicity.
+    fn selectPaths(self: *Engine, states: []const MatchState, patterns: []const ast.Path) ![]const MatchState {
+        var selected = states;
+        for (patterns, 0..) |pattern, index| {
+            if (pattern.selector == .all) continue;
+            var output: std.ArrayList(MatchState) = .empty;
+            for (selected, 0..) |candidate, position| {
+                try self.checkpoint();
+                const length = candidate.paths[index].relationships.len;
+                var retain = true;
+                for (selected, 0..) |other, other_position| {
+                    try self.checkpoint();
+                    if (!sameSelectionGroup(candidate, other, index)) continue;
+                    const other_length = other.paths[index].relationships.len;
+                    if (other_length < length or (pattern.selector == .shortest and other_length == length and other_position < position and !samePath(candidate.paths[index], other.paths[index]))) {
+                        retain = false;
+                        break;
+                    }
+                }
+                if (retain) try output.append(self.a, candidate);
+            }
+            selected = try output.toOwnedSlice(self.a);
+        }
+        return selected;
+    }
     // Inline properties are predicates over the complete MATCH scope. Filter
     // immediately when possible; retain forward references until their aliases
     // are bound, including anonymous entities and each variable-length hop.
@@ -441,9 +480,10 @@ const Engine = struct {
                 for (states) |input| try self.matchPath(input, path, operation.mode, operation.predicate, &next);
                 states = try next.toOwnedSlice(self.a);
             }
+            var eligible: std.ArrayList(MatchState) = .empty;
+            for (states) |matched| if (try self.constraintsMatch(matched.constraints, matched.row, false)) try eligible.append(self.a, matched);
             const initial = output.items.len;
-            for (states) |matched| {
-                if (!try self.constraintsMatch(matched.constraints, matched.row, false)) continue;
+            for (try self.selectPaths(eligible.items, operation.paths)) |matched| {
                 if (operation.predicate) |predicate| if ((try (try self.eval(predicate, matched.row, null)).truth()) != true) continue;
                 try output.append(self.a, matched.row);
             }
@@ -523,7 +563,7 @@ const Engine = struct {
                 const node = (try self.backend.vtable.get(self.backend.ptr, self.a, .{ .table = label.table, .key = key.string })) orelse continue;
                 if (!try self.nodeMatches(node, first)) continue;
                 const bound = (try self.bind(input.row, first.alias, .{ .node = node })) orelse continue;
-                const candidate = (try self.constrain(.{ .row = bound, .used = input.used, .constraints = input.constraints }, .{ .node = node }, first.properties)) orelse continue;
+                const candidate = (try self.constrain(.{ .row = bound, .used = input.used, .paths = input.paths, .constraints = input.constraints }, .{ .node = node }, first.properties)) orelse continue;
                 try self.pathStep(candidate, path, mode, 0, &.{node}, &.{}, output);
             }
             return;
@@ -550,7 +590,7 @@ const Engine = struct {
                     try seen.append(self.a, node.identity);
                     if (!try self.nodeMatches(node, first)) continue;
                     const bound = (try self.bind(input.row, first.alias, .{ .node = node })) orelse continue;
-                    const candidate = (try self.constrain(.{ .row = bound, .used = input.used, .constraints = input.constraints }, .{ .node = node }, first.properties)) orelse continue;
+                    const candidate = (try self.constrain(.{ .row = bound, .used = input.used, .paths = input.paths, .constraints = input.constraints }, .{ .node = node }, first.properties)) orelse continue;
                     try self.pathStep(candidate, path, mode, 0, &.{node}, &.{}, output);
                 }
                 if (page.next == null) break;
@@ -564,35 +604,15 @@ const Engine = struct {
         if (edge_index == path.edges.len) {
             const row = (try self.bind(input.row, path.alias, .{ .path = .{ .nodes = try self.a.dupe(*const v.Node, nodes), .relationships = try self.a.dupe(*const v.Relationship, relationships) } })) orelse return;
             if (!try self.constraintsMatch(input.constraints, row, true)) return;
-            try output.append(self.a, .{ .row = row, .used = input.used, .terminal = nodes[nodes.len - 1].identity, .constraints = input.constraints });
+            const paths = try self.a.alloc(v.Path, input.paths.len + 1);
+            @memcpy(paths[0..input.paths.len], input.paths);
+            paths[input.paths.len] = .{ .nodes = try self.a.dupe(*const v.Node, nodes), .relationships = try self.a.dupe(*const v.Relationship, relationships) };
+            try output.append(self.a, .{ .row = row, .used = input.used, .paths = paths, .constraints = input.constraints });
             return;
         }
-        const before = output.items.len;
         try self.expandPath(input, path, mode, edge_index, nodes, relationships, 0, &.{}, output);
-        if (path.selector != .all and output.items.len > before) {
-            const candidates = try self.a.dupe(MatchState, output.items[before..]);
-            var write = before;
-            for (candidates) |candidate| {
-                const length = candidate.used.len - input.used.len;
-                var minimum = length;
-                for (candidates) |other| if (candidate.terminal.?.eql(other.terminal.?)) {
-                    minimum = @min(minimum, other.used.len - input.used.len);
-                };
-                if (length != minimum) continue;
-                if (path.selector == .shortest) {
-                    var selected = false;
-                    for (output.items[before..write]) |other| if (candidate.terminal.?.eql(other.terminal.?)) {
-                        selected = true;
-                        break;
-                    };
-                    if (selected) continue;
-                }
-                output.items[write] = candidate;
-                write += 1;
-            }
-            output.shrinkRetainingCapacity(write);
-        }
     }
+
     fn expandPath(self: *Engine, input: MatchState, path: ast.Path, mode: ast.PathMode, edge_index: usize, nodes: []const *const v.Node, relationships: []const *const v.Relationship, hops: u32, edge_values: []const v.Value, output: *std.ArrayList(MatchState)) anyerror!void {
         const edge = path.edges[edge_index];
         const current = nodes[nodes.len - 1];
@@ -600,7 +620,7 @@ const Engine = struct {
             if (try self.bind(input.row, path.nodes[edge_index + 1].alias, .{ .node = current })) |node_row| {
                 const edge_value: v.Value = if (edge.variable_length) .{ .list = edge_values } else .{ .relationship = relationships[relationships.len - 1] };
                 if (try self.bind(node_row, edge.alias, edge_value)) |edge_row| {
-                    if (try self.constrain(.{ .row = edge_row, .used = input.used, .constraints = input.constraints }, .{ .node = current }, path.nodes[edge_index + 1].properties)) |candidate|
+                    if (try self.constrain(.{ .row = edge_row, .used = input.used, .paths = input.paths, .constraints = input.constraints }, .{ .node = current }, path.nodes[edge_index + 1].properties)) |candidate|
                         try self.pathStep(candidate, path, mode, edge_index + 1, nodes, relationships, output);
                 }
             }
@@ -660,7 +680,7 @@ const Engine = struct {
                     @memcpy(next_values[0..edge_values.len], edge_values);
                     next_values[edge_values.len] = .{ .relationship = relationship };
                     try self.state();
-                    try self.expandPath(.{ .row = input.row, .used = next_used, .constraints = candidate.constraints }, path, mode, edge_index, next_nodes, next_relationships, hops + 1, next_values, output);
+                    try self.expandPath(.{ .row = input.row, .used = next_used, .paths = input.paths, .constraints = candidate.constraints }, path, mode, edge_index, next_nodes, next_relationships, hops + 1, next_values, output);
                 }
                 if (page.next == null) break;
                 if (cursor) |old| if (std.mem.eql(u8, old, page.next.?)) return error.CypherInvalidBackendCursor;
