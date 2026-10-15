@@ -166,6 +166,26 @@ test "native index owner adapter executes fresh permission stages and recovers r
         acceptance_reads: usize = 0,
         acceptance_writes: usize = 0,
         lose_acceptance_reply: bool = false,
+        pub fn currentAuthority(self: *@This()) !?@import("../metadata/relational_index_worker.zig").Authority {
+            const view = self.value.native_signing orelse return null;
+            return .{ .metadata_incarnation = view.identity.metadata_incarnation, .binding_digest = view.binding_digest, .writer_generation = 1 };
+        }
+        pub fn workJson(self: *@This(), a: std.mem.Allocator, query: @import("../metadata/relational_index_work.zig").Query) ![]u8 {
+            const work = @import("../metadata/relational_index_work.zig");
+            const response: work.Response = switch (query) {
+                .discover => |after| .{ .discovered = .{ .head = if (after == 0) self.value.head else null, .after_table = self.value.head.table_id, .exhausted = after != 0 } },
+                .head => |identity| blk: {
+                    try identity.requireHead(self.value.head);
+                    break :blk .{ .head = self.value.head };
+                },
+                .routes => |request_| blk: {
+                    try request_.identity.requireHead(self.value.head);
+                    if (request_.ordinal != 0 or self.value.head.owner_count != 1) return error.InvalidCatalogRecord;
+                    break :blk .{ .routes = .{ .head = self.value.head, .first_ordinal = 0, .table_name = self.value.dispatch.?.table_name, .targets = .{ .items = &.{.{ .owner = self.value.owner.owner, .start = "", .end = "" }} }, .next_ordinal = null } };
+                },
+            };
+            return std.json.Stringify.valueAlloc(a, response, .{});
+        }
         pub fn systemCatalog(self: *@This(), a: std.mem.Allocator, context: local.api_operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             try std.testing.expect(context.index_publication_authority);
             if (call == .relational_index_source_accept) {
@@ -555,6 +575,24 @@ test "native index owner adapter executes fresh permission stages and recovers r
         try receive_retry.signNative(signing_root, 2, 3, 4);
         _ = try receive_retry.response().requireSignedConsumption(consume_request);
         try std.testing.expect(metadata.acceptance_reads >= 6);
+        {
+            // Synthetic work/metadata directory, actual leased compiled owner.
+            // Automatic scheduling must resume a consumed prefix without
+            // publishing an index or proposing acceptance a second time.
+            var scheduler: @import("../metadata/relational_index_worker.zig").Coordinator = .{};
+            defer scheduler.deinit(std.testing.io);
+            const before = transport.calls;
+            var now = @import("antfly_platform").time.monotonicNs();
+            for (0..40) |_| {
+                const calls_before = transport.calls;
+                _ = try scheduler.step(std.testing.io, alloc, null, &metadata, &local_transport, now);
+                try std.testing.expect(transport.calls - calls_before <= 1);
+                if (transport.calls - before >= 3) break;
+                now += 300 * std.time.ns_per_ms;
+            }
+            try std.testing.expectEqual(@as(usize, 3), transport.calls - before);
+            try std.testing.expectEqual(@as(usize, 1), metadata.acceptance_writes);
+        }
         var retried = try owners.consumeNativeIndexSourceAtRoot(alloc, group, plan.before.name, consume_command, .{});
         defer retried.deinit();
         try std.testing.expect(retried.outcome.value.duplicate);

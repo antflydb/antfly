@@ -191,7 +191,10 @@ pub const Producer = struct {
                     self.phase = .done;
                     return self.result.?;
                 }
-                if (value.observation.header.?.bytes[184] == @backingInt(jobs.private_claims.SourceStream.State.failed)) return error.InvalidPrivateIndexBuildPage;
+                // Failure stops this local attempt; this observation does not
+                // authorize consumption, a metadata failure ACK or publication.
+                // Failed batches intentionally have no deliverable-source proof.
+                if (value.observation.header.?.bytes[184] == @backingInt(jobs.private_claims.SourceStream.State.failed)) return error.PrivateIndexBuildFailed;
                 if (value.signed_source == null) return .{ .pending = self.phase };
                 self.read = if (comptime @hasDecl(@TypeOf(response), "takeSource")) try response.takeSource(self.request) else try value.decodeSigned(self.alloc, self.request);
                 const batch = &self.read.?.batch.?;

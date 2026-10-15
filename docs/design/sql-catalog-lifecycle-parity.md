@@ -6856,3 +6856,47 @@ diff checks passed. The discovery regression includes the shared lifecycle
 directory rather than a terminal-head scan. GC was preview-only; nothing was
 deleted. No original SQL case, throughput benchmark, service activation or push
 is claimed by this milestone.
+
+### Native service scheduling and bounded residency
+
+The standalone control cadence now drives private index discovery, cohort
+capture, fence/reserve receipt delivery, bounded backfill and source consumption
+through the existing receiving ports. The host captures only an already admitted
+native binding, metadata incarnation and writer generation. Raft and hot-standby
+authorities remain excluded; receiving operations independently revalidate current
+permission. Neither discovery nor cached scheduling state is an execution grant.
+
+The pool retains at most four jobs and four distinct owner actors per job. Each
+turn performs one facade/receiving operation outside the pool mutex. Pending
+owners back off; expired attempts restart from durable status. After 4,096
+successful quanta a non-executing job yields residency so four long-lived jobs
+cannot permanently exclude later work. This is a scheduling bound, not a measured
+latency/throughput guarantee. Authority changes cancel retained work. Allocations
+are charged to the existing relational working-set budget, and service teardown
+joins callers and releases their charges before destroying DataServer.
+
+Build failure observations stop the attempt without authorizing consumption,
+publication or a synthesized failure ACK, and without terminating the service.
+Durable cancellation/failure publication still needs its complete state machine.
+
+Tests exercise distinct owner admission, residency
+rotation without evicting an executing job, uncertain acceptance, authority loss,
+allocation failures and scheduled recovery through the actual leased compiled
+owner. Metadata decisions in that owner fixture remain explicitly synthetic.
+The full gate in `/private/tmp/antfly-index-worker-full-debug.log` passed
+156/156 Debug steps: 48 publication, four service/ACK, eight native page,
+six C-ABI, three leased-owner, 14 prerequisite, 46 runtime-contract and
+104 standalone tests, plus shared domain tests and the decoder barrier.
+Counts overlap; no failures or leaks were reported. The initial sandboxed
+standalone run could not bind the TLS fixtures' localhost sockets; the final
+permitted run passed all 104 tests. Boundary, license, original inventory,
+control-catalog, formatting and diff checks passed. Cache housekeeping preserved
+the active Zig cache and deleted no Zig/Rust output; optional UV pruning was
+stopped while waiting on a shared lock, without touching other UV processes.
+
+Still required: EOF/inventory seals, durable failure/cancellation completion,
+bounded parallel target fanout, missing-root repair, actual data-Raft execution,
+terminal schema/catalog activation and full distributed fault qualification.
+Public UNIQUE activation remains guarded; original dispositions remain
+483 implemented / 862 unresolved. No original SQL completion or benchmark is
+claimed by connecting this private worker.

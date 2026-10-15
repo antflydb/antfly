@@ -757,6 +757,7 @@ const LocalStandaloneMetadata = struct {
     data_server: ?*antfly.data.runtime.DataServer = null,
     initial_fk_round_mutex: std.atomic.Mutex = .unlocked,
     relation_reconciliation: @import("../metadata/standalone_relation_reconciliation.zig").Coordinator = .{},
+    index_reconciliation: @import("../metadata/relational_index_worker.zig").Coordinator = .{},
     /// Only private owners actually primed in this process need resident
     /// retirement. Durable terminal metadata remains the authority.
     initial_fk_primed: std.AutoHashMapUnmanaged(u64, TrackedInitialOwner) = .empty,
@@ -1013,6 +1014,7 @@ const LocalStandaloneMetadata = struct {
     }
 
     pub fn deinit(self: *LocalStandaloneMetadata) void {
+        if (self.backend_runtime.filesystemIo()) |io| self.index_reconciliation.deinit(io);
         var initial_owners = self.initial_fk_primed.valueIterator();
         while (initial_owners.next()) |owner| self.alloc.free(owner.table_name);
         self.initial_fk_primed.deinit(self.alloc);
@@ -3616,6 +3618,7 @@ const LocalStandaloneMetadata = struct {
     fn runRound(ptr: *anyopaque) !void {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         try self.reconcileRelations();
+        try self.reconcileIndexes();
         try self.provisionRestoreOwners();
         self.finalizeReadySchemaMigrations() catch |err| switch (err) {
             error.FileNotFound, error.WriterLocked, error.LsmRootWriterAlreadyOpen, error.LmdbUnexpected, error.Corrupted => {},
@@ -3649,6 +3652,43 @@ const LocalStandaloneMetadata = struct {
             };
             try io.sleep(.fromMilliseconds(20), .awake);
         }
+    }
+
+    const IndexWorkHost = struct {
+        metadata: *LocalStandaloneMetadata,
+        pub fn currentAuthority(self: *@This()) !?@import("../metadata/relational_index_worker.zig").Authority {
+            const metadata = self.metadata;
+            // Only a short local authority capture under this lane. Root and
+            // metadata I/O belong to receiving ports, which revalidate current
+            // permission independently before each effect.
+            lockAtomic(&metadata.mutex);
+            defer metadata.mutex.unlock();
+            if (!metadata.standaloneRelationPublicationSupported() or !metadata.localFkPublicationSupported()) return null;
+            const binding = metadata.native_owner_binding orelse return null;
+            const incarnation = metadata.metadata_incarnation orelse return error.InvalidMetadataIncarnation;
+            if (!std.mem.eql(u8, &binding.metadata_incarnation, &incarnation)) return error.StoreRootEnrollmentChanged;
+            return .{ .metadata_incarnation = incarnation, .binding_digest = try binding.digest(), .writer_generation = metadata.hot_standby_binding_generation };
+        }
+        pub fn workJson(self: *@This(), alloc: std.mem.Allocator, query: @import("../metadata/relational_index_work.zig").Query) ![]u8 {
+            const store = self.metadata.lifecycle_store orelse return error.UnsupportedOperation;
+            return store.relationalIndexWorkJson(alloc, group_ids.main_metadata_group_id, query);
+        }
+        pub fn systemCatalog(self: *@This(), alloc: std.mem.Allocator, context: antfly.public_api.operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            return LocalStandaloneMetadata.systemCatalog(self.metadata, alloc, context, call);
+        }
+    };
+
+    fn reconcileIndexes(self: *LocalStandaloneMetadata) !void {
+        const server = self.data_server orelse return;
+        const control = server.api_server_cfg.relational_index_control orelse return;
+        const claims = server.api_server_cfg.relational_index_claims orelse return;
+        const io = self.backend_runtime.filesystemIo() orelse return error.MissingBackendRuntimeIo;
+        var host: IndexWorkHost = .{ .metadata = self };
+        var transport: @import("../api/relational_index_local_delivery.zig").Transport = .{ .control_port = control, .claim_port = claims };
+        _ = self.index_reconciliation.step(io, self.alloc, &server.provisioned_storage.resource_manager, &host, &transport, platform_time.monotonicNs()) catch |err| switch (err) {
+            error.Canceled, error.DeadlineExceeded, error.Timeout, error.NotLeader, error.GenerationPublicationChanged, error.GenerationAdmissionPending, error.MetadataMutationOutcomeUnknown, error.ResourceBudgetExceeded, error.OutOfMemory, error.ResourceTemporarilyUnavailable, error.WriterLocked, error.LsmRootWriterAlreadyOpen, error.UnsupportedNativeIndexOwner, error.PrivateIndexRootRecoveryRequired, error.PrivateIndexBuildFailed, error.UniqueConstraintViolation, error.TableTopologyProtocolUpgradeRequired => false,
+            else => return err,
+        };
     }
 
     fn reconcileRelations(self: *LocalStandaloneMetadata) !void {
@@ -5606,6 +5646,9 @@ pub fn runFromIterator(
         data_server.provisioned_storage.setDenseNativeAuthorityPermitted(true);
     }
     defer data_server.deinitWithDeadline(supervisor.deadline());
+    // Control callers are joined by the later unified lifecycle defer. Release
+    // borrowed resource-manager charges before DataServer destroys that owner.
+    defer local_metadata.index_reconciliation.deinit(node_backend_runtime.ptr().filesystemIo().?);
     const managed_memory = data_server.provisioned_storage.resource_manager.snapshot().memory;
     std.log.info(
         "process memory policy operator_source={s} effective_source={s} configured_limit_bytes={d} effective_limit_bytes={d} managed_hard_limit_bytes={d}",
@@ -13143,6 +13186,11 @@ test "standalone native index owner catalog calls preserve authority and capabil
     defer runtime.deinit();
     var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", root, path, runtime.ptr(), null, .local);
     defer metadata.deinit();
+    var index_host: LocalStandaloneMetadata.IndexWorkHost = .{ .metadata = &metadata };
+    // An initialized catalog without an actual admitted data owner is not
+    // background index execution authority, even for an internal caller.
+    try std.testing.expect(try index_host.currentAuthority() == null);
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, index_host.workJson(alloc, .{ .discover = 0 }));
     const revision = metadata.durable_revision;
     const context: antfly.public_api.operation.RequestContext = .{ .index_publication_authority = true, .setting_admin = true };
     for (calls) |call| {

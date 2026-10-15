@@ -1354,6 +1354,62 @@ const TestDeliveryTransport = struct {
     }
 };
 
+const TestSchedulerHost = struct {
+    const worker = @import("../metadata/relational_index_worker.zig");
+    const work = @import("../metadata/relational_index_work.zig");
+    driver: *TestDriver,
+    active: bool = true,
+    pub fn currentAuthority(self: *@This()) !?worker.Authority {
+        return if (self.active) .{ .metadata_incarnation = @splat('a'), .binding_digest = @splat(1), .writer_generation = 1 } else null;
+    }
+    pub fn workJson(self: *@This(), alloc: std.mem.Allocator, query: work.Query) ![]u8 {
+        try query.validate();
+        const value = self.driver.value;
+        const response: work.Response = switch (query) {
+            .discover => |after| .{ .discovered = .{ .head = if (after == 0) value.head else null, .after_table = value.head.table_id, .exhausted = after != 0 } },
+            .head => |identity| blk: {
+                try identity.requireHead(value.head);
+                break :blk .{ .head = value.head };
+            },
+            .routes => |request| blk: {
+                try request.identity.requireHead(value.head);
+                if (request.ordinal != 0 or value.head.owner_count != 1) return error.InvalidCatalogRecord;
+                break :blk .{ .routes = .{ .head = value.head, .first_ordinal = 0, .table_name = value.dispatch.?.table_name, .targets = .{ .items = &.{.{ .owner = value.owner.owner, .start = "", .end = "" }} }, .next_ordinal = null } };
+            },
+        };
+        return std.json.Stringify.valueAlloc(alloc, response, .{});
+    }
+    pub fn systemCatalog(self: *@This(), alloc: std.mem.Allocator, context: operation.RequestContext, call: calls.Call) ![]u8 {
+        return self.driver.systemCatalog(alloc, context, call);
+    }
+};
+
+fn testSchedulerDelivery(alloc: std.mem.Allocator, permission: publication.OwnerDecision, binding: jobs.Binding, root: local.storage_db_root_signing_identity.State) !void {
+    const worker = @import("../metadata/relational_index_worker.zig");
+    var driver: TestDriver = .{ .value = permission, .binding = binding, .lose_acceptance_reply = true };
+    var host: TestSchedulerHost = .{ .driver = &driver };
+    var sender: TestDeliveryTransport = .{ .driver = &driver, .root = root };
+    var transport = sender.localTransport();
+    var coordinator: worker.Coordinator = .{};
+    defer coordinator.deinit(std.testing.io);
+    var now = @import("antfly_platform").time.monotonicNs();
+    for (0..100) |_| {
+        const before = sender.calls;
+        _ = try coordinator.step(std.testing.io, alloc, null, &host, &transport, now);
+        try std.testing.expect(sender.calls - before <= 1);
+        if (driver.consumption_calls == 1) break;
+        now += 300 * std.time.ns_per_ms;
+    }
+    try std.testing.expectEqual(@as(usize, 1), driver.build_pages);
+    try std.testing.expectEqual(@as(usize, 1), driver.acceptance_calls);
+    try std.testing.expectEqual(@as(usize, 1), driver.consumption_calls);
+    host.active = false;
+    const before = sender.calls;
+    try std.testing.expect(!try coordinator.step(std.testing.io, alloc, null, &host, &transport, now));
+    for (coordinator.jobs) |job| try std.testing.expect(job == null);
+    try std.testing.expectEqual(before, sender.calls);
+}
+
 fn testDeliveryProducer(alloc: std.mem.Allocator, permission: publication.OwnerDecision, binding: jobs.Binding, root: local.storage_db_root_signing_identity.State) !void {
     return testDeliveryProducerMode(alloc, permission, binding, root, false);
 }
@@ -1873,6 +1929,8 @@ test "relational index publication claim receiver binds fresh build permission w
         try std.testing.checkAllAllocationFailures(alloc, testDeliveryProducer, .{ permission, binding.?, root });
         try testDeliveryProducerLocal(alloc, permission, binding.?, root);
         try std.testing.checkAllAllocationFailures(alloc, testDeliveryProducerLocal, .{ permission, binding.?, root });
+        try testSchedulerDelivery(alloc, permission, binding.?, root);
+        try std.testing.checkAllAllocationFailures(alloc, testSchedulerDelivery, .{ permission, binding.?, root });
         {
             var cohort = try jobs.private_claims.delivery.Cohort.init(alloc, &.{.{ .owner = permission.owner.owner, .start = "", .end = "" }});
             defer cohort.deinit();
@@ -1882,7 +1940,7 @@ test "relational index publication claim receiver binds fresh build permission w
             var producer = try DeliveryProducer.init(alloc, &cohort, plan.before.name, source_request, producer_context);
             defer producer.deinit();
             _ = try producer.step(&transport, &failed_driver);
-            try std.testing.expectError(error.InvalidPrivateIndexBuildPage, producer.step(&transport, &failed_driver));
+            try std.testing.expectError(error.PrivateIndexBuildFailed, producer.step(&transport, &failed_driver));
             try std.testing.expectEqual(@as(usize, 0), failed_driver.claim_batches);
             try std.testing.expectEqual(@as(usize, 0), failed_driver.acceptance_calls);
             try std.testing.expectEqual(@as(usize, 0), failed_driver.consumption_calls);

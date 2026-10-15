@@ -44,6 +44,7 @@ pub const RootProof = @import("relational_index_root_attestation.zig").Proof;
 
 test {
     _ = @import("relational_index_work.zig");
+    _ = @import("relational_index_worker.zig");
 }
 
 /// Provenance for one actual canonical source batch. This is not a source ACK,
