@@ -680,7 +680,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "export and import resolution artifacts round trip with public artifact ids",
             "portable graph conversion accepts generation-less v1 edge artifacts",
             "export and import graph edge artifacts round trip with arbitrary ids",
-            "portable relationships preserve parallel identities and arbitrary endpoints",
+            "portable backup relationships preserve parallel identities and arbitrary endpoints",
             "relationship key value decoding releases truncated and failed allocations",
             "AFB2 relationship inventory requires reader version three",
             "document batch round-trip",
@@ -2079,6 +2079,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_lite_native_tests = addFilteredTestRunArtifact(b, lite_native_tests);
     const lite_native_test_step = b.step("lite-native-test", "Run Lite native backend tests");
     lite_native_test_step.dependOn(&run_lite_native_tests.step);
+    const backup_preflight_tests = b.addTest(.{
+        .root_module = lite_native_test_mod,
+        .filters = &.{ "backup preflight", "lite restore staging", "storage.backup_bundle_io.", "storage.backup_bundle." },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("backup-preflight-test", "Verify read-only backup dependency inspection and preparation").dependOn(&addFilteredTestRunArtifact(b, backup_preflight_tests).step);
     const lite_reader_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/lite_reader_test_root.zig"),
         .target = target,
