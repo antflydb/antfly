@@ -265,6 +265,39 @@ pub const GeneratedRecordWriter = *const fn (
     source_guards: []const GeneratedSourceGuard,
     fence: ?GeneratedWriteFence,
 ) anyerror!GeneratedRecordCommit;
+/// An owner may deliver completed results to its current runtime. The receiver
+/// must validate namespace/catalog, lease tenure, and sources transactionally.
+pub const GeneratedPublicationPort = struct {
+    ptr: *anyopaque,
+    commit: GeneratedRecordWriter,
+    heartbeat: *const fn (*anyopaque, GeneratedWriteFence, u64, u64) anyerror!bool,
+    acquire_store: *const fn (*anyopaque, ?GeneratedWriteFence, u64) anyerror!GeneratedStoreLease,
+};
+/// A short owner lease around a storage-only operation. No provider execution
+/// is allowed while this lease is held. The borrowed store belongs to the live
+/// namespace; release also refreshes the detached reader's primary checkpoint.
+pub const GeneratedStoreLease = struct {
+    store: backend_erased.Store,
+    ptr: *anyopaque,
+    release: *const fn (*anyopaque) void,
+    guard_key: *const fn (*anyopaque, []const u8) anyerror!void,
+};
+
+const RuntimePublicationStore = struct {
+    lease: ?GeneratedStoreLease = null,
+    fn init(runtime: *EnrichmentRuntime) !@This() {
+        return .{ .lease = if (runtime.generated_publication) |port| try port.acquire_store(port.ptr, currentGeneratedWriteFence(runtime), runtime.clock.nowRealtimeMs()) else null };
+    }
+    fn store(self: *@This(), runtime: *EnrichmentRuntime) *backend_erased.Store {
+        return if (self.lease) |*lease| &lease.store else &runtime.store;
+    }
+    fn deinit(self: *@This()) void {
+        if (self.lease) |lease| lease.release(lease.ptr);
+    }
+};
+
+pub const GeneratedRecordBatch = derived_types.DerivedBatch;
+
 pub const ArtifactUnitTurnCommit = struct {
     ptr: *anyopaque,
     commit: *const fn (*anyopaque, ?*const @import("../artifact_unit_jobs.zig").DocumentTurn, ?*const @import("../artifact_unit_jobs.zig").WorkTurn) anyerror!void,
@@ -3580,7 +3613,65 @@ fn assetProducerProduceBorrowedRasterBatchReportedGuarded(
     return produced;
 }
 
-fn embedDenseWithRetry(
+fn computationKey(provider: embedder_mod.DenseEmbedder, name: []const u8, text: []const u8, dims: u32) ?[32]u8 {
+    const key_fn = provider.computation_key_fn orelse return null;
+    return key_fn(provider.ptr, name, text, dims) catch null;
+}
+
+fn cacheableVector(vector: []const f32, dims: u32) bool {
+    if (vector.len != dims) return false;
+    for (vector) |value| if (!std.math.isFinite(value)) return false;
+    return true;
+}
+
+fn embedDenseWithRetry(provider: embedder_mod.DenseEmbedder, runtime: *EnrichmentRuntime, name: []const u8, text: []const u8, dims: u32) ![]f32 {
+    const cache = runtime.dense_result_cache orelse return embedDenseWithRetryUncached(provider, runtime, name, text, dims);
+    const key = computationKey(provider, name, text, dims) orelse return embedDenseWithRetryUncached(provider, runtime, name, text, dims);
+    try runtime.active_provider_guard.check();
+    if (try cache.lookup(cache.ptr, runtime.alloc, key)) |vector| return vector;
+    const vector = try embedDenseWithRetryUncached(provider, runtime, name, text, dims);
+    if (cacheableVector(vector, dims)) cache.remember(cache.ptr, key, vector);
+    return vector;
+}
+
+fn embedDenseBatchWithRetry(provider: embedder_mod.DenseEmbedder, runtime: *EnrichmentRuntime, name: []const u8, texts: []const []const u8, dims: u32) ![]const []const f32 {
+    const cache = runtime.dense_result_cache orelse return embedDenseBatchWithRetryUncached(provider, runtime, name, texts, dims);
+    if (provider.computation_key_fn == null) return embedDenseBatchWithRetryUncached(provider, runtime, name, texts, dims);
+    try runtime.active_provider_guard.check();
+    const keys = try runtime.alloc.alloc(?[32]u8, texts.len);
+    defer runtime.alloc.free(keys);
+    const vectors = try runtime.alloc.alloc([]const f32, texts.len);
+    @memset(vectors, &.{});
+    errdefer embedder_mod.freeDenseEmbeddingBatch(runtime.alloc, vectors);
+    var misses: std.ArrayList(usize) = .empty;
+    defer misses.deinit(runtime.alloc);
+    var missing_texts: std.ArrayList([]const u8) = .empty;
+    defer missing_texts.deinit(runtime.alloc);
+    for (texts, 0..) |text, i| {
+        keys[i] = computationKey(provider, name, text, dims);
+        if (keys[i]) |key| if (try cache.lookup(cache.ptr, runtime.alloc, key)) |vector| {
+            vectors[i] = vector;
+            continue;
+        };
+        try misses.append(runtime.alloc, i);
+        try missing_texts.append(runtime.alloc, text);
+    }
+    if (misses.items.len != 0) {
+        const computed = try embedDenseBatchWithRetryUncached(provider, runtime, name, missing_texts.items, dims);
+        defer runtime.alloc.free(computed);
+        if (computed.len != misses.items.len) {
+            for (computed) |vector| runtime.alloc.free(vector);
+            return error.InvalidEmbeddingResponse;
+        }
+        for (computed, misses.items) |vector, index| {
+            vectors[index] = vector;
+            if (keys[index]) |key| if (cacheableVector(vector, dims)) cache.remember(cache.ptr, key, vector);
+        }
+    }
+    return vectors;
+}
+
+fn embedDenseWithRetryUncached(
     dense_embedder: embedder_mod.DenseEmbedder,
     runtime: *EnrichmentRuntime,
     embedding_name: []const u8,
@@ -3619,7 +3710,7 @@ fn embedDenseWithRetry(
     }
 }
 
-fn embedDenseBatchWithRetry(
+fn embedDenseBatchWithRetryUncached(
     dense_embedder: embedder_mod.DenseEmbedder,
     runtime: *EnrichmentRuntime,
     embedding_name: []const u8,
@@ -4581,6 +4672,8 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) UnsupportedEn
 const UnsupportedEnrichmentRuntime = struct {
     alloc: Allocator,
     status_hook: ?StatusHook = null,
+    dense_result_cache: ?embedder_mod.DenseResultCache = null,
+    generated_publication: ?GeneratedPublicationPort = null,
     shared_pdf_windows: ?*SharedPdfWindowScheduler = null,
     /// Borrowed from the owning DB, which stops and destroys this runtime
     /// before releasing BackendRuntime.
@@ -5070,6 +5163,7 @@ const UnsupportedEnrichmentRuntime = struct {
     }
 };
 const PlatformEnrichmentRuntime = struct {
+    pub const testDetachedLeaseRenewal = testPublicationLeaseRenewal;
     const IoBackend = struct {
         borrowed: Io,
 
@@ -5212,6 +5306,8 @@ const PlatformEnrichmentRuntime = struct {
     isolated_failed_indexes: std.StringHashMapUnmanaged(void) = .empty,
     isolated_failed_sources: std.StringHashMapUnmanaged(void) = .empty,
     status_hook: ?StatusHook = null,
+    dense_result_cache: ?embedder_mod.DenseResultCache = null,
+    generated_publication: ?GeneratedPublicationPort = null,
     future: ?background_runtime_mod.MaintenanceScheduler.Handle = null,
 
     pub fn init(
@@ -20391,8 +20487,15 @@ fn storePutPrivateBatchWithRetry(runtime: ?*EnrichmentRuntime, store: *backend_e
 }
 
 fn storePutPrivateBatch(runtime: ?*EnrichmentRuntime, store: *backend_erased.Store, writes: []const KVPair, deletes: []const []const u8) !void {
+    var publication_store = if (runtime) |owner| if (store == &owner.store) try RuntimePublicationStore.init(owner) else RuntimePublicationStore{} else RuntimePublicationStore{};
+    defer publication_store.deinit();
+    const live_store = if (publication_store.lease) |*lease| &lease.store else store;
+    if (publication_store.lease) |lease| {
+        for (writes) |write| try lease.guard_key(lease.ptr, write.key);
+        for (deletes) |key| try lease.guard_key(lease.ptr, key);
+    }
     const fence = if (runtime) |owner| try requiredRuntimeStoreWriteFence(owner) else null;
-    var batch = try store.beginBatch();
+    var batch = try live_store.beginBatch();
     errdefer batch.abort();
     if (runtime) |owner| try validateRuntimeStoreWriteFenceTxn(owner, &batch, fence);
     for (writes) |write| try ordered_publication.requireLegacyMaterialization(&batch, write.key);
@@ -23631,8 +23734,10 @@ fn processOrderedChunkVectorWithAllocator(runtime: *EnrichmentRuntime, alloc: Al
             defer prepared_checkpoint.deinit();
             if (runtime.coverage_apply_mutex) |mutex| mutex.lockShared();
             defer if (runtime.coverage_apply_mutex) |mutex| mutex.unlockShared();
+            var publication_store = try RuntimePublicationStore.init(runtime);
+            defer publication_store.deinit();
             const fence = try requiredRuntimeStoreWriteFence(runtime);
-            var write = try runtime.store.beginWrite();
+            var write = try publication_store.store(runtime).beginWrite();
             var open = true;
             defer if (open) write.abort();
             try validateRuntimeStoreWriteFenceTxn(runtime, &write, fence);
@@ -24418,6 +24523,15 @@ fn storeGuardedEmbeddings(runtime: *EnrichmentRuntime, writes: []const GuardedEm
         return;
     }
     for (writes) |write| if (write.ordered_input != null) return error.ArtifactCatalogDrift;
+    if (runtime.generated_publication != null) {
+        var publication_store = try RuntimePublicationStore.init(runtime);
+        defer publication_store.deinit();
+        var txn = try publication_store.store(runtime).beginWrite();
+        errdefer txn.abort();
+        const fence = try requiredRuntimeStoreWriteFence(runtime);
+        try validateRuntimeStoreWriteFenceTxn(runtime, &txn, fence);
+        return storeGuardedEmbeddingsTxn(runtime, &txn, writes, accepted);
+    }
     if (runtime.artifact_store) |store| {
         var txn = try store.beginWriteTxn();
         errdefer txn.abort();
@@ -29888,7 +30002,7 @@ fn storePutBatchWithRetry(runtime: anytype, writes: []const KVPair, deletes: []c
             },
             else => return err,
         };
-        try runtime.store.sync(false);
+        if (runtime.generated_publication == null) try runtime.store.sync(false);
         return;
     }
 }
@@ -29903,9 +30017,12 @@ fn coverageReceiptIsCurrent(runtime: *EnrichmentRuntime, txn: anytype, transitio
 }
 
 fn saveAppliedSequenceWithRetry(runtime: *EnrichmentRuntime, scope: []const u8, sequence: u64) !void {
+    var publication_store = try RuntimePublicationStore.init(runtime);
+    defer publication_store.deinit();
+    const live_store = publication_store.store(runtime);
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
-        var checkpoint = enrichment_state.loadProjectionCheckpoint(runtime.alloc, runtime.store, scope) catch |err| switch (err) {
+        var checkpoint = enrichment_state.loadProjectionCheckpoint(runtime.alloc, live_store.*, scope) catch |err| switch (err) {
             error.WriterLocked => {
                 if (attempt >= writer_locked_retry_count) return err;
                 backoffWriterLockRetry();
@@ -29916,7 +30033,7 @@ fn saveAppliedSequenceWithRetry(runtime: *EnrichmentRuntime, scope: []const u8, 
         checkpoint.applied_sequence = sequence;
         checkpoint.status = runtimeProjectionStatus(runtime.retrying, runtime.worker_failed);
         checkpoint.config_hash = try enrichmentCatalogConfigHash(runtime.alloc, runtime.index_manager);
-        enrichment_state.saveProjectionCheckpoint(runtime.store, scope, checkpoint) catch |err| switch (err) {
+        enrichment_state.saveProjectionCheckpoint(live_store.*, scope, checkpoint) catch |err| switch (err) {
             error.WriterLocked => {
                 if (attempt >= writer_locked_retry_count) return err;
                 backoffWriterLockRetry();
@@ -29992,9 +30109,12 @@ fn saveReplayCursorForGroup(
     applied_sequence: u64,
     group: enrichment_worker.PendingDocumentGroup,
 ) !void {
+    var publication_store = try RuntimePublicationStore.init(runtime);
+    defer publication_store.deinit();
+    const live_store = publication_store.store(runtime);
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
-        enrichment_state.saveReplayCursor(runtime.store, stream.cursorScope(), .{
+        enrichment_state.saveReplayCursor(live_store.*, stream.cursorScope(), .{
             .base_applied_sequence = applied_sequence,
             .sequence = group.sequence,
             .doc_key = @constCast(group.doc_key),
@@ -30047,9 +30167,12 @@ test "mid-scan checkpoint only advances a stream with nothing outstanding" {
 }
 
 fn clearReplayCursorForStreamWithRetry(runtime: *EnrichmentRuntime, stream: ReplayStream) !void {
+    var publication_store = try RuntimePublicationStore.init(runtime);
+    defer publication_store.deinit();
+    const live_store = publication_store.store(runtime);
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
-        enrichment_state.clearReplayCursor(runtime.store, stream.cursorScope()) catch |err| switch (err) {
+        enrichment_state.clearReplayCursor(live_store.*, stream.cursorScope()) catch |err| switch (err) {
             error.WriterLocked => {
                 if (attempt >= writer_locked_retry_count) return err;
                 backoffWriterLockRetry();
@@ -30067,9 +30190,12 @@ fn clearReplayCursorWithRetry(runtime: *EnrichmentRuntime) !void {
 }
 
 fn saveRuntimeStatusWithRetry(runtime: *EnrichmentRuntime, scope: []const u8, status: enrichment_state.RuntimeStatus) !void {
+    var publication_store = try RuntimePublicationStore.init(runtime);
+    defer publication_store.deinit();
+    const live_store = publication_store.store(runtime);
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
-        enrichment_state.saveRuntimeStatus(runtime.store, scope, status) catch |err| switch (err) {
+        enrichment_state.saveRuntimeStatus(live_store.*, scope, status) catch |err| switch (err) {
             error.WriterLocked => {
                 if (attempt >= writer_locked_retry_count) return err;
                 backoffWriterLockRetry();
@@ -30077,7 +30203,7 @@ fn saveRuntimeStatusWithRetry(runtime: *EnrichmentRuntime, scope: []const u8, st
             },
             else => return err,
         };
-        var checkpoint = enrichment_state.loadProjectionCheckpoint(runtime.alloc, runtime.store, scope) catch |err| switch (err) {
+        var checkpoint = enrichment_state.loadProjectionCheckpoint(runtime.alloc, live_store.*, scope) catch |err| switch (err) {
             error.WriterLocked => {
                 if (attempt >= writer_locked_retry_count) return err;
                 backoffWriterLockRetry();
@@ -30087,7 +30213,7 @@ fn saveRuntimeStatusWithRetry(runtime: *EnrichmentRuntime, scope: []const u8, st
         };
         checkpoint.status = runtimeProjectionStatus(status.retrying, status.worker_failed);
         checkpoint.config_hash = try enrichmentCatalogConfigHash(runtime.alloc, runtime.index_manager);
-        enrichment_state.saveProjectionCheckpoint(runtime.store, scope, checkpoint) catch |err| switch (err) {
+        enrichment_state.saveProjectionCheckpoint(live_store.*, scope, checkpoint) catch |err| switch (err) {
             error.WriterLocked => {
                 if (attempt >= writer_locked_retry_count) return err;
                 backoffWriterLockRetry();
@@ -30486,8 +30612,11 @@ fn coverageCounterInTxn(alloc: Allocator, txn: *backend_erased.Batch, transition
 fn applyCurrentCoverageOutcomeTransitionsForIndex(runtime: *EnrichmentRuntime, transitions: []const CoverageOutcomeTransition) !void {
     if (transitions.len == 0) return;
     try heartbeatEnrichmentLease(runtime);
+    var publication_store = try RuntimePublicationStore.init(runtime);
+    defer publication_store.deinit();
+    const live_store = publication_store.store(runtime);
     const fence = try requiredRuntimeStoreWriteFence(runtime);
-    var batch = try runtime.store.beginBatch();
+    var batch = try live_store.*.beginBatch();
     var committed = false;
     defer if (!committed) batch.abort();
     try validateRuntimeStoreWriteFenceTxn(runtime, &batch, fence);
@@ -30585,7 +30714,7 @@ fn applyCurrentCoverageOutcomeTransitionsForIndex(runtime: *EnrichmentRuntime, t
     try validateRuntimeStoreWriteFenceTxn(runtime, &batch, fence);
     try batch.commit();
     committed = true;
-    try runtime.store.sync(false);
+    try live_store.*.sync(false);
     if (skipped_delta > 0) {
         runtime.skipped_source_count +|= @intCast(skipped_delta);
     } else if (skipped_delta < 0) {
@@ -30878,6 +31007,9 @@ fn appendGeneratedBatchWithRetry(
     artifact_delete_keys: []const []const u8,
     source_guards: []const GeneratedSourceGuard,
 ) !GeneratedRecordCommit {
+    if (runtime.generated_publication) |publication| {
+        return publication.commit(publication.ptr, batch, artifact_promotions, artifact_delete_keys, source_guards, currentGeneratedWriteFence(runtime));
+    }
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
         try heartbeatEnrichmentLease(runtime);
@@ -30898,10 +31030,107 @@ fn heartbeatEnrichmentLease(runtime: *EnrichmentRuntime) !void {
     if (!runtime.lease_fencing_enabled) return;
     const io_impl = runtime.io_impl orelse return;
     const io = io_impl.io();
+    const renewal_alloc = @import("antfly_platform").allocator.concurrentFallback();
+    const renewal = blk: {
+        runtime.mutex.lockUncancelable(io);
+        defer runtime.mutex.unlock(io);
+        const publication = runtime.generated_publication orelse {
+            if (!(try runtime.ownership.heartbeatIfDue(runtime.clock.nowRealtimeMs()))) return error.EnrichmentLeaseFenceLost;
+            return;
+        };
+        const now = runtime.clock.nowRealtimeMs();
+        if (!runtime.ownership.lease_owned) return;
+        if (!runtime.ownership.has_lease or runtime.ownership.lease_epoch == 0) return error.EnrichmentLeaseFenceLost;
+        if (now < runtime.ownership.lease_renew_after_ms) return;
+        break :blk .{
+            .publication = publication,
+            .owner_id = try renewal_alloc.dupe(u8, runtime.ownership.owner_id),
+            .epoch = runtime.ownership.lease_epoch,
+            .now = now,
+            .ttl = runtime.ownership.lease_ttl_ms,
+        };
+    };
+    defer renewal_alloc.free(renewal.owner_id);
+    // The owner callback may queue for a file gate. Never hold the runtime
+    // mutex across it: publication paths acquire that gate before this mutex.
+    if (!try renewal.publication.heartbeat(renewal.publication.ptr, .{
+        .lease_key = enrichment_lease.default_lease_key,
+        .owner_id = renewal.owner_id,
+        .epoch = renewal.epoch,
+    }, renewal.now, renewal.ttl)) return error.EnrichmentLeaseFenceLost;
     runtime.mutex.lockUncancelable(io);
     defer runtime.mutex.unlock(io);
-    if (!(try runtime.ownership.heartbeatIfDue(runtime.clock.nowRealtimeMs())))
-        return error.EnrichmentLeaseFenceLost;
+    if (!runtime.ownership.lease_owned or
+        !std.mem.eql(u8, runtime.ownership.owner_id, renewal.owner_id) or
+        runtime.ownership.lease_ttl_ms != renewal.ttl or
+        !runtime.ownership.noteFencedRenewal(renewal.epoch, renewal.now)) return error.EnrichmentLeaseFenceLost;
+}
+
+fn testPublicationLeaseRenewal() !void {
+    const a = std.testing.allocator;
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(a, .{ .name = "renewal" });
+    defer store.deinit();
+    var erased = try backend_erased.storeFrom(a, store);
+    defer erased.deinit();
+    var runtime: EnrichmentRuntime = .{
+        .alloc = a,
+        .io_impl = .{ .borrowed = std.testing.io },
+        .store = erased,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{},
+        .ownership = try ownership_mod.State.init(a, &erased, enrichment_lease.default_lease_key, .{ .lease_owned = true, .owner_id = "first" }),
+        .lease_fencing_enabled = true,
+    };
+    defer runtime.ownership.deinit(a);
+    try std.testing.expect(try runtime.ownership.ensureLease(runtime.clock.nowRealtimeMs()));
+    const Callback = struct {
+        runtime: *EnrichmentRuntime,
+        calls: usize = 0,
+        replace: bool = false,
+        accept: bool = true,
+        fn heartbeat(ptr: *anyopaque, fence: GeneratedWriteFence, _: u64, _: u64) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            // Fail immediately on lock inversion, instead of hanging the suite.
+            if (!self.runtime.mutex.tryLock()) return error.TestRuntimeMutexHeld;
+            defer self.runtime.mutex.unlock(std.testing.io);
+            self.calls += 1;
+            try std.testing.expectEqual(self.runtime.ownership.lease_epoch, fence.epoch);
+            if (self.replace) {
+                self.runtime.ownership.lease_epoch += 1;
+                // Mutate the original ID to prove the renewal owns its copy.
+                self.runtime.ownership.owner_id[0] = 'x';
+                try std.testing.expectEqualStrings("first", fence.owner_id);
+            }
+            return self.accept;
+        }
+    };
+    var callback: Callback = .{ .runtime = &runtime };
+    runtime.generated_publication = .{ .ptr = &callback, .heartbeat = Callback.heartbeat, .commit = undefined, .acquire_store = undefined };
+    const renewals = runtime.ownership.renewal_count;
+    runtime.ownership.lease_renew_after_ms = 0;
+    try heartbeatEnrichmentLease(&runtime);
+    try std.testing.expectEqual(renewals + 1, runtime.ownership.renewal_count);
+    try std.testing.expectEqual(@as(usize, 1), callback.calls);
+    // The newly calculated deadline avoids redundant owner callbacks.
+    try heartbeatEnrichmentLease(&runtime);
+    try std.testing.expectEqual(@as(usize, 1), callback.calls);
+    runtime.ownership.lease_renew_after_ms = 0;
+    callback.accept = false;
+    try std.testing.expectError(error.EnrichmentLeaseFenceLost, heartbeatEnrichmentLease(&runtime));
+    try std.testing.expectEqual(renewals + 1, runtime.ownership.renewal_count);
+    callback.accept = true;
+    callback.replace = true;
+    try std.testing.expectError(error.EnrichmentLeaseFenceLost, heartbeatEnrichmentLease(&runtime));
+    try std.testing.expectEqual(renewals + 1, runtime.ownership.renewal_count);
 }
 
 /// Renews an enrichment lease while a long-running document transform is in
@@ -30986,12 +31215,10 @@ const RuntimeLeaseHeartbeatGuard = struct {
             };
             if (self.done.isSet()) return;
             const now_ms = self.runtime.clock.nowRealtimeMs();
-            const renewed = self.lease.?.renewFenced(
-                self.owner_id,
-                self.epoch,
-                now_ms,
-                self.ttl_ms,
-            ) catch |err| switch (err) {
+            const renewed = (if (self.runtime.generated_publication) |publication|
+                publication.heartbeat(publication.ptr, .{ .lease_key = enrichment_lease.default_lease_key, .owner_id = self.owner_id, .epoch = self.epoch }, now_ms, self.ttl_ms)
+            else
+                self.lease.?.renewFenced(self.owner_id, self.epoch, now_ms, self.ttl_ms)) catch |err| switch (err) {
                 error.WriterLocked => {
                     // Contention consumes renewal slack. Retry promptly
                     // rather than sleeping another quarter of the lease TTL.
@@ -31303,8 +31530,12 @@ test "optional enrichment reads never classify contention as source absence" {
 }
 
 fn storePut(runtime: *EnrichmentRuntime, key: []const u8, value: []const u8) !void {
+    var publication_store = try RuntimePublicationStore.init(runtime);
+    defer publication_store.deinit();
+    const live_store = publication_store.store(runtime);
+    if (publication_store.lease) |lease| try lease.guard_key(lease.ptr, key);
     const fence = try requiredRuntimeStoreWriteFence(runtime);
-    var txn = try runtime.store.beginWrite();
+    var txn = try live_store.*.beginWrite();
     errdefer txn.abort();
     try validateRuntimeStoreWriteFenceTxn(runtime, &txn, fence);
     try @import("../artifact_publication.zig").requireLegacyMaterialization(&txn, key);
@@ -31320,8 +31551,15 @@ fn storePut(runtime: *EnrichmentRuntime, key: []const u8, value: []const u8) !vo
 }
 
 fn storePutBatch(runtime: *EnrichmentRuntime, writes: []const KVPair, deletes: []const []const u8) !void {
+    var publication_store = try RuntimePublicationStore.init(runtime);
+    defer publication_store.deinit();
+    const live_store = publication_store.store(runtime);
+    if (publication_store.lease) |lease| {
+        for (writes) |write| try lease.guard_key(lease.ptr, write.key);
+        for (deletes) |key| try lease.guard_key(lease.ptr, key);
+    }
     const fence = try requiredRuntimeStoreWriteFence(runtime);
-    var batch = try runtime.store.beginBatch();
+    var batch = try live_store.*.beginBatch();
     errdefer batch.abort();
     try validateRuntimeStoreWriteFenceTxn(runtime, &batch, fence);
     for (writes) |write| try @import("../artifact_publication.zig").requireLegacyMaterialization(&batch, write.key);
@@ -31354,6 +31592,7 @@ fn storePutBatch(runtime: *EnrichmentRuntime, writes: []const KVPair, deletes: [
     }
     try validateRuntimeStoreWriteFenceTxn(runtime, &batch, fence);
     try batch.commit();
+    if (publication_store.lease != null) try live_store.sync(false);
 }
 
 fn remoteRenderConfig(

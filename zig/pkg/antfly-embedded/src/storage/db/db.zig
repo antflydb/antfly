@@ -578,6 +578,8 @@ pub const OpenOptions = struct {
         degree_canary,
     };
 
+    /// External owners drive historical index work outside their capture fence.
+    defer_index_backfill_on_open: bool = false,
     table_storage: ?table_storage_mod.Settings = null,
     open_mode: OpenOptions.OpenMode = .writer,
     /// An authenticated restore decoder needs rows and schema layouts, never
@@ -4114,7 +4116,7 @@ pub const DB = struct {
                 profile.load_indexes_ns = elapsedSince(load_indexes_started_ns);
             } else {
                 const load_indexes_started_ns = monotonicTimeNs();
-                try db.core.loadIndexes();
+                if (opts.defer_index_backfill_on_open) try db.core.loadIndexesDeferredBackfill() else try db.core.loadIndexes();
                 profile.load_indexes_ns = elapsedSince(load_indexes_started_ns);
             }
             if (!openModeRequiresReadOnlyBackends(opts.open_mode)) try finishGraphMergeImport(&db, null);
@@ -30810,6 +30812,14 @@ pub const DB = struct {
     /// Appends internal derived work without exposing the DB's batch execution
     /// context. Runtime partitions use this boundary while retaining the normal
     /// write gate, locking, backlog accounting, and hot-standby mirroring semantics.
+    /// Publish prepared producer output against this runtime's live coordinator.
+    /// The existing transactional guard checks source digests, incarnations,
+    /// and exact lease tenure before any artifact or replay record is committed.
+    pub fn publishPreparedGeneratedBatch(self: *DB, derived_batch: enrichment_runtime_mod.GeneratedRecordBatch, promotions: []const enrichment_runtime_mod.GeneratedArtifactPromotion, deletes: []const []const u8, guards: []const enrichment_runtime_mod.GeneratedSourceGuard, fence: ?enrichment_runtime_mod.GeneratedWriteFence) !enrichment_runtime_mod.GeneratedRecordCommit {
+        if (self.enrichment_append_context == null) try self.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true });
+        return appendGeneratedBatchFromEnrichment(self.enrichment_append_context orelse return error.EnrichmentWaitCanceled, derived_batch, promotions, deletes, guards, fence);
+    }
+
     pub fn derivedAsyncAppendDerivedBatchRecord(self: *DB, derived_batch: derived_types.DerivedBatch) !u64 {
         if (comptime storage_engine.enabled) return storage_engine.call("derivedAsyncAppendDerivedBatchRecord", .{ self, derived_batch });
         return try appendDerivedBatchRecord(self, derived_batch);
