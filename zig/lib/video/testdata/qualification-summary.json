@@ -80,5 +80,44 @@
     "Reference preservation does not establish end-user relevance.",
     "Linux pretrained and full-decoder execution retain their separate source epochs, recorded in the historical commit.",
     "Earlier failed/control reports remain failed; no allocator-relief hook ships."
-  ]
+  ],
+  "fixture_maintenance": {
+    "tested_code_commit": "816eaf412b1be7962e56e3af5f3944bd824ffe3a",
+    "scope": "Layout/ownership verification; historical pretrained production reports are not rerun or relabeled.",
+    "references": "All 26 original reference documents preserve complete parsed values and metadata; numeric lexemes are retained.",
+    "tables": "All executable tokens in qm.zig, cdf.zig and vp9_scan.zig are unchanged.",
+    "canonical_payload_groups": 27,
+    "removed_payload_copies": 56,
+    "removed_json_copies": 17,
+    "native_video": {
+      "passed": 279,
+      "skipped": 2,
+      "failed": 0
+    },
+    "live_windows": {
+      "passed": 25,
+      "failed": 0
+    },
+    "media": {
+      "passed": 218,
+      "failed": 0
+    },
+    "actual_cpu_metal_model": {
+      "passed": 66,
+      "skipped": 0,
+      "failed": 0
+    },
+    "actual_linux_arm64_video": {
+      "passed": 252,
+      "skipped": 29,
+      "failed": 0
+    },
+    "python_tools": {
+      "passed": 66,
+      "failed": 0
+    },
+    "apache_boundary_reachable_sources": 2235,
+    "suite_portability": "Two real coordinator cases pass from a different working directory; changed input hash is rejected. All retained suites resolve inputs and verify pinned hashes.",
+    "maintenance_tools": "Formatter check-only/idempotence/value preservation pass; payload canonicalization rejects changed bytes and requires explicit apply to remove matching aliases."
+  }
 }
