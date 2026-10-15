@@ -943,6 +943,13 @@ test "relational index build pages native owner control preserves committed cuts
     const first_page = try follower.collectCanceledNativeIndexGarbageStep(receipt_identity);
     try std.testing.expect(first_page.advanced);
     try std.testing.expect(!first_page.artifacts_retired);
+    {
+        var completion_txn = try follower.core.store.beginWriteTxn();
+        defer completion_txn.abort();
+        var manager = try follower.core.initTxnManager();
+        defer manager.deinit();
+        try std.testing.expectError(error.PrivateIndexCancellationPending, jobs.Canceled.stage(&completion_txn, &manager, cleanup_binding, null));
+    }
     // Resume the admitted generation after a restart between bounded phases.
     follower.local_execution.replication_write_gate = null;
     follower.close();
@@ -971,6 +978,107 @@ test "relational index build pages native owner control preserves committed cuts
         try std.testing.expectEqualSlices(u8, &gc.initial(unrelated), try read.get(&gc.key(unrelated)));
         try std.testing.expectEqual(@as(u64, 5), (try authority.require(&read, .native, @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace))).sequence);
         try std.testing.expect(try @import("relational_integrity_topology.zig").completed(&read) == null);
+    }
+    follower.local_execution.replication_write_gate = null;
+    try testNativeCancellationCompletion(&follower, cleanup_binding, options);
+}
+
+fn testNativeCancellationCompletion(source: *db_mod.DB, binding: @import("relational_index_owner_job.zig").Binding, options: db_mod.OpenOptions) !void {
+    const jobs = @import("relational_index_owner_job.zig");
+    const native = @import("relational_index_owner_control.zig");
+    const topology = @import("relational_integrity_topology.zig");
+    const authority = @import("../source_authority.zig");
+    const Barrier = @import("antfly_runtime_abi").mutation_barrier.MutationBarrier;
+    var dir = try @import("../../common/test_directory.zig").TestDirectory.init("native-index-cancel-complete-primary");
+    defer dir.cleanup();
+    var standby_dir = try @import("../../common/test_directory.zig").TestDirectory.init("native-index-cancel-complete-standby");
+    defer standby_dir.cleanup();
+    var primary = try db_mod.DB.open(alloc, dir.path(), options);
+    defer primary.close();
+    try seedNativeIndexFixture(source, &primary);
+    var standby = try db_mod.DB.open(alloc, standby_dir.path(), options);
+    defer standby.close();
+    try seedNativeIndexFixture(source, &standby);
+    const Fault = struct {
+        txn: *docstore.DocStore.Txn,
+        fail_at: usize,
+        after: bool,
+        writes: usize = 0,
+        pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+            return self.txn.get(key);
+        }
+        pub fn openCursor(self: *@This()) !docstore.DocStore.Txn.CursorAdapter {
+            return self.txn.openCursor();
+        }
+        pub fn put(self: *@This(), key: []const u8, value: []const u8) !void {
+            if (!self.after and self.writes + 1 == self.fail_at) return error.TestCancellationWriteFailed;
+            try self.txn.put(key, value);
+            self.writes += 1;
+            if (self.after and self.writes == self.fail_at) return error.TestCancellationWriteFailed;
+        }
+    };
+    for (1..3) |fail_at| for ([_]bool{ false, true }) |after| {
+        {
+            var txn = try primary.core.store.beginWriteTxn();
+            defer txn.abort();
+            var fault: Fault = .{ .txn = &txn, .fail_at = fail_at, .after = after };
+            var manager = try primary.core.initTxnManager();
+            defer manager.deinit();
+            try std.testing.expectError(error.TestCancellationWriteFailed, jobs.Canceled.stage(&fault, &manager, binding, null));
+        }
+        var read = try primary.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect(try jobs.Canceled.load(&read) == null);
+        try std.testing.expectEqual(@as(u64, 5), (try authority.load(&read)).?.sequence);
+        try std.testing.expect((try topology.current(&read)).?.eql(binding.fence));
+    };
+    var barrier: Barrier = .{};
+    var publisher: TestNativeIndexPublisher = .{ .barrier = &barrier, .lsn = 6 };
+    defer if (publisher.payload) |bytes| alloc.free(bytes);
+    primary.local_execution.replication_async_batch_mirror = publisher.asMirror();
+    defer primary.local_execution.replication_async_batch_mirror = null;
+    var prepared: native.PreparedCancellationCompletion = .{ .alloc = alloc, .binding = binding };
+    defer prepared.deinit();
+    const pending = try primary.applyPreparedNativeIndexOwnerCancellationCompletion(&prepared, null);
+    try pending.validate();
+    try std.testing.expect(pending.replication_pending and pending.receipt == null and pending.record != null);
+    try std.testing.expectEqual(@as(u64, 6), pending.position.sequence);
+    // Canonical codec, truncation, checksum and semantic-cut validation.
+    const encoded = try pending.record.?.encode();
+    try std.testing.expectEqual(pending.record.?, try jobs.Canceled.decode(&encoded));
+    for (0..encoded.len) |len| try std.testing.expectError(error.InvalidPrivateIndexCancellation, jobs.Canceled.decode(encoded[0..len]));
+    var corrupt = encoded;
+    corrupt[1178] = 1;
+    std.crypto.hash.Blake3.hash(corrupt[0..1184], corrupt[1184..1216], .{});
+    try std.testing.expectError(error.InvalidPrivateIndexCancellation, jobs.Canceled.decode(&corrupt));
+    var invalid = pending.record.?;
+    invalid.position = invalid.cleanup.position;
+    try std.testing.expectError(error.InvalidPrivateIndexCancellation, invalid.encode());
+    publisher.fail = false;
+    primary.close();
+    primary = try db_mod.DB.open(alloc, dir.path(), options);
+    primary.local_execution.replication_async_batch_mirror = publisher.asMirror();
+    const retried = try primary.applyPreparedNativeIndexOwnerCancellationCompletion(&prepared, null);
+    try retried.validate();
+    try std.testing.expect(retried.duplicate and !retried.replication_pending);
+    try std.testing.expectEqual(pending.position, retried.position);
+    try std.testing.expectEqual(.canceled, retried.receipt.?.action);
+    const record_packet: @import("replication_record.zig").Record = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 6, .previous_lsn = 5, .payload = publisher.payload.? };
+    try replication_ingress.applyRecord(&standby, record_packet);
+    try replication_ingress.applyRecord(&standby, record_packet);
+    standby.close();
+    standby = try db_mod.DB.open(alloc, standby_dir.path(), options);
+    try std.testing.expectEqual(@as(u64, 6), try standby.replicationAppliedSequence());
+    for ([_]*db_mod.DB{ &primary, &standby }) |db| {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        var active = (try @import("relational_index_catalog.zig").load(alloc, &read)).?;
+        defer active.deinit();
+        try jobs.verifyRecovery(alloc, &read, &active);
+        try std.testing.expectEqual(retried.record.?, (try jobs.Canceled.load(&read)).?);
+        try std.testing.expect((try topology.current(&read)).?.eql(binding.fence));
+        try std.testing.expect(try topology.completed(&read) == null);
+        try std.testing.expectEqual(binding, (try jobs.load(&read)).?);
     }
 }
 

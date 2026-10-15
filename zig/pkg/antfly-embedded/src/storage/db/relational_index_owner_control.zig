@@ -34,7 +34,7 @@ const release = @import("relational_index_release.zig");
 const resources = @import("../resource_manager.zig");
 const RequestContext = @import("../../api/operation.zig").RequestContext;
 const Waiters = @import("../admission_waiter.zig").Fifo(void);
-pub const envelope_version = 31;
+pub const envelope_version = 32;
 pub const max_response_bytes = 32 * 1024;
 pub const max_cancellation_wire_bytes = 32 * 1024;
 pub const max_encoded_inputs = std.base64.standard.Encoder.calcSize(inputs.max_bytes);
@@ -310,6 +310,7 @@ pub const Effect = union(enum) {
     cancel_control: Command,
     cancel_intent: Admission,
     cancel_cleanup: jobs.Binding,
+    cancel_complete: jobs.Binding,
     claims: ClaimCommand,
     build: pages.Page.PrivateCommand,
     consume: ConsumeCommand,
@@ -333,7 +334,7 @@ pub const Effect = union(enum) {
             .release_gc => |value| value.record.position.namespace,
             .build => |value| value.binding.fence.namespace,
             .cancel_intent => |value| value.fence.namespace,
-            .cancel_cleanup => |value| value.fence.namespace,
+            .cancel_cleanup, .cancel_complete => |value| value.fence.namespace,
         };
     }
 
@@ -350,7 +351,7 @@ pub const Effect = union(enum) {
             .release_gc => |value| try value.validate(),
             .build => |value| try value.validate(),
             .cancel_intent => |value| try value.validate(),
-            .cancel_cleanup => |value| {
+            .cancel_cleanup, .cancel_complete => |value| {
                 _ = try value.encode();
                 if (value.authority != .native or value.phase != .reserved) return error.InvalidPrivateIndexOwnerJob;
             },
@@ -1102,6 +1103,82 @@ pub const ReleaseOutcome = struct {
         if (self.receipt) |value| {
             if (self.replication_pending or self.error_name != null or !std.meta.eql(value, expected)) return error.InvalidPrivateIndexNativeReceipt;
         } else if (!self.replication_pending and self.error_name == null) return error.InvalidPrivateIndexNativeReceipt;
+    }
+};
+
+pub const CancellationCompletionOutcome = struct {
+    binding: jobs.Binding,
+    position: Native,
+    duplicate: bool,
+    record: ?jobs.Canceled = null,
+    receipt: ?@import("relational_index_publication_progress.zig").Receipt = null,
+    replication_pending: bool = false,
+    error_name: ?[]const u8 = null,
+
+    pub fn validate(self: @This()) !void {
+        _ = try self.binding.encode();
+        try self.position.validate();
+        if (!self.position.namespace.eql(self.binding.fence.namespace) or (self.replication_pending and self.error_name == null)) return error.InvalidPrivateIndexCancellation;
+        if (self.record) |record| {
+            try record.validate();
+            if (!std.meta.eql(record.binding, self.binding) or !std.meta.eql(record.position, self.position)) return error.InvalidPrivateIndexCancellation;
+        }
+        if (self.receipt) |receipt| {
+            const record = self.record orelse return error.InvalidPrivateIndexCancellation;
+            if (self.replication_pending or self.error_name != null or !std.meta.eql(receipt, try record.receipt())) return error.InvalidPrivateIndexCancellation;
+        } else if (!self.replication_pending and self.error_name == null) return error.InvalidPrivateIndexCancellation;
+    }
+};
+
+/// Cleanup completion uses the common native commit/outbox boundary. The
+/// trusted receiving adapter must independently obtain metadata permission.
+pub const PreparedCancellationCompletion = struct {
+    pub const ApplyOutcome = CancellationCompletionOutcome;
+    alloc: Allocator,
+    binding: jobs.Binding,
+    context: RequestContext = .{},
+    payload: ?[]u8 = null,
+    prefix_len: usize = 0,
+
+    pub fn deinit(self: *@This()) void {
+        if (self.payload) |bytes| self.alloc.free(bytes);
+        self.* = undefined;
+    }
+    pub fn validate(self: *const @This()) !void {
+        try self.context.ensureActive();
+        try (Effect{ .cancel_complete = self.binding }).validate();
+    }
+    pub fn namespace(self: *const @This()) @FieldType(Native, "namespace") {
+        return self.binding.fence.namespace;
+    }
+    pub fn validateReplay(self: *const @This(), position: Native) !void {
+        try (Frame{ .effect = .{ .cancel_complete = self.binding }, .position = position }).validate();
+    }
+    pub fn replayDuplicateOutcome(self: *const @This(), position: Native) ApplyOutcome {
+        return .{ .binding = self.binding, .position = position, .duplicate = true };
+    }
+    pub fn stage(self: *@This(), core: anytype, txn: anytype, replay: ?Native) !ApplyOutcome {
+        try self.validate();
+        var manager = try core.initTxnManager();
+        defer manager.deinit();
+        const result = try jobs.Canceled.stage(txn, &manager, self.binding, replay);
+        return .{ .binding = self.binding, .position = result.record.position, .record = result.record, .duplicate = result.duplicate };
+    }
+    pub fn hasPublicationReceipt(_: *const @This()) bool {
+        return true;
+    }
+    pub fn populateReceipt(self: *const @This(), txn: anytype, outcome: *ApplyOutcome) !void {
+        const record = (try jobs.Canceled.load(txn)) orelse return error.InvalidPrivateIndexCancellation;
+        if (!std.meta.eql(record.binding, self.binding) or !std.meta.eql(record.position, outcome.position)) return error.PrivateIndexOwnerJobChanged;
+        try record.requireCurrent(txn);
+        outcome.record = record;
+        outcome.receipt = try record.receipt();
+    }
+    pub fn preparePayload(self: *@This()) !void {
+        try prepareNativePayload(self, "cancel_complete", self.binding, max_cancellation_wire_bytes);
+    }
+    pub fn finalizePayload(self: *@This(), position: Native) ![]const u8 {
+        return finalizeNativePayload(self, position);
     }
 };
 

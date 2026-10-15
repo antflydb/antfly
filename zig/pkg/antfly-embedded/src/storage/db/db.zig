@@ -8021,6 +8021,11 @@ pub const DB = struct {
                     defer prepared.deinit();
                     _ = try self.applyPreparedNativeIndexEffect(&prepared, .{ .position = frame.position, .lsn = sequence });
                 },
+                .cancel_complete => |binding| {
+                    var prepared: native_index_control.PreparedCancellationCompletion = .{ .alloc = self.alloc, .binding = binding };
+                    defer prepared.deinit();
+                    _ = try self.applyPreparedNativeIndexOwnerCancellationCompletion(&prepared, .{ .position = frame.position, .lsn = sequence });
+                },
                 .control => |command| {
                     var prepared = self.prepareNativeIndexOwnerControl(command) catch |err| {
                         // Another replay may retire inputs during preparation.
@@ -8618,6 +8623,10 @@ pub const DB = struct {
         return outcome;
     }
 
+    pub fn applyPreparedNativeIndexOwnerCancellationCompletion(self: *DB, prepared: *native_index_control.PreparedCancellationCompletion, replay: ?NativeIndexReplay) !native_index_control.CancellationCompletionOutcome {
+        return self.applyPreparedNativeIndexEffect(prepared, replay);
+    }
+
     /// Canonical private-companion retirement, using the same transaction,
     /// clock, replay marker and outbox path as the terminal release itself.
     /// Standbys only replay these commands; they never choose cleanup pages.
@@ -8688,13 +8697,20 @@ pub const DB = struct {
             if (value.lsn == 0) return error.InvalidControlReceiptPosition;
             try prepared.validateReplay(value.position);
         }
+        // Recovering an old outbox may wait for a standby/checkpoint capture.
+        // Do not hold the shared mutation lease across that completion wait.
+        // No new native effect has started; recheck write authority once the
+        // lease is acquired below, and again under apply-exclusive.
+        if (replay == null) {
+            try self.enforceReplicationWriteGate();
+            try self.ensureDurableReplicationStartupBarrier();
+            try self.flushDurableReplicationOutboxes();
+        }
         var replication_mutation = if (replay == null) self.acquireReplicationMutationShared() else null;
         defer if (replication_mutation) |*lease| lease.release();
         const mirrored = replay == null and self.local_execution.replication_async_batch_mirror != null;
         if (replay == null) {
             try self.enforceReplicationWriteGate();
-            try self.ensureDurableReplicationStartupBarrier();
-            try self.flushDurableReplicationOutboxes();
             try self.preflightReplicationBatchSyncCommit();
             if (self.local_execution.replication_async_metadata_mirror != null and !mirrored) return error.ReplicationPublisherUnavailable;
             if (mirrored) try prepared.preparePayload();

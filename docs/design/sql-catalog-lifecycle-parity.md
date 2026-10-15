@@ -8177,3 +8177,40 @@ and cohort release, mounted public online-index admission/status, later-stage
 replacement-root recovery, hosted/Raft execution and broader index candidates.
 No original-case dispositions change: 483 implemented / 862 unresolved. Component
 qualification does not substitute for unchanged-source public SQL evidence.
+
+### Durable native cancellation cleanup completion
+
+The native owner now has a distinct cleanup-completion effect. It checks the
+actual cancellation intent, drained reserved job, burned allocation/catalogs,
+artifact retirement and private claim-prefix emptiness before committing a new
+native cut. Its 1,216-byte canonical record owns the physical binding, cleanup
+admission and ordered intent/completion positions. The resulting canceled receipt
+binds this record; it is not inferred from queue admission or an absent job.
+The job and source fence remain active for the subsequent cohort release barrier.
+
+The effect uses the existing native transaction, replay marker and durable outbox
+pipeline (private envelope version 32). Pending replication withholds a receipt;
+exact retries recover the original committed position. Cold recovery verifies
+the retained record against current owner state or a later completed epoch.
+Qualification passes for per-write aborts, early completion rejection,
+canonical framing, mirror failure/reopen, duplicate standby replay and unchanged
+job/fence ownership.
+
+The direct reopen/retry regression exposed a shared native-effect lock-order bug:
+startup outbox recovery could wait for checkpoint-capable completion while holding
+the replication mutation shared lease. Recovery now runs before lease acquisition;
+write authority is rechecked after acquisition and under apply-exclusive. The
+fixture deliberately does not manually flush the recovered outbox before retry.
+
+The focused Debug page/runtime gate passed 56/56 build steps in
+`/private/tmp/antfly-index-canceled-completion-debug-5.log`: 13 local storage,
+14 native candidate/owner and 46 runtime-contract tests, with no failures or
+leaks. Apache boundary (2,061 files), licensing, control-catalog, formatting,
+diff and original inventory integrity checks pass. The intermediate failure
+after the lease-order fix was a fixture supplying a null physical catalog to
+reserved-job recovery; it now loads the actual catalog from the same snapshot.
+
+This is the durable native checkpoint, not complete public cancellation activation.
+The leased receiving boundary, signed cleanup witness/metadata verification,
+bounded cancellation scheduling and final cohort fence release remain required.
+Original SQL accounting and performance claims are unchanged.

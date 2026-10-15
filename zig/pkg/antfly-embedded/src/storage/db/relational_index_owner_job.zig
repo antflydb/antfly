@@ -631,6 +631,7 @@ pub fn verifyRecovery(alloc: std.mem.Allocator, txn: anytype, active: ?*const ph
     const binding = try load(txn);
     try cancellation.verifyRecovery(txn, binding);
     _ = try loadCancellationCleanup(txn, binding);
+    try Canceled.verifyRecovery(txn, binding);
     const fence = if (try optional(txn, topology.fence_key)) |bytes| try topology.Fence.decode(bytes) else null;
     if (binding == null) {
         if (fence) |value| if (value.role == .index_build) {
@@ -940,3 +941,125 @@ pub fn requireCancellationArtifactsRetired(txn: anytype, binding: Binding) !void
             return error.PrivateIndexCancellationPending;
     }
 }
+
+/// Durable cleanup completion, distinct from both queue admission and cohort
+/// fence release. All identity/cut data is owned and fixed-size; no schema or
+/// JSON parsing is necessary under the serialized owner transaction.
+pub const Canceled = struct {
+    pub const key = cancellation_cleanup_key ++ ":complete";
+    pub const encoded_len = 1216;
+    binding: Binding,
+    cleanup: CancellationCleanupRecord,
+    intent_position: positions.Native,
+    position: positions.Native,
+
+    pub fn validate(self: @This()) !void {
+        _ = try self.binding.encode();
+        _ = try self.cleanup.encode();
+        try self.intent_position.validate();
+        try self.position.validate();
+        if (self.binding.authority != .native or self.binding.phase != .reserved or
+            !self.cleanup.intent.eql(cancellation.Intent.fromBinding(self.binding)) or
+            !self.intent_position.namespace.eql(self.binding.fence.namespace) or
+            !self.position.namespace.eql(self.binding.fence.namespace) or
+            self.cleanup.position.sequence <= self.intent_position.sequence or
+            self.position.sequence <= self.cleanup.position.sequence) return error.InvalidPrivateIndexCancellation;
+    }
+
+    pub fn encode(self: @This()) ![encoded_len]u8 {
+        try self.validate();
+        var bytes: [encoded_len]u8 = @splat(0);
+        @memcpy(bytes[0..8], "AICC\x01\x00\x00\x00");
+        @memcpy(bytes[8..696], &try self.binding.encode());
+        @memcpy(bytes[696..1112], &try self.cleanup.encode());
+        @memcpy(bytes[1112..1145], &try (positions.Position{ .native = self.intent_position }).encode());
+        @memcpy(bytes[1145..1178], &try (positions.Position{ .native = self.position }).encode());
+        @memcpy(bytes[1184..1216], &digest(bytes[0..1184]));
+        return bytes;
+    }
+
+    pub fn decode(bytes: []const u8) !@This() {
+        if (bytes.len != encoded_len or !std.mem.eql(u8, bytes[0..8], "AICC\x01\x00\x00\x00") or
+            !std.mem.allEqual(u8, bytes[1178..1184], 0) or
+            !std.mem.eql(u8, bytes[1184..1216], &digest(bytes[0..1184]))) return error.InvalidPrivateIndexCancellation;
+        const intent_position = try positions.Position.decode(bytes[1112..1145]);
+        const position = try positions.Position.decode(bytes[1145..1178]);
+        if (intent_position != .native or position != .native) return error.InvalidPrivateIndexCancellation;
+        const result: @This() = .{ .binding = try Binding.decode(bytes[8..696]), .cleanup = try CancellationCleanupRecord.decode(bytes[696..1112]), .intent_position = intent_position.native, .position = position.native };
+        try result.validate();
+        return result;
+    }
+
+    pub fn receipt(self: @This()) !publication.Receipt {
+        const bytes = try self.encode();
+        var hash = std.crypto.hash.Blake3.init(.{});
+        hash.update("antfly/private-index-canceled/v1");
+        hash.update(&bytes);
+        var evidence: Digest = undefined;
+        hash.final(&evidence);
+        const result: publication.Receipt = .{
+            .owner = .{ .plan_id = self.binding.id, .plan_digest = self.binding.plan_digest, .ordinal = self.binding.ordinal, .group_id = self.binding.fence.owner_group_id, .namespace = self.binding.fence.namespace, .fence_digest = self.binding.owner_digest, .authority = .native },
+            .action = .canceled,
+            .position = .{ .native = self.position },
+            .candidate_digest = self.binding.integrity_candidate,
+            .reservation_digest = self.binding.integrity_reserved,
+            .evidence_digest = evidence,
+        };
+        _ = try result.digest();
+        return result;
+    }
+
+    pub fn load(txn: anytype) !?@This() {
+        const record = try decode((try optional(txn, Canceled.key)) orelse return null);
+        const source = try source_authority.require(txn, .native, @import("online_source_contract.zig").namespaceBytes(record.position.namespace));
+        if (record.position.sequence > source.sequence) return error.InvalidPrivateIndexCancellation;
+        return record;
+    }
+
+    pub fn requireCurrent(self: @This(), txn: anytype) !void {
+        try self.validate();
+        try requireCancellationArtifactsRetired(txn, self.binding);
+        try private_claims.requireRetired(txn, self.binding);
+        const actual = (try loadCancellationCleanup(txn, self.binding)) orelse return error.PrivateIndexCancellationRequired;
+        const intent = (try cancellation.load(txn)) orelse return error.PrivateIndexCancellationRequired;
+        if (!std.meta.eql(actual, self.cleanup) or !std.meta.eql(intent.position, self.intent_position)) return error.PrivateIndexOwnerJobChanged;
+    }
+
+    /// The caller stages the native replay marker and durable outbox in this
+    /// same transaction. Even after every local artifact is gone, this never
+    /// lifts a fence or retires the active job before metadata's cohort barrier.
+    pub fn stage(txn: anytype, manager: *transactions.TxnManager, binding: Binding, replay: ?positions.Native) !struct { record: Canceled, duplicate: bool } {
+        _ = try binding.encode();
+        if (try Canceled.load(txn)) |previous| {
+            if (std.meta.eql(previous.binding, binding)) {
+                try previous.requireCurrent(txn);
+                if (replay) |cut| if (!std.meta.eql(cut, previous.position)) return error.InvalidControlReceiptPosition;
+                return .{ .record = previous, .duplicate = true };
+            }
+            const completed = (try topology.completed(txn)) orelse return error.PrivateIndexCancellationPending;
+            if (completed.admission_epoch < previous.binding.fence.admission_epoch or
+                (completed.admission_epoch == previous.binding.fence.admission_epoch and !completed.eql(previous.binding.fence)) or
+                binding.fence.admission_epoch <= previous.binding.fence.admission_epoch) return error.PrivateIndexOwnerJobChanged;
+        }
+        try requireCancellationArtifactsRetired(txn, binding);
+        try private_claims.requireRetired(txn, binding);
+        try topology.requireDrained(txn, manager, binding.fence);
+        const intent = (try cancellation.load(txn)) orelse return error.PrivateIndexCancellationRequired;
+        const cleanup = (try loadCancellationCleanup(txn, binding)) orelse return error.PrivateIndexCancellationRequired;
+        const source = try source_authority.require(txn, .native, @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace));
+        const record: Canceled = .{ .binding = binding, .cleanup = cleanup, .intent_position = intent.position, .position = .{ .namespace = binding.fence.namespace, .sequence = std.math.add(u64, source.sequence, 1) catch return error.InvalidControlReceiptPosition } };
+        const encoded = try record.encode();
+        if (replay) |cut| if (!std.meta.eql(cut, record.position)) return error.InvalidControlReceiptPosition;
+        _ = try source_authority.advance(txn, @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace), if (replay) |cut| cut.sequence else null);
+        try txn.put(Canceled.key, &encoded);
+        return .{ .record = record, .duplicate = false };
+    }
+
+    pub fn verifyRecovery(txn: anytype, binding: ?Binding) !void {
+        const record = (try Canceled.load(txn)) orelse return;
+        if (binding) |current| if (std.meta.eql(current, record.binding)) return record.requireCurrent(txn);
+        const completed = (try topology.completed(txn)) orelse return error.InvalidPrivateIndexCancellation;
+        if (completed.admission_epoch < record.binding.fence.admission_epoch or
+            (completed.admission_epoch == record.binding.fence.admission_epoch and !completed.eql(record.binding.fence))) return error.InvalidPrivateIndexCancellation;
+    }
+};
