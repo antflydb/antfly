@@ -355,6 +355,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     return response;
 }
 const Execution = struct {
+    scheduled_component: bool = false,
     server: *server_api.ApiHttpServer,
     overlay: ?*overlay_api.Overlay = null,
     wal_cut: ?*const @import("lake_wal_cut_cache.zig").Pin = null,
@@ -1897,6 +1898,17 @@ const Execution = struct {
     }
     // Independent executions own every mutable map, runtime pin and allocator.
     // Results retain scheduler admission until joined; no private pool is used.
+    /// Clone immutable request inputs; mutable maps, cursors and pins start
+    /// empty in every lane/partition. Source ownership is explicit at the caller.
+    fn childExecution(base: *Execution, source: *local.serverless_query_lake_serving.ServingSource, scratch: A, output: A) Execution {
+        return .{ .scheduled_component = base.scheduled_component, .server = base.server, .overlay = base.overlay, .wal_cut = base.wal_cut, .table = base.table, .source = source, .store = base.store, .domain = base.domain, .declarations = base.declarations, .context = base.context, .request = base.request, .schema_json = base.schema_json, .hydration_fields = base.hydration_fields, .vector_filter = base.vector_filter, .vector_exclusion = base.vector_exclusion, .recent_runs = base.recent_runs, .recent_declarations = base.recent_declarations, .recent_cloud = base.recent_cloud, .cloud_generations = base.cloud_generations, .typed_delivery = base.typed_delivery, .navigation = base.navigation, .files = base.files, .private_files = base.private_files, .private_digests = base.private_digests, .arena = scratch, .result_allocator = output };
+    }
+    fn prepareVectorMembership(self: *Execution, a: A, req: types.SearchRequest) !void {
+        if (req.filter_query_json.len == 0 and req.exclusion_query_json.len == 0) return;
+        const resolver: @import("lake_index_text_predicate.zig").PhysicalResolver = .{ .server = self.server, .table = self.table, .source = self.source, .context = self.request, .store = self.store.artifactStore(), .store_identity = self.store.identity, .read_context = self.context, .pinned = .{ .artifacts = self.store.artifactStore(), .store_identity = self.store.identity, .domain = self.domain, .declarations = self.declarations, .read_context = self.context } };
+        if (req.filter_query_json.len != 0) self.vector_include_provider = try resolver.openMembership(a, req.filter_query_json);
+        if (req.exclusion_query_json.len != 0) self.vector_exclude_provider = try resolver.openMembership(a, req.exclusion_query_json);
+    }
     fn searchComponents(raw: ?*anyopaque, a: A, components: []const local.storage_db_query_search_exec.ComposedComponent) !local.storage_db_query_search_exec.ComposedComponentBatch {
         const self = from(raw);
         const scheduler = local.sql_parallel_scheduler;
@@ -1926,7 +1938,8 @@ const Execution = struct {
                 owner.arena = .init(owner.budget.allocator());
                 errdefer owner.arena.deinit();
                 owner.source = try base.source.parallelView(owner.budget.allocator());
-                owner.execution = .{ .server = base.server, .overlay = base.overlay, .table = base.table, .source = &owner.source, .store = base.store, .domain = base.domain, .declarations = base.declarations, .context = base.context, .request = base.request, .schema_json = base.schema_json, .hydration_fields = base.hydration_fields, .vector_filter = base.vector_filter, .vector_exclusion = base.vector_exclusion, .recent_runs = base.recent_runs, .recent_declarations = base.recent_declarations, .recent_cloud = base.recent_cloud, .cloud_generations = base.cloud_generations, .typed_delivery = base.typed_delivery, .navigation = base.navigation, .files = base.files, .private_files = base.private_files, .private_digests = base.private_digests, .arena = owner.arena.allocator(), .result_allocator = owner.budget.allocator() };
+                owner.execution = base.childExecution(&owner.source, owner.arena.allocator(), owner.budget.allocator());
+                owner.execution.scheduled_component = true;
                 return owner;
             }
             fn run(owner: *@This()) anyerror!void {
@@ -1934,11 +1947,8 @@ const Execution = struct {
                 const execution = &owner.execution;
                 try execution.context.ensureActive();
                 const req = owner.component.request;
-                if (owner.component.query == .dense or owner.component.query == .sparse) {
-                    const resolver: @import("lake_index_text_predicate.zig").PhysicalResolver = .{ .server = execution.server, .table = execution.table, .source = execution.source, .context = execution.request, .store = execution.store.artifactStore(), .store_identity = execution.store.identity, .read_context = execution.context, .pinned = .{ .artifacts = execution.store.artifactStore(), .store_identity = execution.store.identity, .domain = execution.domain, .declarations = execution.declarations, .read_context = execution.context } };
-                    if (req.filter_query_json.len != 0) execution.vector_include_provider = try resolver.openMembership(owner.budget.allocator(), req.filter_query_json);
-                    if (req.exclusion_query_json.len != 0) execution.vector_exclude_provider = try resolver.openMembership(owner.budget.allocator(), req.exclusion_query_json);
-                }
+                if ((owner.component.query == .dense or owner.component.query == .sparse) and execution.recent_declarations.len == 0)
+                    try execution.prepareVectorMembership(owner.budget.allocator(), req);
                 owner.result = try switch (owner.component.query) {
                     .text => |text| searchText(execution, owner.budget.allocator(), req, text),
                     .default_text => dispatchText(execution, owner.budget.allocator(), req),
@@ -2041,7 +2051,9 @@ const Execution = struct {
                 }
                 owner.parent_source = base.source;
                 if (include_archive) owner.source_view = try base.source.parallelView(owner.budget.allocator());
-                owner.execution = .{ .server = base.server, .overlay = base.overlay, .table = base.table, .source = if (include_archive) &owner.source_view.? else base.source, .store = base.store, .domain = base.domain, .declarations = base.declarations, .context = base.context, .request = base.request, .schema_json = base.schema_json, .hydration_fields = base.hydration_fields, .vector_filter = base.vector_filter, .vector_exclusion = base.vector_exclusion, .active_recent = selected_run != null, .recent_run = selected_run, .recent_runs = base.recent_runs, .recent_declarations = base.recent_declarations, .recent_cloud = base.recent_cloud, .cloud_generations = base.cloud_generations, .typed_delivery = base.typed_delivery, .navigation = base.navigation, .files = base.files, .private_files = base.private_files, .private_digests = base.private_digests, .arena = owner.arena.allocator(), .result_allocator = owner.budget.allocator() };
+                owner.execution = base.childExecution(if (include_archive) &owner.source_view.? else base.source, owner.arena.allocator(), owner.budget.allocator());
+                owner.execution.active_recent = selected_run != null;
+                owner.execution.recent_run = selected_run;
                 return owner;
             }
             fn run(owner: *@This(), request: types.SearchRequest, q: @TypeOf(query)) anyerror!void {
@@ -2050,10 +2062,7 @@ const Execution = struct {
                 if (include_archive and !owner.execution.active_recent and (request.filter_query_json.len != 0 or request.exclusion_query_json.len != 0)) {
                     // Membership cursors are mutable. Reopen them under this lane's
                     // pinned source rather than copying or sharing the parent cursor.
-                    const execution = &owner.execution;
-                    const resolver: @import("lake_index_text_predicate.zig").PhysicalResolver = .{ .server = execution.server, .table = execution.table, .source = execution.source, .context = execution.request, .store = execution.store.artifactStore(), .store_identity = execution.store.identity, .read_context = execution.context, .pinned = .{ .artifacts = execution.store.artifactStore(), .store_identity = execution.store.identity, .domain = execution.domain, .declarations = execution.declarations, .read_context = execution.context } };
-                    if (request.filter_query_json.len != 0) execution.vector_include_provider = try resolver.openMembership(owner.budget.allocator(), request.filter_query_json);
-                    if (request.exclusion_query_json.len != 0) execution.vector_exclude_provider = try resolver.openMembership(owner.budget.allocator(), request.exclusion_query_json);
+                    try owner.execution.prepareVectorMembership(owner.budget.allocator(), request);
                 }
                 owner.result = try part(&owner.execution, owner.budget.allocator(), request, q);
             }
@@ -2071,6 +2080,27 @@ const Execution = struct {
         const runs = if (self.recent_runs.len != 0) self.recent_runs else &legacy;
         var first: usize = 0;
         const archive_count: usize = @intFromBool(include_archive);
+        if (self.scheduled_component) {
+            // The enclosing component already owns scheduler admission. Keep
+            // nested partition allocations inside that lane's quota rather
+            // than multiplying unadmitted caller workspaces under saturation.
+            for (0..runs.len + archive_count) |i| {
+                try self.context.ensureActive();
+                var scratch = std.heap.ArenaAllocator.init(a);
+                defer scratch.deinit();
+                var child = self.childExecution(self.source, scratch.allocator(), a);
+                child.active_recent = !(include_archive and i == 0);
+                child.recent_run = if (child.active_recent) runs[i - archive_count] else null;
+                defer child.deinit();
+                if (!child.active_recent) try child.prepareVectorMembership(a, req);
+                var result = try part(&child, a, req, query);
+                defer result.deinit();
+                const merged = try local.api_query.mergeSearchResults(a, req, &.{ combined.*, result }, 0, req.limit);
+                combined.deinit();
+                combined.* = merged;
+            }
+            return;
+        }
         while (first < runs.len + archive_count) {
             var workers: [3]?*Worker = @splat(null);
             defer {
@@ -3806,6 +3836,7 @@ test "external lake bounded WAL vector lanes join cancel saturate and retry over
         io: std.Io,
         gate: std.Io.Event = .unset,
         started: std.Io.Event = .unset,
+        entered: std.Io.Event = .unset,
         active: std.atomic.Value(usize) = .init(0),
         peak: std.atomic.Value(usize) = .init(0),
         calls: std.atomic.Value(usize) = .init(0),
@@ -3823,6 +3854,7 @@ test "external lake bounded WAL vector lanes join cancel saturate and retry over
             const active = self.active.fetchAdd(1, .acq_rel) + 1;
             defer _ = self.active.fetchSub(1, .acq_rel);
             _ = self.calls.fetchAdd(1, .monotonic);
+            self.entered.set(self.io);
             _ = self.peak.fetchMax(active, .acq_rel);
             if (active >= 2) self.started.set(self.io);
             try self.gate.wait(self.io);
@@ -3839,20 +3871,23 @@ test "external lake bounded WAL vector lanes join cancel saturate and retry over
             try execution.searchVectorParts(alloc, .{ .limit = 2, .full_text = .{ .term = .{ .field = "body", .term = "score" } } }, oversized, part, result, scheduling, true);
         }
     };
-    for ([_]u8{ 0, 1, 2, 3 }) |mode| {
+    for ([_]u8{ 0, 1, 2, 3, 4, 5, 6 }) |mode| {
         var state: State = .{ .io = io };
         var scheduling: local.sql_parallel_scheduler.Scheduler = .{};
         if (mode == 1) scheduling.max_io_workers = 0;
-        if (mode == 1 or mode == 3) state.gate.set(io);
+        if (mode == 1 or mode == 3 or mode == 4 or mode == 6) state.gate.set(io);
         var runs: [4]@import("lake_recent_vectors.zig").Run = undefined;
         for (&runs, 1..) |*run, i| run.* = .{ .prefix = @intCast(i), .digest = @splat(0), .declarations = &.{}, .cloud_generations = null };
         var source: local.serverless_query_lake_serving.ServingSource = .{ .alloc = a, .store = undefined, .inventory = undefined, .scanner = undefined };
         source.scanner.shared_reader = null;
-        var execution: Execution = .{ .server = @ptrCast(@alignCast(&state)), .table = undefined, .source = &source, .store = undefined, .domain = @splat(0), .declarations = &.{}, .context = .{ .io = io }, .request = .{}, .schema_json = "{}", .arena = a, .result_allocator = a, .recent_runs = &runs };
+        var execution: Execution = .{ .scheduled_component = mode >= 4, .server = @ptrCast(@alignCast(&state)), .table = undefined, .source = &source, .store = undefined, .domain = @splat(0), .declarations = &.{}, .context = .{ .io = io }, .request = .{}, .schema_json = "{}", .arena = a, .result_allocator = a, .recent_runs = &runs };
         defer execution.deinit();
-        var result: types.SearchResult = .{ .alloc = a, .hits = &.{}, .total_hits = 0 };
+        var component_budget: local.sql_memory_budget = .{ .backing = a, .limit = 16 * 1024 * 1024 };
+        defer std.debug.assert(component_budget.live == 0);
+        const run_alloc = if (mode == 6) component_budget.allocator() else a;
+        var result: types.SearchResult = .{ .alloc = run_alloc, .hits = &.{}, .total_hits = 0 };
         defer result.deinit();
-        var future = try io.concurrent(State.run, .{ &execution, a, &result, &scheduling, mode == 3 });
+        var future = try io.concurrent(State.run, .{ &execution, run_alloc, &result, &scheduling, mode == 3 or mode == 6 });
         var joined = false;
         defer if (!joined) {
             _ = future.cancel(io) catch {};
@@ -3861,8 +3896,12 @@ test "external lake bounded WAL vector lanes join cancel saturate and retry over
             try state.started.wait(io);
             try std.testing.expect(scheduling.io_workers > 0);
         }
+        if (mode == 5) try state.entered.wait(io);
         joined = true;
-        if (mode == 2) {
+        if (mode == 6) {
+            try std.testing.expectError(error.OutOfMemory, future.await(io));
+            try std.testing.expect(component_budget.isExhausted());
+        } else if (mode == 2 or mode == 5) {
             try std.testing.expectError(error.Canceled, future.cancel(io));
         } else {
             state.gate.set(io);
@@ -3877,7 +3916,7 @@ test "external lake bounded WAL vector lanes join cancel saturate and retry over
             try std.testing.expect(state.peak.load(.acquire) >= 2);
             try std.testing.expect(state.archive_overlap.load(.acquire));
         }
-        if (mode == 1) try std.testing.expectEqual(@as(usize, 1), state.peak.load(.acquire));
+        if (mode == 1 or mode >= 4) try std.testing.expectEqual(@as(usize, 1), state.peak.load(.acquire));
         try std.testing.expectEqual(@as(usize, 0), state.active.load(.acquire));
         try std.testing.expectEqual(@as(usize, 0), scheduling.bytes);
         try std.testing.expectEqual(@as(usize, 0), scheduling.io_workers);

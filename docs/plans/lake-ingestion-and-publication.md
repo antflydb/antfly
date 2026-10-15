@@ -976,3 +976,9 @@ on the caller, cancellation drains pending lanes, and a lane that exhausts its
 16 MiB workspace retries serially under the ordinary request allocation policy.
 Owned results return in declaration order. Fusion, graph dependencies,
 highlights, transforms and final source delivery remain coordinator-owned.
+
+Nested archive/recent vector partitions execute serially inside an already
+scheduled composed lane, using that lane's allocator and workspace quota.
+Standalone vector queries retain archive/recent overlap. This prevents scheduler
+saturation from multiplying unadmitted nested caller workspaces. Regressions
+exercise nested execution, cancellation, and enclosing-quota exhaustion.

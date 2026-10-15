@@ -2964,6 +2964,9 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
         # whose required-condition proof deliberately cannot be extracted.
         large_range = {"range": {"path": "/amount", "gte": count - 10000}}
         ranged_native = query(large_range, profile=True)
+        assert ranged_native["profile"]["sort"]["selection_reason"] == (
+            "indexed_predicate_text_admission"
+        ), ranged_native
         ranged_oracle = query(
             {
                 "bool": {
