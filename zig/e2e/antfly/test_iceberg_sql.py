@@ -1690,6 +1690,16 @@ def test_cold_indexed_iceberg_queries_use_publication_file_navigation(tmp_path):
                 hidden.append((path, unavailable))
         assert hidden, "fixture must contain real data manifests"
         server.restart()
+        # Cold ordinary scans enumerate authenticated publication pages; no
+        # flat inventory or restored data manifests are prerequisites.
+        assert call(
+            "POST", "/sql", {"statement": "SELECT COUNT(*) FROM cold_navigation"}
+        )["rows"] == [["200"]]
+        assert call(
+            "POST",
+            "/sql",
+            {"statement": "SELECT label FROM cold_navigation WHERE label = 'kept'"},
+        )["rows"] == [["kept"]]
         query = {
             "full_text_search": {"field": "body", "term": "common"},
             "fields": ["amount"],
@@ -1725,7 +1735,7 @@ def test_cold_indexed_iceberg_queries_use_publication_file_navigation(tmp_path):
             "/sql",
             {"statement": "SELECT amount FROM cold_navigation WHERE amount = 101"},
         )["rows"] == [["101"]]
-        # Full scans explicitly rediscover ordinary source metadata.
+        # Explicit source discovery remains available when manifests are restored.
         data_manifests = [path for path, _ in hidden]
         for path, unavailable in hidden:
             unavailable.rename(path)
@@ -1743,7 +1753,7 @@ def test_cold_indexed_iceberg_queries_use_publication_file_navigation(tmp_path):
             )
             == 2
         )
-        # Warm full scans borrow the same frozen inventory and ordering plan;
+        # Repeated full scans retain bounded per-file views and canonical order;
         # neither a new query nor a different projection rediscovers manifests.
         for path in data_manifests:
             unavailable = path.with_suffix(".avro.unavailable")

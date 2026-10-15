@@ -2802,6 +2802,8 @@ const StreamingBoolNode = struct {
     average: f32 = 0,
     config: inverted.BM25Config = .{},
     bitmap: ?*const roaring.RoaringBitmap = null,
+    pattern_pin: ?query_mod.PatternMembership.Pin = null,
+    bitmap_local: bool = false,
     offset: u32 = 0,
     count: u32 = 0,
     must: []const *StreamingBoolNode = &.{},
@@ -3038,9 +3040,10 @@ const StreamingBoolNode = struct {
                 .all => .{ .doc = target, .score = 1 },
                 .bitmap => blk: {
                     var iterator = self.bitmap.?.iterator();
-                    const global = iterator.seekTo(self.offset + target) orelse break :blk null;
-                    if (@as(u64, global) >= @as(u64, self.offset) + self.count) break :blk null;
-                    break :blk .{ .doc = global - self.offset, .score = self.boost };
+                    const origin = if (self.bitmap_local) 0 else self.offset;
+                    const global = iterator.seekTo(origin + target) orelse break :blk null;
+                    if (@as(u64, global) >= @as(u64, origin) + self.count) break :blk null;
+                    break :blk .{ .doc = global - origin, .score = self.boost };
                 },
                 .term => blk: {
                     const state = &self.term.?;
@@ -3953,6 +3956,7 @@ const StreamingBoolBuilder = struct {
     lookups: std.StringHashMapUnmanaged(std.StringHashMapUnmanaged(?inverted.LookupResult)) = .empty,
     fn deinit(self: *@This()) void {
         for (self.nodes.items) |node| {
+            if (node.pattern_pin) |pin| pin.release();
             if (node.term) |*term| term.deinit();
         }
         var readers = self.readers.valueIterator();
@@ -4234,6 +4238,13 @@ const StreamingBoolBuilder = struct {
             value.segment_upper = std.math.inf(f32);
             return value;
         }
+        if (self.control.pattern_cache) |cache| if (try cache.pin(filter, self.segment, self.control)) |pin| {
+            value.pattern_pin = pin;
+            value.kind = .bitmap;
+            value.bitmap_local = true;
+            value.bitmap = pin.bitmap();
+            return value;
+        };
         var local = try filter.withControl(self.control).executeWithOffset(self.a, self.segment, self.offset);
         defer local.deinit();
         const bitmap = try self.a.create(roaring.RoaringBitmap);

@@ -887,9 +887,9 @@ with independent admission and conservative accounting for all pinned buffers.
 
 ### Compact coverage, bounded patterns, and recent-vector scheduling
 
-Reader protocol 47 separates the canonical data census digest from freshly
-qualified delete-object evidence. The publication owns a version-2 source-navigation
-root containing that digest and, for explicitly immutable sources, the exact
+Reader protocol 47 introduced the separation between the canonical data census
+digest and qualified delete-object evidence; the current reader protocol is 48.
+The publication owns a version-2 source-navigation root containing that digest and, for explicitly immutable sources, the exact
 freshly discovered source-plan identity. Selection checks current binding,
 credentials, schema, snapshot, file count, and reader authority before using this
 proof. An identical immutable plan can reuse its census without decoding or mapping
@@ -902,7 +902,8 @@ point seeks in the publication's file tree. The source owns an independent nativ
 store client and retained reader handle, so closing a short SQL index cursor cannot
 invalidate later projected hydration. Conflicting fresh selectors fail validation;
 selector caches carry no authorization. Delete-object versions remain fresh on
-every selection, including immutable data-plan reuse.
+every selection unless the selected publication supplies exact version proofs
+under an immutable source contract and an active catalog snapshot pin.
 
 Prefix, wildcard, regexp, and fuzzy text queries participate in bounded routing
 windows and shared Boolean preparation. Segment-local compressed membership feeds
@@ -1039,12 +1040,13 @@ Immutable Iceberg snapshot catalogs use refcounted, path-copying file-ID trees
 that pin immutable manifest chunks. A bounded predecessor cache scopes reuse to
 credentials, source, table location and manifest inheritance. A new snapshot
 reuses unchanged nodes and derives only changed manifest entries. Headers, schema
-and delete applicability remain fresh. Point hydration creates a bounded view
-of the selected files; flat inventory and canonical row ordering are materialized
-only when a full scan needs them. Canonical ordering is published once per
-snapshot with cancellation-aware waiting. Cache admission failure preserves the
-ordinary materialized plan. Initial discovery still reads the manifest list;
-this does not promise constant-time discovery of a new snapshot.
+and delete applicability remain authoritative. Point hydration creates a bounded
+view of the selected files. Publication-backed scans enumerate canonical public
+file records through bounded independent cursors; legacy navigation and explicit
+continuation validation retain flat inventory planning. For those consumers,
+canonical ordering is published once per snapshot with cancellation-aware waiting.
+Cache admission failure preserves the ordinary statement-owned materialized plan.
+Initial discovery still reads the manifest list; this does not promise constant-time discovery of a new snapshot.
 
 Constant-score match-all and bitmap leaves expose finite nonnegative score
 bounds within selective Boolean trees. Invalid or signed boosts retain
@@ -1068,7 +1070,12 @@ rules and row bounds independently and retain leases for shared compressed
 position membership and equality keys. Loading is bounded to 64 MiB, each prepared
 view retains at most 256 MiB of foreign indexes, and residency includes leased
 bytes. Oversized indexes use streaming subset decoding with direct path lookup.
-Fresh object validation remains mandatory before cache lookup.
+Fresh object validation remains mandatory before cache lookup unless an adopted
+publication supplies exact provider versions for a pinned immutable catalog
+snapshot. That proof binds the fresh metadata plan, complete delete recipe,
+coverage and credential/store/namespace scope; reached delete files still use
+version-qualified reads. Unversioned, mutable and unpinned sources retain HEAD
+qualification.
 
 Cold text-frontier traversal may warm sibling term-directory pages on two
 shared scheduler lanes. Each lane owns a 2 MiB workspace and 1 MiB read allowance;
@@ -1090,8 +1097,13 @@ pinned selectors can authenticate the same selected snapshot; the wire format
 is unchanged. Missing or mismatched proof falls back to ordinary discovery.
 Manifest lists and delete manifests remain fresh. Sparse hydration seeks only
 selected file records, with independent native reader authority and fully owned
-file fields. A full scan discovers its inventory from the frozen metadata using
-the ordinary planner; it does not enumerate the publication navigation tree.
+file fields. Ordinary full scans enumerate the authenticated public file tree in
+canonical digest order, holding one owned file view at a time. Independent cursors
+over disjoint digest ranges preserve shared scheduling and ordered parallel
+scans. Legacy navigation without totals, explicit row selections and continuation
+validation retain the frozen metadata planner. Shared flat-plan cache admission
+is optional; overflow plans use the statement allocator and pin bounded manifest
+chunks rather than adding a 64 MiB SQL limit.
 
 Shared position-delete indexes keep 64-bit ordinals in high-word Roaring blocks.
 A selected view borrows a single immutable set; overlapping delete files merge
@@ -1150,3 +1162,33 @@ Pinned-compiler error metadata, Zig/Python formatting and lint, whitespace, all
 109 changed source license headers, and the Apache boundary passed (2,064 source
 files). Live-provider retention qualification and representative archive-scale
 latency/RSS benchmarks remain deferred; no archive speedup multiplier is claimed.
+
+
+### Paged ordered dictionaries and immutable membership pins
+
+Protocol 48 publishes ordered roots with independently authenticated slot, name
+and public-digest dictionaries. Roots contain tree references and counts instead
+of archive-wide file arrays. Serving resolves reached file names/slots through a
+bounded page cache; public-ID ties prepare digests only for participating files.
+Maintenance explicitly materializes slot fingerprints under its existing build
+budget. Dictionary updates copy changed paths and preserve unchanged trees;
+reader-safe GC and closure audits retain all dictionary pages. Version 5/6 roots
+remain readable by the new reader, while new serving/checkpoint roots use 7/8.
+The historical 16,384-file admission limit is replaced by the existing u32 physical
+coordinate domain and actual resource admission.
+
+Pattern membership exposes immutable, query-owned pins for scorer leaves.
+Segment-local iterators avoid both full bitmap cloning and global-offset copies
+on cache hits. Pinned slots cannot be evicted; each builder releases its pins
+before the query memo closes. Mutable filter APIs still return private copies,
+and exhausted optional cache admission retains authoritative execution.
+
+Delete candidate routing unions each partition's sequence suffix once, using its
+minimum data sequence; global and unknown-scope lists are also visited once.
+Publication-bound delete version pages are available only with an immutable
+source contract, an active catalog snapshot pin and exact version-capable
+provider selectors. The query builds routing metadata without per-delete HEADs,
+and loads version records only for applicable delete files. Publication still
+checks fresh providers before and after construction. Recipe mismatch, deadline,
+credential changes and lost reader/snapshot authority remain errors; absent
+proofs and exhausted optional routing admission use fresh qualification.

@@ -136,6 +136,7 @@ pub const Collector = struct {
             try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
             const navigation = try @import("lake_source_navigation.zig").load(a, self.store, ref, self.cancellation(), null);
             for ([_]?@import("../serverless/graph_segment/page_tree.zig").Ref{ navigation.files, navigation.public, navigation.private }) |root| try self.markPages(a, navigation.domain, root, false);
+            if (navigation.delete_proof) |proof| try self.markPages(a, navigation.domain, proof.versions, false);
         }
         for (hydrated.declarations) |declaration| try self.markArtifact(a, declaration.artifact);
         for (hydrated.file_contributions) |contribution| try self.markArtifact(a, contribution.artifact);
@@ -206,6 +207,7 @@ pub const Collector = struct {
     fn retainedNativeRoot(self: *Collector, a: A, comptime native: type, ref: local.serverless_manifest_artifact_ref.ArtifactRef) !native.Root {
         const current = if (@hasDecl(native, "supportsBuildMetadata")) native.supportsBuildMetadata(ref.metadata_version) else ref.metadata_version == native.metadata_version;
         if (current) {
+            if (@hasDecl(native, "loadRootLazy")) return native.loadRootLazy(a, self.store, ref, self.cancellation(), null);
             if (@hasDecl(native, "loadRootDirectory")) return native.loadRootDirectory(a, self.store, ref, self.cancellation(), null);
             return native.loadRoot(a, self.store, ref, self.cancellation(), null);
         }
@@ -391,6 +393,11 @@ pub const Collector = struct {
                 try self.markPages(a, root.domain, root.reverse, false);
                 try self.markPages(a, root.domain, root.ties, false);
                 try self.markPages(a, root.domain, root.predicates, false);
+                if (root.file_dictionary) |dictionary| {
+                    try self.markPages(a, root.domain, dictionary.slots, false);
+                    try self.markPages(a, root.domain, dictionary.names, false);
+                    try self.markPages(a, root.domain, dictionary.public, false);
+                }
             },
             // These lake producers publish self-contained segments. New paged
             // formats must register a child-reference walker before GC accepts

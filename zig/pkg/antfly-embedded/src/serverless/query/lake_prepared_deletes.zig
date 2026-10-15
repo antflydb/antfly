@@ -132,7 +132,11 @@ pub const Prepared = struct {
             var inventory = try iceberg.singleDeleteFileInventoryAlloc(a, request.data_inventory, file, if (qualification != null) null else request.client, if (file.content == .equality_deletes) "iceberg-equality-delete" else "iceberg-position-delete");
             defer inventory.deinit(a);
             if (qualification) |qualified| {
-                const evidence = qualified.versions[original_index];
+                const evidence = try qualified.evidence(a, original_index, file, context);
+                defer if (qualified.proof != null) {
+                    a.free(evidence.etag);
+                    a.free(evidence.version);
+                };
                 const entry = &inventory.files[0];
                 const etag = try a.dupe(u8, evidence.etag);
                 errdefer a.free(etag);

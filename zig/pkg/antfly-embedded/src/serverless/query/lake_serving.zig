@@ -339,15 +339,28 @@ pub fn executePinnedExternalLakeRowsScanAlloc(
     });
 }
 
+pub const DeleteQualification = @import("lake_delete_qualification.zig").Qualification;
+
 pub const ServingSource = struct {
     /// Authorized publication navigation is query-owned. Lookups return fully
     /// owned entries; full scans can rediscover the frozen metadata normally.
+    pub const FileIterator = struct {
+        ptr: *anyopaque,
+        next: *const fn (*anyopaque, std.mem.Allocator, @import("lake_read_context.zig").Context) anyerror!?external_source_api.FileEntry,
+        split: ?*const fn (*anyopaque, std.mem.Allocator, usize, usize, @import("lake_read_context.zig").Context) anyerror!FileIterator = null,
+        has_more: ?*const fn (*anyopaque, @import("lake_read_context.zig").Context) anyerror!bool = null,
+        close: *const fn (*anyopaque) void,
+    };
+    pub const Estimates = struct { rows: u64, bytes: u64 };
     pub const FileNavigation = struct {
         ptr: *anyopaque,
         count: usize,
         plan: [32]u8,
         lookup: *const fn (*anyopaque, std.mem.Allocator, []const u8, @import("lake_read_context.zig").Context) anyerror!external_source_api.FileEntry,
         close: *const fn (*anyopaque) void,
+        delete_proof: ?@import("lake_delete_qualification.zig").Qualification.Proof = null,
+        enumerate: ?*const fn (*anyopaque, std.mem.Allocator, @import("lake_read_context.zig").Context) anyerror!FileIterator = null,
+        estimates: ?Estimates = null,
     };
     pub const SnapshotPlans = struct { requested: [32]u8, current: [32]u8, selected: [32]u8 };
     pub const SnapshotNavigation = struct {
@@ -394,6 +407,11 @@ pub const ServingSource = struct {
     catalog_files: bool = false,
     selected_catalog_view: bool = false,
     attachment_uri: ?[]u8 = null,
+    // Optional shared-plan admission cannot impose a new statement limit.
+    // Private overflow plans use the caller allocator and pin their chunks.
+    private_snapshot: ?*@import("lake_iceberg_snapshot.zig").SnapshotWithDeletePlan = null,
+    private_snapshot_owned: bool = false,
+    local_plan_owned: bool = true,
     // Exact immutable metadata used to construct this inventory, independent
     // of the attachment URI and subsequent catalog pointer changes.
     catalog_metadata: ?@import("../external_source/lake_catalog/types.zig").Table = null,
@@ -422,6 +440,8 @@ pub const ServingSource = struct {
         view.alloc = a;
         view.delete_qualification_owned = false;
         view.inventory_owned = false;
+        view.private_snapshot_owned = false;
+        view.local_plan_owned = false;
         view.catalog_files = false;
         view.pinned_files_owned = false;
         view.attachment_uri = null;
@@ -449,6 +469,11 @@ pub const ServingSource = struct {
         if (self.inventory_owned) self.inventory.deinit(self.alloc);
         if (self.pinned_files_owned) self.alloc.free(self.pinned_files);
         if (self.attachment_uri) |uri| self.alloc.free(uri);
+        if (self.local_plan_owned) if (self.local_plan) |*plan| plan.deinit(self.alloc);
+        if (self.private_snapshot_owned) if (self.private_snapshot) |snapshot| {
+            snapshot.deinit(self.alloc);
+            self.alloc.destroy(snapshot);
+        };
         if (self.plan_lease) |lease| if (parent.plan_lease == null or lease.item != parent.plan_lease.?.item) lease.release();
     }
 
@@ -466,7 +491,8 @@ pub const ServingSource = struct {
         const plan = self.scanner.iceberg_delete_plan orelse return null;
         try self.ensureDeleteQualification();
         const qualification = self.delete_qualification orelse return null;
-        return qualification.acquire(self.scanner.object_reader.client, plan, checked);
+        const proof = if (self.immutable_objects and self.snapshot_pin != null and self.file_navigation != null) self.file_navigation.?.delete_proof else null;
+        return qualification.acquireProven(self.scanner.object_reader.client, plan, checked, proof);
     }
 
     pub fn open(alloc: std.mem.Allocator, schema: storage_schema.TableSchema, options: host_store.OpenOptions) !ServingSource {
@@ -696,8 +722,11 @@ pub const ServingSource = struct {
     pub fn fileCount(self: *const ServingSource) usize {
         return if (self.selected_catalog_view) self.inventory.files.len else if (self.file_navigation) |value| value.count else if (self.catalog()) |index| index.count() else self.inventory.files.len;
     }
+    pub fn canEnumerate(self: *const ServingSource) bool {
+        return self.hasLazyInventory() and self.file_navigation != null and self.file_navigation.?.enumerate != null;
+    }
     pub fn hasLazyInventory(self: *const ServingSource) bool {
-        if (self.deferred_snapshot != null and self.plan_lease != null) return false;
+        if (self.deferred_snapshot != null and (self.plan_lease != null or self.private_snapshot != null)) return false;
         return !self.selected_catalog_view and (self.catalog() != null or self.file_navigation != null) and !self.catalog_files and self.inventory.files.len == 0;
     }
     fn freeCatalogFiles(self: *ServingSource) void {
@@ -722,7 +751,10 @@ pub const ServingSource = struct {
             hash.update("iceberg-full-scan-plan-v1");
             hash.update(&frozen.key);
             var loader: SnapshotPlanLoader = .{ .client = self.scanner.object_reader.client, .source = self.inventory.source_id, .uri = frozen.uri, .snapshot = frozen.snapshot, .metadata = frozen.metadata, .manifests = &frozen.cache.manifests, .chunks = &frozen.cache.inventory_chunks, .scope = frozen.scope, .context = context };
-            const lease = try frozen.cache.decoded.acquire(hash.finalResult(), 64 * 1024 * 1024, context, .{ .ptr = &loader, .load = SnapshotPlanLoader.load });
+            const lease = frozen.cache.decoded.acquire(hash.finalResult(), 64 * 1024 * 1024, context, .{ .ptr = &loader, .load = SnapshotPlanLoader.load }) catch |err| switch (err) {
+                error.OutOfMemory, error.SqlMemoryLimitExceeded => return self.privateFrozenInventory(frozen, context),
+                else => return err,
+            };
             errdefer lease.release();
             const uri = try self.alloc.dupe(u8, self.inventory.source_uri);
             if (self.delete_lease) |held| held.release() else if (self.inventory_owned) if (self.prepared_deletes) |prepared| prepared.destroy(self.alloc);
@@ -746,6 +778,34 @@ pub const ServingSource = struct {
         } else self.inventory.files = try self.catalog().?.materialize(self.alloc, self.inventory.snapshot_id, context);
         self.catalog_files = true;
         self.scanner.inventory = self.inventory;
+    }
+    fn privateFrozenInventory(self: *ServingSource, frozen: DeferredSnapshot, context: @import("lake_read_context.zig").Context) !void {
+        try context.ensureActive();
+        const snapshot = try self.alloc.create(@import("lake_iceberg_snapshot.zig").SnapshotWithDeletePlan);
+        errdefer self.alloc.destroy(snapshot);
+        snapshot.* = try @import("lake_iceberg_snapshot.zig").planSnapshotInventoryAndDeletePlanFromMetadataAlloc(self.alloc, .{ .client = self.scanner.object_reader.client, .source_id = self.inventory.source_id, .metadata_uri = frozen.uri, .requested_snapshot_id = frozen.snapshot, .manifests = &frozen.cache.manifests, .inventory_chunks = &frozen.cache.inventory_chunks, .manifest_scope = frozen.scope, .context = context }, frozen.metadata);
+        errdefer snapshot.deinit(self.alloc);
+        const uri = try self.alloc.dupe(u8, self.inventory.source_uri);
+        errdefer self.alloc.free(uri);
+        if (self.delete_lease) |held| held.release() else if (self.inventory_owned) if (self.prepared_deletes) |prepared| prepared.destroy(self.alloc);
+        self.delete_lease = null;
+        self.prepared_deletes = null;
+        if (self.inventory_owned) {
+            self.inventory.deinit(self.alloc);
+            if (self.scanner.iceberg_delete_plan) |*plan| plan.deinit(self.alloc);
+        }
+        if (self.attachment_uri) |old| self.alloc.free(old);
+        self.attachment_uri = uri;
+        self.private_snapshot = snapshot;
+        self.private_snapshot_owned = true;
+        self.inventory = snapshot.inventory;
+        self.inventory.source_uri = uri;
+        self.inventory_owned = false;
+        self.scanner.inventory = self.inventory;
+        self.scanner.iceberg_delete_plan = snapshot.delete_plan;
+        // Preserve ordinary request admission; no private unbounded cache.
+        // The flat descriptor vector is necessary for existing scan cursors,
+        // while payloads remain borrowed from individually bounded chunks.
     }
     pub fn ensureCanonicalPlan(self: *ServingSource, context: @import("lake_read_context.zig").Context) !void {
         if (self.catalog()) |index| _ = index.ensureOrdering(self.inventory.source_id, self.inventory.snapshot_id, context) catch |err| switch (err) {
@@ -920,7 +980,8 @@ pub const ServingSource = struct {
         if (self.plan_lease) |lease| if (lease.item.file_rank != null) return &lease.item.file_by_id;
         return if (self.local_plan) |*plan| &plan.file_by_id else null;
     }
-    pub fn estimates(self: *const ServingSource) ?struct { rows: u64, bytes: u64 } {
+    pub fn estimates(self: *const ServingSource) ?Estimates {
+        if (self.file_navigation) |navigation| if (navigation.estimates) |value| return value;
         if (self.catalog()) |index| return .{ .rows = index.rows(), .bytes = index.bytes() };
         if (self.plan_lease) |lease| if (lease.item.file_order != null) return .{ .rows = lease.item.estimated_rows, .bytes = lease.item.estimated_bytes };
         return if (self.local_plan) |plan| .{ .rows = plan.estimated_rows, .bytes = plan.estimated_bytes } else null;
@@ -1011,11 +1072,11 @@ pub const ServingSource = struct {
             self.alloc.destroy(reader);
         }
         if (self.verified_selector) |selector| selector.close(selector.ptr);
-        if (self.plan_lease) |lease| lease.release() else if (self.scanner.iceberg_delete_plan) |*value| value.deinit(self.alloc);
+        if (self.plan_lease) |lease| lease.release() else if (self.private_snapshot == null) if (self.scanner.iceberg_delete_plan) |*value| value.deinit(self.alloc);
         if (self.partition_rules) |*rules| rules.deinit();
         if (self.iceberg_schema) |*value| value.deinit();
         self.clearVersions();
-        if (self.local_plan) |*plan| plan.deinit(self.alloc);
+        if (self.local_plan_owned) if (self.local_plan) |*plan| plan.deinit(self.alloc);
         if (self.pinned_files_owned) self.alloc.free(self.pinned_files);
         self.freeCatalogFiles();
         if (self.inventory_owned) self.inventory.deinit(self.alloc);
@@ -1023,6 +1084,10 @@ pub const ServingSource = struct {
         if (self.catalog_metadata) |*table| table.deinit(self.alloc);
         if (self.file_navigation) |value| value.close(value.ptr);
         if (self.deferred_snapshot) |value| value.deinit(self.alloc);
+        if (self.private_snapshot_owned) if (self.private_snapshot) |snapshot| {
+            snapshot.deinit(self.alloc);
+            self.alloc.destroy(snapshot);
+        };
         self.store.deinit();
         if (self.context_store) |store| self.alloc.destroy(store);
         self.* = undefined;
@@ -1235,6 +1300,10 @@ test "external lake metadata navigation full scans share frozen plans and empty 
         fn cleanup(source_: *ServingSource) void {
             if (source_.inventory_owned) source_.inventory.deinit(source_.alloc);
             if (source_.plan_lease) |lease| lease.release();
+            if (source_.private_snapshot_owned) if (source_.private_snapshot) |snapshot| {
+                snapshot.deinit(source_.alloc);
+                source_.alloc.destroy(snapshot);
+            };
             if (source_.attachment_uri) |uri| source_.alloc.free(uri);
             source_.deferred_snapshot.?.deinit(source_.alloc);
         }
@@ -1242,9 +1311,9 @@ test "external lake metadata navigation full scans share frozen plans and empty 
             var first = try source(alloc, client, shared, bytes);
             defer cleanup(&first);
             try first.ensureInventory(.{});
-            const item = first.plan_lease.?.item;
+            const item = if (first.plan_lease) |lease| @intFromPtr(lease.item) else @intFromPtr(first.private_snapshot.?);
             try first.ensureInventory(.{});
-            try std.testing.expectEqual(item, first.plan_lease.?.item);
+            try std.testing.expectEqual(item, if (first.plan_lease) |lease| @intFromPtr(lease.item) else @intFromPtr(first.private_snapshot.?));
             try first.ownInventory();
             try std.testing.expect(first.inventory_owned);
         }
@@ -1259,4 +1328,14 @@ test "external lake metadata navigation full scans share frozen plans and empty 
     try std.testing.expect(first.canonicalOrder().?.ptr == second.canonicalOrder().?.ptr);
     try std.testing.expect(!first.hasLazyInventory());
     try std.testing.checkAllAllocationFailures(a, Fixture.checked, .{ memory.client(), &cache, metadata });
+    var constrained = @import("lake_serving_cache.zig").Cache.init(a);
+    defer constrained.deinit();
+    constrained.decoded.max_loading_bytes = 32 * 1024 * 1024;
+    var private = try Fixture.source(a, memory.client(), &constrained, metadata);
+    defer Fixture.cleanup(&private);
+    try private.ensureInventory(.{});
+    try std.testing.expect(private.private_snapshot != null);
+    try private.ensureInventory(.{});
+    try private.ownInventory();
+    try std.testing.checkAllAllocationFailures(a, Fixture.checked, .{ memory.client(), &constrained, metadata });
 }

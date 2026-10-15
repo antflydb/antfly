@@ -140,11 +140,26 @@ pub const Filter = union(enum) {
 
 /// Bounded query-owned pattern leaves for one immutable corpus/pack. Keys own
 /// only digests; encoded segments and request syntax are never retained. Each
-/// caller receives a private bitmap, so parallel scoring cannot mutate cached
-/// membership or retain a pointer across eviction.
+/// mutable caller receives a private bitmap. Scorers can instead pin immutable
+/// membership until their independent iterators close, preventing eviction.
 pub const PatternMembership = struct {
     const Bitmap = roaring.RoaringBitmap;
-    const Entry = struct { key: [32]u8, bitmap: Bitmap, age: u64 };
+    const Entry = struct { key: [32]u8, bitmap: Bitmap, age: u64, pins: usize = 0 };
+    /// Cache lifetime encloses every scorer. Pinned slots cannot be evicted;
+    /// consumers own independent iterators over immutable segment-local IDs.
+    pub const Pin = struct {
+        cache: *PatternMembership,
+        slot: usize,
+        pub fn bitmap(self: Pin) *const Bitmap {
+            return &self.cache.entries[self.slot].?.bitmap;
+        }
+        pub fn release(self: Pin) void {
+            self.cache.lock();
+            defer self.cache.mutex.unlock();
+            std.debug.assert(self.cache.entries[self.slot].?.pins != 0);
+            self.cache.entries[self.slot].?.pins -= 1;
+        }
+    };
     budget: @import("../sql/memory_budget.zig"),
     entries: [32]?Entry = @splat(null),
     mutex: std.atomic.Mutex = .unlocked,
@@ -160,6 +175,7 @@ pub const PatternMembership = struct {
     fn evict(self: *@This()) bool {
         var oldest: ?usize = null;
         for (self.entries, 0..) |entry, i| if (entry) |held| {
+            if (held.pins != 0) continue;
             if (oldest == null or held.age < self.entries[oldest.?].?.age) oldest = i;
         };
         const index = oldest orelse return false;
@@ -169,7 +185,26 @@ pub const PatternMembership = struct {
     }
     pub fn deinit(self: *@This()) void {
         while (self.evict()) {}
+        for (self.entries) |entry| std.debug.assert(entry == null);
         std.debug.assert(self.budget.live == 0);
+    }
+    pub fn pin(self: *@This(), filter: Filter, seg: *const index_mod.SegmentEntry, control: ExecutionControl) !?Pin {
+        switch (filter) {
+            .prefix, .wildcard, .regexp, .fuzzy => {},
+            else => return null,
+        }
+        try control.check();
+        const key = identity(filter, seg);
+        self.lock();
+        defer self.mutex.unlock();
+        self.tick +%= 1;
+        for (&self.entries, 0..) |*entry, i| if (entry.*) |*held| if (std.mem.eql(u8, &held.key, &key)) {
+            held.pins += 1;
+            held.age = self.tick;
+            self.hits += 1;
+            return .{ .cache = self, .slot = i };
+        };
+        return null;
     }
     fn identity(filter: Filter, seg: *const index_mod.SegmentEntry) [32]u8 {
         var buffer: [1024]u8 = undefined;
@@ -220,7 +255,7 @@ pub const PatternMembership = struct {
                 break;
             };
             if (free == null) {
-                _ = self.evict();
+                if (!self.evict()) return result;
                 continue;
             }
             const copy = result.clone(self.budget.allocator()) catch {
@@ -4003,6 +4038,15 @@ test "external lake metadata navigation pattern leaves reuse immutable membershi
     }
     try testing.expectEqual(@as(usize, 4), memo.builds);
     try testing.expectEqual(@as(usize, 4), memo.hits);
+    const pin = (try memo.pin(leaves[0], segment, .{})).?;
+    const immutable = pin.bitmap();
+    try testing.expect(immutable.contains(0));
+    while (memo.evict()) {}
+    try testing.expect(pin.bitmap() == immutable and immutable.contains(0));
+    try testing.expect(!memo.evict());
+    pin.release();
+    try testing.expect(memo.evict());
+    try testing.expectError(error.Timeout, memo.pin(leaves[0], segment, .{ .deadline_ns = 0 }));
     var pressure = PatternMembership.init(a, 1);
     defer pressure.deinit();
     for (0..2) |_| {

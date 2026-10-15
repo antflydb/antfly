@@ -93,7 +93,7 @@ pub fn openPinned(alloc: Allocator, table: catalog.Table, request: catalog.Scan,
         owner.source_parent = source;
         return cursor;
     }
-    try source.ensureInventory(read_context);
+    if (!source.canEnumerate() or request.physical_selection != null or request.after != null or request.before != null) try source.ensureInventory(read_context);
     return openPinnedMaterialized(alloc, table, request, context, source);
 }
 fn openPinnedMaterialized(alloc: Allocator, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *serving.ServingSource) !catalog.Cursor {
@@ -460,7 +460,7 @@ const Owner = struct {
                 continue;
             }
             last_id = try @import("../storage/rowsource/identity.zig").allocId(alloc, batch.row_refs[selected[count - 1]]);
-            const end = self.position == batch.rowCount() and (self.stream.page_cursor == null or self.stream.page_cursor.?.position == self.stream.page_cursor.?.group.row_count) and self.stream.file_index == self.stream.files.len and self.stream.group_index == self.stream.discovered.?.row_group_plan.row_groups.len;
+            const end = self.position == batch.rowCount() and (self.stream.page_cursor == null or self.stream.page_cursor.?.position == self.stream.page_cursor.?.group.row_count) and self.stream.file_index == self.stream.files.len and self.stream.group_index == self.stream.discovered.?.row_group_plan.row_groups.len and !try self.stream.enumeratedHasMore();
             return .{ .batch = view, .retain_columns = .{ .ptr = self, .retain_fn = retainColumns }, .selection = selected[0..count], .after = if (end or self.primary_key != null) null else last_id };
         }
         return .{ .batch = .{ .snapshot = .{ .table_id = self.stream.source.inventory.source_id, .snapshot_id = self.stream.source.inventory.snapshot_id }, .row_refs = &.{}, .columns = &.{} }, .selection = &.{} };
@@ -489,6 +489,7 @@ const Owner = struct {
     }
     fn splitOrdered(raw: *anyopaque, a: Allocator, maximum: usize) !?[]catalog.Cursor {
         const self: *Owner = @ptrCast(@alignCast(raw));
+        if (self.stream.iterator != null) return self.splitEnumerated(a, maximum);
         if (self.stream.selection != null) return null;
         if (self.started or self.dynamic != null or self.stream.partition_count != 1 or maximum < 2 or self.stream.source.scanner.shared_reader == null) return null;
         // Multiple files form lazy contiguous ranges. Opening a later footer
@@ -516,6 +517,7 @@ const Owner = struct {
         const self: *Owner = @ptrCast(@alignCast(raw));
         if (self.stream.selection != null) return null;
         if (self.started or self.dynamic != null or self.stream.partition_count != 1) return null;
+        if (self.stream.iterator != null) return self.splitEnumerated(a, maximum);
         const count = try self.stream.partitionCount(maximum);
         if (count < 2) return null;
         return try self.splitChildren(a, count, false);
@@ -563,6 +565,31 @@ const Owner = struct {
         }
         a.free(source.inventory.files);
         a.free(source.pinned_files);
+    }
+    fn splitEnumerated(self: *Owner, a: Allocator, maximum: usize) !?[]catalog.Cursor {
+        if (self.started or self.dynamic != null or self.stream.iterator_started or maximum < 2) return null;
+        const parent = self.stream.iterator_parent.?;
+        const iterator = self.stream.iterator.?;
+        const split = iterator.split orelse return null;
+        const count = @min(@min(maximum, parent.fileCount()), 256);
+        if (count < 2) return null;
+        _ = try parent.qualifiedDeletes(self.stream.context);
+        const cursors = try a.alloc(catalog.Cursor, count);
+        errdefer a.free(cursors);
+        var opened: usize = 0;
+        errdefer for (cursors[0..opened]) |cursor| cursor.close(cursor.ptr);
+        for (cursors, 0..) |*cursor, index| {
+            const part = try split(iterator.ptr, a, index, count, self.stream.context);
+            errdefer part.close(part.ptr);
+            cursor.* = try openPinned(a, self.table, .{ .fields = self.stream.columns, .conditions = self.conditions, .primary_key = self.primary_key, .limit = 1024 }, self.context, parent);
+            const child: *Owner = @ptrCast(@alignCast(cursor.ptr));
+            const previous = child.stream.iterator.?;
+            previous.close(previous.ptr);
+            child.stream.iterator = part;
+            opened += 1;
+        }
+        self.started = true;
+        return cursors;
     }
     fn splitChildren(self: *Owner, a: Allocator, count: usize, ordered_files: bool) ![]catalog.Cursor {
         // Publish one query-owned qualifier before independent lanes borrow
@@ -1695,4 +1722,125 @@ test "external lake exact NUMERIC integer pruning retains signed fractional and 
     try std.testing.expect(try numericPruning(a, "n", .neq, fractional) == null);
     const huge = try scalar.numericTextLeaky(arena.allocator(), "9223372036854775808", &work);
     try std.testing.expect(try numericPruning(a, "n", .eq, huge) == null);
+}
+
+test "lake SQL paged publication scans retain one file and split independent ordered ranges" {
+    const a = std.testing.allocator;
+    var lake: TestLake = .{ .memory = TestLake.storage.MemoryObjectStorage.init(a) };
+    try lake.populate(a, 10, &.{ 1, 2, 3 });
+    defer lake.deinit(a);
+    var cache = @import("../serverless/query/lake_serving_cache.zig").Cache.init(a);
+    defer cache.deinit();
+    try lake.source.attachCache(&cache, lake.table.external_base_source.?.binding, .{ .io = std.testing.io });
+    const Navigation = struct {
+        inventory: @import("../serverless/external_source/types.zig").Inventory,
+        order: []const usize,
+        const Self = @This();
+        const Iterator = struct {
+            a: Allocator,
+            nav: *const Self,
+            position: usize,
+            end: usize,
+            fn next(raw: *anyopaque, alloc: Allocator, context: @import("../serverless/query/lake_read_context.zig").Context) !?@import("../serverless/external_source/types.zig").FileEntry {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                try context.ensureActive();
+                if (self.position == self.end) return null;
+                const file = self.nav.inventory.files[self.nav.order[self.position]];
+                const bytes = try std.json.Stringify.valueAlloc(alloc, file, .{});
+                defer alloc.free(bytes);
+                const copy = try std.json.parseFromSliceLeaky(@import("../serverless/external_source/types.zig").FileEntry, alloc, bytes, .{ .allocate = .alloc_always });
+                self.position += 1;
+                return copy;
+            }
+            fn hasMore(raw: *anyopaque, context: @import("../serverless/query/lake_read_context.zig").Context) !bool {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                try context.ensureActive();
+                return self.position < self.end;
+            }
+            fn split(raw: *anyopaque, alloc: Allocator, index: usize, count: usize, context: @import("../serverless/query/lake_read_context.zig").Context) !serving.ServingSource.FileIterator {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                try context.ensureActive();
+                return create(alloc, self.nav, index * self.nav.order.len / count, (index + 1) * self.nav.order.len / count);
+            }
+            fn close(raw: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.a.destroy(self);
+            }
+            fn create(alloc: Allocator, nav: *const Self, first: usize, end: usize) !serving.ServingSource.FileIterator {
+                const self = try alloc.create(@This());
+                self.* = .{ .a = alloc, .nav = nav, .position = first, .end = end };
+                return .{ .ptr = self, .next = @This().next, .split = @This().split, .has_more = @This().hasMore, .close = @This().close };
+            }
+        };
+        fn enumerate(raw: *anyopaque, alloc: Allocator, context: @import("../serverless/query/lake_read_context.zig").Context) !serving.ServingSource.FileIterator {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try context.ensureActive();
+            return Iterator.create(alloc, self, 0, self.order.len);
+        }
+        fn lookup(_: *anyopaque, _: Allocator, _: []const u8, _: @import("../serverless/query/lake_read_context.zig").Context) !@import("../serverless/external_source/types.zig").FileEntry {
+            return error.UnexpectedLookup;
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    const order = try serving.ServingSource.canonicalFileOrder(a, lake.inventory);
+    defer a.free(order);
+    var navigation: Navigation = .{ .inventory = lake.inventory, .order = order };
+    lake.source.inventory.files = &.{};
+    lake.source.scanner.inventory = lake.source.inventory;
+    lake.source.inventory_owned = false;
+    lake.source.file_navigation = .{ .ptr = &navigation, .count = lake.inventory.files.len, .plan = @splat(1), .lookup = Navigation.lookup, .close = Navigation.close, .enumerate = Navigation.enumerate, .estimates = .{ .rows = 30, .bytes = 1000 } };
+    var ids: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (ids.items) |id| a.free(id);
+        ids.deinit(a);
+    }
+    {
+        const serial = try openPinned(a, lake.table, .{ .fields = &.{"amount"}, .limit = 1024 }, .{}, &lake.source);
+        defer serial.close(serial.ptr);
+        const owner: *Owner = @ptrCast(@alignCast(serial.ptr));
+        try std.testing.expect(owner.stream.iterator != null);
+        while (true) {
+            const page = try serial.next(serial.ptr, a, 2);
+            defer page.deinit();
+            for (page.rows) |row| try ids.append(a, try a.dupe(u8, row.id));
+            try std.testing.expect(owner.stream.source.inventory.files.len <= 1);
+            try std.testing.expectEqual(@as(usize, 0), lake.source.inventory.files.len);
+            if (page.after == null) break;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 30), ids.items.len);
+    const parent = try openPinned(a, lake.table, .{ .fields = &.{"amount"}, .limit = 1024 }, .{}, &lake.source);
+    defer parent.close(parent.ptr);
+    const children = (try parent.split_ordered.?(parent.ptr, a, 3)).?;
+    defer {
+        for (children) |child| child.close(child.ptr);
+        a.free(children);
+    }
+    var seen: usize = 0;
+    for (children) |child| while (true) {
+        const page = try child.next(child.ptr, a, 2);
+        defer page.deinit();
+        for (page.rows) |row| {
+            try std.testing.expectEqualStrings(ids.items[seen], row.id);
+            seen += 1;
+        }
+        if (page.after == null) break;
+    };
+    try std.testing.expectEqual(ids.items.len, seen);
+    const counted = try openPinned(a, lake.table, .{ .fields = &.{}, .limit = 1024 }, .{}, &lake.source);
+    defer counted.close(counted.ptr);
+    try std.testing.expectEqual(@as(?u64, 30), try counted.count_rows.?(counted.ptr));
+    try std.testing.expectEqual(@as(?u64, null), try counted.count_rows.?(counted.ptr));
+    const Failure = struct {
+        fn run(alloc: Allocator, table: catalog.Table, source: *serving.ServingSource) !void {
+            const cursor = try openPinned(alloc, table, .{ .fields = &.{"amount"}, .limit = 1024 }, .{}, source);
+            defer cursor.close(cursor.ptr);
+            const parts = (try cursor.split_ordered.?(cursor.ptr, alloc, 3)).?;
+            defer {
+                for (parts) |part| part.close(part.ptr);
+                alloc.free(parts);
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Failure.run, .{ lake.table, &lake.source });
 }

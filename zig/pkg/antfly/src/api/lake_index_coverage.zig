@@ -217,6 +217,11 @@ pub fn finishDigest(source: *Source, context: Context, data: [32]u8) !Coverage {
 /// which deliberately re-stat objects before and after construction.
 pub fn finishReadDigest(source: *Source, context: Context, data: [32]u8) !Coverage {
     const qualified = (try source.qualifiedDeletes(context)) orelse return finishDigest(source, context, data);
+    if (qualified.proof) |proof| {
+        if (!std.mem.eql(u8, &proof.data, &data)) return error.InvalidExternalLakeIndexCoverage;
+        try context.ensureActive();
+        return .{ .source = proof.source, .delete_objects = qualified.digest, .data = data };
+    }
     var hash = Hash.init(.{});
     part(&hash, "native-lake-source-coverage-v2");
     hash.update(&data);

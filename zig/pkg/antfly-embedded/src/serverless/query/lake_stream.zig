@@ -87,6 +87,9 @@ pub const Stream = struct {
     stats: Stats = .{},
     files: []usize,
     owns_files: bool = true,
+    iterator: ?serving.ServingSource.FileIterator = null,
+    iterator_parent: ?*serving.ServingSource = null,
+    iterator_started: bool = false,
     selection: ?@import("lake_row_selection.zig").Selection = null,
     resume_at: ?struct { group: u32, row: u64 } = null,
     active_file: usize = 0,
@@ -350,12 +353,64 @@ pub const Stream = struct {
     pub fn init(alloc: Allocator, source: *serving.ServingSource, columns: []const []const u8, predicates: []const Predicate, parent: Context, limits: Limits) !Stream {
         const context = source.protectContext(parent);
         try context.ensureActive();
+        if (source.canEnumerate()) return initEnumerated(alloc, source, columns, predicates, context, limits);
         try source.ensureInventory(context);
         try source.ensureCanonicalPlan(context);
         const cached_order = source.canonicalOrder();
         if (cached_order == null) try source.inventory.validate();
         const files = cached_order orelse try serving.ServingSource.canonicalFileOrder(alloc, source.inventory);
         return .{ .alloc = alloc, .source = source, .columns = columns, .predicates = predicates, .context = context, .limits = limits, .files = files, .owns_files = cached_order == null, .schema_contract = if (source.iceberg_schema) |schema| schema.columns else &.{} };
+    }
+    fn initEnumerated(a: Allocator, parent: *serving.ServingSource, columns: []const []const u8, predicates: []const Predicate, context: Context, limits: Limits) !Stream {
+        const navigation = parent.file_navigation.?;
+        const iterator = try navigation.enumerate.?(navigation.ptr, a, context);
+        errdefer iterator.close(iterator.ptr);
+        const view = try a.create(serving.ServingSource);
+        errdefer a.destroy(view);
+        view.* = try parent.parallelView(a);
+        errdefer view.closeParallelView(parent);
+        if (view.delete_lease) |lease| lease.release();
+        view.delete_lease = null;
+        view.prepared_deletes = null;
+        view.inventory.files = &.{};
+        view.scanner.inventory = view.inventory;
+        view.selected_catalog_view = true;
+        view.plan_identity = null;
+        view.version_parent = null;
+        view.pinned_files = &.{};
+        view.pinned_files_owned = false;
+        const files = try a.dupe(usize, &.{0});
+        return .{ .alloc = a, .source = view, .columns = columns, .predicates = predicates, .context = context, .limits = limits, .files = files, .file_index = 1, .iterator = iterator, .iterator_parent = parent, .schema_contract = if (parent.iceberg_schema) |schema| schema.columns else &.{} };
+    }
+    fn nextEnumeratedFile(self: *Stream) !bool {
+        const iterator = self.iterator.?;
+        self.iterator_started = true;
+        var file = (try iterator.next(iterator.ptr, self.alloc, self.context)) orelse return false;
+        errdefer file.deinit(self.alloc);
+        const files = try self.alloc.alloc(external.FileEntry, 1);
+        errdefer self.alloc.free(files);
+        const pinned = try self.alloc.alloc(bool, 1);
+        errdefer self.alloc.free(pinned);
+        const parent = self.iterator_parent.?;
+        var view = try parent.parallelView(self.alloc);
+        if (view.delete_lease) |lease| lease.release();
+        view.delete_lease = null;
+        view.prepared_deletes = null;
+        files[0] = file;
+        view.inventory.files = files;
+        view.scanner.inventory = view.inventory;
+        view.catalog_files = true;
+        view.catalog_files_owned = true;
+        view.selected_catalog_view = true;
+        view.plan_identity = null;
+        view.version_parent = null;
+        pinned[0] = view.immutable_objects and (file.etag.len != 0 or (file.version_id.len != 0 and !std.mem.startsWith(u8, file.version_id, "iceberg:") and !std.mem.startsWith(u8, file.version_id, "object-stat:")));
+        view.pinned_files = pinned;
+        view.pinned_files_owned = true;
+        self.source.closeParallelView(parent);
+        self.source.* = view;
+        self.file_index = 0;
+        return true;
     }
     /// A contribution scan keeps the parent snapshot and delete applicability,
     /// but schedules only one pinned object. All footer offsets remain file-local.
@@ -397,7 +452,13 @@ pub const Stream = struct {
         self.owns_files = true;
         self.selection = selection;
     }
+    pub fn enumeratedHasMore(self: *Stream) !bool {
+        const iterator = self.iterator orelse return false;
+        const check = iterator.has_more orelse return true;
+        return check(iterator.ptr, self.context);
+    }
     pub fn partitionCount(self: *Stream, maximum: usize) !usize {
+        if (self.iterator != null) return 1;
         if (self.files.len == 0 or maximum < 2 or self.source.scanner.shared_reader == null) return 1;
         if (self.work) |work| return @min(maximum, work.units.len);
         const planning_io = self.source.scanner.shared_reader.?.context.io orelse self.context.io;
@@ -550,6 +611,11 @@ pub const Stream = struct {
         };
         if (self.owns_files) self.alloc.free(self.files);
         self.mapped_columns.deinit(self.alloc);
+        if (self.iterator) |iterator| {
+            self.source.closeParallelView(self.iterator_parent.?);
+            self.alloc.destroy(self.source);
+            iterator.close(iterator.ptr);
+        }
         self.* = undefined;
     }
     fn clearBatch(self: *Stream) void {
@@ -702,7 +768,9 @@ pub const Stream = struct {
                 self.group_index = unit.group_index;
                 continue;
             } else blk: {
-                if (self.file_index == self.files.len) return null;
+                if (self.file_index == self.files.len) {
+                    if (self.iterator == null or !try self.nextEnumeratedFile()) return null;
+                }
                 const index = self.files[self.file_index];
                 self.file_index += 1;
                 if (self.partition_count > 1 and self.files.len > 1 and (self.file_index - 1) * self.partition_count / self.files.len != self.partition_index) continue;
@@ -1053,6 +1121,18 @@ pub const Stream = struct {
         return starts;
     }
     pub fn countAll(self: *Stream) !?u64 {
+        if (self.iterator != null) {
+            if (self.iterator_started or self.predicates.len != 0) return null;
+            var total: u64 = 0;
+            while (try self.nextEnumeratedFile()) {
+                try self.context.ensureActive();
+                try self.loadFile(0);
+                if (self.discovered) |plan| total = std.math.add(u64, total, plan.inventory.files[0].row_count) catch return error.LakeRowsScanBudgetExceeded;
+                self.clearFile();
+                self.file_index = self.files.len;
+            }
+            return total;
+        }
         if (self.file_index != 0 or self.predicates.len != 0) return null;
         var total: u64 = 0;
         for (self.files) |index| {

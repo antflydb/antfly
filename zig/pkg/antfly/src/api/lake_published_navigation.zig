@@ -37,6 +37,77 @@ const Owner = struct {
         try context.ensureActive();
         return file;
     }
+    fn deleteVersion(raw: *anyopaque, a: A, index: usize, file: local.serverless_query_lake_iceberg_snapshot.IcebergDeleteFile, context: Context) !local.serverless_query_lake_serving.DeleteQualification.Version {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        try context.ensureActive();
+        try self.lease.readContext().ensureActive();
+        return self.resolver.deleteSelector(a, index, file, context);
+    }
+    const Enumeration = struct {
+        a: A,
+        owner: *Owner,
+        resolver: nav.Resolver,
+        pages: @import("../serverless/graph_segment/page_store.zig").PageStore,
+        store: @import("../serverless/artifacts/store.zig").ArtifactStore,
+        cursor: ?@import("../serverless/graph_segment/page_tree.zig").Cursor = null,
+        reads: u64 = std.math.maxInt(u64),
+        writes: u64 = 0,
+        seen: u32 = 0,
+        full: bool = true,
+        pending: ?@import("../serverless/graph_segment/page_tree.zig").Cursor.Record = null,
+        fn next(raw: *anyopaque, a: A, context: Context) !?local.serverless_external_source_types.FileEntry {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try context.ensureActive();
+            try self.owner.lease.readContext().ensureActive();
+            const record = (self.pending orelse try self.cursor.?.next()) orelse {
+                if (self.full and self.seen != self.owner.resolver.root.count) return error.InvalidNativeLakeFileState;
+                return null;
+            };
+            self.pending = null;
+            var file = try self.resolver.inventoryFileForScan(a, record.value);
+            errdefer file.deinit(a);
+            try context.ensureActive();
+            const digest = local.storage_rowsource_identity.fileDigest(self.owner.resolver.root.source, self.owner.resolver.root.snapshot, file.file_id);
+            if (!std.mem.eql(u8, record.key, &digest) or self.seen >= self.owner.resolver.root.count) return error.InvalidNativeLakeFileState;
+            self.seen += 1;
+            return file;
+        }
+        fn hasMore(raw: *anyopaque, context: Context) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try context.ensureActive();
+            try self.owner.lease.readContext().ensureActive();
+            if (self.full) return self.seen < self.owner.resolver.root.count;
+            if (self.pending == null) self.pending = try self.cursor.?.next();
+            return self.pending != null;
+        }
+        fn split(raw: *anyopaque, a: A, index: usize, count: usize, context: Context) !Source.FileIterator {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.owner.enumerateRange(a, index, count, context);
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.cursor) |*cursor| cursor.deinit();
+            self.resolver.deinit();
+            self.a.destroy(self);
+        }
+    };
+    fn enumerate(raw: *anyopaque, a: A, context: Context) !Source.FileIterator {
+        const self: *Owner = @ptrCast(@alignCast(raw));
+        return self.enumerateRange(a, 0, 1, context);
+    }
+    fn enumerateRange(self: *Owner, a: A, index: usize, count: usize, context: Context) !Source.FileIterator {
+        if (count == 0 or count > 256 or index >= count) return error.InvalidNativeLakeFileState;
+        try context.ensureActive();
+        const iterator = try a.create(Enumeration);
+        errdefer a.destroy(iterator);
+        iterator.* = .{ .a = a, .owner = self, .resolver = .{ .root = self.resolver.root, .store = self.store.artifactStore(), .cached = self.resolver.cached, .token = self.resolver.token, .page_cache_limit = 64 * 1024 }, .pages = undefined, .store = self.store.artifactStore() };
+        iterator.pages = .{ .domain = self.resolver.root.domain, .artifacts = &iterator.store, .cancellation = self.resolver.token, .remaining_read_bytes = &iterator.reads, .remaining_write_bytes = &iterator.writes };
+        const lower = [_]u8{@intCast(index * 256 / count)};
+        const upper = [_]u8{@intCast(@min(255, (index + 1) * 256 / count))};
+        iterator.full = count == 1;
+        iterator.cursor = try @import("../serverless/graph_segment/page_tree.zig").Cursor.init(a, iterator.pages.store(), self.resolver.root.public, if (index == 0) "" else &lower, if (index + 1 == count) null else &upper);
+        return .{ .ptr = iterator, .next = Enumeration.next, .split = Enumeration.split, .has_more = Enumeration.hasMore, .close = Enumeration.close };
+    }
     fn close(raw: *anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(raw));
         const a = self.a;
@@ -78,6 +149,7 @@ const Factory = struct {
         if (root.coverage == null or root.coverage.?.plan == null or (!std.mem.eql(u8, &root.coverage.?.plan.?, &plans.requested) and !std.mem.eql(u8, &root.coverage.?.plan.?, &plans.current) and !std.mem.eql(u8, &root.coverage.?.plan.?, &plans.selected)) or
             !std.mem.eql(u8, &root.domain, &domain) or !std.mem.eql(u8, root.source, header.source_id) or
             !std.mem.eql(u8, root.snapshot, header.snapshot_id) or !std.mem.eql(u8, root.schema, header.schema_fingerprint)) return null;
+        if (root.delete_proof) |proof| if (!std.mem.eql(u8, &proof.source, &self.publication.signature.source)) return error.InvalidExternalLakeIndexCoverage;
         const owner = try a.create(Owner);
         errdefer a.destroy(owner);
         owner.a = a;
@@ -95,7 +167,10 @@ const Factory = struct {
         var owned_reads = cached;
         owned_reads.context = owned_context;
         owner.resolver = .{ .root = owned_root, .store = owner.store.artifactStore(), .cached = owned_reads, .token = token };
-        return .{ .ptr = owner, .count = root.count, .plan = root.coverage.?.plan.?, .lookup = Owner.lookup, .close = Owner.close };
+        const delete_proof: ?local.serverless_query_lake_serving.DeleteQualification.Proof = if (root.delete_proof) |proof| proven: {
+            break :proven .{ .ptr = owner, .count = proof.count, .recipe = proof.recipe, .digest = proof.digest, .source = proof.source, .data = proof.data, .lookup = Owner.deleteVersion };
+        } else null;
+        return .{ .ptr = owner, .count = root.count, .plan = root.coverage.?.plan.?, .lookup = Owner.lookup, .close = Owner.close, .delete_proof = delete_proof, .enumerate = if (root.rows != null and root.bytes != null) Owner.enumerate else null, .estimates = if (root.rows != null and root.bytes != null) .{ .rows = root.rows.?, .bytes = root.bytes.? } else null };
     }
 };
 // Before navigation is adopted, an automatic SQL scan owes no native-index

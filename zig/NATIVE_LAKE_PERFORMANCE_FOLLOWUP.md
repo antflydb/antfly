@@ -4700,3 +4700,57 @@ Python formatting/lint, whitespace, staged source licenses and the Apache
 boundary passed (2,065 source files). Live-provider retention and representative
 archive-scale latency/RSS qualification remain deferred. These E2E timings were
 collected during builds and are functional qualification, not benchmarks.
+
+
+### Optional scan admission, paged dictionaries and version-qualified deletes
+
+The full-scan regression is addressed at both layers. Ordinary SQL scans over
+new publication navigation stream canonical public-file pages and retain one
+file view per lane. Disjoint digest intervals keep ordered and unordered scans
+parallel under the shared scheduler; workers own their cursors, readers, version
+maps and selected delete state. Flat plans remain available for callers that
+need a census, with statement-owned overflow when the optional 64 MiB shared
+plan cache declines admission. Overflow ownership and partial cursor creation
+are allocation-failure tested.
+
+Protocol 48 persists ordered file-slot/name/public-digest dictionaries. Selective
+serving and readiness load compact roots and reached records; maintenance loads
+full slot state explicitly. Copy-on-write updates retain unchanged dictionary
+trees and GC follows every new page root. Old 5/6 roots remain readable and new
+serving/checkpoint metadata uses 7/8. A 17,000-file regression verifies selective
+lookups, old-reader stability and bounded changed-page writes.
+
+Pattern scorer leaves borrow pinned immutable segment-local bitmaps. Cache hits
+avoid complete clones and offset materialization, while mutable filter callers
+keep private copies. Pins exclude entries from eviction and release when their
+scoring builder joins/closes. Cold misses and cache pressure use the ordinary
+filter path.
+
+Delete routing coalesces partition/sequence suffixes before union. Pinned,
+immutable catalog snapshots on version-capable providers may publish exact
+provider delete selectors, with coverage/recipe digests authenticated by the
+same publication. Query qualification then builds routing metadata without an
+archive-wide HEAD census and reads only reached selector pages. Version-qualified
+payload reads, snapshot and native reader pins preserve the selected cut.
+Unversioned or mutable sources, absent catalog pins and legacy proofs retain
+fresh validation. Publication verification still re-stats providers before and
+after the build. Live-provider retention qualification and archive-scale latency
+and RSS benchmarks remain deferred.
+
+Each scan lane owns a small navigation cache and independent point-read scratch,
+while immutable decoded pages remain shared. Per-file metadata reads retain their
+individual bounds without imposing an archive-wide 64 MiB navigation ceiling.
+Delete-selector pages use the same immutable decoded navigation cache. Ordered
+readers also keep a bounded decoded-name memo to avoid parsing slot JSON per row;
+output names remain independently owned across eviction.
+
+The final Debug CLI builds. All 47 real Parquet/Iceberg E2Es passed in
+633.06 seconds; after the final provider-selector ownership cleanup, the cold
+Iceberg navigation/scan regression passed again against the rebuilt CLI in
+8.81 seconds. That regression hides real data manifests before cold COUNT and
+unindexed-column filtering, then exercises indexed, retained and fallback reads.
+The focused native suites passed 87 tests (22 shared-engine + 65 server), with no
+failures or leaks. All 492 integration tests passed (184 shared-engine + 308
+server), also without failures or leaks.
+Formatting, lint, generated error metadata, source licenses and the Apache
+product boundary passed (2,065 source files).

@@ -30,15 +30,32 @@ pub const Qualification = struct {
     building: bool = false,
     disabled: bool = false,
     data: ?Data = null,
+    /// Query-owned immutable selectors authenticated by the adopted publication.
+    /// Its owner retains the snapshot and reader leases until all views close.
+    pub const Proof = struct {
+        ptr: *anyopaque,
+        count: usize,
+        recipe: [32]u8,
+        digest: [32]u8,
+        source: [32]u8,
+        data: [32]u8,
+        lookup: *const fn (*anyopaque, A, usize, iceberg.IcebergDeleteFile, Context) anyerror!Version,
+    };
     pub const Version = struct { etag: []const u8, version: []const u8, sequence: i64, position: bool };
     pub const Data = struct {
         versions: []const Version,
         digest: [32]u8,
         recipe: [32]u8,
         cacheable: bool = true,
+        proof: ?Proof = null,
         scopes: std.AutoHashMapUnmanaged([32]u8, std.ArrayList(usize)) = .empty,
         global: std.ArrayList(usize) = .empty,
         unknown: std.ArrayList(usize) = .empty,
+        pub fn evidence(self: *const Data, a: A, index: usize, file: iceberg.IcebergDeleteFile, context: Context) !Version {
+            try context.ensureActive();
+            if (self.proof) |proof| return proof.lookup(proof.ptr, a, index, file, context);
+            return self.versions[index];
+        }
         fn less(self: *const Data, left: usize, right: usize) bool {
             if (self.versions[left].sequence != self.versions[right].sequence) return self.versions[left].sequence < self.versions[right].sequence;
             return left < right;
@@ -59,13 +76,25 @@ pub const Qualification = struct {
         pub fn candidates(self: *const Data, a: A, files: []const external.FileEntry) !?[]usize {
             var selected: std.AutoHashMapUnmanaged(usize, void) = .empty;
             defer selected.deinit(a);
+            // Every list is a suffix by sequence. Its union over a partition
+            // is the suffix starting at that partition's minimum sequence.
+            var scopes: std.AutoHashMapUnmanaged([32]u8, i64) = .empty;
+            defer scopes.deinit(a);
+            var minimum: i64 = std.math.maxInt(i64);
             for (files) |file| {
                 const sequence = file.data_sequence_number orelse return null;
                 const scope = scopeKey(file.partition_spec_id orelse return null, file.partition_field_count, file.partition_values) orelse return null;
-                try self.appendCandidates(a, &selected, self.global.items, sequence);
-                try self.appendCandidates(a, &selected, self.unknown.items, sequence);
-                if (self.scopes.get(scope)) |indices| try self.appendCandidates(a, &selected, indices.items, sequence);
+                minimum = @min(minimum, sequence);
+                const entry = try scopes.getOrPut(a, scope);
+                entry.value_ptr.* = if (entry.found_existing) @min(entry.value_ptr.*, sequence) else sequence;
             }
+            if (files.len != 0) {
+                try self.appendCandidates(a, &selected, self.global.items, minimum);
+                try self.appendCandidates(a, &selected, self.unknown.items, minimum);
+            }
+            var groups = scopes.iterator();
+            while (groups.next()) |entry| if (self.scopes.get(entry.key_ptr.*)) |indices|
+                try self.appendCandidates(a, &selected, indices.items, entry.value_ptr.*);
             const result = try a.alloc(usize, selected.count());
             var it = selected.keyIterator();
             for (result) |*index| index.* = it.next().?.*;
@@ -88,6 +117,9 @@ pub const Qualification = struct {
         @import("antfly_platform").sync.lockYielding(&self.mutex);
     }
     pub fn acquire(self: *Qualification, client: storage.ObjectStorage, plan: iceberg.IcebergDeletePlan, context: Context) !?*const Data {
+        return self.acquireProven(client, plan, context, null);
+    }
+    pub fn acquireProven(self: *Qualification, client: storage.ObjectStorage, plan: iceberg.IcebergDeletePlan, context: Context, proof: ?Proof) !?*const Data {
         while (true) {
             try context.ensureActive();
             self.lock();
@@ -105,7 +137,7 @@ pub const Qualification = struct {
             }
             self.building = true;
             self.mutex.unlock();
-            const data = self.build(client, plan, context) catch |err| {
+            const data = (if (proof) |verified| self.buildProven(plan, context, verified) else self.build(client, plan, context)) catch |err| {
                 const exhausted = err == error.OutOfMemory and self.budget.isExhausted();
                 _ = self.arena.reset(.free_all);
                 self.lock();
@@ -122,6 +154,41 @@ pub const Qualification = struct {
             self.mutex.unlock();
             return &self.data.?;
         }
+    }
+    fn buildProven(self: *Qualification, plan: iceberg.IcebergDeletePlan, context: Context, proof: Proof) !Data {
+        try context.ensureActive();
+        if (proof.count != plan.files.len) return error.InvalidIcebergDeleteManifest;
+        const a = self.arena.allocator();
+        var data: Data = .{ .versions = try a.alloc(Version, plan.files.len), .digest = proof.digest, .recipe = undefined, .proof = proof };
+        var buffer: [4096]u8 = undefined;
+        var writer: std.Io.Writer.Hashing(Hash) = .init(&buffer);
+        try std.json.Stringify.value(plan, .{}, &writer.writer);
+        try writer.writer.flush();
+        writer.hasher.final(&data.recipe);
+        if (!std.mem.eql(u8, &data.recipe, &proof.recipe)) return error.InvalidIcebergDeleteManifest;
+        for (plan.files, @constCast(data.versions)) |file, *version| {
+            try context.ensureActive();
+            try file.validate();
+            version.* = .{ .etag = "", .version = "", .sequence = file.data_sequence_number, .position = file.content == .position_deletes };
+        }
+        try self.route(&data, plan);
+        return data;
+    }
+    fn route(self: *Qualification, data: *Data, plan: iceberg.IcebergDeletePlan) !void {
+        const a = self.arena.allocator();
+        for (plan.files, 0..) |file, index| {
+            if (file.content == .equality_deletes and file.partition_field_count == 0) {
+                try data.global.append(a, index);
+            } else if (scopeKey(file.partition_spec_id, file.partition_field_count, file.partition_values)) |scope| {
+                const entry = try data.scopes.getOrPut(a, scope);
+                if (!entry.found_existing) entry.value_ptr.* = .empty;
+                try entry.value_ptr.append(a, index);
+            } else try data.unknown.append(a, index);
+        }
+        var scopes = data.scopes.valueIterator();
+        while (scopes.next()) |indices| std.mem.sort(usize, indices.items, data, Data.less);
+        std.mem.sort(usize, data.global.items, data, Data.less);
+        std.mem.sort(usize, data.unknown.items, data, Data.less);
     }
     fn build(self: *Qualification, client: storage.ObjectStorage, plan: iceberg.IcebergDeletePlan, context: Context) !Data {
         const a = self.arena.allocator();
@@ -174,20 +241,10 @@ pub const Qualification = struct {
                 versions[index] = .{ .etag = try a.dupe(u8, meta.etag orelse ""), .version = try a.dupe(u8, meta.version_id orelse ""), .sequence = file.data_sequence_number, .position = file.content == .position_deletes };
                 @import("lake_prepared_deletes.zig").Prepared.hashObjectVersion(&hash, file.file_path, versions[index].etag, versions[index].version);
                 if (versions[index].etag.len == 0 and (versions[index].version.len == 0 or std.mem.eql(u8, versions[index].version, "null") or std.mem.startsWith(u8, versions[index].version, "object-stat:") or std.mem.startsWith(u8, versions[index].version, "iceberg:"))) data.cacheable = false;
-                if (file.content == .equality_deletes and file.partition_field_count == 0) {
-                    try data.global.append(a, index);
-                } else if (scopeKey(file.partition_spec_id, file.partition_field_count, file.partition_values)) |scope| {
-                    const entry = try data.scopes.getOrPut(a, scope);
-                    if (!entry.found_existing) entry.value_ptr.* = .empty;
-                    try entry.value_ptr.append(a, index);
-                } else try data.unknown.append(a, index);
             }
             first += count;
         }
-        var scopes = data.scopes.valueIterator();
-        while (scopes.next()) |indices| std.mem.sort(usize, indices.items, &data, Data.less);
-        std.mem.sort(usize, data.global.items, &data, Data.less);
-        std.mem.sort(usize, data.unknown.items, &data, Data.less);
+        try self.route(&data, plan);
         data.digest = hash.finalResult();
         return data;
     }
@@ -300,4 +357,51 @@ test "external lake metadata navigation delete qualification routes partitions a
         }
     };
     try std.testing.checkAllAllocationFailures(a, Failure.run, .{ client, plan });
+    // Many data files in one partition contribute one suffix, including strict
+    // equality and inclusive position sequence boundaries.
+    data_file.partition_values = &p1;
+    const duplicates = try a.alloc(external.FileEntry, 10000);
+    defer a.free(duplicates);
+    @memset(duplicates, data_file);
+    duplicates[0].data_sequence_number = 9;
+    const unioned = (try qualified.candidates(a, duplicates)).?;
+    defer a.free(unioned);
+    try std.testing.expectEqualSlices(usize, &.{1}, unioned);
+    const Selectors = struct {
+        data: *const Qualification.Data,
+        calls: usize = 0,
+        fn read(raw: *anyopaque, alloc: A, index: usize, _: iceberg.IcebergDeleteFile, context: Context) !Qualification.Version {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try context.ensureActive();
+            self.calls += 1;
+            const item = self.data.versions[index];
+            const etag = try alloc.dupe(u8, item.etag);
+            errdefer alloc.free(etag);
+            return .{ .etag = etag, .version = try alloc.dupe(u8, item.version), .sequence = item.sequence, .position = item.position };
+        }
+    };
+    var selectors: Selectors = .{ .data = qualified };
+    const proof: Qualification.Proof = .{ .ptr = &selectors, .count = plan.files.len, .recipe = qualified.recipe, .digest = qualified.digest, .source = @splat(7), .data = @splat(8), .lookup = Selectors.read };
+    const proven = try Qualification.create(a);
+    defer proven.destroy();
+    const before = meter.calls.load(.acquire);
+    const lazy = (try proven.acquireProven(measured, plan, .{}, proof)).?;
+    try std.testing.expectEqual(before, meter.calls.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), selectors.calls);
+    const chosen = (try lazy.candidates(a, &.{data_file})).?;
+    defer a.free(chosen);
+    try std.testing.expectEqualSlices(usize, &.{1}, chosen);
+    const selector = try lazy.evidence(a, chosen[0], plan.files[chosen[0]], .{});
+    defer {
+        a.free(selector.etag);
+        a.free(selector.version);
+    }
+    try std.testing.expectEqual(@as(usize, 1), selectors.calls);
+    try std.testing.expectEqualStrings(qualified.versions[1].etag, selector.etag);
+    const invalid = try Qualification.create(a);
+    defer invalid.destroy();
+    var wrong = proof;
+    wrong.recipe = @splat(0);
+    try std.testing.expectError(error.InvalidIcebergDeleteManifest, invalid.acquireProven(measured, plan, .{}, wrong));
+    try std.testing.expectError(error.DeadlineExceeded, proven.acquireProven(measured, plan, .{ .deadline_ns = 0 }, proof));
 }

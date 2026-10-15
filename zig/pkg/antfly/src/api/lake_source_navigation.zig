@@ -27,6 +27,20 @@ const A = std.mem.Allocator;
 const Token = @import("antfly_cancellation").CancellationToken;
 const Ref = local.serverless_manifest_artifact_ref.ArtifactRef;
 const Inventory = local.serverless_external_source_types.Inventory;
+pub const DeleteProof = struct { recipe: [32]u8, digest: [32]u8, source: [32]u8, data: [32]u8, count: u32, versions: tree.Ref };
+const DeleteVersion = struct { recipe: [32]u8, etag: []const u8, version: []const u8 };
+fn deleteRecipe(value: anytype) [32]u8 {
+    var buffer: [4096]u8 = undefined;
+    var writer: std.Io.Writer.Hashing(std.crypto.hash.sha2.Sha256) = .init(&buffer);
+    std.json.Stringify.value(value, .{}, &writer.writer) catch unreachable;
+    writer.writer.flush() catch unreachable;
+    var digest: [32]u8 = undefined;
+    writer.hasher.final(&digest);
+    return digest;
+}
+fn exactVersion(version: []const u8) bool {
+    return version.len != 0 and !std.mem.eql(u8, version, "null") and !std.mem.startsWith(u8, version, "object-stat:") and !std.mem.startsWith(u8, version, "iceberg:");
+}
 pub const Root = struct {
     version: u8 = 2,
     coverage: ?struct { version: u8 = 1, plan: ?[32]u8, data: [32]u8 } = null,
@@ -35,10 +49,13 @@ pub const Root = struct {
     schema: []const u8,
     snapshot: []const u8,
     count: u32,
+    rows: ?u64 = null,
+    bytes: ?u64 = null,
     files: ?tree.Ref = null,
     file_summary: ?Summary = null,
     public: ?tree.Ref = null,
     private: ?tree.Ref = null,
+    delete_proof: ?DeleteProof = null,
 };
 const Proof = struct { id: [32]u8, digest: [32]u8, index: usize };
 pub const Summary = struct {
@@ -136,6 +153,10 @@ pub fn load(a: A, store: stores.ArtifactStore, ref: Ref, token: Token, cached: ?
     const root = try std.json.parseFromSliceLeaky(Root, a, bytes, .{ .allocate = .alloc_always });
     const scope = (try stores.uploadScopeFromArtifactId(ref.artifact_id)) orelse return error.InvalidNativeLakeFileState;
     if (root.version != ref.metadata_version or !std.mem.eql(u8, &scope.domain, &root.domain) or root.source.len == 0 or root.schema.len == 0 or root.snapshot.len == 0) return error.InvalidNativeLakeFileState;
+    if (root.delete_proof) |proof| {
+        try proof.versions.validate();
+        if (proof.count == 0 or proof.versions.records != proof.count or root.coverage == null or !std.mem.eql(u8, &proof.data, &root.coverage.?.data)) return error.InvalidNativeLakeFileState;
+    }
     if (root.coverage) |proof| if (root.version < 2 or proof.version != 1) return error.InvalidNativeLakeFileState;
     for ([_]?tree.Ref{ root.files, root.public, root.private }) |r| {
         if ((r == null) != (root.count == 0)) return error.InvalidNativeLakeFileState;
@@ -146,6 +167,64 @@ pub fn load(a: A, store: stores.ArtifactStore, ref: Ref, token: Token, cached: ?
     }
     if (root.file_summary) |summary| if (summary.count != root.count or std.mem.order(u8, &summary.first, &summary.last) == .gt) return error.InvalidNativeLakeFileState;
     return root;
+}
+fn publishDeleteProof(a: A, storage_: tree.Store, provider: *Provider, data: [32]u8) !?DeleteProof {
+    const source = provider.source;
+    // A retained catalog snapshot plus exact immutable provider versions is
+    // the proof contract. Unversioned stores keep fresh HEAD qualification.
+    const plan = source.scanner.iceberg_delete_plan orelse return null;
+    if (!source.immutable_objects or source.snapshot_pin == null) return null;
+    if (plan.files.len == 0 or plan.files.len > std.math.maxInt(u32)) return null;
+    try provider.context.ensureActive();
+    const location = try local.serverless_query_lake_range_io.objectLocationForUri(plan.files[0].file_path);
+    const client = if (source.context_store) |context_store| context_store.base else source.scanner.object_reader.client;
+    if (!try client.supportsObjectVersions(location.bucket, provider.context.cancellation)) return null;
+    const qualification = try local.serverless_query_lake_serving.DeleteQualification.create(a);
+    defer qualification.destroy();
+    const evidence_set = (try qualification.acquire(source.scanner.object_reader.client, plan, provider.context)) orelse return null;
+    for (evidence_set.versions) |version| if (!exactVersion(version.version)) return null;
+    const coverage = try @import("lake_index_coverage.zig").finishDigest(source, provider.context, data);
+    if (!std.mem.eql(u8, &coverage.delete_objects, &evidence_set.digest)) return error.ExternalLakeIndexSourceChanged;
+    var builder: tree.SortedBuilder = .{ .alloc = a, .store = storage_ };
+    defer builder.deinit();
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    for (plan.files, evidence_set.versions, 0..) |file, version, index| {
+        try provider.context.ensureActive();
+        _ = scratch.reset(.retain_capacity);
+        var key_: [32]u8 = @splat(0);
+        std.mem.writeInt(u32, key_[28..32], @intCast(index), .big);
+        const bytes = try std.json.Stringify.valueAlloc(scratch.allocator(), DeleteVersion{ .recipe = deleteRecipe(file), .etag = version.etag, .version = version.version }, .{});
+        try builder.add(&key_, bytes);
+    }
+    return .{ .recipe = evidence_set.recipe, .digest = evidence_set.digest, .source = coverage.source, .data = data, .count = @intCast(plan.files.len), .versions = (try builder.finish()).? };
+}
+/// Allocates only one reached delete selector; no archive-wide version map.
+pub fn deleteVersion(a: A, store: stores.ArtifactStore, root: Root, index: usize, file: local.serverless_query_lake_iceberg_snapshot.IcebergDeleteFile, token: Token, context: local.serverless_query_lake_read_context.Context) !local.serverless_query_lake_serving.DeleteQualification.Version {
+    try context.ensureActive();
+    try token.check();
+    const proof = root.delete_proof orelse return error.InvalidNativeLakeFileState;
+    if (index >= proof.count) return error.InvalidNativeLakeFileState;
+    var reads: u64 = 8 * 1024 * 1024;
+    var writes: u64 = 0;
+    var backend = store;
+    var pages: pages_mod.PageStore = .{ .domain = root.domain, .artifacts = &backend, .cancellation = token, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+    var key_: [32]u8 = @splat(0);
+    std.mem.writeInt(u32, key_[28..32], @intCast(index), .big);
+    const bytes = (try lookup(sa, pages.store(), proof.versions, &key_)) orelse return error.InvalidNativeLakeFileState;
+    return ownDeleteVersion(a, bytes, file);
+}
+fn ownDeleteVersion(a: A, bytes: []const u8, file: local.serverless_query_lake_iceberg_snapshot.IcebergDeleteFile) !local.serverless_query_lake_serving.DeleteQualification.Version {
+    const parsed = try std.json.parseFromSlice(DeleteVersion, a, bytes, .{});
+    defer parsed.deinit();
+    const record = parsed.value;
+    if (!std.mem.eql(u8, &record.recipe, &deleteRecipe(file)) or !exactVersion(record.version)) return error.InvalidNativeLakeFileState;
+    const etag = try a.dupe(u8, record.etag);
+    errdefer a.free(etag);
+    return .{ .etag = etag, .version = try a.dupe(u8, record.version), .sequence = file.data_sequence_number, .position = file.content == .position_deletes };
 }
 fn lookup(a: A, storage: tree.Store, root: ?tree.Ref, id: []const u8) !?[]u8 {
     var cursor = try tree.Cursor.init(a, storage, root, id, null);
@@ -182,6 +261,12 @@ pub fn buildProven(a: A, out: A, store: *stores.ArtifactStore, provider: *Provid
     const inv = provider.source.inventory;
     const compatible = if (prior) |old| std.mem.eql(u8, old.source, inv.source_id) and std.mem.eql(u8, old.schema, inv.schema_fingerprint) and std.mem.eql(u8, &old.domain, &store.upload_scope.?.domain) else false;
     var root: Root = .{ .domain = store.upload_scope.?.domain, .source = inv.source_id, .schema = inv.schema_fingerprint, .snapshot = inv.snapshot_id, .count = @intCast(inv.files.len) };
+    root.rows = 0;
+    root.bytes = 0;
+    for (inv.files) |file| {
+        root.rows.? +|= file.row_count;
+        root.bytes.? +|= file.byte_len;
+    }
     if (data) |digest| root.coverage = .{ .plan = if (provider.source.immutable_objects) provider.source.plan_identity else null, .data = digest };
     if (compatible) {
         root.files = prior.?.files;
@@ -192,6 +277,7 @@ pub fn buildProven(a: A, out: A, store: *stores.ArtifactStore, provider: *Provid
     var pages: pages_mod.PageStore = .{ .domain = root.domain, .attempt = store.upload_scope.?.attempt, .artifacts = store, .cancellation = token, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .streaming = true };
     var file_storage = pages.store();
     file_storage.reduce = reduceFiles;
+    if (data) |digest| root.delete_proof = try publishDeleteProof(a, pages.store(), provider, digest);
     var files: Batch = .{ .arena = .init(a) };
     defer files.arena.deinit();
     var private: Batch = .{ .arena = .init(a) };
@@ -371,6 +457,7 @@ pub const Resolver = struct {
     writes: u64 = 0,
     pages: pages_mod.PageStore = undefined,
     page_cache: ?tree.Cache = null,
+    page_cache_limit: usize = 1024 * 1024,
     memo_budget: local.sql_memory_budget = .{ .backing = @import("antfly_platform").allocator.processAllocator(std.heap.smp_allocator), .limit = 4 * 1024 * 1024 },
     memo_arena: ?std.heap.ArenaAllocator = null,
     public_memo: std.StringHashMapUnmanaged([]const u8) = .empty,
@@ -409,7 +496,7 @@ pub const Resolver = struct {
     }
     fn storage(self: *@This()) tree.Store {
         self.pages = .{ .domain = self.root.domain, .artifacts = &self.store, .cancellation = self.token, .remaining_read_bytes = &self.reads, .remaining_write_bytes = &self.writes, .read_cache = .{ .ptr = self, .read = readPage } };
-        if (self.page_cache == null) self.page_cache = .{ .alloc = @import("antfly_platform").allocator.processAllocator(std.heap.smp_allocator), .underlying = self.pages.store() };
+        if (self.page_cache == null) self.page_cache = .{ .alloc = @import("antfly_platform").allocator.processAllocator(std.heap.smp_allocator), .underlying = self.pages.store(), .max_bytes = self.page_cache_limit };
         return self.page_cache.?.store();
     }
     fn readPage(raw: *anyopaque, a: A, store: *stores.ArtifactStore, ref: Ref, offset: u64, length: usize, _: [32]u8, token: Token, budget: *u64) ![]u8 {
@@ -494,8 +581,19 @@ pub const Resolver = struct {
     /// A selected file entry owns every field independently of decoded-page
     /// residency. This permits sparse source opening after cold process restart.
     pub fn inventoryFile(self: *@This(), a: A, id: []const u8) !local.serverless_external_source_types.FileEntry {
+        return self.inventoryFileBounded(a, id, false);
+    }
+    pub fn inventoryFileForScan(self: *@This(), a: A, id: []const u8) !local.serverless_external_source_types.FileEntry {
+        return self.inventoryFileBounded(a, id, true);
+    }
+    fn inventoryFileBounded(self: *@This(), a: A, id: []const u8, scan: bool) !local.serverless_external_source_types.FileEntry {
         try self.lock();
         defer self.mutex.unlock();
+        const previous_reads = self.reads;
+        defer if (scan) {
+            self.reads = previous_reads;
+        };
+        if (scan) self.reads = 8 * 1024 * 1024;
         try self.cached.context.ensureActive();
         try self.token.check();
         var memory: local.sql_memory_budget = .{ .backing = @import("antfly_platform").allocator.processAllocator(std.heap.smp_allocator), .limit = 4 * 1024 * 1024 };
@@ -527,6 +625,24 @@ pub const Resolver = struct {
     /// Return only the exact selectors needed by a reached Parquet file.
     /// The caller owns the strings; all other source metadata remains in its
     /// fresh immutable manifest plan.
+    pub fn deleteSelector(self: *@This(), a: A, index: usize, file_: local.serverless_query_lake_iceberg_snapshot.IcebergDeleteFile, context: local.serverless_query_lake_read_context.Context) !local.serverless_query_lake_serving.DeleteQualification.Version {
+        try context.ensureActive();
+        try self.lock();
+        defer self.mutex.unlock();
+        const proof = self.root.delete_proof orelse return error.InvalidNativeLakeFileState;
+        if (index >= proof.count) return error.InvalidNativeLakeFileState;
+        const previous_reads = self.reads;
+        defer self.reads = previous_reads;
+        self.reads = 8 * 1024 * 1024;
+        var memory: local.sql_memory_budget = .{ .backing = @import("antfly_platform").allocator.processAllocator(std.heap.smp_allocator), .limit = 4 * 1024 * 1024 };
+        var scratch = std.heap.ArenaAllocator.init(memory.allocator());
+        defer scratch.deinit();
+        var key_: [32]u8 = @splat(0);
+        std.mem.writeInt(u32, key_[28..32], @intCast(index), .big);
+        const bytes = (try self.point(scratch.allocator(), proof.versions, &key_)) orelse return error.InvalidNativeLakeFileState;
+        try context.ensureActive();
+        return ownDeleteVersion(a, bytes, file_);
+    }
     pub fn selectors(self: *@This(), a: A, file_: local.serverless_external_source_types.FileEntry) !local.serverless_query_lake_serving.ServingSource.FileVersions {
         try self.lock();
         defer self.mutex.unlock();
@@ -601,6 +717,16 @@ test "external lake bounded WAL paged source navigation resolves only reached id
     const cached: artifacts.CachedRead = .{ .cache = &cache, .scope = @splat(3), .context = .{} };
     var resolver: Resolver = .{ .root = old, .store = store, .cached = cached, .token = .none };
     defer resolver.deinit();
+    {
+        var cold = local.serverless_query_lake_serving_cache.Cache.init(a);
+        defer cold.deinit();
+        var walking: Resolver = .{ .root = old, .store = store, .cached = .{ .cache = &cold, .scope = @splat(5), .context = .{} }, .token = .none, .reads = 0 };
+        defer walking.deinit();
+        var entry = try walking.inventoryFileForScan(a, "file-255");
+        defer entry.deinit(a);
+        try std.testing.expectEqualStrings("file-255", entry.file_id);
+        try std.testing.expectEqual(@as(u64, 0), walking.reads);
+    }
     const Ownership = struct {
         fn check(alloc: A, reader: *Resolver) !void {
             var file_ = try reader.inventoryFile(alloc, "file-255");
@@ -677,4 +803,77 @@ test "external lake bounded WAL paged source navigation resolves only reached id
     newer.cached.context.deadline_ns = 1;
     try std.testing.expectError(error.DeadlineExceeded, newer.file(ca, new_digest, false));
     try std.testing.expectError(error.DeadlineExceeded, newer.inventoryFile(a, "file-0"));
+}
+
+test "external lake metadata navigation durable delete selectors validate only reached versions and remain GC roots" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var provider_storage = @import("../serverless/artifacts/cloud_generations_test_provider.zig").Provider.init(a);
+    defer provider_storage.deinit();
+    var client = provider_storage.client();
+    try client.makeBucket("bucket");
+    var put = try client.putObject("bucket", "delete", "bytes", .{});
+    put.deinit(a);
+    const iceberg = local.serverless_query_lake_iceberg_snapshot;
+    var deletes = [_]iceberg.IcebergDeleteFile{.{ .content = .position_deletes, .file_path = @constCast("s3://bucket/delete"), .file_format = @constCast("PARQUET"), .snapshot_id = 1, .data_sequence_number = 2, .file_sequence_number = 3, .record_count = 1, .file_size_in_bytes = 5 }};
+    const inventory: Inventory = .{ .format = .iceberg, .source_id = @constCast("source"), .source_uri = @constCast("s3://bucket/table"), .snapshot_id = @constCast("snapshot"), .schema_fingerprint = @constCast("schema"), .files = &.{} };
+    const Pin = struct {
+        fn check(_: *anyopaque) !void {}
+        fn close(_: *anyopaque) void {}
+    };
+    var marker: u8 = 0;
+    var source: local.serverless_query_lake_serving.ServingSource = .{ .alloc = a, .store = undefined, .inventory = inventory, .scanner = local.serverless_query_lake_serving.PinnedExternalObjectStorageLakeRowsScanner.init(inventory, client), .immutable_objects = true, .snapshot_pin = .{ .ptr = &marker, .check = Pin.check, .deinit = Pin.close } };
+    source.scanner.iceberg_delete_plan = .{ .files = &deletes };
+    var provider: Provider = .{ .source = &source, .context = .{} };
+    var directory = try local.common_test_directory.TestDirectory.init("delete-version-proof");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@import("lake_index_publication.zig").uploadDomainWithNamespace(1, @splat(7), null), 1, std.testing.io);
+    var reads: u64 = 16 * 1024 * 1024;
+    var writes: u64 = 16 * 1024 * 1024;
+    var pages: pages_mod.PageStore = .{ .domain = store.upload_scope.?.domain, .attempt = store.upload_scope.?.attempt, .artifacts = &store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    const proof = (try publishDeleteProof(a, pages.store(), &provider, @splat(9))).?;
+    const root: Root = .{ .domain = store.upload_scope.?.domain, .source = "source", .schema = "schema", .snapshot = "snapshot", .count = 0, .coverage = .{ .plan = @splat(8), .data = @splat(9) }, .delete_proof = proof };
+    var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+    defer cache.deinit();
+    var resolver: Resolver = .{ .root = root, .store = store, .cached = .{ .cache = &cache, .scope = @splat(3), .context = .{} }, .token = .none };
+    defer resolver.deinit();
+    for (0..2) |_| {
+        const selector = try resolver.deleteSelector(a, 0, deletes[0], .{});
+        a.free(selector.etag);
+        a.free(selector.version);
+    }
+    try std.testing.expect(cache.decoded.hits > 0);
+    const before = provider_storage.stats;
+    const version = try deleteVersion(a, store, root, 0, deletes[0], .none, .{});
+    defer {
+        a.free(version.etag);
+        a.free(version.version);
+    }
+    try std.testing.expect(exactVersion(version.version));
+    try std.testing.expectEqual(before, provider_storage.stats);
+    var changed = deletes[0];
+    changed.file_size_in_bytes += 1;
+    try std.testing.expectError(error.InvalidNativeLakeFileState, deleteVersion(a, store, root, 0, changed, .none, .{}));
+    try std.testing.expectError(error.DeadlineExceeded, deleteVersion(a, store, root, 0, deletes[0], .none, .{ .deadline_ns = 0 }));
+    const root_bytes = try std.json.Stringify.valueAlloc(ca, root, .{});
+    var root_ref = try store.putWithCancellation(root_bytes, .none);
+    defer root_ref.deinit(a);
+    var inventory_ref = try store.putWithCancellation("inventory", .none);
+    defer inventory_ref.deinit(a);
+    var collector: @import("lake_index_gc.zig").Collector = .{ .a = a, .table = 1, .authority = undefined, .store = store, .identity = @splat(7), .context = .{}, .token = @splat(1), .audit_only = true, .remaining_reads = 16 * 1024 * 1024 };
+    defer {
+        var keys = collector.marked.keyIterator();
+        while (keys.next()) |key_| a.free(key_.*);
+        collector.marked.deinit(a);
+    }
+    const publication: local.metadata_lake_index_catalog.Publication = .{ .reader_protocol = local.metadata_lake_index_catalog.native_reader_protocol, .generation = 1, .token = @splat(1), .signature = .{ .desired = @splat(1), .source = proof.source, .credentials = @splat(2), .store = @splat(7) }, .published_at_ms = 1, .base_source = .{ .external_iceberg = .{ .format = .iceberg, .source_uri = "s3://bucket/metadata.json", .snapshot_id = "snapshot", .schema_fingerprint = "schema", .file_inventory_artifact = inventory_ref.artifact_id } }, .inventory = .{ .kind = .external_base_source, .artifact_id = inventory_ref.artifact_id, .checksum = inventory_ref.checksum, .byte_len = inventory_ref.byte_len }, .source_navigation = .{ .kind = .doc_values, .metadata_version = 2, .artifact_id = root_ref.artifact_id, .checksum = root_ref.checksum, .byte_len = root_ref.byte_len } };
+    try collector.markPublication(publication);
+    try std.testing.expect(collector.marked.count() >= 3);
+    source.immutable_objects = false;
+    try std.testing.expect((try publishDeleteProof(a, pages.store(), &provider, @splat(9))) == null);
 }

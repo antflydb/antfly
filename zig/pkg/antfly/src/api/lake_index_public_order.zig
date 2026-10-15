@@ -32,6 +32,8 @@ pub const Cursor = struct {
     reader: *ordered.Reader,
     navigation: ?*Navigation = null,
     digests: []const [32]u8,
+    group_digests: std.AutoHashMapUnmanaged(u32, [32]u8) = .empty,
+    boundary_digest: ?[32]u8 = null,
     lower: []const u8,
     upper: ?[]const u8,
     boundary: ?[]const u8,
@@ -74,7 +76,7 @@ pub const Cursor = struct {
         const ca = result.arena.allocator();
         result.lower = try ca.dupe(u8, lower);
         result.upper = if (upper) |end| try ca.dupe(u8, end) else null;
-        if (reader.root.public_digests.len != reader.root.files.len) return error.InvalidNativeLakeRowIndex;
+        if (reader.root.file_dictionary == null and reader.root.public_digests.len != reader.root.files.len) return error.InvalidNativeLakeRowIndex;
         const digests = reader.root.public_digests;
         result.digests = digests;
         if (boundary) |prefix| {
@@ -83,23 +85,10 @@ pub const Cursor = struct {
             for (value, 0..) |byte, i| if (i >= 6 and i != 70 and i != 79 and !((byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f'))) return error.InvalidRelationalIndexBound;
             const group = std.fmt.parseUnsigned(u32, value[71..79], 16) catch return error.InvalidRelationalIndexBound;
             const row = std.fmt.parseUnsigned(u64, value[80..96], 16) catch return error.InvalidRelationalIndexBound;
-            if (reader.root.public_slots.len != digests.len) return error.InvalidNativeLakeRowIndex;
             var digest_bytes: [32]u8 = undefined;
             _ = std.fmt.hexToBytes(&digest_bytes, value[6..70]) catch return error.InvalidRelationalIndexBound;
-            var lo: usize = 0;
-            var hi = reader.root.public_slots.len;
-            while (lo < hi) {
-                const mid = lo + (hi - lo) / 2;
-                const slot = reader.root.public_slots[mid];
-                switch (std.mem.order(u8, &digests[slot], &digest_bytes)) {
-                    .lt => lo = mid + 1,
-                    .gt => hi = mid,
-                    .eq => {
-                        result.boundary_file = slot;
-                        break;
-                    },
-                }
-            }
+            result.boundary_file = try reader.publicSlot(ca, digest_bytes);
+            result.boundary_digest = digest_bytes;
             if (result.boundary_file == null) return error.InvalidRelationalIndexBound;
             result.boundary = try ca.dupe(u8, prefix);
             std.mem.writeInt(u32, result.boundary_coordinate[0..4], group, .big);
@@ -134,6 +123,7 @@ pub const Cursor = struct {
     fn loadGroup(self: *Cursor) !bool {
         if (self.exhausted) return false;
         _ = self.group_arena.reset(.retain_capacity);
+        self.group_digests = .empty;
         const ca = self.group_arena.allocator();
         const first = (self.pending orelse try self.directory.?.next()) orelse {
             self.exhausted = true;
@@ -180,6 +170,7 @@ pub const Cursor = struct {
                     self.exhausted = true;
                     break :blk null;
                 };
+                try self.prepareDigests(ca);
                 self.seekBoundary();
                 return true;
             }
@@ -235,24 +226,34 @@ pub const Cursor = struct {
             }
             if (record.value.len != 8 or std.mem.readInt(u64, record.value[0..8], .big) == 0) return error.InvalidNativeLakeRowIndex;
             const slot = std.mem.readInt(u32, record.key[record.key.len - 4 ..][0..4], .big);
-            if (slot >= self.digests.len or files.items.len >= self.reader.root.files.len) return error.InvalidNativeLakeRowIndex;
+            if (slot >= self.reader.root.fileCount() or files.items.len >= self.reader.root.fileCount()) return error.InvalidNativeLakeRowIndex;
             try files.append(a, slot);
             record_next = try self.directory.?.next();
         }
+        self.files = files.items;
+        try self.prepareDigests(a);
         const Order = struct {
-            digests: []const [32]u8,
+            digests: *const std.AutoHashMapUnmanaged(u32, [32]u8),
             fn less(order: @This(), x: u32, y: u32) bool {
-                return std.mem.order(u8, &order.digests[x], &order.digests[y]) == .lt;
+                return std.mem.order(u8, &order.digests.get(x).?, &order.digests.get(y).?) == .lt;
             }
         };
-        std.mem.sort(u32, files.items, Order{ .digests = self.digests }, Order.less);
+        std.mem.sort(u32, files.items, Order{ .digests = &self.group_digests }, Order.less);
         return files.toOwnedSlice(a);
+    }
+    fn prepareDigests(self: *Cursor, a: A) !void {
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        for (self.files) |slot| {
+            _ = scratch.reset(.retain_capacity);
+            try self.group_digests.put(a, slot, try self.reader.publicDigest(scratch.allocator(), slot));
+        }
     }
     fn seekBoundary(self: *Cursor) void {
         self.file_position = 0;
         const boundary = self.boundary orelse return;
         if (!std.mem.eql(u8, self.group, boundary)) return;
-        const digest = self.digests[self.boundary_file.?];
+        const digest = self.boundary_digest.?;
         var lo: usize = 0;
         var hi = self.files.len;
         // Lower bound in traversal order, including the boundary file itself:
@@ -260,7 +261,7 @@ pub const Cursor = struct {
         while (lo < hi) {
             const mid = lo + (hi - lo) / 2;
             const pos = if (self.reverse_ids) self.files.len - mid - 1 else mid;
-            const relation = std.mem.order(u8, &self.digests[self.files[pos]], &digest);
+            const relation = std.mem.order(u8, &self.group_digests.get(self.files[pos]).?, &digest);
             if (relation == (if (self.reverse_ids) std.math.Order.gt else .lt)) lo = mid + 1 else hi = mid;
         }
         self.file_position = lo;
@@ -273,7 +274,7 @@ pub const Cursor = struct {
         var lower: []const u8 = try std.mem.concat(ca, u8, &.{ self.group, &file });
         var upper = try orderedSuccessor(ca, lower);
         if (self.boundary) |boundary| if (std.mem.eql(u8, self.group, boundary)) {
-            const relation = std.mem.order(u8, &self.digests[slot], &self.digests[self.boundary_file.?]);
+            const relation = std.mem.order(u8, &self.group_digests.get(slot).?, &self.boundary_digest.?);
             if (relation == (if (self.reverse_ids) std.math.Order.gt else .lt)) return false;
             if (relation == .eq) {
                 const key = try std.mem.concat(ca, u8, &.{ lower, &self.boundary_coordinate });
@@ -293,7 +294,7 @@ pub const Cursor = struct {
         while (result.items.len < count) {
             if (self.rows) |*rows| {
                 if (try rows.next()) |record| {
-                    try result.append(a, try self.reader.decode(record));
+                    try result.append(a, try self.reader.decode(a, record));
                     continue;
                 }
                 rows.deinit();

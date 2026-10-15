@@ -440,7 +440,7 @@ fn claimSlot(a: A, names: *std.ArrayList([]const u8), hashes: *std.ArrayList([32
         hashes.items[slot] = digest;
         return slot;
     }
-    if (names.items.len >= 16384) return error.LakeSidecarBuildLimitExceeded;
+    if (names.items.len >= std.math.maxInt(u32)) return error.LakeSidecarBuildLimitExceeded;
     const slot: u32 = @intCast(names.items.len);
     try names.append(a, file);
     try hashes.append(a, digest);
@@ -465,7 +465,8 @@ test "external lake ordered slot admission remains bounded under lifetime file c
     }
     try std.testing.expectEqual(@as(usize, 16384), names.items.len);
     try std.testing.expectEqualStrings("replacement", names.items[41]);
-    try std.testing.expectError(error.LakeSidecarBuildLimitExceeded, claimSlot(a, &names, &hashes, &vacant, "overflow", @splat(3)));
+    try std.testing.expectEqual(@as(u32, 16384), try claimSlot(a, &names, &hashes, &vacant, "beyond-legacy-cap", @splat(3)));
+    try std.testing.expectEqual(@as(usize, 16385), names.items.len);
 }
 
 fn check(raw: *anyopaque) !void {
