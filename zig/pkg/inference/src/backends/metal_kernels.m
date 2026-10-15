@@ -1111,6 +1111,9 @@ typedef struct termite_metal_decode_runtime {
     id<MTLComputePipelineState> modernbert_training_attention_forward_pipeline;
     id<MTLComputePipelineState> modernbert_training_attention_dq_pipeline;
     id<MTLComputePipelineState> modernbert_training_attention_dkdv_pipeline;
+    id<MTLComputePipelineState> modernbert_training_attention_flash_forward_pipeline;
+    id<MTLComputePipelineState> modernbert_training_attention_flash_dq_pipeline;
+    id<MTLComputePipelineState> modernbert_training_attention_flash_dkdv_pipeline;
     id<MTLComputePipelineState> sdpa_f32_florence_window_hd32_pipeline;
     id<MTLComputePipelineState> florence_window_pack_f32_pipeline;
     id<MTLComputePipelineState> florence_window_unpack_f32_pipeline;
@@ -12233,6 +12236,298 @@ static NSString *termite_metal_shader_source(void) {
            "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
            "    }\n"
            "    if (lid < p.head_dim) { dk[kv + lid] = acc_k; dv[kv + lid] = acc_v; }\n"
+           "}\n"
+           // Tiled FlashAttention-2-style kernels for ModernBERT training
+           // attention (ops/modernbert_training_attention.zig). One threadgroup
+           // reuses K/V (forward, dQ) or Q/dO (dK/dV) across a 32-row block via
+           // simdgroup_float8x8 matmuls and an online softmax (forward only;
+           // backward recomputes P from the saved lse, no rescale needed).
+           // head_dim must be a multiple of 8 and <= 64; threadgroup memory stays
+           // under 22 KB. Falls back to the serial kernels above otherwise, or
+           // when TERMITE_METAL_DISABLE_FLASH_TRAINING_ATTENTION is set.
+           "inline bool mbta_flash_visible(threadgroup const int *rg, int row_pos, int key_pos, uint r, uint key, uint window) {\n"
+           "    threadgroup const int *x = rg + r * 6u;\n"
+           "    int k = int(key);\n"
+           "    if (!((k >= x[0] && k < x[1]) || (k >= x[2] && k < x[3]) || (k >= x[4] && k < x[5]))) return false;\n"
+           "    return window == 0xffffffffu || uint(abs(row_pos - key_pos)) <= window;\n"
+           "}\n"
+           "kernel void termite_modernbert_training_attention_flash_forward(device const float *qkv [[buffer(0)]], device const int *ctrl [[buffer(1)]], device float *output [[buffer(2)]], device float *lse [[buffer(3)]], constant termite_metal_modernbert_training_attention_params &p [[buffer(4)]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {\n"
+           "    constexpr uint BQ = 32u, BK = 16u, DM = 64u;\n"
+           "    threadgroup float ks[BK * DM], vs[BK * DM], ss[BQ * BK], diag[4u * 64u], finrecip[4u * 64u];\n"
+           "    threadgroup int rg[BQ * 6u];\n"
+           "    threadgroup int qp[BQ], kp[BK];\n"
+           "    threadgroup float mrow[BQ], lrow[BQ];\n"
+           "    const uint D = p.head_dim, hidden = p.num_heads * D, h = tg.y;\n"
+           "    const uint QB = (p.seq_len + BQ - 1u) / BQ;\n"
+           "    const uint row = tg.x / QB, blk = tg.x % QB;\n"
+           "    const uint row_start = row * p.seq_len, q0 = row_start + blk * BQ;\n"
+           "    const uint t = uint(tid), s8 = uint(sg) * 8u, L = uint(lane);\n"
+           "    const uint nq = min(BQ, p.seq_len - blk * BQ), nd = D / 8u;\n"
+           "    const float scale = p.scale, neg = -3.402823466e+38f;\n"
+           "    device const float *k = qkv + p.tokens * hidden;\n"
+           "    device const float *v = qkv + 2u * p.tokens * hidden;\n"
+           "    device const int *pos = ctrl + p.tokens * 6u;\n"
+           "    threadgroup float *stage = ss;\n"
+           "    for (uint i = t; i < BQ * 6u; i += 128u) rg[i] = i / 6u < nq ? ctrl[(q0 + i / 6u) * 6u + i % 6u] : 0;\n"
+           "    if (t < BQ) { qp[t] = t < nq ? pos[q0 + t] : 0; mrow[t] = neg; lrow[t] = 0.0f; }\n"
+           "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    uint lo = 0xffffffffu, hi = 0u;\n"
+           "    if (L < nq) { for (uint r = 0u; r < 3u; ++r) { int a = rg[L * 6u + 2u * r], b = rg[L * 6u + 2u * r + 1u]; if (a < b) { lo = min(lo, uint(a)); hi = max(hi, uint(b)); } } }\n"
+           "    lo = simd_min(lo); hi = simd_max(hi);\n"
+           "    int pmin = 2147483647, pmax = -2147483647 - 1;\n"
+           "    if (L < nq) { pmin = qp[L]; pmax = qp[L]; }\n"
+           "    pmin = simd_min(pmin); pmax = simd_max(pmax);\n"
+           "    simdgroup_float8x8 qm[8];\n"
+           "    TERMITE_FOR_UNROLL(uint dt = 0u; dt < 8u; ++dt) if (dt < nd) {\n"
+           "        for (uint i = L; i < 64u; i += 32u) { uint r = s8 + i / 8u, d = dt * 8u + i % 8u; stage[s8 * BK + i] = r < nq ? qkv[(q0 + r) * hidden + h * D + d] * scale : 0.0f; }\n"
+           "        simdgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "        simdgroup_load(qm[dt], stage + s8 * BK, 8u);\n"
+           "        simdgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    }\n"
+           "    simdgroup_float8x8 o[8];\n"
+           "    TERMITE_FOR_UNROLL(uint i = 0u; i < 8u; ++i) if (i < nd) o[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);\n"
+           "    for (uint kb = lo; kb < hi; kb += BK) {\n"
+           "        const uint nk = min(BK, hi - kb);\n"
+           "        const int key_pos = L < nk ? pos[kb + L] : 0;\n"
+           "        const bool near = L < nk && (p.window == 0xffffffffu || (key_pos >= pmin - int(p.window) && key_pos <= pmax + int(p.window)));\n"
+           "        if (!simd_any(near)) continue;\n"
+           "        if (t < BK) kp[t] = t < nk ? pos[kb + t] : 0;\n"
+           "        for (uint i = t; i < BK * D; i += 128u) { uint c = i / D, d = i % D; bool in = c < nk; ks[c * DM + d] = in ? k[(kb + c) * hidden + h * D + d] : 0.0f; vs[c * DM + d] = in ? v[(kb + c) * hidden + h * D + d] : 0.0f; }\n"
+           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "        TERMITE_FOR_UNROLL(uint ct = 0u; ct < 2u; ++ct) {\n"
+           "            simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.0f);\n"
+           "            TERMITE_FOR_UNROLL(uint dt = 0u; dt < 8u; ++dt) if (dt < nd) {\n"
+           "                simdgroup_float8x8 b;\n"
+           "                simdgroup_load(b, ks + ct * 8u * DM + dt * 8u, DM, ulong2(0, 0), true);\n"
+           "                simdgroup_multiply_accumulate(acc, qm[dt], b, acc);\n"
+           "            }\n"
+           "            simdgroup_store(acc, ss + s8 * BK + ct * 8u, BK);\n"
+           "        }\n"
+           "        simdgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "        {\n"
+           "            const uint r = s8 + L / 4u, c0 = (L % 4u) * 4u;\n"
+           "            float vals[4]; float mx = neg;\n"
+           "            for (uint j = 0u; j < 4u; ++j) { uint c = c0 + j; bool vis = r < nq && c < nk && mbta_flash_visible(rg, qp[r], kp[c], r, kb + c, p.window); vals[j] = vis ? ss[r * BK + c] : neg; mx = max(mx, vals[j]); }\n"
+           "            mx = max(mx, simd_shuffle_xor(mx, 1)); mx = max(mx, simd_shuffle_xor(mx, 2));\n"
+           "            const float mold = mrow[r], mnew = max(mold, mx);\n"
+           "            float sum = 0.0f;\n"
+           "            for (uint j = 0u; j < 4u; ++j) { float w = vals[j] == neg ? 0.0f : exp(vals[j] - mnew); ss[r * BK + c0 + j] = w; sum += w; }\n"
+           "            sum += simd_shuffle_xor(sum, 1); sum += simd_shuffle_xor(sum, 2);\n"
+           "            const float alpha = mnew == neg ? 1.0f : (mold == neg ? 0.0f : exp(mold - mnew));\n"
+           "            if (L % 4u == 0u) { lrow[r] = lrow[r] * alpha + sum; mrow[r] = mnew; diag[uint(sg) * 64u + (L / 4u) * 9u] = alpha; }\n"
+           "            for (uint i = L; i < 64u; i += 32u) if (i / 8u != i % 8u) diag[uint(sg) * 64u + i] = 0.0f;\n"
+           "        }\n"
+           "        simdgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "        simdgroup_float8x8 dg; simdgroup_load(dg, diag + uint(sg) * 64u, 8u);\n"
+           "        simdgroup_float8x8 pm0, pm1;\n"
+           "        simdgroup_load(pm0, ss + s8 * BK, BK);\n"
+           "        simdgroup_load(pm1, ss + s8 * BK + 8u, BK);\n"
+           "        TERMITE_FOR_UNROLL(uint dt = 0u; dt < 8u; ++dt) if (dt < nd) {\n"
+           "            simdgroup_float8x8 vm0, vm1;\n"
+           "            simdgroup_load(vm0, vs + dt * 8u, DM);\n"
+           "            simdgroup_load(vm1, vs + 8u * DM + dt * 8u, DM);\n"
+           "            simdgroup_multiply(o[dt], dg, o[dt]);\n"
+           "            simdgroup_multiply_accumulate(o[dt], pm0, vm0, o[dt]);\n"
+           "            simdgroup_multiply_accumulate(o[dt], pm1, vm1, o[dt]);\n"
+           "        }\n"
+           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    }\n"
+           "    for (uint i = L; i < 64u; i += 32u) { uint r = s8 + i / 8u; finrecip[uint(sg) * 64u + i] = (i / 8u == i % 8u) ? (lrow[r] > 0.0f ? 1.0f / lrow[r] : 0.0f) : 0.0f; }\n"
+           "    if (t < nq) lse[(q0 + t) * p.num_heads + h] = lrow[t] > 0.0f ? mrow[t] + log(lrow[t]) : neg;\n"
+           "    simdgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    simdgroup_float8x8 dg2; simdgroup_load(dg2, finrecip + uint(sg) * 64u, 8u);\n"
+           "    TERMITE_FOR_UNROLL(uint dt = 0u; dt < 8u; ++dt) if (dt < nd) {\n"
+           "        simdgroup_multiply(o[dt], dg2, o[dt]);\n"
+           "        simdgroup_store(o[dt], stage + s8 * BK, 8u);\n"
+           "        simdgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "        for (uint i = L; i < 64u; i += 32u) { uint r = s8 + i / 8u; if (r < nq) output[(q0 + r) * hidden + h * D + dt * 8u + i % 8u] = stage[s8 * BK + i]; }\n"
+           "        simdgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    }\n"
+           "}\n"
+           "kernel void termite_modernbert_training_attention_flash_dq(device const float *qkv [[buffer(0)]], device const int *ctrl [[buffer(1)]], device const float *dout [[buffer(2)]], device const float *replayed [[buffer(3)]], device const float *lse [[buffer(4)]], device float *delta [[buffer(5)]], device float *dq [[buffer(6)]], constant termite_metal_modernbert_training_attention_params &p [[buffer(7)]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {\n"
+           "    constexpr uint BQ = 32u, BK = 16u, DM = 64u;\n"
+           "    threadgroup float qs[BQ * DM], dos[BQ * DM], kst[BK * DM], vst[BK * DM];\n"
+           "    threadgroup float ss[BQ * BK], dps[BQ * BK];\n"
+           "    threadgroup int rg[BQ * 6u];\n"
+           "    threadgroup int qp[BQ], kp[BK];\n"
+           "    threadgroup float lrow[BQ], drow[BQ];\n"
+           "    const uint D = p.head_dim, hidden = p.num_heads * D, h = tg.y;\n"
+           "    const uint QB = (p.seq_len + BQ - 1u) / BQ;\n"
+           "    const uint row = tg.x / QB, blk = tg.x % QB;\n"
+           "    const uint row_start = row * p.seq_len, q0 = row_start + blk * BQ;\n"
+           "    const uint t = uint(tid), s8 = uint(sg) * 8u, L = uint(lane);\n"
+           "    const uint nq = min(BQ, p.seq_len - blk * BQ), nd = D / 8u;\n"
+           "    const float scale = p.scale, neg = -3.402823466e+38f;\n"
+           "    device const float *k = qkv + p.tokens * hidden;\n"
+           "    device const float *v = qkv + 2u * p.tokens * hidden;\n"
+           "    device const int *pos = ctrl + p.tokens * 6u;\n"
+           "    for (uint i = t; i < BQ * 6u; i += 128u) rg[i] = i / 6u < nq ? ctrl[(q0 + i / 6u) * 6u + i % 6u] : 0;\n"
+           "    if (t < BQ) {\n"
+           "        uint r = t;\n"
+           "        qp[r] = r < nq ? pos[q0 + r] : 0;\n"
+           "        lrow[r] = r < nq ? lse[(q0 + r) * p.num_heads + h] : neg;\n"
+           "        float d = 0.0f;\n"
+           "        if (r < nq) for (uint dd = 0u; dd < D; ++dd) d += dout[(q0 + r) * hidden + h * D + dd] * replayed[(q0 + r) * hidden + h * D + dd];\n"
+           "        drow[r] = d;\n"
+           "        if (r < nq) delta[(q0 + r) * p.num_heads + h] = d;\n"
+           "    }\n"
+           "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    for (uint i = t; i < BQ * D; i += 128u) { uint r = i / D, d = i % D; bool in = r < nq; qs[r * DM + d] = in ? qkv[(q0 + r) * hidden + h * D + d] : 0.0f; dos[r * DM + d] = in ? dout[(q0 + r) * hidden + h * D + d] : 0.0f; }\n"
+           "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    uint lo = 0xffffffffu, hi = 0u;\n"
+           "    int pmin = 2147483647, pmax = -2147483647 - 1;\n"
+           "    if (L < nq && lrow[L] > neg) { for (uint r = 0u; r < 3u; ++r) { int a = rg[L * 6u + 2u * r], b = rg[L * 6u + 2u * r + 1u]; if (a < b) { lo = min(lo, uint(a)); hi = max(hi, uint(b)); } } pmin = qp[L]; pmax = qp[L]; }\n"
+           "    lo = simd_min(lo); hi = simd_max(hi); pmin = simd_min(pmin); pmax = simd_max(pmax);\n"
+           "    simdgroup_float8x8 qm[8], dm[8], acc[8];\n"
+           "    TERMITE_FOR_UNROLL(uint dt = 0u; dt < 8u; ++dt) if (dt < nd) {\n"
+           "        simdgroup_load(qm[dt], qs + s8 * DM + dt * 8u, DM);\n"
+           "        simdgroup_load(dm[dt], dos + s8 * DM + dt * 8u, DM);\n"
+           "        acc[dt] = make_filled_simdgroup_matrix<float, 8>(0.0f);\n"
+           "    }\n"
+           "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    for (uint kb = lo; kb < hi; kb += BK) {\n"
+           "        const uint nk = min(BK, hi - kb);\n"
+           "        const int key_pos = L < nk ? pos[kb + L] : 0;\n"
+           "        const bool near = L < nk && (p.window == 0xffffffffu || (key_pos >= pmin - int(p.window) && key_pos <= pmax + int(p.window)));\n"
+           "        if (!simd_any(near)) continue;\n"
+           "        if (t < BK) kp[t] = t < nk ? pos[kb + t] : 0;\n"
+           "        for (uint i = t; i < BK * D; i += 128u) { uint c = i / D, d = i % D; bool in = c < nk; kst[c * DM + d] = in ? k[(kb + c) * hidden + h * D + d] : 0.0f; vst[c * DM + d] = in ? v[(kb + c) * hidden + h * D + d] : 0.0f; }\n"
+           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "        TERMITE_FOR_UNROLL(uint ct = 0u; ct < 2u; ++ct) {\n"
+           "            simdgroup_float8x8 accS = make_filled_simdgroup_matrix<float, 8>(0.0f);\n"
+           "            simdgroup_float8x8 accP = make_filled_simdgroup_matrix<float, 8>(0.0f);\n"
+           "            TERMITE_FOR_UNROLL(uint dt = 0u; dt < 8u; ++dt) if (dt < nd) {\n"
+           "                simdgroup_float8x8 bk8, bv8;\n"
+           "                simdgroup_load(bk8, kst + ct * 8u * DM + dt * 8u, DM, ulong2(0, 0), true);\n"
+           "                simdgroup_multiply_accumulate(accS, qm[dt], bk8, accS);\n"
+           "                simdgroup_load(bv8, vst + ct * 8u * DM + dt * 8u, DM, ulong2(0, 0), true);\n"
+           "                simdgroup_multiply_accumulate(accP, dm[dt], bv8, accP);\n"
+           "            }\n"
+           "            simdgroup_store(accS, ss + s8 * BK + ct * 8u, BK);\n"
+           "            simdgroup_store(accP, dps + s8 * BK + ct * 8u, BK);\n"
+           "        }\n"
+           "        simdgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "        {\n"
+           "            const uint r = s8 + L / 4u, c0 = (L % 4u) * 4u;\n"
+           "            for (uint j = 0u; j < 4u; ++j) {\n"
+           "                uint c = c0 + j;\n"
+           "                bool vis = r < nq && c < nk && lrow[r] > neg && mbta_flash_visible(rg, qp[r], kp[c], r, kb + c, p.window);\n"
+           "                float sval = ss[r * BK + c];\n"
+           "                float pval = vis ? exp(sval * scale - lrow[r]) : 0.0f;\n"
+           "                float dpval = dps[r * BK + c];\n"
+           "                ss[r * BK + c] = pval * (dpval - drow[r]) * scale;\n"
+           "            }\n"
+           "        }\n"
+           "        simdgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "        simdgroup_float8x8 dsm0, dsm1;\n"
+           "        simdgroup_load(dsm0, ss + s8 * BK, BK);\n"
+           "        simdgroup_load(dsm1, ss + s8 * BK + 8u, BK);\n"
+           "        TERMITE_FOR_UNROLL(uint dt = 0u; dt < 8u; ++dt) if (dt < nd) {\n"
+           "            simdgroup_float8x8 km0, km1;\n"
+           "            simdgroup_load(km0, kst + dt * 8u, DM);\n"
+           "            simdgroup_load(km1, kst + 8u * DM + dt * 8u, DM);\n"
+           "            simdgroup_multiply_accumulate(acc[dt], dsm0, km0, acc[dt]);\n"
+           "            simdgroup_multiply_accumulate(acc[dt], dsm1, km1, acc[dt]);\n"
+           "        }\n"
+           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    }\n"
+           "    TERMITE_FOR_UNROLL(uint dt = 0u; dt < 8u; ++dt) if (dt < nd) {\n"
+           "        simdgroup_store(acc[dt], ss + s8 * BK, 8u);\n"
+           "        simdgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "        for (uint i = L; i < 64u; i += 32u) { uint r = s8 + i / 8u; if (r < nq) dq[(q0 + r) * hidden + h * D + dt * 8u + i % 8u] = ss[s8 * BK + i]; }\n"
+           "        simdgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    }\n"
+           "}\n"
+           "kernel void termite_modernbert_training_attention_flash_dkdv(device const float *qkv [[buffer(0)]], device const int *ctrl [[buffer(1)]], device const float *dout [[buffer(2)]], device const float *lse [[buffer(3)]], device const float *delta [[buffer(4)]], device float *dk [[buffer(5)]], device float *dv [[buffer(6)]], constant termite_metal_modernbert_training_attention_params &p [[buffer(7)]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {\n"
+           "    constexpr uint BK = 32u, BQT = 16u, DM = 64u;\n"
+           "    threadgroup float kst[BK * DM], vst[BK * DM], qst[BQT * DM], dost[BQT * DM];\n"
+           "    threadgroup float ss[BK * BQT], dps[BK * BQT];\n"
+           "    threadgroup int rg[BQT * 6u];\n"
+           "    threadgroup int kp[BK], qp[BQT];\n"
+           "    threadgroup float lrow[BQT], drow[BQT];\n"
+           "    const uint D = p.head_dim, hidden = p.num_heads * D, h = tg.y;\n"
+           "    const uint KB = (p.seq_len + BK - 1u) / BK;\n"
+           "    const uint row = tg.x / KB, blk = tg.x % KB;\n"
+           "    const uint row_start = row * p.seq_len, k0 = row_start + blk * BK;\n"
+           "    const uint t = uint(tid), s8 = uint(sg) * 8u, L = uint(lane);\n"
+           "    const uint nk = min(BK, p.seq_len - blk * BK), nd = D / 8u;\n"
+           "    const float scale = p.scale, neg = -3.402823466e+38f;\n"
+           "    device const float *k = qkv + p.tokens * hidden;\n"
+           "    device const float *v = qkv + 2u * p.tokens * hidden;\n"
+           "    device const int *pos = ctrl + p.tokens * 6u;\n"
+           "    for (uint i = t; i < BK * D; i += 128u) { uint c = i / D, d = i % D; bool in = c < nk; kst[c * DM + d] = in ? k[(k0 + c) * hidden + h * D + d] : 0.0f; vst[c * DM + d] = in ? v[(k0 + c) * hidden + h * D + d] : 0.0f; }\n"
+           "    if (t < BK) kp[t] = t < nk ? pos[k0 + t] : 0;\n"
+           "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    simdgroup_float8x8 km[8], vm[8], dk_acc[8], dv_acc[8];\n"
+           "    TERMITE_FOR_UNROLL(uint dt = 0u; dt < 8u; ++dt) if (dt < nd) {\n"
+           "        simdgroup_load(km[dt], kst + s8 * DM + dt * 8u, DM);\n"
+           "        simdgroup_load(vm[dt], vst + s8 * DM + dt * 8u, DM);\n"
+           "        dk_acc[dt] = make_filled_simdgroup_matrix<float, 8>(0.0f);\n"
+           "        dv_acc[dt] = make_filled_simdgroup_matrix<float, 8>(0.0f);\n"
+           "    }\n"
+           "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    for (uint q0t = row_start; q0t < row_start + p.seq_len; q0t += BQT) {\n"
+           "        const uint nqt = min(BQT, row_start + p.seq_len - q0t);\n"
+           "        for (uint i = t; i < BQT * 6u; i += 128u) rg[i] = i / 6u < nqt ? ctrl[(q0t + i / 6u) * 6u + i % 6u] : 0;\n"
+           "        if (t < BQT) { qp[t] = t < nqt ? pos[q0t + t] : 0; lrow[t] = t < nqt ? lse[(q0t + t) * p.num_heads + h] : neg; drow[t] = t < nqt ? delta[(q0t + t) * p.num_heads + h] : 0.0f; }\n"
+           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "        for (uint i = t; i < BQT * D; i += 128u) { uint r = i / D, d = i % D; bool in = r < nqt; qst[r * DM + d] = in ? qkv[(q0t + r) * hidden + h * D + d] : 0.0f; dost[r * DM + d] = in ? dout[(q0t + r) * hidden + h * D + d] : 0.0f; }\n"
+           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "        TERMITE_FOR_UNROLL(uint ct = 0u; ct < 2u; ++ct) {\n"
+           "            simdgroup_float8x8 accS = make_filled_simdgroup_matrix<float, 8>(0.0f);\n"
+           "            simdgroup_float8x8 accP = make_filled_simdgroup_matrix<float, 8>(0.0f);\n"
+           "            TERMITE_FOR_UNROLL(uint dt = 0u; dt < 8u; ++dt) if (dt < nd) {\n"
+           "                simdgroup_float8x8 bq8, bd8;\n"
+           "                simdgroup_load(bq8, qst + ct * 8u * DM + dt * 8u, DM, ulong2(0, 0), true);\n"
+           "                simdgroup_multiply_accumulate(accS, km[dt], bq8, accS);\n"
+           "                simdgroup_load(bd8, dost + ct * 8u * DM + dt * 8u, DM, ulong2(0, 0), true);\n"
+           "                simdgroup_multiply_accumulate(accP, vm[dt], bd8, accP);\n"
+           "            }\n"
+           "            simdgroup_store(accS, ss + s8 * BQT + ct * 8u, BQT);\n"
+           "            simdgroup_store(accP, dps + s8 * BQT + ct * 8u, BQT);\n"
+           "        }\n"
+           "        simdgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "        {\n"
+           "            const uint r = s8 + L / 4u, c0 = (L % 4u) * 4u;\n"
+           "            for (uint j = 0u; j < 4u; ++j) {\n"
+           "                uint c = c0 + j;\n"
+           "                bool vis = r < nk && c < nqt && lrow[c] > neg && mbta_flash_visible(rg, qp[c], kp[r], c, k0 + r, p.window);\n"
+           "                float sval = ss[r * BQT + c];\n"
+           "                float pval = vis ? exp(sval * scale - lrow[c]) : 0.0f;\n"
+           "                float dpval = dps[r * BQT + c];\n"
+           "                dps[r * BQT + c] = pval;\n"
+           "                ss[r * BQT + c] = pval * (dpval - drow[c]) * scale;\n"
+           "            }\n"
+           "        }\n"
+           "        simdgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "        simdgroup_float8x8 pm0, pm1, dsm0, dsm1;\n"
+           "        simdgroup_load(pm0, dps + s8 * BQT, BQT);\n"
+           "        simdgroup_load(pm1, dps + s8 * BQT + 8u, BQT);\n"
+           "        simdgroup_load(dsm0, ss + s8 * BQT, BQT);\n"
+           "        simdgroup_load(dsm1, ss + s8 * BQT + 8u, BQT);\n"
+           "        TERMITE_FOR_UNROLL(uint dt = 0u; dt < 8u; ++dt) if (dt < nd) {\n"
+           "            simdgroup_float8x8 do0, do1, qm0, qm1;\n"
+           "            simdgroup_load(do0, dost + dt * 8u, DM);\n"
+           "            simdgroup_load(do1, dost + 8u * DM + dt * 8u, DM);\n"
+           "            simdgroup_multiply_accumulate(dv_acc[dt], pm0, do0, dv_acc[dt]);\n"
+           "            simdgroup_multiply_accumulate(dv_acc[dt], pm1, do1, dv_acc[dt]);\n"
+           "            simdgroup_load(qm0, qst + dt * 8u, DM);\n"
+           "            simdgroup_load(qm1, qst + 8u * DM + dt * 8u, DM);\n"
+           "            simdgroup_multiply_accumulate(dk_acc[dt], dsm0, qm0, dk_acc[dt]);\n"
+           "            simdgroup_multiply_accumulate(dk_acc[dt], dsm1, qm1, dk_acc[dt]);\n"
+           "        }\n"
+           "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    }\n"
+           "    TERMITE_FOR_UNROLL(uint dt = 0u; dt < 8u; ++dt) if (dt < nd) {\n"
+           "        simdgroup_store(dk_acc[dt], ss + s8 * BQT, 8u);\n"
+           "        simdgroup_store(dv_acc[dt], dps + s8 * BQT, 8u);\n"
+           "        simdgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "        for (uint i = L; i < 64u; i += 32u) {\n"
+           "            uint r = s8 + i / 8u;\n"
+           "            if (r < nk) { dk[(k0 + r) * hidden + h * D + dt * 8u + i % 8u] = ss[s8 * BQT + i]; dv[(k0 + r) * hidden + h * D + dt * 8u + i % 8u] = dps[s8 * BQT + i]; }\n"
+           "        }\n"
+           "        simdgroup_barrier(mem_flags::mem_threadgroup);\n"
+           "    }\n"
            "}\n"
            "kernel void termite_sdpa_f32_tg(device const float *q [[buffer(0)]], device const float *k [[buffer(1)]], device const float *v [[buffer(2)]], device const float *bias [[buffer(3)]], device const float *mask [[buffer(4)]], device float *output [[buffer(5)]], constant termite_metal_sdpa_f32_params &p [[buffer(6)]], threadgroup float *scratch [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], uint3 tpg [[threads_per_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
            "    if (p.seq_len == 0u || p.num_heads == 0u || p.head_dim == 0u) return;\n"
@@ -27856,6 +28151,9 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         runtime->modernbert_training_attention_forward_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_modernbert_training_attention_forward");
         runtime->modernbert_training_attention_dq_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_modernbert_training_attention_dq");
         runtime->modernbert_training_attention_dkdv_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_modernbert_training_attention_dkdv");
+        runtime->modernbert_training_attention_flash_forward_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_modernbert_training_attention_flash_forward");
+        runtime->modernbert_training_attention_flash_dq_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_modernbert_training_attention_flash_dq");
+        runtime->modernbert_training_attention_flash_dkdv_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_modernbert_training_attention_flash_dkdv");
         runtime->sdpa_f32_florence_window_hd32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_sdpa_f32_florence_window_hd32");
         runtime->florence_window_pack_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_florence_window_pack_f32");
         runtime->florence_window_unpack_f32_pipeline = termite_metal_make_pipeline(device, precise_library, @"termite_florence_window_unpack_f32");
@@ -28803,6 +29101,9 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->modernbert_training_attention_forward_pipeline = nil;
     runtime->modernbert_training_attention_dq_pipeline = nil;
     runtime->modernbert_training_attention_dkdv_pipeline = nil;
+    runtime->modernbert_training_attention_flash_forward_pipeline = nil;
+    runtime->modernbert_training_attention_flash_dq_pipeline = nil;
+    runtime->modernbert_training_attention_flash_dkdv_pipeline = nil;
     runtime->sdpa_f32_florence_window_hd32_pipeline = nil;
     runtime->florence_window_pack_f32_pipeline = nil;
     runtime->florence_window_unpack_f32_pipeline = nil;
@@ -48177,6 +48478,118 @@ int termite_metal_decode_runtime_modernbert_training_attention_v1(
             [encoder setBuffer:output_buffer offset:output_offset + 2u * rows_bytes atIndex:6];
             [encoder setBytes:params length:sizeof(*params) atIndex:7];
             [encoder setThreadgroupMemoryLength:pair_bytes atIndex:0];
+            [encoder dispatchThreadgroups:groups threadsPerThreadgroup:threads];
+        }
+        termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
+        return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -10);
+    }
+}
+
+/// Tiled FlashAttention-2-style ModernBERT training attention. Same buffer
+/// layout and scratch contract as the _v1 dispatcher above (the Zig wrapper
+/// picks one or the other), but the kernels hold K/V (forward, dQ) or Q/dO
+/// (dK/dV) in simdgroup registers across a 32-row block instead of rereading
+/// them per query. Only eligible for head_dim a multiple of 8, <= 64; the
+/// caller is expected to have already checked this, but this function fails
+/// closed (-3) if it has not.
+int termite_metal_decode_runtime_modernbert_training_attention_flash_v1(
+    termite_metal_decode_runtime *runtime,
+    void *qkv_handle,
+    size_t qkv_offset,
+    void *control_handle,
+    size_t control_offset,
+    void *dout_handle,
+    size_t dout_offset,
+    void *output_handle,
+    size_t output_offset,
+    void *scratch_handle,
+    size_t scratch_offset,
+    const termite_metal_modernbert_training_attention_params *params
+) {
+    if (runtime == NULL || params == NULL || qkv_handle == NULL || control_handle == NULL || output_handle == NULL || scratch_handle == NULL) return -1;
+    if (params->backward != 0 && dout_handle == NULL) return -1;
+    if (runtime->modernbert_training_attention_flash_forward_pipeline == nil || runtime->modernbert_training_attention_flash_dq_pipeline == nil ||
+        runtime->modernbert_training_attention_flash_dkdv_pipeline == nil) return -2;
+    const NSUInteger width = 128u;
+    const size_t tokens = params->tokens;
+    const size_t heads = params->num_heads;
+    const size_t head_dim = params->head_dim;
+    if (tokens == 0 || heads == 0 || head_dim == 0 || params->seq_len == 0 || tokens % params->seq_len != 0 ||
+        tokens * heads > UINT32_MAX) return -1;
+    if (head_dim % 8u != 0u || head_dim > 64u) return -3;
+    if (runtime->modernbert_training_attention_flash_forward_pipeline.maxTotalThreadsPerThreadgroup < width ||
+        runtime->modernbert_training_attention_flash_dq_pipeline.maxTotalThreadsPerThreadgroup < width ||
+        runtime->modernbert_training_attention_flash_dkdv_pipeline.maxTotalThreadsPerThreadgroup < width) return -2;
+    @autoreleasepool {
+        bool frame_owned = (runtime->active_frame_cb == nil);
+        id<MTLBuffer> qkv_buffer = (__bridge id<MTLBuffer>)qkv_handle;
+        id<MTLBuffer> control_buffer = (__bridge id<MTLBuffer>)control_handle;
+        id<MTLBuffer> output_buffer = (__bridge id<MTLBuffer>)output_handle;
+        id<MTLBuffer> scratch_buffer = (__bridge id<MTLBuffer>)scratch_handle;
+        id<MTLBuffer> dout_buffer = params->backward != 0 ? (__bridge id<MTLBuffer>)dout_handle : nil;
+        const size_t hidden = heads * head_dim;
+        const size_t rows_bytes = tokens * hidden * sizeof(float);
+        const size_t stats_bytes = tokens * heads * sizeof(float);
+        const size_t control_bytes = tokens * 7u * sizeof(int32_t);
+        const size_t output_bytes = params->backward != 0 ? 3u * rows_bytes : rows_bytes;
+        const size_t scratch_bytes = params->backward != 0 ? rows_bytes + 2u * stats_bytes : stats_bytes;
+        if (qkv_offset + 3u * rows_bytes > qkv_buffer.length || control_offset + control_bytes > control_buffer.length ||
+            output_offset + output_bytes > output_buffer.length || scratch_offset + scratch_bytes > scratch_buffer.length ||
+            (dout_buffer != nil && dout_offset + rows_bytes > dout_buffer.length)) return -1;
+        id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
+        if (command_buffer == nil) return -5;
+        termite_metal_planned_encoder_range accesses[5];
+        size_t access_count = 4;
+        if (termite_metal_planned_range_make(qkv_buffer, qkv_offset, 3u * rows_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[0], -9) != 0 ||
+            termite_metal_planned_range_make(control_buffer, control_offset, control_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[1], -9) != 0 ||
+            termite_metal_planned_range_make(output_buffer, output_offset, output_bytes, TERMITE_METAL_PLANNED_RANGE_WRITE, &accesses[2], -9) != 0 ||
+            termite_metal_planned_range_make(scratch_buffer, scratch_offset, scratch_bytes, TERMITE_METAL_PLANNED_RANGE_WRITE, &accesses[3], -9) != 0) return -9;
+        if (dout_buffer != nil) {
+            if (termite_metal_planned_range_make(dout_buffer, dout_offset, rows_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[4], -9) != 0) return -9;
+            access_count = 5;
+        }
+        if (termite_metal_decode_runtime_prepare_planned_compute_accesses(runtime, accesses, access_count, -9) != 0) return -9;
+        BOOL encoder_owned = YES;
+        id<MTLComputeCommandEncoder> encoder = termite_metal_scoped_compute_encoder_for(runtime, command_buffer, TERMITE_METAL_COMPUTE_SOURCE_ATTENTION, &encoder_owned);
+        if (encoder == nil) return -5;
+        const size_t batch = tokens / params->seq_len;
+        const size_t blocks_per_row = (params->seq_len + 31u) / 32u;
+        const MTLSize groups = MTLSizeMake(batch * blocks_per_row, heads, 1);
+        const MTLSize threads = MTLSizeMake(width, 1, 1);
+        // Forward writes the output (forward) or the replayed output
+        // (backward), and the log-sum-exp after it in scratch.
+        const size_t lse_at = params->backward != 0 ? scratch_offset + rows_bytes : scratch_offset;
+        [encoder setComputePipelineState:runtime->modernbert_training_attention_flash_forward_pipeline];
+        [encoder setBuffer:qkv_buffer offset:qkv_offset atIndex:0];
+        [encoder setBuffer:control_buffer offset:control_offset atIndex:1];
+        if (params->backward != 0) [encoder setBuffer:scratch_buffer offset:scratch_offset atIndex:2];
+        else [encoder setBuffer:output_buffer offset:output_offset atIndex:2];
+        [encoder setBuffer:scratch_buffer offset:lse_at atIndex:3];
+        [encoder setBytes:params length:sizeof(*params) atIndex:4];
+        [encoder dispatchThreadgroups:groups threadsPerThreadgroup:threads];
+        if (params->backward != 0) {
+            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            const size_t delta_at = lse_at + stats_bytes;
+            [encoder setComputePipelineState:runtime->modernbert_training_attention_flash_dq_pipeline];
+            [encoder setBuffer:qkv_buffer offset:qkv_offset atIndex:0];
+            [encoder setBuffer:control_buffer offset:control_offset atIndex:1];
+            [encoder setBuffer:dout_buffer offset:dout_offset atIndex:2];
+            [encoder setBuffer:scratch_buffer offset:scratch_offset atIndex:3];
+            [encoder setBuffer:scratch_buffer offset:lse_at atIndex:4];
+            [encoder setBuffer:scratch_buffer offset:delta_at atIndex:5];
+            [encoder setBuffer:output_buffer offset:output_offset atIndex:6];
+            [encoder setBytes:params length:sizeof(*params) atIndex:7];
+            [encoder dispatchThreadgroups:groups threadsPerThreadgroup:threads];
+            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            [encoder setComputePipelineState:runtime->modernbert_training_attention_flash_dkdv_pipeline];
+            [encoder setBuffer:qkv_buffer offset:qkv_offset atIndex:0];
+            [encoder setBuffer:control_buffer offset:control_offset atIndex:1];
+            [encoder setBuffer:dout_buffer offset:dout_offset atIndex:2];
+            [encoder setBuffer:scratch_buffer offset:lse_at atIndex:3];
+            [encoder setBuffer:scratch_buffer offset:delta_at atIndex:4];
+            [encoder setBuffer:output_buffer offset:output_offset + rows_bytes atIndex:5];
+            [encoder setBuffer:output_buffer offset:output_offset + 2u * rows_bytes atIndex:6];
+            [encoder setBytes:params length:sizeof(*params) atIndex:7];
             [encoder dispatchThreadgroups:groups threadsPerThreadgroup:threads];
         }
         termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
