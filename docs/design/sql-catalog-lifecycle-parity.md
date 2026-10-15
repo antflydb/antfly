@@ -7796,3 +7796,57 @@ transaction aborts; the original reserved schema, catalogs, clock and runtime
 remain unchanged. Boundary, license, formatting, inventory and generated
 control-catalog checks passed. No committed install, throughput result, public
 activation or new original-case credit is claimed.
+
+### Shared-schema native installation and replay
+
+Private installation now uses the ordinary shared schema writer, not a second
+schema/catalog transaction. Off-lock preparation owns the exact manifest JSON,
+active/versioned public schema writes, native schema epoch, existing physical
+generations and seal-bound activation. Commit rechecks the reserved predecessor
+before writes, then stages native schema history, both catalogs, the durable
+table catalog, activation and installed cut in one transaction. The DB owner's
+participant stages its replay marker or durable replication outbox in that
+same transaction. Resident schema/index publication follows successful commit;
+the exact source fence remains held.
+
+The public validator bytes are independently bound to the admitted manifest,
+including its immutable versioned copy. A missing versioned copy, substituted
+JSON or duplicate public-schema key cannot change semantics between preparation
+and commit. This binding is prepared off-lock and does not compile a schema or
+scan rows under apply. Failure in the post-install transaction participant
+aborts the schema, catalogs, activation, installed cut and participant writes
+together, without consuming the prepared publication or changing the live epoch.
+
+Native effect envelope 29 and kernel ABI 88 add installation replay. Already
+installed preparation avoids schema compilation/publication; exact retries
+verify the current installed successor and original cut. A repeated effect at
+a later transport LSN updates only the replay marker, not native time or the
+schema generation. Pending outbox publication withholds the logical installed
+receipt until flush succeeds. These are internal storage/replay mechanisms;
+the command's metadata decision digest is still an identity, not permission.
+
+Independent metadata/root authorization and its native receiver/C-ABI bridge,
+installed ACK delivery, release/retained-blob retirement, automatic scheduling,
+full capability/adoption barriers and distributed fault qualification remain
+unfinished. No public SQL producer is enabled and no original-case credit is
+claimed; dispositions remain 483 implemented / 862 unresolved.
+
+Qualification: `/private/tmp/antfly-index-install-replay-final-debug-v2.log`
+passed 159/159 Debug build steps, including 11 native page/lifecycle, 50
+publication, four ACK, six C-ABI, three leased-owner, 46 runtime-contract,
+104 standalone and 15 domain tests. The isolated real-LSM fixture uses a
+synthetic metadata decision and copies logical KV state, not signing identity
+or audit files; it does not qualify physical-root adoption. It proves callback
+failure rollback, manifest/public-history binding, pinned old-schema lifetime,
+actual install-frame replay at LSN 5, cold reopen, local installed receipt
+retry, marker-only duplicate replay at LSN 6, and wrong-cut rejection without
+advancing that marker. Native time, schema generation and the source fence
+remain stable on retries. Installed row reads preserve predecessor values.
+
+Boundary, license, inventory, formatting, diff and generated control-catalog
+checks passed. The static checker initially stalled in Python's macOS timezone
+notification startup before running repository code; a stack sample established
+the cause, and the checks passed with host access. Existing outbox regressions
+passed, but install-specific primary outbox publication/fault coverage and the
+distributed authorization/ACK/release workflow still require qualification.
+No throughput result, public activation or new original-case credit is claimed.

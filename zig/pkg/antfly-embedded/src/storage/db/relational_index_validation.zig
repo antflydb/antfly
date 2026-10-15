@@ -411,6 +411,12 @@ pub const Installed = struct {
         return result;
     }
 
+    pub fn requireCurrent(self: @This(), alloc: Allocator, txn: anytype) !void {
+        const current = (try owner.load(txn)) orelse return error.PrivateIndexJobRequired;
+        if (current.phase != .installed or !std.meta.eql(reserved(current), self.command.validation.command.binding)) return error.PrivateIndexOwnerJobChanged;
+        try self.requireSuccessor(alloc, txn);
+    }
+
     fn requireSuccessor(self: @This(), alloc: Allocator, txn: anytype) !void {
         const binding = self.command.validation.command.binding;
         try @import("relational_index_cancellation_intent.zig").requireOpen(txn, binding);

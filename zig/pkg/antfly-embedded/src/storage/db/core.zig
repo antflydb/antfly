@@ -92,6 +92,7 @@ pub const PreparedSchemaMetadata = struct {
     legacy_public_binding: bool = false,
     generated_semantics_match: bool = true,
     reserved_index: ?@import("relational_index_owner_job.zig").Binding = null,
+    reserved_public_schema_digest: ?[32]u8 = null,
     reserved_activation: ?@import("relational_integrity_activation.zig").PreparedIndexPublication = null,
     combined_writes: []docstore_mod.KVPair,
 
@@ -1417,6 +1418,7 @@ pub const DBCore = struct {
                     !(if (binding.physical_before) |before| base.head.eql(before) else false)) return error.PreparedGenerationChanged;
             } else if (binding.physical_before != null) return error.PreparedGenerationChanged;
             prepared.reserved_index = binding;
+            prepared.reserved_public_schema_digest = inputs_mod.digest(reserved_inputs.?.after_json);
         }
         if (prepared.base_schema_view) |view| {
             if (view.version() == table_schema.version) {
@@ -1550,7 +1552,68 @@ pub const DBCore = struct {
         metadata_deletes: []const []const u8,
         reconciled_row_count: ?u64,
     ) !bool {
-        return self.commitPreparedSchemaMetadataMode(prepared, metadata_writes, metadata_deletes, reconciled_row_count, false, null);
+        return self.commitPreparedSchemaMetadataMode(prepared, metadata_writes, metadata_deletes, reconciled_row_count, false, null, null);
+    }
+
+    /// Storage transaction for an independently authorized private index
+    /// installation. The DB owner holds apply-exclusive and owns decision/root
+    /// authentication, replication admission and payload preparation. Its
+    /// participant stages the replay marker/outbox with the installed cut;
+    /// runtime objects are published only after the shared writer commits.
+    /// A decision digest alone is not authorization to call this operation.
+    pub fn commitPreparedSchemaMetadataReservedIndex(
+        self: *DBCore,
+        prepared: *PreparedSchemaMetadata,
+        metadata_writes: []const docstore_mod.KVPair,
+        command: @import("relational_index_validation.zig").InstallCommand,
+        replay: ?@import("receipt_position.zig").Native,
+        participant: anytype,
+    ) !@import("relational_index_validation.zig").Installed {
+        const verification = @import("relational_index_validation.zig");
+        const IndexInstallState = struct {
+            alloc: Allocator,
+            command: verification.InstallCommand,
+            replay: ?@import("receipt_position.zig").Native,
+            participant: if (@TypeOf(participant) == @TypeOf(null)) void else @TypeOf(participant),
+            record: ?verification.Installed = null,
+
+            pub fn validateBefore(state: *@This(), txn: anytype) !void {
+                try state.command.validateBefore(state.alloc, txn);
+            }
+            pub fn stage(state: *@This(), txn: anytype, candidate: integrity_catalog_mod.Catalog) !void {
+                const staged = try verification.Installed.stage(state.alloc, txn, state.command, candidate, state.replay);
+                state.record = staged.record;
+                if (comptime @TypeOf(participant) != @TypeOf(null)) try state.participant.stage(txn, staged.record);
+            }
+        };
+        const binding = prepared.reserved_index orelse return error.PrivateIndexJobRequired;
+        const activation = prepared.reserved_activation orelse return error.PrivateIndexTargetValidationRequired;
+        const public_digest = prepared.reserved_public_schema_digest orelse return error.InvalidPrivateIndexInputs;
+        const public_version_key = try public_schema_mod.versionedSchemaKeyAlloc(self.alloc, binding.physical_candidate.schema_version);
+        defer self.alloc.free(public_version_key);
+        var active_public = false;
+        var versioned_public = false;
+        for (metadata_writes) |write| {
+            const active = std.mem.eql(u8, write.key, public_schema_json_key);
+            const versioned = std.mem.eql(u8, write.key, public_version_key);
+            if (!active and !versioned) continue;
+            if ((active and active_public) or (versioned and versioned_public) or
+                !std.mem.eql(u8, &@import("relational_index_inputs.zig").digest(write.value), &public_digest)) return error.InvalidPrivateIndexInputs;
+            active_public = active_public or active;
+            versioned_public = versioned_public or versioned;
+        }
+        if (!active_public or !versioned_public) return error.InvalidPrivateIndexInputs;
+        if (!std.meta.eql(binding, command.validation.command.binding) or
+            !std.meta.eql(activation.seal, command.validation)) return error.PrivateIndexOwnerJobChanged;
+        var schema_digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(prepared.encoded, &schema_digest, .{});
+        var activation_digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(activation.value, &activation_digest, .{});
+        if (!std.mem.eql(u8, &schema_digest, &command.schema_digest) or
+            !std.mem.eql(u8, &activation_digest, &command.activation_digest)) return error.InvalidPrivateIndexNativeReceipt;
+        var installation: IndexInstallState = .{ .alloc = self.alloc, .command = command, .replay = replay, .participant = if (comptime @TypeOf(participant) == @TypeOf(null)) {} else participant };
+        _ = try self.commitPreparedSchemaMetadataMode(prepared, metadata_writes, &.{}, null, false, null, &installation);
+        return installation.record orelse unreachable;
     }
 
     /// Commit the metadata-published child schema and lift its exact write
@@ -1566,7 +1629,7 @@ pub const DBCore = struct {
         source_fence: @import("relational_integrity_topology_contract.zig").Fence,
     ) !bool {
         if (source_fence.role != .child_generation_source and source_fence.role != .child_generation_dual) return error.InvalidIntegrityTopologyFence;
-        return self.commitPreparedSchemaMetadataMode(prepared, metadata_writes, metadata_deletes, reconciled_row_count, false, source_fence);
+        return self.commitPreparedSchemaMetadataMode(prepared, metadata_writes, metadata_deletes, reconciled_row_count, false, source_fence, null);
     }
 
     /// Rehydrate an exact durable schema without inventing a mutation (or an HA
@@ -1576,7 +1639,7 @@ pub const DBCore = struct {
         prepared: *PreparedSchemaMetadata,
         metadata_writes: []const docstore_mod.KVPair,
     ) !bool {
-        _ = self.commitPreparedSchemaMetadataMode(prepared, metadata_writes, &.{}, null, true, null) catch |err| switch (err) {
+        _ = self.commitPreparedSchemaMetadataMode(prepared, metadata_writes, &.{}, null, true, null, null) catch |err| switch (err) {
             error.SchemaMetadataChanged => return false,
             else => return err,
         };
@@ -1591,10 +1654,13 @@ pub const DBCore = struct {
         reconciled_row_count: ?u64,
         rehydrate_only: bool,
         child_fence: ?@import("relational_integrity_topology_contract.zig").Fence,
+        installation: anytype,
     ) !bool {
         // A reserved candidate is not ordinary DDL authority, even if its
         // fence disappears between preparation and commit.
-        if (prepared.reserved_index != null) return error.PrivateIndexPublicationRequired;
+        if (comptime @TypeOf(installation) == @TypeOf(null)) {
+            if (prepared.reserved_index != null) return error.PrivateIndexPublicationRequired;
+        } else if (prepared.reserved_index == null or child_fence != null or rehydrate_only) return error.PrivateIndexPublicationRequired;
         if (prepared.combined_writes.len != metadata_writes.len + 1)
             return error.InvalidSchemaUpdateRequest;
         try relational_index_catalog_mod.Controller.validateExtraMetadata(metadata_writes, metadata_deletes);
@@ -1671,8 +1737,17 @@ pub const DBCore = struct {
             row_count: u64,
             namespace: doc_identity.Namespace,
             child_fence: ?@import("relational_integrity_topology_contract.zig").Fence,
+            installation: if (@TypeOf(installation) == @TypeOf(null)) void else @TypeOf(installation),
 
             pub fn validateBefore(participants: @This(), txn: anytype) !void {
+                try participants.validateGuards(txn);
+                if (comptime @TypeOf(installation) != @TypeOf(null)) {
+                    try participants.installation.validateBefore(txn);
+                    try participants.prepared.reserved_activation.?.validateBefore(txn);
+                }
+            }
+
+            fn validateGuards(participants: @This(), txn: anytype) !void {
                 // A retained source uses the immutable layouts/validator set
                 // captured at admission. Schema changes must wait for its
                 // terminal receipt; exact rehydration uses stageChanges and
@@ -1685,7 +1760,11 @@ pub const DBCore = struct {
                         return error.IntegrityTopologyBusy;
                 }
                 const topology = @import("relational_integrity_topology.zig");
-                if (participants.child_fence) |expected| {
+                if (comptime @TypeOf(installation) != @TypeOf(null)) {
+                    var manager = try participants.core.initTxnManager();
+                    defer manager.deinit();
+                    try topology.requireDrained(txn, &manager, participants.prepared.reserved_index.?.fence);
+                } else if (participants.child_fence) |expected| {
                     var manager = try participants.core.initTxnManager();
                     defer manager.deinit();
                     try topology.requireDrained(txn, &manager, expected);
@@ -1705,8 +1784,10 @@ pub const DBCore = struct {
                 // Check both cuts: metadata extras must neither erase a
                 // predecessor guard nor install a new guard behind admission.
                 // validateBefore was also called before *any* schema writes.
-                try participants.validateBefore(txn);
+                try participants.validateGuards(txn);
                 try participants.stageChanges(txn);
+                if (comptime @TypeOf(installation) != @TypeOf(null))
+                    try participants.installation.stage(txn, participants.prepared.integrity_catalog.?.catalog);
                 if (participants.child_fence) |expected| {
                     if (expected.role == .child_generation_dual)
                         try txn.delete(@import("relational_integrity_generation_admission.zig").dual_acknowledged_fence_key);
@@ -1745,8 +1826,8 @@ pub const DBCore = struct {
                 }
             }
         };
-        const participants = Participants{ .core = self, .prepared = prepared, .row_count = next_catalog.row_count, .namespace = self.identity_namespace, .child_fence = child_fence };
-        const unchanged = same_active_epoch and try schema_mod.encodedSchemaMetadataUnchanged(
+        const participants = Participants{ .core = self, .prepared = prepared, .row_count = next_catalog.row_count, .namespace = self.identity_namespace, .child_fence = child_fence, .installation = if (comptime @TypeOf(installation) == @TypeOf(null)) {} else installation };
+        const unchanged = if (comptime @TypeOf(installation) != @TypeOf(null)) false else same_active_epoch and try schema_mod.encodedSchemaMetadataUnchanged(
             self.store,
             self.alloc,
             table_schema.version,

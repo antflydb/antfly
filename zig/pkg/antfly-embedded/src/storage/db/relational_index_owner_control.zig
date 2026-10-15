@@ -33,7 +33,7 @@ const validation = @import("relational_index_validation.zig");
 const resources = @import("../resource_manager.zig");
 const RequestContext = @import("../../api/operation.zig").RequestContext;
 const Waiters = @import("../admission_waiter.zig").Fifo(void);
-pub const envelope_version = 28;
+pub const envelope_version = 29;
 pub const max_response_bytes = 32 * 1024;
 pub const max_cancellation_wire_bytes = 32 * 1024;
 pub const max_encoded_inputs = std.base64.standard.Encoder.calcSize(inputs.max_bytes);
@@ -315,6 +315,7 @@ pub const Effect = union(enum) {
     inventory_validation: private_claims.InventoryValidation.Command,
     generation_validation: validation.Command,
     validation_seal: validation.SealCommand,
+    install: validation.InstallCommand,
 
     pub fn namespace(self: Effect) @FieldType(Native, "namespace") {
         return switch (self) {
@@ -324,6 +325,7 @@ pub const Effect = union(enum) {
             .inventory_validation => |value| value.binding.fence.namespace,
             .generation_validation => |value| value.binding.fence.namespace,
             .validation_seal => |value| value.binding.fence.namespace,
+            .install => |value| value.validation.command.binding.fence.namespace,
             .build => |value| value.binding.fence.namespace,
             .cancel_intent => |value| value.fence.namespace,
             .cancel_cleanup => |value| value.fence.namespace,
@@ -338,6 +340,7 @@ pub const Effect = union(enum) {
             .inventory_validation => |value| try value.validate(),
             .generation_validation => |value| try value.validate(),
             .validation_seal => |value| try value.validate(),
+            .install => |value| try value.validate(),
             .build => |value| try value.validate(),
             .cancel_intent => |value| try value.validate(),
             .cancel_cleanup => |value| {
@@ -355,6 +358,7 @@ pub const Effect = union(enum) {
             .inventory_validation => private_claims.InventoryValidation.max_wire_bytes,
             .generation_validation => validation.max_wire_bytes,
             .validation_seal => validation.Seal.max_wire_bytes,
+            .install => validation.Installed.max_wire_bytes,
             else => max_cancellation_wire_bytes,
         };
     }
@@ -1030,6 +1034,129 @@ pub const PreparedValidationSeal = struct {
     }
     pub fn preparePayload(self: *@This()) !void {
         try prepareNativePayload(self, "validation_seal", self.command, validation.Seal.max_wire_bytes);
+    }
+    pub fn finalizePayload(self: *@This(), position: Native) ![]const u8 {
+        return finalizeNativePayload(self, position);
+    }
+};
+
+pub const InstallOutcome = struct {
+    command: validation.InstallCommand,
+    position: Native,
+    duplicate: bool,
+    replication_pending: bool = false,
+    error_name: ?[]const u8 = null,
+    receipt: ?@import("relational_index_publication_progress.zig").Receipt = null,
+    pub fn validate(self: @This()) !void {
+        const expected = try self.command.receipt(self.position);
+        if (self.replication_pending and self.error_name == null) return error.InvalidPrivateIndexNativeReceipt;
+        if (self.receipt) |value| {
+            if (self.replication_pending or self.error_name != null or !std.meta.eql(value, expected)) return error.InvalidPrivateIndexNativeReceipt;
+        } else if (!self.replication_pending and self.error_name == null) return error.InvalidPrivateIndexNativeReceipt;
+    }
+};
+
+/// Owned off-lock installation preparation. Independent metadata/root
+/// authorization belongs to the receiving owner, not to this logical command.
+pub const PreparedInstall = struct {
+    pub const ApplyOutcome = InstallOutcome;
+    const SchemaData = struct {
+        prepared: @import("core.zig").PreparedSchemaMetadata,
+        json: []u8,
+        version_key: []u8,
+    };
+    alloc: Allocator,
+    command: validation.InstallCommand,
+    context: RequestContext = .{},
+    schema_data: ?SchemaData = null,
+    payload: ?[]u8 = null,
+    prefix_len: usize = 0,
+
+    pub fn init(alloc: Allocator, core: *@import("core.zig").DBCore, command: validation.InstallCommand, context: RequestContext) !@This() {
+        try context.ensureActive();
+        try command.validate();
+        var read = try core.store.beginReadTxn();
+        defer read.abort();
+        const binding = command.validation.command.binding;
+        if (try validation.Installed.load(alloc, &read, binding)) |installed| {
+            if (!std.meta.eql(installed.command, command)) return error.InvalidPrivateIndexNativeReceipt;
+            try installed.requireCurrent(alloc, &read);
+            return .{ .alloc = alloc, .command = command, .context = context };
+        }
+        try command.validateBefore(alloc, &read);
+        var candidate = try jobs.reopenCandidate(alloc, &read, binding);
+        defer candidate.deinit();
+        const view = try inputs.decode(candidate.inputs.bytes);
+        const json = try alloc.dupe(u8, view.after_json);
+        errdefer alloc.free(json);
+        const version_key = try schema_api.versionedSchemaKeyAlloc(alloc, binding.physical_candidate.schema_version);
+        errdefer alloc.free(version_key);
+        var parsed = try schema_api.parseValidatedTableSchema(alloc, json);
+        defer parsed.deinit(alloc);
+        const runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+        defer @import("../schema.zig").freeSchema(alloc, runtime);
+        const metadata = [_]@import("../docstore.zig").KVPair{ .{ .key = "\x00\x00__metadata__:schema_json", .value = json }, .{ .key = version_key, .value = json } };
+        var prepared = try core.prepareSchemaMetadataReservedIndex(runtime, &metadata, .{ .binding = binding, .candidate = &candidate });
+        errdefer prepared.deinit();
+        try context.ensureActive();
+        return .{ .alloc = alloc, .command = command, .context = context, .schema_data = .{ .prepared = prepared, .json = json, .version_key = version_key } };
+    }
+    pub fn deinit(self: *@This()) void {
+        if (self.schema_data) |*data| {
+            data.prepared.deinit();
+            self.alloc.free(data.version_key);
+            self.alloc.free(data.json);
+        }
+        if (self.payload) |bytes| self.alloc.free(bytes);
+        self.* = undefined;
+    }
+    pub fn validate(self: *const @This()) !void {
+        try self.context.ensureActive();
+        try self.command.validate();
+    }
+    pub fn namespace(self: *const @This()) @FieldType(Native, "namespace") {
+        return self.command.validation.command.binding.fence.namespace;
+    }
+    pub fn validateReplay(self: *const @This(), position: Native) !void {
+        try (Frame{ .effect = .{ .install = self.command }, .position = position }).validate();
+        _ = try self.command.receipt(position);
+    }
+    pub fn replayDuplicateOutcome(self: *const @This(), position: Native) InstallOutcome {
+        return .{ .command = self.command, .position = position, .duplicate = true };
+    }
+    pub fn requiresSchemaCommit(self: *const @This()) bool {
+        return if (self.schema_data) |data| data.prepared.publication != null else false;
+    }
+    pub fn commitSchema(self: *@This(), core: *@import("core.zig").DBCore, position: ?Native, participant: anytype) !InstallOutcome {
+        try self.validate();
+        const data = if (self.schema_data) |*value| value else return error.PrivateIndexPublicationRequired;
+        const metadata = [_]@import("../docstore.zig").KVPair{ .{ .key = "\x00\x00__metadata__:schema_json", .value = data.json }, .{ .key = data.version_key, .value = data.json } };
+        const installed = try core.commitPreparedSchemaMetadataReservedIndex(&data.prepared, &metadata, self.command, position, participant);
+        return .{ .command = self.command, .position = installed.position, .duplicate = false };
+    }
+    /// Only exact installed retries use the ordinary transaction branch. New
+    /// installation must use the shared schema writer above, never a second
+    /// independent schema/catalog transaction.
+    pub fn stage(self: *@This(), _: anytype, txn: anytype, position: ?Native) !InstallOutcome {
+        try self.validate();
+        if (self.requiresSchemaCommit()) return error.PrivateIndexPublicationRequired;
+        const installed = (try validation.Installed.load(self.alloc, txn, self.command.validation.command.binding)) orelse return error.InvalidPrivateIndexNativeReceipt;
+        try installed.requireCurrent(self.alloc, txn);
+        if (!std.meta.eql(installed.command, self.command)) return error.InvalidPrivateIndexNativeReceipt;
+        if (position) |expected| if (!std.meta.eql(expected, installed.position)) return error.InvalidPrivateIndexNativeReceipt;
+        return self.replayDuplicateOutcome(installed.position);
+    }
+    pub fn hasPublicationReceipt(_: *const @This()) bool {
+        return true;
+    }
+    pub fn populateReceipt(self: *const @This(), txn: anytype, outcome: *InstallOutcome) !void {
+        const installed = (try validation.Installed.load(self.alloc, txn, self.command.validation.command.binding)) orelse return error.InvalidPrivateIndexNativeReceipt;
+        try installed.requireCurrent(self.alloc, txn);
+        if (!std.meta.eql(installed.command, self.command) or !std.meta.eql(installed.position, outcome.position)) return error.InvalidPrivateIndexNativeReceipt;
+        outcome.receipt = try self.command.receipt(installed.position);
+    }
+    pub fn preparePayload(self: *@This()) !void {
+        try prepareNativePayload(self, "install", self.command, validation.Installed.max_wire_bytes);
     }
     pub fn finalizePayload(self: *@This(), position: Native) ![]const u8 {
         return finalizeNativePayload(self, position);

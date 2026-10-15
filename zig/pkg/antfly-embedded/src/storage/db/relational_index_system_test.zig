@@ -2319,6 +2319,143 @@ test "relational index build pages identity dispatch caches immutable candidates
                     try txn.put(range.range_key, moved);
                     try std.testing.expectError(error.ConstraintActivationOwnerChanged, activated.stage(&txn));
                 }
+                {
+                    // Isolated storage qualification only: copy logical KV
+                    // state, not the filesystem signing identity/audit files.
+                    // No metadata authorization or physical adoption is claimed.
+                    var install_directory = try @import("../../common/test_directory.zig").TestDirectory.init("native-index-install-commit");
+                    defer install_directory.cleanup();
+                    var installed_db = try db_mod.DB.open(alloc, install_directory.path(), options);
+                    var installed_db_open = true;
+                    defer if (installed_db_open) installed_db.close();
+                    {
+                        var source_read = try db.core.store.beginReadTxn();
+                        defer source_read.abort();
+                        var source_cursor = try source_read.openCursor();
+                        defer source_cursor.close();
+                        // Seed physical fixture state without interpreting it
+                        // as one application mutation containing both producer
+                        // rows and retention/source-authority controls.
+                        var destination_txn = try installed_db.core.store.runtime_store.beginWrite();
+                        errdefer destination_txn.abort();
+                        var entry = try source_cursor.first();
+                        while (entry) |item| : (entry = try source_cursor.next()) try destination_txn.put(item.key, item.value);
+                        try destination_txn.commit();
+                    }
+                    installed_db.close();
+                    installed_db_open = false;
+                    installed_db = try db_mod.DB.open(alloc, install_directory.path(), options);
+                    installed_db_open = true;
+                    try std.testing.expect(installed_db.root_incarnation != db.root_incarnation);
+                    const installed_public_key = try api.versionedSchemaKeyAlloc(alloc, binding.physical_candidate.schema_version);
+                    defer alloc.free(installed_public_key);
+                    const install_metadata = [_]docstore.KVPair{ metadata[0], .{ .key = installed_public_key, .value = after } };
+                    var install_schema = try installed_db.core.prepareSchemaMetadataReservedIndex(runtime, &install_metadata, .{ .binding = binding, .candidate = &candidate });
+                    var install_schema_owned = true;
+                    defer if (install_schema_owned) install_schema.deinit();
+                    var schema_digest: [32]u8 = undefined;
+                    std.crypto.hash.Blake3.hash(install_schema.encoded, &schema_digest, .{});
+                    var activation_digest: [32]u8 = undefined;
+                    std.crypto.hash.Blake3.hash(install_schema.reserved_activation.?.value, &activation_digest, .{});
+                    const install_command: Verification.InstallCommand = .{ .validation = install_schema.reserved_activation.?.seal, .metadata_decision = @splat(7), .schema_digest = schema_digest, .activation_digest = activation_digest };
+                    const InstallCommitHook = struct {
+                        const marker = "\x00\x00__metadata__:native-index-install-test-marker";
+                        fail: bool,
+                        pub fn stage(hook: @This(), txn: anytype, installed_record: Verification.Installed) !void {
+                            var bytes: [8]u8 = undefined;
+                            std.mem.writeInt(u64, &bytes, installed_record.position.sequence, .little);
+                            try txn.put(marker, &bytes);
+                            if (hook.fail) return error.TestInstallCommitFailed;
+                        }
+                    };
+                    {
+                        installed_db.core.lockApplyExclusive();
+                        defer installed_db.core.unlockApplyExclusive();
+                        try std.testing.expectError(error.InvalidPrivateIndexInputs, installed_db.core.commitPreparedSchemaMetadataReservedIndex(&install_schema, &metadata, install_command, null, null));
+                        var altered_metadata = install_metadata;
+                        altered_metadata[0].value = "{}";
+                        try std.testing.expectError(error.InvalidPrivateIndexInputs, installed_db.core.commitPreparedSchemaMetadataReservedIndex(&install_schema, &altered_metadata, install_command, null, null));
+                        try std.testing.expectError(error.TestInstallCommitFailed, installed_db.core.commitPreparedSchemaMetadataReservedIndex(&install_schema, &install_metadata, install_command, null, InstallCommitHook{ .fail = true }));
+                    }
+                    try std.testing.expectEqual(@as(u32, 1), installed_db.core.schema.?.version);
+                    try std.testing.expectEqual(@as(u32, 1), installed_db.core.table_catalog.active_schema_version);
+                    {
+                        var failed_read = try installed_db.core.store.beginReadTxn();
+                        defer failed_read.abort();
+                        try std.testing.expectError(error.NotFound, failed_read.get(InstallCommitHook.marker));
+                        try std.testing.expect(try Verification.Installed.load(alloc, &failed_read, binding) == null);
+                        try @import("relational_index_owner_job.zig").requireReserved(&failed_read, binding);
+                        try std.testing.expectEqual(sequence + 1, (try authority.load(&failed_read)).?.sequence);
+                    }
+                    install_schema.deinit();
+                    install_schema_owned = false;
+                    var install_packet: native.PreparedInstall = .{ .alloc = alloc, .command = install_command };
+                    defer install_packet.deinit();
+                    try install_packet.preparePayload();
+                    const installed_position: @import("receipt_position.zig").Native = .{ .namespace = binding.fence.namespace, .sequence = sequence + 2 };
+                    const install_payload = try install_packet.finalizePayload(installed_position);
+                    var install_record: @import("replication_record.zig").Record = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 5, .previous_lsn = 4, .payload = install_payload };
+                    {
+                        var pinned_before = installed_db.core.schema_registry.acquire().?;
+                        defer pinned_before.release();
+                        try replication_ingress.applyRecord(&installed_db, install_record);
+                        try replication_ingress.applyRecord(&installed_db, install_record);
+                        try std.testing.expectEqual(@as(u32, 1), pinned_before.version());
+                    }
+                    const committed: Verification.Installed = .{ .command = install_command, .position = installed_position };
+                    try std.testing.expectEqual(@as(u64, 5), try installed_db.replicationAppliedSequence());
+                    try std.testing.expectEqual(@as(u32, 2), installed_db.core.schema.?.version);
+                    try std.testing.expectEqual(@as(u32, 2), installed_db.core.table_catalog.active_schema_version);
+                    try std.testing.expectEqual(sequence + 2, committed.position.sequence);
+                    installed_db.close();
+                    installed_db_open = false;
+                    installed_db = try db_mod.DB.open(alloc, install_directory.path(), options);
+                    installed_db_open = true;
+                    try std.testing.expectEqual(@as(u32, 2), installed_db.core.schema.?.version);
+                    try std.testing.expectEqual(@as(u32, 2), installed_db.core.table_catalog.active_schema_version);
+                    {
+                        var installed_read = try installed_db.core.store.beginReadTxn();
+                        defer installed_read.abort();
+                        try std.testing.expectEqualDeep(committed, (try Verification.Installed.load(alloc, &installed_read, binding)).?);
+                        try std.testing.expectError(error.NotFound, installed_read.get(InstallCommitHook.marker));
+                        try std.testing.expectEqualStrings(after, try installed_read.get(installed_public_key));
+                        try activation.requireReady(&installed_read, candidate.next.catalog);
+                        try std.testing.expect((try @import("relational_integrity_topology.zig").current(&installed_read)).?.eql(binding.fence));
+                    }
+                    {
+                        var duplicate_install = try installed_db.prepareNativeIndexOwnerInstallation(install_command, .{});
+                        defer duplicate_install.deinit();
+                        try std.testing.expect(!duplicate_install.requiresSchemaCommit());
+                        const installed_retry = try installed_db.applyPreparedNativeIndexOwnerInstallation(&duplicate_install, null);
+                        try installed_retry.validate();
+                        try std.testing.expect(installed_retry.duplicate);
+                        try std.testing.expectEqualDeep(try install_command.receipt(committed.position), installed_retry.receipt.?);
+                    }
+                    const catalog_generation = installed_db.core.table_catalog.generation;
+                    install_record.lsn = 6;
+                    install_record.previous_lsn = 5;
+                    try replication_ingress.applyRecord(&installed_db, install_record);
+                    try replication_ingress.applyRecord(&installed_db, install_record);
+                    try std.testing.expectEqual(@as(u64, 6), try installed_db.replicationAppliedSequence());
+                    try std.testing.expectEqual(catalog_generation, installed_db.core.table_catalog.generation);
+                    {
+                        var duplicate_read = try installed_db.core.store.beginReadTxn();
+                        defer duplicate_read.abort();
+                        try std.testing.expectEqual(committed.position.sequence, (try authority.load(&duplicate_read)).?.sequence);
+                    }
+                    var wrong_position = committed.position;
+                    wrong_position.sequence += 1;
+                    install_record.lsn = 7;
+                    install_record.previous_lsn = 6;
+                    install_record.payload = try install_packet.finalizePayload(wrong_position);
+                    try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, replication_ingress.applyRecord(&installed_db, install_record));
+                    try std.testing.expectEqual(@as(u64, 6), try installed_db.replicationAppliedSequence());
+                    const installed_row = (try installed_db.get(alloc, "row000")).?;
+                    defer alloc.free(installed_row);
+                    const source_row = (try db.get(alloc, "row000")).?;
+                    defer alloc.free(source_row);
+                    try std.testing.expectEqualStrings(source_row, installed_row);
+                }
                 var read = try db.core.store.beginReadTxn();
                 defer read.abort();
                 try @import("relational_index_owner_job.zig").requireReserved(&read, binding);

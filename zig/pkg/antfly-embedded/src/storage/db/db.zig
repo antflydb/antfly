@@ -8000,6 +8000,14 @@ pub const DB = struct {
                     defer prepared.deinit();
                     _ = try self.applyPreparedNativeIndexEffect(&prepared, .{ .position = frame.position, .lsn = sequence });
                 },
+                .install => |command| {
+                    var prepared = self.prepareNativeIndexOwnerInstallation(command, .{}) catch |err| {
+                        if (try self.replicationMutationAlreadyApplied(sequence)) return;
+                        return err;
+                    };
+                    defer prepared.deinit();
+                    _ = try self.applyPreparedNativeIndexOwnerInstallation(&prepared, .{ .position = frame.position, .lsn = sequence });
+                },
                 .control => |command| {
                     var prepared = self.prepareNativeIndexOwnerControl(command) catch |err| {
                         // Another replay may retire inputs during preparation.
@@ -8497,6 +8505,16 @@ pub const DB = struct {
     }
 
     /// One commit/replication machinery for native index controls and intent.
+    /// Storage adapter only. The receiving owner must independently authorize
+    /// the metadata decision and physical root before preparing installation.
+    pub fn prepareNativeIndexOwnerInstallation(self: *DB, command: @import("relational_index_validation.zig").InstallCommand, context: @import("../../api/operation.zig").RequestContext) !native_index_control.PreparedInstall {
+        return native_index_control.PreparedInstall.init(self.alloc, self.core, command, context);
+    }
+
+    pub fn applyPreparedNativeIndexOwnerInstallation(self: *DB, prepared: *native_index_control.PreparedInstall, replay: ?NativeIndexReplay) !native_index_control.InstallOutcome {
+        return self.applyPreparedNativeIndexEffect(prepared, replay);
+    }
+
     /// Preparation owns its off-lock payload; only its bounded effect stages
     /// under apply-exclusive, together with the transport marker and outbox.
     fn applyPreparedNativeIndexEffect(self: *DB, prepared: anytype, replay: ?NativeIndexReplay) !@TypeOf(prepared.*).ApplyOutcome {
@@ -8527,27 +8545,34 @@ pub const DB = struct {
             try self.lockApplyForPortableRuntime();
             defer self.core.unlockApply();
             if (replay == null) try self.enforceReplicationWriteGate();
-            var txn = try self.core.store.beginWriteTxn();
-            errdefer txn.abort();
-            if (replay) |value| {
-                // Recheck in the same serialized transaction as the effect.
-                // The off-lock fast path cannot prevent a newer replay from
-                // committing while this command is being prepared.
-                const current = try apply_receipts.readReplicationAppliedSequenceTxn(&txn);
-                if (current >= value.lsn) {
-                    txn.abort();
-                    return prepared.replayDuplicateOutcome(value.position);
-                }
-            }
-            const forwarded: ?@import("receipt_position.zig").Native = if (replay) |value| value.position else null;
-            outcome = try prepared.stage(self.core, &txn, forwarded);
-            if (replay) |value| {
-                var marker_buf: [replication_applied_lsn_value_len]u8 = undefined;
-                const marker = replicationAppliedSequenceWrite(value.lsn, &marker_buf);
-                try txn.put(marker.key, marker.value);
-            }
-            if (mirrored and !outcome.duplicate) try self.stageRestoreStagingReplicationOutbox(&txn, try prepared.finalizePayload(outcome.position));
-            try txn.commit();
+            if (comptime @hasDecl(@TypeOf(prepared.*), "requiresSchemaCommit")) {
+                if (prepared.requiresSchemaCommit()) {
+                    // The apply fence excludes marker writers through the
+                    // shared schema commit. Its participant stages the marker
+                    // and outbox inside THAT transaction, not a follow-up one.
+                    if (replay) |value| {
+                        var read = try self.core.store.beginReadTxn();
+                        defer read.abort();
+                        if (try apply_receipts.readReplicationAppliedSequenceTxn(&read) >= value.lsn)
+                            return prepared.replayDuplicateOutcome(value.position);
+                    }
+                    const SchemaParticipant = struct {
+                        db: *DB,
+                        prepared: @TypeOf(prepared),
+                        replay: ?NativeIndexReplay,
+                        mirrored: bool,
+                        pub fn stage(participant: @This(), txn: anytype, installed: @import("relational_index_validation.zig").Installed) !void {
+                            if (participant.replay) |value| {
+                                var marker_buf: [replication_applied_lsn_value_len]u8 = undefined;
+                                const marker = replicationAppliedSequenceWrite(value.lsn, &marker_buf);
+                                try txn.put(marker.key, marker.value);
+                            }
+                            if (participant.mirrored) try participant.db.stageRestoreStagingReplicationOutbox(txn, try participant.prepared.finalizePayload(installed.position));
+                        }
+                    };
+                    outcome = try prepared.commitSchema(self.core, if (replay) |value| value.position else null, SchemaParticipant{ .db = self, .prepared = prepared, .replay = replay, .mirrored = mirrored });
+                } else outcome = try self.stagePreparedNativeIndexTransaction(prepared, replay, mirrored);
+            } else outcome = try self.stagePreparedNativeIndexTransaction(prepared, replay, mirrored);
         }
         // Snapshot/commit barriers must not be held across publication or an
         // acknowledgement wait. A committed outbox remains an explicit pending
@@ -8571,6 +8596,31 @@ pub const DB = struct {
                 return outcome;
             };
         }
+        return outcome;
+    }
+
+    /// Caller holds snapshot/replay admission and apply-exclusive. Ordinary
+    /// effects and already-installed retries share the same atomic marker and
+    /// outbox path; new schema installation uses the shared writer above.
+    fn stagePreparedNativeIndexTransaction(self: *DB, prepared: anytype, replay: ?NativeIndexReplay, mirrored: bool) !@TypeOf(prepared.*).ApplyOutcome {
+        var txn = try self.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        if (replay) |value| {
+            const current = try apply_receipts.readReplicationAppliedSequenceTxn(&txn);
+            if (current >= value.lsn) {
+                txn.abort();
+                return prepared.replayDuplicateOutcome(value.position);
+            }
+        }
+        const forwarded: ?@import("receipt_position.zig").Native = if (replay) |value| value.position else null;
+        const outcome = try prepared.stage(self.core, &txn, forwarded);
+        if (replay) |value| {
+            var marker_buf: [replication_applied_lsn_value_len]u8 = undefined;
+            const marker = replicationAppliedSequenceWrite(value.lsn, &marker_buf);
+            try txn.put(marker.key, marker.value);
+        }
+        if (mirrored and !outcome.duplicate) try self.stageRestoreStagingReplicationOutbox(&txn, try prepared.finalizePayload(outcome.position));
+        try txn.commit();
         return outcome;
     }
 
