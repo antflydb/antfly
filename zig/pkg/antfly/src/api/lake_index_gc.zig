@@ -370,6 +370,7 @@ pub const Collector = struct {
                     try self.markPages(a, root.domain, root.directories.routing, false);
                     try self.markPages(a, root.domain, root.pack_ownership, false);
                     try self.markPages(a, root.domain, root.source_routes, false);
+                    try self.markPages(a, root.domain, root.tie_bounds, false);
                     try self.markPages(a, root.domain, root.term_statistics, false);
                     for (root.statistics_deltas) |delta_run| try self.markPages(a, root.domain, delta_run.page, false);
                     try self.markPages(a, root.domain, root.term_directory.branches, false);

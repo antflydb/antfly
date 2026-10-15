@@ -900,3 +900,16 @@ Cold Iceberg manifest plans use shared singleflight construction after fresh
 catalog resolution, so concurrent readers share immutable data without sharing
 request authority. Missing cloud generation-map pages are derived-artifact loss
 and admit rebuilding; provider authorization failures remain operational errors.
+
+
+Native serving refinements intersect complete indexed-predicate pack proofs with
+the global score frontier, and use regex/fuzzy automata to skip impossible
+vocabulary ranges before postings admission. Serving packs also publish paged,
+authenticated minimum logical positions for safe equal-score pruning under the
+default comparator. These pages participate in publication reuse and reader-safe
+GC; existing publications acquire them during the next serving refresh.
+Retained native WAL cuts pin independently cached row-group partition indexes
+and borrow their decoded row values, so unchanged groups share indexes and key
+filters across cuts without reconstructing the entire overlay. Legacy cuts keep
+their existing compatibility path. Exact counts, typed tie ordering and recent
+row visibility preserve their conservative execution contracts.

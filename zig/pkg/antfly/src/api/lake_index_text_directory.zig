@@ -172,6 +172,7 @@ pub const Mutations = struct {
     a: A,
     sort: local.sql_spill.Sort,
     forest: @import("lake_index_delta_runs.zig").Forest,
+    reduction: @FieldType(tree.Store, "reduce") = null,
     ordinal: u64 = 0,
     pub fn init(a: A, manager: *local.sql_spill.Manager, storage: tree.Store) Mutations {
         var sort = local.sql_spill.Sort.init(a, manager, &.{.{}}, 1024 * 1024);
@@ -238,7 +239,8 @@ pub const Mutations = struct {
     pub fn finish(self: *Mutations, prior: ?tree.Ref) !?tree.Ref {
         try self.flush();
         const changes = try self.forest.finish() orelse return prior;
-        const storage = self.forest.store;
+        var storage = self.forest.store;
+        if (self.reduction) |reduction| storage.reduce = reduction;
         var delta = try tree.Cursor.init(self.a, storage, changes, "", null);
         defer delta.deinit();
         if (prior != null and changes.records < @max(4096, prior.?.records / 4)) {

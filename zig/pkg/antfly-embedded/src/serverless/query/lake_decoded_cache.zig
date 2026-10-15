@@ -33,6 +33,8 @@ pub const Item = struct {
     budget: Budget,
     arena: std.heap.ArenaAllocator,
     payload: Payload = .{ .columns = &.{} },
+    /// Close extension resources while its immutable dependencies are pinned.
+    extension_deinit: ?*const fn (*anyopaque) void = null,
     // Snapshot-local canonical row-ID ordering and totals, computed once.
     file_order: ?[]usize = null,
     file_rank: ?[]usize = null,
@@ -57,6 +59,7 @@ pub const Item = struct {
     fn destroy(self: *Item, cache: *Cache) void {
         const parent = self.dependency;
         const a = self.budget.backing;
+        if (self.extension_deinit) |close| close(self.payload.extension);
         for (self.dependencies) |item| cache.releaseLocked(item);
         for (self.foreign_dependencies) |lease| {
             std.debug.assert(lease.cache != cache);

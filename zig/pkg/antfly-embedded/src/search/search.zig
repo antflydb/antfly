@@ -3106,6 +3106,45 @@ pub const TermPattern = struct {
         if (self.allocation_failed) return error.OutOfMemory;
         return matched;
     }
+    /// Return a viable prefix strictly after this term, skipping dead dictionary
+    /// subtrees. null proves exhaustion; the caller owns the returned key.
+    pub fn seekAfter(self: *TermPattern, a: Allocator, term: []const u8) !?[]u8 {
+        if (self.allocation_failed) return error.OutOfMemory;
+        if (self.impossible) return null;
+        const automaton = if (self.regex) |*regex| regex.automaton() else if (self.fuzzy) |*fuzzy| fuzzy.automaton() else return error.InvalidArgument;
+        const states = try a.alloc(usize, term.len + 1);
+        defer a.free(states);
+        states[0] = automaton.start();
+        if (self.allocation_failed) return error.OutOfMemory;
+        var length: usize = 0;
+        while (length < term.len) : (length += 1) {
+            states[length + 1] = try self.checkedAccept(automaton, states[length], term[length]);
+            if (!automaton.canMatch(states[length + 1])) break;
+        }
+        if (length == term.len) {
+            for (0..256) |byte| if (automaton.canMatch(try self.checkedAccept(automaton, states[length], @intCast(byte)))) {
+                const next = try a.alloc(u8, length + 1);
+                @memcpy(next[0..length], term);
+                next[length] = @intCast(byte);
+                return next;
+            };
+        } else length += 1;
+        while (length != 0) {
+            length -= 1;
+            for (@as(usize, term[length]) + 1..256) |byte| if (automaton.canMatch(try self.checkedAccept(automaton, states[length], @intCast(byte)))) {
+                const next = try a.alloc(u8, length + 1);
+                @memcpy(next[0..length], term[0..length]);
+                next[length] = @intCast(byte);
+                return next;
+            };
+        }
+        return null;
+    }
+    fn checkedAccept(self: *TermPattern, automaton: anytype, state: usize, byte: u8) !usize {
+        const next = automaton.accept(state, byte);
+        if (self.allocation_failed) return error.OutOfMemory;
+        return next;
+    }
     fn allocator(self: *TermPattern) Allocator {
         return .{ .ptr = self, .vtable = &.{ .alloc = allocate, .resize = resize, .remap = remap, .free = free } };
     }
@@ -3126,6 +3165,40 @@ pub const TermPattern = struct {
         @as(*TermPattern, @ptrCast(@alignCast(raw))).budget.allocator().rawFree(bytes, alignment, ra);
     }
 };
+
+test "external lake metadata navigation automaton seeks never skip matching byte terms" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var terms: std.ArrayList([]const u8) = .empty;
+    const alphabet = [_]u8{ 0, 'a', 'b', 'c', 255 };
+    try terms.append(arena.allocator(), "");
+    for (alphabet) |x| {
+        try terms.append(arena.allocator(), try arena.allocator().dupe(u8, &.{x}));
+        for (alphabet) |y| {
+            try terms.append(arena.allocator(), try arena.allocator().dupe(u8, &.{ x, y }));
+            for (alphabet) |z| try terms.append(arena.allocator(), try arena.allocator().dupe(u8, &.{ x, y, z }));
+        }
+    }
+    std.mem.sort([]const u8, terms.items, {}, struct {
+        fn less(_: void, l: []const u8, r: []const u8) bool {
+            return std.mem.lessThan(u8, l, r);
+        }
+    }.less);
+    for ([_]SearchQuery{ .{ .regexp = .{ .field = "body", .pattern = "a.*b" } }, .{ .regexp = .{ .field = "body", .pattern = "(ab|bc)" } }, .{ .regexp = .{ .field = "body", .pattern = "[^a]*" } }, .{ .fuzzy = .{ .field = "body", .term = "ab", .max_edits = 1 } } }) |query| {
+        const matcher = try TermPattern.create(a, query);
+        defer matcher.deinit();
+        for (terms.items, 0..) |term, i| {
+            const seek = try matcher.seekAfter(a, term);
+            defer if (seek) |key| a.free(key);
+            if (seek) |key| try std.testing.expect(std.mem.order(u8, key, term) == .gt);
+            for (terms.items[i + 1 ..]) |later| if (try matcher.matches(later)) {
+                try std.testing.expect(seek != null);
+                try std.testing.expect(std.mem.order(u8, later, seek.?) != .lt);
+            };
+        }
+    }
+}
 
 test "external lake metadata navigation pattern allocation failures never prove absence" {
     const a = std.testing.allocator;
@@ -3253,7 +3326,7 @@ pub const TextNavigationPlan = struct {
             },
         }
     }
-    pub const RangeBound = struct { upper: f32, possible: bool };
+    pub const RangeBound = struct { upper: f32, possible: bool, exact: bool = false };
     /// Exact membership counts for a single positive term (including one-token
     /// analyzed matches and equivalent wrappers). The caller proves that no
     /// private visibility mask, residual predicate, or accepted overlay applies.
@@ -3280,11 +3353,12 @@ pub const TextNavigationPlan = struct {
         // order. Cover both canonical paths before the physical mask is known.
         const plain = try self.nodeBound(self.root, source);
         const constrained = try self.nodeBound(self.constrained_root, source);
-        return .{ .upper = @max(plain.upper, constrained.upper), .possible = plain.possible or constrained.possible };
+        return .{ .upper = @max(plain.upper, constrained.upper), .possible = plain.possible or constrained.possible, .exact = plain.exact and constrained.exact };
     }
     fn nodeBound(self: *const TextNavigationPlan, node: *const LoweredText, source: Summaries) anyerror!RangeBound {
         var upper: f32 = 0;
         var possible = true;
+        var exact = true;
         switch (node.kind) {
             .none => possible = false,
             .all, .bitmap => return .{ .upper = std.math.inf(f32), .possible = true },
@@ -3300,6 +3374,7 @@ pub const TextNavigationPlan = struct {
                 upper = node.boost;
             },
             .term => {
+                exact = false;
                 const term = node.term.?;
                 const stats = try @constCast(&self.stats).get(term.field, term.term);
                 const summary = try source.read(source.ptr, term.field, term.term, stats.average, self.config);
@@ -3310,6 +3385,7 @@ pub const TextNavigationPlan = struct {
             .phrase => {
                 // Exact phrase frequency cannot exceed first-position TF.
                 // Every position needs at least one present alternative.
+                exact = !node.scored;
                 var idf: f32 = 0;
                 var first: ?index_mod.IndexSnapshot.TextTermSummary = null;
                 for (node.groups, 0..) |group, i| {
@@ -3330,6 +3406,7 @@ pub const TextNavigationPlan = struct {
                 for (node.must) |child| {
                     const value = try self.nodeBound(child, source);
                     possible = possible and value.possible;
+                    exact = exact and value.exact;
                     upper += value.upper;
                 }
                 var optional: f32 = 0;
@@ -3337,6 +3414,7 @@ pub const TextNavigationPlan = struct {
                 for (node.should) |child| {
                     const value = try self.nodeBound(child, source);
                     present += @intFromBool(value.possible);
+                    exact = exact and value.exact;
                     const score = @max(0, value.upper);
                     if (node.group_optional) optional += score else upper += score;
                 }
@@ -3345,9 +3423,9 @@ pub const TextNavigationPlan = struct {
                 upper *= node.boost;
             },
         }
-        if (!possible) return .{ .upper = 0, .possible = false };
+        if (!possible) return .{ .upper = 0, .possible = false, .exact = true };
         if (node.boost < 0 or !std.math.isFinite(upper)) return .{ .upper = std.math.inf(f32), .possible = true };
-        return .{ .upper = if (upper > 0) std.math.nextAfter(f32, upper * 1.000001, std.math.inf(f32)) else upper, .possible = true };
+        return .{ .upper = if (upper > 0 and !exact) std.math.nextAfter(f32, upper * 1.000001, std.math.inf(f32)) else upper, .possible = true, .exact = exact };
     }
 };
 

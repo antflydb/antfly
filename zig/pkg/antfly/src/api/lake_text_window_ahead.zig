@@ -21,10 +21,12 @@ const scheduler = @import("antfly_local_sources").sql_parallel_scheduler;
 const Window = @import("lake_index_text_directory.zig").RoutingCursor.Window;
 const Id = [32]u8;
 const Pin = @import("antfly_local_sources").storage_db_query_search_exec.PinnedTextSource;
+const Position = @import("lake_index_text_directory.zig").Position;
 const Self = @This();
 pub const Source = struct {
     ptr: *anyopaque,
     next: *const fn (*anyopaque, []Id, ?f32) anyerror!?Window,
+    next_ranked: ?*const fn (*anyopaque, []Id, ?f32, ?Position) anyerror!?Window = null,
     prepare: ?*const fn (*anyopaque, []const Id) anyerror!?Pin = null,
 };
 source: Source,
@@ -33,13 +35,14 @@ scheduling: *scheduler.Scheduler,
 ids: [64]Id = undefined,
 limit: usize = 1,
 cutoff: ?f32 = null,
+position: ?Position = null,
 task: ?scheduler.Task(anyerror!?Window) = null,
 prepared: ?Pin = null,
 pub fn init(source: Source, io: ?std.Io) Self {
     return .{ .source = source, .io = io, .scheduling = scheduler.global() };
 }
 fn run(self: *Self) anyerror!?Window {
-    const window = (try self.source.next(self.source.ptr, self.ids[0..self.limit], self.cutoff)) orelse return null;
+    const window = (if (self.source.next_ranked) |ranked| try ranked(self.source.ptr, self.ids[0..self.limit], self.cutoff, self.position) else try self.source.next(self.source.ptr, self.ids[0..self.limit], self.cutoff)) orelse return null;
     if (self.source.prepare) |prepare| {
         var pin = (prepare(self.source.ptr, window.identities) catch null) orelse return window;
         self.prepared = pin.share(std.heap.page_allocator) catch {
@@ -50,6 +53,9 @@ fn run(self: *Self) anyerror!?Window {
     return window;
 }
 pub fn next(self: *Self, limit: usize, cutoff: ?f32) !?Window {
+    return self.nextRanked(limit, cutoff, null);
+}
+pub fn nextRanked(self: *Self, limit: usize, cutoff: ?f32, position: ?Position) !?Window {
     if (self.task) |task| {
         var pending = task;
         self.task = null;
@@ -57,6 +63,7 @@ pub fn next(self: *Self, limit: usize, cutoff: ?f32) !?Window {
     }
     self.limit = @min(self.ids.len, @max(1, limit));
     self.cutoff = cutoff;
+    self.position = position;
     return self.run();
 }
 pub fn takePrepared(self: *Self) ?Pin {
@@ -65,9 +72,13 @@ pub fn takePrepared(self: *Self) ?Pin {
     return pin;
 }
 pub fn prefetch(self: *Self, limit: usize, cutoff: ?f32) void {
+    self.prefetchRanked(limit, cutoff, null);
+}
+pub fn prefetchRanked(self: *Self, limit: usize, cutoff: ?f32, position: ?Position) void {
     std.debug.assert(self.task == null and self.prepared == null);
     self.limit = @min(self.ids.len, @max(1, limit));
     self.cutoff = cutoff;
+    self.position = position;
     if (self.io) |io| self.task = self.scheduling.submitIoTransient(io, 16 * 1024 * 1024, run, .{self});
 }
 pub fn deinit(self: *Self) void {

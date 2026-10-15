@@ -76,17 +76,17 @@ pub const Part = struct {
         std.debug.assert(self.budget.live == 0);
         self.budget.backing.destroy(self);
     }
-    fn build(backing: A, keys: []const []const u8, previous: ?*Part, delta: []const Entry) !*Part {
+    fn build(backing: A, keys: []const []const u8, previous: ?*Part, delta: []const Entry, borrow_rows: bool) !*Part {
         const self = try backing.create(Part);
         self.* = .{ .budget = .{ .backing = backing, .limit = 128 * 1024 * 1024 } };
         self.arena = .init(self.budget.allocator());
         errdefer self.release();
-        return self.fill(keys, previous, delta) catch |err| {
+        return self.fill(keys, previous, delta, borrow_rows) catch |err| {
             if (err == error.OutOfMemory and self.budget.isExhausted()) return error.LakeOverlayTooLarge;
             return err;
         };
     }
-    fn fill(self: *Part, keys: []const []const u8, previous: ?*Part, delta: []const Entry) !*Part {
+    fn fill(self: *Part, keys: []const []const u8, previous: ?*Part, delta: []const Entry, borrow_rows: bool) !*Part {
         const backing = self.budget.backing;
         var scratch = std.heap.ArenaAllocator.init(self.budget.allocator());
         defer scratch.deinit();
@@ -110,7 +110,7 @@ pub const Part = struct {
         var hash = std.crypto.hash.Blake3.init(.{});
         for (ids, entries, changes) |id, *entry, *change| {
             const source = latest.get(id).?;
-            change.* = .{ .op = source.op, .row = try local.storage_typed_json.clone(a, source.row) };
+            change.* = .{ .op = source.op, .row = if (borrow_rows) source.row else try local.storage_typed_json.clone(a, source.row) };
             entry.* = .{ .id = try a.dupe(u8, id), .change = change.* };
             if (change.op == .upsert) {
                 try live.append(a, entry.id);
@@ -141,6 +141,7 @@ pub const Part = struct {
 };
 pub const Image = struct {
     a: A,
+    borrowed: bool = false,
     parts: [256]?*Part = @splat(null),
     blocks: [256][]const Change = @splat(&.{}),
     block_digests: [256][32]u8 = @splat(@splat(0)),
@@ -149,12 +150,21 @@ pub const Image = struct {
     change_count: usize = 0,
     rebuilt_rows: usize = 0,
     pub fn release(self: *Image) void {
+        std.debug.assert(!self.borrowed);
         for (self.parts) |part| if (part) |owned| owned.release();
         for (self.key_fields) |key| self.a.free(key);
         self.a.free(self.key_fields);
         self.a.destroy(self);
     }
+    /// Row bytes belong to the enclosing decoded group. Its cleanup releases
+    /// this image before destroying the group's row arena.
+    pub fn fromBorrowedChanges(a: A, delta: ingestion.Pending) !*Image {
+        return build(a, null, delta, true);
+    }
     pub fn update(a: A, previous: ?*const Image, delta: ingestion.Pending) !*Image {
+        return build(a, previous, delta, false);
+    }
+    fn build(a: A, previous: ?*const Image, delta: ingestion.Pending, borrow_rows: bool) !*Image {
         const self = try a.create(Image);
         self.* = .{ .a = a };
         errdefer self.release();
@@ -180,7 +190,7 @@ pub const Image = struct {
             try changed[partition(id)].append(sa, .{ .id = id, .change = change });
         }
         for (&self.parts, changed) |*part, changes| if (changes.items.len != 0) {
-            const next = try Part.build(a, keys, part.*, changes.items);
+            const next = try Part.build(a, keys, part.*, changes.items, borrow_rows);
             if (part.*) |old| old.release();
             part.* = next;
             self.rebuilt_rows += next.entries.len;

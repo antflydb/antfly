@@ -4343,3 +4343,55 @@ Qualification on merged main `f56cf1f4c7` for selective pattern navigation:
 Provider retention qualification and archive-scale latency/RSS measurements
 remain deferred. These fixture checks establish correctness and bounded work;
 they do not claim an archive-scale timing improvement.
+
+
+### PR #1112: intersected score navigation, vocabulary seeks, retained views and ties
+
+Indexed metadata pack proofs now restrict the publication-wide score frontier.
+The frontier owns a sorted copy of the bounded pack identities and clips each
+candidate range before reading term envelopes. Row predicates remain residual
+checks under the same publication. An empty proof admits no archive packs;
+recent WAL rows remain independently admitted and scored with global statistics.
+
+Regex and fuzzy expansion now use the scorer's automaton to seek to the next
+viable byte prefix in the authenticated global dictionary. Dead prefixes skip
+sibling dictionary pages through the existing forward cursor. Expansion keeps
+the 128-match, 4096-candidate, automaton-memory and metadata-read limits; exceeding
+a limit remains unknown and uses complete bounded admission. Allocation failure
+cannot become an absence proof. Wildcards retain literal-prefix seeks.
+
+Native retained row groups build independently owned partition indexes and key
+filters once, borrowing the group's already decoded row values. Each decoded cut
+keeps only a small composite image view and pins its groups. Unchanged groups
+share row indexes, stable IDs, fingerprints and predicate syntax across cuts;
+they do not flatten into a new full row map or JSON key disjunction. Legacy cuts
+retain their existing decoding path. Group cleanup releases its indexes before
+its row arena, and eviction cannot invalidate a cut's foreign group leases.
+
+Serving compaction publishes an authenticated tree of minimum logical file/rank
+positions per pack. Internal reductions store the minimum over each subtree.
+Appends and replacements update only changed pack paths; older publications
+bootstrap this navigation from manifests/spans on their next refresh. GC and
+reuse verification include these pages. Ranked admission carries an immutable
+score/tie cutoff through bounded lookahead. Equal-score pruning requires a
+logical-position proof under the default comparator; typed secondary ordering,
+recent ties, count-only and full-match evaluation retain conservative admission.
+Constant-score bounds avoid unnecessary floating-point inflation; BM25 bounds
+retain their rounding margin.
+
+Regression qualification includes large dictionaries with over 4096 irrelevant
+terms, differential byte-automaton seeks, filtered competitive admission,
+reversed physical/logical pack order, shared retained-partition identity and
+real Parquet tie/filter comparisons before and after restart. Archive-scale
+latency/RSS benchmarks and live-provider retention qualification remain deferred.
+
+
+Qualification on the final refinement revision: the default shared-owner CLI
+built in Debug mode; lake integration passed 172 shared-engine and 296 server
+tests (468 total), focused navigation/ownership checks passed 9 shared-engine
+and 53 server tests (62 total), and all 46 real Parquet/Iceberg E2Es passed in
+309.55 seconds. The real-file fixture compares constant-score ties and indexed
+filters with independent full admission before and after restart. Native error
+transport generation, Zig formatting, Python lint/formatting, whitespace,
+licenses and the Apache product boundary also passed. Fresh origin/main remained
+at f56cf1f4c7 and was already included in the branch.

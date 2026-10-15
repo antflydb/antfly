@@ -28,13 +28,20 @@ const Token = @import("antfly_cancellation").CancellationToken;
 const A = std.mem.Allocator;
 const Id = [32]u8;
 const Plan = local.search_search.TextNavigationPlan;
+const ties = @import("lake_index_text_ties.zig");
+const Position = ties.Position;
 const Metrics = @import("lake_query_metrics.zig").Metrics;
 const Node = struct {
     first: Id,
     last: Id,
     upper: f32,
+    minimum: ?Position = null,
     fn priority(_: void, l: Node, r: Node) std.math.Order {
         const score = std.math.order(r.upper, l.upper);
+        if (score == .eq and l.minimum != null and r.minimum != null) {
+            const order = ties.compare(l.minimum.?, r.minimum.?);
+            if (order != .eq) return order;
+        }
         return if (score == .eq) std.mem.order(u8, &l.first, &r.first) else score;
     }
 };
@@ -69,6 +76,22 @@ reductions: u64 = 0,
 admitted: u64 = 0,
 summary_cache_hits: u64 = 0,
 pending: ?Pending = null,
+selection: ?[]const Id = null,
+
+/// Intersect authenticated score ranges with a complete predicate admission
+/// proof. Own the small sorted set; residual row filtering stays in the scorer.
+pub fn restrict(self: *Self, identities: []const Id) !void {
+    std.debug.assert(self.admitted == 0 and self.pending == null);
+    const owned = try self.syntax.allocator().dupe(Id, identities);
+    std.mem.sort(Id, owned, {}, struct {
+        fn less(_: void, l: Id, r: Id) bool {
+            return std.mem.lessThan(u8, &l, &r);
+        }
+    }.less);
+    self.selection = owned;
+    self.heap.clearRetainingCapacity();
+    if (try self.bound(@splat(0), @splat(255))) |node| try self.heap.push(self.budget.allocator(), node);
+}
 
 pub fn create(a: A, root: corpus.Root, store: stores.ArtifactStore, cached: artifacts.CachedRead, token: Token, text: local.storage_db_types.TextQuery, analysis: local.introducer.TextAnalysisConfig, schema: local.storage_schema.TableSchema) !?*Self {
     return createObserved(a, root, store, cached, token, text, analysis, schema, null);
@@ -203,6 +226,13 @@ fn patternTerms(raw: *anyopaque, out: A, query: local.search_search.SearchQuery)
         // A literal wildcard is one exact dictionary lookup, even when many
         // longer terms share its bytes. Do not turn it into a prefix census.
         if (matcher.wildcard) |literal| if (literal.exact) break;
+        if (matcher.regex != null or matcher.fuzzy != null) {
+            const seek = (try matcher.seekAfter(a, term)) orelse break;
+            defer a.free(seek);
+            const key = try corpus.statistics.keyAlloc(a, matcher.field(), seek);
+            defer a.free(key);
+            try cursor.seekForward(key);
+        }
     }
     // Materialized prefix fields override the ordinary field only in segments
     // where they exist. Union both possibilities, keeping admission a superset.
@@ -290,15 +320,43 @@ const Range = struct {
         return .{ .frequency = 0, .tf_upper = 0 };
     }
 };
-fn bound(self: *Self, first: Id, last: Id) !?Node {
+fn bound(self: *Self, input_first: Id, input_last: Id) !?Node {
     try self.check();
+    var first = input_first;
+    var last = input_last;
+    if (self.selection) |ids| {
+        var lo: usize = 0;
+        var hi = ids.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (std.mem.order(u8, &ids[mid], &first) == .lt) lo = mid + 1 else hi = mid;
+        }
+        const start = lo;
+        hi = ids.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (std.mem.order(u8, &ids[mid], &last) != .gt) lo = mid + 1 else hi = mid;
+        }
+        if (start == lo) return null;
+        first = ids[start];
+        last = ids[lo - 1];
+    }
     _ = self.scratch.reset(.retain_capacity);
     var range: Range = .{ .owner = self, .first = first, .last = last };
     const result = try self.plan.?.rangeBound(.{ .ptr = &range, .read = Range.summary });
     if (!result.possible) return null;
-    return if (range.found_first) |actual| .{ .first = actual, .last = range.found_last, .upper = result.upper } else null;
+    if (range.found_first) |actual| {
+        // BM25 rounding margins cannot establish an equal-score proof. Avoid
+        // tie-tree reads entirely unless this bound has exact f32 arithmetic.
+        const minimum = if (result.exact and self.root.tie_bounds != null) try ties.range(self.scratch.allocator(), self.cache.store(), self.root.tie_bounds.?, actual, range.found_last) else null;
+        return .{ .first = actual, .last = range.found_last, .upper = result.upper, .minimum = minimum };
+    }
+    return null;
 }
 pub fn next(self: *Self, cutoff: ?f32) !?Id {
+    return self.nextRanked(cutoff, null);
+}
+pub fn nextRanked(self: *Self, cutoff: ?f32, position: ?Position) !?Id {
     try self.check();
     while (self.overflow_len != 0 or self.heap.items.len != 0) {
         try self.check();
@@ -307,7 +365,7 @@ pub fn next(self: *Self, cutoff: ?f32) !?Id {
             self.overflow_len -= 1;
             break :blk self.overflow[self.overflow_len];
         } else self.heap.pop().?;
-        if (cutoff) |floor| if (node.upper < floor) {
+        if (cutoff) |floor| if (node.upper < floor or (node.upper == floor and position != null and node.minimum != null and ties.compare(node.minimum.?, position.?) != .lt)) {
             self.pruned = true;
             self.pruned_ranges += 1;
             continue;
@@ -350,13 +408,16 @@ pub fn next(self: *Self, cutoff: ?f32) !?Id {
 /// Bound admission by count and authenticated payload size. A carried leaf owns
 /// no descriptor, physical manifest or posting payload.
 pub fn nextWindow(self: *Self, output: []Id, cutoff: ?f32, max_bytes: u64) !?[]const Id {
+    return self.nextWindowRanked(output, cutoff, null, max_bytes);
+}
+pub fn nextWindowRanked(self: *Self, output: []Id, cutoff: ?f32, position: ?Position, max_bytes: u64) !?[]const Id {
     if (output.len == 0 or max_bytes == 0) return error.InvalidNativeLakeTextCorpus;
     var count: usize = 0;
     var bytes: u64 = 0;
     while (count < output.len and bytes < max_bytes) {
         try self.check();
         const leaf: Pending = if (self.pending) |held| held else blk: {
-            const id = (try self.next(cutoff)) orelse break;
+            const id = (try self.nextRanked(cutoff, position)) orelse break;
             _ = self.scratch.reset(.retain_capacity);
             const size = try @import("lake_index_text_directory.zig").segmentBytes(self.scratch.allocator(), self.cache.store(), self.root, id);
             break :blk .{ .identity = id, .bytes = size };
@@ -501,6 +562,74 @@ test "external lake global frontier reaches late competitive segments and comple
             matches += 1;
         }
         try std.testing.expectEqual(@as(usize, 3), matches);
+    }
+    const filtered = (try create(a, root, store, cached, .none, .{ .term = .{ .field = "body", .term = "common" } }, .{}, .{})).?;
+    defer filtered.deinit();
+    var low: Id = @splat(0);
+    low[31] = 3;
+    try filtered.restrict(&.{ last, low });
+    try std.testing.expectEqual(last, (try filtered.next(null)).?);
+    try std.testing.expect((try filtered.next(strong)) == null);
+    try std.testing.expectEqual(@as(u64, 1), filtered.admitted);
+    const empty = (try create(a, root, store, cached, .none, .{ .term = .{ .field = "body", .term = "common" } }, .{}, .{})).?;
+    defer empty.deinit();
+    try empty.restrict(&.{});
+    try std.testing.expect((try empty.next(null)) == null);
+    // Pack hashes ascend while logical file order descends.
+    const TieSource = struct {
+        position: u32 = 0,
+        key_: [36]u8 = @splat(0),
+        value: [36]u8 = undefined,
+        pub fn next(self: *@This()) !?tree.Cursor.Record {
+            if (self.position == 8192) return null;
+            std.mem.writeInt(u32, self.key_[28..32], self.position, .big);
+            var file: Id = @splat(0);
+            std.mem.writeInt(u32, file[28..32], 8191 - self.position, .big);
+            self.value = ties.encode(.{ .file = file, .rank = 0 });
+            self.position += 1;
+            return .{ .key = &self.key_, .value = &self.value };
+        }
+    };
+    var tie_source: TieSource = .{};
+    var tie_store = pages.store();
+    tie_store.reduce = ties.reduce;
+    var tied_root = root;
+    tied_root.tie_bounds = try tree.buildSorted(a, tie_store, &tie_source);
+    const tied = (try create(a, tied_root, store, cached, .none, .{ .prefix = .{ .field = "body", .prefix = "ra" } }, .{}, .{})).?;
+    defer tied.deinit();
+    try std.testing.expectEqual(last, (try tied.nextRanked(null, null)).?);
+    try std.testing.expect((try tied.nextRanked(1, .{ .file = @splat(0), .rank = 0 })) == null);
+    try std.testing.expect(tied.pruned);
+    try std.testing.expectEqual(@as(u64, 1), tied.admitted);
+    const recent_tie = (try create(a, tied_root, store, cached, .none, .{ .prefix = .{ .field = "body", .prefix = "ra" } }, .{}, .{})).?;
+    defer recent_tie.deinit();
+    try std.testing.expect((try recent_tie.nextRanked(1, .{ .file = @splat(0), .rank = 0, .recent = true })) != null);
+    const Vocabulary = struct {
+        position: usize = 0,
+        key_: [64]u8 = undefined,
+        value: [8]u8 = undefined,
+        pub fn next(self: *@This()) !?tree.Cursor.Record {
+            if (self.position == 5001) return null;
+            self.key_[0..8].* = "\x00\x00\x00\x04body".*;
+            const term = if (self.position == 5000) "rare" else try std.fmt.bufPrint(self.key_[8..], "a{d:0>5}", .{self.position});
+            if (self.position == 5000) @memcpy(self.key_[8..12], term);
+            self.position += 1;
+            std.mem.writeInt(u64, &self.value, 1, .big);
+            return .{ .key = self.key_[0 .. 8 + term.len], .value = &self.value };
+        }
+    };
+    var vocabulary: Vocabulary = .{};
+    var large_root = root;
+    large_root.term_statistics = try tree.buildSorted(a, pages.store(), &vocabulary);
+    for ([_]local.storage_db_types.TextQuery{ .{ .regexp = .{ .field = "body", .pattern = "ra[a-z]e" } }, .{ .fuzzy = .{ .field = "body", .term = "raze", .max_edits = 1 } } }) |pattern| {
+        const routed = (try create(a, large_root, store, cached, .none, pattern, .{}, .{})).?;
+        defer routed.deinit();
+        var matches: usize = 0;
+        while (try routed.next(null)) |_| {
+            matches += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 3), matches);
+        try std.testing.expect(routed.charged_bytes < 2 * 1024 * 1024);
     }
     const ManyTerms = struct {
         position: u32 = 0,

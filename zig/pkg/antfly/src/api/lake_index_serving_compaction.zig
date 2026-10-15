@@ -40,6 +40,7 @@ const Builder = struct {
     collect_term_deltas: bool = true,
     ownership: *corpus.text_directory.Mutations,
     source_routes: *corpus.text_directory.Mutations,
+    ties: *corpus.text_directory.Mutations,
     open_packs: std.ArrayList(Chunk) = .empty,
     open_tails: std.ArrayList(corpus.Root.Tail) = .empty,
     candidates: [4]std.ArrayList(corpus.Root.Tail) = @splat(.empty),
@@ -68,6 +69,7 @@ const Builder = struct {
     }
     fn owner(self: *@This(), group: corpus.FileGroup, manifest: Chunk, deleting: bool) !void {
         try @import("lake_index_source_routes.zig").mutate(self.a, self.source_routes, group, deleting);
+        try @import("lake_index_text_ties.zig").mutate(self.a, self.ties, group, deleting);
         const a = self.pending_arena[0].child_allocator;
         const bytes = try std.json.Stringify.valueAlloc(a, manifest, .{});
         defer a.free(bytes);
@@ -302,7 +304,10 @@ pub fn publishDelta(a: A, out: A, store: *stores.ArtifactStore, current: corpus.
     defer ownership.deinit();
     var source_routes = corpus.text_directory.Mutations.init(a, &manager, pages.store());
     defer source_routes.deinit();
-    var builder: Builder = .{ .a = a, .out = ca, .store = store, .context = context, .token = token, .pages = &pages, .terms = &terms, .ownership = &ownership, .source_routes = &source_routes, .pending_arena = .{ .init(a), .init(a), .init(a), .init(a) } };
+    var ties = corpus.text_directory.Mutations.init(a, &manager, pages.store());
+    ties.reduction = @import("lake_index_text_ties.zig").reduce;
+    defer ties.deinit();
+    var builder: Builder = .{ .a = a, .out = ca, .store = store, .context = context, .token = token, .pages = &pages, .terms = &terms, .ownership = &ownership, .source_routes = &source_routes, .ties = &ties, .pending_arena = .{ .init(a), .init(a), .init(a), .init(a) } };
     defer for (&builder.pending_arena) |*pending| pending.deinit();
     var prior: ?corpus.Root = null;
     if (previous) |old| if (old.serving != null) {
@@ -411,6 +416,16 @@ pub fn publishDelta(a: A, out: A, store: *stores.ArtifactStore, current: corpus.
         var bootstrap: Bootstrap = .{ .pages = &pages, .terms = &terms, .context = context, .token = token };
         try corpus.text_directory.walkSegments(a, root, store.*, token, &bootstrap);
     }
+    if (prior == null or prior.?.tie_bounds == null) {
+        // Bootstrap compact navigation once for an older publication. Only
+        // manifests/spans are read, never postings or source Parquet data.
+        for (try corpus.text_directory.fileRecords(ca, root, store.*, null, token)) |record| {
+            _ = scratch.reset(.free_all);
+            const group = try corpus.loadFileManifest(scratch.allocator(), store.*, record.manifest, root.domain, token, null);
+            try @import("lake_index_text_ties.zig").mutate(a, &ties, group, false);
+        }
+    }
+    root.tie_bounds = try ties.finish(if (prior) |old| old.tie_bounds else null);
     root.term_directory = try terms.finish(pages.store(), if (prior) |old| old.term_directory else .{});
     root.source_layout_version = 1;
     root.source_routes_version = 1;
@@ -520,6 +535,7 @@ test "external lake global frontier cross file packs preserve coordinates ties r
     current.serving = try publish(a, ca, &store, current, null, &first_plan, .{ .io = std.testing.io }, .none);
     const first = try corpus.servingRoot(ca, store, current, .none, null);
     try std.testing.expectEqual(@as(u32, 1), first.segment_count);
+    try std.testing.expectEqual(@as(u64, 1), first.tie_bounds.?.records);
     try std.testing.expectEqual(@as(usize, 1), first.open_packs.len);
     const first_packs = try corpus.text_directory.fileRecords(ca, first, store, null, .none);
     for (first_packs) |pack| {
@@ -553,6 +569,7 @@ test "external lake global frontier cross file packs preserve coordinates ties r
         collector.marked.deinit(a);
     }
     try collector.markArtifact(ca, .{ .kind = .text_segment, .metadata_version = corpus.metadata_version, .artifact_id = root_ref.artifact_id, .checksum = root_ref.checksum, .byte_len = root_ref.byte_len });
+    try std.testing.expect(collector.marked.contains(&try pages_mod.PageStore.identity(first.domain, first.tie_bounds.?)));
     for (first_packs) |pack| {
         const retained_pack = try corpus.loadFileManifest(ca, store, pack.manifest, current.domain, .none, null);
         for (retained_pack.source_pages) |page| try std.testing.expect(collector.marked.contains(page.artifact_id));

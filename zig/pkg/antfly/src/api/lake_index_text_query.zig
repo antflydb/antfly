@@ -1488,7 +1488,7 @@ const Execution = struct {
         }
         const frontier_mod = @import("lake_index_text_frontier.zig");
         var frontier: ?*frontier_mod = null;
-        if (predicate_selection == null and scoreFrontierEligible(req, if (ordering) |*order| order else null)) {
+        if (scoreFrontierEligible(req, if (ordering) |*order| order else null)) {
             _ = plan.reset(.retain_capacity);
             const analysis = try local.storage_db_catalog_index_manager.parseTextAnalysisForIndexConfig(plan.allocator(), root.config_json, runtime);
             // Analysis is retained in plan until the frontier is destroyed.
@@ -1501,6 +1501,7 @@ const Execution = struct {
             };
         }
         defer if (frontier) |value| value.deinit();
+        if (frontier) |value| if (predicate_selection) |ids_| try value.restrict(ids_);
         var preparation: ?*frontier_mod = null;
         if (frontier == null and req.distributed_text_stats.len == 0) {
             _ = plan.reset(.retain_capacity);
@@ -1566,9 +1567,12 @@ const Execution = struct {
                 return try owner.server.lake_text_corpora.acquireSelected(owner.server.embedding_provider_runtime.io, owner.store.artifactStore(), self_.declaration.artifact, self_.root, owner.schema_json, self_.cached, owner.context, self_.token, selected_ids);
             }
             fn next(raw: *anyopaque, output: [][32]u8, cutoff: ?f32) !?@import("lake_index_text_directory.zig").RoutingCursor.Window {
+                return nextRanked(raw, output, cutoff, null);
+            }
+            fn nextRanked(raw: *anyopaque, output: [][32]u8, cutoff: ?f32, position: ?@import("lake_index_text_directory.zig").Position) !?@import("lake_index_text_directory.zig").RoutingCursor.Window {
                 const self_: *@This() = @ptrCast(@alignCast(raw));
                 if (self_.frontier) |value| {
-                    const selected_ids = (try value.nextWindow(output, cutoff, self_.max_bytes)) orelse return null;
+                    const selected_ids = (try value.nextWindowRanked(output, cutoff, position, self_.max_bytes)) orelse return null;
                     return .{ .identities = selected_ids, .doc_offset = 0 };
                 }
                 if (self_.selected) |value| return value.nextBounded(output, self_.max_bytes);
@@ -1576,7 +1580,7 @@ const Execution = struct {
             }
         };
         var navigation: Navigation = .{ .frontier = frontier, .reader = reader, .selected = selected_reader, .max_bytes = window_config.admission_window_bytes, .execution = self, .root = root, .declaration = selected, .cached = cached, .token = cancellation };
-        var ahead = @import("lake_text_window_ahead.zig").init(.{ .ptr = &navigation, .next = Navigation.next, .prepare = Navigation.prepare }, self.context.io);
+        var ahead = @import("lake_text_window_ahead.zig").init(.{ .ptr = &navigation, .next = Navigation.next, .next_ranked = Navigation.nextRanked, .prepare = Navigation.prepare }, self.context.io);
         defer ahead.deinit();
         // Reuse the region even when the caller is itself an arena: freeing a
         // fresh child region per window would retain every window in its parent.
@@ -1592,8 +1596,9 @@ const Execution = struct {
             const competitive_cutoff = if (req.evaluation_matches) null else winners.cutoff();
             // Recent rows seed the competitive cutoff, but retain their logical
             // position after all archive rows when equal scores are compared.
+            const tie_cutoff = if (req.evaluation_matches) null else winners.tieCutoff();
             const recent_window = recent != null and !recent_scored;
-            const pulled = if (recent_window) null else try ahead.next(if (frontier != null) batch_limit else window_config.admission_window_segments, competitive_cutoff);
+            const pulled = if (recent_window) null else try ahead.nextRanked(if (frontier != null) batch_limit else window_config.admission_window_segments, competitive_cutoff, tie_cutoff);
             if (pulled == null and !recent_window) break;
             var prepared = if (!recent_window) ahead.takePrepared() else null;
             defer if (prepared) |*pin| pin.deinit();
@@ -1602,10 +1607,10 @@ const Execution = struct {
                 // Copy worker-owned output before the single lookahead reuses it.
                 @memcpy(ids[0..value.identities.len], value.identities);
                 window = .{ .identities = ids[0..value.identities.len], .doc_offset = value.doc_offset };
-                ahead.prefetch(if (frontier != null) batch_limit else window_config.admission_window_segments, competitive_cutoff);
+                ahead.prefetchRanked(if (frontier != null) batch_limit else window_config.admission_window_segments, competitive_cutoff, tie_cutoff);
             } else {
                 recent_scored = true;
-                ahead.prefetch(if (frontier != null) batch_limit else window_config.admission_window_segments, competitive_cutoff);
+                ahead.prefetchRanked(if (frontier != null) batch_limit else window_config.admission_window_segments, competitive_cutoff, tie_cutoff);
             }
             var child: Execution = .{ .server = self.server, .table = self.table, .source = self.source, .store = self.store, .domain = self.domain, .declarations = self.declarations, .context = self.context, .request = self.request, .schema_json = self.schema_json, .arena = wa, .result_allocator = wa, .navigation = self.navigation, .files = self.files, .private_files = self.private_files, .private_digests = self.private_digests, .typed_delivery = true, .forced_selection = window.identities, .prefetched_archive = if (prepared != null) &prepared.? else null, .overlay = self.overlay, .overlay_preparation = if (self.overlay != null) frontier orelse preparation else null, .recent_text_source = if (recent != null) &recent.? else null, .recent_text_window = recent_window };
             defer child.deinit();
@@ -3300,6 +3305,10 @@ const PagedWinners = struct {
                 !std.mem.eql(u8, req.order_by[0].field, "_score") or !req.order_by[0].desc) return null;
         }
         return self.heap.peek().?.hit.score orelse 0;
+    }
+    fn tieCutoff(self: *const PagedWinners) ?@import("lake_index_text_directory.zig").Position {
+        if (self.heap.context != null or self.cutoff() == null) return null;
+        return self.heap.peek().?.position;
     }
     fn deinit(self: *PagedWinners) void {
         while (self.heap.pop()) |entry| {

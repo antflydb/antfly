@@ -229,6 +229,7 @@ pub const Root = struct {
     inventory_delta_version: u8 = 0,
     source_routes_version: u8 = 0,
     source_routes: ?statistics.Ref = null,
+    tie_bounds: ?statistics.Ref = null,
     open_packs: []const artifacts.ChunkRef = &.{},
     open_tails: []const Tail = &.{},
     seekable: bool = false,
@@ -300,6 +301,10 @@ pub const Root = struct {
         if (self.pack_ownership) |ref| try ref.validate();
         if (self.source_layout_version > 1) return error.InvalidNativeLakeTextCorpus;
         if (self.inventory_delta_version > 2 or (self.inventory_delta_version != 0 and self.inventory_version != 3)) return error.InvalidNativeLakeTextCorpus;
+        if (self.tie_bounds) |ref| {
+            try ref.validate();
+            if (ref.records != self.segment_count) return error.InvalidNativeLakeTextCorpus;
+        }
         if (self.source_routes_version > 1 or (self.source_routes != null and self.source_routes_version != 1)) return error.InvalidNativeLakeTextCorpus;
         if (self.source_routes) |ref| try ref.validate();
         if (self.open_tails.len != 0) {
@@ -1383,6 +1388,7 @@ fn validateReuse(backing_a: A, backend: stores.ArtifactStore, root: Root, root_i
     try validator.pages(root.checkpoint_removed_files);
     try validator.pages(root.pack_ownership);
     try validator.pages(root.source_routes);
+    try validator.pages(root.tie_bounds);
     try validator.pages(root.term_statistics);
     for (root.statistics_deltas) |run| try validator.pages(run.page);
     try validator.pages(root.term_directory.leaves);

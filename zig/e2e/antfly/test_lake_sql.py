@@ -4848,6 +4848,49 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(
                 assert found["profile"]["sort"]["selection_reason"] == (
                     "bounded_global_text_frontier"
                 ), found
+            # Constant-score ties retain the independent full-admission order.
+            for offset in (0, 61):
+                tied = dict(
+                    direct,
+                    full_text_search={"prefix": "qu", "field": "body"},
+                    offset=offset,
+                    limit=19,
+                )
+                found = call("POST", "/tables/profile_text/query", tied)
+                complete = full_admission(
+                    dict(
+                        request,
+                        full_text_search=tied["full_text_search"],
+                        offset=offset,
+                        limit=19,
+                    )
+                )
+                assert [
+                    (h["_score"], h["_source"]["amount"]) for h in found["hits"]["hits"]
+                ] == [
+                    (h["_score"], h["_source"]["amount"])
+                    for h in complete["hits"]["hits"]
+                ]
+            filtered_query = dict(
+                direct,
+                offset=0,
+                limit=7,
+                filter_query={"range": {"path": "/amount", "gte": 50, "lt": 160}},
+            )
+            filtered = call("POST", "/tables/profile_text/query", filtered_query)
+            complete = full_admission(
+                dict(
+                    request,
+                    filter_query=filtered_query["filter_query"],
+                    offset=0,
+                    limit=7,
+                )
+            )
+            assert [
+                (h["_score"], h["_source"]["amount"]) for h in filtered["hits"]["hits"]
+            ] == [
+                (h["_score"], h["_source"]["amount"]) for h in complete["hits"]["hits"]
+            ]
             highlighted = call(
                 "POST",
                 "/tables/profile_text/query",
