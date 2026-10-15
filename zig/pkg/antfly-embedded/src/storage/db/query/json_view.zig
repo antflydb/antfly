@@ -380,8 +380,6 @@ pub const View = struct {
         const Frame = struct {
             object: bool = false,
             key: bool = true,
-            arena: std.heap.ArenaAllocator,
-            names: std.StringHashMapUnmanaged(void) = .empty,
             node: ?*View.Node = null,
             children: std.ArrayListUnmanaged(View.Child) = .empty,
             selected: ?*const Selector = null,
@@ -489,25 +487,26 @@ pub const View = struct {
                 }
             }
         };
-        var frames: std.ArrayListUnmanaged(Frame) = .empty;
+        var keys: @import("antfly-json").ObjectKeyWorkspace(Frame) = .init(scratch);
+        const frames = &keys.stack;
         defer {
             for (frames.items) |*frame| {
-                frame.arena.deinit();
-                scratch.destroy(frame.pending_storage);
+                scratch.destroy(frame.state.pending_storage);
             }
-            frames.deinit(scratch);
+            keys.deinit();
         }
         var depth: usize = 0;
         var root_seen = false;
         while (!root_seen or depth != 0) {
             const token = try scanner.peekNextTokenType();
             if (depth != 0) {
-                const frame = &frames.items[depth - 1];
+                const frame = &frames.items[depth - 1].state;
                 if ((frame.object and frame.key and token == .object_end) or (!frame.object and token == .array_end)) {
                     _ = try scanner.next();
                     try frame.finishContainer(alloc);
+                    try keys.finishFrame(depth - 1);
                     depth -= 1;
-                    if (depth != 0) try frames.items[depth - 1].finishValue(alloc, raw, scanner.cursor);
+                    if (depth != 0) try frames.items[depth - 1].state.finishValue(alloc, raw, scanner.cursor);
                     continue;
                 }
                 if (frame.object and frame.key) {
@@ -519,11 +518,11 @@ pub const View = struct {
                         frame.key = false;
                         continue;
                     }
-                    const name = switch (try scanner.nextAllocMax(frame.arena.allocator(), .alloc_if_needed, raw.len)) {
+                    const name = switch (try keys.nextKey(depth - 1, scanner, raw.len)) {
                         .string, .allocated_string => |key_name| key_name,
                         else => return error.SyntaxError,
                     };
-                    if (policy == .all or frame.selected != null) if ((try frame.names.getOrPut(frame.arena.allocator(), name)).found_existing) return error.DuplicateField;
+                    if (policy == .all or frame.selected != null) try keys.remember(depth - 1, name, false);
                     frame.retain = frame.wants(name);
                     frame.name = if (frame.retain and frame.node != null) (frame.node.?.object_index.canonicalName(name) orelse try alloc.dupe(u8, name)) else name;
                     frame.key = false;
@@ -534,23 +533,22 @@ pub const View = struct {
             }
             root_seen = true;
             if (token == .object_begin or token == .array_begin) {
-                const selected_node: ?*View.Node = if (depth == 0) (if (token == .object_begin or root_mode == .any_container) &view.root else null) else if (frames.items[depth - 1].pending_selector != null) frames.items[depth - 1].pending_node else null;
-                const selected_plan = if (depth == 0) (if (token == .object_begin or root_mode == .any_container) selector else null) else frames.items[depth - 1].pending_selector;
+                const selected_node: ?*View.Node = if (depth == 0) (if (token == .object_begin or root_mode == .any_container) &view.root else null) else if (frames.items[depth - 1].state.pending_selector != null) frames.items[depth - 1].state.pending_node else null;
+                const selected_plan = if (depth == 0) (if (token == .object_begin or root_mode == .any_container) selector else null) else frames.items[depth - 1].state.pending_selector;
                 _ = try scanner.next();
-                if (depth == frames.items.len) {
-                    try frames.ensureUnusedCapacity(scratch, 1);
-                    frames.appendAssumeCapacity(.{ .arena = .init(scratch), .pending_storage = try scratch.create(View.Node) });
-                }
-                const frame = &frames.items[depth];
-                var key_arena = frame.arena;
-                _ = key_arena.reset(.{ .retain_with_limit = 16 * 1024 });
-                frame.* = .{ .pending_storage = frame.pending_storage, .arena = key_arena, .object = token == .object_begin, .node = selected_node, .selected = selected_plan, .defer_items = options.defer_fanout and token == .array_begin and selected_plan != null and selected_plan.?.fanout != null, .retain_all = depth == 0 and options.retain_root_fields, .excluded = if (depth == 0) options.root_excluded else &.{} };
-                try frame.plan(alloc);
+                const fresh = depth == frames.items.len;
+                const pending_storage = if (fresh) try scratch.create(View.Node) else frames.items[depth].state.pending_storage;
+                keys.enter(depth, .{ .pending_storage = pending_storage, .object = token == .object_begin, .node = selected_node, .selected = selected_plan, .defer_items = options.defer_fanout and token == .array_begin and selected_plan != null and selected_plan.?.fanout != null, .retain_all = depth == 0 and options.retain_root_fields, .excluded = if (depth == 0) options.root_excluded else &.{} }) catch |err| {
+                    // Failed stack growth never takes ownership of a new node.
+                    if (fresh) scratch.destroy(pending_storage);
+                    return err;
+                };
+                try frames.items[depth].state.plan(alloc);
                 depth += 1;
             } else {
                 if (token == .object_end or token == .array_end or token == .end_of_document) return error.SyntaxError;
                 try scanner.skipValue();
-                if (depth != 0) try frames.items[depth - 1].finishValue(alloc, raw, scanner.cursor);
+                if (depth != 0) try frames.items[depth - 1].state.finishValue(alloc, raw, scanner.cursor);
             }
         }
         view.root.raw = raw[root_start..scanner.cursor];
@@ -959,4 +957,57 @@ test "public graph metric borrowed wire streaming deferred fanout preserves obje
     try std.testing.expect(ignored.root.children == null);
     var strict = View.init(arena.allocator(), ignored.root.raw);
     try std.testing.expectError(error.DuplicateField, strict.prepareProjectionWithOptions(selector, .all, .object_only, .{ .defer_fanout = true }));
+}
+
+test "public graph metric borrowed wire projection preparation reuses wide sibling keys" {
+    const a = std.testing.allocator;
+    var calls: ?usize = null;
+    for ([_]usize{ 10, 100 }) |count| {
+        var input: std.Io.Writer.Allocating = .init(a);
+        defer input.deinit();
+        try input.writer.writeAll("{\"unused\":[");
+        for (0..count) |row| {
+            if (row != 0) try input.writer.writeByte(',');
+            try input.writer.writeByte('{');
+            for (0..1000) |i| {
+                if (i != 0) try input.writer.writeByte(',');
+                try input.writer.print("\"\\u006b{d}\":0", .{i});
+            }
+            try input.writer.writeByte('}');
+        }
+        try input.writer.writeAll("]}");
+        var counted: std.testing.FailingAllocator = .init(a, .{});
+        var view = View.init(counted.allocator(), input.written());
+        var selector: Selector = .{};
+        try view.prepareProjection(&selector, .all, .object_only);
+        if (calls) |prior| try std.testing.expectEqual(prior, counted.allocations);
+        calls = counted.allocations;
+        try std.testing.expect(counted.allocations < 32);
+        try std.testing.expect(counted.allocated_bytes < 128 * 1024);
+        try std.testing.expectEqual(counted.allocated_bytes, counted.freed_bytes);
+    }
+}
+
+test "public graph metric borrowed wire projection key workspace preserves active ancestors and visited policy" {
+    const a = std.testing.allocator;
+    const Fixture = struct {
+        fn run(alloc: Allocator) !void {
+            var view = View.init(alloc, "{\"unused\":[{\"\\u0061\":0},{\"a\":1}]}");
+            var selector: Selector = .{};
+            try view.prepareProjection(&selector, .all, .object_only);
+        }
+    };
+    try Fixture.run(a);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Fixture.run, .{});
+    for ([_][]const u8{
+        "{\"unused\":[{\"a\":0,\"\\u0061\":1}]}",
+        "{\"\\u0061\":{\"b\":0},\"a\":1}",
+    }) |raw| {
+        var view = View.init(a, raw);
+        var selector: Selector = .{};
+        try std.testing.expectError(error.DuplicateField, view.prepareProjection(&selector, .all, .object_only));
+    }
+    var unvisited = View.init(a, "{\"unused\":[{\"a\":0,\"\\u0061\":1}]}");
+    var selector: Selector = .{};
+    try unvisited.prepareProjection(&selector, .visited, .object_only);
 }
