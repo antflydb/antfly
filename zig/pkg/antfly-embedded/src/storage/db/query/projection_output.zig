@@ -440,7 +440,11 @@ const StreamContext = struct {
         var depth: usize = 0;
         while (!root_seen or depth != 0) {
             try resetScratch(&self.tokens);
-            const token = try scanner.nextAllocMax(self.tokens.allocator(), .alloc_if_needed, max_len);
+            const expecting_key = depth != 0 and self.keys.stack.items[depth - 1].state.object and self.keys.stack.items[depth - 1].state.key;
+            const token = if (expecting_key)
+                try self.keys.nextKey(depth - 1, scanner, max_len)
+            else
+                try scanner.nextAllocMax(self.tokens.allocator(), .alloc_if_needed, max_len);
             if (token == .end_of_document) {
                 if (!root_seen or depth != 0) return error.SyntaxError;
                 break;
@@ -463,7 +467,7 @@ const StreamContext = struct {
                         .string, .allocated_string => |s| s,
                         else => return error.SyntaxError,
                     };
-                    try self.keys.remember(depth - 1, name, token == .allocated_string);
+                    try self.keys.remember(depth - 1, name, false);
                     if (frame.count != 0) try writer.writeByte(',');
                     try std.json.Stringify.value(name, .{}, writer);
                     try writer.writeByte(':');

@@ -29,11 +29,16 @@ pub fn ObjectKeyWorkspace(comptime State: type) type {
             keys: std.heap.ArenaAllocator,
             seen: std.StringHashMapUnmanaged(void) = .empty,
             underused: bool = false,
+            bytes: usize = 0,
+            active: bool = false,
         };
         allocator: std.mem.Allocator,
         stack: std.ArrayListUnmanaged(Frame) = .empty,
         table_bytes: usize = 0,
         key_bytes: usize = 0,
+        // Backing bytes in completed frames only; active ancestors are required
+        // state, not candidates for retirement. Updated at enter/finish in O(1).
+        idle_bytes: usize = 0,
         pub const reuse_limit = 256 * 1024;
         // Count actual backing bytes, including arena headers, without depending
         // on private container layouts. Maps do not retain their allocator; arenas
@@ -42,6 +47,7 @@ pub fn ObjectKeyWorkspace(comptime State: type) type {
         const ScratchAllocator = struct {
             backing: std.mem.Allocator,
             bytes: *usize,
+            frame_bytes: *usize,
             fn allocator(self: *@This()) std.mem.Allocator {
                 return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
             }
@@ -49,24 +55,28 @@ pub fn ObjectKeyWorkspace(comptime State: type) type {
                 const self: *@This() = @ptrCast(@alignCast(ctx));
                 const result = self.backing.rawAlloc(len, alignment, ra) orelse return null;
                 self.bytes.* += len;
+                self.frame_bytes.* += len;
                 return result;
             }
             fn resize(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) bool {
                 const self: *@This() = @ptrCast(@alignCast(ctx));
                 if (!self.backing.rawResize(buf, alignment, len, ra)) return false;
                 self.bytes.* = self.bytes.* - buf.len + len;
+                self.frame_bytes.* = self.frame_bytes.* - buf.len + len;
                 return true;
             }
             fn remap(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) ?[*]u8 {
                 const self: *@This() = @ptrCast(@alignCast(ctx));
                 const result = self.backing.rawRemap(buf, alignment, len, ra) orelse return null;
                 self.bytes.* = self.bytes.* - buf.len + len;
+                self.frame_bytes.* = self.frame_bytes.* - buf.len + len;
                 return result;
             }
             fn free(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, ra: usize) void {
                 const self: *@This() = @ptrCast(@alignCast(ctx));
                 self.backing.rawFree(buf, alignment, ra);
                 self.bytes.* -= buf.len;
+                self.frame_bytes.* -= buf.len;
             }
         };
 
@@ -82,6 +92,7 @@ pub fn ObjectKeyWorkspace(comptime State: type) type {
             self.stack = .empty;
             self.table_bytes = 0;
             self.key_bytes = 0;
+            self.idle_bytes = 0;
         }
         pub fn retainedBytes(self: *const Self) usize {
             return self.stack.capacity * @sizeOf(Frame) + self.table_bytes + self.key_bytes;
@@ -89,12 +100,16 @@ pub fn ObjectKeyWorkspace(comptime State: type) type {
         pub fn enter(self: *Self, depth: usize, state: State) !void {
             std.debug.assert(depth <= self.stack.items.len);
             if (depth == self.stack.items.len) try self.stack.append(self.allocator, .{ .state = state, .keys = .init(self.allocator) });
-            self.stack.items[depth].state = state;
+            const frame = &self.stack.items[depth];
+            std.debug.assert(!frame.active);
+            self.idle_bytes -= frame.bytes;
+            frame.active = true;
+            frame.state = state;
         }
         /// Decoded names borrow this frame until finishFrame; unescaped names
         /// borrow the scanner's input. No transient allocator escapes the call.
         pub fn nextKey(self: *Self, depth: usize, scanner: *std.json.Scanner, max_len: usize) !std.json.Token {
-            var counted: ScratchAllocator = .{ .backing = self.allocator, .bytes = &self.key_bytes };
+            var counted: ScratchAllocator = .{ .backing = self.allocator, .bytes = &self.key_bytes, .frame_bytes = &self.stack.items[depth].bytes };
             const keys = &self.stack.items[depth].keys;
             keys.child_allocator = counted.allocator();
             defer keys.child_allocator = self.allocator;
@@ -104,10 +119,10 @@ pub fn ObjectKeyWorkspace(comptime State: type) type {
         /// the frame so resetting token scratch cannot invalidate its key set.
         /// Names passed without copying must remain valid until finishFrame.
         pub fn remember(self: *Self, depth: usize, name: []const u8, copy: bool) !void {
-            var tables_counted: ScratchAllocator = .{ .backing = self.allocator, .bytes = &self.table_bytes };
+            var tables_counted: ScratchAllocator = .{ .backing = self.allocator, .bytes = &self.table_bytes, .frame_bytes = &self.stack.items[depth].bytes };
             const frame = &self.stack.items[depth];
             const key = if (copy) copied: {
-                var keys_counted: ScratchAllocator = .{ .backing = self.allocator, .bytes = &self.key_bytes };
+                var keys_counted: ScratchAllocator = .{ .backing = self.allocator, .bytes = &self.key_bytes, .frame_bytes = &self.stack.items[depth].bytes };
                 frame.keys.child_allocator = keys_counted.allocator();
                 defer frame.keys.child_allocator = self.allocator;
                 break :copied try frame.keys.allocator().dupe(u8, name);
@@ -115,8 +130,8 @@ pub fn ObjectKeyWorkspace(comptime State: type) type {
             if ((try frame.seen.getOrPut(tables_counted.allocator(), key)).found_existing) return error.DuplicateField;
         }
         pub fn finishFrame(self: *Self, depth: usize) !void {
-            var tables_counted: ScratchAllocator = .{ .backing = self.allocator, .bytes = &self.table_bytes };
-            var keys_counted: ScratchAllocator = .{ .backing = self.allocator, .bytes = &self.key_bytes };
+            var tables_counted: ScratchAllocator = .{ .backing = self.allocator, .bytes = &self.table_bytes, .frame_bytes = &self.stack.items[depth].bytes };
+            var keys_counted: ScratchAllocator = .{ .backing = self.allocator, .bytes = &self.key_bytes, .frame_bytes = &self.stack.items[depth].bytes };
             const frame = &self.stack.items[depth];
             frame.keys.child_allocator = keys_counted.allocator();
             defer frame.keys.child_allocator = self.allocator;
@@ -130,20 +145,29 @@ pub fn ObjectKeyWorkspace(comptime State: type) type {
                 const sparse = frame.seen.count() < frame.seen.capacity() / 16;
                 const retire_sparse = sparse and frame.underused;
                 frame.underused = sparse;
-                const tables_over_budget = self.stack.capacity * @sizeOf(Frame) + self.table_bytes > reuse_limit;
-                if (retire_sparse or tables_over_budget) {
+                if (retire_sparse) {
                     frame.seen.deinit(tables_counted.allocator());
                     frame.seen = .empty;
                     frame.underused = false;
-                } else if (frame.seen.count() != 0) frame.seen.clearRetainingCapacity();
-            } else if (frame.seen.count() != 0) frame.seen.clearRetainingCapacity();
-            if (!frame.keys.reset(if (frame.keys.queryCapacity() > 16 * 1024) .free_all else .retain_capacity)) return error.OutOfMemory;
-            if (self.retainedBytes() > reuse_limit) {
-                frame.seen.deinit(tables_counted.allocator());
-                frame.seen = .empty;
-                frame.underused = false;
-                _ = frame.keys.reset(.free_all);
+                }
             }
+            if (!frame.keys.reset(if (frame.keys.queryCapacity() > reuse_limit) .free_all else .retain_capacity)) return error.OutOfMemory;
+            // Only completed storage competes for reuse. Required active ancestors
+            // must not force allocation churn in every small sibling.
+            if (self.stack.capacity * @sizeOf(Frame) + self.idle_bytes + frame.bytes > reuse_limit) {
+                _ = frame.keys.reset(.free_all);
+                if (self.stack.capacity * @sizeOf(Frame) + self.idle_bytes + frame.bytes > reuse_limit) {
+                    frame.seen.deinit(tables_counted.allocator());
+                    frame.seen = .empty;
+                    frame.underused = false;
+                }
+            }
+            // Clear only a retained table; retiring a wide table must not
+            // first pay to clear its metadata. No key is read after arena reset.
+            if (frame.seen.count() != 0) frame.seen.clearRetainingCapacity();
+            std.debug.assert(frame.active);
+            frame.active = false;
+            self.idle_bytes += frame.bytes;
         }
         /// Call after every active frame has closed. This check is constant
         /// time even when earlier values reached a much greater depth.

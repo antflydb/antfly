@@ -26,8 +26,9 @@ const std = @import("std");
 pub fn validateTyped(comptime T: type, alloc: std.mem.Allocator, input: []const u8) !void {
     var scanner = std.json.Scanner.initCompleteInput(alloc, input);
     defer scanner.deinit();
-    var validator: Validator = .{ .alloc = alloc, .scanner = &scanner, .options = .{ .allocate = .alloc_if_needed, .max_value_len = input.len }, .dynamic_scan = .init(alloc) };
+    var validator: Validator = .{ .alloc = alloc, .scanner = &scanner, .options = .{ .allocate = .alloc_if_needed, .max_value_len = input.len }, .dynamic_scan = .init(alloc), .typed_keys = .init(alloc) };
     defer validator.dynamic_scan.deinit();
+    defer validator.typed_keys.deinit();
     try validator.value(T);
     if (try scanner.next() != .end_of_document) return error.UnexpectedToken;
 }
@@ -130,6 +131,8 @@ const Validator = struct {
     scanner: *std.json.Scanner,
     options: std.json.ParseOptions,
     dynamic_scan: ValueScanner,
+    typed_keys: @import("object_key_workspace.zig").ObjectKeyWorkspace(void),
+    typed_depth: usize = 0,
 
     fn expect(self: *@This(), comptime token: std.meta.Tag(std.json.Token)) !void {
         if (try self.scanner.next() != token) return error.UnexpectedToken;
@@ -150,19 +153,22 @@ const Validator = struct {
             return self.dynamic();
         }
         try self.expect(.object_begin);
-        var keys = std.heap.ArenaAllocator.init(self.alloc);
-        defer keys.deinit();
-        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        const depth = self.typed_depth;
+        try self.typed_keys.enter(depth, {});
+        self.typed_depth += 1;
+        defer self.typed_depth -= 1;
         while (true) {
-            const token = try self.scanner.nextAllocMax(keys.allocator(), .alloc_if_needed, self.options.max_value_len.?);
+            const token = try self.typed_keys.nextKey(depth, self.scanner, self.options.max_value_len.?);
             const name = switch (token) {
                 .string, .allocated_string => |name| name,
                 .object_end => break,
                 else => return error.UnexpectedToken,
             };
-            if ((try seen.getOrPut(keys.allocator(), name)).found_existing) return error.DuplicateField;
+            try self.typed_keys.remember(depth, name, false);
             try self.value(Child);
         }
+        try self.typed_keys.finishFrame(depth);
+        if (depth == 0) self.typed_keys.finishValue();
     }
     fn object(self: *@This(), comptime T: type) anyerror!void {
         @setEvalBranchQuota(100000);
@@ -509,4 +515,99 @@ test "value scanner remains movable after decoded key allocation" {
     try moved.scan(&scanner, raw.len, null);
     try std.testing.expectEqual(@as(usize, 0), original.keys.retainedBytes());
     try std.testing.expectEqual(counted.allocated_bytes - counted.freed_bytes, moved.keys.retainedBytes());
+}
+
+test "wide active ancestors preserve bounded child reuse regardless of member order" {
+    const a = std.testing.allocator;
+    var calls: [2]usize = undefined;
+    for (0..2) |mode| {
+        var input: std.Io.Writer.Allocating = .init(a);
+        defer input.deinit();
+        try input.writer.writeByte('{');
+        for (0..2) |part| {
+            if (part != 0) try input.writer.writeByte(',');
+            if (part == mode) {
+                for (0..12000) |i| {
+                    if (i != 0) try input.writer.writeByte(',');
+                    try input.writer.print("\"k{d}\":0", .{i});
+                }
+            } else {
+                try input.writer.writeAll("\"items\":[");
+                for (0..1000) |i| {
+                    if (i != 0) try input.writer.writeByte(',');
+                    try input.writer.writeAll("{\"\\u0061\":0}");
+                }
+                try input.writer.writeByte(']');
+            }
+        }
+        try input.writer.writeByte('}');
+        var counted: std.testing.FailingAllocator = .init(a, .{});
+        var workspace: ValueScanner = .init(counted.allocator());
+        defer workspace.deinit();
+        var scanner = std.json.Scanner.initCompleteInput(a, input.written());
+        defer scanner.deinit();
+        try workspace.scan(&scanner, input.written().len, null);
+        calls[mode] = counted.allocations;
+        try std.testing.expect(calls[mode] < 32);
+        try std.testing.expectEqual(counted.allocated_bytes - counted.freed_bytes, workspace.keys.retainedBytes());
+        try std.testing.expect(workspace.keys.retainedBytes() <= ValueScanner.Keys.reuse_limit);
+    }
+    try std.testing.expectEqual(calls[0], calls[1]);
+}
+
+test "idle key storage remains bounded while ancestors are active" {
+    const Keys = @import("object_key_workspace.zig").ObjectKeyWorkspace(void);
+    var counted: std.testing.FailingAllocator = .init(std.testing.allocator, .{});
+    var keys: Keys = .init(counted.allocator());
+    defer keys.deinit();
+    for (0..6) |depth| {
+        try keys.enter(depth, {});
+        for (0..2000) |i| {
+            var buf: [32]u8 = undefined;
+            const name = try std.fmt.bufPrint(&buf, "k{d}", .{i});
+            try keys.remember(depth, name, true);
+        }
+    }
+    for (0..6) |i| {
+        try keys.finishFrame(5 - i);
+        try std.testing.expect(keys.idle_bytes + keys.stack.capacity * @sizeOf(Keys.Frame) <= Keys.reuse_limit);
+        try std.testing.expectEqual(counted.allocated_bytes - counted.freed_bytes, keys.retainedBytes());
+        var total: usize = 0;
+        var idle: usize = 0;
+        for (keys.stack.items) |frame| {
+            total += frame.bytes;
+            if (!frame.active) idle += frame.bytes;
+        }
+        try std.testing.expectEqual(total, keys.table_bytes + keys.key_bytes);
+        try std.testing.expectEqual(idle, keys.idle_bytes);
+    }
+    keys.finishValue();
+    try std.testing.expect(keys.retainedBytes() <= Keys.reuse_limit);
+}
+
+test "typed scalar maps reuse keys while preserving child contracts and ownership" {
+    const a = std.testing.allocator;
+    const Map = std.json.ArrayHashMap(f64);
+    for ([_][]const u8{ "[]", "null", "{\"a\":[]}", "{\"a\":\"bad\"}", "{\"a\":0,\"\\u0061\":1}" }) |invalid| {
+        if (validateTyped(Map, a, invalid)) |_| return error.ExpectedInvalidMap else |_| {}
+    }
+    const Fixture = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            try validateTyped([]std.json.ArrayHashMap(Map), alloc, "[{\"\\u0061\":{\"b\":0}},{\"x\":{\"a\":1.2}}]");
+        }
+    };
+    try Fixture.run(a);
+    try std.testing.checkAllAllocationFailures(a, Fixture.run, .{});
+    var input: std.Io.Writer.Allocating = .init(a);
+    defer input.deinit();
+    try input.writer.writeByte('[');
+    for (0..1000) |i| {
+        if (i != 0) try input.writer.writeByte(',');
+        try input.writer.writeAll("{\"\\u0061\":0.4,\"dense\":0.7}");
+    }
+    try input.writer.writeByte(']');
+    var counted: std.testing.FailingAllocator = .init(a, .{});
+    try validateTyped([]Map, counted.allocator(), input.written());
+    try std.testing.expect(counted.allocations <= 4);
+    try std.testing.expectEqual(counted.allocated_bytes, counted.freed_bytes);
 }
