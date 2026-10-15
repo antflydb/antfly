@@ -132,6 +132,10 @@ pub const GraphReplacementBuild = struct {
     producer_replay_resume_b64: ?[]const u8 = null,
     producer_replay_target: u64 = 0,
 };
+fn replacementNeedsProducerReader(job: GraphReplacementBuild) bool {
+    return job.phase != .failed and (!job.producer_replay_complete or job.producer_replay_resume_b64 != null or job.producer_replay_target > 0);
+}
+
 const text_field_analyzers_prefix = "\x00\x00__metadata__:text_field_analyzers:";
 const active_index_root_pointer_file = ".antfly-active-index-root";
 const active_index_root_pointer_magic_v1 = "antfly-active-index-root-v1\n";
@@ -11988,11 +11992,14 @@ pub const IndexManager = struct {
         var stored = try indexConfigWithCoverageGeneration(self.alloc, self.io, cfg);
         errdefer stored.deinit(self.alloc);
         try self.stageGraphReplacementResolvers(old, stored, pending.value);
+        const needs_producer_replay = validated.artifact_sources.len > 0 or for (self.resolvers.items[resolver_checkpoint..]) |resolver| {
+            if (self.getEnrichmentByName(resolver.source_artifact) != null) break true;
+        } else false;
         try self.prepareStorageForFreshCatalogEntry(store, stored);
         try self.provisionConfiguredIndexDirDurable(stored);
         const key = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ graph_replacement_build_prefix, stored.name });
         defer self.alloc.free(key);
-        const value = try std.json.Stringify.valueAlloc(self.alloc, GraphReplacementBuild{ .name = stored.name, .generation = stored.coverage_generation, .old = old, .config = stored, .request_hash = types.indexConfigHash(cfg), .applied_sequence = floor, .producer_replay_complete = validated.artifact_sources.len == 0 }, .{});
+        const value = try std.json.Stringify.valueAlloc(self.alloc, GraphReplacementBuild{ .name = stored.name, .generation = stored.coverage_generation, .old = old, .config = stored, .request_hash = types.indexConfigHash(cfg), .applied_sequence = floor, .producer_replay_complete = !needs_producer_replay }, .{});
         defer self.alloc.free(value);
         var runtime_store = try initRuntimeStore(self.alloc, store);
         defer runtime_store.deinit();
@@ -12104,11 +12111,24 @@ pub const IndexManager = struct {
             return error.IndexReplacementPending;
     }
 
-    fn requireExclusiveResolverOwner(self: *const IndexManager, name: []const u8, old: []const u8, replacement: []const u8, pending: []const GraphReplacementBuild) !void {
+    fn resolverHasOtherGraphOwner(self: *const IndexManager, name: []const u8, excluded: []const u8) !bool {
         for (self.graph_indexes.items) |graph| {
-            if (!std.mem.eql(u8, graph.config.name, old) and try self.indexDeclaresResolver(graph.config.config_json, name))
-                return error.ResolverReplacementOwnershipConflict;
+            if (!std.mem.eql(u8, graph.config.name, excluded) and try self.indexDeclaresResolver(graph.config.config_json, name)) return true;
         }
+        for (self.status_only_index_configs) |graph| {
+            if (graph.kind != .graph or std.mem.eql(u8, graph.name, excluded)) continue;
+            const declared = self.indexDeclaresResolver(graph.config_json, name) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                // A broken config cannot prove that it released ownership.
+                else => true,
+            };
+            if (declared) return true;
+        }
+        return false;
+    }
+
+    fn requireExclusiveResolverOwner(self: *const IndexManager, name: []const u8, old: []const u8, replacement: []const u8, pending: []const GraphReplacementBuild) !void {
+        if (try self.resolverHasOtherGraphOwner(name, old)) return error.ResolverReplacementOwnershipConflict;
         for (pending) |job| {
             if (job.phase == .failed or std.mem.eql(u8, job.name, replacement)) continue;
             if (job.config) |config| if (try self.indexDeclaresResolver(config.config_json, name))
@@ -12146,7 +12166,17 @@ pub const IndexManager = struct {
         var txn = try runtime_store.store.beginWrite();
         errdefer txn.abort();
         try txn.put(key, value);
+        var upgraded_reader_version: ?u32 = null;
+        if (replacementNeedsProducerReader(job) and self.minimum_reader_version.load(.acquire) < 3) {
+            const resolvers = try self.serializeResolverDefinitions(self.alloc);
+            defer self.alloc.free(resolvers);
+            upgraded_reader_version = try self.stampCatalogReaderVersion(&txn, resolvers);
+            try @import("../artifact_inventory.zig").refresh(&txn);
+        }
         try txn.commit();
+        // Ordinary progress checkpoints must not overwrite a concurrent
+        // catalog mutation's newer reader cache with an earlier observation.
+        if (upgraded_reader_version) |version| self.minimum_reader_version.store(version, .release);
     }
 
     pub fn failGraphReplacement(self: *IndexManager, store: anytype, job: GraphReplacementBuild) !void {
@@ -22504,15 +22534,15 @@ pub const IndexManager = struct {
         var retiring: std.ArrayList([]const u8) = .empty;
         errdefer retiring.deinit(alloc);
         for (self.resolvers.items) |cfg| {
-            if (cfg.inline_managed == false or !try self.indexDeclaresResolver(config_json, cfg.name)) continue;
-            var shared = false;
-            for (self.graph_indexes.items) |entry| {
-                if (std.mem.eql(u8, entry.config.name, excluded)) continue;
-                if (try self.indexDeclaresResolver(entry.config.config_json, cfg.name)) {
-                    shared = true;
-                    break;
-                }
-            }
+            if (cfg.inline_managed == false) continue;
+            const declared = self.indexDeclaresResolver(config_json, cfg.name) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                // Explicitly deleting an unreadable index is allowed, but its
+                // unknown declaration cannot prove ownership of an identity.
+                else => false,
+            };
+            if (!declared) continue;
+            const shared = try self.resolverHasOtherGraphOwner(cfg.name, excluded);
             if (!shared) try retiring.append(alloc, cfg.name);
         }
         return retiring.toOwnedSlice(alloc);
@@ -22542,7 +22572,10 @@ pub const IndexManager = struct {
     fn enrichmentsAfterIndexRemovalAlloc(self: *IndexManager, excluded: []const u8, resolvers: []const ResolverConfig, jobs: []const GraphReplacementBuild) ![]enrichment_catalog.EnrichmentConfig {
         var live: std.StringHashMapUnmanaged(void) = .empty;
         defer live.deinit(self.alloc);
-        for (self.enrichments.items) |entry| {
+        var producers: std.StringHashMapUnmanaged(*const enrichment_catalog.EnrichmentConfig) = .empty;
+        defer producers.deinit(self.alloc);
+        for (self.enrichments.items) |*entry| {
+            try producers.put(self.alloc, entry.name, entry);
             if (entry.graph_inline_managed != true) try live.put(self.alloc, entry.name, {});
         }
         for (self.graph_indexes.items) |entry| {
@@ -22552,6 +22585,37 @@ pub const IndexManager = struct {
         for (self.text_indexes.items) |entry| {
             if (std.mem.eql(u8, entry.config.name, excluded)) continue;
             for (entry.source_artifact_names) |name| try live.put(self.alloc, name, {});
+        }
+        // Quarantine removes runtimes, never catalog ownership. If a broken
+        // config cannot be interpreted, retain producers conservatively.
+        for (self.status_only_index_configs) |cfg| {
+            if (std.mem.eql(u8, cfg.name, excluded)) continue;
+            switch (cfg.kind) {
+                .graph => {
+                    var graph = parseGraphConfig(self.alloc, cfg.config_json) catch |err| switch (err) {
+                        error.OutOfMemory => return err,
+                        else => return self.alloc.dupe(enrichment_catalog.EnrichmentConfig, self.enrichments.items),
+                    };
+                    defer graph.deinit(self.alloc);
+                    for (graph.artifact_sources) |source| {
+                        if (producers.get(source.artifact_name)) |producer| try live.put(self.alloc, producer.name, {});
+                    }
+                },
+                .full_text => {
+                    const text = parseTextConfig(self.alloc, cfg.config_json) catch |err| switch (err) {
+                        error.OutOfMemory => return err,
+                        else => return self.alloc.dupe(enrichment_catalog.EnrichmentConfig, self.enrichments.items),
+                    };
+                    defer text.deinit(self.alloc);
+                    for (text.source_artifact_names) |source| {
+                        if (producers.get(source)) |producer| try live.put(self.alloc, producer.name, {});
+                    }
+                    if (text.source_artifact_name) |source| {
+                        if (producers.get(source)) |producer| try live.put(self.alloc, producer.name, {});
+                    }
+                },
+                else => {},
+            }
         }
         for (resolvers) |cfg| {
             if (!cfg.retired) try live.put(self.alloc, cfg.source_artifact, {});
@@ -22564,18 +22628,21 @@ pub const IndexManager = struct {
                 for (graph.artifact_sources) |source| {
                     // The parsed job is temporary; borrow the catalog name so
                     // reachability keys outlive the parser arena.
-                    if (self.getEnrichmentByName(source.artifact_name)) |producer|
+                    if (producers.get(source.artifact_name)) |producer|
                         try live.put(self.alloc, producer.name, {});
                 }
             }
         }
-        while (true) {
-            const before = live.count();
-            for (self.enrichments.items) |entry| {
-                if (live.contains(entry.name) and entry.source_artifact_name.len > 0)
-                    try live.put(self.alloc, entry.source_artifact_name, {});
+        // Each producer has at most one upstream. Walk each newly reached
+        // dependency once instead of rescanning the catalog for every DAG level.
+        for (self.enrichments.items) |entry| {
+            if (!live.contains(entry.name)) continue;
+            var upstream = entry.source_artifact_name;
+            while (upstream.len > 0) {
+                const reached = try live.getOrPut(self.alloc, upstream);
+                if (reached.found_existing) break;
+                upstream = if (producers.get(upstream)) |producer| producer.source_artifact_name else "";
             }
-            if (live.count() == before) break;
         }
         var kept: std.ArrayList(enrichment_catalog.EnrichmentConfig) = .empty;
         errdefer kept.deinit(self.alloc);
@@ -22916,19 +22983,25 @@ pub const IndexManager = struct {
             if (producer.graph_inline_managed == true) break 3;
         } else 1;
         const authoritative = @max(producer_version, @max(baseline, try resolver_catalog.catalogReaderVersion(self.alloc, catalog)));
-        var pending = false;
+        var pending_version: u32 = 1;
         {
             var cursor = try txn.openCursor();
             defer cursor.close();
-            if (try cursor.seekAtOrAfter(graph_replacement_build_prefix)) |kv|
-                pending = std.mem.startsWith(u8, kv.key, graph_replacement_build_prefix);
+            var row = try cursor.seekAtOrAfter(graph_replacement_build_prefix);
+            while (row) |kv| : (row = try cursor.next()) {
+                if (!std.mem.startsWith(u8, kv.key, graph_replacement_build_prefix)) break;
+                var job = try std.json.parseFromSlice(GraphReplacementBuild, self.alloc, kv.value, .{ .ignore_unknown_fields = true });
+                defer job.deinit();
+                pending_version = @max(pending_version, if (replacementNeedsProducerReader(job.value)) @as(u32, 3) else 2);
+            }
         }
-        const version = if (pending) @max(authoritative, 2) else authoritative;
+        const pending = pending_version > 1;
+        const version = @max(authoritative, pending_version);
         // Pre-epoch libraries ignore minimum_reader_version, but their strict
         // array parser rejects a versioned resolver envelope. Publish both
         // fences atomically; restore the plain array when the last shadow ends.
         const fenced_catalog = if (pending and try resolver_catalog.catalogReaderVersion(self.alloc, catalog) == 1)
-            try std.fmt.allocPrint(self.alloc, "{{\"version\":2,\"resolvers\":{s}}}", .{catalog})
+            try std.fmt.allocPrint(self.alloc, "{{\"version\":{d},\"resolvers\":{s}}}", .{ version, catalog })
         else
             null;
         defer if (fenced_catalog) |data| self.alloc.free(data);
@@ -48258,4 +48331,109 @@ test "capi resolver failed reservation keeps its fence and rejects foreign gener
     }
     try std.testing.expect(try manager.cancelGraphReplacement(&store, "new"));
     try std.testing.expectEqual(@as(u32, 1), manager.minimum_reader_version.load(.acquire));
+}
+
+test "inline resolver replacement preserves quarantined graph and text producer references" {
+    const a = std.testing.allocator;
+    for (0..3) |mode| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}", .{tmp.sub_path}, 0);
+        defer a.free(path);
+        var store = try docstore_mod.DocStore.open(a, path, .{});
+        defer store.close();
+        var manager = try IndexManager.init(a, path);
+        defer manager.deinit();
+        const owner: types.IndexConfig = .{ .name = "quarantined", .kind = .graph, .config_json = "{\"source\":{\"artifact\":\"relations\",\"format\":\"extraction_relation\"},\"artifact\":{\"name\":\"relations\",\"kind\":\"asset\",\"source\":{\"type\":\"field\",\"value\":\"relations\"},\"content_type\":\"application/json\"}}" };
+        try manager.add(&store, owner);
+        manager.removeInMemory(owner.name);
+        var failed = owner;
+        if (mode == 1) {
+            failed.kind = .full_text;
+            failed.config_json = "{\"artifact_name\":\"relations\"}";
+        } else if (mode == 2) failed.config_json = "{";
+        try manager.recordFailedIndexLoad(failed, error.IncompleteBulkPublish);
+        if (mode == 2) _ = try manager.upsertResolver(&store, .{ .name = "other", .table = "default", .source_artifact = "other", .resolution_artifact = "other_resolved", .key_template = "entity/{{ uslug _entity.text }}", .inline_managed = true, .promote = false });
+        try manager.add(&store, .{ .name = "old", .kind = .graph, .config_json = "{}" });
+        var prepared = try manager.prepareGraphReplacementConfig(&store, "old", .{ .name = "new", .kind = .graph, .config_json = "{}" }, 0);
+        defer prepared.deinit(a);
+        try std.testing.expect(try manager.cancelGraphReplacement(&store, "new"));
+        try std.testing.expect(manager.get("quarantined") != null);
+        try std.testing.expect(manager.getEnrichment(.asset, "relations") != null);
+        const planned = try manager.planGeneratedEnrichments(a, "fresh", "{\"relations\":[]}", &.{}, &.{});
+        defer enrichment_types.deinitGeneratedRequests(a, planned);
+        try std.testing.expectEqual(@as(usize, 1), planned.len);
+        try std.testing.expect(try manager.remove(&store, "quarantined"));
+        try std.testing.expect(manager.getEnrichment(.asset, "relations") == null);
+        if (mode == 2) try std.testing.expect(manager.getResolver("other") != null);
+    }
+}
+
+test "inline resolver replacement rejects quarantined shared ownership and preserves retirement references" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}", .{tmp.sub_path}, 0);
+    defer a.free(path);
+    var store = try docstore_mod.DocStore.open(a, path, .{});
+    defer store.close();
+    var manager = try IndexManager.init(a, path);
+    defer manager.deinit();
+    const old = "{\"resolvers\":[{\"name\":\"concepts\"}]}";
+    const next = "{\"resolvers\":[{\"name\":\"concepts\",\"table\":\"default\",\"source_artifact\":\"kg_v2\",\"resolution_artifact\":\"resolved_v2\",\"key_template\":\"entity/{{ uslug _entity.text }}\",\"promote\":false}]}";
+    try manager.add(&store, .{ .name = "old", .kind = .graph, .config_json = old });
+    try manager.recordFailedIndexLoad(.{ .name = "quarantined", .kind = .graph, .config_json = old }, error.IncompleteBulkPublish);
+    _ = try manager.upsertResolver(&store, .{ .name = "concepts", .table = "default", .source_artifact = "kg_v1", .resolution_artifact = "resolved_v1", .key_template = "entity/{{ uslug _entity.text }}", .inline_managed = true, .promote = false });
+    try std.testing.expectError(error.ResolverReplacementOwnershipConflict, manager.prepareGraphReplacementConfig(&store, "old", .{ .name = "new", .kind = .graph, .config_json = next }, 0));
+    try std.testing.expect(try manager.remove(&store, "old"));
+    try std.testing.expect(manager.getResolver("concepts") != null);
+    try std.testing.expect(try manager.remove(&store, "quarantined"));
+    try std.testing.expect(manager.getResolver("concepts") == null);
+}
+
+test "inline resolver replacement fences explicit producer replay and upgrades legacy reservations" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}", .{tmp.sub_path}, 0);
+    defer a.free(path);
+    var store = try docstore_mod.DocStore.open(a, path, .{});
+    defer store.close();
+    var manager = try IndexManager.init(a, path);
+    defer manager.deinit();
+    try manager.addEnrichment(&store, .{ .name = "relations", .kind = .asset, .field = "relations", .content_type = "application/json" });
+    try manager.add(&store, .{ .name = "old", .kind = .graph, .config_json = "{}" });
+    var prepared = try manager.prepareGraphReplacementConfig(&store, "old", .{ .name = "new", .kind = .graph, .config_json = "{\"source\":{\"artifact\":\"relations\",\"format\":\"extraction_relation\"}}" }, 0);
+    defer prepared.deinit(a);
+    const Check = struct {
+        fn fence(backend: anytype) !void {
+            var txn = try backend.beginRead();
+            defer txn.abort();
+            try std.testing.expectError(error.UnsupportedDatabaseReaderVersion, resolver_catalog.readMinimumReaderVersion(&txn, 2));
+        }
+    };
+    var runtime_store = try initRuntimeStore(a, &store);
+    defer runtime_store.deinit();
+    try Check.fence(&runtime_store.store);
+    try std.testing.expectEqual(@as(u32, 1), try manager.authoritativeReaderVersion(&store));
+    // Simulate a reservation from an epoch-2 writer before replay existed.
+    {
+        var txn = try runtime_store.store.beginWrite();
+        errdefer txn.abort();
+        try txn.put(resolver_catalog.minimum_reader_key, "2");
+        try txn.put(resolver_catalog_key, "{\"version\":2,\"resolvers\":[]}");
+        try txn.commit();
+        manager.minimum_reader_version.store(2, .release);
+    }
+    const jobs = try manager.graphReplacementBuildsAlloc(&store, a);
+    defer jobs.deinit();
+    try manager.saveGraphReplacementBuild(&store, jobs.value[0]);
+    try Check.fence(&runtime_store.store);
+    try std.testing.expect(try manager.cancelGraphReplacement(&store, "new"));
+    {
+        var txn = try runtime_store.store.beginRead();
+        defer txn.abort();
+        try std.testing.expectEqual(@as(u32, 1), try resolver_catalog.readMinimumReaderVersion(&txn, 1));
+    }
+    try std.testing.expect(manager.getEnrichment(.asset, "relations") != null);
 }

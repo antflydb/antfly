@@ -54,6 +54,7 @@ pub const VTable = struct {
     resolutionStart: *const fn (self: *@import("db/resolution_runtime.zig").ResolutionRuntime) Outcome(void),
     resolutionStop: *const fn (self: *@import("db/resolution_runtime.zig").ResolutionRuntime) Outcome(void),
     resolutionCatchUp: *const fn (self: *@import("db/resolution_runtime.zig").ResolutionRuntime) Outcome(void),
+    resolutionCatchUpOnce: *const fn (self: *@import("db/resolution_runtime.zig").ResolutionRuntime) Outcome(void),
     resolutionRequestReresolveBacklog: *const fn (self: *@import("db/resolution_runtime.zig").ResolutionRuntime) Outcome(void),
     resolutionHasReresolveBacklog: *const fn (self: *@import("db/resolution_runtime.zig").ResolutionRuntime) Outcome(bool),
     resolutionRunReresolveBacklogWindow: *const fn (self: *@import("db/resolution_runtime.zig").ResolutionRuntime) Outcome(@import("db/resolution_runtime.zig").ReresolveEnqueueResult),

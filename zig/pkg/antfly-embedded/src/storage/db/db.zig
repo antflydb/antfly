@@ -28455,6 +28455,13 @@ pub const DB = struct {
         var owner = self.acquireReplicationMutationShared();
         defer if (owner) |*lease| lease.release();
         try self.enforceReplicationWriteGate();
+        if (!saved.producer_replay_complete and self.core.index_manager.minimum_reader_version.load(.acquire) < 3) {
+            // Upgrade legacy reservations before appending any producer work.
+            // A crash must never leave new prerequisites open to epoch-2 writers.
+            try self.lockApplyForPortableRuntime();
+            defer self.core.unlockApply();
+            try self.core.index_manager.saveGraphReplacementBuild(self.core.store, saved);
+        }
         if (saved.producer_replay_complete and saved.producer_replay_target > 0) {
             releaseReplicationMutationShared(&owner);
             try self.ensureGraphReplacementEnrichmentRuntime();
@@ -28688,6 +28695,30 @@ pub const DB = struct {
         return true;
     }
 
+    fn driveManualGraphReplacementReplay(self: *DB, producer_target: u64, deadline: u64) !void {
+        if (openModeRequiresReadOnlyBackends(self.open_mode) or monotonicTimeNs() >= deadline) return;
+        try self.enforceReplicationWriteGate();
+        if (self.enrichment_runtime) |runtime| {
+            if (!self.local_execution.optional_runtime_workers_enabled and !runtime.isStarted() and producer_target > runtime.stats().applied_sequence) {
+                // The enrichment guard uses its own real-time clock; the API
+                // wait deadline is monotonic. Convert the remaining duration.
+                const remaining = deadline -| monotonicTimeNs();
+                const provider_deadline = runtime.deadline_clock.nowRealtimeNs() +| remaining;
+                runtime.catchUpUntilWithVisibilityDeadline(producer_target, .none, provider_deadline) catch |err| switch (err) {
+                    error.EnrichmentWaitTimeout, error.EnrichmentRetryInProgress => return,
+                    else => return err,
+                };
+            }
+        }
+        if (monotonicTimeNs() >= deadline) return;
+        if (self.hasConfiguredResolvers()) {
+            if (self.resolution_runtime == null) try self.initResolutionRuntime();
+            const resolution = self.resolution_runtime.?;
+            resolution.notifySequence(self.core.nextDerivedSequence());
+            if ((!self.local_execution.optional_runtime_workers_enabled or !self.resolver_workers_enabled) and !resolution.worker_started.load(.acquire)) try resolution.catchUpOnce();
+        }
+    }
+
     /// Wait for the generation returned by registration, including across
     /// caller-managed wait quanta. Reusing its name never completes this wait.
     pub fn waitGraphReplacement(self: *DB, name: []const u8, generation: u64, timeout_ms: u64) !void {
@@ -28715,6 +28746,7 @@ pub const DB = struct {
                 if (try self.graphReplacementGenerationCommitted(name, generation)) return;
                 return error.Busy;
             }
+            try self.driveManualGraphReplacementReplay(pending.producer_replay_target, deadline);
             _ = try self.advanceGraphReplacementUntil(deadline);
             // The control IO also exists for manual/inline runtimes. Never
             // spin when there is no independent background IO runtime.
@@ -138687,13 +138719,8 @@ test "inline resolver replacement preserves shared explicit and upstream produce
             {
                 var probe = try db.core.store.beginProbeTxn();
                 defer probe.abort();
-                if (mode == 5) {
-                    // Explicit producers have no ownership metadata; only the
-                    // temporary reservation fence is needed.
-                    try std.testing.expectEqual(@as(u32, 2), try @import("catalog/resolver_catalog.zig").readMinimumReaderVersion(&probe, 2));
-                } else {
-                    try std.testing.expectError(error.UnsupportedDatabaseReaderVersion, @import("catalog/resolver_catalog.zig").readMinimumReaderVersion(&probe, 2));
-                }
+                // Explicit producers need the same replay fence as shorthand.
+                try std.testing.expectError(error.UnsupportedDatabaseReaderVersion, @import("catalog/resolver_catalog.zig").readMinimumReaderVersion(&probe, 2));
             }
             if (mode == 1) try db.addIndex(.{ .name = "shared", .kind = .graph, .config_json = "{\"source\":{\"artifact\":\"relations\",\"format\":\"extraction_relation\"}}" });
             if (mode == 2) _ = try db.upsertEnrichment(.{ .name = "relations", .kind = .asset, .field = "relations", .content_type = "application/json" });
@@ -139051,4 +139078,74 @@ test "public graph metric borrowed wire hydration preserves exact output policy 
         }, &result, null, null));
         for (hits, 0..) |hit, i| try std.testing.expectEqual(i < fail_index, hit.stored_data != null);
     }
+}
+
+test "inline resolver replacement manual wait drives producer and resolution dependencies" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("resolver-manual-wait");
+    defer directory.cleanup();
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(a, .{ .backend = .manual, .borrowed_io = .{ .general = std.testing.io } });
+    defer runtime.deinit();
+    var db = try DB.open(a, directory.path(), .{ .backend_runtime = runtime.ptr(), .executor = .{ .backend = .manual }, .start_optional_runtimes = false, .start_optional_runtime_workers = false, .start_independent_maintenance = false });
+    defer db.close();
+    const old = try inlineResolverReplacementConfigAlloc(a, "kg_v1", "resolved_v1", "entity/{{ uslug _entity.text }}");
+    defer a.free(old);
+    const next = try inlineResolverReplacementConfigAlloc(a, "kg_v2", "resolved_v2", "entity/{{ uslug _entity.text }}");
+    defer a.free(next);
+    try db.addIndex(.{ .name = "old", .kind = .graph, .config_json = old });
+    _ = try db.upsertResolverWithResultOptions(.{ .name = "concepts", .table = "default", .source_artifact = "kg_v1", .resolution_artifact = "resolved_v1", .key_template = "entity/{{ uslug _entity.text }}", .inline_managed = true, .promote = false }, .{ .drain_backfill = false });
+    for (0..3) |i| {
+        const key = try std.fmt.allocPrint(a, "claim:{d:0>3}", .{i});
+        defer a.free(key);
+        try db.batch(.{ .writes = &.{.{ .key = key, .value = "{\"kg\":{\"entities\":[{\"id\":\"a\",\"text\":\"Ada\",\"label\":\"person\"}]}}" }} });
+    }
+    const generation = try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = next });
+    try std.testing.expectError(error.Busy, db.waitGraphReplacement("new", generation, 0));
+    db.waitGraphReplacement("new", generation, 30_000) catch |err| {
+        const jobs = try db.graphReplacementStatusAlloc(a);
+        defer jobs.deinit();
+        const status = try std.json.Stringify.valueAlloc(a, jobs.value, .{});
+        defer a.free(status);
+        std.debug.print("manual replacement {s}; enrichment={any}; resolution={any}\n", .{ status, db.enrichment_runtime.?.stats(), db.resolutionStageStats() });
+        return err;
+    };
+    try std.testing.expect(!db.enrichment_runtime.?.isStarted());
+    try std.testing.expect(!db.resolution_runtime.?.worker_started.load(.acquire));
+    for (0..3) |i| {
+        const key = try std.fmt.allocPrint(a, "claim:{d:0>3}", .{i});
+        defer a.free(key);
+        const edges = try db.getEdges(a, "new", key, "mentions", .out);
+        defer graph_mod.GraphIndex.freeEdges(a, edges);
+        try std.testing.expectEqual(@as(usize, 1), edges.len);
+        try std.testing.expectEqualStrings("entity/ada", edges[0].target);
+    }
+}
+
+test "inline resolver replacement replays staged sources absent from graph sources" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("resolver-source-only-replay");
+    defer directory.cleanup();
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(a, .{ .backend = .manual, .borrowed_io = .{ .general = std.testing.io } });
+    defer runtime.deinit();
+    var db = try DB.open(a, directory.path(), .{ .backend_runtime = runtime.ptr(), .executor = .{ .backend = .manual }, .start_optional_runtimes = false, .start_independent_maintenance = false });
+    defer db.close();
+    const old = "{\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}],\"resolvers\":[{\"name\":\"concepts\"}]}";
+    const next = "{\"edge_types\":[{\"name\":\"R\",\"field\":\"links\"}],\"resolvers\":[{\"name\":\"concepts\",\"table\":\"default\",\"source_artifact\":\"kg_v2\",\"resolution_artifact\":\"resolved_v2\",\"key_template\":\"entity/{{ uslug _entity.text }}\",\"promote\":false}]}";
+    try db.addIndex(.{ .name = "old", .kind = .graph, .config_json = old });
+    _ = try db.upsertResolverWithResultOptions(.{ .name = "concepts", .table = "default", .source_artifact = "kg_v1", .resolution_artifact = "resolved_v1", .key_template = "entity/{{ uslug _entity.text }}", .inline_managed = true, .promote = false }, .{ .drain_backfill = false });
+    try db.batch(.{ .writes = &.{.{ .key = "claim", .value = "{\"kg\":{\"entities\":[{\"id\":\"a\",\"text\":\"Ada\",\"label\":\"person\"}]}}" }} });
+    try db.addEnrichment(.{ .name = "kg_v2", .kind = .asset, .field = "kg", .content_type = "application/json" });
+    const generation = try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = next });
+    {
+        const jobs = try db.graphReplacementStatusAlloc(a);
+        defer jobs.deinit();
+        try std.testing.expect(!jobs.value[0].producer_replay_complete);
+    }
+    try db.runUntilIdle();
+    try db.waitGraphReplacement("new", generation, 0);
+    const key = try internal_keys.resolutionArtifactKeyAlloc(a, "claim", "resolved_v2");
+    defer a.free(key);
+    const resolved = try db.core.store.get(a, key);
+    defer a.free(resolved);
+    try std.testing.expect(std.mem.indexOf(u8, resolved, "entity/ada") != null);
 }

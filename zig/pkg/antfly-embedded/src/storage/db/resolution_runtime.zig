@@ -2528,10 +2528,19 @@ pub const ResolutionRuntime = struct {
         if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionCatchUp", .{self});
         lockMutex(&self.catch_up_mutex);
         defer self.catch_up_mutex.unlock();
-        return self.catchUpLocked(false);
+        return self.catchUpLocked(false, default_max_records_per_window);
     }
 
-    fn catchUpLocked(self: *ResolutionRuntime, single_window: bool) !void {
+    /// Cooperative manual maintenance: one journal record or one bounded
+    /// backfill page, without waiting behind another replay owner.
+    pub fn catchUpOnce(self: *ResolutionRuntime) !void {
+        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionCatchUpOnce", .{self});
+        if (!self.catch_up_mutex.tryLock()) return;
+        defer self.catch_up_mutex.unlock();
+        try self.catchUpLocked(true, 1);
+    }
+
+    fn catchUpLocked(self: *ResolutionRuntime, single_window: bool, max_records: usize) !void {
         while (true) {
             const target = self.target_sequence.load(.acquire);
             const applied = self.applied_sequence.load(.acquire);
@@ -2568,7 +2577,7 @@ pub const ResolutionRuntime = struct {
                 // from_sequence is exclusive (records with seq > from), matching
                 // the derived workers, which pass their applied_sequence.
                 applied,
-                default_max_records_per_window,
+                max_records,
                 self.write_ctx,
                 self.write_fn,
                 self.candidate_source,
@@ -2716,7 +2725,7 @@ pub const ResolutionRuntime = struct {
             !self.backfill_pending.load(.acquire)) return null;
         if (!self.catch_up_mutex.tryLock()) return 25;
         defer self.catch_up_mutex.unlock();
-        self.catchUpLocked(true) catch |err| {
+        self.catchUpLocked(true, default_max_records_per_window) catch |err| {
             std.log.warn("resolution catch-up failed: {s}", .{@errorName(err)});
             return 50;
         };

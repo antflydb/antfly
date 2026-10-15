@@ -241,6 +241,8 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     capi_options.addOption(bool, "inference_enabled", true);
     capi_mod.addOptions("capi_build_options", capi_options);
     capi_root_mod.addOptions("capi_build_options", capi_options);
+    embedded_support_mod.addOptions("capi_build_options", capi_options);
+    embedded_support_mod.addImport("antfly_storage_root", embedded_support_mod);
     capi_root_mod.addImport("antfly_storage_root", capi_root_mod);
     capi_mod.addImport("antfly_vector", vector_mod);
     capi_mod.addImport("structlog", structlog_mod);
