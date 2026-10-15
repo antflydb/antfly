@@ -8213,10 +8213,10 @@ pub const DB = struct {
     }
 
     /// One durable root-local audit turn, independent of replicated build
-    /// progress. The receiving root owner supplies its pinned physical root
-    /// (which may contain several DB namespaces) and retains its lifecycle
-    /// lease. This method grants no publication or adoption authority.
-    pub fn stepNativeIndexOwnerAudit(self: *DB, table_name: []const u8, request: NativeIndexOwnerBuildRequest, physical_root_dir: []const u8, root_incarnation: u128, context: @import("../../api/operation.zig").RequestContext) !@import("relational_index_audit_checkpoint.zig").Summary {
+    /// progress. The receiving owner supplies its pinned signing authority;
+    /// the physical incarnation comes from this live DB. Both lifecycle leases
+    /// must remain held. This grants no publication or adoption authority.
+    pub fn stepNativeIndexOwnerAudit(self: *DB, table_name: []const u8, request: NativeIndexOwnerBuildRequest, signing_root_dir: []const u8, signing_root_incarnation: u128, context: @import("../../api/operation.zig").RequestContext) !@import("relational_index_audit_checkpoint.zig").Summary {
         try context.ensureActive();
         try request.validate();
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
@@ -8230,16 +8230,16 @@ pub const DB = struct {
         var budget = if (self.core.index_manager.resource_manager) |manager| resource_manager_mod.BudgetedAllocator.initReclaiming(manager, .relational_preparation_working_set, self.alloc, 1) else null;
         defer if (budget) |*value| value.deinit();
         const alloc = if (budget) |*value| value.allocator() else self.alloc;
-        return self.stepNativeIndexOwnerAuditWithAllocator(alloc, io, request, physical_root_dir, root_incarnation, binding, expected, context) catch |err| {
+        return self.stepNativeIndexOwnerAuditWithAllocator(alloc, io, request, signing_root_dir, signing_root_incarnation, binding, expected, context) catch |err| {
             if (budget) |value| if (value.denied()) return error.ResourceBudgetExceeded;
             return err;
         };
     }
 
-    fn stepNativeIndexOwnerAuditWithAllocator(self: *DB, alloc: Allocator, io: std.Io, request: NativeIndexOwnerBuildRequest, physical_root_dir: []const u8, root_incarnation: u128, binding: @import("relational_index_owner_job.zig").Binding, expected: @import("relational_index_private_claims.zig").TargetExpectation, context: @import("../../api/operation.zig").RequestContext) !@import("relational_index_audit_checkpoint.zig").Summary {
+    fn stepNativeIndexOwnerAuditWithAllocator(self: *DB, alloc: Allocator, io: std.Io, request: NativeIndexOwnerBuildRequest, signing_root_dir: []const u8, signing_root_incarnation: u128, binding: @import("relational_index_owner_job.zig").Binding, expected: @import("relational_index_private_claims.zig").TargetExpectation, context: @import("../../api/operation.zig").RequestContext) !@import("relational_index_audit_checkpoint.zig").Summary {
         const checkpoint = @import("relational_index_audit_checkpoint.zig");
         const claims = @import("relational_index_private_claims.zig");
-        var guard = try checkpoint.open(alloc, io, physical_root_dir, root_incarnation, binding, expected, context);
+        var guard = try checkpoint.open(alloc, io, signing_root_dir, signing_root_incarnation, self.root_incarnation, binding, expected, context);
         defer guard.deinit();
         var state = try guard.load();
         defer if (state) |*value| value.deinit();
@@ -8247,13 +8247,13 @@ pub const DB = struct {
             const next = next: {
                 var read = try self.core.store.beginReadTxn();
                 defer read.abort();
-                break :next try claims.InventoryValidation.auditPage(alloc, &read, binding, expected, root_incarnation, if (state) |value| value.inventory else null, request.budget, context);
+                break :next try claims.InventoryValidation.auditPage(alloc, &read, binding, expected, self.root_incarnation, if (state) |value| value.inventory else null, request.budget, context);
             };
             state = .{ .inventory = next };
         } else if (state.?.inventory.fields.phase == .ready) {
             var lease = try self.native_index_build_cache.acquire(io, self.alloc, self.core.index_manager.resource_manager, self.core, request, binding, context);
             defer lease.deinit();
-            const next = try @import("relational_index_validation.zig").auditPage(alloc, self.core, binding, expected, &lease.reservation().artifacts.?.addition, root_incarnation, state.?.inventory, if (state.?.generation) |*value| value else null, request.budget, context);
+            const next = try @import("relational_index_validation.zig").auditPage(alloc, self.core, binding, expected, &lease.reservation().artifacts.?.addition, self.root_incarnation, state.?.inventory, if (state.?.generation) |*value| value else null, request.budget, context);
             if (state.?.generation) |*value| value.deinit();
             state.?.generation = next;
         }

@@ -4093,7 +4093,8 @@ pub fn storageOwnerNativeIndexControlJson(
         return .ok;
     }
     if (request.operation == .build) {
-        if (request.manifest.len != 0 or request.control.version != kernel_owner_abi.abi_version or request.control.has_execution_deadline > 1 or
+        const native = @import("antfly_local_sources").storage_db_relational_index_owner_control;
+        if (request.manifest.len > native.AuditRoot.max_wire_bytes or (request.manifest.len != 0 and request.manifest.ptr == null) or request.control.version != kernel_owner_abi.abi_version or request.control.has_execution_deadline > 1 or
             request.control.table_name.len != 0 or request.control.request_json.len != 0) return .invalid_argument;
         var parsed = std.json.parseFromSlice(db_mod.DB.NativeIndexOwnerBuildRequest, handle.alloc, request.request_json.slice(), .{ .ignore_unknown_fields = false, .allocate = .alloc_always }) catch |err| return switch (err) {
             error.OutOfMemory => .out_of_memory,
@@ -4101,6 +4102,16 @@ pub fn storageOwnerNativeIndexControlJson(
         };
         defer parsed.deinit();
         if (parsed.value.identity.owner_group_id != handle.storage_owner_group_id) return .invalid_argument;
+        var root_scope: ?std.json.Parsed(native.AuditRoot) = null;
+        defer if (root_scope) |*value| value.deinit();
+        if (parsed.value.target_expectation != null) {
+            if (request.manifest.len == 0) return .invalid_argument;
+            root_scope = std.json.parseFromSlice(native.AuditRoot, handle.alloc, request.manifest.slice(), .{ .ignore_unknown_fields = false, .allocate = .alloc_always, .max_value_len = native.AuditRoot.max_wire_bytes }) catch |err| return switch (err) {
+                error.OutOfMemory => .out_of_memory,
+                else => .invalid_argument,
+            };
+            root_scope.?.value.validate() catch return .invalid_argument;
+        } else if (request.manifest.len != 0) return .invalid_argument;
         var response = NativeIndexResponse.init() catch |err| return storageOwnerStatusFromError(err);
         defer response.deinit();
         const context: @import("antfly_local_sources").api_operation.RequestContext = .{
@@ -4108,6 +4119,25 @@ pub fn storageOwnerNativeIndexControlJson(
             .cancellation = ownerQueryCancellation(&request.control),
         };
         const result = handle.db.stepNativeIndexOwnerBuild(request.table_name.slice(), parsed.value, context) catch |err| return storageOwnerStatusFromError(err);
+        // A newly committed canonical page consumes this turn. Only an inert
+        // observation of ready progress can advance one root-local audit page.
+        if (result == .generation and result.generation.duplicate and !result.generation.replication_pending and result.generation.record.fields.phase == .ready) {
+            const root = root_scope.?.value;
+            const summary = handle.db.stepNativeIndexOwnerAudit(request.table_name.slice(), parsed.value, root.root_dir, root.root_incarnation, context) catch |err| return storageOwnerStatusFromError(switch (err) {
+                error.PrivateIndexAuditScopeChanged,
+                error.InvalidRelationalIndexValidation,
+                error.InvalidPrivateIndexClaimInventory,
+                error.InvalidRootSigningIdentity,
+                error.RootSigningIdentityRootChanged,
+                error.InsecureRootSigningIdentity,
+                error.FileNotFound,
+                => error.PrivateIndexRootRecoveryRequired,
+                else => err,
+            });
+            const outcome: native.BuildResponse = .{ .audit = .{ .binding = result.generation.binding, .expected = result.generation.record.expected, .audit = summary } };
+            outcome.validateFor(parsed.value) catch |err| return storageOwnerStatusFromError(err);
+            return response.finish(outcome, out_response);
+        }
         return response.finish(result, out_response);
     }
     if (request.operation == .receipt) {

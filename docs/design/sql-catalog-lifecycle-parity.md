@@ -7242,3 +7242,63 @@ These gates overlap and do not add original SQL coverage. Boundary, license,
 inventory, generated control-catalog, formatting and diff checks pass. The
 sync-capable directory-open flag follows the Linux std.Io implementation;
 the executed gates here are macOS Debug, not Linux runtime qualification.
+
+### Receiving-worker audit ingress and independent physical incarnation
+
+Native validation now advances root-local auditing through the existing leased
+compiled-owner/C-ABI path. The authenticated receiver supplies a bounded
+signing-root context from its configured root and independently obtained
+metadata signing view. Remote control requests cannot select filesystem paths.
+The private ABI is 83; coordinated decoder floor 46 covers the new unsigned
+`audit` progress reply. It is not native publication/install capability.
+
+A newly committed canonical validation page consumes its whole turn. Only an
+inert, mirror-debt-free observation of canonical generation readiness may
+advance one root-local audit page. The worker no longer retires validation
+work on canonical readiness: it waits through partial root-local progress and
+checks both inventory and generation completion/failure. Root drift, corrupt
+local checkpoints and missing signing identity report root recovery required;
+malformed incoming context reports invalid argument. No metadata validation
+ACK is fabricated from the new reply.
+
+Signing authority and physical DB identity are separate. One provisioned root
+can own many DB namespaces/generations. AFRIA v2 signs the authority's root
+incarnation together with the actual pinned DB's physical incarnation, complete
+owner binding, frozen target, canonical seals and audit cursors. The latter
+identity comes from the compiled DB, never a request. A valid old checkpoint
+for a replaced DB starts no progress even when its canonical records and
+parent signing key are unchanged. It must be re-audited from scratch. The
+one-slot-per-namespace layout still bounds attempt churn. No AFRIA v1 legacy
+reader is added for this private development format.
+
+The native response retains local source cardinality separately from target
+claim cardinality; distributed ownership does not require them to be equal.
+Scope JSON accommodates worst-case escaping of the platform's admitted path
+scalar size and rejects oversized borrowed lengths before pointer access.
+The escaped-path unit case qualifies the codec, not filesystem path creation.
+
+The real C-ABI LSM fixture consumes an actual EOF source with synthetic metadata
+acceptance, validates one target claim with zero local source rows, advances
+the signed local audit, rejects a wrong signing root and verifies no native
+sequence advancement during audit pages. It then replaces the closed DB's
+durable physical identity while retaining the primary/canonical bytes and
+parent key, reopens, and proves the old ready checkpoint cannot skip the fresh
+audit. This is controlled identity replacement, not staged snapshot restore
+or distributed authorization qualification. The scheduling fixture waits
+through partial audit progress before retiring its volatile owner.
+
+Authenticated proof joining, its separate native capability barrier, actual
+restore/adoption/ACK enforcement, installation/release, durable terminal failure
+completion, missing-root repair, actual data-Raft execution, terminal catalog
+publication and complete distributed faults remain unfinished. Public UNIQUE
+activation remains guarded. Original dispositions remain 483 implemented /
+862 unresolved; these internal regressions add no original SQL coverage.
+
+The final aggregate gate in
+`/private/tmp/antfly-root-audit-ingress-final-debug.log` passed 159/159 Debug
+steps: ten native-page, 48 publication, four ACK, three leased-owner, six C-ABI,
+46 runtime-contract and 104 standalone tests, plus their domain/decoder
+prerequisites. Counts overlap and are not independent SQL coverage. Boundary,
+license, original inventory, generated control-catalog, formatting and diff
+checks passed. Runtime qualification here is macOS Debug; Linux's directory
+open/sync requirement is additionally checked against the std.Io implementation.

@@ -28,7 +28,7 @@ const Context = @import("../../api/operation.zig").RequestContext;
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const Allocator = std.mem.Allocator;
 const Digest = [32]u8;
-const magic = "AFRIA\x01\x00\x00";
+const magic = "AFRIA\x02\x00\x00";
 const max_header = 8192;
 const max_checkpoint = 16 + max_header + generation.max_wire_bytes + 64;
 
@@ -39,13 +39,13 @@ pub const State = struct {
         if (self.generation) |*value| value.deinit();
         self.* = undefined;
     }
-    fn validate(self: State, root: signing.State, binding: jobs.Binding, expected: claims.TargetExpectation) !void {
+    fn validate(self: State, root: signing.State, physical_incarnation: u128, binding: jobs.Binding, expected: claims.TargetExpectation) !void {
         try expected.requireBinding(binding);
-        if (self.inventory.root_incarnation != root.root_incarnation or
+        if (root.root_incarnation == 0 or physical_incarnation == 0 or self.inventory.root_incarnation != physical_incarnation or
             !equal(self.inventory.expectation_digest, try expected.digest()) or !nonzero(self.inventory.canonical_digest) or !nonzero(self.inventory.page_digest)) return error.PrivateIndexAuditScopeChanged;
         try self.inventory.fields.validate(expected);
         if (self.generation) |value| {
-            if (self.inventory.fields.phase != .ready or value.root_incarnation != root.root_incarnation or
+            if (self.inventory.fields.phase != .ready or value.root_incarnation != physical_incarnation or
                 !nonzero(value.canonical_digest) or !equal(value.inventory_audit_digest, self.inventory.page_digest) or
                 !equal(try value.progress.summary.expected.digest(), try expected.digest()) or
                 !equal(value.progress.summary.inventory_digest, self.inventory.canonical_digest)) return error.PrivateIndexAuditScopeChanged;
@@ -55,14 +55,25 @@ pub const State = struct {
 };
 pub const Summary = struct {
     root_incarnation: u128,
+    physical_root_incarnation: u128,
     expectation_digest: Digest,
     inventory: claims.InventoryValidation.Fields,
     generation: ?generation.Fields,
     generation_canonical_digest: ?Digest,
+    source_members: ?u64,
     checkpoint_digest: Digest,
+    pub fn validateFor(self: @This(), expected: claims.TargetExpectation, root_incarnation: u128) !void {
+        try expected.validate();
+        try self.inventory.validate(expected);
+        if (root_incarnation == 0 or self.root_incarnation != root_incarnation or self.physical_root_incarnation == 0 or !equal(self.expectation_digest, try expected.digest()) or !nonzero(self.checkpoint_digest)) return error.InvalidRelationalIndexValidation;
+        if (self.generation) |fields| {
+            if (self.inventory.phase != .ready or !nonzero(self.generation_canonical_digest orelse return error.InvalidRelationalIndexValidation)) return error.InvalidRelationalIndexValidation;
+            try fields.validate(self.source_members orelse return error.InvalidRelationalIndexValidation);
+        } else if (self.generation_canonical_digest != null or self.source_members != null) return error.InvalidRelationalIndexValidation;
+    }
 };
 const Scope = struct { canonical_digest: Digest, inventory_audit_digest: Digest };
-const Header = struct { binding_digest: Digest, inventory: claims.InventoryValidation.Audit, generation_scope: ?Scope };
+const Header = struct { signing_root_incarnation: u128, binding_digest: Digest, inventory: claims.InventoryValidation.Audit, generation_scope: ?Scope };
 fn equal(a: Digest, b: Digest) bool {
     return std.mem.eql(u8, &a, &b);
 }
@@ -76,7 +87,7 @@ fn hash(bytes: []const u8) Digest {
 }
 fn message(bytes: []const u8) Digest {
     var digest = std.crypto.hash.Blake3.init(.{});
-    digest.update("antfly/private-index-root-local-checkpoint/v1");
+    digest.update("antfly/private-index-root-local-checkpoint/v2");
     digest.update(bytes);
     var result: Digest = undefined;
     digest.final(&result);
@@ -86,9 +97,9 @@ fn permissions() std.Io.File.Permissions {
     if (comptime @import("builtin").os.tag == .windows) return .default_file;
     return @fromBackingInt(0o600);
 }
-fn encode(alloc: Allocator, root: signing.State, binding: jobs.Binding, expected: claims.TargetExpectation, state: State) ![]u8 {
-    try state.validate(root, binding, expected);
-    const header: Header = .{ .binding_digest = hash(&try binding.encode()), .inventory = state.inventory, .generation_scope = if (state.generation) |value| .{ .canonical_digest = value.canonical_digest, .inventory_audit_digest = value.inventory_audit_digest } else null };
+fn encode(alloc: Allocator, root: signing.State, physical_incarnation: u128, binding: jobs.Binding, expected: claims.TargetExpectation, state: State) ![]u8 {
+    try state.validate(root, physical_incarnation, binding, expected);
+    const header: Header = .{ .signing_root_incarnation = root.root_incarnation, .binding_digest = hash(&try binding.encode()), .inventory = state.inventory, .generation_scope = if (state.generation) |value| .{ .canonical_digest = value.canonical_digest, .inventory_audit_digest = value.inventory_audit_digest } else null };
     const json = try std.json.Stringify.valueAlloc(alloc, header, .{});
     defer alloc.free(json);
     if (json.len > max_header) return error.InvalidRelationalIndexValidation;
@@ -106,7 +117,7 @@ fn encode(alloc: Allocator, root: signing.State, binding: jobs.Binding, expected
     @memcpy(bytes[bytes.len - 64 ..], &try root.sign(&message(bytes[0 .. bytes.len - 64])));
     return bytes;
 }
-fn decode(alloc: Allocator, root: signing.State, binding: jobs.Binding, expected: claims.TargetExpectation, bytes: []const u8) !State {
+fn decode(alloc: Allocator, root: signing.State, physical_incarnation: u128, binding: jobs.Binding, expected: claims.TargetExpectation, bytes: []const u8) !State {
     if (bytes.len < 80 or bytes.len > max_checkpoint or !std.mem.eql(u8, bytes[0..8], magic)) return error.InvalidRelationalIndexValidation;
     const json_len = std.mem.readInt(u32, bytes[8..12], .little);
     const binary_len = std.mem.readInt(u32, bytes[12..16], .little);
@@ -117,15 +128,16 @@ fn decode(alloc: Allocator, root: signing.State, binding: jobs.Binding, expected
     defer parsed.deinit();
     const canonical = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
     defer alloc.free(canonical);
-    if (!std.mem.eql(u8, canonical, bytes[16..][0..json_len]) or
+    if (!std.mem.eql(u8, canonical, bytes[16..][0..json_len]) or parsed.value.signing_root_incarnation != root.root_incarnation or
         (parsed.value.generation_scope != null) != (binary_len != 0)) return error.PrivateIndexAuditScopeChanged;
     if (!equal(parsed.value.binding_digest, hash(&try binding.encode()))) return error.PrivateIndexAuditOwnerChanged;
+    if (parsed.value.inventory.root_incarnation != physical_incarnation) return error.PrivateIndexAuditPhysicalRootChanged;
     var result: State = .{ .inventory = parsed.value.inventory };
     errdefer result.deinit();
     if (parsed.value.generation_scope) |scope| {
-        result.generation = .{ .root_incarnation = root.root_incarnation, .canonical_digest = scope.canonical_digest, .inventory_audit_digest = scope.inventory_audit_digest, .progress = try generation.Loaded.decode(alloc, bytes[16 + json_len ..][0..binary_len]) };
+        result.generation = .{ .root_incarnation = physical_incarnation, .canonical_digest = scope.canonical_digest, .inventory_audit_digest = scope.inventory_audit_digest, .progress = try generation.Loaded.decode(alloc, bytes[16 + json_len ..][0..binary_len]) };
     }
-    try result.validate(root, binding, expected);
+    try result.validate(root, physical_incarnation, binding, expected);
     return result;
 }
 
@@ -134,6 +146,7 @@ pub const Guard = struct {
     io: std.Io,
     root_dir: []const u8,
     root: signing.State,
+    physical_incarnation: u128,
     binding: jobs.Binding,
     expected: claims.TargetExpectation,
     path: []u8,
@@ -170,12 +183,12 @@ pub const Guard = struct {
         var reader = file.reader(self.io, &buffer);
         const bytes = try reader.interface.allocRemaining(self.alloc, .limited(max_checkpoint + 1));
         defer self.alloc.free(bytes);
-        const result = decode(self.alloc, self.root, self.binding, self.expected, bytes) catch |err| switch (err) {
+        const result = decode(self.alloc, self.root, self.physical_incarnation, self.binding, self.expected, bytes) catch |err| switch (err) {
             // The canonical native job has one slot per namespace. A newly
             // authorized owner starts from scratch, never from the prior job's
             // authenticated prefix. Its first save atomically replaces this
             // same slot, bounding checkpoint files after repeated job churn.
-            error.PrivateIndexAuditOwnerChanged => return null,
+            error.PrivateIndexAuditOwnerChanged, error.PrivateIndexAuditPhysicalRootChanged => return null,
             else => return err,
         };
         self.checkpoint_digest = hash(bytes);
@@ -183,7 +196,7 @@ pub const Guard = struct {
     }
     pub fn save(self: *@This(), state: State) !void {
         try self.requireRoot();
-        const bytes = try encode(self.alloc, self.root, self.binding, self.expected, state);
+        const bytes = try encode(self.alloc, self.root, self.physical_incarnation, self.binding, self.expected, state);
         defer self.alloc.free(bytes);
         const digest = hash(bytes);
         if (self.checkpoint_digest) |previous| if (equal(previous, digest)) return;
@@ -217,18 +230,19 @@ pub const Guard = struct {
         self.checkpoint_digest = digest;
     }
     pub fn summary(self: *const @This(), state: State) !Summary {
-        try state.validate(self.root, self.binding, self.expected);
-        return .{ .root_incarnation = self.root.root_incarnation, .expectation_digest = state.inventory.expectation_digest, .inventory = state.inventory.fields, .generation = if (state.generation) |value| value.progress.summary.fields else null, .generation_canonical_digest = if (state.generation) |value| value.canonical_digest else null, .checkpoint_digest = self.checkpoint_digest orelse return error.PrivateIndexTargetValidationRequired };
+        try state.validate(self.root, self.physical_incarnation, self.binding, self.expected);
+        return .{ .root_incarnation = self.root.root_incarnation, .physical_root_incarnation = self.physical_incarnation, .expectation_digest = state.inventory.expectation_digest, .inventory = state.inventory.fields, .generation = if (state.generation) |value| value.progress.summary.fields else null, .generation_canonical_digest = if (state.generation) |value| value.canonical_digest else null, .source_members = if (state.generation) |value| value.progress.summary.source_members else null, .checkpoint_digest = self.checkpoint_digest orelse return error.PrivateIndexTargetValidationRequired };
     }
 };
 
-/// root_dir is the owning physical root, not a snapshot/staging input. The
-/// root lifecycle lease must outlive this guard and every scan it protects.
-pub fn open(alloc: Allocator, io: std.Io, root_dir: []const u8, root_incarnation: u128, binding: jobs.Binding, expected: claims.TargetExpectation, context: Context) !Guard {
+/// root_dir is the provisioned signing root, not a snapshot/staging input.
+/// physical_incarnation comes from the pinned live DB, never a remote request.
+/// Both root lifecycle leases outlive this guard and every scan it protects.
+pub fn open(alloc: Allocator, io: std.Io, root_dir: []const u8, root_incarnation: u128, physical_incarnation: u128, binding: jobs.Binding, expected: claims.TargetExpectation, context: Context) !Guard {
     try context.ensureActive();
     try expected.requireBinding(binding);
     const identity = try root_identity.load(alloc, io, root_dir);
-    if (root_incarnation == 0 or identity.incarnation != root_incarnation) return error.PrivateIndexAuditScopeChanged;
+    if (root_incarnation == 0 or physical_incarnation == 0 or identity.incarnation != root_incarnation) return error.PrivateIndexAuditScopeChanged;
     // Provisioning owns key creation. An audit must not mint a new identity
     // or wait on an unrelated root-key creation lock.
     const root = try signing.load(alloc, io, root_dir);
@@ -267,7 +281,7 @@ pub fn open(alloc: Allocator, io: std.Io, root_dir: []const u8, root_incarnation
         try io.sleep(.fromMilliseconds(1), .awake);
     }
     errdefer file.unlock(io);
-    const result: Guard = .{ .alloc = alloc, .io = io, .root_dir = root_dir, .root = root, .binding = binding, .expected = expected, .path = path, .directory = opened_directory, .lock = file, .context = context };
+    const result: Guard = .{ .alloc = alloc, .io = io, .root_dir = root_dir, .root = root, .physical_incarnation = physical_incarnation, .binding = binding, .expected = expected, .path = path, .directory = opened_directory, .lock = file, .context = context };
     try result.requireRoot();
     const temporary = try std.fmt.allocPrint(alloc, "{s}.tmp", .{std.fs.path.basename(path)});
     defer alloc.free(temporary);

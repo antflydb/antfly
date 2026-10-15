@@ -19,7 +19,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 82;
+pub const abi_version: u32 = 83;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -1197,6 +1197,8 @@ pub const NativeIndexOwnerControlRequest = extern struct {
     operation: NativeIndexOwnerOperation,
     table_name: BorrowedBytes = .{},
     request_json: BorrowedBytes = .{},
+    /// Raw immutable inputs for admission; bounded host-selected AuditRoot
+    /// JSON for validation. Remote callers never select this filesystem scope.
     manifest: BorrowedBytes = .{},
     /// Used by bounded build/source/consume operations; callbacks are never retained.
     control: ControlledJsonOperationRequest = .{},

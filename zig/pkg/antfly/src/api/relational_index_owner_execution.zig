@@ -221,6 +221,7 @@ pub const ControlResponse = union(enum) {
                     .complete => |item| item.binding,
                     .inventory => |item| item.binding,
                     .generation => |item| item.binding,
+                    .audit => |item| item.binding,
                 };
                 if (binding.fence.namespace.table_id != request.table_id) return error.InvalidPrivateIndexNativeReceipt;
                 var build = try native.BuildRequest.init(.{ .id = request.id, .plan_digest = binding.plan_digest, .owner_digest = binding.owner_digest, .ordinal = binding.ordinal, .namespace = binding.fence.namespace, .owner_group_id = request.group_id }, binding, request.build_budget orelse .{});
@@ -228,9 +229,10 @@ pub const ControlResponse = union(enum) {
                     build.target_expectation = switch (value.outcome) {
                         .inventory => |item| item.record.expected,
                         .generation => |item| item.record.expected,
+                        .audit => |item| item.expected,
                         else => return error.InvalidPrivateIndexNativeReceipt,
                     };
-                } else if (value.outcome == .inventory or value.outcome == .generation) return error.InvalidPrivateIndexNativeReceipt;
+                } else if (value.outcome == .inventory or value.outcome == .generation or value.outcome == .audit) return error.InvalidPrivateIndexNativeReceipt;
                 try value.outcome.validateFor(build);
                 return;
             },
@@ -988,7 +990,7 @@ pub fn step(alloc: std.mem.Allocator, source: anytype, metadata: anytype, table_
     if (request.operation == .build or request.operation == .validate) {
         const binding = state.value orelse return error.PrivateIndexRootRecoveryRequired;
         const build = if (request.operation == .validate) try permission.value.nativeInventoryValidation(hot_request, binding, request.build_budget orelse .{}) else try permission.value.nativeBuild(hot_request, binding, request.build_budget orelse .{});
-        const rooted = try source.stepNativeIndexOwnerBuildAtRoot(alloc, request.group_id, table_name, build, context);
+        const rooted = try source.stepNativeIndexOwnerBuildAtRoot(alloc, request.group_id, table_name, build, if (permission.value.native_signing) |view| view.identity.root_incarnation else null, context);
         errdefer rooted.outcome.deinit();
         try rooted.outcome.value.validateFor(build);
         if (rooted.root_generation == 0) return error.InvalidPrivateIndexNativeReceipt;
@@ -1059,6 +1061,7 @@ const TestDriver = struct {
     build_pages: usize = 0,
     inventory_pages: usize = 0,
     generation_pages: usize = 0,
+    audit_pages: usize = 0,
     inventory_finished: bool = false,
     source_reads: usize = 0,
     source_failed: bool = false,
@@ -1190,12 +1193,21 @@ const TestDriver = struct {
         return .{ .root_generation = self.root_generation, .outcome = try parsed(native.ConsumeOutcome, alloc, .{ .binding = command.binding, .accepted = command.accepted, .record = self.consumed_record, .position = self.consumed_record.?.position, .duplicate = duplicate }) };
     }
 
-    pub fn stepNativeIndexOwnerBuildAtRoot(self: *TestDriver, alloc: std.mem.Allocator, _: u64, _: []const u8, request: native.BuildRequest, context: operation.RequestContext) !@FieldType(Result, "building") {
+    pub fn stepNativeIndexOwnerBuildAtRoot(self: *TestDriver, alloc: std.mem.Allocator, _: u64, _: []const u8, request: native.BuildRequest, audit_root_incarnation: ?u128, context: operation.RequestContext) !@FieldType(Result, "building") {
         try context.ensureActive();
         const binding = self.binding orelse return error.PrivateIndexRootRecoveryRequired;
         try request.requireBinding(binding);
         if (request.target_expectation) |expected| {
             if (self.inventory_finished) {
+                if (self.generation_pages != 0) {
+                    self.audit_pages += 1;
+                    const address = try local.storage_db_relational_integrity_contract.Address.init(expected.generation, "logical\x00\xff\x80");
+                    // Scheduling only: physical durability and signatures are
+                    // separately exercised by the real LSM/root fixtures.
+                    const fields: local.storage_db_relational_index_validation.Fields = .{ .phase = if (self.audit_pages == 1) .primary else .ready, .counts = @splat(@as(u64, if (self.audit_pages == 1) 0 else 1)), .chain = @splat(7), .cursor_digest = local.storage_db_relational_integrity_contract.hash("") };
+                    const audit_summary: local.storage_db_relational_index_audit_checkpoint.Summary = .{ .root_incarnation = audit_root_incarnation orelse 7, .physical_root_incarnation = 11, .expectation_digest = try expected.digest(), .inventory = .{ .phase = .ready, .rows = 1, .inventory_xor = expected.inventory_xor, .claim_rows = 1, .claim_xor = expected.inventory_xor, .claim_cursor = address.claimKey(), .chain = @splat(7), .cursor = jobs.private_claims.inventoryKey(address) }, .generation = fields, .generation_canonical_digest = @splat(8), .source_members = 1, .checkpoint_digest = @splat(9) };
+                    return .{ .root_generation = self.root_generation, .outcome = try parsed(native.BuildResponse, alloc, .{ .audit = .{ .binding = binding, .expected = expected, .audit = audit_summary } }) };
+                }
                 self.generation_pages += 1;
                 const position: local.storage_db_receipt_position.Native = .{ .namespace = binding.fence.namespace, .sequence = 7 };
                 // Scheduling-only physical progress; real durable generation
@@ -1484,6 +1496,7 @@ fn testSchedulerDeliveryFault(alloc: std.mem.Allocator, permission: publication.
     }
     try std.testing.expect(driver.inventory_pages != 0);
     try std.testing.expect(driver.generation_pages != 0);
+    try std.testing.expect(driver.audit_pages >= 2);
     try std.testing.expectEqual(@as(usize, 1), driver.build_pages);
     try std.testing.expectEqual(@as(usize, 1), driver.consumption_calls);
     try std.testing.expect(driver.value.head.phase == .building);

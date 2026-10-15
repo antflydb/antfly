@@ -93,9 +93,11 @@ const std = @import("std");
 /// the authenticated native validation/install/release publication protocol.
 /// Version 45 decodes AICV v2's bidirectional claim-inventory audit. This is
 /// physical progress, not authenticated native publication capability.
-pub const current_version: u16 = 45;
-pub const index_publication_head_version: u16 = 45;
-pub const index_delivery_version: u16 = 45;
+/// Version 46 decodes bounded root-local audit progress on native validation
+/// replies. This still grants no authenticated publication/install capability.
+pub const current_version: u16 = 46;
+pub const index_publication_head_version: u16 = 46;
+pub const index_delivery_version: u16 = 46;
 pub const schema_reader_publication_version: u16 = 39;
 pub const schema_reader_floor_version: u16 = 38;
 pub const schema_reader_capability_version: u16 = 37;

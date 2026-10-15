@@ -975,7 +975,7 @@ test "relational index build pages identity dispatch caches immutable candidates
         const result = try db.stepNativeIndexOwnerBuild("items", request, .{});
         try result.validateFor(request);
         switch (result) {
-            .inventory, .generation => return error.UnexpectedInventoryValidation,
+            .inventory, .generation, .audit => return error.UnexpectedInventoryValidation,
             .advanced => |value| {
                 pages += 1;
                 try std.testing.expect(pages <= 9);
@@ -1873,7 +1873,7 @@ test "relational index build pages identity dispatch caches immutable candidates
                     restarted_generation = restarted_generation or restart_generation;
                     db.close();
                     db = try db_mod.DB.open(alloc, directory.path(), options);
-                    var guard = try checkpoint.open(alloc, io, directory.path(), db.root_incarnation, binding, validation_request.target_expectation.?, .{});
+                    var guard = try checkpoint.open(alloc, io, directory.path(), db.root_incarnation, db.root_incarnation, binding, validation_request.target_expectation.?, .{});
                     defer guard.deinit();
                     var retained = (try guard.load()).?;
                     defer retained.deinit();
@@ -1891,7 +1891,7 @@ test "relational index build pages identity dispatch caches immutable candidates
                 try std.testing.expectEqual(original[2], (try authority.load(&read)).?.sequence);
             }
             const raw = raw: {
-                var guard = try checkpoint.open(alloc, io, directory.path(), db.root_incarnation, binding, validation_request.target_expectation.?, .{});
+                var guard = try checkpoint.open(alloc, io, directory.path(), db.root_incarnation, db.root_incarnation, binding, validation_request.target_expectation.?, .{});
                 defer guard.deinit();
                 const Wait = struct {
                     calls: usize = 0,
@@ -1906,13 +1906,13 @@ test "relational index build pages identity dispatch caches immutable candidates
                     other_binding.fence.namespace.range_id += 1;
                     var other_expected = validation_request.target_expectation.?;
                     other_expected.binding_digest = Integrity.hash(&try other_binding.encode());
-                    var independent = try checkpoint.open(alloc, io, directory.path(), db.root_incarnation, other_binding, other_expected, .{});
+                    var independent = try checkpoint.open(alloc, io, directory.path(), db.root_incarnation, db.root_incarnation, other_binding, other_expected, .{});
                     defer independent.deinit();
                     try std.testing.expect(!std.mem.eql(u8, guard.path, independent.path));
                     try std.testing.expect(try independent.load() == null);
                 }
                 var waiting: Wait = .{};
-                try std.testing.expectError(error.Canceled, checkpoint.open(alloc, io, directory.path(), db.root_incarnation, binding, validation_request.target_expectation.?, .{ .cancellation = .{ .ptr = &waiting, .is_cancelled_fn = Wait.waitCanceled } }));
+                try std.testing.expectError(error.Canceled, checkpoint.open(alloc, io, directory.path(), db.root_incarnation, db.root_incarnation, binding, validation_request.target_expectation.?, .{ .cancellation = .{ .ptr = &waiting, .is_cancelled_fn = Wait.waitCanceled } }));
                 try std.testing.expectEqual(@as(usize, 32), waiting.calls);
                 const temporary = try std.fmt.allocPrint(alloc, "{s}.tmp", .{guard.path});
                 defer alloc.free(temporary);
@@ -1926,12 +1926,12 @@ test "relational index build pages identity dispatch caches immutable candidates
                 next_binding.id[0] ^= 1;
                 var next_expected = validation_request.target_expectation.?;
                 next_expected.binding_digest = Integrity.hash(&try next_binding.encode());
-                var guard = try checkpoint.open(alloc, io, directory.path(), db.root_incarnation, next_binding, next_expected, .{});
+                var guard = try checkpoint.open(alloc, io, directory.path(), db.root_incarnation, db.root_incarnation, next_binding, next_expected, .{});
                 defer guard.deinit();
                 try std.testing.expect(try guard.load() == null);
             }
             {
-                var guard = try checkpoint.open(alloc, io, directory.path(), db.root_incarnation, binding, validation_request.target_expectation.?, .{});
+                var guard = try checkpoint.open(alloc, io, directory.path(), db.root_incarnation, db.root_incarnation, binding, validation_request.target_expectation.?, .{});
                 defer guard.deinit();
                 const temporary = try std.fmt.allocPrint(alloc, "{s}.tmp", .{guard.path});
                 defer alloc.free(temporary);
@@ -1964,7 +1964,7 @@ test "relational index build pages identity dispatch caches immutable candidates
                 var peer = try @import("../../common/test_directory.zig").TestDirectory.init("native-index-audit-peer-root");
                 defer peer.cleanup();
                 const peer_key = try @import("root_signing_identity.zig").loadOrCreate(alloc, io, peer.path());
-                var guard = try checkpoint.open(alloc, io, peer.path(), peer_key.root_incarnation, binding, validation_request.target_expectation.?, .{});
+                var guard = try checkpoint.open(alloc, io, peer.path(), peer_key.root_incarnation, peer_key.root_incarnation, binding, validation_request.target_expectation.?, .{});
                 defer guard.deinit();
                 {
                     var file = try @import("antfly_runtime_fs").fs_paths.createFilePortable(io, guard.path, .{ .exclusive = true, .permissions = if (comptime @import("builtin").os.tag == .windows) .default_file else @fromBackingInt(0o600) });

@@ -3684,7 +3684,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         return .{ .root_generation = lease.entry.generation, .outcome = result, .wire = parsed };
     }
 
-    pub fn stepNativeIndexOwnerBuildAtRoot(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: native_index_control.BuildRequest, context: request_operation.RequestContext) !RootedNativeIndexOwnerBuild {
+    pub fn stepNativeIndexOwnerBuildAtRoot(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: native_index_control.BuildRequest, audit_root_incarnation: ?u128, context: request_operation.RequestContext) !RootedNativeIndexOwnerBuild {
         try context.ensureActive();
         try request.validate();
         var lease = try self.acquireNativeIndexOwner(group_id, table_name, request.identity, context);
@@ -3695,11 +3695,18 @@ pub const ProvisionedKernelOwnerSource = struct {
         const native_context = try platformDeadlineContext(context);
         var cancellation = native_context.cancellation;
         try context.ensureActive();
-        var response = try lease.owner().nativeIndexOwnerBuildJson(table_name, encoded, .{ .execution_deadline_ns = native_context.deadline_ns, .cancellation_ctx = &cancellation, .cancellation_fn = cancellationTokenRequested });
+        const root_scope = if (request.target_expectation != null) scope: {
+            const value: native_index_control.AuditRoot = .{ .root_dir = self.replica_root_dir, .root_incarnation = audit_root_incarnation orelse return error.NativeIndexSigningUnavailable };
+            try value.validate();
+            break :scope try std.json.Stringify.valueAlloc(alloc, value, .{});
+        } else null;
+        defer if (root_scope) |bytes| alloc.free(bytes);
+        var response = try lease.owner().nativeIndexOwnerBuildScopedJson(table_name, encoded, root_scope orelse "", .{ .execution_deadline_ns = native_context.deadline_ns, .cancellation_ctx = &cancellation, .cancellation_fn = cancellationTokenRequested });
         defer response.deinit();
         var result = try std.json.parseFromSlice(native_index_control.BuildResponse, alloc, response.bytes(), .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
         errdefer result.deinit();
         try result.value.validateFor(request);
+        if (result.value == .audit and result.value.audit.audit.root_incarnation != audit_root_incarnation) return error.InvalidPrivateIndexNativeReceipt;
         return .{ .root_generation = lease.entry.generation, .outcome = result };
     }
 

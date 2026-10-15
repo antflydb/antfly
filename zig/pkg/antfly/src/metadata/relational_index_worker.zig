@@ -260,7 +260,7 @@ const Job = struct {
                     }
                     if (response.value != .building) return error.InvalidPrivateIndexNativeReceipt;
                     const pending = switch (response.value.building.outcome) {
-                        .inventory, .generation => return error.InvalidPrivateIndexNativeReceipt,
+                        .inventory, .generation, .audit => return error.InvalidPrivateIndexNativeReceipt,
                         .advanced => |value| value.replication_pending,
                         .complete => |value| blk: {
                             if (value.state == .failed) return error.PrivateIndexBuildFailed;
@@ -299,6 +299,7 @@ const Job = struct {
                 const pending = switch (outcome) {
                     .inventory => |value| value.replication_pending,
                     .generation => |value| value.replication_pending,
+                    .audit => false,
                     else => return error.InvalidPrivateIndexNativeReceipt,
                 };
                 if (pending) {
@@ -312,12 +313,22 @@ const Job = struct {
                     .generation => |value| switch (value.record.fields.phase) {
                         .primary, .forward, .ownership => {},
                         .failed => return error.PrivateIndexGenerationValidationFailed,
-                        .ready => {
-                            // Still unsigned physical progress. The joined
-                            // authenticated metadata ACK is a separate step.
-                            self.retireOwner(index);
-                            self.retry_at_ns = now_ns +| std.time.ns_per_s;
-                        },
+                        // The next validation turn must re-audit this root;
+                        // canonical readiness is not local physical evidence.
+                        .ready => {},
+                    },
+                    .audit => |value| {
+                        if (value.audit.inventory.phase == .failed) return error.PrivateIndexTargetInventoryMismatch;
+                        if (value.audit.generation) |fields| switch (fields.phase) {
+                            .failed => return error.PrivateIndexGenerationValidationFailed,
+                            .ready => {
+                                // Still unsigned physical progress. Joining
+                                // authenticated metadata proofs is separate.
+                                self.retireOwner(index);
+                                self.retry_at_ns = now_ns +| std.time.ns_per_s;
+                            },
+                            else => {},
+                        };
                     },
                     else => unreachable,
                 }

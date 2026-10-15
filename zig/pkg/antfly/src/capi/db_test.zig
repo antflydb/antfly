@@ -1520,6 +1520,136 @@ test "storage owner native index raw admission and bounded controls preserve loc
         try std.testing.expectEqual(build_position, try source_read.batch.?.header.position());
         try std.testing.expectEqual(try source_read.digest(), try wire.value.headerCommitment());
         try std.testing.expectEqual(@as(u64, 1), handle.db.native_index_build_cache.compilations);
+        // Synthetic metadata acceptance qualifies the compiled storage path,
+        // not distributed authorization. Consume the actual empty EOF source.
+        const Source = local.storage_db_relational_index_owner_job.private_claims.SourceStream;
+        const Integrity = local.storage_db_relational_integrity_contract;
+        const eof = source_read.batch.?.header;
+        var accepted: Source.Accepted = .{ .metadata_incarnation = @splat('1'), .binding_digest = Integrity.hash(&try source_read.binding.encode()), .scope_digest = eof.bytes[40..72].*, .ordinal = std.mem.readInt(u64, eof.bytes[104..112], .little), .rows = 0, .batch_rows = 0, .source_sequence = (try eof.position()).sequence, .batch_digest = eof.digest(), .logical_digest = try source_read.digest(), .previous_decision = @splat(0), .decision_digest = @splat(0), .state = .ready };
+        accepted.decision_digest = accepted.computedDigest();
+        try accepted.requireFor(source_read.binding, eof);
+        const consume: native.ConsumeCommand = .{ .binding = source_read.binding, .accepted = accepted };
+        const consume_json = try std.json.Stringify.valueAlloc(a, consume, .{});
+        defer a.free(consume_json);
+        var consumed_bytes: kernel_owner_abi.OwnedBytes = .{};
+        try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &.{ .operation = .consume, .table_name = .fromSlice("items"), .request_json = .fromSlice(consume_json) }, &consumed_bytes));
+        defer freeRawBuffer(consumed_bytes.ptr, consumed_bytes.len);
+        var consumed = try std.json.parseFromSlice(native.ConsumeOutcome, a, consumed_bytes.slice(), .{});
+        defer consumed.deinit();
+        try consumed.value.validateFor(consume);
+        const expected: local.storage_db_relational_index_owner_job.private_claims.TargetExpectation = expected: {
+            var read = try handle.db.core.store.beginReadTxn();
+            defer read.abort();
+            const address = try Integrity.Address.init(source_read.batch.?.scope.generation, "compiled\x00\xff\x80-owner-claim");
+            const claim = try Integrity.Claim.decode(&address.claimKey(), try read.get(&address.claimKey()));
+            const head = (try Source.load(&read, source_read.binding)).?;
+            break :expected .{ .metadata_incarnation = accepted.metadata_incarnation, .binding_digest = accepted.binding_digest, .generation = address.generation, .completion_revision = 1, .source_consumption_digest = try consumed.value.record.?.prefix().digest(), .source_progress_digest = head.progress_digest, .table_name_digest = Integrity.hash("items"), .rows = 1, .inventory_xor = claim.memberDigest(), .provenance = @splat(9) };
+        };
+        var validation = try native.BuildRequest.init(identity, source_read.binding, .{ .records = 1 });
+        validation.target_expectation = expected;
+        const validation_json = try std.json.Stringify.valueAlloc(a, validation, .{});
+        defer a.free(validation_json);
+        // The provisioned signing authority can own many physical DB roots.
+        var signing_directory = try TestDirectory.init("native-index-signing-root");
+        defer signing_directory.cleanup();
+        const root_key = try local.storage_db_root_signing_identity.loadOrCreate(a, std.testing.io, signing_directory.path());
+        try std.testing.expect(root_key.root_incarnation != handle.db.root_incarnation);
+        const root: native.AuditRoot = .{ .root_dir = signing_directory.path(), .root_incarnation = root_key.root_incarnation };
+        const root_json = try std.json.Stringify.valueAlloc(a, root, .{});
+        defer a.free(root_json);
+        var validate_request: kernel_owner_abi.NativeIndexOwnerControlRequest = .{ .operation = .build, .table_name = .fromSlice("items"), .request_json = .fromSlice(validation_json) };
+        var validated: kernel_owner_abi.OwnedBytes = .{};
+        try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &validate_request, &validated));
+        validate_request.manifest = .{ .ptr = @ptrFromInt(1), .len = native.AuditRoot.max_wire_bytes + 1 };
+        try std.testing.expectEqual(kernel_owner_abi.Status.invalid_argument, server_api.storageOwnerNativeIndexControlJson(id, &validate_request, &validated));
+        validate_request.manifest = .fromSlice(root_json);
+        var canonical_ready = false;
+        var audited = false;
+        for (0..32) |_| {
+            try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &validate_request, &validated));
+            const buffer = validated;
+            defer freeRawBuffer(buffer.ptr, buffer.len);
+            var result = try std.json.parseFromSlice(native.BuildResponse, a, buffer.slice(), .{});
+            defer result.deinit();
+            try result.value.validateFor(validation);
+            switch (result.value) {
+                .inventory => |value| {
+                    try std.testing.expect(value.record.fields.phase != .failed);
+                    build_position = value.position;
+                },
+                .generation => |value| {
+                    try std.testing.expect(value.record.fields.phase != .failed);
+                    build_position = value.position;
+                    if (value.record.fields.phase == .ready) {
+                        try std.testing.expect(!value.duplicate);
+                        canonical_ready = true;
+                        var wrong = root;
+                        wrong.root_incarnation ^= 1;
+                        const wrong_json = try std.json.Stringify.valueAlloc(a, wrong, .{});
+                        defer a.free(wrong_json);
+                        var rejected = validate_request;
+                        rejected.manifest = .fromSlice(wrong_json);
+                        try std.testing.expectEqual(kernel_owner_abi.Status.private_index_root_recovery_required, server_api.storageOwnerNativeIndexControlJson(id, &rejected, &validated));
+                        try std.testing.expect(validated.ptr == null);
+                    }
+                },
+                .audit => |value| {
+                    try std.testing.expect(canonical_ready);
+                    try value.audit.validateFor(expected, root.root_incarnation);
+                    try std.testing.expectEqual(handle.db.root_incarnation, value.audit.physical_root_incarnation);
+                    var read = try handle.db.core.store.beginReadTxn();
+                    defer read.abort();
+                    try std.testing.expectEqual(build_position.sequence, (try local.storage_source_authority.load(&read)).?.sequence);
+                    if (value.audit.generation) |fields| {
+                        try std.testing.expect(fields.phase != .failed);
+                        if (fields.phase == .ready) {
+                            try std.testing.expectEqual(@as(u64, 1), value.audit.inventory.rows);
+                            try std.testing.expectEqual(@as(?u64, 0), value.audit.source_members);
+                            try std.testing.expectEqualDeep(@as([3]u64, @splat(0)), fields.counts);
+                            audited = true;
+                            break;
+                        }
+                    }
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+        try std.testing.expect(audited);
+        {
+            // Privileged physical-incarnation replacement, not a snapshot
+            // import test. Keep the primary/canonical bytes and parent key,
+            // replace only the actual DB identity while it is closed, and
+            // prove that the old ready checkpoint cannot skip the new audit.
+            const Identity = local.storage_db_root_identity;
+            var replacement = try TestDirectory.init("native-index-replacement-identity");
+            defer replacement.cleanup();
+            const next = try Identity.loadOrCreate(a, std.testing.io, replacement.path());
+            const next_path = try Identity.checkpointPathAlloc(a, replacement.path());
+            defer a.free(next_path);
+            const live_path = try Identity.checkpointPathAlloc(a, directory.path());
+            defer a.free(live_path);
+            const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, next_path, a, .limited(1024));
+            defer a.free(bytes);
+            try std.testing.expect(next.incarnation != handle.db.root_incarnation);
+            handle.db.close();
+            _ = try local.storage_db_native_backup.writeFileDurable(std.testing.io, live_path, bytes);
+            handle.db = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .primary_backend = .{ .lsm = .{} }, .online_source_authority = .native, .identity_namespace = header.fence.namespace });
+            try std.testing.expectEqual(next.incarnation, handle.db.root_incarnation);
+            try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerNativeIndexControlJson(id, &validate_request, &validated));
+            defer freeRawBuffer(validated.ptr, validated.len);
+            var fresh = try std.json.parseFromSlice(native.BuildResponse, a, validated.slice(), .{});
+            defer fresh.deinit();
+            try fresh.value.validateFor(validation);
+            try std.testing.expect(fresh.value == .audit);
+            try std.testing.expectEqual(root.root_incarnation, fresh.value.audit.audit.root_incarnation);
+            try std.testing.expectEqual(next.incarnation, fresh.value.audit.audit.physical_root_incarnation);
+            try std.testing.expectEqual(.scanning, fresh.value.audit.audit.inventory.phase);
+            try std.testing.expectEqual(@as(u64, 0), fresh.value.audit.audit.inventory.rows);
+            try std.testing.expect(fresh.value.audit.audit.generation == null);
+            var read = try handle.db.core.store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expectEqual(build_position.sequence, (try local.storage_source_authority.load(&read)).?.sequence);
+        }
     }
     request.operation = .cancel_intent;
     request.request_json = .fromSlice(json);

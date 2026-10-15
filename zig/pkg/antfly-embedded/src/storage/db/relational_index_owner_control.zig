@@ -724,9 +724,11 @@ pub const BuildResponse = union(enum) {
     complete: BuildCompletion,
     inventory: InventoryOutcome,
     generation: GenerationOutcome,
+    audit: AuditOutcome,
 
     pub fn validateFor(self: BuildResponse, request: BuildRequest) !void {
         switch (self) {
+            .audit => |value| try value.validateFor(request),
             .inventory => |value| try value.validateFor(request),
             .generation => |value| try value.validateFor(request),
             .complete => |value| try value.validateFor(request),
@@ -738,6 +740,45 @@ pub const BuildResponse = union(enum) {
                     value.replication_pending != (value.error_name != null)) return error.InvalidPrivateIndexNativeReceipt;
             },
         }
+    }
+};
+
+/// Host-selected signing authority, sent only across the private compiled
+/// boundary. The live DB supplies its separate physical incarnation. Remote
+/// control requests never select this filesystem context.
+pub const AuditRoot = struct {
+    pub const max_wire_bytes = 6 * std.Io.Dir.max_path_bytes + 256;
+    root_dir: []const u8,
+    root_incarnation: u128,
+    pub fn validate(self: @This()) !void {
+        if (self.root_incarnation == 0 or self.root_dir.len == 0 or self.root_dir.len > std.Io.Dir.max_path_bytes or std.mem.indexOfScalar(u8, self.root_dir, 0) != null) return error.InvalidPrivateIndexNativeReceipt;
+    }
+};
+test "relational index build pages audit scope retains escaped path bytes within the scalar limit" {
+    const alloc = std.testing.allocator;
+    const path = try alloc.alloc(u8, std.Io.Dir.max_path_bytes);
+    defer alloc.free(path);
+    @memset(path, 1);
+    const value: AuditRoot = .{ .root_dir = path, .root_incarnation = 1 };
+    try value.validate();
+    const json = try std.json.Stringify.valueAlloc(alloc, value, .{});
+    defer alloc.free(json);
+    try std.testing.expect(json.len > 5 * path.len and json.len <= AuditRoot.max_wire_bytes);
+    var parsed = try std.json.parseFromSlice(AuditRoot, alloc, json, .{ .ignore_unknown_fields = false, .max_value_len = AuditRoot.max_wire_bytes });
+    defer parsed.deinit();
+    try parsed.value.validate();
+    try std.testing.expectEqualSlices(u8, path, parsed.value.root_dir);
+}
+/// Unsigned progress only. The local checkpoint digest is not a portable
+/// publication certificate and never substitutes for metadata proof joining.
+pub const AuditOutcome = struct {
+    binding: jobs.Binding,
+    expected: private_claims.TargetExpectation,
+    audit: @import("relational_index_audit_checkpoint.zig").Summary,
+    pub fn validateFor(self: @This(), request: BuildRequest) !void {
+        try request.requireBinding(self.binding);
+        if (!std.mem.eql(u8, &try self.expected.digest(), &try (request.target_expectation orelse return error.InvalidPrivateIndexNativeReceipt).digest())) return error.InvalidPrivateIndexNativeReceipt;
+        try self.audit.validateFor(self.expected, self.audit.root_incarnation);
     }
 };
 
