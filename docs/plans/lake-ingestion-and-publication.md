@@ -1029,8 +1029,8 @@ Delete-file decoding has a separate immutable cache shared across selected data
 views. Its identity binds fresh provider ETag/version, complete delete recipe,
 schema, credential scope and decoding/application policy. Objects without a
 strong provider identity bypass it. Selected views apply sequence/partition
-rules and row bounds independently, own their position membership, and retain
-leases for borrowed equality keys. Loading is bounded to 64 MiB, each prepared
+rules and row bounds independently and retain leases for shared compressed
+position membership and equality keys. Loading is bounded to 64 MiB, each prepared
 view retains at most 256 MiB of foreign indexes, and residency includes leased
 bytes. Oversized indexes use streaming subset decoding with direct path lookup.
 Fresh object validation remains mandatory before cache lookup.
@@ -1044,3 +1044,74 @@ private scoring/traversal state. Cancellation drains workers before request
 state is released. Benchmark component durations measure each worker's actual
 execution, including membership preparation, rather than result transfer;
 parallel durations can overlap and are not additive wall-clock time.
+
+
+Publication file navigation can now open immutable Iceberg sources before data
+manifest discovery. The source still resolves the fresh metadata location,
+selected snapshot and schema. An authenticated publication root must match the
+credential-scoped metadata-plan digest, table/store/namespace domain, source,
+snapshot and schema. The existing digest variants for current and explicitly
+pinned selectors can authenticate the same selected snapshot; the wire format
+is unchanged. Missing or mismatched proof falls back to ordinary discovery.
+Manifest lists and delete manifests remain fresh. Sparse hydration seeks only
+selected file records, with independent native reader authority and fully owned
+file fields. A full scan discovers its inventory from the frozen metadata using
+the ordinary planner; it does not enumerate the publication navigation tree.
+
+Shared position-delete indexes keep 64-bit ordinals in high-word Roaring blocks.
+A selected view borrows a single immutable set; overlapping delete files merge
+compressed blocks only when necessary. Decoding computes the canonical sorted
+fingerprint prefix once, preserving existing publication identities without
+re-expanding every selected view into a row hash map. Row bounds, sequence and
+partition applicability, scanned-row and retained-byte limits still apply.
+
+Ordered text pagination prepares analysis and global statistics once and reuses
+query-local membership across physical candidate batches. Four immutable pack
+bitmaps share an 8 MiB budget and LRU eviction. The memo retains no source pins,
+request callbacks or mutable scorer state. Allocation pressure returns to the
+ordinary candidate path; cancellation still propagates. Distributed statistics
+retain their existing preparation path. Exact scoring and predicates remain
+authoritative after the optional membership prefilter.
+
+Cloud generation navigation reclaims idle credential-scope cache owners when
+either a new owner or an existing owner's decoded pages need shared-budget
+headroom. Only cache pins are reclaimed; active reader pins retain their owners.
+With no reclaimable owner, optional navigation caching keeps its uncached or
+query-local fallback rather than requiring shared cache admission.
+
+
+Fallible decoded-cache constructors now complete before installing the payload
+union tag. Missing manifest or allocation failures leave the prior empty payload
+valid for cleanup; fully constructed resources retain normal destruction if a
+later preparation step fails. Regression coverage retries a missing-manifest
+load and verifies surviving shared snapshot leases. Synonym membership also
+propagates allocation failure instead of silently dropping expansion matches,
+allowing the optional ordered bitmap memo to fall back without false negatives.
+
+
+Publication navigation binds read callbacks to its own retained native handle,
+not the source opener's temporary handle. Native search shares its existing
+reader lease; SQL acquires a lease only when it has none. Navigation authority
+therefore survives source-open return without adding a second search lease.
+The cold-restart test exercises this boundary during final source hydration.
+
+
+Residual predicates resolve a bounded source view directly from the physical
+selection's file identities before assigning scan-local file ordinals. This
+works with both persistent catalogs and publication navigation, without expanding
+selected row coordinates or discovering unrelated data manifests. Full scans
+retain credential-scoped immutable parsed-manifest reuse under fresh selection.
+The cold E2E includes ordered indexed-range plus unindexed-prefix filtering while
+data manifests remain unavailable.
+
+
+Final qualification with origin/main `e32171bfb1`: the Debug CLI built; all
+485 lake integration tests passed (180 shared-engine and 305 server), all 81
+focused tests passed (19 and 62), and all 47 real Parquet/Iceberg E2Es passed in
+313.34 seconds. The strengthened cold restart E2E covers native text, retained
+text, SQL point lookup, ordered indexed-range/unindexed-prefix residual filtering
+with data manifests unavailable, and ordinary full scans after restoration.
+Pinned-compiler error metadata, Zig/Python formatting and lint, whitespace, all
+109 changed source license headers, and the Apache boundary passed (2,064 source
+files). Live-provider retention qualification and representative archive-scale
+latency/RSS benchmarks remain deferred; no archive speedup multiplier is claimed.

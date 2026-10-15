@@ -21,7 +21,7 @@ const deletes = @import("lake_iceberg_deletes.zig");
 const A = std.mem.Allocator;
 pub const Index = struct {
     arena: std.heap.ArenaAllocator,
-    positions: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(u64)) = .empty,
+    positions: std.StringHashMapUnmanaged(@import("lake_delete_positions.zig").Set) = .empty,
     equality: std.StringHashMapUnmanaged(void) = .empty,
     scanned: u64 = 0,
     decoded_pages: usize = 0,
@@ -55,9 +55,9 @@ pub const Index = struct {
                         const entry = try self.positions.getOrPut(owned, value.data_file_path);
                         if (!entry.found_existing) {
                             entry.key_ptr.* = try owned.dupe(u8, value.data_file_path);
-                            entry.value_ptr.* = .empty;
+                            entry.value_ptr.* = .{};
                         }
-                        try entry.value_ptr.append(owned, value.row_position);
+                        try entry.value_ptr.add(owned, value.row_position);
                     } else {
                         const key = try deletes.equalityKeyFromBatchRowAlloc(a, batch, row, names);
                         defer a.free(key);
@@ -70,6 +70,8 @@ pub const Index = struct {
             }
             self.decoded_pages += cursor.pages_decoded;
         }
+        var positions = self.positions.valueIterator();
+        while (positions.next()) |set| try set.seal(owned);
         return self;
     }
 };

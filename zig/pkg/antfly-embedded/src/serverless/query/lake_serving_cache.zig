@@ -900,7 +900,8 @@ pub const Reader = struct {
             read: ranges.RangeRead,
             fn load(raw: *anyopaque, item: *@import("lake_decoded_cache.zig").Item) !void {
                 const self_loader: *@This() = @ptrCast(@alignCast(raw));
-                item.payload = .{ .footer = try self_loader.reader.decodeFooter(item.arena.allocator(), self_loader.read) };
+                const decoded = try self_loader.reader.decodeFooter(item.arena.allocator(), self_loader.read);
+                item.payload = .{ .footer = decoded };
             }
         }{ .reader = self, .read = read };
         return self.cache.decoded.acquire(key, 32 * 1024 * 1024, self.context, .{ .ptr = &loader, .load = @TypeOf(loader).load });

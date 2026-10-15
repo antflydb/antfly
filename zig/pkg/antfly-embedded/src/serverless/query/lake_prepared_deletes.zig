@@ -27,7 +27,7 @@ pub const Prepared = struct {
     arena: std.heap.ArenaAllocator,
     delete_files: []const iceberg.IcebergDeleteFile,
     equality: []Equality,
-    positions: std.AutoHashMapUnmanaged(Position, void) = .empty,
+    positions: Positions = .{},
     columns: []const []const u8,
     files: std.StringHashMapUnmanaged(FileIndex) = .empty,
     decoded_pages: usize = 0,
@@ -37,6 +37,52 @@ pub const Prepared = struct {
     const FileIndex = struct { index: usize, equality: []const usize = &.{}, fingerprint: [32]u8 = @splat(0) };
     const Equality = struct { file: usize, fingerprint: [32]u8 = @splat(0), keys: std.StringHashMapUnmanaged(void) = .empty };
     const Position = struct { file: usize, ordinal: u64 };
+    const PositionSet = @import("lake_delete_positions.zig").Set;
+    const Positions = struct {
+        borrowed: std.AutoHashMapUnmanaged(usize, *const PositionSet) = .empty,
+        owned: std.AutoHashMapUnmanaged(usize, PositionSet) = .empty,
+        total: usize = 0,
+        pub fn count(self: *const @This()) usize {
+            return self.total;
+        }
+        fn get(self: *const @This(), file: usize) ?*const PositionSet {
+            return self.borrowed.get(file) orelse self.owned.getPtr(file);
+        }
+        fn contains(self: *const @This(), position: Position) bool {
+            return if (self.get(position.file)) |set| set.contains(position.ordinal) else false;
+        }
+        fn mutable(self: *@This(), a: A, file: usize) !*PositionSet {
+            const slot = try self.owned.getOrPut(a, file);
+            if (!slot.found_existing) slot.value_ptr.* = .{};
+            if (self.borrowed.get(file)) |prior| {
+                try slot.value_ptr.merge(a, prior);
+                _ = self.borrowed.remove(file);
+            }
+            return slot.value_ptr;
+        }
+        fn put(self: *@This(), a: A, position: Position, _: void) !void {
+            const set = try self.mutable(a, position.file);
+            const before = set.count;
+            try set.add(a, position.ordinal);
+            self.total += set.count - before;
+        }
+        fn adopt(self: *@This(), a: A, file: usize, set: *const PositionSet) !void {
+            if (self.get(file)) |prior| {
+                if (prior == set) return;
+                const target = try self.mutable(a, file);
+                const before = target.count;
+                try target.merge(a, set);
+                self.total += target.count - before;
+            } else {
+                try self.borrowed.put(a, file, set);
+                self.total += set.count;
+            }
+        }
+        fn seal(self: *@This(), a: A) !void {
+            var values = self.owned.valueIterator();
+            while (values.next()) |set| try set.seal(a);
+        }
+    };
     pub fn hashObjectVersion(hash: *std.crypto.hash.sha2.Sha256, uri: []const u8, etag: []const u8, version: []const u8) void {
         for ([_][]const u8{ uri, etag, version }) |part| {
             var length: [8]u8 = undefined;
@@ -93,7 +139,8 @@ pub const Prepared = struct {
                     file_: iceberg.IcebergDeleteFile,
                     fn load(raw: *anyopaque, item: *@import("lake_decoded_cache.zig").Item) !void {
                         const value: *@This() = @ptrCast(@alignCast(raw));
-                        item.payload = .{ .delete_file = try @import("lake_delete_file_index.zig").Index.create(item.budget.allocator(), value.request, value.inventory_, value.file_) };
+                        const decoded = try @import("lake_delete_file_index.zig").Index.create(item.budget.allocator(), value.request, value.inventory_, value.file_);
+                        item.payload = .{ .delete_file = decoded };
                     }
                 };
                 var loader: Loader = .{ .request = request, .inventory_ = inventory, .file_ = file };
@@ -133,12 +180,10 @@ pub const Prepared = struct {
                             for ([_][]const u8{ data_file.file_id, data_file.object_uri }, 0..) |path, alias| {
                                 if (alias == 1 and std.mem.eql(u8, path, data_file.file_id)) continue;
                                 if (data_paths.get(path).? != data_index) continue;
-                                const ordinals = decoded.positions.get(path) orelse continue;
-                                for (ordinals.items) |ordinal| {
-                                    if (ordinal >= data_file.row_count) return error.ExternalSourceRowOutOfBounds;
-                                    try self.positions.put(owned, .{ .file = data_index, .ordinal = ordinal }, {});
-                                    if (self.positions.count() > request.application_limits.max_deleted_rows) return error.IcebergDeleteApplicationTooLarge;
-                                }
+                                const ordinals = decoded.positions.getPtr(path) orelse continue;
+                                if (ordinals.count != 0 and ordinals.maximum >= data_file.row_count) return error.ExternalSourceRowOutOfBounds;
+                                try self.positions.adopt(owned, data_index, ordinals);
+                                if (self.positions.count() > request.application_limits.max_deleted_rows) return error.IcebergDeleteApplicationTooLarge;
                             }
                         }
                     }
@@ -195,32 +240,16 @@ pub const Prepared = struct {
         }
         self.equality = equalities.items;
         self.columns = columns.items;
-        const positions = try a.alloc(Position, self.positions.count());
-        defer a.free(positions);
-        var position_iterator = self.positions.keyIterator();
-        for (positions) |*position| position.* = position_iterator.next().?.*;
-        std.mem.sort(Position, positions, {}, struct {
-            fn less(_: void, l: Position, r: Position) bool {
-                return if (l.file != r.file) l.file < r.file else l.ordinal < r.ordinal;
-            }
-        }.less);
-        var position_index: usize = 0;
+        try self.positions.seal(owned);
         for (request.data_inventory.files, 0..) |file, index| {
             var applicable: std.ArrayList(usize) = .empty;
             for (self.equality, 0..) |entry, equality_index| {
                 if (try iceberg.equalityDeleteAppliesToFile(file, request.delete_plan.files[entry.file])) try applicable.append(owned, equality_index);
             }
-            var digest = std.crypto.hash.sha2.Sha256.init(.{});
-            digest.update("native-lake-file-deletes-v1");
-            var encoded: [8]u8 = undefined;
-            const begin = position_index;
-            while (position_index < positions.len and positions[position_index].file == index) : (position_index += 1) {}
-            std.mem.writeInt(u64, &encoded, position_index - begin, .little);
-            digest.update(&encoded);
-            for (positions[begin..position_index]) |position| {
-                std.mem.writeInt(u64, &encoded, position.ordinal, .little);
-                digest.update(&encoded);
-            }
+            var empty: PositionSet = .{};
+            // Empty sets allocate no blocks; the prefix preserves v1 identities.
+            try empty.seal(owned);
+            var digest = (self.positions.get(index) orelse &empty).fingerprint.?;
             for (applicable.items) |equality_index| digest.update(&self.equality[equality_index].fingerprint);
             try self.files.put(owned, try owned.dupe(u8, file.file_id), .{ .index = index, .equality = applicable.items, .fingerprint = digest.finalResult() });
         }
@@ -470,6 +499,11 @@ test "external lake metadata navigation shares immutable delete files across sel
     defer second.destroy(a);
     try std.testing.expectEqual(calls, reader.calls);
     try std.testing.expect(first.file_leases.items[0].item == second.file_leases.items[0].item);
+    try std.testing.expectEqual(@as(usize, 0), first.positions.owned.count());
+    try std.testing.expectEqual(@as(usize, 0), second.positions.owned.count());
+    const repeated = try Prepared.createCached(a, request, &cache, @splat(1), .{});
+    defer repeated.destroy(a);
+    try std.testing.expect(second.positions.get(0).? == repeated.positions.get(0).?);
     try std.testing.expect(first.positions.contains(.{ .file = 0, .ordinal = 0 }));
     try std.testing.expect(second.positions.contains(.{ .file = 0, .ordinal = 1 }));
     cache.max_loading_bytes = 0;

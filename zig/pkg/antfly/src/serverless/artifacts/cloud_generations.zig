@@ -123,6 +123,7 @@ pub const NavigationOwner = struct {
     refs: std.atomic.Value(usize) = .init(1),
     budget: local.sql_memory_budget,
     navigation: Navigation = .{},
+    pool: ?*NavigationPool = null,
     pub fn release(self: *NavigationOwner) void {
         if (self.refs.fetchSub(1, .acq_rel) != 1) return;
         self.navigation.deinit();
@@ -155,13 +156,42 @@ pub const NavigationPool = struct {
             self.entries[target] = null;
             retired.owner.release();
         }
-        const owner = try self.budget.allocator().create(NavigationOwner);
-        owner.* = .{ .budget = .{ .backing = self.budget.allocator(), .limit = 64 * 1024 * 1024 } };
+        const owner = while (true) {
+            break self.budget.allocator().create(NavigationOwner) catch |err| {
+                if (err != error.OutOfMemory) return err;
+                const idle = self.removeIdleLocked(null) orelse return err;
+                idle.release();
+                continue;
+            };
+        };
+        owner.* = .{ .pool = self, .budget = .{ .backing = self.budget.allocator(), .limit = 64 * 1024 * 1024 } };
         owner.navigation.cache_limit = 64 * 1024 * 1024;
         owner.navigation.cache_allocator = owner.budget.allocator();
         self.entries[target] = .{ .scope = scope, .owner = owner, .used = self.clock };
         _ = owner.refs.fetchAdd(1, .monotonic);
         return owner;
+    }
+    fn removeIdleLocked(self: *NavigationPool, exclude: ?*NavigationOwner) ?*NavigationOwner {
+        var oldest: ?usize = null;
+        for (self.entries, 0..) |entry, i| if (entry) |held| {
+            if (held.owner == exclude or held.owner.refs.load(.acquire) != 1) continue;
+            if (oldest == null or held.used < self.entries[oldest.?].?.used) oldest = i;
+        };
+        const index = oldest orelse return null;
+        const retired = self.entries[index].?.owner;
+        self.entries[index] = null;
+        return retired;
+    }
+    /// Reclaim cache pins only. Active readers retain their navigation owners.
+    fn reclaimIdle(self: *NavigationPool, exclude: *NavigationOwner) bool {
+        lock(&self.mu);
+        const retired = self.removeIdleLocked(exclude);
+        self.mu.unlock();
+        if (retired) |owner| {
+            owner.release();
+            return true;
+        }
+        return false;
     }
     pub fn deinit(self: *NavigationPool) void {
         for (&self.entries) |*entry| if (entry.*) |held| {
@@ -343,7 +373,11 @@ pub const Reader = struct {
         // Otherwise a full byte budget would prevent reaching LRU eviction.
         const staging = @min(self.cacheLimit(), result.body.len * 4 + 16 * 1024);
         while ((local.sql_memory_budget.headroom(ca) orelse std.math.maxInt(usize)) < staging) {
-            if (!self.evictOne()) break;
+            if (!self.evictOne()) {
+                const owner = self.shared orelse break;
+                const pool = owner.pool orelse break;
+                if (!pool.reclaimIdle(owner)) break;
+            }
         }
         const owned = ca.dupe(u8, result.body) catch return node;
         const owned_ref = cloneRef(ca, ref) catch {
@@ -1257,6 +1291,22 @@ test "external lake global frontier shared generation navigation survives reques
     }
     try std.testing.expectEqual(before, provider.gets);
     try std.testing.expect(two.cachedBytes() <= 8 * 1024 * 1024);
+    // Decoded-page admission also reclaims another idle scope, even when
+    // the owner's own cache is empty and cannot free any bytes.
+    var reclaim: NavigationPool = .{ .budget = .{ .backing = a, .limit = 64 * 1024 * 1024 } };
+    defer reclaim.deinit();
+    var old_scope: Reader = .{ .client = client, .bucket = "bucket", .prefix = "native", .root = root, .shared = try reclaim.acquire(@splat(1)) };
+    var initial = (try old_scope.lookup(a, &id, .none)).?;
+    initial.deinit(a);
+    try std.testing.expect(old_scope.cachedBytes() > 0);
+    old_scope.deinit();
+    var new_scope: Reader = .{ .client = client, .bucket = "bucket", .prefix = "native", .root = root, .shared = try reclaim.acquire(@splat(2)) };
+    defer new_scope.deinit();
+    reclaim.budget.limit = reclaim.budget.live + 1;
+    var admitted = (try new_scope.lookup(a, &id, .none)).?;
+    admitted.deinit(a);
+    try std.testing.expect(new_scope.cachedBytes() > 0);
+    for (reclaim.entries) |entry| if (entry) |held| try std.testing.expect(!std.mem.eql(u8, &held.scope, &(@as([32]u8, @splat(1)))));
     var pressure: NavigationPool = .{};
     defer pressure.deinit();
     pressure.budget.limit = @sizeOf(NavigationOwner) + 1;
@@ -1361,4 +1411,17 @@ test "external lake global frontier cold map reads coalesce and canceled leaders
         try std.testing.expectEqualStrings("v1", record.generation);
         try std.testing.expectEqual(@as(usize, if (cancel) 2 else 1), gate.calls.load(.monotonic));
     }
+}
+
+test "external lake metadata navigation pool reclaims idle scopes before owner admission" {
+    var pool: NavigationPool = .{ .budget = .{ .backing = std.testing.allocator, .limit = @sizeOf(NavigationOwner) + 1 } };
+    defer pool.deinit();
+    (try pool.acquire(@splat(1))).release();
+    const next = try pool.acquire(@splat(2));
+    try std.testing.expectEqual(@as(usize, 2), next.refs.load(.acquire));
+    // A live reader cannot be reclaimed to satisfy another scope.
+    try std.testing.expectError(error.OutOfMemory, pool.acquire(@splat(3)));
+    try std.testing.expectEqual(@as(usize, 2), next.refs.load(.acquire));
+    next.release();
+    (try pool.acquire(@splat(3))).release();
 }

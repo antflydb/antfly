@@ -163,10 +163,16 @@ pub const TermFilter = struct {
 
         // Synonym expansion: check if field has a synonym section
         if (try seg.reader.getSection(self.field, .synonym)) |syn_data| {
-            var syn_reader = synonyms_mod.SynonymReader.init(alloc, syn_data) catch return result;
+            var syn_reader = synonyms_mod.SynonymReader.init(alloc, syn_data) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return result,
+            };
             defer syn_reader.deinit();
 
-            const expanded = syn_reader.expandTerm(alloc, self.term) catch return result;
+            const expanded = syn_reader.expandTerm(alloc, self.term) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return result,
+            };
             if (expanded) |terms| {
                 defer {
                     for (terms) |t| alloc.free(t);
@@ -3811,7 +3817,7 @@ test "geo shape filter point in polygon" {
     try testing.expect(contains.isEmpty());
 }
 
-test "term filter with synonym expansion" {
+test "external lake metadata navigation term filter keeps synonym membership complete under pressure" {
     const alloc = testing.allocator;
 
     // Build inverted index: doc0 has "fast", doc1 has "quick"
@@ -3855,4 +3861,13 @@ test "term filter with synonym expansion" {
     try testing.expect(bm.contains(0)); // "fast" — direct match
     try testing.expect(bm.contains(1)); // "quick" — synonym expansion
     try testing.expect(!bm.contains(2)); // "slow" — not a synonym
+    const Checked = struct {
+        fn run(a: Allocator, segment: *const index_mod.SegmentEntry) !void {
+            var matches = try (Filter{ .term = .{ .field = "text", .term = "fast" } }).execute(a, segment);
+            defer matches.deinit();
+            try testing.expectEqual(@as(usize, 2), matches.cardinality());
+            try testing.expect(matches.contains(0) and matches.contains(1));
+        }
+    };
+    try testing.checkAllAllocationFailures(alloc, Checked.run, .{seg});
 }

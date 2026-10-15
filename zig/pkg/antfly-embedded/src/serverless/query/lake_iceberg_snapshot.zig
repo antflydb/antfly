@@ -346,6 +346,62 @@ fn emptyInventoryAlloc(alloc: Allocator, request: SnapshotReadRequest, bytes: []
     return .{ .format = .iceberg, .source_id = source_id, .source_uri = uri, .snapshot_id = snapshot_id, .schema_fingerprint = fingerprint, .files = try alloc.alloc(external_source.FileEntry, 0) };
 }
 
+/// Read the selected snapshot identity without discovering data manifests.
+/// A caller may use this only with an independently authenticated file proof.
+pub fn snapshotHeaderAlloc(a: Allocator, request: SnapshotReadRequest, bytes: []const u8) !external_source.Inventory {
+    try request.validate();
+    if (bytes.len == 0 or bytes.len > request.limits.metadata_object_bytes) return error.IcebergMetadataObjectTooLarge;
+    try request.context.ensureActive();
+    if (try emptyInventoryAlloc(a, request, bytes)) |empty| return empty;
+    var plan = try iceberg_metadata.parseMetadataPlanAlloc(a, request.metadata_uri, bytes, request.requested_snapshot_id);
+    defer plan.deinit(a);
+    const source = try a.dupe(u8, request.source_id);
+    errdefer a.free(source);
+    const uri = try a.dupe(u8, plan.location);
+    errdefer a.free(uri);
+    const snapshot = try a.dupe(u8, plan.current_snapshot_id);
+    errdefer a.free(snapshot);
+    return .{ .format = .iceberg, .source_id = source, .source_uri = uri, .snapshot_id = snapshot, .schema_fingerprint = try a.dupe(u8, plan.schema_fingerprint), .files = &.{} };
+}
+/// Delete applicability stays fresh even when data-file discovery is deferred.
+/// Read the manifest list and delete manifests; data manifests remain unopened.
+pub fn deletePlanFromMetadataAlloc(a: Allocator, request: SnapshotReadRequest, bytes: []const u8) !IcebergDeletePlan {
+    try request.validate();
+    if (bytes.len == 0 or bytes.len > request.limits.metadata_object_bytes) return error.IcebergMetadataObjectTooLarge;
+    try request.context.ensureActive();
+    if (try emptyInventoryAlloc(a, request, bytes)) |empty_| {
+        var empty = empty_;
+        empty.deinit(a);
+        return .{ .files = &.{} };
+    }
+    var plan = try iceberg_metadata.parseMetadataPlanAlloc(a, request.metadata_uri, bytes, request.requested_snapshot_id);
+    defer plan.deinit(a);
+    var client = request.client;
+    client.allocator = a;
+    const list_bytes = try readFullObjectAlloc(a, &client, request.cache, plan.currentSnapshot().manifest_list_uri, .iceberg_metadata, null, request.limits.manifest_list_object_bytes);
+    defer a.free(list_bytes);
+    var list = try iceberg_avro.parseManifestListAlloc(a, list_bytes);
+    defer list.deinit(a);
+    var files: std.ArrayList(IcebergDeleteFile) = .empty;
+    errdefer {
+        deinitDeleteFileItems(a, files.items);
+        files.deinit(a);
+    }
+    for (list.entries) |entry| if (entry.content == .deletes) {
+        try request.context.ensureActive();
+        var manifest = try readManifest(a, request, entry);
+        defer manifest.close(a);
+        try appendActiveDeleteFilesFromManifestAlloc(a, &files, entry, manifest.value, plan);
+    };
+    const result: IcebergDeletePlan = .{ .files = try files.toOwnedSlice(a) };
+    errdefer {
+        var owned = result;
+        owned.deinit(a);
+    }
+    try result.validate();
+    return result;
+}
+
 pub fn readSnapshotInventoryAndDeletePlanAlloc(
     alloc: Allocator,
     request: SnapshotReadRequest,
@@ -378,7 +434,8 @@ fn readManifest(a: Allocator, request: SnapshotReadRequest, entry: iceberg_avro.
             client.allocator = alloc;
             const bytes = try readFullObjectAlloc(alloc, &client, self.request.cache, self.entry.manifest_path, if (self.entry.content == .data) .iceberg_metadata else .iceberg_delete_metadata, self.entry.manifest_length, self.request.limits.manifest_object_bytes);
             defer alloc.free(bytes);
-            item.payload = .{ .iceberg_manifest = try iceberg_avro.parseDataManifestAlloc(alloc, bytes) };
+            const decoded = try iceberg_avro.parseDataManifestAlloc(alloc, bytes);
+            item.payload = .{ .iceberg_manifest = decoded };
         }
     };
     if (request.manifests) |cache| {
@@ -870,7 +927,8 @@ fn acquireInventoryChunk(request: SnapshotReadRequest, entry: iceberg_avro.Manif
                 out.* = try iceberg_inventory.resolveManifestEntry(input, self.entry, self.format);
                 out.partition_spec_id = self.entry.partition_spec_id;
             }
-            item.payload = .{ .iceberg_chunk = try iceberg_inventory.planInventoryFromDataFilesAlloc(a, .{ .source_id = "chunk", .source_uri = "chunk", .snapshot_id = "manifest-chunk", .schema_fingerprint = "chunk", .data_files = entries }) };
+            const decoded = try iceberg_inventory.planInventoryFromDataFilesAlloc(a, .{ .source_id = "chunk", .source_uri = "chunk", .snapshot_id = "manifest-chunk", .schema_fingerprint = "chunk", .data_files = entries });
+            item.payload = .{ .iceberg_chunk = decoded };
         }
     };
     var loader: Loader = .{ .request = request, .entry = entry, .format = format };

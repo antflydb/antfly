@@ -1222,6 +1222,20 @@ fn PredicateResolver(comptime Set: type) type {
         fn scanSelected(self: Self, a: A, input: Compiled, selected: *const PhysicalSet) !?PredicateResult {
             var arena = std.heap.ArenaAllocator.init(a);
             defer arena.deinit();
+            if (self.source.hasLazyInventory()) {
+                // Physical blocks are keyed by logical file identity. Resolve a
+                // bounded file view before assigning scan-local file ordinals;
+                // neither publication navigation nor a lazy catalog has a flat
+                // inventory until the selected files are explicitly reached.
+                const ids = try arena.allocator().alloc([]const u8, selected.files.count());
+                var files = selected.files.keyIterator();
+                for (ids) |*id| id.* = files.next().?.*;
+                var view = try self.source.selectedFilesView(a, ids, self.read_context);
+                defer view.closeParallelView(self.source);
+                var scoped = self;
+                scoped.source = &view;
+                return scoped.scanSelected(a, input, selected);
+            }
             var fields: std.ArrayList([]const u8) = .empty;
             if (!try @import("lake_index_search_filter.zig").dependencies(arena.allocator(), self.table, input, &fields)) return null;
             var result = Set.init(a);

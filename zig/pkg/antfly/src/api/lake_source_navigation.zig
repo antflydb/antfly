@@ -491,6 +491,39 @@ pub const Resolver = struct {
         const found = (try self.point(scratch.allocator(), if (public) self.root.public else self.root.private, &id)) orelse return null;
         return self.remember(map, hex, found) orelse try a.dupe(u8, found);
     }
+    /// A selected file entry owns every field independently of decoded-page
+    /// residency. This permits sparse source opening after cold process restart.
+    pub fn inventoryFile(self: *@This(), a: A, id: []const u8) !local.serverless_external_source_types.FileEntry {
+        try self.lock();
+        defer self.mutex.unlock();
+        try self.cached.context.ensureActive();
+        try self.token.check();
+        var memory: local.sql_memory_budget = .{ .backing = @import("antfly_platform").allocator.processAllocator(std.heap.smp_allocator), .limit = 4 * 1024 * 1024 };
+        var scratch = std.heap.ArenaAllocator.init(memory.allocator());
+        defer scratch.deinit();
+        const bytes = (try self.point(scratch.allocator(), self.root.files, &key(id))) orelse return error.ExternalLakeSnapshotMismatch;
+        const record = try std.json.parseFromSliceLeaky(Record, scratch.allocator(), bytes, .{});
+        if (!std.mem.eql(u8, record.file.file_id, id)) return error.ExternalLakeSnapshotMismatch;
+        try record.file.validate();
+        // The binary codec transfers ordinary FileEntry ownership and cleans up
+        // partially decoded fields on allocation failure. Leaky JSON decoding
+        // into the request allocator would strand allocations under pressure.
+        const codec = local.serverless_external_source_codec;
+        const encoded = try codec.encodeAlloc(scratch.allocator(), .{
+            .format = .iceberg,
+            .source_id = @constCast(self.root.source),
+            .source_uri = @constCast("published-navigation"),
+            .snapshot_id = @constCast(self.root.snapshot),
+            .schema_fingerprint = @constCast(self.root.schema),
+            .files = @constCast(&[_]local.serverless_external_source_types.FileEntry{record.file}),
+        });
+        var inventory = try codec.decodeAlloc(a, encoded);
+        defer inventory.deinit(a);
+        const file_ = inventory.files[0];
+        a.free(inventory.files);
+        inventory.files = &.{};
+        return file_;
+    }
     /// Return only the exact selectors needed by a reached Parquet file.
     /// The caller owns the strings; all other source metadata remains in its
     /// fresh immutable manifest plan.
@@ -568,6 +601,21 @@ test "external lake bounded WAL paged source navigation resolves only reached id
     const cached: artifacts.CachedRead = .{ .cache = &cache, .scope = @splat(3), .context = .{} };
     var resolver: Resolver = .{ .root = old, .store = store, .cached = cached, .token = .none };
     defer resolver.deinit();
+    const Ownership = struct {
+        fn check(alloc: A, reader: *Resolver) !void {
+            var file_ = try reader.inventoryFile(alloc, "file-255");
+            defer file_.deinit(alloc);
+            try std.testing.expectEqualStrings("file-255", file_.file_id);
+            // Every field is owned independently of the immutable decoded page.
+            file_.file_id[0] = 'X';
+            try std.testing.expectEqualStrings("exact", file_.etag);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Ownership.check, .{&resolver});
+    var owned_file = try resolver.inventoryFile(a, "file-255");
+    defer owned_file.deinit(a);
+    try std.testing.expectEqualStrings("file-255", owned_file.file_id);
+    try std.testing.expectError(error.ExternalLakeSnapshotMismatch, resolver.inventoryFile(a, "absent"));
     const versions = try resolver.selectors(a, entries[255]);
     defer a.free(versions.etag);
     defer a.free(versions.version_id);
@@ -628,4 +676,5 @@ test "external lake bounded WAL paged source navigation resolves only reached id
     // Wrong authority cannot turn a cached page into a capability.
     newer.cached.context.deadline_ns = 1;
     try std.testing.expectError(error.DeadlineExceeded, newer.file(ca, new_digest, false));
+    try std.testing.expectError(error.DeadlineExceeded, newer.inventoryFile(a, "file-0"));
 }

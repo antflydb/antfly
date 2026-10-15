@@ -1595,3 +1595,147 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
         if held_intents.exists():
             intents.unlink()
             held_intents.rename(intents)
+
+
+def test_cold_indexed_iceberg_queries_use_publication_file_navigation(tmp_path):
+    """Cold search and SQL point reads must not reopen data manifests."""
+    if not os.environ.get("ANTFLY_E2E_FULL_LAKE"):
+        for dependency in ("pyiceberg", "fastavro", "pyarrow"):
+            pytest.importorskip(dependency)
+    import fastavro
+    import pyarrow as pa
+    from pyiceberg.catalog.sql import SqlCatalog
+    from pyiceberg.schema import Schema
+    from pyiceberg.types import LongType, NestedField, StringType
+
+    catalog = SqlCatalog(
+        "cold_navigation",
+        uri=f"sqlite:///{tmp_path}/catalog.db",
+        warehouse=(tmp_path / "warehouse").as_uri(),
+    )
+    catalog.create_namespace("cold_navigation")
+    table = catalog.create_table(
+        "cold_navigation.items",
+        schema=Schema(
+            NestedField(1, "amount", LongType(), required=False),
+            NestedField(2, "body", StringType(), required=False),
+            NestedField(3, "label", StringType(), required=False),
+        ),
+    )
+    for start in (0, 100):
+        table.append(
+            pa.table(
+                {
+                    "amount": range(start, start + 100),
+                    "body": ["needle common"] * 100,
+                    "label": [
+                        "kept" if i == 101 else "other"
+                        for i in range(start, start + 100)
+                    ],
+                }
+            )
+        )
+    root = tmp_path / "lake"
+    _export_table(table, root)
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    server = StandaloneAntflyServer(binary, "127.0.0.1", 0)
+    hidden = []
+    failed = True
+    try:
+
+        def call(method, path, body=None):
+            response = requests.request(
+                method,
+                server.api_url + path,
+                json=body,
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                timeout=60,
+            )
+            assert response.ok, response.text + "\n" + server.debug_logs()
+            value = response.json()
+            return value["responses"][0] if "responses" in value else value
+
+        call(
+            "POST",
+            "/tables/cold_navigation",
+            {
+                "num_shards": 1,
+                "schema": {
+                    "storage_mode": "relational",
+                    "base_source": {
+                        "kind": "external",
+                        "table_id": "cold-navigation",
+                        "format": "iceberg",
+                        "object_mutability": "immutable",
+                        "uri": root.as_uri(),
+                    },
+                    "relational_indexes": [
+                        {"name": "amount_idx", "keys": [{"column": "amount"}]}
+                    ],
+                },
+                "indexes": {"body_text": {"type": "full_text", "field": "body"}},
+            },
+        )
+        deadline = time.monotonic() + 300
+        while not call("GET", "/tables/cold_navigation/indexes/body_text")["status"][
+            "readiness"
+        ]["queryable"]:
+            assert time.monotonic() < deadline, server.debug_logs()
+            time.sleep(0.1)
+        for path in (root / "buckets/antfly/objects/metadata").glob("*.avro"):
+            records = list(fastavro.reader(io.BytesIO(path.read_bytes()[84:])))
+            if records and "data_file" in records[0]:
+                unavailable = path.with_suffix(".avro.unavailable")
+                path.rename(unavailable)
+                hidden.append((path, unavailable))
+        assert hidden, "fixture must contain real data manifests"
+        server.restart()
+        query = {
+            "full_text_search": {"field": "body", "term": "common"},
+            "fields": ["amount"],
+            "limit": 3,
+        }
+        first = call("POST", "/tables/cold_navigation/query", query)
+        assert len(first["hits"]["hits"]) == 3
+        # Retained cuts select an explicit snapshot, while publication was built
+        # using the current selector. Both authenticate the same metadata plan.
+        token = first["remote_snapshot"]
+        repeated = call(
+            "POST", "/tables/cold_navigation/query", {**query, "remote_snapshot": token}
+        )
+        assert repeated["hits"]["hits"] == first["hits"]["hits"]
+        residual = call(
+            "POST",
+            "/tables/cold_navigation/query",
+            {
+                **query,
+                "filter_query": {
+                    "conjuncts": [
+                        {"range": {"path": "/amount", "gte": 101}},
+                        {"prefix": {"path": "/label", "value": "ke"}},
+                    ]
+                },
+                "order_by": [{"field": "_score", "desc": True}],
+            },
+        )
+        assert [hit["_source"] for hit in residual["hits"]["hits"]] == [{"amount": 101}]
+
+        assert call(
+            "POST",
+            "/sql",
+            {"statement": "SELECT amount FROM cold_navigation WHERE amount = 101"},
+        )["rows"] == [["101"]]
+        # Full scans explicitly rediscover ordinary source metadata.
+        for path, unavailable in hidden:
+            unavailable.rename(path)
+        hidden.clear()
+        assert call(
+            "POST", "/sql", {"statement": "SELECT COUNT(*) FROM cold_navigation"}
+        )["rows"] == [["200"]]
+        failed = False
+    finally:
+        for path, unavailable in hidden:
+            unavailable.rename(path)
+        if failed:
+            print(server.debug_logs())
+        server.stop()

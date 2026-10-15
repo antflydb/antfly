@@ -125,7 +125,8 @@ pub const Cursor = struct {
                 column: *Column,
                 fn load(raw: *anyopaque, item: *@import("lake_decoded_cache.zig").Item) !void {
                     const value: *@This() = @ptrCast(@alignCast(raw));
-                    item.payload = .{ .page_directory = try value.cursor.readIndex(value.column, item.arena.allocator()) };
+                    const decoded = try value.cursor.readIndex(value.column, item.arena.allocator());
+                    item.payload = .{ .page_directory = decoded };
                 }
             }{ .cursor = self, .column = column };
             const limit = @min(shared.cache.decoded.max_loading_bytes, self.limits.max_struct_allocation_bytes);
@@ -255,7 +256,8 @@ pub const Cursor = struct {
                             bytes: []const u8,
                             fn load(raw: *anyopaque, item: *@import("lake_decoded_cache.zig").Item) !void {
                                 const value: *@This() = @ptrCast(@alignCast(raw));
-                                item.payload = .{ .dictionary = try decodeDictionaryAlloc(item.arena.allocator(), value.chunk, value.header, value.bytes) };
+                                const decoded = try decodeDictionaryAlloc(item.arena.allocator(), value.chunk, value.header, value.bytes);
+                                item.payload = .{ .dictionary = decoded };
                             }
                         }{ .chunk = column.chunk, .header = parsed.header, .bytes = encoded[parsed.header_len..] };
                         const lease = try reader.cache.decoded.acquire(key, @min(reader.cache.decoded.max_loading_bytes, self.limits.max_decoded_bytes / share *| 4), reader.context, .{ .ptr = &loader, .load = @TypeOf(loader).load });

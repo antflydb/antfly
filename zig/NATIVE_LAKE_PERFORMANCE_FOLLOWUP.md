@@ -4600,3 +4600,62 @@ whitespace, all 104 changed source license headers, and the Apache product
 boundary passed (2,060 source files). These results qualify behavior and
 ownership; representative archive-scale latency/RSS and live-provider retention
 qualification remain deferred.
+
+
+Cold immutable Iceberg indexed reads now authenticate publication file navigation
+against fresh metadata, selected snapshot/schema and credential/table/store
+identity before deferring data manifests. Both native search and SQL use this
+opener. Manifest-list/delete discovery remains fresh, selected file metadata is
+query-owned, and full scans discover files from frozen metadata normally. Current
+and retained explicit-snapshot requests accept the existing matching digest
+variants without changing the publication format. A cold-restart E2E removes
+data manifests after publication and exercises text, retained text and SQL point
+reads, then restores manifests for the full-scan fallback.
+
+Position-delete membership is shared as compressed 64-bit Roaring blocks. Views
+borrow immutable singleton sets and merge blocks only for overlapping delete
+files. Cached canonical fingerprint prefixes preserve publication IDs. Ordered
+text batches prepare syntax/statistics once and share at most four immutable
+pack membership bitmaps under an 8 MiB query quota, evicting or falling back on
+pressure while leaving exact scoring/filtering authoritative. Cloud generation
+navigation now reclaims other idle credential scopes for owner and decoded-page
+admission; active readers remain pinned. Regressions cover admission pressure,
+shared delete ownership/high coordinates/fingerprint compatibility, and repeated
+ordered batches with bounded fallback.
+
+
+Fallible decoded-cache constructors now complete before installing the payload
+union tag. Missing manifest or allocation failures leave the prior empty payload
+valid for cleanup; fully constructed resources retain normal destruction if a
+later preparation step fails. Regression coverage retries a missing-manifest
+load and verifies surviving shared snapshot leases. Synonym membership also
+propagates allocation failure instead of silently dropping expansion matches,
+allowing the optional ordered bitmap memo to fall back without false negatives.
+
+
+Publication navigation binds read callbacks to its own retained native handle,
+not the source opener's temporary handle. Native search shares its existing
+reader lease; SQL acquires a lease only when it has none. Navigation authority
+therefore survives source-open return without adding a second search lease.
+The cold-restart test exercises this boundary during final source hydration.
+
+
+Residual predicates resolve a bounded source view directly from the physical
+selection's file identities before assigning scan-local file ordinals. This
+works with both persistent catalogs and publication navigation, without expanding
+selected row coordinates or discovering unrelated data manifests. Full scans
+retain credential-scoped immutable parsed-manifest reuse under fresh selection.
+The cold E2E includes ordered indexed-range plus unindexed-prefix filtering while
+data manifests remain unavailable.
+
+
+Final qualification with origin/main `e32171bfb1`: the Debug CLI built; all
+485 lake integration tests passed (180 shared-engine and 305 server), all 81
+focused tests passed (19 and 62), and all 47 real Parquet/Iceberg E2Es passed in
+313.34 seconds. The strengthened cold restart E2E covers native text, retained
+text, SQL point lookup, ordered indexed-range/unindexed-prefix residual filtering
+with data manifests unavailable, and ordinary full scans after restoration.
+Pinned-compiler error metadata, Zig/Python formatting and lint, whitespace, all
+109 changed source license headers, and the Apache boundary passed (2,064 source
+files). Live-provider retention qualification and representative archive-scale
+latency/RSS benchmarks remain deferred; no archive speedup multiplier is claimed.
