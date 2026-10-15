@@ -32,6 +32,7 @@ pub const Artifact = struct {
 pub fn add(b: *std.Build, options: std.Build.TestOptions) Artifact {
     var object_options = options;
     object_options.use_llvm = @import("../../../build_support/embedded/source_owner.zig").llvmBackend(options.root_module.resolved_target.?.result);
+    object_options.max_rss = @import("runtime_memory.zig").linkedTestCompileMaxRss(options.name, b.graph.host.result, options.root_module.resolved_target.?.result, options.root_module.optimize, options.max_rss);
     object_options.emit_object = true;
     object_options.test_runner = options.test_runner orelse .{
         .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),

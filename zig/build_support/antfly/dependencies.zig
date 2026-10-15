@@ -1284,7 +1284,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     };
     inference_engine_mod.addImport("engine_memory", antfly_imports.storage_boundary.memory);
     runtime_abi_mod.addImport("antfly_test_error_logs", antfly_imports.storage_boundary.test_error_logs);
-    const ordinal_tests = b.addTest(.{ .root_module = antfly_imports.storage_boundary.ordinals });
+    const ordinal_tests = b.addTest(.{ .name = "storage-ordinal-core-tests", .root_module = antfly_imports.storage_boundary.ordinals, .use_llvm = @import("../embedded/source_owner.zig").llvmBackend(target.result) });
     b.step("storage-ordinal-core-test", "Verify bulk storage operations through the configured implementation")
         .dependOn(&b.addRunArtifact(ordinal_tests).step);
     const doc_set_tests_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/storage_doc_set_test_root.zig"), .target = target, .optimize = optimize });

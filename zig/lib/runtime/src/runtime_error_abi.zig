@@ -744,6 +744,27 @@ pub const Detail = enum(c_int) {
     runtime_already_ready,
     document_extraction_working_set_too_large,
     document_artifact_publication_failed,
+    // Physical storage callback capability, integrity and admission outcomes.
+    crc_mismatch,
+    invalid_data,
+    mapped_artifact_unsupported,
+    immutable_read_source_unsupported,
+    directory_listing_unsupported,
+    unsupported_storage_lease,
+    durable_atomic_write_unsupported,
+    durable_atomic_rename_unsupported,
+    durable_file_sync_unsupported,
+    durable_directory_sync_unsupported,
+    stable_file_lease_unsupported,
+    read_only,
+    storage_closed,
+    cache_budget_exceeded,
+    buffer_too_small,
+    file_too_big,
+    invalid_scratch,
+    invalid_atomic_write_offset,
+    canceled_range_read,
+    source_visitor_failed,
 };
 
 pub const Status = extern struct {
@@ -1423,6 +1444,26 @@ pub fn statusFromError(err: anyerror) Status {
         error.RuntimeAlreadyReady => status(.conflict, .runtime_already_ready),
         error.DocumentExtractionWorkingSetTooLarge => status(.invalid_argument, .document_extraction_working_set_too_large),
         error.DocumentArtifactPublicationFailed => status(.conflict, .document_artifact_publication_failed),
+        error.CrcMismatch => status(.corrupt, .crc_mismatch),
+        error.InvalidData => status(.corrupt, .invalid_data),
+        error.MappedArtifactUnsupported => status(.unsupported, .mapped_artifact_unsupported),
+        error.ImmutableReadSourceUnsupported => status(.unsupported, .immutable_read_source_unsupported),
+        error.DirectoryListingUnsupported => status(.unsupported, .directory_listing_unsupported),
+        error.UnsupportedStorageLease => status(.unsupported, .unsupported_storage_lease),
+        error.DurableAtomicWriteUnsupported => status(.unsupported, .durable_atomic_write_unsupported),
+        error.DurableAtomicRenameUnsupported => status(.unsupported, .durable_atomic_rename_unsupported),
+        error.DurableFileSyncUnsupported => status(.unsupported, .durable_file_sync_unsupported),
+        error.DurableDirectorySyncUnsupported => status(.unsupported, .durable_directory_sync_unsupported),
+        error.StableFileLeaseUnsupported => status(.unsupported, .stable_file_lease_unsupported),
+        error.ReadOnly => status(.forbidden, .read_only),
+        error.StorageClosed => status(.unavailable, .storage_closed),
+        error.CacheBudgetExceeded => status(.unavailable, .cache_budget_exceeded),
+        error.BufferTooSmall => status(.invalid_argument, .buffer_too_small),
+        error.FileTooBig => status(.invalid_argument, .file_too_big),
+        error.InvalidScratch => status(.invalid_argument, .invalid_scratch),
+        error.InvalidAtomicWriteOffset => status(.invalid_argument, .invalid_atomic_write_offset),
+        error.CanceledRangeRead => status(.cancelled, .canceled_range_read),
+        error.SourceVisitorFailed => status(.internal, .source_visitor_failed),
         else => status(.internal, .none),
     };
 }
@@ -1469,6 +1510,27 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
     return switch (detail) {
         .document_extraction_working_set_too_large => "DocumentExtractionWorkingSetTooLarge",
         .document_artifact_publication_failed => "DocumentArtifactPublicationFailed",
+        .crc_mismatch => "CrcMismatch",
+        .invalid_data => "InvalidData",
+        .mapped_artifact_unsupported => "MappedArtifactUnsupported",
+        .immutable_read_source_unsupported => "ImmutableReadSourceUnsupported",
+        .directory_listing_unsupported => "DirectoryListingUnsupported",
+        .unsupported_storage_lease => "UnsupportedStorageLease",
+        .durable_atomic_write_unsupported => "DurableAtomicWriteUnsupported",
+        .durable_atomic_rename_unsupported => "DurableAtomicRenameUnsupported",
+        .durable_file_sync_unsupported => "DurableFileSyncUnsupported",
+        .durable_directory_sync_unsupported => "DurableDirectorySyncUnsupported",
+        .stable_file_lease_unsupported => "StableFileLeaseUnsupported",
+        .read_only => "ReadOnly",
+        .storage_closed => "StorageClosed",
+        .cache_budget_exceeded => "CacheBudgetExceeded",
+        .buffer_too_small => "BufferTooSmall",
+        .file_too_big => "FileTooBig",
+        .invalid_scratch => "InvalidScratch",
+        .invalid_atomic_write_offset => "InvalidAtomicWriteOffset",
+        .canceled_range_read => "CanceledRangeRead",
+        .source_visitor_failed => "SourceVisitorFailed",
+
         .external_lake_read_only => "ExternalLakeReadOnly",
         .external_lake_snapshot_mismatch => "ExternalLakeSnapshotMismatch",
         .external_lake_schema_mismatch => "ExternalLakeSchemaMismatch",
@@ -2412,5 +2474,13 @@ test "external lake and spill errors retain exact identity across runtime archiv
 test "inference command and lifecycle errors retain their identities across engine calls" {
     inline for (.{ error.WarmInferenceServerUnavailable, error.UnsupportedServerGenerateOption, error.MissingInferenceListener, error.RuntimeFailed, error.RuntimeStopping, error.RuntimeAlreadyReady }) |err| {
         try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
+    }
+}
+
+test "storage callback boundaries retain capability integrity and bounded-read outcomes" {
+    for ([_]anyerror{ error.CrcMismatch, error.InvalidData, error.MappedArtifactUnsupported, error.ImmutableReadSourceUnsupported, error.DirectoryListingUnsupported, error.UnsupportedStorageLease, error.DurableAtomicWriteUnsupported, error.DurableAtomicRenameUnsupported, error.DurableFileSyncUnsupported, error.DurableDirectorySyncUnsupported, error.StableFileLeaseUnsupported, error.ReadOnly, error.StorageClosed, error.CacheBudgetExceeded, error.BufferTooSmall, error.FileTooBig, error.InvalidScratch, error.InvalidAtomicWriteOffset, error.CanceledRangeRead }) |err| {
+        const encoded = statusFromError(err);
+        try std.testing.expect(errorHasStableDetail(err));
+        try std.testing.expectEqual(err, errorFromStatus(encoded));
     }
 }

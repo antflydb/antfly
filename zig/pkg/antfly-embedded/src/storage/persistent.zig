@@ -334,8 +334,8 @@ const SegmentFileStore = struct {
         if (writer.vtable.finish_source != null or writer.vtable.finish_mapped != null) writer.setCacheIntent(.cold_sequential);
         try writer.appendSlice(bytes);
         active = false;
-        if (writer.vtable.finish_source) |finish_source| return .fromNative(try finish_source(writer.ptr));
-        if (writer.vtable.finish_mapped) |finish_mapped| return .fromMappedArtifact(try finish_mapped(writer.ptr));
+        if (writer.vtable.finish_source != null) return .fromNative(try writer.finishSource());
+        if (writer.vtable.finish_mapped != null) return .fromMappedArtifact(try writer.finishMapped());
         writer.finish() catch |err| {
             // The atomic writer preserves the previously published segment on
             // failure and the caller receives the error for retry/rollback.
@@ -2308,8 +2308,8 @@ pub const PersistentIndex = struct {
 
         writer_active = false;
         const finish_write_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
-        const finished_source = if (writer.vtable.finish_source) |finish_source| try finish_source(writer.ptr) else null;
-        const finished_mapping = if (finished_source != null) null else if (writer.vtable.finish_mapped) |finish_mapped| try finish_mapped(writer.ptr) else blk: {
+        const finished_source = if (writer.vtable.finish_source != null) try writer.finishSource() else null;
+        const finished_mapping = if (finished_source != null) null else if (writer.vtable.finish_mapped != null) try writer.finishMapped() else blk: {
             try writer.finish();
             break :blk null;
         };
@@ -2989,10 +2989,10 @@ pub const PersistentIndex = struct {
         try sink_adapter.flush();
 
         writer_active = false;
-        var data: ?index_mod.SegmentData = if (writer.vtable.finish_source) |finish_source|
-            .fromNative(try finish_source(writer.ptr))
-        else if (writer.vtable.finish_mapped) |finish_mapped|
-            .fromMappedArtifact(try finish_mapped(writer.ptr))
+        var data: ?index_mod.SegmentData = if (writer.vtable.finish_source != null)
+            .fromNative(try writer.finishSource())
+        else if (writer.vtable.finish_mapped != null)
+            .fromMappedArtifact(try writer.finishMapped())
         else blk: {
             try writer.finish();
             break :blk if (publication_admission) |*admission|
