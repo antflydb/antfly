@@ -66,6 +66,13 @@ pub const ArtifactWrite = struct {
 /// batch and explicit for a narrower reconciliation such as graph-only replay.
 pub const RecordWrite = struct {
     inputs: ?replay_read_set.View = null,
+    /// Both phases derive from the same input view. Detached publication must
+    /// admit them together so phase one's own writes cannot invalidate phase
+    /// two. Each phase retains its replay hints and durable handoff semantics.
+    graph_reconciliation: ?struct {
+        keys: []const []const u8,
+        writes: []const ArtifactWrite,
+    } = null,
     batch: derived_types.DerivedBatch,
     artifact_writes: []const ArtifactWrite = &.{},
     artifact_deletes: []const []const u8 = &.{},
@@ -74,6 +81,17 @@ pub const RecordWrite = struct {
     /// split-delta, and HA handoff. The DB writer batches this metadata while
     /// it still owns the hot-standby mutation/fencing boundary.
     publish_resolution_handoff: bool = false,
+
+    pub fn graphReconciliationWrite(self: RecordWrite) ?RecordWrite {
+        const graph = self.graph_reconciliation orelse return null;
+        return .{
+            .inputs = self.inputs,
+            .batch = .{ .changed_artifact_keys = graph.keys },
+            .artifact_writes = graph.writes,
+            .publish_resolution_handoff = graph.writes.len > 0,
+            .target_hints = &.{.graph},
+        };
+    }
 };
 
 pub const DerivedRecordWriter = *const fn (ptr: *anyopaque, write: RecordWrite) anyerror!u64;
@@ -1476,7 +1494,12 @@ pub fn processRecordKeys(
             .artifact_writes = pending.artifact_writes.items,
             .artifact_deletes = pending.artifact_deletes.items,
             .publish_resolution_handoff = true,
+            .graph_reconciliation = if (pending.graph_only_keys.items.len > 0) .{
+                .keys = pending.graph_only_keys.items,
+                .writes = pending.refresh_writes.items,
+            } else null,
         });
+        return;
     }
     if (pending.graph_only_keys.items.len > 0) {
         _ = try write_fn(write_ctx, .{
@@ -3251,6 +3274,7 @@ const CaptureWriter = struct {
             }
         }
         self.calls += 1;
+        if (write.graphReconciliationWrite()) |graph| return writeFn(ptr, graph);
         return self.calls;
     }
 };

@@ -429,7 +429,10 @@ the detached replay watermark after a successful commit. Resolver primary
 effects and their replay record commit together; derived projection work runs
 outside the owner gate. Resolver publication also validates the inputs read
 during computation, including absent keys and scanned candidate ranges, and
-rejects changes to resolver configurations. Unrelated keys remain publishable.
+rejects changes to resolver configurations. Mixed full and graph-only resolver
+phases share one publication admission and input validation, preserving their
+separate replay hints without invalidating themselves between commits.
+Unrelated keys remain publishable.
 
 `antfly_db_pending_work_stats_json` includes `index_replay_debt` per namespace:
 each index reports its `applied_sequence`, `target_sequence`, and

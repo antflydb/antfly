@@ -51429,8 +51429,18 @@ fn appendResolutionRecordWithProjection(
         defer guarded_keys.deinit(ctx.alloc);
         for (write.artifact_writes) |artifact| try guarded_keys.append(ctx.alloc, artifact.key);
         try guarded_keys.appendSlice(ctx.alloc, write.artifact_deletes);
+        if (write.graph_reconciliation) |graph| try guarded_keys.appendSlice(ctx.alloc, graph.keys);
         return port.publish(port.ptr, write.batch, guarded_keys.items, write.inputs, &request, Request.apply);
     };
+    if (write.graphReconciliationWrite()) |graph| {
+        // The detached port above holds one live writer lease across both
+        // phases. Validate their common inputs once, before either commits.
+        // Ordinary callers retain the same ordered two-record behavior.
+        var primary = write;
+        primary.graph_reconciliation = null;
+        _ = try appendResolutionRecordWithProjection(ctx_ptr, primary, before_handoff_publish, defer_projection);
+        return appendResolutionRecordWithProjection(ctx_ptr, graph, before_handoff_publish, defer_projection);
+    }
     if (write.artifact_writes.len == 0 and write.artifact_deletes.len == 0 and write.target_hints == null) {
         if (defer_projection) {
             var current = ctx.batchContext();

@@ -22,6 +22,15 @@ pub const Range = struct { lower: []const u8, upper: []const u8, digest: [32]u8 
 pub const View = struct {
     points: []const Point = &.{},
     ranges: []const Range = &.{},
+    // Borrows Capture's index, just like the point/range slices. Publication
+    // uses it to avoid scanning every input for each output guard.
+    point_index: std.StringHashMapUnmanaged(usize) = .empty,
+
+    pub fn hasPoint(self: View, key: []const u8) bool {
+        if (self.point_index.count() > 0) return self.point_index.contains(key);
+        for (self.points) |point| if (std.mem.eql(u8, point.key, key)) return true;
+        return false;
+    }
 
     /// The caller holds the live writer fence for this entire validation and
     /// the following commit. Use logical reads, matching the resolver's store.
@@ -82,7 +91,7 @@ pub const Capture = struct {
         self.arena.deinit();
     }
     pub fn view(self: *const Capture) View {
-        return .{ .points = self.points.items, .ranges = self.ranges.items };
+        return .{ .points = self.points.items, .ranges = self.ranges.items, .point_index = self.seen };
     }
     pub fn notePoint(self: *Capture, key: []const u8, value: ?[]const u8) !void {
         const digest = fingerprint(value);

@@ -203,8 +203,13 @@ pub const PreparedPublication = struct {
         try self.guardDocument(database, doc_key);
     }
 
-    fn guardReplayKey(self: *@This(), database: *h.db_mod.DB, key: []const u8) !void {
+    fn guardReplayKey(self: *@This(), database: *h.db_mod.DB, key: []const u8, inputs: ?@import("../storage/db/replay_read_set.zig").View) !void {
         try self.guardKey(database, key);
+        // Computed resolver outputs were read through the captured logical
+        // store and validated above. A prior publication in this turn may
+        // have changed them legitimately; comparing them again to the turn's
+        // original physical snapshot would reject our own committed output.
+        if (inputs) |read_set| if (read_set.hasPoint(key)) return;
         const captured_read = self.source_read orelse return error.EnrichmentWaitCanceled;
         var expected = try captured_read.openReadScope(alloc);
         defer expected.close();
@@ -249,8 +254,8 @@ pub const PreparedPublication = struct {
         for (record.changed_doc_keys) |key| try self.guardDocument(database, key);
         for (record.deleted_doc_keys) |key| try self.guardDocument(database, key);
         for (record.overwritten_doc_keys) |key| try self.guardDocument(database, key);
-        for (record.changed_artifact_keys) |key| try self.guardReplayKey(database, key);
-        for (artifact_keys) |key| try self.guardReplayKey(database, key);
+        for (record.changed_artifact_keys) |key| try self.guardReplayKey(database, key, inputs);
+        for (artifact_keys) |key| try self.guardReplayKey(database, key, inputs);
         const sequence = try apply(request, database);
         // The physical header alone does not update the detached DocStore's
         // committed/reserved sequence caches. Only mirror successful commits.

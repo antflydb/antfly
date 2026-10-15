@@ -5722,8 +5722,8 @@ test "capi SQL resolver publication fences captured inputs and resolver generati
     const alloc = std.testing.allocator;
     const resolution = @import("antfly_local_sources").storage_db_resolution_runtime;
     const k = @import("antfly_local_sources").storage_internal_keys;
-    const Mode = enum { unchanged, unrelated, source, sibling, override, candidate, catalog };
-    for ([_]Mode{ .unchanged, .unrelated, .source, .sibling, .override, .candidate, .catalog }) |mode| {
+    const Mode = enum { unchanged, unrelated, source, sibling, override, candidate, catalog, mixed, mixed_conflict, repeated };
+    for ([_]Mode{ .unchanged, .unrelated, .source, .sibling, .override, .candidate, .catalog, .mixed, .mixed_conflict, .repeated }) |mode| {
         errdefer std.debug.print("resolver publication fence mode={s}\n", .{@tagName(mode)});
         var directory = try TestDirectory.init("capi-sql-resolver-input-fence");
         defer directory.cleanup();
@@ -5761,6 +5761,26 @@ test "capi SQL resolver publication fences captured inputs and resolver generati
             errdefer txn.abort();
             try txn.put(source, "{\"entities\":[{\"id\":\"e0\",\"label\":\"Person\",\"text\":\"Old Name\"}]}");
             try txn.commit();
+            if (mode == .mixed or mode == .mixed_conflict) {
+                // A second source is already resolved, making the captured record
+                // contain both changed and unchanged decisions.
+                try guard.handle.db.batch(.{ .writes = &.{.{ .key = "doc2", .value = "{}" }}, .sync_level = .write });
+                const second = try k.artifactNamedPrefixAlloc(alloc, "doc2", "asset", "mentions");
+                defer alloc.free(second);
+                var second_txn = try guard.handle.db.core.store.beginWriteTxn();
+                errdefer second_txn.abort();
+                try second_txn.put(second, "{\"entities\":[{\"id\":\"e0\",\"label\":\"Person\",\"text\":\"Old Name\"}]}");
+                try second_txn.commit();
+                const runtime = guard.handle.db.resolution_runtime.?;
+                var borrowed = runtime.store_handle.store;
+                var adapter: resolution.DbArtifactStore(@TypeOf(borrowed)) = .{ .store = &borrowed, .index_manager = guard.handle.db.core.index_manager };
+                const configs = try guard.handle.db.core.listResolvers(alloc);
+                defer {
+                    for (configs) |*cfg| cfg.deinit(alloc);
+                    alloc.free(configs);
+                }
+                try resolution.processRecordKeys(alloc, configs, adapter.artifactStore(), null, &.{second}, runtime.write_ctx, runtime.write_fn, null, null);
+            }
         }
         const Probe = struct {
             handle: ?*anyopaque,
@@ -5783,10 +5803,11 @@ test "capi SQL resolver publication fences captured inputs and resolver generati
                         _ = try guard.handle.db.core.upsertResolver(.{ .name = "review", .table = "default", .source_artifact = "mentions", .resolution_artifact = "resolution", .key_template = "changed/{{ slug _entity.text }}", .config_generation = 2, .promote = false, .labels = &.{"Person"} });
                     } else if (self.mode == .candidate) {
                         try guard.handle.db.batch(.{ .writes = &.{.{ .key = "old_name", .value = "{\"name\":\"Canonical\"}" }}, .sync_level = .write });
-                    } else if (self.mode != .unchanged) {
+                    } else if (self.mode != .unchanged and self.mode != .mixed and self.mode != .repeated) {
                         const a = std.heap.c_allocator;
                         const key = switch (self.mode) {
                             .source => try a.dupe(u8, self.source),
+                            .mixed_conflict => try k.artifactNamedPrefixAlloc(a, "doc2", "asset", "mentions"),
                             .sibling => try k.resolutionArtifactKeyAlloc(a, "doc", "sibling"),
                             .override => try resolution.reviewOverrideArtifactKeyAlloc(a, "doc", "mentions", "resolution"),
                             else => try a.dupe(u8, "unrelated"),
@@ -5807,14 +5828,29 @@ test "capi SQL resolver publication fences captured inputs and resolver generati
                     for (resolvers) |*cfg| cfg.deinit(a);
                     a.free(resolvers);
                 }
-                resolution.processRecordKeys(a, resolvers, adapter.artifactStore(), null, &.{self.source}, runtime.write_ctx, runtime.write_fn, null, null) catch |err| {
+                const second = try k.artifactNamedPrefixAlloc(a, "doc2", "asset", "mentions");
+                defer a.free(second);
+                const changed = if (self.mode == .mixed or self.mode == .mixed_conflict) &[_][]const u8{ self.source, second } else &[_][]const u8{self.source};
+                const replay_before = root.db.core.nextDerivedSequence();
+                resolution.processRecordKeys(a, resolvers, adapter.artifactStore(), null, changed, runtime.write_ctx, runtime.write_fn, null, null) catch |err| {
                     if (err != error.EnrichmentWaitCanceled and err != error.EnrichmentSourceChanged) return err;
                     self.rejection = err;
                 };
+                if (self.mode == .repeated) {
+                    // Refreshing the detached checkpoint after the first
+                    // publication makes its output the second record's input.
+                    // Both records must finish in this same captured turn.
+                    try resolution.processRecordKeys(a, resolvers, adapter.artifactStore(), null, changed, runtime.write_ctx, runtime.write_fn, null, null);
+                }
                 // Inspect before the ordinary maintenance pass can retry from
                 // a new snapshot and publish a fresh, valid decision.
                 const guard = public.enterHandle(self.handle, .read).?;
                 defer guard.leave();
+                if (self.mode == .mixed) {
+                    try std.testing.expectEqual(replay_before + 2, root.db.core.nextDerivedSequence());
+                    try std.testing.expectEqual(@as(u64, 1), guard.connection.?.owner.publication_stats.replay_attempts);
+                    try std.testing.expectEqual(@as(u64, 0), guard.connection.?.owner.publication_stats.replay_refused);
+                }
                 const value = try guard.handle.db.core.getStoreValue(a, self.out);
                 defer if (value) |bytes| a.free(bytes);
                 if (self.rejection != null) try std.testing.expect(value == null) else try std.testing.expect(value != null);
@@ -5826,7 +5862,7 @@ test "capi SQL resolver publication fences captured inputs and resolver generati
         _ = try owner.maintenanceTurnForTest();
         owner.test_after_capture = null;
         if (probe.failure) |err| return err;
-        try std.testing.expectEqual(mode != .unchanged and mode != .unrelated, probe.rejection != null);
+        try std.testing.expectEqual(mode != .unchanged and mode != .unrelated and mode != .mixed and mode != .repeated, probe.rejection != null);
     }
 }
 
