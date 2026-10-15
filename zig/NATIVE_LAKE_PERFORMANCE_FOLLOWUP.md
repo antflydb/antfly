@@ -4462,3 +4462,17 @@ scores/ties over real Parquet, archive/recent overlap with cancellation and quot
 pressure, source-view ownership, and immutable manifest reuse across freshly
 selected snapshots and credential scopes. Live-provider retention qualification
 and archive-scale latency/RSS benchmarking remain deferred.
+
+
+Final qualification after merging origin/main fc4f2402ad (#1137): the Debug CLI
+rebuilt, all 472 lake integration tests passed (174 shared-engine and 298 server),
+all 68 focused tests passed (13 shared-engine and 55 server), and all 46 real
+Parquet/Iceberg E2Es passed in 306.69 seconds. The focused suite now includes
+main's bounded constant-score cursor/cancellation regressions. Pure patterns
+retain their dedicated bitmap collector while mixed Boolean trees use streaming
+lowering; prepared counts carry cancellation/deadlines through shared filters.
+Runtime failure conflicts preserve main's published numeric identities.
+Compiler-local native error generation, Zig/Python formatting and lint,
+whitespace, license checks and the Apache product boundary passed (2,052 source
+files). Provider retention qualification and archive-scale performance
+benchmarks remain deferred.
