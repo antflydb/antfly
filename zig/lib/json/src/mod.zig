@@ -52,6 +52,7 @@ pub const validate = std.json.validate;
 pub const validateTyped = @import("validate_typed.zig").validateTyped;
 pub const scanValue = @import("validate_typed.zig").scanValue;
 pub const ValueScanner = @import("validate_typed.zig").ValueScanner;
+pub const ObjectKeyWorkspace = @import("object_key_workspace.zig").ObjectKeyWorkspace;
 pub const MemberObserver = @import("validate_typed.zig").MemberObserver;
 pub const Error = std.json.Error;
 pub const default_buffer_size = std.json.default_buffer_size;

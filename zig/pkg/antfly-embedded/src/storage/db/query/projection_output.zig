@@ -413,15 +413,14 @@ const StreamContext = struct {
     work: Allocator,
     tokens: std.heap.ArenaAllocator,
     scanners: std.heap.ArenaAllocator,
-    frames: std.ArrayListUnmanaged(Frame) = .empty,
-    const Frame = struct { object: bool, key: bool = true, count: usize = 0, arena: std.heap.ArenaAllocator, names: std.StringHashMapUnmanaged(void) = .empty };
+    keys: @import("antfly-json").ObjectKeyWorkspace(FrameState),
+    const FrameState = struct { object: bool, key: bool = true, count: usize = 0 };
     fn init(scratch: Allocator) StreamContext {
         const work = @import("antfly_platform").allocator.reclaimingScratch(scratch);
-        return .{ .work = work, .tokens = .init(work), .scanners = .init(work) };
+        return .{ .work = work, .tokens = .init(work), .scanners = .init(work), .keys = .init(work) };
     }
     fn deinit(self: *StreamContext) void {
-        for (self.frames.items) |*frame| frame.arena.deinit();
-        self.frames.deinit(self.work);
+        self.keys.deinit();
         self.tokens.deinit();
         self.scanners.deinit();
     }
@@ -429,10 +428,12 @@ const StreamContext = struct {
         try resetScratch(&self.scanners);
         var scanner = std.json.Scanner.initCompleteInput(self.scanners.allocator(), raw);
         defer scanner.deinit();
+        errdefer self.keys.deinit();
         try self.writeValue(writer, &scanner, raw.len, parse_numbers);
         if (try scanner.next() != .end_of_document) return error.SyntaxError;
     }
     fn writeValue(self: *StreamContext, writer: *std.Io.Writer, scanner: *std.json.Scanner, max_len: usize, parse_numbers: bool) !void {
+        errdefer self.keys.deinit();
         var root_seen = false;
         // Reuse arenas across siblings, but keep each live ancestor's duplicate
         // keys until its object ends. Retention is capped at every reuse.
@@ -448,9 +449,7 @@ const StreamContext = struct {
                 try writer.writeByte(if (token == .object_end) '}' else ']');
                 if (depth == 0) return error.SyntaxError;
                 depth -= 1;
-                const closed = &self.frames.items[depth];
-                try resetScratch(&closed.arena);
-                closed.names = .empty;
+                try self.keys.finishFrame(depth);
                 continue;
             }
             if (depth == 0) {
@@ -458,14 +457,13 @@ const StreamContext = struct {
                 root_seen = true;
             }
             if (depth != 0) {
-                const frame = &self.frames.items[depth - 1];
+                const frame = &self.keys.stack.items[depth - 1].state;
                 if (frame.object and frame.key) {
                     const name = switch (token) {
                         .string, .allocated_string => |s| s,
                         else => return error.SyntaxError,
                     };
-                    const key = if (token == .allocated_string) try frame.arena.allocator().dupe(u8, name) else name;
-                    if ((try frame.names.getOrPut(frame.arena.allocator(), key)).found_existing) return error.DuplicateField;
+                    try self.keys.remember(depth - 1, name, token == .allocated_string);
                     if (frame.count != 0) try writer.writeByte(',');
                     try std.json.Stringify.value(name, .{}, writer);
                     try writer.writeByte(':');
@@ -483,9 +481,7 @@ const StreamContext = struct {
             switch (token) {
                 .object_begin, .array_begin => {
                     try writer.writeByte(if (token == .object_begin) '{' else '[');
-                    if (depth == self.frames.items.len) try self.frames.append(self.work, .{ .object = token == .object_begin, .arena = .init(self.work) });
-                    const frame = &self.frames.items[depth];
-                    frame.* = .{ .object = token == .object_begin, .arena = frame.arena };
+                    try self.keys.enter(depth, .{ .object = token == .object_begin });
                     depth += 1;
                 },
                 .string, .allocated_string => |s| try std.json.Stringify.value(s, .{}, writer),
@@ -496,6 +492,7 @@ const StreamContext = struct {
                 else => return error.SyntaxError,
             }
         }
+        self.keys.finishValue();
     }
 };
 
@@ -1001,4 +998,84 @@ test "public graph metric borrowed wire primed nested fanout survives replacemen
     };
     try Fixture.run(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "public graph metric borrowed wire streaming writer reuses wide escaped key tables" {
+    const a = std.testing.allocator;
+    var input = std.Io.Writer.Allocating.init(a);
+    defer input.deinit();
+    var expected = std.Io.Writer.Allocating.init(a);
+    defer expected.deinit();
+    try input.writer.writeByte('{');
+    try expected.writer.writeByte('{');
+    for (0..1000) |i| {
+        if (i != 0) {
+            try input.writer.writeByte(',');
+            try expected.writer.writeByte(',');
+        }
+        try input.writer.print("\"\\u006b{d}\":0", .{i});
+        try expected.writer.print("\"k{d}\":0", .{i});
+    }
+    try input.writer.writeByte('}');
+    try expected.writer.writeByte('}');
+    const Fixture = struct {
+        fn run(alloc: Allocator, raw: []const u8, canonical: []const u8) !void {
+            var counted: std.testing.FailingAllocator = .init(alloc, .{});
+            var context = StreamContext.init(counted.allocator());
+            defer context.deinit();
+            for (0..4) |iteration| {
+                var out = std.Io.Writer.Allocating.init(alloc);
+                defer out.deinit();
+                const calls = counted.allocations;
+                context.writeSpan(&out.writer, raw, true) catch |err| return if (err == error.WriteFailed) error.OutOfMemory else err;
+                try std.testing.expectEqualStrings(canonical, out.written());
+                if (iteration != 0) try std.testing.expectEqual(calls, counted.allocations);
+                try std.testing.expect(context.keys.retainedBytes() <= @TypeOf(context.keys).reuse_limit);
+            }
+        }
+    };
+    try Fixture.run(a, input.written(), expected.written());
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Fixture.run, .{ input.written(), expected.written() });
+}
+
+test "public graph metric borrowed wire streaming writer retires sparse tables and recovers from write failure" {
+    const a = std.testing.allocator;
+    var context = StreamContext.init(a);
+    defer context.deinit();
+    var wide = std.Io.Writer.Allocating.init(a);
+    defer wide.deinit();
+    try wide.writer.writeByte('{');
+    for (0..5000) |i| {
+        if (i != 0) try wide.writer.writeByte(',');
+        try wide.writer.print("\"k{d}\":0", .{i});
+    }
+    try wide.writer.writeByte('}');
+    var output = std.Io.Writer.Allocating.init(a);
+    defer output.deinit();
+    try context.writeSpan(&output.writer, wide.written(), true);
+    try std.testing.expect(context.keys.table_bytes > 64 * 1024);
+    try context.writeSpan(&output.writer, "{\"a\":0}", true);
+    try context.writeSpan(&output.writer, "{\"a\":0}", true);
+    try std.testing.expect(context.keys.table_bytes < 1024);
+    var memory: [2]u8 = undefined;
+    var fixed = std.Io.Writer.fixed(&memory);
+    try std.testing.expectError(error.WriteFailed, context.writeSpan(&fixed, "{\"a\":{\"b\":0}}", true));
+    try std.testing.expectEqual(@as(usize, 0), context.keys.retainedBytes());
+    try std.testing.expectError(error.DuplicateField, context.writeSpan(&output.writer, "{\"x\":0,\"\\u0078\":1}", true));
+    try std.testing.expectEqual(@as(usize, 0), context.keys.retainedBytes());
+    var recovered = std.Io.Writer.Allocating.init(a);
+    defer recovered.deinit();
+    try context.writeSpan(&recovered.writer, "{\"\\u0061\":{\"a\":1}}", true);
+    try std.testing.expectEqualStrings("{\"a\":{\"a\":1}}", recovered.written());
+    const depth = 10000;
+    const deep = try a.alloc(u8, depth * 2 + 1);
+    defer a.free(deep);
+    @memset(deep[0..depth], '[');
+    deep[depth] = '0';
+    @memset(deep[depth + 1 ..], ']');
+    var deep_output = std.Io.Writer.Allocating.init(a);
+    defer deep_output.deinit();
+    try context.writeSpan(&deep_output.writer, deep, true);
+    try std.testing.expectEqualStrings(deep, deep_output.written());
+    try std.testing.expectEqual(@as(usize, 0), context.keys.retainedBytes());
 }
