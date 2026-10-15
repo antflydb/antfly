@@ -687,9 +687,9 @@ fn dynamicStreamAllocationRun(a: std.mem.Allocator) !void {
 test "AVC dynamic incremental registry owners bootstrap and epoch replacement unwind allocation failures" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, dynamicStreamAllocationRun, .{});
 }
-fn bootstrapSuffixRun(comptime name: []const u8, comptime independent_reset: bool) !void {
+fn bootstrapSuffixRun(fixture_bytes: []const u8, comptime independent_reset: bool) !void {
     const a = std.testing.allocator;
-    var source = media.source.Source{ .allocator = a, .identity = "bootstrap-source", .storage = .{ .borrowed = @embedFile("../testdata/" ++ name ++ ".mp4") } };
+    var source = media.source.Source{ .allocator = a, .identity = "bootstrap-source", .storage = .{ .borrowed = fixture_bytes } };
     var reader = try media.mp4.Reader.init(a, &source, .{});
     defer reader.deinit();
     const owner = try Stream.init(a, &reader, .{});
@@ -733,6 +733,6 @@ fn bootstrapSuffixRun(comptime name: []const u8, comptime independent_reset: boo
 }
 
 test "AVC parameter bootstrap reconstructs reset suffixes and preserves non-IDR reference requirements" {
-    try bootstrapSuffixRun("h264-dynamic-geometry", true);
-    try bootstrapSuffixRun("h264-dynamic-pps", false);
+    try bootstrapSuffixRun(@embedFile("../testdata/h264-dynamic-geometry.mp4"), true);
+    try bootstrapSuffixRun(@embedFile("../testdata/h264-dynamic-pps.mp4"), false);
 }
