@@ -4262,6 +4262,27 @@ representative archive-scale latency and RSS benchmarks remain deferred.
   with isolated mutable state, join-owned reservations, explicit cancelable joins,
   deterministic merging, and serial fallback for oversized partitions.
 
-Main is merged through `7cf87a418f`. Live-provider retention qualification remains
+Main is merged through `f56cf1f4c7`. Live-provider retention qualification remains
 deferred; certificate audit bypass remains disabled by default. These refinements
 do not claim representative archive-scale latency or RSS benchmark results.
+
+
+Qualification after merging main `f56cf1f4c7`:
+
+- Debug lake integration: 169 shared-engine and 295 server tests passed (464 total).
+- Focused navigation/frontier/WAL checks: 6 shared-engine and 52 server tests
+  passed (58 total), including cancelable vector joins, saturated admission,
+  oversized serial retries, mixed pattern scores/cursors, complete GC proof
+  changes, and real Parquet hydration after the original cursor/store close.
+- The default shared-owner CLI built in Debug mode. All 46 real Parquet/Iceberg
+  E2Es passed in 300.06 seconds, including immutable source qualification,
+  indexed metadata conjunctions, deletes, schema evolution, retained vector cuts,
+  incremental refresh, projection/highlights, embedded pruning, and restart.
+- The merged shared-owner adapters remain intact. Generated native error transport
+  includes the branch's cloud-map, typed-JSON, and text-preparation errors; its
+  pinned-compiler generation check passed.
+- Zig/Python formatting, lint, whitespace, license headers, and the Apache product
+  boundary passed (2,051 source files).
+
+Live-provider retention qualification and archive-scale latency/RSS benchmarks
+remain deferred; no benchmark speedup is claimed by these correctness fixtures.
