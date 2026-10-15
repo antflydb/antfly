@@ -58,6 +58,7 @@ pub var test_stop_entered: std.atomic.Value(bool) = .init(false);
 pub var test_start_failures_remaining: std.atomic.Value(u32) = .init(0);
 pub var test_execute_admission_failures_remaining: std.atomic.Value(u32) = .init(0);
 pub var test_finish_admission_failures_remaining: std.atomic.Value(u32) = .init(0);
+pub var test_task_failure_error: anyerror = error.PersistentDescriptorAdmissionExhausted;
 pub var test_finish_lookup_required_remaining: std.atomic.Value(u32) = .init(0);
 pub var test_publication_handoffs: std.atomic.Value(u32) = .init(0);
 pub var test_lookup_prepare_apply_lock_released: std.atomic.Value(bool) = .init(false);
@@ -443,7 +444,7 @@ const PlatformTextMergeRuntime = struct {
             // mutation waits for stop before taking the apply lock, so this
             // acquisition cannot form a shutdown lock cycle.
             lockApplyExclusive(self.apply_mutex);
-            if (err == error.Canceled) {
+            if (index_manager_mod.IndexManager.isTextMergeCancellation(err)) {
                 self.index_manager.cancelTextMergeTask(&task);
                 self.apply_mutex.unlockExclusive();
                 self.signalProducerAdmissionChanged();
@@ -505,7 +506,7 @@ const PlatformTextMergeRuntime = struct {
                         if (next_lease) |lease| lease.unlock();
                         next_lease = null;
                         lockApplyExclusive(self.apply_mutex);
-                        if (prepare_err == error.Canceled) {
+                        if (index_manager_mod.IndexManager.isTextMergeCancellation(prepare_err)) {
                             self.index_manager.cancelTextMergeTask(&task);
                             self.apply_mutex.unlockExclusive();
                             self.signalProducerAdmissionChanged();
@@ -529,7 +530,7 @@ const PlatformTextMergeRuntime = struct {
                     };
                     continue;
                 }
-                if (err == error.Canceled) {
+                if (index_manager_mod.IndexManager.isTextMergeCancellation(err)) {
                     self.index_manager.cancelTextMergeTask(&task);
                     self.apply_mutex.unlockExclusive();
                     self.signalProducerAdmissionChanged();
@@ -981,7 +982,7 @@ fn workerStep(runtime: *TextMergeRuntime) ?u64 {
         runtime.native_storage_pool.releaseDescriptorsForTest(io, 1);
     }
     const ran = runtime.runOnce() catch |err| {
-        if (err == error.Canceled) {
+        if (index_manager_mod.IndexManager.isTextMergeCancellation(err)) {
             // A canceled wait is not necessarily a graceful shutdown: the
             // maintenance scheduler itself can cancel and re-arm this
             // worker's own wakeup as ordinary rescheduling (for example a
@@ -1044,7 +1045,7 @@ fn executeTextMergeTaskForRuntime(
     task: *const index_manager_mod.IndexManager.TextMergeTask,
 ) !index_manager_mod.IndexManager.TextMergeResult {
     if (builtin.is_test and consumeTestFailure(&test_execute_admission_failures_remaining)) {
-        return error.PersistentDescriptorAdmissionExhausted;
+        return test_task_failure_error;
     }
     return try index_manager_mod.IndexManager.executeTextMergeTask(allocator, task);
 }
@@ -1059,7 +1060,7 @@ fn finishTextMergeTaskForRuntime(
         return error.TextMergePublicationLookupRequired;
     }
     if (builtin.is_test and consumeTestFailure(&test_finish_admission_failures_remaining)) {
-        return error.PersistentDescriptorAdmissionExhausted;
+        return test_task_failure_error;
     }
     return if (borrowed_apply_lease) try index_manager.finishTextMergeTaskWithPublicationLease(task, result) else try index_manager.finishTextMergeTask(task, result);
 }

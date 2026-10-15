@@ -288,7 +288,10 @@ fn processResolutionArtifactWithCatalog(
             {
                 // Resolve-only catalogs retain graph identities without creating
                 // entity documents. Previously admitted sink work is recovered above.
-                if (!cfg.promote) return 0;
+                // Shadow decisions are private until the graph swap commits.
+                // Activation advances the revision and durably backfills them,
+                // so consuming their journal records here cannot lose work.
+                if (!cfg.promote or cfg.replacement_index.len > 0) return 0;
                 current = true;
                 break;
             }
