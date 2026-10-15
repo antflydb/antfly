@@ -37,7 +37,7 @@ pub const Owner = struct {
     }
     fn scratch(self: *Owner) !*Resources {
         if (self.resources) |resources| return resources;
-        const resources = try self.work.create(Resources);
+        const resources = try self.alloc.create(Resources);
         resources.* = .init(self.work);
         self.resources = resources;
         self.owns_resources = true;
@@ -53,7 +53,7 @@ pub const Owner = struct {
         self.retireCursors();
         if (self.owns_resources) {
             self.resources.?.deinit();
-            self.work.destroy(self.resources.?);
+            self.alloc.destroy(self.resources.?);
             self.resources = null;
             self.owns_resources = false;
         }
@@ -70,6 +70,10 @@ const Resources = struct {
     idle: ?*CursorScratch = null,
     idle_bytes: usize = 0,
     active: usize = 0,
+    // The first lease shares stable row-owned control storage. Additional
+    // simultaneous leases retain independently reclaimable heap metadata.
+    primary: CursorScratch = undefined,
+    primary_in_use: bool = false,
     const reuse_limit = 256 * 1024;
 
     fn init(work: Allocator) Resources {
@@ -81,8 +85,11 @@ const Resources = struct {
             self.idle_bytes -= slot.retainedBytes();
             break :reused slot;
         } else fresh: {
-            const slot = try self.work.create(CursorScratch);
-            slot.* = .{ .accounting = .{ .backing = self.work }, .arena = undefined, .scan_arena = undefined, .owner = .borrowed(self.work, self) };
+            const slot = if (!self.primary_in_use) primary: {
+                self.primary_in_use = true;
+                break :primary &self.primary;
+            } else try self.work.create(CursorScratch);
+            slot.* = .{ .inline_control = slot == &self.primary, .accounting = .{ .backing = self.work }, .arena = undefined, .scan_arena = undefined, .owner = .borrowed(self.work, self) };
             slot.arena = .init(slot.accounting.allocator());
             slot.scan_arena = .init(slot.accounting.allocator());
             break :fresh slot;
@@ -115,7 +122,7 @@ const Resources = struct {
         slot.arena.deinit();
         slot.scan_arena.deinit();
         std.debug.assert(slot.accounting.bytes == 0);
-        self.work.destroy(slot);
+        if (slot == &self.primary) self.primary_in_use = false else self.work.destroy(slot);
     }
     fn deinit(self: *Resources) void {
         std.debug.assert(self.active == 0);
@@ -125,11 +132,13 @@ const Resources = struct {
         }
         self.idle_bytes = 0;
         self.preparation.deinit();
+        std.debug.assert(!self.primary_in_use);
     }
 };
 
 const CursorScratch = struct {
     next: ?*CursorScratch = null,
+    inline_control: bool = false,
     accounting: ArenaAccounting,
     arena: std.heap.ArenaAllocator,
     // Scanner state spans rows, so it cannot share the row-reset arena.
@@ -138,7 +147,7 @@ const CursorScratch = struct {
     view: View = undefined,
 
     fn retainedBytes(self: *const CursorScratch) usize {
-        return @sizeOf(CursorScratch) + self.accounting.bytes;
+        return (if (self.inline_control) @as(usize, 0) else @sizeOf(CursorScratch)) + self.accounting.bytes;
     }
 };
 
@@ -759,6 +768,7 @@ const FanoutRows = struct {
                         // selected path once avoids rescanning every ancestor's
                         // remaining subtree for a deep field selection.
                         slot.view = .init(a, span.node.raw[start..]);
+                        slot.view.validated_ranges = span.view.validated_ranges;
                         try slot.view.prepareProjectionValueWithWorkspace(self.selector.?, .visited, .object_only, .{ .defer_fanout = true }, scanner, span.node.raw, &self.resources.preparation);
                     } else if (token == .object_begin and !std.mem.eql(u8, self.path[0], "*")) {
                         // Discover the selected root member while advancing
@@ -777,7 +787,7 @@ const FanoutRows = struct {
                                 else => {},
                             }
                             const value_start = scanner.cursor;
-                            try scanner.skipValue();
+                            if (span.view.validated_ranges == null or !try span.view.validated_ranges.?.skip(scanner, false)) try scanner.skipValue();
                             if (std.mem.eql(u8, key, self.path[0])) selected = span.node.raw[value_start..scanner.cursor];
                         }
                         _ = try scanner.next();
@@ -786,6 +796,7 @@ const FanoutRows = struct {
                         try scanner.skipValue();
                         slot.view = .init(a, span.node.raw[start..scanner.cursor]);
                     }
+                    slot.view.validated_ranges = span.view.validated_ranges;
                     slot.view.parse_numbers = span.view.parse_numbers;
                     break :blk .{ .span = .{ .view = &slot.view, .node = &slot.view.root } };
                 },
@@ -1466,4 +1477,52 @@ test "public graph metric borrowed wire streaming writer retires sparse tables a
     try context.writeSpan(&deep_output.writer, deep, true);
     try std.testing.expectEqualStrings(deep, deep_output.written());
     try std.testing.expectEqual(@as(usize, 0), context.keys.retainedBytes());
+}
+
+test "public graph metric borrowed wire validated fanout extents preserve ordered projections and failure cleanup" {
+    const a = std.testing.allocator;
+    const query = @import("../document_query.zig");
+    var raw: std.Io.Writer.Allocating = .init(a);
+    defer raw.deinit();
+    try raw.writer.writeAll("{\"items\":[{\"x\":[{\"m\":1,\"huge\":\"");
+    try raw.writer.splatByteAll('a', 4096);
+    try raw.writer.writeAll("\"},{\"n\":2}]},{\"x\":[{\"m\":3}]}]}");
+    const Fixture = struct {
+        fn run(alloc: Allocator, input: []const u8) !void {
+            const fields: []const []const u8 = &.{ "items.x.m", "items.x.0.n", "items.x.n" };
+            const opts: @import("../types.zig").LookupOptions = .{ .fields = fields, .include_all_fields = false };
+            var expected = try query.lookupJson(alloc, input, opts);
+            defer expected.deinit(alloc);
+            var actual = try query.lookupJsonWithOutput(alloc, alloc, input, opts);
+            defer actual.deinit(alloc);
+            try std.testing.expectEqualStrings(expected.json, actual.json);
+        }
+    };
+    try Fixture.run(a, raw.written());
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Fixture.run, .{raw.written()});
+    const invalid = "{\"items\":[{\"x\":[{\"m\":1,\"deep\":{\"d\":0,\"d\":1}}]}]}";
+    try std.testing.expectError(error.DuplicateField, query.lookupJsonWithOutput(a, a, invalid, .{ .fields = &.{"items.x.m"}, .include_all_fields = false }));
+}
+
+test "public graph metric borrowed wire lossy validated fanout index bounds scratch across many arrays" {
+    const a = std.testing.allocator;
+    const query = @import("../document_query.zig");
+    const counters = @import("../../lite/test_allocator.zig");
+    var raw: std.Io.Writer.Allocating = .init(a);
+    defer raw.deinit();
+    try raw.writer.writeAll("{\"items\":[");
+    for (0..5000) |i| {
+        if (i != 0) try raw.writer.writeByte(',');
+        try raw.writer.print("{{\"x\":[{{\"{s}\":{d}}}]}}", .{ if (i % 3 == 0) "missing" else "m", i });
+    }
+    try raw.writer.writeAll("]}");
+    const opts: @import("../types.zig").LookupOptions = .{ .fields = &.{"items.x.m"}, .include_all_fields = false };
+    var expected = try query.lookupJson(a, raw.written(), opts);
+    defer expected.deinit(a);
+    var no_resize: counters.NoResizeAllocator = .{ .backing = a };
+    var budget: counters.BudgetAllocator = .{ .backing = no_resize.allocator(), .limit = 256 * 1024 };
+    var actual = try query.lookupJsonWithOutput(budget.allocator(), a, raw.written(), opts);
+    defer actual.deinit(a);
+    try std.testing.expectEqualStrings(expected.json, actual.json);
+    try std.testing.expectEqual(@as(usize, 0), budget.live);
 }

@@ -122,7 +122,9 @@ pub fn lookupJsonWithSourcesPolicy(alloc: Allocator, output: Allocator, raw: []c
     const JsonView = @import("query/json_view.zig").View;
     var view = JsonView.init(a, raw);
     view.parse_numbers = true;
-    try view.prepareProjectionWithOptions(plan.selector, .all, .object_only, .{ .defer_fanout = true, .retain_root_fields = plan.include_all or plan.passthrough, .root_excluded = plan.excluded });
+    var ranges = JsonView.ValidatedRanges.init(a);
+    defer ranges.deinit();
+    try view.prepareProjectionWithOptions(plan.selector, .all, .object_only, .{ .defer_fanout = true, .retain_root_fields = plan.include_all or plan.passthrough, .root_excluded = plan.excluded, .ranges = &ranges });
     const overlays = try a.alloc(JsonView.RootSource, sources.len);
     for (sources, overlays) |source, *overlay| overlay.* = source;
     view.root_sources = overlays;

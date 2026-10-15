@@ -29,6 +29,8 @@ pub const View = struct {
     materialized_values: usize = 0,
     parse_numbers: bool = false,
     root_sources: []const RootSource = &.{},
+    validated_ranges: ?*const ValidatedRanges = null,
+    pub const ValidatedRanges = @import("validated_ranges.zig").ValidatedRanges;
     pub const RootSource = struct {
         name: []const u8,
         value: Value = .null,
@@ -345,9 +347,12 @@ pub const View = struct {
         // fanout items without caching navigation for the whole array.
         defer_fanout: bool = false,
         root_excluded: []const []const u8 = &.{},
+        ranges: ?*ValidatedRanges = null,
     };
     pub fn prepareProjectionWithOptions(view: *View, selector: *const Selector, policy: DuplicatePolicy, root_mode: RootMode, options: PreparationOptions) !void {
         const raw = view.root.raw;
+        view.validated_ranges = null;
+        if (options.ranges) |ranges| ranges.begin(raw.len);
         errdefer {
             view.root.raw = raw;
             view.invalidatePreparation();
@@ -356,9 +361,14 @@ pub const View = struct {
         defer scanner.deinit();
         try view.prepareProjectionValue(selector, policy, root_mode, options, &scanner, raw, @import("antfly_platform").allocator.reclaimingScratch(view.alloc));
         if (try scanner.next() != .end_of_document) return error.SyntaxError;
+        if (options.ranges) |ranges| {
+            ranges.seal(policy == .all);
+            view.validated_ranges = ranges;
+        }
     }
 
     fn invalidatePreparation(view: *View) void {
+        view.validated_ranges = null;
         view.root.children = null;
         view.root.object_index = .empty;
         view.root.array_index.clearRetainingCapacity();
@@ -368,6 +378,8 @@ pub const View = struct {
     const PreparationFrame = struct {
         object: bool = false,
         key: bool = true,
+        container_start: usize = 0,
+        inside_fanout: bool = false,
         node: ?*View.Node = null,
         children: std.ArrayListUnmanaged(View.Child) = .empty,
         selected: ?*const Selector = null,
@@ -523,6 +535,10 @@ pub const View = struct {
                 const frame = &frames.items[depth - 1].state;
                 if ((frame.object and frame.key and token == .object_end) or (!frame.object and token == .array_end)) {
                     _ = try scanner.next();
+                    if (options.ranges) |ranges| {
+                        if (!frame.object and frame.node == null and frame.selected != null and frame.selected.?.fanout != null)
+                            try ranges.remember(raw[frame.container_start..scanner.cursor]);
+                    }
                     try frame.finishContainer(alloc);
                     try keys.finishFrame(depth - 1);
                     depth -= 1;
@@ -555,10 +571,22 @@ pub const View = struct {
             if (token == .object_begin or token == .array_begin) {
                 const selected_node: ?*View.Node = if (depth == 0) (if (token == .object_begin or root_mode == .any_container) &view.root else null) else if (frames.items[depth - 1].state.pending_selector != null) frames.items[depth - 1].state.pending_node else null;
                 const selected_plan = if (depth == 0) (if (token == .object_begin or root_mode == .any_container) selector else null) else frames.items[depth - 1].state.pending_selector;
+                // Initial preparation already checked every descendant key in
+                // document JSON. A deferred array without numeric slots needs
+                // only its validated extent, not another descendant traversal.
+                if (token == .array_begin and options.defer_fanout and selected_plan != null and selected_plan.?.fanout != null and selected_plan.?.indices.count() == 0) {
+                    const start = scanner.cursor;
+                    if (view.validated_ranges) |ranges| if (try ranges.skip(scanner, true)) {
+                        if (selected_node) |node| node.* = .{ .raw = raw[start..scanner.cursor], .state = .{ .fanout_keys_validated = true } };
+                        if (depth != 0) try frames.items[depth - 1].state.finishValue(alloc, raw, scanner.cursor);
+                        continue;
+                    };
+                }
+                const container_start = scanner.cursor;
                 _ = try scanner.next();
                 const fresh = depth == frames.items.len;
                 const pending_storage = if (fresh) try scratch.create(View.Node) else frames.items[depth].state.pending_storage;
-                keys.enter(depth, .{ .pending_storage = pending_storage, .object = token == .object_begin, .node = selected_node, .selected = selected_plan, .defer_items = options.defer_fanout and token == .array_begin and selected_plan != null and selected_plan.?.fanout != null, .retain_all = depth == 0 and options.retain_root_fields, .excluded = if (depth == 0) options.root_excluded else &.{} }) catch |err| {
+                keys.enter(depth, .{ .container_start = container_start, .inside_fanout = (depth != 0 and frames.items[depth - 1].state.inside_fanout) or (options.defer_fanout and token == .array_begin and selected_plan != null and selected_plan.?.fanout != null), .pending_storage = pending_storage, .object = token == .object_begin, .node = selected_node, .selected = selected_plan, .defer_items = options.defer_fanout and token == .array_begin and selected_plan != null and selected_plan.?.fanout != null, .retain_all = depth == 0 and options.retain_root_fields, .excluded = if (depth == 0) options.root_excluded else &.{} }) catch |err| {
                     // Failed stack growth never takes ownership of a new node.
                     if (fresh) scratch.destroy(pending_storage);
                     return err;
@@ -567,7 +595,11 @@ pub const View = struct {
                 depth += 1;
             } else {
                 if (token == .object_end or token == .array_end or token == .end_of_document) return error.SyntaxError;
-                try scanner.skipValue();
+                const start = scanner.cursor;
+                if (view.validated_ranges == null or !try view.validated_ranges.?.skip(scanner, false)) try scanner.skipValue();
+                if (options.ranges) |ranges| {
+                    if (scanner.cursor - start >= 256 and depth != 0 and frames.items[depth - 1].state.inside_fanout) try ranges.remember(raw[start..scanner.cursor]);
+                }
                 if (depth != 0) try frames.items[depth - 1].state.finishValue(alloc, raw, scanner.cursor);
             }
         }
@@ -1143,4 +1175,27 @@ test "public graph metric borrowed wire preparation workspace reuses across row 
     defer recovered_scanner.deinit();
     var recovered_view = View.init(a, raw);
     try recovered_view.prepareProjectionValueWithWorkspace(&selector, .all, .object_only, .{}, &recovered_scanner, raw, &workspace);
+}
+
+test "public graph metric borrowed wire validated ranges publish only after complete preparation and preserve visited policy" {
+    const a = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const selector = try plan_mod.compile(alloc, &.{.{ .parts = &.{ "items", "x", "m" } }});
+    var ranges = View.ValidatedRanges.init(alloc);
+    defer ranges.deinit();
+    const raw = "{\"items\":[{\"x\":[{\"m\":1,\"ignored\":{\"d\":0,\"d\":1}}]}]}";
+    var view = View.init(alloc, raw);
+    try view.prepareProjectionWithOptions(selector, .visited, .object_only, .{ .defer_fanout = true, .ranges = &ranges });
+    try std.testing.expect(ranges.complete);
+    try std.testing.expect(!ranges.all_keys);
+    // A previous visited pass cannot authorize skipping duplicate checks in
+    // a stronger pass, and failed validation cannot leave a usable certificate.
+    try std.testing.expectError(error.DuplicateField, view.prepareProjectionWithOptions(selector, .all, .object_only, .{ .defer_fanout = true, .ranges = &ranges }));
+    try std.testing.expect(!ranges.complete);
+    try std.testing.expect(view.validated_ranges == null);
+    view = View.init(alloc, "{\"items\":[{\"x\":[{\"m\":1}]}]}");
+    try view.prepareProjectionWithOptions(selector, .all, .object_only, .{ .defer_fanout = true, .ranges = &ranges });
+    try std.testing.expect(ranges.complete and ranges.all_keys);
 }
