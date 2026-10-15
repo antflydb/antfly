@@ -1331,7 +1331,16 @@ created on demand, including after reopen; manual owners retain synchronous
 execution without starting background workers. The old graph and public resolver
 remain authoritative during the build. Label exclusions, query routing, and
 sibling canonical-key dependencies use separate serving and per-replacement
-views, including for legacy reservations with shared input streams. Cancellation of fresh reservations
+views, including for legacy reservations with shared input streams. Graph replay,
+relation endpoint maps, foreground projection and mention-state protection use
+only public resolvers plus the target graph's own private contracts. Serving
+graphs cannot consume staged decisions even when they share its extraction
+producer without declaring a resolver, or are admitted after staging. Every
+successor advances its revision and schedules bounded replay at cutover,
+including resolve-only contracts, to release decisions to those serving graphs.
+`run_until_idle` drains replay released by its final swap before returning,
+including on manual owners without background workers.
+Cancellation of fresh reservations
 never changes serving sibling revisions. Cancelling or failing a legacy shared-source
 reservation invalidates any potentially contaminated serving decisions durably. Cutover durably invalidates source-sharing
 siblings affected by retiring the predecessor, including canonical-key dependencies and resets their replay cursors in

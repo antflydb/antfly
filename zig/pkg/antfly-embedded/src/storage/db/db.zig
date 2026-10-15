@@ -32289,12 +32289,18 @@ pub const DB = struct {
             if (self.promotion_runtime == null) try self.initPromotionRuntime();
         }
         try self.drainReplayStagesUntilStableWithOptions(options);
+        const replacement_catalog_generation = self.core.index_manager.write_plan_generation.load(.acquire);
         if (options.drain_relational_indexes) {
             while (try self.advanceGraphReplacement()) {
                 try ensureSnapshotActive(options.cancellation);
                 try self.drainReplayStagesUntilStableWithOptions(options);
             }
         } else _ = try self.advanceGraphReplacement();
+        // The final swap can return false while releasing durable resolver
+        // replay. Drain that handoff before reporting idle, including manual
+        // owners with no worker to consume it after this call returns.
+        if (self.core.index_manager.write_plan_generation.load(.acquire) != replacement_catalog_generation)
+            try self.drainReplayStagesUntilStableWithOptions(options);
         _ = try self.evaluateAlgebraicAdaptiveCandidates();
         while (try self.runAlgebraicAdaptiveWork() != 0) {}
         try self.flushAppliedSequencesForIdle();
@@ -48162,7 +48168,7 @@ fn appendPrecomputedGraphSourceArtifactKey(
             // An empty map still marks that a resolver targets the artifact,
             // so unresolved relation sources wait for it rather than falling
             // back to the owning document.
-            const pending_resolutions: ?[]const u8 = if (resolverTargetsGraphArtifact(self.core.index_manager, source.artifact_name)) "{}" else null;
+            const pending_resolutions: ?[]const u8 = if (resolverTargetsGraphArtifact(self.core.index_manager, graph_entry.config.name, source.artifact_name)) "{}" else null;
             const graph_writes = try graphWritesFromArtifactValueAlloc(
                 self.alloc,
                 graph_entry.config.name,
@@ -54531,9 +54537,9 @@ const graphEndpointResolutionsJsonAlloc = local_mutation.graphEndpointResolution
 
 /// Whether any resolver consumes `artifact_name`, i.e. whether extraction
 /// entities in that artifact will eventually get canonical keys.
-fn resolverTargetsGraphArtifact(index_manager: *index_manager_mod.IndexManager, artifact_name: []const u8) bool {
+fn resolverTargetsGraphArtifact(index_manager: *index_manager_mod.IndexManager, index_name: []const u8, artifact_name: []const u8) bool {
     for (index_manager.resolvers.items) |cfg| {
-        if (std.mem.eql(u8, cfg.source_artifact, artifact_name)) return true;
+        if (cfg.visibleToGraph(index_name) and std.mem.eql(u8, cfg.source_artifact, artifact_name)) return true;
     }
     return false;
 }
@@ -139393,6 +139399,90 @@ test "inline resolver replacement preserves serving sibling routing until durabl
             try db.runUntilIdle();
             try Check.count(&db, if (cancel) 1 else 2);
             try std.testing.expect(db.indexGeneration(if (cancel) "old" else "new") != null);
+        }
+    }
+}
+
+test "inline resolver replacement isolates serving graph consumers and releases them at cutover" {
+    const a = std.testing.allocator;
+    for ([_]bool{ true, false }) |cancel| {
+        var directory = try TestDirectory.init("resolver-graph-consumer-isolation");
+        defer directory.cleanup();
+        var host = try background_runtime_mod.BackendRuntimeHandle.init(a, .{ .backend = .manual, .borrowed_io = .{ .general = std.testing.io } });
+        defer host.deinit();
+        const options: OpenOptions = .{ .backend_runtime = host.ptr(), .executor = .{ .backend = .manual }, .start_optional_runtimes = false, .start_optional_runtime_workers = false, .start_independent_maintenance = false };
+        const old = try inlineResolverReplacementConfigAlloc(a, "kg_v1", "resolved_v1", "entity/{{ uslug _entity.text }}");
+        defer a.free(old);
+        const next = try inlineResolverReplacementConfigAlloc(a, "kg_v2", "resolved_v2", "entity/{{ uslug _entity.text }}");
+        defer a.free(next);
+        const serving = "{\"source\":{\"artifact\":\"kg_v2\",\"format\":\"extraction_graph\",\"mention_edge_type\":\"mentions\"},\"edge_types\":[{\"name\":\"mentions\"}]}";
+        const document = "{\"kg\":{\"entities\":[{\"id\":\"a\",\"text\":\"Ada\",\"label\":\"person\"}]}}";
+        var generation: u64 = 0;
+        {
+            var db = try DB.open(a, directory.path(), options);
+            defer db.close();
+            try db.initResolutionRuntime();
+            try db.initPromotionRuntime();
+            try db.addIndex(.{ .name = "old", .kind = .graph, .config_json = old });
+            _ = try db.upsertResolverWithResultOptions(.{ .name = "concepts", .table = "default", .source_artifact = "kg_v1", .resolution_artifact = "resolved_v1", .key_template = "entity/{{ uslug _entity.text }}", .inline_managed = true, .promote = false }, .{ .drain_backfill = false });
+            try db.addEnrichment(.{ .name = "kg_v2", .kind = .asset, .field = "kg", .content_type = "application/json" });
+            try db.addIndex(.{ .name = "serving", .kind = .graph, .config_json = serving });
+            var enrichment: enrichment_runtime_mod.Config = .{ .enable_without_producers = true };
+            try db.initOptionalEnrichmentRuntime(&enrichment);
+            try db.batch(.{ .writes = &.{.{ .key = "claim", .value = document }} });
+            try db.runUntilIdle();
+            generation = try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = next });
+            try std.testing.expect(try db.advanceGraphReplacement());
+            try db.enrichment_runtime.?.catchUpUntil(db.core.nextDerivedSequence());
+            try db.resolution_runtime.?.catchUp();
+            try db.drainReplayStagesUntilStableWithOptions(.{});
+            try std.testing.expect(db.indexGeneration("new") == null);
+            // Foreground writes and endpoint reconstruction must use the same
+            // visibility as mention replay, even before a decision exists.
+            try std.testing.expect(!resolverTargetsGraphArtifact(db.core.index_manager, "serving", "kg_v2"));
+            try std.testing.expect(resolverTargetsGraphArtifact(db.core.index_manager, "new", "kg_v2"));
+            const public_map = try graphEndpointResolutionsJsonAlloc(a, db.core.store, db.core.index_manager, "claim", "serving", "kg_v2");
+            defer if (public_map) |raw| a.free(raw);
+            try std.testing.expect(public_map == null);
+            const private_map = (try graphEndpointResolutionsJsonAlloc(a, db.core.store, db.core.index_manager, "claim", "new", "kg_v2")).?;
+            defer a.free(private_map);
+            try std.testing.expect(std.mem.indexOf(u8, private_map, "entity/ada") != null);
+            const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(a, "claim", "resolved_v2");
+            defer a.free(resolution_key);
+            const public_asset = try resolutionOwningAssetArtifactKeyAlloc(a, db.core.index_manager, "serving", resolution_key);
+            defer if (public_asset) |key| a.free(key);
+            try std.testing.expect(public_asset == null);
+            const private_asset = (try resolutionOwningAssetArtifactKeyAlloc(a, db.core.index_manager, "new", resolution_key)).?;
+            defer a.free(private_asset);
+            // Reverse admission order: constructing another graph after private
+            // decisions landed must not adopt them during initial backfill.
+            try db.addIndex(.{ .name = "late", .kind = .graph, .config_json = serving });
+            try db.batch(.{ .writes = &.{.{ .key = "during", .value = document }} });
+            try db.drainReplayStagesUntilStableWithOptions(.{});
+            for ([_][]const u8{ "serving", "late" }) |index| for ([_][]const u8{ "claim", "during" }) |doc| {
+                const edges = try db.getEdges(a, index, doc, "mentions", .out);
+                defer graph_mod.GraphIndex.freeEdges(a, edges);
+                try std.testing.expectEqual(@as(usize, 0), edges.len);
+            };
+            if (cancel) try std.testing.expect(try db.cancelReplacement("new"));
+        }
+        {
+            var db = try DB.open(a, directory.path(), options);
+            defer db.close();
+            try db.runUntilIdle();
+            if (!cancel) try db.waitGraphReplacement("new", generation, 0);
+            for ([_][]const u8{ "serving", "late" }) |index| for ([_][]const u8{ "claim", "during" }) |doc| {
+                const edges = try db.getEdges(a, index, doc, "mentions", .out);
+                defer graph_mod.GraphIndex.freeEdges(a, edges);
+                try std.testing.expectEqual(@as(usize, if (cancel) 0 else 1), edges.len);
+                if (!cancel) try std.testing.expectEqualStrings("entity/ada", edges[0].target);
+            };
+            if (!cancel) {
+                const edges = try db.getEdges(a, "new", "claim", "mentions", .out);
+                defer graph_mod.GraphIndex.freeEdges(a, edges);
+                try std.testing.expectEqual(@as(usize, 1), edges.len);
+                try std.testing.expectEqualStrings("entity/ada", edges[0].target);
+            }
         }
     }
 }

@@ -301,6 +301,13 @@ pub const ResolverConfig = struct {
         return !self.retired and !other.retired and std.mem.eql(u8, self.replacement_index, other.replacement_index);
     }
 
+    /// Graph names are reserved while a replacement is private. Its shadow
+    /// uses that same name, so only that graph may consume staged decisions.
+    /// Public contracts remain available to graphs with unchanged resolvers.
+    pub fn visibleToGraph(self: ResolverConfig, index_name: []const u8) bool {
+        return self.replacement_index.len == 0 or std.mem.eql(u8, self.replacement_index, index_name);
+    }
+
     pub fn clone(alloc: Allocator, cfg: ResolverConfig) !ResolverConfig {
         var owned = cfg;
         // Establish an empty cleanup owner before the first allocation. Keep

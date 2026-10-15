@@ -22796,7 +22796,7 @@ pub const IndexManager = struct {
         // A published successor takes the public identity atomically with its
         // graph. Preserve the predecessor as a nonexecuting parse contract for
         // old resolution records still present in the shared artifact store.
-        var promotion_released = false;
+        var resolver_released = false;
         var retired_private_sources: std.StringHashMapUnmanaged(u8) = .empty;
         defer retired_private_sources.deinit(self.alloc);
         for (definitions) |*next| {
@@ -22813,12 +22813,12 @@ pub const IndexManager = struct {
                     previous.inline_managed = true;
                     break;
                 }
-                // Republishing at a new revision releases shadow decisions to
-                // promotion, including resolvers with work retention disabled.
-                if (next.promote) {
-                    next.resolution_generation = try std.math.add(u64, next.effectiveGeneration(), 1);
-                    promotion_released = true;
-                }
+                // Serving graphs ignored private records, including graphs
+                // consuming this source without an inline declaration. Publish
+                // a new revision and bounded replay for every successor, even
+                // resolve-only ones; promotion uses the same handoff.
+                next.resolution_generation = try std.math.add(u64, next.effectiveGeneration(), 1);
+                resolver_released = true;
                 next.name = next.replacement_resolver;
                 next.replacement_index = "";
                 next.replacement_resolver = "";
@@ -22897,7 +22897,7 @@ pub const IndexManager = struct {
         try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, resolver_catalog.merge_catalog_key, merge_data);
         try txn.put(resolver_catalog.merge_catalog_key, merge_data);
         // Revisions and durable replay cursors publish with ownership removal.
-        if (promotion_released or legacy_routing_repaired or routing_changed) {
+        if (resolver_released or legacy_routing_repaired or routing_changed) {
             try txn.put(resolver_catalog.reresolve_resume_key, "");
             try txn.put(resolver_catalog.reresolve_repair_resume_key, "");
         }
