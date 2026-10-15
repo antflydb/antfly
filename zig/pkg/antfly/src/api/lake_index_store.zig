@@ -22,11 +22,13 @@ const stores = @import("../serverless/artifacts/store.zig");
 const A = std.mem.Allocator;
 
 pub const Store = struct {
+    const Reopen = struct { config: ?*const local.common_config.Config, secrets: ?*local.common_secrets.FileStore, deployment: local.common_config.DeploymentMode, local_base_dir: ?[]const u8 };
     opened: local.serverless_object_store_support.OpenedObjectStore,
     implementation: artifacts.ObjectStore,
     identity: local.metadata_lake_index_catalog.Digest,
     locator: local.metadata_lake_index_catalog.StoreLocator,
     cloud_binding: ?@import("lake_cloud_publication.zig").Binding = null,
+    reopen_options: ?Reopen = null,
 
     pub fn open(a: A, config: *const local.common_config.Config, secrets: ?*local.common_secrets.FileStore, read_only: bool) !Store {
         return openNative(a, config, secrets, read_only, config.deployment_mode, null);
@@ -81,7 +83,7 @@ pub const Store = struct {
             .tls = if (opened.s3_client) |s3| s3.cfg.credentials.use_ssl else true,
         };
         try locator.validate();
-        return .{ .opened = opened, .implementation = implementation, .identity = identity, .locator = locator };
+        return .{ .opened = opened, .implementation = implementation, .identity = identity, .locator = locator, .reopen_options = .{ .config = config, .secrets = secrets, .deployment = deployment, .local_base_dir = local_base_dir } };
     }
     /// Reopen a retained namespace with currently authorized credentials. A
     /// connection can rotate keys, but cannot silently redirect old collection
@@ -96,8 +98,22 @@ pub const Store = struct {
         retained.storage.artifacts = .{ .connection = if (locator.connection) |connection| @constCast(connection) else null, .bucket = @constCast(locator.bucket), .prefix = @constCast(locator.prefix) };
         var opened = try openNative(a, &retained, secrets, read_only, deployment, local_base_dir);
         errdefer opened.deinit();
+        // The temporary configuration override must not escape.
+        opened.reopen_options = .{ .config = config, .secrets = secrets, .deployment = deployment, .local_base_dir = local_base_dir };
         if (opened.locator.protocol != locator.protocol or opened.locator.tls != locator.tls or !std.mem.eql(u8, opened.locator.root, locator.root) or !std.mem.eql(u8, opened.locator.bucket, locator.bucket) or !std.mem.eql(u8, opened.locator.prefix, locator.prefix)) return error.NativeArtifactStoreLocationChanged;
         return opened;
+    }
+    /// Reopen independent client ownership for a query-local lazy selector.
+    /// Both physical location and current credential scope must still match.
+    pub fn reopenReadOnly(self: *const Store, a: A) !Store {
+        const options = self.reopen_options orelse return error.NativeArtifactStorageRequired;
+        var result = if (options.config) |config|
+            try openRetainedNative(a, config, options.secrets, self.locator, true, options.deployment, options.local_base_dir)
+        else
+            try openNative(a, null, options.secrets, true, options.deployment, options.local_base_dir);
+        errdefer result.deinit();
+        if (!std.mem.eql(u8, &result.identity, &self.identity)) return error.ExternalLakeIndexStoreChanged;
+        return result;
     }
     pub fn bindPublication(self: *Store, publication: local.metadata_lake_index_catalog.Publication, token: @import("antfly_cancellation").CancellationToken) !void {
         if (self.cloud_binding) |*held| {

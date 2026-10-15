@@ -45,15 +45,18 @@ pub fn select(a: A, table: sql.Table, source: *local.serverless_query_lake_servi
     return selectCached(a, table, source, store, context, policy, null);
 }
 pub fn selectCached(a: A, table: sql.Table, source: *local.serverless_query_lake_serving.ServingSource, store: *Store, context: Context, policy: Policy, cache: ?*local.serverless_query_lake_serving_cache.Cache) !?Selected {
+    return selectCachedWithLease(a, table, source, store, context, policy, cache, null);
+}
+pub fn selectCachedWithLease(a: A, table: sql.Table, source: *local.serverless_query_lake_serving.ServingSource, store: *Store, context: Context, policy: Policy, cache: ?*local.serverless_query_lake_serving_cache.Cache, reader: ?*@import("lake_index_reader_lease.zig").Handle) !?Selected {
     try context.ensureActive();
-    return selectVerified(a, table, source, store, context, cache) catch |err| {
+    return selectVerified(a, table, source, store, context, cache, reader) catch |err| {
         try context.ensureActive();
         if (err == error.OutOfMemory) return err;
         if (policy == .required) return err;
         return null;
     };
 }
-fn selectVerified(a: A, table: sql.Table, source: *local.serverless_query_lake_serving.ServingSource, store: *Store, context: Context, cache: ?*local.serverless_query_lake_serving_cache.Cache) !Selected {
+fn selectVerified(a: A, table: sql.Table, source: *local.serverless_query_lake_serving.ServingSource, store: *Store, context: Context, cache: ?*local.serverless_query_lake_serving_cache.Cache, reader: ?*@import("lake_index_reader_lease.zig").Handle) !Selected {
     const definitions = table.external_indexes orelse return error.ExternalLakeIndexUnavailable;
     var state = try catalog.parse(a, definitions.catalog_json);
     errdefer state.deinit();
@@ -76,56 +79,88 @@ fn selectVerified(a: A, table: sql.Table, source: *local.serverless_query_lake_s
         owned.by_id.deinit(a);
         owned.inventory.deinit(a);
     };
-    if (cached) |shared| inventory_lease = try @import("lake_index_decoded_metadata.zig").acquire(InventoryMetadata, shared, artifacts, published.inventory, normalized, InventoryMetadata.load) else owned_inventory = try InventoryMetadata.load(a, artifacts, published.inventory, normalized, null);
-    const metadata = if (inventory_lease) |owned| owned.value else &owned_inventory.?;
-    const inventory = metadata.inventory;
-    try local.serverless_query_lake_scan_plan.validateBindingInventoryIdentity(binding, inventory);
-    // The plan key is derived from freshly read metadata bytes and credential
-    // scope, never a snapshot label or TTL. Mutable sources always revalidate.
-    const proof_key = if (source.immutable_objects and source.plan_lease != null and source.plan_identity != null and cache != null) key: {
-        var hash = std.crypto.hash.Blake3.init(.{});
-        hash.update("native-lake-verified-coverage-v1");
-        hash.update(&source.plan_identity.?);
-        hash.update(&published.signature.desired);
-        hash.update(&published.signature.source);
-        hash.update(&published.signature.credentials);
-        hash.update(&published.signature.store);
-        hash.update(published.inventory.artifact_id);
-        hash.update(published.inventory.checksum);
-        var result: [32]u8 = undefined;
-        hash.final(&result);
-        break :key result;
-    } else null;
-    const proof_lease = if (proof_key) |key| cache.?.decoded.lookup(key) else null;
-    defer if (proof_lease) |lease| lease.release();
-    const data = if (proof_lease) |lease|
-        @as(*const coverage.DataProof, @ptrCast(@alignCast(lease.item.payload.extension))).*
-    else
-        try coverage.pinData(source, context, inventory, &metadata.by_id);
-    const pinned = try coverage.finish(source, context, data);
-    if (!std.mem.eql(u8, &published.signature.source, &pinned.source)) return error.ExternalLakeIndexSourceChanged;
-    if (proof_lease == null) {
-        if (inventory.files.len != source.inventory.files.len) return error.InvalidExternalLakeIndexCoverage;
-        for (source.inventory.files) |current| {
-            const stored = metadata.by_id.get(current.file_id) orelse return error.InvalidExternalLakeIndexCoverage;
-            if (!std.mem.eql(u8, stored.object_uri, current.object_uri) or
-                !std.mem.eql(u8, stored.etag, current.etag) or !std.mem.eql(u8, stored.version_id, current.version_id) or
-                stored.byte_len != current.byte_len or stored.row_count != current.row_count) return error.InvalidExternalLakeIndexCoverage;
+    var pinned_delete_objects: catalog.Digest = undefined;
+    if (published.reader_protocol >= 47 and published.source_navigation != null) {
+        // Fresh source discovery remains mandatory. The publication contributes
+        // a compact authenticated proof, not another archive-sized inventory.
+        const navigation = @import("lake_source_navigation.zig");
+        var root_arena = std.heap.ArenaAllocator.init(a);
+        defer root_arena.deinit();
+        var root_pin: ?@import("lake_index_decoded_metadata.zig").Owned(navigation.Root) = null;
+        defer if (root_pin) |pin| pin.release();
+        const ref = published.source_navigation.?;
+        const root = if (cached) |shared| loaded: {
+            root_pin = try @import("lake_index_decoded_metadata.zig").acquire(navigation.Root, shared, artifacts, ref, normalized, navigation.load);
+            break :loaded root_pin.?.value.*;
+        } else try navigation.load(root_arena.allocator(), artifacts, ref, normalized, null);
+        const expected_domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(table.id, store.identity, published.namespace);
+        if (!std.mem.eql(u8, &root.domain, &expected_domain) or root.count != source.inventory.files.len or
+            !std.mem.eql(u8, root.source, source.inventory.source_id) or !std.mem.eql(u8, root.schema, source.inventory.schema_fingerprint) or
+            !std.mem.eql(u8, root.snapshot, source.inventory.snapshot_id)) return error.InvalidExternalLakeIndexCoverage;
+        try local.serverless_query_lake_scan_plan.validateBindingInventoryIdentity(binding, source.inventory);
+        const immutable_proof = source.immutable_objects and source.plan_identity != null and root.coverage != null and
+            root.coverage.?.plan != null and std.mem.eql(u8, &source.plan_identity.?, &root.coverage.?.plan.?) and
+            reader != null and cached != null and store.reopen_options != null;
+        const data = if (immutable_proof) root.coverage.?.data else coverage.dataDigest(try coverage.pinData(source, context, null, null));
+        // Delete object versions are always freshly qualified, including when
+        // the data census is inherited from an identical immutable plan.
+        const pinned = try coverage.finishDigest(source, context, data);
+        if (!std.mem.eql(u8, &published.signature.source, &pinned.source)) return error.ExternalLakeIndexSourceChanged;
+        pinned_delete_objects = pinned.delete_objects;
+        if (immutable_proof) try @import("lake_verified_file_selector.zig").install(source, store, published, root, cached.?, reader.?);
+    } else {
+        if (cached) |shared| inventory_lease = try @import("lake_index_decoded_metadata.zig").acquire(InventoryMetadata, shared, artifacts, published.inventory, normalized, InventoryMetadata.load) else owned_inventory = try InventoryMetadata.load(a, artifacts, published.inventory, normalized, null);
+        const metadata = if (inventory_lease) |owned| owned.value else &owned_inventory.?;
+        const inventory = metadata.inventory;
+        try local.serverless_query_lake_scan_plan.validateBindingInventoryIdentity(binding, inventory);
+        // The plan key is derived from freshly read metadata bytes and credential
+        // scope, never a snapshot label or TTL. Mutable sources always revalidate.
+        const proof_key = if (source.immutable_objects and source.plan_lease != null and source.plan_identity != null and cache != null) key: {
+            var hash = std.crypto.hash.Blake3.init(.{});
+            hash.update("native-lake-verified-coverage-v1");
+            hash.update(&source.plan_identity.?);
+            hash.update(&published.signature.desired);
+            hash.update(&published.signature.source);
+            hash.update(&published.signature.credentials);
+            hash.update(&published.signature.store);
+            hash.update(published.inventory.artifact_id);
+            hash.update(published.inventory.checksum);
+            var result: [32]u8 = undefined;
+            hash.final(&result);
+            break :key result;
+        } else null;
+        const proof_lease = if (proof_key) |key| cache.?.decoded.lookup(key) else null;
+        defer if (proof_lease) |lease| lease.release();
+        const data = if (proof_lease) |lease|
+            @as(*const coverage.DataProof, @ptrCast(@alignCast(lease.item.payload.extension))).*
+        else
+            try coverage.pinData(source, context, inventory, &metadata.by_id);
+        const pinned = if (published.reader_protocol < 47) try coverage.finishLegacy(source, context, data) else try coverage.finish(source, context, data);
+        if (!std.mem.eql(u8, &published.signature.source, &pinned.source)) return error.ExternalLakeIndexSourceChanged;
+        if (proof_lease == null) {
+            if (inventory.files.len != source.inventory.files.len) return error.InvalidExternalLakeIndexCoverage;
+            for (source.inventory.files) |current| {
+                const stored = metadata.by_id.get(current.file_id) orelse return error.InvalidExternalLakeIndexCoverage;
+                if (!std.mem.eql(u8, stored.object_uri, current.object_uri) or
+                    !std.mem.eql(u8, stored.etag, current.etag) or !std.mem.eql(u8, stored.version_id, current.version_id) or
+                    stored.byte_len != current.byte_len or stored.row_count != current.row_count) return error.InvalidExternalLakeIndexCoverage;
+            }
+            if (proof_key) |key| {
+                const lease = try cache.?.decoded.create(4096);
+                defer lease.release();
+                const proof = try lease.item.arena.allocator().create(coverage.DataProof);
+                proof.* = data;
+                lease.item.payload = .{ .extension = proof };
+                cache.?.decoded.publish(key, lease);
+            }
+        } else if (inventory_lease) |owned| {
+            // Resolve provider versions only for files that survive pruning. The
+            // source retains its own lease, independent of Selected's lifetime.
+            if (source.verified_inventory_lease) |lease| lease.release();
+            source.verified_inventory_lease = owned.lease.retain();
+            source.verified_files = &owned.value.by_id;
         }
-        if (proof_key) |key| {
-            const lease = try cache.?.decoded.create(4096);
-            defer lease.release();
-            const proof = try lease.item.arena.allocator().create(coverage.DataProof);
-            proof.* = data;
-            lease.item.payload = .{ .extension = proof };
-            cache.?.decoded.publish(key, lease);
-        }
-    } else if (inventory_lease) |owned| {
-        // Resolve provider versions only for files that survive pruning. The
-        // source retains its own lease, independent of Selected's lifetime.
-        if (source.verified_inventory_lease) |lease| lease.release();
-        source.verified_inventory_lease = owned.lease.retain();
-        source.verified_files = &owned.value.by_id;
+        pinned_delete_objects = pinned.delete_objects;
     }
     try context.ensureActive();
     var directory_lease: ?@import("lake_index_decoded_metadata.zig").Owned(@import("lake_index_directory.zig").Document) = null;
@@ -142,7 +177,7 @@ fn selectVerified(a: A, table: sql.Table, source: *local.serverless_query_lake_s
             try state.value.published.?.validate();
         }
     } else try @import("lake_index_directory.zig").hydrateLazy(state.arena.allocator(), artifacts, &state.value.published.?, normalized, cached);
-    return .{ .state = state, .delete_objects = pinned.delete_objects, .inventory_lease = inventory_lease, .directory_lease = directory_lease };
+    return .{ .state = state, .delete_objects = pinned_delete_objects, .inventory_lease = inventory_lease, .directory_lease = directory_lease };
 }
 
 const InventoryMetadata = struct {
@@ -161,7 +196,7 @@ const InventoryMetadata = struct {
     }
 };
 
-test "external lake coverage proofs bind immutable plans publications and fresh request authority" {
+test "external lake legacy coverage proofs bind immutable plans publications and fresh request authority" {
     const a = std.testing.allocator;
     var directory = try local.common_test_directory.TestDirectory.init("coverage-proof-selection");
     defer directory.cleanup();
@@ -197,7 +232,14 @@ test "external lake coverage proofs bind immutable plans publications and fresh 
     defer a.free(published);
     var parsed = try catalog.parse(a, published);
     defer parsed.deinit();
-    const sql_table: sql.Table = .{ .id = 9, .physical_name = "lake", .schema_version = 1, .columns = &.{}, .external_base_source = binding, .external_indexes = .{ .catalog_json = published, .indexes_json = table.indexes_json, .schema_json = schema_json, .desired = parsed.value.published.?.signature.desired } };
+    // Retained protocol-46 publications keep the original signature preimage
+    // and inventory-backed proof memo even after protocol-47 publication.
+    parsed.value.published.?.reader_protocol = 46;
+    parsed.value.published.?.source_navigation = null;
+    parsed.value.published.?.signature.source = (try coverage.finishLegacy(&source, .{}, try coverage.pinData(&source, .{}, null, null))).source;
+    const legacy_json = try catalog.encode(a, parsed.value);
+    defer a.free(legacy_json);
+    const sql_table: sql.Table = .{ .id = 9, .physical_name = "lake", .schema_version = 1, .columns = &.{}, .external_base_source = binding, .external_indexes = .{ .catalog_json = legacy_json, .indexes_json = table.indexes_json, .schema_json = schema_json, .desired = parsed.value.published.?.signature.desired } };
     var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
     defer cache.deinit();
     for (0..4) |phase| {

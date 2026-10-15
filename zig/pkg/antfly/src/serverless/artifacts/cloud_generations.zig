@@ -470,6 +470,11 @@ pub const VacuumCut = struct {
     floor: u64,
     cutoff: u64,
     marks: ?@import("../graph_segment/page_tree.zig").Ref,
+    pub fn fingerprint(self: @This(), a: A) ![32]u8 {
+        const bytes = try std.json.Stringify.valueAlloc(a, .{ .format = "native-cloud-vacuum-proof-v1", .cut = self }, .{});
+        defer a.free(bytes);
+        return hash(bytes);
+    }
     pub fn validate(self: @This()) !void {
         if (self.floor > self.cutoff or self.cutoff == 0 or std.mem.allEqual(u8, &self.domain, 0)) return error.InvalidCloudGenerationMap;
         if (self.marks) |root| try root.validate();
@@ -641,8 +646,10 @@ pub const Writer = struct {
         const io = try self.operationIo();
         try self.flush_mu.lock(io);
         defer self.flush_mu.unlock(io);
-        const root = self.reader.root orelse return .{ .cutoff = cut.cutoff, .done = true };
-        if (progress.cutoff == cut.cutoff and progress.done) return progress;
+        const proof = try cut.fingerprint(self.a);
+        const same_proof = progress.cutoff == cut.cutoff and progress.proof != null and std.mem.eql(u8, &progress.proof.?, &proof);
+        const root = self.reader.root orelse return .{ .cutoff = cut.cutoff, .proof = proof, .done = true };
+        if (same_proof and progress.done) return progress;
         const State = struct {
             writer: *Writer,
             cut: VacuumCut,
@@ -711,7 +718,10 @@ pub const Writer = struct {
         var pages: @import("../graph_segment/page_store.zig").PageStore = .{ .domain = cut.domain, .artifacts = store, .cancellation = token, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
         var cache: @import("../graph_segment/page_tree.zig").Cache = .{ .alloc = self.a, .underlying = pages.store() };
         defer cache.deinit();
-        const after = if (!progress.done) progress.after else null;
+        // Cursors prove work only under the complete GC evidence. A new
+        // mark root can retire records without changing the generation cutoff.
+        // Legacy cursors have no proof and restart safely.
+        const after = if (same_proof and !progress.done) progress.after else null;
         var state: State = .{ .writer = self, .cut = cut, .after = after, .last = after, .token = token, .marks = cache.store() };
         const next = try state.prune(root, 0, @splat(0));
         // A failed pass leaves the old root and cursor intact. Readers retain
@@ -720,7 +730,7 @@ pub const Writer = struct {
         defer self.mu.unlock();
         freeRef(self.a, self.reader.root.?);
         self.reader.root = next;
-        return .{ .cutoff = cut.cutoff, .after = state.last, .done = state.done };
+        return .{ .cutoff = cut.cutoff, .proof = proof, .after = state.last, .done = state.done };
     }
     fn update(self: *Writer, old: ?Ref, changes: []const Record, depth: u8, token: Token) anyerror!Ref {
         try token.check();
@@ -1092,6 +1102,39 @@ test "external lake global frontier cloud vacuum resumes from GC evidence and pr
         defer if (found) |*record| record.deinit(a);
         try std.testing.expectEqual(i % 2 == 0 or i % 7 == 0, found != null);
     }
+    // Switch real GC cuts with a partial cursor, including unchanged cutoffs.
+    for ([_]u64{ 2, 3 }) |next_cutoff| {
+        var switching: Writer = .{ .a = a, .reader = .{ .client = client, .bucket = "bucket", .prefix = "maps", .root = try cloneRef(a, original) }, .scope = scope, .complete = true };
+        defer switching.deinit();
+        var switched = try switching.vacuum(&store, cut, .{}, .none);
+        try std.testing.expect(!switched.done);
+        const newer: VacuumCut = .{ .domain = scope.domain, .floor = 1, .cutoff = next_cutoff, .marks = null };
+        const next_proof = try newer.fingerprint(a);
+        var switched_passes: usize = 0;
+        while ((!switched.done or !std.meta.eql(switched.proof, @as(?[32]u8, next_proof))) and switched_passes < 32) : (switched_passes += 1) {
+            switched = try switching.vacuum(&store, newer, switched, .none);
+        }
+        try std.testing.expect(switched.done);
+        for (&ids, 0..) |*id, i| {
+            if (i % 7 == 0) continue;
+            var remaining_record = try switching.reader.lookup(a, id, .none);
+            defer if (remaining_record) |*record| record.deinit(a);
+            try std.testing.expect(remaining_record == null);
+        }
+    }
+    // Completed and legacy progress must also restart for changed evidence.
+    const empty_cut: VacuumCut = .{ .domain = scope.domain, .floor = 1, .cutoff = cut.cutoff, .marks = null };
+    var complete_progress = progress;
+    var complete_passes: usize = 0;
+    const empty_proof = try empty_cut.fingerprint(a);
+    while ((!complete_progress.done or !std.meta.eql(complete_progress.proof, @as(?[32]u8, empty_proof))) and complete_passes < 32) : (complete_passes += 1) {
+        complete_progress = try writer.vacuum(&store, empty_cut, complete_progress, .none);
+    }
+    try std.testing.expect(complete_progress.done);
+    try std.testing.expectEqualDeep(empty_proof, complete_progress.proof.?);
+    const legacy = try writer.vacuum(&store, cut, .{ .cutoff = cut.cutoff, .done = true }, .none);
+    try std.testing.expectEqualDeep(try cut.fingerprint(a), legacy.proof.?);
+    try std.testing.expect(!legacy.done);
     const cancelled: Token = .{ .ptr = &passes, .is_cancelled_fn = struct {
         fn check(_: *const anyopaque) bool {
             return true;

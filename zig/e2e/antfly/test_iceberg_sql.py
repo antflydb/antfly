@@ -406,6 +406,7 @@ def test_indexed_metadata_conjunctions_preserve_sort_and_cursor_pages(
                         "kind": "external",
                         "table_id": "sort-pages",
                         "format": source_format,
+                        "object_mutability": "immutable",
                         "uri": root.as_uri(),
                     },
                     "relational_indexes": [

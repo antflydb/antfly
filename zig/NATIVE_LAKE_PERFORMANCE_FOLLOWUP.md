@@ -4245,3 +4245,23 @@ remains off by default. Qualification on merged main `0cba59bceb`:
 
 These checks establish correctness and bounded work for the covered fixtures;
 representative archive-scale latency and RSS benchmarks remain deferred.
+
+
+## Protocol-47 refinements
+
+- Bind cloud vacuum cursors and completion to the complete GC proof, including
+  mark roots at unchanged cutoffs; legacy unbound progress restarts safely.
+- Persist a portable data census digest in source navigation. Identical freshly
+  authorized immutable plans skip published-inventory decoding and resolve exact
+  file selectors lazily. Mutable data and delete objects retain fresh validation.
+  Sources independently own their native client and retained reader handle.
+- Admit prefix/wildcard/regexp/fuzzy searches through bounded windows and shared
+  Boolean preparation, with segment-local compressed membership and bounded top-k
+  state. Unknown pattern bounds remain conservative, preserving global scores.
+- Search recent dense/sparse partitions in bounded batches on the shared scheduler,
+  with isolated mutable state, join-owned reservations, explicit cancelable joins,
+  deterministic merging, and serial fallback for oversized partitions.
+
+Main is merged through `7cf87a418f`. Live-provider retention qualification remains
+deferred; certificate audit bypass remains disabled by default. These refinements
+do not claim representative archive-scale latency or RSS benchmark results.

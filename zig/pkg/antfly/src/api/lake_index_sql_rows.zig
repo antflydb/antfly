@@ -1295,7 +1295,7 @@ fn openDynamicContext(a: A, server: *server_api.ApiHttpServer, table: catalog.Ta
             return err;
         };
         owner.read_context = owner.lease.?.readContext();
-        selected = (try @import("lake_index_selection.zig").selectCached(ca, table, source, &owner.store, owner.read_context, policy, &server.lake_read_cache)) orelse return null;
+        selected = (try @import("lake_index_selection.zig").selectCachedWithLease(ca, table, source, &owner.store, owner.read_context, policy, &server.lake_read_cache, owner.lease)) orelse return null;
     }
     var parsed = try local.schema_mod.parseValidatedTableSchema(a, definitions.schema_json);
     defer parsed.deinit(a);

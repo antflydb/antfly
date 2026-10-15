@@ -26,7 +26,7 @@ pub const Digest = [32]u8;
 pub const Token = [16]u8;
 pub const DirectoryRef = struct { artifact_id: []const u8, checksum: []const u8, byte_len: u64, count: u32 };
 pub const max_directory_artifacts: usize = 4096;
-pub const native_reader_protocol: u16 = 46;
+pub const native_reader_protocol: u16 = 47;
 
 // Catalog envelopes must remain readable so reconciliation can replace older
 // derived formats. Serving still requires the current reader protocol.
@@ -94,7 +94,7 @@ pub const CloudRetentionCertificate = struct {
     roots: []const Digest,
     binding: Digest,
 };
-pub const CloudVacuumProgress = struct { cutoff: u64 = 0, after: ?Digest = null, done: bool = false };
+pub const CloudVacuumProgress = struct { cutoff: u64 = 0, proof: ?Digest = null, after: ?Digest = null, done: bool = false };
 pub const CloudGenerations = struct {
     root: artifacts.ProviderGenerationRef,
     complete: bool = false,
@@ -161,7 +161,8 @@ pub const Publication = struct {
             else => return error.InvalidLakeIndexCatalog,
         }
         if (self.source_navigation) |navigation| {
-            if (self.reader_protocol < 46 or navigation.kind != .doc_values or navigation.metadata_version != 1) return error.InvalidLakeIndexCatalog;
+            if (self.reader_protocol < 46 or navigation.kind != .doc_values or (navigation.metadata_version != 1 and navigation.metadata_version != 2)) return error.InvalidLakeIndexCatalog;
+            if (navigation.metadata_version == 2 and self.reader_protocol < 47) return error.InvalidLakeIndexCatalog;
             try artifactValid(navigation);
         }
         try artifactValid(self.inventory);

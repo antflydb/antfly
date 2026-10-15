@@ -37,7 +37,7 @@ fn optionalWord(hash: *Hash, value: ?u64) void {
     hash.update(&.{@intFromBool(value != null)});
     if (value) |number| word(hash, number);
 }
-fn versionIsStrong(etag: []const u8, version: []const u8) bool {
+pub fn versionIsStrong(etag: []const u8, version: []const u8) bool {
     return etag.len != 0 or (version.len != 0 and !std.mem.startsWith(u8, version, "object-stat:v1:") and !std.mem.startsWith(u8, version, "iceberg:"));
 }
 fn jsonPart(a: A, hash: *Hash, value: anytype) !void {
@@ -60,7 +60,7 @@ const ObjectStat = struct {
         return worker_client.statObject(location.bucket, location.key);
     }
 };
-pub const Coverage = struct { source: [32]u8, delete_objects: [32]u8 };
+pub const Coverage = struct { source: [32]u8, delete_objects: [32]u8, data: [32]u8 };
 pub fn pin(source: *Source, context: Context) !Coverage {
     return pinWithInventory(source, context, null);
 }
@@ -195,9 +195,27 @@ pub fn pinData(source: *Source, context: Context, previous: ?local.serverless_ex
     try jsonPart(a, &hash, source.inventory.deleted_row_groups);
     return hash;
 }
+pub fn dataDigest(data: DataProof) [32]u8 {
+    var copy = data;
+    return copy.finalResult();
+}
+/// Protocol 47 persists the data census digest independently of fresh delete
+/// evidence. No compiler-specific hash state becomes durable wire metadata.
 pub fn finish(source: *Source, context: Context, data: DataProof) !Coverage {
+    return finishDigest(source, context, dataDigest(data));
+}
+pub fn finishDigest(source: *Source, context: Context, data: [32]u8) !Coverage {
+    var hash = Hash.init(.{});
+    part(&hash, "native-lake-source-coverage-v2");
+    hash.update(&data);
+    return finishHash(source, context, hash, data);
+}
+pub fn finishLegacy(source: *Source, context: Context, data: DataProof) !Coverage {
+    return finishHash(source, context, data, dataDigest(data));
+}
+fn finishHash(source: *Source, context: Context, input: Hash, digest: [32]u8) !Coverage {
     const a = source.alloc;
-    var hash = data;
+    var hash = input;
     var client = source.scanner.object_reader.client;
     client.allocator = a;
     const Work = ObjectStat;
@@ -243,7 +261,7 @@ pub fn finish(source: *Source, context: Context, data: DataProof) !Coverage {
         }
     }
     try context.ensureActive();
-    return .{ .source = hash.finalResult(), .delete_objects = delete_versions.finalResult() };
+    return .{ .source = hash.finalResult(), .delete_objects = delete_versions.finalResult(), .data = digest };
 }
 
 test "external lake native index coverage rejects synthetic provider identities" {

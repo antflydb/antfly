@@ -340,6 +340,14 @@ pub fn executePinnedExternalLakeRowsScanAlloc(
 }
 
 pub const ServingSource = struct {
+    pub const FileVersions = struct { etag: []u8, version_id: []u8 };
+    /// Query-owned authenticated selector pages retain independent native
+    /// reader authority until source teardown. Caches contain data only.
+    pub const VerifiedSelector = struct {
+        ptr: *anyopaque,
+        read: *const fn (*anyopaque, std.mem.Allocator, external_source_api.FileEntry, @import("lake_read_context.zig").Context) anyerror!FileVersions,
+        close: *const fn (*anyopaque) void,
+    };
     alloc: std.mem.Allocator,
     snapshot_pin: ?host_store.SnapshotPin = null,
     store: object_store_support.OpenedObjectStore,
@@ -364,6 +372,7 @@ pub const ServingSource = struct {
     // Only installed after a full coverage check against this immutable plan.
     verified_files: ?*const std.StringHashMapUnmanaged(*const external_source_api.FileEntry) = null,
     verified_inventory_lease: ?@import("lake_decoded_cache.zig").Lease = null,
+    verified_selector: ?VerifiedSelector = null,
     context_store: ?*@import("lake_read_context.zig").Store = null,
     prepared_deletes: ?*@import("lake_prepared_deletes.zig").Prepared = null,
 
@@ -693,6 +702,7 @@ pub const ServingSource = struct {
             reader.drain(true);
             self.alloc.destroy(reader);
         }
+        if (self.verified_selector) |selector| selector.close(selector.ptr);
         if (self.plan_lease) |lease| lease.release() else if (self.scanner.iceberg_delete_plan) |*value| value.deinit(self.alloc);
         if (self.partition_rules) |*rules| rules.deinit();
         if (self.iceberg_schema) |*value| value.deinit();

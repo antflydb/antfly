@@ -186,7 +186,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     var selected = blk: {
         const publication_started = @import("antfly_platform").time.monotonicNs();
         defer server.lake_query_metrics.record(.publication, publication_started);
-        break :blk (try @import("lake_index_selection.zig").selectCached(ca, sql_table, &source, &store, context, .required, &server.lake_read_cache)) orelse return error.ExternalLakeIndexUnavailable;
+        break :blk (try @import("lake_index_selection.zig").selectCachedWithLease(ca, sql_table, &source, &store, context, .required, &server.lake_read_cache, lease)) orelse return error.ExternalLakeIndexUnavailable;
     };
     defer selected.deinit();
     const publication_bytes = try local.metadata_lake_index_catalog.encode(ca, .{ .namespace = selected.publication().namespace, .generation = selected.publication().generation, .published = selected.publication() });
@@ -1383,7 +1383,7 @@ const Execution = struct {
             req.aggregations_json.len != 0 or
             (!req.count_only and req.limit == 0)) return null;
         switch (text) {
-            .term, .match, .phrase, .bool_query => {},
+            .term, .match, .phrase, .bool_query, .prefix, .wildcard, .regexp, .fuzzy => {},
             else => return null,
         }
         if (self.overlay != null and req.distributed_text_stats.len != 0) return null;
@@ -1858,6 +1858,103 @@ const Execution = struct {
         self.recent_dense_entries.clearRetainingCapacity();
         self.recent_sparse_entries.clearRetainingCapacity();
     }
+    // Independent executions own every mutable map, runtime pin and allocator.
+    // Results retain scheduler admission until joined; no private pool is used.
+    fn searchRecentParts(self: *Execution, a: A, req: types.SearchRequest, query: anytype, comptime part: anytype, combined: *types.SearchResult, scheduling: *local.sql_parallel_scheduler.Scheduler) !void {
+        const scheduler = local.sql_parallel_scheduler;
+        const workspace = 16 * 1024 * 1024;
+        const Worker = struct {
+            budget: local.sql_memory_budget = .{ .backing = std.heap.page_allocator, .limit = workspace },
+            arena: std.heap.ArenaAllocator,
+            execution: Execution,
+            result: ?types.SearchResult = null,
+            task: ?scheduler.Task(anyerror!void) = null,
+            failure: ?anyerror = null,
+            done: std.Io.Event = .unset,
+            fn create(base: *Execution, selected_run: @import("lake_recent_vectors.zig").Run, limit: usize, backing: A) !*@This() {
+                const owner = try std.heap.page_allocator.create(@This());
+                owner.* = .{ .arena = undefined, .execution = undefined };
+                owner.budget.limit = limit;
+                owner.budget.backing = backing;
+                owner.arena = .init(owner.budget.allocator());
+                owner.execution = .{ .server = base.server, .overlay = base.overlay, .table = base.table, .source = base.source, .store = base.store, .domain = base.domain, .declarations = base.declarations, .context = base.context, .request = base.request, .schema_json = base.schema_json, .hydration_fields = base.hydration_fields, .vector_filter = base.vector_filter, .vector_exclusion = base.vector_exclusion, .active_recent = true, .recent_run = selected_run, .recent_runs = base.recent_runs, .recent_declarations = base.recent_declarations, .recent_cloud = base.recent_cloud, .cloud_generations = base.cloud_generations, .typed_delivery = base.typed_delivery, .navigation = base.navigation, .files = base.files, .private_files = base.private_files, .private_digests = base.private_digests, .arena = owner.arena.allocator(), .result_allocator = owner.budget.allocator() };
+                return owner;
+            }
+            fn run(owner: *@This(), request: types.SearchRequest, q: @TypeOf(query)) anyerror!void {
+                defer if (owner.execution.context.io) |io| owner.done.set(io);
+                try owner.execution.context.ensureActive();
+                owner.result = try part(&owner.execution, owner.budget.allocator(), request, q);
+            }
+            fn close(owner: *@This()) void {
+                std.debug.assert(owner.task == null);
+                if (owner.result) |*result| result.deinit();
+                owner.execution.deinit();
+                owner.arena.deinit();
+                std.debug.assert(owner.budget.live == 0);
+                std.heap.page_allocator.destroy(owner);
+            }
+        };
+        const legacy = [_]@import("lake_recent_vectors.zig").Run{.{ .prefix = 0, .digest = @splat(0), .declarations = self.recent_declarations, .cloud_generations = self.recent_cloud }};
+        const runs = if (self.recent_runs.len != 0) self.recent_runs else &legacy;
+        var first: usize = 0;
+        while (first < runs.len) {
+            var workers: [3]?*Worker = @splat(null);
+            defer {
+                for (&workers) |*slot| if (slot.*) |worker| {
+                    if (worker.task) |task| {
+                        var pending = task;
+                        worker.task = null;
+                        _ = pending.cancel(self.context.io.?) catch {};
+                    }
+                    worker.close();
+                };
+            }
+            const count = @min(workers.len, runs.len - first);
+            for (workers[0..count], 0..) |*slot, i| {
+                const worker = try Worker.create(self, runs[first + i], workspace, @import("antfly_platform").allocator.processAllocator(std.heap.page_allocator));
+                slot.* = worker;
+                if (self.context.io) |io| worker.task = scheduling.submitIo(io, workspace, Worker.run, .{ worker, req, query });
+                if (worker.task == null) Worker.run(worker, req, query) catch |err| {
+                    // Cancellation must unwind immediately: swallowing it
+                    // would consume the caller cancellation point before joins.
+                    if (err != error.OutOfMemory or !worker.budget.isExhausted()) return err;
+                    worker.failure = err;
+                };
+            }
+            // Consume one joined lane immediately. Other result owners keep
+            // their reservations until their own join, rather than accumulating
+            // a batch of live results outside shared admission.
+            for (workers[0..count], 0..) |*slot, i| {
+                var worker = slot.*.?;
+                if (worker.task) |task| {
+                    // Future.await itself is uncancelable. Wait at an explicit
+                    // cancellation point while the task still owns its lease.
+                    try worker.done.wait(self.context.io.?);
+                    var pending = task;
+                    worker.task = null;
+                    pending.await(self.context.io.?) catch |err| {
+                        worker.failure = err;
+                    };
+                }
+                if (worker.failure) |err| {
+                    if (err != error.OutOfMemory or !worker.budget.isExhausted()) return err;
+                    // Large individual requests retain the serial path's
+                    // allocation policy instead of inheriting a lane quota.
+                    worker.close();
+                    slot.* = null;
+                    worker = try Worker.create(self, runs[first + i], std.math.maxInt(usize), a);
+                    slot.* = worker;
+                    try Worker.run(worker, req, query);
+                }
+                const merged = try local.api_query.mergeSearchResults(a, req, &.{ combined.*, worker.result.? }, 0, req.limit);
+                combined.deinit();
+                combined.* = merged;
+                worker.close();
+                slot.* = null;
+            }
+            first += count;
+        }
+    }
     fn searchDense(raw: ?*anyopaque, a: A, req: types.SearchRequest, query: types.DenseKnnQuery) !types.SearchResult {
         const self = from(raw);
         if (self.recent_declarations.len == 0) return searchDensePart(raw, a, req, query);
@@ -1867,24 +1964,7 @@ const Execution = struct {
         self.active_recent = false;
         var combined = try searchDensePart(raw, a, leaf, query);
         defer combined.deinit();
-        const base_runtime = self.unit_runtime;
-        self.active_recent = true;
-        defer {
-            self.active_recent = false;
-            self.recent_run = null;
-            self.unit_runtime = base_runtime;
-        }
-        const legacy = [_]@import("lake_recent_vectors.zig").Run{.{ .prefix = 0, .digest = @splat(0), .declarations = self.recent_declarations, .cloud_generations = self.recent_cloud }};
-        for (if (self.recent_runs.len != 0) self.recent_runs else &legacy) |run| {
-            self.recent_run = run;
-            const held = self.runtimes.items.len;
-            defer self.releaseRecentWindow(held);
-            var recent = try searchDensePart(raw, a, leaf, query);
-            defer recent.deinit();
-            const merged = try local.api_query.mergeSearchResults(a, leaf, &.{ combined, recent }, 0, leaf.limit);
-            combined.deinit();
-            combined = merged;
-        }
+        try self.searchRecentParts(a, leaf, query, searchDensePart, &combined, local.sql_parallel_scheduler.global());
         return local.api_query.mergeSearchResults(a, req, &.{combined}, req.offset, req.limit);
     }
     fn searchDensePart(raw: ?*anyopaque, a: A, req: types.SearchRequest, dense: types.DenseKnnQuery) !types.SearchResult {
@@ -1958,24 +2038,7 @@ const Execution = struct {
         self.active_recent = false;
         var combined = try searchSparsePart(raw, a, leaf, query);
         defer combined.deinit();
-        const base_runtime = self.unit_runtime;
-        self.active_recent = true;
-        defer {
-            self.active_recent = false;
-            self.recent_run = null;
-            self.unit_runtime = base_runtime;
-        }
-        const legacy = [_]@import("lake_recent_vectors.zig").Run{.{ .prefix = 0, .digest = @splat(0), .declarations = self.recent_declarations, .cloud_generations = self.recent_cloud }};
-        for (if (self.recent_runs.len != 0) self.recent_runs else &legacy) |run| {
-            self.recent_run = run;
-            const held = self.runtimes.items.len;
-            defer self.releaseRecentWindow(held);
-            var recent = try searchSparsePart(raw, a, leaf, query);
-            defer recent.deinit();
-            const merged = try local.api_query.mergeSearchResults(a, leaf, &.{ combined, recent }, 0, leaf.limit);
-            combined.deinit();
-            combined = merged;
-        }
+        try self.searchRecentParts(a, leaf, query, searchSparsePart, &combined, local.sql_parallel_scheduler.global());
         return local.api_query.mergeSearchResults(a, req, &.{combined}, req.offset, req.limit);
     }
     fn searchSparsePart(raw: ?*anyopaque, a: A, req: types.SearchRequest, sparse: types.SparseKnnQuery) !types.SearchResult {
@@ -3558,4 +3621,76 @@ test "external lake bounded WAL retained publication cancellation reaches cloud 
     const token = retainedCancellation(&expired);
     try std.testing.expectError(error.DeadlineExceeded, token.check());
     try std.testing.expect(local.storage_object_storage.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn).?.isCancelled());
+}
+
+test "external lake bounded WAL vector lanes join cancel saturate and retry oversized partitions" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const State = struct {
+        io: std.Io,
+        gate: std.Io.Event = .unset,
+        started: std.Io.Event = .unset,
+        active: std.atomic.Value(usize) = .init(0),
+        peak: std.atomic.Value(usize) = .init(0),
+        calls: std.atomic.Value(usize) = .init(0),
+        fn part(raw: ?*anyopaque, alloc: A, _: types.SearchRequest, oversized: bool) !types.SearchResult {
+            const execution = Execution.from(raw);
+            const self: *@This() = @ptrCast(@alignCast(execution.server));
+            const active = self.active.fetchAdd(1, .acq_rel) + 1;
+            defer _ = self.active.fetchSub(1, .acq_rel);
+            _ = self.calls.fetchAdd(1, .monotonic);
+            _ = self.peak.fetchMax(active, .acq_rel);
+            if (active >= 2) self.started.set(self.io);
+            try self.gate.wait(self.io);
+            if (oversized and execution.recent_run.?.prefix == 1) {
+                const bytes = try alloc.alloc(u8, 17 * 1024 * 1024);
+                alloc.free(bytes);
+            }
+            const hits = try alloc.alloc(types.SearchHit, 1);
+            errdefer alloc.free(hits);
+            hits[0] = .{ .id = try std.fmt.allocPrint(alloc, "run-{d}", .{execution.recent_run.?.prefix}), .score = @floatFromInt(execution.recent_run.?.prefix) };
+            return .{ .alloc = alloc, .hits = hits, .total_hits = 1 };
+        }
+        fn run(execution: *Execution, alloc: A, result: *types.SearchResult, scheduling: *local.sql_parallel_scheduler.Scheduler, oversized: bool) !void {
+            try execution.searchRecentParts(alloc, .{ .limit = 2, .full_text = .{ .term = .{ .field = "body", .term = "score" } } }, oversized, part, result, scheduling);
+        }
+    };
+    for ([_]u8{ 0, 1, 2, 3 }) |mode| {
+        var state: State = .{ .io = io };
+        var scheduling: local.sql_parallel_scheduler.Scheduler = .{};
+        if (mode == 1) scheduling.max_io_workers = 0;
+        if (mode == 1 or mode == 3) state.gate.set(io);
+        var runs: [4]@import("lake_recent_vectors.zig").Run = undefined;
+        for (&runs, 1..) |*run, i| run.* = .{ .prefix = @intCast(i), .digest = @splat(0), .declarations = &.{}, .cloud_generations = null };
+        var execution: Execution = .{ .server = @ptrCast(@alignCast(&state)), .table = undefined, .source = undefined, .store = undefined, .domain = @splat(0), .declarations = &.{}, .context = .{ .io = io }, .request = .{}, .schema_json = "{}", .arena = a, .result_allocator = a, .recent_runs = &runs };
+        defer execution.deinit();
+        var result: types.SearchResult = .{ .alloc = a, .hits = &.{}, .total_hits = 0 };
+        defer result.deinit();
+        var future = try io.concurrent(State.run, .{ &execution, a, &result, &scheduling, mode == 3 });
+        var joined = false;
+        defer if (!joined) {
+            _ = future.cancel(io) catch {};
+        };
+        if (mode == 0 or mode == 2) {
+            try state.started.wait(io);
+            try std.testing.expect(scheduling.io_workers > 0);
+        }
+        joined = true;
+        if (mode == 2) {
+            try std.testing.expectError(error.Canceled, future.cancel(io));
+        } else {
+            state.gate.set(io);
+            try future.await(io);
+            try std.testing.expectEqual(@as(u32, 4), result.total_hits);
+            try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+            try std.testing.expectEqualStrings("run-4", result.hits[0].id);
+            try std.testing.expectEqualStrings("run-3", result.hits[1].id);
+            try std.testing.expectEqual(@as(usize, if (mode == 3) 5 else 4), state.calls.load(.acquire));
+        }
+        if (mode == 0) try std.testing.expect(state.peak.load(.acquire) >= 2);
+        if (mode == 1) try std.testing.expectEqual(@as(usize, 1), state.peak.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), state.active.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), scheduling.bytes);
+        try std.testing.expectEqual(@as(usize, 0), scheduling.io_workers);
+    }
 }

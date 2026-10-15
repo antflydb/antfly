@@ -848,3 +848,45 @@ WAL position, partition progress, and artifact-retention horizon. Reusable parti
 jobs have separate identities and cannot individually claim table-wide readiness.
 Retained cursor replay shares decoded immutable WAL groups across neighboring cuts,
 with independent admission and conservative accounting for all pinned buffers.
+
+
+### Compact coverage, bounded patterns, and recent-vector scheduling
+
+Reader protocol 47 separates the canonical data census digest from freshly
+qualified delete-object evidence. The publication owns a version-2 source-navigation
+root containing that digest and, for explicitly immutable sources, the exact
+freshly discovered source-plan identity. Selection checks current binding,
+credentials, schema, snapshot, file count, and reader authority before using this
+proof. An identical immutable plan can reuse its census without decoding or mapping
+the published inventory. Mutable sources and unmatched plans still qualify current
+objects and recompute the complete census. Historical publications retain their
+original signature preimage and validation path.
+
+Reached Parquet files obtain their exact provider selectors through authenticated
+point seeks in the publication's file tree. The source owns an independent native
+store client and retained reader handle, so closing a short SQL index cursor cannot
+invalidate later projected hydration. Conflicting fresh selectors fail validation;
+selector caches carry no authorization. Delete-object versions remain fresh on
+every selection, including immutable data-plan reuse.
+
+Prefix, wildcard, regexp, and fuzzy text queries participate in bounded routing
+windows and shared Boolean preparation. Segment-local compressed membership feeds
+the ordinary top-k collector instead of corpus-wide document-ID and score arrays.
+Unknown pattern membership never prunes a segment. Mixed clauses retain global
+BM25 statistics, constant-score boosts, deletions, filtering, and stable cursor ties.
+Explicit sorts and aggregations keep their existing complete-input operators.
+
+Recent dense and sparse vector partitions use independent mutable executions in
+batches of at most three. Shared I/O scheduler admission remains held through result
+joining, with a 16 MiB workspace per concurrent lane. Saturated work runs inline;
+a partition exceeding its lane quota is retried serially under the existing request
+allocation policy. Cancelable completion points precede joining; inline
+cancellation immediately unwinds sibling work. All lanes join or cancel before
+owners are released, and merges retain partition order and global result shaping. This improves overlap across
+recent partitions without creating an operator-specific thread pool.
+
+Cloud generation-map vacuum progress binds its cursor and completion state to a
+versioned digest of the entire GC cut: retention domain, floor, cutoff, and mark-tree
+root. Changed evidence or legacy progress without that digest restarts enumeration,
+even when the numerical cutoff is unchanged. Prior reader-held map roots remain
+immutable and independently retained.

@@ -1008,7 +1008,7 @@ pub const Adapter = struct {
             };
             context = owner.reader_lease.?.readContext();
         }
-        var selected = (try @import("lake_index_selection.zig").selectCached(sa, table, &source, &owner.store, context, .automatic, &self.server.lake_read_cache)) orelse return null;
+        var selected = (try @import("lake_index_selection.zig").selectCachedWithLease(sa, table, &source, &owner.store, context, .automatic, &self.server.lake_read_cache, owner.reader_lease)) orelse return null;
         defer selected.deinit();
         const owned = owner.arena.allocator();
         const references = try owned.alloc(local.serverless_manifest_artifact_ref.ArtifactRef, identities.len);

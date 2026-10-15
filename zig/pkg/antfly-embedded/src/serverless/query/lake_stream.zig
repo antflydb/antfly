@@ -801,6 +801,13 @@ pub const Stream = struct {
                 self.source.alloc.free(entry.version_id);
                 entry.etag = etag;
                 entry.version_id = version;
+            } else if (self.source.immutable_objects and self.source.verified_selector != null) {
+                const selector = self.source.verified_selector.?;
+                const versions = try selector.read(selector.ptr, self.source.alloc, entry, self.context);
+                self.source.alloc.free(entry.etag);
+                self.source.alloc.free(entry.version_id);
+                entry.etag = versions.etag;
+                entry.version_id = versions.version_id;
             } else try iceberg.pinInventoryDataFileObjectVersions(self.source.alloc, self.source.scanner.object_reader.client, &single);
             if (sparse) try self.source.versions.put(self.source.alloc, index, entry) else {
                 self.source.inventory.files[index] = entry;

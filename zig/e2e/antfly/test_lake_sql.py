@@ -3002,7 +3002,7 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
             assert [h["_source"]["amount"] for h in unfiltered["hits"]["hits"]] == [
                 amount
             ]
-            # The prefix clause forces full-corpus admission but cannot match.
+            # The prefix clause requires complete bounded admission but cannot match.
             # Selective routing must retain global BM25 collection statistics.
             full_corpus = query(
                 {"match_all": {}},

@@ -28,7 +28,8 @@ const Token = @import("antfly_cancellation").CancellationToken;
 const Ref = local.serverless_manifest_artifact_ref.ArtifactRef;
 const Inventory = local.serverless_external_source_types.Inventory;
 pub const Root = struct {
-    version: u8 = 1,
+    version: u8 = 2,
+    coverage: ?struct { version: u8 = 1, plan: ?[32]u8, data: [32]u8 } = null,
     domain: [32]u8,
     source: []const u8,
     schema: []const u8,
@@ -129,12 +130,13 @@ fn key(bytes: []const u8) [32]u8 {
     return result;
 }
 pub fn load(a: A, store: stores.ArtifactStore, ref: Ref, token: Token, cached: ?artifacts.CachedRead) !Root {
-    if (ref.kind != .doc_values or ref.metadata_version != 1 or ref.byte_len > 64 * 1024) return error.InvalidNativeLakeFileState;
+    if (ref.kind != .doc_values or (ref.metadata_version != 1 and ref.metadata_version != 2) or ref.byte_len > 64 * 1024) return error.InvalidNativeLakeFileState;
     const bytes = try artifacts.readArtifact(a, store, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, cached);
     defer a.free(bytes);
     const root = try std.json.parseFromSliceLeaky(Root, a, bytes, .{ .allocate = .alloc_always });
     const scope = (try stores.uploadScopeFromArtifactId(ref.artifact_id)) orelse return error.InvalidNativeLakeFileState;
-    if (root.version != 1 or !std.mem.eql(u8, &scope.domain, &root.domain) or root.source.len == 0 or root.schema.len == 0 or root.snapshot.len == 0) return error.InvalidNativeLakeFileState;
+    if (root.version != ref.metadata_version or !std.mem.eql(u8, &scope.domain, &root.domain) or root.source.len == 0 or root.schema.len == 0 or root.snapshot.len == 0) return error.InvalidNativeLakeFileState;
+    if (root.coverage) |proof| if (root.version < 2 or proof.version != 1) return error.InvalidNativeLakeFileState;
     for ([_]?tree.Ref{ root.files, root.public, root.private }) |r| {
         if ((r == null) != (root.count == 0)) return error.InvalidNativeLakeFileState;
         if (r) |value| {
@@ -174,9 +176,13 @@ const Batch = struct {
 pub const BuildStats = struct { prior_pages: usize = 0, prior_records: usize = 0, skipped_subtrees: usize = 0 };
 pub const Built = struct { ref: Ref, delta: Delta, stats: BuildStats };
 pub fn build(a: A, out: A, store: *stores.ArtifactStore, provider: *Provider, prior: ?Root, token: Token) !Built {
+    return buildProven(a, out, store, provider, prior, token, null);
+}
+pub fn buildProven(a: A, out: A, store: *stores.ArtifactStore, provider: *Provider, prior: ?Root, token: Token, data: ?[32]u8) !Built {
     const inv = provider.source.inventory;
     const compatible = if (prior) |old| std.mem.eql(u8, old.source, inv.source_id) and std.mem.eql(u8, old.schema, inv.schema_fingerprint) and std.mem.eql(u8, &old.domain, &store.upload_scope.?.domain) else false;
     var root: Root = .{ .domain = store.upload_scope.?.domain, .source = inv.source_id, .schema = inv.schema_fingerprint, .snapshot = inv.snapshot_id, .count = @intCast(inv.files.len) };
+    if (data) |digest| root.coverage = .{ .plan = if (provider.source.immutable_objects) provider.source.plan_identity else null, .data = digest };
     if (compatible) {
         root.files = prior.?.files;
         root.private = prior.?.private;
@@ -352,7 +358,7 @@ pub fn build(a: A, out: A, store: *stores.ArtifactStore, provider: *Provider, pr
     defer a.free(bytes);
     var uploaded = try store.putWithCancellation(bytes, token);
     defer uploaded.deinit(store.allocator);
-    return .{ .stats = stats, .ref = .{ .kind = .doc_values, .metadata_version = 1, .artifact_id = try out.dupe(u8, uploaded.artifact_id), .checksum = try out.dupe(u8, uploaded.checksum), .byte_len = uploaded.byte_len }, .delta = .{ .source = inv.source_id, .schema = inv.schema_fingerprint, .prior_count = if (compatible) prior.?.count else 0, .prior_snapshot = if (compatible) try out.dupe(u8, prior.?.snapshot) else null, .files = current, .changed = changed, .prior_changed = prior_changed.items, .by_id = native_by_id } };
+    return .{ .stats = stats, .ref = .{ .kind = .doc_values, .metadata_version = 2, .artifact_id = try out.dupe(u8, uploaded.artifact_id), .checksum = try out.dupe(u8, uploaded.checksum), .byte_len = uploaded.byte_len }, .delta = .{ .source = inv.source_id, .schema = inv.schema_fingerprint, .prior_count = if (compatible) prior.?.count else 0, .prior_snapshot = if (compatible) try out.dupe(u8, prior.?.snapshot) else null, .files = current, .changed = changed, .prior_changed = prior_changed.items, .by_id = native_by_id } };
 }
 /// The resolver borrows fresh publication authority. Only immutable root/page
 /// payloads enter shared caches; request contexts never escape this owner.
@@ -485,6 +491,28 @@ pub const Resolver = struct {
         const found = (try self.point(scratch.allocator(), if (public) self.root.public else self.root.private, &id)) orelse return null;
         return self.remember(map, hex, found) orelse try a.dupe(u8, found);
     }
+    /// Return only the exact selectors needed by a reached Parquet file.
+    /// The caller owns the strings; all other source metadata remains in its
+    /// fresh immutable manifest plan.
+    pub fn selectors(self: *@This(), a: A, file_: local.serverless_external_source_types.FileEntry) !local.serverless_query_lake_serving.ServingSource.FileVersions {
+        try self.lock();
+        defer self.mutex.unlock();
+        try self.cached.context.ensureActive();
+        try self.token.check();
+        var memory: local.sql_memory_budget = .{ .backing = @import("antfly_platform").allocator.processAllocator(std.heap.smp_allocator), .limit = 4 * 1024 * 1024 };
+        var scratch = std.heap.ArenaAllocator.init(memory.allocator());
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+        const bytes = (try self.point(sa, self.root.files, &key(file_.file_id))) orelse return error.ExternalLakeSnapshotMismatch;
+        const record = try std.json.parseFromSliceLeaky(Record, sa, bytes, .{});
+        if (!std.mem.eql(u8, record.file.file_id, file_.file_id) or !std.mem.eql(u8, record.file.object_uri, file_.object_uri) or record.file.byte_len != file_.byte_len) return error.ExternalLakeSnapshotMismatch;
+        const coverage = @import("lake_index_coverage.zig");
+        if (!coverage.versionIsStrong(record.file.etag, record.file.version_id)) return error.InvalidExternalLakeIndexCoverage;
+        if (coverage.versionIsStrong(file_.etag, file_.version_id) and (!std.mem.eql(u8, file_.etag, record.file.etag) or !std.mem.eql(u8, file_.version_id, record.file.version_id))) return error.ExternalLakeIndexSourceChanged;
+        const etag = try a.dupe(u8, record.file.etag);
+        errdefer a.free(etag);
+        return .{ .etag = etag, .version_id = try a.dupe(u8, record.file.version_id) };
+    }
     pub fn digest(self: *@This(), a: A, file_id: []const u8) ![]const u8 {
         try self.lock();
         defer self.mutex.unlock();
@@ -529,13 +557,27 @@ test "external lake bounded WAL paged source navigation resolves only reached id
     source.prepared_deletes = null;
     source.scanner.iceberg_delete_plan = null;
     var provider: Provider = .{ .source = &source, .context = .{ .io = std.testing.io } };
-    const first = try build(a, ca, &store, &provider, null, .none);
+    source.immutable_objects = true;
+    source.plan_identity = @splat(8);
+    const first = try buildProven(a, ca, &store, &provider, null, .none, @splat(9));
     const old = try load(ca, store, first.ref, .none, null);
+    try std.testing.expectEqualDeep(@as([32]u8, @splat(8)), old.coverage.?.plan.?);
+    try std.testing.expectEqualDeep(@as([32]u8, @splat(9)), old.coverage.?.data);
     var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
     defer cache.deinit();
     const cached: artifacts.CachedRead = .{ .cache = &cache, .scope = @splat(3), .context = .{} };
     var resolver: Resolver = .{ .root = old, .store = store, .cached = cached, .token = .none };
     defer resolver.deinit();
+    const versions = try resolver.selectors(a, entries[255]);
+    defer a.free(versions.etag);
+    defer a.free(versions.version_id);
+    try std.testing.expectEqualStrings("exact", versions.etag);
+    var wrong_file = entries[255];
+    wrong_file.byte_len += 1;
+    try std.testing.expectError(error.ExternalLakeSnapshotMismatch, resolver.selectors(a, wrong_file));
+    wrong_file = entries[255];
+    wrong_file.etag = @constCast("changed");
+    try std.testing.expectError(error.ExternalLakeIndexSourceChanged, resolver.selectors(a, wrong_file));
     const public_id = local.storage_rowsource_identity.fileDigest("source", "before", "file-255");
     const public_hex = std.fmt.bytesToHex(public_id, .lower);
     try std.testing.expectEqualStrings("file-255", (try resolver.file(ca, &public_hex, true)).?);
