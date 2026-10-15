@@ -150,6 +150,10 @@ fn runUntilIdleWithoutWaitingForEnrichmentRetriesWithCancellation(
     return .{ .value = self.runUntilIdleWithoutWaitingForEnrichmentRetriesWithCancellation(cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+fn runBackgroundReplayWithCancellation(self: *DB, cancellation: types.CancellationToken) engine.Outcome(bool) {
+    return .{ .value = self.runBackgroundReplayWithCancellation(cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
 fn runBackgroundMaintenanceWithCancellation(self: *DB, cancellation: types.CancellationToken) engine.Outcome(bool) {
     return .{ .value = self.runBackgroundMaintenanceWithCancellation(cancellation) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
@@ -627,6 +631,10 @@ fn derivedAsyncAppendDerivedBatchRecord(self: *DB, derived_batch: @import("db/de
 
 fn runDerivedUntil(self: *DB, sequence: u64) engine.Outcome(void) {
     return .{ .value = self.runDerivedUntil(sequence) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
+fn waitForCurrentIndexTargets(self: *DB, index_names: []const []const u8, deadline_ns: u64) engine.Outcome(u64) {
+    return .{ .value = self.waitForCurrentIndexTargets(index_names, deadline_ns) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
 fn runDerivedUntilTargets(self: *DB, sequence: u64, index_names: []const []const u8) engine.Outcome(void) {
@@ -2026,12 +2034,12 @@ comptime {
                 return @ptrCast(&@field(Exports, name));
             }
         };
-        @export(&Accessor.get, .{ .name = "antfly_storage_engine_" ++ name ++ "_v22", .visibility = .hidden });
+        @export(&Accessor.get, .{ .name = "antfly_storage_engine_" ++ name ++ "_v23", .visibility = .hidden });
     }
     @export(&clearError, .{ .name = "antfly_storage_error_clear_v1", .visibility = .hidden });
     @export(&errorCode, .{ .name = "antfly_storage_error_code_v1", .visibility = .hidden });
     @export(&errorDetail, .{ .name = "antfly_storage_error_detail_v1", .visibility = .hidden });
     @export(&setError, .{ .name = "antfly_storage_error_set_v1", .visibility = .hidden });
     @export(&getAggregationDescriptor, .{ .name = "antfly_storage_engine_get_aggregation_descriptor_v1", .visibility = .hidden });
-    @export(&getDescriptor, .{ .name = "antfly_storage_engine_get_descriptor_v22", .visibility = .hidden });
+    @export(&getDescriptor, .{ .name = "antfly_storage_engine_get_descriptor_v23", .visibility = .hidden });
 }

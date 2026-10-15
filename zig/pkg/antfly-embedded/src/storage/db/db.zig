@@ -28465,8 +28465,10 @@ pub const DB = struct {
                     break;
                 }
                 if (count == 32 or visited == 4096) break;
+                // Setup can consume a short caller quantum. Admit one
+                // bounded scan unit so repeated waits cannot starve the job.
+                if (visited != 0 and monotonicTimeNs() >= build_deadline) break;
                 visited += 1;
-                if (monotonicTimeNs() >= build_deadline) break;
                 if (internal_keys.isStoredDocumentRowKey(kv.key)) {
                     const key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(a, kv.key)).?;
                     count += 1;
@@ -30530,6 +30532,8 @@ pub const DB = struct {
         /// Explicit idle calls drain all relational work. A borrowed writer
         /// advances one fair page and returns its remaining debt to its owner.
         drain_relational_indexes: bool = true,
+        drain_graph_replacements: bool = true,
+        bounded_replay: bool = false,
         /// Run the foreground enrichment catch-up pass to full completion
         /// instead of bounding it at the request-visibility default
         /// (`sync_wait_timeout_ms`, 5 minutes). Only `runUntilIdle` sets
@@ -30637,6 +30641,19 @@ pub const DB = struct {
         }
         self.executor.notifySequence(sequence);
         try self.executor.waitForAllWithVisibilityWait(sequence, wait);
+    }
+
+    /// Wait only for the selected indexes, before acquiring statement fences.
+    /// The returned primary sequence lets the caller retry capture if a write
+    /// arrived between replay completion and its multi-table read fence.
+    pub fn waitForCurrentIndexTargets(self: *DB, index_names: []const []const u8, deadline_ns: u64) !u64 {
+        if (comptime storage_engine.enabled) return storage_engine.call("waitForCurrentIndexTargets", .{ self, index_names, deadline_ns });
+        const sequence = self.core.nextDerivedSequence();
+        try self.runDerivedUntilTargetsWithVisibilityWait(sequence, index_names, .{
+            .deadline_ns = deadline_ns,
+            .clock = self.backend_runtime.monotonicClock(),
+        });
+        return sequence;
     }
 
     pub fn runDerivedUntilTargets(self: *DB, sequence: u64, index_names: []const []const u8) !void {
@@ -30774,7 +30791,7 @@ pub const DB = struct {
             if (options.no_progress_timeout_ns != 0) try self.checkTargetAdvanceNoProgress(options.no_progress_timeout_ns);
 
             const next_target = self.core.nextDerivedSequence();
-            if (next_target <= stable_target) {
+            if (options.bounded_replay or next_target <= stable_target) {
                 try waitForManagedIndexesApplied(self, sequence, sync_targets.all_indexes);
                 _ = try self.runArtifactRepairMetadataMaintenancePass();
                 return;
@@ -31036,7 +31053,7 @@ pub const DB = struct {
                 runtime.stats().applied_sequence > starting_promotion_applied
             else
                 false;
-            if (self.core.nextDerivedSequence() <= starting_sequence and !resolution_advanced and !promotion_advanced) return;
+            if (options.bounded_replay or (self.core.nextDerivedSequence() <= starting_sequence and !resolution_advanced and !promotion_advanced)) return;
         }
         return error.RunUntilIdleDidNotConverge;
     }
@@ -32112,11 +32129,13 @@ pub const DB = struct {
     fn runUntilIdleWithReplayDrainOptions(self: *DB, options: ReplayDrainOptions) !void {
         _ = try self.retryPortableRuntimeActivationIfNeeded();
         try self.drainReplayStagesUntilStableWithOptions(options);
-        if (options.drain_relational_indexes) {
-            while (try self.advanceGraphReplacement()) {
-                try ensureSnapshotActive(options.cancellation);
-            }
-        } else _ = try self.advanceGraphReplacement();
+        if (options.drain_graph_replacements) {
+            if (options.drain_relational_indexes) {
+                while (try self.advanceGraphReplacement()) {
+                    try ensureSnapshotActive(options.cancellation);
+                }
+            } else _ = try self.advanceGraphReplacement();
+        }
         _ = try self.evaluateAlgebraicAdaptiveCandidates();
         while (try self.runAlgebraicAdaptiveWork() != 0) {}
         try self.flushAppliedSequencesForIdle();
@@ -32617,6 +32636,23 @@ pub const DB = struct {
         if (comptime storage_engine.enabled) return storage_engine.call("runBackgroundMaintenanceWithCancellation", .{ self, cancellation });
         try self.runUntilIdleWithReplayDrainOptions(.{ .cancellation = cancellation, .drain_relational_indexes = false });
         return self.hasPendingGraphReplacements() or self.local_execution.relational_index_maintenance_sweep.isPending();
+    }
+
+    /// Detached Lite turns alternate replay with generation-scoped shadow
+    /// construction. Never chase a moving write tip or rebuild shadows while
+    /// retaining a serving-index publication footprint.
+    pub fn runBackgroundReplayWithCancellation(self: *DB, cancellation: types.CancellationToken) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("runBackgroundReplayWithCancellation", .{ self, cancellation });
+        const before = self.core.nextDerivedSequence();
+        try self.runUntilIdleWithReplayDrainOptions(.{
+            .cancellation = cancellation,
+            .drain_relational_indexes = false,
+            .drain_graph_replacements = false,
+            .bounded_replay = true,
+            .max_windows_per_index = 1,
+        });
+        return self.core.nextDerivedSequence() > before or self.executor.snapshotStats().workers_with_replay_debt != 0 or
+            self.hasPendingGraphReplacements() or self.local_execution.relational_index_maintenance_sweep.isPending();
     }
 
     pub fn rebuildDenseIndexesForTargetCoverage(self: *DB, alloc: Allocator) !usize {

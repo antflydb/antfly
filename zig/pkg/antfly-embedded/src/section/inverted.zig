@@ -548,6 +548,25 @@ fn decodeTermDictBlockValueDelta(encoded: u64, last_postings_offset: *u64) u64 {
     return last_postings_offset.*;
 }
 
+/// A block fence need only sort at or above its last term and strictly
+/// below the next block. Short separators keep a multi-megabyte term out of
+/// the FST's per-byte construction stack without dropping or truncating it.
+fn termBlockCeilingAlloc(alloc: Allocator, last: []const u8, next: ?[]const u8) ![]u8 {
+    const end = if (next) |upper| commonPrefixLen(last, upper) else 0;
+    var i = end;
+    while (i < last.len) : (i += 1) {
+        if (last[i] == 255) continue;
+        if (next) |upper| {
+            if (i >= upper.len or last[i] + 1 > upper[i] or
+                (last[i] + 1 == upper[i] and i + 1 == upper.len)) break;
+        }
+        const fence = try alloc.dupe(u8, last[0 .. i + 1]);
+        fence[i] += 1;
+        return fence;
+    }
+    return alloc.dupe(u8, last);
+}
+
 fn encodeBlockedTermDictionary(alloc: Allocator, entries: []const TermDictEntry) ![]u8 {
     var block_data = std.ArrayListUnmanaged(u8).empty;
     defer block_data.deinit(alloc);
@@ -560,7 +579,7 @@ fn encodeBlockedTermDictionary(alloc: Allocator, entries: []const TermDictEntry)
     const term_bytes = estimateTermBytes(entries);
     try block_data.ensureTotalCapacity(alloc, term_bytes.total +| entries.len * 12 +| estimated_block_count * 16);
     try index_records.ensureTotalCapacity(alloc, estimated_block_count * term_dict_index_record_size);
-    try index_terms.ensureTotalCapacity(alloc, estimated_block_count * (term_bytes.max +| 5));
+    try index_terms.ensureTotalCapacity(alloc, estimated_block_count * 16);
 
     const fst_registry_size: usize = std.math.clamp(entries.len, 64, 65_536);
     var block_fst_builder = try fst.Builder.init(alloc, .{
@@ -573,8 +592,10 @@ fn encodeBlockedTermDictionary(alloc: Allocator, entries: []const TermDictEntry)
     while (i < entries.len) {
         const end = chooseTermBlockEnd(entries.len, i);
         const first_term = entries[i].term;
-        const ceiling_term = entries[end - 1].term;
-        const prefix_len = commonPrefixLen(first_term, ceiling_term);
+        const last_term = entries[end - 1].term;
+        const ceiling_term = try termBlockCeilingAlloc(alloc, last_term, if (end < entries.len) entries[end].term else null);
+        defer alloc.free(ceiling_term);
+        const prefix_len = commonPrefixLen(first_term, last_term);
         const prefix = first_term[0..prefix_len];
         const block_offset: u64 = @intCast(block_data.items.len);
         try block_fst_builder.insert(ceiling_term, block_offset);
@@ -675,7 +696,7 @@ const StreamingTermDictionaryBuilder = struct {
 
     fn add(self: *StreamingTermDictionaryBuilder, term: []const u8, value: u64) !void {
         if (self.finalized_blocks) return error.InvalidData;
-        if (self.pending_count == term_dict_block_max_entries) try self.flushPendingBlock();
+        if (self.pending_count == term_dict_block_max_entries) try self.flushPendingBlock(term);
         if (term.len > std.math.maxInt(u32) or self.pending_term_bytes.items.len > std.math.maxInt(u32) - term.len) {
             return error.InvalidData;
         }
@@ -694,11 +715,13 @@ const StreamingTermDictionaryBuilder = struct {
         return self.pending_term_bytes.items[entry.term_offset..][0..entry.term_len];
     }
 
-    fn flushPendingBlock(self: *StreamingTermDictionaryBuilder) !void {
+    fn flushPendingBlock(self: *StreamingTermDictionaryBuilder, next: ?[]const u8) !void {
         if (self.pending_count == 0) return;
         const first_term = self.pendingTerm(self.pending_entries[0]);
-        const ceiling_term = self.pendingTerm(self.pending_entries[self.pending_count - 1]);
-        const prefix_len = commonPrefixLen(first_term, ceiling_term);
+        const last_term = self.pendingTerm(self.pending_entries[self.pending_count - 1]);
+        const ceiling_term = try termBlockCeilingAlloc(self.alloc, last_term, next);
+        defer self.alloc.free(ceiling_term);
+        const prefix_len = commonPrefixLen(first_term, last_term);
         const prefix = first_term[0..prefix_len];
         if (self.block_data.items.len > std.math.maxInt(u32) or self.index_terms.items.len > std.math.maxInt(u32)) {
             return error.InvalidData;
@@ -736,7 +759,7 @@ const StreamingTermDictionaryBuilder = struct {
 
     fn finalizeBlocks(self: *StreamingTermDictionaryBuilder) !void {
         if (self.finalized_blocks) return;
-        try self.flushPendingBlock();
+        try self.flushPendingBlock(null);
         self.finalized_blocks = true;
     }
 
@@ -2768,6 +2791,12 @@ pub const TermIterator = struct {
                     // each block's terms one by one.
                     self.blocks_pruned += 1;
                     if (!try self.seekPastDeadPrefix(block_prefix[0..dead_len])) return false;
+                    // A shortened fence can equal the next prefix even when
+                    // this block contains only dead terms. Consume that same
+                    // block after seeking so pruning always makes progress.
+                    if (self.block_iter.current()) |found| if (found.val == block_offset) {
+                        _ = try self.block_iter.nextEntry();
+                    };
                     continue;
                 }
             }
@@ -11255,4 +11284,65 @@ test "mapping windows use linear lookahead for moderately sparse chunks" {
     try std.testing.expectEqual(@as(usize, 125), state.reads);
     try std.testing.expectEqual(@as(u64, 1), iterator.mapping_window_refills);
     try std.testing.expect(iterator.test_mapping_scan_steps <= 128);
+}
+
+test "blocked term fences bound FST construction for oversized searchable terms" {
+    const a = std.testing.allocator;
+    const resources = @import("../storage/resource_manager.zig");
+    var budgets = resources.Options.defaultBudgets();
+    budgets[@backingInt(resources.Slice.full_text_build_working_set)] = .{ .hard_limit_bytes = 16 * 1024 * 1024 };
+    var manager = resources.ResourceManager.init(.{ .budgets = budgets });
+    var budget = resources.BudgetedAllocator.init(&manager, .full_text_build_working_set, a, 1);
+    defer budget.deinit();
+    const term = try a.alloc(u8, 1024 * 1024);
+    defer a.free(term);
+    @memset(term, 'x');
+    {
+        var builder = InvertedIndexBuilder.init(budget.allocator(), .{});
+        defer builder.deinit();
+        try builder.addDocument(0, &.{.{ .term = term, .freq = 1 }});
+        const encoded = try builder.build();
+        defer budget.allocator().free(encoded);
+        var reader = try InvertedIndexReader.init(budget.allocator(), encoded);
+        try std.testing.expect(try reader.lookupChecked(term) != null);
+        var iter = try reader.rangeTermIterator(term, null);
+        defer iter.deinit();
+        try std.testing.expectEqualStrings(term, (try iter.next()).?.term);
+        try std.testing.expect(try iter.next() == null);
+        // The existing non-streaming encoder must use the same small fences.
+        const dictionary = try encodeBlockedTermDictionary(budget.allocator(), &.{.{ .term = term, .value = 0 }});
+        defer budget.allocator().free(dictionary);
+        try std.testing.expect(dictionary.len < term.len + 1024);
+    }
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.full_text_build_working_set).used_bytes);
+}
+
+test "short term block ceilings preserve ordering and automaton pruning progress" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { last: []const u8, next: ?[]const u8 }{
+        .{ .last = "", .next = "a" },
+        .{ .last = "a", .next = "aa" },
+        .{ .last = "a0zzzz", .next = "a1" },
+        .{ .last = "a0zzzz", .next = "a1more" },
+        .{ .last = "a0zzzz", .next = "a2" },
+        .{ .last = "\xff\xff", .next = null },
+        .{ .last = "a\xff\xff", .next = null },
+    };
+    for (cases) |case| {
+        const fence = try termBlockCeilingAlloc(a, case.last, case.next);
+        defer a.free(fence);
+        try std.testing.expect(std.mem.order(u8, case.last, fence) != .gt);
+        if (case.next) |next| try std.testing.expect(std.mem.order(u8, fence, next) == .lt);
+    }
+    var builder = InvertedIndexBuilder.init(a, .{});
+    defer builder.deinit();
+    try builder.addDocument(0, &.{.{ .term = "alpha", .freq = 1 }});
+    const encoded = try builder.build();
+    defer a.free(encoded);
+    var reader = try InvertedIndexReader.init(a, encoded);
+    var prefix = fst.StartsWith{ .prefix = "b" };
+    var rejected = try reader.fstSearchIterator(prefix.automaton());
+    defer rejected.deinit();
+    try std.testing.expect(try rejected.next() == null);
+    try std.testing.expectEqual(@as(usize, 1), rejected.blocks_pruned);
 }

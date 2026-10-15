@@ -389,7 +389,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     raft_harness_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
 
     const introducer_test_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly-embedded/src/introducer.zig"),
+        .root_source_file = b.path("pkg/antfly/src/introducer_test_root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -847,6 +847,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     secret_store_abi_provider_mod.addImport("antfly_platform", platform_mod);
     const secret_store_abi_provider = b.addLibrary(.{
         .name = "secret-store-abi-test-provider",
+        .use_llvm = @import("../../../build_support/embedded/shared_library.zig").llvmBackend(target.result),
         .root_module = secret_store_abi_provider_mod,
         .linkage = .static,
     });
@@ -862,6 +863,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     secret_store_abi_test_mod.linkLibrary(secret_store_abi_provider);
     const secret_store_abi_tests = b.addTest(.{
         .root_module = secret_store_abi_test_mod,
+        .use_llvm = @import("../../../build_support/embedded/shared_library.zig").llvmBackend(target.result),
         .filters = &.{ "secret store operations retain their IO owner across runtime archives", "secret store archive boundary" },
     });
     const run_secret_store_abi_tests = b.addRunArtifact(secret_store_abi_tests);
@@ -2024,7 +2026,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const introducer_tests = b.addTest(.{
         .root_module = introducer_test_mod,
-        .filters = selectTestFilters(b, &.{}),
+        .filters = selectTestFilters(b, &.{"introducer."}),
         .test_runner = .{
             .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,

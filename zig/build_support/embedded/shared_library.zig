@@ -130,6 +130,12 @@ pub fn addWithStorageOwner(b: *std.Build, module: *std.Build.Module, providers: 
         // Traverse imports without caching Module.getGraph: composition owners
         // still add build-info imports after this helper returns.
         addLinks(b, run, module, &visited, &libraries);
+        if (storage_owner) |owner| {
+            // The owner is already force-loaded above. Its imported native
+            // dependencies still belong to this final dynamic image.
+            libraries.put(owner, {}) catch @panic("OOM");
+            addLinks(b, run, owner.root_module, &visited, &libraries);
+        }
         for (providers) |provider| {
             if (!(libraries.getOrPut(provider) catch @panic("OOM")).found_existing) {
                 run.addFileArg(provider.getEmittedBin());

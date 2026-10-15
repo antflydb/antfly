@@ -452,20 +452,39 @@ pub fn Adapter(comptime native: type) type {
             var fences: [64]DB.StatementReadFence = undefined;
             var held: usize = 0;
             defer for (fences[0..held]) |*fence| fence.release();
-            while (held != owner_count) {
-                errdefer {
+            const visibility_deadline = self.db.backend_runtime.monotonicClock().nowRealtimeNs() +| 5 * std.time.ns_per_s;
+            var search_sequences: [64]u64 = undefined;
+            while (true) {
+                // Replay must run before any statement fence excludes index
+                // publication. Only the indexes used by each search are waited.
+                for (requests, prepared, 0..) |request, *search, i| if (search.*) |*owned| {
+                    var selected_adapter = try self.selected(request.table.physical_name);
+                    search_sequences[i] = try selected_adapter.waitSearchIndexes(search_arena.allocator(), owned.req, visibility_deadline);
+                };
+                while (held != owner_count) {
+                    errdefer {
+                        for (fences[0..held]) |*fence| fence.release();
+                        held = 0;
+                    }
+                    if (try owners[held].tryStatementReadFence()) |fence| {
+                        fences[held] = fence;
+                        held += 1;
+                        continue;
+                    }
                     for (fences[0..held]) |*fence| fence.release();
                     held = 0;
+                    if (std.Io.Clock.awake.now(io).nanoseconds >= deadline.nanoseconds) return error.SqlStatementReadUnavailable;
+                    try io.sleep(.fromMilliseconds(1), .awake);
                 }
-                if (try owners[held].tryStatementReadFence()) |fence| {
-                    fences[held] = fence;
-                    held += 1;
-                    continue;
-                }
+                const changed = for (requests, prepared, 0..) |request, *search, i| {
+                    if (search.* == null) continue;
+                    const selected_adapter = try self.selected(request.table.physical_name);
+                    if (selected_adapter.db.core.nextDerivedSequence() != search_sequences[i]) break true;
+                } else false;
+                if (!changed) break;
                 for (fences[0..held]) |*fence| fence.release();
                 held = 0;
                 if (std.Io.Clock.awake.now(io).nanoseconds >= deadline.nanoseconds) return error.SqlStatementReadUnavailable;
-                try io.sleep(.fromMilliseconds(1), .awake);
             }
             for (requests, prepared, cursors) |request, *search, *cursor| {
                 if (search.*) |*owned| {
@@ -517,6 +536,27 @@ pub fn Adapter(comptime native: type) type {
             owned.req.fields = &.{};
             owned.req.include_all_fields = true;
             return owned;
+        }
+
+        fn waitSearchIndexes(self: *Self, alloc: std.mem.Allocator, req: types.SearchRequest, deadline_ns: u64) !u64 {
+            var names: std.ArrayList([]const u8) = .empty;
+            defer names.deinit(alloc);
+            const append = struct {
+                fn unique(a: std.mem.Allocator, list: *std.ArrayList([]const u8), name: []const u8) !void {
+                    for (list.items) |existing| if (std.mem.eql(u8, existing, name)) return;
+                    try list.append(a, name);
+                }
+            }.unique;
+            if (req.index_name) |name| try append(alloc, &names, name);
+            if (req.primary_text_index_name) |name| try append(alloc, &names, name);
+            for (req.full_text_queries) |query| try append(alloc, &names, query.index_name);
+            for (req.dense_queries) |query| try append(alloc, &names, query.index_name);
+            for (req.sparse_queries) |query| try append(alloc, &names, query.index_name);
+            for (req.graph_queries) |query| try append(alloc, &names, query.name);
+            if (req.full_text_queries.len == 0 and req.primary_text_index_name == null and req.index_name == null and
+                (req.full_text != null or (req.dense == null and req.sparse == null and req.dense_queries.len == 0 and req.sparse_queries.len == 0 and req.graph_queries.len == 0)))
+                try append(alloc, &names, native.public_api.tables.default_full_text_index_name);
+            return self.db.waitForCurrentIndexTargets(names.items, deadline_ns);
         }
 
         const SearchCursor = struct {
