@@ -58,25 +58,31 @@ def test_authenticated_cypher_postimage_policy_on_replicated_owners(
     cluster = three_by_three_backup_cluster
     leader = urlsplit(cluster.metadata_leader_public_url())
     endpoint = f"{leader.scheme}://{leader.hostname}:{leader.port}"
-    script = (
-        Path(__file__).resolve().parents[2]
-        / "scripts"
-        / "verify_cypher_postimage_policy.py"
-    )
-    result = subprocess.run(
-        [sys.executable, str(script), "--url", endpoint],
-        env={
-            **os.environ,
-            "ANTFLY_CYPHER_TEST_AUTH": f"admin:{AUTH_BOOTSTRAP_PASSWORD}",
-        },
-        capture_output=True,
-        text=True,
-        timeout=220,
-    )
-    assert result.returncode == 0, (
-        result.stdout + result.stderr + "\n" + cluster.debug_logs()
-    )
-    assert "4 authenticated Cypher postimage-policy checks passed" in result.stdout
+    for name, expected in (
+        (
+            "verify_cypher_postimage_policy.py",
+            "4 authenticated Cypher postimage-policy checks passed",
+        ),
+        (
+            "verify_cypher_edge_policy.py",
+            "8 authenticated edge-only SQL-null, unit-CALL and WITH CHECK checks passed",
+        ),
+    ):
+        script = Path(__file__).resolve().parents[2] / "scripts" / name
+        result = subprocess.run(
+            [sys.executable, str(script), "--url", endpoint],
+            env={
+                **os.environ,
+                "ANTFLY_CYPHER_TEST_AUTH": f"admin:{AUTH_BOOTSTRAP_PASSWORD}",
+            },
+            capture_output=True,
+            text=True,
+            timeout=220,
+        )
+        assert result.returncode == 0, (
+            result.stdout + result.stderr + "\n" + cluster.debug_logs()
+        )
+        assert expected in result.stdout
 
 
 @pytest.mark.parametrize("preexisting_producers", [False, True])

@@ -268,6 +268,53 @@ test "unit write subqueries preserve the incoming outer row" {
     try std.testing.expectEqual(@as(usize, 1), fixture.commits);
 }
 
+test "standalone unit subqueries propagate writes through nested calls and UNION" {
+    var fixture = Fixture.init();
+    defer fixture.arena.deinit();
+    for ([_][]const u8{
+        "CALL { CREATE (:Person {age:1}) }",
+        "CALL { CALL { CREATE (:Person {age:2}) } }",
+        "CALL { MATCH (n:Person) SET n.age=3 }",
+        "CALL { MATCH (n:Person) REMOVE n.age }",
+        "CALL { MERGE (:Person {age:4}) } UNION CALL { CREATE (:Person {age:5}) }",
+        "CALL { MATCH (n:Person) DELETE n }",
+    }) |text| {
+        var result = try fixture.run(text);
+        defer result.deinit();
+        try std.testing.expect(!result.read_only);
+        try std.testing.expectEqual(@as(usize, 0), result.columns.len);
+        try std.testing.expectEqual(@as(usize, 0), result.rows.len);
+    }
+    try std.testing.expectEqual(@as(usize, 0), fixture.nodes.len);
+    var explained = try fixture.run("EXPLAIN CALL { CALL { CREATE (:Person) } }");
+    defer explained.deinit();
+    try std.testing.expect(!explained.read_only);
+    try std.testing.expectEqual(@as(usize, 0), fixture.nodes.len);
+    try std.testing.expectError(error.CypherQueryRequiresReturn, fixture.run("CALL { MATCH (n:Person) RETURN n }"));
+    try std.testing.expectError(error.CypherExistsMutation, fixture.run("RETURN EXISTS { CALL { CREATE (:Person) } }"));
+}
+
+test "relationship-only plans never rewrite unchanged source rows" {
+    const Host = struct {
+        fn commit(_: *anyopaque, _: A, _: []const b.Mutation) !void {}
+    };
+    var fixture = Fixture.init();
+    defer fixture.arena.deinit();
+    var seeded = try fixture.run("CREATE (a:Person)-[:KNOWS]->(:Person)");
+    seeded.deinit();
+    @constCast(fixture.relationships[0]).identity.key = "cypher:edge";
+    const a = fixture.arena.allocator();
+    var overlay: root.transaction.Overlay = .{ .base = fixture.backend(), .host = .{ .ptr = &fixture, .new_identity = Fixture.identity, .commit = Host.commit } };
+    const backend = overlay.backend();
+    try backend.vtable.bind(backend.ptr, a, graph);
+    try backend.vtable.begin.?(backend.ptr);
+    const edge = overlay.relationships.items[0].value;
+    try backend.vtable.mutate.?(backend.ptr, a, .{ .set_properties = .{ .target = .{ .relationship = .{ .identity = edge.identity, .index = edge.index } }, .properties = &.{.{ .name = "since", .value = .{ .integer = 2026 } }}, .replace = false } });
+    const plans = try root.mutations.build(a, graph, &overlay);
+    try std.testing.expectEqual(@as(usize, 0), plans[0].writes.items.len);
+    try std.testing.expectEqual(@as(usize, 1), plans[0].edges.items.len);
+}
+
 test "created relationship postimages survive unit subqueries and drive later writes" {
     var fixture = Fixture.init();
     defer fixture.arena.deinit();

@@ -94,7 +94,7 @@ if (api.exports.antfly_embedded_smoke_run() !== 0) {
     throw new Error("hosted text index did not survive close/reopen");
 }
 api.open();
-api.putMany({ a: { id: "a" }, b: { id: "b" } });
+api.putMany({ a: { id: "a", meta: null }, b: { id: "b" } });
 api.addIndex({ name: "links", kind: "graph", config_json: "{}" });
 api.graphCatalog({ action: "put", name: "knowledge", definition: {
     labels: [{ name: "Document", table: "docs" }],
@@ -149,5 +149,15 @@ const bulkWrite = api.cypher("knowledge", {query:"UNWIND range(1,256) AS x CREAT
 if (bulkWrite.rows[0][0].value !== "256" || bulkWrite.stats.intermediate_states > 15000) throw new Error("WASM bulk create planning exceeded linear work");
 const bulkDelete = api.cypher("knowledge", {query:"MATCH (n:Document) WHERE n.id STARTS WITH 'bulk' DELETE n RETURN count(n)"});
 if (bulkDelete.rows[0][0].value !== "256") throw new Error("WASM bulk delete lost rows");
+for (const query of [
+    "CALL { CALL { MATCH ()-[r:KNOWS]->() SET r.since=2026 } }",
+    "CALL { MATCH ()-[r:KNOWS]->() REMOVE r.since }",
+    "CALL { MATCH ()-[r:KNOWS]->() DELETE r }",
+]) {
+    const result = api.cypher("knowledge", { query });
+    if (result.read_only || result.columns.length || result.rows.length || result.commit?.status !== "committed") throw new Error("WASM standalone unit CALL did not commit an empty result");
+    const source = api.lookup("a")._source;
+    if (!Object.hasOwn(source, "meta") || source.meta !== null) throw new Error("WASM edge-only mutation changed its source document");
+}
 api.close();
 console.log("antfly embedded shared smoke passed: ok");

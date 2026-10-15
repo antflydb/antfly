@@ -365,6 +365,9 @@ pub const MutationExtraBatch = struct {
     /// Exact old/new index tuple spans derived under the pinned index plan.
     /// Each prepared primary writer reserves its spans before publication.
     index_span_digests: []const [range_protection.index_span_digest_bytes]u8 = &.{},
+    /// Logical sources changed by graph-only intents. Reserve their document
+    /// ranges just like primary writes, without replacing primary row bytes.
+    graph_sources: []const WriteIntent = &.{},
 };
 
 pub const SchemaBinding = struct {
@@ -745,6 +748,7 @@ pub const TxnManager = struct {
             self.traceWriteIntentFails(txn_id, intents, "IntentConflict");
             return err;
         };
+        try self.checkIntentConflicts(extra_batch.graph_sources, txn_id);
         try self.checkIndexSpanGuardConflicts(extra_batch.index_span_digests, txn_id);
 
         const previous_admission = try self.loadIntentAdmission(self.alloc, txn_id);
@@ -842,14 +846,14 @@ pub const TxnManager = struct {
             const tracking_active = try range_protection.isActive(&probe);
             if (!tracking_active and extra_batch.index_span_digests.len != 0) return error.SqlRangeTrackingRequired;
             if (tracking_active) {
-                for (intents) |intent| {
+                for ([_][]const WriteIntent{ intents, extra_batch.graph_sources }) |sources| for (sources) |intent| {
                     if (std.mem.startsWith(u8, intent.key, "\x00\x00")) continue;
                     const id = range_protection.bucket(intent.key);
                     if (writer_buckets.isSet(id)) continue;
                     writer_buckets.set(id);
                     writer_keys[id] = range_protection.writerKey(id);
                     try range_reservations.append(self.alloc, .{ .key = &writer_keys[id], .expected_version = 0, .comparison = .exact_value, .expected_value = null });
-                }
+                };
                 for (extra_batch.index_span_digests, 0..) |digest, i| {
                     index_writer_keys[i] = range_protection.indexWriterKey(digest);
                     try range_reservations.append(self.alloc, .{ .key = &index_writer_keys[i], .expected_version = 0, .comparison = .exact_value, .expected_value = null });

@@ -32,13 +32,21 @@ fn plan(plans: []Plan, table: []const u8) !*Plan {
     return error.UndefinedGraphTable;
 }
 pub fn document(a: A, node: *const v.Node) ![]const u8 {
-    var properties: std.ArrayList(v.Entry) = .empty;
-    for (node.properties) |entry| {
-        try v.validatePropertyValue(entry.value);
-        if (entry.value != .null) try properties.append(a, entry);
-    }
-    return std.json.Stringify.valueAlloc(a, v.Value{ .map = properties.items }, .{});
+    for (node.properties) |entry| try v.validatePropertyValue(entry.value);
+    return std.json.Stringify.valueAlloc(a, Document{ .properties = node.properties }, .{});
 }
+const Document = struct {
+    properties: []const v.Entry,
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.beginObject();
+        for (self.properties) |entry| {
+            if (entry.value == .null) continue;
+            try writer.objectField(entry.name);
+            try writer.write(entry.value);
+        }
+        try writer.endObject();
+    }
+};
 fn edgeId(a: A, relationship: *const v.Relationship) ![]const u8 {
     if (std.mem.startsWith(u8, relationship.identity.key, "cypher:")) return relationship.identity.key;
     const tuple = try std.json.parseFromSliceLeaky([]const []const u8, a, relationship.identity.key, .{});
@@ -53,8 +61,6 @@ pub fn build(a: A, graph: root.catalog.Graph, overlay: *root.transaction.Overlay
         } else false;
         if (!exists) try plans.append(a, .{ .table = label.table });
     }
-    var handled: v.IdentitySet = .empty;
-    defer handled.deinit(a);
     for (overlay.nodes.items) |node| {
         try overlay.charge(1);
         if (!node.dirty) continue;
@@ -91,14 +97,9 @@ pub fn build(a: A, graph: root.catalog.Graph, overlay: *root.transaction.Overlay
             edge.metadata_json = try std.json.Stringify.valueAlloc(a, .{ .source_table = relationship.source.table, .target_table = relationship.target.table, .antfly_cypher = .{ .version = @as(u8, 1), .properties = root.wire.Value{ .value = .{ .map = relationship.properties } } } }, .{});
             try entry.edges.append(a, edge);
         }
-        const source_position = overlay.node_positions.get(relationship.source) orelse return error.CypherDeletedEntity;
-        const source = overlay.nodes.items[source_position];
-        if (!source.dirty and !handled.contains(relationship.source)) {
-            if (source.deleted) return error.CypherDeletedEntity;
-            try overlay.chargeValue(.{ .map = source.value.properties });
-            try entry.writes.append(a, .{ .key = source.value.identity.key, .value = try document(a, source.value) });
-            try handled.put(a, relationship.source, {});
-        }
+        // Graph effects have their own durable intents. Their source-row
+        // authorization is checked against the native row under a read guard;
+        // never reconstruct an unchanged SQL row from its Cypher projection.
     }
     return plans.toOwnedSlice(a);
 }

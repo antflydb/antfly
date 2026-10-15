@@ -1042,3 +1042,47 @@ def test_repeated_updates_of_shared_aliases_scale_linearly(require_native, aflit
             if previous:
                 assert work < previous * 3
             previous = work
+
+
+@pytest.mark.parametrize("constraint", ["", " NOT NULL"])
+def test_relationship_only_writes_preserve_sql_json_nulls(require_native, aflite_path, constraint):
+    with af.create_hosted(aflite_path) as database:
+        database.sql(f"CREATE TABLE docs (id TEXT, meta JSONB{constraint})")
+        database.sql("INSERT INTO docs (_id,id,meta) VALUES ('a','a','null'::jsonb),('b','b','{}'::jsonb)")
+        with database.open_table("docs") as table:
+            table.add_index({"name": "links", "kind": "graph", "config_json": "{}"})
+        database.graph_catalog_json(
+            {
+                "action": "put",
+                "name": "g",
+                "definition": {
+                    "labels": [{"name": "D", "table": "docs"}],
+                    "relationships": [
+                        {
+                            "name": "LINK",
+                            "index": "links",
+                            "source_label": "D",
+                            "target_label": "D",
+                            "stored_type": "link",
+                        }
+                    ],
+                },
+            }
+        )
+        before = database.sql("SELECT id,meta,meta IS NULL FROM docs ORDER BY id")
+        assert before["rows"] == [["a", None, False], ["b", {}, False]]
+        for query in (
+            "CALL { MATCH (a:D {id:'a'}),(b:D {id:'b'}) CREATE (a)-[:LINK {age:1}]->(b) }",
+            "CALL { CALL { MATCH ()-[r:LINK]->() SET r.age=2 } }",
+            "CALL { MATCH ()-[r:LINK]->() REMOVE r.age }",
+            "CALL { MATCH ()-[r:LINK]->() DELETE r }",
+        ):
+            result = database.cypher_json("g", {"query": query})
+            assert result["rows"] == [] and result["columns"] == [] and not result["read_only"]
+            assert result["commit"]["status"] == "committed"
+            assert database.sql("SELECT id,meta,meta IS NULL FROM docs ORDER BY id") == before
+    with af.open_hosted(aflite_path) as database:
+        assert database.sql("SELECT id,meta,meta IS NULL FROM docs ORDER BY id") == before
+        assert (
+            database.cypher_json("g", {"query": "MATCH ()-[r:LINK]->() RETURN count(r)"})["rows"][0][0]["value"] == "0"
+        )

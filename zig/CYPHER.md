@@ -56,6 +56,20 @@ qualified through native storage and durable SQL normalization. Normalized rows
 retain their private preparation marker through the coordinator, owner RPC,
 compiled owner, and native storage boundaries.
 
+Relationship-only CREATE/SET/REMOVE/DELETE stages native graph effects without
+rewriting unchanged endpoint documents. SQL JSON nulls, SQL NULLs, constraints,
+and unrelated enrichment inputs retain their stored representation. Protected
+sources are checked against both UPDATE USING and WITH CHECK on the unchanged
+typed native row, once per source, and retained by a content/version read guard.
+Graph-only prepares reserve source ranges durably, including across reopen, so
+removing the document rewrite does not weaken conflict protection. Unit CALL
+subqueries propagate their write status through nested calls and UNION arms;
+an outer RETURN is optional when the statement writes.
+Cypher preparation drains pending local endpoint cleanup in bounded pages before
+capture, including on hosted/WASM owners without background workers. Admission
+cancellation and deadlines apply between pages. External lake owners reject
+graph-only mutations at PREPARE, before a durable transaction decision.
+
 Native row-policy qualification covers initial schema version zero, filtered
 scans and traversal, allowed writes, durable rejection of policy-denied writes,
 and SQL GRAPH_TABLE. Six standalone/HA policy publication and restart tests

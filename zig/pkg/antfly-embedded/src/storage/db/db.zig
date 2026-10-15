@@ -18589,7 +18589,16 @@ pub const DB = struct {
     /// evaluated on typed ordinals, not reconstructed JSON projections.
     pub const enforceRowPolicyMutationLocked = local_mutation.enforceRowPolicyMutationLocked;
 
-    fn enforceRowPolicyIntentsLocked(self: *DB, schema_view: schema_registry_mod.SchemaView, intents: []const transactions_mod.WriteIntent, principal: *const row_policy_authority_mod.Payload) !void {
+    fn enforceRowPolicyIntentsLocked(
+        self: *DB,
+        schema_view: schema_registry_mod.SchemaView,
+        intents: []const transactions_mod.WriteIntent,
+        graph_sources: []const transactions_mod.WriteIntent,
+        principal: *const row_policy_authority_mod.Payload,
+        scratch: Allocator,
+        predicates: *std.ArrayListUnmanaged(transactions_mod.VersionPredicate),
+        predicate_alloc: Allocator,
+    ) !void {
         if (principal.access != .write) return error.RowPolicyAuthenticationRequired;
         const bundle = if (self.local_execution.row_policy_bundle) |*installed| installed else return error.RowPolicyCatalogChanged;
         const schema = schema_view.tableSchema().*;
@@ -18603,24 +18612,38 @@ pub const DB = struct {
         defer delete_old.deinit();
         var probe = try self.core.store.beginProbeTxn();
         defer probe.abort();
+        var primary_keys: std.StringHashMapUnmanaged(void) = .empty;
+        if (graph_sources.len != 0) for (intents) |intent| {
+            if (!isMetadataKey(intent.key)) try primary_keys.put(scratch, intent.key, {});
+        };
+        for (graph_sources) |dependency| {
+            const source = dependency.key;
+            // A changed source is checked through its primary intent below.
+            // An edge-only mutation instead checks the unchanged native
+            // row, preserving SQL/JSON nulls and avoiding index/enrichment
+            // churn. Check and retain one read guard per distinct source.
+            if (primary_keys.contains(source)) continue;
+            const store_key = try encodeStoreLookupKeyAlloc(self, scratch, source);
+            const bytes = probe.getLeased(store_key) catch |err| switch (err) {
+                error.NotFound => return error.RowPolicyDenied,
+                else => return err,
+            };
+            if (try relational_store.rowSchemaVersion(bytes) != schema.version) return error.RowPolicyCatalogChanged;
+            const old = if (self.core.store.valuesAreAuthenticated())
+                try relational_row_codec.ordinalRowViewTrusted(bytes, schema, schema_view.physicalLayout())
+            else
+                try relational_row_codec.ordinalRowViewSelective(bytes, schema, schema_view.physicalLayout());
+            if (!try update_old.permits(old) or !try update_new.permits(old)) return error.RowPolicyDenied;
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+            try predicates.append(predicate_alloc, .{
+                .key = source,
+                .expected_version = (try ttl_mod.readTimestamp(self.core.store, scratch, source)) orelse return error.RowPolicyDenied,
+                .expected_content_digest = digest,
+            });
+        }
         for (intents) |intent| {
-            if (@import("graph_transaction_effects.zig").isEffect(intent.key)) {
-                var scratch = std.heap.ArenaAllocator.init(self.alloc);
-                defer scratch.deinit();
-                const effect = try @import("graph_transaction_effects.zig").decode(scratch.allocator(), intent.key, intent.value orelse return error.InvalidTxnRecord);
-                const source = switch (effect) {
-                    .write => |edge| edge.source,
-                    .delete => |edge| edge.source,
-                };
-                // Graph effects inherit the source row's policy. Require its
-                // primary intent, which the remainder of this loop validates
-                // through INSERT/UPDATE/DELETE old and new row predicates.
-                const covered = for (intents) |row| {
-                    if (!isMetadataKey(row.key) and std.mem.eql(u8, row.key, source)) break true;
-                } else false;
-                if (!covered) return error.RowPolicyMutationUnsupported;
-                continue;
-            }
+            if (@import("graph_transaction_effects.zig").isEffect(intent.key)) continue;
             if (isMetadataKey(intent.key)) return error.RowPolicyMutationUnsupported;
             const store_key = try encodeStoreLookupKeyAlloc(self, self.alloc, intent.key);
             defer self.alloc.free(store_key);
@@ -18649,7 +18672,16 @@ pub const DB = struct {
         try checkLookupOptionsActive(opts);
         if (opts.cypher_prepare) {
             if (key.len != 0 or opts.fields.len != 0 or self.open_mode == .query_readonly) return error.InvalidArgument;
-            try self.runMaintenanceUntilWithCancellation(self.currentMaintenanceTargetSequence(), .{}, opts.cancellation orelse .none, opts.execution_deadline_ns orelse monotonicTimeNs() + 30 * std.time.ns_per_s);
+            const deadline = opts.execution_deadline_ns orelse monotonicTimeNs() + 30 * std.time.ns_per_s;
+            // Hosted/WASM owners have no background cleanup worker. Weak-sync
+            // transactions may leave endpoint jobs behind; drain bounded pages
+            // before capturing graph reads, honoring the admission deadline.
+            while (true) {
+                try checkLookupOptionsActive(opts);
+                if (monotonicTimeNs() >= deadline) return error.DeadlineExceeded;
+                if (!try self.drainStandaloneGraphEndpointCleanupWithOptions(.{}, 1)) break;
+            }
+            try self.runMaintenanceUntilWithCancellation(self.currentMaintenanceTargetSequence(), .{}, opts.cancellation orelse .none, deadline);
             try self.flushAppliedSequencesForIdle();
             return null;
         }
@@ -24070,7 +24102,7 @@ pub const DB = struct {
         } else if (ordered_receipt == null) {
             row_policy_lease = try self.local_execution.row_policy_gate.enterRaw();
         } else if (self.local_execution.row_policy_gate.currentPhase() != .disabled and
-            (req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0))
+            (req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or req.graph_writes.len != 0 or req.graph_deletes.len != 0))
         {
             return error.RowPolicyAuthenticationRequired;
         }
@@ -24146,6 +24178,7 @@ pub const DB = struct {
         }
         for (effective_ops.graph_writes.items) |edge| try graph_contract.append(graph_alloc, preparation_alloc, &intents, .{ .write = edge });
         for (effective_ops.graph_deletes.items) |edge| try graph_contract.append(graph_alloc, preparation_alloc, &intents, .{ .delete = edge });
+        const graph_sources = try graph_contract.sources(graph_alloc, intents.items);
         var predicates = std.ArrayListUnmanaged(transactions_mod.VersionPredicate).empty;
         defer predicates.deinit(preparation_alloc);
 
@@ -24215,6 +24248,8 @@ pub const DB = struct {
         const binding = try self.core.transactionSchemaBinding(preparation_alloc, txn_id);
         var prepared_schema_view = try self.acquireTransactionSchemaView(preparation_alloc, binding);
         defer if (prepared_schema_view) |*view| view.release();
+        if (prepared_schema_view) |view| if (view.tableSchema().external_base_source != null and
+            (effective_ops.writes.len != 0 or effective_ops.deletes.len != 0 or graph_sources.len != 0)) return error.ExternalLakeReadOnly;
         if (req.schema_version) |version| {
             const view = prepared_schema_view orelse return error.PreparedGenerationChanged;
             if (view.version() != version) return error.PreparedGenerationChanged;
@@ -24312,7 +24347,7 @@ pub const DB = struct {
         if (binding == null) try self.validatePreparedSchemaViewLocked(prepared_schema_view);
         if (row_policy_principal) |principal| {
             const view = prepared_schema_view orelse return error.RowPolicyCatalogChanged;
-            try self.enforceRowPolicyIntentsLocked(view, intents.items, principal);
+            try self.enforceRowPolicyIntentsLocked(view, intents.items, graph_sources, principal, graph_alloc, &predicates, preparation_alloc);
         }
         const integrity_mod = @import("relational_integrity.zig");
         const activation_mod = @import("relational_integrity_activation.zig");
@@ -24442,13 +24477,14 @@ pub const DB = struct {
                 txn_id,
                 intents.items,
                 predicates.items,
-                .{ .writes = &.{marker}, .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null }, .preparation_allocator = preparation_alloc, .index_span_digests = index_spans },
+                .{ .writes = &.{marker}, .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null }, .preparation_allocator = preparation_alloc, .index_span_digests = index_spans, .graph_sources = graph_sources },
             );
         } else {
             try self.core.writeIntentsExtraBatch(txn_id, intents.items, predicates.items, .{
                 .preparation_allocator = preparation_alloc,
                 .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null },
                 .index_span_digests = index_spans,
+                .graph_sources = graph_sources,
             });
         }
     }
@@ -137034,6 +137070,9 @@ test "db external lake rejects native mutations before and after cold reopen" {
         try std.testing.expect(db.core.schema.?.external_base_source != null);
         try std.testing.expectError(error.ExternalLakeReadOnly, db.batch(.{ .writes = &.{.{ .key = "one", .value = "{\"amount\":1}" }} }));
         try std.testing.expectError(error.ExternalLakeReadOnly, db.batch(.{ .deletes = &.{"one"} }));
+        const txn = try db.beginTransaction(100 + iteration * 2);
+        try std.testing.expectError(error.ExternalLakeReadOnly, db.writeTransaction(txn, .{ .graph_writes = &.{.{ .index_name = "g", .source = "one", .target = "two", .edge_type = "R" }} }));
+        try db.abortTransaction(txn, 101 + iteration * 2);
     }
 }
 
@@ -137323,6 +137362,74 @@ test "db graph endpoint cleanup transaction graph effects advance source ranges 
     try std.testing.expectError(error.IntentConflict, db.batch(.{ .graph_writes = &.{.{ .edge_id = "second", .index_name = "g", .source = "a", .target = "b", .edge_type = "R" }} }));
     try db.abortTransaction(id, 101);
     try db.batch(.{ .graph_writes = &.{.{ .edge_id = "second", .index_name = "g", .source = "a", .target = "b", .edge_type = "R" }} });
+}
+
+test "db graph endpoint cleanup graph-only prepares reserve source ranges across reopen" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("cypher-graph-only-prepare-range");
+    defer directory.cleanup();
+    const edge: types.GraphEdgeWrite = .{ .edge_id = "explicit", .index_name = "g", .source = "a", .target = "b", .edge_type = "R" };
+    const tracking = @import("../range_protection.zig");
+    var writer: types.TxnId = undefined;
+    var generation: u64 = undefined;
+    {
+        var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+        defer db.close();
+        try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+        try db.batch(.{ .activate_range_tracking = true });
+        try db.batch(.{ .writes = &.{ .{ .key = "a", .value = "{}" }, .{ .key = "b", .value = "{}" } } });
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        generation = (try tracking.generation(&read, tracking.bucket("a"))).?;
+        writer = try db.beginTransaction(100);
+        try db.writeTransaction(writer, .{ .graph_writes = &.{edge} });
+    }
+    {
+        var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+        defer db.close();
+        const reader = try db.beginTransaction(101);
+        const request: types.TransactionIntentRequest = .{ .range_guards = &.{.{ .bucket = tracking.bucket("a"), .generation = generation }} };
+        try std.testing.expectError(error.IntentConflict, db.writeTransaction(reader, request));
+        try db.abortTransaction(writer, 102);
+        try db.writeTransaction(reader, request);
+        const blocked = try db.beginTransaction(103);
+        try std.testing.expectError(error.IntentConflict, db.writeTransaction(blocked, .{ .graph_writes = &.{edge} }));
+        try db.abortTransaction(reader, 104);
+        try db.writeTransaction(blocked, .{ .graph_writes = &.{edge} });
+        try db.commitTransaction(blocked, 105);
+    }
+}
+
+test "db graph endpoint cleanup pages Cypher preparation drains weak-sync hosted deletions" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("cypher-hosted-prepare-cleanup");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+    var keys: [600][]const u8 = undefined;
+    var writes: [602]types.BatchWrite = undefined;
+    var initialized: usize = 0;
+    defer for (keys[0..initialized]) |key| a.free(key);
+    for (&keys, writes[0..600], 0..) |*key, *write, i| {
+        key.* = try std.fmt.allocPrint(a, "bulk:{d}", .{i});
+        initialized += 1;
+        write.* = .{ .key = key.*, .value = "{}" };
+    }
+    writes[600] = .{ .key = "a", .value = "{}" };
+    writes[601] = .{ .key = "b", .value = "{}" };
+    try db.batch(.{ .writes = &writes, .graph_writes = &.{.{ .index_name = "g", .source = "a", .target = "b", .edge_type = "R" }}, .timestamp_ns = 99, .sync_level = .full_index });
+    const txn = try db.beginTransaction(100);
+    try db.writeTransaction(txn, .{ .deletes = &keys });
+    try db.commitTransaction(txn, 101);
+    try std.testing.expect(try db.core.store.hasGraphEndpointCleanup());
+    try std.testing.expectError(error.DeadlineExceeded, db.lookup(a, "", .{ .cypher_prepare = true, .execution_deadline_ns = monotonicTimeNs() -| 1 }));
+    try std.testing.expect(try db.core.store.hasGraphEndpointCleanup());
+    _ = try db.lookup(a, "", .{ .cypher_prepare = true });
+    try std.testing.expect(!try db.core.store.hasGraphEndpointCleanup());
+    const edges = try db.getEdges(a, "g", "a", "", .out);
+    defer graph_mod.GraphIndex.freeEdges(a, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
 }
 
 test "db v02 native restore repairs released projections" {

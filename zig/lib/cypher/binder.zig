@@ -26,9 +26,9 @@ pub fn validate(a: std.mem.Allocator, graph: catalog.Graph, query: ast.Query) !v
     var scratch = std.heap.ArenaAllocator.init(memory.allocator());
     defer scratch.deinit();
     var binder: Binder = .{ .a = scratch.allocator(), .graph = graph, .source = query.source };
-    const first = try binder.clauses(query.clauses, .empty, false);
+    const first = (try binder.clauses(query.clauses, .empty, false)).output;
     for (query.unions) |arm| {
-        const other = try binder.clauses(arm.clauses, .empty, false);
+        const other = (try binder.clauses(arm.clauses, .empty, false)).output;
         if (first.items.len != other.items.len) return error.CypherUnionColumnMismatch;
         for (first.items, other.items) |left, right| if (!std.mem.eql(u8, left.name, right.name)) return error.CypherUnionColumnMismatch;
     }
@@ -39,7 +39,7 @@ pub fn columns(a: std.mem.Allocator, graph: catalog.Graph, query: ast.Query) ![]
     var scratch = std.heap.ArenaAllocator.init(memory.allocator());
     defer scratch.deinit();
     var binder: Binder = .{ .a = scratch.allocator(), .graph = graph, .source = query.source };
-    const output = try binder.clauses(query.clauses, .empty, false);
+    const output = (try binder.clauses(query.clauses, .empty, false)).output;
     const names = try a.alloc([]const u8, output.items.len);
     var initialized: usize = 0;
     errdefer {
@@ -100,7 +100,8 @@ const Binder = struct {
         for (path.nodes) |node| for (node.properties) |property| try self.expression(scope, property.value, false);
         for (path.edges) |edge| for (edge.properties) |property| try self.expression(scope, property.value, false);
     }
-    fn clauses(self: *Binder, input: []const ast.Clause, initial: Scope, nested: bool) anyerror!Scope {
+    const Clauses = struct { output: Scope, writes: bool };
+    fn clauses(self: *Binder, input: []const ast.Clause, initial: Scope, nested: bool) anyerror!Clauses {
         var scope: Scope = .empty;
         try scope.appendSlice(self.a, initial.items);
         var output: Scope = .empty;
@@ -176,7 +177,8 @@ const Binder = struct {
                 },
                 .subquery => |inner| {
                     const exports = try self.clauses(inner, scope, true);
-                    for (exports.items) |symbol| {
+                    writes = writes or exports.writes;
+                    for (exports.output.items) |symbol| {
                         if (find(scope, symbol.name) != null) return error.CypherVariableConflict;
                         try scope.append(self.a, symbol);
                     }
@@ -209,7 +211,7 @@ const Binder = struct {
             }
         }
         if (!returned and !writes and !nested) return error.CypherQueryRequiresReturn;
-        return if (returned) output else .empty;
+        return .{ .output = if (returned) output else .empty, .writes = writes };
     }
     fn assignments(self: *Binder, scope: Scope, values: []const ast.Assignment) !void {
         for (values) |assignment| {

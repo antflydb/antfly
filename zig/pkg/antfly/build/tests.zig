@@ -687,7 +687,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "export and import resolution artifacts round trip with public artifact ids",
             "portable graph conversion accepts generation-less v1 edge artifacts",
             "export and import graph edge artifacts round trip with arbitrary ids",
-            "portable relationships preserve parallel identities and arbitrary endpoints",
+            "portable backup relationships preserve parallel identities and arbitrary endpoints",
             "relationship key value decoding releases truncated and failed allocations",
             "AFB2 relationship inventory requires reader version three",
             "document batch round-trip",

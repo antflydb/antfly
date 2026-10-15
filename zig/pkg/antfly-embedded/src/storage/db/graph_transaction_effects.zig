@@ -47,6 +47,25 @@ pub fn decode(a: A, key: []const u8, value: []const u8) !Effect {
     if (!std.mem.eql(u8, expected, key)) return error.InvalidTxnRecord;
     return envelope.effect;
 }
+/// Logical write dependencies are conflict/range reservations only. Keeping
+/// them separate from primary intents preserves the original document bytes.
+/// Decode into the request preparation arena; returned keys borrow that arena.
+pub fn sources(a: A, intents: []const txn.WriteIntent) ![]const txn.WriteIntent {
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(a);
+    var output: std.ArrayList(txn.WriteIntent) = .empty;
+    errdefer output.deinit(a);
+    for (intents) |intent| {
+        if (!isEffect(intent.key)) continue;
+        const effect = try decode(a, intent.key, intent.value orelse return error.InvalidTxnRecord);
+        const source = switch (effect) {
+            inline else => |edge| edge.source,
+        };
+        if ((try seen.getOrPut(a, source)).found_existing) continue;
+        try output.append(a, .{ .key = source, .value = null });
+    }
+    return output.toOwnedSlice(a);
+}
 pub const Batch = struct {
     writes: []const types.BatchWrite,
     deletes: []const []const u8,
