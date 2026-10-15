@@ -33,6 +33,65 @@ const ReadWorkspace = @import("read_workspace.zig").Workspace;
 const read_scratch = @import("../../segment_source.zig").Scratch;
 const bounded_cursor_test_documents: usize = 512;
 
+test "lite detached writer admission fences documents and index catalogs" {
+    const Admission = struct {
+        denied: bool = false,
+        entered: usize = 0,
+        active: usize = 0,
+        fn enter(ptr: *anyopaque, _: PublicationScope) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.denied) return error.EnrichmentSourceChanged;
+            self.entered += 1;
+            self.active += 1;
+        }
+        fn leave(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.active -= 1;
+        }
+    };
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "detached-admission.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    var admission: Admission = .{};
+    store.writer_admission = .{ .ptr = &admission, .enter = Admission.enter, .leave = Admission.leave };
+    defer store.writer_admission = null;
+    var write = try store.beginWrite();
+    try write.put("document", "value");
+    try write.commit();
+    try std.testing.expectEqual(@as(usize, 0), admission.active);
+    try std.testing.expectEqual(@as(usize, 2), admission.entered);
+    var indexes = @import("index_storage.zig").Store.init(a, &store);
+    try indexes.storage().writeFileAbsolute("/index", "segment");
+    try std.testing.expectEqual(@as(usize, 0), admission.active);
+    try std.testing.expectEqual(@as(usize, 3), admission.entered);
+    const PendingIndex = struct {
+        fn apply(_: *anyopaque, file: *native.NativeFile) !void {
+            try file.putIndexCatalogRecord("/pending-index", "published");
+        }
+    };
+    try store.submitIndexMutation(&admission, PendingIndex.apply, false);
+    try std.testing.expect(store.file.durable_header == null);
+    var next_owner = try native.NativeFile.openWithIo(a, std.testing.io, path, .{ .read_only = true, .internal_reader = true });
+    defer next_owner.close();
+    const visible = (try next_owner.getIndexCatalogRecordAlloc(a, "/pending-index")).?;
+    defer a.free(visible);
+    try std.testing.expectEqualStrings("published", visible);
+    const checkpoint = store.file.activeCheckpoint();
+    admission.denied = true;
+    try std.testing.expectError(error.EnrichmentSourceChanged, store.beginWrite());
+    try std.testing.expectError(error.EnrichmentSourceChanged, indexes.storage().writeFileAbsolute("/index", "stale"));
+    try std.testing.expectEqualDeep(checkpoint, store.file.activeCheckpoint());
+    admission.denied = false;
+    var next = try store.beginWrite();
+    next.abort();
+    try std.testing.expectEqual(@as(usize, 0), admission.active);
+}
+
 test "lite reclamation stale quota estimates expire after roots shrink" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -823,6 +882,40 @@ test "lite reclamation externally locked refresh defers debt to its maintenance 
     try std.testing.expect((try owner.checkWithCancel(null)).valid);
 }
 
+test "lite externally locked reopen defers allocator conversion and reclamation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "external-owner-open.aflite");
+    defer alloc.free(path);
+    {
+        var legacy = try Store.createWithOptions(alloc, path, .{ .io = std.testing.io, .reclamation = .{ .page_reuse = false, .enabled = false } });
+        defer legacy.close();
+        var write = try legacy.beginWrite();
+        errdefer write.abort();
+        try write.put("doc", "original");
+        try write.commit();
+    }
+    var lease = try native.lockWriterPathWithIo(alloc, std.testing.io, path);
+    defer lease.close();
+    var owner = try Store.openWithOptions(alloc, path, .{ .io = std.testing.io, .externally_locked = true });
+    defer owner.close();
+    try std.testing.expect(!owner.file.header.indexed_reclamation);
+    try std.testing.expectEqual(@as(u64, 0), owner.maintenance_policy.status.assessment_count);
+    try std.testing.expectEqual(@as(u64, 0), owner.maintenance_policy.status.rewrite_count);
+    // Ordinary writes remain valid before the scheduled format conversion.
+    var write = try owner.beginWrite();
+    errdefer write.abort();
+    try write.put("doc", "updated");
+    try write.commit();
+    try owner.maintainOnce(false);
+    try std.testing.expect(owner.file.header.indexed_reclamation);
+    try std.testing.expectEqual(@as(u64, 1), owner.maintenance_policy.status.rewrite_count);
+    var read = try owner.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("updated", try read.get("doc"));
+}
+
 test "lite reclamation writable reopen services debt and read only reopen does not" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1137,6 +1230,7 @@ const MutationRequest = struct {
     done: bool = false,
     leader: bool = false,
     durable: bool = true,
+    index_only: bool = false,
     result: anyerror!void = {},
 };
 
@@ -1211,6 +1305,16 @@ pub const ArtifactLease = struct {
 };
 
 var next_score_cache_owner: std.atomic.Value(u64) = .init(1);
+/// Optional owner admission around every document/index publication.
+/// Detached computation can retain this Store without retaining a file
+/// writer lease; admission must validate its checkpoint before mutation.
+pub const PublicationScope = enum { primary, index, reclamation };
+
+pub const WriterAdmission = struct {
+    ptr: *anyopaque,
+    enter: *const fn (*anyopaque, PublicationScope) anyerror!void,
+    leave: *const fn (*anyopaque) void,
+};
 
 pub const Store = struct {
     score_cache_owner: u64 = 0,
@@ -1233,6 +1337,9 @@ pub const Store = struct {
     retired_file_bytes: u64 = 0,
     artifact_account: ?*ArtifactAccount = null,
     artifact_registry: ?*artifact_source.Registry = null,
+    /// Short-lived capture runtimes fence artifact readers instead of changing
+    /// the durable catalog merely to open their existing immutable inputs.
+    artifact_reader_fence: bool = false,
     artifact_cleanup_cursor: artifact_source.SweepCursor = .{},
     artifact_marker_sweep: artifact_source.MarkerSweep = .{},
     maintenance_policy: reclamation.Policy = .{},
@@ -1256,6 +1363,7 @@ pub const Store = struct {
     maintenance_running: bool = false,
     generation_workspace_active: bool = false,
     maintenance_start_suppressed: bool = false,
+    test_maintenance_hook: if (@import("builtin").is_test) ?MaintenanceTestHook else void = if (@import("builtin").is_test) null else {},
     test_maintenance_cycles: if (@import("builtin").is_test) std.atomic.Value(u64) else void = if (@import("builtin").is_test) .init(0) else {},
     admission_refresh_size: u64 = 0,
     admission_artifact_revision: u64 = 0,
@@ -1272,11 +1380,18 @@ pub const Store = struct {
     commit_head: ?*MutationRequest = null,
     commit_tail: ?*MutationRequest = null,
     commit_draining: bool = false,
+    writer_admission: ?WriterAdmission = null,
     writer_active: bool = false,
     writer_ticketed: bool = false,
     next_writer_ticket: u64 = 0,
     serving_writer_ticket: u64 = 0,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
+
+    pub const MaintenancePhase = enum { assessment, copy };
+    pub const MaintenanceTestHook = struct {
+        ptr: *anyopaque,
+        notify: *const fn (*anyopaque, MaintenancePhase) anyerror!void,
+    };
 
     pub fn open(allocator: Allocator, path: []const u8, read_only: bool) !Store {
         return try openWithOptions(allocator, path, .{ .read_only = read_only });
@@ -1305,19 +1420,19 @@ pub const Store = struct {
             .maintenance_start_suppressed = true,
         };
         errdefer result.close();
-        // A standalone owner may live for only one CLI invocation, so it
-        // services debt on reopen. Externally locked connections instead have
-        // a lease-scoped maintenance owner: refreshing a cached generation
-        // must not reclaim pages and publish another checkpoint on every
-        // foreground handoff. That publication invalidates the other
-        // connections and makes their next calls repeat this work.
+        // A standalone owner may live for only one CLI invocation, so reopen
+        // services its debt. External owners schedule this work themselves:
+        // their opens/refreshes run under a connection capture fence and must
+        // never perform a full assessment or generation rewrite there.
         result.file.retirement_work_pages = opts.reclamation.retirement_work_pages;
         result.file.reserve_retirement_capacity = true;
         result.file.vacuum_target_indexed = opts.reclamation.page_reuse;
-        if (!opts.read_only and opts.reclamation.page_reuse and !result.file.header.indexed_reclamation) {
-            _ = try result.vacuumWithCancel(null);
+        if (!opts.read_only and !opts.externally_locked) {
+            if (opts.reclamation.page_reuse and !result.file.header.indexed_reclamation) {
+                _ = try result.vacuumWithCancel(null);
+            }
+            result.maintainOnce(false) catch |err| result.recordMaintenanceError(err);
         }
-        if (!opts.read_only and !opts.externally_locked) result.maintainOnce(false) catch |err| result.recordMaintenanceError(err);
         result.maintenance_start_suppressed = opts.externally_locked;
         return result;
     }
@@ -1694,6 +1809,21 @@ pub const Store = struct {
         try self.submitMutation(&request, Request.apply);
     }
 
+    /// Owner-only rebinding after proving immutable index inputs unchanged.
+    /// Primary and index publications share the newest allocator/checkpoint;
+    /// existing read pins keep their original immutable roots.
+    pub fn refreshIndexPublicationCheckpoint(self: *Store, header: native.Header) !void {
+        lockStore(self);
+        defer self.mutex.unlock();
+        if (self.file.transaction_header != null or self.file.durable_header != null or
+            self.file.checkpoint_publication_uncertain or self.secret_store_uncertain or
+            self.file.header.page_size != header.page_size or
+            self.file.header.indexed_reclamation != header.indexed_reclamation) return error.EnrichmentWaitCanceled;
+        try self.file.adoptIndexPublicationHeader(header);
+        self.assessment_cache = null;
+        self.publishReadCheckpointAssumeLocked();
+    }
+
     pub fn backendStore(self: *Store) NativeBackendStore {
         return NativeBackendStore.init(self);
     }
@@ -1787,7 +1917,16 @@ pub const Store = struct {
 
     fn maintainOnceWithCancel(self: *Store, force: bool, cancel: ?*const maintenance.CancelToken) !void {
         if (self.read_only) return;
+        // External owners also defer requested allocator-format conversion to
+        // this detached maintenance turn. Vacuum uses the same short capture
+        // and checked publication boundaries as an ordinary reclamation copy.
+        if (self.maintenance_policy.options.page_reuse and !self.file.header.indexed_reclamation) {
+            _ = try self.vacuumWithCancel(cancel);
+            return;
+        }
         {
+            if (self.writer_admission) |admission| try admission.enter(admission.ptr, .reclamation);
+            defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
             lockStore(self);
             defer self.mutex.unlock();
             if (self.maintenance_running or self.generation_workspace_active or self.file.change_capture != null) return;
@@ -1815,6 +1954,8 @@ pub const Store = struct {
         var assessed_indexed: bool = undefined;
         var assessed_generation: u64 = undefined;
         {
+            if (self.writer_admission) |admission| try admission.enter(admission.ptr, .reclamation);
+            defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
             lockStore(self);
             defer self.mutex.unlock();
             if (self.maintenance_running or self.generation_workspace_active or self.file.change_capture != null) return;
@@ -1863,6 +2004,7 @@ pub const Store = struct {
             self.maintenance_wake.set(self.file.runtime());
             self.mutex.unlock();
         }
+        if (@import("builtin").is_test) if (self.test_maintenance_hook) |hook| try hook.notify(hook.ptr, .assessment);
         const scan_started = std.Io.Clock.awake.now(self.file.runtime());
         const stats = cached_stats orelse try snapshot.?.liveStats(cancel);
         const scan_finished = std.Io.Clock.awake.now(self.file.runtime());
@@ -2142,6 +2284,8 @@ pub const Store = struct {
         var capture = native.ChangeCapture{};
         defer capture.deinit(self.allocator);
         var source = blk: {
+            if (self.writer_admission) |admission| try admission.enter(admission.ptr, .reclamation);
+            defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
             lockStore(self);
             defer self.mutex.unlock();
             if (cancel) |token| try token.check();
@@ -2200,6 +2344,7 @@ pub const Store = struct {
             self.admission_refresh_size = 0;
             self.mutex.unlock();
         }
+        if (@import("builtin").is_test) if (self.test_maintenance_hook) |hook| try hook.notify(hook.ptr, .copy);
         var image = try source.prepareVacuum(cancel);
         defer image.deinit();
         image.prepared.no_sync = true;
@@ -2337,6 +2482,8 @@ pub const Store = struct {
     /// Open a read-only snapshot at the live header and move the captured
     /// changes out of `capture` into `changes`. Caller holds the store mutex.
     fn takeResidualVacuumChangesAssumeLocked(self: *Store, capture: *native.ChangeCapture, changes: *native.ChangeCapture) !native.NativeFile {
+        if (self.writer_admission) |admission| try admission.enter(admission.ptr, .reclamation);
+        defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
         const io = self.file.runtime();
         if (capture.overflow) {
             std.log.warn("lite vacuum gave up: change capture overflowed before catch-up captured={d} key_bytes={d}", .{ capture.count, capture.key_bytes });
@@ -2478,7 +2625,15 @@ pub const Store = struct {
         return self.submitMutationWithDurability(context, apply, true);
     }
 
+    pub fn submitIndexMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool) !void {
+        return self.submitScopedMutation(context, apply, durable, true);
+    }
+
     pub fn submitMutationWithDurability(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool) !void {
+        return self.submitScopedMutation(context, apply, durable, false);
+    }
+
+    fn submitScopedMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool, index_only: bool) !void {
         if (self.read_only) return error.ReadOnly;
         defer {
             // Start after publication: even one large final mutation crossing
@@ -2487,7 +2642,7 @@ pub const Store = struct {
             self.maintenance_wake.set(self.file.runtime());
         }
         const io = self.file.runtime();
-        var request = MutationRequest{ .context = context, .apply = apply, .durable = durable };
+        var request = MutationRequest{ .context = context, .apply = apply, .durable = durable, .index_only = index_only };
         self.commit_mutex.lockUncancelable(io);
         if (self.commit_tail) |tail| tail.next = &request else self.commit_head = &request;
         self.commit_tail = &request;
@@ -2525,6 +2680,11 @@ pub const Store = struct {
     }
 
     fn applyMutationGroup(self: *Store, head: *MutationRequest) !void {
+        var index_only = true;
+        var member: ?*MutationRequest = head;
+        while (member) |item| : (member = item.next) index_only = index_only and item.index_only;
+        if (self.writer_admission) |admission| try admission.enter(admission.ptr, if (index_only) .index else .primary);
+        defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
         lockStore(self);
         defer self.mutex.unlock();
         if (self.secret_store_uncertain) return error.OutcomeUnknown;
@@ -2535,7 +2695,10 @@ pub const Store = struct {
         try self.file.beginTransaction();
         errdefer self.file.abortTransaction();
         var current: ?*MutationRequest = head;
-        var durable = false;
+        // Detached writers release their kernel lease after this group. The
+        // next owner must see its allocator and index roots on disk; a volatile
+        // durable_header cannot safely survive that ownership handoff.
+        var durable = self.writer_admission != null;
         while (current) |item| {
             durable = durable or item.durable;
             try item.apply(item.context, &self.file);
@@ -2555,6 +2718,8 @@ pub const Store = struct {
 
     pub fn reserveWriterSlot(self: *Store) !void {
         if (self.read_only) return error.ReadOnly;
+        if (self.writer_admission) |admission| try admission.enter(admission.ptr, .primary);
+        errdefer if (self.writer_admission) |admission| admission.leave(admission.ptr);
         const io = self.file.runtime();
         self.writer_mutex.lockUncancelable(io);
         defer self.writer_mutex.unlock(io);
@@ -2565,6 +2730,8 @@ pub const Store = struct {
 
     pub fn reserveWriterSlotYielding(self: *Store) !void {
         if (self.read_only) return error.ReadOnly;
+        if (self.writer_admission) |admission| try admission.enter(admission.ptr, .primary);
+        errdefer if (self.writer_admission) |admission| admission.leave(admission.ptr);
         const io = self.file.runtime();
         self.writer_mutex.lockUncancelable(io);
         defer self.writer_mutex.unlock(io);
@@ -2582,6 +2749,7 @@ pub const Store = struct {
         self.writer_mutex.lockUncancelable(io);
         defer {
             self.writer_mutex.unlock(io);
+            if (self.writer_admission) |admission| admission.leave(admission.ptr);
             self.maintenance_wake.set(io);
             self.startMaintenance();
         }
@@ -2975,6 +3143,15 @@ pub const Txn = struct {
 
     /// Caller owns the result. Unlike get(), this does not retain keys or
     /// values in the transaction. Pending mutations still take precedence.
+    /// Pending mutations take precedence; persisted presence validates only
+    /// record headers and keys, never external value pages.
+    pub fn contains(self: *Txn, key: []const u8) !bool {
+        var cursor = try self.openKeyCursor();
+        defer cursor.close();
+        const found = cursor.seekAtOrAfter(key) catch |err| return if (err == error.NotFound) false else err;
+        return std.mem.eql(u8, found, key);
+    }
+
     pub fn getOwned(self: *Txn, allocator: Allocator, key: []const u8) ![]u8 {
         const lookup_key = if (self.prefix.len == 0) key else try std.mem.concat(allocator, u8, &.{ self.prefix, key });
         defer if (self.prefix.len > 0) allocator.free(lookup_key);
@@ -3713,6 +3890,10 @@ pub const Cursor = struct {
     owned_value: ?[]u8 = null,
     disk_candidate: ?native.DocumentIndexEntry = null,
     last_direction: ?Direction = null,
+
+    pub fn setKeysOnly(self: *Cursor) void {
+        self.load_values = false;
+    }
 
     pub fn close(self: *Cursor) void {
         self.records.deinit(self.txn.allocator);

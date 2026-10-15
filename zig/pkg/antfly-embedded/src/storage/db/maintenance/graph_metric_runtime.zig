@@ -332,7 +332,9 @@ pub fn defaultLeaseKey(role: Role) []const u8 {
     };
 }
 
-pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
+// Named branches keep native ABI identities stable across LLVM owners.
+pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) UnsupportedGraphMetricRuntime else PlatformGraphMetricRuntime;
+const UnsupportedGraphMetricRuntime = struct {
     config: Config,
 
     pub fn init(
@@ -399,7 +401,8 @@ pub const GraphMetricRuntime = if (builtin.os.tag == .freestanding) struct {
         _ = self;
         return .{};
     }
-} else struct {
+};
+const PlatformGraphMetricRuntime = struct {
     alloc: Allocator,
     owned_identity: ?[]u8 = null,
     runtime_io: ?Io,

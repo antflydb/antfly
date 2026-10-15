@@ -43,6 +43,8 @@ const synonyms_mod = @import("../section/synonyms.zig");
 // A failed read must never be converted into an empty filter result.
 pub const FilterError = anyerror;
 
+pub const ExecutionControl = @import("execution_control.zig").ExecutionControl;
+
 const geo_filter_earth_radius_meters: f64 = 6371008.8;
 
 /// A filter that produces a bitmap of matching document IDs.
@@ -67,6 +69,20 @@ pub const Filter = union(enum) {
     geo_shape: GeoShapeFilter,
     match_none: void,
     match_all: void,
+
+    pub fn withControl(self: Filter, control: ExecutionControl) Filter {
+        var result = self;
+        switch (result) {
+            .bool_filter => |*f| f.control = control,
+            .prefix => |*f| f.control = control,
+            .fuzzy => |*f| f.control = control,
+            .wildcard => |*f| f.control = control,
+            .regexp => |*f| f.control = control,
+            .term_range => |*f| f.control = control,
+            else => {},
+        }
+        return result;
+    }
 
     /// Execute this filter against a single segment, returning matching doc IDs.
     pub fn execute(self: Filter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
@@ -186,6 +202,7 @@ pub const TermFilter = struct {
 /// If both must and should are empty, matches nothing.
 /// If must is empty but should is non-empty, should results are the base.
 pub const BoolFilter = struct {
+    control: ExecutionControl = .{},
     must: []const Filter,
     should: []const Filter,
     must_not: []const Filter,
@@ -202,7 +219,8 @@ pub const BoolFilter = struct {
 
         // Process must clauses (AND)
         for (self.must) |clause| {
-            var clause_bm = if (clause == .doc_num) try clause.doc_num.refine(alloc, seg, doc_offset, if (result) |*r| r else null) else try clause.executeWithOffset(alloc, seg, doc_offset);
+            try self.control.check();
+            var clause_bm = if (clause == .doc_num) try clause.doc_num.refine(alloc, seg, doc_offset, if (result) |*r| r else null) else try clause.withControl(self.control).executeWithOffset(alloc, seg, doc_offset);
             if (result) |*r| {
                 r.andWith(&clause_bm);
                 clause_bm.deinit();
@@ -215,7 +233,7 @@ pub const BoolFilter = struct {
         if (self.should.len > 0) {
             const required_should: u32 = if (self.min_should_match == 0 and result == null) 1 else self.min_should_match;
             if (required_should > 0) {
-                var should_bm = try executeShouldClauses(alloc, self.should, required_should, seg, doc_offset);
+                var should_bm = try executeShouldClauses(alloc, self.should, required_should, seg, doc_offset, self.control);
                 errdefer should_bm.deinit();
                 if (result) |*r| {
                     r.andWith(&should_bm);
@@ -233,7 +251,8 @@ pub const BoolFilter = struct {
 
         // Process must_not clauses (ANDNOT)
         for (self.must_not) |clause| {
-            var clause_bm = if (clause == .doc_num) try clause.doc_num.refine(alloc, seg, doc_offset, &result.?) else try clause.executeWithOffset(alloc, seg, doc_offset);
+            try self.control.check();
+            var clause_bm = if (clause == .doc_num) try clause.doc_num.refine(alloc, seg, doc_offset, &result.?) else try clause.withControl(self.control).executeWithOffset(alloc, seg, doc_offset);
             defer clause_bm.deinit();
             result.?.andNotWith(&clause_bm);
         }
@@ -248,6 +267,7 @@ fn executeShouldClauses(
     min_should_match: u32,
     seg: *const index_mod.SegmentEntry,
     doc_offset: u32,
+    control: ExecutionControl,
 ) FilterError!roaring.RoaringBitmap {
     if (min_should_match > should.len) {
         return roaring.RoaringBitmap.init(alloc);
@@ -257,7 +277,8 @@ fn executeShouldClauses(
         var result = roaring.RoaringBitmap.init(alloc);
         errdefer result.deinit();
         for (should) |clause| {
-            var clause_bm = try clause.executeWithOffset(alloc, seg, doc_offset);
+            try control.check();
+            var clause_bm = try clause.withControl(control).executeWithOffset(alloc, seg, doc_offset);
             defer clause_bm.deinit();
             try result.orWith(&clause_bm);
         }
@@ -268,11 +289,15 @@ fn executeShouldClauses(
     defer counts.deinit(alloc);
 
     for (should) |clause| {
-        var clause_bm = try clause.executeWithOffset(alloc, seg, doc_offset);
+        try control.check();
+        var clause_bm = try clause.withControl(control).executeWithOffset(alloc, seg, doc_offset);
         defer clause_bm.deinit();
 
         var iter = clause_bm.iterator();
+        var visited: usize = 0;
         while (iter.next()) |doc_id| {
+            if (visited % 256 == 0) try control.check();
+            visited += 1;
             const entry = try counts.getOrPut(alloc, doc_id);
             if (!entry.found_existing) entry.value_ptr.* = 0;
             entry.value_ptr.* += 1;
@@ -282,7 +307,10 @@ fn executeShouldClauses(
     var result = roaring.RoaringBitmap.init(alloc);
     errdefer result.deinit();
     var iter = counts.iterator();
+    var visited: usize = 0;
     while (iter.next()) |entry| {
+        if (visited % 256 == 0) try control.check();
+        visited += 1;
         if (entry.value_ptr.* >= min_should_match) {
             try result.add(entry.key_ptr.*);
         }
@@ -293,6 +321,7 @@ fn executeShouldClauses(
 /// Prefix match: finds all terms starting with a prefix via FST range iteration.
 /// Returns the union of posting bitmaps for all matching terms.
 pub const PrefixFilter = struct {
+    control: ExecutionControl = .{},
     field: []const u8,
     prefix: []const u8,
     indexed_field: ?[]const u8 = null,
@@ -353,6 +382,7 @@ pub const PrefixFilter = struct {
         // lexicographically earlier terms, which turns type-ahead queries into
         // a full term-dictionary scan as the corpus vocabulary grows.
         var term_iter = try inv_reader.rangeTermIterator(self.prefix, null);
+        term_iter.setControl(self.control);
         defer term_iter.deinit();
 
         var result = roaring.RoaringBitmap.init(alloc);
@@ -371,17 +401,8 @@ pub const PrefixFilter = struct {
                 continue;
             }
             if (comptime collect_stats) stats.?.matching_terms += 1;
-            // Term matches prefix — union its postings
-            switch (entry.result) {
-                .postings => |p| {
-                    var bm = try p.docBitmap(alloc);
-                    defer bm.deinit();
-                    try result.orWith(&bm);
-                },
-                .one_hit => |h| {
-                    try result.add(h.doc_num);
-                },
-            }
+            try self.control.check();
+            try unionTermEntry(alloc, &result, entry, self.control);
         }
 
         return result;
@@ -565,12 +586,19 @@ pub const AutomatonExecutionStats = struct {
 };
 
 /// Union the postings of one dictionary entry into `result`.
-fn unionTermEntry(alloc: Allocator, result: *roaring.RoaringBitmap, entry: inverted.TermIterator.Entry) FilterError!void {
+fn unionTermEntry(alloc: Allocator, result: *roaring.RoaringBitmap, entry: inverted.TermIterator.Entry, control: ExecutionControl) FilterError!void {
+    try control.check();
     switch (entry.result) {
         .postings => |p| {
-            var bm = try p.docBitmap(alloc);
-            defer bm.deinit();
-            try result.orWith(&bm);
+            var postings = try p.iterator(alloc);
+            defer postings.deinit();
+            postings.decode_positions = false;
+            var visited: usize = 0;
+            while (try postings.next()) |hit| {
+                if (visited % 256 == 0) try control.check();
+                visited += 1;
+                try result.add(hit.doc_id);
+            }
         },
         .one_hit => |h| {
             try result.add(h.doc_num);
@@ -589,7 +617,9 @@ fn collectAutomatonTerms(
     comptime collect_stats: bool,
     stats: ?*AutomatonExecutionStats,
 ) FilterError!void {
+    term_iter.setControl(context.control);
     while (true) {
+        try context.control.check();
         const next_entry = if (comptime collect_stats)
             try term_iter.nextWithDecodedCount(&stats.?.dictionary_terms_decoded)
         else
@@ -597,13 +627,14 @@ fn collectAutomatonTerms(
         const entry = next_entry orelse break;
         if (!accept(context, entry.term)) continue;
         if (comptime collect_stats) stats.?.matching_terms += 1;
-        try unionTermEntry(alloc, result, entry);
+        try unionTermEntry(alloc, result, entry, context.control);
     }
     if (comptime collect_stats) stats.?.blocks_pruned = term_iter.blocksPruned();
 }
 
 /// Fuzzy match: finds all terms within Levenshtein edit distance via FST automaton search.
 pub const FuzzyFilter = struct {
+    control: ExecutionControl = .{},
     field: []const u8,
     term: []const u8,
     max_edits: u8 = 1,
@@ -681,6 +712,7 @@ fn editDistance(a: []const u8, b: []const u8) u32 {
 
 /// Regex filter: matches terms against a regular expression using FST automaton search.
 pub const RegexpFilter = struct {
+    control: ExecutionControl = .{},
     field: []const u8,
     pattern: []const u8,
     boost: f32 = 1.0,
@@ -735,6 +767,7 @@ pub const RegexpFilter = struct {
 /// Lexicographic term range filter: matches docs containing any term in [min, max].
 /// Unlike RangeFilter (numeric on doc values), this operates on FST term strings.
 pub const TermRangeFilter = struct {
+    control: ExecutionControl = .{},
     field: []const u8,
     min: ?[]const u8 = null,
     max: ?[]const u8 = null,
@@ -763,6 +796,7 @@ pub const TermRangeFilter = struct {
         } else null;
 
         var term_iter = try inv_reader.rangeTermIterator(start, end);
+        term_iter.setControl(self.control);
         defer term_iter.deinit();
 
         var result = roaring.RoaringBitmap.init(alloc);
@@ -775,14 +809,7 @@ pub const TermRangeFilter = struct {
                     if (std.mem.eql(u8, entry.term, m)) continue;
                 }
             }
-            switch (entry.result) {
-                .postings => |p| {
-                    var bm = try p.docBitmap(alloc);
-                    defer bm.deinit();
-                    try result.orWith(&bm);
-                },
-                .one_hit => |h| try result.add(h.doc_num),
-            }
+            try unionTermEntry(alloc, &result, entry, self.control);
         }
 
         return result;
@@ -1611,6 +1638,7 @@ pub const DateRangeFilter = struct {
 /// Wildcard match: glob-style `*` (any chars) and `?` (single char) matching.
 /// Iterates FST terms and matches against the pattern.
 pub const WildcardFilter = struct {
+    control: ExecutionControl = .{},
     field: []const u8,
     pattern: []const u8,
     boost: f32 = 1.0,
@@ -1663,7 +1691,7 @@ pub const WildcardFilter = struct {
             if (comptime collect_stats) stats.?.exact_lookup = true;
             if ((try inv_reader.lookup(literal_prefix))) |lookup| {
                 if (comptime collect_stats) stats.?.matching_terms = 1;
-                try unionTermEntry(alloc, &result, .{ .term = literal_prefix, .result = lookup });
+                try unionTermEntry(alloc, &result, .{ .term = literal_prefix, .result = lookup }, self.control);
             }
             return result;
         }
@@ -1672,6 +1700,7 @@ pub const WildcardFilter = struct {
             try inv_reader.rangeTermIterator(literal_prefix, null)
         else
             try inv_reader.termIterator();
+        term_iter.setControl(self.control);
         defer term_iter.deinit();
 
         while (true) {
@@ -1686,9 +1715,11 @@ pub const WildcardFilter = struct {
                 if (std.mem.order(u8, entry.term, literal_prefix) == .gt) break;
                 continue;
             }
+            try self.control.check();
             if (!wildcardMatch(self.pattern, entry.term)) continue;
             if (comptime collect_stats) stats.?.matching_terms += 1;
-            try unionTermEntry(alloc, &result, entry);
+            try self.control.check();
+            try unionTermEntry(alloc, &result, entry, self.control);
         }
 
         return result;
@@ -2919,6 +2950,39 @@ fn buildLargeDictionarySegmentForTest(alloc: Allocator, extra_terms: []const []c
         try hits.append(alloc, .{ .term = term, .freq = 1, .norm = 10 });
     }
     return buildTestSegmentWithTerms(alloc, &.{.{ .terms = hits.items }});
+}
+
+test "dictionary expansion cancels during nonmatching scans and nested boolean evaluation" {
+    const alloc = testing.allocator;
+    const bytes = try buildLargeDictionarySegmentForTest(alloc, &.{"zz-target"});
+    defer alloc.free(bytes);
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    const snapshot = writer.snapshot();
+    const Cancel = struct {
+        calls: usize = 0,
+        fn check(ptr: *const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(ptr)));
+            self.calls += 1;
+            return self.calls >= 20;
+        }
+    };
+    const filters = [_]Filter{
+        .{ .wildcard = .{ .field = "body", .pattern = "*never-present" } },
+        .{ .regexp = .{ .field = "body", .pattern = ".*never-present" } },
+        .{ .prefix = .{ .field = "body", .prefix = "catalog" } },
+        .{ .fuzzy = .{ .field = "body", .term = "catalog-00000", .max_edits = 2 } },
+        .{ .term_range = .{ .field = "body", .min = "catalog" } },
+    };
+    for (filters) |filter| {
+        var cancel = Cancel{};
+        const control: ExecutionControl = .{ .cancellation = .{ .ptr = &cancel, .is_cancelled_fn = Cancel.check } };
+        const clauses = [_]Filter{filter};
+        const nested: Filter = .{ .bool_filter = .{ .must = &clauses, .should = &.{}, .must_not = &.{} } };
+        try testing.expectError(error.Canceled, nested.withControl(control).execute(alloc, &snapshot.segments[0]));
+        try testing.expect(cancel.calls <= 22);
+    }
 }
 
 test "wildcard filter seeks by literal prefix in large term dictionary" {

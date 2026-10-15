@@ -57,6 +57,12 @@ pub fn build(b: *std.Build) void {
                 openapi.dependOn(&run.step);
         }
         const artifact = entry.*.cast(std.Build.Step.Compile) orelse continue;
+        // Shared native owners keep their real imports, options and native
+        // objects. The cache fixture replaces expensive bodies for these
+        // providers just as it does for the seven runtime archives below.
+        if (std.mem.eql(u8, artifact.name, "antfly-storage-engine") or
+            std.mem.eql(u8, artifact.name, "antfly-inference-core"))
+            artifact.root_module.root_source_file = sources.add(b.fmt("{s}-cache-body.zig", .{artifact.name}), "comptime {}\n");
         profiles.check(artifact);
         profiles.addInferenceWasmProbe(b, artifact);
         profiles.addBenchmarkProbe(b, artifact);
@@ -176,6 +182,8 @@ pub fn build(b: *std.Build) void {
     }
     inline for (std.meta.tags(runtime.RuntimeLibraryUnit)) |unit| {
         const artifact = artifacts.runtime.runtime_library_artifacts[@backingInt(unit)].?;
+        if (artifact.root_module.resolved_target.?.result.ofmt == .elf and artifact.use_llvm != true)
+            std.debug.panic("{s} runtime archive differs from its provider callback backend", .{@tagName(unit)});
         var seen = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
         if (unit != .inference) {
             var identity_seen = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);

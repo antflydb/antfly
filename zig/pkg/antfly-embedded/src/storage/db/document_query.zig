@@ -34,6 +34,147 @@ pub fn lookupJson(
     };
 }
 
+/// Borrowed only during a synchronous search. Copies that change fields or
+/// inclusion mode cannot accidentally reuse a plan for another projection.
+pub const BorrowedSpanProjection = struct {
+    plan: *const SpanProjectionPlan,
+    fields: []const []const u8,
+    include_all_fields: bool,
+    pub fn matches(self: @This(), opts: types.LookupOptions) bool {
+        return self.fields.ptr == opts.fields.ptr and self.fields.len == opts.fields.len and self.include_all_fields == opts.include_all_fields;
+    }
+};
+
+pub const SpanProjectionPlan = struct {
+    arena: std.heap.ArenaAllocator,
+    selector: *const @import("query/json_projection_plan.zig").Selector,
+    paths: []const @import("query/json_projection_plan.zig").Path,
+    excluded: []const []const u8,
+    include_all: bool,
+    passthrough: bool,
+
+    pub fn init(alloc: Allocator, opts: types.LookupOptions) !?@This() {
+        if (!spanProjectionSupported(opts.fields)) return null;
+        var arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        var excluded: std.ArrayListUnmanaged([]const u8) = .empty;
+        var has_positive = false;
+        var has_negative = false;
+        var include_all = false;
+        for (opts.fields) |field| {
+            if (field.len > 0 and field[0] == '-') {
+                has_negative = true;
+                if (field.len > 1) try excluded.append(a, try a.dupe(u8, field[1..]));
+            } else {
+                has_positive = true;
+                include_all = include_all or std.mem.eql(u8, field, "*");
+            }
+        }
+        var paths: std.ArrayListUnmanaged(@import("query/json_projection_plan.zig").Path) = .empty;
+        for (opts.fields) |field| {
+            if (field.len == 0 or field[0] == '-' or std.mem.eql(u8, field, "*")) continue;
+            var parts: std.ArrayListUnmanaged([]const u8) = .empty;
+            const owned = try a.dupe(u8, field);
+            var tokens = std.mem.tokenizeScalar(u8, owned, '.');
+            while (tokens.next()) |part| try parts.append(a, part);
+            if (parts.items.len == 0) continue;
+            const omit = for (excluded.items) |name| {
+                if (std.mem.eql(u8, name, "*") or std.mem.eql(u8, name, parts.items[0])) break true;
+            } else false;
+            if (!omit) try paths.append(a, .{ .parts = parts.items });
+        }
+        const selector = try @import("query/json_projection_plan.zig").compile(a, paths.items);
+        return .{
+            .arena = arena,
+            .selector = selector,
+            .paths = paths.items,
+            .excluded = excluded.items,
+            .include_all = include_all or (!has_positive and has_negative),
+            .passthrough = opts.fields.len == 0 and opts.include_all_fields,
+        };
+    }
+    pub fn deinit(self: *@This()) void {
+        self.arena.deinit();
+    }
+};
+
+/// Per-row spans and projection containers use scratch; selector plans can be
+/// shared across the request and remain immutable during row preparation.
+pub const ProjectionSource = @import("query/json_view.zig").View.RootSource;
+pub fn lookupJsonWithPlan(alloc: Allocator, output: Allocator, raw: []const u8, plan: *const SpanProjectionPlan) !types.LookupResult {
+    return lookupJsonWithSources(alloc, output, raw, plan, &.{});
+}
+/// Synthetic fields replace their primary counterparts without constructing a
+/// DOM of the primary document. Sources remain borrowed until serialization
+/// completes; projected containers are independent so later paths can mutate them.
+pub fn lookupJsonWithSources(alloc: Allocator, output: Allocator, raw: []const u8, plan: *const SpanProjectionPlan, sources: []const ProjectionSource) !types.LookupResult {
+    return lookupJsonWithSourcesPolicy(alloc, output, raw, plan, sources, false);
+}
+pub fn lookupJsonWithSourcesPolicy(alloc: Allocator, output: Allocator, raw: []const u8, plan: *const SpanProjectionPlan, sources: []const ProjectionSource, exact: bool) !types.LookupResult {
+    if (plan.passthrough and sources.len == 0) return .{ .json = try output.dupe(u8, raw) };
+    var arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
+    defer arena.deinit();
+    const a = arena.allocator();
+    const JsonView = @import("query/json_view.zig").View;
+    var view = JsonView.init(a, raw);
+    view.parse_numbers = true;
+    try view.prepareProjectionWithOptions(plan.selector, .all, .object_only, .{ .defer_fanout = true, .retain_root_fields = plan.include_all or plan.passthrough, .root_excluded = plan.excluded });
+    const overlays = try a.alloc(JsonView.RootSource, sources.len);
+    for (sources, overlays) |source, *overlay| overlay.* = source;
+    view.root_sources = overlays;
+    const Projection = @import("query/projection_output.zig").Output;
+    var projected: Projection.Object = .empty;
+    if (plan.include_all or plan.passthrough) {
+        try Projection.includePreparedRootExcept(a, &projected, &view, plan.excluded);
+    } else for (plan.paths) |path| try Projection.includeRoot(a, &projected, &view, path.parts);
+    return .{ .json = try (Projection{ .object = projected }).serializeWithPolicy(a, output, exact) };
+}
+
+pub fn lookupJsonWithOutput(alloc: Allocator, output: Allocator, raw: []const u8, opts: types.LookupOptions) !types.LookupResult {
+    if (opts.fields.len == 0 and opts.include_all_fields) return .{ .json = try output.dupe(u8, raw) };
+    if (try SpanProjectionPlan.init(alloc, opts)) |value| {
+        var plan = value;
+        defer plan.deinit();
+        return lookupJsonWithSourcesPolicy(alloc, output, raw, &plan, &.{}, opts.output_exact);
+    }
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    var projected = try projectLookupView(alloc, parsed.value, opts);
+    defer deinitProjectionView(alloc, &projected);
+    return .{ .json = try serializeWithOutput(alloc, output, projected) };
+}
+
+pub fn spanProjectionSupported(fields: []const []const u8) bool {
+    var positives: usize = 0;
+    var all = false;
+    for (fields) |field| {
+        const negative = field.len > 0 and field[0] == '-';
+        const name = if (negative) field[1..] else field;
+        if (negative and std.mem.indexOfScalar(u8, name, '.') != null) return false;
+        const special_wildcard = std.mem.eql(u8, name, "_embeddings.*") or std.mem.eql(u8, name, "_chunks.*") or std.mem.eql(u8, name, "_artifacts.*");
+        if (std.mem.indexOfScalar(u8, name, '*') != null and !std.mem.eql(u8, name, "*") and !special_wildcard) return false;
+        if (!negative) {
+            positives += 1;
+            all = all or std.mem.eql(u8, name, "*");
+        }
+    }
+    // Mixing wildcard inclusion with later array selections is order-sensitive.
+    return !all or positives == 1;
+}
+
+/// Validate skipped subtrees too, including duplicate object keys. Reuse one
+/// key arena per nesting level rather than allocating a DOM for every value.
+/// Scalar values are scanned without decoding or retaining their strings.
+/// Encode once in reclaimable scratch, then publish one exact-sized body.
+/// Growing writers must never leave superseded buffers in a response arena.
+pub fn serializeWithOutput(scratch: Allocator, output: Allocator, value: std.json.Value) ![]u8 {
+    var writer = std.Io.Writer.Allocating.init(scratch);
+    defer writer.deinit();
+    std.json.Stringify.value(value, .{}, &writer.writer) catch return error.OutOfMemory;
+    return output.dupe(u8, writer.written());
+}
+
 pub fn projectLookupJsonValue(
     alloc: Allocator,
     raw: []const u8,
@@ -121,6 +262,12 @@ fn applyIncludePattern(
     while (parts.next()) |part| try path.append(alloc, part);
     if (path.items.len == 0) return;
     try applyIncludeRecursive(borrowed, alloc, src, dst, path.items, 0);
+}
+
+/// Clone projection containers while borrowing immutable scalar storage.
+/// Source owners must remain alive until the projected result is serialized.
+pub fn applyIncludeBorrowedPath(alloc: Allocator, src: std.json.ObjectMap, dst: *std.json.ObjectMap, parts: []const []const u8) Allocator.Error!void {
+    return applyIncludeRecursive(true, alloc, src, dst, parts, 0);
 }
 
 pub fn applyIncludePath(alloc: Allocator, src: std.json.ObjectMap, dst: *std.json.ObjectMap, parts: []const []const u8) Allocator.Error!void {
@@ -524,4 +671,307 @@ fn projectionViewScenario(a: Allocator) !void {
 test "external lake projection views borrow lexemes and own containers across allocation failures" {
     try projectionViewScenario(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, projectionViewScenario, .{});
+}
+
+test "public graph metric borrowed wire bounded projection writer response memory" {
+    const a = std.testing.allocator;
+    const Counter = @import("../lite/test_allocator.zig").BudgetAllocator;
+    var input = std.Io.Writer.Allocating.init(a);
+    defer input.deinit();
+    try input.writer.writeAll("{\"values\":[");
+    for (0..8192) |i| {
+        if (i > 0) try input.writer.writeAll(",");
+        try input.writer.writeAll("123456789");
+    }
+    try input.writer.writeAll("],\"omit\":true}");
+    const opts: types.LookupOptions = .{ .fields = &.{"values"}, .include_all_fields = false };
+    var previous_retained: usize = 0;
+    for (0..2) |mode| {
+        var counted: Counter = .{ .backing = a, .limit = 8 * 1024 * 1024 };
+        var output = std.heap.ArenaAllocator.init(counted.allocator());
+        var scratch = std.heap.ArenaAllocator.init(a);
+        var body_bytes: usize = 0;
+        for (0..64) |_| {
+            const document = if (mode == 0) old: {
+                const projected = try lookupJson(scratch.allocator(), input.written(), opts);
+                break :old try output.allocator().dupe(u8, projected.json);
+            } else (try lookupJsonWithOutput(scratch.allocator(), output.allocator(), input.written(), opts)).json;
+            body_bytes += document.len;
+            try std.testing.expect(std.mem.startsWith(u8, document, "{\"values\":[123456789"));
+            _ = scratch.reset(.{ .retain_with_limit = 64 * 1024 });
+        }
+        std.debug.print("PROJECTION_RESPONSE mode={d} documents=64 body_bytes={d} retained_output_bytes={d} peak_output_bytes={d} allocations={d}\n", .{ mode, body_bytes, counted.live, counted.peak, counted.alloc_calls });
+        if (mode == 0) previous_retained = counted.live else try std.testing.expect(counted.live <= previous_retained + 4096);
+        scratch.deinit();
+        output.deinit();
+        try std.testing.expectEqual(@as(usize, 0), counted.live);
+    }
+}
+
+test "public graph metric borrowed wire bounded native projection scratch response memory" {
+    const a = std.testing.allocator;
+    const ProbeSchema = @import("../schema.zig");
+    const ProbeCodec = @import("algebraic/relational_row_codec.zig");
+    const ProbePlan = @import("query/relational_projection.zig").Plan;
+    const Counter = @import("../lite/test_allocator.zig").BudgetAllocator;
+    const columns = [_]ProbeSchema.RelationalColumn{.{ .name = "payload", .path = "payload", .column_type = .json, .is_json = true, .json_kind = .any }};
+    const table = ProbeSchema.TableSchema{ .version = 1, .storage_mode = .relational, .relational_columns = &columns };
+    var layout = try ProbeCodec.PhysicalLayout.init(a, table);
+    defer layout.deinit();
+    var input = std.Io.Writer.Allocating.init(a);
+    defer input.deinit();
+    try input.writer.writeAll("{\"items\":[");
+    for (0..1024) |i| {
+        if (i > 0) try input.writer.writeAll(",");
+        try input.writer.writeAll("{\"id\":123,\"junk\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}");
+    }
+    try input.writer.writeAll("]}");
+    const cells = [_]ProbeCodec.Cell{.{ .ordinal = 0, .path = "payload", .is_json = true, .value_type = .bytes_val, .value = .{ .bytes_val = input.written() } }};
+    const encoded = try ProbeCodec.serializeOrdinal(a, 1, &columns, &cells, @splat(0));
+    defer a.free(encoded);
+    const row = try ProbeCodec.ordinalRowViewTrusted(encoded, table, &layout);
+    var previous_retained: usize = 0;
+    for (0..2) |mode| {
+        var counted: Counter = .{ .backing = a, .limit = 8 * 1024 * 1024 };
+        var output = std.heap.ArenaAllocator.init(counted.allocator());
+        var scratch = std.heap.ArenaAllocator.init(a);
+        var body_bytes: usize = 0;
+        for (0..16) |_| {
+            var plan = try ProbePlan.init(scratch.allocator(), table, &layout, &.{"payload.items.id"});
+            const document = if (mode == 0) old: {
+                const projected = try plan.project(scratch.allocator(), row);
+                break :old try output.allocator().dupe(u8, projected);
+            } else try plan.projectWithOutput(scratch.allocator(), output.allocator(), row);
+            body_bytes += document.len;
+            try std.testing.expect(std.mem.startsWith(u8, document, "{\"payload\":{\"items\":[{\"id\":123}"));
+            plan.deinit();
+            _ = scratch.reset(.{ .retain_with_limit = 64 * 1024 });
+        }
+        std.debug.print("NATIVE_PROJECTION_RESPONSE mode={d} documents=16 body_bytes={d} retained_output_bytes={d} peak_output_bytes={d} allocations={d}\n", .{ mode, body_bytes, counted.live, counted.peak, counted.alloc_calls });
+        if (mode == 0) previous_retained = counted.live else try std.testing.expect(counted.live <= previous_retained + 4096);
+        scratch.deinit();
+        output.deinit();
+        try std.testing.expectEqual(@as(usize, 0), counted.live);
+    }
+}
+
+test "public graph metric borrowed wire span projection preserves document selectors and errors" {
+    const Case = struct {
+        fn run(a: Allocator) !void {
+            const inputs = [_][]const u8{
+                "{\"a\":{\"x\":1e2,\"y\":true},\"b\":[{\"x\":1,\"y\":2},{\"x\":3},null,[1]],\"c\":null}",
+                "{\"a\":{\"x\":\"hello\\nworld\",\"y\":9007199254740993},\"b\":[1,2]}",
+                "{\"a\":{\"x\":null},\"b\":[]}",
+                "42",
+                "{\"\\u0061\":{\"\\u0078\":\"escaped key\"}}",
+                "{\"a\":{\"x\":[{\"y\":1},{\"y\":2}]},\"b\":[{\"x\":1},{\"x\":2},3,{\"x\":4}]}",
+            };
+            const selections = [_][]const []const u8{
+                &.{"a.x"},                     &.{ "b.x", "b.y" },                   &.{"b.01.x"},                    &.{"b.0"},
+                &.{ "a", "a.x" },              &.{ "a.x", "a" },                     &.{ "c", "a.y" },                &.{ "missing.x", "a.missing" },
+                &.{ "", ".a..x." },            &.{"*"},                              &.{ "a", "-a.y" },               &.{"-b"},
+                &.{ "b.x", "b.3.x", "b.0.x" }, &.{ "b.00.x", "b.0.y", "b.x", "-a" }, &.{ "a.x.0.y", "-a", "b.0" },    &.{ "b.0.x", "b.x" },
+                &.{ "b.3", "b.0", "b.01" },    &.{ "a.x.0.y", "a.x.1.y" },           &.{ "a", "a.x.1.y", "a.x.0.y" }, &.{"b.999999999999999999999999999999999999999"},
+                &.{"b.18446744073709551615"},  &.{},
+            };
+            for (inputs) |raw| for (selections) |fields| {
+                const opts: types.LookupOptions = .{ .fields = fields, .include_all_fields = false };
+                var old = try lookupJson(a, raw, opts);
+                defer old.deinit(a);
+                var fresh = try lookupJsonWithOutput(a, a, raw, opts);
+                defer fresh.deinit(a);
+                try std.testing.expectEqualStrings(old.json, fresh.json);
+            };
+        }
+    };
+    try Case.run(std.testing.allocator);
+    const opts: types.LookupOptions = .{ .fields = &.{"keep"}, .include_all_fields = false };
+    for ([_][]const u8{ "{\"keep\":1,\"omit\":{\"x\":1,\"x\":2}}", "{\"keep\":1,\"omit\":[{\"x\":1,\"x\":2}]}" }) |raw|
+        try std.testing.expectError(error.DuplicateField, lookupJsonWithOutput(std.testing.allocator, std.testing.allocator, raw, opts));
+    for ([_][]const u8{ "{\"keep\":1,\"omit\":[}", "{\"keep\":1}{}", "", "{\"keep\":}", "{\"keep\":1,\"omit\":\"\\uZZZZ\"}" }) |raw| {
+        if (lookupJsonWithOutput(std.testing.allocator, std.testing.allocator, raw, opts)) |result| {
+            std.testing.allocator.free(result.json);
+            return error.TestUnexpectedResult;
+        } else |err| try std.testing.expect(err != error.OutOfMemory);
+    }
+    const Fail = struct {
+        fn run(a: Allocator) !void {
+            var result = try lookupJsonWithOutput(a, a, "{\"keep\":[{\"n\":1}],\"omit\":[{\"n\":2},{\"n\":3}]}", .{ .fields = &.{ "keep.n", "keep.0.n" }, .include_all_fields = false });
+            defer result.deinit(a);
+            try std.testing.expectEqualStrings("{\"keep\":[{\"n\":1}]}", result.json);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fail.run, .{});
+}
+
+test "public graph metric borrowed wire span projection bounds omitted document scratch" {
+    const a = std.testing.allocator;
+    const Counter = @import("../lite/test_allocator.zig").BudgetAllocator;
+    var input = std.Io.Writer.Allocating.init(a);
+    defer input.deinit();
+    try input.writer.writeAll("{\"keep\":7,\"omit\":[");
+    for (0..16384) |i| {
+        if (i != 0) try input.writer.writeByte(',');
+        try input.writer.writeAll("{\"n\":123,\"s\":\"ignored\"}");
+    }
+    try input.writer.writeAll("]}");
+    var peaks: [4]usize = undefined;
+    for (0..4) |mode| {
+        var counted: Counter = .{ .backing = a, .limit = if (mode == 0) 16 * 1024 * 1024 else 64 * 1024 };
+        const opts: types.LookupOptions = .{ .fields = if (mode == 3) &.{ "keep", "omit.n", "-omit" } else if (mode == 2) &.{"-omit"} else &.{"keep"}, .include_all_fields = false };
+        var result = if (mode == 0) try lookupJson(counted.allocator(), input.written(), opts) else try lookupJsonWithOutput(counted.allocator(), a, input.written(), opts);
+        try std.testing.expectEqualStrings("{\"keep\":7}", result.json);
+        peaks[mode] = counted.peak;
+        result.deinit(if (mode == 0) counted.allocator() else a);
+        try std.testing.expectEqual(@as(usize, 0), counted.live);
+    }
+    try std.testing.expect(peaks[1] < peaks[0] / 10 and peaks[2] < peaks[0] / 10 and peaks[3] < 64 * 1024);
+    std.debug.print("SPAN_PROJECTION omitted_objects=16384 dom_peak={d} span_peak={d} exclusion_peak={d} contradictory_peak={d}\n", .{ peaks[0], peaks[1], peaks[2], peaks[3] });
+}
+
+test "public graph metric borrowed wire span projection fuses validation and sparse array indices" {
+    const a = std.testing.allocator;
+    const Counter = @import("../lite/test_allocator.zig").BudgetAllocator;
+    var input = std.Io.Writer.Allocating.init(a);
+    defer input.deinit();
+    try input.writer.writeAll("{\"arr\":[");
+    for (0..20000) |i| {
+        if (i != 0) try input.writer.writeByte(',');
+        try input.writer.print("{d}", .{i});
+    }
+    try input.writer.writeAll("]}");
+    const fields = [_][]const u8{ "arr.19999", "arr.19990", "arr.19998", "arr.19997", "arr.19996", "arr.19995", "arr.19994", "arr.19993", "arr.19992", "arr.19991", "arr.19989", "arr.19988", "arr.19987", "arr.19986", "arr.19985", "arr.19984" };
+    var budget: Counter = .{ .backing = a, .limit = 64 * 1024 };
+    var result = try lookupJsonWithOutput(budget.allocator(), a, input.written(), .{ .fields = &fields, .include_all_fields = false });
+    defer result.deinit(a);
+    try std.testing.expectEqualStrings("{\"arr\":[19984]}", result.json);
+    try std.testing.expectEqual(@as(usize, 0), budget.live);
+    std.debug.print("FUSED_ARRAY_PROJECTION rows=20000 selectors=16 scratch_peak={d}\n", .{budget.peak});
+    // Inspect the navigation directly: unselected elements never become nodes.
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const View = @import("query/json_view.zig").View;
+    var view = View.init(arena.allocator(), input.written());
+    var plan = (try SpanProjectionPlan.init(a, .{ .fields = &fields, .include_all_fields = false })).?;
+    defer plan.deinit();
+    try view.prepareProjection(plan.selector, .all, .object_only);
+    const arr = &view.root.children.?[0].node;
+    try std.testing.expect(arr.children == null);
+    try std.testing.expectEqual(@as(u32, 16), arr.array_index.count());
+}
+
+test "public graph metric borrowed wire immutable selector plans share nested fanout state" {
+    const a = std.testing.allocator;
+    const opts: types.LookupOptions = .{ .fields = &.{ "items.a.b", "items.0.a.c", "items.00.a.d" }, .include_all_fields = false };
+    var plan = (try SpanProjectionPlan.init(a, opts)).?;
+    defer plan.deinit();
+    const compiled_bytes = plan.arena.queryCapacity();
+    for (0..16) |_| {
+        var result = try lookupJsonWithPlan(a, a, "{\"items\":[{\"a\":{\"b\":1,\"c\":2,\"d\":3}},{\"a\":{\"b\":4}}]}", &plan);
+        defer result.deinit(a);
+        var old = try lookupJson(a, "{\"items\":[{\"a\":{\"b\":1,\"c\":2,\"d\":3}},{\"a\":{\"b\":4}}]}", opts);
+        defer old.deinit(a);
+        try std.testing.expectEqualStrings(old.json, result.json);
+        try std.testing.expectEqual(compiled_bytes, plan.arena.queryCapacity());
+    }
+    const Fail = struct {
+        fn run(failing: Allocator) !void {
+            var owned = (try SpanProjectionPlan.init(failing, opts)).?;
+            defer owned.deinit();
+            var result = try lookupJsonWithPlan(failing, failing, "{\"items\":[{\"a\":{\"b\":1,\"c\":2,\"d\":3}}]}", &owned);
+            defer result.deinit(failing);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Fail.run, .{});
+}
+
+test "public graph metric borrowed wire selector compiler bounds depth and iterative union work" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const compiler = @import("query/json_projection_plan.zig");
+    const parts = try a.alloc([]const u8, compiler.max_path_depth);
+    defer a.free(parts);
+    @memset(parts, "x");
+    _ = try compiler.compile(arena.allocator(), &.{.{ .parts = parts }});
+    const too_deep = try a.alloc([]const u8, 100000);
+    defer a.free(too_deep);
+    @memset(too_deep, "x");
+    try std.testing.expectError(error.InvalidQueryRequest, compiler.compile(arena.allocator(), &.{.{ .parts = too_deep }}));
+    // The previously crashing public constructor fails cleanly on shallow data.
+    var path = std.Io.Writer.Allocating.init(a);
+    defer path.deinit();
+    try path.writer.writeAll("missing");
+    for (0..100000) |_| try path.writer.writeAll(".x");
+    try std.testing.expectError(error.InvalidQueryRequest, lookupJsonWithOutput(a, a, "{}", .{ .fields = &.{path.written()}, .include_all_fields = false }));
+    const aliases = try a.alloc(compiler.Path, compiler.max_components + 1);
+    defer a.free(aliases);
+    @memset(aliases, .{ .parts = &.{"x"} });
+    try std.testing.expectError(error.InvalidQueryRequest, compiler.compile(arena.allocator(), aliases));
+}
+
+test "public graph metric borrowed wire wide projection retains only selected object spans" {
+    const a = std.testing.allocator;
+    const Counter = @import("../lite/test_allocator.zig").BudgetAllocator;
+    var input = std.Io.Writer.Allocating.init(a);
+    defer input.deinit();
+    try input.writer.writeAll("{\"keep\":1");
+    for (0..20000) |i| try input.writer.print(",\"field{d}\":0", .{i});
+    try input.writer.writeByte('}');
+    var plan = (try SpanProjectionPlan.init(a, .{ .fields = &.{"keep"}, .include_all_fields = false })).?;
+    defer plan.deinit();
+    var counter: Counter = .{ .backing = a, .limit = 4 * 1024 * 1024 };
+    var result = try lookupJsonWithPlan(counter.allocator(), a, input.written(), &plan);
+    defer result.deinit(a);
+    try std.testing.expectEqualStrings("{\"keep\":1}", result.json);
+    try std.testing.expectEqual(@as(usize, 0), counter.live);
+    std.debug.print("WIDE_OBJECT_FIXED fields=20000 input_bytes={d} scratch_peak={d}\n", .{ input.written().len, counter.peak });
+    var arena2 = std.heap.ArenaAllocator.init(a);
+    defer arena2.deinit();
+    const View = @import("query/json_view.zig").View;
+    var view = View.init(arena2.allocator(), input.written());
+    try view.prepareProjection(plan.selector, .all, .object_only);
+    try std.testing.expectEqual(@as(usize, 1), view.root.children.?.len);
+    try std.testing.expectEqual(@as(u32, 1), view.root.object_index.count());
+    try std.testing.expectError(error.DuplicateField, lookupJsonWithPlan(a, a, "{\"keep\":1,\"skip\":2,\"skip\":3}", &plan));
+    var all = try lookupJsonWithOutput(a, a, "{\"keep\":1,\"skip\":2}", .{ .fields = &.{"-skip"}, .include_all_fields = false });
+    defer all.deinit(a);
+    try std.testing.expectEqualStrings("{\"keep\":1}", all.json);
+}
+
+test "public graph metric borrowed wire compact fanout object spans bound total projection scratch" {
+    const a = std.testing.allocator;
+    const Counter = @import("../lite/test_allocator.zig").BudgetAllocator;
+    var input = std.Io.Writer.Allocating.init(a);
+    defer input.deinit();
+    try input.writer.writeAll("{\"items\":[");
+    for (0..8000) |i| {
+        if (i != 0) try input.writer.writeByte(',');
+        try input.writer.writeAll("{\"a\":{\"b\":1,\"c\":2},\"skip\":3}");
+    }
+    try input.writer.writeAll("]}");
+    var counter: Counter = .{ .backing = a, .limit = (switch (@import("builtin").mode) {
+        .debug, .safe => @as(usize, 20),
+        .fast, .small => 12,
+    }) * 1024 * 1024 };
+    var plan = (try SpanProjectionPlan.init(a, .{ .fields = &.{"items.a.b"}, .include_all_fields = false })).?;
+    defer plan.deinit();
+    var result = try lookupJsonWithPlan(counter.allocator(), a, input.written(), &plan);
+    defer result.deinit(a);
+    try std.testing.expectEqual(@as(usize, 112011), result.json.len);
+    try std.testing.expect(std.mem.startsWith(u8, result.json, "{\"items\":[{\"a\":{\"b\":1}}"));
+    try std.testing.expectEqual(@as(usize, 0), counter.live);
+    std.debug.print("COMPACT_FANOUT rows=8000 scratch_peak={d}\n", .{counter.peak});
+}
+
+test "public graph metric borrowed wire exact policy keeps raw passthrough independent of scratch" {
+    const a = std.testing.allocator;
+    var plan = (try SpanProjectionPlan.init(a, .{})).?;
+    defer plan.deinit();
+    var refused = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    const raw = "{\"items\":[1,2,3]}";
+    var result = try lookupJsonWithSourcesPolicy(refused.allocator(), a, raw, &plan, &.{}, true);
+    defer result.deinit(a);
+    try std.testing.expectEqualStrings(raw, result.json);
+    try std.testing.expectEqual(@as(usize, 0), refused.alloc_index);
 }

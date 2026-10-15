@@ -60,7 +60,7 @@ def main() -> None:
     rng = random.Random(args.seed)
     rows = [
         json.loads(line)
-        for line in args.records.read_text().splitlines()
+        for line in args.records.read_text().split("\n")
         if line.strip()
     ]
     yes = [r for r in rows if r["kind"] == "noul" and r["target"][1] > r["target"][0]]

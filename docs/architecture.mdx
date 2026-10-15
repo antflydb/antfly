@@ -1,207 +1,138 @@
 ---
 title: Architecture
-unlisted: true
-description: Deep dive into Antfly's distributed architecture and design principles
+sidebar: concepts
+order: 7
+description: How the Antfly engine is built, from deployment modes and storage engines through the write path, indexes, inference, transactions, and operations
 ---
 
 <Questions>
-- How does Antfly's distributed architecture work?
-- What is multi-Raft consensus?
-- How does Antfly handle sharding?
-- What storage engine does Antfly use?
-- How does Antfly ensure data consistency?
+- How is Antfly's architecture put together?
+- What is the difference between a deployment mode and a storage engine?
+- What happens to a document between the write and when it becomes searchable?
+- How do Raft, sharding, and cross-shard transactions work in Antfly?
+- How does Antfly handle high availability, backups, and upgrades?
 </Questions>
 
 ## Overview
 
-Antfly is a distributed key-value store and vector search engine built on a **multi-Raft consensus architecture**. It combines the best of traditional databases with modern AI capabilities to deliver hybrid search at scale.
+Antfly is one runtime that owns storage, indexing, inference, and background work. Documents, full-text segments, vector postings, graph edges, and the models that chunk, embed, rerank, and extract all live in one process tree, so a deployment needs no external queue, cache tier, vector store, or model server. Native libraries (GPU drivers, an optional `libwasmtime`) plug into Antfly's runtime rather than the other way round. The server, the storage engine it shares with embedded use, and the inference runtime are written in Zig under [`zig/`](https://github.com/antflydb/antfly/tree/main/zig); the background for that choice is in [Search-and-Inference, From First Principles](https://antfly.io/research/antfly-zig).
 
-## What Makes Antfly Unique
+The rest of this page describes what ships today and labels work in progress as such. Each section links the design doc that is authoritative for it.
 
-### Hybrid Search
+## Deployment Modes and Storage Engines
 
-- **BM25 + Vector Similarity**: Full-text search with vector embeddings using Reciprocal Rank Fusion (RRF)
-- **Multimodal**: Index and search text, images, and audio with native Antfly models or application-managed vectors
-- **Managed Index Embedders**: Antfly Inference, Ollama, OpenAI, OpenRouter, Cohere, Gemini, Vertex AI, and AWS Bedrock
+Topology and persistence are independent choices. A deployment mode answers which processes run; a storage engine answers where durable state lives. Lite is a storage engine, not a topology.
 
-### Distributed Consensus
+| Mode | Command | Runtime ownership | Storage engines |
+| --- | --- | --- | --- |
+| Embedded | none; the application links `libantfly` | The application opens the database directly, with no server | `lite`, `local` |
+| Standalone | `antfly standalone` | One process owns metadata, data, the APIs, and inference | `lite`, `local` |
+| Distributed | `antfly metadata`, `antfly data` | Split roles with Raft replication; scales horizontally | `local` |
+| Serverless (in progress) | `antfly serverless` | Stateless compute over object-backed durable state | `object` |
 
-- **Multi-Raft Design**: Separate consensus groups for metadata (single cluster) and storage (one per shard)
-- **Horizontal Sharding**: Tables partitioned by key range across shards with configurable replication
-- **Fine-Grained Durability**: Control write consistency with sync levels (propose, write, full_text, enrichments, full_index)
+| Engine | Durable representation |
+| --- | --- |
+| `lite` | One portable `.aflite` file with a single writable owner, on Antfly's native page engine. No Raft; durability is the `fsync` policy. |
+| `local` | A directory per node. Shards use Antfly's native LSM tree: sorted runs (`runs/<id>.tbl`) plus a manifest, with background flush and compaction. |
+| `object` | S3-compatible (including R2) or GCS object storage, with separate lanes for WAL, manifests, artifacts, and catalog. |
 
-### AI-Native Features
-
-- **RAG**: Streaming retrieval-augmented generation with Server-Sent Events
-- **Native Agents**: Retrieval and query-builder agents for bounded query planning, tool selection, and answer generation
-- **Document Chunking**: Semantic chunking service (Antfly Inference) with multi-tier caching
-- **Async Enrichment**: Background embedding and summarization with leader-only processing
-
-### Developer Experience
-
-- **JSON Schema Extensions**: Custom `x-antfly-*` annotations for indexing
-- **MongoDB-Style Transforms**: In-place updates ($inc, $set, $push) without read-modify-write
-- **Linear Merge**: Stateless import of sorted records from external sources
-- **Template Rendering**: Handlebars templates for custom document rendering
-- **Graph Operations**: Declarative queries with traversals and pathfinding
-
-### Flexible Indexing
-
-- **Index Types**: `full_text` (BM25), `embeddings` (dense, sparse, and late-interaction vectors), `graph` (traversal and pathfinding), `algebraic` (aggregates and materializations), `relational` (ordered composite keys over typed rows)
-- **Enrichers**: summaries, embeddings, chunking (async background processing)
-- **Query Processors**: `chunker` (semantic document splitting), `pruner` (result filtering), `reranker` (relevance re-scoring)
-- **Multimodal**: Native ClipClap embeddings, durable extraction, or application-managed vectors
-- **Pluggable Architecture**: Easy to add custom index types via registry pattern
-
-## Core Components
-
-### Storage Layer
-
-**Native LSM Engine**
-
-Antfly's storage engine is implemented natively in Zig (`zig/pkg/antfly-embedded/src/storage`). Shards use the native LSM-tree engine (`storage/lsm`) with a write-ahead log, table files, and background compaction. Each shard owns its own storage instance, providing:
-- Efficient data storage and retrieval
-- Fast range scans
-- Reliable crash recovery via write-ahead logging
-
-### Consensus and Distribution
-
-**Raft Consensus Algorithm**
-
-Antfly ensures data consistency across nodes using the Raft consensus algorithm:
-- Strong consistency guarantees
-- Automatic leader election
-- Log replication across nodes
-- Split-brain prevention
-
-### Multi-Raft Architecture
-
-Unlike single-raft systems, Antfly employs a sophisticated multi-raft design:
-
-- **Shard-Level Consensus**: Each data shard runs its own Raft group
-- **Independent Scaling**: Shards can be moved and replicated independently
-- **Fault Isolation**: Failures in one shard don't affect others
-- **Parallel Operations**: Multiple raft groups can process requests simultaneously
+Switching a running deployment between engines is a migration, never a config toggle. Fresh local, single-shard standalone tables without replication keep source embeddings in a separate vector store instead of the primary LSM. Design: [STORAGE.md](https://github.com/antflydb/antfly/blob/main/zig/STORAGE.md), [LITE.md](https://github.com/antflydb/antfly/blob/main/zig/LITE.md), [VECTOR_STORE.md](https://github.com/antflydb/antfly/blob/main/zig/VECTOR_STORE.md), [SERVERLESS.md](https://github.com/antflydb/antfly/blob/main/zig/SERVERLESS.md). The concept page for the single-file engine is [Antfly Lite](/docs/guides/lite).
 
 ## Data Model
 
-### Document Storage
+**Tables, shards, and Raft groups.** A table is split by key range into `num_shards` shards. In a distributed deployment the metadata nodes run one Raft group for cluster topology and schemas, and every shard runs its own Raft group with `replication_factor` replicas (default 3, maximum 5). Shards move, replicate, and fail independently. Raft messages and snapshots travel between nodes over HTTP. Lite has no Raft, and serverless tables allocate no data Raft groups. Design: [raft/RAFT.md](https://github.com/antflydb/antfly/blob/main/zig/pkg/antfly/src/raft/RAFT.md), [DB.md](https://github.com/antflydb/antfly/blob/main/zig/DB.md).
 
-Antfly stores data as JSON documents with:
-- Schema-optional design for flexibility
-- Automatic indexing of fields
-- Support for nested structures
+**Table profiles.** Tables are document-first by default: each document is a compressed JSON value with optional, soft schema, and every index is derived from it. A `storage_mode: relational` table is the second profile on the same engine. Its schema is required and closed, rows are stored as typed packed rows, and declared scalar properties become typed columns so predicates, sorts, and aggregates can be served columnar. A `json` column keeps document-style indexing where it is wanted. Both profiles use the same shards, Raft, indexes, and enrichments. Design: [RELATIONAL.md](https://github.com/antflydb/antfly/blob/main/zig/RELATIONAL.md), [SYSTEM_CATALOG.md](https://github.com/antflydb/antfly/blob/main/zig/SYSTEM_CATALOG.md); the [Document Engine](/docs/guides/document-engine) page covers mappings and queries on document tables.
 
-### Sharding Strategy
+**Lakes and foreign sources.** Lake tables query Parquet and Iceberg data in object storage in place, with Antfly-native full-text, vector, sparse, graph, and algebraic indexes built as sidecars. Lake tables and SQL are in progress ([#145](https://github.com/antflydb/antfly/pull/145)). Two features connect external PostgreSQL databases today. Query-time `foreign_sources` read or join external tables per request, and CDC (`replication_sources`) streams changes over logical replication into ordinary Antfly tables. Design: [LAKES.md](https://github.com/antflydb/antfly/blob/main/zig/LAKES.md), [REMOTE_TABLE_SERVING.md](https://github.com/antflydb/antfly/blob/main/zig/REMOTE_TABLE_SERVING.md), [CDC.md](https://github.com/antflydb/antfly/blob/main/zig/CDC.md); the [CDC replication](/docs/guides/cdc-replication) guide walks through a pipeline.
 
-Tables are divided into shards by key range, and each shard is replicated by its own Raft group with a configurable replication factor. Size-based automatic split and merge (`max_shard_size_bytes`, default 64 MiB) is opt-in: set `disable_shard_alloc: false` in the shard allocation config to enable it.
+## Write Path
 
-## Indexing Architecture
+A batch write follows a document-first contract:
 
-### Full-Text Search
+1. **Parse once.** Each document is parsed and stripped of DB-owned special fields (`_embeddings`, `_edges`), and its text, vector, and graph directives are derived from that one parsed form.
+2. **Commit the base document.** The base state commits through the shard's Raft log. Single-shard batches are atomic within the shard. Batches that span shards use a distributed transaction (see [Consistency and Transactions](#consistency-and-transactions)).
+3. **Append to the derived-work log.** One batch-shaped record goes into a sequence-numbered, idempotent log.
+4. **Advance per-index watermarks.** Each index worker applies the log at its own pace and publishes a durable checkpoint saying which base sequence it serves. The log truncates at the minimum watermark. Rebuilding from the document store is a repair fallback, not the replay path.
 
-Implemented natively in Zig (`zig/pkg/antfly-embedded/src/search`) as a Lucene-style segment index with FST-based term dictionaries and roaring-bitmap postings, our full-text indexing provides:
-- Language-aware tokenization
-- Fuzzy matching and phrase search
-- Faceted search capabilities
-- Custom analyzers and filters
+The per-request `sync_level` picks how far a write gets before the response returns:
 
-### Vector Indexing
+| `sync_level` | Returns after |
+| --- | --- |
+| `propose` (default) | Raft accepts the proposal |
+| `write` | The write is durably applied to the local store |
+| `full_text` | The full-text index WAL write |
+| `enrichments` | Enrichments are computed before commit; a synchronous producer failure rejects the write |
+| `full_index` | Full-text, enrichment, and vector index writes all complete |
 
-Dense vectors are indexed in postings (leaf clusters of vectors) under a hierarchical balanced clustering (HBC) centroid tree (`zig/lib/vectorindex`). Once an index grows past about 1,024 postings, the default `centroid_directory_mode: auto` routes through a flat centroid directory instead of the tree. The index offers:
-- Approximate nearest neighbor search that scans the closest leaves, then reranks candidates with exact distances
-- Configurable precision/performance tradeoffs (search effort, leaf size, rerank policy)
-- Support for high-dimensional vectors
-- Incremental updates with [SPFresh](https://arxiv.org/abs/2410.14452)-style local maintenance: an insert touches one posting, oversized leaves split, undersized leaves merge into a sibling, and a background pass moves boundary vectors between sibling leaves. Updates never trigger a full rebuild
-- Quantization using [RaBitQ](https://arxiv.org/abs/2405.12497): each leaf stores 1-bit codes of vector residuals against the leaf centroid, and full-precision vectors are kept for reranking
+**Enrichments and artifacts.** Enrichments are managed producers of durable artifacts, and they come in three kinds. A `chunk` enrichment splits text, audio, or images into windows; the `fixed` chunker is the default. An `embedding` enrichment produces dense or sparse vectors. An `asset` enrichment produces any other derived payload: summaries, entity extraction, classification, decisions, OCR, and transcripts. The `document_extraction` asset producer turns PDFs into durable page units, falling back to local OCR for pages without native text, and it handles audio transcription. Enrichments can chain: a chunk enrichment can read an asset artifact, and an embedding enrichment can read chunks. Artifacts belong to the enrichment, not to an index, and they live inside their document's key range. As a result, one chunking pass can feed several indexes, and deleting a document cleans up its artifacts with a bounded scan. Indexes consume artifacts. An artifact-backed index can union up to 64 artifact streams, so whole-document and chunk vectors can sit in one embeddings index. Only the active shard leader runs enrichment work, and coverage accounting keeps a failed or lagging producer from reporting as ready. Design: [DB.md: Write Contract](https://github.com/antflydb/antfly/blob/main/zig/DB.md#write-contract), [DB.md: Derived Work Log](https://github.com/antflydb/antfly/blob/main/zig/DB.md#derived-work-log-and-projection-checkpoints), [ENRICHMENTS.md](https://github.com/antflydb/antfly/blob/main/zig/ENRICHMENTS.md), [ARTIFACTS.md](https://github.com/antflydb/antfly/blob/main/zig/ARTIFACTS.md); the guide is [Artifact Indexes](/docs/guides/artifact-indexes).
 
-### Hybrid Search Engine
+## Indexes
 
-The query engine seamlessly combines both index types:
-- Unified scoring across text and vector results
-- Query-time weighting of different signals
-- Efficient multi-index traversal
-- Result deduplication and ranking
+Index types form a closed set, and one table can carry any combination of them:
 
-## AI Integration
+- **`full_text`**: BM25 over Lucene-style segments with FST term dictionaries and roaring-bitmap postings. Analyzers include Snowball stemmers. Queries cover phrase, fuzzy, wildcard, regex, numeric, and geo, plus highlighting and faceting through `aggregations` (terms, range, histogram, date_histogram, geo). Search visibility waits for the segment write, not compaction; merges run in the background. Design: [FULL_TEXT.md](https://github.com/antflydb/antfly/blob/main/zig/FULL_TEXT.md).
+- **`embeddings`, dense**: an HBC (hierarchical balanced clustering) index. Search runs a beam over a centroid tree (branching factor 16, search width 32), scans the closest leaf postings, then does a boundary rerank. That rerank exact-scores only the candidates whose [RaBitQ](https://arxiv.org/abs/2405.12497) error bounds overlap the cutoff. Leaves store 1-bit-per-dimension residual codes against the leaf centroid, and full-precision vectors are kept for rerank. Large indexes route through a flat exact-centroid directory instead of the tree. The only public tuning knob is `search_effort` (0 to 1, default 0.5). HBC applies [SPFresh](https://arxiv.org/abs/2410.14452)-style local maintenance: inserts touch one posting, and leaves split and merge locally. Routine writes never trigger a full rebuild; shard splits rebuild child indexes with a bulk builder. Distance kernels use portable `@Vector` SIMD with AVX2/AVX-512 and NEON paths. Design: [HBC.md](https://github.com/antflydb/antfly/blob/main/zig/HBC.md), [SPFRESH.md](https://github.com/antflydb/antfly/blob/main/zig/SPFRESH.md), [DENSE_INDEXING_LIFECYCLE.md](https://github.com/antflydb/antfly/blob/main/zig/DENSE_INDEXING_LIFECYCLE.md).
+- **`embeddings`, sparse** (`sparse: true`): a [SPLADE](https://arxiv.org/abs/2107.05720) learned-sparse inverted index.
+- **`graph`**: edges come from the `_edges` field or from extraction artifacts. `graph_queries` run traversals, shortest and k-shortest paths, and MATCH patterns, and they can start from another result set such as `$full_text_results`. Published graph metrics (`pagerank`, `degree`, `eigenvector`, `hits_authority`, `hits_hub`) are maintained in the background and can be queried during rebuilds. Design: [GRAPH.md](https://github.com/antflydb/antfly/blob/main/zig/GRAPH.md), [GRAPH_METRICS.md](https://github.com/antflydb/antfly/blob/main/zig/GRAPH_METRICS.md); guide: [Graph Navigation](/docs/guides/graph-navigation).
+- **`algebraic`**: typed fields derived from the schema, plus declarative exact aggregate recipes that the engine materializes. Eligible queries reuse a complete, snapshot-bound materialization instead of scanning. Design: [ALGEBRAIC.md](https://github.com/antflydb/antfly/blob/main/zig/ALGEBRAIC.md).
+- **`relational`**: composite ordered keys on relational tables, each with its own direction, null placement, and collation. Indexes build asynchronously, and indexed queries require complete coverage. Design: [RELATIONAL.md](https://github.com/antflydb/antfly/blob/main/zig/RELATIONAL.md).
 
-### Embedding Pipeline
+**Fusion and query processors.** A query can combine full-text, dense, sparse, and graph result sets. `merge_config` fuses them with Reciprocal Rank Fusion (default, `rank_constant` 60) or Relative Score Fusion, and per-index `weights` apply to both. Query processors then run in order. The `reranker` is a cross-encoder, or a late-interaction model (ColBERT- or ColQwen-style MaxSim); late interaction is a reranker, not an index type. `graph_metric_rerank` reorders by a published graph metric, `pruner` drops low-quality tails after fusion and reranking and before paging, and `document_renderer` formats results. Design: [DB.md: Search Contract](https://github.com/antflydb/antfly/blob/main/zig/DB.md#search-contract), [RERANKING.md](https://github.com/antflydb/antfly/blob/main/zig/pkg/inference/RERANKING.md); the guide is [Tune Hybrid Search](/docs/guides/hybrid-search).
 
-- **Plugin Architecture**: Modular design supports multiple embedding providers through a unified interface
-- **Batch Processing**: Efficient batching of embedding requests to maximize throughput
-- **Caching Layer**: Smart caching of embeddings to reduce API calls and latency
-- **Async Processing**: Non-blocking embedding generation with progress tracking
+## Query Surfaces
 
-## Reliability Features
+- **HTTP JSON API** under `/db/v1`, generated from the OpenAPI specs in [`specs/openapi/`](https://github.com/antflydb/antfly/tree/main/specs/openapi). Go, TypeScript, and Python [SDKs](/docs/sdks) wrap generated clients; the Rust SDK is generated.
+- **SQL and the PostgreSQL wire protocol** (in progress): SQL is lowered to native typed plans rather than executed as SQL text, and an opt-in pgwire listener serves `psql`-compatible clients. Design: [SQL extraction](https://github.com/antflydb/antfly/blob/main/docs/design/sql/extraction.md), [pgwire](https://github.com/antflydb/antfly/blob/main/zig/pkg/antfly/src/pgwire/README.md).
+- **Native agents**: `POST /agents/retrieval` (retrieval and streaming answers over SSE), `POST /agents/query-builder` (natural language to an Antfly query), and `POST /agents/research`, which also runs as durable `/agents/research/jobs` ([Deep Research](/docs/guides/deep-research)). Design: [A2A.md](https://github.com/antflydb/antfly/blob/main/zig/A2A.md), [DEEP_RESEARCH.md](https://github.com/antflydb/antfly/blob/main/zig/DEEP_RESEARCH.md).
+- **MCP and A2A**: an MCP server at `/mcp/v1`, and an A2A adapter at `/a2a` with `/.well-known/agent-card.json`. Both delegate to the same operations as HTTP, so auth and validation stay in one place. Design: [MCP.md](https://github.com/antflydb/antfly/blob/main/zig/MCP.md), [A2A.md](https://github.com/antflydb/antfly/blob/main/zig/A2A.md).
+- **C API and embedded bindings**: `libantfly` is the stable C ABI for local databases and for database-free inference. Go, Python, Rust, and TypeScript bindings sit on it under the `embedded` package name. Design: [CAPI.md](https://github.com/antflydb/antfly/blob/main/zig/CAPI.md), [embedded bindings](https://github.com/antflydb/antfly/blob/main/docs/design/embedded-bindings.md).
+- **WASM extensions**: a Postgres-style extension lifecycle under `/extensions/v1`, whose WASM handlers run in a sandbox with fuel and memory limits. Today only `wasm:` MCP-tool handlers execute, and they need an external `libwasmtime` that Antfly loads at runtime (`ANTFLY_WASMTIME_LIB`). Design: [EXTENSIONS.md](https://github.com/antflydb/antfly/blob/main/zig/EXTENSIONS.md).
 
-### Write-Ahead Logging
+## Inference
 
-Every operation is logged before execution:
-- Durability guarantees
-- Point-in-time recovery
-- Efficient batch commits
-- Configurable sync policies
+[Antfly Inference](/docs/guides/inference) runs embedding, chunking, reranking, extraction, classification, decision, OCR, transcription, and generation models. It loads GGUF, safetensors, and ONNX directly; ONNX graphs are parsed and run on Antfly's own kernels, with no ONNX Runtime. Backends are CPU, Metal, and CUDA, with PJRT/XLA and WASM/WebGPU builds experimental. The runtime serves `/ai/v1` beside `/db/v1`.
 
-### Write Visibility
+Standalone runs inference in-process, and managed enrichments call it directly instead of looping back through HTTP. Builds with a GPU or driver-backed backend (Metal, CUDA, PJRT) delegate all inference to a supervised `antfly inference _worker` child, so a wedged driver call is killed and respawned without taking the database down. Setting `inference.api_url` turns embedded inference off and sends `provider: antfly` calls to a separate `antfly inference run` process; on Kubernetes, the operator manages those as InferencePools. External providers implement the same interfaces. Embedders are Ollama, OpenAI, OpenRouter, Cohere, Gemini, Vertex AI, and AWS Bedrock, and rerankers and generators have their own provider lists. Design: [STANDALONE.md](https://github.com/antflydb/antfly/blob/main/zig/STANDALONE.md), [inference ROADMAP.md](https://github.com/antflydb/antfly/blob/main/zig/pkg/inference/ROADMAP.md), [ONNX.md](https://github.com/antflydb/antfly/blob/main/zig/pkg/inference/ONNX.md).
 
-Writes commit through the shard's Raft log. Secondary indexes and enrichments are applied asynchronously after commit. The per-request `sync_level` (`propose` by default, then `write`, `full_text`, `enrichments`, and `full_index`) chooses how far a write progresses before the request returns.
+## Consistency and Transactions
 
-## Network Architecture
+- **Raft per shard.** Writes commit through the owning shard's Raft log, and each shard has its own leader. Only the active leader runs reconciliation, enrichment, and other background mutation work.
+- **Cross-shard writes.** These use coordinator-driven two-phase commit over write intents. The coordinator shard writes a transaction record and participants write intents that stay invisible until resolution. A recovery loop finishes resolution after a coordinator failure.
+- **Optimistic concurrency.** `POST /transactions/commit` is stateless OCC: the client submits read versions (from `X-Antfly-Version`) with its writes, and a changed version aborts with `409`. Server-managed sessions under `/transactions/begin` add staged reads and writes, plus savepoints.
+- **Timestamps.** A committed key's visible version is the transaction's commit timestamp, not its intent timestamp. Batch predicates and transactional predicates compare against the same versioning model.
 
-### Raft Transport
+Design: [DB.md: Transaction / HLC Contract](https://github.com/antflydb/antfly/blob/main/zig/DB.md#transaction--hlc-contract), [AntflyTransaction.tla](https://github.com/antflydb/antfly/blob/main/zig/specs/tla/AntflyTransaction.tla).
 
-Raft messages and snapshots travel between nodes over HTTP (`zig/pkg/antfly/src/raft/transport`). The peer endpoint schema can describe HTTP/2, HTTP/3, and QUIC endpoints, and the HTTP stack (`zig/lib/httpx`) implements QUIC/HTTP-3, but the Raft transport currently uses HTTP.
+## Runtime and Resources
 
-### API Design
+Each node owns one `BackendRuntime`, shared by metadata, data, and every DB opened on the node. It owns bounded `std.Io` executor lanes (general, Raft inbound and outbound, public API, inference, control plane), a durable job lane with per-owner close and drain, and shared storage I/O pools. Subsystems do not spawn private threads. Derived replay, LSM flush and compaction, text merge, enrichment replay, TTL cleanup, and transaction recovery all run as typed work on this runtime. Background execution is an optimization over the inline path, not a separate durability model. That is why the same code runs threaded in a server, inline in tests and embedded use, and under deterministic simulation.
 
-The REST API is designed for:
-- Intuitive resource-based operations
-- Streaming support for large responses
-- Comprehensive error handling
-- OpenAPI specification
+Memory is governed per process. `ResourceManager` owns the physical budget shared by storage caches, indexing, and embedded inference. `ModelManager` decides model residency and eviction. An `AdmissionController` mirrors inference leases into the `ResourceManager`. The budget comes from `--process-memory-budget-mb` (or `ANTFLY_PROCESS_MEMORY_BUDGET_MB`), clamped by a finite cgroup limit, with host memory as a development fallback. Under pressure, optional cache admission is sampled and then stopped. Inference admission fails fast with `503` and `Retry-After` rather than queueing. Design: [MANAGERS.md](https://github.com/antflydb/antfly/blob/main/zig/MANAGERS.md), [DB.md: Runtime Ownership](https://github.com/antflydb/antfly/blob/main/zig/DB.md#runtime-ownership).
 
-## Deployment Modes
+## Availability and Operations
 
-### Standalone Mode
+| Mode | Availability mechanism |
+| --- | --- |
+| Embedded (Lite) | Single writer. Durability is the `fsync` policy, with no replication. |
+| Standalone | Optional Postgres-style hot standby (`antfly standby`): WAL streaming to replicas, fenced promotion, planned `antfly standby switchover`, and `antfly standby follow` to repoint standbys. |
+| Distributed | Multi-Raft replication for metadata and each shard, with quorum writes and online shard splits. |
+| Serverless (in progress) | Durable state in object storage, with stateless, replaceable compute. |
 
-For development and small deployments:
-- Single binary runs metadata, data, and Antfly Inference
-- Zero configuration required
+- **Backups and restore.** Table and cluster backups go to local disk, S3, or GCS as content-addressed manifests and blobs, and incremental capture is supported. There is no point-in-time recovery or WAL archive; restore picks one backup manifest. Design: [BACKUPS.md](https://github.com/antflydb/antfly/blob/main/zig/BACKUPS.md), [HOT_STANDBY.md](https://github.com/antflydb/antfly/blob/main/zig/HOT_STANDBY.md).
+- **Shard split and merge.** Automatic split and merge on `max_shard_size_bytes` (default 64 MiB) is opt-in: set the top-level node config `disable_shard_alloc: false`. Design: [DB.md: Shard Split Contract](https://github.com/antflydb/antfly/blob/main/zig/DB.md#shard-split-contract), [SCALING.md](https://github.com/antflydb/antfly/blob/main/zig/SCALING.md).
+- **Autoscaling.** The Kubernetes [operator](/docs/operator) can scale data nodes on CPU and memory utilization within configured bounds, scaling down one node at a time. It is opt-in. InferencePools scale through a HorizontalPodAutoscaler. Design: [OPERATOR.md](https://github.com/antflydb/antfly/blob/main/go/pkg/operator/OPERATOR.md).
 
-**Minimum Requirements (Standalone Mode):**
-- 2 CPU cores
-- 4GB RAM
-- 20GB storage
-- Suitable for small VPS or local development
+## Upgrades
 
-### Production Mode
+Upgrading from v0.2 to v0.3 is a stop-all upgrade. Take a backup, stop every metadata, data, and standby node, and start the same v0.3 build on all of them: metadata nodes first, then data nodes, then standbys. The first open advances the on-disk format, so rolling back means restoring the stopped copy with the old binary. The procedure is in [Upgrading v0.2 servers](https://github.com/antflydb/antfly/blob/main/docs/reference/v02-server-upgrade.md). Rolling mixed-version upgrades are the contract for releases after v0.3. For a standalone deployment, hot-standby switchover is the online upgrade path.
 
-For scale and reliability:
-- Separate `antfly metadata` and `antfly data` nodes
-- Configurable replication topology
-- Rolling upgrade capability
+## Verification
 
-**Recommended Requirements (Production):**
-- Metadata nodes: 4+ CPU cores, 8GB+ RAM
-- Storage nodes: 8+ CPU cores, 16GB+ RAM, SSD storage
-- Network: Low-latency connections between nodes
+- **VOPR deterministic simulation.** A virtual `std.Io` runs unmodified production code under seeded scheduling, network, clock, crash, and resource faults. Scenarios cover metadata, Raft, transactions, storage, standby, derived workflows, backup, and a full deployment-shaped cluster, and each promoted scenario must replay byte for byte. Design: [VOPR.md](https://github.com/antflydb/antfly/blob/main/zig/VOPR.md).
+- **TLA+.** Specs cover Raft (forked from etcd's), 2PC with OCC, shard split, snapshot transfer, and the LSM lifecycle. Trace validation replays Raft and transaction executions against their models. Design: [specs/tla/README.md](https://github.com/antflydb/antfly/blob/main/zig/specs/tla/README.md).
+- **Chaos and end to end.** Bounded chaos campaigns cover Raft restarts over HTTP, LSM compaction, and hot-standby crashes and partitions, and a Python end-to-end suite exercises the public API and SDKs. Design: [TESTING.md](https://github.com/antflydb/antfly/blob/main/zig/TESTING.md).
 
-### Other Modes
+## Further Reading
 
-- **Antfly Lite**: the engine embedded in a single `.aflite` file (`antfly lite`, C ABI bindings)
-- **Hot standby**: a single node plus an `antfly standby` replica
-- **Serverless**: `antfly serverless` over S3-compatible or GCS object storage
-
-## Performance Optimizations
-
-- **Query Planning**: Cost-based optimizer for complex queries
-- **Connection Pooling**: Efficient resource management for concurrent requests
-- **Memory Management**: Careful control of memory usage with configurable limits
-
-## Future Architecture Goals
-
-We're continuously evolving Antfly's architecture to:
-- Support even larger scale deployments
-- Reduce query latency further
-- Improve multi-model capabilities
-- Enhance operational simplicity
+The full index of design documents is in [zig/ROADMAP.md](https://github.com/antflydb/antfly/blob/main/zig/ROADMAP.md#design-documents). For terms used on this page, see the [Glossary](/docs/glossary).

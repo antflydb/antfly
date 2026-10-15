@@ -67,6 +67,7 @@ fn ownerFence(db: *h.db_mod.DB, alloc: std.mem.Allocator, id: [16]u8, role: topo
 }
 
 fn store(handle: *h.Handle, alloc: std.mem.Allocator, job: ?Job) !void {
+    @import("sql_ddl.zig").invalidate(handle);
     const bytes = if (job) |value| try std.json.Stringify.valueAlloc(alloc, value, .{}) else null;
     defer if (bytes) |value| alloc.free(value);
     var write = try handle.db.core.store.beginWriteTxn();

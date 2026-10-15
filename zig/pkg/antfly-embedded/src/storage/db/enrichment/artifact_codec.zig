@@ -67,6 +67,27 @@ pub fn hashEmbeddingSource(source: []const u8, semantic_producer: []const u8) u6
     return hasher.final();
 }
 
+pub fn hashEmbeddingSourceForGeneration(source: []const u8, semantic_producer: []const u8, generation: u64) u64 {
+    return hashEmbeddingIdentityForGeneration(hashEmbeddingSource(source, semantic_producer), generation);
+}
+
+pub fn hashEmbeddingIdentityForGeneration(original: u64, generation: u64) u64 {
+    if (generation == 0) return original;
+    var bytes: [16]u8 = undefined;
+    std.mem.writeInt(u64, bytes[0..8], original, .little);
+    std.mem.writeInt(u64, bytes[8..16], generation, .little);
+    return std.hash.XxHash64.hash(0, &bytes);
+}
+
+test "embedding reprocess generations preserve legacy hashes and isolate completed work" {
+    const ordinary = hashEmbeddingSource("same text", "model");
+    try std.testing.expectEqual(ordinary, hashEmbeddingSourceForGeneration("same text", "model", 0));
+    const first = hashEmbeddingSourceForGeneration("same text", "model", 1);
+    try std.testing.expect(first != ordinary);
+    try std.testing.expect(first != hashEmbeddingSourceForGeneration("same text", "model", 2));
+    try std.testing.expect(first != hashEmbeddingSourceForGeneration("same text", "replacement model", 1));
+}
+
 pub fn encodeDenseEmbeddingAlloc(alloc: Allocator, source_hash: ?u64, vector: []const f32) ![]u8 {
     return encodeDenseEmbeddingWithOriginAlloc(alloc, source_hash, false, vector);
 }

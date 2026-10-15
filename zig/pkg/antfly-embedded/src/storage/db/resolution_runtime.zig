@@ -28,6 +28,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const AtomicU64 = @import("antfly_platform").atomic.Value(u64);
 const resolver_lib = @import("antfly_resolver");
+pub const replay_read_set = @import("replay_read_set.zig");
 const matcher = @import("antfly_matcher");
 const resolver_catalog = @import("catalog/resolver_catalog.zig");
 const resolution_handoff = @import("resolution_handoff.zig");
@@ -64,6 +65,14 @@ pub const ArtifactWrite = struct {
 /// one durability boundary; `target_hints` is null for hints inferred from the
 /// batch and explicit for a narrower reconciliation such as graph-only replay.
 pub const RecordWrite = struct {
+    inputs: ?replay_read_set.View = null,
+    /// Both phases derive from the same input view. Detached publication must
+    /// admit them together so phase one's own writes cannot invalidate phase
+    /// two. Each phase retains its replay hints and durable handoff semantics.
+    graph_reconciliation: ?struct {
+        keys: []const []const u8,
+        writes: []const ArtifactWrite,
+    } = null,
     batch: derived_types.DerivedBatch,
     artifact_writes: []const ArtifactWrite = &.{},
     artifact_deletes: []const []const u8 = &.{},
@@ -72,6 +81,17 @@ pub const RecordWrite = struct {
     /// split-delta, and HA handoff. The DB writer batches this metadata while
     /// it still owns the hot-standby mutation/fencing boundary.
     publish_resolution_handoff: bool = false,
+
+    pub fn graphReconciliationWrite(self: RecordWrite) ?RecordWrite {
+        const graph = self.graph_reconciliation orelse return null;
+        return .{
+            .inputs = self.inputs,
+            .batch = .{ .changed_artifact_keys = graph.keys },
+            .artifact_writes = graph.writes,
+            .publish_resolution_handoff = graph.writes.len > 0,
+            .target_hints = &.{.graph},
+        };
+    }
 };
 
 pub const DerivedRecordWriter = *const fn (ptr: *anyopaque, write: RecordWrite) anyerror!u64;
@@ -412,7 +432,8 @@ fn processChangedExtractionWithConfigOptions(
 
     const candidate_batch = if (candidate_source) |source| try source.beginBatch(gpa, &.{cfg.table}) else null;
     defer if (candidate_batch) |batch| batch.deinit(gpa);
-    const batch_source = if (candidate_batch) |batch| batch.source else null;
+    var receiving_source = if (candidate_batch) |batch| batch.source.receive() else null;
+    const batch_source = if (receiving_source) |*receiver| receiver.sourceView() else null;
 
     const sibling_excludes = try siblingClaimedLabelsAlloc(gpa, resolvers, cfg);
     defer freeSiblingClaimedLabels(gpa, sibling_excludes);
@@ -1398,7 +1419,7 @@ fn entityRawFromStore(allocator: std.mem.Allocator, store: resolver_lib.Artifact
 pub fn processRecordKeys(
     gpa: std.mem.Allocator,
     resolvers: []const ResolverConfig,
-    store: resolver_lib.ArtifactStore,
+    source_store: resolver_lib.ArtifactStore,
     provider: ?resolver_lib.CandidateProvider,
     changed_artifact_keys: []const []const u8,
     write_ctx: *anyopaque,
@@ -1406,6 +1427,9 @@ pub fn processRecordKeys(
     candidate_source: ?CandidateSource,
     embedder: ?embedder_mod.DenseEmbedder,
 ) !void {
+    var tracked: TrackingStore = .{ .inner = source_store, .reads = .init(gpa) };
+    defer tracked.reads.deinit();
+    const store = tracked.store();
     var pending: PendingRecordCommit = .{};
     defer pending.deinit(gpa);
 
@@ -1465,19 +1489,160 @@ pub fn processRecordKeys(
 
     if (pending.full_keys.items.len > 0) {
         _ = try write_fn(write_ctx, .{
+            .inputs = tracked.reads.view(),
             .batch = .{ .changed_artifact_keys = pending.full_keys.items },
             .artifact_writes = pending.artifact_writes.items,
             .artifact_deletes = pending.artifact_deletes.items,
             .publish_resolution_handoff = true,
+            .graph_reconciliation = if (pending.graph_only_keys.items.len > 0) .{
+                .keys = pending.graph_only_keys.items,
+                .writes = pending.refresh_writes.items,
+            } else null,
         });
+        return;
     }
     if (pending.graph_only_keys.items.len > 0) {
         _ = try write_fn(write_ctx, .{
+            .inputs = tracked.reads.view(),
             .batch = .{ .changed_artifact_keys = pending.graph_only_keys.items },
             .artifact_writes = pending.refresh_writes.items,
             .publish_resolution_handoff = pending.refresh_writes.items.len > 0,
             .target_hints = &.{.graph},
         });
+    }
+}
+
+/// Records local inputs actually observed by the resolver, including negative
+/// reads and candidate ranges. Never retain the caller's temporary key/value.
+const TrackingStore = struct {
+    inner: resolver_lib.ArtifactStore,
+    reads: replay_read_set.Capture,
+    fn store(self: *@This()) resolver_lib.ArtifactStore {
+        return .{ .ptr = self, .vtable = &.{ .get = get, .put = put, .delete = delete, .scan_prefix = scan, .materialize_row = materialize } };
+    }
+    fn get(ptr: *anyopaque, a: Allocator, key: []const u8) anyerror!?[]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const value = try self.inner.get(a, key);
+        errdefer if (value) |bytes| a.free(bytes);
+        try self.reads.notePoint(key, value);
+        return value;
+    }
+    fn put(_: *anyopaque, _: []const u8, _: []const u8) anyerror!void {
+        return error.ReadOnly;
+    }
+    fn delete(_: *anyopaque, _: []const u8) anyerror!void {
+        return error.ReadOnly;
+    }
+    fn materialize(ptr: *anyopaque, a: Allocator, key: []const u8, value: []const u8) anyerror![]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return self.inner.materializeRow(a, key, value);
+    }
+    fn scan(ptr: *anyopaque, lower: []const u8, upper: []const u8, ctx: *anyopaque, consume: *const fn (*anyopaque, []const u8, []const u8) anyerror!void) anyerror!void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const Scan = struct {
+            hash: std.crypto.hash.Blake3 = .init(.{}),
+            last: std.ArrayList(u8) = .empty,
+            alloc: Allocator,
+            ctx: *anyopaque,
+            consume: *const fn (*anyopaque, []const u8, []const u8) anyerror!void,
+            fn visit(raw: *anyopaque, key: []const u8, value: []const u8) anyerror!void {
+                const scan_ctx: *@This() = @ptrCast(@alignCast(raw));
+                replay_read_set.hashEntry(&scan_ctx.hash, key, value);
+                scan_ctx.last.clearRetainingCapacity();
+                try scan_ctx.last.appendSlice(scan_ctx.alloc, key);
+                try scan_ctx.consume(scan_ctx.ctx, key, value);
+            }
+        };
+        const a = self.reads.arena.allocator();
+        var scan_ctx: Scan = .{ .alloc = a, .ctx = ctx, .consume = consume };
+        self.inner.scanPrefix(lower, upper, &scan_ctx, Scan.visit) catch |err| {
+            // A candidate limit can stop the scan early. Validate only its
+            // observed prefix, including the entry that stopped the callback.
+            if (scan_ctx.last.items.len > 0) {
+                try scan_ctx.last.append(a, 0);
+                try self.reads.noteRange(lower, scan_ctx.last.items, replay_read_set.finish(&scan_ctx.hash));
+            }
+            return err;
+        };
+        try self.reads.noteRange(lower, upper, replay_read_set.finish(&scan_ctx.hash));
+    }
+};
+
+/// Native admission regression: negative reads, range phantoms and early-stop
+/// bounds must survive the erased store used by production resolution.
+pub fn testReplayReadTracking(source: backend_erased.Store) !void {
+    var store = source;
+    const a = std.testing.allocator;
+    const Writer = struct {
+        fn put(s: backend_erased.Store, key: []const u8, value: []const u8) !void {
+            var borrowed_store = s;
+            var txn = try borrowed_store.beginWrite();
+            errdefer txn.abort();
+            try txn.put(key, value);
+            try txn.commit();
+        }
+    };
+    var borrowed = store;
+    var adapter: DbArtifactStore(backend_erased.Store) = .{ .store = &borrowed };
+    var tracked: TrackingStore = .{ .inner = adapter.artifactStore(), .reads = .init(a) };
+    defer tracked.reads.deinit();
+    try Writer.put(store, "read-range/a", "one");
+    try Writer.put(store, "read-range/c", "three");
+    const value = (try tracked.store().get(a, "read-range/a")).?;
+    defer a.free(value);
+    try std.testing.expect((try tracked.store().get(a, "read-missing")) == null);
+    {
+        var read = try store.beginRead();
+        defer read.abort();
+        try tracked.reads.view().validate(&read);
+    }
+    try Writer.put(store, "unrelated", "ok");
+    {
+        var read = try store.beginRead();
+        defer read.abort();
+        try tracked.reads.view().validate(&read);
+    }
+    try Writer.put(store, "read-missing", "appeared");
+    {
+        var read = try store.beginRead();
+        defer read.abort();
+        try std.testing.expectError(error.EnrichmentWaitCanceled, tracked.reads.view().validate(&read));
+    }
+    const Consume = struct {
+        fn all(_: *anyopaque, _: []const u8, _: []const u8) anyerror!void {}
+        fn first(_: *anyopaque, _: []const u8, _: []const u8) anyerror!void {
+            return error.TestScanDone;
+        }
+    };
+    var dummy: u8 = 0;
+    var full: TrackingStore = .{ .inner = adapter.artifactStore(), .reads = .init(a) };
+    defer full.reads.deinit();
+    try full.store().scanPrefix("read-range/", "read-range0", &dummy, Consume.all);
+    {
+        var read = try store.beginRead();
+        defer read.abort();
+        try full.reads.view().validate(&read);
+    }
+    try Writer.put(store, "read-range/b", "phantom");
+    {
+        var read = try store.beginRead();
+        defer read.abort();
+        try std.testing.expectError(error.EnrichmentWaitCanceled, full.reads.view().validate(&read));
+    }
+    var limited: TrackingStore = .{ .inner = adapter.artifactStore(), .reads = .init(a) };
+    defer limited.reads.deinit();
+    try std.testing.expectError(error.TestScanDone, limited.store().scanPrefix("read-range/", "read-range0", &dummy, Consume.first));
+    try Writer.put(store, "read-range/z", "outside observed prefix");
+    {
+        var read = try store.beginRead();
+        defer read.abort();
+        try limited.reads.view().validate(&read);
+    }
+    try Writer.put(store, "read-range/0", "new earlier candidate");
+    {
+        var read = try store.beginRead();
+        defer read.abort();
+        try std.testing.expectError(error.EnrichmentWaitCanceled, limited.reads.view().validate(&read));
     }
 }
 
@@ -2264,6 +2429,7 @@ pub const ResolutionRuntime = struct {
     }
 
     pub fn deinit(self: *ResolutionRuntime) void {
+        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionDeinit", .{self}) catch @panic("incompatible storage owner");
         self.stop();
         self.store_handle.deinit();
         self.* = undefined;
@@ -2314,6 +2480,7 @@ pub const ResolutionRuntime = struct {
     }
 
     pub fn start(self: *ResolutionRuntime) !void {
+        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionStart", .{self});
         // Without io there is no background thread; the stage is then driven
         // synchronously via catchUp (e.g. from runUntilIdle).
         const io = self.io orelse return;
@@ -2327,6 +2494,7 @@ pub const ResolutionRuntime = struct {
     }
 
     pub fn stop(self: *ResolutionRuntime) void {
+        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionStop", .{self}) catch @panic("incompatible storage owner");
         self.shutdown_flag.store(true, .release);
         if (self.io) |io| {
             self.worker_mutex.lockUncancelable(io);
@@ -2357,6 +2525,7 @@ pub const ResolutionRuntime = struct {
     /// unchanged decisions use graph-only reconciliation. `applied_sequence`
     /// advances only after those durable writes.
     pub fn catchUp(self: *ResolutionRuntime) !void {
+        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionCatchUp", .{self});
         lockMutex(&self.catch_up_mutex);
         defer self.catch_up_mutex.unlock();
         return self.catchUpLocked(false);
@@ -2422,6 +2591,7 @@ pub const ResolutionRuntime = struct {
     /// Mark the resolver backfill dirty. `runReresolveBacklogWindow` then enqueues
     /// extraction artifacts in bounded windows into the normal replay pipeline.
     pub fn requestReresolveBacklog(self: *ResolutionRuntime) !void {
+        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionRequestReresolveBacklog", .{self});
         lockMutex(&self.catch_up_mutex);
         defer self.catch_up_mutex.unlock();
         defer self.notifyBackfill();
@@ -2440,6 +2610,7 @@ pub const ResolutionRuntime = struct {
     /// True when a prior resolver catalog mutation has durably marked corpus
     /// backfill dirty but the bounded reresolve backlog has not fully drained.
     pub fn hasReresolveBacklog(self: *ResolutionRuntime) !bool {
+        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionHasReresolveBacklog", .{self});
         lockMutex(&self.catch_up_mutex);
         defer self.catch_up_mutex.unlock();
         return (try hasReresolveCursor(&self.store_handle.store, resolver_catalog.reresolve_resume_key)) or
@@ -2450,6 +2621,7 @@ pub const ResolutionRuntime = struct {
     /// re-resolution. This does not run resolver work inline; it appends a replay
     /// record and lets `catchUp` process it through the normal stage.
     pub fn runReresolveBacklogWindow(self: *ResolutionRuntime) !ReresolveEnqueueResult {
+        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionRunReresolveBacklogWindow", .{self});
         lockMutex(&self.catch_up_mutex);
         defer self.catch_up_mutex.unlock();
         return self.runReresolveBacklogWindowLocked();
@@ -2523,6 +2695,7 @@ pub const ResolutionRuntime = struct {
     /// The review queue: every stored review-band mention awaiting curation.
     /// Caller owns the result (`freePendingReviews`).
     pub fn pendingReviews(self: *ResolutionRuntime, alloc: std.mem.Allocator) ![]PendingReview {
+        if (comptime @import("../engine_selection.zig").enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("resolutionPendingReviews", .{ self, alloc });
         lockMutex(&self.catch_up_mutex);
         defer self.catch_up_mutex.unlock();
         const resolvers = try self.index_manager.listResolvers(self.alloc);
@@ -3101,6 +3274,7 @@ const CaptureWriter = struct {
             }
         }
         self.calls += 1;
+        if (write.graphReconciliationWrite()) |graph| return writeFn(ptr, graph);
         return self.calls;
     }
 };

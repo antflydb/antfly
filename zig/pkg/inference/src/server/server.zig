@@ -9637,8 +9637,13 @@ pub const Node = struct {
             var device_lease: ?runtime.tier.memory.AdmissionLease = null;
             defer if (device_lease) |*owned| owned.release();
             if (backend == .metal or backend == .cuda) {
-                const device_limits = self.config.generation_budget_overrides.apply(self.defaultGenerationLimits(.gpu));
                 const full_device_bytes = try boundary_executor.deviceScratchUpperBound(execution_options);
+                const device_limits = try runtime.tier.memory.withAutomaticScratchFloor(
+                    self.config.generation_budget_overrides.apply(self.defaultGenerationLimits(.gpu)),
+                    self.config.generation_budget_overrides.scratch_limit_bytes,
+                    working_bytes,
+                    full_device_bytes,
+                );
                 if (workspace_plan) |plan| {
                     request_options.device.max_encoder_device_bytes = try plan.requestEncoderLimit(execution_options.device.max_encoder_device_bytes);
                     request_options.profile_encoder_device_limit = execution_options.device.max_encoder_device_bytes;
@@ -9792,8 +9797,13 @@ pub const Node = struct {
         var device_lease: ?runtime.tier.memory.AdmissionLease = null;
         defer if (device_lease) |*owned| owned.release();
         if (backend == .metal or backend == .cuda) {
-            const device_limits = self.config.generation_budget_overrides.apply(self.defaultGenerationLimits(.gpu));
             const device_bytes = try span_v2_executor.deviceScratchUpperBound(config, longest);
+            const device_limits = try runtime.tier.memory.withAutomaticScratchFloor(
+                self.config.generation_budget_overrides.apply(self.defaultGenerationLimits(.gpu)),
+                self.config.generation_budget_overrides.scratch_limit_bytes,
+                working_bytes,
+                device_bytes,
+            );
             budget.* = runtime.tier.memory.RunBudget.init(device_limits);
             try budget.reserveEstimate(.{ .prompt_tokens = 0, .retained_tokens = 0, .kv_bytes = 0, .kv_tier = .host, .scratch_bytes = working_bytes, .scratch_tier = .host });
             try budget.reserveEstimate(.{ .prompt_tokens = 0, .retained_tokens = 0, .kv_bytes = 0, .kv_tier = .backend, .scratch_bytes = device_bytes, .scratch_tier = .backend });

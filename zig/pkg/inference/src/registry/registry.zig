@@ -31,7 +31,7 @@ const decide_qualification = @import("../models/gliner_decide_qualification.zig"
 const safetensors_mod = @import("../models/safetensors.zig");
 const managed_receipt = @import("managed_receipt.zig");
 const c_file = @import("../util/c_file.zig");
-const pull_diagnostics = @import("pull_diagnostics.zig");
+pub const pull_diagnostics = @import("pull_diagnostics.zig");
 pub const download = @import("download.zig");
 pub const qwen3vl_catalog = @import("qwen3vl_catalog.zig");
 pub const qwen3_embedding_catalog = @import("qwen3_embedding_catalog.zig");
@@ -527,7 +527,7 @@ pub const ModelRegistry = struct {
         capabilities_csv: ?[]const u8,
         projector_selection: download.ProjectorSelection,
         caller_sink: download.ProgressSink,
-    ) !void {
+    ) anyerror!void {
         // Both CLIs and the linked engine use this path. Preserve the cause
         // and report it here before a caller reduces it to a startup error.
         return self.pullWithProgressImpl(io, ref_str, hub_config, tasks_csv, capabilities_csv, projector_selection, caller_sink) catch |err| {

@@ -644,6 +644,7 @@ pub const DocStore = struct {
         /// Exact key presence in this transaction's view. Physical references
         /// prove presence without resolving external source/artifact payloads.
         pub fn contains(self: *Txn, key: []const u8) !bool {
+            if (self.write) |*write| return write.contains(key);
             if (self.probe) |*probe| return try probe.contains(key);
             _ = self.getPhysical(key) catch |err| switch (err) {
                 error.NotFound => return false,
@@ -776,7 +777,7 @@ pub const DocStore = struct {
             if (try graphRelationshipRetiredCached(self, self.alloc, key, &self.graph_retirements_maybe)) return;
 
             try maintainGraphIncoming(self, self.alloc, key, value, false, false);
-            try self.document_revisions.touch(self.alloc, key);
+            try self.document_revisions.touchValue(self.alloc, key, value);
             try self.artifact_footprint.touch(key, value);
             try self.range_mutation.touch(self, key);
             try self.artifact_inputs.touch(self.alloc, self, key, value);
@@ -800,7 +801,7 @@ pub const DocStore = struct {
                     else => return err,
                 };
             }
-            try self.document_revisions.touch(self.alloc, key);
+            try self.document_revisions.touchValue(self.alloc, key, null);
             try self.artifact_footprint.touch(key, null);
             try self.range_mutation.touch(self, key);
             try self.artifact_inputs.touch(self.alloc, self, key, null);
@@ -849,6 +850,12 @@ pub const DocStore = struct {
             defer cursor.close();
             const row = (try cursor.seekAtOrAfter(prefix)) orelse return false;
             return std.mem.startsWith(u8, row.key, prefix);
+        }
+
+        pub fn openPhysicalKeyCursorAdapter(self: *Txn) !CursorAdapter {
+            var cursor = try self.openPhysicalCursorAdapter();
+            cursor.setKeysOnly();
+            return cursor;
         }
 
         pub fn openPhysicalCursorAdapter(self: *Txn) !CursorAdapter {
@@ -952,7 +959,7 @@ pub const DocStore = struct {
                 if (try graphRelationshipRetiredCached(self, self.alloc, key, self.graph_retirements_maybe)) return;
 
                 try maintainGraphIncoming(self, self.alloc, key, value, false, false);
-                try self.document_revisions.touch(self.alloc, key);
+                try self.document_revisions.touchValue(self.alloc, key, value);
                 try self.artifact_footprint.touch(key, value);
                 try self.range_mutation.touch(self, key);
                 try self.artifact_inputs.touch(self.alloc, self, key, value);
@@ -989,7 +996,7 @@ pub const DocStore = struct {
                 if (!retirement_checked and try graphRelationshipRetiredCached(self, self.alloc, key, self.graph_retirements_maybe)) return;
 
                 try maintainGraphIncoming(self, self.alloc, key, value, true, retirement_checked);
-                try self.document_revisions.touch(self.alloc, key);
+                try self.document_revisions.touchValue(self.alloc, key, value);
                 try self.artifact_footprint.touch(key, value);
                 // Active tracking requires point updates for bucket counters.
                 // Restore bulk writers publish into a fresh identity; they may
@@ -1025,7 +1032,7 @@ pub const DocStore = struct {
                         else => return err,
                     };
                 }
-                try self.document_revisions.touch(self.alloc, key);
+                try self.document_revisions.touchValue(self.alloc, key, null);
                 try self.artifact_footprint.touch(key, null);
                 try self.range_mutation.touch(self, key);
                 try self.artifact_inputs.touch(self.alloc, self, key, null);
@@ -2818,6 +2825,7 @@ pub const DocStore = struct {
             for (deletes.items) |key| alloc.free(key);
             deletes.deinit(alloc);
         }
+        try deletes.ensureTotalCapacityPrecise(alloc, replay_truncate_batch_keys);
 
         // Replay lanes are append-only. Capturing each lane independently is
         // sufficient below an acknowledged retirement watermark, and avoids
@@ -2825,44 +2833,51 @@ pub const DocStore = struct {
         // enrichment completion.
         for (0..replay_hints.len + 1) |lane| {
             const ordinal = if (lane < replay_hints.len) replayHintOrdinal(replay_hints[lane]) else internal_keys.replay_all_kind;
-            var txn = try self.beginReplayLaneScanTxn(ordinal, 0);
-            defer txn.abort();
-            var cur = try txn.openCursor();
-            defer cur.close();
-            const lower = internal_keys.replayRangeLower(ordinal, 0);
-            const upper = internal_keys.replayRangeUpper(ordinal);
-            cur.setUpperBound(&upper);
-            var entry = try cur.seekAtOrAfter(&lower);
-            while (entry) |kv| : (entry = try cur.next()) {
-                if (std.mem.order(u8, kv.key, &upper) != .lt) break;
-                const sequence = internal_keys.parseReplayEntrySequence(kv.key, ordinal) orelse break;
-                if (sequence > up_to_sequence) break;
-                try deletes.append(alloc, try alloc.dupe(u8, kv.key));
+            var from_sequence: u64 = 0;
+            while (true) {
+                var last_sequence = from_sequence;
+                {
+                    var txn = try self.beginReplayLaneScanTxn(ordinal, from_sequence);
+                    defer txn.abort();
+                    var cur = try txn.openCursor();
+                    defer cur.close();
+                    const lower = internal_keys.replayRangeLower(ordinal, from_sequence);
+                    const upper = internal_keys.replayRangeUpper(ordinal);
+                    cur.setUpperBound(&upper);
+                    var entry = try cur.seekAtOrAfter(&lower);
+                    while (entry) |kv| : (entry = try cur.next()) {
+                        if (std.mem.order(u8, kv.key, &upper) != .lt) break;
+                        const sequence = internal_keys.parseReplayEntrySequence(kv.key, ordinal) orelse break;
+                        if (sequence > up_to_sequence) break;
+                        const key = try alloc.dupe(u8, kv.key);
+                        errdefer alloc.free(key);
+                        try deletes.append(alloc, key);
+                        last_sequence = sequence;
+                        if (deletes.items.len == replay_truncate_batch_keys) break;
+                    }
+                }
+                if (deletes.items.len == 0) break;
+                // Release the read generation before each bounded commit.
+                // Acknowledged rows are never replayed again; interruption
+                // leaves idempotent progress for the next maintenance pass.
+                var batch = try self.beginWriteBatch();
+                errdefer batch.abort();
+                for (deletes.items) |key| {
+                    batch.delete(key) catch |err| switch (err) {
+                        error.NotFound => {},
+                        else => return err,
+                    };
+                }
+                try batch.commit();
+                for (deletes.items) |key| alloc.free(key);
+                deletes.clearRetainingCapacity();
+                if (last_sequence >= up_to_sequence or last_sequence == std.math.maxInt(u64)) break;
+                from_sequence = last_sequence + 1;
             }
-        }
-
-        // Commit in bounded chunks. Entries at or below an acknowledged
-        // retirement watermark are never read again, so deleting them is
-        // idempotent and partial progress is safe. A single batch for a large
-        // retained backlog exceeds the LSM's per-commit admission limit
-        // (ResourceBudgetExceeded), which failed every reopen of a large table.
-        var start: usize = 0;
-        while (start < deletes.items.len) {
-            const end = @min(start + replay_truncate_batch_keys, deletes.items.len);
-            var batch = try self.beginWriteBatch();
-            errdefer batch.abort();
-            for (deletes.items[start..end]) |key| {
-                batch.delete(key) catch |err| switch (err) {
-                    error.NotFound => {},
-                    else => return err,
-                };
-            }
-            try batch.commit();
-            start = end;
         }
     }
 
-    const replay_truncate_batch_keys: usize = 64 * 1024;
+    const replay_truncate_batch_keys: usize = 4096;
 
     /// Scan all keys with the given prefix. Caller owns returned slices.
     pub fn scanPrefix(self: *DocStore, alloc: Allocator, prefix: []const u8) ![]OwnedKVPair {
@@ -5147,6 +5162,54 @@ test "docstore replay rows use replay keyspace" {
     try std.testing.expectEqual(@as(usize, 0), remaining.len);
 }
 
+test "docstore replay retirement pages keys within bounded memory and preserves unacknowledged rows" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf);
+    defer cleanupTmp(path);
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+    const cutoff: u64 = DocStore.replay_truncate_batch_keys * 2 + 17;
+    const hints = [_]u8{ internal_keys.replay_all_kind, replayHintOrdinal(.dense_vector) };
+    var sequence: u64 = 1;
+    while (sequence <= cutoff + 1) {
+        var batch = try store.beginWriteBatch();
+        errdefer batch.abort();
+        try batch.put(&internal_keys.replay_meta_init_key, "1");
+        const end = @min(sequence + 1024, cutoff + 2);
+        while (sequence < end) : (sequence += 1) {
+            const payload = try change_journal_mod.encodeRecord(alloc, .{ .sequence = sequence, .changed_doc_keys = &.{"doc"}, .target_hints = &.{.dense_vector} });
+            defer alloc.free(payload);
+            for (hints) |hint| {
+                const key = internal_keys.replayEntryKey(hint, sequence);
+                try batch.put(&key, payload);
+            }
+        }
+        try batch.commit();
+    }
+    const resources = @import("resource_manager.zig");
+    var budgets = resources.Options.defaultBudgets();
+    budgets[@backingInt(resources.Slice.lsm_read_working_set)] = .{ .hard_limit_bytes = 128 * 1024 };
+    var manager = resources.ResourceManager.init(.{ .budgets = budgets, .memory_budget = .{ .hard_limit_bytes = 128 * 1024 } });
+    defer manager.deinit(alloc);
+    var bounded = resources.BudgetedAllocator.init(&manager, .lsm_read_working_set, alloc, 1);
+    defer bounded.deinit();
+    try store.truncateReplayUpTo(bounded.allocator(), cutoff);
+    // A second pass has no retired debt. Both lanes preserve the next row.
+    try store.truncateReplayUpTo(bounded.allocator(), cutoff);
+    for (hints) |hint| {
+        const retired = internal_keys.replayEntryKey(hint, cutoff);
+        try std.testing.expectError(error.NotFound, store.get(alloc, &retired));
+        const remaining = internal_keys.replayEntryKey(hint, cutoff + 1);
+        const payload = try store.get(alloc, &remaining);
+        defer alloc.free(payload);
+        var decoded = try change_journal_mod.decodeRecord(alloc, payload);
+        defer decoded.deinit();
+        try std.testing.expectEqual(cutoff + 1, decoded.record.sequence);
+    }
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_read_working_set).used_bytes);
+}
+
 test "docstore indexes replay rows by hint and truncates them" {
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
@@ -6281,4 +6344,52 @@ test "graph endpoint cleanup bulk retirement mask releases ownership on decoding
     var batch = try store.beginWriteBatch();
     defer batch.abort();
     try std.testing.expectError(error.InvalidGraphRetirement, DocStore.graphBulkRetirementMask(alloc, batch.asTxn(), &.{.{ .key = edge, .value = "edge" }}));
+}
+
+test "public graph metric borrowed wire content authority shares txn batch append abort and reopen boundaries" {
+    const a = std.testing.allocator;
+    const revision = @import("document_mutation_revision.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const key = try internal_keys.documentKeyAlloc(a, "doc");
+    defer a.free(key);
+    var expected: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("last", &expected, .{});
+    for (0..2) |pass| {
+        var backend = try lsm_backend.Backend.open(a, path, .{ .flush_threshold_bytes = 1024 * 1024 });
+        defer backend.close();
+        var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+        defer store.close();
+        if (pass == 0) {
+            try store.put(key, "first");
+            var pinned = try store.beginReadTxn();
+            defer pinned.abort();
+            const before = (try revision.loadContent(&pinned, key)).?;
+            {
+                var writer = try store.beginWriteTxn();
+                defer writer.abort();
+                try writer.put(key, "aborted");
+            }
+            {
+                var batch = try store.beginWriteBatch();
+                errdefer batch.abort();
+                try batch.asTxn().appendPut(key, "last");
+                try batch.commit();
+            }
+            try std.testing.expectEqualSlices(u8, &before.digest, &(try revision.loadContent(&pinned, key)).?.digest);
+        }
+        var current = try store.beginReadTxn();
+        defer current.abort();
+        try std.testing.expectEqualSlices(u8, &expected, &(try revision.loadContent(&current, key)).?.digest);
+        try std.testing.expectEqualStrings("last", try current.get(key));
+        if (pass == 1) {
+            try store.delete(key);
+            var deleted = try store.beginReadTxn();
+            defer deleted.abort();
+            try std.testing.expect((try revision.loadContent(&deleted, key)) == null);
+            try std.testing.expectError(error.NotFound, deleted.get(key));
+        }
+    }
 }

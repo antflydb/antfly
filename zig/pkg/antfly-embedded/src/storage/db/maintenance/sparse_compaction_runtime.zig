@@ -31,7 +31,9 @@ pub const Config = struct {
 
 pub var test_start_failures_remaining: std.atomic.Value(u32) = .init(0);
 
-pub const SparseCompactionRuntime = if (builtin.os.tag == .freestanding) struct {
+// Named branches keep native ABI identities stable across LLVM owners.
+pub const SparseCompactionRuntime = if (builtin.os.tag == .freestanding) UnsupportedSparseCompactionRuntime else PlatformSparseCompactionRuntime;
+const UnsupportedSparseCompactionRuntime = struct {
     config: Config,
 
     pub fn init(
@@ -78,7 +80,8 @@ pub const SparseCompactionRuntime = if (builtin.os.tag == .freestanding) struct 
         _ = self;
         return false;
     }
-} else struct {
+};
+const PlatformSparseCompactionRuntime = struct {
     alloc: Allocator,
     /// Borrowed backend-neutral executor owned by BackendRuntime.
     io: ?Io,
