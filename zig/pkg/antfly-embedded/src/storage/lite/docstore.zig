@@ -38,7 +38,7 @@ test "lite detached writer admission fences documents and index catalogs" {
         denied: bool = false,
         entered: usize = 0,
         active: usize = 0,
-        fn enter(ptr: *anyopaque) !void {
+        fn enter(ptr: *anyopaque, _: PublicationScope) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.denied) return error.EnrichmentSourceChanged;
             self.entered += 1;
@@ -1218,6 +1218,7 @@ const MutationRequest = struct {
     done: bool = false,
     leader: bool = false,
     durable: bool = true,
+    index_only: bool = false,
     result: anyerror!void = {},
 };
 
@@ -1295,9 +1296,11 @@ var next_score_cache_owner: std.atomic.Value(u64) = .init(1);
 /// Optional owner admission around every document/index publication.
 /// Detached computation can retain this Store without retaining a file
 /// writer lease; admission must validate its checkpoint before mutation.
+pub const PublicationScope = enum { primary, index, reclamation };
+
 pub const WriterAdmission = struct {
     ptr: *anyopaque,
-    enter: *const fn (*anyopaque) anyerror!void,
+    enter: *const fn (*anyopaque, PublicationScope) anyerror!void,
     leave: *const fn (*anyopaque) void,
 };
 
@@ -1348,6 +1351,7 @@ pub const Store = struct {
     maintenance_running: bool = false,
     generation_workspace_active: bool = false,
     maintenance_start_suppressed: bool = false,
+    test_index_publication_hook: if (@import("builtin").is_test) ?struct { ptr: *anyopaque, notify: *const fn (*anyopaque) anyerror!void } else void = if (@import("builtin").is_test) null else {},
     test_maintenance_hook: if (@import("builtin").is_test) ?MaintenanceTestHook else void = if (@import("builtin").is_test) null else {},
     test_maintenance_cycles: if (@import("builtin").is_test) std.atomic.Value(u64) else void = if (@import("builtin").is_test) .init(0) else {},
     admission_refresh_size: u64 = 0,
@@ -1794,6 +1798,21 @@ pub const Store = struct {
         try self.submitMutation(&request, Request.apply);
     }
 
+    /// Owner-only rebinding after proving immutable index inputs unchanged.
+    /// Primary and index publications share the newest allocator/checkpoint;
+    /// existing read pins keep their original immutable roots.
+    pub fn refreshIndexPublicationCheckpoint(self: *Store, header: native.Header) !void {
+        lockStore(self);
+        defer self.mutex.unlock();
+        if (self.file.transaction_header != null or self.file.durable_header != null or
+            self.file.checkpoint_publication_uncertain or self.secret_store_uncertain or
+            self.file.header.page_size != header.page_size or
+            self.file.header.indexed_reclamation != header.indexed_reclamation) return error.EnrichmentWaitCanceled;
+        try self.file.adoptIndexPublicationHeader(header);
+        self.assessment_cache = null;
+        self.publishReadCheckpointAssumeLocked();
+    }
+
     pub fn backendStore(self: *Store) NativeBackendStore {
         return NativeBackendStore.init(self);
     }
@@ -1895,7 +1914,7 @@ pub const Store = struct {
             return;
         }
         {
-            if (self.writer_admission) |admission| try admission.enter(admission.ptr);
+            if (self.writer_admission) |admission| try admission.enter(admission.ptr, .reclamation);
             defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
             lockStore(self);
             defer self.mutex.unlock();
@@ -1924,7 +1943,7 @@ pub const Store = struct {
         var assessed_indexed: bool = undefined;
         var assessed_generation: u64 = undefined;
         {
-            if (self.writer_admission) |admission| try admission.enter(admission.ptr);
+            if (self.writer_admission) |admission| try admission.enter(admission.ptr, .reclamation);
             defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
             lockStore(self);
             defer self.mutex.unlock();
@@ -2254,7 +2273,7 @@ pub const Store = struct {
         var capture = native.ChangeCapture{};
         defer capture.deinit(self.allocator);
         var source = blk: {
-            if (self.writer_admission) |admission| try admission.enter(admission.ptr);
+            if (self.writer_admission) |admission| try admission.enter(admission.ptr, .reclamation);
             defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
             lockStore(self);
             defer self.mutex.unlock();
@@ -2452,7 +2471,7 @@ pub const Store = struct {
     /// Open a read-only snapshot at the live header and move the captured
     /// changes out of `capture` into `changes`. Caller holds the store mutex.
     fn takeResidualVacuumChangesAssumeLocked(self: *Store, capture: *native.ChangeCapture, changes: *native.ChangeCapture) !native.NativeFile {
-        if (self.writer_admission) |admission| try admission.enter(admission.ptr);
+        if (self.writer_admission) |admission| try admission.enter(admission.ptr, .reclamation);
         defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
         const io = self.file.runtime();
         if (capture.overflow) {
@@ -2595,7 +2614,15 @@ pub const Store = struct {
         return self.submitMutationWithDurability(context, apply, true);
     }
 
+    pub fn submitIndexMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool) !void {
+        return self.submitScopedMutation(context, apply, durable, true);
+    }
+
     pub fn submitMutationWithDurability(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool) !void {
+        return self.submitScopedMutation(context, apply, durable, false);
+    }
+
+    fn submitScopedMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool, index_only: bool) !void {
         if (self.read_only) return error.ReadOnly;
         defer {
             // Start after publication: even one large final mutation crossing
@@ -2604,7 +2631,7 @@ pub const Store = struct {
             self.maintenance_wake.set(self.file.runtime());
         }
         const io = self.file.runtime();
-        var request = MutationRequest{ .context = context, .apply = apply, .durable = durable };
+        var request = MutationRequest{ .context = context, .apply = apply, .durable = durable, .index_only = index_only };
         self.commit_mutex.lockUncancelable(io);
         if (self.commit_tail) |tail| tail.next = &request else self.commit_head = &request;
         self.commit_tail = &request;
@@ -2642,7 +2669,11 @@ pub const Store = struct {
     }
 
     fn applyMutationGroup(self: *Store, head: *MutationRequest) !void {
-        if (self.writer_admission) |admission| try admission.enter(admission.ptr);
+        var index_only = true;
+        var member: ?*MutationRequest = head;
+        while (member) |item| : (member = item.next) index_only = index_only and item.index_only;
+        if (@import("builtin").is_test) if (index_only) if (self.test_index_publication_hook) |hook| try hook.notify(hook.ptr);
+        if (self.writer_admission) |admission| try admission.enter(admission.ptr, if (index_only) .index else .primary);
         defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
         lockStore(self);
         defer self.mutex.unlock();
@@ -2674,7 +2705,7 @@ pub const Store = struct {
 
     pub fn reserveWriterSlot(self: *Store) !void {
         if (self.read_only) return error.ReadOnly;
-        if (self.writer_admission) |admission| try admission.enter(admission.ptr);
+        if (self.writer_admission) |admission| try admission.enter(admission.ptr, .primary);
         errdefer if (self.writer_admission) |admission| admission.leave(admission.ptr);
         const io = self.file.runtime();
         self.writer_mutex.lockUncancelable(io);
@@ -2686,7 +2717,7 @@ pub const Store = struct {
 
     pub fn reserveWriterSlotYielding(self: *Store) !void {
         if (self.read_only) return error.ReadOnly;
-        if (self.writer_admission) |admission| try admission.enter(admission.ptr);
+        if (self.writer_admission) |admission| try admission.enter(admission.ptr, .primary);
         errdefer if (self.writer_admission) |admission| admission.leave(admission.ptr);
         const io = self.file.runtime();
         self.writer_mutex.lockUncancelable(io);

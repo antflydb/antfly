@@ -265,6 +265,39 @@ pub const GeneratedRecordWriter = *const fn (
     source_guards: []const GeneratedSourceGuard,
     fence: ?GeneratedWriteFence,
 ) anyerror!GeneratedRecordCommit;
+/// An owner may deliver completed results to its current runtime. The receiver
+/// must validate namespace/catalog, lease tenure, and sources transactionally.
+pub const GeneratedPublicationPort = struct {
+    ptr: *anyopaque,
+    commit: GeneratedRecordWriter,
+    heartbeat: *const fn (*anyopaque, GeneratedWriteFence, u64, u64) anyerror!bool,
+    acquire_store: *const fn (*anyopaque, ?GeneratedWriteFence, u64) anyerror!GeneratedStoreLease,
+};
+/// A short owner lease around a storage-only operation. No provider execution
+/// is allowed while this lease is held. The borrowed store belongs to the live
+/// namespace; release also refreshes the detached reader's primary checkpoint.
+pub const GeneratedStoreLease = struct {
+    store: backend_erased.Store,
+    ptr: *anyopaque,
+    release: *const fn (*anyopaque) void,
+    guard_key: *const fn (*anyopaque, []const u8) anyerror!void,
+};
+
+const RuntimePublicationStore = struct {
+    lease: ?GeneratedStoreLease = null,
+    fn init(runtime: *EnrichmentRuntime) !@This() {
+        return .{ .lease = if (runtime.generated_publication) |port| try port.acquire_store(port.ptr, currentGeneratedWriteFence(runtime), runtime.clock.nowRealtimeMs()) else null };
+    }
+    fn store(self: *@This(), runtime: *EnrichmentRuntime) *backend_erased.Store {
+        return if (self.lease) |*lease| &lease.store else &runtime.store;
+    }
+    fn deinit(self: *@This()) void {
+        if (self.lease) |lease| lease.release(lease.ptr);
+    }
+};
+
+pub const GeneratedRecordBatch = derived_types.DerivedBatch;
+
 pub const ArtifactUnitTurnCommit = struct {
     ptr: *anyopaque,
     commit: *const fn (*anyopaque, ?*const @import("../artifact_unit_jobs.zig").DocumentTurn, ?*const @import("../artifact_unit_jobs.zig").WorkTurn) anyerror!void,
@@ -4408,6 +4441,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     alloc: Allocator,
     status_hook: ?StatusHook = null,
     dense_result_cache: ?embedder_mod.DenseResultCache = null,
+    generated_publication: ?GeneratedPublicationPort = null,
     shared_pdf_windows: ?*SharedPdfWindowScheduler = null,
     /// Borrowed from the owning DB, which stops and destroys this runtime
     /// before releasing BackendRuntime.
@@ -5039,6 +5073,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     isolated_failed_sources: std.StringHashMapUnmanaged(void) = .empty,
     status_hook: ?StatusHook = null,
     dense_result_cache: ?embedder_mod.DenseResultCache = null,
+    generated_publication: ?GeneratedPublicationPort = null,
     future: ?background_runtime_mod.MaintenanceScheduler.Handle = null,
 
     pub fn init(
@@ -20197,8 +20232,15 @@ fn storePutPrivateBatchWithRetry(runtime: ?*EnrichmentRuntime, store: *backend_e
 }
 
 fn storePutPrivateBatch(runtime: ?*EnrichmentRuntime, store: *backend_erased.Store, writes: []const KVPair, deletes: []const []const u8) !void {
+    var publication_store = if (runtime) |owner| if (store == &owner.store) try RuntimePublicationStore.init(owner) else RuntimePublicationStore{} else RuntimePublicationStore{};
+    defer publication_store.deinit();
+    const live_store = if (publication_store.lease) |*lease| &lease.store else store;
+    if (publication_store.lease) |lease| {
+        for (writes) |write| try lease.guard_key(lease.ptr, write.key);
+        for (deletes) |key| try lease.guard_key(lease.ptr, key);
+    }
     const fence = if (runtime) |owner| try requiredRuntimeStoreWriteFence(owner) else null;
-    var batch = try store.beginBatch();
+    var batch = try live_store.beginBatch();
     errdefer batch.abort();
     if (runtime) |owner| try validateRuntimeStoreWriteFenceTxn(owner, &batch, fence);
     for (writes) |write| try ordered_publication.requireLegacyMaterialization(&batch, write.key);
@@ -24224,6 +24266,15 @@ fn storeGuardedEmbeddings(runtime: *EnrichmentRuntime, writes: []const GuardedEm
         return;
     }
     for (writes) |write| if (write.ordered_input != null) return error.ArtifactCatalogDrift;
+    if (runtime.generated_publication != null) {
+        var publication_store = try RuntimePublicationStore.init(runtime);
+        defer publication_store.deinit();
+        var txn = try publication_store.store(runtime).beginWrite();
+        errdefer txn.abort();
+        const fence = try requiredRuntimeStoreWriteFence(runtime);
+        try validateRuntimeStoreWriteFenceTxn(runtime, &txn, fence);
+        return storeGuardedEmbeddingsTxn(runtime, &txn, writes, accepted);
+    }
     if (runtime.artifact_store) |store| {
         var txn = try store.beginWriteTxn();
         errdefer txn.abort();
@@ -29705,9 +29756,12 @@ fn coverageReceiptIsCurrent(runtime: *EnrichmentRuntime, txn: anytype, transitio
 }
 
 fn saveAppliedSequenceWithRetry(runtime: *EnrichmentRuntime, scope: []const u8, sequence: u64) !void {
+    var publication_store = try RuntimePublicationStore.init(runtime);
+    defer publication_store.deinit();
+    const live_store = publication_store.store(runtime);
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
-        var checkpoint = enrichment_state.loadProjectionCheckpoint(runtime.alloc, runtime.store, scope) catch |err| switch (err) {
+        var checkpoint = enrichment_state.loadProjectionCheckpoint(runtime.alloc, live_store.*, scope) catch |err| switch (err) {
             error.WriterLocked => {
                 if (attempt >= writer_locked_retry_count) return err;
                 backoffWriterLockRetry();
@@ -29718,7 +29772,7 @@ fn saveAppliedSequenceWithRetry(runtime: *EnrichmentRuntime, scope: []const u8, 
         checkpoint.applied_sequence = sequence;
         checkpoint.status = runtimeProjectionStatus(runtime.retrying, runtime.worker_failed);
         checkpoint.config_hash = try enrichmentCatalogConfigHash(runtime.alloc, runtime.index_manager);
-        enrichment_state.saveProjectionCheckpoint(runtime.store, scope, checkpoint) catch |err| switch (err) {
+        enrichment_state.saveProjectionCheckpoint(live_store.*, scope, checkpoint) catch |err| switch (err) {
             error.WriterLocked => {
                 if (attempt >= writer_locked_retry_count) return err;
                 backoffWriterLockRetry();
@@ -29794,9 +29848,12 @@ fn saveReplayCursorForGroup(
     applied_sequence: u64,
     group: enrichment_worker.PendingDocumentGroup,
 ) !void {
+    var publication_store = try RuntimePublicationStore.init(runtime);
+    defer publication_store.deinit();
+    const live_store = publication_store.store(runtime);
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
-        enrichment_state.saveReplayCursor(runtime.store, stream.cursorScope(), .{
+        enrichment_state.saveReplayCursor(live_store.*, stream.cursorScope(), .{
             .base_applied_sequence = applied_sequence,
             .sequence = group.sequence,
             .doc_key = @constCast(group.doc_key),
@@ -29849,9 +29906,12 @@ test "mid-scan checkpoint only advances a stream with nothing outstanding" {
 }
 
 fn clearReplayCursorForStreamWithRetry(runtime: *EnrichmentRuntime, stream: ReplayStream) !void {
+    var publication_store = try RuntimePublicationStore.init(runtime);
+    defer publication_store.deinit();
+    const live_store = publication_store.store(runtime);
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
-        enrichment_state.clearReplayCursor(runtime.store, stream.cursorScope()) catch |err| switch (err) {
+        enrichment_state.clearReplayCursor(live_store.*, stream.cursorScope()) catch |err| switch (err) {
             error.WriterLocked => {
                 if (attempt >= writer_locked_retry_count) return err;
                 backoffWriterLockRetry();
@@ -29869,9 +29929,12 @@ fn clearReplayCursorWithRetry(runtime: *EnrichmentRuntime) !void {
 }
 
 fn saveRuntimeStatusWithRetry(runtime: *EnrichmentRuntime, scope: []const u8, status: enrichment_state.RuntimeStatus) !void {
+    var publication_store = try RuntimePublicationStore.init(runtime);
+    defer publication_store.deinit();
+    const live_store = publication_store.store(runtime);
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
-        enrichment_state.saveRuntimeStatus(runtime.store, scope, status) catch |err| switch (err) {
+        enrichment_state.saveRuntimeStatus(live_store.*, scope, status) catch |err| switch (err) {
             error.WriterLocked => {
                 if (attempt >= writer_locked_retry_count) return err;
                 backoffWriterLockRetry();
@@ -29879,7 +29942,7 @@ fn saveRuntimeStatusWithRetry(runtime: *EnrichmentRuntime, scope: []const u8, st
             },
             else => return err,
         };
-        var checkpoint = enrichment_state.loadProjectionCheckpoint(runtime.alloc, runtime.store, scope) catch |err| switch (err) {
+        var checkpoint = enrichment_state.loadProjectionCheckpoint(runtime.alloc, live_store.*, scope) catch |err| switch (err) {
             error.WriterLocked => {
                 if (attempt >= writer_locked_retry_count) return err;
                 backoffWriterLockRetry();
@@ -29889,7 +29952,7 @@ fn saveRuntimeStatusWithRetry(runtime: *EnrichmentRuntime, scope: []const u8, st
         };
         checkpoint.status = runtimeProjectionStatus(status.retrying, status.worker_failed);
         checkpoint.config_hash = try enrichmentCatalogConfigHash(runtime.alloc, runtime.index_manager);
-        enrichment_state.saveProjectionCheckpoint(runtime.store, scope, checkpoint) catch |err| switch (err) {
+        enrichment_state.saveProjectionCheckpoint(live_store.*, scope, checkpoint) catch |err| switch (err) {
             error.WriterLocked => {
                 if (attempt >= writer_locked_retry_count) return err;
                 backoffWriterLockRetry();
@@ -30288,8 +30351,11 @@ fn coverageCounterInTxn(alloc: Allocator, txn: *backend_erased.Batch, transition
 fn applyCurrentCoverageOutcomeTransitionsForIndex(runtime: *EnrichmentRuntime, transitions: []const CoverageOutcomeTransition) !void {
     if (transitions.len == 0) return;
     try heartbeatEnrichmentLease(runtime);
+    var publication_store = try RuntimePublicationStore.init(runtime);
+    defer publication_store.deinit();
+    const live_store = publication_store.store(runtime);
     const fence = try requiredRuntimeStoreWriteFence(runtime);
-    var batch = try runtime.store.beginBatch();
+    var batch = try live_store.*.beginBatch();
     var committed = false;
     defer if (!committed) batch.abort();
     try validateRuntimeStoreWriteFenceTxn(runtime, &batch, fence);
@@ -30387,7 +30453,7 @@ fn applyCurrentCoverageOutcomeTransitionsForIndex(runtime: *EnrichmentRuntime, t
     try validateRuntimeStoreWriteFenceTxn(runtime, &batch, fence);
     try batch.commit();
     committed = true;
-    try runtime.store.sync(false);
+    try live_store.*.sync(false);
     if (skipped_delta > 0) {
         runtime.skipped_source_count +|= @intCast(skipped_delta);
     } else if (skipped_delta < 0) {
@@ -30680,6 +30746,9 @@ fn appendGeneratedBatchWithRetry(
     artifact_delete_keys: []const []const u8,
     source_guards: []const GeneratedSourceGuard,
 ) !GeneratedRecordCommit {
+    if (runtime.generated_publication) |publication| {
+        return publication.commit(publication.ptr, batch, artifact_promotions, artifact_delete_keys, source_guards, currentGeneratedWriteFence(runtime));
+    }
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
         try heartbeatEnrichmentLease(runtime);
@@ -30702,6 +30771,15 @@ fn heartbeatEnrichmentLease(runtime: *EnrichmentRuntime) !void {
     const io = io_impl.io();
     runtime.mutex.lockUncancelable(io);
     defer runtime.mutex.unlock(io);
+    if (runtime.generated_publication) |publication| {
+        const now = runtime.clock.nowRealtimeMs();
+        if (!runtime.ownership.lease_owned or now < runtime.ownership.lease_renew_after_ms) return;
+        const fence = currentGeneratedWriteFence(runtime) orelse return error.EnrichmentLeaseFenceLost;
+        if (!try publication.heartbeat(publication.ptr, fence, now, runtime.ownership.lease_ttl_ms)) return error.EnrichmentLeaseFenceLost;
+        runtime.ownership.lease_expires_at_ms = now +| runtime.ownership.lease_ttl_ms;
+        runtime.ownership.lease_renew_after_ms = now +| runtime.ownership.lease_ttl_ms / 2;
+        return;
+    }
     if (!(try runtime.ownership.heartbeatIfDue(runtime.clock.nowRealtimeMs())))
         return error.EnrichmentLeaseFenceLost;
 }
@@ -30788,12 +30866,10 @@ const RuntimeLeaseHeartbeatGuard = struct {
             };
             if (self.done.isSet()) return;
             const now_ms = self.runtime.clock.nowRealtimeMs();
-            const renewed = self.lease.?.renewFenced(
-                self.owner_id,
-                self.epoch,
-                now_ms,
-                self.ttl_ms,
-            ) catch |err| switch (err) {
+            const renewed = (if (self.runtime.generated_publication) |publication|
+                publication.heartbeat(publication.ptr, .{ .lease_key = enrichment_lease.default_lease_key, .owner_id = self.owner_id, .epoch = self.epoch }, now_ms, self.ttl_ms)
+            else
+                self.lease.?.renewFenced(self.owner_id, self.epoch, now_ms, self.ttl_ms)) catch |err| switch (err) {
                 error.WriterLocked => {
                     // Contention consumes renewal slack. Retry promptly
                     // rather than sleeping another quarter of the lease TTL.
@@ -31105,8 +31181,12 @@ test "optional enrichment reads never classify contention as source absence" {
 }
 
 fn storePut(runtime: *EnrichmentRuntime, key: []const u8, value: []const u8) !void {
+    var publication_store = try RuntimePublicationStore.init(runtime);
+    defer publication_store.deinit();
+    const live_store = publication_store.store(runtime);
+    if (publication_store.lease) |lease| try lease.guard_key(lease.ptr, key);
     const fence = try requiredRuntimeStoreWriteFence(runtime);
-    var txn = try runtime.store.beginWrite();
+    var txn = try live_store.*.beginWrite();
     errdefer txn.abort();
     try validateRuntimeStoreWriteFenceTxn(runtime, &txn, fence);
     try @import("../artifact_publication.zig").requireLegacyMaterialization(&txn, key);
@@ -31122,8 +31202,15 @@ fn storePut(runtime: *EnrichmentRuntime, key: []const u8, value: []const u8) !vo
 }
 
 fn storePutBatch(runtime: *EnrichmentRuntime, writes: []const KVPair, deletes: []const []const u8) !void {
+    var publication_store = try RuntimePublicationStore.init(runtime);
+    defer publication_store.deinit();
+    const live_store = publication_store.store(runtime);
+    if (publication_store.lease) |lease| {
+        for (writes) |write| try lease.guard_key(lease.ptr, write.key);
+        for (deletes) |key| try lease.guard_key(lease.ptr, key);
+    }
     const fence = try requiredRuntimeStoreWriteFence(runtime);
-    var batch = try runtime.store.beginBatch();
+    var batch = try live_store.*.beginBatch();
     errdefer batch.abort();
     try validateRuntimeStoreWriteFenceTxn(runtime, &batch, fence);
     for (writes) |write| try @import("../artifact_publication.zig").requireLegacyMaterialization(&batch, write.key);

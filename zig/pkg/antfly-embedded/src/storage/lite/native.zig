@@ -3426,6 +3426,22 @@ pub const NativeFile = struct {
         return self.header.checkpoints[self.header.active_checkpoint];
     }
 
+    /// Rebind a borrowed index writer after its owner has verified the inode,
+    /// catalog epoch and unchanged immutable index inputs under a writer lease.
+    /// The newest allocator state must accompany the newest primary roots.
+    pub fn adoptIndexPublicationHeader(self: *NativeFile, header: Header) !void {
+        if (self.transaction_header != null or self.durable_header != null or self.checkpoint_publication_uncertain or
+            self.header.page_size != header.page_size or self.header.indexed_reclamation != header.indexed_reclamation) return error.EnrichmentWaitCanceled;
+        self.invalidateLedger();
+        self.page_cache.clear(self.allocator);
+        self.free_pages_verified = false;
+        self.namespace_directory_cache_root = std.math.maxInt(u64);
+        self.namespace_directory_delta_depth = 0;
+        deinitNamespaceDirectory(self.allocator, &self.namespace_directory_cache);
+        self.namespace_directory_cache = .empty;
+        self.header = header;
+    }
+
     fn invalidateLedger(self: *NativeFile) void {
         if (self.ledger) |state| {
             state.deinit();

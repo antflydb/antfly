@@ -30530,6 +30530,14 @@ pub const DB = struct {
     /// Appends internal derived work without exposing the DB's batch execution
     /// context. Runtime partitions use this boundary while retaining the normal
     /// write gate, locking, backlog accounting, and hot-standby mirroring semantics.
+    /// Publish prepared producer output against this runtime's live coordinator.
+    /// The existing transactional guard checks source digests, incarnations,
+    /// and exact lease tenure before any artifact or replay record is committed.
+    pub fn publishPreparedGeneratedBatch(self: *DB, derived_batch: enrichment_runtime_mod.GeneratedRecordBatch, promotions: []const enrichment_runtime_mod.GeneratedArtifactPromotion, deletes: []const []const u8, guards: []const enrichment_runtime_mod.GeneratedSourceGuard, fence: ?enrichment_runtime_mod.GeneratedWriteFence) !enrichment_runtime_mod.GeneratedRecordCommit {
+        if (self.enrichment_append_context == null) try self.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true });
+        return appendGeneratedBatchFromEnrichment(self.enrichment_append_context orelse return error.EnrichmentWaitCanceled, derived_batch, promotions, deletes, guards, fence);
+    }
+
     pub fn derivedAsyncAppendDerivedBatchRecord(self: *DB, derived_batch: derived_types.DerivedBatch) !u64 {
         return try appendDerivedBatchRecord(self, derived_batch);
     }

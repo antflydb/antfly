@@ -27,6 +27,180 @@ const alloc = std.heap.c_allocator;
 const memo_mod = @import("antfly_inference_query_embedding_cache");
 const cache_budget = @import("antfly_cache_budget");
 const embedding_memo_bytes = 16 * 1024 * 1024;
+const EnrichmentRuntime = std.meta.Child(std.meta.Child(@FieldType(h.db_mod.DB, "enrichment_runtime")));
+const PublicationPort = std.meta.Child(@FieldType(EnrichmentRuntime, "generated_publication"));
+const PublicationParameters = @typeInfo(std.meta.Child(@FieldType(PublicationPort, "commit"))).@"fn".param_types;
+const GeneratedBatch = PublicationParameters[1].?;
+const Promotions = PublicationParameters[2].?;
+const SourceGuards = PublicationParameters[4].?;
+const WriteFence = std.meta.Child(PublicationParameters[5].?);
+const StoreLease = @typeInfo(@typeInfo(std.meta.Child(@FieldType(PublicationPort, "acquire_store"))).@"fn".return_type.?).error_union.payload;
+const RuntimeStore = @FieldType(StoreLease, "store");
+const SourceRead = @typeInfo(@typeInfo(std.meta.Child(@FieldType(RuntimeStore.VTable, "begin_read"))).@"fn".return_type.?).error_union.payload;
+const keys = @import("../storage/internal_keys.zig");
+const ProducerLease = @FieldType(@FieldType(EnrichmentRuntime, "ownership"), "lease");
+const NativeStore = std.meta.Child(std.meta.Child(@FieldType(std.meta.Child(@FieldType(h.Handle, "owned_lite_backend")), "native_docstore")));
+const WriterAdmission = std.meta.Child(@FieldType(NativeStore, "writer_admission"));
+const PublicationScope = @typeInfo(std.meta.Child(@FieldType(WriterAdmission, "enter"))).@"fn".param_types[1].?;
+
+fn catalogStamp(database: *h.db_mod.DB) ![32]u8 {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var hash = std.crypto.hash.Blake3.init(.{});
+    if (try database.getSchemaJson(a)) |schema| hash.update(schema);
+    const indexes = try database.core.listIndexes(a);
+    std.mem.sort(@TypeOf(indexes[0]), indexes, {}, struct {
+        fn less(_: void, lhs: @TypeOf(indexes[0]), rhs: @TypeOf(indexes[0])) bool {
+            return std.mem.lessThan(u8, lhs.name, rhs.name);
+        }
+    }.less);
+    hash.update(try std.json.Stringify.valueAlloc(a, indexes, .{}));
+    var digest: [32]u8 = undefined;
+    hash.final(&digest);
+    return digest;
+}
+
+// Completed producer bytes are delivered to the current runtime, rather than
+// replaying inference whenever an unrelated primary commit moves the file tip.
+pub const PreparedPublication = struct {
+    owner: *Owner,
+    name: []const u8,
+    identity: std.meta.Child(@FieldType(h.db_mod.OpenOptions, "identity_namespace")),
+    catalog: [32]u8,
+    index_prefix: []const u8,
+    snapshot_root: *h.Handle,
+    source_read: ?*SourceRead,
+    relational_rows: bool,
+    index_inputs_changed: bool = false,
+
+    fn current(self: *@This()) !*h.db_mod.DB {
+        const root = try self.owner.refresh();
+        if (Owner.needsOutcomeReconciliation(root)) return error.EnrichmentWaitCanceled;
+        try @import("sql_commit.zig").recover(root);
+        try @import("sql_ddl.zig").recover(root);
+        const database = try @import("tables.zig").get(root, self.name);
+        if (!std.meta.eql(database.core.identity_namespace, self.identity) or
+            !std.mem.eql(u8, &(try catalogStamp(database)), &self.catalog)) return error.EnrichmentSourceChanged;
+        return database;
+    }
+
+    fn commit(ptr: *anyopaque, batch: GeneratedBatch, promotions: Promotions, deletes: []const []const u8, guards: SourceGuards, fence: ?WriteFence) !@typeInfo(@typeInfo(std.meta.Child(@FieldType(PublicationPort, "commit"))).@"fn".return_type.?).error_union.payload {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const io = h.handleLockIo();
+        self.owner.gate.mutex.lockUncancelable(io);
+        defer self.owner.gate.mutex.unlock(io);
+        if (self.owner.stopping.load(.acquire)) return error.Canceled;
+        var lease = try native.lockWriterPathWithIo(alloc, io, self.owner.path);
+        defer lease.close();
+        const database = try self.current();
+        // Namespace and catalog are stable under the owner fence. The native
+        // writer validates the captured source digests/incarnations and lease
+        // inside its live transaction, preserving unrelated primary commits.
+        const result = database.publishPreparedGeneratedBatch(batch, promotions, deletes, guards, fence) catch |err| switch (err) {
+            error.EnrichmentSourceChanged, error.EnrichmentLeaseFenceLost => return error.EnrichmentWaitCanceled,
+            else => return err,
+        };
+        self.owner.notifyMutation();
+        return result;
+    }
+
+    const HeldStore = struct {
+        publication: *PreparedPublication,
+        path_lease: native.PathWriterLock,
+        database: *h.db_mod.DB,
+
+        fn release(ptr: *anyopaque) void {
+            const held: *@This() = @ptrCast(@alignCast(ptr));
+            const p = held.publication;
+            const snapshot = p.snapshot_root.owned_lite_backend.?.native_docstore.?;
+            // Opening the live coordinator can add immutable-reader leases.
+            // Rebind primary reads after publication, but remember any changed
+            // LSM inputs: adopting a header must never erase that evidence.
+            var latest = native.NativeFile.openWithIo(alloc, h.handleLockIo(), p.owner.path, .{ .read_only = true, .internal_reader = true }) catch null;
+            if (latest) |*file| {
+                defer file.close();
+                const live_stat = file.file.stat(file.runtime()) catch null;
+                const captured_stat = snapshot.file.file.stat(snapshot.file.runtime()) catch null;
+                const same_inode = live_stat != null and captured_stat != null and live_stat.?.inode == captured_stat.?.inode;
+                if (same_inode) {
+                    const before = Owner.indexFingerprint(&snapshot.file, p.index_prefix) catch null;
+                    const after = Owner.indexFingerprint(file, p.index_prefix) catch null;
+                    if (before == null or after == null or !std.mem.eql(u8, &before.?, &after.?)) p.index_inputs_changed = true;
+                    snapshot.refreshIndexPublicationCheckpoint(file.header) catch {
+                        p.index_inputs_changed = true;
+                    };
+                } else p.index_inputs_changed = true;
+            } else p.index_inputs_changed = true;
+            held.path_lease.close();
+            p.owner.gate.mutex.unlock(h.handleLockIo());
+            alloc.destroy(held);
+        }
+
+        fn guardKey(ptr: *anyopaque, key: []const u8) !void {
+            const held: *@This() = @ptrCast(@alignCast(ptr));
+            const p = held.publication;
+            const doc_key = (try keys.decodeDocumentComponentAlloc(alloc, key)) orelse return;
+            defer alloc.free(doc_key);
+            const expected = p.source_read orelse return error.EnrichmentWaitCanceled;
+            const row_key = if (p.relational_rows) try @import("../storage/db/relational_store.zig").keyAlloc(alloc, doc_key) else try keys.documentKeyAlloc(alloc, doc_key);
+            defer alloc.free(row_key);
+            const ordinal_key = try keys.identityDocToOrdinalKeyAlloc(alloc, doc_key);
+            defer alloc.free(ordinal_key);
+            var actual = try held.database.enrichment_runtime.?.store.beginRead();
+            defer actual.abort();
+            for ([_][]const u8{ row_key, ordinal_key }) |source_key| {
+                const before = expected.get(source_key) catch |err| if (err == error.NotFound) null else return err;
+                const after = actual.get(source_key) catch |err| if (err == error.NotFound) null else return err;
+                if ((before == null) != (after == null)) return error.EnrichmentWaitCanceled;
+                if (before) |bytes| if (!std.mem.eql(u8, bytes, after.?)) return error.EnrichmentWaitCanceled;
+            }
+            if (expected.get(ordinal_key)) |ordinal| {
+                if (ordinal.len != 4) return error.EnrichmentWaitCanceled;
+                const state_key = keys.identityOrdinalStateKey(std.mem.readInt(u32, ordinal[0..4], .little));
+                const before = try expected.get(&state_key);
+                const after = try actual.get(&state_key);
+                if (!std.mem.eql(u8, before, after)) return error.EnrichmentWaitCanceled;
+            } else |err| if (err != error.NotFound) return err;
+        }
+    };
+
+    fn acquireStore(ptr: *anyopaque, fence: ?WriteFence, now_ms: u64) !StoreLease {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const io = h.handleLockIo();
+        self.owner.gate.mutex.lockUncancelable(io);
+        errdefer self.owner.gate.mutex.unlock(io);
+        if (self.owner.stopping.load(.acquire)) return error.Canceled;
+        var lease = try native.lockWriterPathWithIo(alloc, io, self.owner.path);
+        errdefer lease.close();
+        const database = try self.current();
+        if (fence) |expected| {
+            var ownership = try ProducerLease.init(alloc, database.core.store, expected.lease_key);
+            defer ownership.deinit();
+            const live = (try ownership.load(alloc)) orelse return error.EnrichmentLeaseFenceLost;
+            defer alloc.free(live.owner_id);
+            if (live.epoch != expected.epoch or live.expires_at_ms <= now_ms or !std.mem.eql(u8, live.owner_id, expected.owner_id)) return error.EnrichmentLeaseFenceLost;
+        }
+        if (database.enrichment_runtime == null) try database.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true });
+        const held = try alloc.create(HeldStore);
+        held.* = .{ .publication = self, .path_lease = lease, .database = database };
+        return .{ .store = database.enrichment_runtime.?.store, .ptr = held, .release = HeldStore.release, .guard_key = HeldStore.guardKey };
+    }
+
+    fn heartbeat(ptr: *anyopaque, fence: WriteFence, now_ms: u64, ttl_ms: u64) !bool {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const io = h.handleLockIo();
+        self.owner.gate.mutex.lockUncancelable(io);
+        defer self.owner.gate.mutex.unlock(io);
+        if (self.owner.stopping.load(.acquire)) return error.Canceled;
+        var path_lease = try native.lockWriterPathWithIo(alloc, io, self.owner.path);
+        defer path_lease.close();
+        const database = try self.current();
+        var lease = try ProducerLease.init(alloc, database.core.store, fence.lease_key);
+        defer lease.deinit();
+        return lease.renewFenced(fence.owner_id, fence.epoch, now_ms, ttl_ms);
+    }
+};
 
 // Foreign threads can immediately reenter after a read. Ticket ordering keeps
 // a stream of short reads from starving queued writers and maintenance.
@@ -220,6 +394,25 @@ pub const Owner = struct {
             runtime.stats().applied_sequence < database.core.nextEnrichmentSequence();
     }
 
+    fn indexFingerprint(file: *native.NativeFile, prefix: []const u8) ![32]u8 {
+        var cursor = try file.indexCatalogCursor(file.activeCheckpoint(), prefix);
+        defer cursor.deinit();
+        var hash = std.crypto.hash.Blake3.init(.{});
+        var count: usize = 0;
+        while (try cursor.next()) |record| {
+            defer file.allocator.free(record.key);
+            count += 1;
+            if (count > 4096) return error.ResourceLimitExceeded;
+            const length: u64 = record.key.len;
+            hash.update(std.mem.asBytes(&length));
+            hash.update(record.key);
+            hash.update(std.mem.asBytes(&record.page_id));
+        }
+        var digest: [32]u8 = undefined;
+        hash.final(&digest);
+        return digest;
+    }
+
     fn lookupEmbedding(ptr: *anyopaque, a: std.mem.Allocator, key: [32]u8) !?[]f32 {
         const self: *Owner = @ptrCast(@alignCast(ptr));
         return self.embedding_memo.?.lookup(&self.embedding_memo_budget, a, key);
@@ -233,7 +426,7 @@ pub const Owner = struct {
     // Admission never waits while a storage operation owns DB/index locks.
     // A foreground owner can therefore refresh its own runtime and publish
     // without a lock-order cycle with detached maintenance.
-    fn enterMaintenanceWriter(ptr: *anyopaque) !void {
+    fn enterMaintenanceWriter(ptr: *anyopaque, scope: PublicationScope) !void {
         const root: *h.Handle = @ptrCast(@alignCast(ptr));
         const self = root.maintenance_owner.?;
         root.maintenance_admission_mutex.lockUncancelable(h.handleLockIo());
@@ -243,7 +436,8 @@ pub const Owner = struct {
             return;
         }
         if (self.stopping.load(.acquire)) return error.Canceled;
-        if (!self.gate.mutex.tryLock()) return error.EnrichmentWaitCanceled;
+        if (scope == .index) if (root.maintenance_publication) |p| if (p.index_inputs_changed) return error.EnrichmentWaitCanceled;
+        if (scope == .index) self.gate.mutex.lockUncancelable(h.handleLockIo()) else if (!self.gate.mutex.tryLock()) return error.EnrichmentWaitCanceled;
         errdefer self.gate.mutex.unlock(h.handleLockIo());
         if (self.current) |current| if (needsOutcomeReconciliation(current)) return error.EnrichmentWaitCanceled;
         var lease = native.lockWriterPathWithIo(alloc, h.handleLockIo(), self.path) catch |err| switch (err) {
@@ -254,8 +448,23 @@ pub const Owner = struct {
         var probe = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.path, .{ .read_only = true, .internal_reader = true });
         defer probe.close();
         const file = &root.owned_lite_backend.?.native_docstore.?.file;
-        if ((try probe.file.stat(probe.runtime())).inode != (try file.file.stat(file.runtime())).inode or
-            !std.meta.eql(probe.header, file.header)) return error.EnrichmentWaitCanceled;
+        if ((try probe.file.stat(probe.runtime())).inode != (try file.file.stat(file.runtime())).inode) return error.EnrichmentWaitCanceled;
+        if (!std.meta.eql(probe.header, file.header)) {
+            if (scope != .index) return error.EnrichmentWaitCanceled;
+            const publication = root.maintenance_publication orelse return error.EnrichmentWaitCanceled;
+            _ = try publication.current();
+            // Foreground refresh may create reader leases. Those are outside
+            // the index's physical path and cannot invalidate its LSM inputs.
+            var latest = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.path, .{ .read_only = true, .internal_reader = true });
+            defer latest.close();
+            if ((try latest.file.stat(latest.runtime())).inode != (try file.file.stat(file.runtime())).inode) return error.EnrichmentWaitCanceled;
+            if (file.activeCheckpoint().index_catalog_root_page != latest.activeCheckpoint().index_catalog_root_page) {
+                const expected = try indexFingerprint(file, publication.index_prefix);
+                const actual = try indexFingerprint(&latest, publication.index_prefix);
+                if (!std.mem.eql(u8, &expected, &actual)) return error.EnrichmentWaitCanceled;
+            }
+            try root.owned_lite_backend.?.native_docstore.?.refreshIndexPublicationCheckpoint(latest.header);
+        }
         root.maintenance_writer_lease = lease;
         root.maintenance_writer_references = 1;
     }
@@ -386,12 +595,21 @@ pub const Owner = struct {
             // mutation/publication retain the normal immutable-range leases.
             root.owned_lite_backend.?.native_docstore.?.artifact_reader_fence = false;
         }
+        const publication_name = try alloc.dupe(u8, if (selected) |table| table.name else "default");
+        defer alloc.free(publication_name);
+        const index_prefix = try std.fmt.allocPrint(alloc, "{s}/", .{database.core.index_manager.base_path});
+        defer alloc.free(index_prefix);
+        var source_read = if (database.enrichment_runtime) |runtime| try runtime.store.beginRead() else null;
+        defer if (source_read) |*read| read.abort();
+        var publication: PreparedPublication = .{ .owner = self, .name = publication_name, .identity = database.core.identity_namespace, .catalog = try catalogStamp(database), .index_prefix = index_prefix, .snapshot_root = root, .source_read = if (source_read) |*read| read else null, .relational_rows = if (database.enrichment_runtime) |runtime| runtime.config.relational_base_rows else false };
         root.maintenance_references += 1;
         root.maintenance_owner = self;
+        root.maintenance_publication = &publication;
         const store = root.owned_lite_backend.?.native_docstore.?;
         if (database.enrichment_runtime) |runtime| {
             if (self.embedding_memo == null) self.embedding_memo = memo_mod.QueryEmbeddingCache.init(alloc, io, .{ .max_bytes = embedding_memo_bytes, .ttl_ns = std.time.ns_per_min });
             runtime.dense_result_cache = .{ .ptr = self, .lookup = lookupEmbedding, .remember = rememberEmbedding };
+            runtime.generated_publication = .{ .ptr = &publication, .commit = PreparedPublication.commit, .heartbeat = PreparedPublication.heartbeat, .acquire_store = PreparedPublication.acquireStore };
         }
         store.writer_admission = .{ .ptr = root, .enter = enterMaintenanceWriter, .leave = leaveMaintenanceWriter };
         lease.close();
@@ -401,7 +619,13 @@ pub const Owner = struct {
 
         const cancellation = h.db_mod.types.CancellationToken.fromAtomic(&self.stopping);
         var pending = if (run_database) database.runBackgroundMaintenanceWithCancellation(cancellation) catch true else false;
-        if (database.enrichment_runtime) |runtime| runtime.dense_result_cache = null;
+        if (database.enrichment_runtime) |runtime| {
+            runtime.dense_result_cache = null;
+            runtime.generated_publication = null;
+        }
+        root.maintenance_publication = null;
+        if (source_read) |*read| read.abort();
+        source_read = null;
         if (independent) {
             // End the input fences before reclamation. Keeping them in an
             // idle runtime would needlessly prevent in-place page service.

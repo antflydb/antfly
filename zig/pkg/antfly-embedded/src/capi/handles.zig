@@ -65,6 +65,7 @@ pub const Handle = struct {
     sql_ddl_recovery_scans: if (builtin.is_test) u64 else void = if (builtin.is_test) 0 else {},
     sql_commit_recovery_scans: if (builtin.is_test) u64 else void = if (builtin.is_test) 0 else {},
     maintenance_references: usize = 0,
+    maintenance_publication: ?*@import("lite_connection.zig").PreparedPublication = null,
     maintenance_owner: ?*@import("lite_connection.zig").Owner = null,
     maintenance_writer_lease: ?lite_backend.native.PathWriterLock = null,
     maintenance_writer_references: usize = 0,

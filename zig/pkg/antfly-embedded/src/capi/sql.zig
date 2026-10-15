@@ -250,6 +250,9 @@ pub fn Adapter(comptime native: type) type {
         pub fn localRequiresCoordination(self: *Self) bool {
             if (databaseRequiresCoordination(self.db)) return true;
             if (self.handle) |handle| {
+                // A missing namespace may contain inbound constraints. Force
+                // the complete catalog check rather than treating it as empty.
+                if (handle.embedded_table_errors.count() != 0) return true;
                 if (databaseRequiresCoordination(&handle.db)) return true;
                 var tables = handle.embedded_tables.valueIterator();
                 while (tables.next()) |table| if (databaseRequiresCoordination(&table.*.db)) return true;
