@@ -367,9 +367,12 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     const run_pgwire_tests = b.addRunArtifact(pgwire_tests);
     // Honor stripped CI builds: cold framing/array compiles fit the original
     // 1 GiB reservation. Debugger builds exceeded it, so reserve their larger
-    // working set separately. The 64 MiB runtime bound is unchanged.
+    // working set separately.
     pgwire_tests.step.max_rss = (if (strip) @as(usize, 1) else 2) * 1024 * 1024 * 1024;
-    run_pgwire_tests.step.max_rss = 64 * 1024 * 1024;
+    // Linux includes the launcher's inherited high-water RSS in child rusage:
+    // CI reported 93 MiB while standalone Linux tests use only 17-21 MiB.
+    // Reserve 128 MiB for that process envelope; allocator bounds stay intact.
+    run_pgwire_tests.step.max_rss = (if (target.result.os.tag == .linux) @as(usize, 128) else 64) * 1024 * 1024;
     b.step("pgwire-test", "Run PostgreSQL wire framing, session, and lifecycle tests").dependOn(&run_pgwire_tests.step);
     const openapi_root_check = addOpenApiRootCheckStep(b);
     openapi_check_step.dependOn(&openapi_root_check.step);
@@ -1281,7 +1284,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     };
     inference_engine_mod.addImport("engine_memory", antfly_imports.storage_boundary.memory);
     runtime_abi_mod.addImport("antfly_test_error_logs", antfly_imports.storage_boundary.test_error_logs);
-    const ordinal_tests = b.addTest(.{ .root_module = antfly_imports.storage_boundary.ordinals });
+    const ordinal_tests = b.addTest(.{ .name = "storage-ordinal-core-tests", .root_module = antfly_imports.storage_boundary.ordinals, .use_llvm = @import("../embedded/source_owner.zig").llvmBackend(target.result) });
     b.step("storage-ordinal-core-test", "Verify bulk storage operations through the configured implementation")
         .dependOn(&b.addRunArtifact(ordinal_tests).step);
     const doc_set_tests_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/storage_doc_set_test_root.zig"), .target = target, .optimize = optimize });
