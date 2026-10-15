@@ -1178,6 +1178,19 @@ pub const MetadataHttpClient = struct {
         }
         return parsed.value;
     }
+    pub fn completeRelationalIndexSourceControlled(self: *MetadataHttpClient, base_uri: []const u8, request: @import("relational_index_delivery_journal.zig").CompletionRequest, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !@import("relational_index_delivery_journal.zig").Status {
+        const journal = @import("relational_index_delivery_journal.zig");
+        if (cancellation) |value| if (value.isCancelled()) return error.Cancelled;
+        if (remaining_ms == 0) return error.Timeout;
+        try request.validate();
+        const bytes = try self.forwardSystemCatalogControlled(base_uri, .{ .relational_index_source_complete = request }, .{ .remaining_ms = remaining_ms, .forwards_remaining = 2, .campaign_allowed = true }, false, cancellation);
+        defer self.alloc.free(bytes);
+        if (bytes.len == 0 or bytes.len > journal.max_completion_bytes) return error.MetadataMutationOutcomeUnknown;
+        var parsed = std.json.parseFromSlice(journal.Status, self.alloc, bytes, .{}) catch return error.MetadataMutationOutcomeUnknown;
+        defer parsed.deinit();
+        if (!(parsed.value.isCompleted(request) catch return error.MetadataMutationOutcomeUnknown)) return error.MetadataMutationOutcomeUnknown;
+        return parsed.value;
+    }
 
     pub fn relationalIndexOwnerAckStatus(self: *MetadataHttpClient, base_uri: []const u8, request: @import("relational_index_publication.zig").Ack, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !@import("relational_index_publication.zig").AckStatus {
         const publication = @import("relational_index_publication.zig");
@@ -1293,7 +1306,7 @@ pub const MetadataHttpClient = struct {
             .{ .name = authority.header_name, .value = grant orelse "" },
         };
         var delivery: http_common.RequestDeliveryTracker = .{};
-        var response = internal_service_auth.executeRequest(self.alloc, self.executor, .{ .method = .POST, .uri = uri, .headers = &headers, .body = body, .content_type = "application/json", .timeout_ms = @min(default_request_timeout_ms, forwarding.remaining_ms), .delivery_tracker = &delivery, .cancellation = cancellation, .max_response_bytes = if (input == .relational_index_source_accept) 16 * 1024 else null }, self.internal_service) catch |err| {
+        var response = internal_service_auth.executeRequest(self.alloc, self.executor, .{ .method = .POST, .uri = uri, .headers = &headers, .body = body, .content_type = "application/json", .timeout_ms = @min(default_request_timeout_ms, forwarding.remaining_ms), .delivery_tracker = &delivery, .cancellation = cancellation, .max_response_bytes = if (input == .relational_index_source_accept or input == .relational_index_source_complete) 16 * 1024 else null }, self.internal_service) catch |err| {
             if (delivery.load() == .not_sent or (delivery.load() == .unknown and err == error.ConnectionRefused)) return error.RaftMutationRequestNotSent;
             return error.MetadataMutationOutcomeUnknown;
         };
@@ -4658,7 +4671,7 @@ test "relational index publication ACK client binds read grants and never retrie
             defer call.deinit();
             const mutation = call.value.isMutation();
             try std.testing.expect(call.value.isRelationalIndexOwnerCall());
-            if (call.value == .relational_index_source_accept_status or call.value == .relational_index_source_accept) try std.testing.expectEqual(@as(?usize, 16 * 1024), request.max_response_bytes);
+            if (call.value == .relational_index_source_accept_status or call.value == .relational_index_source_accept or call.value == .relational_index_source_complete) try std.testing.expectEqual(@as(?usize, 16 * 1024), request.max_response_bytes);
             var response: http_common.HttpResponse = .{ .status = self.status, .body = try a.dupe(u8, self.body) };
             errdefer response.deinit(a);
             const headers = try a.alloc(http_common.Header, if (mutation) 1 else 2);

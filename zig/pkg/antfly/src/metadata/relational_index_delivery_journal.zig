@@ -28,6 +28,7 @@ const progress = local.storage_db_relational_index_publication_progress;
 const Digest = [32]u8;
 const prefix = "\x00\x00__metadata__:relational_index_delivery:v1:";
 pub const max_command_bytes = delivery.max_wire_bytes + 16 * 1024;
+pub const max_completion_bytes = 16 * 1024;
 pub fn allGroupsPrefix() []const u8 {
     return prefix;
 }
@@ -115,6 +116,13 @@ pub const Consumed = struct {
     pub fn verify(self: Consumed) !void {
         self.proof.verify(try self.digest()) catch return error.InvalidPrivateIndexClaimReceipt;
     }
+    pub fn requireHead(self: Consumed, head: Head) !void {
+        _ = try head.encode();
+        if (head.state != .ready or !equal(self.metadata_incarnation, head.metadata_incarnation) or
+            !equal(self.binding_digest, head.binding_digest) or self.ordinal != head.ordinal or self.rows != head.rows or
+            !equal(self.batch_digest, head.batch_digest) or !equal(self.decision_digest, head.decision_digest) or
+            self.position.sequence <= head.source_sequence) return error.InvalidPrivateIndexClaimReceipt;
+    }
 };
 
 pub const Head = struct {
@@ -164,7 +172,7 @@ pub const Head = struct {
     pub fn encode(self: Head) ![encoded_len]u8 {
         try self.validate();
         var bytes: [encoded_len]u8 = @splat(0);
-        @memcpy(bytes[0..8], "AIDA\x01\x00\x00\x00");
+        @memcpy(bytes[0..8], "AIDA\x02\x00\x00\x00");
         inline for (.{ "metadata_incarnation", "binding_digest", "scope_digest" }, 0..) |field, i| @memcpy(bytes[8 + i * 32 ..][0..32], &@field(self, field));
         inline for (.{ "ordinal", "rows", "batch_rows", "source_sequence" }, 0..) |field, i| std.mem.writeInt(u64, bytes[104 + i * 8 ..][0..8], @field(self, field), .little);
         inline for (.{ "batch_digest", "logical_digest", "previous_decision", "decision_digest", "accepted_root", "provenance" }, 0..) |field, i| @memcpy(bytes[136 + i * 32 ..][0..32], &@field(self, field));
@@ -175,7 +183,7 @@ pub const Head = struct {
         return bytes;
     }
     pub fn decode(bytes: []const u8) !Head {
-        if (bytes.len != encoded_len or !std.mem.eql(u8, bytes[0..8], "AIDA\x01\x00\x00\x00") or !std.mem.allEqual(u8, bytes[369..384], 0) or
+        if (bytes.len != encoded_len or !std.mem.eql(u8, bytes[0..8], "AIDA\x02\x00\x00\x00") or !std.mem.allEqual(u8, bytes[369..384], 0) or
             !std.mem.eql(u8, bytes[384..416], &hash(bytes[0..384]))) return error.InvalidPrivateIndexClaimInventory;
         var result: Head = undefined;
         inline for (.{ "metadata_incarnation", "binding_digest", "scope_digest" }, 0..) |field, i| @field(result, field) = bytes[8 + i * 32 ..][0..32].*;
@@ -221,8 +229,11 @@ pub const Inventory = struct {
 };
 
 pub const SourceRecord = struct {
+    pub const prefix_len = Head.encoded_len + jobs.Binding.encoded_len + 4;
+    pub const max_bytes = prefix_len + max_completion_bytes + delivery.max_wire_bytes;
     head: Head,
     signed: std.json.Parsed(delivery.Signed),
+    completion: ?Consumed = null,
     pub fn deinit(self: *SourceRecord) void {
         self.signed.deinit();
         self.* = undefined;
@@ -241,20 +252,59 @@ pub const SourceRecord = struct {
         const json = try std.json.Stringify.valueAlloc(alloc, signed, .{});
         defer alloc.free(json);
         if (json.len == 0 or json.len > delivery.max_wire_bytes) return error.InvalidCatalogRecord;
-        return std.mem.concat(alloc, u8, &.{ &try head.encode(), json });
+        return std.mem.concat(alloc, u8, &.{ &try head.encode(), &try signed.data.source.encode(), &.{ 0, 0, 0, 0 }, json });
+    }
+    pub const Prefix = struct { head: Head, binding: jobs.Binding, completion: ?Consumed, signed_bytes: []const u8 };
+    /// Bounded completion lookup never reparses all target delivery proofs.
+    /// The owner directory independently anchors the complete retained bytes.
+    pub fn peek(alloc: std.mem.Allocator, bytes: []const u8) !Prefix {
+        if (bytes.len <= prefix_len or bytes.len > max_bytes) return error.InvalidCatalogRecord;
+        const head = try Head.decode(bytes[0..Head.encoded_len]);
+        const binding = try jobs.Binding.decode(bytes[Head.encoded_len..][0..jobs.Binding.encoded_len]);
+        if (!equal(head.binding_digest, try bindingDigest(binding))) return error.InvalidCatalogRecord;
+        const len = std.mem.readInt(u32, bytes[prefix_len - 4 ..][0..4], .little);
+        if (len > max_completion_bytes or len >= bytes.len - prefix_len) return error.InvalidCatalogRecord;
+        var complete: ?Consumed = null;
+        if (len != 0) {
+            var parsed = try std.json.parseFromSlice(Consumed, alloc, bytes[prefix_len..][0..len], .{ .ignore_unknown_fields = false, .max_value_len = 128 });
+            defer parsed.deinit();
+            complete = parsed.value;
+            try complete.?.verify();
+            try complete.?.requireHead(head);
+            if (!complete.?.position.namespace.eql(binding.fence.namespace)) return error.InvalidCatalogRecord;
+            const canonical = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+            defer alloc.free(canonical);
+            if (!std.mem.eql(u8, canonical, bytes[prefix_len..][0..len])) return error.InvalidCatalogRecord;
+        }
+        const signed_bytes = bytes[prefix_len + len ..];
+        if (signed_bytes.len > delivery.max_wire_bytes) return error.InvalidCatalogRecord;
+        return .{ .head = head, .binding = binding, .completion = complete, .signed_bytes = signed_bytes };
+    }
+    pub fn completed(alloc: std.mem.Allocator, bytes: []const u8, consumed: Consumed) ![]u8 {
+        const prefix_ = try peek(alloc, bytes);
+        try consumed.requireHead(prefix_.head);
+        if (!consumed.position.namespace.eql(prefix_.binding.fence.namespace)) return error.InvalidPrivateIndexClaimReceipt;
+        try consumed.verify();
+        const json = try std.json.Stringify.valueAlloc(alloc, consumed, .{});
+        defer alloc.free(json);
+        if (json.len > max_completion_bytes) return error.InvalidPrivateIndexClaimReceipt;
+        var len: [4]u8 = undefined;
+        std.mem.writeInt(u32, &len, @intCast(json.len), .little);
+        return std.mem.concat(alloc, u8, &.{ bytes[0 .. prefix_len - 4], &len, json, prefix_.signed_bytes });
     }
     pub fn decode(alloc: std.mem.Allocator, bytes: []const u8) !SourceRecord {
-        if (bytes.len <= Head.encoded_len or bytes.len > Head.encoded_len + delivery.max_wire_bytes) return error.InvalidCatalogRecord;
-        const head = try Head.decode(bytes[0..Head.encoded_len]);
-        var signed = try std.json.parseFromSlice(delivery.Signed, alloc, bytes[Head.encoded_len..], .{ .allocate = .alloc_always, .max_value_len = 128 });
+        const prefix_ = try peek(alloc, bytes);
+        const head = prefix_.head;
+        var signed = try std.json.parseFromSlice(delivery.Signed, alloc, prefix_.signed_bytes, .{ .allocate = .alloc_always, .ignore_unknown_fields = false, .max_value_len = 128 });
         errdefer signed.deinit();
         try signed.value.verify();
         for (signed.value.data.parts.items) |part| try part.target.verifyRecorded(part.rows);
         try requireHead(head, signed.value);
+        if (!std.mem.eql(u8, &try prefix_.binding.encode(), &try signed.value.data.source.encode())) return error.InvalidCatalogRecord;
         const canonical = try std.json.Stringify.valueAlloc(alloc, signed.value, .{});
         defer alloc.free(canonical);
-        if (!std.mem.eql(u8, canonical, bytes[Head.encoded_len..])) return error.InvalidCatalogRecord;
-        return .{ .head = head, .signed = signed };
+        if (!std.mem.eql(u8, canonical, prefix_.signed_bytes)) return error.InvalidCatalogRecord;
+        return .{ .head = head, .signed = signed, .completion = prefix_.completion };
     }
 };
 
@@ -293,6 +343,15 @@ pub const Status = struct {
     query: Query,
     head: ?Head,
     replication_pending: bool = false,
+    completed: bool = false,
+    pub fn isCompleted(self: Status, request: CompletionRequest) !bool {
+        try request.validate();
+        if (!std.meta.eql(self.query, request.query)) return error.GenerationPublicationChanged;
+        if (self.replication_pending or !self.completed) return false;
+        const head = self.head orelse return error.InvalidCatalogRecord;
+        try request.consumed.requireHead(head);
+        return true;
+    }
     pub fn isAccepted(self: Status, request: Request) !bool {
         if (!std.meta.eql(self.query, Query.from(request))) return error.InvalidGenerationPublication;
         if (self.replication_pending) return false;
@@ -303,6 +362,76 @@ pub const Status = struct {
     }
 };
 pub const Request = struct { signed: delivery.Signed, consumed: ?Consumed = null };
+pub const CompletionRequest = struct {
+    query: Query,
+    consumed: Consumed,
+    pub fn validate(self: CompletionRequest) !void {
+        try self.query.validate();
+        try self.consumed.verify();
+        if (self.consumed.position.namespace.table_id != self.query.table_id) return error.InvalidPrivateIndexClaimReceipt;
+    }
+};
+
+pub const PreparedCompletion = struct {
+    alloc: std.mem.Allocator,
+    table_id: u64,
+    ordinal: u16,
+    expected_head: [progress.Head.encoded_len]u8,
+    expected_owner: [progress.OwnerState.encoded_len]u8,
+    expected_source: Digest,
+    next_head: [progress.Head.encoded_len]u8,
+    next_owner: [progress.OwnerState.encoded_len]u8,
+    source_bytes: ?[]u8,
+    pub fn deinit(self: *@This()) void {
+        if (self.source_bytes) |bytes| self.alloc.free(bytes);
+        self.* = undefined;
+    }
+    pub fn stage(self: *const @This(), txn: anytype, group: u64) !void {
+        const source = self.source_bytes orelse return;
+        var buf: [192]u8 = undefined;
+        if (!std.mem.eql(u8, try txn.get(try publication.headKey(&buf, group, self.table_id)), &self.expected_head) or
+            !std.mem.eql(u8, try txn.get(try publication.ownerKey(&buf, group, self.table_id, self.ordinal)), &self.expected_owner) or
+            !equal(hash(try txn.get(try sourceKey(&buf, group, self.table_id, self.ordinal))), self.expected_source)) return error.GenerationPublicationChanged;
+        try txn.put(try sourceKey(&buf, group, self.table_id, self.ordinal), source);
+        try txn.put(try publication.ownerKey(&buf, group, self.table_id, self.ordinal), &self.next_owner);
+        try txn.put(try publication.headKey(&buf, group, self.table_id), &self.next_head);
+    }
+};
+
+pub fn prepareCompletion(alloc: std.mem.Allocator, txn: anytype, group: u64, request: CompletionRequest, authority: anytype) !PreparedCompletion {
+    try request.validate();
+    var buf: [192]u8 = undefined;
+    const query = request.query;
+    const head = try progress.Head.decode(try txn.get(try publication.headKey(&buf, group, query.table_id)));
+    if (!std.mem.eql(u8, &head.plan_id, &query.id) or head.phase != .building) return error.GenerationPublicationChanged;
+    const ordinal = try publication.ownerOrdinal(txn, group, query.table_id, query.group_id);
+    var owner = try progress.OwnerState.decode(try txn.get(try publication.ownerKey(&buf, group, query.table_id, ordinal)));
+    const expected_owner = try owner.encode();
+    const expected_source = owner.source_delivery;
+    const raw = try txn.get(try sourceKey(&buf, group, query.table_id, ordinal));
+    if (!equal(hash(raw), owner.source_delivery)) return error.InvalidCatalogRecord;
+    const prefix_ = try SourceRecord.peek(alloc, raw);
+    if (prefix_.binding.ordinal != ordinal or prefix_.binding.fence.owner_group_id != query.group_id or
+        !std.mem.eql(u8, &prefix_.binding.id, &query.id) or prefix_.binding.fence.namespace.table_id != query.table_id or
+        owner.source_completed != (prefix_.completion != null) or
+        (owner.source_completed and head.completed_sources == 0) or (!owner.source_completed and head.completed_sources == head.owner_count)) return error.InvalidCatalogRecord;
+    try request.consumed.requireHead(prefix_.head);
+    if (!request.consumed.position.namespace.eql(prefix_.binding.fence.namespace)) return error.InvalidPrivateIndexClaimReceipt;
+    var next = head;
+    var source_bytes: ?[]u8 = null;
+    errdefer if (source_bytes) |bytes| alloc.free(bytes);
+    if (owner.source_completed) {
+        if (!equal(try prefix_.completion.?.digest(), try request.consumed.digest())) return error.GenerationPublicationChanged;
+    } else {
+        next = try head.completeSource(owner);
+        source_bytes = try SourceRecord.completed(alloc, raw, request.consumed);
+        owner.source_delivery = hash(source_bytes.?);
+        owner.source_completed = true;
+    }
+    // All borrowed bytes have been consumed/copied before independent reads.
+    try authority.verifyConsumption(txn, group, prefix_.binding, request.consumed);
+    return .{ .alloc = alloc, .table_id = query.table_id, .ordinal = ordinal, .expected_head = try head.encode(), .expected_owner = expected_owner, .expected_source = expected_source, .next_head = try next.encode(), .next_owner = try owner.encode(), .source_bytes = source_bytes };
+}
 const TargetUpdate = struct { ordinal: u16, bytes: [TargetRecord.encoded_len]u8 };
 const OwnerUpdate = struct { ordinal: u16, bytes: [progress.OwnerState.encoded_len]u8 };
 pub const Prepared = struct {
@@ -350,7 +479,7 @@ pub fn prepare(alloc: std.mem.Allocator, txn: anytype, group: u64, request: Requ
     var source_owner = try progress.OwnerState.decode(try txn.get(try publication.ownerKey(&buf, group, data.source.fence.namespace.table_id, data.source.ordinal)));
     // Decode/hash borrowed native buffers before the next read.
     const previous = if (try optional(txn, try sourceKey(&buf, group, data.source.fence.namespace.table_id, data.source.ordinal))) |bytes| blk: {
-        if (bytes.len <= Head.encoded_len or bytes.len > Head.encoded_len + delivery.max_wire_bytes or !equal(hash(bytes), source_owner.source_delivery)) return error.InvalidCatalogRecord;
+        if (bytes.len <= SourceRecord.prefix_len or bytes.len > SourceRecord.max_bytes or !equal(hash(bytes), source_owner.source_delivery)) return error.InvalidCatalogRecord;
         break :blk try Head.decode(bytes[0..Head.encoded_len]);
     } else blk: {
         if (nonzero(&source_owner.source_delivery)) return error.InvalidCatalogRecord;
@@ -462,7 +591,7 @@ fn requireEnrollment(alloc: std.mem.Allocator, reader: anytype, group: u64, proo
     defer identity.deinit();
     if (!std.meta.eql(identity.value, proof.identity)) return error.InvalidCatalogRecord;
 }
-pub const Counts = struct { sources: usize = 0, targets: usize = 0, source_rows: u64 = 0, target_rows: u64 = 0 };
+pub const Counts = struct { sources: usize = 0, targets: usize = 0, completed: u16 = 0, source_rows: u64 = 0, target_rows: u64 = 0 };
 /// Complete forward checkpoint verification; online acceptance never scans the
 /// owner cohort. Exact owner anchors also protect zero-row source decisions.
 pub fn verifyOwner(alloc: std.mem.Allocator, reader: anytype, group: u64, head: progress.Head, owner: progress.OwnerState, incarnation: Digest) !Counts {
@@ -472,6 +601,11 @@ pub fn verifyOwner(alloc: std.mem.Allocator, reader: anytype, group: u64, head: 
         var record = try SourceRecord.decode(alloc, bytes);
         defer record.deinit();
         if (!equal(record.head.metadata_incarnation, incarnation) or record.signed.value.data.source.ordinal != owner.owner.ordinal) return error.InvalidCatalogRecord;
+        if (owner.source_completed != (record.completion != null)) return error.InvalidCatalogRecord;
+        if (record.completion) |complete| {
+            try requireEnrollment(alloc, reader, group, complete.proof, incarnation);
+            result.completed = 1;
+        }
         try requireRetainedBinding(alloc, reader, group, head, record.signed.value.data.source);
         try requireEnrollment(alloc, reader, group, record.signed.value.proof, incarnation);
         for (record.signed.value.data.parts.items) |part| {
@@ -480,7 +614,7 @@ pub fn verifyOwner(alloc: std.mem.Allocator, reader: anytype, group: u64, head: 
         }
         result.sources = 1;
         result.source_rows = record.head.rows;
-    }
+    } else if (owner.source_completed) return error.InvalidCatalogRecord;
     if (try anchored(reader, try targetKey(&buf, group, head.table_id, owner.owner.ordinal), owner.target_inventory)) |bytes| {
         const record = try TargetRecord.decode(bytes);
         if (!equal(record.inventory.metadata_incarnation, incarnation) or record.binding.ordinal != owner.owner.ordinal) return error.InvalidCatalogRecord;

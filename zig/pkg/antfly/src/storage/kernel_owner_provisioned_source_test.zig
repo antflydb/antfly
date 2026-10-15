@@ -166,6 +166,9 @@ test "native index owner adapter executes fresh permission stages and recovers r
         acceptance_reads: usize = 0,
         acceptance_writes: usize = 0,
         lose_acceptance_reply: bool = false,
+        completed: bool = false,
+        completion_writes: usize = 0,
+        lose_completion_reply: bool = true,
         pub fn currentAuthority(self: *@This()) !?@import("../metadata/relational_index_worker.zig").Authority {
             const view = self.value.native_signing orelse return null;
             return .{ .metadata_incarnation = view.identity.metadata_incarnation, .binding_digest = view.binding_digest, .writer_generation = 1 };
@@ -188,6 +191,19 @@ test "native index owner adapter executes fresh permission stages and recovers r
         }
         pub fn systemCatalog(self: *@This(), a: std.mem.Allocator, context: local.api_operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             try std.testing.expect(context.index_publication_authority);
+            if (call == .relational_index_source_complete) {
+                const journal = @import("../metadata/relational_index_delivery_journal.zig");
+                const request_ = call.relational_index_source_complete;
+                try request_.validate();
+                try request_.consumed.requireHead(self.acceptance orelse return error.InvalidPrivateIndexClaimReceipt);
+                if (!self.completed) self.completion_writes += 1;
+                self.completed = true;
+                if (self.lose_completion_reply) {
+                    self.lose_completion_reply = false;
+                    return error.MetadataMutationOutcomeUnknown;
+                }
+                return std.json.Stringify.valueAlloc(a, journal.Status{ .query = request_.query, .head = self.acceptance, .completed = true }, .{});
+            }
             if (call == .relational_index_source_accept) {
                 const journal = @import("../metadata/relational_index_delivery_journal.zig");
                 const request = call.relational_index_source_accept;
@@ -201,7 +217,7 @@ test "native index owner adapter executes fresh permission stages and recovers r
             }
             if (call == .relational_index_source_accept_status) {
                 self.acceptance_reads += 1;
-                return std.json.Stringify.valueAlloc(a, @import("../metadata/relational_index_delivery_journal.zig").Status{ .query = call.relational_index_source_accept_status, .head = self.acceptance, .replication_pending = self.acceptance_pending }, .{});
+                return std.json.Stringify.valueAlloc(a, @import("../metadata/relational_index_delivery_journal.zig").Status{ .query = call.relational_index_source_accept_status, .head = self.acceptance, .replication_pending = self.acceptance_pending, .completed = self.completed }, .{});
             }
             var value = self.value;
             if (call.relational_index_owner_decision.claim_groups) |groups| {
@@ -587,11 +603,12 @@ test "native index owner adapter executes fresh permission stages and recovers r
                 const calls_before = transport.calls;
                 _ = try scheduler.step(std.testing.io, alloc, null, &metadata, &local_transport, now);
                 try std.testing.expect(transport.calls - calls_before <= 1);
-                if (transport.calls - before >= 3) break;
+                if (transport.calls - before >= 2 and scheduler.jobs[0].?.owners[0] == null) break;
                 now += 300 * std.time.ns_per_ms;
             }
-            try std.testing.expectEqual(@as(usize, 3), transport.calls - before);
+            try std.testing.expectEqual(@as(usize, 2), transport.calls - before);
             try std.testing.expectEqual(@as(usize, 1), metadata.acceptance_writes);
+            try std.testing.expectEqual(@as(usize, 1), metadata.completion_writes);
         }
         var retried = try owners.consumeNativeIndexSourceAtRoot(alloc, group, plan.before.name, consume_command, .{});
         defer retried.deinit();

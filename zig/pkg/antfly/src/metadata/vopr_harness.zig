@@ -6929,6 +6929,7 @@ pub const MetadataAdminVoprSource = struct {
             .relational_index_owner_ack,
             .relational_index_owner_ack_status,
             .relational_index_source_accept,
+            .relational_index_source_complete,
             .relational_index_source_accept_status,
             .fk_initial_create_prepare,
             .constraint_name_prepare,

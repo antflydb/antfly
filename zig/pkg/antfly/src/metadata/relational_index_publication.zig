@@ -1335,6 +1335,7 @@ pub fn verifyOwned(a: Allocator, txn: anytype, group: u64, table: u64) !Verified
     var receipt_count: usize = 0;
     var delivery_counts: [2]usize = @splat(0);
     var delivery_rows: [2]u64 = @splat(0);
+    var completed_sources: u16 = 0;
     var cached_enrollment: ?root_enrollment.Identity = null;
     for (prepared.owners, 0..) |expected, i| {
         const owner = progress.OwnerState.decode(try txn.get(try ownerKey(&buf, group, table, @intCast(i)))) catch return error.InvalidCatalogRecord;
@@ -1343,6 +1344,7 @@ pub fn verifyOwned(a: Allocator, txn: anytype, group: u64, table: u64) !Verified
         if (!std.mem.eql(u8, try txn.get(try dispatchKey(&buf, group, table, @intCast(i))), prepared.dispatch[i])) return error.InvalidCatalogRecord;
         const accepted = try @import("relational_index_delivery_journal.zig").verifyOwner(a, txn, group, head, owner, std.fmt.bytesToHex(parsed.value.table_guard.incarnation, .lower));
         delivery_counts[0] += accepted.sources;
+        completed_sources += accepted.completed;
         delivery_counts[1] += accepted.targets;
         delivery_rows[0] = std.math.add(u64, delivery_rows[0], accepted.source_rows) catch return error.InvalidCatalogRecord;
         delivery_rows[1] = std.math.add(u64, delivery_rows[1], accepted.target_rows) catch return error.InvalidCatalogRecord;
@@ -1377,6 +1379,7 @@ pub fn verifyOwned(a: Allocator, txn: anytype, group: u64, table: u64) !Verified
     }
     if (!std.meta.eql(counts, head.counts)) return error.InvalidCatalogRecord;
     if (delivery_rows[0] != delivery_rows[1]) return error.InvalidCatalogRecord;
+    if (completed_sources != head.completed_sources) return error.InvalidCatalogRecord;
     const pending = switch (head.phase) {
         .installing, .releasing, .published, .canceled => false,
         else => true,

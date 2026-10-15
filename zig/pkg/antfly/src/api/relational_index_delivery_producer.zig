@@ -38,7 +38,7 @@ pub const SignedClosure = struct {
     }
 };
 
-pub const Phase = enum { status, consume_prefix, source, target, close, accept, resolve_accept, consume_batch, done };
+pub const Phase = enum { status, consume_prefix, source, target, close, accept, resolve_accept, consume_batch, complete, resolve_completion, done };
 pub const Result = union(enum) {
     pending: Phase,
     idle,
@@ -133,6 +133,17 @@ pub const Producer = struct {
         const value = self.closed.?;
         return .{ .signed = .{ .data = value.owned.data, .proof = value.proof }, .consumed = self.prefix };
     }
+    fn completion(self: *const Producer) journal.CompletionRequest {
+        return .{ .query = self.query(), .consumed = self.prefix.? };
+    }
+    fn observeCompletion(self: *Producer, status: journal.Status) !void {
+        if (status.replication_pending) {
+            self.phase = .resolve_completion;
+        } else if (try status.isCompleted(self.completion())) {
+            self.result = .{ .advanced = .{ .consumed = self.prefix.?, .eof = true, .drained = true } };
+            self.phase = .done;
+        } else self.phase = .complete;
+    }
     fn observeAcceptance(self: *Producer, status: journal.Status) !void {
         if (status.replication_pending) {
             self.phase = .resolve_accept;
@@ -171,7 +182,7 @@ pub const Producer = struct {
             },
             .consume_prefix => {
                 self.prefix = (try self.consume(transport)) orelse return .{ .pending = self.phase };
-                self.phase = .source;
+                self.phase = if (self.head.?.state == .ready) .complete else .source;
             },
             .source => {
                 var response = try transport.control(self.alloc, self.table_name, self.request, self.context);
@@ -259,9 +270,27 @@ pub const Producer = struct {
             .resolve_accept => try self.observeAcceptance(try self.metadataCall(metadata, .{ .relational_index_source_accept_status = self.query() })),
             .consume_batch => {
                 const consumed = (try self.consume(transport)) orelse return .{ .pending = self.phase };
-                self.result = .{ .advanced = .{ .consumed = consumed, .eof = self.head.?.state == .ready } };
-                self.phase = .done;
-                return self.result.?;
+                self.prefix = consumed;
+                if (self.head.?.state == .ready) self.phase = .complete else {
+                    self.result = .{ .advanced = .{ .consumed = consumed, .eof = false } };
+                    self.phase = .done;
+                    return self.result.?;
+                }
+            },
+            .complete => {
+                const status = self.metadataCall(metadata, .{ .relational_index_source_complete = self.completion() }) catch |err| switch (@as(anyerror, err)) {
+                    error.MetadataMutationOutcomeUnknown, error.Timeout => {
+                        self.phase = .resolve_completion;
+                        return .{ .pending = self.phase };
+                    },
+                    else => return err,
+                };
+                try self.observeCompletion(status);
+                if (self.phase == .done) return self.result.?;
+            },
+            .resolve_completion => {
+                try self.observeCompletion(try self.metadataCall(metadata, .{ .relational_index_source_accept_status = self.query() }));
+                if (self.phase == .done) return self.result.?;
             },
         }
         return .{ .pending = self.phase };

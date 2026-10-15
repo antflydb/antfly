@@ -1045,12 +1045,34 @@ const TestDriver = struct {
     acceptance_calls: usize = 0,
     lose_acceptance_reply: bool = false,
     consumption_calls: usize = 0,
+    completion_calls: usize = 0,
+    completion_requests: usize = 0,
+    completed: bool = false,
+    lose_completion_reply: bool = false,
+    lose_completion_before_commit: bool = false,
     consumed_record: ?jobs.private_claims.SourceStream.Consumption = null,
     cancel_after_commit: ?*std.atomic.Value(bool) = null,
 
     pub fn systemCatalog(self: *TestDriver, alloc: std.mem.Allocator, context: operation.RequestContext, call: calls.Call) ![]u8 {
         try std.testing.expect(context.index_publication_authority);
-        if (call == .relational_index_source_accept_status) return std.json.Stringify.valueAlloc(alloc, delivery_journal.Status{ .query = call.relational_index_source_accept_status, .head = self.acceptance_head }, .{});
+        if (call == .relational_index_source_accept_status) return std.json.Stringify.valueAlloc(alloc, delivery_journal.Status{ .query = call.relational_index_source_accept_status, .head = self.acceptance_head, .completed = self.completed }, .{});
+        if (call == .relational_index_source_complete) {
+            const request = call.relational_index_source_complete;
+            try request.validate();
+            try request.consumed.requireHead(self.acceptance_head orelse return error.InvalidPrivateIndexClaimReceipt);
+            self.completion_requests += 1;
+            if (self.lose_completion_before_commit) {
+                self.lose_completion_before_commit = false;
+                return error.MetadataMutationOutcomeUnknown;
+            }
+            if (!self.completed) self.completion_calls += 1;
+            self.completed = true;
+            if (self.lose_completion_reply) {
+                self.lose_completion_reply = false;
+                return error.MetadataMutationOutcomeUnknown;
+            }
+            return std.json.Stringify.valueAlloc(alloc, delivery_journal.Status{ .query = request.query, .head = self.acceptance_head, .completed = true }, .{});
+        }
         if (call == .relational_index_source_accept) {
             const request = call.relational_index_source_accept;
             self.acceptance_head = try @import("relational_index_delivery_producer.zig").testing.acceptedHead(request, self.acceptance_head);
@@ -1385,8 +1407,14 @@ const TestSchedulerHost = struct {
 };
 
 fn testSchedulerDelivery(alloc: std.mem.Allocator, permission: publication.OwnerDecision, binding: jobs.Binding, root: local.storage_db_root_signing_identity.State) !void {
+    return testSchedulerDeliveryFault(alloc, permission, binding, root, false);
+}
+fn testSchedulerDeliveryBeforeCommit(alloc: std.mem.Allocator, permission: publication.OwnerDecision, binding: jobs.Binding, root: local.storage_db_root_signing_identity.State) !void {
+    return testSchedulerDeliveryFault(alloc, permission, binding, root, true);
+}
+fn testSchedulerDeliveryFault(alloc: std.mem.Allocator, permission: publication.OwnerDecision, binding: jobs.Binding, root: local.storage_db_root_signing_identity.State, before_commit: bool) !void {
     const worker = @import("../metadata/relational_index_worker.zig");
-    var driver: TestDriver = .{ .value = permission, .binding = binding, .lose_acceptance_reply = true };
+    var driver: TestDriver = .{ .value = permission, .binding = binding, .lose_acceptance_reply = true, .lose_completion_reply = !before_commit, .lose_completion_before_commit = before_commit };
     var host: TestSchedulerHost = .{ .driver = &driver };
     var sender: TestDeliveryTransport = .{ .driver = &driver, .root = root };
     var transport = sender.localTransport();
@@ -1397,12 +1425,23 @@ fn testSchedulerDelivery(alloc: std.mem.Allocator, permission: publication.Owner
         const before = sender.calls;
         _ = try coordinator.step(std.testing.io, alloc, null, &host, &transport, now);
         try std.testing.expect(sender.calls - before <= 1);
-        if (driver.consumption_calls == 1) break;
+        if (driver.completion_calls == 1 and coordinator.jobs[0].?.owners[0] == null) break;
         now += 300 * std.time.ns_per_ms;
     }
     try std.testing.expectEqual(@as(usize, 1), driver.build_pages);
     try std.testing.expectEqual(@as(usize, 1), driver.acceptance_calls);
     try std.testing.expectEqual(@as(usize, 1), driver.consumption_calls);
+    try std.testing.expectEqual(@as(usize, 1), driver.completion_calls);
+    try std.testing.expectEqual(@as(usize, if (before_commit) 2 else 1), driver.completion_requests);
+    driver.value.head.completed_sources = driver.value.head.owner_count;
+    driver.value.head.completion_revision = driver.value.head.revision;
+    const completed_calls = sender.calls;
+    for (0..12) |_| {
+        now += 300 * std.time.ns_per_ms;
+        _ = try coordinator.step(std.testing.io, alloc, null, &host, &transport, now);
+    }
+    try std.testing.expectEqual(completed_calls, sender.calls);
+    try std.testing.expect(driver.value.head.phase == .building);
     host.active = false;
     const before = sender.calls;
     try std.testing.expect(!try coordinator.step(std.testing.io, alloc, null, &host, &transport, now));
@@ -1454,12 +1493,13 @@ fn testDeliveryProducerMode(alloc: std.mem.Allocator, permission: publication.Ow
         if (observed == .advanced) break;
     }
     try std.testing.expect(pending_target and resolved);
-    try std.testing.expect(observed == .advanced and observed.advanced.eof and !observed.advanced.drained);
+    try std.testing.expect(observed == .advanced and observed.advanced.eof and observed.advanced.drained);
     try std.testing.expectEqual(@as(u64, 1), observed.advanced.consumed.rows);
     try observed.advanced.consumed.verify();
     try std.testing.expectEqual(@as(usize, 2), driver.claim_batches);
     try std.testing.expectEqual(@as(usize, 1), driver.acceptance_calls);
     try std.testing.expectEqual(@as(usize, 1), driver.consumption_calls);
+    try std.testing.expectEqual(@as(usize, 1), driver.completion_calls);
     canceled.store(true, .release);
     const before = sender.calls;
     _ = try producer.step(transport, &driver);
@@ -1931,6 +1971,8 @@ test "relational index publication claim receiver binds fresh build permission w
         try std.testing.checkAllAllocationFailures(alloc, testDeliveryProducerLocal, .{ permission, binding.?, root });
         try testSchedulerDelivery(alloc, permission, binding.?, root);
         try std.testing.checkAllAllocationFailures(alloc, testSchedulerDelivery, .{ permission, binding.?, root });
+        try testSchedulerDeliveryBeforeCommit(alloc, permission, binding.?, root);
+        try std.testing.checkAllAllocationFailures(alloc, testSchedulerDeliveryBeforeCommit, .{ permission, binding.?, root });
         {
             var cohort = try jobs.private_claims.delivery.Cohort.init(alloc, &.{.{ .owner = permission.owner.owner, .start = "", .end = "" }});
             defer cohort.deinit();

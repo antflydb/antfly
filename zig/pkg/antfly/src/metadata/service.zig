@@ -3424,7 +3424,7 @@ test "relation mutation admission projects naming capability without materializi
 pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
     // AIPH v2 also applies to unmarked plans. Classify it before the older
     // table-definition profile can return a weaker decoder requirement.
-    if (command == .accept_relational_index_delivery or command == .begin_relational_index_publication or command == .ack_relational_index_publication)
+    if (command == .complete_relational_index_source or command == .accept_relational_index_delivery or command == .begin_relational_index_publication or command == .ack_relational_index_publication)
         return metadata_topology_protocol.index_publication_head_version;
     const has_reader_requirements = switch (command) {
         .upsert_table => |table| table.schema_reader_requirements != null,
@@ -3621,6 +3621,8 @@ test "relational index publication admission requires its own coordinated decode
     try std.testing.expectEqual(metadata_topology_protocol.index_publication_head_version, transitionRequiredCoordinatedDecoderVersion(ack));
     const delivery: metadata_storage.TransitionCommand = .{ .accept_relational_index_delivery = "{}" };
     try std.testing.expectEqual(metadata_topology_protocol.index_delivery_version, transitionRequiredCoordinatedDecoderVersion(delivery));
+    const completion: metadata_storage.TransitionCommand = .{ .complete_relational_index_source = "{}" };
+    try std.testing.expectEqual(metadata_topology_protocol.index_delivery_version, transitionRequiredCoordinatedDecoderVersion(completion));
 }
 
 test "system catalog CHECK identity decoder barrier covers admission and planless owner ACKs" {

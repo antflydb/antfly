@@ -191,6 +191,14 @@ const Job = struct {
                 if (response.value != .head) return error.InvalidCatalogRecord;
                 try self.identity.requireHead(response.value.head);
                 owner.head = response.value.head;
+                if (response.value.head.completed_sources == response.value.head.owner_count) {
+                    // Every consumed EOF is durable. Do not rebuild/reconsume
+                    // sources while waiting for physical target validation.
+                    // This barrier is not permission to install or release.
+                    self.retireOwner(index);
+                    self.retry_at_ns = now_ns +| std.time.ns_per_s;
+                    return;
+                }
                 owner.stage = switch (response.value.head.phase) {
                     .fencing, .reserving => .control,
                     .building => .build,

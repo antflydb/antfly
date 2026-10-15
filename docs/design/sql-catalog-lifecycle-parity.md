@@ -6900,3 +6900,60 @@ terminal schema/catalog activation and full distributed fault qualification.
 Public UNIQUE activation remains guarded; original dispositions remain
 483 implemented / 862 unresolved. No original SQL completion or benchmark is
 claimed by connecting this private worker.
+
+### Durable consumed-EOF completion
+
+Accepted EOF and physical source consumption remain separate facts. Completion
+now joins the retained accepted EOF to an actual root-signed consumption prefix:
+same incarnation, binding, ordinal, decision, batch and cumulative rows, with a
+later native cut in the exact source namespace. Metadata independently repeats
+current owner, range, enrollment and reported-cut checks before committing.
+An unreported consumption cut is deferred, not accepted or treated as a service
+failure. This is not a caller-supplied "done" flag.
+
+One bounded transaction CASes and stages the retained source proof, owner seal
+and compact cohort head. The owner flag prevents double counting; the head
+counts completed sources and records a stable revision at the final completion.
+The head is 208 bytes regardless of cohort size. Source records retain a fixed
+binding prefix, so completion does not reparse the last batch's complete target
+proof array. Full checkpoint verification still verifies those proofs, the
+consumption signature, enrollment, owner anchors and exact completion count.
+The private formats are AIPH v3, AIPO v5 and AIDA v2; coordinated decoder floor
+42 guards admission and transition tag 81. No legacy private-format reader was
+added, and ordinary document/relational row formats did not change.
+
+The receiving metadata service, compiled facade, standalone adapter and mounted
+HTTP transport share the completion contract, body-bound authority and bounded
+reply budget. The producer cannot report completed EOF until metadata confirms
+completion without standby debt. Unknown replies resolve through a read before
+retrying the exact prefix. Restart may recover a consumed EOF after its body is
+gone; completion does not require resending claims or acceptance. Once all EOFs
+are complete, the worker stops repeating source operations while waiting for
+physical target validation. It does not synthesize a validation/install ACK.
+
+Tests cover committed acceptance/completion, actual transaction rollback at each
+of three staged writes, bad signatures/prefixes and unreported cuts, duplicate
+completion, snapshot count mismatch, standby debt, reopen, lost completion
+replies, allocation failures and the actual leased compiled owner's recovered
+consumption. The leased-owner fixture's metadata decisions remain synthetic;
+independent real metadata tests qualify durable completion separately.
+
+The aggregate gate in `/private/tmp/antfly-index-completion-full-debug-v2.log`
+passed 159/159 Debug steps and 17/17 progress-state tests, including publication,
+service/ACK, leased-owner, native page, C-ABI, runtime-contract and all 104
+standalone tests. The subsequent test-only expansion in
+`/private/tmp/antfly-index-completion-fault-debug.log` passed 60/60 Debug steps
+with all 48 publication tests. It distinguishes uncertain completion before
+commit (one prefix retry, no second consumption) from a lost committed reply
+(read-only resolution, no second mutation). Counts overlap; neither gate
+reported a failure or leak. Boundary, license, original inventory,
+control-catalog, formatting and diff checks passed.
+
+Still required: frozen expected target-inventory projections and physical target
+seals, native validation/install/release, durable failure/cancellation completion,
+missing-root repair, bounded parallel target fanout, actual data-Raft execution,
+terminal catalog publication and complete distributed faults. A completion
+counter or XOR inventory is not physical-root validation or authority by itself.
+Public UNIQUE activation remains guarded. Original SQL dispositions remain
+483 implemented / 862 unresolved; this milestone claims no original SQL case or
+throughput benchmark.

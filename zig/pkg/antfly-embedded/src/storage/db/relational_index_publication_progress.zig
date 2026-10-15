@@ -114,7 +114,7 @@ pub const Receipt = struct {
 
 /// Fixed-size head: ACK application does not rewrite/reparse a 4,096-owner plan.
 pub const Head = struct {
-    pub const encoded_len = 192;
+    pub const encoded_len = 208;
     reader_requirements: ?@import("../../common/schema_readers.zig").ReaderRequirements = null,
     plan_id: Id,
     plan_digest: Digest,
@@ -126,6 +126,9 @@ pub const Head = struct {
     phase: Phase = .fencing,
     failure: Failure = .none,
     counts: [7]u16 = @splat(0),
+    completed_sources: u16 = 0,
+    /// Stable metadata barrier once the last source's consumed EOF commits.
+    completion_revision: u64 = 0,
 
     pub fn validate(self: Head) !void {
         if (self.reader_requirements) |requirements| if (!requirements.valid()) return error.InvalidGenerationPublication;
@@ -134,6 +137,11 @@ pub const Head = struct {
             self.table_id == 0 or self.revision == 0 or self.owner_count == 0 or self.owner_count > max_owners)
             return error.InvalidGenerationPublication;
         for (self.counts) |count| if (count > self.owner_count) return error.InvalidGenerationPublication;
+        if (self.completed_sources > self.owner_count or
+            (self.completed_sources == self.owner_count) != (self.completion_revision != 0) or
+            self.completion_revision > self.revision or
+            (self.completed_sources != 0 and (self.phase == .fencing or self.phase == .reserving)) or
+            (self.completed_sources != 0 and self.counts[1] != self.owner_count)) return error.InvalidGenerationPublication;
         const c = self.counts;
         if (c[1] > c[0] or c[2] > c[1] or c[3] > c[2] or c[4] > c[3] or c[5] > c[1] or c[6] > c[5])
             return error.InvalidGenerationPublication;
@@ -166,6 +174,24 @@ pub const Head = struct {
     }
     fn bump(self: *Head) !void {
         self.revision = std.math.add(u64, self.revision, 1) catch return error.GenerationPublicationChanged;
+    }
+
+    /// Metadata verifies the actual signed consumption before using this
+    /// bounded counter update. Owner completion is staged in the same txn.
+    pub fn completeSource(self: Head, owner: OwnerState) !Head {
+        try self.validate();
+        try owner.validate();
+        if (self.phase != .building or owner.owner.authority != .native or
+            !equal(owner.owner.plan_digest, self.plan_digest) or !std.mem.eql(u8, &owner.owner.plan_id, &self.plan_id) or
+            owner.owner.namespace.table_id != self.table_id or owner.owner.ordinal >= self.owner_count or
+            !owner.has(.reserved) or !nonzero(&owner.source_delivery) or owner.source_completed or
+            self.completed_sources == self.owner_count) return error.GenerationPublicationChanged;
+        var next = self;
+        next.completed_sources += 1;
+        try next.bump();
+        if (next.completed_sources == next.owner_count) next.completion_revision = next.revision;
+        try next.validate();
+        return next;
     }
 
     /// Stage this decision AND the public descriptor/name-reservation switch
@@ -201,7 +227,7 @@ pub const Head = struct {
         try self.validate();
         var bytes: [encoded_len]u8 = @splat(0);
         @memcpy(bytes[0..4], "AIPH");
-        bytes[4] = 2;
+        bytes[4] = 3;
         bytes[5] = @backingInt(self.phase);
         bytes[6] = @backingInt(self.failure);
         @memcpy(bytes[8..24], &self.plan_id);
@@ -216,13 +242,16 @@ pub const Head = struct {
             std.mem.writeInt(u32, bytes[152..156], requirements.semantic_version, .little);
             std.mem.writeInt(u32, bytes[156..160], requirements.encoding_version, .little);
         }
-        @memcpy(bytes[160..192], &checksum(bytes[0..160]));
+        std.mem.writeInt(u16, bytes[160..162], self.completed_sources, .little);
+        std.mem.writeInt(u64, bytes[168..176], self.completion_revision, .little);
+        @memcpy(bytes[176..208], &checksum(bytes[0..176]));
         return bytes;
     }
 
     pub fn decode(bytes: []const u8) !Head {
-        if (bytes.len != encoded_len or !std.mem.eql(u8, bytes[0..4], "AIPH") or bytes[4] != 2 or bytes[7] != 0 or
-            !std.mem.eql(u8, &checksum(bytes[0..160]), bytes[160..192])) return error.InvalidGenerationPublication;
+        if (bytes.len != encoded_len or !std.mem.eql(u8, bytes[0..4], "AIPH") or bytes[4] != 3 or bytes[7] != 0 or
+            !std.mem.allEqual(u8, bytes[162..168], 0) or
+            !std.mem.eql(u8, &checksum(bytes[0..176]), bytes[176..208])) return error.InvalidGenerationPublication;
         var result: Head = .{
             .plan_id = bytes[8..24].*,
             .plan_digest = bytes[24..56].*,
@@ -233,6 +262,8 @@ pub const Head = struct {
             .owner_count = std.mem.readInt(u16, bytes[136..138], .little),
             .phase = std.enums.fromInt(Phase, bytes[5]) orelse return error.InvalidGenerationPublication,
             .failure = std.enums.fromInt(Failure, bytes[6]) orelse return error.InvalidGenerationPublication,
+            .completed_sources = std.mem.readInt(u16, bytes[160..162], .little),
+            .completion_revision = std.mem.readInt(u64, bytes[168..176], .little),
         };
         const semantic = std.mem.readInt(u32, bytes[152..156], .little);
         const encoding = std.mem.readInt(u32, bytes[156..160], .little);
@@ -255,6 +286,7 @@ pub const OwnerState = struct {
     /// Metadata-owned record commitments; never native publication evidence.
     source_delivery: Digest = @splat(0),
     target_inventory: Digest = @splat(0),
+    source_completed: bool = false,
 
     fn has(self: OwnerState, action: Action) bool {
         return self.flags & bit(action) != 0;
@@ -288,15 +320,17 @@ pub const OwnerState = struct {
             (self.has(.released) and !self.has(.installed)) or (self.has(.canceled) and !self.has(.reserved)) or
             (self.has(.cancel_released) and !self.has(.canceled))) return error.InvalidGenerationPublication;
         if ((nonzero(&self.source_delivery) or nonzero(&self.target_inventory)) and (self.owner.authority != .native or !self.has(.reserved))) return error.InvalidGenerationPublication;
+        if (self.source_completed and !nonzero(&self.source_delivery)) return error.InvalidGenerationPublication;
     }
 
     pub fn encode(self: OwnerState) ![encoded_len]u8 {
         try self.validate();
         var bytes: [encoded_len]u8 = @splat(0);
         @memcpy(bytes[0..4], "AIPO");
-        bytes[4] = 4;
+        bytes[4] = 5;
         bytes[5] = self.flags;
         bytes[6] = @backingInt(self.owner.authority);
+        bytes[7] = @intFromBool(self.source_completed);
         @memcpy(bytes[8..24], &self.owner.plan_id);
         @memcpy(bytes[24..56], &self.owner.plan_digest);
         std.mem.writeInt(u16, bytes[56..58], self.owner.ordinal, .little);
@@ -315,8 +349,8 @@ pub const OwnerState = struct {
     }
 
     pub fn decode(bytes: []const u8) !OwnerState {
-        if (bytes.len != encoded_len or !std.mem.eql(u8, bytes[0..4], "AIPO") or bytes[4] != 4 or
-            bytes[7] != 0 or !std.mem.allEqual(u8, bytes[58..64], 0) or
+        if (bytes.len != encoded_len or !std.mem.eql(u8, bytes[0..4], "AIPO") or bytes[4] != 5 or
+            bytes[7] > 1 or !std.mem.allEqual(u8, bytes[58..64], 0) or
             !std.mem.allEqual(u8, bytes[161..168], 0) or
             !std.mem.eql(u8, &checksum(bytes[0..680]), bytes[680..712])) return error.InvalidGenerationPublication;
         var result: OwnerState = .{
@@ -336,6 +370,7 @@ pub const OwnerState = struct {
             .flags = bytes[5],
             .source_delivery = bytes[616..648].*,
             .target_inventory = bytes[648..680].*,
+            .source_completed = bytes[7] != 0,
             .position = if (std.mem.allEqual(u8, bytes[128..161], 0)) null else positions.Position.decode(bytes[128..161]) catch return error.InvalidGenerationPublication,
         };
         for (&result.receipts, 0..) |*digest, i| digest.* = bytes[168 + i * 32 ..][0..32].*;
@@ -485,7 +520,7 @@ fn testReceipt(head: Head, owner: OwnerState, action: Action) Receipt {
         .raft => position.raft.index + 1,
         .native => position.native.sequence + 1,
     } else 1;
-    const position: positions.Position = if (owner.position != null and owner.position.? == .native)
+    const position: positions.Position = if (owner.owner.authority == .native)
         .{ .native = .{ .namespace = owner.owner.namespace, .sequence = next } }
     else
         .{ .raft = .{ .term = if (owner.position) |previous| previous.raft.term else 1, .index = next } };
@@ -517,6 +552,30 @@ test "index publication waits for every owner before build publication and relea
     try std.testing.expectEqual(Phase.releasing, head.phase);
     try testAck(&head, &owners[0], .released);
     try std.testing.expectEqual(Phase.published, head.phase);
+}
+
+test "index publication completed sources count each owner once and preserve a stable final barrier" {
+    var head = testHead(3);
+    var owners = [_]OwnerState{ testOwner(0), testOwner(1), testOwner(2) };
+    for (&owners) |*owner| owner.owner.authority = .native;
+    for ([_]Action{ .fenced, .reserved }) |action| for (&owners) |*owner| try testAck(&head, owner, action);
+    for (&owners, 0..) |*owner, index| {
+        // Pure counter test: metadata, not this helper, verifies consumption.
+        owner.source_delivery = @splat(7);
+        head = try head.completeSource(owner.*);
+        owner.source_completed = true;
+        try std.testing.expectEqual(@as(u16, @intCast(index + 1)), head.completed_sources);
+        try std.testing.expectEqual(@as(u64, if (index == 2) head.revision else 0), head.completion_revision);
+        try std.testing.expectError(error.GenerationPublicationChanged, head.completeSource(owner.*));
+        head = try Head.decode(&try head.encode());
+        owner.* = try OwnerState.decode(&try owner.encode());
+    }
+    const barrier = head.completion_revision;
+    try testAck(&head, &owners[0], .validated);
+    try std.testing.expectEqual(barrier, head.completion_revision);
+    var corrupt = head;
+    corrupt.completed_sources = 1;
+    try std.testing.expectError(error.InvalidGenerationPublication, corrupt.validate());
 }
 
 test "index cancellation burns every owner including unvisited ones before any release" {
@@ -713,7 +772,7 @@ test "index progress codecs reject every byte corruption and invalid checksummed
     }
     var impossible = head_bytes;
     impossible[5] = @backingInt(Phase.published);
-    @memcpy(impossible[160..192], &checksum(impossible[0..160]));
+    @memcpy(impossible[176..208], &checksum(impossible[0..176]));
     try std.testing.expectError(error.InvalidGenerationPublication, Head.decode(&impossible));
 }
 
@@ -729,12 +788,12 @@ test "index publication reader requirements survive ACKs and reject partial chec
         var invalid = canonical;
         std.mem.writeInt(u32, invalid[152..156], pair[0], .little);
         std.mem.writeInt(u32, invalid[156..160], pair[1], .little);
-        @memcpy(invalid[160..192], &checksum(invalid[0..160]));
+        @memcpy(invalid[176..208], &checksum(invalid[0..176]));
         try std.testing.expectError(error.InvalidGenerationPublication, Head.decode(&invalid));
     }
     var old_format = canonical;
     old_format[4] = 1;
-    @memcpy(old_format[160..192], &checksum(old_format[0..160]));
+    @memcpy(old_format[176..208], &checksum(old_format[0..176]));
     try std.testing.expectError(error.InvalidGenerationPublication, Head.decode(&old_format));
 }
 
@@ -746,7 +805,7 @@ test "index progress stays fixed size at maximum owner count and fails closed on
         try testAck(&head, &owner, .fenced);
     }
     try std.testing.expectEqual(Phase.reserving, head.phase);
-    try std.testing.expectEqual(@as(usize, 192), (try head.encode()).len);
+    try std.testing.expectEqual(@as(usize, 208), (try head.encode()).len);
     head.revision = std.math.maxInt(u64);
     try std.testing.expectError(error.GenerationPublicationChanged, head.cancel(head.revision, .requested));
     head = testHead(1);

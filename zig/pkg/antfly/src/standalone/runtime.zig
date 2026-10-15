@@ -2617,6 +2617,28 @@ const LocalStandaloneMetadata = struct {
                 if (!(parsed.value.isAccepted(request) catch return error.MetadataMutationOutcomeUnknown)) return error.MetadataMutationOutcomeUnknown;
                 return observed;
             },
+            .relational_index_source_complete => |request| {
+                const journal = @import("../metadata/relational_index_delivery_journal.zig");
+                const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+                const bytes = try std.json.Stringify.valueAlloc(alloc, request, .{});
+                defer alloc.free(bytes);
+                if (bytes.len > journal.max_completion_bytes) return error.CatalogCommandTooLarge;
+                try store.validateRelationalIndexSourceCompletion(group_ids.main_metadata_group_id, bytes);
+                try context.ensureActive();
+                const prior_revision = self.durable_revision;
+                store.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .complete_relational_index_source = bytes }) catch return error.MetadataMutationOutcomeUnknown;
+                const observed_revision = store.standaloneRevision() catch return error.MetadataMutationOutcomeUnknown;
+                if (prior_revision != 0 and prior_revision != std.math.maxInt(u64) and observed_revision == prior_revision + 1) {
+                    self.epoch = observed_revision;
+                    self.durable_revision = observed_revision;
+                } else self.reloadLifecycleProjectionLocked() catch return error.MetadataMutationOutcomeUnknown;
+                const observed = store.relationalIndexSourceAcceptanceStatusJson(alloc, group_ids.main_metadata_group_id, request.query) catch return error.MetadataMutationOutcomeUnknown;
+                errdefer alloc.free(observed);
+                var parsed = std.json.parseFromSlice(journal.Status, alloc, observed, .{}) catch return error.MetadataMutationOutcomeUnknown;
+                defer parsed.deinit();
+                if (!(parsed.value.isCompleted(request) catch return error.MetadataMutationOutcomeUnknown)) return error.MetadataMutationOutcomeUnknown;
+                return observed;
+            },
             .relational_index_owner_ack => |request| {
                 const publication = @import("../metadata/relational_index_publication.zig");
                 const store = self.lifecycle_store orelse return error.UnsupportedOperation;
@@ -3686,7 +3708,7 @@ const LocalStandaloneMetadata = struct {
         var host: IndexWorkHost = .{ .metadata = self };
         var transport: @import("../api/relational_index_local_delivery.zig").Transport = .{ .control_port = control, .claim_port = claims };
         _ = self.index_reconciliation.step(io, self.alloc, &server.provisioned_storage.resource_manager, &host, &transport, platform_time.monotonicNs()) catch |err| switch (err) {
-            error.Canceled, error.DeadlineExceeded, error.Timeout, error.NotLeader, error.GenerationPublicationChanged, error.GenerationAdmissionPending, error.MetadataMutationOutcomeUnknown, error.ResourceBudgetExceeded, error.OutOfMemory, error.ResourceTemporarilyUnavailable, error.WriterLocked, error.LsmRootWriterAlreadyOpen, error.UnsupportedNativeIndexOwner, error.PrivateIndexRootRecoveryRequired, error.PrivateIndexBuildFailed, error.UniqueConstraintViolation, error.TableTopologyProtocolUpgradeRequired => false,
+            error.Canceled, error.DeadlineExceeded, error.Timeout, error.NotLeader, error.GenerationPublicationChanged, error.GenerationAdmissionPending, error.IndexOwnerReceiptChanged, error.MetadataMutationOutcomeUnknown, error.ResourceBudgetExceeded, error.OutOfMemory, error.ResourceTemporarilyUnavailable, error.WriterLocked, error.LsmRootWriterAlreadyOpen, error.UnsupportedNativeIndexOwner, error.PrivateIndexRootRecoveryRequired, error.PrivateIndexBuildFailed, error.UniqueConstraintViolation, error.TableTopologyProtocolUpgradeRequired => false,
             else => return err,
         };
     }

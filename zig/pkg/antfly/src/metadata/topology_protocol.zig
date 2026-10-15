@@ -85,9 +85,11 @@ const std = @import("std");
 /// Version 41 binds source-delivery and expected-inventory records to AIPO v4
 /// owner directories, persists compact complete-delivery provenance, and
 /// decodes ordered delivery acceptance. This does not enable native consumption.
-pub const current_version: u16 = 41;
-pub const index_publication_head_version: u16 = 41;
-pub const index_delivery_version: u16 = 41;
+/// Version 42 decodes AIPH v3 completion counters, AIPO v5 source seals and
+/// final consumed-EOF acknowledgments. It does not imply index installation.
+pub const current_version: u16 = 42;
+pub const index_publication_head_version: u16 = 42;
+pub const index_delivery_version: u16 = 42;
 pub const schema_reader_publication_version: u16 = 39;
 pub const schema_reader_floor_version: u16 = 38;
 pub const schema_reader_capability_version: u16 = 37;

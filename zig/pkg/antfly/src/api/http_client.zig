@@ -447,6 +447,7 @@ pub const RelationalIndexDeliveryTransport = struct {
         const status = switch (call) {
             .relational_index_source_accept_status => |query| try self.metadata.relationalIndexSourceAcceptanceStatus(self.metadata_uri, query, try control_budget.remainingTimeoutMs(), &cancellation),
             .relational_index_source_accept => |request| try self.metadata.acceptRelationalIndexSourceControlled(self.metadata_uri, request, try control_budget.remainingTimeoutMs(), &cancellation),
+            .relational_index_source_complete => |request| try self.metadata.completeRelationalIndexSourceControlled(self.metadata_uri, request, try control_budget.remainingTimeoutMs(), &cancellation),
             else => return error.InvalidGenerationPublication,
         };
         return std.json.Stringify.valueAlloc(alloc, status, .{});
