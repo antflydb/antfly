@@ -981,7 +981,7 @@ def test_bulk_mutations_and_string_scans_share_the_statement_budget(require_nati
 
 def test_native_capture_and_bulk_delete_fit_the_default_memory_ceiling(require_native, aflite_path):
     with af.create_hosted(aflite_path) as database:
-        database.sql("CREATE TABLE docs (id TEXT)")
+        database.sql("CREATE TABLE docs (id TEXT, age BIGINT)")
         database.graph_catalog_json(
             {"action": "put", "name": "g", "definition": {"labels": [{"name": "D", "table": "docs"}]}}
         )

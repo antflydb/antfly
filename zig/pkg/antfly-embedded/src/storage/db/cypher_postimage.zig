@@ -19,11 +19,17 @@ const cypher = @import("cypher");
 const A = std.mem.Allocator;
 pub fn normalize(self: anytype, a: A, graph: cypher.catalog.Graph, node: *const cypher.value.Node, apply_defaults: bool) !*const cypher.value.Node {
     try cypher.value.validatePropertyValue(.{ .map = node.properties });
-    var document = try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, cypher.value.Value{ .map = node.properties }, .{}), .{ .parse_numbers = false });
+    // Only the normalized property values survive this callback. Keep schema
+    // expression and JSON decode buffers out of the statement's retained arena,
+    // while preserving its quota/failure allocator boundary.
+    var scratch = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(a));
+    defer scratch.deinit();
+    const temporary = scratch.allocator();
+    var document = try std.json.parseFromSliceLeaky(std.json.Value, temporary, try std.json.Stringify.valueAlloc(temporary, cypher.value.Value{ .map = node.properties }, .{}), .{ .parse_numbers = false });
     var schema_view = self.core.acquireSchemaView();
     defer if (schema_view) |*view| view.release();
     if (schema_view) |view| if (view.validator()) |validator| {
-        if (validator.execution.expressions) |expressions| try expressions.applyJsonWithPolicy(a, &document, if (apply_defaults) .apply_to_absent else .preserve_absence);
+        if (validator.execution.expressions) |expressions| try expressions.applyJsonWithPolicy(temporary, &document, if (apply_defaults) .apply_to_absent else .preserve_absence);
     };
     const value = try cypher.value.Value.fromJson(a, document);
     const result = try a.create(cypher.value.Node);
@@ -34,7 +40,8 @@ pub fn normalize(self: anytype, a: A, graph: cypher.catalog.Graph, node: *const 
     return result;
 }
 pub fn relationships(self: anytype, a: A, graph: cypher.catalog.Graph, node: *const cypher.value.Node) ![]const *const cypher.value.Relationship {
-    var scratch = std.heap.ArenaAllocator.init(a);
+    if (graph.relationships.len == 0) return &.{};
+    var scratch = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(a));
     defer scratch.deinit();
     const temporary = scratch.allocator();
     const json = try cypher.mutations.document(temporary, node);

@@ -139,6 +139,11 @@ and containers. Result ownership includes commit-time arena growth.
 Retained capture decodes each provider page in a temporary budgeted arena,
 clones authorized entities and cursors, then reclaims the scan and JSON buffers
 before the next page. This keeps temporary allocations out of the retained cut.
+Native postimage normalization and field extraction likewise reclaim JSON and
+schema-expression scratch buffers before the next mutation. Empty relationship
+catalogs bypass extraction. Native regressions execute 8,000-row CREATE,
+SET/REMOVE through repeated nested aliases, and DELETE within the default
+statement memory ceiling.
 
 Query-owned string caches reuse codepoint/trim analysis, casing, reversal, and
 numeric conversions for immutable input allocations. Uncached scans reserve
@@ -147,6 +152,12 @@ with cached needle preprocessing. Large immutable maps similarly index property
 names once; small maps use charged bounded scans. Map projections and property
 merges avoid quadratic name searches. Regression tests cover bounded work,
 cancellation, rollback before commit, and retained page-allocator lifetimes.
+
+The final native 1,000/2,000/4,000/8,000-row DELETE probe reports
+35,001/74,001/156,001/328,001 work units, including retained-cut sorting.
+The 8,000-row delete dropped from roughly 44s to 4.3s; the cached 400,000-byte
+trim/size reduction dropped from 5.5s to 0.06s. SET and REMOVE also scale roughly
+linearly through 8,000 rows. These timings are diagnostic, not test thresholds.
 
 All public SDK graph catalog mutation helpers preserve committed-but-pending
 visibility outcomes. Go create/update return `GraphCatalogMutationResult` with
