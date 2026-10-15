@@ -235,11 +235,16 @@ pub fn layout(examples: []const Example) !architecture.Layout {
 /// model's limits. Padding keys are masked and padded option logits carry no
 /// loss, so results are unchanged; graph construction and autodiff (seconds
 /// per new shape on the released checkpoint) are no longer paid per step.
+/// Sequences pad up to a multiple of this many tokens. Programs are cheap to
+/// build and cached per layout, so the bucket only trades padding (wasted
+/// work in every op) against the number of cached programs.
+pub const sequence_bucket = 16;
+
 pub fn bucketedLayout(examples: []const Example, cfg: modern.Config) !architecture.Layout {
     var l = try layout(examples);
     const laya = cfg.laya orelse return error.InvalidLayaConfig;
     const sequence_limit = if (laya.packing.enabled()) laya.packing.max_packed_len else laya.max_len;
-    l.sequence = @intCast(@min(std.mem.alignForward(usize, l.sequence, 64), @max(sequence_limit, l.sequence)));
+    l.sequence = @intCast(@min(std.mem.alignForward(usize, l.sequence, sequence_bucket), @max(sequence_limit, l.sequence)));
     l.options = @intCast(@min(std.mem.alignForward(usize, l.options, 4), @max(laya.maxOptions(), l.options)));
     return l;
 }
