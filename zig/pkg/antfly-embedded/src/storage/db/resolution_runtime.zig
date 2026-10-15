@@ -538,7 +538,7 @@ fn processChangedExtractionWithConfigOptions(
     const stage = resolver_lib.ResolutionStage{
         .resolver = &resolver,
         .config_generation = cfg.effectiveGeneration(),
-        .promotion_enabled = cfg.promote,
+        .promotion_enabled = cfg.promote and cfg.replacement_index.len == 0,
         .retain_work = retain_work,
         .work_retention = cfg.retain_work,
         .max_work_bytes = cfg.max_work_bytes,

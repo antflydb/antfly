@@ -1170,7 +1170,8 @@ catalog transaction removes the temporary fence. Cancellation validates both
 in-memory and durable generation ownership before retiring anything; a foreign
 publication returns `ANTFLY_REPLACEMENT_CONFIGURATION_MISMATCH` without mutation. A separate baseline preserves permanent resolver-feature
 requirements: a plain completed replacement returns to version 1, while actual
-authoritative resolver features retain version 2.
+authoritative resolver features retain version 2, and inline resolver handoffs
+or graph producer ownership metadata require version 3.
 Deadline Busy means registration
 was accepted and the shadow continues in the background. Without wait, Busy is
 limited to bounded registration admission. Drain with `run_until_idle` to await
@@ -1325,10 +1326,22 @@ Producer replay yields after at most 4096 physical records, a 4 MiB byte budget,
 or a 100 ms quantum (and honors an earlier caller deadline). Byte and time
 budgets are checked between records, so a single oversized record still makes
 progress. Its durable cursor includes artifact-only pages, rather than counting
-only primary documents toward the work budget.
+only primary documents toward the work budget. The scan ends at the document
+namespace boundary; replay journals and identity state do not extend it.
 The successor takes the public name in the same transaction that activates the
 shadow graph; cancellation or terminal build failure retires only the staged
-execution contract. Pending replacement and resolution work resume after reopen.
+execution contract. Staged resolver decisions cannot promote entity documents.
+Activation advances the successor's resolution revision and saves a bounded
+backfill cursor in the same transaction. That backfill releases promotions after
+cutover, including after a restart and when retained resolver work is disabled;
+serving resolver promotions continue during construction.
+
+Graph shorthand records producer ownership in the enrichment catalog. Removal,
+cancellation and cutover atomically remove owned producers with no surviving
+index, resolver, pending shadow or downstream producer references. Explicit
+producer upserts adopt ownership, keeping those producers available independently.
+Older producer catalogs without ownership provenance are conservatively retained.
+Pending replacement and resolution work resume after reopen.
 
 The successor inherits durable merges and, when omitted in its declaration,
 inline aliases. Resolver mutations return `replacement_pending` during the build;

@@ -32031,15 +32031,12 @@ pub const DB = struct {
 
     fn runUntilIdleWithReplayDrainOptions(self: *DB, options: ReplayDrainOptions) !void {
         _ = try self.retryPortableRuntimeActivationIfNeeded();
-        // Reopened manual owners also need the staged resolver's synchronous
-        // replay drivers before the graph replacement drain starts.
-        if (!openModeRequiresReadOnlyBackends(self.open_mode)) {
-            for (self.core.index_manager.resolvers.items) |resolver| {
-                if (resolver.replacement_index.len == 0) continue;
-                if (self.resolution_runtime == null) try self.initResolutionRuntime();
-                if (self.promotion_runtime == null) try self.initPromotionRuntime();
-                break;
-            }
+        // Manual owners need synchronous resolver drivers both during shadow
+        // construction and after a crash between activation and promotion.
+        // Creating these drivers does not start background workers.
+        if (!openModeRequiresReadOnlyBackends(self.open_mode) and self.hasConfiguredResolvers()) {
+            if (self.resolution_runtime == null) try self.initResolutionRuntime();
+            if (self.promotion_runtime == null) try self.initPromotionRuntime();
         }
         try self.drainReplayStagesUntilStableWithOptions(options);
         if (options.drain_relational_indexes) {
@@ -34575,7 +34572,11 @@ pub const DB = struct {
         var state = ScanState{ .alloc = alloc, .database = self, .index_manager = self.core.index_manager, .limit = limit, .options = options };
         defer state.last_store_key.deinit(alloc);
         errdefer state.deinitPartial();
-        try self.core.store.scanWithContext(lower, "", .{ .lower_exclusive = lower_exclusive }, &state, ScanState.scanEntry);
+        const upper = (try internal_keys.documentRangeUpperAlloc(alloc, "")) orelse return error.InvalidArgument;
+        defer alloc.free(upper);
+        // Old persisted cursors may already have crossed the document domain.
+        if (std.mem.order(u8, lower, upper) == .lt)
+            try self.core.store.scanWithContext(lower, upper, .{ .lower_exclusive = lower_exclusive }, &state, ScanState.scanEntry);
 
         var next_lower: ?[]u8 = null;
         if (state.last_store_key.items.len > 0) next_lower = try state.last_store_key.toOwnedSlice(alloc);
@@ -137822,6 +137823,192 @@ test "inline resolver replacement producer pages bound physical records bytes an
         try std.testing.expectEqual(@as(usize, 2), refs);
     }
     try std.testing.expect(try db.cancelReplacement("new"));
+}
+
+test "inline resolver replacement gates promotion until durable activation across reopen" {
+    const a = std.testing.allocator;
+    const Config = struct {
+        fn make(alloc: Allocator, artifact: []const u8, resolution: []const u8, field: []const u8, retention: []const u8) ![]u8 {
+            return std.json.Stringify.valueAlloc(alloc, .{
+                .artifact = .{ .name = artifact, .kind = "asset", .source = .{ .type = "field", .value = field }, .content_type = "application/json" },
+                .source = .{ .artifact = artifact, .format = "extraction_graph", .mention_edge_type = "mentions" },
+                .edge_types = .{.{ .name = "mentions" }},
+                .resolvers = .{.{ .name = "concepts", .table = "default", .source_artifact = artifact, .resolution_artifact = resolution, .key_template = "entity/{{ uslug _entity.text }}", .promote = true, .retain_work = retention }},
+            }, .{});
+        }
+    };
+    for ([_]bool{ false, true }) |cancel| {
+        for ([_][]const u8{ "full", "none" }) |retention| {
+            var directory = try TestDirectory.init("replacement-promotion-activation");
+            defer directory.cleanup();
+            var runtime = try background_runtime_mod.BackendRuntimeHandle.init(a, .{ .backend = .manual, .borrowed_io = .{ .general = std.testing.io } });
+            defer runtime.deinit();
+            var sink = FakePromotionSink{ .alloc = a };
+            defer sink.deinit();
+            const options: OpenOptions = .{ .backend_runtime = runtime.ptr(), .executor = .{ .backend = .manual }, .start_optional_runtimes = false, .start_independent_maintenance = false, .entity_sink = sink.sink() };
+            const old = try Config.make(a, "kg_v1", "resolved_v1", "kg", retention);
+            defer a.free(old);
+            const next = try Config.make(a, "kg_v2", "resolved_v2", "kg_next", retention);
+            defer a.free(next);
+            {
+                var db = try DB.open(a, directory.path(), options);
+                defer db.close();
+                try db.initResolutionRuntime();
+                try db.initPromotionRuntime();
+                var enrichment: enrichment_runtime_mod.Config = .{ .enable_without_producers = true };
+                try db.initOptionalEnrichmentRuntime(&enrichment);
+                try db.addIndex(.{ .name = "old", .kind = .graph, .config_json = old });
+                _ = try db.upsertResolverWithResultOptions(.{ .name = "concepts", .table = "default", .source_artifact = "kg_v1", .resolution_artifact = "resolved_v1", .key_template = "entity/{{ uslug _entity.text }}", .promote = true, .inline_managed = true, .retain_work = if (std.mem.eql(u8, retention, "none")) .none else .full }, .{ .drain_backfill = false });
+                try db.batch(.{ .writes = &.{.{ .key = "claim", .value = "{\"kg\":{\"entities\":[{\"id\":\"a\",\"text\":\"Ada\",\"label\":\"person\"}]},\"kg_next\":{\"entities\":[{\"id\":\"a\",\"text\":\"Grace\",\"label\":\"person\"}]}}" }} });
+                try db.runUntilIdle();
+                try std.testing.expectEqual(@as(usize, 1), sink.count());
+                _ = try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = next });
+                // Drive producers/resolution/promotion without constructing or
+                // activating the shadow graph. Serving promotion stays live.
+                try std.testing.expect(try db.advanceGraphReplacement());
+                try db.enrichment_runtime.?.catchUpUntil(db.core.nextDerivedSequence());
+                try db.resolution_runtime.?.catchUp();
+                db.promotion_runtime.?.notifySequence(db.core.nextDerivedSequence());
+                try db.promotion_runtime.?.catchUp();
+                const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(a, "claim", "resolved_v2");
+                defer a.free(resolution_key);
+                const resolved = try db.core.store.get(a, resolution_key);
+                defer a.free(resolved);
+                try std.testing.expect(std.mem.indexOf(u8, resolved, "Grace") != null);
+                try std.testing.expectEqual(@as(usize, 1), sink.count());
+                try std.testing.expect(db.indexGeneration("new") == null);
+                if (cancel) {
+                    try std.testing.expect(try db.cancelReplacement("new"));
+                    try std.testing.expect(db.core.index_manager.getEnrichment(.asset, "kg_v2") == null);
+                } else {
+                    // Close immediately after publication, before releasing
+                    // the deferred promotion backfill to its runtime.
+                    for (0..128) |_| {
+                        if (db.indexGeneration("new") != null) break;
+                        try db.drainReplayStagesUntilStableWithOptions(.{});
+                        try std.testing.expectEqual(@as(usize, 1), sink.count());
+                        _ = try db.advanceGraphReplacement();
+                    }
+                    if (db.indexGeneration("new") == null) {
+                        const jobs = try db.graphReplacementStatusAlloc(a);
+                        defer jobs.deinit();
+                        const status = try std.json.Stringify.valueAlloc(a, jobs.value, .{});
+                        defer a.free(status);
+                        std.debug.print("replacement did not activate: {s}\n", .{status});
+                    }
+                    try std.testing.expect(db.indexGeneration("new") != null);
+                    try std.testing.expect(db.core.index_manager.getEnrichment(.asset, "kg_v1") == null);
+                }
+                try std.testing.expectEqual(@as(usize, 1), sink.count());
+            }
+            {
+                var db = try DB.open(a, directory.path(), options);
+                defer db.close();
+                try db.runUntilIdle();
+                try std.testing.expectEqual(@as(usize, if (cancel) 1 else 2), sink.count());
+                if (!cancel) try std.testing.expect(sink.findKey("entity/grace") != null);
+                const edges = try db.core.index_manager.graphIndex(if (cancel) "old" else "new").?.index.getEdges(a, "claim", "mentions", .out);
+                defer graph_mod.GraphIndex.freeEdges(a, edges);
+                try std.testing.expectEqual(@as(usize, 1), edges.len);
+                try std.testing.expectEqualStrings(if (cancel) "entity/ada" else "entity/grace", edges[0].target);
+                try db.runUntilIdle();
+                try std.testing.expectEqual(@as(usize, if (cancel) 1 else 2), sink.count());
+                try db.batch(.{ .writes = &.{.{ .key = "fresh", .value = "{\"kg\":{\"entities\":[]},\"kg_next\":{\"entities\":[]}}" }} });
+                try std.testing.expect(db.core.index_manager.getEnrichment(.asset, if (cancel) "kg_v2" else "kg_v1") == null);
+            }
+        }
+    }
+}
+
+test "inline resolver replacement preserves shared explicit and upstream producers" {
+    const a = std.testing.allocator;
+    for (0..6) |mode| {
+        var directory = try TestDirectory.init("replacement-producer-ownership");
+        defer directory.cleanup();
+        var runtime = try background_runtime_mod.BackendRuntimeHandle.init(a, .{ .backend = .manual, .borrowed_io = .{ .general = std.testing.io } });
+        defer runtime.deinit();
+        const options: OpenOptions = .{ .backend_runtime = runtime.ptr(), .executor = .{ .backend = .manual }, .start_optional_runtimes = false, .start_independent_maintenance = false };
+        {
+            var db = try DB.open(a, directory.path(), options);
+            defer db.close();
+            try db.addIndex(.{ .name = "old", .kind = .graph, .config_json = "{}" });
+            const config = "{\"source\":{\"artifact\":\"relations\",\"format\":\"extraction_relation\"},\"artifact\":{\"name\":\"relations\",\"kind\":\"asset\",\"source\":{\"type\":\"field\",\"value\":\"relations\"},\"content_type\":\"application/json\"}}";
+            if (mode == 5) try db.addEnrichment(.{ .name = "relations", .kind = .asset, .field = "relations", .content_type = "application/json" });
+            _ = try db.replaceGraphIndex("old", .{ .name = "new", .kind = .graph, .config_json = config });
+            {
+                var probe = try db.core.store.beginProbeTxn();
+                defer probe.abort();
+                if (mode == 5) {
+                    // Explicit producers have no ownership metadata; only the
+                    // temporary reservation fence is needed.
+                    try std.testing.expectEqual(@as(u32, 2), try @import("catalog/resolver_catalog.zig").readMinimumReaderVersion(&probe, 2));
+                } else {
+                    try std.testing.expectError(error.UnsupportedDatabaseReaderVersion, @import("catalog/resolver_catalog.zig").readMinimumReaderVersion(&probe, 2));
+                }
+            }
+            if (mode == 1) try db.addIndex(.{ .name = "shared", .kind = .graph, .config_json = "{\"source\":{\"artifact\":\"relations\",\"format\":\"extraction_relation\"}}" });
+            if (mode == 2) _ = try db.upsertEnrichment(.{ .name = "relations", .kind = .asset, .field = "relations", .content_type = "application/json" });
+            if (mode == 3) {
+                try db.addIndex(.{ .name = "other", .kind = .graph, .config_json = "{}" });
+                _ = try db.replaceGraphIndex("other", .{ .name = "other_new", .kind = .graph, .config_json = "{\"source\":{\"artifact\":\"relations\",\"format\":\"extraction_relation\"}}" });
+            }
+            if (mode == 4) try db.addEnrichment(.{ .name = "copied_relations", .kind = .asset, .source_artifact_name = "relations", .producer_json = "{\"type\":\"copy\"}" });
+            try std.testing.expect(try db.cancelReplacement("new"));
+            if ((mode != 0) != (db.core.index_manager.getEnrichment(.asset, "relations") != null))
+                std.debug.print("producer ownership mode {d}\n", .{mode});
+            try std.testing.expectEqual(mode != 0, db.core.index_manager.getEnrichment(.asset, "relations") != null);
+        }
+        {
+            var db = try DB.open(a, directory.path(), options);
+            defer db.close();
+            if ((mode != 0) != (db.core.index_manager.getEnrichment(.asset, "relations") != null))
+                std.debug.print("producer ownership mode {d}\n", .{mode});
+            try std.testing.expectEqual(mode != 0, db.core.index_manager.getEnrichment(.asset, "relations") != null);
+            const planned = try db.core.index_manager.planGeneratedEnrichments(a, "fresh", "{\"relations\":[]}", &.{}, &.{});
+            defer enrichment_types.deinitGeneratedRequests(a, planned);
+            try std.testing.expectEqual(@as(usize, if (mode == 0) 0 else if (mode == 4) 2 else 1), planned.len);
+            if (mode == 3) {
+                try std.testing.expect(try db.cancelReplacement("other_new"));
+                try std.testing.expect(db.core.index_manager.getEnrichment(.asset, "relations") == null);
+            }
+        }
+    }
+}
+
+test "inline resolver replacement source paging stops before replay and identity namespaces" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("replacement-source-domain");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .executor = .{ .backend = .manual }, .start_optional_runtimes = false });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "only", .value = "{}" }} });
+    for ([_]u8{ internal_keys.replay_namespace, internal_keys.identity_namespace }) |namespace| {
+        for (0..8) |i| try db.core.store.put(&.{ namespace, 0x77, @intCast(i) }, "irrelevant replay or identity record");
+    }
+    var lower = try db.core.documentRangeLowerAlloc("");
+    defer a.free(lower);
+    var total: usize = 0;
+    var complete = false;
+    for (0..32) |_| {
+        var batch = try db.collectStoredGeneratedReplayBatch(a, lower, total > 0, 32, .{ .max_records = 2 });
+        defer batch.deinit(a);
+        total += batch.writes.len;
+        if (batch.complete) {
+            complete = true;
+            break;
+        }
+        const next = batch.next_lower orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(internal_keys.user_namespace, next[0]);
+        a.free(lower);
+        lower = try a.dupe(u8, next);
+    }
+    try std.testing.expect(complete);
+    try std.testing.expectEqual(@as(usize, 1), total);
+    // Compatibility with a cursor persisted by the former unbounded scan.
+    var past = try db.collectStoredGeneratedReplayBatch(a, &.{ internal_keys.replay_namespace, 0x77 }, true, 32, .{});
+    defer past.deinit(a);
+    try std.testing.expect(past.complete);
+    try std.testing.expectEqual(@as(usize, 0), past.writes.len);
 }
 
 fn inlineResolverReplacementConfigAlloc(a: Allocator, artifact: []const u8, resolution: []const u8, key_template: []const u8) ![]u8 {

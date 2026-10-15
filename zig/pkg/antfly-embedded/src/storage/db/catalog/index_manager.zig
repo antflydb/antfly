@@ -12535,7 +12535,7 @@ pub const IndexManager = struct {
 
         for (self.enrichments.items) |*entry| {
             if (!std.mem.eql(u8, entry.name, internal.name)) continue;
-            if (try internalEnrichmentConfigsEqual(self.alloc, entry.*, internal)) return .unchanged;
+            if (entry.graph_inline_managed != true and try internalEnrichmentConfigsEqual(self.alloc, entry.*, internal)) return .unchanged;
 
             var replacement = try enrichment_catalog.EnrichmentConfig.clone(self.alloc, internal);
             var previous = entry.*;
@@ -22506,6 +22506,54 @@ pub const IndexManager = struct {
         return self.persistCatalogExcludingWithConfigAndAtomicMutation(store, excluded_name, null, atomic_mutation);
     }
 
+    /// Compute reachability in the post-removal catalog. Preserve explicit
+    /// producers, live consumers, pending shadows and all upstream dependencies.
+    fn enrichmentsAfterIndexRemovalAlloc(self: *IndexManager, excluded: []const u8, resolvers: []const ResolverConfig, jobs: []const GraphReplacementBuild) ![]enrichment_catalog.EnrichmentConfig {
+        var live: std.StringHashMapUnmanaged(void) = .empty;
+        defer live.deinit(self.alloc);
+        for (self.enrichments.items) |entry| {
+            if (entry.graph_inline_managed != true) try live.put(self.alloc, entry.name, {});
+        }
+        for (self.graph_indexes.items) |entry| {
+            if (std.mem.eql(u8, entry.config.name, excluded)) continue;
+            for (entry.artifact_sources) |source| try live.put(self.alloc, source.artifact_name, {});
+        }
+        for (self.text_indexes.items) |entry| {
+            if (std.mem.eql(u8, entry.config.name, excluded)) continue;
+            for (entry.source_artifact_names) |name| try live.put(self.alloc, name, {});
+        }
+        for (resolvers) |cfg| {
+            if (!cfg.retired) try live.put(self.alloc, cfg.source_artifact, {});
+        }
+        for (jobs) |job| {
+            if (job.phase == .failed or std.mem.eql(u8, job.name, excluded) or std.mem.eql(u8, job.old, excluded)) continue;
+            if (job.config) |cfg| {
+                var graph = try parseGraphConfig(self.alloc, cfg.config_json);
+                defer graph.deinit(self.alloc);
+                for (graph.artifact_sources) |source| {
+                    // The parsed job is temporary; borrow the catalog name so
+                    // reachability keys outlive the parser arena.
+                    if (self.getEnrichmentByName(source.artifact_name)) |producer|
+                        try live.put(self.alloc, producer.name, {});
+                }
+            }
+        }
+        while (true) {
+            const before = live.count();
+            for (self.enrichments.items) |entry| {
+                if (live.contains(entry.name) and entry.source_artifact_name.len > 0)
+                    try live.put(self.alloc, entry.source_artifact_name, {});
+            }
+            if (live.count() == before) break;
+        }
+        var kept: std.ArrayList(enrichment_catalog.EnrichmentConfig) = .empty;
+        errdefer kept.deinit(self.alloc);
+        for (self.enrichments.items) |entry| {
+            if (live.contains(entry.name)) try kept.append(self.alloc, entry);
+        }
+        return kept.toOwnedSlice(self.alloc);
+    }
+
     fn persistCatalogExcludingWithConfigAndAtomicMutation(self: *IndexManager, store: anytype, excluded_name: []const u8, removed_config: ?[]const u8, atomic_mutation: ?AtomicCatalogMutation) !void {
         const data = if (self.get(excluded_name) != null)
             try serializeCatalogExcluding(self.alloc, self, excluded_name)
@@ -22603,6 +22651,7 @@ pub const IndexManager = struct {
         // A published successor takes the public identity atomically with its
         // graph. Preserve the predecessor as a nonexecuting parse contract for
         // old resolution records still present in the shared artifact store.
+        var promotion_released = false;
         for (definitions) |*next| {
             if (next.replacement_index.len == 0) continue;
             if (self.get(next.replacement_index) != null and !std.mem.eql(u8, next.replacement_index, excluded_name)) {
@@ -22613,6 +22662,12 @@ pub const IndexManager = struct {
                     previous.retired = true;
                     previous.inline_managed = true;
                     break;
+                }
+                // Republishing at a new revision releases shadow decisions to
+                // promotion, including resolvers with work retention disabled.
+                if (next.promote) {
+                    next.resolution_generation = try std.math.add(u64, next.effectiveGeneration(), 1);
+                    promotion_released = true;
                 }
                 next.name = next.replacement_resolver;
                 next.replacement_index = "";
@@ -22627,6 +22682,18 @@ pub const IndexManager = struct {
                 }
             }
         }
+        const retained_producers = try self.enrichmentsAfterIndexRemovalAlloc(excluded_name, definitions, jobs.value);
+        defer self.alloc.free(retained_producers);
+        const has_generated_targets = targets: {
+            const previous = self.enrichments.items;
+            self.enrichments.items = retained_producers;
+            defer self.enrichments.items = previous;
+            break :targets try self.computeGeneratedEnrichmentTargetCacheExcluding(excluded_name, null);
+        };
+        const enrichment_data = try enrichment_catalog.serializeCatalog(self.alloc, retained_producers);
+        defer self.alloc.free(enrichment_data);
+        try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, enrichment_catalog_key, enrichment_data);
+        try txn.put(enrichment_catalog_key, enrichment_data);
         // Allocate the complete post-commit catalog before crossing durability.
         var next_active: std.ArrayListUnmanaged(ResolverConfig) = .empty;
         var next_retired: std.ArrayListUnmanaged(ResolverConfig) = .empty;
@@ -22653,7 +22720,7 @@ pub const IndexManager = struct {
         try txn.put(resolver_catalog.merge_catalog_key, merge_data);
         // Revisions and durable replay cursors publish with ownership removal.
         for (definitions) |cfg| {
-            if (!cfg.retired and self.routingChangedByRetirement(cfg, retiring)) {
+            if (promotion_released or !cfg.retired and self.routingChangedByRetirement(cfg, retiring)) {
                 try txn.put(resolver_catalog.reresolve_resume_key, "");
                 try txn.put(resolver_catalog.reresolve_repair_resume_key, "");
                 break;
@@ -22690,6 +22757,20 @@ pub const IndexManager = struct {
         self.retired_resolvers.deinit(self.alloc);
         self.resolvers = next_active;
         self.retired_resolvers = next_retired;
+        // No allocations or fallible work after commit. Compact the owned
+        // entries in place; retained_producers is a borrowed projection.
+        var producer_position: usize = 0;
+        for (self.enrichments.items) |entry| {
+            if (producer_position < retained_producers.len and retained_producers[producer_position].name.ptr == entry.name.ptr) {
+                self.enrichments.items[producer_position] = entry;
+                producer_position += 1;
+            } else {
+                var removed = entry;
+                removed.deinit(self.alloc);
+            }
+        }
+        self.enrichments.items.len = producer_position;
+        self.storeGeneratedEnrichmentTargetCache(has_generated_targets);
         transferred = true;
         _ = self.write_plan_generation.fetchAdd(1, .release);
     }
@@ -22723,8 +22804,12 @@ pub const IndexManager = struct {
         errdefer txn.abort();
         try @import("../relational_integrity_topology.zig").requireUnfencedOrUnchanged(&txn, enrichment_catalog_key, data);
         try txn.put(enrichment_catalog_key, data);
+        const resolvers = try self.serializeResolverDefinitions(self.alloc);
+        defer self.alloc.free(resolvers);
+        const reader_version = try self.stampCatalogReaderVersion(&txn, resolvers);
         try @import("../artifact_inventory.zig").refresh(&txn);
         try txn.commit();
+        self.minimum_reader_version.store(reader_version, .release);
         // Enrichment definitions are part of the immutable foreground write
         // plan just as much as index definitions. Advance only after durable
         // commit so cached generations never expose uncommitted configuration.
@@ -22796,7 +22881,10 @@ pub const IndexManager = struct {
         };
         const baseline = if (baseline_raw) |raw| try std.fmt.parseInt(u32, raw, 10) else current;
         if (baseline > resolver_catalog.supported_reader_version) return error.UnsupportedDatabaseReaderVersion;
-        const authoritative = @max(baseline, try resolver_catalog.catalogReaderVersion(self.alloc, catalog));
+        const producer_version: u32 = for (self.enrichments.items) |producer| {
+            if (producer.graph_inline_managed == true) break 3;
+        } else 1;
+        const authoritative = @max(producer_version, @max(baseline, try resolver_catalog.catalogReaderVersion(self.alloc, catalog)));
         var pending = false;
         {
             var cursor = try txn.openCursor();
@@ -23081,7 +23169,9 @@ pub const IndexManager = struct {
                 var graph_cfg = try parseGraphConfig(self.alloc, cfg.config_json);
                 defer graph_cfg.deinit(self.alloc);
                 if (graph_cfg.shorthand_asset) |asset| {
-                    changed = (try self.ensureAssetEnrichment(asset)) or changed;
+                    var owned_asset = asset;
+                    owned_asset.graph_inline_managed = true;
+                    changed = (try self.ensureAssetEnrichment(owned_asset)) or changed;
                 }
                 for (graph_cfg.artifact_sources) |source| {
                     if (graph_cfg.shorthand_asset) |asset| {
