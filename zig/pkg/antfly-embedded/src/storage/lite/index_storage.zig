@@ -304,14 +304,14 @@ const CatalogWrite = struct {
 
 fn writeFileReserved(self: *Store, path: []const u8, contents: []const u8) !void {
     var mutation = CatalogWrite{ .kind = .put, .path = path, .value = contents };
-    try self.docs.submitMutation(&mutation, CatalogWrite.apply);
+    try self.docs.submitIndexMutation(&mutation, CatalogWrite.apply, true);
 }
 
 fn appendFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8, sync: bool) !void {
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, path);
     var mutation = CatalogWrite{ .kind = .append, .path = path, .value = contents };
-    try self.docs.submitMutationWithDurability(&mutation, CatalogWrite.apply, sync);
+    try self.docs.submitIndexMutation(&mutation, CatalogWrite.apply, sync);
 }
 
 fn beginAtomicWrite(ptr: *anyopaque, allocator: Allocator, path: []const u8) !AtomicWriteSink {
@@ -326,14 +326,14 @@ fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !
     try validateIndexPath(self, old_path);
     try validateIndexPath(self, new_path);
     var mutation = CatalogWrite{ .kind = .rename, .path = old_path, .value = new_path };
-    try self.docs.submitMutation(&mutation, CatalogWrite.apply);
+    try self.docs.submitIndexMutation(&mutation, CatalogWrite.apply, true);
 }
 
 fn deleteFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, path);
     var mutation = CatalogWrite{ .kind = .delete, .path = path };
-    try self.docs.submitMutation(&mutation, CatalogWrite.apply);
+    try self.docs.submitIndexMutation(&mutation, CatalogWrite.apply, true);
 }
 
 fn deleteTree(ptr: *anyopaque, path: []const u8) !void {
@@ -349,7 +349,7 @@ fn deleteTree(ptr: *anyopaque, path: []const u8) !void {
         }
     };
     var request = Context{ .store = self, .path = directory };
-    try self.docs.submitMutation(&request, Context.apply);
+    try self.docs.submitIndexMutation(&request, Context.apply, true);
 }
 
 // Subtree deletion stays one atomic native transaction. Each private flush
@@ -457,7 +457,7 @@ fn syncContentsAbsolute(ptr: *anyopaque, path: []const u8) !void {
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, path);
     var mutation = CatalogWrite{ .kind = .sync, .path = path };
-    try self.docs.submitMutation(&mutation, CatalogWrite.apply);
+    try self.docs.submitIndexMutation(&mutation, CatalogWrite.apply, true);
 }
 
 fn syncParentAbsolute(ptr: *anyopaque, path: []const u8) !void {
@@ -704,7 +704,7 @@ const NativeAtomicWriteSink = struct {
         defer self.deinit();
         if (self.failure) |err| return err;
         if (self.file != null) try self.flush();
-        try self.storage.docs.submitMutation(self, publish);
+        try self.storage.docs.submitIndexMutation(self, publish, true);
     }
 
     fn finishSource(ptr: *anyopaque) !@import("../../segment_source.zig").Source {
@@ -712,7 +712,7 @@ const NativeAtomicWriteSink = struct {
         defer self.deinit();
         if (self.failure) |err| return err;
         if (self.file != null) try self.flush();
-        try self.storage.docs.submitMutation(self, publish);
+        try self.storage.docs.submitIndexMutation(self, publish, true);
         return self.storage.docs.openArtifactSource(self.path);
     }
 
@@ -726,7 +726,7 @@ const NativeAtomicWriteSink = struct {
         try self.flush();
         const mapped = try mapArtifact(file, self.persisted);
         errdefer std.posix.munmap(mapped);
-        try self.storage.docs.submitMutation(self, publish);
+        try self.storage.docs.submitIndexMutation(self, publish, true);
         const lease = self.artifact_lease.?;
         self.artifact_lease = null;
         return .{ .bytes = mapped, .context = lease, .release = docstore.ArtifactLease.release };

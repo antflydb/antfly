@@ -58,6 +58,18 @@ pub const Handle = struct {
     parent_handle: ?*Handle = null,
     table_handles: std.ArrayList(*anyopaque) = .empty,
     sql_decision_uncertain: bool = false,
+    // New generations inspect durable recovery once. Every job producer dirties
+    // these flags before admission, including uncertain publication outcomes.
+    sql_commit_recovery_needed: bool = true,
+    sql_ddl_recovery_needed: bool = true,
+    sql_ddl_recovery_scans: if (builtin.is_test) u64 else void = if (builtin.is_test) 0 else {},
+    sql_commit_recovery_scans: if (builtin.is_test) u64 else void = if (builtin.is_test) 0 else {},
+    maintenance_references: usize = 0,
+    maintenance_publication: ?*@import("lite_connection.zig").PreparedPublication = null,
+    maintenance_owner: ?*@import("lite_connection.zig").Owner = null,
+    maintenance_writer_lease: ?lite_backend.native.PathWriterLock = null,
+    maintenance_writer_references: usize = 0,
+    maintenance_admission_mutex: std.Io.Mutex = .init,
     embedded_path: ?[]u8 = null,
     embedded_open_options: db_mod.OpenOptions = .{},
     embedded_tables: std.StringHashMapUnmanaged(*@import("tables.zig").Table) = .empty,

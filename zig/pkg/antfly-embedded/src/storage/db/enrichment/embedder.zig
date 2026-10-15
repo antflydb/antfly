@@ -85,9 +85,20 @@ pub const SparseEmbedDeinitFn = *const fn (ptr: *anyopaque, alloc: Allocator) vo
 
 pub const SparseEmbedding = @import("antfly_sparse_embedding").SparseEmbedding;
 
+/// Optional pure-computation memo. Every artifact publication still validates
+/// its source revision and generation; cached vectors carry no write authority.
+pub const DenseResultCache = struct {
+    ptr: *anyopaque,
+    lookup: *const fn (*anyopaque, Allocator, [32]u8) anyerror!?[]f32,
+    remember: *const fn (*anyopaque, [32]u8, []const f32) void,
+};
+
 pub const DenseEmbedder = struct {
     ptr: *anyopaque,
     dense_embed_fn: DenseEmbedFn,
+    /// Stable effective provider/model/credential identity plus exact text and
+    /// dimensions. Opaque custom providers opt out by leaving this null.
+    computation_key_fn: ?*const fn (*anyopaque, []const u8, []const u8, u32) anyerror!?[32]u8 = null,
     dense_embed_batch_fn: ?DenseEmbedBatchFn = null,
     dense_embed_parts_fn: ?DenseEmbedPartsFn = null,
     dense_embed_part_items_fn: ?DenseEmbedPartItemsFn = null,

@@ -1354,13 +1354,17 @@ pub fn resolveConflictOwners(alloc: Allocator, source: reads.TableReadSource, me
 }
 
 pub fn resolveConflictTargetOwners(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, ranges: []const RangeRecord, name: []const u8, version: u32, target: ConflictTarget, writes: []const types.BatchWrite, previous: []const contract.TableCommitRequest, control: RequestContext) ![]const ConflictOwner {
+    return resolveConflictTargetOwnersWithScratch(alloc, alloc, source, metadata, ranges, name, version, target, writes, previous, control);
+}
+
+pub fn resolveConflictTargetOwnersWithScratch(alloc: Allocator, scratch_alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, ranges: []const RangeRecord, name: []const u8, version: u32, target: ConflictTarget, writes: []const types.BatchWrite, previous: []const contract.TableCommitRequest, control: RequestContext) ![]const ConflictOwner {
     if (target.constraint_name != null and (target.columns.len != 0 or target.expressions.len != 0 or target.predicate.len != 0)) return error.InvalidIntegrityDefinition;
     if (writes.len > 4096) return error.TransactionTooLarge;
     // Absence is useful only after EVERY current owner proves unique coverage.
-    try ensureUniqueCoverageControlled(alloc, source, metadata, ranges, &.{name}, control);
-    var before: ?Prepared = if (previous.len != 0) try prepareModeInternal(alloc, source, metadata, previous, control, &.{}, true, &.{}, false) else null;
+    try ensureUniqueCoverageControlled(scratch_alloc, source, metadata, ranges, &.{name}, control);
+    var before: ?Prepared = if (previous.len != 0) try prepareModeInternal(scratch_alloc, source, metadata, previous, control, &.{}, true, &.{}, false) else null;
     defer if (before) |*prepared| prepared.deinit();
-    var builder: Builder = .{ .alloc = alloc, .source = source, .metadata = metadata, .control = try boundedControl(control), .previous = if (before) |prepared| prepared.tables else &.{} };
+    var builder: Builder = .{ .alloc = alloc, .scratch_alloc = scratch_alloc, .source = source, .metadata = metadata, .control = try boundedControl(control), .previous = if (before) |prepared| prepared.tables else &.{} };
     defer builder.deinit();
     const table = try builder.load(name);
     if (table.view.version() != version) return error.PreparedGenerationChanged;
@@ -1373,8 +1377,11 @@ pub fn resolveConflictTargetOwners(alloc: Allocator, source: reads.TableReadSour
     for (writes, owners) |write, *owner| {
         try builder.control.ensureActive();
         try builder.charge(write.key.len + write.value.len);
-        var row = try mapper.PreparedRelationalWrite.initTyped(alloc, alloc, alloc, false, write.key, write.value, null, table.view.tableSchema().*, table.view.physicalLayout(), write.json_null_fields, false);
-        defer row.deinit(alloc);
+        var row_arena = std.heap.ArenaAllocator.init(scratch_alloc);
+        defer row_arena.deinit();
+        const row_alloc = row_arena.allocator();
+        var row = try mapper.PreparedRelationalWrite.initTyped(row_alloc, row_alloc, row_alloc, false, write.key, write.value, null, table.view.tableSchema().*, table.view.physicalLayout(), write.json_null_fields, false);
+        defer row.deinit(row_alloc);
         const addresses = try plan.conflictAddresses(alloc, selected, try row.typedView(table.view.tableSchema().*, table.view.physicalLayout()));
         const guards = try alloc.alloc(planner.storage.Command, addresses.len);
         const identities = try alloc.alloc([]const u8, addresses.len);
