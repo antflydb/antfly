@@ -2710,7 +2710,7 @@ test "enrichment distinguishes transient capacity from permanent resource limits
 
 test "enrichment retries unknown errors and isolates known permanent errors" {
     try std.testing.expectEqual(EnrichmentErrorDisposition.retryable_request, enrichmentErrorDisposition(error.UnexpectedEndOfInput));
-    for ([_]anyerror{ error.MissingPdfEof, error.InvalidPdfHeader, error.MalformedXrefStream, error.InvalidFlateStream, error.InvalidPageTree }) |err| {
+    for ([_]anyerror{ error.MissingPdfEof, error.InvalidPdfHeader, error.MalformedXrefStream, error.InvalidFlateStream, error.InvalidPageTree, error.MissingRoot, error.MissingPages, error.EmptyPdfPageTree, error.InvalidPdf }) |err| {
         try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(err));
     }
     try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.UnsupportedEmbeddingProvider));

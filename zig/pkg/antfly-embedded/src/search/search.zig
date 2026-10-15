@@ -925,32 +925,24 @@ fn executeFilterQuery(
         // document-ID array plus one ScoredHit for every matching document.
         var matches = try snap.executeFilterBitmap(alloc, filter.withControl(request.control));
         defer matches.deinit();
+        try applyDocNumConstraintsToBitmap(alloc, &matches, request);
         var scored = std.ArrayListUnmanaged(scorer_mod.ScoredHit).empty;
         defer scored.deinit(alloc);
         const keep = @min(snap.liveDocCount(), request.k +| request.offset);
-        var total: u32 = 0;
+        const total = std.math.cast(u32, matches.cardinality()) orelse return error.CountOverflow;
         var visited: usize = 0;
         var iterator = matches.iterator();
-        const constrained = requestHasDocNumConstraints(request);
         var scan_page = true;
-        if (!constrained) {
-            try request.control.check();
-            total = std.math.cast(u32, matches.cardinality()) orelse return error.CountOverflow;
-            if (request.search_after) |cursor| {
-                if (boost == cursor.score) {
-                    if (cursor.doc_id == std.math.maxInt(u32)) scan_page = false else iterator.seek(cursor.doc_id + 1);
-                } else scan_page = boost < cursor.score;
-            }
+        if (request.search_after) |cursor| {
+            if (boost == cursor.score) {
+                if (cursor.doc_id == std.math.maxInt(u32)) scan_page = false else iterator.seek(cursor.doc_id + 1);
+            } else scan_page = boost < cursor.score;
         }
         while (scan_page) {
-            if (!constrained and scored.items.len >= keep) break;
+            if (scored.items.len >= keep) break;
             const doc_id = iterator.next() orelse break;
             if (visited % 256 == 0) try request.control.check();
             visited += 1;
-            if (constrained) {
-                if (!requestAllowsDocNum(request, doc_id)) continue;
-                total = try std.math.add(u32, total, 1);
-            }
             if (request.search_after) |cursor| {
                 if (!(boost < cursor.score or (boost == cursor.score and doc_id > cursor.doc_id))) continue;
             }
@@ -1641,6 +1633,59 @@ fn subtractScoresFromHits(alloc: Allocator, map: *ScoreMap, hits: []const scorer
 
 fn requestHasDocNumConstraints(request: SearchRequest) bool {
     return request.filter_doc_bitmap != null or request.exclude_doc_bitmap != null or request.filter_doc_nums_positive or request.exclude_doc_nums.len > 0;
+}
+
+fn applyDocNumConstraintsToBitmap(alloc: Allocator, matches: *roaring.RoaringBitmap, request: SearchRequest) !void {
+    try request.control.check();
+    if (request.filter_doc_bitmap) |bitmap| matches.andWith(bitmap);
+    if (request.exclude_doc_bitmap) |bitmap| matches.andNotWith(bitmap);
+    if (request.filter_doc_nums_positive) {
+        var allowed = roaring.RoaringBitmap.init(alloc);
+        errdefer allowed.deinit();
+        // Enumerate the smaller side. A small positive filter must not scan
+        // millions of matches, and a small match set must not scan a huge filter.
+        if (request.filter_doc_nums.len <= matches.cardinality()) {
+            for (request.filter_doc_nums, 0..) |doc_id, visited| {
+                if (visited % 256 == 0) try request.control.check();
+                if (matches.contains(doc_id) and !containsSortedU32(request.exclude_doc_nums, doc_id)) try allowed.add(doc_id);
+            }
+        } else {
+            var iterator = matches.iterator();
+            var visited: usize = 0;
+            while (iterator.next()) |doc_id| : (visited += 1) {
+                if (visited % 256 == 0) try request.control.check();
+                if (requestAllowsDocNum(request, doc_id)) try allowed.add(doc_id);
+            }
+        }
+        matches.deinit();
+        matches.* = allowed;
+    } else if (request.exclude_doc_nums.len <= 64) {
+        for (request.exclude_doc_nums, 0..) |doc_id, visited| {
+            if (visited % 256 == 0) try request.control.check();
+            matches.removeRetainingStorage(doc_id);
+        }
+    } else if (request.exclude_doc_nums.len <= matches.cardinality()) {
+        // Bulk exclusion avoids repeatedly shifting sparse array containers.
+        var excluded = roaring.RoaringBitmap.init(alloc);
+        defer excluded.deinit();
+        for (request.exclude_doc_nums, 0..) |doc_id, visited| {
+            if (visited % 256 == 0) try request.control.check();
+            try excluded.add(doc_id);
+        }
+        matches.andNotWith(&excluded);
+    } else {
+        var allowed = roaring.RoaringBitmap.init(alloc);
+        errdefer allowed.deinit();
+        var iterator = matches.iterator();
+        var visited: usize = 0;
+        while (iterator.next()) |doc_id| : (visited += 1) {
+            if (visited % 256 == 0) try request.control.check();
+            if (!containsSortedU32(request.exclude_doc_nums, doc_id)) try allowed.add(doc_id);
+        }
+        matches.deinit();
+        matches.* = allowed;
+    }
+    try request.control.check();
 }
 
 fn requestAllowsDocNum(request: SearchRequest, doc_id: u32) bool {
@@ -6190,6 +6235,41 @@ test "constant score pages remain bounded after a cursor and cancel while exclud
     }));
     try std.testing.expectEqual(@as(usize, 2), cancel.calls);
 
+    const LimitedChecks = struct {
+        calls: usize = 0,
+        fn check(ptr: *const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(ptr)));
+            self.calls += 1;
+            return self.calls >= 12;
+        }
+    };
+    var limited = LimitedChecks{};
+    var selective = try execute(alloc, writer.snapshot(), .{
+        .query = .{ .doc_num = .{ .ids = &doc_nums } },
+        .k = 1,
+        .include_stored = false,
+        .filter_doc_nums = &.{16383},
+        .filter_doc_nums_positive = true,
+        .control = .{ .cancellation = .{ .ptr = &limited, .is_cancelled_fn = LimitedChecks.check } },
+    });
+    defer selective.deinit();
+    try std.testing.expectEqual(@as(u32, 1), selective.total_hits);
+    try std.testing.expectEqual(@as(u32, 16383), selective.hits[0].doc_id);
+    try std.testing.expect(limited.calls < 12);
+
+    limited.calls = 0;
+    var exclusion = try execute(alloc, writer.snapshot(), .{
+        .query = .{ .doc_num = .{ .ids = &doc_nums } },
+        .k = 1,
+        .include_stored = false,
+        .exclude_doc_nums = &.{16383},
+        .control = .{ .cancellation = .{ .ptr = &limited, .is_cancelled_fn = LimitedChecks.check } },
+    });
+    defer exclusion.deinit();
+    try std.testing.expectEqual(@as(u32, 16383), exclusion.total_hits);
+    try std.testing.expectEqual(@as(u32, 0), exclusion.hits[0].doc_id);
+    try std.testing.expect(limited.calls < 12);
+
     const allowed = [_]u32{ 0, 100, 1000, 2002, 2004, 2006, 2008, 2010, 4094 };
     var scratch: [64 * 1024]u8 = undefined;
     var bounded = std.heap.FixedBufferAllocator.init(&scratch);
@@ -6234,6 +6314,46 @@ test "constant score pages remain bounded after a cursor and cancel while exclud
     try std.testing.expectEqual(@as(u32, doc_nums.len), deep_page.total_hits);
     try std.testing.expectEqual(@as(usize, 3), deep_page.hits.len);
     for (deep_page.hits, [_]u32{ 15001, 15002, 15003 }) |hit, expected| try std.testing.expectEqual(expected, hit.doc_id);
+
+    var positive = roaring.RoaringBitmap.init(alloc);
+    defer positive.deinit();
+    for ([_]u32{ 1000, 2002, 2004, 2006, 2008, 2010, 4094 }) |doc_id| try positive.add(doc_id);
+    var negative = roaring.RoaringBitmap.init(alloc);
+    defer negative.deinit();
+    try negative.add(2004);
+    request.filter_doc_bitmap = &positive;
+    request.exclude_doc_bitmap = &negative;
+    request.filter_doc_nums = &allowed;
+    request.filter_doc_nums_positive = true;
+    request.exclude_doc_nums = &.{2006};
+    request.search_after = .{ .score = 2.5, .doc_id = 2000 };
+    request.offset = 2;
+    var composed = try execute(alloc, writer.snapshot(), request);
+    defer composed.deinit();
+    try std.testing.expectEqual(@as(u32, 5), composed.total_hits);
+    try std.testing.expectEqual(@as(usize, 2), composed.hits.len);
+    try std.testing.expectEqual(@as(u32, 2010), composed.hits[0].doc_id);
+    try std.testing.expectEqual(@as(u32, 4094), composed.hits[1].doc_id);
+    try std.testing.expectEqual(@as(u64, 7), positive.cardinality());
+    try std.testing.expectEqual(@as(u64, 1), negative.cardinality());
+
+    request.filter_doc_bitmap = null;
+    request.exclude_doc_bitmap = null;
+    request.filter_doc_nums_positive = false;
+    request.exclude_doc_nums = doc_nums[1 .. doc_nums.len - 1];
+    request.search_after = null;
+    request.offset = 0;
+    var bulk_excluded = try execute(alloc, writer.snapshot(), request);
+    defer bulk_excluded.deinit();
+    try std.testing.expectEqual(@as(u32, 2), bulk_excluded.total_hits);
+    try std.testing.expectEqual(@as(usize, 2), bulk_excluded.hits.len);
+    try std.testing.expectEqual(@as(u32, 0), bulk_excluded.hits[0].doc_id);
+    try std.testing.expectEqual(@as(u32, 16383), bulk_excluded.hits[1].doc_id);
+    request.filter_doc_bitmap = &positive;
+    var small_match_set = try execute(alloc, writer.snapshot(), request);
+    defer small_match_set.deinit();
+    try std.testing.expectEqual(@as(u32, 0), small_match_set.total_hits);
+    try std.testing.expectEqual(@as(usize, 0), small_match_set.hits.len);
 }
 
 test "exact inclusive term range preserves prefix constant scores" {
