@@ -152,15 +152,15 @@ test "video portable H264 PCM byte alignment and emulation prevention match FFmp
 test "video H264 all seven FMO maps and ASO reconstruct known PCM samples" {
     inline for (.{
         .{ @embedFile("../testdata/h264-groups-0-0.mp4"), @embedFile("../testdata/h264-groups-0-0.nv12") },
-        .{ @embedFile("../testdata/h264-groups-1-0.mp4"), @embedFile("../testdata/h264-groups-1-0.nv12") },
-        .{ @embedFile("../testdata/h264-groups-2-0.mp4"), @embedFile("../testdata/h264-groups-2-0.nv12") },
-        .{ @embedFile("../testdata/h264-groups-3-0.mp4"), @embedFile("../testdata/h264-groups-3-0.nv12") },
-        .{ @embedFile("../testdata/h264-groups-3-1.mp4"), @embedFile("../testdata/h264-groups-3-1.nv12") },
-        .{ @embedFile("../testdata/h264-groups-4-0.mp4"), @embedFile("../testdata/h264-groups-4-0.nv12") },
-        .{ @embedFile("../testdata/h264-groups-4-1.mp4"), @embedFile("../testdata/h264-groups-4-1.nv12") },
-        .{ @embedFile("../testdata/h264-groups-5-0.mp4"), @embedFile("../testdata/h264-groups-5-0.nv12") },
-        .{ @embedFile("../testdata/h264-groups-5-1.mp4"), @embedFile("../testdata/h264-groups-5-1.nv12") },
-        .{ @embedFile("../testdata/h264-groups-6-0.mp4"), @embedFile("../testdata/h264-groups-6-0.nv12") },
+        .{ @embedFile("../testdata/h264-groups-1-0.mp4"), @embedFile("../testdata/h264-groups-0-0.nv12") },
+        .{ @embedFile("../testdata/h264-groups-2-0.mp4"), @embedFile("../testdata/h264-groups-0-0.nv12") },
+        .{ @embedFile("../testdata/h264-groups-3-0.mp4"), @embedFile("../testdata/h264-groups-0-0.nv12") },
+        .{ @embedFile("../testdata/h264-groups-3-1.mp4"), @embedFile("../testdata/h264-groups-0-0.nv12") },
+        .{ @embedFile("../testdata/h264-groups-4-0.mp4"), @embedFile("../testdata/h264-groups-0-0.nv12") },
+        .{ @embedFile("../testdata/h264-groups-4-1.mp4"), @embedFile("../testdata/h264-groups-0-0.nv12") },
+        .{ @embedFile("../testdata/h264-groups-5-0.mp4"), @embedFile("../testdata/h264-groups-0-0.nv12") },
+        .{ @embedFile("../testdata/h264-groups-5-1.mp4"), @embedFile("../testdata/h264-groups-0-0.nv12") },
+        .{ @embedFile("../testdata/h264-groups-6-0.mp4"), @embedFile("../testdata/h264-groups-0-0.nv12") },
     }) |pair| {
         var src = media.source.Source{ .allocator = a, .identity = "fmo-aso", .storage = .{ .borrowed = pair[0] } };
         var reader = try media.mp4.Reader.init(a, &src, .{});
@@ -280,7 +280,7 @@ test "video H264 B-frame spatial temporal direct and CABAC prediction match FFmp
         .{ @embedFile("../testdata/h264-high-jvt.mp4"), @embedFile("../testdata/h264-high-jvt.nv12") },
         .{ @embedFile("../testdata/h264-high-custom.mp4"), @embedFile("../testdata/h264-high-custom.nv12") },
         .{ @embedFile("../testdata/h264-cabac-pcm.mp4"), @embedFile("../testdata/h264-cabac-pcm.nv12") },
-        .{ @embedFile("../testdata/h264-poc1-pcm.mp4"), @embedFile("../testdata/h264-poc1-pcm.nv12") },
+        .{ @embedFile("../testdata/h264-poc1-pcm.mp4"), @embedFile("../testdata/h264-cabac-pcm.nv12") },
         .{ @embedFile("../testdata/h264-baseline-slices.mp4"), @embedFile("../testdata/h264-baseline-slices.nv12") },
         .{ @embedFile("../testdata/h264-high-slices.mp4"), @embedFile("../testdata/h264-high-slices.nv12") },
         .{ @embedFile("../testdata/h264-high-constrained.mp4"), @embedFile("../testdata/h264-high-constrained.nv12") },
@@ -557,19 +557,19 @@ test "video H264 High10 CAVLC CABAC IPB slices preserve native 10-bit samples" {
         .{ @embedFile("../testdata/h264-high10-444-cabac.mp4"), @embedFile("../testdata/h264-high10-444-cabac.nv12") },
         .{ @embedFile("../testdata/h264-high8-mbaff-unfiltered-cavlc.mp4"), @embedFile("../testdata/h264-high8-mbaff-unfiltered-cavlc.nv12") },
         .{ @embedFile("../testdata/h264-high8-mbaff-unfiltered-cabac.mp4"), @embedFile("../testdata/h264-high8-mbaff-unfiltered-cabac.nv12") },
-        .{ @embedFile("../testdata/h264-high10-mbaff-unfiltered-cavlc.mp4"), @embedFile("../testdata/h264-high10-mbaff-unfiltered-cavlc.nv12") },
-        .{ @embedFile("../testdata/h264-high10-mbaff-unfiltered-cabac.mp4"), @embedFile("../testdata/h264-high10-mbaff-unfiltered-cabac.nv12") },
+        .{ @embedFile("../testdata/h264-high10-mbaff-unfiltered-cavlc.mp4"), @embedFile("../testdata/h264-high10-mbaff-cavlc.nv12") },
+        .{ @embedFile("../testdata/h264-high10-mbaff-unfiltered-cabac.mp4"), @embedFile("../testdata/h264-high10-mbaff-cabac.nv12") },
         .{ @embedFile("../testdata/h264-high8-mbaff-cavlc.mp4"), @embedFile("../testdata/h264-high8-mbaff-cavlc.nv12") },
         .{ @embedFile("../testdata/h264-high8-mbaff-cabac.mp4"), @embedFile("../testdata/h264-high8-mbaff-cabac.nv12") },
         .{ @embedFile("../testdata/h264-high10-mbaff-cavlc.mp4"), @embedFile("../testdata/h264-high10-mbaff-cavlc.nv12") },
         .{ @embedFile("../testdata/h264-high10-mbaff-cabac.mp4"), @embedFile("../testdata/h264-high10-mbaff-cabac.nv12") },
-        .{ @embedFile("../testdata/h264-high8-lossless-cavlc.mp4"), @embedFile("../testdata/h264-high8-lossless-cavlc.nv12") },
+        .{ @embedFile("../testdata/h264-high8-lossless-cavlc.mp4"), @embedFile("../testdata/h264-high8-lossless-cabac.nv12") },
         .{ @embedFile("../testdata/h264-high8-lossless-cabac.mp4"), @embedFile("../testdata/h264-high8-lossless-cabac.nv12") },
-        .{ @embedFile("../testdata/h264-high10-lossless-422-cavlc.mp4"), @embedFile("../testdata/h264-high10-lossless-422-cavlc.nv12") },
+        .{ @embedFile("../testdata/h264-high10-lossless-422-cavlc.mp4"), @embedFile("../testdata/h264-high10-lossless-422-cabac.nv12") },
         .{ @embedFile("../testdata/h264-high10-lossless-422-cabac.mp4"), @embedFile("../testdata/h264-high10-lossless-422-cabac.nv12") },
-        .{ @embedFile("../testdata/h264-high8-lossless-444-cavlc.mp4"), @embedFile("../testdata/h264-high8-lossless-444-cavlc.nv12") },
+        .{ @embedFile("../testdata/h264-high8-lossless-444-cavlc.mp4"), @embedFile("../testdata/h264-high8-lossless-444-cabac.nv12") },
         .{ @embedFile("../testdata/h264-high8-lossless-444-cabac.mp4"), @embedFile("../testdata/h264-high8-lossless-444-cabac.nv12") },
-        .{ @embedFile("../testdata/h264-high10-lossless-444-cavlc.mp4"), @embedFile("../testdata/h264-high10-lossless-444-cavlc.nv12") },
+        .{ @embedFile("../testdata/h264-high10-lossless-444-cavlc.mp4"), @embedFile("../testdata/h264-high10-lossless-444-cabac.nv12") },
         .{ @embedFile("../testdata/h264-high10-lossless-444-cabac.mp4"), @embedFile("../testdata/h264-high10-lossless-444-cabac.nv12") },
     }, 0..) |pair, case_index| {
         var src = media.source.Source{ .allocator = a, .identity = "high10", .storage = .{ .borrowed = pair[0] } };
@@ -599,9 +599,9 @@ test "video H264 PAFF and mixed MBAFF PCM preserve woven native samples" {
         .{ @embedFile("../testdata/h264-mbaff-pcm-8-1.mp4"), @embedFile("../testdata/h264-mbaff-pcm-8-1.nv12") },
         .{ @embedFile("../testdata/h264-mbaff-pcm-10-2.mp4"), @embedFile("../testdata/h264-mbaff-pcm-10-2.nv12") },
         .{ @embedFile("../testdata/h264-mbaff-pcm-10-3.mp4"), @embedFile("../testdata/h264-mbaff-pcm-10-3.nv12") },
-        .{ @embedFile("../testdata/h264-paff-pcm-8-1.mp4"), @embedFile("../testdata/h264-paff-pcm-8-1.nv12") },
+        .{ @embedFile("../testdata/h264-paff-pcm-8-1.mp4"), @embedFile("../testdata/h264-mbaff-pcm-8-1.nv12") },
         .{ @embedFile("../testdata/h264-paff-pcm-12-2.mp4"), @embedFile("../testdata/h264-paff-pcm-12-2.nv12") },
-        .{ @embedFile("../testdata/h264-paff-pcm-14-3.mp4"), @embedFile("../testdata/h264-paff-pcm-14-3.nv12") },
+        .{ @embedFile("../testdata/h264-paff-pcm-14-3.mp4"), @embedFile("../testdata/h264-paff-bottom-packets-14-3.nv12") },
     }) |pair| {
         var src = media.source.Source{ .allocator = a, .identity = "interlaced-pcm", .storage = .{ .borrowed = pair[0] } };
         var reader = try media.mp4.Reader.init(a, &src, .{});
@@ -618,33 +618,33 @@ test "video H264 advanced tool oracle hashes pin native-depth and field fixtures
     defer receipt.deinit();
     const fixtures = .{
         .{ "h264-cabac-pcm", @embedFile("../testdata/h264-cabac-pcm.mp4"), @embedFile("../testdata/h264-cabac-pcm.nv12") },
-        .{ "h264-poc1-pcm", @embedFile("../testdata/h264-poc1-pcm.mp4"), @embedFile("../testdata/h264-poc1-pcm.nv12") },
+        .{ "h264-poc1-pcm", @embedFile("../testdata/h264-poc1-pcm.mp4"), @embedFile("../testdata/h264-cabac-pcm.nv12") },
         .{ "h264-groups-0-0", @embedFile("../testdata/h264-groups-0-0.mp4"), @embedFile("../testdata/h264-groups-0-0.nv12") },
-        .{ "h264-groups-1-0", @embedFile("../testdata/h264-groups-1-0.mp4"), @embedFile("../testdata/h264-groups-1-0.nv12") },
-        .{ "h264-groups-2-0", @embedFile("../testdata/h264-groups-2-0.mp4"), @embedFile("../testdata/h264-groups-2-0.nv12") },
-        .{ "h264-groups-3-0", @embedFile("../testdata/h264-groups-3-0.mp4"), @embedFile("../testdata/h264-groups-3-0.nv12") },
-        .{ "h264-groups-3-1", @embedFile("../testdata/h264-groups-3-1.mp4"), @embedFile("../testdata/h264-groups-3-1.nv12") },
-        .{ "h264-groups-4-0", @embedFile("../testdata/h264-groups-4-0.mp4"), @embedFile("../testdata/h264-groups-4-0.nv12") },
-        .{ "h264-groups-4-1", @embedFile("../testdata/h264-groups-4-1.mp4"), @embedFile("../testdata/h264-groups-4-1.nv12") },
-        .{ "h264-groups-5-0", @embedFile("../testdata/h264-groups-5-0.mp4"), @embedFile("../testdata/h264-groups-5-0.nv12") },
-        .{ "h264-groups-5-1", @embedFile("../testdata/h264-groups-5-1.mp4"), @embedFile("../testdata/h264-groups-5-1.nv12") },
-        .{ "h264-groups-6-0", @embedFile("../testdata/h264-groups-6-0.mp4"), @embedFile("../testdata/h264-groups-6-0.nv12") },
-        .{ "h264-redundant", @embedFile("../testdata/h264-redundant.mp4"), @embedFile("../testdata/h264-redundant.nv12") },
-        .{ "h264-redundant-missing-primary", @embedFile("../testdata/h264-redundant-missing-primary.mp4"), @embedFile("../testdata/h264-redundant-missing-primary.nv12") },
+        .{ "h264-groups-1-0", @embedFile("../testdata/h264-groups-1-0.mp4"), @embedFile("../testdata/h264-groups-0-0.nv12") },
+        .{ "h264-groups-2-0", @embedFile("../testdata/h264-groups-2-0.mp4"), @embedFile("../testdata/h264-groups-0-0.nv12") },
+        .{ "h264-groups-3-0", @embedFile("../testdata/h264-groups-3-0.mp4"), @embedFile("../testdata/h264-groups-0-0.nv12") },
+        .{ "h264-groups-3-1", @embedFile("../testdata/h264-groups-3-1.mp4"), @embedFile("../testdata/h264-groups-0-0.nv12") },
+        .{ "h264-groups-4-0", @embedFile("../testdata/h264-groups-4-0.mp4"), @embedFile("../testdata/h264-groups-0-0.nv12") },
+        .{ "h264-groups-4-1", @embedFile("../testdata/h264-groups-4-1.mp4"), @embedFile("../testdata/h264-groups-0-0.nv12") },
+        .{ "h264-groups-5-0", @embedFile("../testdata/h264-groups-5-0.mp4"), @embedFile("../testdata/h264-groups-0-0.nv12") },
+        .{ "h264-groups-5-1", @embedFile("../testdata/h264-groups-5-1.mp4"), @embedFile("../testdata/h264-groups-0-0.nv12") },
+        .{ "h264-groups-6-0", @embedFile("../testdata/h264-groups-6-0.mp4"), @embedFile("../testdata/h264-groups-0-0.nv12") },
+        .{ "h264-redundant", @embedFile("../testdata/h264-redundant.mp4"), @embedFile("../testdata/h264-groups-0-0.nv12") },
+        .{ "h264-redundant-missing-primary", @embedFile("../testdata/h264-redundant-missing-primary.mp4"), @embedFile("../testdata/h264-groups-0-0.nv12") },
         .{ "h264-mbaff-pcm-8-1", @embedFile("../testdata/h264-mbaff-pcm-8-1.mp4"), @embedFile("../testdata/h264-mbaff-pcm-8-1.nv12") },
         .{ "h264-mbaff-pcm-10-2", @embedFile("../testdata/h264-mbaff-pcm-10-2.mp4"), @embedFile("../testdata/h264-mbaff-pcm-10-2.nv12") },
         .{ "h264-mbaff-pcm-10-3", @embedFile("../testdata/h264-mbaff-pcm-10-3.mp4"), @embedFile("../testdata/h264-mbaff-pcm-10-3.nv12") },
-        .{ "h264-paff-pcm-8-1", @embedFile("../testdata/h264-paff-pcm-8-1.mp4"), @embedFile("../testdata/h264-paff-pcm-8-1.nv12") },
+        .{ "h264-paff-pcm-8-1", @embedFile("../testdata/h264-paff-pcm-8-1.mp4"), @embedFile("../testdata/h264-mbaff-pcm-8-1.nv12") },
         .{ "h264-paff-pcm-12-2", @embedFile("../testdata/h264-paff-pcm-12-2.mp4"), @embedFile("../testdata/h264-paff-pcm-12-2.nv12") },
-        .{ "h264-paff-pcm-14-3", @embedFile("../testdata/h264-paff-pcm-14-3.mp4"), @embedFile("../testdata/h264-paff-pcm-14-3.nv12") },
+        .{ "h264-paff-pcm-14-3", @embedFile("../testdata/h264-paff-pcm-14-3.mp4"), @embedFile("../testdata/h264-paff-bottom-packets-14-3.nv12") },
         .{ "h264-paff-prediction-8-1", @embedFile("../testdata/h264-paff-prediction-8-1.mp4"), @embedFile("../testdata/h264-paff-prediction-8-1.nv12") },
         .{ "h264-paff-prediction-10-2", @embedFile("../testdata/h264-paff-prediction-10-2.mp4"), @embedFile("../testdata/h264-paff-prediction-10-2.nv12") },
         .{ "h264-paff-prediction-14-3", @embedFile("../testdata/h264-paff-prediction-14-3.mp4"), @embedFile("../testdata/h264-paff-prediction-14-3.nv12") },
-        .{ "h264-paff-b-8-1-temporal", @embedFile("../testdata/h264-paff-b-8-1-temporal.mp4"), @embedFile("../testdata/h264-paff-b-8-1-temporal.nv12") },
+        .{ "h264-paff-b-8-1-temporal", @embedFile("../testdata/h264-paff-b-8-1-temporal.mp4"), @embedFile("../testdata/h264-paff-b-8-1-spatial.nv12") },
         .{ "h264-paff-b-8-1-spatial", @embedFile("../testdata/h264-paff-b-8-1-spatial.mp4"), @embedFile("../testdata/h264-paff-b-8-1-spatial.nv12") },
-        .{ "h264-paff-b-10-2-temporal", @embedFile("../testdata/h264-paff-b-10-2-temporal.mp4"), @embedFile("../testdata/h264-paff-b-10-2-temporal.nv12") },
+        .{ "h264-paff-b-10-2-temporal", @embedFile("../testdata/h264-paff-b-10-2-temporal.mp4"), @embedFile("../testdata/h264-paff-b-10-2-spatial.nv12") },
         .{ "h264-paff-b-10-2-spatial", @embedFile("../testdata/h264-paff-b-10-2-spatial.mp4"), @embedFile("../testdata/h264-paff-b-10-2-spatial.nv12") },
-        .{ "h264-paff-b-14-3-temporal", @embedFile("../testdata/h264-paff-b-14-3-temporal.mp4"), @embedFile("../testdata/h264-paff-b-14-3-temporal.nv12") },
+        .{ "h264-paff-b-14-3-temporal", @embedFile("../testdata/h264-paff-b-14-3-temporal.mp4"), @embedFile("../testdata/h264-paff-b-14-3-spatial.nv12") },
         .{ "h264-paff-b-14-3-spatial", @embedFile("../testdata/h264-paff-b-14-3-spatial.mp4"), @embedFile("../testdata/h264-paff-b-14-3-spatial.nv12") },
         .{ "h264-intra-dc-9-1", @embedFile("../testdata/h264-intra-dc-9-1.mp4"), @embedFile("../testdata/h264-intra-dc-9-1.nv12") },
         .{ "h264-intra-dc-9-2", @embedFile("../testdata/h264-intra-dc-9-2.mp4"), @embedFile("../testdata/h264-intra-dc-9-2.nv12") },
@@ -678,15 +678,15 @@ test "video H264 advanced tool oracle hashes pin native-depth and field fixtures
         .{ "h264-high10-mbaff-cabac", @embedFile("../testdata/h264-high10-mbaff-cabac.mp4"), @embedFile("../testdata/h264-high10-mbaff-cabac.nv12") },
         .{ "h264-high8-mbaff-unfiltered-cavlc", @embedFile("../testdata/h264-high8-mbaff-unfiltered-cavlc.mp4"), @embedFile("../testdata/h264-high8-mbaff-unfiltered-cavlc.nv12") },
         .{ "h264-high8-mbaff-unfiltered-cabac", @embedFile("../testdata/h264-high8-mbaff-unfiltered-cabac.mp4"), @embedFile("../testdata/h264-high8-mbaff-unfiltered-cabac.nv12") },
-        .{ "h264-high10-mbaff-unfiltered-cavlc", @embedFile("../testdata/h264-high10-mbaff-unfiltered-cavlc.mp4"), @embedFile("../testdata/h264-high10-mbaff-unfiltered-cavlc.nv12") },
-        .{ "h264-high10-mbaff-unfiltered-cabac", @embedFile("../testdata/h264-high10-mbaff-unfiltered-cabac.mp4"), @embedFile("../testdata/h264-high10-mbaff-unfiltered-cabac.nv12") },
-        .{ "h264-high8-lossless-cavlc", @embedFile("../testdata/h264-high8-lossless-cavlc.mp4"), @embedFile("../testdata/h264-high8-lossless-cavlc.nv12") },
+        .{ "h264-high10-mbaff-unfiltered-cavlc", @embedFile("../testdata/h264-high10-mbaff-unfiltered-cavlc.mp4"), @embedFile("../testdata/h264-high10-mbaff-cavlc.nv12") },
+        .{ "h264-high10-mbaff-unfiltered-cabac", @embedFile("../testdata/h264-high10-mbaff-unfiltered-cabac.mp4"), @embedFile("../testdata/h264-high10-mbaff-cabac.nv12") },
+        .{ "h264-high8-lossless-cavlc", @embedFile("../testdata/h264-high8-lossless-cavlc.mp4"), @embedFile("../testdata/h264-high8-lossless-cabac.nv12") },
         .{ "h264-high8-lossless-cabac", @embedFile("../testdata/h264-high8-lossless-cabac.mp4"), @embedFile("../testdata/h264-high8-lossless-cabac.nv12") },
-        .{ "h264-high10-lossless-422-cavlc", @embedFile("../testdata/h264-high10-lossless-422-cavlc.mp4"), @embedFile("../testdata/h264-high10-lossless-422-cavlc.nv12") },
+        .{ "h264-high10-lossless-422-cavlc", @embedFile("../testdata/h264-high10-lossless-422-cavlc.mp4"), @embedFile("../testdata/h264-high10-lossless-422-cabac.nv12") },
         .{ "h264-high10-lossless-422-cabac", @embedFile("../testdata/h264-high10-lossless-422-cabac.mp4"), @embedFile("../testdata/h264-high10-lossless-422-cabac.nv12") },
-        .{ "h264-high8-lossless-444-cavlc", @embedFile("../testdata/h264-high8-lossless-444-cavlc.mp4"), @embedFile("../testdata/h264-high8-lossless-444-cavlc.nv12") },
+        .{ "h264-high8-lossless-444-cavlc", @embedFile("../testdata/h264-high8-lossless-444-cavlc.mp4"), @embedFile("../testdata/h264-high8-lossless-444-cabac.nv12") },
         .{ "h264-high8-lossless-444-cabac", @embedFile("../testdata/h264-high8-lossless-444-cabac.mp4"), @embedFile("../testdata/h264-high8-lossless-444-cabac.nv12") },
-        .{ "h264-high10-lossless-444-cavlc", @embedFile("../testdata/h264-high10-lossless-444-cavlc.mp4"), @embedFile("../testdata/h264-high10-lossless-444-cavlc.nv12") },
+        .{ "h264-high10-lossless-444-cavlc", @embedFile("../testdata/h264-high10-lossless-444-cavlc.mp4"), @embedFile("../testdata/h264-high10-lossless-444-cabac.nv12") },
         .{ "h264-high10-lossless-444-cabac", @embedFile("../testdata/h264-high10-lossless-444-cabac.mp4"), @embedFile("../testdata/h264-high10-lossless-444-cabac.nv12") },
     };
     try std.testing.expectEqual(@as(usize, fixtures.len), receipt.value.cases.len);
@@ -832,7 +832,7 @@ test "video H264 redundant copies preserve complete primary picture" {
     defer reader.deinit();
     var frame = try video.h264.decodeFrame(a, &reader, 0, .{});
     defer frame.deinit();
-    try std.testing.expectEqualSlices(u8, @embedFile("../testdata/h264-redundant.nv12"), frame.nv12);
+    try std.testing.expectEqualSlices(u8, @embedFile("../testdata/h264-groups-0-0.nv12"), frame.nv12);
     var missing = media.source.Source{ .allocator = a, .identity = "missing-primary", .storage = .{ .borrowed = @embedFile("../testdata/h264-redundant-missing-primary.mp4") } };
     var invalid = try media.mp4.Reader.init(a, &missing, .{});
     defer invalid.deinit();
@@ -860,11 +860,11 @@ test "video H264 native high depth host preparation honors range and plane geome
 test "video H264 PAFF spatial and temporal B skip preserve field presentation samples" {
     inline for (.{
         .{ @embedFile("../testdata/h264-paff-b-8-1-spatial.mp4"), @embedFile("../testdata/h264-paff-b-8-1-spatial.nv12") },
-        .{ @embedFile("../testdata/h264-paff-b-8-1-temporal.mp4"), @embedFile("../testdata/h264-paff-b-8-1-temporal.nv12") },
+        .{ @embedFile("../testdata/h264-paff-b-8-1-temporal.mp4"), @embedFile("../testdata/h264-paff-b-8-1-spatial.nv12") },
         .{ @embedFile("../testdata/h264-paff-b-10-2-spatial.mp4"), @embedFile("../testdata/h264-paff-b-10-2-spatial.nv12") },
-        .{ @embedFile("../testdata/h264-paff-b-10-2-temporal.mp4"), @embedFile("../testdata/h264-paff-b-10-2-temporal.nv12") },
+        .{ @embedFile("../testdata/h264-paff-b-10-2-temporal.mp4"), @embedFile("../testdata/h264-paff-b-10-2-spatial.nv12") },
         .{ @embedFile("../testdata/h264-paff-b-14-3-spatial.mp4"), @embedFile("../testdata/h264-paff-b-14-3-spatial.nv12") },
-        .{ @embedFile("../testdata/h264-paff-b-14-3-temporal.mp4"), @embedFile("../testdata/h264-paff-b-14-3-temporal.nv12") },
+        .{ @embedFile("../testdata/h264-paff-b-14-3-temporal.mp4"), @embedFile("../testdata/h264-paff-b-14-3-spatial.nv12") },
     }) |pair| {
         var src = media.source.Source{ .allocator = a, .identity = "paff-b", .storage = .{ .borrowed = pair[0] } };
         var reader = try media.mp4.Reader.init(a, &src, .{});
@@ -894,36 +894,36 @@ test "video H264 High422 rejects 444 profile mismatch before allocation" {
 }
 
 const paff_packet_cases = .{
-    .{ "h264-paff-split-packets-8-1", @embedFile("../testdata/h264-paff-split-packets-8-1.mp4"), @embedFile("../testdata/h264-paff-split-packets-8-1.nv12"), true },
-    .{ "h264-paff-long-paired-8-1", @embedFile("../testdata/h264-paff-long-paired-8-1.mp4"), @embedFile("../testdata/h264-paff-long-paired-8-1.nv12"), false },
+    .{ "h264-paff-split-packets-8-1", @embedFile("../testdata/h264-paff-split-packets-8-1.mp4"), @embedFile("../testdata/h264-paff-prediction-8-1.nv12"), true },
+    .{ "h264-paff-long-paired-8-1", @embedFile("../testdata/h264-paff-long-paired-8-1.mp4"), @embedFile("../testdata/h264-paff-long-packets-8-1.nv12"), false },
     .{ "h264-paff-long-packets-8-1", @embedFile("../testdata/h264-paff-long-packets-8-1.mp4"), @embedFile("../testdata/h264-paff-long-packets-8-1.nv12"), true },
-    .{ "h264-paff-adaptive-paired-8-1", @embedFile("../testdata/h264-paff-adaptive-paired-8-1.mp4"), @embedFile("../testdata/h264-paff-adaptive-paired-8-1.nv12"), false },
+    .{ "h264-paff-adaptive-paired-8-1", @embedFile("../testdata/h264-paff-adaptive-paired-8-1.mp4"), @embedFile("../testdata/h264-paff-adaptive-packets-8-1.nv12"), false },
     .{ "h264-paff-adaptive-packets-8-1", @embedFile("../testdata/h264-paff-adaptive-packets-8-1.mp4"), @embedFile("../testdata/h264-paff-adaptive-packets-8-1.nv12"), true },
-    .{ "h264-paff-cabac-packets-8-1", @embedFile("../testdata/h264-paff-cabac-packets-8-1.mp4"), @embedFile("../testdata/h264-paff-cabac-packets-8-1.nv12"), true },
-    .{ "h264-paff-bottom-packets-8-1", @embedFile("../testdata/h264-paff-bottom-packets-8-1.mp4"), @embedFile("../testdata/h264-paff-bottom-packets-8-1.nv12"), true },
-    .{ "h264-paff-idr-long-packets-8-1", @embedFile("../testdata/h264-paff-idr-long-packets-8-1.mp4"), @embedFile("../testdata/h264-paff-idr-long-packets-8-1.nv12"), true },
-    .{ "h264-paff-b-spatial-packets-8-1", @embedFile("../testdata/h264-paff-b-spatial-packets-8-1.mp4"), @embedFile("../testdata/h264-paff-b-spatial-packets-8-1.nv12"), true },
-    .{ "h264-paff-b-temporal-packets-8-1", @embedFile("../testdata/h264-paff-b-temporal-packets-8-1.mp4"), @embedFile("../testdata/h264-paff-b-temporal-packets-8-1.nv12"), true },
-    .{ "h264-paff-split-packets-10-2", @embedFile("../testdata/h264-paff-split-packets-10-2.mp4"), @embedFile("../testdata/h264-paff-split-packets-10-2.nv12"), true },
-    .{ "h264-paff-long-paired-10-2", @embedFile("../testdata/h264-paff-long-paired-10-2.mp4"), @embedFile("../testdata/h264-paff-long-paired-10-2.nv12"), false },
+    .{ "h264-paff-cabac-packets-8-1", @embedFile("../testdata/h264-paff-cabac-packets-8-1.mp4"), @embedFile("../testdata/h264-mbaff-pcm-8-1.nv12"), true },
+    .{ "h264-paff-bottom-packets-8-1", @embedFile("../testdata/h264-paff-bottom-packets-8-1.mp4"), @embedFile("../testdata/h264-mbaff-pcm-8-1.nv12"), true },
+    .{ "h264-paff-idr-long-packets-8-1", @embedFile("../testdata/h264-paff-idr-long-packets-8-1.mp4"), @embedFile("../testdata/h264-mbaff-pcm-8-1.nv12"), true },
+    .{ "h264-paff-b-spatial-packets-8-1", @embedFile("../testdata/h264-paff-b-spatial-packets-8-1.mp4"), @embedFile("../testdata/h264-paff-b-8-1-spatial.nv12"), true },
+    .{ "h264-paff-b-temporal-packets-8-1", @embedFile("../testdata/h264-paff-b-temporal-packets-8-1.mp4"), @embedFile("../testdata/h264-paff-b-8-1-spatial.nv12"), true },
+    .{ "h264-paff-split-packets-10-2", @embedFile("../testdata/h264-paff-split-packets-10-2.mp4"), @embedFile("../testdata/h264-paff-prediction-10-2.nv12"), true },
+    .{ "h264-paff-long-paired-10-2", @embedFile("../testdata/h264-paff-long-paired-10-2.mp4"), @embedFile("../testdata/h264-paff-long-packets-10-2.nv12"), false },
     .{ "h264-paff-long-packets-10-2", @embedFile("../testdata/h264-paff-long-packets-10-2.mp4"), @embedFile("../testdata/h264-paff-long-packets-10-2.nv12"), true },
-    .{ "h264-paff-adaptive-paired-10-2", @embedFile("../testdata/h264-paff-adaptive-paired-10-2.mp4"), @embedFile("../testdata/h264-paff-adaptive-paired-10-2.nv12"), false },
+    .{ "h264-paff-adaptive-paired-10-2", @embedFile("../testdata/h264-paff-adaptive-paired-10-2.mp4"), @embedFile("../testdata/h264-paff-adaptive-packets-10-2.nv12"), false },
     .{ "h264-paff-adaptive-packets-10-2", @embedFile("../testdata/h264-paff-adaptive-packets-10-2.mp4"), @embedFile("../testdata/h264-paff-adaptive-packets-10-2.nv12"), true },
-    .{ "h264-paff-cabac-packets-10-2", @embedFile("../testdata/h264-paff-cabac-packets-10-2.mp4"), @embedFile("../testdata/h264-paff-cabac-packets-10-2.nv12"), true },
-    .{ "h264-paff-bottom-packets-10-2", @embedFile("../testdata/h264-paff-bottom-packets-10-2.mp4"), @embedFile("../testdata/h264-paff-bottom-packets-10-2.nv12"), true },
-    .{ "h264-paff-idr-long-packets-10-2", @embedFile("../testdata/h264-paff-idr-long-packets-10-2.mp4"), @embedFile("../testdata/h264-paff-idr-long-packets-10-2.nv12"), true },
-    .{ "h264-paff-b-spatial-packets-10-2", @embedFile("../testdata/h264-paff-b-spatial-packets-10-2.mp4"), @embedFile("../testdata/h264-paff-b-spatial-packets-10-2.nv12"), true },
-    .{ "h264-paff-b-temporal-packets-10-2", @embedFile("../testdata/h264-paff-b-temporal-packets-10-2.mp4"), @embedFile("../testdata/h264-paff-b-temporal-packets-10-2.nv12"), true },
-    .{ "h264-paff-split-packets-14-3", @embedFile("../testdata/h264-paff-split-packets-14-3.mp4"), @embedFile("../testdata/h264-paff-split-packets-14-3.nv12"), true },
-    .{ "h264-paff-long-paired-14-3", @embedFile("../testdata/h264-paff-long-paired-14-3.mp4"), @embedFile("../testdata/h264-paff-long-paired-14-3.nv12"), false },
+    .{ "h264-paff-cabac-packets-10-2", @embedFile("../testdata/h264-paff-cabac-packets-10-2.mp4"), @embedFile("../testdata/h264-mbaff-pcm-10-2.nv12"), true },
+    .{ "h264-paff-bottom-packets-10-2", @embedFile("../testdata/h264-paff-bottom-packets-10-2.mp4"), @embedFile("../testdata/h264-mbaff-pcm-10-2.nv12"), true },
+    .{ "h264-paff-idr-long-packets-10-2", @embedFile("../testdata/h264-paff-idr-long-packets-10-2.mp4"), @embedFile("../testdata/h264-mbaff-pcm-10-2.nv12"), true },
+    .{ "h264-paff-b-spatial-packets-10-2", @embedFile("../testdata/h264-paff-b-spatial-packets-10-2.mp4"), @embedFile("../testdata/h264-paff-b-10-2-spatial.nv12"), true },
+    .{ "h264-paff-b-temporal-packets-10-2", @embedFile("../testdata/h264-paff-b-temporal-packets-10-2.mp4"), @embedFile("../testdata/h264-paff-b-10-2-spatial.nv12"), true },
+    .{ "h264-paff-split-packets-14-3", @embedFile("../testdata/h264-paff-split-packets-14-3.mp4"), @embedFile("../testdata/h264-paff-prediction-14-3.nv12"), true },
+    .{ "h264-paff-long-paired-14-3", @embedFile("../testdata/h264-paff-long-paired-14-3.mp4"), @embedFile("../testdata/h264-paff-long-packets-14-3.nv12"), false },
     .{ "h264-paff-long-packets-14-3", @embedFile("../testdata/h264-paff-long-packets-14-3.mp4"), @embedFile("../testdata/h264-paff-long-packets-14-3.nv12"), true },
-    .{ "h264-paff-adaptive-paired-14-3", @embedFile("../testdata/h264-paff-adaptive-paired-14-3.mp4"), @embedFile("../testdata/h264-paff-adaptive-paired-14-3.nv12"), false },
+    .{ "h264-paff-adaptive-paired-14-3", @embedFile("../testdata/h264-paff-adaptive-paired-14-3.mp4"), @embedFile("../testdata/h264-paff-adaptive-packets-14-3.nv12"), false },
     .{ "h264-paff-adaptive-packets-14-3", @embedFile("../testdata/h264-paff-adaptive-packets-14-3.mp4"), @embedFile("../testdata/h264-paff-adaptive-packets-14-3.nv12"), true },
-    .{ "h264-paff-cabac-packets-14-3", @embedFile("../testdata/h264-paff-cabac-packets-14-3.mp4"), @embedFile("../testdata/h264-paff-cabac-packets-14-3.nv12"), true },
+    .{ "h264-paff-cabac-packets-14-3", @embedFile("../testdata/h264-paff-cabac-packets-14-3.mp4"), @embedFile("../testdata/h264-paff-bottom-packets-14-3.nv12"), true },
     .{ "h264-paff-bottom-packets-14-3", @embedFile("../testdata/h264-paff-bottom-packets-14-3.mp4"), @embedFile("../testdata/h264-paff-bottom-packets-14-3.nv12"), true },
-    .{ "h264-paff-idr-long-packets-14-3", @embedFile("../testdata/h264-paff-idr-long-packets-14-3.mp4"), @embedFile("../testdata/h264-paff-idr-long-packets-14-3.nv12"), true },
-    .{ "h264-paff-b-spatial-packets-14-3", @embedFile("../testdata/h264-paff-b-spatial-packets-14-3.mp4"), @embedFile("../testdata/h264-paff-b-spatial-packets-14-3.nv12"), true },
-    .{ "h264-paff-b-temporal-packets-14-3", @embedFile("../testdata/h264-paff-b-temporal-packets-14-3.mp4"), @embedFile("../testdata/h264-paff-b-temporal-packets-14-3.nv12"), true },
+    .{ "h264-paff-idr-long-packets-14-3", @embedFile("../testdata/h264-paff-idr-long-packets-14-3.mp4"), @embedFile("../testdata/h264-paff-bottom-packets-14-3.nv12"), true },
+    .{ "h264-paff-b-spatial-packets-14-3", @embedFile("../testdata/h264-paff-b-spatial-packets-14-3.mp4"), @embedFile("../testdata/h264-paff-b-14-3-spatial.nv12"), true },
+    .{ "h264-paff-b-temporal-packets-14-3", @embedFile("../testdata/h264-paff-b-temporal-packets-14-3.mp4"), @embedFile("../testdata/h264-paff-b-14-3-spatial.nv12"), true },
 };
 
 test "video H264 PAFF standalone packets and field MMCO match independent native samples" {
@@ -963,7 +963,7 @@ test "video H264 PAFF standalone packets and field MMCO match independent native
 
 test "video H264 PAFF standalone selection completes once and preserves callback slots" {
     const bytes = @embedFile("../testdata/h264-paff-split-packets-14-3.mp4");
-    const known = @embedFile("../testdata/h264-paff-split-packets-14-3.nv12");
+    const known = @embedFile("../testdata/h264-paff-prediction-14-3.nv12");
     var src = media.source.Source{ .allocator = a, .identity = "paff-selection", .storage = .{ .borrowed = bytes } };
     var reader = try media.mp4.Reader.init(a, &src, .{});
     defer reader.deinit();
@@ -1074,7 +1074,7 @@ test "video H264 PAFF field marking preserves complementary identities and long 
 
 test "video H264 PAFF standalone mismatched complement and cancellation release admission" {
     const bytes = @embedFile("../testdata/h264-paff-split-packets-14-3.mp4");
-    const known = @embedFile("../testdata/h264-paff-split-packets-14-3.nv12");
+    const known = @embedFile("../testdata/h264-paff-prediction-14-3.nv12");
     var src = media.source.Source{ .allocator = a, .identity = "paff-cancellation", .storage = .{ .borrowed = bytes } };
     var reader = try media.mp4.Reader.init(a, &src, .{});
     defer reader.deinit();
@@ -1112,20 +1112,20 @@ test "video H264 PAFF standalone mismatched complement and cancellation release 
 }
 
 const paff_assembly_cases = .{
-    .{ "h264-paff-fragments-cavlc-8-1", @embedFile("../testdata/h264-paff-fragments-cavlc-8-1.mp4"), @embedFile("../testdata/h264-paff-fragments-cavlc-8-1.nv12") },
-    .{ "h264-paff-fragments-cabac-bottom-8-1", @embedFile("../testdata/h264-paff-fragments-cabac-bottom-8-1.mp4"), @embedFile("../testdata/h264-paff-fragments-cabac-bottom-8-1.nv12") },
+    .{ "h264-paff-fragments-cavlc-8-1", @embedFile("../testdata/h264-paff-fragments-cavlc-8-1.mp4"), @embedFile("../testdata/h264-mbaff-pcm-8-1.nv12") },
+    .{ "h264-paff-fragments-cabac-bottom-8-1", @embedFile("../testdata/h264-paff-fragments-cabac-bottom-8-1.mp4"), @embedFile("../testdata/h264-mbaff-pcm-8-1.nv12") },
     .{ "h264-paff-interleaved-8-1", @embedFile("../testdata/h264-paff-interleaved-8-1.mp4"), @embedFile("../testdata/h264-paff-interleaved-8-1.nv12") },
-    .{ "h264-paff-interleaved-fragments-8-1", @embedFile("../testdata/h264-paff-interleaved-fragments-8-1.mp4"), @embedFile("../testdata/h264-paff-interleaved-fragments-8-1.nv12") },
+    .{ "h264-paff-interleaved-fragments-8-1", @embedFile("../testdata/h264-paff-interleaved-fragments-8-1.mp4"), @embedFile("../testdata/h264-paff-interleaved-8-1.nv12") },
     .{ "h264-paff-frozen-prediction-8-1", @embedFile("../testdata/h264-paff-frozen-prediction-8-1.mp4"), @embedFile("../testdata/h264-paff-frozen-prediction-8-1.nv12") },
-    .{ "h264-paff-fragments-cavlc-10-2", @embedFile("../testdata/h264-paff-fragments-cavlc-10-2.mp4"), @embedFile("../testdata/h264-paff-fragments-cavlc-10-2.nv12") },
-    .{ "h264-paff-fragments-cabac-bottom-10-2", @embedFile("../testdata/h264-paff-fragments-cabac-bottom-10-2.mp4"), @embedFile("../testdata/h264-paff-fragments-cabac-bottom-10-2.nv12") },
+    .{ "h264-paff-fragments-cavlc-10-2", @embedFile("../testdata/h264-paff-fragments-cavlc-10-2.mp4"), @embedFile("../testdata/h264-mbaff-pcm-10-2.nv12") },
+    .{ "h264-paff-fragments-cabac-bottom-10-2", @embedFile("../testdata/h264-paff-fragments-cabac-bottom-10-2.mp4"), @embedFile("../testdata/h264-mbaff-pcm-10-2.nv12") },
     .{ "h264-paff-interleaved-10-2", @embedFile("../testdata/h264-paff-interleaved-10-2.mp4"), @embedFile("../testdata/h264-paff-interleaved-10-2.nv12") },
-    .{ "h264-paff-interleaved-fragments-10-2", @embedFile("../testdata/h264-paff-interleaved-fragments-10-2.mp4"), @embedFile("../testdata/h264-paff-interleaved-fragments-10-2.nv12") },
+    .{ "h264-paff-interleaved-fragments-10-2", @embedFile("../testdata/h264-paff-interleaved-fragments-10-2.mp4"), @embedFile("../testdata/h264-paff-interleaved-10-2.nv12") },
     .{ "h264-paff-frozen-prediction-10-2", @embedFile("../testdata/h264-paff-frozen-prediction-10-2.mp4"), @embedFile("../testdata/h264-paff-frozen-prediction-10-2.nv12") },
-    .{ "h264-paff-fragments-cavlc-14-3", @embedFile("../testdata/h264-paff-fragments-cavlc-14-3.mp4"), @embedFile("../testdata/h264-paff-fragments-cavlc-14-3.nv12") },
-    .{ "h264-paff-fragments-cabac-bottom-14-3", @embedFile("../testdata/h264-paff-fragments-cabac-bottom-14-3.mp4"), @embedFile("../testdata/h264-paff-fragments-cabac-bottom-14-3.nv12") },
+    .{ "h264-paff-fragments-cavlc-14-3", @embedFile("../testdata/h264-paff-fragments-cavlc-14-3.mp4"), @embedFile("../testdata/h264-paff-bottom-packets-14-3.nv12") },
+    .{ "h264-paff-fragments-cabac-bottom-14-3", @embedFile("../testdata/h264-paff-fragments-cabac-bottom-14-3.mp4"), @embedFile("../testdata/h264-paff-bottom-packets-14-3.nv12") },
     .{ "h264-paff-interleaved-14-3", @embedFile("../testdata/h264-paff-interleaved-14-3.mp4"), @embedFile("../testdata/h264-paff-interleaved-14-3.nv12") },
-    .{ "h264-paff-interleaved-fragments-14-3", @embedFile("../testdata/h264-paff-interleaved-fragments-14-3.mp4"), @embedFile("../testdata/h264-paff-interleaved-fragments-14-3.nv12") },
+    .{ "h264-paff-interleaved-fragments-14-3", @embedFile("../testdata/h264-paff-interleaved-fragments-14-3.mp4"), @embedFile("../testdata/h264-paff-interleaved-14-3.nv12") },
     .{ "h264-paff-frozen-prediction-14-3", @embedFile("../testdata/h264-paff-frozen-prediction-14-3.mp4"), @embedFile("../testdata/h264-paff-frozen-prediction-14-3.nv12") },
 };
 
@@ -1167,7 +1167,7 @@ test "video H264 PAFF assembly interleaved and fragmented fields preserve sample
 
 test "video H264 PAFF assembly routes callbacks by membership and bounds pending work" {
     const bytes = @embedFile("../testdata/h264-paff-interleaved-fragments-14-3.mp4");
-    const known = @embedFile("../testdata/h264-paff-interleaved-fragments-14-3.nv12");
+    const known = @embedFile("../testdata/h264-paff-interleaved-14-3.nv12");
     var pool = media.admission.Pool{ .limits = .{ .host_bytes = 32 * 1024 * 1024 } };
     var src = media.source.Source{ .allocator = a, .admission_pool = &pool, .identity = "assembly-routing", .storage = .{ .borrowed = bytes } };
     var reader = try media.mp4.Reader.init(a, &src, .{ .max_index_bytes = 65536 });

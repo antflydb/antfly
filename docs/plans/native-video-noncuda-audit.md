@@ -117,3 +117,10 @@ Historical fixture READMEs can describe their measured epoch and commands;
 removed output files are recovered from that commit or regenerated with their
 producer. Their old test counts, source fingerprints and failed outcomes are
 not promoted to current evidence by this cleanup.
+
+Fixture layout maintenance keeps independent reference values intact while
+sharing exact JSON copies and expected pixel payloads. See the
+[maintenance commands](../../zig/lib/video/testdata/README.md#fixture-maintenance).
+Live benchmark suites resolve relative input paths and check their hashes.
+Reference/table row formatting changes source-file hashes; historical production
+measurements and their recorded fingerprints remain bound to the earlier epoch.

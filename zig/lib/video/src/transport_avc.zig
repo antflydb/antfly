@@ -575,8 +575,14 @@ test "native TS AVC packet adapter decodes every selected picture against indepe
         }
     };
     const a = std.testing.allocator;
-    inline for (.{ "closed", "bframes", "closed-split", "bframes-split" }) |name| {
-        const oracle = try std.json.parseFromSlice(Oracle, a, @embedFile("../testdata/transport/" ++ name ++ ".json"), .{});
+    inline for (.{
+        .{ "closed", @embedFile("../testdata/transport/closed.json") },
+        .{ "bframes", @embedFile("../testdata/transport/bframes.json") },
+        .{ "closed-split", @embedFile("../testdata/transport/closed.json") },
+        .{ "bframes-split", @embedFile("../testdata/transport/bframes.json") },
+    }) |fixture| {
+        const name = fixture[0];
+        const oracle = try std.json.parseFromSlice(Oracle, a, fixture[1], .{});
         defer oracle.deinit();
         var source = try Reader.init(a, "transport-qualification", @embedFile("../testdata/transport/" ++ name ++ ".ts"), .{}, .{});
         defer source.deinit();

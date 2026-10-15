@@ -20,7 +20,7 @@ const media = @import("antfly_media");
 const video = @import("antfly_video");
 const factory = internal.architectures.session_factory;
 const pipeline = internal.pipelines.embedding_gemma2;
-const Case = struct { id: []const u8, path: []const u8, init_end: usize, fragment_ends: []const usize, duration_ns: i64 = 2 * std.time.ns_per_s, qualify_reader_cache: bool = false, advance_ns: ?u64 = null, incremental_validation: bool = true };
+const Case = struct { id: []const u8, path: []const u8, sha256: ?[]const u8 = null, init_end: usize, fragment_ends: []const usize, duration_ns: i64 = 2 * std.time.ns_per_s, qualify_reader_cache: bool = false, advance_ns: ?u64 = null, incremental_validation: bool = true };
 const Query = struct { id: []const u8, text: []const u8 };
 const Suite = struct { cases: []const Case, queries: []const Query = &.{} };
 const QueryResult = struct { id: []const u8, vector: []f32 };
@@ -109,7 +109,14 @@ pub fn main(init: std.process.Init) !void {
     var results = std.ArrayList(Measurement).empty;
     var cache_results = std.ArrayList(CacheMeasurement).empty;
     for (parsed.value.cases) |case| {
-        const bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, case.path, a, .limited(64 * 1024 * 1024));
+        const fixture_path = try std.fs.path.resolve(a, &.{ std.fs.path.dirname(suite_path.?) orelse ".", case.path });
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, fixture_path, a, .limited(64 * 1024 * 1024));
+        if (case.sha256) |expected| {
+            if (expected.len != 64) return error.InvalidFixtureHash;
+            var digest: [32]u8 = undefined;
+            _ = std.fmt.hexToBytes(&digest, expected) catch return error.InvalidFixtureHash;
+            if (!std.mem.eql(u8, &digest, &fixtureDigest(bytes))) return error.FixtureChanged;
+        }
         if (case.init_end == 0 or case.init_end >= bytes.len or case.fragment_ends.len == 0 or case.fragment_ends.len > 256) return error.InvalidFixture;
         var previous = case.init_end;
         for (case.fragment_ends) |end| {
@@ -201,4 +208,10 @@ pub fn main(init: std.process.Init) !void {
     }
     const report = try std.json.Stringify.valueAlloc(a, .{ .status = "pass", .backend = if (metal) "metal" else "native", .timing_scope = "completed live adapter and complete-clip baseline; diagnostic shared-host timing", .cases = results.items, .queries = queries.items, .reader_cache = cache_results.items }, .{ .whitespace = .indent_2 });
     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = output orelse return error.MissingOutput, .data = report });
+}
+
+fn fixtureDigest(bytes: []const u8) [32]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    return digest;
 }

@@ -17,7 +17,7 @@
 const std = @import("std");
 const media = @import("antfly_media");
 const video = @import("antfly_video");
-const Case = struct { id: []const u8, path: []const u8, init_end: usize = 0, fragment_ends: []const usize = &.{}, packet_units: bool = false, normalize_clock: bool = false, duration_ns: i64 = 2 * std.time.ns_per_s };
+const Case = struct { id: []const u8, path: []const u8, sha256: ?[]const u8 = null, init_end: usize = 0, fragment_ends: []const usize = &.{}, packet_units: bool = false, normalize_clock: bool = false, duration_ns: i64 = 2 * std.time.ns_per_s };
 const Suite = struct { cases: []const Case };
 const Sample = struct { completed_ns: u64, windows: usize, validation_walks: usize, metadata_snapshots: ?usize, admitted_peak_bytes: u64, digest: [32]u8 };
 const Result = struct { case: []const u8, packet_units: bool, normalized_clock: bool, samples: []Sample };
@@ -132,8 +132,18 @@ pub fn main(init: std.process.Init) !void {
     var built: usize = 0;
     defer for (results[0..built]) |result| a.free(result.samples);
     for (suite.value.cases, results) |case, *result| {
-        const bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, case.path, a, .limited(64 * 1024 * 1024));
+        const fixture_path = try std.fs.path.resolve(a, &.{ std.fs.path.dirname(args[1]) orelse ".", case.path });
+        defer a.free(fixture_path);
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, fixture_path, a, .limited(64 * 1024 * 1024));
         defer a.free(bytes);
+        if (case.sha256) |expected| {
+            if (expected.len != 64) return error.InvalidFixtureHash;
+            var digest: [32]u8 = undefined;
+            _ = std.fmt.hexToBytes(&digest, expected) catch return error.InvalidFixtureHash;
+            var actual: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(bytes, &actual, .{});
+            if (!std.mem.eql(u8, &digest, &actual)) return error.FixtureChanged;
+        }
         if (!case.packet_units) {
             if (case.init_end == 0 or case.init_end >= bytes.len or case.fragment_ends.len == 0) return error.InvalidFixture;
             var previous = case.init_end;

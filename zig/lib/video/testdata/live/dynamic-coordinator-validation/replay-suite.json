@@ -2,7 +2,7 @@
   "cases": [
     {
       "id": "sintel-6s",
-      "path": "/private/tmp/native-video-dynamic-live/sintel-avc3.mp4",
+      "path": "../configuration-compaction-validation/sintel-avc3.mp4",
       "init_end": 1011,
       "fragment_ends": [
         5339,
@@ -14,11 +14,12 @@
       ],
       "advance_ns": 1000000000,
       "qualify_reader_cache": true,
-      "incremental_validation": false
+      "incremental_validation": false,
+      "sha256": "a664d4fec33430d4402568ec7236c178aa2be744d9d43a1748e8a1a80a60f1fa"
     },
     {
       "id": "sintel-6s-sparse",
-      "path": "/private/tmp/native-video-dynamic-live/sintel-avc3.mp4",
+      "path": "../configuration-compaction-validation/sintel-avc3.mp4",
       "init_end": 1011,
       "fragment_ends": [
         5339,
@@ -30,7 +31,8 @@
       ],
       "advance_ns": 3000000000,
       "qualify_reader_cache": true,
-      "incremental_validation": false
+      "incremental_validation": false,
+      "sha256": "a664d4fec33430d4402568ec7236c178aa2be744d9d43a1748e8a1a80a60f1fa"
     }
   ],
   "queries": [

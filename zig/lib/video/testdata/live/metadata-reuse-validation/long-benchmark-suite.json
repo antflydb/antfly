@@ -2,7 +2,7 @@
   "cases": [
     {
       "id": "sintel-52s-480x320",
-      "path": "/private/tmp/native-video-validation-reuse/sintel-52s-fragmented.mp4",
+      "path": "sintel-52s-fragmented.mp4",
       "init_end": 1010,
       "fragment_ends": [
         24159,
@@ -32,7 +32,8 @@
         1588853,
         1602568,
         1602873
-      ]
+      ],
+      "sha256": "653092895417c0f37cb14f2e2293ab19cd5a23c6518ba1e91f24a2627a183bed"
     }
   ]
 }

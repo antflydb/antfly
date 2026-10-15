@@ -1,0 +1,223 @@
+{
+  "scope": "Identical expected pixel payloads and dynamic fixture data. Coded test cases, per-case oracle hashes and module-local container goldens remain distinct.",
+  "groups": [
+    {
+      "path": "zig/lib/video/testdata/h264-cabac-pcm.nv12",
+      "sha256": "1b673da57de9176509e82b4ce9228b51cef0a50a246da5735490dd07bfec4be9",
+      "aliases": [
+        "zig/lib/video/testdata/h264-poc1-pcm.nv12"
+      ]
+    },
+    {
+      "path": "zig/lib/video/testdata/h264-groups-0-0.nv12",
+      "sha256": "ee926c2fff385c2e4ac413cf50a0dbe4088261d8507d6a438032bfc3b660b6bd",
+      "aliases": [
+        "zig/lib/video/testdata/h264-groups-1-0.nv12",
+        "zig/lib/video/testdata/h264-groups-2-0.nv12",
+        "zig/lib/video/testdata/h264-groups-3-0.nv12",
+        "zig/lib/video/testdata/h264-groups-3-1.nv12",
+        "zig/lib/video/testdata/h264-groups-4-0.nv12",
+        "zig/lib/video/testdata/h264-groups-4-1.nv12",
+        "zig/lib/video/testdata/h264-groups-5-0.nv12",
+        "zig/lib/video/testdata/h264-groups-5-1.nv12",
+        "zig/lib/video/testdata/h264-groups-6-0.nv12",
+        "zig/lib/video/testdata/h264-redundant-missing-primary.nv12",
+        "zig/lib/video/testdata/h264-redundant.nv12"
+      ]
+    },
+    {
+      "path": "zig/lib/video/testdata/h264-high10-lossless-422-cabac.nv12",
+      "sha256": "102ceebdcac7af2358d793a7b91948846311966efdfc89432dd3433eb2f4956d",
+      "aliases": [
+        "zig/lib/video/testdata/h264-high10-lossless-422-cavlc.nv12"
+      ]
+    },
+    {
+      "path": "zig/lib/video/testdata/h264-high10-lossless-444-cabac.nv12",
+      "sha256": "4ddcb5a6c2f8a7b055e8b211fcd7f2cd9a3d227af5dc1fab9e5826e5fcb2047a",
+      "aliases": [
+        "zig/lib/video/testdata/h264-high10-lossless-444-cavlc.nv12"
+      ]
+    },
+    {
+      "path": "zig/lib/video/testdata/h264-high10-mbaff-cabac.nv12",
+      "sha256": "9c8b2cffba452a6e5c79cea861ade33832894e319d7142676897a6113d600d17",
+      "aliases": [
+        "zig/lib/video/testdata/h264-high10-mbaff-unfiltered-cabac.nv12"
+      ]
+    },
+    {
+      "path": "zig/lib/video/testdata/h264-high10-mbaff-cavlc.nv12",
+      "sha256": "a470bc94d2e3c3e909593278002fd68ba505a1a7502e3b674cce17dbd4c5b3ba",
+      "aliases": [
+        "zig/lib/video/testdata/h264-high10-mbaff-unfiltered-cavlc.nv12"
+      ]
+    },
+    {
+      "path": "zig/lib/video/testdata/h264-high8-lossless-444-cabac.nv12",
+      "sha256": "a77ac1bfc91722a3aeb43804470db8496d9b62c5e430439055a4e5e043006142",
+      "aliases": [
+        "zig/lib/video/testdata/h264-high8-lossless-444-cavlc.nv12"
+      ]
+    },
+    {
+      "path": "zig/lib/video/testdata/h264-high8-lossless-cabac.nv12",
+      "sha256": "d0a5305dc8c78645fbb8ad4a76a3f93a002d5a8aa8c4058597bb6d40bb62d6f6",
+      "aliases": [
+        "zig/lib/video/testdata/h264-high8-lossless-cavlc.nv12"
+      ]
+    },
+    {
+      "path": "zig/lib/video/testdata/h264-mbaff-pcm-10-2.nv12",
+      "sha256": "d5d1cde45d4a7d2d4180ce039c0188db3d6030d3a81a8adfaf91c79fde2a23ca",
+      "aliases": [
+        "zig/lib/video/testdata/h264-paff-bottom-packets-10-2.nv12",
+        "zig/lib/video/testdata/h264-paff-cabac-packets-10-2.nv12",
+        "zig/lib/video/testdata/h264-paff-fragments-cabac-bottom-10-2.nv12",
+        "zig/lib/video/testdata/h264-paff-fragments-cavlc-10-2.nv12",
+        "zig/lib/video/testdata/h264-paff-idr-long-packets-10-2.nv12"
+      ]
+    },
+    {
+      "path": "zig/lib/video/testdata/h264-mbaff-pcm-8-1.nv12",
+      "sha256": "c2c4db4a8d55e4e51a4089930f0f5cbb0ce80adad6abbe7c5a0bf7a313c140ae",
+      "aliases": [
+        "zig/lib/video/testdata/h264-paff-bottom-packets-8-1.nv12",
+        "zig/lib/video/testdata/h264-paff-cabac-packets-8-1.nv12",
+        "zig/lib/video/testdata/h264-paff-fragments-cabac-bottom-8-1.nv12",
+        "zig/lib/video/testdata/h264-paff-fragments-cavlc-8-1.nv12",
+        "zig/lib/video/testdata/h264-paff-idr-long-packets-8-1.nv12",
+        "zig/lib/video/testdata/h264-paff-pcm-8-1.nv12"
+      ]
+    },
+    {
+      "path": "zig/lib/video/testdata/h264-paff-adaptive-packets-10-2.nv12",
+      "sha256": "a10f708be3dc6be2b66208813d52f079ff8b56a16717aaa971ac221557fef49b",
+      "aliases": [
+        "zig/lib/video/testdata/h264-paff-adaptive-paired-10-2.nv12"
+      ]
+    },
+    {
+      "path": "zig/lib/video/testdata/h264-paff-adaptive-packets-14-3.nv12",
+      "sha256": "29b42b5ff5501342ad3525b3b253da7ed2eba26bc4924d6556c52bf079028109",
+      "aliases": [
+        "zig/lib/video/testdata/h264-paff-adaptive-paired-14-3.nv12"
+      ]
+    },
+    {
+      "path": "zig/lib/video/testdata/h264-paff-adaptive-packets-8-1.nv12",
+      "sha256": "6f51d410b19d6eb3814c6371dc7e2fe31daf696436f5ed7aa94fd7de05d7c17f",
+      "aliases": [
+        "zig/lib/video/testdata/h264-paff-adaptive-paired-8-1.nv12"
+      ]
+    },
+    {
+      "path": "zig/lib/video/testdata/h264-paff-b-10-2-spatial.nv12",
+      "sha256": "392c84e44f9236062133120120ddb7bb62f65231fcacb7f34e8aa3aadec80298",
+      "aliases": [
+        "zig/lib/video/testdata/h264-paff-b-10-2-temporal.nv12",
+        "zig/lib/video/testdata/h264-paff-b-spatial-packets-10-2.nv12",
+        "zig/lib/video/testdata/h264-paff-b-temporal-packets-10-2.nv12"
+      ]
+    },
+    {
+      "path": "zig/lib/video/testdata/h264-paff-b-14-3-spatial.nv12",
+      "sha256": "baa14bc51dea98fff5634e43bb1544e6db10bb721d22c25117ea0dcf3decbfcf",
+      "aliases": [
+        "zig/lib/video/testdata/h264-paff-b-14-3-temporal.nv12",
+        "zig/lib/video/testdata/h264-paff-b-spatial-packets-14-3.nv12",
+        "zig/lib/video/testdata/h264-paff-b-temporal-packets-14-3.nv12"
+      ]
+    },
+    {
+      "path": "zig/lib/video/testdata/h264-paff-b-8-1-spatial.nv12",
+      "sha256": "a1841eabfa5529df7a0223caf5ca1d553637428eca110f8e663495380e1b1887",
+      "aliases": [
+        "zig/lib/video/testdata/h264-paff-b-8-1-temporal.nv12",
+        "zig/lib/video/testdata/h264-paff-b-spatial-packets-8-1.nv12",
+        "zig/lib/video/testdata/h264-paff-b-temporal-packets-8-1.nv12"
+      ]
+    },
+    {
+      "path": "zig/lib/video/testdata/h264-paff-bottom-packets-14-3.nv12",
+      "sha256": "0dda37185bb29d410276a50e43fad5bdab361ba402afa4974cf450a78f615439",
+      "aliases": [
+        "zig/lib/video/testdata/h264-paff-cabac-packets-14-3.nv12",
+        "zig/lib/video/testdata/h264-paff-fragments-cabac-bottom-14-3.nv12",
+        "zig/lib/video/testdata/h264-paff-fragments-cavlc-14-3.nv12",
+        "zig/lib/video/testdata/h264-paff-idr-long-packets-14-3.nv12",
+        "zig/lib/video/testdata/h264-paff-pcm-14-3.nv12"
+      ]
+    },
+    {
+      "path": "zig/lib/video/testdata/h264-paff-interleaved-10-2.nv12",
+      "sha256": "bfd72e28be715069abc6a3cb0cc283846669d352e1d0f7969744a736066ae0f0",
+      "aliases": [
+        "zig/lib/video/testdata/h264-paff-interleaved-fragments-10-2.nv12"
+      ]
+    },
+    {
+      "path": "zig/lib/video/testdata/h264-paff-interleaved-14-3.nv12",
+      "sha256": "b5c75507aeddc95f308bd3571898bf1b229683e6bb8717e3d8e10ef8702d7c00",
+      "aliases": [
+        "zig/lib/video/testdata/h264-paff-interleaved-fragments-14-3.nv12"
+      ]
+    },
+    {
+      "path": "zig/lib/video/testdata/h264-paff-interleaved-8-1.nv12",
+      "sha256": "c4cee7c6fe3e4992c1db6d087bd3a7e911556bdc3cc898de483b1753d8725764",
+      "aliases": [
+        "zig/lib/video/testdata/h264-paff-interleaved-fragments-8-1.nv12"
+      ]
+    },
+    {
+      "path": "zig/lib/video/testdata/h264-paff-long-packets-10-2.nv12",
+      "sha256": "9ffa5ee3b655e649489ee21b09ea67709e256e73527cb94738ff675709fbd846",
+      "aliases": [
+        "zig/lib/video/testdata/h264-paff-long-paired-10-2.nv12"
+      ]
+    },
+    {
+      "path": "zig/lib/video/testdata/h264-paff-long-packets-14-3.nv12",
+      "sha256": "9a1f5bfd087023620c3ddb95987053e16ecfc65429eded3c0a1ee3a6bcca0e86",
+      "aliases": [
+        "zig/lib/video/testdata/h264-paff-long-paired-14-3.nv12"
+      ]
+    },
+    {
+      "path": "zig/lib/video/testdata/h264-paff-long-packets-8-1.nv12",
+      "sha256": "7697c7902b85be539d44382f5372765d9edcae4a6a73ebafdb5ba57cd9e2d4b4",
+      "aliases": [
+        "zig/lib/video/testdata/h264-paff-long-paired-8-1.nv12"
+      ]
+    },
+    {
+      "path": "zig/lib/video/testdata/h264-paff-prediction-10-2.nv12",
+      "sha256": "bddbc2ec8fdad2e5f56cf04ae9b09f4f7281abcbfb4c334ad868a10cdac20f56",
+      "aliases": [
+        "zig/lib/video/testdata/h264-paff-split-packets-10-2.nv12"
+      ]
+    },
+    {
+      "path": "zig/lib/video/testdata/h264-paff-prediction-14-3.nv12",
+      "sha256": "0f6ed9f8fa2f3b93c940822f407ae8daff70f4cf15c4d6b455886ca853adee21",
+      "aliases": [
+        "zig/lib/video/testdata/h264-paff-split-packets-14-3.nv12"
+      ]
+    },
+    {
+      "path": "zig/lib/video/testdata/h264-paff-prediction-8-1.nv12",
+      "sha256": "1f42ae9110110213e81b77b939f449e057bf8ecc15557b6cb3c1363ccbfd885f",
+      "aliases": [
+        "zig/lib/video/testdata/h264-paff-split-packets-8-1.nv12"
+      ]
+    },
+    {
+      "path": "zig/lib/video/testdata/live/configuration-compaction-validation/sintel-avc3.mp4",
+      "sha256": "a664d4fec33430d4402568ec7236c178aa2be744d9d43a1748e8a1a80a60f1fa",
+      "aliases": [
+        "zig/lib/video/testdata/live/dynamic-coordinator-validation/sintel-avc3.mp4"
+      ]
+    }
+  ]
+}

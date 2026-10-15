@@ -1,12 +1,12 @@
 {
-  "source": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/native-video-design/tools/embeddinggemma2/testdata/retrieval-long/sintel-52s.mp4",
+  "source": "tools/embeddinggemma2/testdata/retrieval-long/sintel-52s.mp4",
   "generation": [
-    "/opt/homebrew/bin/ffmpeg",
+    "ffmpeg",
     "-nostdin",
     "-v",
     "error",
     "-i",
-    "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/native-video-design/tools/embeddinggemma2/testdata/retrieval-long/sintel-52s.mp4",
+    "tools/embeddinggemma2/testdata/retrieval-long/sintel-52s.mp4",
     "-map",
     "0:v:0",
     "-c:v",
@@ -15,7 +15,7 @@
     "-movflags",
     "frag_keyframe+empty_moov+default_base_moof",
     "-y",
-    "/private/tmp/native-video-validation-reuse/sintel-52s-fragmented.mp4"
+    ".benchmark-assets/video-live/sintel-52s-fragmented.mp4"
   ],
   "remux_only": true,
   "trimmed_trailing_index": true,

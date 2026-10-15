@@ -293,3 +293,37 @@ observed at original picture 722. The JSON receipt pins coded bytes and every
 independent FFmpeg NV12 picture hash. FFmpeg and libvpx independently agree on
 the first failing original picture. The native regression hashes all six
 pictures and checks returned-output/reference ownership independently.
+
+## Fixture maintenance
+
+Live suite paths are relative to their suite JSON, and each case pins the input
+SHA-256. The live model and coordinator benchmark executables resolve those
+paths independently of the process working directory and reject changed inputs.
+Canonical suite JSON is shared across the historical platform/feature folders;
+backend choice remains a command-line option.
+
+Reference vectors use eight numeric values per row. Format regenerated independent
+oracles without rounding values or dropping metadata:
+
+```sh
+python3 tools/embeddinggemma2/format_reference_fixtures.py /path/to/oracle.json
+```
+
+`--check` validates formatting without writing. Formatting changes file hashes;
+it does not change parsed values, checkpoint/corpus identity or historical raw
+report hashes. Existing measured receipts retain their original source epoch.
+
+Identical expected-pixel payloads and the dynamic AVC fixture share canonical
+files listed in [shared-payloads.json](shared-payloads.json). Coded test cases,
+per-case decoded hashes and assertions remain independent. After regenerating
+fixtures, verify/canonicalize equivalent duplicate outputs:
+
+```sh
+python3 zig/lib/video/scripts/canonicalize_shared_payloads.py
+python3 zig/lib/video/scripts/canonicalize_shared_payloads.py --apply
+```
+
+`--apply` removes only aliases whose bytes match the pinned canonical payload;
+any changed oracle stops the operation before deletion. Small container goldens
+compiled independently by media/video remain module-local. Encoded corpus copies
+at module boundaries retain their existing identities and provenance.
