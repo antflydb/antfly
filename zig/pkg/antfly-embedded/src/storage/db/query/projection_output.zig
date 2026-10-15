@@ -169,6 +169,9 @@ pub const Output = union(enum) {
                     fanout.* = .{ .source = source, .path = path, .selector = if (source == .span and path.len > 1) try @import("json_projection_plan.zig").compile(a, &.{.{ .parts = path }}) else null };
                     const rows = try a.create(FanoutRows);
                     rows.* = FanoutRows.initOwned(a, fanout.*);
+                    // Primed rows may be replaced or abandoned. Their retained
+                    // navigation belongs to a; no independent scratch escapes.
+                    defer rows.preparation.deinit();
                     if (try rows.next()) |first| {
                         fanout.prepared = rows;
                         fanout.first = first;
@@ -290,6 +293,7 @@ pub const Output = union(enum) {
                     // siblings share independently reclaimable bounded scratch.
                     rows.arena.deinit();
                     rows.arena = .init(context.work);
+                    rows.preparation = .init(context.work);
                 }
                 while (try rows.next()) |object| {
                     if (count != 0) try writer.writeByte(',');
@@ -507,6 +511,7 @@ const FanoutRows = struct {
     path: []const []const u8,
     selector: ?*const @import("json_projection_plan.zig").Selector,
     arena: std.heap.ArenaAllocator,
+    preparation: View.PreparationWorkspace,
     scanner: ?std.json.Scanner = null,
     started: bool = false,
     index: usize = 0,
@@ -515,13 +520,14 @@ const FanoutRows = struct {
         return initOwned(@import("antfly_platform").allocator.reclaimingScratch(a), fanout);
     }
     fn initOwned(work: Allocator, fanout: Output.Fanout) FanoutRows {
-        return .{ .source = fanout.source, .path = fanout.path, .selector = fanout.selector, .arena = .init(work), .scanner = switch (fanout.source) {
+        return .{ .source = fanout.source, .path = fanout.path, .selector = fanout.selector, .arena = .init(work), .preparation = .init(work), .scanner = switch (fanout.source) {
             .span => |span| std.json.Scanner.initCompleteInput(work, span.node.raw),
             .logical, .embeddings, .embedding_stream, .vector, .component => null,
         } };
     }
     fn deinit(self: *FanoutRows) void {
         if (self.scanner) |*scanner| scanner.deinit();
+        self.preparation.deinit();
         self.arena.deinit();
     }
     fn next(self: *FanoutRows) anyerror!?Output.Object {
@@ -556,7 +562,7 @@ const FanoutRows = struct {
                         // selected path once avoids rescanning every ancestor's
                         // remaining subtree for a deep field selection.
                         self.view = .init(a, span.node.raw[start..]);
-                        try self.view.prepareProjectionValue(self.selector.?, .visited, .object_only, .{ .defer_fanout = true }, scanner, span.node.raw, a);
+                        try self.view.prepareProjectionValueWithWorkspace(self.selector.?, .visited, .object_only, .{ .defer_fanout = true }, scanner, span.node.raw, &self.preparation);
                     } else if (token == .object_begin and !std.mem.eql(u8, self.path[0], "*")) {
                         // Discover the selected root member while advancing
                         // the array scanner, avoiding a second scan per item.

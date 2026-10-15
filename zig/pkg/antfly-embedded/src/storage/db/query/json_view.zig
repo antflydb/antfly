@@ -365,136 +365,156 @@ pub const View = struct {
         view.root.state = .{};
     }
 
+    const PreparationFrame = struct {
+        object: bool = false,
+        key: bool = true,
+        node: ?*View.Node = null,
+        children: std.ArrayListUnmanaged(View.Child) = .empty,
+        selected: ?*const Selector = null,
+        name: []const u8 = "",
+        retain: bool = false,
+        retain_all: bool = false,
+        defer_items: bool = false,
+        omitted: bool = false,
+        excluded: []const []const u8 = &.{},
+        ordinal: usize = 0,
+        start: usize = 0,
+        pending_node: ?*View.Node = null,
+        // Stable across work-stack growth; reused for siblings. Only the
+        // finished child is copied into the view's retained navigation.
+        pending_storage: *View.Node,
+        pending_selector: ?*const Selector = null,
+
+        fn wants(self: *@This(), name: []const u8) bool {
+            if (self.selected == null) return false;
+            for (self.excluded) |omit| if (std.mem.eql(u8, omit, "*") or std.mem.eql(u8, omit, name)) return false;
+            return self.retain_all or self.selected.?.fields.contains(name);
+        }
+
+        fn plan(self: *@This(), a: Allocator) !void {
+            const node = self.node orelse return;
+            if (self.object) {
+                node.children = null;
+                node.object_index.clearRetainingCapacity();
+                if (!self.retain_all and self.selected.?.fields.count() <= 8) node.object_index = try ObjectIndex.selected(a, self.selected.?);
+                node.markObjectComplete(false);
+                return;
+            }
+            node.state.fanout_keys_validated = false;
+            const selected = self.selected orelse return;
+            var indices = selected.indices.iterator();
+            while (indices.next()) |entry| try self.node.?.array_index.put(a, entry.key_ptr.*, null);
+        }
+        fn beginValue(self: *@This(), start: usize, object_value: bool) !void {
+            self.start = start;
+            self.pending_node = null;
+            self.pending_selector = null;
+            const selected = self.selected orelse return;
+            if (self.object) {
+                if (!self.retain) return;
+                if (selected.fields.get(self.name)) |child| {
+                    if (child.fields.count() != 0) {
+                        self.pending_selector = child;
+                        if (self.node != null) self.pending_node = self.pending_storage;
+                    }
+                }
+            } else {
+                const item = selected.array_items.get(self.ordinal);
+                if (item == null and selected.fanout == null) return;
+                if (self.node != null and (!self.defer_items or item != null)) self.pending_node = self.pending_storage;
+                if (object_value) {
+                    const child = item orelse selected.fanout.?;
+                    if (child.fields.count() != 0) self.pending_selector = child;
+                }
+            }
+            if (self.pending_node) |node| node.* = .{ .raw = &.{} };
+        }
+        fn finishValue(self: *@This(), a: Allocator, source: []const u8, end: usize) !void {
+            if (self.node) |parent| {
+                const span = source[self.start..end];
+                if (self.pending_node) |node| node.raw = span;
+                if (self.object) {
+                    if (!self.retain) {
+                        self.omitted = true;
+                        self.ordinal += 1;
+                        return;
+                    }
+                    try parent.object_index.put(a, self.name, self.children.items.len);
+                    // Tiny selectors should not reserve eight full nodes
+                    // per object. Allocate lazily and bound the first slab
+                    // by the known selector width, never the source width.
+                    if (self.children.capacity == 0 and !self.retain_all) try self.children.ensureTotalCapacityPrecise(a, @min(self.selected.?.fields.count(), 8));
+                    try self.children.append(a, .{ .node = if (self.pending_node) |node| node.* else .{ .raw = span } });
+                } else if (self.pending_node) |node| {
+                    if (self.selected.?.fanout != null and !self.defer_items) try self.children.append(a, .{ .node = node.* }) else {
+                        const owned = try a.create(View.Node);
+                        owned.* = node.*;
+                        try parent.array_index.put(a, self.ordinal, owned);
+                    }
+                }
+            }
+            self.ordinal += 1;
+        }
+        fn finishContainer(self: *@This(), a: Allocator) !void {
+            if (self.node) |node| {
+                if (!self.object and self.selected.?.fanout != null) node.state.fanout_keys_validated = true;
+                if (self.object or (self.selected.?.fanout != null and !self.defer_items)) node.children = try self.children.toOwnedSlice(a);
+                if (self.object) {
+                    node.markObjectComplete(!self.omitted);
+                    if (!node.objectComplete()) {
+                        var it = self.selected.?.fields.iterator();
+                        while (it.next()) |entry| {
+                            if (node.object_index.contains(entry.key_ptr.*)) continue;
+                            // Missing-name cache keys belong to the view,
+                            // which can outlive its borrowed selector plan.
+                            const name = try a.dupe(u8, entry.key_ptr.*);
+                            try node.object_index.put(a, name, std.math.maxInt(usize));
+                        }
+                    }
+                }
+            }
+        }
+    };
+    /// Reusable parser state, independent of row-owned navigation. Completed
+    /// keys are bounded; an oversized traversal retires before the next value.
+    pub const PreparationWorkspace = struct {
+        keys: @import("antfly-json").ObjectKeyWorkspace(PreparationFrame),
+        pub fn init(work: Allocator) @This() {
+            return .{ .keys = .init(@import("antfly_platform").allocator.reclaimingScratch(work)) };
+        }
+        pub fn deinit(self: *@This()) void {
+            for (self.keys.stack.items) |frame| self.keys.allocator.destroy(frame.state.pending_storage);
+            self.keys.deinit();
+        }
+        pub fn retainedBytes(self: *const @This()) usize {
+            return self.keys.retainedBytes() + self.keys.stack.items.len * @sizeOf(View.Node);
+        }
+        fn finishValue(self: *@This()) void {
+            if (self.retainedBytes() > @TypeOf(self.keys).reuse_limit) self.deinit();
+        }
+    };
+
     /// Consume one value from a scanner over `raw`, leaving its enclosing
     /// container positioned at the next separator. Captured spans use the same
     /// immutable backing bytes; navigation belongs only to this view's arena.
     pub fn prepareProjectionValue(view: *View, selector: *const Selector, policy: DuplicatePolicy, root_mode: RootMode, options: PreparationOptions, scanner: *std.json.Scanner, raw: []const u8, work: Allocator) !void {
+        var workspace: PreparationWorkspace = .init(work);
+        defer workspace.deinit();
+        try view.prepareProjectionValueWithWorkspace(selector, policy, root_mode, options, scanner, raw, &workspace);
+    }
+
+    pub fn prepareProjectionValueWithWorkspace(view: *View, selector: *const Selector, policy: DuplicatePolicy, root_mode: RootMode, options: PreparationOptions, scanner: *std.json.Scanner, raw: []const u8, workspace: *PreparationWorkspace) !void {
         errdefer {
             // A failed preparation cannot publish half-built caches to a
             // later predicate or projection using this same source view.
             view.invalidatePreparation();
+            workspace.deinit();
         }
         const alloc = view.alloc;
         const root_start = scanner.cursor;
-        const scratch = work;
-        const Frame = struct {
-            object: bool = false,
-            key: bool = true,
-            node: ?*View.Node = null,
-            children: std.ArrayListUnmanaged(View.Child) = .empty,
-            selected: ?*const Selector = null,
-            name: []const u8 = "",
-            retain: bool = false,
-            retain_all: bool = false,
-            defer_items: bool = false,
-            omitted: bool = false,
-            excluded: []const []const u8 = &.{},
-            ordinal: usize = 0,
-            start: usize = 0,
-            pending_node: ?*View.Node = null,
-            // Stable across work-stack growth; reused for siblings. Only the
-            // finished child is copied into the view's retained navigation.
-            pending_storage: *View.Node,
-            pending_selector: ?*const Selector = null,
-
-            fn wants(self: *@This(), name: []const u8) bool {
-                if (self.selected == null) return false;
-                for (self.excluded) |omit| if (std.mem.eql(u8, omit, "*") or std.mem.eql(u8, omit, name)) return false;
-                return self.retain_all or self.selected.?.fields.contains(name);
-            }
-
-            fn plan(self: *@This(), a: Allocator) !void {
-                const node = self.node orelse return;
-                if (self.object) {
-                    node.children = null;
-                    node.object_index.clearRetainingCapacity();
-                    if (!self.retain_all and self.selected.?.fields.count() <= 8) node.object_index = try ObjectIndex.selected(a, self.selected.?);
-                    node.markObjectComplete(false);
-                    return;
-                }
-                node.state.fanout_keys_validated = false;
-                const selected = self.selected orelse return;
-                var indices = selected.indices.iterator();
-                while (indices.next()) |entry| try self.node.?.array_index.put(a, entry.key_ptr.*, null);
-            }
-            fn beginValue(self: *@This(), start: usize, object_value: bool) !void {
-                self.start = start;
-                self.pending_node = null;
-                self.pending_selector = null;
-                const selected = self.selected orelse return;
-                if (self.object) {
-                    if (!self.retain) return;
-                    if (selected.fields.get(self.name)) |child| {
-                        if (child.fields.count() != 0) {
-                            self.pending_selector = child;
-                            if (self.node != null) self.pending_node = self.pending_storage;
-                        }
-                    }
-                } else {
-                    const item = selected.array_items.get(self.ordinal);
-                    if (item == null and selected.fanout == null) return;
-                    if (self.node != null and (!self.defer_items or item != null)) self.pending_node = self.pending_storage;
-                    if (object_value) {
-                        const child = item orelse selected.fanout.?;
-                        if (child.fields.count() != 0) self.pending_selector = child;
-                    }
-                }
-                if (self.pending_node) |node| node.* = .{ .raw = &.{} };
-            }
-            fn finishValue(self: *@This(), a: Allocator, source: []const u8, end: usize) !void {
-                if (self.node) |parent| {
-                    const span = source[self.start..end];
-                    if (self.pending_node) |node| node.raw = span;
-                    if (self.object) {
-                        if (!self.retain) {
-                            self.omitted = true;
-                            self.ordinal += 1;
-                            return;
-                        }
-                        try parent.object_index.put(a, self.name, self.children.items.len);
-                        // Tiny selectors should not reserve eight full nodes
-                        // per object. Allocate lazily and bound the first slab
-                        // by the known selector width, never the source width.
-                        if (self.children.capacity == 0 and !self.retain_all) try self.children.ensureTotalCapacityPrecise(a, @min(self.selected.?.fields.count(), 8));
-                        try self.children.append(a, .{ .node = if (self.pending_node) |node| node.* else .{ .raw = span } });
-                    } else if (self.pending_node) |node| {
-                        if (self.selected.?.fanout != null and !self.defer_items) try self.children.append(a, .{ .node = node.* }) else {
-                            const owned = try a.create(View.Node);
-                            owned.* = node.*;
-                            try parent.array_index.put(a, self.ordinal, owned);
-                        }
-                    }
-                }
-                self.ordinal += 1;
-            }
-            fn finishContainer(self: *@This(), a: Allocator) !void {
-                if (self.node) |node| {
-                    if (!self.object and self.selected.?.fanout != null) node.state.fanout_keys_validated = true;
-                    if (self.object or (self.selected.?.fanout != null and !self.defer_items)) node.children = try self.children.toOwnedSlice(a);
-                    if (self.object) {
-                        node.markObjectComplete(!self.omitted);
-                        if (!node.objectComplete()) {
-                            var it = self.selected.?.fields.iterator();
-                            while (it.next()) |entry| {
-                                if (node.object_index.contains(entry.key_ptr.*)) continue;
-                                // Missing-name cache keys belong to the view,
-                                // which can outlive its borrowed selector plan.
-                                const name = try a.dupe(u8, entry.key_ptr.*);
-                                try node.object_index.put(a, name, std.math.maxInt(usize));
-                            }
-                        }
-                    }
-                }
-            }
-        };
-        var keys: @import("antfly-json").ObjectKeyWorkspace(Frame) = .init(scratch);
+        const keys = &workspace.keys;
+        const scratch = keys.allocator;
         const frames = &keys.stack;
-        defer {
-            for (frames.items) |*frame| {
-                scratch.destroy(frame.state.pending_storage);
-            }
-            keys.deinit();
-        }
         var depth: usize = 0;
         var root_seen = false;
         while (!root_seen or depth != 0) {
@@ -552,6 +572,7 @@ pub const View = struct {
             }
         }
         view.root.raw = raw[root_start..scanner.cursor];
+        workspace.finishValue();
     }
 
     pub fn materialize(self: *View, node: *Node) !Value {
@@ -1010,4 +1031,116 @@ test "public graph metric borrowed wire projection key workspace preserves activ
     var unvisited = View.init(a, "{\"unused\":[{\"a\":0,\"\\u0061\":1}]}");
     var selector: Selector = .{};
     try unvisited.prepareProjection(&selector, .visited, .object_only);
+}
+
+test "public graph metric borrowed wire arena backed preparation bounds physical scratch" {
+    const a = std.testing.allocator;
+    var plan_arena = std.heap.ArenaAllocator.init(a);
+    defer plan_arena.deinit();
+    const selector = try plan_mod.compile(plan_arena.allocator(), &.{.{ .parts = &.{ "items", "chosen" } }});
+    for ([_]usize{ 1, 10 }) |count| {
+        var input: std.Io.Writer.Allocating = .init(a);
+        defer input.deinit();
+        try input.writer.writeAll("{\"items\":[");
+        for (0..count) |row| {
+            if (row != 0) try input.writer.writeByte(',');
+            try input.writer.writeByte('{');
+            for (0..12000) |i| {
+                if (i != 0) try input.writer.writeByte(',');
+                try input.writer.print("\"k{d}\":0", .{i});
+            }
+            try input.writer.writeAll(",\"chosen\":1}");
+        }
+        try input.writer.writeAll("]}");
+        const counters = @import("../../lite/test_allocator.zig");
+        var stable: counters.NoResizeAllocator = .{ .backing = a };
+        var budget: counters.BudgetAllocator = .{ .backing = stable.allocator(), .limit = 1024 * 1024 };
+        var row = std.heap.ArenaAllocator.init(budget.allocator());
+        defer row.deinit();
+        var scanner = std.json.Scanner.initCompleteInput(row.allocator(), input.written());
+        defer scanner.deinit();
+        var view = View.init(row.allocator(), input.written());
+        try view.prepareProjectionValue(selector, .visited, .object_only, .{ .defer_fanout = true }, &scanner, input.written(), row.allocator());
+        try std.testing.expect(budget.peak < 512 * 1024);
+        try std.testing.expect(budget.live < 4096);
+        const items = (try view.field(&view.root, "items")).?;
+        try std.testing.expectEqual(@as(u8, '['), items.kind());
+    }
+}
+
+test "public graph metric borrowed wire temporary preparation preserves retained escaped names and failures" {
+    const Fixture = struct {
+        fn run(a: Allocator) !void {
+            var row = std.heap.ArenaAllocator.init(a);
+            defer row.deinit();
+            const raw = "{\"\\u006futer\":{\"\\u0069nner\":7}}";
+            var scanner = std.json.Scanner.initCompleteInput(row.allocator(), raw);
+            defer scanner.deinit();
+            var view = View.init(row.allocator(), raw);
+            {
+                var plan_arena = std.heap.ArenaAllocator.init(a);
+                defer plan_arena.deinit();
+                const selector = try plan_mod.compile(plan_arena.allocator(), &.{.{ .parts = &.{ "outer", "inner" } }});
+                var temporary = std.heap.ArenaAllocator.init(row.allocator());
+                defer temporary.deinit();
+                try view.prepareProjectionValue(selector, .all, .object_only, .{}, &scanner, raw, temporary.allocator());
+            }
+            // Both the selector and temporary owner have retired. Navigation
+            // and decoded retained names still belong to the output row.
+            const outer = (try view.field(&view.root, "outer")).?;
+            const inner = (try view.field(outer, "inner")).?;
+            try std.testing.expectEqualStrings("7", inner.raw);
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "public graph metric borrowed wire reclaimable preparation preserves scratch quotas" {
+    const a = std.testing.allocator;
+    const Counter = @import("../../lite/test_allocator.zig").BudgetAllocator;
+    var budget: Counter = .{ .backing = a, .limit = 32 };
+    var temporary = std.heap.ArenaAllocator.init(budget.allocator());
+    defer temporary.deinit();
+    var row = std.heap.ArenaAllocator.init(a);
+    defer row.deinit();
+    const raw = "{\"a\":0}";
+    var scanner = std.json.Scanner.initCompleteInput(a, raw);
+    defer scanner.deinit();
+    var view = View.init(row.allocator(), raw);
+    var selector: Selector = .{};
+    try std.testing.expectError(error.OutOfMemory, view.prepareProjectionValue(&selector, .all, .object_only, .{}, &scanner, raw, temporary.allocator()));
+    try std.testing.expectEqual(@as(usize, 0), budget.live);
+    try std.testing.expect(budget.alloc_attempts > 0);
+}
+
+test "public graph metric borrowed wire preparation workspace reuses across row retirement and recovers" {
+    const a = std.testing.allocator;
+    const raw = "{\"\\u0061\":{\"\\u0062\":1}}";
+    var counted: std.testing.FailingAllocator = .init(a, .{});
+    var workspace: View.PreparationWorkspace = .init(counted.allocator());
+    defer workspace.deinit();
+    var selector: Selector = .{};
+    for (0..8) |iteration| {
+        var row = std.heap.ArenaAllocator.init(a);
+        defer row.deinit();
+        var scanner = std.json.Scanner.initCompleteInput(row.allocator(), raw);
+        defer scanner.deinit();
+        var view = View.init(row.allocator(), raw);
+        const calls = counted.allocations;
+        try view.prepareProjectionValueWithWorkspace(&selector, .all, .object_only, .{}, &scanner, raw, &workspace);
+        if (iteration != 0) try std.testing.expectEqual(calls, counted.allocations);
+        try std.testing.expect(workspace.retainedBytes() <= 256 * 1024);
+        try std.testing.expectEqual(counted.allocated_bytes - counted.freed_bytes, workspace.retainedBytes());
+    }
+    const invalid = "{\"a\":0,\"\\u0061\":1}";
+    var invalid_scanner = std.json.Scanner.initCompleteInput(a, invalid);
+    defer invalid_scanner.deinit();
+    var invalid_view = View.init(a, invalid);
+    try std.testing.expectError(error.DuplicateField, invalid_view.prepareProjectionValueWithWorkspace(&selector, .all, .object_only, .{}, &invalid_scanner, invalid, &workspace));
+    try std.testing.expectEqual(@as(usize, 0), workspace.retainedBytes());
+    var recovered_scanner = std.json.Scanner.initCompleteInput(a, raw);
+    defer recovered_scanner.deinit();
+    var recovered_view = View.init(a, raw);
+    try recovered_view.prepareProjectionValueWithWorkspace(&selector, .all, .object_only, .{}, &recovered_scanner, raw, &workspace);
 }
