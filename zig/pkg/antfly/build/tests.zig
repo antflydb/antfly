@@ -1946,6 +1946,22 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-relational-index-http-test", "Run unified relational index CRUD and document index compatibility").dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, relational_index_http_tests, &.{ "api http server unified relational index CRUD", "api http server serves table index metadata routes", "index maintenance actions require table admin permission" }).step);
+    const artifact_http_filters = &.{ "artifact repair body", "artifact repair query params", "document artifact routes declare", "artifact operations apply source document" };
+    const artifact_http_tests = b.addTest(.{
+        .name = "artifact-http-tests",
+        .root_module = api_http_runtime_test_mod,
+        .filters = artifact_http_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-api-artifact-http-test", "Run artifact maintenance request and authorization contracts").dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, artifact_http_tests, artifact_http_filters).step);
+    const native_query_repository_filters = &.{ "external lake native", "external lake invalid native" };
+    const native_query_repository_tests = b.addTest(.{
+        .name = "native-query-repository-tests",
+        .root_module = api_http_runtime_test_mod,
+        .filters = native_query_repository_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-api-native-query-repository-test", "Run native query checkpoint reuse, retention and executor ownership contracts").dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, native_query_repository_tests, native_query_repository_filters).step);
     const api_http_runtime_test_step = b.step("antfly-api-test", "Run API contracts and linked-boundary tests");
     // Cross-package imports do not discover their libraries' tests in this
     // root. Compile shared contracts at their own module boundary instead.
@@ -2660,7 +2676,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     text_frontier_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const text_frontier_tests = b.addTest(.{
         .root_module = text_frontier_mod,
-        .filters = selectTestFilters(b, &.{ "external lake global frontier", "external lake metadata navigation", "external lake bounded window profiles", "external lake exact segment admission", "external lake bounded transforms", "external lake bounded window lookahead", "external lake bounded WAL" }),
+        .filters = selectTestFilters(b, &.{ "external lake global frontier", "external lake metadata navigation", "external lake bounded window profiles", "external lake exact segment admission", "external lake bounded transforms", "external lake bounded window lookahead", "external lake bounded WAL", "constant score" }),
         // The combined real-file/cloud owner peaks near 10 GB under optimized
         // codegen; declare headroom instead of compiling twice on RSS retry.
         .max_rss = @as(usize, if (optimize == .debug) 8 else 12) * 1024 * 1024 * 1024,
@@ -5220,11 +5236,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("vector-payload-bench", "Build real-file source payload and hash benchmarks").dependOn(&install_vector_payload_bench.step);
 
     const vector_payload_test_mod = makeLmdbModule(b, "pkg/antfly/src/vector_payload_store_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
-    vector_payload_test_mod.addImport("antfly_test_error_logs", b.createModule(.{
-        .root_source_file = b.path("pkg/antfly-embedded/src/test_error_logs.zig"),
-        .target = target,
-        .optimize = optimize,
-    }));
+    vector_payload_test_mod.addImport("antfly_test_error_logs", antfly_imports.storage_boundary.test_error_logs);
     antfly_imports.configureRuntimeContracts(vector_payload_test_mod);
     vector_payload_test_mod.addImport("bloom", bloom_mod);
     vector_payload_test_mod.addImport("antfly_vectorindex", vectorindex_mod);

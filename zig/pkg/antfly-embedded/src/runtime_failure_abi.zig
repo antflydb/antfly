@@ -736,7 +736,8 @@ pub const Status = enum(u32) {
     sql_feature_not_supported = 776,
     catalog_publication_proof_pending = 777,
     seed_replica_policy_mismatch = 778,
-    decision_limit_exceeded = 779,
+    document_artifact_publication_failed = 779,
+    decision_limit_exceeded = 780,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

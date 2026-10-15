@@ -2665,6 +2665,7 @@ pub const InvertedIndexReader = struct {
 };
 
 pub const TermIterator = struct {
+    control: @import("../search/execution_control.zig").ExecutionControl = .{},
     alloc: Allocator,
     reader: *const InvertedIndexReader,
     block_iter: fst.FSTIterator,
@@ -2702,6 +2703,7 @@ pub const TermIterator = struct {
 
     fn nextInternal(self: *TermIterator, comptime track_decoded: bool, decoded_count: ?*u64) !?Entry {
         while (true) {
+            try self.control.check();
             if (self.current_block_remaining == 0) {
                 if (!try self.loadNextBlock()) return null;
             }
@@ -2745,6 +2747,7 @@ pub const TermIterator = struct {
 
     fn loadNextBlock(self: *TermIterator) !bool {
         while (true) {
+            try self.control.check();
             const current = self.block_iter.current() orelse return false;
             const block_offset: usize = @intCast(current.val);
             if (block_offset >= self.reader.dict_blocks.len) return error.InvalidData;
@@ -9572,6 +9575,13 @@ pub const ScopedInvertedIndexReader = struct {
         contiguous: TermIterator,
         ranges: RangeIterator,
 
+        pub fn setControl(self: *Iterator, control: @import("../search/execution_control.zig").ExecutionControl) void {
+            switch (self.*) {
+                .contiguous => |*iterator| iterator.control = control,
+                .ranges => |*iterator| iterator.control = control,
+            }
+        }
+
         pub fn blocksPruned(self: *const Iterator) u64 {
             return switch (self.*) {
                 .contiguous => |*iterator| iterator.blocks_pruned,
@@ -9603,6 +9613,7 @@ pub const ScopedInvertedIndexReader = struct {
     };
 
     const RangeIterator = struct {
+        control: @import("../search/execution_control.zig").ExecutionControl = .{},
         context: *Context,
         scratch: @import("../segment_source.zig").Scratch,
         block: u32 = 0,
@@ -9641,6 +9652,7 @@ pub const ScopedInvertedIndexReader = struct {
             }
             const a = self.context.allocator;
             while (!self.done) {
+                try self.control.check();
                 if (self.remaining == 0 and !try self.loadBlock()) return null;
                 const shared = try readVarintU32(self.bytes, &self.cursor);
                 const leaf_length = try readVarintU32(self.bytes, &self.cursor);

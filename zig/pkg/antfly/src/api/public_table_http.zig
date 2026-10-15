@@ -185,6 +185,7 @@ pub const TableApi = struct {
         GraphExternalAliasSourceUnsupported,
         GraphReverseVariablePathUnsupported,
         HierarchyCursorStale,
+        DocumentArtifactPublicationFailed,
         TopologyChanged,
         QueryEmbeddingInputTooLarge,
         EmbeddingIndexNotFound,
@@ -2014,6 +2015,9 @@ pub fn handleTableQueryRequest(
             },
             error.QueryEmbeddingInputTooLarge => {
                 return try queryDependencyErrorOwnedResponse(alloc, 413, "query_embedding_input_too_large", "query embedding input too large", false);
+            },
+            error.DocumentArtifactPublicationFailed => {
+                return try queryDependencyErrorOwnedResponse(alloc, 409, "document_artifact_publication_failed", "document extraction failed; inspect the artifact manifest and reprocess after correcting the failure", false);
             },
             error.EmbeddingIndexNotFound => {
                 return try queryDependencyErrorOwnedResponse(alloc, 422, "embedding_index_not_found", "embedding index not found", false);
@@ -4283,6 +4287,19 @@ test "public table query handler preserves structured filter and hierarchy diagn
     try std.testing.expectEqualStrings("use_source_grouping_or_direct_members", hierarchy_error.value.action);
     try std.testing.expect(std.mem.indexOf(u8, hierarchy_error.value.message, "return_mode") == null);
     try std.testing.expect(!hierarchy_error.value.retryable);
+
+    var failed_backend = Backend{ .err = error.DocumentArtifactPublicationFailed };
+    var failed_response = try handleTableQueryRequest(std.testing.allocator, "docs", "{}", null, failed_backend.iface());
+    defer failed_response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 409), failed_response.status);
+    try std.testing.expect(failed_response.json);
+    try std.testing.expect(failed_response.retry_after_seconds == null);
+    const PublicationFailure = struct { code: []const u8, @"error": []const u8, message: []const u8, retryable: bool };
+    var failure = try std.json.parseFromSlice(PublicationFailure, std.testing.allocator, failed_response.body, .{});
+    defer failure.deinit();
+    try std.testing.expectEqualStrings("document_artifact_publication_failed", failure.value.code);
+    try std.testing.expectEqualStrings(failure.value.code, failure.value.@"error");
+    try std.testing.expect(!failure.value.retryable);
 
     var unsupported_backend = Backend{ .err = error.UnsupportedQueryRequest };
     var unsupported_resp = try handleTableQueryRequest(

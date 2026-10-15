@@ -14062,6 +14062,7 @@ pub const ApiHttpServer = struct {
             error.Timeout => return error.Timeout,
             error.IdentityReadGenerationChanged => return error.ReadUnavailable,
             error.HierarchyCursorStale => return error.HierarchyCursorStale,
+            error.DocumentArtifactPublicationFailed => return error.DocumentArtifactPublicationFailed,
             error.TopologyChanged => return error.TopologyChanged,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
             error.IndexRebuilding => return error.IndexRebuilding,
@@ -14427,6 +14428,7 @@ pub const ApiHttpServer = struct {
                 error.TableNotFound, error.NotFound => return error.NotFound,
                 error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
                 error.HierarchyCursorStale => return error.HierarchyCursorStale,
+                error.DocumentArtifactPublicationFailed => return error.DocumentArtifactPublicationFailed,
                 error.TopologyChanged => return error.TopologyChanged,
                 error.CatalogGenerationChanged => return error.CatalogGenerationChanged,
                 error.ModelNotFound => return error.ModelNotFound,
@@ -14524,6 +14526,7 @@ pub const ApiHttpServer = struct {
             => return err,
             error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
             error.HierarchyCursorStale => return error.HierarchyCursorStale,
+            error.DocumentArtifactPublicationFailed => return error.DocumentArtifactPublicationFailed,
             error.TopologyChanged => return error.TopologyChanged,
             error.CatalogGenerationChanged => return error.CatalogGenerationChanged,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
@@ -14614,6 +14617,7 @@ pub const ApiHttpServer = struct {
             error.TableNotFound => return error.NotFound,
             error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
             error.HierarchyCursorStale => return error.HierarchyCursorStale,
+            error.DocumentArtifactPublicationFailed => return error.DocumentArtifactPublicationFailed,
             error.TopologyChanged => return error.TopologyChanged,
             error.CatalogGenerationChanged => return error.CatalogGenerationChanged,
             error.ModelNotFound => return error.ModelNotFound,
@@ -22034,6 +22038,7 @@ pub const ApiHttpServer = struct {
                 false,
             ),
             error.QueryEmbeddingInputTooLarge => try contextualQueryDependencyErrorResponse(self.alloc, 413, "query_embedding_input_too_large", "query embedding input too large", false),
+            error.DocumentArtifactPublicationFailed => try contextualQueryDependencyErrorResponse(self.alloc, 409, "document_artifact_publication_failed", "document extraction failed; inspect the artifact manifest and reprocess after correcting the failure", false),
             error.EmbeddingIndexNotFound => try contextualQueryDependencyErrorResponse(self.alloc, 422, "embedding_index_not_found", "embedding index not found", false),
             error.QueryEmbeddingOverloaded => try contextualQueryDependencyErrorResponse(self.alloc, 429, "query_embedding_overloaded", "query embedding overloaded", true),
             error.EmbedRateLimited => try contextualQueryDependencyErrorResponse(self.alloc, 429, "query_embedding_rate_limited", "query embedding rate limited", true),
@@ -22391,8 +22396,8 @@ pub const ApiHttpServer = struct {
 
     pub fn handlePublicListArtifactRepairIssues(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !public_table_http.OwnedResponse {
         const source = self.table_writes orelse return try publicOperationTextResponse(self.alloc, 405, "method not allowed");
-        var parsed = std.json.parseFromSlice(PublicRepairListRequest, self.alloc, if (body.len > 0) body else "{}", .{ .ignore_unknown_fields = true }) catch {
-            return try publicOperationTextResponse(self.alloc, 400, "invalid repair list request");
+        var parsed = std.json.parseFromSlice(PublicRepairListRequest, self.alloc, if (body.len > 0) body else "{}", .{}) catch {
+            return try publicOperationTextResponse(self.alloc, 400, "invalid repair list request; use kind to filter artifact kinds");
         };
         defer parsed.deinit();
         const target = std.meta.stringToEnum(db_mod.types.RepairTarget, parsed.value.target) orelse return try publicOperationTextResponse(self.alloc, 400, "invalid repair target");
@@ -22440,7 +22445,7 @@ pub const ApiHttpServer = struct {
 
     pub fn handlePublicRunTableRepair(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !public_table_http.OwnedResponse {
         const source = self.table_writes orelse return try publicOperationTextResponse(self.alloc, 405, "method not allowed");
-        var parsed = std.json.parseFromSlice(PublicRepairRunRequest, self.alloc, if (body.len > 0) body else "{}", .{ .ignore_unknown_fields = true }) catch {
+        var parsed = std.json.parseFromSlice(PublicRepairRunRequest, self.alloc, if (body.len > 0) body else "{}", .{}) catch {
             return try publicOperationTextResponse(self.alloc, 400, "invalid repair request");
         };
         defer parsed.deinit();
@@ -30949,6 +30954,15 @@ pub fn runtimeSchemaDebugRequested(query: []const u8) bool {
 fn parseUnsignedQueryParam(query: []const u8, key: []const u8) !?u64 {
     const value = parseSimpleQueryParam(query, key) orelse return null;
     return try std.fmt.parseUnsigned(u64, value, 10);
+}
+
+test "artifact repair body rejects unknown kind spelling and accepts embedding filters" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.UnknownField, std.json.parseFromSlice(ApiHttpServer.PublicRepairListRequest, alloc, "{\"artifact_kind\":\"embedding\"}", .{}));
+    var parsed = try std.json.parseFromSlice(ApiHttpServer.PublicRepairListRequest, alloc, "{\"kind\":\"embedding\"}", .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(db_mod.types.ArtifactRepairKind.embedding, parsed.value.kind.?);
+    try std.testing.expectError(error.UnknownField, std.json.parseFromSlice(ApiHttpServer.PublicRepairRunRequest, alloc, "{\"artifact_kind\":\"embedding\"}", .{}));
 }
 
 test "artifact repair query params decode percent encoded values" {
