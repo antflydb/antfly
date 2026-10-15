@@ -515,6 +515,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (eligible) {
                     const requires_inline_generated =
                         (req.sync_level == .full_text or req.sync_level == .enrichments or req.sync_level == .full_index) or
+                        opts.force_generated_artifact_names.len != 0 or
                         splitShadowRequiresMaterializedDerivedBatch(self);
                     const rows = try preparation_alloc.alloc(?mapper.PreparedRelationalWrite, effective_req.writes.len);
                     @memset(rows, null);
@@ -675,6 +676,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             {
                 const requires_inline_generated =
                     (effective_req.sync_level == .full_text or effective_req.sync_level == .enrichments or effective_req.sync_level == .full_index) or
+                    opts.force_generated_artifact_names.len != 0 or
                     splitShadowRequiresMaterializedDerivedBatch(self);
                 if (requires_inline_generated and effective_req.writes.len > 0) {
                     const precompute_generated_start_ns = monotonicTimeNs();
@@ -2090,6 +2092,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 effective_req.sync_level != .full_text and
                 effective_req.sync_level != .enrichments and
                 effective_req.sync_level != .full_index and
+                opts.force_generated_artifact_names.len == 0 and
                 !splitShadowRequiresMaterializedDerivedBatch(self);
             const include_generated_enrichment_hint = use_thin_replay_fast_path and
                 S.ownerField(self, "core").*.hasGeneratedEnrichmentTargets();
