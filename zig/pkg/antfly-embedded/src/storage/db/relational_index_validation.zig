@@ -330,6 +330,197 @@ pub const Seal = struct {
         return .{ .seal = result, .duplicate = false };
     }
 };
+/// Stable logical installation identity. The receiving owner must obtain the
+/// metadata decision independently; a digest supplied to these storage
+/// primitives is not permission to install or adopt a different physical root.
+pub const InstallCommand = struct {
+    validation: Seal,
+    metadata_decision: Digest,
+    schema_digest: Digest,
+    activation_digest: Digest,
+
+    pub fn validate(self: @This()) !void {
+        _ = try self.validation.command.receipt(self.validation.position);
+        if (!nonzero(self.metadata_decision) or !nonzero(self.schema_digest) or !nonzero(self.activation_digest)) return error.InvalidPrivateIndexNativeReceipt;
+    }
+
+    pub fn validateBefore(self: @This(), alloc: Allocator, txn: anytype) !void {
+        try self.validate();
+        const binding = self.validation.command.binding;
+        try owner.requireReserved(txn, binding);
+        const actual = try SealCommand.prepare(alloc, txn, binding, self.validation.command.expected);
+        if (!std.meta.eql(actual, self.validation.command) or
+            !std.meta.eql((try Seal.load(alloc, txn, binding)) orelse return error.PrivateIndexTargetValidationRequired, self.validation)) return error.InvalidRelationalIndexValidation;
+    }
+
+    pub fn evidenceDigest(self: @This()) !Digest {
+        try self.validate();
+        var buffer: [32 * 1024]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buffer);
+        try std.json.Stringify.value(self, .{}, &writer);
+        var state = std.crypto.hash.Blake3.init(.{});
+        state.update("antfly/private-index-installed/v1");
+        state.update(writer.buffered());
+        var result: Digest = undefined;
+        state.final(&result);
+        return result;
+    }
+
+    pub fn receipt(self: @This(), position: Native) !@import("relational_index_publication_progress.zig").Receipt {
+        try self.validate();
+        try position.validate();
+        if (!position.namespace.eql(self.validation.position.namespace) or position.sequence <= self.validation.position.sequence) return error.InvalidPrivateIndexNativeReceipt;
+        var result = try self.validation.command.receipt(self.validation.position);
+        result.action = .installed;
+        result.position = .{ .native = position };
+        result.evidence_digest = try self.evidenceDigest();
+        _ = try result.digest();
+        return result;
+    }
+};
+
+/// One reusable installed cut, committed with schema, catalogs, activation,
+/// replay marker and outbox. A staged record MUST NOT be signed or returned as
+/// a publication receipt before that containing transaction commits.
+pub const Installed = struct {
+    pub const key = owner.key ++ ":installed";
+    pub const max_wire_bytes = 32 * 1024;
+    command: InstallCommand,
+    position: Native,
+
+    fn reserved(binding: owner.Binding) owner.Binding {
+        var before = binding;
+        before.phase = .reserved;
+        return before;
+    }
+
+    pub fn load(alloc: Allocator, txn: anytype, binding: owner.Binding) !?@This() {
+        const bytes = (try optional(txn, Installed.key)) orelse return null;
+        if (bytes.len < 40 or bytes.len > Installed.max_wire_bytes or !std.mem.eql(u8, bytes[0..8], "AIIS\x01\x00\x00\x00") or
+            !equal(bytes[bytes.len - 32 ..][0..32].*, hash(bytes[0 .. bytes.len - 32]))) return error.InvalidPrivateIndexNativeReceipt;
+        var parsed = try std.json.parseFromSlice(@This(), alloc, bytes[8 .. bytes.len - 32], .{ .ignore_unknown_fields = false, .max_value_len = 128 });
+        defer parsed.deinit();
+        const result = parsed.value;
+        _ = try result.command.receipt(result.position);
+        const canonical = try std.json.Stringify.valueAlloc(alloc, result, .{});
+        defer alloc.free(canonical);
+        if (!std.mem.eql(u8, canonical, bytes[8 .. bytes.len - 32])) return error.InvalidPrivateIndexNativeReceipt;
+        if (!std.meta.eql(result.command.validation.command.binding, reserved(binding))) return null;
+        const current = try authority.require(txn, .native, @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace));
+        if (result.position.sequence > current.sequence) return error.InvalidPrivateIndexNativeReceipt;
+        return result;
+    }
+
+    fn requireSuccessor(self: @This(), alloc: Allocator, txn: anytype) !void {
+        const binding = self.command.validation.command.binding;
+        try @import("relational_index_cancellation_intent.zig").requireOpen(txn, binding);
+        const fence = (try @import("relational_integrity_topology.zig").current(txn)) orelse return error.IntegrityTopologyFenceMissing;
+        if (!fence.eql(binding.fence)) return error.IntegrityTopologyChanged;
+        const identity = try @import("relational_integrity_catalog.zig").boundSchemaIdentity(try txn.get(@import("relational_integrity_catalog.zig").key), binding.integrity_candidate);
+        if (identity.version != binding.physical_candidate.schema_version or !equal(identity.digest, self.command.schema_digest)) return error.RelationalIndexCatalogSchemaMismatch;
+        if (!equal(hash(try txn.get(@import("../schema.zig").schema_key)), self.command.schema_digest)) return error.RelationalIndexCatalogSchemaMismatch;
+        const physical = try catalog.Head.decode(try txn.get(catalog.head_key));
+        if (!physical.eql(binding.physical_candidate)) return error.PreparedGenerationChanged;
+        const sealed = (try Seal.load(alloc, txn, binding)) orelse return error.PrivateIndexTargetValidationRequired;
+        if (!std.meta.eql(sealed, self.command.validation)) return error.InvalidRelationalIndexValidation;
+        const activation = @import("relational_integrity_activation.zig");
+        const raw = try txn.get(activation.key);
+        if (!equal(hash(raw), self.command.activation_digest)) return error.ConstraintActivationChanged;
+        const progress = try activation.Progress.decode(raw);
+        if (!equal(progress.owner, try activation.ownership(txn)) or progress.schema_version != identity.version) return error.ConstraintActivationOwnerChanged;
+    }
+
+    /// Called AFTER the exact successor schema/catalog/activation are staged.
+    /// The caller also stages its replay marker and durable outbox, then aborts
+    /// on every error. This neither commits nor publishes runtime objects.
+    pub fn stage(alloc: Allocator, txn: anytype, command: InstallCommand, candidate_catalog: @import("relational_integrity_catalog.zig").Catalog, replay: ?Native) !struct { record: Installed, duplicate: bool } {
+        try command.validate();
+        const binding = command.validation.command.binding;
+        if (replay) |position| _ = try command.receipt(position);
+        const current = (try owner.load(txn)) orelse return error.PrivateIndexJobRequired;
+        if (!std.meta.eql(reserved(current), binding)) return error.PrivateIndexOwnerJobChanged;
+        if (try Installed.load(alloc, txn, binding)) |previous| {
+            if (current.phase != .installed or !std.meta.eql(previous.command, command)) return error.InvalidPrivateIndexNativeReceipt;
+            if (replay) |position| if (!std.meta.eql(position, previous.position)) return error.InvalidPrivateIndexNativeReceipt;
+            try previous.requireSuccessor(alloc, txn);
+            return .{ .record = previous, .duplicate = true };
+        }
+        if (current.phase != .reserved) return error.InvalidPrivateIndexOwnerJob;
+        const namespace = @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace);
+        const source = try authority.require(txn, .native, namespace);
+        const position: Native = .{ .namespace = binding.fence.namespace, .sequence = std.math.add(u64, source.sequence, 1) catch return error.InvalidControlReceiptPosition };
+        const record: @This() = .{ .command = command, .position = position };
+        _ = try command.receipt(position);
+        try record.requireSuccessor(alloc, txn);
+        const activation = @import("relational_integrity_activation.zig");
+        const progress = try activation.Progress.decode(try txn.get(activation.key));
+        if (!equal(candidate_catalog.schema_digest, command.schema_digest) or
+            candidate_catalog.schema_version != binding.physical_candidate.schema_version or
+            !progress.matches(candidate_catalog, try activation.ownership(txn))) return error.ConstraintActivationChanged;
+        const json = try std.json.Stringify.valueAlloc(alloc, record, .{});
+        defer alloc.free(json);
+        if (json.len + 40 > Installed.max_wire_bytes) return error.InvalidPrivateIndexNativeReceipt;
+        const bytes = try alloc.alloc(u8, json.len + 40);
+        defer alloc.free(bytes);
+        @memcpy(bytes[0..8], "AIIS\x01\x00\x00\x00");
+        @memcpy(bytes[8..][0..json.len], json);
+        @memcpy(bytes[bytes.len - 32 ..], &hash(bytes[0 .. bytes.len - 32]));
+        var installed = binding;
+        installed.phase = .installed;
+        const sequence = try authority.advance(txn, namespace, if (replay) |value| value.sequence else null);
+        std.debug.assert(sequence == position.sequence);
+        try txn.put(owner.key, &try installed.encode());
+        try txn.put(Installed.key, bytes);
+        return .{ .record = record, .duplicate = false };
+    }
+
+    /// Structural history verification only, never execution or physical-root
+    /// adoption. First check the REAL installed successor and cut. Then verify
+    /// the frozen pre-install proofs through a read-only historical metadata
+    /// view bound to retained immutable schema/catalog bytes. Physical records,
+    /// namespace, range, clocks and canonical validation data remain real reads.
+    pub fn verifyRecovery(alloc: Allocator, txn: anytype, binding: owner.Binding, active: ?*const catalog.Loaded) !void {
+        if (binding.phase != .installed) return error.InvalidPrivateIndexOwnerJob;
+        const record = (try Installed.load(alloc, txn, binding)) orelse return error.InvalidPrivateIndexNativeReceipt;
+        try record.requireSuccessor(alloc, txn);
+        const current = active orelse return error.MissingRelationalIndexDefinitions;
+        if (!current.head.eql(binding.physical_candidate) or !equal(current.schema_digest, record.command.schema_digest)) return error.RelationalIndexCatalogSchemaMismatch;
+        var candidate = try owner.reopenCandidate(alloc, txn, binding);
+        defer candidate.deinit();
+        const schema = @import("../schema.zig");
+        const before_key = try schema.schemaVersionKeyAlloc(alloc, binding.physical_reserved.schema_version);
+        defer alloc.free(before_key);
+        const before_schema = try alloc.dupe(u8, try txn.get(before_key));
+        defer alloc.free(before_schema);
+        if (!equal(hash(before_schema), binding.schema_before)) return error.RelationalIndexCatalogSchemaMismatch;
+        const historical = struct {
+            source: @TypeOf(txn),
+            job: [owner.Binding.encoded_len]u8,
+            head: @TypeOf(binding.physical_reserved.encode()),
+            schema_bytes: []const u8,
+            catalog_bytes: []const u8,
+
+            pub fn get(self: *@This(), key_: []const u8) ![]const u8 {
+                if (std.mem.eql(u8, key_, owner.key)) return &self.job;
+                if (std.mem.eql(u8, key_, catalog.head_key)) return &self.head;
+                if (std.mem.eql(u8, key_, schema.schema_key)) return self.schema_bytes;
+                if (std.mem.eql(u8, key_, @import("relational_integrity_catalog.zig").key)) return self.catalog_bytes;
+                return self.source.get(key_);
+            }
+            pub fn openCursor(self: *@This()) @TypeOf(self.source.openCursor()) {
+                return self.source.openCursor();
+            }
+        };
+        var before: historical = .{ .source = txn, .job = try reserved(binding).encode(), .head = binding.physical_reserved.encode(), .schema_bytes = before_schema, .catalog_bytes = candidate.reservation.value };
+        var previous = try catalog.decode(alloc, binding.physical_reserved, try txn.get(&catalog.blobKey(binding.physical_reserved.blob_digest)));
+        defer previous.deinit();
+        try owner.verifyUninstalledRecovery(alloc, &before, reserved(binding), &previous);
+        const activation = @import("relational_integrity_activation.zig");
+        const progress = try activation.Progress.decode(try txn.get(activation.key));
+        if (!progress.matches(candidate.next.catalog, try activation.ownership(txn))) return error.ConstraintActivationChanged;
+    }
+};
+
 /// Owned, root-local progress only. Never import this from a replicated
 /// snapshot or submit it as an ordered native effect. Durable checkpoint
 /// ownership and adoption/signing authority belong to the physical-root owner.

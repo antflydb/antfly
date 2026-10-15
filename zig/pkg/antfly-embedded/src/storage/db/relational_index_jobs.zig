@@ -174,7 +174,7 @@ fn getOptional(txn: anytype, key: []const u8) !?[]const u8 {
     };
 }
 
-pub fn ownership(txn: *docstore.DocStore.Txn) !Digest {
+pub fn ownership(txn: anytype) !Digest {
     const identity = @import("doc_identity.zig");
     const namespace = (try identity.loadNamespaceTxn(txn)) orelse identity.default_namespace;
     const range = (try getOptional(txn, range_state.range_key)) orelse &full_range;

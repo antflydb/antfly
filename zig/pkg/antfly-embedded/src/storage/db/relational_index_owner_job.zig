@@ -32,7 +32,7 @@ const inputs_mod = @import("relational_index_inputs.zig");
 const cancellation = @import("relational_index_cancellation_intent.zig");
 const Digest = [32]u8;
 pub const key = "\x00\x00__metadata__:relational_index_owner_job:v1";
-pub const Phase = enum(u8) { fencing, reserved };
+pub const Phase = enum(u8) { fencing, reserved, installed };
 pub const private_claims = @import("relational_index_private_claims.zig");
 pub const cancellation_cleanup_key = key ++ ":cancel-gc";
 
@@ -162,7 +162,7 @@ pub const Binding = struct {
         } else if (self.physical_reserved.revision != 2) return error.InvalidPrivateIndexOwnerJob;
         var out: [encoded_len]u8 = @splat(0);
         @memcpy(out[0..4], "AIOJ");
-        std.mem.writeInt(u32, out[4..8], 3, .little);
+        std.mem.writeInt(u32, out[4..8], 4, .little);
         @memcpy(out[8..24], &self.id);
         @memcpy(out[24..56], &self.plan_digest);
         @memcpy(out[56..88], &self.owner_digest);
@@ -186,7 +186,7 @@ pub const Binding = struct {
 
     pub fn decode(bytes: []const u8) !Binding {
         if (bytes.len != encoded_len or !std.mem.eql(u8, bytes[0..4], "AIOJ") or
-            std.mem.readInt(u32, bytes[4..8], .little) != 3 or bytes[227] > 1 or
+            std.mem.readInt(u32, bytes[4..8], .little) != 4 or bytes[227] > 1 or
             !std.mem.allEqual(u8, bytes[229..232], 0) or
             !std.mem.eql(u8, bytes[656..688], &digest(bytes[0..656]))) return error.InvalidPrivateIndexOwnerJob;
         if (bytes[227] == 0 and !std.mem.allEqual(u8, bytes[360..444], 0)) return error.InvalidPrivateIndexOwnerJob;
@@ -453,7 +453,7 @@ fn requireNativeCuts(txn: anytype, job: Binding) !void {
     const fenced = try readNativeCutAt(txn, job, .fenced, state);
     const reserved = try readNativeCutAt(txn, job, .reserved, state);
     if (fenced) |cut| if (cut.position.sequence <= admitted.position.sequence) return error.InvalidPrivateIndexNativeReceipt;
-    if (job.phase == .reserved) {
+    if (job.phase == .reserved or job.phase == .installed) {
         if (fenced == null or reserved == null or reserved.?.position.sequence <= fenced.?.position.sequence) return error.InvalidPrivateIndexNativeReceipt;
     } else if (reserved != null) return error.InvalidPrivateIndexNativeReceipt;
 }
@@ -526,6 +526,7 @@ fn requireNativeJob(txn: anytype, binding: Binding) !Binding {
     const current = (try load(txn)) orelse return error.PrivateIndexJobRequired;
     if (!std.mem.eql(u8, &try nativeContext(current), &try nativeContext(binding))) return error.PrivateIndexOwnerJobChanged;
     try requireActive(txn, binding.fence);
+    if (current.phase == .installed) return error.PrivateIndexPublicationRequired;
     if (current.phase == .reserved) {
         try requireReservedState(txn, binding);
     } else {
@@ -643,6 +644,23 @@ pub fn verifyRecovery(alloc: std.mem.Allocator, txn: anytype, active: ?*const ph
     if (fence == null) return error.IntegrityTopologyFenceMissing;
     if (!fence.?.eql(job.fence)) return error.IntegrityTopologyChanged;
     try requireNativeCuts(txn, job);
+    const installation = @import("relational_index_validation.zig").Installed;
+    if (job.phase == .installed) {
+        try installation.verifyRecovery(alloc, txn, job, active);
+        return;
+    }
+    if (try installation.load(alloc, txn, job) != null) return error.InvalidPrivateIndexOwnerJob;
+    try verifyUninstalledRecovery(alloc, txn, job, active);
+}
+
+/// Read-only proof verification against an explicitly retained predecessor.
+/// Never grants page execution and cannot recursively select installed state.
+pub fn verifyUninstalledRecovery(alloc: std.mem.Allocator, txn: anytype, job: Binding, active: ?*const physical_catalog.Loaded) !void {
+    if (job.phase == .installed) return error.InvalidPrivateIndexOwnerJob;
+    try requireNamespace(txn, job);
+    const fence = (try topology.current(txn)) orelse return error.IntegrityTopologyFenceMissing;
+    if (!fence.eql(job.fence)) return error.IntegrityTopologyChanged;
+    try requireNativeCuts(txn, job);
     var prepared_candidate = try reopenCandidate(alloc, txn, job);
     defer prepared_candidate.deinit();
     if (try topology.completed(txn)) |completed| {
@@ -654,6 +672,7 @@ pub fn verifyRecovery(alloc: std.mem.Allocator, txn: anytype, active: ?*const ph
     const expected_integrity = if (job.phase == .fencing) job.integrity_before else job.integrity_reserved;
     if (!std.mem.eql(u8, &digest(integrity), &expected_integrity)) return error.IntegrityCatalogChanged;
     switch (job.phase) {
+        .installed => unreachable, // Verified against the real successor above.
         .fencing => {
             if (job.physical_before) |before| {
                 if (active == null or !active.?.head.eql(before)) return error.PreparedGenerationChanged;

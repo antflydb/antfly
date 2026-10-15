@@ -7753,3 +7753,46 @@ preparation still cannot use ordinary schema commit; an unsealed one owns no
 activation delta. Boundary, license, inventory, generated control-catalog,
 formatting and diff checks passed. No throughput measurement, full native
 activation or original SQL case credit is claimed.
+
+### Seal-bound installed-state transaction component
+
+The private owner job now has an explicit installed phase (AIOJ v4; kernel
+ABI 87). An AIIS v1 installed cut binds the original canonical validation
+seal, metadata decision identity, exact native successor schema and exact
+prepared activation bytes. The metadata decision digest is an identity, NOT
+authentication: the future receiving owner must independently authorize it.
+Staging advances the native clock and writes the job/installed record only
+after checking the staged successor catalogs, activation ownership and seal.
+Exact retries reuse the original cut; old build/reservation/cancellation
+entry points cannot reinterpret an installed job as an unfinished build.
+
+Installed structural recovery first verifies the real successor and installed
+cut, then checks frozen pre-install proofs through a read-only historical
+metadata view. The immutable predecessor schema and reserved catalog must
+match the admitted identities; all physical records, namespace/range, clocks
+and canonical validation records remain real store reads. Physical catalog
+publication retains the one exact job-bound reserved definition blob needed
+for this verification instead of deleting it with the ordinary old head.
+Terminal release must retire that retained blob; this is not indefinite
+catalog-history retention or physical-root adoption permission.
+
+This component neither commits a schema nor publishes resident runtime
+objects, authenticates a decision, stages a replication marker/outbox or
+releases a fence. The shared Core/DB install transaction, native install
+wire/replay effect and receiver, installed ACK, automatic install/release
+scheduling, capability/adoption barriers and full distributed fault coverage
+remain unfinished. Structural verification in a staged LSM transaction is
+not a committed cold-reopen or distributed-install qualification. Original
+dispositions remain 483 implemented / 862 unresolved.
+
+Qualification: `/private/tmp/antfly-installed-cut-final-debug-v2.log` passed
+159/159 Debug build steps, including the native page/lifecycle, candidate,
+publication, ACK, C-ABI, leased-owner, runtime-contract and standalone suites.
+The real LSM fixture stages installation without committing, verifies the
+installed state and predecessor proofs, checks exact retry/wrong-cut/missing
+record handling, exhaustively injects allocation failures, and injects errors
+before/after each native clock, job and installed-record write. Every attempted
+transaction aborts; the original reserved schema, catalogs, clock and runtime
+remain unchanged. Boundary, license, formatting, inventory and generated
+control-catalog checks passed. No committed install, throughput result, public
+activation or new original-case credit is claimed.

@@ -124,6 +124,15 @@ pub fn privateIndexGeneration(table_id: u64, allocation: u64) !integrity.Generat
     return generation(try incarnationFromTableId(table_id), allocation);
 }
 
+/// Read a schema identity only after binding the complete canonical catalog
+/// bytes to an independently admitted digest. No definition allocation or
+/// schema compilation belongs in the install transaction's fixed read set.
+pub fn boundSchemaIdentity(bytes: []const u8, expected: integrity.Digest) !struct { version: u32, digest: integrity.Digest } {
+    if (bytes.len < header_len + 32 or bytes.len > max_catalog_bytes or
+        !std.mem.eql(u8, bytes[0..4], "AIC2") or !std.mem.eql(u8, &digest(bytes), &expected)) return error.IntegrityCatalogChanged;
+    return .{ .version = std.mem.readInt(u32, bytes[20..24], .little), .digest = bytes[24..56].* };
+}
+
 pub fn decode(alloc: Allocator, bytes: []const u8) !Catalog {
     if (bytes.len < header_len + 32 or bytes.len > max_catalog_bytes or !std.mem.eql(u8, bytes[0..4], "AIC2") or
         !std.mem.eql(u8, bytes[bytes.len - 32 ..], &digest(bytes[0 .. bytes.len - 32]))) return error.InvalidIntegrityCatalog;

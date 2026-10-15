@@ -318,9 +318,18 @@ pub const Prepared = struct {
         const gc = @import("relational_index_gc.zig");
         try gc.admitRetirements(txn, self.retired.len);
         for (self.retired) |id| try txn.put(&gc.key(id), &gc.initial(id));
-        // Loaded views own their definitions and MVCC retains old roots.
-        if (self.expected) |old| if (!std.mem.eql(u8, &old.blob_digest, &self.head.blob_digest))
-            try txn.delete(&blobKey(old.blob_digest));
+        // Loaded views own definitions and MVCC retains old roots, but cold
+        // installed-job recovery also needs its exact reserved predecessor.
+        // Retain only that one immutable blob until publication releases its
+        // job. Retention is not publication authority.
+        if (self.expected) |old| if (!std.mem.eql(u8, &old.blob_digest, &self.head.blob_digest)) {
+            const job = try @import("relational_index_owner_job.zig").load(txn);
+            const retained = if (job) |binding|
+                binding.phase == .reserved and binding.physical_reserved.eql(old) and binding.physical_candidate.eql(self.head)
+            else
+                false;
+            if (!retained) try txn.delete(&blobKey(old.blob_digest));
+        };
         return true;
     }
 };

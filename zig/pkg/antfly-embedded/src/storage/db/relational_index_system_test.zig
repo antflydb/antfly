@@ -2157,6 +2157,103 @@ test "relational index build pages identity dispatch caches immutable candidates
                 try std.testing.expectEqual(activation.State.enforced, (try activation.Progress.decode(activated.value)).state);
                 try std.testing.expectError(error.PrivateIndexPublicationRequired, db.core.commitPreparedSchemaMetadata(&schema_prepared, &metadata, &.{}, null));
                 {
+                    // Transaction-component coverage, not a metadata-authorized
+                    // install: the decision digest is test data and every write
+                    // aborts. No staged receipt may escape as durable evidence.
+                    const Digests = struct {
+                        fn of(bytes: []const u8) [32]u8 {
+                            var result: [32]u8 = undefined;
+                            std.crypto.hash.Blake3.hash(bytes, &result, .{});
+                            return result;
+                        }
+                    };
+                    const install_command: Verification.InstallCommand = .{
+                        .validation = activated.seal,
+                        .metadata_decision = @splat(7),
+                        .schema_digest = Digests.of(schema_prepared.encoded),
+                        .activation_digest = Digests.of(activated.value),
+                    };
+                    const InstallAllocations = struct {
+                        fn run(task_alloc: std.mem.Allocator, database: *db_mod.DB, prepared_schema: *@import("core.zig").PreparedSchemaMetadata, requested: Verification.InstallCommand) !void {
+                            var install_txn = try database.core.store.beginWriteTxn();
+                            defer install_txn.abort();
+                            try requested.validateBefore(task_alloc, &install_txn);
+                            try prepared_schema.reserved_activation.?.validateBefore(&install_txn);
+                            try install_txn.put(@import("../schema.zig").schema_key, prepared_schema.encoded);
+                            _ = try prepared_schema.relational_indexes.?.metadata.stage(&install_txn);
+                            try prepared_schema.integrity_catalog.?.stage(&install_txn);
+                            try prepared_schema.reserved_activation.?.stage(&install_txn);
+                            _ = try Verification.Installed.stage(task_alloc, &install_txn, requested, prepared_schema.integrity_catalog.?.catalog, null);
+                        }
+                    };
+                    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, InstallAllocations.run, .{ &db, &schema_prepared, install_command });
+                    var txn = try db.core.store.beginWriteTxn();
+                    defer txn.abort();
+                    try install_command.validateBefore(alloc, &txn);
+                    try activated.validateBefore(&txn);
+                    try txn.put(@import("../schema.zig").schema_key, schema_prepared.encoded);
+                    _ = try schema_prepared.relational_indexes.?.metadata.stage(&txn);
+                    try schema_prepared.integrity_catalog.?.stage(&txn);
+                    try activated.stage(&txn);
+                    const staged = try Verification.Installed.stage(alloc, &txn, install_command, schema_prepared.integrity_catalog.?.catalog, null);
+                    try std.testing.expect(!staged.duplicate);
+                    try std.testing.expectEqual(sequence + 2, staged.record.position.sequence);
+                    const owner_job = @import("relational_index_owner_job.zig");
+                    try std.testing.expectEqual(owner_job.Phase.installed, (try owner_job.load(&txn)).?.phase);
+                    try std.testing.expectError(error.PrivateIndexOwnerJobChanged, owner_job.requireReserved(&txn, binding));
+                    const retried = try Verification.Installed.stage(alloc, &txn, install_command, schema_prepared.integrity_catalog.?.catalog, staged.record.position);
+                    try std.testing.expect(retried.duplicate);
+                    try std.testing.expectEqualDeep(staged.record, retried.record);
+                    const PhysicalCatalog = @import("relational_index_catalog.zig");
+                    var installed_catalog = try PhysicalCatalog.decode(alloc, binding.physical_candidate, try txn.get(&PhysicalCatalog.blobKey(binding.physical_candidate.blob_digest)));
+                    defer installed_catalog.deinit();
+                    try owner_job.verifyRecovery(alloc, &txn, &installed_catalog);
+                    var wrong_cut = staged.record.position;
+                    wrong_cut.sequence += 1;
+                    try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, Verification.Installed.stage(alloc, &txn, install_command, schema_prepared.integrity_catalog.?.catalog, wrong_cut));
+                    try txn.delete(Verification.Installed.key);
+                    try std.testing.expectError(error.InvalidPrivateIndexNativeReceipt, owner_job.verifyRecovery(alloc, &txn, &installed_catalog));
+                }
+                {
+                    const InstallFault = struct {
+                        txn: *docstore.DocStore.Txn,
+                        target: []const u8,
+                        after_put: bool,
+                        pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+                            return self.txn.get(key);
+                        }
+                        pub fn put(self: *@This(), key: []const u8, value: []const u8) !void {
+                            if (!std.mem.eql(u8, key, self.target)) return self.txn.put(key, value);
+                            if (self.after_put) try self.txn.put(key, value);
+                            return error.TestInstalledWriteFailed;
+                        }
+                    };
+                    const failure_keys = [_][]const u8{ authority.key, @import("relational_index_owner_job.zig").key, Verification.Installed.key };
+                    for (failure_keys) |failure_key| for ([_]bool{ false, true }) |after_put| {
+                        var txn = try db.core.store.beginWriteTxn();
+                        defer txn.abort();
+                        try activated.validateBefore(&txn);
+                        try txn.put(@import("../schema.zig").schema_key, schema_prepared.encoded);
+                        _ = try schema_prepared.relational_indexes.?.metadata.stage(&txn);
+                        try schema_prepared.integrity_catalog.?.stage(&txn);
+                        try activated.stage(&txn);
+                        var schema_digest: [32]u8 = undefined;
+                        std.crypto.hash.Blake3.hash(schema_prepared.encoded, &schema_digest, .{});
+                        var activation_digest: [32]u8 = undefined;
+                        std.crypto.hash.Blake3.hash(activated.value, &activation_digest, .{});
+                        const install_command: Verification.InstallCommand = .{ .validation = activated.seal, .metadata_decision = @splat(7), .schema_digest = schema_digest, .activation_digest = activation_digest };
+                        var fault: InstallFault = .{ .txn = &txn, .target = failure_key, .after_put = after_put };
+                        try std.testing.expectError(error.TestInstalledWriteFailed, Verification.Installed.stage(alloc, &fault, install_command, schema_prepared.integrity_catalog.?.catalog, null));
+                    };
+                }
+                {
+                    var read = try db.core.store.beginReadTxn();
+                    defer read.abort();
+                    try std.testing.expect(try Verification.Installed.load(alloc, &read, binding) == null);
+                    try std.testing.expectEqual(sequence + 1, (try authority.load(&read)).?.sequence);
+                    try @import("relational_index_owner_job.zig").requireReserved(&read, binding);
+                }
+                {
                     var txn = try db.core.store.beginWriteTxn();
                     defer txn.abort();
                     try txn.delete(Verification.Seal.key);
