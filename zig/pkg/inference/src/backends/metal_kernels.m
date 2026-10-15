@@ -6468,7 +6468,10 @@ typedef struct termite_metal_sdpa_segments_f32_params {
 } termite_metal_sdpa_segments_f32_params;
 
 /// ModernBERT training attention V1 (ops/modernbert_training_attention.zig).
-/// Mirrored in the MSL source and metal_runtime.zig.
+/// Mirrored in the MSL source and metal_runtime.zig. `dropout_probability`
+/// and `dropout_seed` are segment training attention's head-layer dropout
+/// (the ModernBERT trunk always passes probability 0); only the flash
+/// kernels below implement the mask.
 typedef struct termite_metal_modernbert_training_attention_params {
     uint32_t tokens;
     uint32_t seq_len;
@@ -6477,7 +6480,8 @@ typedef struct termite_metal_modernbert_training_attention_params {
     uint32_t window;
     uint32_t backward;
     float scale;
-    uint32_t reserved0;
+    float dropout_probability;
+    uint64_t dropout_seed;
 } termite_metal_modernbert_training_attention_params;
 
 typedef struct termite_metal_sdpa_f32_params {
@@ -6690,7 +6694,7 @@ static NSString *termite_metal_shader_source(void) {
            "struct termite_metal_convert_dtype_f32_params { uint elem_count; uint kind; uint reserved0; uint reserved1; };\n"
            "struct termite_metal_sdpa_f32_params { uint batch; uint seq_len; uint num_heads; uint head_dim; uint bias_mode; uint has_mask; uint layout; uint reserved1; };\n"
            "struct termite_metal_sdpa_segments_f32_params { uint queries; uint keys; uint num_heads; uint head_dim; uint window; uint reserved0; uint reserved1; uint reserved2; };\n"
-           "struct termite_metal_modernbert_training_attention_params { uint tokens; uint seq_len; uint num_heads; uint head_dim; uint window; uint backward; float scale; uint reserved0; };\n"
+           "struct termite_metal_modernbert_training_attention_params { uint tokens; uint seq_len; uint num_heads; uint head_dim; uint window; uint backward; float scale; float dropout_probability; ulong dropout_seed; };\n"
            "struct termite_metal_disentangled_relative_attention_f32_params { uint batch; uint seq_len; uint num_heads; uint head_dim; uint has_mask; uint reserved0; uint reserved1; uint reserved2; };\n"
            "struct termite_metal_deberta_relative_score_gemm_f32_params { uint batch; uint seq_len; uint rel_len; uint num_heads; uint head_dim; uint mode; uint reserved0; uint reserved1; };\n"
            "struct termite_metal_transpose_f32_params { uint rank; uint total; uint reserved0; uint reserved1; uint dims[8]; uint in_strides[8]; uint out_strides[8]; uint perm[8]; };\n"
@@ -12251,6 +12255,28 @@ static NSString *termite_metal_shader_source(void) {
            "    if (!((k >= x[0] && k < x[1]) || (k >= x[2] && k < x[3]) || (k >= x[4] && k < x[5]))) return false;\n"
            "    return window == 0xffffffffu || uint(abs(row_pos - key_pos)) <= window;\n"
            "}\n"
+           // Replayable attention-probability dropout, bit-for-bit matching
+           // linalg.segmentAttentionDropoutKeep (zig/lib/linalg/src/attention.zig):
+           // a splitmix64 finalizer mixes the flat (batch, head, query, key)
+           // index, XORed with the caller's seed; the high 32 bits decide keep
+           // vs drop against a threshold derived from `probability`. `query`
+           // and `key` are row-local positions (0..seq_len-1), not absolute
+           // token indices. Multiplying by 2^32 is exact in f32 (a power-of-two
+           // scale), so this threshold matches the host's f64 computation
+           // exactly without needing double precision on the GPU.
+           "inline ulong mbta_dropout_mix(ulong value) {\n"
+           "    ulong x = value + 0x9e3779b97f4a7c15UL;\n"
+           "    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9UL;\n"
+           "    x = (x ^ (x >> 27)) * 0x94d049bb133111ebUL;\n"
+           "    return x ^ (x >> 31);\n"
+           "}\n"
+           "inline float mbta_dropout_keep(ulong seed, uint batch, uint head, uint num_heads, uint seq_len, uint query, uint key, float probability) {\n"
+           "    if (probability <= 0.0f) return 1.0f;\n"
+           "    ulong index = (((ulong(batch) * ulong(num_heads) + ulong(head)) * ulong(seq_len) + ulong(query)) * ulong(seq_len) + ulong(key));\n"
+           "    ulong bits = mbta_dropout_mix(seed ^ mbta_dropout_mix(index));\n"
+           "    ulong threshold = ulong(probability * 4294967296.0f);\n"
+           "    return (bits >> 32) < threshold ? 0.0f : 1.0f / (1.0f - probability);\n"
+           "}\n"
            "kernel void termite_modernbert_training_attention_flash_forward(device const float *qkv [[buffer(0)]], device const int *ctrl [[buffer(1)]], device float *output [[buffer(2)]], device float *lse [[buffer(3)]], constant termite_metal_modernbert_training_attention_params &p [[buffer(4)]], ushort tid [[thread_index_in_threadgroup]], ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]], uint2 tg [[threadgroup_position_in_grid]]) {\n"
            "    constexpr uint BQ = 32u, BK = 16u, DM = 64u;\n"
            "    threadgroup float ks[BK * DM], vs[BK * DM], ss[BQ * BK], diag[4u * 64u], finrecip[4u * 64u];\n"
@@ -12311,7 +12337,7 @@ static NSString *termite_metal_shader_source(void) {
            "            mx = max(mx, simd_shuffle_xor(mx, 1)); mx = max(mx, simd_shuffle_xor(mx, 2));\n"
            "            const float mold = mrow[r], mnew = max(mold, mx);\n"
            "            float sum = 0.0f;\n"
-           "            for (uint j = 0u; j < 4u; ++j) { float w = vals[j] == neg ? 0.0f : exp(vals[j] - mnew); ss[r * BK + c0 + j] = w; sum += w; }\n"
+           "            for (uint j = 0u; j < 4u; ++j) { uint c = c0 + j; float w = vals[j] == neg ? 0.0f : exp(vals[j] - mnew); sum += w; float keep = mbta_dropout_keep(p.dropout_seed, row, h, p.num_heads, p.seq_len, q0 + r - row_start, kb + c - row_start, p.dropout_probability); ss[r * BK + c0 + j] = w * keep; }\n"
            "            sum += simd_shuffle_xor(sum, 1); sum += simd_shuffle_xor(sum, 2);\n"
            "            const float alpha = mnew == neg ? 1.0f : (mold == neg ? 0.0f : exp(mold - mnew));\n"
            "            if (L % 4u == 0u) { lrow[r] = lrow[r] * alpha + sum; mrow[r] = mnew; diag[uint(sg) * 64u + (L / 4u) * 9u] = alpha; }\n"
@@ -12415,7 +12441,8 @@ static NSString *termite_metal_shader_source(void) {
            "                float sval = ss[r * BK + c];\n"
            "                float pval = vis ? exp(sval * scale - lrow[r]) : 0.0f;\n"
            "                float dpval = dps[r * BK + c];\n"
-           "                ss[r * BK + c] = pval * (dpval - drow[r]) * scale;\n"
+           "                float keep = mbta_dropout_keep(p.dropout_seed, row, h, p.num_heads, p.seq_len, q0 + r - row_start, kb + c - row_start, p.dropout_probability);\n"
+           "                ss[r * BK + c] = pval * (keep * dpval - drow[r]) * scale;\n"
            "            }\n"
            "        }\n"
            "        simdgroup_barrier(mem_flags::mem_threadgroup);\n"
@@ -12495,8 +12522,9 @@ static NSString *termite_metal_shader_source(void) {
            "                float sval = ss[r * BQT + c];\n"
            "                float pval = vis ? exp(sval * scale - lrow[c]) : 0.0f;\n"
            "                float dpval = dps[r * BQT + c];\n"
-           "                dps[r * BQT + c] = pval;\n"
-           "                ss[r * BQT + c] = pval * (dpval - drow[c]) * scale;\n"
+           "                float keep = mbta_dropout_keep(p.dropout_seed, row, h, p.num_heads, p.seq_len, q0t + c - row_start, k0 + r - row_start, p.dropout_probability);\n"
+           "                dps[r * BQT + c] = pval * keep;\n"
+           "                ss[r * BQT + c] = pval * (keep * dpval - drow[c]) * scale;\n"
            "            }\n"
            "        }\n"
            "        simdgroup_barrier(mem_flags::mem_threadgroup);\n"
