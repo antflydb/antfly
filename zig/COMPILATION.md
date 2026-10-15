@@ -1433,3 +1433,49 @@ with `-Dstrip=true`, including independent embedded composition; retired flags
 are absent from both. The current complete Apache audit verifies 2,050 source
 files, and all 35 boundary-checker regressions pass. Temporary local graph-check
 caches were removed. Wolfspider release execution remains in progress.
+
+### Linux owner and final-link qualification (2026-10-15)
+
+ELF Zig runtime archives, their final executable callers, and linked test
+objects use the same LLVM backend policy as the shared native providers.
+The default x86 Debug final link failed to resolve 232 private symbols in the
+real server composition; the matching LLVM composition passes. Static
+consumers precede the physical engine in final archive order. The final image
+receives the engine's inference and enrichment dependencies without making
+their emission prerequisites of adapter codegen.
+
+Provider discovery stops at dynamic-library boundaries and excludes foreign
+targets. A browser artifact cannot acquire a native engine or libc through
+the native finalizer. Direct source-test objects keep their test compilation
+context; linked production archives use their own context. Visits are keyed
+by both module and context because one module may serve both compilations.
+The small ELF/WASM fixture covers these cases, repeated finalization, exact
+provider counts, and independent archive emission.
+
+Module graph clones own their mutable configuration containers. Zig's
+`Module.init(.existing)` makes a shallow copy; late SDK/include-path changes
+could free a buffer still referenced by another clone, crashing configuration
+serialization. The shared clone helper copies those containers and resets the
+cached import graph. A regression verifies independent buffers and late path
+mutation; the real GNU server/C API configuration also passes after this fix.
+
+Both stripped x86_64-linux-musl Debug and unstripped x86_64-linux-gnu Debug
+server/C API builds pass 78/78 steps with Zig 0.17.0. The export audit retains
+exactly 118 public C functions. The GNU server version command and the real
+public C API smoke client execute successfully in Linux. Unstripped GNU
+provider codegen peaks at about 5 GiB per large owner in this local cross
+qualification; existing large-owner claims remain unchanged.
+
+The shared PDF asset owner exceeded its 256 MiB claim in Linux CI (about
+303 MiB). Its 512 MiB reservation retains compiler headroom and the single
+shared copy of immutable fonts and glyph lookup data. Local unstripped GNU
+codegen reported 264 MiB.
+
+Pgwire passes all 110 tests in each stripped/unstripped Linux executable:
+standalone peak RSS is approximately 17/21 MiB, respectively. Linux child
+rusage can also retain the launcher's earlier high-water RSS: a trivial
+`/bin/true` child of a Python process retaining 72 MiB reported 83 MiB in
+the same qualification environment. This accounts for a process envelope
+larger than the leaf test's working set. CI reported approximately 93 MiB,
+so the Linux test-step reservation is 128 MiB (other hosts retain 64 MiB).
+The native array/spool allocator measurements and limits are unchanged.

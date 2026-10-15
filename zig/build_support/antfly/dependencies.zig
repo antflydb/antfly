@@ -367,9 +367,12 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     const run_pgwire_tests = b.addRunArtifact(pgwire_tests);
     // Honor stripped CI builds: cold framing/array compiles fit the original
     // 1 GiB reservation. Debugger builds exceeded it, so reserve their larger
-    // working set separately. The 64 MiB runtime bound is unchanged.
+    // working set separately.
     pgwire_tests.step.max_rss = (if (strip) @as(usize, 1) else 2) * 1024 * 1024 * 1024;
-    run_pgwire_tests.step.max_rss = 64 * 1024 * 1024;
+    // Linux includes the launcher's inherited high-water RSS in child rusage:
+    // CI reported 93 MiB while standalone Linux tests use only 17-21 MiB.
+    // Reserve 128 MiB for that process envelope; allocator bounds stay intact.
+    run_pgwire_tests.step.max_rss = (if (target.result.os.tag == .linux) @as(usize, 128) else 64) * 1024 * 1024;
     b.step("pgwire-test", "Run PostgreSQL wire framing, session, and lifecycle tests").dependOn(&run_pgwire_tests.step);
     const openapi_root_check = addOpenApiRootCheckStep(b);
     openapi_check_step.dependOn(&openapi_root_check.step);
