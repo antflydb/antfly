@@ -36,6 +36,7 @@ pub const Reader = struct {
     fetch: Fetch,
     control: Control,
     io: std.Io,
+    io_receiver: ?@import("antfly_runtime_abi").io_abi.Receiver = null,
     refs: std.atomic.Value(usize) = .init(1),
     mutex: std.Io.Mutex = .init,
     cache: [32]?Cached = @splat(null),
@@ -65,6 +66,16 @@ pub const Reader = struct {
         self.files = owned;
         return self;
     }
+    pub fn createWithExecutor(a: A, executor: @import("antfly_runtime_abi").io_abi.Borrow, root: []const u8, files: []const File, fetch: Fetch, control: Control) !*Reader {
+        var receiver = try executor.receive();
+        // create only copies metadata. Rebind the receiver at its stable owner
+        // before any I/O can outlive this callback's stack frame.
+        const self = try create(a, receiver.io(), root, files, fetch, control);
+        self.io_receiver = receiver;
+        self.io = self.io_receiver.?.io();
+        return self;
+    }
+
     fn checkpointReference(raw: *anyopaque, a: A) !?[]u8 {
         const self = cast(raw);
         try self.control.token().check();

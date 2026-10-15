@@ -2312,6 +2312,10 @@ pub const AntflyApiHandler = struct {
                 .status = 409,
                 .message = "HierarchyCursorStale",
             },
+            error.DocumentArtifactPublicationFailed => .{
+                .status = 409,
+                .message = "DocumentArtifactPublicationFailed",
+            },
             else => null,
         };
     }
@@ -10341,6 +10345,9 @@ test "typed internal HTTP errors preserve conflict semantics" {
     const stale_cursor = AntflyApiHandler.sharedInternalHttpErrorSpec(error.HierarchyCursorStale).?;
     try std.testing.expectEqual(@as(u16, 409), stale_cursor.status);
     try std.testing.expectEqualStrings("HierarchyCursorStale", stale_cursor.message);
+    const failed_publication = AntflyApiHandler.sharedInternalHttpErrorSpec(error.DocumentArtifactPublicationFailed).?;
+    try std.testing.expectEqual(@as(u16, 409), failed_publication.status);
+    try std.testing.expectEqualStrings("DocumentArtifactPublicationFailed", failed_publication.message);
     try std.testing.expect(AntflyApiHandler.sharedInternalHttpErrorSpec(error.NotFound) == null);
 }
 
