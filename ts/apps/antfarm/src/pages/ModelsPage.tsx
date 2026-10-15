@@ -6,6 +6,11 @@ import {
   DashboardToolbar,
   Input,
   MonoLabel,
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
   Sheet,
   SheetContent,
   SheetDescription,
@@ -109,6 +114,13 @@ const CAPABILITY_LABELS: Record<ExtractorCapability, string> = {
 
 function capabilityLabel(capability: string): string {
   return CAPABILITY_LABELS[capability as ExtractorCapability] ?? capability.replaceAll("_", " ");
+}
+
+function modelProvider(model: InferenceModel): string {
+  // Local inference's connection provider is Antfly; the namespace identifies
+  // the model publisher (for example, google or fastino).
+  const namespace = huggingFaceRepoId(model.source)?.split("/")[0];
+  return (namespace || model.provider).toLowerCase();
 }
 
 function runtimeStatus(runtime: ModelRuntime | undefined) {
@@ -683,16 +695,16 @@ const ModelDetailSheet: React.FC<{
             <div className="flex items-start justify-between gap-3">
               <div>
                 <h4 className="font-mono text-xs font-medium uppercase tracking-[0.08em]">
-                  Runtime
+                  Model status
                 </h4>
                 <p className="mt-1 text-xs text-muted-foreground">
                   {builtIn
-                    ? "This built-in chunking mode does not create a model runtime."
+                    ? "This built-in chunking mode does not load a model."
                     : providerManaged
                       ? "Loading and residency are managed by this provider."
                       : !runtimeSupported
-                        ? "This server does not expose model lifecycle controls. Running a request still loads the model on demand."
-                        : "Explicit loading warms the normal runtime cache. Idle eviction still applies."}
+                        ? "This server does not support Antfarm model controls. Running a request still loads the model on demand."
+                        : "Load and unload affect the shared server cache, including other clients. Idle eviction still applies."}
                 </p>
               </div>
               <span className={cn("shrink-0 font-mono text-xs", status.tone)}>
@@ -735,7 +747,7 @@ const ModelDetailSheet: React.FC<{
                       }
                       title={
                         instance.startup_managed
-                          ? "Startup-managed runtimes cannot be unloaded here"
+                          ? "Startup-managed models cannot be unloaded here"
                           : instance.state === "in_use" || instance.active_requests > 0
                             ? "Wait for active requests to finish"
                             : undefined
@@ -1078,6 +1090,7 @@ const ModelsPage: React.FC = () => {
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedType, setSelectedType] = useState<ModelType | "all">("all");
   const [selectedConnection, setSelectedConnection] = useState("all");
+  const [selectedProvider, setSelectedProvider] = useState("all");
   const [selectedModelId, setSelectedModelId] = useState<string | null>(null);
   const [sheetOpen, setSheetOpen] = useState(false);
   const selectedModel = selectedModelId
@@ -1098,10 +1111,16 @@ const ModelsPage: React.FC = () => {
     [models]
   );
 
+  const providers = useMemo(
+    () => [...new Set(models.map(modelProvider))].sort((a, b) => a.localeCompare(b)),
+    [models]
+  );
+
   const filteredModels = useMemo(() => {
     return models.filter((model) => {
       if (selectedType !== "all" && model.type !== selectedType) return false;
       if (selectedConnection !== "all" && model.connectionId !== selectedConnection) return false;
+      if (selectedProvider !== "all" && modelProvider(model) !== selectedProvider) return false;
 
       if (searchQuery) {
         const query = searchQuery.toLowerCase();
@@ -1114,7 +1133,7 @@ const ModelsPage: React.FC = () => {
 
       return true;
     });
-  }, [models, searchQuery, selectedConnection, selectedType]);
+  }, [models, searchQuery, selectedConnection, selectedProvider, selectedType]);
 
   const modelsByType = useMemo(() => {
     const grouped: Record<ModelType, InferenceModel[]> = {
@@ -1236,25 +1255,43 @@ const ModelsPage: React.FC = () => {
 
       {/* Search and filters */}
       <DashboardToolbar className="md:flex-col md:items-stretch">
-        <div className="relative">
-          <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
-          <Input
-            placeholder="Search models..."
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            className="pl-10 h-11 bg-background w-full"
-          />
-          {searchQuery && (
-            <Button
-              variant="ghost"
-              size="icon"
-              aria-label="Clear search"
-              className="absolute right-1 top-1/2 -translate-y-1/2 h-8 w-8 hover:bg-muted"
-              onClick={() => setSearchQuery("")}
+        <div className="flex flex-col gap-3 sm:flex-row">
+          <div className="relative flex-1">
+            <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+            <Input
+              placeholder="Search models..."
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              className="pl-10! h-11 bg-background w-full"
+            />
+            {searchQuery && (
+              <Button
+                variant="ghost"
+                size="icon"
+                aria-label="Clear search"
+                className="absolute right-1 top-1/2 -translate-y-1/2 h-8 w-8 hover:bg-muted"
+                onClick={() => setSearchQuery("")}
+              >
+                <X className="w-4 h-4" />
+              </Button>
+            )}
+          </div>
+          <Select value={selectedProvider} onValueChange={setSelectedProvider}>
+            <SelectTrigger
+              aria-label="Filter models by provider"
+              className="w-full shrink-0 data-[size=default]:h-11 sm:w-52!"
             >
-              <X className="w-4 h-4" />
-            </Button>
-          )}
+              <SelectValue placeholder="All providers" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All providers</SelectItem>
+              {providers.map((provider) => (
+                <SelectItem key={provider} value={provider}>
+                  {provider}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
         </div>
 
         <div

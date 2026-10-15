@@ -23,6 +23,7 @@ const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const httpx = @import("httpx");
 const api = @import("inference_api");
+const antfarm_models = @import("antfarm_models.zig");
 const generating_api = @import("antfly_generating_openapi");
 const extraction_api = @import("antfly_extraction_openapi");
 const readers_api = @import("antfly_readers");
@@ -20289,7 +20290,7 @@ pub const Node = struct {
     fn apiRuntime(
         allocator: std.mem.Allocator,
         entry: model_manager_mod.RuntimeSnapshotEntry,
-    ) !api.ModelRuntime {
+    ) !antfarm_models.ModelRuntime {
         return .{
             .runtime_id = try std.fmt.allocPrint(allocator, "{x:0>32}", .{entry.runtime_id}),
             .state = switch (entry.state) {
@@ -20339,10 +20340,10 @@ pub const Node = struct {
         io: std.Io,
         only_runtime_id: ?model_manager_mod.RuntimeId,
         preferred_task: ?api.ModelKind,
-    ) ![]const api.ModelRuntimeModel {
+    ) ![]const antfarm_models.ModelRuntimeModel {
         var snapshot = try self.model_manager.runtimeSnapshot(allocator, runtimeManifestTaskMask);
         defer snapshot.deinit();
-        if (snapshot.entries.len == 0) return try allocator.alloc(api.ModelRuntimeModel, 0);
+        if (snapshot.entries.len == 0) return try allocator.alloc(antfarm_models.ModelRuntimeModel, 0);
         const canonical_models_dir = try realPathExistingAlloc(allocator, io, self.config.models_dir);
         defer allocator.free(canonical_models_dir);
 
@@ -20350,7 +20351,7 @@ pub const Node = struct {
             task: api.ModelKind,
             model: []const u8,
             loading: bool = false,
-            runtimes: std.ArrayList(api.ModelRuntime) = .empty,
+            runtimes: std.ArrayList(antfarm_models.ModelRuntime) = .empty,
         };
         var groups = std.ArrayList(Group).empty;
         for (snapshot.entries) |entry| {
@@ -20392,7 +20393,7 @@ pub const Node = struct {
             }
         }
 
-        const result = try allocator.alloc(api.ModelRuntimeModel, groups.items.len);
+        const result = try allocator.alloc(antfarm_models.ModelRuntimeModel, groups.items.len);
         for (groups.items, result) |*group, *model| {
             model.* = .{
                 .task = group.task,
@@ -20407,11 +20408,11 @@ pub const Node = struct {
 
     pub fn listModelRuntimes(self: *Node, ctx: *httpx.Context) !httpx.Response {
         const models = try self.runtimeModelsAlloc(ctx.allocator, ctx.io, null, null);
-        return ctx.json(api.ModelRuntimeResponse{ .object = "model_runtime", .models = models });
+        return ctx.json(antfarm_models.ModelRuntimeResponse{ .object = "model_runtime", .models = models });
     }
 
     pub fn loadModelRuntime(self: *Node, ctx: *httpx.Context) !httpx.Response {
-        var parsed = (try ctx.parseJson(api.ModelRuntimeLoadRequest)) orelse
+        var parsed = (try ctx.parseJson(antfarm_models.ModelRuntimeLoadRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "Request body required" });
         defer parsed.deinit();
         const request = parsed.value;
@@ -20472,7 +20473,7 @@ pub const Node = struct {
 
         const models = try self.runtimeModelsAlloc(ctx.allocator, ctx.io, runtime_id, request.task);
         if (models.len == 0) {
-            return ctx.json(api.ModelRuntimeLoadResponse{
+            return ctx.json(antfarm_models.ModelRuntimeLoadResponse{
                 .outcome = "loaded",
                 .model = .{
                     .task = request.task,
@@ -20482,18 +20483,18 @@ pub const Node = struct {
                 },
             });
         }
-        return ctx.json(api.ModelRuntimeLoadResponse{ .outcome = "loaded", .model = models[0] });
+        return ctx.json(antfarm_models.ModelRuntimeLoadResponse{ .outcome = "loaded", .model = models[0] });
     }
 
     pub fn unloadModelRuntime(self: *Node, ctx: *httpx.Context) !httpx.Response {
-        var parsed = (try ctx.parseJson(api.ModelRuntimeUnloadRequest)) orelse
+        var parsed = (try ctx.parseJson(antfarm_models.ModelRuntimeUnloadRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "Request body required" });
         defer parsed.deinit();
         const runtime_id = model_manager_mod.parseRuntimeId(parsed.value.runtime_id) catch
             return ctx.status(400).json(.{ .@"error" = "INVALID_RUNTIME_ID", .message = "runtime_id is invalid" });
         return switch (self.model_manager.unloadRuntime(runtime_id)) {
-            .unloaded => ctx.json(api.ModelRuntimeUnloadResponse{ .outcome = "unloaded" }),
-            .already_unloaded => ctx.json(api.ModelRuntimeUnloadResponse{ .outcome = "already_unloaded" }),
+            .unloaded => ctx.json(antfarm_models.ModelRuntimeUnloadResponse{ .outcome = "unloaded" }),
+            .already_unloaded => ctx.json(antfarm_models.ModelRuntimeUnloadResponse{ .outcome = "already_unloaded" }),
             .loading => ctx.status(409).json(.{ .@"error" = "RUNTIME_LOADING", .message = "runtime is still loading", .retryable = true }),
             .in_use => |active| ctx.status(409).json(.{ .@"error" = "RUNTIME_IN_USE", .message = "runtime is serving active requests", .retryable = true, .active_requests = active }),
             .startup_managed => ctx.status(409).json(.{ .@"error" = "RUNTIME_PRELOAD_MANAGED", .message = "runtime is managed by startup preload configuration", .retryable = false }),
@@ -20948,6 +20949,11 @@ pub const Node = struct {
         const router = api.ServerRouter(Node).init(self);
         var prefixed = AiPrefixedServer(prefix, @TypeOf(server.*)){ .inner = server, .node = self };
         try router.register(&prefixed);
+        // Antfarm implementation detail, intentionally absent from OpenAPI/SDKs.
+        // The AI prefix retains the host's inference authentication and permissions.
+        try prefixed.get("/_antfarm/models/status", httpx.Handler.bind(self, listModelRuntimes));
+        try prefixed.post("/_antfarm/models/load", httpx.Handler.bind(self, loadModelRuntime));
+        try prefixed.post("/_antfarm/models/unload", httpx.Handler.bind(self, unloadModelRuntime));
         // Keep the retired endpoint deterministic when inference routes share
         // the standalone public server. Without an explicit tombstone, httpx
         // reports 405 because nearby generated routes match the path shape,
@@ -25309,14 +25315,14 @@ const InferenceHttpRouteAdmission = enum { none, inference };
 fn inferenceHttpRouteAdmission(comptime method: []const u8, comptime path: []const u8) InferenceHttpRouteAdmission {
     if (comptime std.mem.eql(u8, method, "GET")) {
         if (comptime std.mem.eql(u8, path, "/models") or
-            std.mem.eql(u8, path, "/models/runtime") or
+            std.mem.eql(u8, path, "/_antfarm/models/status") or
             std.mem.eql(u8, path, "/predictors") or
             std.mem.eql(u8, path, "/transcription/sessions/:session_id") or
             std.mem.eql(u8, path, "/transcription/sessions/:session_id/events")) return .none;
     } else if (comptime std.mem.eql(u8, method, "DELETE")) {
         if (comptime std.mem.eql(u8, path, "/transcription/sessions/:session_id")) return .none;
     } else if (comptime std.mem.eql(u8, method, "POST")) {
-        if (comptime std.mem.eql(u8, path, "/models/unload")) return .none;
+        if (comptime std.mem.eql(u8, path, "/_antfarm/models/unload")) return .none;
         if (comptime std.mem.eql(u8, path, "/chat/completions") or
             std.mem.eql(u8, path, "/chunk") or
             std.mem.eql(u8, path, "/dictate") or
@@ -25329,7 +25335,7 @@ fn inferenceHttpRouteAdmission(comptime method: []const u8, comptime path: []con
             std.mem.eql(u8, path, "/extract") or
             std.mem.eql(u8, path, "/generate") or
             std.mem.eql(u8, path, "/generate/batch") or
-            std.mem.eql(u8, path, "/models/load") or
+            std.mem.eql(u8, path, "/_antfarm/models/load") or
             std.mem.eql(u8, path, "/predict") or
             std.mem.eql(u8, path, "/read") or
             std.mem.eql(u8, path, "/rerank") or
@@ -28239,9 +28245,9 @@ test "Qwen3-VL read routing admits only generation bundles" {
 }
 
 test "runtime unload bypasses inference admission while load remains admitted" {
-    try std.testing.expectEqual(InferenceHttpRouteAdmission.none, inferenceHttpRouteAdmission("POST", "/models/unload"));
-    try std.testing.expectEqual(InferenceHttpRouteAdmission.inference, inferenceHttpRouteAdmission("POST", "/models/load"));
-    try std.testing.expectEqual(InferenceHttpRouteAdmission.none, inferenceHttpRouteAdmission("GET", "/models/runtime"));
+    try std.testing.expectEqual(InferenceHttpRouteAdmission.none, inferenceHttpRouteAdmission("POST", "/_antfarm/models/unload"));
+    try std.testing.expectEqual(InferenceHttpRouteAdmission.inference, inferenceHttpRouteAdmission("POST", "/_antfarm/models/load"));
+    try std.testing.expectEqual(InferenceHttpRouteAdmission.none, inferenceHttpRouteAdmission("GET", "/_antfarm/models/status"));
 }
 
 test "runtime model snapshot keeps a published runtime visible after its manifest disappears" {
@@ -28792,9 +28798,9 @@ test "registerRoutesOn prefixes embed aliases and metrics route" {
     try std.testing.expect(server.hasRoute(.post, public_api_prefix ++ "/generate/batch"));
     try std.testing.expect(server.hasRoute(.get, public_api_prefix ++ "/models"));
     try std.testing.expectEqual(@as(usize, 1), server.routeCount(.get, public_api_prefix ++ "/models"));
-    try std.testing.expect(server.hasRoute(.get, public_api_prefix ++ "/models/runtime"));
-    try std.testing.expect(server.hasRoute(.post, public_api_prefix ++ "/models/load"));
-    try std.testing.expect(server.hasRoute(.post, public_api_prefix ++ "/models/unload"));
+    try std.testing.expect(!server.hasRoute(.get, public_api_prefix ++ "/models/runtime"));
+    try std.testing.expect(!server.hasRoute(.post, public_api_prefix ++ "/models/load"));
+    try std.testing.expect(!server.hasRoute(.post, public_api_prefix ++ "/models/unload"));
     try std.testing.expect(server.hasRoute(.get, public_api_prefix ++ "/metrics"));
     try std.testing.expect(server.hasRoute(.post, public_api_prefix ++ "/dictate"));
     try std.testing.expect(server.hasRoute(.post, public_api_prefix ++ "/transcription/sessions"));
@@ -29613,6 +29619,12 @@ test "registerAiRoutesOn excludes Traditional ML predictor routes" {
     try std.testing.expect(server.hasRoute(.post, ai_api_prefix ++ "/embeddings"));
     try std.testing.expect(server.hasRoute(.post, ai_api_prefix ++ "/generate/batch"));
     try std.testing.expect(server.hasRoute(.get, ai_api_prefix ++ "/models"));
+    try std.testing.expect(server.hasRoute(.get, ai_api_prefix ++ "/_antfarm/models/status"));
+    try std.testing.expect(server.hasRoute(.post, ai_api_prefix ++ "/_antfarm/models/load"));
+    try std.testing.expect(server.hasRoute(.post, ai_api_prefix ++ "/_antfarm/models/unload"));
+    try std.testing.expect(!server.hasRoute(.get, ai_api_prefix ++ "/models/runtime"));
+    try std.testing.expect(!server.hasRoute(.post, ai_api_prefix ++ "/models/load"));
+    try std.testing.expect(!server.hasRoute(.post, ai_api_prefix ++ "/models/unload"));
     try std.testing.expect(server.hasRoute(.post, ai_api_prefix ++ "/recognize"));
     try std.testing.expect(server.hasRoute(.post, ai_api_prefix ++ "/dictate"));
     try std.testing.expect(server.hasRoute(.post, ai_api_prefix ++ "/transcription/sessions/:session_id/audio"));
@@ -29977,9 +29989,9 @@ test "registerRoutesOn supports alternate prefixes through the shared router" {
     try std.testing.expect(server.hasRoute(.post, "/custom/v9/embed"));
     try std.testing.expect(server.hasRoute(.post, "/custom/v9/embeddings"));
     try std.testing.expect(server.hasRoute(.get, "/custom/v9/models"));
-    try std.testing.expect(server.hasRoute(.get, "/custom/v9/models/runtime"));
-    try std.testing.expect(server.hasRoute(.post, "/custom/v9/models/load"));
-    try std.testing.expect(server.hasRoute(.post, "/custom/v9/models/unload"));
+    try std.testing.expect(!server.hasRoute(.get, "/custom/v9/models/runtime"));
+    try std.testing.expect(!server.hasRoute(.post, "/custom/v9/models/load"));
+    try std.testing.expect(!server.hasRoute(.post, "/custom/v9/models/unload"));
     try std.testing.expect(server.hasRoute(.get, "/custom/v9/metrics"));
 }
 

@@ -5,6 +5,8 @@
 @import "@xyflow/react/dist/style.css";
 @import "@antfly/graph/styles.css";
 
+/* Keep app utilities discoverable in ignored .worktrees checkouts. */
+@source "./";
 @source "../node_modules/@antfly/design-system/dist/**/*.js";
 @source "../../../packages/graph/src/**/*.{ts,tsx,js,jsx}";
 @source "../node_modules/streamdown/dist/*.js";

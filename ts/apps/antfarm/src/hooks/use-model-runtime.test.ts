@@ -60,7 +60,7 @@ describe("useModelRuntime", () => {
     await waitFor(() => expect(hook.result.current.loading).toBe(false));
 
     expect(fetchMock).toHaveBeenCalledWith(
-      "http://inference.test/ai/v1/models/runtime",
+      "http://inference.test/ai/v1/_antfarm/models/status",
       expect.objectContaining({ credentials: "same-origin" })
     );
     expect(hook.result.current.runtimeFor("embedder", "acme/embed")?.runtimes[0]).toMatchObject({
@@ -83,7 +83,7 @@ describe("useModelRuntime", () => {
 
     expect(fetchMock).toHaveBeenNthCalledWith(
       2,
-      "http://inference.test/ai/v1/models/unload",
+      "http://inference.test/ai/v1/_antfarm/models/unload",
       expect.objectContaining({ method: "POST", body: JSON.stringify({ runtime_id: "runtime-1" }) })
     );
     expect(fetchMock).toHaveBeenCalledTimes(3);

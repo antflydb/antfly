@@ -1,14 +1,30 @@
-import type { components } from "@antfly/sdk";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useApiConfig } from "@/hooks/use-api-config";
 
-export type ModelRuntimeState = components["schemas"]["InferenceModelRuntimeState"];
-export type ModelRuntimeInstance = components["schemas"]["InferenceModelRuntime"];
-export type ModelRuntime = components["schemas"]["InferenceModelRuntimeModel"];
-type ModelRuntimeResponse = components["schemas"]["InferenceModelRuntimeResponse"];
-type RuntimeActionResponse =
-  | components["schemas"]["InferenceModelRuntimeLoadResponse"]
-  | components["schemas"]["InferenceModelRuntimeUnloadResponse"];
+// Private Antfarm wire types; model-cache controls are not a public SDK contract.
+export type ModelRuntimeState = "loading" | "loaded" | "in_use";
+export interface ModelRuntimeInstance {
+  runtime_id: string;
+  state: ModelRuntimeState;
+  runtime_kind: "primary" | "composite";
+  active_requests: number;
+  startup_managed: boolean;
+  backend?: string | null;
+  device?: string | null;
+  residency_mode: "backend_managed" | "streamed" | "resident";
+  last_used_ms: number;
+}
+export interface ModelRuntime {
+  task: string;
+  model: string;
+  load_state: string;
+  runtimes: ModelRuntimeInstance[];
+}
+interface ModelRuntimeResponse {
+  object: "model_runtime";
+  models: ModelRuntime[];
+}
+type RuntimeActionResponse = { outcome: string; model?: ModelRuntime };
 
 export class ModelRuntimeError extends Error {
   readonly code?: string;
@@ -63,7 +79,7 @@ export function useModelRuntime(): ModelRuntimeStateResult {
   const { inferenceApiUrl } = useApiConfig();
   // Lifecycle endpoints always describe the local runtime. Callers decide
   // whether a catalog row is local or provider-managed from its connection.
-  const endpoint = `${inferenceApiUrl}/ai/v1/models/runtime`;
+  const endpoint = `${inferenceApiUrl}/ai/v1/_antfarm/models/status`;
   const [models, setModels] = useState<ModelRuntime[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -153,7 +169,7 @@ export function useModelRuntime(): ModelRuntimeStateResult {
       setError(null);
       try {
         const response = await runtimeRequest<RuntimeActionResponse>(
-          `${inferenceApiUrl}/ai/v1/models/${path}`,
+          `${inferenceApiUrl}/ai/v1/_antfarm/models/${path}`,
           { method: "POST", body: JSON.stringify(body), signal: controller.signal }
         );
         if (generation !== endpointGenerationRef.current || controller.signal.aborted) {

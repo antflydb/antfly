@@ -62,6 +62,7 @@ interface ReadResponse {
   object: "list";
   model: string;
   data: ReadResult[];
+  usage?: { completion_tokens: number };
 }
 
 interface UploadedImage {
@@ -475,6 +476,12 @@ const ReaderPlaygroundPage: React.FC = () => {
               <Zap className="h-3 w-3" />
               {readResult.model}
             </Badge>
+            {readResult.usage != null && (
+              <Badge className="gap-1.5">
+                <Hash className="h-3 w-3" />
+                {readResult.usage.completion_tokens} output tokens
+              </Badge>
+            )}
             {processingTime != null && (
               <Badge className="gap-1.5">
                 <Clock className="h-3 w-3" />

@@ -118,7 +118,7 @@ async function installApiMocks(page: Page) {
   });
 
   await page.route("**/healthz", (route) => route.fulfill({ json: { status: "ok" } }));
-  await page.route("**/ai/v1/models/runtime", (route) =>
+  await page.route("**/ai/v1/_antfarm/models/status", (route) =>
     route.fulfill({ json: { object: "model_runtime", models: [] } })
   );
   await page.route("**/ai/v1/models", (route) =>
@@ -344,15 +344,15 @@ test.describe("AI workflow routes", () => {
         : [],
     });
 
-    await page.route("**/ai/v1/models/runtime", (route) =>
+    await page.route("**/ai/v1/_antfarm/models/status", (route) =>
       route.fulfill({ json: { object: "model_runtime", models: [runtimeModel()] } })
     );
-    await page.route("**/ai/v1/models/load", async (route) => {
+    await page.route("**/ai/v1/_antfarm/models/load", async (route) => {
       loaded = true;
       actions.push("load");
       await route.fulfill({ json: { outcome: "loaded", model: runtimeModel() } });
     });
-    await page.route("**/ai/v1/models/unload", async (route) => {
+    await page.route("**/ai/v1/_antfarm/models/unload", async (route) => {
       loaded = false;
       actions.push("unload");
       await route.fulfill({ json: { outcome: "unloaded", runtime_id: "runtime-1" } });
@@ -413,6 +413,7 @@ test.describe("AI workflow routes", () => {
         json: {
           object: "list",
           model: "mock-reader",
+          usage: { completion_tokens: 8 },
           data: [
             { index: 1, text: "second image text" },
             { index: 0, text: "first image text" },
@@ -435,6 +436,7 @@ test.describe("AI workflow routes", () => {
     await expect(page.getByAltText("second.png").first()).toBeVisible();
     await page.getByRole("button", { name: "Read Images" }).click();
 
+    await expect(page.getByText("8 output tokens")).toBeVisible();
     await expect(page.getByText("first image text")).toBeVisible();
     await page.getByRole("button", { name: "Image 2" }).click();
     await expect(page.getByText("second image text")).toBeVisible();

@@ -223,37 +223,6 @@ pub const Client = struct {
         return ApiResponse(types.ModelsResponse).fromResponse(self.allocator, &resp);
     }
 
-    /// Load a model into the local runtime cache
-    /// POST /models/load
-    pub fn loadModelRuntime(self: *@This(), body: types.ModelRuntimeLoadRequest) !ApiResponse(types.ModelRuntimeLoadResponse) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/models/load", .{self.base_url});
-        defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
-        defer self.allocator.free(json_body);
-        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return ApiResponse(types.ModelRuntimeLoadResponse).fromResponse(self.allocator, &resp);
-    }
-
-    /// Inspect locally cached model runtimes
-    /// GET /models/runtime
-    pub fn listModelRuntimes(self: *@This()) !ApiResponse(types.ModelRuntimeResponse) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/models/runtime", .{self.base_url});
-        defer self.allocator.free(url);
-        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
-        return ApiResponse(types.ModelRuntimeResponse).fromResponse(self.allocator, &resp);
-    }
-
-    /// Unload one exact local runtime incarnation
-    /// POST /models/unload
-    pub fn unloadModelRuntime(self: *@This(), body: types.ModelRuntimeUnloadRequest) !ApiResponse(types.ModelRuntimeUnloadResponse) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/models/unload", .{self.base_url});
-        defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
-        defer self.allocator.free(json_body);
-        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return ApiResponse(types.ModelRuntimeUnloadResponse).fromResponse(self.allocator, &resp);
-    }
-
     /// Run a traditional ML predictor
     /// POST /predict
     pub fn predict(self: *@This(), body: types.PredictRequest) !ApiResponse(types.PredictResponse) {
