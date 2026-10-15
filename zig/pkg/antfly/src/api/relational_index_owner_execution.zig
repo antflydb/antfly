@@ -220,13 +220,17 @@ pub const ControlResponse = union(enum) {
                     .advanced => |item| item.binding,
                     .complete => |item| item.binding,
                     .inventory => |item| item.binding,
+                    .generation => |item| item.binding,
                 };
                 if (binding.fence.namespace.table_id != request.table_id) return error.InvalidPrivateIndexNativeReceipt;
                 var build = try native.BuildRequest.init(.{ .id = request.id, .plan_digest = binding.plan_digest, .owner_digest = binding.owner_digest, .ordinal = binding.ordinal, .namespace = binding.fence.namespace, .owner_group_id = request.group_id }, binding, request.build_budget orelse .{});
                 if (request.operation == .validate) {
-                    if (value.outcome != .inventory) return error.InvalidPrivateIndexNativeReceipt;
-                    build.target_expectation = value.outcome.inventory.record.expected;
-                } else if (value.outcome == .inventory) return error.InvalidPrivateIndexNativeReceipt;
+                    build.target_expectation = switch (value.outcome) {
+                        .inventory => |item| item.record.expected,
+                        .generation => |item| item.record.expected,
+                        else => return error.InvalidPrivateIndexNativeReceipt,
+                    };
+                } else if (value.outcome == .inventory or value.outcome == .generation) return error.InvalidPrivateIndexNativeReceipt;
                 try value.outcome.validateFor(build);
                 return;
             },
@@ -364,7 +368,7 @@ pub fn claimHttpFailure(status: u16, body: []const u8) ?anyerror {
         408 => inline for (.{ error.Canceled, error.Cancelled, error.DeadlineExceeded }) |err| {
             if (std.mem.eql(u8, body, @errorName(err))) return err;
         },
-        503 => inline for (.{ error.InvalidPrivateIndexClaimReceipt, error.InvalidPrivateIndexClaimInventory, error.InvalidPrivateIndexOwnerJob, error.InvalidPrivateIndexInputs, error.InvalidPrivateIndexNativeReceipt, error.PrivateIndexJobRequired, error.PrivateIndexRootRecoveryRequired, error.PrivateIndexPublicationRequired, error.PrivateIndexCancellationPending, error.PrivateIndexCancellationRequired, error.ImmutableRelationalIndexDefinitionConflict, error.InvalidIndexPublicationCandidate, error.InvalidRelationalIndexProgress, error.MissingRelationalIndexDefinitions, error.RelationalIndexCatalogSchemaMismatch, error.InvalidPrivateIndexCancellation, error.ResourceBudgetExceeded, error.PrivateIndexClaimBacklogFull }) |err| {
+        503 => inline for (.{ error.InvalidPrivateIndexClaimReceipt, error.InvalidPrivateIndexClaimInventory, error.InvalidPrivateIndexOwnerJob, error.InvalidPrivateIndexInputs, error.InvalidPrivateIndexNativeReceipt, error.PrivateIndexJobRequired, error.PrivateIndexRootRecoveryRequired, error.PrivateIndexPublicationRequired, error.PrivateIndexCancellationPending, error.PrivateIndexCancellationRequired, error.ImmutableRelationalIndexDefinitionConflict, error.InvalidIndexPublicationCandidate, error.InvalidRelationalIndexProgress, error.InvalidRelationalIndexValidation, error.PrivateIndexTargetValidationRequired, error.MissingRelationalIndexDefinitions, error.RelationalIndexCatalogSchemaMismatch, error.InvalidPrivateIndexCancellation, error.ResourceBudgetExceeded, error.PrivateIndexClaimBacklogFull }) |err| {
             if (std.mem.eql(u8, body, @errorName(err))) return err;
         },
         else => {},
@@ -1054,6 +1058,8 @@ const TestDriver = struct {
     pending: bool = false,
     build_pages: usize = 0,
     inventory_pages: usize = 0,
+    generation_pages: usize = 0,
+    inventory_finished: bool = false,
     source_reads: usize = 0,
     source_failed: bool = false,
     acceptance_head: ?delivery_journal.Head = null,
@@ -1189,7 +1195,15 @@ const TestDriver = struct {
         const binding = self.binding orelse return error.PrivateIndexRootRecoveryRequired;
         try request.requireBinding(binding);
         if (request.target_expectation) |expected| {
+            if (self.inventory_finished) {
+                self.generation_pages += 1;
+                const position: local.storage_db_receipt_position.Native = .{ .namespace = binding.fence.namespace, .sequence = 7 };
+                // Scheduling-only physical progress; real durable generation
+                // bytes and replay are qualified by the independent LSM tests.
+                return .{ .root_generation = self.root_generation, .outcome = try parsed(native.BuildResponse, alloc, .{ .generation = .{ .binding = binding, .record = .{ .expected = expected, .inventory_digest = @splat(9), .source_members = 1, .fields = .{ .phase = .ready, .counts = @splat(1), .chain = @splat(7), .cursor_digest = local.storage_db_relational_integrity_contract.hash("") }, .position = position, .page_digest = @splat(8) }, .position = position, .duplicate = false } }) };
+            }
             self.inventory_pages += 1;
+            self.inventory_finished = true;
             const address = try local.storage_db_relational_integrity_contract.Address.init(expected.generation, "logical\x00\xff\x80");
             const position: local.storage_db_receipt_position.Native = .{ .namespace = binding.fence.namespace, .sequence = 6 };
             return .{ .root_generation = self.root_generation, .outcome = try parsed(native.BuildResponse, alloc, .{ .inventory = .{ .binding = binding, .record = .{ .expected = expected, .fields = .{ .phase = .ready, .rows = 1, .inventory_xor = expected.inventory_xor, .chain = @splat(7), .cursor = jobs.private_claims.inventoryKey(address) }, .position = position, .page_digest = @splat(8) }, .position = position, .duplicate = false } }) };
@@ -1469,6 +1483,7 @@ fn testSchedulerDeliveryFault(alloc: std.mem.Allocator, permission: publication.
         _ = try coordinator.step(std.testing.io, alloc, null, &host, &transport, now);
     }
     try std.testing.expect(driver.inventory_pages != 0);
+    try std.testing.expect(driver.generation_pages != 0);
     try std.testing.expectEqual(@as(usize, 1), driver.build_pages);
     try std.testing.expectEqual(@as(usize, 1), driver.consumption_calls);
     try std.testing.expect(driver.value.head.phase == .building);

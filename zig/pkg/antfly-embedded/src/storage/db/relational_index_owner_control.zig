@@ -29,10 +29,11 @@ const private_claims = @import("relational_index_private_claims.zig");
 const integrity = @import("relational_integrity_contract.zig");
 const Allocator = std.mem.Allocator;
 const pages = @import("relational_index_jobs.zig");
+const validation = @import("relational_index_validation.zig");
 const resources = @import("../resource_manager.zig");
 const RequestContext = @import("../../api/operation.zig").RequestContext;
 const Waiters = @import("../admission_waiter.zig").Fifo(void);
-pub const envelope_version = 25;
+pub const envelope_version = 26;
 pub const max_cancellation_wire_bytes = 32 * 1024;
 pub const max_encoded_inputs = std.base64.standard.Encoder.calcSize(inputs.max_bytes);
 pub const max_claim_wire_bytes = 6 * private_claims.max_bytes + 128 * 1024;
@@ -311,6 +312,7 @@ pub const Effect = union(enum) {
     build: pages.Page.PrivateCommand,
     consume: ConsumeCommand,
     inventory_validation: private_claims.InventoryValidation.Command,
+    generation_validation: validation.Command,
 
     pub fn namespace(self: Effect) @FieldType(Native, "namespace") {
         return switch (self) {
@@ -318,6 +320,7 @@ pub const Effect = union(enum) {
             .claims => |value| value.binding.fence.namespace,
             .consume => |value| value.binding.fence.namespace,
             .inventory_validation => |value| value.binding.fence.namespace,
+            .generation_validation => |value| value.binding.fence.namespace,
             .build => |value| value.binding.fence.namespace,
             .cancel_intent => |value| value.fence.namespace,
             .cancel_cleanup => |value| value.fence.namespace,
@@ -330,6 +333,7 @@ pub const Effect = union(enum) {
             .claims => |value| try value.validate(),
             .consume => |value| try value.validate(),
             .inventory_validation => |value| try value.validate(),
+            .generation_validation => |value| try value.validate(),
             .build => |value| try value.validate(),
             .cancel_intent => |value| try value.validate(),
             .cancel_cleanup => |value| {
@@ -345,6 +349,7 @@ pub const Effect = union(enum) {
             .claims => max_claim_wire_bytes,
             .build => pages.Page.PrivateCommand.max_wire_bytes,
             .inventory_validation => private_claims.InventoryValidation.max_wire_bytes,
+            .generation_validation => validation.max_wire_bytes,
             else => max_cancellation_wire_bytes,
         };
     }
@@ -718,10 +723,12 @@ pub const BuildResponse = union(enum) {
     advanced: BuildOutcome,
     complete: BuildCompletion,
     inventory: InventoryOutcome,
+    generation: GenerationOutcome,
 
     pub fn validateFor(self: BuildResponse, request: BuildRequest) !void {
         switch (self) {
             .inventory => |value| try value.validateFor(request),
+            .generation => |value| try value.validateFor(request),
             .complete => |value| try value.validateFor(request),
             .advanced => |value| {
                 if (request.target_expectation != null) return error.InvalidPrivateIndexNativeReceipt;
@@ -786,6 +793,87 @@ pub const PreparedInventoryValidation = struct {
     pub fn populateReceipt(_: *const @This(), _: anytype, _: *InventoryOutcome) !void {}
     pub fn preparePayload(self: *@This()) !void {
         try prepareNativePayload(self, "inventory_validation", self.batch.command, private_claims.InventoryValidation.max_wire_bytes);
+    }
+    pub fn finalizePayload(self: *@This(), position: Native) ![]const u8 {
+        return finalizeNativePayload(self, position);
+    }
+};
+
+/// Physical generation verification remains unsigned progress. Metadata must
+/// still authenticate/join the physical proofs before accepting validation.
+pub const GenerationOutcome = struct {
+    binding: jobs.Binding,
+    record: validation.Summary,
+    position: Native,
+    duplicate: bool,
+    replication_pending: bool = false,
+    error_name: ?[]const u8 = null,
+    pub fn validateFor(self: GenerationOutcome, request: BuildRequest) !void {
+        try request.requireBinding(self.binding);
+        const expected = request.target_expectation orelse return error.InvalidPrivateIndexNativeReceipt;
+        try self.record.validate();
+        if (!std.mem.eql(u8, &try expected.digest(), &try self.record.expected.digest()) or
+            !std.meta.eql(self.position, self.record.position) or !self.position.namespace.eql(request.identity.namespace) or
+            self.replication_pending != (self.error_name != null)) return error.InvalidPrivateIndexNativeReceipt;
+    }
+};
+pub const PreparedGenerationValidation = struct {
+    pub const ApplyOutcome = GenerationOutcome;
+    alloc: Allocator,
+    page: validation.Prepared,
+    payload: ?[]u8 = null,
+    prefix_len: usize = 0,
+    pub fn prepare(alloc: Allocator, core: anytype, reservation: *const Prepared, expected: private_claims.TargetExpectation, budget: pages.Budget, context: RequestContext) !?@This() {
+        if (reservation.command.effect != .reserved) return error.PrivateIndexOwnerJobChanged;
+        const artifacts = if (reservation.artifacts) |*value| value else return error.InvalidPrivateIndexOwnerJob;
+        var binding = reservation.command.binding;
+        binding.phase = .reserved;
+        const page = (try validation.Prepared.prepare(alloc, core, binding, expected, &artifacts.addition, budget, context)) orelse return null;
+        return .{ .alloc = alloc, .page = page };
+    }
+    pub fn replay(alloc: Allocator, core: anytype, command: validation.Command) !@This() {
+        try command.validate();
+        var view = core.acquireSchemaView() orelse return error.RelationalTableRequired;
+        defer view.release();
+        var read = try core.store.beginReadTxn();
+        defer read.abort();
+        try jobs.requireReserved(&read, command.binding);
+        var manifest = try inputs.Prepared.load(alloc, &read, command.binding.inputs_digest);
+        defer manifest.deinit();
+        var artifacts = try Artifacts.init(alloc, view, &read, manifest.bytes);
+        defer artifacts.deinit();
+        if (!std.mem.eql(u8, &artifacts.unique.generation, &command.expected.generation)) return error.PrivateIndexOwnerJobChanged;
+        return .{ .alloc = alloc, .page = try validation.Prepared.replay(alloc, core, &artifacts.addition, command) };
+    }
+    pub fn deinit(self: *@This()) void {
+        if (self.payload) |bytes| self.alloc.free(bytes);
+        self.page.deinit();
+        self.* = undefined;
+    }
+    pub fn validate(self: *const @This()) !void {
+        try self.page.context.ensureActive();
+        try self.page.command.validate();
+    }
+    pub fn namespace(self: *const @This()) @FieldType(Native, "namespace") {
+        return self.page.command.binding.fence.namespace;
+    }
+    pub fn validateReplay(self: *const @This(), position: Native) !void {
+        try (Frame{ .effect = .{ .generation_validation = self.page.command }, .position = position }).validate();
+    }
+    pub fn replayDuplicateOutcome(self: *const @This(), position: Native) GenerationOutcome {
+        const command = self.page.command;
+        return .{ .binding = command.binding, .record = .{ .expected = command.expected, .inventory_digest = command.inventory_digest, .source_members = command.source_members, .fields = command.next, .position = position, .page_digest = command.digest() catch unreachable }, .position = position, .duplicate = true };
+    }
+    pub fn stage(self: *@This(), core: anytype, txn: anytype, position: ?Native) !GenerationOutcome {
+        const result = try self.page.stage(core, txn, position);
+        return .{ .binding = self.page.command.binding, .record = result.summary, .position = result.summary.position, .duplicate = result.duplicate };
+    }
+    pub fn hasPublicationReceipt(_: *const @This()) bool {
+        return false;
+    }
+    pub fn populateReceipt(_: *const @This(), _: anytype, _: *GenerationOutcome) !void {}
+    pub fn preparePayload(self: *@This()) !void {
+        try prepareNativePayload(self, "generation_validation", self.page.command, validation.max_wire_bytes);
     }
     pub fn finalizePayload(self: *@This(), position: Native) ![]const u8 {
         return finalizeNativePayload(self, position);

@@ -240,6 +240,29 @@ pub const ClaimProjection = struct {
     tuple: tuples.TuplePlan,
 };
 
+/// The repair and read-only validation paths use the same schema-bound row
+/// projection. Scratch is reused across rows; payload ownership stays with the
+/// caller's short-lived row arena, never the immutable schema registry.
+pub const RowProjection = struct {
+    alloc: Allocator,
+    source: ?registry.SchemaView = null,
+    tuple: ?tuples.TuplePlan = null,
+    cover: ?@import("relational_index_cover.zig").Source = null,
+    predicate: ?@import("relational_index_predicate.zig").Source = null,
+    encoded: std.ArrayList(u8) = .empty,
+    pub fn deinit(self: *@This()) void {
+        if (self.tuple) |*value| value.deinit();
+        if (self.cover) |*value| value.deinit();
+        if (self.predicate) |*value| value.deinit();
+        self.encoded.deinit(self.alloc);
+        if (self.source) |*view| view.release();
+    }
+    pub fn prepare(self: *@This(), payload_alloc: Allocator, core: anytype, pinned: catalog.WriteSnapshot, index: plans.BoundIndex, row: []const u8, document: []const u8) !?struct { tuple: []const u8, payload: []const u8 } {
+        const payload = (try Page.prepareTuple(self.alloc, payload_alloc, core, pinned, index, row, document, &self.source, &self.tuple, &self.cover, &self.predicate, &self.encoded)) orelse return null;
+        return .{ .tuple = self.encoded.items, .payload = payload };
+    }
+};
+
 pub const Page = struct {
     arena: std.heap.ArenaAllocator,
     pinned: catalog.WriteSnapshot,

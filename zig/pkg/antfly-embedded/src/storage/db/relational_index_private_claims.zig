@@ -1092,6 +1092,16 @@ pub const InventoryValidation = struct {
         if (!record.position.namespace.eql(binding.fence.namespace) or record.position.sequence <= provenance.reserved or record.position.sequence > provenance.maximum) return error.InvalidPrivateIndexClaimInventory;
         return record;
     }
+    pub fn requireReady(alloc: Allocator, txn: anytype, binding: jobs.Binding, expected: TargetExpectation) !struct { digest: integrity.Digest, source_members: u64, position: Native } {
+        _ = try requireLocal(txn, binding, expected);
+        const record = (try load(alloc, txn, binding)) orelse return error.PrivateIndexTargetValidationRequired;
+        if (record.fields.phase != .ready or !std.mem.eql(u8, &try record.expected.digest(), &try expected.digest())) return error.PrivateIndexTargetValidationRequired;
+        const encoded = try record.encode(alloc);
+        defer alloc.free(encoded);
+        const head = (try SourceStream.load(txn, binding)).?;
+        const consumed = (try SourceStream.loadConsumption(txn, binding, head)).?;
+        return .{ .digest = hash(encoded), .source_members = consumed.accepted.rows, .position = record.position };
+    }
     pub const Prepared = struct {
         command: Command,
         context: @import("../../api/operation.zig").RequestContext,

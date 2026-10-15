@@ -7022,3 +7022,65 @@ source EOF, progress and cut, not the entire retained scan prefix. Public UNIQUE
 activation remains guarded. Original SQL dispositions remain 483 implemented /
 862 unresolved; this work does not qualify another original SQL case or claim a
 throughput improvement.
+
+### Bounded read-only physical generation verification
+
+The native worker now advances from completed claim inventory to a separate
+physical generation verifier. It never calls the repair pass and interprets its
+successful repairs as validation. A primary document-prefix pass verifies the
+canonical tuple, covering payload, forward entry, reverse entry and ownership
+companion for each member. It also detects reverse-only orphan document
+prefixes. Generation-local forward and ownership passes reject extras,
+malformed keys, wrong tuples, payload mismatches, orphan companions and
+out-of-range entries. Completeness binds to the consumed local source member
+count, not the independently routed target-claim count. These counts may differ
+on distributed owners.
+
+Repair and verification share the exact schema-bound row-projection kernel.
+Immutable historical views and projected plans are reused within each page;
+child plans are released before their schema view. Per-row scratch retains
+capacity without retaining all decoded rows. Document-prefix successors skip
+unrelated index/artifact fanout. Each turn examines at most 128 records and
+honors cancellation, deadlines and byte/time budgets. Like construction, the
+byte/time budget is soft for one indivisible large row; no new small-key or
+small-row restriction is imposed to make verification pass.
+
+AIGV v1 separates a bounded binary continuation (up to the existing 1 MiB key
+limit) from its fixed summary. Responses never carry that large cursor. Native
+envelope 26 carries the continuation compactly as base64 only in the ordered
+effect; replay recomputes actual row/pair contents, counts, cursor and chain
+before accepting it. Native authority, progress, transport marker and durable
+outbox remain one atomic mutation. Exact replay is inert; structural recovery
+checks the retained inventory/source/cut binding. Cancellation cleanup retires
+both inventory and generation checkpoints. Metadata decoder floor 44 covers
+the progress contract, not authenticated native publication capability.
+
+The LSM fixture covers missing forward/reverse/ownership records, a covering
+payload altered with its physical checksum recomputed, malformed forward keys,
+reverse-only and ownership-only orphans, and a primary row removed with all
+its physical companions. Failures are durable across reopen and do not repair
+the injected bytes. Valid data completes all three passes with three-record
+pages, survives restart and uses the shared compiled reservation. Actual
+normalized ingress qualifies generation replay/idempotence. Maximum-size
+cursor codec coverage is explicitly separate from continuation authority: a
+substituted cursor decodes but is rejected by physical replay. Allocator-failure
+and differing source/target cardinality tests qualify their own limited claims.
+
+`/private/tmp/antfly-generation-verifier-full-debug.log` passed 159/159 Debug
+steps, including publication, ACK, leased-owner, C-ABI, runtime-contract,
+native-page and all 104 standalone tests. After source-catalog regeneration,
+`/private/tmp/antfly-generation-verifier-final-debug.log` passed 56/56 steps
+with all 46 runtime-contract and nine native-page tests, including checkpoint
+retirement on cancellation. The final no-repair assertions passed 53/53 Debug
+steps in `/private/tmp/antfly-generation-verifier-no-repair-debug.log`. These
+gates overlap and are not independent SQL coverage. Boundary, license,
+original-inventory, generated control-catalog, formatting and diff checks pass.
+
+Physical generation readiness is still unsigned progress, not a metadata
+validation ACK. Remaining work includes authenticated proof joining and its
+native capability barrier, full prefix re-audit on restore/adoption (including
+claim-only orphans), install/release, durable failure completion, missing-root
+repair, bounded parallel target fanout, actual data-Raft execution, terminal
+catalog publication and complete distributed faults. Public UNIQUE activation
+remains guarded. Original dispositions remain 483 implemented / 862 unresolved;
+no additional original SQL case or throughput improvement is claimed here.

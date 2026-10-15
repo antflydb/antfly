@@ -260,7 +260,7 @@ const Job = struct {
                     }
                     if (response.value != .building) return error.InvalidPrivateIndexNativeReceipt;
                     const pending = switch (response.value.building.outcome) {
-                        .inventory => return error.InvalidPrivateIndexNativeReceipt,
+                        .inventory, .generation => return error.InvalidPrivateIndexNativeReceipt,
                         .advanced => |value| value.replication_pending,
                         .complete => |value| blk: {
                             if (value.state == .failed) return error.PrivateIndexBuildFailed;
@@ -286,7 +286,7 @@ const Job = struct {
                 } else self.retireOwner(index);
             },
             .inventory => {
-                const request: execution.Request = .{ .table_id = self.identity.table_id, .group_id = identity.group_id, .id = self.identity.id, .operation = .validate, .build_budget = .{ .records = 128 } };
+                const request: execution.Request = .{ .table_id = self.identity.table_id, .group_id = identity.group_id, .id = self.identity.id, .operation = .validate, .build_budget = .{ .records = 128, .bytes = 16 * 1024 * 1024 } };
                 var response = try transport.control(alloc, self.table_name.?, request, context_);
                 defer response.deinit();
                 try response.value.validate(request);
@@ -294,20 +294,32 @@ const Job = struct {
                     self.retireOwner(index);
                     return;
                 }
-                if (response.value != .building or response.value.building.outcome != .inventory) return error.InvalidPrivateIndexNativeReceipt;
-                const outcome = response.value.building.outcome.inventory;
-                if (outcome.replication_pending) {
+                if (response.value != .building) return error.InvalidPrivateIndexNativeReceipt;
+                const outcome = response.value.building.outcome;
+                const pending = switch (outcome) {
+                    .inventory => |value| value.replication_pending,
+                    .generation => |value| value.replication_pending,
+                    else => return error.InvalidPrivateIndexNativeReceipt,
+                };
+                if (pending) {
                     owner.retry_at_ns = now_ns +| retry_ns;
                     return;
                 }
-                switch (outcome.record.fields.phase) {
-                    .scanning => {},
-                    .failed => return error.PrivateIndexTargetInventoryMismatch,
-                    .ready => {
-                        // Claims alone are not a generation/publication ACK.
-                        self.retireOwner(index);
-                        self.retry_at_ns = now_ns +| std.time.ns_per_s;
+                switch (outcome) {
+                    .inventory => |value| if (value.record.fields.phase == .failed) {
+                        return error.PrivateIndexTargetInventoryMismatch;
                     },
+                    .generation => |value| switch (value.record.fields.phase) {
+                        .primary, .forward, .ownership => {},
+                        .failed => return error.PrivateIndexGenerationValidationFailed,
+                        .ready => {
+                            // Still unsigned physical progress. The joined
+                            // authenticated metadata ACK is a separate step.
+                            self.retireOwner(index);
+                            self.retry_at_ns = now_ns +| std.time.ns_per_s;
+                        },
+                    },
+                    else => unreachable,
                 }
             },
         }

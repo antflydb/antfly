@@ -89,9 +89,11 @@ const std = @import("std");
 /// final consumed-EOF acknowledgments. It does not imply index installation.
 /// Version 43 freezes target expectations from completed sources and decodes
 /// AIDA v3's fixed EOF-header prefix. This is not native validation capability.
-pub const current_version: u16 = 43;
-pub const index_publication_head_version: u16 = 43;
-pub const index_delivery_version: u16 = 43;
+/// Version 44 decodes bounded physical-generation progress. It does not enable
+/// the authenticated native validation/install/release publication protocol.
+pub const current_version: u16 = 44;
+pub const index_publication_head_version: u16 = 44;
+pub const index_delivery_version: u16 = 44;
 pub const schema_reader_publication_version: u16 = 39;
 pub const schema_reader_floor_version: u16 = 38;
 pub const schema_reader_capability_version: u16 = 37;

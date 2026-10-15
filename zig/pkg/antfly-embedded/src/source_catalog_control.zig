@@ -445,6 +445,7 @@ pub const storage_db_relational_index_publication_progress = @import("storage/db
 pub const storage_db_relational_index_records = @import("storage/db/relational_index_records.zig");
 pub const storage_db_relational_index_status_contract = @import("storage/db/relational_index_status_contract.zig");
 pub const storage_db_relational_index_system_test = @import("storage/db/relational_index_system_test.zig");
+pub const storage_db_relational_index_validation = @import("storage/db/relational_index_validation.zig");
 pub const storage_db_relational_initial_child_publication = @import("storage/db/relational_initial_child_publication.zig");
 pub const storage_db_relational_integrity = @import("storage/db/relational_integrity.zig");
 pub const storage_db_relational_integrity_activation = @import("storage/db/relational_integrity_activation.zig");

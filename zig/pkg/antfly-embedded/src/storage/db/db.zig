@@ -7987,6 +7987,14 @@ pub const DB = struct {
                     defer prepared.deinit();
                     _ = try self.applyPreparedNativeIndexEffect(&prepared, .{ .position = frame.position, .lsn = sequence });
                 },
+                .generation_validation => |command| {
+                    var prepared = native_index_control.PreparedGenerationValidation.replay(self.alloc, self.core, command) catch |err| {
+                        if (try self.replicationMutationAlreadyApplied(sequence)) return;
+                        return err;
+                    };
+                    defer prepared.deinit();
+                    _ = try self.applyPreparedNativeIndexEffect(&prepared, .{ .position = frame.position, .lsn = sequence });
+                },
                 .control => |command| {
                     var prepared = self.prepareNativeIndexOwnerControl(command) catch |err| {
                         // Another replay may retire inputs during preparation.
@@ -8219,6 +8227,7 @@ pub const DB = struct {
                 return err;
             };
         };
+        var advance_generation = false;
         const outcome: native_index_control.InventoryOutcome = if (inventory_page) |value| blk: {
             var prepared: native_index_control.PreparedInventoryValidation = .{ .alloc = alloc, .batch = value };
             defer prepared.deinit();
@@ -8240,10 +8249,49 @@ pub const DB = struct {
                 self.local_execution.durable_replication_outbox_maybe.store(true, .release);
                 self.scheduleDurableReplicationOutboxRecovery();
             }
+            advance_generation = !result.replication_pending and record.fields.phase == .ready;
             break :blk result;
         };
         try outcome.validateFor(request);
+        if (advance_generation) return self.stepNativeIndexGenerationValidation(request, binding, context);
         return .{ .inventory = outcome };
+    }
+
+    fn stepNativeIndexGenerationValidation(self: *DB, request: NativeIndexOwnerBuildRequest, binding: @import("relational_index_owner_job.zig").Binding, context: @import("../../api/operation.zig").RequestContext) !NativeIndexOwnerBuildResponse {
+        const io = self.backend_runtime.io() orelse return error.UnsupportedPlatform;
+        var lease = try self.native_index_build_cache.acquire(io, self.alloc, self.core.index_manager.resource_manager, self.core, request, binding, context);
+        defer lease.deinit();
+        var budget = if (self.core.index_manager.resource_manager) |manager| resource_manager_mod.BudgetedAllocator.initReclaiming(manager, .relational_preparation_working_set, self.alloc, 1) else null;
+        defer if (budget) |*value| value.deinit();
+        const alloc = if (budget) |*value| value.allocator() else self.alloc;
+        var prepared = native_index_control.PreparedGenerationValidation.prepare(alloc, self.core, lease.reservation(), request.target_expectation.?, request.budget, context) catch |err| {
+            if (budget) |value| if (value.denied()) return error.ResourceBudgetExceeded;
+            return err;
+        };
+        defer if (prepared) |*value| value.deinit();
+        const outcome: native_index_control.GenerationOutcome = if (prepared) |*value| self.applyPreparedNativeIndexEffect(value, null) catch |err| {
+            if (budget) |working| if (working.denied()) return error.ResourceBudgetExceeded;
+            return err;
+        } else blk: {
+            try context.ensureActive();
+            try self.enforceReplicationWriteGate();
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            var loaded = (try @import("relational_index_validation.zig").load(alloc, &read, binding)) orelse return error.InvalidRelationalIndexValidation;
+            defer loaded.deinit();
+            const frozen = try @import("relational_index_private_claims.zig").InventoryValidation.requireReady(alloc, &read, binding, request.target_expectation.?);
+            if (!std.mem.eql(u8, &loaded.summary.inventory_digest, &frozen.digest) or loaded.summary.source_members != frozen.source_members or loaded.summary.position.sequence <= frozen.position.sequence) return error.PrivateIndexOwnerJobChanged;
+            var result: native_index_control.GenerationOutcome = .{ .binding = binding, .record = loaded.summary, .position = loaded.summary.position, .duplicate = true };
+            if (try durable_outbox_store.hasPendingTxn(&read)) {
+                result.replication_pending = true;
+                result.error_name = "ReplicationOutboxPending";
+                self.local_execution.durable_replication_outbox_maybe.store(true, .release);
+                self.scheduleDurableReplicationOutboxRecovery();
+            }
+            break :blk result;
+        };
+        try outcome.validateFor(request);
+        return .{ .generation = outcome };
     }
 
     /// Reservation retains its compiled candidate across bounded page prepares.

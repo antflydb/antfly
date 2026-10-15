@@ -689,6 +689,7 @@ pub fn verifyRecovery(alloc: std.mem.Allocator, txn: anytype, active: ?*const ph
     const pages = @import("relational_index_jobs.zig");
     if (job.authority == .native) try @import("relational_index_owner_control.zig").PreparedBuild.verifyRecovery(txn, job);
     if (job.authority == .native) try private_claims.InventoryValidation.verifyRecovery(alloc, txn, job);
+    if (job.authority == .native) try @import("relational_index_validation.zig").verifyRecovery(alloc, txn, job);
     // Decode borrowed progress last: another store read may invalidate it.
     const owner = try pages.ownership(txn);
     if (try optional(txn, &pages.progressKey(job.index))) |bytes| {
@@ -885,6 +886,7 @@ pub fn stageCancellationCleanupWithReplay(txn: anytype, manager: *transactions.T
     try txn.put(&queue_key, &gc.initial(binding.index));
     try @import("relational_index_private_claims.zig").SourceStream.stageCanceled(txn, binding);
     try txn.delete(&private_claims.InventoryValidation.key(binding));
+    try txn.delete(&@import("relational_index_validation.zig").key(binding));
     // No page can resume after this exact cancellation has queued its data.
     // Retire the bounded retry slot before GC removes the progress it binds.
     try txn.delete(@import("relational_index_owner_control.zig").PreparedBuild.checkpoint_key);

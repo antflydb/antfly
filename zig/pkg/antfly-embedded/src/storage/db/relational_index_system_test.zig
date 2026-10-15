@@ -890,7 +890,7 @@ test "relational index build pages identity dispatch caches immutable candidates
     const authority = @import("../source_authority.zig");
     const resources = @import("../resource_manager.zig");
     const before = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"},\"email\":{\"type\":\"string\"}},\"additionalProperties\":false}}}}";
-    const after = "{\"version\":2,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"},\"email\":{\"type\":\"string\"}},\"additionalProperties\":false}}},\"relational_indexes\":[{\"name\":\"email_idx\",\"keys\":[{\"column\":\"email\",\"direction\":\"desc\"}]}],\"unique_constraints\":[{\"name\":\"email_idx\",\"origin\":\"index\",\"columns\":[\"email\"]}]}";
+    const after = "{\"version\":2,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"},\"email\":{\"type\":\"string\"}},\"additionalProperties\":false}}},\"relational_indexes\":[{\"name\":\"email_idx\",\"keys\":[{\"column\":\"email\",\"direction\":\"desc\"}],\"include_columns\":[\"id\"]}],\"unique_constraints\":[{\"name\":\"email_idx\",\"origin\":\"index\",\"columns\":[\"email\"]}]}";
     var directory = try @import("../../common/test_directory.zig").TestDirectory.init("native-index-build-dispatch");
     defer directory.cleanup();
     var resource_options: resources.Options = .{ .identity_allocator = alloc, .memory_budget = .{ .hard_limit_bytes = 1024 * 1024 * 1024 } };
@@ -975,7 +975,7 @@ test "relational index build pages identity dispatch caches immutable candidates
         const result = try db.stepNativeIndexOwnerBuild("items", request, .{});
         try result.validateFor(request);
         switch (result) {
-            .inventory => return error.UnexpectedInventoryValidation,
+            .inventory, .generation => return error.UnexpectedInventoryValidation,
             .advanced => |value| {
                 pages += 1;
                 try std.testing.expect(pages <= 9);
@@ -1382,15 +1382,209 @@ test "relational index build pages identity dispatch caches immutable candidates
             if (fields.phase == .ready) {
                 try std.testing.expectEqual(@as(u64, 32), fields.rows);
                 try std.testing.expectEqualSlices(u8, &expected_xor, &fields.inventory_xor);
-                const observed = try db.stepNativeIndexOwnerBuild("items", validation_request, .{});
-                try observed.validateFor(validation_request);
-                try std.testing.expect(observed.inventory.duplicate);
-                try std.testing.expectEqual(result.inventory.position, observed.inventory.position);
                 break;
             }
             try std.testing.expectEqual(Validation.Phase.scanning, fields.phase);
         }
         // Inventory readiness alone cannot publish the candidate schema.
+        try std.testing.expectEqual(@as(u32, 1), db.core.schema.?.version);
+        const Verification = @import("relational_index_validation.zig");
+        const physical = @import("relational_index_records.zig");
+        const Keys = struct { forward: []u8, reverse: []u8, ownership: []u8, primary: []u8 };
+        const saved_keys: Keys = keys: {
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            var cursor = try read.openCursor();
+            defer cursor.close();
+            const entry = (try cursor.seekAtOrAfter(&try physical.forwardPrefix(binding.index))).?;
+            const forward = try alloc.dupe(u8, entry.key);
+            errdefer alloc.free(forward);
+            const owned = try physical.forwardOwnership(forward);
+            const raw = try std.mem.concat(alloc, u8, &.{ &.{internal.user_namespace}, owned.document_component });
+            defer alloc.free(raw);
+            const document = (try internal.decodeDocumentComponentAlloc(alloc, raw)).?;
+            defer alloc.free(document);
+            var reverse: std.ArrayList(u8) = .empty;
+            errdefer reverse.deinit(alloc);
+            try physical.appendReverseKey(alloc, &reverse, binding.index, document);
+            var ownership: std.ArrayList(u8) = .empty;
+            errdefer ownership.deinit(alloc);
+            try physical.appendOwnershipFromReverse(alloc, &ownership, reverse.items);
+            break :keys .{ .forward = forward, .reverse = try reverse.toOwnedSlice(alloc), .ownership = try ownership.toOwnedSlice(alloc), .primary = try internal.relationalRowKeyAlloc(alloc, document) };
+        };
+        defer inline for (@typeInfo(Keys).@"struct".field_names) |field| alloc.free(@field(saved_keys, field));
+        var saved_values: [4][]u8 = undefined;
+        inline for (@typeInfo(Keys).@"struct".field_names, 0..) |field, i| {
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            saved_values[i] = try alloc.dupe(u8, try read.get(@field(saved_keys, field)));
+        }
+        defer for (saved_values) |value| alloc.free(value);
+        const Fault = enum { missing_forward, missing_reverse, missing_ownership, bad_cover, malformed_forward, orphan_reverse, orphan_ownership, removed_row_and_pairs };
+        for ([_]Fault{ .missing_forward, .missing_reverse, .missing_ownership, .bad_cover, .malformed_forward, .orphan_reverse, .orphan_ownership, .removed_row_and_pairs }) |fault| {
+            var extra: std.ArrayList(u8) = .empty;
+            defer extra.deinit(alloc);
+            if (fault == .malformed_forward) try extra.appendSlice(alloc, &(try physical.forwardPrefix(binding.index))) else {
+                try physical.appendReverseKey(alloc, &extra, binding.index, "orphan");
+                if (fault == .orphan_ownership) {
+                    var ownership: std.ArrayList(u8) = .empty;
+                    defer ownership.deinit(alloc);
+                    try physical.appendOwnershipFromReverse(alloc, &ownership, extra.items);
+                    extra.clearRetainingCapacity();
+                    try extra.appendSlice(alloc, ownership.items);
+                }
+            }
+            {
+                var corrupt = try db.core.store.beginWriteTxn();
+                errdefer corrupt.abort();
+                switch (fault) {
+                    .missing_forward => try corrupt.delete(saved_keys.forward),
+                    .missing_reverse => try corrupt.delete(saved_keys.reverse),
+                    .missing_ownership => try corrupt.delete(saved_keys.ownership),
+                    .bad_cover => {
+                        const value = try alloc.dupe(u8, saved_values[0]);
+                        defer alloc.free(value);
+                        try std.testing.expect(value.len > 4);
+                        value[0] ^= 1;
+                        var crc = @import("antfly_hash").Crc32c.init();
+                        crc.update(saved_keys.forward);
+                        crc.update(value[0 .. value.len - 4]);
+                        std.mem.writeInt(u32, value[value.len - 4 ..][0..4], crc.final(), .little);
+                        try corrupt.put(saved_keys.forward, value);
+                    },
+                    .malformed_forward, .orphan_reverse, .orphan_ownership => try corrupt.put(extra.items, ""),
+                    .removed_row_and_pairs => inline for (@typeInfo(Keys).@"struct".field_names) |field| {
+                        try corrupt.delete(@field(saved_keys, field));
+                    },
+                }
+                try corrupt.commit();
+            }
+            var turns: usize = 0;
+            while (true) {
+                const outcome = try db.stepNativeIndexOwnerBuild("items", validation_request, .{});
+                try outcome.validateFor(validation_request);
+                try std.testing.expect(outcome == .generation);
+                turns += 1;
+                try std.testing.expect(turns <= 40);
+                if (outcome.generation.record.fields.phase == .failed) {
+                    const expected_failure: Verification.Failure = switch (fault) {
+                        .missing_forward => .missing_forward,
+                        .missing_reverse => .missing_reverse,
+                        .missing_ownership => .invalid_ownership,
+                        .bad_cover => .invalid_payload,
+                        .malformed_forward => .malformed_key,
+                        .orphan_reverse, .orphan_ownership => .missing_primary,
+                        .removed_row_and_pairs => .count_mismatch,
+                    };
+                    try std.testing.expectEqual(expected_failure, outcome.generation.record.fields.failure);
+                    {
+                        var inspect = try db.core.store.beginReadTxn();
+                        defer inspect.abort();
+                        switch (fault) {
+                            .missing_forward => try std.testing.expectError(error.NotFound, inspect.get(saved_keys.forward)),
+                            .missing_reverse => try std.testing.expectError(error.NotFound, inspect.get(saved_keys.reverse)),
+                            .missing_ownership => try std.testing.expectError(error.NotFound, inspect.get(saved_keys.ownership)),
+                            .bad_cover => try std.testing.expect(!std.mem.eql(u8, saved_values[0], try inspect.get(saved_keys.forward))),
+                            .malformed_forward, .orphan_reverse, .orphan_ownership => try std.testing.expectEqualStrings("", try inspect.get(extra.items)),
+                            .removed_row_and_pairs => inline for (@typeInfo(Keys).@"struct".field_names) |field| {
+                                try std.testing.expectError(error.NotFound, inspect.get(@field(saved_keys, field)));
+                            },
+                        }
+                    }
+                    db.close();
+                    db = try db_mod.DB.open(alloc, directory.path(), options);
+                    const retained = try db.stepNativeIndexOwnerBuild("items", validation_request, .{});
+                    try std.testing.expect(retained.generation.duplicate);
+                    try std.testing.expectEqualDeep(outcome.generation.record, retained.generation.record);
+                    break;
+                }
+                try std.testing.expect(outcome.generation.record.fields.phase != .ready);
+            }
+            // Privileged fault injection/reset, not a repair endpoint: each
+            // fixture starts from the exact same primary/companion bytes.
+            var reset = try db.core.store.beginWriteTxn();
+            errdefer reset.abort();
+            inline for (@typeInfo(Keys).@"struct".field_names, 0..) |field, i| try reset.put(@field(saved_keys, field), saved_values[i]);
+            try reset.delete(extra.items);
+            try reset.delete(&Verification.key(binding));
+            try reset.commit();
+        }
+        {
+            var lease = try db.native_index_build_cache.acquire(std.testing.io, alloc, &manager, db.core, validation_request, binding, .{});
+            defer lease.deinit();
+            var page = (try native.PreparedGenerationValidation.prepare(alloc, db.core, lease.reservation(), validation_request.target_expectation.?, validation_request.budget, .{})).?;
+            defer page.deinit();
+            {
+                const raw_cursor = try alloc.alloc(u8, @import("relational_index_limits.zig").max_cursor_key_bytes);
+                defer alloc.free(raw_cursor);
+                @memset(raw_cursor, 255);
+                const b64 = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(raw_cursor.len));
+                defer alloc.free(b64);
+                _ = std.base64.standard.Encoder.encode(b64, raw_cursor);
+                var wire_command = page.page.command;
+                wire_command.cursor_b64 = b64;
+                wire_command.next.cursor_digest = @import("relational_integrity_contract.zig").hash(raw_cursor);
+                const packet = try std.json.Stringify.valueAlloc(alloc, .{ .schema_version = native.envelope_version, .request = @as(struct {}, .{}), .index_owner_control = native.Frame{ .effect = .{ .generation_validation = wire_command }, .position = frozen.inventory.position } }, .{});
+                defer alloc.free(packet);
+                var parsed_packet = try @import("replication_effects.zig").decodeBatchMutationRequest(alloc, .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 2, .previous_lsn = 1, .payload = packet });
+                defer parsed_packet.deinit();
+                try std.testing.expectEqualStrings(b64, parsed_packet.value.index_owner_control.?.effect.generation_validation.cursor_b64);
+                // Codec coverage is not a continuation proof: the actual
+                // replayer must reject this substituted physical cursor.
+                try std.testing.expectError(error.InvalidRelationalIndexValidation, native.PreparedGenerationValidation.replay(alloc, db.core, wire_command));
+            }
+            var replayed_page = try native.PreparedGenerationValidation.replay(alloc, db.core, page.page.command);
+            replayed_page.deinit();
+            var forged = page.page.command;
+            forged.next.chain[0] ^= 1;
+            try std.testing.expectError(error.InvalidRelationalIndexValidation, native.PreparedGenerationValidation.replay(alloc, db.core, forged));
+            try page.preparePayload();
+            const sequence = current: {
+                var read = try db.core.store.beginReadTxn();
+                defer read.abort();
+                break :current (try authority.load(&read)).?.sequence + 1;
+            };
+            const position: @import("receipt_position.zig").Native = .{ .namespace = binding.fence.namespace, .sequence = sequence };
+            const payload = try page.finalizePayload(position);
+            const record: @import("replication_record.zig").Record = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 2, .previous_lsn = 1, .payload = payload };
+            try replication_ingress.applyRecord(&db, record);
+            try replication_ingress.applyRecord(&db, record);
+            try std.testing.expectEqual(@as(u64, 2), try db.replicationAppliedSequence());
+        }
+        var turns: usize = 0;
+        var prior_counts: [3]u64 = .{ 3, 0, 0 };
+        while (true) {
+            const outcome = try db.stepNativeIndexOwnerBuild("items", validation_request, .{});
+            try outcome.validateFor(validation_request);
+            const fields = outcome.generation.record.fields;
+            var examined: u64 = 0;
+            for (fields.counts, prior_counts) |count, prior_count| {
+                try std.testing.expect(count >= prior_count);
+                examined += count - prior_count;
+            }
+            try std.testing.expect(examined <= 3);
+            prior_counts = fields.counts;
+            turns += 1;
+            try std.testing.expect(turns <= 40);
+            if (turns == 5) {
+                db.close();
+                db = try db_mod.DB.open(alloc, directory.path(), options);
+                var read = try db.core.store.beginReadTxn();
+                defer read.abort();
+                var retained = (try Verification.load(alloc, &read, binding)).?;
+                defer retained.deinit();
+                try std.testing.expectEqualDeep(outcome.generation.record, retained.summary);
+            }
+            if (fields.phase == .ready) {
+                try std.testing.expectEqualDeep(@as([3]u64, @splat(32)), fields.counts);
+                const observed_generation = try db.stepNativeIndexOwnerBuild("items", validation_request, .{});
+                try std.testing.expect(observed_generation.generation.duplicate);
+                try std.testing.expectEqual(outcome.generation.position, observed_generation.generation.position);
+                break;
+            }
+            try std.testing.expect(fields.phase != .failed);
+        }
+        try std.testing.expectEqual(@as(u64, 1), db.native_index_build_cache.compilations);
         try std.testing.expectEqual(@as(u32, 1), db.core.schema.?.version);
     }
     var cancellation = try db.prepareNativeIndexOwnerCancellation(native.Admission.fromBinding(binding));
@@ -1398,6 +1592,15 @@ test "relational index build pages identity dispatch caches immutable candidates
     _ = try db.applyPreparedNativeIndexOwnerCancellation(&cancellation, null);
     try std.testing.expect(db.native_index_build_cache.entry == null);
     try std.testing.expectError(error.PrivateIndexPublicationCanceled, db.stepNativeIndexOwnerBuild("items", request, .{}));
+    var cleanup = try db.prepareNativeIndexOwnerCleanup(identity);
+    defer cleanup.deinit();
+    _ = try db.applyPreparedNativeIndexOwnerCleanup(&cleanup, null);
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectError(error.NotFound, read.get(&@import("relational_index_private_claims.zig").InventoryValidation.key(binding)));
+        try std.testing.expectError(error.NotFound, read.get(&@import("relational_index_validation.zig").key(binding)));
+    }
     db.close();
     try std.testing.expectEqual(@as(u64, 0), manager.snapshot().slices[slice].used_bytes);
 }
