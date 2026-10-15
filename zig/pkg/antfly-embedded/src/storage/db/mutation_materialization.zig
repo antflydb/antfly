@@ -8396,7 +8396,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     // corruption: advance past the stale upsert and let the following
                     // delete record remove any indexed value. This also prevents TTL
                     // cleanup from wedging replay on an artifact it correctly removed.
-                    if (repair_reason == .missing_artifact and !try denseEmbeddingWriteSourceDocumentExists(ctx, write)) {
+                    // For external indexes the artifact itself is the source: an
+                    // explicit null removes it while leaving the document alive.
+                    if (repair_reason == .missing_artifact and
+                        ((if (ctx.index_manager.denseIndex(index_name)) |entry| entry.external else false) or
+                            !try denseEmbeddingWriteSourceDocumentExists(ctx, write)))
+                    {
                         try removed_indices.append(ctx.alloc, probe.write_index);
                         continue;
                     }
@@ -8442,7 +8447,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     // ordering as dense cleanup. If a later delete already removed
                     // both the source and artifact, this stale upsert is superseded;
                     // the later delete record remains responsible for index removal.
-                    if (reason == .missing_artifact and !try replaySourceDocumentExists(ctx, write.doc_key)) {
+                    // External nulls remove only the authoritative artifact, so
+                    // source document existence cannot distinguish supersession.
+                    if (reason == .missing_artifact and
+                        ((if (ctx.index_manager.sparseIndex(index_name)) |entry| entry.external else false) or
+                            !try replaySourceDocumentExists(ctx, write.doc_key)))
+                    {
                         try removed_indices.append(ctx.alloc, write_idx);
                         continue;
                     }

@@ -24310,6 +24310,16 @@ pub const DB = struct {
                         intent.retained_artifact_keys += 1;
                     }
                 }
+                // Explicit nulls publish vector tombstones in the retained
+                // source frame just like a document delete. Reserve both their
+                // encoded keys and bytes before voting prepared, even when the
+                // current artifact is absent (it may be replaced before apply).
+                for (extracted.deleted_embedding_indexes) |name| {
+                    const key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, intent.key, name);
+                    defer alloc.free(key);
+                    intent.retained_artifact_bytes = std.math.add(u64, intent.retained_artifact_bytes, 16 + key.len) catch return error.TransactionTooLarge;
+                    intent.retained_artifact_keys += 1;
+                }
             } else {
                 const prefix = try internal_keys.artifactRootPrefixAlloc(alloc, intent.key);
                 defer alloc.free(prefix);
@@ -101703,6 +101713,124 @@ test "db document _embeddings external indexes ignore source vector fields and i
         }
         // Ordinary application data need not be parseable as a vector.
         try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"embedding\":\"application data\"}" }}, .sync_level = .full_index });
+    }
+}
+
+test "db document _embeddings transaction null reserves retained artifact tombstones" {
+    const alloc = std.testing.allocator;
+    const retention = @import("../retained_effects.zig");
+    for ([_]bool{ false, true }) |sparse| {
+        var dir = try TestDirectory.init("external-null-transaction");
+        defer dir.cleanup();
+        var db = try DB.open(alloc, dir.path(), .{ .start_index_workers = false, .start_optional_runtimes = false });
+        defer db.close();
+        try db.addIndex(.{ .name = "vec", .kind = if (sparse) .sparse_vector else .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"external\":true}" });
+        const document: [128]u8 = @splat('x');
+        try db.batch(.{ .writes = &.{.{ .key = &document, .value = if (sparse) "{\"title\":\"initial\",\"_embeddings\":{\"vec\":{\"indices\":[7],\"values\":[1]}}}" else "{\"title\":\"initial\",\"_embeddings\":{\"vec\":[1,0,0]}}" }}, .timestamp_ns = 10, .sync_level = .full_index });
+        const key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, &document, "vec");
+        defer alloc.free(key);
+        const before = try db.core.store.get(alloc, key);
+        defer alloc.free(before);
+        {
+            var txn = try db.core.store.beginWriteTxn();
+            errdefer txn.abort();
+            const ns = (try txn.get(&internal_keys.identity_namespace_key))[0..24].*;
+            _ = try retention.admitWithDirectVectors(&txn, ns, 1, @splat(9), retention.default_limit, true);
+            try txn.commit();
+        }
+        const edit = try db.beginTransaction(20);
+        try db.writeTransaction(edit, .{ .transforms = &.{.{ .key = &document, .operations = &.{.{ .op = .set, .path = "caption", .value_json = "\"edited\"" }} }} });
+        try db.resolveTransactionIntentsWithSyncLevel(edit, .committed, 30, .full_index);
+        const after_edit = try db.core.store.get(alloc, key);
+        defer alloc.free(after_edit);
+        try std.testing.expectEqualStrings(before, after_edit);
+        const abort = try db.beginTransaction(40);
+        try db.writeTransaction(abort, .{ .writes = &.{.{ .key = &document, .value = "{\"_embeddings\":{\"vec\":null}}" }} });
+        try db.resolveTransactionIntents(abort, .aborted, 50);
+        const after_abort = try db.core.store.get(alloc, key);
+        defer alloc.free(after_abort);
+        try std.testing.expectEqualStrings(before, after_abort);
+        const remove = try db.beginTransaction(60);
+        try db.writeTransaction(remove, .{ .writes = &.{.{ .key = &document, .value = "{\"title\":\"removed\",\"_embeddings\":{\"vec\":null}}" }} });
+        var reserved: u64 = 0;
+        var retained_before: u64 = 0;
+        {
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            reserved = (try retention.loadReservations(&read)).?.bytes;
+            retained_before = (try retention.load(&read)).?.retained_bytes;
+        }
+        try db.resolveReplicatedTransactionAtOrderedReceipt(remove, .committed, 70, .full_index, .none, .{ .term = 1, .index = 1 }, null);
+        {
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            const actual = (try retention.load(&read)).?.retained_bytes - retained_before;
+            try std.testing.expect(actual <= reserved);
+        }
+        try std.testing.expectError(error.NotFound, db.core.store.get(alloc, key));
+    }
+}
+
+test "db document _embeddings stale replay skips external null with surviving source" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |sparse| {
+        var dir = try TestDirectory.init("external-null-window");
+        defer dir.cleanup();
+        var db = try DB.open(alloc, dir.path(), .{ .start_index_workers = false, .start_optional_runtimes = false });
+        defer db.close();
+        try db.addIndex(.{ .name = "vec", .kind = if (sparse) .sparse_vector else .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"external\":true}" });
+        try db.batch(.{ .writes = &.{.{ .key = "doc", .value = if (sparse) "{\"_embeddings\":{\"vec\":{\"indices\":[7],\"values\":[3]}}}" else "{\"_embeddings\":{\"vec\":[0,0,1]}}" }}, .sync_level = .write });
+        try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"title\":\"survives\",\"_embeddings\":{\"vec\":null}}" }}, .sync_level = .write });
+        const artifact = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc", "vec");
+        defer alloc.free(artifact);
+        // Model an earlier replay window that contains only the stale upsert.
+        // The later null has already committed, but its journal record will be
+        // consumed in a subsequent window. Source document existence is irrelevant.
+        if (sparse) {
+            var writes = try collectSparseEmbeddingWritesForBatch(alloc, db.core.index_manager, &.{}, &.{artifact}, "vec");
+            defer writes.deinit();
+            try filterAndRecordSparseEmbeddingArtifactRepairIssuesForReplay(db.async_context, "vec", &writes, 1);
+            try std.testing.expectEqual(@as(usize, 0), writes.writes.len);
+        } else {
+            var writes = try collectDenseEmbeddingWritesForBatch(alloc, db.core.index_manager, &.{}, &.{artifact}, "vec");
+            defer writes.deinit();
+            try filterAndRecordDenseEmbeddingArtifactRepairIssuesForReplay(db.async_context, "vec", 3, &writes, 1);
+            try std.testing.expectEqual(@as(usize, 0), writes.writes.len);
+        }
+        const issues = try db.listEmbeddingArtifactRepairIssues(alloc, "vec", 0);
+        defer types.freeEmbeddingArtifactRepairIssues(alloc, issues);
+        try std.testing.expectEqual(@as(usize, 0), issues.len);
+        try db.runUntilIdle();
+    }
+}
+
+test "db document _embeddings queued null replacement and omission converge" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |sparse| {
+        var dir = try TestDirectory.init("external-null-queued");
+        defer dir.cleanup();
+        var db = try DB.open(alloc, dir.path(), .{ .start_index_workers = false, .start_optional_runtimes = false });
+        defer db.close();
+        try db.addIndex(.{ .name = "vec", .kind = if (sparse) .sparse_vector else .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"external\":true}" });
+        const value = if (sparse) "{\"title\":\"vector\",\"_embeddings\":{\"vec\":{\"indices\":[7],\"values\":[3]}}}" else "{\"title\":\"vector\",\"_embeddings\":{\"vec\":[0,0,1]}}";
+        try db.batch(.{ .writes = &.{.{ .key = "doc", .value = value }}, .sync_level = .write });
+        try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"_embeddings\":{\"vec\":null}}" }}, .sync_level = .write });
+        try db.batch(.{ .writes = &.{.{ .key = "doc", .value = value }}, .sync_level = .write });
+        try db.batch(.{ .transforms = &.{.{ .key = "doc", .operations = &.{.{ .op = .set, .path = "caption", .value_json = "\"preserved\"" }} }}, .sync_level = .write });
+        try db.runUntilIdle();
+        {
+            var result = try db.search(alloc, .{ .index_name = "vec", .query = if (sparse) .{ .sparse_knn = .{ .indices = &.{7}, .values = &.{1}, .k = 10 } } else .{ .dense_knn = .{ .vector = &.{ 0, 0, 1 }, .k = 10 } }, .limit = 10 });
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+        }
+        try db.batch(.{ .writes = &.{.{ .key = "doc", .value = value }}, .sync_level = .write });
+        try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"_embeddings\":{\"vec\":null}}" }}, .sync_level = .write });
+        db.close();
+        db = try DB.open(alloc, dir.path(), .{});
+        try db.runUntilIdle();
+        var result = try db.search(alloc, .{ .index_name = "vec", .query = if (sparse) .{ .sparse_knn = .{ .indices = &.{7}, .values = &.{1}, .k = 10 } } else .{ .dense_knn = .{ .vector = &.{ 0, 0, 1 }, .k = 10 } }, .limit = 10 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 0), result.hits.len);
     }
 }
 
