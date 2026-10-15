@@ -240,7 +240,7 @@ pub fn resolve(context: anytype, table: catalog.Table, clause: ast.Conflict, bin
     const prepare = context.backend.vtable.prepare_mutations orelse return error.UnsupportedSqlExecution;
     const normalized = try prepare(context.backend.ptr, context.arena, table, proposed);
     if (normalized.len != proposed.len) return error.InvalidSqlBackendResponse;
-    const owners = if (!primary(clause)) try (context.backend.vtable.resolve_conflict_owners orelse return error.UnsupportedSqlExecution)(context.backend.ptr, context.arena, table, .{ .columns = clause.columns, .expressions = binding.arbiter_expressions, .conditions = binding.arbiter_conditions, .constraint_name = clause.constraint_name }, normalized) else null;
+    const owners = if (!primary(clause)) try (context.backend.vtable.resolve_conflict_owners orelse return error.UnsupportedSqlExecution)(context.backend.ptr, context.arena, context.alloc, table, .{ .columns = clause.columns, .expressions = binding.arbiter_expressions, .conditions = binding.arbiter_conditions, .constraint_name = clause.constraint_name }, normalized) else null;
     if (owners) |items| if (items.len != normalized.len) return error.InvalidSqlBackendResponse;
     if (clause.constraint_name == null and clause.columns.len == 0 and clause.expressions.len == 0) {
         for (proposed, normalized) |original, value| {

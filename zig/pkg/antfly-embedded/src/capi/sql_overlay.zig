@@ -139,9 +139,10 @@ pub fn open(alloc: std.mem.Allocator, native: catalog.Cursor, session: *Session,
         if (entry.mutation.predicate_only) continue;
         const mutation = entry.mutation;
         try self.shadowed.put(a, try a.dupe(u8, mutation.key), {});
-        const value = mutation.row orelse continue;
         if (request.primary_key) |key| if (!std.mem.eql(u8, mutation.key, key)) continue;
         if (request.after) |after| if (std.mem.order(u8, mutation.key, after) != .gt) continue;
+        const bytes = entry.encoded_row orelse continue;
+        const value = try std.json.parseFromSliceLeaky(Json, a, bytes, .{ .parse_numbers = false, .allocate = .alloc_always });
         var object: std.json.ObjectMap = .empty;
         const nulls = try a.alloc(bool, table.columns.len);
         for (table.columns, nulls) |column, *sql_null| {

@@ -18,6 +18,7 @@ comptime {
     _ = @import("sql_describe.zig");
 }
 const handles = @import("handles.zig");
+pub const testMaintenanceCaptureAdmission = @import("lite_connection.zig").testMaintenanceCaptureAdmission;
 pub const std = handles.std;
 pub const builtin = handles.builtin;
 pub const local_write = handles.local_write;
@@ -2397,6 +2398,7 @@ pub const LiteResolvedOpenOptions = struct {
     busy_timeout_ms: u64 = 0,
     /// Internal: the connection boundary owns the cross-process path lease.
     externally_locked: bool = false,
+    artifact_reader_fence: bool = false,
 };
 
 pub fn optionFieldType(comptime Options: type, comptime field_name: []const u8) type {
@@ -2631,6 +2633,8 @@ pub fn openLiteHandleAllocWithRuntime(
         backend.native_docstore.?.maintenance_start_suppressed = true;
     }
 
+    backend.native_docstore.?.artifact_reader_fence = resolved.artifact_reader_fence;
+
     var opts = db_mod.OpenOptions{
         .open_mode = resolved.open_mode,
         .external_derived_checkpoints = false,
@@ -2653,11 +2657,12 @@ pub fn openLiteHandleAllocWithRuntime(
     }
     opts.start_resolver_workers = false;
     if (resolved.externally_locked) {
-        // The connection worker drives maintenance while holding its path lease.
+        // The connection worker captures inputs and publishes under short path leases.
         opts.start_independent_maintenance = false;
         opts.executor = .{ .backend = .manual };
         opts.start_optional_runtime_workers = false;
         opts.start_resolver_workers = false;
+        opts.defer_index_backfill_on_open = true;
     }
     try backend.configureDbOpenOptions(&opts);
 
@@ -3084,6 +3089,8 @@ pub fn antfly_db_import_backup(handle_ptr: ?*anyopaque, backup: capi.Slice) call
         return capi.recordError(.busy, @src().fn_name ++ ": close table handles before importing a backup");
     }
     @import("database_backup.zig").validate(handle.alloc, backup.bytes()) catch |err| return capi.mapError(err);
+    @import("sql_ddl.zig").invalidate(handle);
+    handle.sql_commit_recovery_needed = true;
     if (handle.owned_lite_backend != null) {
         @import("database_backup.zig").importLite(handle, backup.bytes()) catch |err| return capi.mapError(err);
     } else {
@@ -4669,6 +4676,7 @@ pub fn antfly_db_set_schema_json(
     }
     defer guard.leave();
     const handle = guard.handle;
+    @import("sql_ddl.zig").invalidate(handle);
     handle.database().*.setSchemaJson(handle.alloc, schema_json.bytes()) catch |err| return capi.mapError(err);
     return .ok;
 }
@@ -5670,8 +5678,6 @@ pub fn executeEmbeddedSql(handle: *Handle, table_name: []const u8, request_json:
         if (value.active and (compiled.statement == .create_table or compiled.statement == .drop_table or compiled.statement == .catalog_ddl or compiled.statement == .policy_ddl)) return error.UnsupportedSqlExecution;
     }
     try @import("tables.zig").loadAvailable(handle);
-    try @import("sql_commit.zig").recover(handle);
-    try @import("sql_ddl.zig").recover(handle);
     var adapter = sql.Adapter(antfly){ .transaction = session, .handle = handle, .db = handle.database(), .table_name = table_name, .read_only = !liteOpenModeCanWrite(handle.open_mode) or (if (session) |value| value.read_only else false) };
     var error_context: antfly.capi_dependencies.sql_errors.Context = .{};
     var result = sql.runtime.execute(handle.alloc, adapter.backend(), &compiled, parsed.value.parameters, .{ .result_rows = parsed.value.limit, .error_context = &error_context }) catch |err| {
