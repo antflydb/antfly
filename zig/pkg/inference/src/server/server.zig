@@ -17261,6 +17261,91 @@ pub const Node = struct {
         });
     }
 
+    pub fn antfarmReaders(_: *Node, ctx: *httpx.Context) !httpx.Response {
+        return ctx.json(.{ .apple_ocr = .{ .available = readers_api.apple.enabled } });
+    }
+
+    /// Antfarm's native OCR adapter uses the existing reader contract and the
+    /// same request permits, media policy, cancellation, and memory admission.
+    pub fn antfarmAppleOcr(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        if (!readers_api.apple.enabled) return ctx.status(501).json(.{ .@"error" = "APPLE_OCR_UNAVAILABLE", .message = "Apple OCR is unavailable on this server" });
+        const Request = struct {
+            images: []const struct { url: []const u8 },
+            recognition_level: @FieldType(readers_api.Config, "recognition_level") = .accurate,
+            recognition_languages: []const []const u8 = &.{"en-US"},
+            uses_language_correction: bool = false,
+        };
+        var parsed = (try ctx.parseJson(Request)) orelse return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "Request body required" });
+        defer parsed.deinit();
+        const body = parsed.value;
+        if (body.images.len == 0 or body.images.len > readers_api.apple.max_images)
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "Provide between one and eight images" });
+        const cfg = readers_api.Config{ .provider = .apple, .recognition_level = body.recognition_level, .recognition_languages = body.recognition_languages, .uses_language_correction = body.uses_language_correction };
+        cfg.validate() catch return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "Invalid OCR recognition options" });
+        var source_bytes: usize = 0;
+        for (body.images) |item| source_bytes = addReadInlineSourceBytes(source_bytes, item.url, readInlineSourceByteCap(self)) catch
+            return ctx.status(413).json(.{ .@"error" = "BATCH_TOO_LARGE", .message = "Inline image sources exceed server capacity" });
+        const admission = readRequestAdmission(self, body.images.len, source_bytes, null);
+        if (try self.acquireSlotUnits(ctx, admission.units)) |response| return response;
+        defer self.releaseSlotUnits(admission.units);
+        const limits = self.config.generation_budget_overrides.apply(self.defaultGenerationLimits(.cpu));
+        var lease = self.model_manager.acquireRunResourceAmounts(.cpu, limits, .{
+            .host_scratch_bytes = readers_api.apple.native_workspace_reservation_bytes + readers_api.apple.max_batch_bytes + readers_api.apple.default_response_bytes,
+        }) catch |err| return inferenceFailureResponse(ctx, err);
+        defer lease.release();
+        const control = httpInferenceExecutionControl(self, ctx);
+        const Cancel = struct {
+            fn check(raw: *const anyopaque) bool {
+                const active: *const InferenceExecutionControl = @ptrCast(@alignCast(raw));
+                active.check() catch return true;
+                return false;
+            }
+        };
+        self.metrics.incRequest("read");
+        defer self.metrics.decActive();
+        const owned = try ctx.allocator.alloc(scraping.DownloadedContent, body.images.len);
+        var filled: usize = 0;
+        defer {
+            for (owned[0..filled]) |*item| item.deinit(ctx.allocator);
+            ctx.allocator.free(owned);
+        }
+        const encoded = try ctx.allocator.alloc(readers_api.EncodedImage, body.images.len);
+        defer ctx.allocator.free(encoded);
+        var bytes: usize = 0;
+        var pixels = ReadDecodedImageBudget.init(admission, effectiveRequestContentSecurity(self).max_image_dimension);
+        for (body.images, 0..) |item, i| {
+            owned[i] = downloadReadBatchContentForRequest(self, ctx.allocator, item.url, @min(admission.byte_cap, readers_api.apple.max_batch_bytes), bytes, .{ .io = ctx.io, .control = control }) catch |err|
+                return remoteContentErrorResponse(ctx, err);
+            filled += 1;
+            bytes += owned[i].data.len;
+            pixels.addImage(owned[i].data) catch |err| return readImageErrorResponse(ctx, err);
+            encoded[i] = .{ .bytes = owned[i].data, .mime_type = image_pipeline.mimeEssenceForEncoded(owned[i].data) orelse return inferenceExecutorContractFailureResponse(ctx, error.InvalidInferenceMedia) };
+        }
+        var result = readers_api.apple.readEncoded(ctx.allocator, cfg, .{ .images = encoded }, .{
+            .timeout_ms = try remainingInferenceDeadlineMs(control.deadline_ns, embedTimingNowNs()),
+            .cancellation = .{ .ptr = &control, .is_cancelled_fn = Cancel.check },
+        }) catch |err| switch (err) {
+            error.AppleOcrBusy => return ctx.status(503).json(.{ .@"error" = "APPLE_OCR_BUSY", .message = "Apple OCR is busy; try again", .retryable = true }),
+            error.UnsupportedAppleOcrLanguage => return ctx.status(400).json(.{ .@"error" = "UNSUPPORTED_LANGUAGE", .message = "The selected OCR language is unavailable on this server" }),
+            error.InferenceDecodedPixelsExceeded, error.InferenceEncodedBytesExceeded, error.ResponseTooLarge => return ctx.status(413).json(.{ .@"error" = "REQUEST_TOO_LARGE", .message = "OCR input or output exceeds server capacity" }),
+            error.InvalidInferenceMedia, error.UnsupportedInferenceMimeType => return ctx.status(400).json(.{ .@"error" = "INVALID_IMAGE", .message = "Apple OCR accepts PNG and JPEG images" }),
+            else => return inferenceFailureResponse(ctx, err),
+        };
+        defer result.deinit(ctx.allocator);
+        // Preserve native pixel coordinates and confidence without a lossy
+        // conversion through the model reader's region representation.
+        var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        const Item = struct { object: []const u8 = "read", index: usize, text: []const u8, regions: std.json.Value };
+        const items = try alloc.alloc(Item, result.items.len);
+        for (result.items, items, 0..) |item, *out, i| {
+            const regions = try std.json.parseFromSlice(std.json.Value, alloc, item.regions_json orelse "[]", .{ .allocate = .alloc_always });
+            out.* = .{ .index = i, .text = item.text, .regions = regions.value };
+        }
+        return ctx.json(.{ .object = "list", .model = "Apple Vision OCR", .data = items });
+    }
+
     pub fn readImages(self: *Node, ctx: *httpx.Context) !httpx.Response {
         const execution_control = httpInferenceExecutionControl(self, ctx);
         const uses_attachment_envelope = requestUsesAttachmentEnvelope(ctx);
@@ -20961,6 +21046,8 @@ pub const Node = struct {
         try router.register(&prefixed);
         // Antfarm implementation detail, intentionally absent from OpenAPI/SDKs.
         // The AI prefix retains the host's inference authentication and permissions.
+        try prefixed.get("/_antfarm/readers", httpx.Handler.bind(self, antfarmReaders));
+        try prefixed.post("/_antfarm/readers/apple", httpx.Handler.bind(self, antfarmAppleOcr));
         try prefixed.get("/_antfarm/models/status", httpx.Handler.bind(self, listModelRuntimes));
         try prefixed.post("/_antfarm/models/load", httpx.Handler.bind(self, loadModelRuntime));
         try prefixed.post("/_antfarm/models/unload", httpx.Handler.bind(self, unloadModelRuntime));
@@ -25326,6 +25413,7 @@ fn inferenceHttpRouteAdmission(comptime method: []const u8, comptime path: []con
     if (comptime std.mem.eql(u8, method, "GET")) {
         if (comptime std.mem.eql(u8, path, "/models") or
             std.mem.eql(u8, path, "/_antfarm/models/status") or
+            std.mem.eql(u8, path, "/_antfarm/readers") or
             std.mem.eql(u8, path, "/predictors") or
             std.mem.eql(u8, path, "/transcription/sessions/:session_id") or
             std.mem.eql(u8, path, "/transcription/sessions/:session_id/events")) return .none;
@@ -25346,6 +25434,7 @@ fn inferenceHttpRouteAdmission(comptime method: []const u8, comptime path: []con
             std.mem.eql(u8, path, "/generate") or
             std.mem.eql(u8, path, "/generate/batch") or
             std.mem.eql(u8, path, "/_antfarm/models/load") or
+            std.mem.eql(u8, path, "/_antfarm/readers/apple") or
             std.mem.eql(u8, path, "/predict") or
             std.mem.eql(u8, path, "/read") or
             std.mem.eql(u8, path, "/rerank") or
@@ -29629,6 +29718,8 @@ test "registerAiRoutesOn excludes Traditional ML predictor routes" {
     try std.testing.expect(server.hasRoute(.post, ai_api_prefix ++ "/embeddings"));
     try std.testing.expect(server.hasRoute(.post, ai_api_prefix ++ "/generate/batch"));
     try std.testing.expect(server.hasRoute(.get, ai_api_prefix ++ "/models"));
+    try std.testing.expect(server.hasRoute(.get, ai_api_prefix ++ "/_antfarm/readers"));
+    try std.testing.expect(server.hasRoute(.post, ai_api_prefix ++ "/_antfarm/readers/apple"));
     try std.testing.expect(server.hasRoute(.get, ai_api_prefix ++ "/_antfarm/models/status"));
     try std.testing.expect(server.hasRoute(.post, ai_api_prefix ++ "/_antfarm/models/load"));
     try std.testing.expect(server.hasRoute(.post, ai_api_prefix ++ "/_antfarm/models/unload"));

@@ -36,6 +36,7 @@ import { PlaygroundEmptyState } from "@/components/branded-empty-state";
 import { BackendInfoBar } from "@/components/playground/BackendInfoBar";
 import { NoModelsGuide } from "@/components/playground/NoModelsGuide";
 import { useApiConfig } from "@/hooks/use-api-config";
+import { APPLE_OCR_READER, useAppleOcr } from "@/hooks/use-apple-ocr";
 import { useSelectedInferenceModels } from "@/hooks/use-connections";
 import { useModelSelection } from "@/hooks/use-model-selection";
 import { findIndexedResult, modelsAcceptingInput } from "@/lib/inference-playground-contracts";
@@ -170,11 +171,24 @@ const ReaderPlaygroundPage: React.FC = () => {
     () => modelsAcceptingInput(connectedModels, "image").map((model) => model.name),
     [connectedModels]
   );
-  const availableReaders = connectionModels;
-  const modelsLoaded = !modelsLoading;
+  const appleOcr = useAppleOcr();
+  const availableReaders = useMemo(
+    () =>
+      appleOcr.loading || modelsLoading
+        ? []
+        : appleOcr.available
+          ? [...connectionModels, APPLE_OCR_READER]
+          : connectionModels,
+    [appleOcr.available, appleOcr.loading, connectionModels, modelsLoading]
+  );
+  const modelsLoaded = !modelsLoading && !appleOcr.loading;
+  const [recognitionLevel, setRecognitionLevel] = useState<"accurate" | "fast">("accurate");
+  const [recognitionLanguages, setRecognitionLanguages] = useState("en-US");
   const { model: selectedReaderModel, setModel: setSelectedReaderModel } = useModelSelection({
     models: availableReaders,
   });
+
+  const isAppleOcr = selectedReaderModel === APPLE_OCR_READER;
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: model/backend identity invalidates in-flight results
   useEffect(() => {
@@ -206,30 +220,43 @@ const ReaderPlaygroundPage: React.FC = () => {
 
   // --- Image handling ---
 
-  const processImageFiles = useCallback((files: FileList | File[]) => {
-    const fileArray = Array.from(files).filter((f) => f.type.startsWith("image/"));
-    for (const file of fileArray) {
-      const reader = new FileReader();
-      reader.onload = (e) => {
-        const dataUri = e.target?.result as string;
-        const img = new Image();
-        img.onload = () => {
-          setImages((prev) => [
-            ...prev,
-            {
-              id: crypto.randomUUID(),
-              name: file.name,
-              dataUri,
-              width: img.naturalWidth,
-              height: img.naturalHeight,
-            },
-          ]);
+  const processImageFiles = useCallback(
+    (files: FileList | File[]) => {
+      const fileArray = Array.from(files).filter((f) => f.type.startsWith("image/"));
+      if (
+        isAppleOcr &&
+        fileArray.some((file) => !["image/png", "image/jpeg"].includes(file.type))
+      ) {
+        setError(
+          "Apple OCR supports PNG and JPEG images. Select a vision model for other formats."
+        );
+        return;
+      }
+      setError(null);
+      for (const file of fileArray) {
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          const dataUri = e.target?.result as string;
+          const img = new Image();
+          img.onload = () => {
+            setImages((prev) => [
+              ...prev,
+              {
+                id: crypto.randomUUID(),
+                name: file.name,
+                dataUri,
+                width: img.naturalWidth,
+                height: img.naturalHeight,
+              },
+            ]);
+          };
+          img.src = dataUri;
         };
-        img.src = dataUri;
-      };
-      reader.readAsDataURL(file);
-    }
-  }, []);
+        reader.readAsDataURL(file);
+      }
+    },
+    [isAppleOcr]
+  );
 
   const handleImageDrop = useCallback(
     (e: React.DragEvent) => {
@@ -260,8 +287,8 @@ const ReaderPlaygroundPage: React.FC = () => {
       setError("Please upload at least one image");
       return;
     }
-    if (!selectedReaderModel) {
-      setError("Please select a model");
+    if (!selectedReaderModel || !availableReaders.includes(selectedReaderModel)) {
+      setError("Please select an available reader");
       return;
     }
 
@@ -274,19 +301,30 @@ const ReaderPlaygroundPage: React.FC = () => {
 
     try {
       const body: Record<string, unknown> = {
-        model: selectedReaderModel,
         images: images.map((img) => ({ url: img.dataUri })),
       };
-      if (prompt.trim()) body.prompt = prompt.trim();
-      if (maxTokens && Number.parseInt(maxTokens, 10) > 0)
-        body.max_tokens = Number.parseInt(maxTokens, 10);
+      if (isAppleOcr) {
+        body.recognition_level = recognitionLevel;
+        body.recognition_languages = recognitionLanguages
+          .split(",")
+          .map((value) => value.trim())
+          .filter(Boolean);
+      } else {
+        body.model = selectedReaderModel;
+        if (prompt.trim()) body.prompt = prompt.trim();
+        if (maxTokens && Number.parseInt(maxTokens, 10) > 0)
+          body.max_tokens = Number.parseInt(maxTokens, 10);
+      }
 
-      const data = await fetchInferenceJson<ReadResponse>(inferenceUrl("read"), {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-        signal: controller.signal,
-      });
+      const data = await fetchInferenceJson<ReadResponse>(
+        inferenceUrl(isAppleOcr ? "_antfarm/readers/apple" : "read"),
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+          signal: controller.signal,
+        }
+      );
       if (abortControllerRef.current !== controller || controller.signal.aborted) return;
       setReadResult(data);
       setProcessingTime(performance.now() - startTime);
@@ -365,7 +403,7 @@ const ReaderPlaygroundPage: React.FC = () => {
         <div>
           <DashboardPageTitle className="font-aeonik">Reader Playground</DashboardPageTitle>
           <DashboardPageDescription>
-            Extract text, structured fields, and regions from images using vision models
+            Extract text, structured fields, and regions using vision models or native OCR
           </DashboardPageDescription>
         </div>
         <DashboardPageActions>
@@ -395,7 +433,7 @@ const ReaderPlaygroundPage: React.FC = () => {
           <CardContent>
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
               <div className="space-y-2">
-                <Label htmlFor="reader-model">Model</Label>
+                <Label htmlFor="reader-model">Reader</Label>
                 <Select
                   value={selectedReaderModel}
                   onValueChange={setSelectedReaderModel}
@@ -415,36 +453,77 @@ const ReaderPlaygroundPage: React.FC = () => {
                   <SelectContent>
                     {availableReaders.map((model) => (
                       <SelectItem key={model} value={model}>
-                        {model}
+                        {model === APPLE_OCR_READER ? "Apple Vision OCR" : model}
                       </SelectItem>
                     ))}
                   </SelectContent>
                 </Select>
               </div>
-              <div className="space-y-2">
-                <Label htmlFor="prompt">Prompt</Label>
-                <Input
-                  id="prompt"
-                  placeholder="Optional prompt..."
-                  value={prompt}
-                  onChange={(e) => setPrompt(e.target.value)}
-                />
-              </div>
-              <div className="space-y-2">
-                <Label htmlFor="max-tokens">Max Tokens</Label>
-                <Input
-                  id="max-tokens"
-                  type="number"
-                  placeholder="Default"
-                  value={maxTokens}
-                  onChange={(e) => setMaxTokens(e.target.value)}
-                />
-              </div>
+              {isAppleOcr ? (
+                <>
+                  <div className="space-y-2">
+                    <Label htmlFor="ocr-recognition-level">Recognition</Label>
+                    <Select
+                      value={recognitionLevel}
+                      onValueChange={(value) => setRecognitionLevel(value as "accurate" | "fast")}
+                    >
+                      <SelectTrigger id="ocr-recognition-level">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="accurate">Accurate</SelectItem>
+                        <SelectItem value="fast">Fast</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="ocr-languages">Languages</Label>
+                    <Input
+                      id="ocr-languages"
+                      value={recognitionLanguages}
+                      onChange={(event) => setRecognitionLanguages(event.target.value)}
+                      placeholder="en-US, fr-FR"
+                    />
+                  </div>
+                  <p className="text-sm text-muted-foreground sm:col-span-3">
+                    Extracts visible text from PNG and JPEG images on the connected Mac. For image
+                    descriptions or questions, select a vision model such as Qwen3-VL. Enter
+                    comma-separated language codes. The first request may take longer.
+                  </p>
+                </>
+              ) : (
+                <>
+                  <div className="space-y-2">
+                    <Label htmlFor="prompt">Prompt</Label>
+                    <Input
+                      id="prompt"
+                      placeholder="Optional prompt..."
+                      value={prompt}
+                      onChange={(e) => setPrompt(e.target.value)}
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="max-tokens">Max Tokens</Label>
+                    <Input
+                      id="max-tokens"
+                      type="number"
+                      placeholder="Default"
+                      value={maxTokens}
+                      onChange={(e) => setMaxTokens(e.target.value)}
+                    />
+                  </div>
+                </>
+              )}
             </div>
             <FormActions>
               <AIWorkflowSubmitButton
                 onClick={handleReadImages}
-                disabled={isLoading || images.length === 0 || !selectedReaderModel}
+                disabled={
+                  isLoading ||
+                  images.length === 0 ||
+                  !availableReaders.includes(selectedReaderModel) ||
+                  (isAppleOcr && !recognitionLanguages.trim())
+                }
                 running={isLoading}
                 runningLabel="Reading…"
                 onCancel={() => {
@@ -521,13 +600,13 @@ const ReaderPlaygroundPage: React.FC = () => {
                 <Upload className="h-8 w-8 mx-auto mb-2 text-muted-foreground" />
                 <p className="text-sm text-muted-foreground">Drop images here or click to browse</p>
                 <p className="text-xs text-muted-foreground mt-1">
-                  Supports PNG, JPG, WebP, and more
+                  {isAppleOcr ? "Supports PNG and JPEG" : "Supports PNG, JPG, WebP, and more"}
                 </p>
               </div>
               <input
                 ref={imageInputRef}
                 type="file"
-                accept="image/*"
+                accept={isAppleOcr ? "image/png,image/jpeg" : "image/*"}
                 multiple
                 className="hidden"
                 onChange={(e) => {
@@ -793,8 +872,9 @@ const ReaderPlaygroundPage: React.FC = () => {
       {/* Help text */}
       <div className="text-xs text-muted-foreground space-y-1">
         <p>
-          Extracts text, structured fields, and text regions from images using vision models (e.g.,
-          Donut, Florence, TrOCR). Set a prompt to guide extraction for specific models.
+          {isAppleOcr
+            ? "Accurate and Fast control text recognition. Photos without readable text may return no text or false detections."
+            : "Use a prompt to guide supported vision models: extract text, describe the image, or ask a question about it."}
         </p>
       </div>
     </AIWorkflowPage>

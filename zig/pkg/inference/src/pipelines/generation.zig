@@ -3469,41 +3469,6 @@ pub const NativeGenerationPipeline = struct {
         return self.generateWithCallback(messages, config, on_token, on_token_ctx);
     }
 
-    // Diagnostic snapshots add no GPU fences. Shared-backend counters can include
-    // peer requests; use a serialized run when attributing them to one request.
-    fn qwenMetalProfileSnapshot(self: *NativeGenerationPipeline) ?ops.BackendDebugTimingSnapshot {
-        if (self.cb.kind() != .metal or self.gpt_config.family != .qwen3_vl or
-            !platform.env.getenvBool("TERMITE_QWEN3VL_PROFILE")) return null;
-        if (self.execution_lock) |mutex| platform.sync.lockYielding(mutex);
-        defer if (self.execution_lock) |mutex| mutex.unlock();
-        return self.cb.debugTimingSnapshot();
-    }
-
-    fn profileQwenMetalPhase(self: *NativeGenerationPipeline, previous: *?ops.BackendDebugTimingSnapshot, phase: []const u8) void {
-        const before = previous.* orelse return;
-        const after = self.qwenMetalProfileSnapshot() orelse return;
-        previous.* = after;
-        const a = after.provider;
-        const b = before.provider;
-        std.log.info("qwen3vl_metal_phase: phase={s} frame_submits={d} frame_wait_ns={d} frame_gpu_ns={d} tensor_download_bytes={d} tensor_device_readbacks={d} runtime_linear_calls={d} quant_device_calls={d} quant_wrapper_calls={d} decode_frame_hits={d} decode_frame_fallbacks={d} runtime_private_bytes={d} runtime_shared_bytes={d} quant_private_bytes={d} quant_mapped_bytes={d}", .{
-            phase,
-            a.decoder_runtime_frame_submits -| b.decoder_runtime_frame_submits,
-            a.decoder_runtime_frame_wait_nanos -| b.decoder_runtime_frame_wait_nanos,
-            a.decoder_runtime_frame_gpu_nanos -| b.decoder_runtime_frame_gpu_nanos,
-            a.metal_tensor_host_mirror_download_bytes -| b.metal_tensor_host_mirror_download_bytes,
-            a.metal_tensor_to_host_device_calls -| b.metal_tensor_to_host_device_calls,
-            a.decoder_runtime_apply_linear_calls -| b.decoder_runtime_apply_linear_calls,
-            after.quant.device_native_calls -| before.quant.device_native_calls,
-            after.quant.wrapper_calls -| before.quant.wrapper_calls,
-            a.active_decode_frame_successes -| b.active_decode_frame_successes,
-            a.active_decode_frame_fallbacks -| b.active_decode_frame_fallbacks,
-            a.metal_runtime_private_bytes,
-            a.metal_runtime_shared_bytes,
-            a.metal_provider_quantized_runtime_private_bytes,
-            a.metal_provider_quantized_runtime_mapped_bytes,
-        });
-    }
-
     fn generateWithCallback(
         self: *NativeGenerationPipeline,
         messages: []const Message,
@@ -3513,7 +3478,6 @@ pub const NativeGenerationPipeline = struct {
     ) !GenerationResult {
         if (self.execution_control) |control| try control.update(.tokenizing, 0, 1);
         const allocator = self.allocator;
-        var qwen_metal_profile = self.qwenMetalProfileSnapshot();
         const started_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
         // Coordinated requests report occupancy under the step mutex instead.
         const ocr_profile_start = if (self.cb.kind() == .metal and self.execution_lock == null and
@@ -4020,7 +3984,6 @@ pub const NativeGenerationPipeline = struct {
         );
 
         const runtime_prepare_started_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
-        self.profileQwenMetalPhase(&qwen_metal_profile, "multimodal_prepare");
         const whole_model_kv_policy = generationKvCapacityPolicyForRoute(
             if (self.compiled_partition_backend == .metal and
                 self.compiled_attachment_target == .whole_model and
@@ -4051,7 +4014,6 @@ pub const NativeGenerationPipeline = struct {
         const runtime_prepared = try self.prepareCompiledGenerationRuntime(runtime_prepare_token_hint);
         debugGenerationStage("prepare compiled generation runtime end prepared={}", .{runtime_prepared});
         const prefill_started_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
-        self.profileQwenMetalPhase(&qwen_metal_profile, "runtime_prepare");
         if (runtime_prepared) {
             debugGenerationStage(
                 "prepared compiled generation runtime prompt_token_count={d} token_hint={d}",
@@ -4118,7 +4080,6 @@ pub const NativeGenerationPipeline = struct {
         const prefill_last_hidden = prefill_output.last_hidden;
         const prefill_last_hidden_rows = prefill_output.last_hidden_rows;
         const finished_prefill_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
-        self.profileQwenMetalPhase(&qwen_metal_profile, "prefill");
         defer if (prefill_last_logits) |logits| allocator.free(logits);
         defer if (prefill_last_hidden) |hidden| self.cb.free(hidden);
         if (config.qwen3vl_parity_logits_path) |path| {
@@ -4933,7 +4894,6 @@ pub const NativeGenerationPipeline = struct {
         }
 
         const text_decode_started_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
-        self.profileQwenMetalPhase(&qwen_metal_profile, "decode");
         const text = try self.tokenizer.decode(allocator, text_gen_ids);
         errdefer allocator.free(text);
         const reasoning_text = if (reasoning_gen_token_ids.len > 0) blk: {

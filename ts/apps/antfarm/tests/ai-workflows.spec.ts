@@ -118,6 +118,9 @@ async function installApiMocks(page: Page) {
   });
 
   await page.route("**/healthz", (route) => route.fulfill({ json: { status: "ok" } }));
+  await page.route("**/ai/v1/_antfarm/readers", (route) =>
+    route.fulfill({ json: { apple_ocr: { available: false } } })
+  );
   await page.route("**/ai/v1/_antfarm/models/status", (route) =>
     route.fulfill({ json: { object: "model_runtime", models: [] } })
   );
@@ -403,6 +406,53 @@ test.describe("AI workflow routes", () => {
     expect(url.searchParams.get("model")).toBe("mock-reader-second");
     expect(url.searchParams.get("connection")).toBe("local-inference");
     await expect(page.getByText("mock-reader-second", { exact: true }).first()).toBeVisible();
+  });
+
+  test("Apple OCR uses native controls and preserves text regions", async ({ page }) => {
+    await page.route("**/ai/v1/_antfarm/readers", (route) =>
+      route.fulfill({ json: { apple_ocr: { available: true } } })
+    );
+    await page.route("**/ai/v1/_antfarm/readers/apple", async (route) => {
+      const body = route.request().postDataJSON();
+      expect(body.recognition_level).toBe("accurate");
+      expect(body.recognition_languages).toEqual(["en-US"]);
+      expect(body.images).toHaveLength(1);
+      expect(body.model).toBeUndefined();
+      expect(body.prompt).toBeUndefined();
+      expect(body.max_tokens).toBeUndefined();
+      await route.fulfill({
+        json: {
+          object: "list",
+          model: "Apple Vision OCR",
+          data: [
+            {
+              object: "read",
+              index: 0,
+              text: "Invoice 12345",
+              regions: [{ text: "Invoice 12345", bbox: [10, 10, 100, 30], confidence: 0.99 }],
+            },
+          ],
+        },
+      });
+    });
+    await page.goto("/inference/playground/read?model=apple-vision-ocr");
+    await expect(page.getByLabel("Recognition")).toBeVisible();
+    await expect(page.getByLabel("Prompt", { exact: true })).toHaveCount(0);
+    await expect(page.getByLabel("Max Tokens", { exact: true })).toHaveCount(0);
+    await page.getByRole("button", { name: "Load Sample" }).click();
+    await page.getByRole("button", { name: "Read Images" }).click();
+    await expect(page.getByText("Invoice 12345", { exact: true }).first()).toBeVisible();
+    await expect(page.getByRole("tab", { name: /Regions/ })).toBeVisible();
+  });
+
+  test("unavailable Apple OCR never becomes a selectable reader", async ({ page }) => {
+    await page.route("**/ai/v1/_antfarm/readers", (route) =>
+      route.fulfill({ json: { apple_ocr: { available: false } } })
+    );
+    await page.goto("/inference/playground/read");
+    await page.getByLabel("Reader", { exact: true }).click();
+    await expect(page.getByRole("option", { name: "Apple Vision OCR" })).toHaveCount(0);
+    await expect(page.getByRole("option", { name: "mock-reader", exact: true })).toBeVisible();
   });
 
   test("reader maps reordered server results to the corresponding images", async ({ page }) => {
