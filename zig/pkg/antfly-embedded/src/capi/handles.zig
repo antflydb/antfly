@@ -79,6 +79,7 @@ pub const Handle = struct {
     embedding_cache_pending_bytes: usize = 0,
     embedded_table_open_mutex: std.Io.Mutex = .init,
     embedded_catalog_loaded: bool = false,
+    embedded_tables_discovered: bool = false,
     embedded_table_records: std.StringHashMapUnmanaged(u64) = .empty,
     embedded_table_errors: std.StringHashMapUnmanaged([]const u8) = .empty,
     embedded_next_table_id: u64 = 2,

@@ -4702,6 +4702,13 @@ pub fn antfly_db_run_until_idle(handle_ptr: ?*anyopaque) callconv(.c) capi.Error
 fn pendingNamespaceStatsValue(a: Allocator, database: *db_mod.DB) !std.json.Value {
     const bytes = try std.json.Stringify.valueAlloc(a, database.pendingWorkStats(), .{});
     var value = try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{});
+    const debt = try database.listDerivedReplayDebt(a);
+    defer {
+        for (debt) |*item| item.deinit(a);
+        a.free(debt);
+    }
+    const debt_json = try std.json.Stringify.valueAlloc(a, debt, .{});
+    try value.object.put(a, "index_replay_debt", try std.json.parseFromSliceLeaky(std.json.Value, a, debt_json, .{}));
     const jobs = try database.graphReplacementStatusAlloc(a);
     defer jobs.deinit();
     var rows: std.ArrayList(std.json.Value) = .empty;
@@ -4732,6 +4739,11 @@ pub fn pendingWorkStatsJson(handle: *Handle) !capi.Buffer {
     const a = arena.allocator();
     var aggregate = handle.database().pendingWorkStats();
     var output = try pendingNamespaceStatsValue(a, handle.database());
+    const context = handle.lite_connection_context orelse if (handle.parent_handle) |parent| parent.lite_connection_context else null;
+    if (context) |connection| {
+        const stats = try std.json.Stringify.valueAlloc(a, connection.owner.publication_stats, .{});
+        try output.object.put(a, "background_publications", try std.json.parseFromSliceLeaky(std.json.Value, a, stats, .{}));
+    }
     if (handle.selected_table_name != null) return stringifyJson(output);
     var snapshots: std.json.ObjectMap = .empty;
     var iterator = handle.embedded_tables.iterator();
@@ -5679,7 +5691,6 @@ pub fn executeEmbeddedSql(handle: *Handle, table_name: []const u8, request_json:
         if (value.failed) return error.SqlTransactionAborted;
         if (value.active and (compiled.statement == .create_table or compiled.statement == .drop_table or compiled.statement == .catalog_ddl or compiled.statement == .policy_ddl)) return error.UnsupportedSqlExecution;
     }
-    try @import("tables.zig").loadAvailable(handle);
     var adapter = sql.Adapter(antfly){ .transaction = session, .handle = handle, .db = handle.database(), .table_name = table_name, .read_only = !liteOpenModeCanWrite(handle.open_mode) or (if (session) |value| value.read_only else false) };
     var error_context: antfly.capi_dependencies.sql_errors.Context = .{};
     var result = sql.runtime.execute(handle.alloc, adapter.backend(), &compiled, parsed.value.parameters, .{ .result_rows = parsed.value.limit, .error_context = &error_context }) catch |err| {
