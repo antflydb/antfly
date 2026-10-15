@@ -5416,6 +5416,14 @@ test "capi SQL index publication accepts unrelated primary commits and fences ch
                 try txn.commit();
             }
         }
+        if (index_changed) {
+            const guard = public.enterHandle(handle, .exclusive).?;
+            defer guard.leave();
+            // Native SQL may queue its index work. Publish an actual conflicting
+            // target here so rejection proves the old bytes cannot overwrite a
+            // newer owner's immutable artifact.
+            try guard.handle.db.core.index_manager.text_lsm_storage.?.writeFileAbsolute("__antfly_lite/indexes/body_text/prepared.bin", "foreground index bytes");
+        }
         gate.allowed.set(shared.handleLockIo());
         background.join();
         joined = true;
@@ -5425,10 +5433,9 @@ test "capi SQL index publication accepts unrelated primary commits and fences ch
         } else if (gate.publication_error) |err| return err;
 
         if (index_changed) {
-            // Foreground SQL also publishes this index. Its manifests, WALs and
-            // segment IDs changed; the captured build must yield and retry from
-            // that new state, never overwrite it with the old manifest.
-            try std.testing.expect(owner.maintenance_pending);
+            // The target now belongs to a newer owner. The captured publication
+            // must yield and retry, preserving the foreground artifact.
+            if (!owner.maintenance_pending) return error.TestIndexChangeNotPending;
         }
         for (0..64) |_| {
             if (!try owner.maintenanceTurnForTest()) break;
@@ -5438,18 +5445,16 @@ test "capi SQL index publication accepts unrelated primary commits and fences ch
         // foreground rows or their searchable terms.
         const guard = public.enterHandle(handle, .exclusive).?;
         defer guard.leave();
-        if (!index_changed) {
-            const storage = guard.handle.db.core.index_manager.text_lsm_storage.?;
-            const published = try storage.readFileAlloc(alloc, "__antfly_lite/indexes/body_text/prepared.bin", 1024);
-            defer alloc.free(published);
-            try std.testing.expectEqualStrings("prepared index bytes", published);
-        }
-        var result = try guard.handle.db.search(alloc, .{ .index_name = "body_text", .full_text = .{ .term = .{ .field = "body", .term = "needle" } }, .limit = 10 });
+        const storage = guard.handle.db.core.index_manager.text_lsm_storage.?;
+        const published = try storage.readFileAlloc(alloc, "__antfly_lite/indexes/body_text/prepared.bin", 1024);
+        defer alloc.free(published);
+        try std.testing.expectEqualStrings(if (index_changed) "foreground index bytes" else "prepared index bytes", published);
+        var result = try guard.handle.db.search(alloc, .{ .index_name = "body_text", .full_text = .{ .match = .{ .field = "body", .text = "original needle" } }, .limit = 10 });
         defer result.deinit();
         try std.testing.expect(result.hits.len != 0);
         try std.testing.expectEqualStrings("original", result.hits[0].id);
         if (index_changed) {
-            var unrelated = try guard.handle.db.search(alloc, .{ .index_name = "body_text", .full_text = .{ .term = .{ .field = "body", .term = "unrelated" } }, .limit = 10 });
+            var unrelated = try guard.handle.db.search(alloc, .{ .index_name = "body_text", .full_text = .{ .match = .{ .field = "body", .text = "unrelated" } }, .limit = 10 });
             defer unrelated.deinit();
             try std.testing.expectEqual(@as(usize, 8), unrelated.hits.len);
         }
