@@ -42,7 +42,7 @@ reports correctly contain zero hits/eleven stores, and sparse reports zero
 hits/four stores. Pair qualification uses the explicit prefix policy:
 
 ```sh
-python tools/embeddinggemma2/video_incremental_qualification.py \
+python zig/pkg/inference/scripts/embeddinggemma2/video_incremental_qualification.py \
   --incremental zig/lib/video/testdata/live/dynamic-coordinator-validation/native.json \
   --replay zig/lib/video/testdata/live/dynamic-coordinator-validation/native-replay.json \
   --reference zig/lib/video/testdata/live/dynamic-coordinator-validation/pytorch-mps.json \

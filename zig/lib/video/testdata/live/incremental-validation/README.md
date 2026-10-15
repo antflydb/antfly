@@ -46,9 +46,9 @@ measures reference preservation, without end-user relevance labels.
 Reproduce the offline oracle and completed pair gate with the pinned environment:
 
 ```sh
-python tools/embeddinggemma2/video_rolling_reference.py \
+python zig/pkg/inference/scripts/embeddinggemma2/video_rolling_reference.py \
   --model-dir /path/to/verified/checkpoint --backend mps --output /tmp/oracle.json
-python tools/embeddinggemma2/video_incremental_qualification.py \
+python zig/pkg/inference/scripts/embeddinggemma2/video_incremental_qualification.py \
   --incremental zig/lib/video/testdata/live/incremental-validation/native.json \
   --replay zig/lib/video/testdata/live/incremental-validation/native-replay.json \
   --reference /tmp/oracle.json --output /tmp/pair-agreement.json

@@ -5,14 +5,14 @@ epoch. Generated reports/logs were removed from the current tree; see
 [qualification and historical recovery](../../../../../../docs/plans/native-video-noncuda-audit.md#artifact-policy-and-historical-evidence).
 Fixture inputs and independent reference oracles remain checked in.
 
-The real Sintel fixture is `tools/embeddinggemma2/testdata/live-pretrained`.
+The real Sintel fixture is `zig/pkg/inference/scripts/embeddinggemma2/testdata/live-pretrained`.
 It derives six seconds beginning at second 20 of the existing pinned trailer,
 scales to 128x72 at 10 fps, and uses single-threaded libx264 with one-second
 closed GOPs in fragmented MP4. FFmpeg is only an offline fixture/reference tool.
 Fixture metadata pins both compressed output and original source hashes and
 records the initialization/media boundaries. Sintel is by the Blender
 Foundation, licensed under CC BY 3.0; the existing trailer provenance is retained
-in `tools/embeddinggemma2/testdata/retrieval-long`.
+in `zig/pkg/inference/scripts/embeddinggemma2/testdata/retrieval-long`.
 
 Pinned pretrained native CPU, Metal and actual Linux ARM64 run the real
 `embedNextLive` adapter over those units. Each backend produces three windows
@@ -44,8 +44,8 @@ From the repository root with the already acquired pinned bundle and pinned
 Transformers environment:
 
 ```sh
-python3 -B tools/embeddinggemma2/video_live_qualification.py --model-dir /path/to/model --backend cpu --output /tmp/oracle.json
-python3 -B tools/embeddinggemma2/video_live_qualification.py --model-dir /path/to/model --binary /tmp/live/bin/antfly-embeddinggemma2-live --backend native --reference /tmp/oracle.json --output /tmp/native.json
+python3 -B zig/pkg/inference/scripts/embeddinggemma2/video_live_qualification.py --model-dir /path/to/model --backend cpu --output /tmp/oracle.json
+python3 -B zig/pkg/inference/scripts/embeddinggemma2/video_live_qualification.py --model-dir /path/to/model --binary /tmp/live/bin/antfly-embeddinggemma2-live --backend native --reference /tmp/oracle.json --output /tmp/native.json
 # Repeat with --backend metal. Execute the Linux binary on actual Linux.
 ```
 

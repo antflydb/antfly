@@ -82,7 +82,7 @@ remain pending and are not established by the local macOS 27 result.
 ## Reproduce
 
 Use the repository-pinned Zig toolchain and the qualification environment pinned
-by `tools/embeddinggemma2/reference.py` and `linux-reference.Dockerfile`. From the
+by `zig/pkg/inference/scripts/embeddinggemma2/reference.py` and `linux-reference.Dockerfile`. From the
 repository root:
 
 ```sh
@@ -90,7 +90,7 @@ mkdir -p .benchmark-results/video
 zig build --build-file zig/lib/video/build.zig test-video test-live-windows -Doptimize=ReleaseSafe
 zig build --build-file zig/lib/media/build.zig test-media test-media-http -Doptimize=ReleaseSafe
 zig build --build-file zig/pkg/inference/build.zig test-video-model -Doptimize=ReleaseSafe
-python3 -m unittest discover -s tools/embeddinggemma2 -p 'test_*.py'
+python3 -m unittest discover -s zig/pkg/inference/scripts/embeddinggemma2 -p 'test_*.py'
 ```
 
 The Linux [qualification workflow](../../.github/workflows/zig-video-qualification.yml)
@@ -103,10 +103,10 @@ For a local pretrained comparison, build the inference benchmark server, supply
 the verified checkpoint and use a checked-in independent oracle:
 
 ```sh
-python3 tools/embeddinggemma2/video_compare.py --backend metal \
+python3 zig/pkg/inference/scripts/embeddinggemma2/video_compare.py --backend metal \
   --binary zig/zig-out/bin/antfly-inference-bench-server \
   --model-dir /path/to/verified/checkpoint \
-  --corpus tools/embeddinggemma2/testdata/retrieval/webm-corpus.json \
+  --corpus zig/pkg/inference/scripts/embeddinggemma2/testdata/retrieval/webm-corpus.json \
   --reference zig/lib/video/testdata/webm-validation/pytorch-cpu.json \
   --warmups 0 --iterations 1 --concurrency 2 --sustained-rounds 2 \
   --collect-metal-telemetry --output .benchmark-results/video/webm-metal.json

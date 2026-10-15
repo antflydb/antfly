@@ -2,7 +2,7 @@
 
 Recorded run results and output filenames below describe the measured historical
 epoch. Generated reports/logs were removed from the current tree; see
-[qualification and historical recovery](../../../../docs/plans/native-video-noncuda-audit.md#artifact-policy-and-historical-evidence).
+[qualification and historical recovery](../../../../../../../docs/plans/native-video-noncuda-audit.md#artifact-policy-and-historical-evidence).
 Fixture inputs and independent reference oracles remain checked in.
 
 This corpus compares reference preservation, with no application relevance labels.
@@ -31,12 +31,12 @@ From the worktree root, with pinned checkpoint weights and the qualification
 Python environment installed:
 
 ```sh
-python tools/embeddinggemma2/video_compare.py --backend cpu \
-  --corpus tools/embeddinggemma2/testdata/sampling/corpus.json \
+python zig/pkg/inference/scripts/embeddinggemma2/video_compare.py --backend cpu \
+  --corpus zig/pkg/inference/scripts/embeddinggemma2/testdata/sampling/corpus.json \
   --model-dir .benchmark-assets/native-video/model \
   --output /tmp/sampling-pytorch.json --warmups 0 --iterations 1
-python tools/embeddinggemma2/video_compare.py --backend native \
-  --corpus tools/embeddinggemma2/testdata/sampling/corpus.json \
+python zig/pkg/inference/scripts/embeddinggemma2/video_compare.py --backend native \
+  --corpus zig/pkg/inference/scripts/embeddinggemma2/testdata/sampling/corpus.json \
   --model-dir .benchmark-assets/native-video/model \
   --binary zig/pkg/inference/zig-out/bin/antfly-inference-bench-server \
   --reference /tmp/sampling-pytorch.json --output /tmp/sampling-native.json \

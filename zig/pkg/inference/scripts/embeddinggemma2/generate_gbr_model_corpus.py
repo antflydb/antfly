@@ -214,7 +214,7 @@ def main():
                                 title="Antfly generated identity-matrix RGB pattern",
                                 license="Apache-2.0",
                                 source_sha256=sha(raw),
-                                generation="tools/embeddinggemma2/generate_gbr_model_corpus.py",
+                                generation="zig/pkg/inference/scripts/embeddinggemma2/generate_gbr_model_corpus.py",
                             ),
                         )
                     )

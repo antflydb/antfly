@@ -27,7 +27,7 @@
     },
     {
       "id": "paff-reference",
-      "path": "../../../../zig/lib/video/testdata/h264-paff-adaptive-packets-8-1.mp4",
+      "path": "../../../../../../lib/video/testdata/h264-paff-adaptive-packets-8-1.mp4",
       "sha256": "9461910f8b55ece42054ec89e1fa4d4d9ca169e46299250e76a1732090b43b50",
       "provenance": {
         "title": "Generated Apache-2.0 native video qualification fixture",
@@ -36,7 +36,7 @@
     },
     {
       "id": "paff-timestamps",
-      "path": "../../../../zig/lib/video/testdata/h264-paff-adaptive-packets-8-1.mp4",
+      "path": "../../../../../../lib/video/testdata/h264-paff-adaptive-packets-8-1.mp4",
       "sha256": "9461910f8b55ece42054ec89e1fa4d4d9ca169e46299250e76a1732090b43b50",
       "provenance": {
         "title": "Generated Apache-2.0 native video qualification fixture",
@@ -50,7 +50,7 @@
     },
     {
       "id": "vp9-timestamps",
-      "path": "../../../../zig/lib/video/testdata/vpx-av1/vp9.webm",
+      "path": "../../../../../../lib/video/testdata/vpx-av1/vp9.webm",
       "sha256": "2e0d62c79b2218cae6176456b718e0fe720456d9f3e341d57279307ccd6a190a",
       "provenance": {
         "title": "Generated Apache-2.0 native video qualification fixture",
@@ -64,7 +64,7 @@
     },
     {
       "id": "av1-timestamps",
-      "path": "../../../../zig/lib/video/testdata/vpx-av1/av1.webm",
+      "path": "../../../../../../lib/video/testdata/vpx-av1/av1.webm",
       "sha256": "ea8e68c7029ac3e3361795eff2e351660d5cf9713094c8cf044a4178dbc89614",
       "provenance": {
         "title": "Generated Apache-2.0 native video qualification fixture",

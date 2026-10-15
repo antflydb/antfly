@@ -4,7 +4,7 @@
   "documents": [
     {
       "id": "vp9-window-36",
-      "path": "../../../../zig/lib/video/testdata/benchmarks/webm/corpus/sintel-vp9-480p.webm",
+      "path": "../../../../../../lib/video/testdata/benchmarks/webm/corpus/sintel-vp9-480p.webm",
       "sha256": "ca6aeaac633a85d30808550a152d31ecf0cf376da1f2d202f42a2b728fb63338",
       "provenance": {
         "title": "Sintel trailer, Blender Foundation",
@@ -21,7 +21,7 @@
     },
     {
       "id": "vp9-window-44",
-      "path": "../../../../zig/lib/video/testdata/benchmarks/webm/corpus/sintel-vp9-480p.webm",
+      "path": "../../../../../../lib/video/testdata/benchmarks/webm/corpus/sintel-vp9-480p.webm",
       "sha256": "ca6aeaac633a85d30808550a152d31ecf0cf376da1f2d202f42a2b728fb63338",
       "provenance": {
         "title": "Sintel trailer, Blender Foundation",
@@ -38,7 +38,7 @@
     },
     {
       "id": "av1-window-36",
-      "path": "../../../../zig/lib/video/testdata/benchmarks/webm/corpus/sintel-av1-480p.webm",
+      "path": "../../../../../../lib/video/testdata/benchmarks/webm/corpus/sintel-av1-480p.webm",
       "sha256": "db6917f3a9d42ed3fce12384711d31f84ffd1aef682a2ea8f04d7815497ec187",
       "provenance": {
         "title": "Sintel trailer, Blender Foundation",
@@ -55,7 +55,7 @@
     },
     {
       "id": "av1-window-44",
-      "path": "../../../../zig/lib/video/testdata/benchmarks/webm/corpus/sintel-av1-480p.webm",
+      "path": "../../../../../../lib/video/testdata/benchmarks/webm/corpus/sintel-av1-480p.webm",
       "sha256": "db6917f3a9d42ed3fce12384711d31f84ffd1aef682a2ea8f04d7815497ec187",
       "provenance": {
         "title": "Sintel trailer, Blender Foundation",

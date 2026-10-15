@@ -25,8 +25,11 @@ import json
 from pathlib import Path
 import subprocess
 
-ROOT = Path(__file__).resolve().parents[2]
-SOURCE = ROOT / "tools/embeddinggemma2/testdata/retrieval/scene-1-h264.mp4"
+ROOT = Path(__file__).resolve().parents[5]
+SOURCE = (
+    ROOT
+    / "zig/pkg/inference/scripts/embeddinggemma2/testdata/retrieval/scene-1-h264.mp4"
+)
 OUTPUT = ROOT / "zig/lib/video/testdata/vpx-av1"
 
 
@@ -121,7 +124,10 @@ def main():
             )
         )
     corpus = json.loads(
-        (ROOT / "tools/embeddinggemma2/testdata/retrieval/corpus.json").read_text()
+        (
+            ROOT
+            / "zig/pkg/inference/scripts/embeddinggemma2/testdata/retrieval/corpus.json"
+        ).read_text()
     )
     provenance = next(
         row["provenance"] for row in corpus["documents"] if row["id"] == "scene-1-h264"

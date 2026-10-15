@@ -20,7 +20,7 @@ vectors, scores and rankings are retained; these are preservation measurements,
 not model relevance judgments.
 
 The independently verified plane hashes in
-`tools/embeddinggemma2/testdata/av1-formats/formats.json` match pinned AOM goldens.
+`zig/pkg/inference/scripts/embeddinggemma2/testdata/av1-formats/formats.json` match pinned AOM goldens.
 The failure therefore requires preparation-policy investigation. FFmpeg repeats
 unexpanded gray samples in the monochrome 8-bit RGB path; native preparation
 expands coded limited range. Broader high-depth/chroma conversion differences
@@ -29,15 +29,15 @@ are not yet explained or fixed. No threshold was relaxed.
 Reproduce from the repository root with the pinned checkpoint and fresh server:
 
 ```sh
-python3 tools/embeddinggemma2/generate_av1_model_corpus.py \
-  --output tools/embeddinggemma2/testdata/av1-formats
-python tools/embeddinggemma2/video_compare.py --backend cpu \
-  --corpus tools/embeddinggemma2/testdata/av1-formats/corpus.json \
+python3 zig/pkg/inference/scripts/embeddinggemma2/generate_av1_model_corpus.py \
+  --output zig/pkg/inference/scripts/embeddinggemma2/testdata/av1-formats
+python zig/pkg/inference/scripts/embeddinggemma2/video_compare.py --backend cpu \
+  --corpus zig/pkg/inference/scripts/embeddinggemma2/testdata/av1-formats/corpus.json \
   --model-dir .benchmark-assets/native-video/model \
   --output /tmp/av1-reference.json --warmups 0 --iterations 1 \
   --threads 4 --concurrency 1 --sustained-rounds 1
-python tools/embeddinggemma2/video_compare.py --backend native \
-  --corpus tools/embeddinggemma2/testdata/av1-formats/corpus.json \
+python zig/pkg/inference/scripts/embeddinggemma2/video_compare.py --backend native \
+  --corpus zig/pkg/inference/scripts/embeddinggemma2/testdata/av1-formats/corpus.json \
   --model-dir .benchmark-assets/native-video/model \
   --binary zig/pkg/inference/zig-out/bin/antfly-inference-bench-server \
   --reference /tmp/av1-reference.json --output /tmp/av1-native.json \

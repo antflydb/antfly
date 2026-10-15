@@ -2,7 +2,7 @@
   "cases": [
     {
       "id": "sintel-6s",
-      "path": "../../../../../../tools/embeddinggemma2/testdata/live-pretrained/sintel-6s.mp4",
+      "path": "../../../../../../zig/pkg/inference/scripts/embeddinggemma2/testdata/live-pretrained/sintel-6s.mp4",
       "init_end": 991,
       "fragment_ends": [
         5277,
@@ -19,7 +19,7 @@
     },
     {
       "id": "sintel-6s-sparse",
-      "path": "../../../../../../tools/embeddinggemma2/testdata/live-pretrained/sintel-6s.mp4",
+      "path": "../../../../../../zig/pkg/inference/scripts/embeddinggemma2/testdata/live-pretrained/sintel-6s.mp4",
       "init_end": 991,
       "fragment_ends": [
         5277,

@@ -32,9 +32,9 @@ disconnect does not prove cancellation completion. Broader scalable streams,
 operating-point switching, display policies, real-stream/fuzz campaigns,
 full-pipeline load/performance and the remaining non-CUDA scope stay active.
 
-Reproduce generation with `tools/embeddinggemma2/generate_av1_model_corpus.py
---include-scalable --output tools/embeddinggemma2/testdata/av1-layers`.
-Run `tools/embeddinggemma2/video_compare.py` with that corpus, the pinned
+Reproduce generation with `zig/pkg/inference/scripts/embeddinggemma2/generate_av1_model_corpus.py
+--include-scalable --output zig/pkg/inference/scripts/embeddinggemma2/testdata/av1-layers`.
+Run `zig/pkg/inference/scripts/embeddinggemma2/video_compare.py` with that corpus, the pinned
 checkpoint, CPU/native/Metal backends, `--warmups 0 --iterations 1 --threads 4
 --concurrency 1 --sustained-rounds 1`, and `--process-memory-budget-mb 4096`
 for owned native servers. Use this `pytorch-cpu.json` as `--reference`.

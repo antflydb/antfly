@@ -34,7 +34,7 @@ import reference
 import video_compare
 
 RECIPE = "embeddinggemma2-f32-mean-v6-webm-presentation"
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[5]
 ASSETS = ROOT / "zig/pkg/inference/src/testdata/video/presentation"
 
 

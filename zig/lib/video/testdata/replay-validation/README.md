@@ -23,7 +23,7 @@ Ten existing sampling vectors and eight requests each also pass on macOS CPU,
 Metal and actual Linux ARM64. The current metadata campaign passes 101,920 runs.
 
 Source clip attribution/pixel oracles are in `../benchmarks/webm`. The model
-corpus is `tools/embeddinggemma2/testdata/replay/corpus.json`; weights stay outside
+corpus is `zig/pkg/inference/scripts/embeddinggemma2/testdata/replay/corpus.json`; weights stay outside
 these receipts. `webm-benchmark INPUT replay_compare 2` reproduces library checks.
 Gate logs trim terminal blank lines. Each receipt records source/artifact/binary
 hashes. This does not close broader codec, SIMD/scheduling, display or live scope.

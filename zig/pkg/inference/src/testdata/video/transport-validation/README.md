@@ -30,7 +30,7 @@ heap-placement-dependent allocation counts; production allocation is unchanged.
 
 Reproduce with `zig build test-video-model` in the inference package. Use
 `install-video-model-tests` for another host, and `bench-server` for pretrained
-execution. From the repository root, run `tools/embeddinggemma2/video_compare.py`
+execution. From the repository root, run `zig/pkg/inference/scripts/embeddinggemma2/video_compare.py`
 with this corpus, pinned checkpoint, CPU reference and native/Metal server;
 controls and exact binary identities are retained in reports. The Linux image
 ran with network disabled, only staged task inputs, binaries and output mounted.

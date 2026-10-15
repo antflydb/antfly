@@ -44,7 +44,7 @@ class PinnedVideoPolicyFixtures(unittest.TestCase):
         self.assertEqual(sum(count * ticks for count, ticks in durations), 32768)
         self.assertGreater(len(set(ticks for _, ticks in durations)), 1)
         native_fixture = (
-            Path(__file__).resolve().parents[2]
+            Path(__file__).resolve().parents[5]
             / "zig/pkg/inference/src/testdata/video/mjpeg-vfr.mov"
         )
         self.assertEqual(vfr, native_fixture.read_bytes())

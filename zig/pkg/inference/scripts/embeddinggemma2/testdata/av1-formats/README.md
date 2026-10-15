@@ -8,8 +8,8 @@ sources and independent AOM plane goldens are in
 Regenerate from the repository root:
 
 ```sh
-python3 tools/embeddinggemma2/generate_av1_model_corpus.py \
-  --output tools/embeddinggemma2/testdata/av1-formats
+python3 zig/pkg/inference/scripts/embeddinggemma2/generate_av1_model_corpus.py \
+  --output zig/pkg/inference/scripts/embeddinggemma2/testdata/av1-formats
 ```
 
 The offline generator writes deterministic WebM without changing coded temporal
@@ -18,7 +18,7 @@ and displayed counts, and compares FFmpeg's complete decoded planes with pinned
 AOM frame hashes. `formats.json` retains those checks. FFmpeg is a qualification
 tool; inference retains its pure Zig codec runtime.
 
-Use `tools/embeddinggemma2/video_compare.py` with this `corpus.json`, a pinned
+Use `zig/pkg/inference/scripts/embeddinggemma2/video_compare.py` with this `corpus.json`, a pinned
 checkpoint and backends `cpu`, `native` and `metal`. Supply the CPU report through
 `--reference` for the native runs. Vector and score gates remain unchanged.
 The reports in `zig/lib/video/testdata/av1-model-validation` record failures:

@@ -44,14 +44,14 @@ claims rely on the native decoder, preparation and pretrained gates. Timings are
 shared-host diagnostics, without a production throughput claim. Broader display,
 codec/fuzz/load/performance and the remaining non-CUDA scope stay active.
 
-Reproduce clips with `tools/embeddinggemma2/generate_gbr_model_corpus.py --aomenc
-/path/to/pinned/aomenc --output tools/embeddinggemma2/testdata/gbr-formats`.
+Reproduce clips with `zig/pkg/inference/scripts/embeddinggemma2/generate_gbr_model_corpus.py --aomenc
+/path/to/pinned/aomenc --output zig/pkg/inference/scripts/embeddinggemma2/testdata/gbr-formats`.
 AOM's existing 12-bit non-4:2:0 CLI initialization workaround uses profile zero
 with explicit subsampling, letting it promote to Professional; FFprobe verifies
 the actual output. The source/tool identities and normalized commands are in
 `formats.json`. Reproduce RGB pixels with
 `zig/lib/video/scripts/generate_rgb_gbr_fixture.py --output /tmp/gbr.bin`.
-Run `tools/embeddinggemma2/video_compare.py` with the corpus, pinned checkpoint,
+Run `zig/pkg/inference/scripts/embeddinggemma2/video_compare.py` with the corpus, pinned checkpoint,
 CPU/native/Metal backends, `--warmups 0 --iterations 1 --threads 4 --concurrency 1
 --sustained-rounds 1`, and `--process-memory-budget-mb 4096` for owned servers.
 Use this `pytorch-cpu.json` as `--reference`. Linux runs static aarch64-linux-musl

@@ -10,12 +10,12 @@ clip and the corpus byte-exactly. No application relevance labels are supplied.
 Regenerate from the repository root:
 
 ```sh
-python3 tools/embeddinggemma2/generate_gbr_model_corpus.py \
+python3 zig/pkg/inference/scripts/embeddinggemma2/generate_gbr_model_corpus.py \
   --aomenc /path/to/pinned/aomenc \
-  --output tools/embeddinggemma2/testdata/gbr-formats
+  --output zig/pkg/inference/scripts/embeddinggemma2/testdata/gbr-formats
 ```
 
-The [qualification receipts](../../../../zig/lib/video/testdata/gbr-model-validation/README.md)
+The [qualification receipts](../../../../../../lib/video/testdata/gbr-model-validation/README.md)
 record pretrained CPU/Metal/Linux preservation, reset/retry/half-close/sustained
 checks and the old server's rejection. Reference tools are offline only;
 production remains maintained native Zig. Wide-gamut/HDR RGB, camera streams

@@ -20,7 +20,7 @@ processor extension, not a claim about upstream automatic metadata handling.
 All native backends match vector and prompt-token gates.
 
 Reproduce fixtures with `python3 zig/lib/video/scripts/generate_webm_presentation_fixtures.py`.
-Run `tools/embeddinggemma2/video_webm_presentation_qualification.py` with
+Run `zig/pkg/inference/scripts/embeddinggemma2/video_webm_presentation_qualification.py` with
 `--backend cpu`, pinned `--model-dir` and `--output`; native/Metal also require
 `--binary` and `--reference`. Checkpoints remain local and are not committed.
 Container/video/model test commands are `zig build test-media`,

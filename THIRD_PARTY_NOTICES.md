@@ -822,8 +822,8 @@ POSSIBILITY OF SUCH DAMAGE.
 
 ## Sintel retrieval qualification media
 
-The clips in `tools/embeddinggemma2/testdata/retrieval/` and
-`tools/embeddinggemma2/testdata/retrieval-long/` are derived from the Sintel
+The clips in `zig/pkg/inference/scripts/embeddinggemma2/testdata/retrieval/` and
+`zig/pkg/inference/scripts/embeddinggemma2/testdata/retrieval-long/` are derived from the Sintel
 trailer, copyright Blender Foundation, https://durian.blender.org/, under
 Creative Commons Attribution 3.0 Unported:
 https://creativecommons.org/licenses/by/3.0/.

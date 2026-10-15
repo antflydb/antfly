@@ -47,7 +47,7 @@ or pretrained field parity. Each packet fixture owns a bounded 256 KiB parsed
 index resized to one retained packet, plus its independent backing/metadata.
 The 52-second, 480x320 real Sintel case remuxes the tracked long fixture with
 FFmpeg copy mode and strips the trailing mfra; encoded video is not changed.
-Sintel is © Blender Foundation, durian.blender.org, licensed under [CC BY 3.0](https://creativecommons.org/licenses/by/3.0/). The parent was resized/re-encoded as described in [its provenance](../../../../../../tools/embeddinggemma2/testdata/retrieval-long/README.md); this derivative changes only MP4 framing and removes the trailing index.
+Sintel is © Blender Foundation, durian.blender.org, licensed under [CC BY 3.0](https://creativecommons.org/licenses/by/3.0/). The parent was resized/re-encoded as described in [its provenance](../../../../../../zig/pkg/inference/scripts/embeddinggemma2/testdata/retrieval-long/README.md); this derivative changes only MP4 framing and removes the trailing index.
 It delivers 27 windows with exact source interval/eligibility/ordered packet
 clock+payload digests and 54 versus 27 validation walks. Single cold/warm
 samples before are 41.2/40.5 seconds and after 20.4/24.4 seconds. These long
@@ -79,7 +79,7 @@ before/after text files respectively, and build with
 suite format is recorded in the JSON artifacts; replace absolute input paths
 for the local checkout. The long-fixture manifest records the exact offline
 FFmpeg remux command and fragment boundaries. Existing
-`tools/embeddinggemma2/video_live_qualification.py` verifies native/Metal against
+`zig/pkg/inference/scripts/embeddinggemma2/video_live_qualification.py` verifies native/Metal against
 the pinned oracle in the prior pretrained receipt. Linux uses the pinned,
 offline/read-only ARM64 image with read-only fixture/model/binary mounts.
 

@@ -24,19 +24,19 @@ commit `92cd495f2720c064bc78eb2d93e28704c5bce51f` in a separate Python environme
 From the repository root:
 
 ```sh
-python tools/embeddinggemma2/reference.py acquire /tmp/embeddinggemma2/model
-python tools/embeddinggemma2/reference.py video-oracle /tmp/embeddinggemma2/model \
+python zig/pkg/inference/scripts/embeddinggemma2/reference.py acquire /tmp/embeddinggemma2/model
+python zig/pkg/inference/scripts/embeddinggemma2/reference.py video-oracle /tmp/embeddinggemma2/model \
   --output /tmp/embeddinggemma2/oracle/video-oracle.json
 
 cd zig/pkg/inference
 ANTFLY_EMBEDDINGGEMMA2_MODEL=/tmp/embeddinggemma2/model \
-ANTFLY_EMBEDDINGGEMMA2_VIDEO_ORACLE="$PWD/../../../tools/embeddinggemma2/testdata/video/video-oracle.json" \
+ANTFLY_EMBEDDINGGEMMA2_VIDEO_ORACLE="$PWD/scripts/embeddinggemma2/testdata/video/video-oracle.json" \
 ANTFLY_EMBEDDINGGEMMA2_VIDEO_REPORT=/tmp/embeddinggemma2/native.json \
 zig build test-embeddinggemma2 -Dmetal=false -Doptimize=ReleaseSafe --summary all -- \
   --test-filter 'embeddinggemma2 pretrained video'
 
 ANTFLY_EMBEDDINGGEMMA2_MODEL=/tmp/embeddinggemma2/model \
-ANTFLY_EMBEDDINGGEMMA2_VIDEO_ORACLE="$PWD/../../../tools/embeddinggemma2/testdata/video/video-oracle.json" \
+ANTFLY_EMBEDDINGGEMMA2_VIDEO_ORACLE="$PWD/scripts/embeddinggemma2/testdata/video/video-oracle.json" \
 ANTFLY_EMBEDDINGGEMMA2_VIDEO_REPORT=/tmp/embeddinggemma2/metal.json \
 ANTFLY_EMBEDDINGGEMMA2_METAL=1 \
 zig build test-embeddinggemma2 -Dmetal=true -Doptimize=ReleaseSafe --summary all -- \

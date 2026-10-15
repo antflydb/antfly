@@ -460,7 +460,7 @@ Final-vector agreement, actual occupancy, scoped transfer counters and memory
 counter coverage are separate evidence. Runtime/model pools and bounded workspace
 are not interchangeable peak-memory measurements.
 
-Use [image campaigns](../../../tools/embeddinggemma2/image_campaign.py) for pinned
+Use [image campaigns](../../../zig/pkg/inference/scripts/embeddinggemma2/image_campaign.py) for pinned
 baseline/candidate order, hashes, complete vectors and HTTP concurrency 1/2/4/8.
 Warm distributions need ten warmups and at least 100 samples; cold first-forward
 runs use a separate process. Amortized batch seconds/image is not caller latency.
@@ -484,7 +484,7 @@ vectors download. The owner retains its creating backend through cleanup.
 and unsupported providers retain compatibility. Current audio-only handoff has
 its own qualification below.
 
-The [PDF benchmark](../../../tools/embeddinggemma2/pdf_campaign.py)
+The [PDF benchmark](../../../zig/pkg/inference/scripts/embeddinggemma2/pdf_campaign.py)
 measures actual parser/rendered rasters through embedding, with explicit document/
 page IDs, round-robin scheduling, at most four live pages, four private readers,
 256 MiB raster output, private 256 MiB scratch per worker and eight-million-pixel
@@ -691,7 +691,7 @@ zig-out/bin/antfly-audio-embedding-bench --model MODEL --audio CLIP \
 Image `projector` excludes decode, `embedding` shares a borrowed raster after one
 decode, and `encoded-embedding` decodes every row. Audio `--scope pcm` excludes
 codec decode; `--prepare-ahead off` and `--batching off` isolate compatibility.
-`tools/embeddinggemma2/{image,pdf}_campaign.py` retains pinned binaries/inputs,
+`zig/pkg/inference/scripts/embeddinggemma2/{image,pdf}_campaign.py` retains pinned binaries/inputs,
 ordered vectors, errors and baseline/candidate order. PDF `--scope render` compares
 CPU/GPU rendering without a model. Run its pixel preflight before measured waves;
 report real and synthetic pages separately. Scope and warmup/sample counts in the

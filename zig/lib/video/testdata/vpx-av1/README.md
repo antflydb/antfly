@@ -56,4 +56,4 @@ Sintel scene-1 excerpt. Sintel © Blender Foundation / durian.blender.org,
 [CC BY 3.0](https://creativecommons.org/licenses/by/3.0/). Retain this attribution.
 `real-streams.json` records source provenance, commands and all 96 displayed
 picture hashes from independent FFmpeg decoders. Regenerate offline with
-`tools/embeddinggemma2/generate_webm_real.py`; native builds never invoke it.
+`zig/pkg/inference/scripts/embeddinggemma2/generate_webm_real.py`; native builds never invoke it.

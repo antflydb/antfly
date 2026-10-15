@@ -64,8 +64,8 @@ From the worktree, using the pinned reference environment and an existing
 qualified server binary/checkpoint:
 
 ```sh
-python tools/embeddinggemma2/video_compare.py --backend native --binary /path/to/antfly-inference-bench-server --model-dir .benchmark-assets/native-video/model --corpus tools/embeddinggemma2/testdata/retrieval-long/corpus.json --reference zig/lib/video/testdata/retrieval-validation/long-pytorch-cpu.json --warmups 0 --iterations 1 --concurrency 2 --sustained-rounds 4 --request-timeout 180 --sustained-request-timeout 180 --output /tmp/native-long.json
-python -m unittest discover -s tools/embeddinggemma2 -p 'test*compare.py'
+python zig/pkg/inference/scripts/embeddinggemma2/video_compare.py --backend native --binary /path/to/antfly-inference-bench-server --model-dir .benchmark-assets/native-video/model --corpus zig/pkg/inference/scripts/embeddinggemma2/testdata/retrieval-long/corpus.json --reference zig/lib/video/testdata/retrieval-validation/long-pytorch-cpu.json --warmups 0 --iterations 1 --concurrency 2 --sustained-rounds 4 --request-timeout 180 --sustained-request-timeout 180 --output /tmp/native-long.json
+python -m unittest discover -s zig/pkg/inference/scripts/embeddinggemma2 -p 'test*compare.py'
 ```
 
 Repeat with `metal`, or `cpu`/`mps` without the server binary. Reference runs use

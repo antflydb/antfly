@@ -111,7 +111,7 @@ zig build test-video-model -Doptimize=ReleaseSafe
 From the worktree with the pinned checkpoint/reference environment:
 
 ```sh
-python tools/embeddinggemma2/video_compare.py --backend metal --binary /tmp/telemetry/bin/antfly-inference-bench-server --model-dir .benchmark-assets/native-video/model --corpus tools/embeddinggemma2/testdata/retrieval-long/corpus.json --reference zig/lib/video/testdata/retrieval-validation/long-pytorch-cpu.json --warmups 0 --iterations 1 --concurrency 2 --sustained-rounds 4 --request-timeout 600 --sustained-request-timeout 180 --collect-metal-telemetry --output /tmp/telemetry-metal.json
+python zig/pkg/inference/scripts/embeddinggemma2/video_compare.py --backend metal --binary /tmp/telemetry/bin/antfly-inference-bench-server --model-dir .benchmark-assets/native-video/model --corpus zig/pkg/inference/scripts/embeddinggemma2/testdata/retrieval-long/corpus.json --reference zig/lib/video/testdata/retrieval-validation/long-pytorch-cpu.json --warmups 0 --iterations 1 --concurrency 2 --sustained-rounds 4 --request-timeout 600 --sustained-request-timeout 180 --collect-metal-telemetry --output /tmp/telemetry-metal.json
 python -m unittest tools.embeddinggemma2.test_compare tools.embeddinggemma2.test_video_compare
 zig test zig/pkg/inference/src/backends/metal_telemetry.zig -O ReleaseSafe
 ```
@@ -121,7 +121,7 @@ For a reference Linux image, download the official
 context from the verified reference environment and build it:
 
 ```sh
-python tools/embeddinggemma2/prepare_linux_reference.py --ffmpeg-source /tmp/ffmpeg-9.0.2.tar.xz --output /tmp/linux-reference
+python zig/pkg/inference/scripts/embeddinggemma2/prepare_linux_reference.py --ffmpeg-source /tmp/ffmpeg-9.0.2.tar.xz --output /tmp/linux-reference
 docker build --platform linux/arm64 -t antfly-video-reference-linux:ffmpeg9 /tmp/linux-reference
 ```
 

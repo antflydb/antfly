@@ -4,7 +4,7 @@
   "documents": [
     {
       "id": "vp8-inter",
-      "path": "../../../../zig/lib/video/testdata/vp8-inter.webm",
+      "path": "../../../../../../lib/video/testdata/vp8-inter.webm",
       "sha256": "ef29c5a11930ece81cd00e4cf59c6ae088e6ecc62b44e7400e2f13ceab2e9b56",
       "provenance": {
         "title": "Generated native codec differential fixture",
@@ -14,7 +14,7 @@
     },
     {
       "id": "vp9-inter",
-      "path": "../../../../zig/lib/video/testdata/vpx-av1/vp9.webm",
+      "path": "../../../../../../lib/video/testdata/vpx-av1/vp9.webm",
       "sha256": "2e0d62c79b2218cae6176456b718e0fe720456d9f3e341d57279307ccd6a190a",
       "provenance": {
         "title": "Generated native codec differential fixture",
@@ -24,7 +24,7 @@
     },
     {
       "id": "av1-inter",
-      "path": "../../../../zig/lib/video/testdata/vpx-av1/av1.webm",
+      "path": "../../../../../../lib/video/testdata/vpx-av1/av1.webm",
       "sha256": "ea8e68c7029ac3e3361795eff2e351660d5cf9713094c8cf044a4178dbc89614",
       "provenance": {
         "title": "Generated native codec differential fixture",
@@ -34,7 +34,7 @@
     },
     {
       "id": "vp9-sintel",
-      "path": "../../../../zig/lib/video/testdata/vpx-av1/vp9-sintel.webm",
+      "path": "../../../../../../lib/video/testdata/vpx-av1/vp9-sintel.webm",
       "sha256": "1fd1e8d44f01589af360a84b7cd35075e0ff6ddb10d0f713afcf3d40e0dd9cf0",
       "provenance": {
         "title": "Sintel trailer",
@@ -83,7 +83,7 @@
     },
     {
       "id": "av1-sintel",
-      "path": "../../../../zig/lib/video/testdata/vpx-av1/av1-sintel.webm",
+      "path": "../../../../../../lib/video/testdata/vpx-av1/av1-sintel.webm",
       "sha256": "39f9a248fbc0ca290dcbca8f0211c32092aa3f6515d3a9d703df7d082f96d117",
       "provenance": {
         "title": "Sintel trailer",

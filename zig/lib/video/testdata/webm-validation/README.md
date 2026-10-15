@@ -47,16 +47,16 @@ use them as correctness/lifetime receipts, not isolated throughput claims.
 
 ## Reproduce
 
-With the pinned checkpoint acquired using `tools/embeddinggemma2/reference.py`,
+With the pinned checkpoint acquired using `zig/pkg/inference/scripts/embeddinggemma2/reference.py`,
 run from the repository root (reference encoders/decoders are offline tools):
 
 ```sh
-python tools/embeddinggemma2/video_compare.py --backend cpu \
-  --corpus tools/embeddinggemma2/testdata/retrieval/webm-corpus.json \
+python zig/pkg/inference/scripts/embeddinggemma2/video_compare.py --backend cpu \
+  --corpus zig/pkg/inference/scripts/embeddinggemma2/testdata/retrieval/webm-corpus.json \
   --model-dir .benchmark-assets/native-video/model \
   --warmups 0 --iterations 1 --output /tmp/webm-reference.json
-python tools/embeddinggemma2/video_compare.py --backend native \
-  --corpus tools/embeddinggemma2/testdata/retrieval/webm-corpus.json \
+python zig/pkg/inference/scripts/embeddinggemma2/video_compare.py --backend native \
+  --corpus zig/pkg/inference/scripts/embeddinggemma2/testdata/retrieval/webm-corpus.json \
   --model-dir .benchmark-assets/native-video/model \
   --binary zig/pkg/inference/zig-out/bin/antfly-inference-bench-server \
   --reference /tmp/webm-reference.json --warmups 0 --iterations 1 \

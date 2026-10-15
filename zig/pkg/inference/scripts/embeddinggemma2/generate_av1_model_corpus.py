@@ -255,7 +255,7 @@ def generate(source, output, ffprobe, ffmpeg, include_scalable=False):
                     "source_sha256": sha(original),
                     "source": str(original),
                     "generation": "zig/lib/video/scripts/generate_av1_extended_fixtures.py",
-                    "muxer": "tools/embeddinggemma2/generate_av1_model_corpus.py (packet-preserving WebM)",
+                    "muxer": "zig/pkg/inference/scripts/embeddinggemma2/generate_av1_model_corpus.py (packet-preserving WebM)",
                 },
             }
         )

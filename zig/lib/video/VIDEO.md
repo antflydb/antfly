@@ -231,7 +231,7 @@ Use the repository Zig toolchain. From the repository root:
 ```sh
 zig build --build-file zig/lib/video/build.zig test-video test-live-windows -Doptimize=ReleaseSafe
 zig build --build-file zig/pkg/inference/build.zig test-video-model -Doptimize=ReleaseSafe
-python3 -m unittest discover -s tools/embeddinggemma2 -p 'test_*.py'
+python3 -m unittest discover -s zig/pkg/inference/scripts/embeddinggemma2 -p 'test_*.py'
 ```
 
 Portable Linux execution, independent per-picture goldens, retained-frame fuzz

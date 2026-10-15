@@ -120,4 +120,4 @@ def fixtures(directory):
 
 
 if __name__ == "__main__":
-    fixtures(Path(__file__).resolve().parents[2] / "zig/lib/video/testdata")
+    fixtures(Path(__file__).resolve().parents[5] / "zig/lib/video/testdata")

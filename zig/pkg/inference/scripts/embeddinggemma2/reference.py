@@ -404,7 +404,7 @@ def video_oracle(directory, output):
             ],
             check=True,
         )
-    original = Path(__file__).resolve().parents[2] / "zig/lib/video/testdata/mjpeg.mov"
+    original = Path(__file__).resolve().parents[5] / "zig/lib/video/testdata/mjpeg.mov"
     shutil.copyfile(original, assets / "video-mjpeg.mov")
     clips = {}
     provenance = []

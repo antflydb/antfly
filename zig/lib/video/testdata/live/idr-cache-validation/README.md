@@ -33,7 +33,7 @@ rolling intervals 0, 2 and 4. No fresh PyTorch oracle is claimed for the others.
 Reproduce the completed report gate with the pinned qualification environment:
 
 ```sh
-python tools/embeddinggemma2/video_rolling_qualification.py \
+python zig/pkg/inference/scripts/embeddinggemma2/video_rolling_qualification.py \
   --report zig/lib/video/testdata/live/idr-cache-validation/native.json \
   --reference zig/lib/video/testdata/live/pretrained-validation/pytorch.json \
   --output /tmp/rolling-agreement.json

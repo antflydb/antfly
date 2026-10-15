@@ -1,12 +1,12 @@
 {
-  "source": "tools/embeddinggemma2/testdata/retrieval-long/sintel-52s.mp4",
+  "source": "zig/pkg/inference/scripts/embeddinggemma2/testdata/retrieval-long/sintel-52s.mp4",
   "generation": [
     "ffmpeg",
     "-nostdin",
     "-v",
     "error",
     "-i",
-    "tools/embeddinggemma2/testdata/retrieval-long/sintel-52s.mp4",
+    "zig/pkg/inference/scripts/embeddinggemma2/testdata/retrieval-long/sintel-52s.mp4",
     "-map",
     "0:v:0",
     "-c:v",
