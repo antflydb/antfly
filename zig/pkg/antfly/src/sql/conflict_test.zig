@@ -74,7 +74,7 @@ const Fixture = struct {
     expected_constraint: ?[]const u8 = null,
     capture_states: [8]Cursor = undefined,
     capture_cursors: [8]catalog.Cursor = undefined,
-    fn owners(ptr: *anyopaque, alloc: Allocator, _: catalog.Table, target: catalog.ConflictTarget, input: []const catalog.Mutation) ![]const catalog.ConflictOwner {
+    fn owners(ptr: *anyopaque, alloc: Allocator, _: Allocator, _: catalog.Table, target: catalog.ConflictTarget, input: []const catalog.Mutation) ![]const catalog.ConflictOwner {
         const self: *Fixture = @ptrCast(@alignCast(ptr));
         self.owner_calls += 1;
         if (self.expected_constraint) |name| {
