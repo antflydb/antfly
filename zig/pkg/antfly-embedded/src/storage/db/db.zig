@@ -101725,7 +101725,7 @@ test "db document _embeddings transaction null reserves retained artifact tombst
         var db = try DB.open(alloc, dir.path(), .{ .start_index_workers = false, .start_optional_runtimes = false });
         defer db.close();
         try db.addIndex(.{ .name = "vec", .kind = if (sparse) .sparse_vector else .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"external\":true}" });
-        const document: [128]u8 = @splat('x');
+        const document: [256]u8 = @splat('x');
         try db.batch(.{ .writes = &.{.{ .key = &document, .value = if (sparse) "{\"title\":\"initial\",\"_embeddings\":{\"vec\":{\"indices\":[7],\"values\":[1]}}}" else "{\"title\":\"initial\",\"_embeddings\":{\"vec\":[1,0,0]}}" }}, .timestamp_ns = 10, .sync_level = .full_index });
         const key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, &document, "vec");
         defer alloc.free(key);
