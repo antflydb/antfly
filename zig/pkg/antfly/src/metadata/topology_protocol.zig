@@ -113,10 +113,12 @@ const std = @import("std");
 /// authorize adoption of a different physical root.
 pub const current_version: u16 = 53;
 pub const index_publication_release_version: u16 = 53;
-pub const index_publication_installation_version: u16 = 52;
-pub const index_publication_decision_version: u16 = 52;
-pub const index_publication_head_version: u16 = 52;
-pub const index_delivery_version: u16 = 52;
+// One coordinated floor for this unreleased protocol. A cohort capable only
+// of an earlier partial stage must not admit work that it cannot finish.
+pub const index_publication_installation_version: u16 = 53;
+pub const index_publication_decision_version: u16 = 53;
+pub const index_publication_head_version: u16 = 53;
+pub const index_delivery_version: u16 = 53;
 pub const schema_reader_publication_version: u16 = 39;
 pub const schema_reader_floor_version: u16 = 38;
 pub const schema_reader_capability_version: u16 = 37;

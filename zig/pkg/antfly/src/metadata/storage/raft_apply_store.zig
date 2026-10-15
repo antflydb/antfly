@@ -5199,8 +5199,19 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
         {
             var release_request = lookup;
             release_request.operation = .release;
-            try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, store.relationalIndexOwnerDecisionJson(alloc, group, release_request));
             var activation = (try store.topologyActivation(group)).?;
+            {
+                var lowered = activation;
+                lowered.version = topology_protocol.index_publication_release_version - 1;
+                const lowered_json = try std.json.Stringify.valueAlloc(alloc, lowered, .{});
+                defer alloc.free(lowered_json);
+                const original_json = try std.json.Stringify.valueAlloc(alloc, activation, .{});
+                defer alloc.free(original_json);
+                const activation_key = try RaftApplyStore.topologyActivationKeyForGroup(&buf, group);
+                try store.store.put(activation_key, lowered_json);
+                defer store.store.put(activation_key, original_json) catch unreachable;
+                try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, store.relationalIndexOwnerDecisionJson(alloc, group, release_request));
+            }
             activation.version = topology_protocol.index_publication_release_version;
             const activation_json = try std.json.Stringify.valueAlloc(alloc, activation, .{});
             defer alloc.free(activation_json);
