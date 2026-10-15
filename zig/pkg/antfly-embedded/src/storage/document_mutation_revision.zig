@@ -242,6 +242,16 @@ pub const BackfillPage = struct {
         self.arena.deinit();
     }
     pub fn prepare(alloc: std.mem.Allocator, store: anytype, restart: bool) !?@This() {
+        return prepareWithClock(alloc, store, restart, MonotonicClock{});
+    }
+    const MonotonicClock = struct {
+        pub fn now(_: @This()) u64 {
+            return @import("antfly_platform").time.monotonicNs();
+        }
+    };
+    /// The clock is a static dependency: production retains its bounded scan
+    /// with no function-pointer overhead, while tests can control preemption.
+    pub fn prepareWithClock(alloc: std.mem.Allocator, store: anytype, restart: bool, clock: anytype) !?@This() {
         var arena = std.heap.ArenaAllocator.init(alloc);
         errdefer arena.deinit();
         const a = arena.allocator();
@@ -272,10 +282,10 @@ pub const BackfillPage = struct {
         var last: []const u8 = previous;
         var rows: usize = 0;
         var bytes: usize = 0;
-        const deadline = @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_ms;
+        const deadline = clock.now() +| 2 * std.time.ns_per_ms;
         while (item) |row| {
             if (!keys.isInternalUserKey(row.key)) break;
-            if (rows > 0 and (rows >= 128 or entries.items.len >= 32 or bytes >= 4 * 1024 * 1024 or @import("antfly_platform").time.monotonicNs() >= deadline)) break;
+            if (rows > 0 and (rows >= 128 or entries.items.len >= 32 or bytes >= 4 * 1024 * 1024 or clock.now() >= deadline)) break;
             if (row.key.len > 65536) return error.InvalidDocumentAuthorityCursor;
             last = try a.dupe(u8, row.key);
             // Metadata has a separate scope; its point reads cannot retire
@@ -676,4 +686,59 @@ test "public graph metric borrowed wire targeted proof repair bounds deduplicate
         }
     };
     try std.testing.checkAllAllocationFailures(a, Fail.run, .{});
+}
+
+test "public graph metric borrowed wire backfill deadline yields one row and resumes without skipping proofs" {
+    const a = std.testing.allocator;
+    const Lite = @import("lite/docstore.zig");
+    const Store = @import("docstore.zig").DocStore;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/authority-deadline.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var lite = try Lite.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true });
+    defer lite.close();
+    var store = try Store.openRuntime(a, try lite.runtimeStore(a));
+    defer store.close();
+    const ids = [_][]const u8{ "a", "b", "c" };
+    for (ids) |id| {
+        const key = try keys.documentKeyAlloc(a, id);
+        defer a.free(key);
+        try store.put(key, id);
+        try store.delete(&contentKey(keyForPhysical(key).?));
+    }
+    const Clock = struct {
+        value: u64 = 0,
+        pub fn now(self: *@This()) u64 {
+            const result = self.value;
+            self.value += 2 * std.time.ns_per_ms;
+            return result;
+        }
+    };
+    var clock: Clock = .{};
+    var pages: usize = 0;
+    var installed: usize = 0;
+    while (try BackfillPage.prepareWithClock(a, &store, false, &clock)) |prepared| {
+        var page = prepared;
+        defer page.deinit();
+        try std.testing.expectEqual(@as(usize, 1), page.entries.len);
+        pages += 1;
+        try std.testing.expect(pages <= ids.len);
+        var write = try store.beginWriteTxn();
+        errdefer write.abort();
+        installed += try page.stage(&write);
+        try write.commit();
+    }
+    try std.testing.expectEqual(ids.len, pages);
+    try std.testing.expectEqual(ids.len, installed);
+    var read = try store.beginReadTxn();
+    defer read.abort();
+    for (ids) |id| {
+        const key = try keys.documentKeyAlloc(a, id);
+        defer a.free(key);
+        const content = (try loadContent(&read, key)).?;
+        var expected: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(id, &expected, .{});
+        try std.testing.expectEqualSlices(u8, &expected, &content.digest);
+    }
 }

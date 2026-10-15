@@ -137112,7 +137112,14 @@ test "public graph metric borrowed wire content migration fences edits abort del
         for ([_][]const u8{ ka, kb, kc }) |key| try write.delete(&revision.contentKey(revision.keyForPhysical(key).?));
         try write.commit();
     }
-    var prepared = (try revision.BackfillPage.prepare(a, db.core.store, false)).?;
+    // This fixture exercises fencing within one page. A real 2 ms clock may
+    // yield before b/c under load; deadline pagination is tested separately.
+    const Clock = struct {
+        pub fn now(_: @This()) u64 {
+            return 0;
+        }
+    };
+    var prepared = (try revision.BackfillPage.prepareWithClock(a, db.core.store, false, Clock{})).?;
     defer prepared.deinit();
     // The publisher must skip records modified/deleted after hashing.
     try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"n\":4}" }}, .deletes = &.{"c"} });
