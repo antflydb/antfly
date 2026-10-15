@@ -52,6 +52,8 @@ pub fn create(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lan
             .optimize = optimize,
             .pic = true,
         });
+        // Cold Linux Debug codegen peaks at 303 MiB. Reserve 512 MiB for
+        // compiler variance while retaining one shared immutable asset owner.
         const library = b.addLibrary(.{ .name = "antfly-pdf-font-assets", .linkage = .static, .root_module = owner, .use_llvm = @import("../embedded/shared_library.zig").llvmBackend(target.result), .max_rss = 512 * 1024 * 1024 });
         library.link_data_sections = true;
         module.root_source_file = files.add("pdf_standard_fonts_shared.zig", b.fmt(

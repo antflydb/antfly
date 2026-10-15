@@ -1465,3 +1465,103 @@ with `-Dstrip=true`, including independent embedded composition; retired flags
 are absent from both. The current complete Apache audit verifies 2,050 source
 files, and all 35 boundary-checker regressions pass. Temporary local graph-check
 caches were removed. Wolfspider release execution remains in progress.
+
+### Linux owner and final-link qualification (2026-10-15)
+
+ELF Zig runtime archives, their final executable callers, and linked test
+objects use the same LLVM backend policy as the shared native providers.
+The default x86 Debug final link failed to resolve 232 private symbols in the
+real server composition; the matching LLVM composition passes. Static
+consumers precede the physical engine in final archive order. The final image
+receives the engine's inference and enrichment dependencies without making
+their emission prerequisites of adapter codegen.
+
+Provider discovery stops at dynamic-library boundaries and excludes foreign
+targets. A browser artifact cannot acquire a native engine or libc through
+the native finalizer. Direct source-test objects keep their test compilation
+context; linked production archives use their own context. Visits are keyed
+by both module and context because one module may serve both compilations.
+The small ELF/WASM fixture covers these cases, repeated finalization, exact
+provider counts, and independent archive emission.
+
+Module graph clones own their mutable configuration containers. Zig's
+`Module.init(.existing)` makes a shallow copy; late SDK/include-path changes
+could free a buffer still referenced by another clone, crashing configuration
+serialization. The shared clone helper copies those containers and resets the
+cached import graph. A regression verifies independent buffers and late path
+mutation; the real GNU server/C API configuration also passes after this fix.
+
+Both stripped x86_64-linux-musl Debug and unstripped x86_64-linux-gnu Debug
+server/C API builds pass 78/78 steps with Zig 0.17.0. The export audit retains
+exactly 118 public C functions. The GNU server version command and the real
+public C API smoke client execute successfully in Linux. Unstripped GNU
+provider codegen peaks at about 5 GiB per large owner in this local cross
+qualification; existing large-owner claims remain unchanged.
+
+The shared PDF asset owner exceeded its 256 MiB claim in Linux CI (about
+303 MiB). Its 512 MiB reservation retains compiler headroom and the single
+shared copy of immutable fonts and glyph lookup data. Local unstripped GNU
+codegen reported 264 MiB.
+
+Pgwire passes all 110 tests in each stripped/unstripped Linux executable:
+standalone peak RSS is approximately 17/21 MiB, respectively. Linux child
+rusage can also retain the launcher's earlier high-water RSS: a trivial
+`/bin/true` child of a Python process retaining 72 MiB reported 83 MiB in
+the same qualification environment. This accounts for a process envelope
+larger than the leaf test's working set. CI reported approximately 93 MiB,
+so the Linux test-step reservation is 128 MiB (other hosts retain 64 MiB).
+The native array/spool allocator measurements and limits are unchanged.
+
+### Native Linux LLVM Debug admission and storage callback errors (2026-10-15)
+
+PR CI run 38693574492 compiled the baseline x86_64 GNU/Linux CPU Debug
+profile without stripping. The API archive peaked at 12,089,720,832 bytes,
+exceeding its former 10 GiB reservation. Its native Linux profile now reserves
+15 GiB, exceeding that sample by more than 25%. Distributed/CLI summaries
+rounded to 8G/2G; their 12/4 GiB claims allow another whole GiB for rounding
+before adding 25% headroom. Other runtime claims retain their conservative
+values. Cross-host, stripped, sanitized and non-baseline profiles do not
+inherit these measurements. Admission tests prevent the API from overlapping
+with distributed/storage work within CI's 22 GiB compiler budget while still
+allowing the smaller CLI alongside it.
+
+The same run measured public-api-parity and data-runtime test objects at
+16,964,825,088 and 11,133,898,752 bytes. Their native Linux LLVM Debug floors
+are 20/14 GiB, each including at least 25% headroom and fitting that budget
+alone. The policy never lowers an authored claim and leaves other test roots
+and build modes unchanged.
+
+The production smoke reproduces Lite table creation returning HTTP 202 with
+committed repair debt. Erased storage read/probe/batch and namespace handles
+had not all adopted the existing callback error-domain bridge. A raw Zig
+error number returned by a caller-owned backend can identify a different
+error in the compiled physical owner. Every fallible method on those handles
+now uses the originating dispatcher, with direct calls retained inside the
+same compilation unit. The private engine ABI advances to v22 for the new
+handle layouts; aggregation callers use the matching accessor version.
+
+Storage test discovery now includes the native query reuse and runtime
+callback sources. Ordinal tests retain their separately configured module
+owner, are declared as dedicated local sources in the audit, and run in the
+storage aggregate. Importing ordinal source files into the server catalog
+would create duplicate module ownership. The audit validates dedicated local
+paths against the local storage root, independently of server-owned suites.
+Production smoke failures print server logs before temporary cleanup.
+
+Lite's index-file storage, atomic writers, cold readers, range futures and
+immutable range sources also retain their originating callback dispatcher.
+Source visitors carry a return dispatcher so visitor failures cross back in
+the correct error domain. The caller retains its exact visitor error while a
+stable stop marker travels through the provider. Capability/integrity/resource
+outcomes have append-only runtime error details, preserving optional mapping
+fallbacks and corruption checks. Persistent publication uses the writer methods
+rather than bypassing the dispatcher through raw vtable fields. Borrowed spans,
+range coalescing, and local direct-call paths remain available.
+
+
+Storage/source qualification passes 61 selected tests with unexpected error
+logs treated as failures, including borrowed spans, fused authentication,
+file I/O and returned writer/reader dispatch. The ordinal suite passes 2/2,
+the shard audit passes, and all 28 runtime error-identity tests pass.
+The restored native-query-reuse and runtime-callback tests also execute and
+pass (2/2), rather than merely being accepted by the discovery audit.

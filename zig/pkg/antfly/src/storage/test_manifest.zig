@@ -22,6 +22,8 @@
 //! duplicate, stale, or multiply-owned entries before any shard is compiled.
 
 comptime {
+    _ = @import("antfly_local_sources").storage_db_native_query_reuse;
+    _ = @import("antfly_local_sources").storage_db_runtime_callbacks;
     _ = @import("antfly_local_sources").storage_db_replay_vector_collectors;
     _ = @import("antfly_local_sources").storage_db_owned_keys;
     _ = @import("antfly_local_sources").storage_db_read_projection;

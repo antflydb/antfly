@@ -182,6 +182,8 @@ pub fn build(b: *std.Build) void {
     }
     inline for (std.meta.tags(runtime.RuntimeLibraryUnit)) |unit| {
         const artifact = artifacts.runtime.runtime_library_artifacts[@backingInt(unit)].?;
+        if (artifact.root_module.resolved_target.?.result.ofmt == .elf and artifact.use_llvm != true)
+            std.debug.panic("{s} runtime archive differs from its provider callback backend", .{@tagName(unit)});
         var seen = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
         if (unit != .inference) {
             var identity_seen = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);

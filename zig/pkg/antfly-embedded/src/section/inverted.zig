@@ -9864,7 +9864,7 @@ pub const ScopedInvertedIndexReader = struct {
 
         fn check(ptr: *anyopaque) !void {
             const self: *Context = @ptrCast(@alignCast(ptr));
-            if (self.view.source == .ranges) if (self.view.source.ranges.check_read_context) |check_context| try check_context(self.view.source.ranges.ptr);
+            try self.view.source.checkReadContext();
         }
 
         fn read(ptr: *anyopaque, offset: u64, output: []u8) !void {

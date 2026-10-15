@@ -31,6 +31,8 @@ pub const Artifact = struct {
 
 pub fn add(b: *std.Build, options: std.Build.TestOptions) Artifact {
     var object_options = options;
+    object_options.use_llvm = @import("../../../build_support/embedded/source_owner.zig").llvmBackend(options.root_module.resolved_target.?.result);
+    object_options.max_rss = @import("runtime_memory.zig").linkedTestCompileMaxRss(options.name, b.graph.host.result, options.root_module.resolved_target.?.result, options.root_module.optimize, options.max_rss);
     object_options.emit_object = true;
     object_options.test_runner = options.test_runner orelse .{
         .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
@@ -46,7 +48,7 @@ pub fn add(b: *std.Build, options: std.Build.TestOptions) Artifact {
     object_options.root_module = splitNativeSources(b, options.root_module, module, options.name, &clones);
     const object = b.addTest(object_options);
     module.addObject(object);
-    const executable = b.addExecutable(.{ .name = options.name, .root_module = module });
+    const executable = b.addExecutable(.{ .name = options.name, .root_module = module, .use_llvm = object_options.use_llvm });
     return .{ .object = object, .executable = executable };
 }
 
@@ -121,14 +123,12 @@ fn splitNativeSources(
     clones: *std.AutoHashMap(*std.Build.Module, *std.Build.Module),
 ) *std.Build.Module {
     if (clones.get(original)) |existing| return existing;
-    const copy = b.allocator.create(std.Build.Module) catch @panic("OOM");
-    copy.init(original.owner, .{ .existing = original });
+    const copy = @import("../../../build_support/embedded/source_owner.zig").cloneModule(b, original);
     copy.import_table = .empty;
     copy.link_objects = .empty;
     copy.cached_graph = .{ .modules = &.{}, .names = &.{} };
     clones.put(original, copy) catch @panic("OOM");
-    const native_module = b.allocator.create(std.Build.Module) catch @panic("OOM");
-    native_module.init(original.owner, .{ .existing = original });
+    const native_module = @import("../../../build_support/embedded/source_owner.zig").cloneModule(b, original);
     native_module.root_source_file = null;
     native_module.import_table = .empty;
     native_module.cached_graph = .{ .modules = &.{}, .names = &.{} };
