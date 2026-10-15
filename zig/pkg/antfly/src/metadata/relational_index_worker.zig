@@ -39,12 +39,13 @@ const idle_lifetime_ns = 60 * std.time.ns_per_s;
 const max_job_quanta = 4096;
 
 pub const Authority = struct { metadata_incarnation: [32]u8, binding_digest: [32]u8, writer_generation: u64 };
-const Stage = enum { refresh, control, acknowledge, resolve_ack, build, deliver, inventory, install };
+const Stage = enum { refresh, control, acknowledge, resolve_ack, decide, resolve_decision, build, deliver, inventory, install };
 const Owner = struct {
     ordinal: u16,
     stage: Stage = .refresh,
     head: ?progress.Head = null,
     ack: ?publication.Ack = null,
+    decision: ?publication.DecidePublish = null,
     stream: ?producer.Producer = null,
     deadline_ns: u64,
     retry_at_ns: u64 = 0,
@@ -192,7 +193,10 @@ const Job = struct {
                 try self.identity.requireHead(response.value.head);
                 owner.head = response.value.head;
                 if (response.value.head.phase == .building and response.value.head.completed_sources == response.value.head.owner_count) {
-                    owner.stage = .inventory;
+                    if (response.value.head.counts[@backingInt(progress.Action.validated)] == response.value.head.owner_count) {
+                        owner.decision = .{ .table_id = self.identity.table_id, .id = self.identity.id, .expected_revision = response.value.head.revision };
+                        owner.stage = .decide;
+                    } else owner.stage = .inventory;
                     return;
                 }
                 owner.stage = switch (response.value.head.phase) {
@@ -207,6 +211,40 @@ const Job = struct {
                         return;
                     },
                 };
+            },
+            .decide, .resolve_decision => {
+                const request = owner.decision orelse return error.InvalidCatalogRecord;
+                const call: calls.Call = if (owner.stage == .decide) .{ .relational_index_publish_decide = request } else .{ .relational_index_publish_status = request };
+                const bytes = host.systemCatalog(alloc, context_, call) catch |err| switch (@as(anyerror, err)) {
+                    error.MetadataMutationOutcomeUnknown, error.Timeout => {
+                        owner.stage = .resolve_decision;
+                        owner.retry_at_ns = now_ns +| retry_ns;
+                        return;
+                    },
+                    error.GenerationPublicationChanged, error.MetadataReplicationPending => {
+                        owner.decision = null;
+                        owner.stage = .refresh;
+                        owner.retry_at_ns = now_ns +| retry_ns;
+                        return;
+                    },
+                    else => return err,
+                };
+                defer alloc.free(bytes);
+                if (bytes.len == 0 or bytes.len > publication.DecisionStatus.max_wire_bytes) return error.InvalidCatalogRecord;
+                var response = try std.json.parseFromSlice(publication.DecisionStatus, alloc, bytes, .{ .ignore_unknown_fields = false });
+                defer response.deinit();
+                if (response.value.replication_pending) {
+                    owner.stage = .resolve_decision;
+                    owner.retry_at_ns = now_ns +| retry_ns;
+                } else if (try response.value.isDecided(request)) {
+                    self.retireOwner(index);
+                } else {
+                    // Resolve the exact job before choosing a fresh CAS cut;
+                    // neither this branch nor recovery replays SQL DDL.
+                    owner.decision = null;
+                    owner.stage = .refresh;
+                    owner.retry_at_ns = now_ns +| retry_ns;
+                }
             },
             .control => {
                 const request: execution.Request = .{ .table_id = self.identity.table_id, .group_id = identity.group_id, .id = self.identity.id, .operation = if (owner.head.?.phase == .fencing) .fence else .reserve };

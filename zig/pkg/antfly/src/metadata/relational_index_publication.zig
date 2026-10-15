@@ -54,6 +54,24 @@ pub const DecidePublish = struct {
 };
 pub const RootProof = @import("relational_index_root_attestation.zig").Proof;
 
+/// Exact observation of an admitted job's irreversible decision. A metadata
+/// outbox obligation withholds completion even if the local head advanced.
+pub const DecisionStatus = struct {
+    pub const max_wire_bytes = 2048;
+    head: progress.Head,
+    replication_pending: bool = false,
+
+    pub fn isDecided(self: @This(), request: DecidePublish) !bool {
+        try request.validate();
+        try self.head.validate();
+        if (self.head.table_id != request.table_id or !std.mem.eql(u8, &self.head.plan_id, &request.id) or
+            self.head.revision < request.expected_revision) return error.GenerationPublicationChanged;
+        const decided = self.head.phase == .installing or self.head.phase == .releasing or self.head.phase == .published;
+        if (decided and self.head.revision <= request.expected_revision) return error.GenerationPublicationChanged;
+        return decided and !self.replication_pending;
+    }
+};
+
 test "relational index publication decision requires an exact nonzero job and usable revision" {
     const valid: DecidePublish = .{ .table_id = 1, .id = @splat(2), .expected_revision = 3 };
     try valid.validate();
@@ -399,7 +417,8 @@ pub const max_ack_status_bytes = 8192;
 pub fn ownerAckHttpFailure(status: u16, body: []const u8) ?anyerror {
     const failures: []const anyerror = switch (status) {
         400 => &.{ error.InvalidIndexOwnerReceipt, error.InvalidGenerationPublication },
-        409 => &.{ error.IndexOwnerReceiptChanged, error.GenerationPublicationChanged, error.GenerationPublicationNotFound },
+        409 => &.{ error.IndexOwnerReceiptChanged, error.GenerationPublicationChanged, error.GenerationPublicationNotFound, error.MetadataReplicationPending },
+        503 => &.{error.MetadataReplicationPending},
         500 => &.{error.InvalidCatalogRecord},
         else => return null,
     };

@@ -2558,7 +2558,7 @@ const LocalStandaloneMetadata = struct {
         }
         const shared_catalog_mutation = call == .mutate or call == .setting_mutate or call == .policy_definition_mutate or
             call == .policy_publication_begin or call == .policy_publication_mutate or
-            call == .fk_initial_create_begin or call == .fk_initial_create_mutate or call == .relational_index_owner_ack or call == .store_root_enroll;
+            call == .fk_initial_create_begin or call == .fk_initial_create_mutate or call == .relational_index_owner_ack or call == .relational_index_publish_decide or call == .store_root_enroll;
         if (shared_catalog_mutation) if (self.hot_standby_catalog_server) |server| {
             try server.hot_standby_public_gate_state.checkWrite(server.hot_standby_public_gate_state.currentGeneration());
         };
@@ -2637,6 +2637,36 @@ const LocalStandaloneMetadata = struct {
                 var parsed = std.json.parseFromSlice(journal.Status, alloc, observed, .{}) catch return error.MetadataMutationOutcomeUnknown;
                 defer parsed.deinit();
                 if (!(parsed.value.isCompleted(request) catch return error.MetadataMutationOutcomeUnknown)) return error.MetadataMutationOutcomeUnknown;
+                return observed;
+            },
+            .relational_index_publish_status => |request| {
+                const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+                return store.relationalIndexPublicationDecisionStatusJson(alloc, group_ids.main_metadata_group_id, request);
+            },
+            .relational_index_publish_decide => |request| {
+                const publication = @import("../metadata/relational_index_publication.zig");
+                const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+                try request.validate();
+                try store.validateRelationalIndexPublicationDecision(group_ids.main_metadata_group_id, request);
+                try context.ensureActive();
+                const previous = self.durable_revision;
+                store.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .decide_relational_index_publication = request }) catch return error.MetadataMutationOutcomeUnknown;
+                // Publication changes the descriptor, unlike an owner ACK.
+                // Update one table on our exact revision; reconcile a coherent
+                // full projection only if another writer overtook that cut.
+                const actual = (store.getTable(alloc, group_ids.main_metadata_group_id, request.table_id) catch return error.MetadataMutationOutcomeUnknown) orelse return error.MetadataMutationOutcomeUnknown;
+                defer antfly.metadata.table_manager.freeTable(alloc, actual);
+                const revision = store.standaloneRevision() catch return error.MetadataMutationOutcomeUnknown;
+                if (previous != 0 and previous != std.math.maxInt(u64) and revision == previous + 1) {
+                    self.manager.upsertTable(actual) catch return error.MetadataMutationOutcomeUnknown;
+                    self.epoch = revision;
+                    self.durable_revision = revision;
+                } else self.reloadLifecycleProjectionLocked() catch return error.MetadataMutationOutcomeUnknown;
+                const observed = store.relationalIndexPublicationDecisionStatusJson(alloc, group_ids.main_metadata_group_id, request) catch return error.MetadataMutationOutcomeUnknown;
+                errdefer alloc.free(observed);
+                var parsed = std.json.parseFromSlice(publication.DecisionStatus, alloc, observed, .{}) catch return error.MetadataMutationOutcomeUnknown;
+                defer parsed.deinit();
+                if (!(parsed.value.isDecided(request) catch return error.MetadataMutationOutcomeUnknown)) return error.MetadataMutationOutcomeUnknown;
                 return observed;
             },
             .relational_index_owner_ack => |request| {

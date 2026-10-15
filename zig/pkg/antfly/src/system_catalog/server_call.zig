@@ -81,6 +81,8 @@ pub const Call = union(enum) {
     relational_index_owner_decision: @import("../metadata/relational_index_publication.zig").OwnerRequest,
     relational_index_owner_ack: @import("../metadata/relational_index_publication.zig").Ack,
     relational_index_owner_ack_status: @import("../metadata/relational_index_publication.zig").Ack,
+    relational_index_publish_decide: @import("../metadata/relational_index_publication.zig").DecidePublish,
+    relational_index_publish_status: @import("../metadata/relational_index_publication.zig").DecidePublish,
     relational_index_source_accept: @import("../metadata/relational_index_delivery_journal.zig").Request,
     relational_index_source_accept_status: @import("../metadata/relational_index_delivery_journal.zig").Query,
     relational_index_source_complete: @import("../metadata/relational_index_delivery_journal.zig").CompletionRequest,
@@ -144,6 +146,8 @@ pub const Call = union(enum) {
             .relational_index_owner_decision,
             .relational_index_owner_ack,
             .relational_index_owner_ack_status,
+            .relational_index_publish_decide,
+            .relational_index_publish_status,
             .relational_index_source_accept,
             .relational_index_source_complete,
             .relational_index_source_accept_status,
@@ -159,12 +163,12 @@ pub const Call = union(enum) {
     }
 
     pub fn isMutation(self: @This()) bool {
-        return self == .mutate or self == .fk_initial_retirement_ack or self == .relational_index_owner_ack or self == .relational_index_source_accept or self == .relational_index_source_complete or
+        return self == .mutate or self == .fk_initial_retirement_ack or self == .relational_index_owner_ack or self == .relational_index_publish_decide or self == .relational_index_source_accept or self == .relational_index_source_complete or
             (self != .store_root_enrollment_status and self != .constraint_name_prepare and self != .constraint_name_check and self.requiresAdministrativeGrant());
     }
 
     pub fn isRelationalIndexOwnerCall(self: @This()) bool {
-        return self == .relational_index_owner_decision or self == .relational_index_owner_ack or self == .relational_index_owner_ack_status or self == .relational_index_source_accept or self == .relational_index_source_accept_status or self == .relational_index_source_complete;
+        return self == .relational_index_owner_decision or self == .relational_index_owner_ack or self == .relational_index_owner_ack_status or self == .relational_index_publish_decide or self == .relational_index_publish_status or self == .relational_index_source_accept or self == .relational_index_source_accept_status or self == .relational_index_source_complete;
     }
 };
 
@@ -188,7 +192,9 @@ test "relational index publication ACK calls require body bound authority and di
     const accept: Call = .{ .relational_index_source_accept = undefined };
     const accepted: Call = .{ .relational_index_source_accept_status = undefined };
     const completed: Call = .{ .relational_index_source_complete = undefined };
-    for ([_]Call{ ack, status, accept, accepted, completed }) |call| {
+    const decide: Call = .{ .relational_index_publish_decide = undefined };
+    const decided: Call = .{ .relational_index_publish_status = undefined };
+    for ([_]Call{ ack, status, accept, accepted, completed, decide, decided }) |call| {
         try std.testing.expect(call.requiresSettingAuthorityReadGrant());
         try std.testing.expect(!call.requiresAdministrativeGrant());
         try std.testing.expect(call.isRelationalIndexOwnerCall());
@@ -198,6 +204,8 @@ test "relational index publication ACK calls require body bound authority and di
     try std.testing.expect(accept.isMutation());
     try std.testing.expect(completed.isMutation());
     try std.testing.expect(!accepted.isMutation());
+    try std.testing.expect(decide.isMutation());
+    try std.testing.expect(!decided.isMutation());
 }
 
 test "system catalog policy publication status is a service-only read, not a setting grant" {

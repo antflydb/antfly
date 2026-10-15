@@ -1230,7 +1230,7 @@ pub const MetadataHttpClient = struct {
             .{ .name = routes.Routes.raft_mutation_campaign_allowed_header, .value = "false" },
             .{ .name = authority.header_name, .value = grant orelse "" },
         };
-        var response = try internal_service_auth.executeRequest(self.alloc, self.executor, .{ .method = .POST, .uri = uri, .headers = &headers, .body = body, .content_type = "application/json", .timeout_ms = @min(default_request_timeout_ms, remaining_ms), .cancellation = cancellation, .max_response_bytes = if (input == .relational_index_source_accept_status) 16 * 1024 else null }, self.internal_service);
+        var response = try internal_service_auth.executeRequest(self.alloc, self.executor, .{ .method = .POST, .uri = uri, .headers = &headers, .body = body, .content_type = "application/json", .timeout_ms = @min(default_request_timeout_ms, remaining_ms), .cancellation = cancellation, .max_response_bytes = if (input == .relational_index_publish_status) @import("relational_index_publication.zig").DecisionStatus.max_wire_bytes else if (input == .relational_index_source_accept_status) 16 * 1024 else null }, self.internal_service);
         defer response.deinit(self.alloc);
         if ((input == .fk_initial_create_prepare or input == .constraint_name_prepare or input == .constraint_name_check) and response.status != 200) {
             if (system_catalog.definiteNamingError(response.status, response.body)) |err| return err;
@@ -1306,7 +1306,7 @@ pub const MetadataHttpClient = struct {
             .{ .name = authority.header_name, .value = grant orelse "" },
         };
         var delivery: http_common.RequestDeliveryTracker = .{};
-        var response = internal_service_auth.executeRequest(self.alloc, self.executor, .{ .method = .POST, .uri = uri, .headers = &headers, .body = body, .content_type = "application/json", .timeout_ms = @min(default_request_timeout_ms, forwarding.remaining_ms), .delivery_tracker = &delivery, .cancellation = cancellation, .max_response_bytes = if (input == .relational_index_source_accept or input == .relational_index_source_complete) 16 * 1024 else null }, self.internal_service) catch |err| {
+        var response = internal_service_auth.executeRequest(self.alloc, self.executor, .{ .method = .POST, .uri = uri, .headers = &headers, .body = body, .content_type = "application/json", .timeout_ms = @min(default_request_timeout_ms, forwarding.remaining_ms), .delivery_tracker = &delivery, .cancellation = cancellation, .max_response_bytes = if (input == .relational_index_publish_decide) @import("relational_index_publication.zig").DecisionStatus.max_wire_bytes else if (input == .relational_index_source_accept or input == .relational_index_source_complete) 16 * 1024 else null }, self.internal_service) catch |err| {
             if (delivery.load() == .not_sent or (delivery.load() == .unknown and err == error.ConnectionRefused)) return error.RaftMutationRequestNotSent;
             return error.MetadataMutationOutcomeUnknown;
         };
@@ -4672,6 +4672,7 @@ test "relational index publication ACK client binds read grants and never retrie
             const mutation = call.value.isMutation();
             try std.testing.expect(call.value.isRelationalIndexOwnerCall());
             if (call.value == .relational_index_source_accept_status or call.value == .relational_index_source_accept or call.value == .relational_index_source_complete) try std.testing.expectEqual(@as(?usize, 16 * 1024), request.max_response_bytes);
+            if (call.value == .relational_index_publish_status or call.value == .relational_index_publish_decide) try std.testing.expectEqual(@as(?usize, publication.DecisionStatus.max_wire_bytes), request.max_response_bytes);
             var response: http_common.HttpResponse = .{ .status = self.status, .body = try a.dupe(u8, self.body) };
             errdefer response.deinit(a);
             const headers = try a.alloc(http_common.Header, if (mutation) 1 else 2);
@@ -4745,7 +4746,22 @@ test "relational index publication ACK client binds read grants and never retrie
     const before = executor.calls;
     try std.testing.expectError(error.Cancelled, client.acceptRelationalIndexSourceControlled("http://metadata.invalid", undefined, 25, &canceled));
     try std.testing.expectError(error.Cancelled, client.forwardSystemCatalogControlled("http://metadata.invalid", .{ .relational_index_source_accept = undefined }, .{ .remaining_ms = 25, .forwards_remaining = 2, .campaign_allowed = true }, false, &canceled));
+    try std.testing.expectError(error.Cancelled, client.forwardSystemCatalogControlled("http://metadata.invalid", .{ .relational_index_publish_decide = undefined }, .{ .remaining_ms = 25, .forwards_remaining = 2, .campaign_allowed = true }, false, &canceled));
+    try std.testing.expectError(error.Cancelled, client.readSystemCatalog("http://metadata.invalid", .{ .relational_index_publish_status = undefined }, 25, &canceled));
     try std.testing.expectEqual(before, executor.calls);
+    executor.wrong_cluster = false;
+    executor.outcome = routes.Routes.raft_mutation_outcome_committed;
+    executor.body = "{}";
+    const decision: publication.DecidePublish = .{ .table_id = request.table_id, .id = request.signed.receipt.owner.plan_id, .expected_revision = 1 };
+    const decision_status = try client.readSystemCatalog("http://metadata.invalid", .{ .relational_index_publish_status = decision }, 25, null);
+    defer decision_status.deinit(alloc);
+    const decision_reply = try client.forwardSystemCatalogControlled("http://metadata.invalid", .{ .relational_index_publish_decide = decision }, .{ .remaining_ms = 25, .forwards_remaining = 2, .campaign_allowed = true }, false, null);
+    defer alloc.free(decision_reply);
+    executor.status = 409;
+    executor.body = "MetadataReplicationPending";
+    executor.outcome = routes.Routes.raft_mutation_outcome_not_proposed;
+    try std.testing.expectError(error.MetadataReplicationPending, client.forwardSystemCatalogControlled("http://metadata.invalid", .{ .relational_index_publish_decide = decision }, .{ .remaining_ms = 25, .forwards_remaining = 2, .campaign_allowed = true }, false, null));
+    try std.testing.expectError(error.MetadataReplicationPending, client.readSystemCatalog("http://metadata.invalid", .{ .relational_index_publish_status = decision }, 25, null));
 }
 
 test "system catalog relation replacement preserves private grants and definitive ownership rejection" {

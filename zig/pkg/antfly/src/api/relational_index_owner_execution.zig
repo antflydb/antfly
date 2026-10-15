@@ -1261,6 +1261,12 @@ const TestDriver = struct {
     installation_ack_requests: usize = 0,
     installation_acks: usize = 0,
     installation_digest: ?publication.Digest = null,
+    validated_outcome: ?native.ValidatedOutcome = null,
+    decision_fault: ValidationFault = .none,
+    decision_requests: usize = 0,
+    decision_effects: usize = 0,
+    decision_status_calls: usize = 0,
+    decision_pending_checks: usize = 0,
     inventory_finished: bool = false,
     source_reads: usize = 0,
     source_failed: bool = false,
@@ -1278,6 +1284,39 @@ const TestDriver = struct {
 
     pub fn systemCatalog(self: *TestDriver, alloc: std.mem.Allocator, context: operation.RequestContext, call: calls.Call) ![]u8 {
         try std.testing.expect(context.index_publication_authority);
+        if (call == .relational_index_publish_decide or call == .relational_index_publish_status) {
+            const request = if (call == .relational_index_publish_decide) call.relational_index_publish_decide else call.relational_index_publish_status;
+            try request.validate();
+            if (call == .relational_index_publish_decide) {
+                self.decision_requests += 1;
+                if (self.decision_fault == .before_commit) {
+                    self.decision_fault = .none;
+                    return error.MetadataMutationOutcomeUnknown;
+                }
+                if (self.decision_fault == .stale_revision) {
+                    self.decision_fault = .none;
+                    self.value.head.revision += 1;
+                    return error.GenerationPublicationChanged;
+                }
+                if (self.value.head.phase == .building) {
+                    self.value.head = try self.value.head.decidePublish(request.expected_revision);
+                    self.decision_effects += 1;
+                    const seal = if (self.installation_response) |response| response.installed.logical.command.validation else sealed: {
+                        const validated = self.validated_outcome orelse return error.TestMissingValidatedOutcome;
+                        break :sealed local.storage_db_relational_index_validation.Seal{ .command = validated.logical.command, .position = validated.logical.position };
+                    };
+                    self.value.native_install = .{ .validation = seal, .decision_digest = try publication.NativeInstallGrant.decisionDigest(self.value.metadata_group_id, self.value.metadata_incarnation, self.value.head) };
+                }
+                if (self.decision_fault == .lost_reply or self.decision_fault == .pending or self.decision_fault == .restart_committed) {
+                    if (self.decision_fault == .pending) self.decision_pending_checks = 3;
+                    self.decision_fault = .none;
+                    return error.MetadataMutationOutcomeUnknown;
+                }
+            } else self.decision_status_calls += 1;
+            const pending = self.decision_pending_checks != 0;
+            if (pending) self.decision_pending_checks -= 1;
+            return std.json.Stringify.valueAlloc(alloc, publication.DecisionStatus{ .head = self.value.head, .replication_pending = pending }, .{});
+        }
         if (call == .relational_index_owner_ack or call == .relational_index_owner_ack_status) {
             const request = if (call == .relational_index_owner_ack) call.relational_index_owner_ack else call.relational_index_owner_ack_status;
             try request.validate();
@@ -1471,7 +1510,9 @@ const TestDriver = struct {
                         const position: local.storage_db_receipt_position.Native = .{ .namespace = binding.fence.namespace, .sequence = 8 };
                         const duplicate = self.validation_seal_effects != 0;
                         if (!duplicate) self.validation_seal_effects += 1;
-                        return .{ .root_generation = self.root_generation, .outcome = try parsed(native.BuildResponse, alloc, .{ .validated = .{ .physical = physical, .logical = .{ .command = command, .position = position, .duplicate = duplicate, .receipt = try command.receipt(position) } } }) };
+                        const validated: native.ValidatedOutcome = .{ .physical = physical, .logical = .{ .command = command, .position = position, .duplicate = duplicate, .receipt = try command.receipt(position) } };
+                        self.validated_outcome = validated;
+                        return .{ .root_generation = self.root_generation, .outcome = try parsed(native.BuildResponse, alloc, .{ .validated = validated }) };
                     }
                     return .{ .root_generation = self.root_generation, .outcome = try parsed(native.BuildResponse, alloc, .{ .audit = physical }) };
                 }
@@ -1837,7 +1878,7 @@ fn testSchedulerDeliveryFault(alloc: std.mem.Allocator, permission: publication.
             for (coordinator.jobs[0].?.owners) |owner| if (owner != null) break :active true;
             break :active false;
         };
-        if (driver.validation_acks == 1 and !resident and (validation_fault != .restart_committed or driver.validation_permission_acks != 0)) break;
+        if (driver.validation_acks == 1 and !resident and (validation_fault != .restart_committed or driver.decision_effects != 0)) break;
     }
     try std.testing.expect(driver.inventory_pages != 0);
     try std.testing.expect(driver.generation_pages != 0);
@@ -1850,11 +1891,14 @@ fn testSchedulerDeliveryFault(alloc: std.mem.Allocator, permission: publication.
     if (validation_fault == .lost_reply or validation_fault == .before_commit) try std.testing.expect(driver.validation_status_calls != 0);
     if (validation_fault == .physical_only) try std.testing.expect(driver.audit_pages >= 5);
     if (validation_fault == .restart or validation_fault == .restart_committed) try std.testing.expect(restarted);
-    if (validation_fault == .restart_committed) try std.testing.expect(driver.validation_permission_acks != 0);
+    if (validation_fault == .restart_committed) {
+        try std.testing.expectEqual(@as(usize, 1), driver.decision_effects);
+        try std.testing.expectEqual(local.storage_db_relational_index_publication_progress.Phase.installing, driver.value.head.phase);
+    }
     try std.testing.expectEqual(@as(u16, 1), driver.value.head.counts[@backingInt(local.storage_db_relational_index_publication_progress.Action.validated)]);
     try std.testing.expectEqual(@as(usize, 1), driver.build_pages);
     try std.testing.expectEqual(@as(usize, 1), driver.consumption_calls);
-    try std.testing.expect(driver.value.head.phase == .building);
+    try std.testing.expectEqual(if (validation_fault == .restart_committed) local.storage_db_relational_index_publication_progress.Phase.installing else .building, driver.value.head.phase);
     host.active = false;
     const before = sender.calls;
     try std.testing.expect(!try coordinator.step(std.testing.io, alloc, null, &host, &transport, now));
@@ -2420,8 +2464,13 @@ test "relational index publication claim receiver binds fresh build permission w
 
 fn testSchedulerInstallationFaults(alloc: std.mem.Allocator, permission: publication.OwnerDecision, binding: jobs.Binding, root: local.storage_db_root_signing_identity.State, outcome: native.InstallationResponse) !void {
     const worker = @import("../metadata/relational_index_worker.zig");
-    for ([_]TestDriver.ValidationFault{ .before_commit, .lost_reply, .pending, .stale_revision, .restart, .restart_committed }) |fault| {
-        var driver: TestDriver = .{ .value = permission, .binding = binding, .installation_response = outcome, .validation_fault = fault };
+    for ([_]bool{ false, true }) |automatic_decision| for ([_]TestDriver.ValidationFault{ .none, .before_commit, .lost_reply, .pending, .stale_revision, .restart, .restart_committed }) |fault| {
+        var driver: TestDriver = .{ .value = permission, .binding = binding, .installation_response = outcome, .validation_fault = if (automatic_decision) .none else fault, .decision_fault = if (automatic_decision) fault else .none };
+        if (automatic_decision) {
+            driver.value.head.phase = .building;
+            driver.value.head.revision -= 1;
+            driver.value.native_install = null;
+        }
         var host: TestSchedulerHost = .{ .driver = &driver };
         var sender: TestDeliveryTransport = .{ .driver = &driver, .root = root };
         var transport = sender.localTransport();
@@ -2429,7 +2478,7 @@ fn testSchedulerInstallationFaults(alloc: std.mem.Allocator, permission: publica
         defer coordinator.deinit(std.testing.io);
         var now = @import("antfly_platform").time.monotonicNs();
         var restarted = false;
-        for (0..60) |_| {
+        for (0..90) |_| {
             const before = sender.calls;
             _ = try coordinator.step(std.testing.io, alloc, null, &host, &transport, now);
             try std.testing.expect(sender.calls - before <= 1);
@@ -2437,7 +2486,9 @@ fn testSchedulerInstallationFaults(alloc: std.mem.Allocator, permission: publica
                 var cut = false;
                 for (coordinator.jobs) |job| if (job) |active| {
                     for (active.owners) |owner| if (owner) |value| {
-                        if (value.ack != null and driver.installation_acks == @as(usize, if (fault == .restart_committed) 1 else 0)) cut = true;
+                        const stage_present = if (automatic_decision) value.decision != null else value.ack != null;
+                        const completed = if (automatic_decision) driver.decision_effects else driver.installation_acks;
+                        if (stage_present and completed == @as(usize, if (fault == .restart_committed) 1 else 0)) cut = true;
                     };
                 };
                 if (cut) {
@@ -2458,11 +2509,15 @@ fn testSchedulerInstallationFaults(alloc: std.mem.Allocator, permission: publica
             now += 300 * std.time.ns_per_ms;
         }
         try std.testing.expectEqual(@as(usize, 1), driver.installation_acks);
-        try std.testing.expectEqual(@as(usize, if (fault == .before_commit or fault == .stale_revision) 2 else 1), driver.installation_ack_requests);
+        try std.testing.expectEqual(@as(usize, if (!automatic_decision and (fault == .before_commit or fault == .stale_revision)) 2 else 1), driver.installation_ack_requests);
+        if (automatic_decision) {
+            try std.testing.expectEqual(@as(usize, 1), driver.decision_effects);
+            try std.testing.expectEqual(@as(usize, if (fault == .before_commit or fault == .stale_revision) 2 else 1), driver.decision_requests);
+        }
         try std.testing.expectEqual(local.storage_db_relational_index_publication_progress.Phase.releasing, driver.value.head.phase);
         try std.testing.expect(driver.installation_calls != 0);
         if (fault == .restart or fault == .restart_committed) try std.testing.expect(restarted);
-    }
+    };
 }
 
 test "relational index publication installed receiver binds fresh decision and retains paired physical witnesses" {

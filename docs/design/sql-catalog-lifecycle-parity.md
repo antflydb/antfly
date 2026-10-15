@@ -8072,3 +8072,37 @@ Automatic publication-decision dispatch, durable native release/retirement,
 latest-stage replacement-root adoption and full distributed/public producer
 qualification remain unfinished. Original accounting is unchanged at
 483 implemented / 862 unresolved.
+
+Full installed-witness qualification subsequently passed 159/159 Debug steps
+in `/private/tmp/antfly-installed-ack-full-debug.log`.
+
+### Automatic irreversible publication decisions
+
+Authority-bound private decision/status calls reuse the admitted job's existing
+atomic descriptor/name/head transaction. Both metadata-leader and standalone
+ports preserve uncertain post-proposal outcomes; status binds the exact table,
+job and pre-decision revision and withholds completion while an outbox remains.
+Private HTTP replies are capped at 2 KiB, including body-bound read grants and
+definitive versus ambiguous pending-publication errors.
+
+When every frozen source and validation ACK is complete, the bounded scheduler
+submits the decision and resolves uncertainty through status before selecting
+a fresh CAS cut. Restart recovery advances from durable progress, never by
+replaying SQL DDL. Standalone publishes the changed descriptor through an O(1)
+table upsert on its exact revision, falling back to coherent projection reload
+only if another writer overtook that cut.
+
+Coverage includes decision authority/locking, post-proposal uncertainty, pending
+publication, commit/reopen status, exact job correlation and scheduler faults
+before/after commit, lost replies, stale revisions and volatile restarts. The
+initial expanded gate passed its standalone suites but exposed two old phase/
+permission expectations in the validation-restart fixture; these were updated
+to assert the new durable decision advance while retaining single-seal and
+single-ACK checks. The corrected focused Debug gate passed 75/75 steps in
+`/private/tmp/antfly-auto-index-decision-debug-v3.log`. Boundary, licensing,
+inventory, formatting, diff and control-catalog checks pass; a final broader
+gate for this revision remains pending.
+
+Durable native release/retirement, latest-stage replacement-root adoption and
+full distributed/public producer qualification remain unfinished. No original
+SQL dispositions or throughput claims change.

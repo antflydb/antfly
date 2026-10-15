@@ -4871,6 +4871,13 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
         defer alloc.free(floor);
         try clone.applyStandaloneCommand(group, .{ .activate_topology_protocol = floor });
         try clone.validateRelationalIndexPublicationDecision(group, decision);
+        {
+            const status_json = try clone.relationalIndexPublicationDecisionStatusJson(alloc, group, decision);
+            defer alloc.free(status_json);
+            var status = try std.json.parseFromSlice(index_publication.DecisionStatus, alloc, status_json, .{});
+            defer status.deinit();
+            try std.testing.expect(!try status.value.isDecided(decision));
+        }
         var stale = decision;
         stale.expected_revision -= 1;
         try std.testing.expectError(error.GenerationPublicationChanged, clone.validateRelationalIndexPublicationDecision(group, stale));
@@ -4960,6 +4967,16 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
         const committed = try clone.snapshotBuilder().buildSnapshot(alloc, group);
         defer alloc.free(committed);
         {
+            const status_json = try clone.relationalIndexPublicationDecisionStatusJson(alloc, group, decision);
+            defer alloc.free(status_json);
+            var status = try std.json.parseFromSlice(index_publication.DecisionStatus, alloc, status_json, .{});
+            defer status.deinit();
+            try std.testing.expect(try status.value.isDecided(decision));
+            var wrong = decision;
+            wrong.id[0] ^= 1;
+            try std.testing.expectError(error.GenerationPublicationChanged, status.value.isDecided(wrong));
+        }
+        {
             const install_group = install_group: {
                 var read = try clone.store.beginReadTxn();
                 defer read.abort();
@@ -4971,6 +4988,11 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
                 try clone.store.put(RaftApplyStore.metadata_hot_standby.outbox_key, "pending-index-decision");
                 defer clone.store.delete(RaftApplyStore.metadata_hot_standby.outbox_key) catch unreachable;
                 try std.testing.expectError(error.MetadataReplicationPending, clone.relationalIndexOwnerDecisionJson(alloc, group, lookup));
+                const status_json = try clone.relationalIndexPublicationDecisionStatusJson(alloc, group, decision);
+                defer alloc.free(status_json);
+                var status = try std.json.parseFromSlice(index_publication.DecisionStatus, alloc, status_json, .{});
+                defer status.deinit();
+                try std.testing.expect(!try status.value.isDecided(decision));
             }
             const InstallGrantAllocations = struct {
                 fn run(task_alloc: std.mem.Allocator, store_: *RaftApplyStore, metadata_group: u64, lookup_request: index_publication.OwnerRequest) !void {
@@ -17924,6 +17946,22 @@ pub const RaftApplyStore = struct {
         defer txn.abort();
         var prepared = try self.prepareRelationalIndexPublicationDecisionTxn(&txn, group_id, decision);
         defer if (prepared) |*value| value.deinit(self.alloc);
+    }
+
+    pub fn relationalIndexPublicationDecisionStatusJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: index_publication.DecidePublish) ![]u8 {
+        try request.validate();
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        _ = try self.standbyRelationActivationTxn(&txn, group_id, topology_protocol.index_publication_decision_version);
+        var buf: [192]u8 = undefined;
+        const head = index_progress.Head.decode(txn.get(try index_publication.headKey(&buf, group_id, request.table_id)) catch |err| switch (err) {
+            error.NotFound => return error.GenerationPublicationNotFound,
+            else => return err,
+        }) catch return error.InvalidCatalogRecord;
+        try index_publication.requireActivePointer(&txn, group_id, head);
+        const status: index_publication.DecisionStatus = .{ .head = head, .replication_pending = try stagingGet(&txn, metadata_hot_standby.outbox_key) != null };
+        _ = try status.isDecided(request);
+        return std.json.Stringify.valueAlloc(alloc, status, .{});
     }
 
     const IndexPublicationDecision = struct {
