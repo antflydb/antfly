@@ -290,11 +290,7 @@ fn stageAfbRestoreBackupWithOptions(
     defer root_manifest.deinit();
     if (root_manifest.value.mode != .full) return error.BackupBaseRequired;
     try backup_bundle.validateReadablePayloadFeatures(root_manifest.value);
-    var expanded_bytes: u64 = 0;
-    for (root_manifest.value.objects) |object| {
-        if (object.size_bytes > options.max_prepared_bytes -| expanded_bytes) return error.BackupExpansionLimitExceeded;
-        expanded_bytes += object.size_bytes;
-    }
+    try backup_bundle.validatePreparationSizeLimit(root_manifest.value, options.max_prepared_bytes);
     if (root_manifest.value.representation == .native) {
         return try stageNativeAfbRestoreBackup(
             allocator,
@@ -1277,6 +1273,59 @@ test "lite restore staging expands a self-contained native AFB2 bundle" {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, restored_payload, allocator, .limited(128));
     defer allocator.free(bytes);
     try std.testing.expectEqualStrings("native-generation-payload", bytes);
+}
+
+test "lite restore staging rejects unreferenced native blob bytes before extraction" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+    const input = try std.fs.path.join(alloc, &.{ root, "unused-blob.afb2" });
+    defer alloc.free(input);
+    const location = try std.fmt.allocPrint(alloc, "file://{s}/never-created", .{root});
+    defer alloc.free(location);
+    const first = "0000000000000000000000000000000000000000000000000000000000000000";
+    const second = "1111111111111111111111111111111111111111111111111111111111111111";
+    const encoded = try backup_bundle.encodeManifestAlloc(alloc, .{
+        .representation = .native,
+        .backup_id = "test",
+        .table_name = "docs",
+        .objects = &.{.{ .logical_path = "test-metadata.json", .role = "manifest", .size_bytes = 16, .sha256 = first }},
+        .blobs = &.{
+            .{ .sha256 = first, .logical_size_bytes = 16, .stored_size_bytes = 16 },
+            .{ .sha256 = second, .logical_size_bytes = 4 * 1024 * 1024, .stored_size_bytes = 4 * 1024 * 1024 },
+        },
+    });
+    defer alloc.free(encoded);
+    {
+        var file = try tmp.dir.createFile(io, "unused-blob.afb2", .{});
+        defer file.close(io);
+        var buffer: [4096]u8 = undefined;
+        var writer = file.writer(io, &buffer);
+        try backup_codec.writeHeaderTo(&writer.interface, .{
+            .format_version = backup_codec.format_version,
+            .flags = 0,
+            .created_at_ns = 0,
+            .backup_id = @splat(0),
+            .table_count = 1,
+            .shard_count = 1,
+        });
+        try backup_codec.writeBlockTo(&writer.interface, .bundle_manifest, encoded);
+        // No payload/footer: the declared byte budget must reject the source
+        // before extraction attempts to read either or creates a repository.
+        try writer.end();
+    }
+    try std.testing.expectError(error.BackupExpansionLimitExceeded, stageInputRestoreBackupWithOptions(
+        alloc,
+        input,
+        "docs",
+        "test",
+        location,
+        .{ .max_prepared_bytes = 1024 * 1024 },
+    ));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "never-created", .{}));
 }
 
 test "lite restore staging accepts aflite input for normal restore" {
