@@ -5150,6 +5150,13 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
             pub fn get(self: *@This(), key: []const u8) ![]const u8 {
                 return self.txn.get(key);
             }
+            pub fn delete(self: *@This(), key: []const u8) !void {
+                const fail = self.writes + 1 == self.fail_at;
+                if (fail and !self.after) return error.TestInstallationWriteFailed;
+                try self.txn.delete(key);
+                self.writes += 1;
+                if (fail) return error.TestInstallationWriteFailed;
+            }
         };
         for (1..4) |fail_at| for ([_]bool{ false, true }) |after| {
             var expected_head: [index_progress.Head.encoded_len]u8 = undefined;
@@ -5190,6 +5197,50 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
         try store.validateRelationalIndexOwnerAck(group, duplicate_json);
         try store.applyStandaloneCommand(group, .{ .ack_relational_index_publication = duplicate_json });
         {
+            var release_request = lookup;
+            release_request.operation = .release;
+            try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, store.relationalIndexOwnerDecisionJson(alloc, group, release_request));
+            var activation = (try store.topologyActivation(group)).?;
+            activation.version = topology_protocol.index_publication_release_version;
+            const activation_json = try std.json.Stringify.valueAlloc(alloc, activation, .{});
+            defer alloc.free(activation_json);
+            try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = activation_json });
+            const release_json = try store.relationalIndexOwnerDecisionJson(alloc, group, release_request);
+            defer alloc.free(release_json);
+            var release_permission = try std.json.parseFromSlice(index_publication.OwnerDecision, alloc, release_json, .{});
+            defer release_permission.deinit();
+            try release_permission.value.requireRequest(release_request);
+            const release_intent = try release_permission.value.nativeReleaseIntent(release_request);
+            try std.testing.expectEqualDeep(command, release_intent.installed.command);
+            try std.testing.expectEqualDeep(position, release_intent.installed.position);
+            const release_grant = release_permission.value.native_release.?;
+            var changed = release_permission.value;
+            changed.native_release = null;
+            try std.testing.expectError(error.InvalidCatalogRecord, changed.requireRequest(release_request));
+            changed = release_permission.value;
+            changed.native_release.?.decision_digest[0] ^= 1;
+            try std.testing.expectError(error.InvalidCatalogRecord, changed.requireRequest(release_request));
+            changed = release_permission.value;
+            changed.native_release.?.installed.position.sequence += 1;
+            try std.testing.expectError(error.InvalidCatalogRecord, changed.requireRequest(release_request));
+            changed = release_permission.value;
+            changed.native_release.?.installed.command.metadata_decision[0] ^= 1;
+            try std.testing.expectError(error.InvalidCatalogRecord, changed.requireRequest(release_request));
+            var later = release_permission.value.head;
+            later.revision += 1;
+            try std.testing.expectEqualDeep(release_grant.decision_digest, try index_publication.NativeReleaseGrant.decisionDigest(group, release_permission.value.metadata_incarnation, later));
+            later.phase = .published;
+            later.counts[@backingInt(index_progress.Action.released)] = later.owner_count;
+            try std.testing.expectEqualDeep(release_grant.decision_digest, try index_publication.NativeReleaseGrant.decisionDigest(group, release_permission.value.metadata_incarnation, later));
+            later = release_permission.value.head;
+            later.phase = .installing;
+            later.counts[@backingInt(index_progress.Action.installed)] = 0;
+            try std.testing.expectError(error.InvalidCatalogRecord, index_publication.NativeReleaseGrant.decisionDigest(group, release_permission.value.metadata_incarnation, later));
+            try store.store.put(RaftApplyStore.metadata_hot_standby.outbox_key, "pending-release-permission");
+            defer store.store.delete(RaftApplyStore.metadata_hot_standby.outbox_key) catch unreachable;
+            try std.testing.expectError(error.MetadataReplicationPending, store.relationalIndexOwnerDecisionJson(alloc, group, release_request));
+        }
+        {
             try store.store.put(RaftApplyStore.metadata_hot_standby.outbox_key, "pending-installed-ack");
             defer store.store.delete(RaftApplyStore.metadata_hot_standby.outbox_key) catch unreachable;
             const pending_json = try store.relationalIndexOwnerAckStatusJson(alloc, group, ack);
@@ -5197,6 +5248,106 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
             var pending = try std.json.parseFromSlice(index_publication.AckStatus, alloc, pending_json, .{});
             defer pending.deinit();
             try std.testing.expect(!try pending.value.isAcknowledged(ack));
+        }
+        {
+            var release_request = lookup;
+            release_request.operation = .release;
+            const release_json = try store.relationalIndexOwnerDecisionJson(alloc, group, release_request);
+            defer alloc.free(release_json);
+            var permission_release = try std.json.parseFromSlice(index_publication.OwnerDecision, alloc, release_json, .{});
+            defer permission_release.deinit();
+            const release_intent = try permission_release.value.nativeReleaseIntent(release_request);
+            var release_position = position;
+            release_position.sequence += 1;
+            const release_receipt = try release_intent.receipt(release_position);
+            const release_ack: index_publication.Ack = .{ .table_id = lookup.table_id, .expected_revision = permission_release.value.head.revision, .signed = .{ .receipt = release_receipt, .proof = try ack.signed.proof.sign(root, try release_receipt.digest()) } };
+            const release_bytes = try std.json.Stringify.valueAlloc(alloc, release_ack, .{});
+            defer alloc.free(release_bytes);
+            try std.testing.expectError(error.IndexOwnerReceiptChanged, store.validateRelationalIndexOwnerAck(group, release_bytes));
+            {
+                var txn = try store.store.beginWriteTxn();
+                errdefer txn.abort();
+                var arena = std.heap.ArenaAllocator.init(alloc);
+                defer arena.deinit();
+                const a = arena.allocator();
+                const current = (try store.loadStoreHeaderTxn(&txn, group, ack.signed.proof.identity.store_id)).?;
+                defer metadata_table_manager.freeStore(alloc, current);
+                const address = try RaftApplyStore.ReportAddress.active(a, &txn, group, current.store_id);
+                const report = (try RaftApplyStore.readStoreGroupReportTxn(a, &txn, group, address, lookup.group_id, true)).?;
+                const runtimes = try a.dupe(@TypeOf(report.runtime_statuses[0]), report.runtime_statuses);
+                runtimes[0].source_authority.?.sequence = release_position.sequence;
+                var refreshed = current;
+                refreshed.runtime_statuses = runtimes;
+                refreshed.group_statuses = report.group_statuses;
+                _ = try store.updateListingStoreTxn(&txn, group, current.store_id, refreshed);
+                try txn.commit();
+            }
+            try store.validateRelationalIndexOwnerAck(group, release_bytes);
+            var forged_intent = release_intent;
+            forged_intent.metadata_decision[0] ^= 1;
+            var forged = release_ack;
+            forged.signed.receipt = try forged_intent.receipt(release_position);
+            forged.signed.proof = try forged.signed.proof.sign(root, try forged.signed.receipt.digest());
+            try forged.validate();
+            const rejected = try std.json.Stringify.valueAlloc(alloc, forged, .{});
+            defer alloc.free(rejected);
+            try std.testing.expectError(error.IndexOwnerReceiptChanged, store.validateRelationalIndexOwnerAck(group, rejected));
+            for (1..5) |fail_at| for ([_]bool{ false, true }) |after| {
+                var expected_head: [index_progress.Head.encoded_len]u8 = undefined;
+                var expected_owner: [index_progress.OwnerState.encoded_len]u8 = undefined;
+                {
+                    var txn = try store.store.beginWriteTxn();
+                    defer txn.abort();
+                    const prepared = try store.prepareRelationalIndexOwnerAckTxn(&txn, group, release_bytes);
+                    expected_head = prepared.update.expected_head;
+                    expected_owner = prepared.update.expected_owner;
+                    var fault: Fault = .{ .txn = &txn, .fail_at = fail_at, .after = after };
+                    try std.testing.expectError(error.TestInstallationWriteFailed, prepared.stage(&fault, group));
+                    try std.testing.expectEqual(if (after) fail_at else fail_at - 1, fault.writes);
+                }
+                var read = try store.store.beginReadTxn();
+                defer read.abort();
+                try std.testing.expectEqualSlices(u8, &expected_head, try read.get(try index_publication.headKey(&buf, group, lookup.table_id)));
+                try std.testing.expectEqualSlices(u8, &expected_owner, try read.get(try index_publication.ownerKey(&buf, group, lookup.table_id, ordinal)));
+                const lock = (try @import("../table_lifecycle_lock.zig").read(&read, group, lookup.table_id)).?;
+                try std.testing.expectEqualDeep(release_ack.signed.receipt.owner.plan_id, lock.id);
+                try std.testing.expectError(error.NotFound, read.get(try index_publication.proofKey(&buf, group, lookup.table_id, ordinal, .released)));
+            };
+            try store.applyStandaloneCommand(group, .{ .ack_relational_index_publication = release_bytes });
+            opened = false;
+            store.deinit();
+            store = try RaftApplyStore.init(alloc, .{ .root_dir = path });
+            opened = true;
+            try verifyRelationRecoveryForTest(&store, alloc, group);
+            const terminal_json = try store.relationalIndexOwnerAckStatusJson(alloc, group, release_ack);
+            defer alloc.free(terminal_json);
+            var terminal = try std.json.parseFromSlice(index_publication.AckStatus, alloc, terminal_json, .{});
+            defer terminal.deinit();
+            try std.testing.expectEqual(index_progress.Phase.published, terminal.value.head.phase);
+            try std.testing.expect(try terminal.value.isAcknowledged(release_ack));
+            {
+                // Valid signatures and consistent local hashes cannot hide a
+                // release for a different metadata decision during recovery.
+                var txn = try store.store.beginWriteTxn();
+                defer txn.abort();
+                var changed_owner = terminal.value.owner;
+                changed_owner.receipts[@backingInt(index_progress.Action.released)] = try forged.signed.receipt.digest();
+                changed_owner.attestations[@backingInt(index_progress.Action.released)] = try forged.signed.commitment();
+                try txn.put(try index_publication.ownerKey(&buf, group, lookup.table_id, ordinal), &try changed_owner.encode());
+                const changed_proof = try index_publication.StoredProof.encode(forged.signed, null, null);
+                try txn.put(try index_publication.proofKey(&buf, group, lookup.table_id, ordinal, .released), changed_proof.slice());
+                try std.testing.expectError(error.InvalidCatalogRecord, index_publication.verifyJob(alloc, &txn, group, lookup.table_id));
+            }
+            {
+                var txn = try store.store.beginWriteTxn();
+                defer txn.abort();
+                var activation = (try store.topologyActivation(group)).?;
+                activation.version = topology_protocol.index_publication_release_version - 1;
+                const lowered = try std.json.Stringify.valueAlloc(alloc, activation, .{});
+                defer alloc.free(lowered);
+                try txn.put(try RaftApplyStore.topologyActivationKeyForGroup(&buf, group), lowered);
+                try std.testing.expectError(error.InvalidMetadataSnapshot, store.buildMetadataSnapshotTxn(alloc, &txn, group, null));
+            }
         }
     }
 
@@ -5254,6 +5405,9 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
             }
             pub fn get(self: *@This(), key: []const u8) ![]const u8 {
                 return self.txn.get(key);
+            }
+            pub fn delete(self: *@This(), key: []const u8) !void {
+                try self.txn.delete(key);
             }
         };
         {
@@ -5734,6 +5888,10 @@ pub const OwnerAckTestFixture = if (@import("builtin").is_test) struct {
                         try self.txn.put(key, value);
                         self.writes += 1;
                         if (fail) return error.TestProofWriteFailed;
+                    }
+                    pub fn delete(self: *@This(), key: []const u8) anyerror!void {
+                        try self.txn.delete(key);
+                        self.writes += 1;
                     }
                 };
                 for ([_]bool{ false, true }) |after| {
@@ -17355,8 +17513,8 @@ pub const RaftApplyStore = struct {
         proof_bytes: index_publication.StoredProof,
 
         /// Every failure after staging begins must abort the outer transaction.
-        /// Keeping proof persistence here makes the three-record atomic cut
-        /// identical for production and fault-injected transaction adapters.
+        /// Proof persistence and terminal lock retirement share the same
+        /// atomic cut in production and fault-injected transaction adapters.
         fn stage(self: *const @This(), txn: anytype, group_id: u64) !void {
             var head_buf: [192]u8 = undefined;
             var owner_buf: [192]u8 = undefined;
@@ -17364,6 +17522,9 @@ pub const RaftApplyStore = struct {
             if (self.update.changed) {
                 var proof_buf: [160]u8 = undefined;
                 try txn.put(try index_publication.proofKey(&proof_buf, group_id, self.table_id, self.ordinal, self.action), self.proof_bytes.slice());
+                const next = try index_progress.Head.decode(&self.update.next_head);
+                if (next.phase == .published or next.phase == .canceled)
+                    try @import("../table_lifecycle_lock.zig").release(txn, group_id, self.table_id, .{ .kind = .index_build, .id = next.plan_id });
             }
         }
     };
@@ -17410,6 +17571,8 @@ pub const RaftApplyStore = struct {
         try self.requireIndexOwnerRootReceiptTxn(txn, group_id, ack.signed, head.reader_requirements);
         if (ack.validation) |witness| _ = try self.verifyRelationalIndexAuditTxn(txn, group_id, witness.signed, witness.outcome);
         if (ack.installation) |witness| try self.verifyRelationalIndexInstallationTxn(txn, group_id, witness);
+        if (action == .released and ack.signed.receipt.owner.authority == .native)
+            try self.verifyRelationalIndexReleaseTxn(txn, group_id, head, previous_owner, ack.signed);
         const root = try ack.signed.commitment();
         if (previous_evidence) |previous| {
             const old_grant = previous.signed.proof;
@@ -17537,6 +17700,24 @@ pub const RaftApplyStore = struct {
     /// accepting publication transaction must repeat this exact verification.
     pub fn verifyRelationalIndexAuditTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, signed: index_publication.SignedAudit, outcome: @import("antfly_local_sources").storage_db_relational_index_owner_control.AuditOutcome) ![32]u8 {
         return self.verifyRelationalIndexAuditModeTxn(txn, group_id, signed, outcome, .validation);
+    }
+
+    /// Reconstruct release from metadata's accepted installed cut. Replaying
+    /// the old generation audit after release would incorrectly reject normal
+    /// user writes; the terminal native receipt binds the immutable build cut.
+    fn verifyRelationalIndexReleaseTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, head: index_progress.Head, owner: index_progress.OwnerState, signed: index_publication.SignedReceipt) !void {
+        _ = try self.standbyRelationActivationTxn(txn, group_id, topology_protocol.index_publication_release_version);
+        var buf: [192]u8 = undefined;
+        const accepted = try index_publication.storedProof(self.alloc, try txn.get(try index_publication.proofKey(&buf, group_id, head.table_id, owner.owner.ordinal, .installed)), head, owner, .installed);
+        const witness = accepted.installation orelse return error.InvalidCatalogRecord;
+        const incarnation = (try decodeMetadataIncarnationRecord(try txn.get(try metadataIncarnationKeyForGroup(&buf, group_id)))).incarnation;
+        const grant: index_publication.NativeReleaseGrant = .{
+            .installed = .{ .command = witness.command, .position = accepted.signed.receipt.position.native },
+            .decision_digest = try index_publication.NativeReleaseGrant.decisionDigest(group_id, incarnation, head),
+        };
+        try grant.validateFor(group_id, incarnation, head, owner);
+        _ = try self.currentIndexBuildOwnerTxnImpl(txn, group_id, grant.installed.command.validation.command.binding, null, .installation);
+        try index_publication.requireNativeReleaseReceipt(group_id, incarnation, head, owner, accepted, signed);
     }
 
     fn verifyRelationalIndexInstallationTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, witness: index_publication.InstallationWitness) !void {
@@ -17920,6 +18101,16 @@ pub const RaftApplyStore = struct {
             decision.native_install = .{
                 .validation = .{ .command = try witness.outcome.logicalCommand(), .position = accepted.signed.receipt.position.native },
                 .decision_digest = try index_publication.NativeInstallGrant.decisionDigest(group_id, incarnation, head),
+            };
+        }
+        if (owner.owner.authority == .native and request.operation == .release) {
+            _ = try self.standbyRelationActivationTxn(&txn, group_id, topology_protocol.index_publication_release_version);
+            const accepted = try index_publication.storedProof(self.alloc, try txn.get(try index_publication.proofKey(&buf, group_id, request.table_id, ordinal, .installed)), head, owner, .installed);
+            const witness = accepted.installation orelse return error.InvalidCatalogRecord;
+            try self.requireIndexOwnerRootReceiptTxn(&txn, group_id, accepted.signed, head.reader_requirements);
+            decision.native_release = .{
+                .installed = .{ .command = witness.command, .position = accepted.signed.receipt.position.native },
+                .decision_digest = try index_publication.NativeReleaseGrant.decisionDigest(group_id, incarnation, head),
             };
         }
         var route_arena = std.heap.ArenaAllocator.init(self.alloc);
@@ -34568,6 +34759,8 @@ fn validateSchemaReaderSnapshotCut(alloc: std.mem.Allocator, group_id: u64, rows
             const head = try index_progress.Head.decode(row.value);
             const decided = head.phase == .installing or head.phase == .releasing or head.phase == .published;
             required_version = @max(required_version, if (decided) topology_protocol.index_publication_decision_version else topology_protocol.index_publication_head_version);
+            if (head.counts[@backingInt(index_progress.Action.released)] != 0)
+                required_version = @max(required_version, topology_protocol.index_publication_release_version);
             if (required_version == topology_protocol.current_version) break;
         } else if (std.mem.startsWith(u8, row.key, tables_prefix)) {
             if ((try borrowTableProjection(row.value, .identity)).schema_reader_requirements != null) {

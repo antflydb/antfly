@@ -632,6 +632,56 @@ pub const NativeInstallGrant = struct {
     }
 };
 
+/// Release is a separate all-owner decision, not permission inferred from one
+/// owner's installation. Reconstruct it from metadata's exact retained cut.
+pub const NativeReleaseGrant = struct {
+    installed: local.storage_db_relational_index_validation.Installed,
+    decision_digest: Digest,
+
+    pub fn decisionDigest(group: u64, incarnation: local.metadata_incarnation.MetadataClusterIncarnation, head: progress.Head) !Digest {
+        try head.validate();
+        if (group == 0 or !local.metadata_incarnation.isValid(incarnation) or
+            (head.phase != .releasing and head.phase != .published) or
+            head.counts[@backingInt(progress.Action.installed)] != head.owner_count) return error.InvalidCatalogRecord;
+        var state = std.crypto.hash.Blake3.init(.{});
+        state.update("antfly/native-index-release-decision/v1");
+        state.update(&try NativeInstallGrant.decisionDigest(group, incarnation, head));
+        var result: Digest = undefined;
+        state.final(&result);
+        return result;
+    }
+
+    pub fn intent(self: @This()) @FieldType(native_control.ReleaseOutcome, "intent") {
+        return .{ .installed = self.installed, .metadata_decision = self.decision_digest };
+    }
+
+    pub fn validateFor(self: @This(), group: u64, incarnation: local.metadata_incarnation.MetadataClusterIncarnation, head: progress.Head, owner: progress.OwnerState) !void {
+        try (NativeInstallGrant{ .validation = self.installed.command.validation, .decision_digest = self.installed.command.metadata_decision }).validateFor(group, incarnation, head, owner);
+        const receipt = try self.installed.command.receipt(self.installed.position);
+        if (!std.mem.eql(u8, &self.decision_digest, &try decisionDigest(group, incarnation, head)) or
+            !std.meta.eql(receipt.owner, owner.owner) or
+            !std.mem.eql(u8, &try receipt.digest(), &owner.receipts[@backingInt(progress.Action.installed)])) return error.InvalidCatalogRecord;
+        try self.intent().validate();
+    }
+};
+
+/// Shared live-apply and recovery check. Root replacement requires a distinct
+/// physical recovery protocol; a release signature cannot adopt an old cut.
+pub fn requireNativeReleaseReceipt(group: u64, incarnation: local.metadata_incarnation.MetadataClusterIncarnation, head: progress.Head, owner: progress.OwnerState, installed: StoredProof.Decoded, signed: SignedReceipt) !void {
+    const witness = installed.installation orelse return error.InvalidCatalogRecord;
+    const grant: NativeReleaseGrant = .{
+        .installed = .{ .command = witness.command, .position = installed.signed.receipt.position.native },
+        .decision_digest = try NativeReleaseGrant.decisionDigest(group, incarnation, head),
+    };
+    try grant.validateFor(group, incarnation, head, owner);
+    if (signed.receipt.position != .native or
+        !std.meta.eql(try grant.intent().receipt(signed.receipt.position.native), signed.receipt) or
+        !std.meta.eql(installed.signed.proof.identity, signed.proof.identity) or
+        !std.meta.eql(installed.signed.proof.authority, signed.proof.authority) or
+        installed.signed.proof.root_generation != signed.proof.root_generation or
+        installed.signed.proof.reporter_incarnation != signed.proof.reporter_incarnation) return error.IndexOwnerReceiptChanged;
+}
+
 pub const OwnerDecision = struct {
     pub const Attestation = struct {
         table_name: []const u8,
@@ -649,6 +699,7 @@ pub const OwnerDecision = struct {
     claim_routes: ?ClaimRoutes = null,
     target_expectation: ?local.storage_db_relational_index_owner_job.private_claims.TargetExpectation = null,
     native_install: ?NativeInstallGrant = null,
+    native_release: ?NativeReleaseGrant = null,
     /// Read-only recovery of an already accepted latest stage. This is never
     /// execution permission, schema input, or an index allocation request.
     attestation: ?Attestation = null,
@@ -670,6 +721,10 @@ pub const OwnerDecision = struct {
             const grant = self.native_install orelse return error.InvalidCatalogRecord;
             try grant.validateFor(self.metadata_group_id, self.metadata_incarnation, self.head, self.owner);
         } else if (self.native_install != null) return error.InvalidCatalogRecord;
+        if (request.operation == .release and self.disposition == .execute and self.owner.owner.authority == .native) {
+            const grant = self.native_release orelse return error.InvalidCatalogRecord;
+            try grant.validateFor(self.metadata_group_id, self.metadata_incarnation, self.head, self.owner);
+        } else if (self.native_release != null) return error.InvalidCatalogRecord;
         if (request.claim_groups) |groups| {
             if (self.disposition == .execute) {
                 const routes = self.claim_routes orelse return error.InvalidCatalogRecord;
@@ -797,6 +852,16 @@ pub const OwnerDecision = struct {
         result.target_expectation = expected;
         try result.validate();
         return result;
+    }
+
+    /// Retries after job retirement match the native terminal release record;
+    /// a caller-supplied binding or native position is never required.
+    pub fn nativeReleaseIntent(self: OwnerDecision, request: OwnerRequest) !@FieldType(native_control.ReleaseOutcome, "intent") {
+        if (request.operation != .release) return error.InvalidGenerationPublication;
+        _ = try self.nativeExecutionIdentity(request);
+        const grant = self.native_release orelse return error.InvalidCatalogRecord;
+        try self.requireRetainedNativeBinding(grant.installed.command.validation.command.binding);
+        return grant.intent();
     }
 
     fn requireNativeBinding(self: OwnerDecision, request: OwnerRequest, observed: local.storage_db_relational_index_owner_job.Binding) !void {
@@ -1671,6 +1736,7 @@ pub fn verifyOwned(a: Allocator, txn: anytype, group: u64, table: u64) !Verified
         delivery_counts[1] += accepted.targets;
         delivery_rows[0] = std.math.add(u64, delivery_rows[0], accepted.source_rows) catch return error.InvalidCatalogRecord;
         delivery_rows[1] = std.math.add(u64, delivery_rows[1], accepted.target_rows) catch return error.InvalidCatalogRecord;
+        var installed_proof: ?StoredProof.Decoded = null;
         for (owner.receipts, 0..) |logical, action_index| {
             const action: progress.Action = @fromBackingInt(@intCast(action_index));
             if (std.mem.allEqual(u8, &logical, 0)) {
@@ -1680,6 +1746,10 @@ pub fn verifyOwned(a: Allocator, txn: anytype, group: u64, table: u64) !Verified
             const proof_bytes = try optionalGet(txn, try proofKey(&buf, group, table, @intCast(i), action));
             const retained = try storedProof(a, proof_bytes orelse return error.InvalidCatalogRecord, head, owner, action);
             const signed = retained.signed;
+            if (action == .installed) installed_proof = retained;
+            if (action == .released and owner.owner.authority == .native) {
+                requireNativeReleaseReceipt(group, std.fmt.bytesToHex(parsed.value.table_guard.incarnation, .lower), head, owner, installed_proof orelse return error.InvalidCatalogRecord, signed) catch return error.InvalidCatalogRecord;
+            }
             if (retained.validation) |witness| {
                 const frozen = @import("relational_index_delivery_journal.zig").frozenTargetForRecovery(a, txn, group, head, owner, signed.proof.identity.metadata_incarnation) catch |err| switch (err) {
                     error.OutOfMemory => return err,

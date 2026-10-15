@@ -108,7 +108,11 @@ const std = @import("std");
 /// native installation/release and public producer activation remain separate.
 /// Version 52 requires retained, paired physical witnesses for native installed
 /// ACKs and verifies them against the successor catalog and durable decision.
-pub const current_version: u16 = 52;
+/// Version 53 derives native release permission from the complete installed
+/// owner cohort and exact retained cut. This does not enable public DDL or
+/// authorize adoption of a different physical root.
+pub const current_version: u16 = 53;
+pub const index_publication_release_version: u16 = 53;
 pub const index_publication_installation_version: u16 = 52;
 pub const index_publication_decision_version: u16 = 52;
 pub const index_publication_head_version: u16 = 52;
