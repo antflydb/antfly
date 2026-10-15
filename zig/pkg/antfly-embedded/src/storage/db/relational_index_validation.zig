@@ -195,6 +195,85 @@ pub fn verifyRecovery(alloc: Allocator, txn: anytype, binding: owner.Binding) !v
     const frozen = try claims.InventoryValidation.requireReady(alloc, txn, binding, loaded.summary.expected);
     if (!equal(frozen.digest, loaded.summary.inventory_digest) or frozen.source_members != loaded.summary.source_members or loaded.summary.position.sequence <= frozen.position.sequence) return error.InvalidRelationalIndexValidation;
 }
+/// Owned, root-local progress only. Never import this from a replicated
+/// snapshot or submit it as an ordered native effect. Durable checkpoint
+/// ownership and adoption/signing authority belong to the physical-root owner.
+pub const Audit = struct {
+    root_incarnation: u128,
+    canonical_digest: Digest,
+    inventory_audit_digest: Digest,
+    progress: Loaded,
+    pub fn deinit(self: *@This()) void {
+        self.progress.deinit();
+        self.* = undefined;
+    }
+};
+/// Recompute every physical pass without disturbing the canonical generation
+/// cursor. Requires this root's completed inventory audit; neither that audit
+/// nor this result grants permission to publish or attest the generation.
+pub fn auditPage(alloc: Allocator, core: anytype, binding: owner.Binding, expected: Expected, addition: *const catalog.PrivateAddition, root_incarnation: u128, inventory_audit: claims.InventoryValidation.Audit, previous: ?*const Audit, budget: jobs.Budget, context: Context) !Audit {
+    try context.ensureActive();
+    try budget.validate();
+    try expected.requireBinding(binding);
+    if (root_incarnation == 0 or inventory_audit.root_incarnation != root_incarnation or
+        !equal(inventory_audit.expectation_digest, try expected.digest())) return error.PrivateIndexAuditScopeChanged;
+    try inventory_audit.fields.validate(expected);
+    if (inventory_audit.fields.phase != .ready or !nonzero(inventory_audit.page_digest)) return error.PrivateIndexTargetValidationRequired;
+    if (!addition.candidate.head.eql(binding.physical_candidate) or !addition.reservation.head.eql(binding.physical_reserved) or addition.index.mapKey() != binding.index.mapKey()) return error.PrivateIndexOwnerJobChanged;
+    const pinned: catalog.WriteSnapshot = .{ .head = addition.candidate.head, .plan = addition.plan.clone() };
+    defer {
+        var copy = pinned;
+        copy.deinit();
+    }
+    const index = for (pinned.plan.boundIndexes()) |value| {
+        if (value.id().mapKey() == binding.index.mapKey()) break value;
+    } else return error.IndexNotFound;
+    var read = try core.store.beginReadTxn();
+    defer read.abort();
+    const frozen = try claims.InventoryValidation.requireReady(alloc, &read, binding, expected);
+    if (!equal(inventory_audit.canonical_digest, frozen.digest)) return error.PrivateIndexAuditScopeChanged;
+    var canonical = (try load(alloc, &read, binding)) orelse return error.PrivateIndexTargetValidationRequired;
+    defer canonical.deinit();
+    if (!equal(try canonical.summary.expected.digest(), try expected.digest()) or
+        !equal(canonical.summary.inventory_digest, frozen.digest) or canonical.summary.source_members != frozen.source_members or
+        canonical.summary.position.sequence <= frozen.position.sequence) return error.PrivateIndexAuditScopeChanged;
+    if (canonical.summary.fields.phase != .ready) return error.PrivateIndexTargetValidationRequired;
+    var local: ?Loaded = null;
+    if (previous) |state| {
+        if (state.root_incarnation != root_incarnation or !equal(state.canonical_digest, canonical.digest) or
+            !equal(state.inventory_audit_digest, inventory_audit.page_digest) or
+            !equal(try state.progress.summary.expected.digest(), try expected.digest()) or
+            !equal(state.progress.summary.inventory_digest, frozen.digest) or state.progress.summary.source_members != frozen.source_members or
+            !std.meta.eql(state.progress.summary.position, canonical.summary.position)) return error.PrivateIndexAuditScopeChanged;
+        const encoded = try encodeRecord(alloc, state.progress.summary, state.progress.cursor);
+        defer alloc.free(encoded);
+        if (!equal(hash(encoded), state.progress.digest)) return error.InvalidRelationalIndexValidation;
+        if (state.progress.summary.fields.phase == .ready or state.progress.summary.fields.phase == .failed) {
+            const cursor = try alloc.dupe(u8, state.progress.cursor);
+            return .{ .root_incarnation = root_incarnation, .canonical_digest = canonical.digest, .inventory_audit_digest = inventory_audit.page_digest, .progress = .{ .alloc = alloc, .summary = state.progress.summary, .cursor = cursor, .digest = state.progress.digest } };
+        }
+        local = state.progress;
+    }
+    var page = (try Prepared.preparePage(alloc, core, &read, binding, expected, pinned, index, core.schemaNamespaceGeneration(), frozen, local, budget, context, null)) orelse return error.InvalidRelationalIndexValidation;
+    defer page.deinit();
+    var digest = std.crypto.hash.Blake3.init(.{});
+    digest.update("antfly/private-index-generation-root-local-audit/v1");
+    var root_bytes: [16]u8 = undefined;
+    std.mem.writeInt(u128, &root_bytes, root_incarnation, .little);
+    digest.update(&root_bytes);
+    digest.update(&canonical.digest);
+    digest.update(&inventory_audit.page_digest);
+    digest.update(&try page.command.digest());
+    var page_digest: Digest = undefined;
+    digest.final(&page_digest);
+    const cursor = try alloc.alloc(u8, try std.base64.standard.Decoder.calcSizeForSlice(page.command.cursor_b64));
+    errdefer alloc.free(cursor);
+    try std.base64.standard.Decoder.decode(cursor, page.command.cursor_b64);
+    const summary: Summary = .{ .expected = expected, .inventory_digest = frozen.digest, .source_members = frozen.source_members, .fields = page.command.next, .position = canonical.summary.position, .page_digest = page_digest };
+    const encoded = try encodeRecord(alloc, summary, cursor);
+    defer alloc.free(encoded);
+    return .{ .root_incarnation = root_incarnation, .canonical_digest = canonical.digest, .inventory_audit_digest = inventory_audit.page_digest, .progress = .{ .alloc = alloc, .summary = summary, .cursor = cursor, .digest = hash(encoded) } };
+}
 fn cursorEnd(alloc: Allocator, value: []const u8) ![]u8 {
     var end = value.len;
     while (end != 0) {
@@ -312,6 +391,9 @@ pub const Prepared = struct {
         if (loaded) |value| {
             if (!equal(try value.summary.expected.digest(), try expected.digest()) or !equal(value.summary.inventory_digest, frozen.digest) or value.summary.source_members != frozen.source_members or value.summary.position.sequence <= frozen.position.sequence) return error.PrivateIndexOwnerJobChanged;
         }
+        return preparePage(alloc, core, &read, binding, expected, pinned, index, namespace_generation, frozen, loaded, budget, context, replay_command);
+    }
+    fn preparePage(alloc: Allocator, core: anytype, read: anytype, binding: owner.Binding, expected: Expected, pinned: catalog.WriteSnapshot, index: @import("relational_index_plan.zig").BoundIndex, namespace_generation: u64, frozen: anytype, loaded: ?Loaded, budget: jobs.Budget, context: Context, replay_command: ?Command) !?Prepared {
         var arena = std.heap.ArenaAllocator.init(alloc);
         errdefer arena.deinit();
         const a = arena.allocator();
@@ -335,7 +417,7 @@ pub const Prepared = struct {
             break :initial .{ .chain = chain, .cursor_digest = hash("") };
         };
         const phase = next.phase;
-        const range = try range_state.decodeRangeAlloc(a, (try optional(&read, range_state.range_key)) orelse &@as([8]u8, @splat(0)));
+        const range = try range_state.decodeRangeAlloc(a, (try optional(read, range_state.range_key)) orelse &@as([8]u8, @splat(0)));
         const lower: []const u8 = switch (phase) {
             .primary => try internal.documentExactPrefixAlloc(a, range.start),
             .forward => try a.dupe(u8, &try records.forwardPrefix(binding.index)),
@@ -369,7 +451,7 @@ pub const Prepared = struct {
             const row_alloc = row_arena.allocator();
             if (kv.key.len > max_cursor) return error.InvalidRelationalIndexValidation;
             const observed = try row_alloc.dupe(u8, kv.key);
-            var probe: Probe(@TypeOf(&read)) = .{ .txn = &read, .chain = &next.chain, .bytes = observed.len };
+            var probe: Probe(@TypeOf(read)) = .{ .txn = read, .chain = &next.chain, .bytes = observed.len };
             var document: ?[]const u8 = null;
             var continuation: []const u8 = observed;
             var failure: Failure = .none;

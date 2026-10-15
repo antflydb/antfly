@@ -7137,3 +7137,52 @@ failure completion, missing-root repair, bounded parallel target fanout, actual
 data-Raft execution, terminal catalog publication and complete distributed
 fault coverage. Public UNIQUE activation stays guarded. Original dispositions
 remain 483 implemented / 862 unresolved; no original SQL completion is claimed.
+
+### Root-local physical re-audit kernels
+
+Identity-preserving restore must not rewind the imported canonical inventory or
+generation checkpoints. Ordered native effects bind to their prior-record
+digests; deleting or resetting those records would diverge from the source's
+journal. Physical re-audit therefore has separate root-local progress, which
+must never be imported as canonical job state or submitted as a native effect.
+
+The inventory kernel begins at the start even when canonical progress already
+says ready. It reuses both bounded claim/inventory passes, binds its progress to
+the physical root incarnation, expected logical target and exact canonical
+record digest, and rejects a changed root or seal rather than adopting the old
+scanned prefix. The generation kernel requires the same root's completed
+inventory audit and reuses all three existing physical verification passes.
+Its owned binary cursor retains the existing legal key limit; summaries remain
+bounded. Generation progress additionally binds to the canonical generation
+record and the inventory audit's final digest. Cancellation and normal page
+budgets apply to both kernels, including calls with terminal checkpoints.
+
+Neither kernel writes canonical records, advances native authority, repairs
+physical bytes, signs an ACK or grants publication permission. Progress passed
+to these internal functions must belong to the trusted root-local owner; the
+structures are not an authenticated external checkpoint interface. The caller
+must retain the physical root's lease and existing source fence. Durable local
+checkpoint storage/authentication and actual restore/adoption enforcement are
+still required; this is not a claim that restart or restore integration is done.
+
+The real LSM fixture recomputes inventory and generation coverage behind
+canonical ready records. It checks changed-root and changed-seal rejection,
+cancellation, terminal repeat calls, and bounded continuation across short read
+transactions. Injected claim-only and missing-forward corruption must fail the
+local audits without changing canonical progress or the native sequence and
+without repairing the corrupt bytes. These are controlled physical-corruption
+fixtures, not authorization for writes through a frozen source.
+
+The aggregate gate in
+`/private/tmp/antfly-root-local-audits-full-debug.log` passed 159/159 Debug
+steps, including nine native-page, 48 publication, four ACK, three leased-owner,
+six C-ABI, 46 runtime-contract and 104 standalone tests. These gates overlap
+and do not represent independent SQL coverage. Boundary, license, original
+inventory, generated control-catalog, formatting and diff checks passed. No
+canonical format, native envelope or capability-floor change is introduced.
+
+Original dispositions remain 483 implemented / 862 unresolved. These internal
+tests do not qualify more original SQL cases. Public UNIQUE activation remains
+guarded until proof joining, capability barriers, restore/adoption enforcement,
+install/release, durable terminal completion and distributed fault coverage
+are integrated.

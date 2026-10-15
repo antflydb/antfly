@@ -1232,6 +1232,57 @@ pub const InventoryValidation = struct {
         const consumed = (try SourceStream.loadConsumption(txn, binding, head)).?;
         return .{ .digest = hash(encoded), .source_members = consumed.accepted.rows, .position = record.position };
     }
+    /// Root-local audit state must never be imported as canonical job state or
+    /// submitted through the native mutation/outbox interface. Its owner keeps
+    /// it outside the replicated snapshot, under the physical root's lease.
+    /// This component grants no adoption, signing or publication authority.
+    pub const Audit = struct {
+        root_incarnation: u128,
+        expectation_digest: integrity.Digest,
+        canonical_digest: integrity.Digest,
+        fields: Fields,
+        page_digest: integrity.Digest,
+    };
+    /// Recompute physical coverage from scratch without rewinding canonical
+    /// cursors, advancing native authority, or perturbing replication markers.
+    /// Ordinary restart may resume a root-local checkpoint; a different root
+    /// or canonical seal must start a new audit rather than adopt its prefix.
+    pub fn auditPage(alloc: Allocator, txn: anytype, binding: jobs.Binding, expected: TargetExpectation, root_incarnation: u128, previous: ?Audit, budget: @import("relational_index_jobs.zig").Budget, context: @import("../../api/operation.zig").RequestContext) !Audit {
+        try context.ensureActive();
+        try budget.validate();
+        if (root_incarnation == 0) return error.PrivateIndexAuditScopeChanged;
+        const provenance = try requireLocal(txn, binding, expected);
+        const canonical = (try load(alloc, txn, binding)) orelse return error.PrivateIndexTargetValidationRequired;
+        if (!std.mem.eql(u8, &try canonical.expected.digest(), &try expected.digest())) return error.PrivateIndexAuditScopeChanged;
+        const canonical_bytes = try canonical.encode(alloc);
+        defer alloc.free(canonical_bytes);
+        const canonical_digest = hash(canonical_bytes);
+        const expectation_digest = try expected.digest();
+        var local: ?Record = null;
+        var previous_digest: integrity.Digest = @splat(0);
+        if (previous) |state| {
+            if (state.root_incarnation != root_incarnation or !std.mem.eql(u8, &state.expectation_digest, &expectation_digest) or
+                !std.mem.eql(u8, &state.canonical_digest, &canonical_digest)) return error.PrivateIndexAuditScopeChanged;
+            try state.fields.validate(expected);
+            if (std.mem.allEqual(u8, &state.page_digest, 0)) return error.InvalidPrivateIndexClaimInventory;
+            if (state.fields.phase == .ready or state.fields.phase == .failed) return state;
+            local = .{ .expected = expected, .fields = state.fields, .position = canonical.position, .page_digest = state.page_digest };
+            const encoded = try local.?.encode(alloc);
+            defer alloc.free(encoded);
+            previous_digest = hash(encoded);
+        }
+        const page = (try InventoryValidation.Prepared.preparePage(txn, binding, expected, budget, context, provenance, local, previous_digest, null)) orelse return error.InvalidPrivateIndexClaimInventory;
+        var digest = std.crypto.hash.Blake3.init(.{});
+        digest.update("antfly/private-unique-root-local-audit/v1");
+        var root_bytes: [16]u8 = undefined;
+        std.mem.writeInt(u128, &root_bytes, root_incarnation, .little);
+        digest.update(&root_bytes);
+        digest.update(&canonical_digest);
+        digest.update(&try page.command.digest());
+        var page_digest: integrity.Digest = undefined;
+        digest.final(&page_digest);
+        return .{ .root_incarnation = root_incarnation, .expectation_digest = expectation_digest, .canonical_digest = canonical_digest, .fields = page.command.next, .page_digest = page_digest };
+    }
     pub const Prepared = struct {
         command: Command,
         context: @import("../../api/operation.zig").RequestContext,
@@ -1251,12 +1302,15 @@ pub const InventoryValidation = struct {
             try budget.validate();
             const provenance = try requireLocal(txn, binding, expected);
             const record = try load(alloc, txn, binding);
+            const previous = if (try optional(txn, &key(binding))) |bytes| hash(bytes) else @as(integrity.Digest, @splat(0));
+            return preparePage(txn, binding, expected, budget, context, provenance, record, previous, replay_command);
+        }
+        fn preparePage(txn: anytype, binding: jobs.Binding, expected: TargetExpectation, budget: @import("relational_index_jobs.zig").Budget, context: @import("../../api/operation.zig").RequestContext, provenance: Provenance, record: ?Record, previous: integrity.Digest, replay_command: ?Command) !?@This() {
             if (record) |current| {
                 if (!std.mem.eql(u8, &try current.expected.digest(), &try expected.digest())) return error.PrivateIndexOwnerJobChanged;
                 if (replay_command) |command| if (std.mem.eql(u8, &current.page_digest, &try command.digest())) return .{ .command = command, .context = context };
                 if (current.fields.phase != .scanning and current.fields.phase != .claims) return null;
             }
-            const previous = if (try optional(txn, &key(binding))) |bytes| hash(bytes) else @as(integrity.Digest, @splat(0));
             var next = if (record) |current| current.fields else try initial(expected);
             const from = next.phase;
             var scanned: u16 = 0;

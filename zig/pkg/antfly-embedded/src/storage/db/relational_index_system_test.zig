@@ -1471,6 +1471,92 @@ test "relational index build pages identity dispatch caches immutable candidates
         }
         try std.testing.expect(restarted_claims);
         try std.testing.expect(orphan_exercised and foreign_deleted);
+        {
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            const canonical = try alloc.dupe(u8, try read.get(&Validation.key(binding)));
+            defer alloc.free(canonical);
+            const before_sequence = (try authority.load(&read)).?.sequence;
+            var audit: ?Validation.Audit = null;
+            try std.testing.expectError(error.PrivateIndexAuditScopeChanged, Validation.auditPage(alloc, &read, binding, validation_request.target_expectation.?, 0, null, validation_request.budget, .{}));
+            var audit_canceled = std.atomic.Value(bool).init(true);
+            const canceled_context: @import("../../api/operation.zig").RequestContext = .{ .cancellation = @import("../../api/operation.zig").CancellationToken.fromAtomic(&audit_canceled) };
+            try std.testing.expectError(error.Canceled, Validation.auditPage(alloc, &read, binding, validation_request.target_expectation.?, db.root_incarnation, null, validation_request.budget, canceled_context));
+            var turns: usize = 0;
+            while (true) {
+                audit = try Validation.auditPage(alloc, &read, binding, validation_request.target_expectation.?, db.root_incarnation, audit, validation_request.budget, .{});
+                turns += 1;
+                try std.testing.expect(turns <= 48);
+                if (turns == 2) {
+                    try std.testing.expectError(error.PrivateIndexAuditScopeChanged, Validation.auditPage(alloc, &read, binding, validation_request.target_expectation.?, db.root_incarnation ^ 1, audit, validation_request.budget, .{}));
+                }
+                if (audit.?.fields.phase == .ready) break;
+                try std.testing.expect(audit.?.fields.phase != .failed);
+            }
+            try std.testing.expectEqual(@as(u64, 32), audit.?.fields.claim_rows);
+            const terminal = try Validation.auditPage(alloc, &read, binding, validation_request.target_expectation.?, db.root_incarnation, audit, validation_request.budget, .{});
+            try std.testing.expectEqualDeep(audit.?, terminal);
+            try std.testing.expectError(error.Canceled, Validation.auditPage(alloc, &read, binding, validation_request.target_expectation.?, db.root_incarnation, audit, validation_request.budget, canceled_context));
+            try std.testing.expectEqualSlices(u8, canonical, try read.get(&Validation.key(binding)));
+            try std.testing.expectEqual(before_sequence, (try authority.load(&read)).?.sequence);
+        }
+        {
+            // A restored canonical "ready" cursor cannot substitute for a
+            // new root's physical audit. Leave the canonical proof untouched,
+            // inject an orphan, and recompute from the beginning read-only.
+            const orphan_address = try Integrity.Address.init(validation_request.target_expectation.?.generation, late.command.claims[0].tuple);
+            const orphan_value = try late.command.claims[0].encode(alloc, orphan_address);
+            defer alloc.free(orphan_value);
+            try db.core.store.putBatch(&.{.{ .key = &orphan_address.claimKey(), .value = orphan_value }}, &.{});
+            var read = try db.core.store.beginReadTxn();
+            var read_open = true;
+            defer if (read_open) read.abort();
+            const canonical = try alloc.dupe(u8, try read.get(&Validation.key(binding)));
+            defer alloc.free(canonical);
+            const before_sequence = (try authority.load(&read)).?.sequence;
+            var audit: ?Validation.Audit = null;
+            var turns: usize = 0;
+            while (true) {
+                audit = try Validation.auditPage(alloc, &read, binding, validation_request.target_expectation.?, db.root_incarnation, audit, validation_request.budget, .{});
+                turns += 1;
+                try std.testing.expect(turns <= 48);
+                if (audit.?.fields.phase == .failed) break;
+                try std.testing.expect(audit.?.fields.phase != .ready);
+            }
+            try std.testing.expectEqual(Validation.Failure.claim_companion, audit.?.fields.failure);
+            try std.testing.expectEqual(Validation.Phase.ready, (try Validation.load(alloc, &read, binding)).?.fields.phase);
+            try std.testing.expectEqualSlices(u8, canonical, try read.get(&Validation.key(binding)));
+            try std.testing.expectEqual(before_sequence, (try authority.load(&read)).?.sequence);
+            read.abort();
+            read_open = false;
+            try db.core.store.putBatch(&.{}, &.{&orphan_address.claimKey()});
+        }
+        {
+            // Local progress cannot carry a scanned prefix across a change to
+            // the canonical seal, even on the same physical root.
+            const saved = saved: {
+                var read = try db.core.store.beginReadTxn();
+                defer read.abort();
+                break :saved try alloc.dupe(u8, try read.get(&Validation.key(binding)));
+            };
+            defer alloc.free(saved);
+            const first = first: {
+                var read = try db.core.store.beginReadTxn();
+                defer read.abort();
+                break :first try Validation.auditPage(alloc, &read, binding, validation_request.target_expectation.?, db.root_incarnation, null, validation_request.budget, .{});
+            };
+            var changed = try Validation.Record.decode(alloc, saved);
+            changed.page_digest[0] ^= 1;
+            const altered = try changed.encode(alloc);
+            defer alloc.free(altered);
+            try db.core.store.putBatch(&.{.{ .key = &Validation.key(binding), .value = altered }}, &.{});
+            {
+                var read = try db.core.store.beginReadTxn();
+                defer read.abort();
+                try std.testing.expectError(error.PrivateIndexAuditScopeChanged, Validation.auditPage(alloc, &read, binding, validation_request.target_expectation.?, db.root_incarnation, first, validation_request.budget, .{}));
+            }
+            try db.core.store.putBatch(&.{.{ .key = &Validation.key(binding), .value = saved }}, &.{});
+        }
         // Inventory readiness alone cannot publish the candidate schema.
         try std.testing.expectEqual(@as(u32, 1), db.core.schema.?.version);
         const Verification = @import("relational_index_validation.zig");
@@ -1668,6 +1754,89 @@ test "relational index build pages identity dispatch caches immutable candidates
                 break;
             }
             try std.testing.expect(fields.phase != .failed);
+        }
+        {
+            var inventory_audit: ?Validation.Audit = null;
+            var inventory_turns: usize = 0;
+            while (true) {
+                var read = try db.core.store.beginReadTxn();
+                defer read.abort();
+                inventory_audit = try Validation.auditPage(alloc, &read, binding, validation_request.target_expectation.?, db.root_incarnation, inventory_audit, validation_request.budget, .{});
+                inventory_turns += 1;
+                try std.testing.expect(inventory_turns <= 48);
+                if (inventory_audit.?.fields.phase == .ready) break;
+                try std.testing.expect(inventory_audit.?.fields.phase != .failed);
+            }
+            var lease = try db.native_index_build_cache.acquire(std.testing.io, alloc, &manager, db.core, validation_request, binding, .{});
+            defer lease.deinit();
+            const addition = &lease.reservation().artifacts.?.addition;
+            const canonical = canonical: {
+                var read = try db.core.store.beginReadTxn();
+                defer read.abort();
+                break :canonical try alloc.dupe(u8, try read.get(&Verification.key(binding)));
+            };
+            defer alloc.free(canonical);
+            const sequence = sequence: {
+                var read = try db.core.store.beginReadTxn();
+                defer read.abort();
+                break :sequence (try authority.load(&read)).?.sequence;
+            };
+            var audit: ?Verification.Audit = null;
+            defer if (audit) |*value| value.deinit();
+            var audit_turns: usize = 0;
+            while (true) {
+                const next = try Verification.auditPage(alloc, db.core, binding, validation_request.target_expectation.?, addition, db.root_incarnation, inventory_audit.?, if (audit) |*value| value else null, validation_request.budget, .{});
+                if (audit) |*value| value.deinit();
+                audit = next;
+                audit_turns += 1;
+                try std.testing.expect(audit_turns <= 40);
+                if (audit_turns == 2) {
+                    try std.testing.expectError(error.PrivateIndexAuditScopeChanged, Verification.auditPage(alloc, db.core, binding, validation_request.target_expectation.?, addition, db.root_incarnation ^ 1, inventory_audit.?, &audit.?, validation_request.budget, .{}));
+                    var other_inventory = inventory_audit.?;
+                    other_inventory.page_digest[0] ^= 1;
+                    try std.testing.expectError(error.PrivateIndexAuditScopeChanged, Verification.auditPage(alloc, db.core, binding, validation_request.target_expectation.?, addition, db.root_incarnation, other_inventory, &audit.?, validation_request.budget, .{}));
+                }
+                if (audit.?.progress.summary.fields.phase == .ready) break;
+                try std.testing.expect(audit.?.progress.summary.fields.phase != .failed);
+            }
+            try std.testing.expectEqualDeep(@as([3]u64, @splat(32)), audit.?.progress.summary.fields.counts);
+            var generation_audit_canceled = std.atomic.Value(bool).init(true);
+            try std.testing.expectError(error.Canceled, Verification.auditPage(alloc, db.core, binding, validation_request.target_expectation.?, addition, db.root_incarnation, inventory_audit.?, &audit.?, validation_request.budget, .{ .cancellation = @import("../../api/operation.zig").CancellationToken.fromAtomic(&generation_audit_canceled) }));
+            audit.?.progress.digest[0] ^= 1;
+            try std.testing.expectError(error.InvalidRelationalIndexValidation, Verification.auditPage(alloc, db.core, binding, validation_request.target_expectation.?, addition, db.root_incarnation, inventory_audit.?, &audit.?, validation_request.budget, .{}));
+            audit.?.progress.digest[0] ^= 1;
+            var repeated = try Verification.auditPage(alloc, db.core, binding, validation_request.target_expectation.?, addition, db.root_incarnation, inventory_audit.?, &audit.?, validation_request.budget, .{});
+            defer repeated.deinit();
+            try std.testing.expectEqualDeep(audit.?.progress.summary, repeated.progress.summary);
+            try std.testing.expectEqualSlices(u8, audit.?.progress.cursor, repeated.progress.cursor);
+            // Imported canonical readiness cannot hide physical corruption.
+            // This changes no logical claim; the completed inventory audit
+            // remains scoped correctly, but the generation must be re-read.
+            try db.core.store.putBatch(&.{}, &.{saved_keys.forward});
+            var corrupt_audit: ?Verification.Audit = null;
+            defer if (corrupt_audit) |*value| value.deinit();
+            var corrupt_turns: usize = 0;
+            while (true) {
+                const next = try Verification.auditPage(alloc, db.core, binding, validation_request.target_expectation.?, addition, db.root_incarnation, inventory_audit.?, if (corrupt_audit) |*value| value else null, validation_request.budget, .{});
+                if (corrupt_audit) |*value| value.deinit();
+                corrupt_audit = next;
+                corrupt_turns += 1;
+                try std.testing.expect(corrupt_turns <= 40);
+                if (corrupt_audit.?.progress.summary.fields.phase == .failed) break;
+                try std.testing.expect(corrupt_audit.?.progress.summary.fields.phase != .ready);
+            }
+            try std.testing.expectEqual(Verification.Failure.missing_forward, corrupt_audit.?.progress.summary.fields.failure);
+            {
+                var read = try db.core.store.beginReadTxn();
+                defer read.abort();
+                var retained = (try Verification.load(alloc, &read, binding)).?;
+                defer retained.deinit();
+                try std.testing.expectEqual(Verification.Phase.ready, retained.summary.fields.phase);
+                try std.testing.expectEqualSlices(u8, canonical, try read.get(&Verification.key(binding)));
+                try std.testing.expectEqual(sequence, (try authority.load(&read)).?.sequence);
+                try std.testing.expectError(error.NotFound, read.get(saved_keys.forward));
+            }
+            try db.core.store.putBatch(&.{.{ .key = saved_keys.forward, .value = saved_values[0] }}, &.{});
         }
         try std.testing.expectEqual(@as(u64, 1), db.native_index_build_cache.compilations);
         try std.testing.expectEqual(@as(u32, 1), db.core.schema.?.version);
