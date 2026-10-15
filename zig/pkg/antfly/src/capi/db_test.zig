@@ -5487,3 +5487,80 @@ test "capi SQL missing namespace forces coordinated catalog validation" {
 test "capi SQL maintenance capture queues after bounded foreground contention" {
     try public.testMaintenanceCaptureAdmission();
 }
+
+test "capi SQL detached renewal releases the mutex and rejects changed tenure" {
+    if (builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const Runtime = std.meta.Child(std.meta.Child(@FieldType(db_mod.DB, "enrichment_runtime")));
+    try Runtime.testDetachedLeaseRenewal();
+}
+
+test "capi SQL idle native maintenance avoids runtime construction and resumes work" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("capi-sql-idle-maintenance");
+    defer directory.cleanup();
+    const path = try tempTestAflitePath(a, directory.path(), "database");
+    defer a.free(path);
+    defer cleanupTestFile(path);
+    var options: capi.OpenOptions = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
+    options.storage_kind = capi.storage_kind_lite;
+    options.profile = capi.profile_native;
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
+    defer antfly_db_close(handle);
+    const owner = blk: {
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        break :blk guard.connection.?.owner;
+    };
+    owner.stopping.store(true, .release);
+    owner.wake.set(shared.handleLockIo());
+    owner.worker.?.join();
+    owner.worker = null;
+    owner.stopping.store(false, .release);
+    // Finish any initial reclamation. Later idle polls must reuse the physical
+    // store and must neither open a DB runtime nor refresh the foreground DB.
+    for (0..64) |_| if (!try owner.maintenanceTurnForTest()) break;
+    const opens = owner.test_runtime_snapshot_opens;
+    for (0..8) |_| {
+        const current = owner.current.?;
+        const snapshot = owner.maintenance_snapshot.?;
+        // Real page retirement may advance the file tip. Reuse is required
+        // when the checkpoint is stable, rather than across real GC writes.
+        var probe = try lite_backend.native.NativeFile.openWithIo(a, shared.handleLockIo(), path, .{ .read_only = true, .internal_reader = true });
+        const same_tip = std.meta.eql(probe.header, current.owned_lite_backend.?.native_docstore.?.file.header) and
+            std.meta.eql(probe.header, snapshot.owned_lite_backend.?.native_docstore.?.file.header);
+        probe.close();
+        _ = try owner.maintenanceTurnForTest();
+        if (same_tip) {
+            try std.testing.expectEqual(current, owner.current.?);
+            try std.testing.expectEqual(snapshot, owner.maintenance_snapshot.?);
+        }
+        try std.testing.expect(!owner.maintenance_snapshot.?.db_live);
+    }
+    try std.testing.expectEqual(opens, owner.test_runtime_snapshot_opens);
+    // Enrichment/index work still upgrades the storage-only snapshot and is
+    // replayed through the ordinary independent native maintenance runtime.
+    {
+        const guard = public.enterHandle(handle, .exclusive).?;
+        defer guard.leave();
+        try guard.handle.db.setSchemaJson(a,
+            \\{"version":1,"default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"body":{"type":"string"}},"additionalProperties":true}}}}
+        );
+        try guard.handle.db.addIndex(.{ .name = "body_text", .kind = .full_text, .config_json = "{\"field\":\"body\"}" });
+        try guard.handle.db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"indexed after idle\"}" }}, .sync_level = .write });
+        owner.maintenance_pending = true;
+    }
+    for (0..64) |_| if (!try owner.maintenanceTurnForTest()) break;
+    try std.testing.expect(owner.test_runtime_snapshot_opens > opens);
+    const after_work = owner.test_runtime_snapshot_opens;
+    for (0..8) |_| _ = try owner.maintenanceTurnForTest();
+    try std.testing.expectEqual(after_work, owner.test_runtime_snapshot_opens);
+    const guard = public.enterHandle(handle, .exclusive).?;
+    defer guard.leave();
+    var result = try guard.handle.db.search(a, .{ .index_name = "body_text", .full_text = .{ .match = .{ .field = "body", .text = "indexed after idle" } }, .limit = 10 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("doc", result.hits[0].id);
+}

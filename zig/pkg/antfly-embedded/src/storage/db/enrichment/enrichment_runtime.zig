@@ -4933,6 +4933,7 @@ const UnsupportedEnrichmentRuntime = struct {
     }
 };
 const PlatformEnrichmentRuntime = struct {
+    pub const testDetachedLeaseRenewal = testPublicationLeaseRenewal;
     const IoBackend = struct {
         borrowed: Io,
 
@@ -30780,19 +30781,107 @@ fn heartbeatEnrichmentLease(runtime: *EnrichmentRuntime) !void {
     if (!runtime.lease_fencing_enabled) return;
     const io_impl = runtime.io_impl orelse return;
     const io = io_impl.io();
+    const renewal_alloc = @import("antfly_platform").allocator.concurrentFallback();
+    const renewal = blk: {
+        runtime.mutex.lockUncancelable(io);
+        defer runtime.mutex.unlock(io);
+        const publication = runtime.generated_publication orelse {
+            if (!(try runtime.ownership.heartbeatIfDue(runtime.clock.nowRealtimeMs()))) return error.EnrichmentLeaseFenceLost;
+            return;
+        };
+        const now = runtime.clock.nowRealtimeMs();
+        if (!runtime.ownership.lease_owned) return;
+        if (!runtime.ownership.has_lease or runtime.ownership.lease_epoch == 0) return error.EnrichmentLeaseFenceLost;
+        if (now < runtime.ownership.lease_renew_after_ms) return;
+        break :blk .{
+            .publication = publication,
+            .owner_id = try renewal_alloc.dupe(u8, runtime.ownership.owner_id),
+            .epoch = runtime.ownership.lease_epoch,
+            .now = now,
+            .ttl = runtime.ownership.lease_ttl_ms,
+        };
+    };
+    defer renewal_alloc.free(renewal.owner_id);
+    // The owner callback may queue for a file gate. Never hold the runtime
+    // mutex across it: publication paths acquire that gate before this mutex.
+    if (!try renewal.publication.heartbeat(renewal.publication.ptr, .{
+        .lease_key = enrichment_lease.default_lease_key,
+        .owner_id = renewal.owner_id,
+        .epoch = renewal.epoch,
+    }, renewal.now, renewal.ttl)) return error.EnrichmentLeaseFenceLost;
     runtime.mutex.lockUncancelable(io);
     defer runtime.mutex.unlock(io);
-    if (runtime.generated_publication) |publication| {
-        const now = runtime.clock.nowRealtimeMs();
-        if (!runtime.ownership.lease_owned or now < runtime.ownership.lease_renew_after_ms) return;
-        const fence = currentGeneratedWriteFence(runtime) orelse return error.EnrichmentLeaseFenceLost;
-        if (!try publication.heartbeat(publication.ptr, fence, now, runtime.ownership.lease_ttl_ms)) return error.EnrichmentLeaseFenceLost;
-        runtime.ownership.lease_expires_at_ms = now +| runtime.ownership.lease_ttl_ms;
-        runtime.ownership.lease_renew_after_ms = now +| runtime.ownership.lease_ttl_ms / 2;
-        return;
-    }
-    if (!(try runtime.ownership.heartbeatIfDue(runtime.clock.nowRealtimeMs())))
-        return error.EnrichmentLeaseFenceLost;
+    if (!runtime.ownership.lease_owned or
+        !std.mem.eql(u8, runtime.ownership.owner_id, renewal.owner_id) or
+        runtime.ownership.lease_ttl_ms != renewal.ttl or
+        !runtime.ownership.noteFencedRenewal(renewal.epoch, renewal.now)) return error.EnrichmentLeaseFenceLost;
+}
+
+fn testPublicationLeaseRenewal() !void {
+    const a = std.testing.allocator;
+    var backend = mem_backend.Backend.init(a, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(a, .{ .name = "renewal" });
+    defer store.deinit();
+    var erased = try backend_erased.storeFrom(a, store);
+    defer erased.deinit();
+    var runtime: EnrichmentRuntime = .{
+        .alloc = a,
+        .io_impl = .{ .borrowed = std.testing.io },
+        .store = erased,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{},
+        .ownership = try ownership_mod.State.init(a, &erased, enrichment_lease.default_lease_key, .{ .lease_owned = true, .owner_id = "first" }),
+        .lease_fencing_enabled = true,
+    };
+    defer runtime.ownership.deinit(a);
+    try std.testing.expect(try runtime.ownership.ensureLease(runtime.clock.nowRealtimeMs()));
+    const Callback = struct {
+        runtime: *EnrichmentRuntime,
+        calls: usize = 0,
+        replace: bool = false,
+        accept: bool = true,
+        fn heartbeat(ptr: *anyopaque, fence: GeneratedWriteFence, _: u64, _: u64) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            // Fail immediately on lock inversion, instead of hanging the suite.
+            if (!self.runtime.mutex.tryLock()) return error.TestRuntimeMutexHeld;
+            defer self.runtime.mutex.unlock(std.testing.io);
+            self.calls += 1;
+            try std.testing.expectEqual(self.runtime.ownership.lease_epoch, fence.epoch);
+            if (self.replace) {
+                self.runtime.ownership.lease_epoch += 1;
+                // Mutate the original ID to prove the renewal owns its copy.
+                self.runtime.ownership.owner_id[0] = 'x';
+                try std.testing.expectEqualStrings("first", fence.owner_id);
+            }
+            return self.accept;
+        }
+    };
+    var callback: Callback = .{ .runtime = &runtime };
+    runtime.generated_publication = .{ .ptr = &callback, .heartbeat = Callback.heartbeat, .commit = undefined, .acquire_store = undefined };
+    const renewals = runtime.ownership.renewal_count;
+    runtime.ownership.lease_renew_after_ms = 0;
+    try heartbeatEnrichmentLease(&runtime);
+    try std.testing.expectEqual(renewals + 1, runtime.ownership.renewal_count);
+    try std.testing.expectEqual(@as(usize, 1), callback.calls);
+    // The newly calculated deadline avoids redundant owner callbacks.
+    try heartbeatEnrichmentLease(&runtime);
+    try std.testing.expectEqual(@as(usize, 1), callback.calls);
+    runtime.ownership.lease_renew_after_ms = 0;
+    callback.accept = false;
+    try std.testing.expectError(error.EnrichmentLeaseFenceLost, heartbeatEnrichmentLease(&runtime));
+    try std.testing.expectEqual(renewals + 1, runtime.ownership.renewal_count);
+    callback.accept = true;
+    callback.replace = true;
+    try std.testing.expectError(error.EnrichmentLeaseFenceLost, heartbeatEnrichmentLease(&runtime));
+    try std.testing.expectEqual(renewals + 1, runtime.ownership.renewal_count);
 }
 
 /// Renews an enrichment lease while a long-running document transform is in

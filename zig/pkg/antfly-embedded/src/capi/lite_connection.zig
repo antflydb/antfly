@@ -349,6 +349,7 @@ pub const Owner = struct {
     maintenance_table_cursor: usize = 0,
     maintenance_round_pending: bool = false,
     maintenance_capture_misses: u8 = 0,
+    test_runtime_snapshot_opens: if (h.builtin.is_test) u64 else void = if (h.builtin.is_test) 0 else {},
     embedding_memo: ?memo_mod.QueryEmbeddingCache = null,
     embedding_memo_budget: cache_budget.CacheBudget = .init(embedding_memo_bytes),
     test_after_capture: if (h.builtin.is_test) ?struct { ptr: *anyopaque, notify: *const fn (*anyopaque, *h.Handle) void } else void = if (h.builtin.is_test) null else {},
@@ -540,17 +541,33 @@ pub const Owner = struct {
         stats.rewrite_count = @max(stats.rewrite_count, previous.rewrite_count);
     }
 
-    fn refreshMaintenanceSnapshot(self: *Owner, foreground: *h.Handle) !*h.Handle {
+    fn refreshMaintenanceSnapshot(self: *Owner, foreground: *h.Handle, need_database: bool) !*h.Handle {
         const file = &foreground.owned_lite_backend.?.native_docstore.?.file;
         if (self.maintenance_snapshot) |snapshot| {
             const captured = &snapshot.owned_lite_backend.?.native_docstore.?.file;
-            if (snapshot.db_live and std.meta.eql(file.header, captured.header) and
+            if ((!need_database or snapshot.db_live) and std.meta.eql(file.header, captured.header) and
                 (try file.file.stat(file.runtime())).inode == (try captured.file.stat(captured.runtime())).inode) return snapshot;
         }
         var options = self.options;
         options.externally_locked = true;
         options.artifact_reader_fence = true;
-        const snapshot = try api.openLiteHandleAllocWithRuntime(alloc, self.path, options, false, h.handleLockIo(), null);
+        const snapshot = if (need_database) blk: {
+            const opened = try api.openLiteHandleAllocWithRuntime(alloc, self.path, options, false, h.handleLockIo(), null);
+            if (comptime h.builtin.is_test) self.test_runtime_snapshot_opens += 1;
+            break :blk opened;
+        } else blk: {
+            // Reclamation needs the physical store, never a DB/catalog/provider
+            // runtime. Keep this cheap owner across idle polls of the same tip.
+            var backend = try h.lite_backend.Handle.open(alloc, self.path, .{
+                .externally_locked = true,
+                .no_sync = options.no_sync,
+                .io = h.handleLockIo(),
+            });
+            errdefer backend.deinit();
+            const opened = try alloc.create(h.Handle);
+            opened.* = .{ .alloc = alloc, .db = undefined, .db_live = false, .owned_lite_backend = backend, .open_mode = options.open_mode };
+            break :blk opened;
+        };
         snapshot.lease_snapshot = true;
         snapshot.sql_commit_recovery_needed = foreground.sql_commit_recovery_needed;
         snapshot.sql_ddl_recovery_needed = foreground.sql_ddl_recovery_needed;
@@ -625,8 +642,8 @@ pub const Owner = struct {
         // merely because inference or segment construction is still running.
         // Hosted/manual runtimes retain their caller-supplied provider borrow.
         const independent = self.options.profile == .native;
-        const root = if (independent) try self.refreshMaintenanceSnapshot(foreground) else foreground;
-        if (independent) {
+        const root = if (independent) try self.refreshMaintenanceSnapshot(foreground, run_database) else foreground;
+        if (independent and run_database) {
             database = if (selected) |table| try @import("tables.zig").get(root, table.name) else &root.db;
             // Only construction uses inode-fenced reads. Sources opened by
             // mutation/publication retain the normal immutable-range leases.
@@ -636,18 +653,18 @@ pub const Owner = struct {
         defer alloc.free(publication_name);
         const index_prefix = try std.fmt.allocPrint(alloc, "{s}/", .{database.core.index_manager.base_path});
         defer alloc.free(index_prefix);
-        var source_read = if (database.enrichment_runtime) |runtime| try runtime.store.beginRead() else null;
+        var source_read = if (run_database) (if (database.enrichment_runtime) |runtime| try runtime.store.beginRead() else null) else null;
         defer if (source_read) |*read| read.abort();
-        var publication: PreparedPublication = .{ .owner = self, .name = publication_name, .identity = database.core.identity_namespace, .incarnation = database.root_incarnation, .catalog = try catalogStamp(database), .index_prefix = index_prefix, .snapshot_root = root, .source_read = if (source_read) |*read| read else null, .relational_rows = if (database.enrichment_runtime) |runtime| runtime.config.relational_base_rows else false };
+        var publication: PreparedPublication = .{ .owner = self, .name = publication_name, .identity = database.core.identity_namespace, .incarnation = database.root_incarnation, .catalog = if (run_database) try catalogStamp(database) else @splat(0), .index_prefix = index_prefix, .snapshot_root = root, .source_read = if (source_read) |*read| read else null, .relational_rows = if (database.enrichment_runtime) |runtime| runtime.config.relational_base_rows else false };
         root.maintenance_references += 1;
         root.maintenance_owner = self;
         root.maintenance_publication = &publication;
         const store = root.owned_lite_backend.?.native_docstore.?;
-        if (database.enrichment_runtime) |runtime| {
+        if (run_database) if (database.enrichment_runtime) |runtime| {
             if (self.embedding_memo == null) self.embedding_memo = memo_mod.QueryEmbeddingCache.init(alloc, io, .{ .max_bytes = embedding_memo_bytes, .ttl_ns = std.time.ns_per_min });
             runtime.dense_result_cache = .{ .ptr = self, .lookup = lookupEmbedding, .remember = rememberEmbedding };
             runtime.generated_publication = .{ .ptr = &publication, .commit = PreparedPublication.commit, .heartbeat = PreparedPublication.heartbeat, .acquire_store = PreparedPublication.acquireStore };
-        }
+        };
         store.writer_admission = .{ .ptr = root, .enter = enterMaintenanceWriter, .leave = leaveMaintenanceWriter };
         lease.close();
         lease_held = false;
@@ -657,14 +674,14 @@ pub const Owner = struct {
         if (comptime h.builtin.is_test) if (self.test_after_capture) |hook| hook.notify(hook.ptr, root);
         const cancellation = h.db_mod.types.CancellationToken.fromAtomic(&self.stopping);
         var pending = if (run_database) database.runBackgroundMaintenanceWithCancellation(cancellation) catch true else false;
-        if (database.enrichment_runtime) |runtime| {
+        if (run_database) if (database.enrichment_runtime) |runtime| {
             runtime.dense_result_cache = null;
             runtime.generated_publication = null;
-        }
+        };
         root.maintenance_publication = null;
         if (source_read) |*read| read.abort();
         source_read = null;
-        if (independent) {
+        if (independent and root.db_live) {
             // End the input fences before reclamation. Keeping them in an
             // idle runtime would needlessly prevent in-place page service.
             @import("tables.zig").closeAll(root);
@@ -690,7 +707,11 @@ pub const Owner = struct {
             !std.meta.eql(self.current.?.owned_lite_backend.?.native_docstore.?.file.header, store.file.header)
         else
             self.current != root;
-        self.maintenance_round_pending = self.maintenance_round_pending or pending or changed;
+        // A moved physical tip requires a prompt refresh, not another DB
+        // replay pass. Reader leases/index housekeeping also move that tip;
+        // treating them as enrichment debt makes idle runtime opens perpetual.
+        // The next capture checks the durable journal for foreground work.
+        self.maintenance_round_pending = self.maintenance_round_pending or pending;
         if (self.maintenance_table_cursor == 0) {
             // Mutations arriving during the detached turn still wake the owner;
             // replay debt is inspected again under the next capture fence.
@@ -698,7 +719,7 @@ pub const Owner = struct {
             self.maintenance_round_pending = false;
         }
         self.collectRetired();
-        return self.maintenance_pending or self.maintenance_table_cursor != 0;
+        return self.maintenance_pending or self.maintenance_table_cursor != 0 or changed;
     }
 
     pub fn maintenanceTurnForTest(self: *Owner) !bool {
