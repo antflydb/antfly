@@ -7573,3 +7573,43 @@ independent LSM/C-ABI and metadata-store qualification. They are not complete
 distributed restart/restore fault tests. Boundary, license, inventory, generated
 control-catalog, formatting and diff checks passed. Results are macOS Debug;
 no original SQL disposition or measured throughput change is claimed.
+
+### Reserved-generation schema installation preparation
+
+The shared core schema preparer now has an explicit reserved-index path. It
+checks the durable reserved job/fence and immutable input/catalog identities,
+requires the exact candidate public validator (including any supplied versioned
+copy), and prepares the existing physical and integrity generations rather than
+allocating successors. The physical write plan retains the actual candidate
+schema epoch and its validator. Warm owners may still hold their unchanged
+pre-reservation write snapshot; reopened owners may bind that same plan to the
+burned allocation head. Both are checked against the captured binding, while
+the durable reservation is independently required.
+
+Compilation, owned catalog bytes and runtime objects are prepared outside
+serialized apply. Preparation neither selects a durable candidate head nor
+publishes a runtime snapshot. The prepared schema retains its fixed job binding;
+ordinary schema commit, child-generation commit and rehydration explicitly
+reject it. This closes the generation-allocation gap in cold installation
+preparation, not the installation protocol itself.
+
+Still required: the durable metadata publication decision and an authenticated
+native install participant that stages schema, both catalogs, activation,
+installed job/cut, replay marker and outbox in the same store transaction, then
+non-fallibly publishes the prepared runtime objects. Installation must retain
+the source fence until the distinct release effect. Existing public activation
+guards remain in place. No decoder floor, kernel ABI, canonical envelope or
+original SQL disposition changes in this preparation milestone.
+
+Qualification: `/private/tmp/antfly-reserved-schema-final-debug.log` passed
+59/59 Debug build steps: ten native lifecycle/page tests, 14 candidate tests,
+15 catalog tests and 46 runtime-contract tests. LSM preparation checks the exact
+reserved physical ID, integrity CAS bytes, validator-bearing schema epoch,
+unchanged durable catalog/clock and rejection through all three ordinary schema
+commit paths. Missing/mismatched active validators, inconsistent versioned
+validators and stale job bindings are rejected. Reopened LSM physical
+preparation additionally runs exhaustive allocation-failure/leak checks on the
+owned catalog/plan transfer and proves that neither durable nor runtime heads
+are selected. This is preparation/ownership evidence, not an installed native
+effect, a distributed publication fault gate or original-case credit. Boundary,
+license, inventory, generated control-catalog, formatting and diff checks passed.

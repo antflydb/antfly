@@ -26,6 +26,7 @@ const internal = @import("../internal_keys.zig");
 const primary_mod = @import("antfly_server_test_sources").local_test_sources.storage_hot_standby_primary;
 const time = @import("antfly_platform").time;
 const alloc = std.testing.allocator;
+const docstore = @import("../docstore.zig");
 
 /// Synthetic metadata decision for storage-engine qualification only. Public
 /// receivers must fetch real durable acceptance from independent metadata.
@@ -357,6 +358,64 @@ test "relational index build pages native owner control preserves committed cuts
         try std.testing.expectEqual(outcome.position, (try jobs.nativeEffectPosition(&txn, binding, effect)).?);
         try std.testing.expectEqual(outcome.position.sequence, (try authority.load(&txn)).?.sequence);
         try std.testing.expectError(error.NotFound, txn.get(&internal.ordered_document_applied_entry_key));
+    }
+    // Cold schema installation preparation must retain the built generations,
+    // not run ordinary DDL allocation against the reserved catalogs. This is
+    // deliberately not installation authority or a metadata publish decision.
+    {
+        var reserved = binding;
+        reserved.phase = .reserved;
+        var after_schema = try api.parseValidatedTableSchema(alloc, after);
+        defer after_schema.deinit(alloc);
+        const runtime = try api.deriveRuntimeTableSchema(alloc, after_schema);
+        defer @import("../schema.zig").freeSchema(alloc, runtime);
+        const writes = [_]docstore.KVPair{.{ .key = "\x00\x00__metadata__:schema_json", .value = after }};
+        var prepared_schema = try primary.core.prepareSchemaMetadataReservedIndex(runtime, &writes, .{ .binding = reserved, .candidate = &candidate });
+        defer prepared_schema.deinit();
+        const indexes = prepared_schema.relational_indexes.?;
+        try std.testing.expect(indexes.metadata.head.eql(binding.physical_candidate));
+        try std.testing.expect(indexes.metadata.expected.?.eql(binding.physical_reserved));
+        try std.testing.expectEqual(binding.index.mapKey(), indexes.plan.boundIndexes()[0].id().mapKey());
+        try std.testing.expectEqual(prepared_schema.epoch.?, indexes.plan.schemaView().epoch);
+        try std.testing.expect(indexes.plan.schemaView().validator() != null);
+        try std.testing.expectEqualSlices(u8, candidate.next.value, prepared_schema.integrity_catalog.?.value);
+        try std.testing.expectEqualSlices(u8, candidate.reservation.value, prepared_schema.integrity_catalog.?.expected.?);
+        // Even a fully prepared candidate cannot bypass native installation
+        // by using ordinary, child-generation or rehydration schema commit.
+        try std.testing.expectError(error.PrivateIndexPublicationRequired, primary.core.commitPreparedSchemaMetadata(&prepared_schema, &writes, &.{}, null));
+        try std.testing.expectError(error.PrivateIndexPublicationRequired, primary.core.rehydratePreparedSchemaMetadata(&prepared_schema, &writes));
+        var child_fence = binding.fence;
+        child_fence.role = .child_generation_source;
+        try std.testing.expectError(error.PrivateIndexPublicationRequired, primary.core.commitPreparedSchemaMetadataPublishedChild(&prepared_schema, &writes, &.{}, null, child_fence));
+        var read = try primary.core.store.beginReadTxn();
+        defer read.abort();
+        var still_active = primary.core.schema_registry.acquire().?;
+        defer still_active.release();
+        try std.testing.expectEqual(binding.physical_reserved.schema_version, still_active.version());
+        try jobs.requireReserved(&read, reserved);
+        try std.testing.expectEqualSlices(u8, candidate.reservation.value, try read.get(catalog.key));
+        try std.testing.expectEqual(@as(u64, 3), (try authority.load(&read)).?.sequence);
+    }
+    {
+        var reserved = binding;
+        reserved.phase = .reserved;
+        var after_schema = try api.parseValidatedTableSchema(alloc, after);
+        defer after_schema.deinit(alloc);
+        const runtime = try api.deriveRuntimeTableSchema(alloc, after_schema);
+        defer @import("../schema.zig").freeSchema(alloc, runtime);
+        // The schema validator is part of the immutable candidate, not a
+        // caller-selected same-version public payload.
+        const wrong = [_]docstore.KVPair{.{ .key = "\x00\x00__metadata__:schema_json", .value = before }};
+        try std.testing.expectError(error.InvalidPrivateIndexInputs, primary.core.prepareSchemaMetadataReservedIndex(runtime, &wrong, .{ .binding = reserved, .candidate = &candidate }));
+        try std.testing.expectError(error.InvalidPrivateIndexInputs, primary.core.prepareSchemaMetadataReservedIndex(runtime, &.{}, .{ .binding = reserved, .candidate = &candidate }));
+        var stale = reserved;
+        stale.owner_digest[0] ^= 1;
+        const writes = [_]docstore.KVPair{.{ .key = "\x00\x00__metadata__:schema_json", .value = after }};
+        const versioned = try api.versionedSchemaKeyAlloc(alloc, runtime.version);
+        defer alloc.free(versioned);
+        const inconsistent = [_]docstore.KVPair{ writes[0], .{ .key = versioned, .value = before } };
+        try std.testing.expectError(error.InvalidPrivateIndexInputs, primary.core.prepareSchemaMetadataReservedIndex(runtime, &inconsistent, .{ .binding = reserved, .candidate = &candidate }));
+        try std.testing.expectError(error.PrivateIndexOwnerJobChanged, primary.core.prepareSchemaMetadataReservedIndex(runtime, &writes, .{ .binding = stale, .candidate = &candidate }));
     }
     // Every bounded page (including EOF) is ordered progress, not UNIQUE
     // validation. Replay the prepared boundary, never another timed scan.

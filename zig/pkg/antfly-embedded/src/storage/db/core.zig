@@ -91,6 +91,7 @@ pub const PreparedSchemaMetadata = struct {
     same_version_layout_matches: bool = false,
     legacy_public_binding: bool = false,
     generated_semantics_match: bool = true,
+    reserved_index: ?@import("relational_index_owner_job.zig").Binding = null,
     combined_writes: []docstore_mod.KVPair,
 
     fn init(
@@ -1326,13 +1327,13 @@ pub const DBCore = struct {
         table_schema: schema_mod.TableSchema,
         metadata_writes: []const docstore_mod.KVPair,
     ) !PreparedSchemaMetadata {
-        return self.prepareSchemaMetadataMode(table_schema, metadata_writes, false, null);
+        return self.prepareSchemaMetadataMode(table_schema, metadata_writes, false, null, null);
     }
 
     /// Pin the translator's source epoch before preparing index/constraint
     /// transitions. Atomic commit rechecks this same immutable schema view.
     pub fn prepareSchemaMetadataAtVersion(self: *DBCore, table_schema: schema_mod.TableSchema, metadata_writes: []const docstore_mod.KVPair, expected_version: u32) !PreparedSchemaMetadata {
-        return self.prepareSchemaMetadataMode(table_schema, metadata_writes, false, expected_version);
+        return self.prepareSchemaMetadataMode(table_schema, metadata_writes, false, expected_version, null);
     }
 
     /// Only the private, metadata-authenticated child generation installer may
@@ -1343,7 +1344,20 @@ pub const DBCore = struct {
         table_schema: schema_mod.TableSchema,
         metadata_writes: []const docstore_mod.KVPair,
     ) !PreparedSchemaMetadata {
-        return self.prepareSchemaMetadataMode(table_schema, metadata_writes, true, null);
+        return self.prepareSchemaMetadataMode(table_schema, metadata_writes, true, null, null);
+    }
+
+    pub const ReservedIndexPreparation = struct {
+        binding: @import("relational_index_owner_job.zig").Binding,
+        candidate: *const @import("relational_index_candidate.zig").Candidate,
+    };
+
+    /// Prepare the reserved physical/integrity generations against the real
+    /// candidate schema epoch outside serialized apply. This grants no install
+    /// authority: ordinary commit rejects it until a native install participant
+    /// can commit the decision, receipt and outbox while retaining the fence.
+    pub fn prepareSchemaMetadataReservedIndex(self: *DBCore, table_schema: schema_mod.TableSchema, metadata_writes: []const docstore_mod.KVPair, reserved: ReservedIndexPreparation) !PreparedSchemaMetadata {
+        return self.prepareSchemaMetadataMode(table_schema, metadata_writes, false, reserved.binding.physical_reserved.schema_version, reserved);
     }
 
     fn prepareSchemaMetadataMode(
@@ -1352,8 +1366,26 @@ pub const DBCore = struct {
         metadata_writes: []const docstore_mod.KVPair,
         published_child: bool,
         expected_version: ?u32,
+        reserved_index: ?ReservedIndexPreparation,
     ) !PreparedSchemaMetadata {
         try relational_index_catalog_mod.Controller.validateExtraMetadata(metadata_writes, &.{});
+        const reserved_inputs: ?@import("relational_index_inputs.zig").View = if (reserved_index) |reserved|
+            try @import("relational_index_inputs.zig").decode(reserved.candidate.inputs.bytes)
+        else
+            null;
+        if (reserved_inputs) |inputs| {
+            const versioned = try public_schema_mod.versionedSchemaKeyAlloc(self.alloc, table_schema.version);
+            defer self.alloc.free(versioned);
+            var matched_public_schema = false;
+            for (metadata_writes) |write| {
+                const active = std.mem.eql(u8, write.key, public_schema_json_key);
+                if (active or std.mem.eql(u8, write.key, versioned)) {
+                    if (!std.mem.eql(u8, write.value, inputs.after_json)) return error.InvalidPrivateIndexInputs;
+                    matched_public_schema = matched_public_schema or active;
+                }
+            }
+            if (!matched_public_schema) return error.InvalidPrivateIndexInputs;
+        }
         var prepared = try PreparedSchemaMetadata.init(self.alloc, table_schema, metadata_writes);
         errdefer prepared.deinit();
         prepared.base_schema_view = self.schema_registry.acquire();
@@ -1362,6 +1394,28 @@ pub const DBCore = struct {
             if (base.version() != expected) return error.PreparedGenerationChanged;
         }
         prepared.base_relational_indexes = self.relational_indexes.acquire();
+        if (reserved_index) |reserved| {
+            const binding = reserved.binding;
+            if (binding.phase != .reserved or !binding.fence.namespace.eql(self.identity_namespace) or
+                table_schema.version != binding.physical_candidate.schema_version) return error.PrivateIndexOwnerJobChanged;
+            var txn = try self.store.beginReadTxn();
+            defer txn.abort();
+            try @import("relational_index_owner_job.zig").requireReserved(&txn, binding);
+            const candidate = reserved.candidate;
+            const inputs_mod = @import("relational_index_inputs.zig");
+            if (!std.mem.eql(u8, &inputs_mod.digest(candidate.inputs.bytes), &binding.inputs_digest) or
+                !std.mem.eql(u8, &inputs_mod.digest(candidate.next.value), &binding.integrity_candidate) or
+                !std.mem.eql(u8, &inputs_mod.digest(candidate.reservation.value), &binding.integrity_reserved) or
+                !std.mem.eql(u8, &inputs_mod.digest(prepared.encoded), &candidate.next.catalog.schema_digest)) return error.InvalidPrivateIndexInputs;
+            // Reservation changes durable allocation, not the active write
+            // plan. A warm owner can still pin its predecessor; reopening the
+            // store binds that same plan to the burned reservation head.
+            if (prepared.base_relational_indexes) |base| {
+                if (!base.head.eql(binding.physical_reserved) and
+                    !(if (binding.physical_before) |before| base.head.eql(before) else false)) return error.PreparedGenerationChanged;
+            } else if (binding.physical_before != null) return error.PreparedGenerationChanged;
+            prepared.reserved_index = binding;
+        }
         if (prepared.base_schema_view) |view| {
             if (view.version() == table_schema.version) {
                 const base_encoded = try schema_mod.serializeSchema(self.alloc, view.tableSchema().*);
@@ -1388,6 +1442,11 @@ pub const DBCore = struct {
         // idempotent schema retries both exercise this path.
         const index_view = if (prepared.same_version_layout_matches and !prepared.legacy_public_binding) prepared.base_schema_view.? else next_view;
         prepared.relational_indexes = declarations: {
+            if (reserved_index) |reserved| {
+                const binding = reserved.binding;
+                const inputs = reserved_inputs.?;
+                break :declarations try self.relational_indexes.prepareReservedAddition(prepared.base_schema_view.?, index_view, binding.physical_reserved, binding.physical_candidate, inputs.name);
+            }
             if (next_view.validator()) |validator| {
                 var arena = std.heap.ArenaAllocator.init(self.alloc);
                 defer arena.deinit();
@@ -1417,7 +1476,10 @@ pub const DBCore = struct {
         {
             var digest: [32]u8 = undefined;
             std.crypto.hash.Blake3.hash(prepared.encoded, &digest, .{});
-            prepared.integrity_catalog = try integrity_catalog_mod.prepareWithChecks(
+            prepared.integrity_catalog = if (reserved_index) |reserved| blk: {
+                const inputs = reserved_inputs.?;
+                break :blk try integrity_catalog_mod.prepareIndexPublication(self.alloc, inputs.predecessor, previous_integrity orelse return error.IntegrityCatalogChanged, reserved.candidate.next.value, inputs.name);
+            } else try integrity_catalog_mod.prepareWithChecks(
                 self.alloc,
                 previous_integrity,
                 try integrity_catalog_mod.incarnationFromTableId(self.identity_namespace.table_id),
@@ -1520,6 +1582,9 @@ pub const DBCore = struct {
         rehydrate_only: bool,
         child_fence: ?@import("relational_integrity_topology_contract.zig").Fence,
     ) !bool {
+        // A reserved candidate is not ordinary DDL authority, even if its
+        // fence disappears between preparation and commit.
+        if (prepared.reserved_index != null) return error.PrivateIndexPublicationRequired;
         if (prepared.combined_writes.len != metadata_writes.len + 1)
             return error.InvalidSchemaUpdateRequest;
         try relational_index_catalog_mod.Controller.validateExtraMetadata(metadata_writes, metadata_deletes);

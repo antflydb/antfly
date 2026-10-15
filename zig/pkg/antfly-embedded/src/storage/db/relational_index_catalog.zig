@@ -646,6 +646,20 @@ pub const Controller = struct {
         return .{ .owner = self, .metadata = metadata, .plan = try bindWritePlan(self.alloc, view, &next) };
     }
 
+    /// Cold preparation, not publication authority. Reopen the reserved
+    /// addition instead of allocating a successor: the build already populated
+    /// these physical IDs. Installation must atomically stage the schema,
+    /// catalogs, authenticated job effect and outbox while retaining its fence.
+    pub fn prepareReservedAddition(self: *Controller, before: registry.SchemaView, after: registry.SchemaView, reserved: Head, candidate: Head, name: []const u8) !PreparedPublication {
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        var addition = try PrivateAddition.reopen(self.alloc, &txn, before, after, reserved, candidate, name);
+        // Transfer both candidate objects; releasing the addition would also
+        // release the owned plan that must survive this read transaction.
+        defer addition.reservation.deinit();
+        return .{ .owner = self, .metadata = addition.candidate, .plan = addition.plan };
+    }
+
     pub fn validateExtraMetadata(writes: []const docstore.KVPair, deletes: []const []const u8) !void {
         for (writes) |write| if (isReservedMetadataKey(write.key)) return error.ReservedRelationalIndexMetadataKey;
         for (deletes) |key| if (isReservedMetadataKey(key)) return error.ReservedRelationalIndexMetadataKey;
@@ -1000,6 +1014,24 @@ fn testPrivateReopenAllocations(alloc: Allocator, txn: *docstore.DocStore.Txn, b
     try std.testing.expectEqual(candidate.revision, addition.index.generation);
 }
 
+fn testReservedPublicationAllocations(alloc: Allocator, store: *docstore.DocStore, before: registry.SchemaView, after: registry.SchemaView, reserved: Head, candidate: Head) !void {
+    var controller = Controller{ .alloc = alloc, .io = std.testing.io, .store = store };
+    defer controller.deinit();
+    var prepared = try controller.prepareReservedAddition(before, after, reserved, candidate, "b_label");
+    defer prepared.deinit();
+    try std.testing.expect(prepared.owner == &controller);
+    try std.testing.expect(prepared.metadata.expected.?.eql(reserved));
+    try std.testing.expect(prepared.metadata.head.eql(candidate));
+    try std.testing.expectEqual(candidate.revision, prepared.plan.boundIndexes()[0].id().generation);
+    try std.testing.expectEqual(after.epoch, prepared.plan.schemaView().epoch);
+    // Preparation cannot publish a runtime snapshot or choose the candidate
+    // durable head, even after its private read transaction has ended.
+    try std.testing.expect(controller.acquire() == null);
+    var read = try store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expect(reserved.eql(try Head.decode(try read.get(head_key))));
+}
+
 test "relational index private addition reopens unpublished LSM plans and rejects missing or corrupt definitions" {
     const alloc = std.testing.allocator;
     const Backend = @import("../lsm_backend.zig").Backend;
@@ -1060,6 +1092,8 @@ test "relational index private addition reopens unpublished LSM plans and reject
     };
     defer addition.deinit();
     try std.testing.expectEqual(index.mapKey(), addition.plan.boundIndexes()[0].id().mapKey());
+    try testReservedPublicationAllocations(alloc, &store, before, after, reserved, candidate);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, testReservedPublicationAllocations, .{ &store, before, after, reserved, candidate });
     const key = blobKey(candidate.blob_digest);
     {
         var txn = try store.beginWriteTxn();
