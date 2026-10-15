@@ -431,6 +431,7 @@ pub const storage_db_receipt_position = @import("storage/db/receipt_position.zig
 pub const storage_db_relational_columns = @import("storage/db/relational_columns.zig");
 pub const storage_db_relational_constraint_jobs = @import("storage/db/relational_constraint_jobs.zig");
 pub const storage_db_relational_expression_system_test = @import("storage/db/relational_expression_system_test.zig");
+pub const storage_db_relational_index_audit_checkpoint = @import("storage/db/relational_index_audit_checkpoint.zig");
 pub const storage_db_relational_index_catalog = @import("storage/db/relational_index_catalog.zig");
 pub const storage_db_relational_index_cover = @import("storage/db/relational_index_cover.zig");
 pub const storage_db_relational_index_cover_system_test = @import("storage/db/relational_index_cover_system_test.zig");

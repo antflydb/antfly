@@ -99,6 +99,15 @@ pub const Loaded = struct {
     summary: Summary,
     cursor: []u8,
     digest: Digest,
+    pub fn encodeAlloc(self: @This(), alloc: Allocator) ![]u8 {
+        const bytes = try encodeRecord(alloc, self.summary, self.cursor);
+        errdefer alloc.free(bytes);
+        if (!equal(hash(bytes), self.digest)) return error.InvalidRelationalIndexValidation;
+        return bytes;
+    }
+    pub fn decode(alloc: Allocator, bytes: []const u8) !@This() {
+        return decodeRecord(alloc, bytes);
+    }
     pub fn deinit(self: *@This()) void {
         self.alloc.free(self.cursor);
         self.* = undefined;

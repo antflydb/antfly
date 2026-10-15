@@ -7186,3 +7186,59 @@ tests do not qualify more original SQL cases. Public UNIQUE activation remains
 guarded until proof joining, capability barriers, restore/adoption enforcement,
 install/release, durable terminal completion and distributed fault coverage
 are integrated.
+
+### Durable physical-root audit checkpoints
+
+The root-local inventory/generation kernels now have a signed checkpoint
+repository and a bounded DB entry point. `stepNativeIndexOwnerAudit` validates
+the actual native job, table and frozen target, uses the relational preparation
+budget, advances at most one audit page, and persists its local result without
+changing canonical progress, primary rows or native authority. This is local
+verification, not a replicated mutation; followers are not excluded by the
+replication write gate. Query-readonly DB opens remain readonly.
+
+The receiving root owner supplies the physical root directory/incarnation and
+retains its lifecycle lease. Root signing keys must already be provisioned;
+audit execution does not mint identities or wait on their creation locks.
+Checkpoint signatures bind the complete owner identity, frozen expectation,
+root incarnation, canonical seals, inventory audit and binary generation
+cursor. The signature is checked before parsing the potentially large cursor.
+The private AFRIA v1 framing is root-local only, not a native effect or an
+authenticated metadata publication receipt.
+
+Files live in `.relational-index-audits` outside the primary snapshot. There is
+one checkpoint slot and stable lock per DB namespace, matching the existing
+single canonical native-job slot. Different namespaces can share a logical
+job ID without sharing progress or a lock. A valid signed checkpoint from a
+different owner starts no local progress: the new job must rescan from the
+beginning before atomically replacing the same slot. Corrupt signatures and
+changed same-owner seals fail closed. Attempts do not accumulate checkpoint
+files. Namespace/root retirement still belongs to the physical owner lifecycle.
+
+Directory/file opens reject symlinks and checkpoint files are private regular
+files. Operations use the retained directory handle. Per-namespace advisory
+locks wait through cancellation-aware `std.Io` sleeps, not thread primitives or
+the apply lock. Writes use file sync, atomic rename and directory sync; first
+publication also syncs the containing root to close concurrent mkdir races.
+An abandoned exact temporary file is removed only under its namespace lock.
+Unchanged terminal saves avoid rewriting and syncing the checkpoint.
+
+The LSM fixture exercises DB restart during inventory and generation audits,
+unchanged canonical bytes/native sequence, independent namespace locks, lock
+wait cancellation, owner replacement without prefix adoption, abandoned-temp
+recovery, signature corruption and rejection of an intact checkpoint copied
+from another root. These do not qualify metadata adoption or distributed Raft
+faults. Receiving-worker/C-ABI integration, authenticated proof joining,
+capability barriers and actual restore/adoption/ACK enforcement remain
+unfinished. Public UNIQUE activation stays guarded; original SQL dispositions
+remain 483 implemented / 862 unresolved.
+
+`/private/tmp/antfly-root-audit-checkpoint-final-debug.log` passed 159/159
+Debug steps, including nine native-page, 48 publication, four ACK, three
+leased-owner, six C-ABI, 46 runtime-contract and 104 standalone tests. The
+final directory-open adjustment passed 53/53 Debug steps with all nine
+native-page tests in `/private/tmp/antfly-root-audit-checkpoint-sync-debug.log`.
+These gates overlap and do not add original SQL coverage. Boundary, license,
+inventory, generated control-catalog, formatting and diff checks pass. The
+sync-capable directory-open flag follows the Linux std.Io implementation;
+the executed gates here are macOS Debug, not Linux runtime qualification.

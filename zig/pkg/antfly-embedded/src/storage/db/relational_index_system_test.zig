@@ -1838,6 +1838,146 @@ test "relational index build pages identity dispatch caches immutable candidates
             }
             try db.core.store.putBatch(&.{.{ .key = saved_keys.forward, .value = saved_values[0] }}, &.{});
         }
+        {
+            const checkpoint = @import("relational_index_audit_checkpoint.zig");
+            const io = std.testing.io;
+            _ = try @import("root_signing_identity.zig").loadOrCreate(alloc, io, directory.path());
+            try std.testing.expectError(error.PrivateIndexAuditScopeChanged, db.stepNativeIndexOwnerAudit("items", validation_request, directory.path(), db.root_incarnation ^ 1, .{}));
+            const original = original: {
+                var read = try db.core.store.beginReadTxn();
+                defer read.abort();
+                break :original .{ try alloc.dupe(u8, try read.get(&Validation.key(binding))), try alloc.dupe(u8, try read.get(&Verification.key(binding))), (try authority.load(&read)).?.sequence };
+            };
+            defer alloc.free(original[0]);
+            defer alloc.free(original[1]);
+            var restarted_inventory = false;
+            var restarted_generation = false;
+            var audit_turns: usize = 0;
+            var terminal: ?checkpoint.Summary = null;
+            while (true) {
+                const result = try db.stepNativeIndexOwnerAudit("items", validation_request, directory.path(), db.root_incarnation, .{});
+                audit_turns += 1;
+                try std.testing.expect(audit_turns <= 96);
+                try std.testing.expect(result.inventory.phase != .failed);
+                if (result.generation) |fields| {
+                    try std.testing.expect(fields.phase != .failed);
+                    if (fields.phase == .ready) {
+                        terminal = result;
+                        break;
+                    }
+                }
+                const restart_inventory = audit_turns == 2;
+                const restart_generation = result.generation != null and result.generation.?.counts[0] != 0 and !restarted_generation;
+                if (restart_inventory or restart_generation) {
+                    restarted_inventory = restarted_inventory or restart_inventory;
+                    restarted_generation = restarted_generation or restart_generation;
+                    db.close();
+                    db = try db_mod.DB.open(alloc, directory.path(), options);
+                    var guard = try checkpoint.open(alloc, io, directory.path(), db.root_incarnation, binding, validation_request.target_expectation.?, .{});
+                    defer guard.deinit();
+                    var retained = (try guard.load()).?;
+                    defer retained.deinit();
+                    try std.testing.expectEqualDeep(result, try guard.summary(retained));
+                }
+            }
+            try std.testing.expect(restarted_inventory and restarted_generation);
+            const repeated = try db.stepNativeIndexOwnerAudit("items", validation_request, directory.path(), db.root_incarnation, .{});
+            try std.testing.expectEqualDeep(terminal.?, repeated);
+            {
+                var read = try db.core.store.beginReadTxn();
+                defer read.abort();
+                try std.testing.expectEqualSlices(u8, original[0], try read.get(&Validation.key(binding)));
+                try std.testing.expectEqualSlices(u8, original[1], try read.get(&Verification.key(binding)));
+                try std.testing.expectEqual(original[2], (try authority.load(&read)).?.sequence);
+            }
+            const raw = raw: {
+                var guard = try checkpoint.open(alloc, io, directory.path(), db.root_incarnation, binding, validation_request.target_expectation.?, .{});
+                defer guard.deinit();
+                const Wait = struct {
+                    calls: usize = 0,
+                    fn waitCanceled(ptr: *const anyopaque) bool {
+                        const self: *@This() = @ptrCast(@alignCast(@constCast(ptr)));
+                        self.calls += 1;
+                        return self.calls >= 32;
+                    }
+                };
+                {
+                    var other_binding = binding;
+                    other_binding.fence.namespace.range_id += 1;
+                    var other_expected = validation_request.target_expectation.?;
+                    other_expected.binding_digest = Integrity.hash(&try other_binding.encode());
+                    var independent = try checkpoint.open(alloc, io, directory.path(), db.root_incarnation, other_binding, other_expected, .{});
+                    defer independent.deinit();
+                    try std.testing.expect(!std.mem.eql(u8, guard.path, independent.path));
+                    try std.testing.expect(try independent.load() == null);
+                }
+                var waiting: Wait = .{};
+                try std.testing.expectError(error.Canceled, checkpoint.open(alloc, io, directory.path(), db.root_incarnation, binding, validation_request.target_expectation.?, .{ .cancellation = .{ .ptr = &waiting, .is_cancelled_fn = Wait.waitCanceled } }));
+                try std.testing.expectEqual(@as(usize, 32), waiting.calls);
+                const temporary = try std.fmt.allocPrint(alloc, "{s}.tmp", .{guard.path});
+                defer alloc.free(temporary);
+                const stale = try std.Io.Dir.cwd().createFile(io, temporary, .{ .exclusive = true });
+                stale.close(io);
+                break :raw try std.Io.Dir.cwd().readFileAlloc(io, guard.path, alloc, .limited(Verification.max_wire_bytes + 16384));
+            };
+            defer alloc.free(raw);
+            {
+                var next_binding = binding;
+                next_binding.id[0] ^= 1;
+                var next_expected = validation_request.target_expectation.?;
+                next_expected.binding_digest = Integrity.hash(&try next_binding.encode());
+                var guard = try checkpoint.open(alloc, io, directory.path(), db.root_incarnation, next_binding, next_expected, .{});
+                defer guard.deinit();
+                try std.testing.expect(try guard.load() == null);
+            }
+            {
+                var guard = try checkpoint.open(alloc, io, directory.path(), db.root_incarnation, binding, validation_request.target_expectation.?, .{});
+                defer guard.deinit();
+                const temporary = try std.fmt.allocPrint(alloc, "{s}.tmp", .{guard.path});
+                defer alloc.free(temporary);
+                try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openFile(io, temporary, .{}));
+                var retained = (try guard.load()).?;
+                defer retained.deinit();
+                try std.testing.expectEqualDeep(terminal.?, try guard.summary(retained));
+                const Write = struct {
+                    fn at(path: []const u8, bytes: []const u8) !void {
+                        var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .write_only });
+                        defer file.close(std.testing.io);
+                        var buffer: [4096]u8 = undefined;
+                        var writer = file.writer(std.testing.io, &buffer);
+                        try writer.interface.writeAll(bytes);
+                        try writer.end();
+                        try file.sync(std.testing.io);
+                    }
+                };
+                const corrupted = try alloc.dupe(u8, raw);
+                defer alloc.free(corrupted);
+                corrupted[corrupted.len - 1] ^= 1;
+                try Write.at(guard.path, corrupted);
+                try std.testing.expectError(error.InvalidRelationalIndexValidation, guard.load());
+                // Controlled fault restoration, never a checkpoint repair API.
+                try Write.at(guard.path, raw);
+            }
+            {
+                // Even an intact source checkpoint cannot become local proof
+                // merely by copying it into another restored physical root.
+                var peer = try @import("../../common/test_directory.zig").TestDirectory.init("native-index-audit-peer-root");
+                defer peer.cleanup();
+                const peer_key = try @import("root_signing_identity.zig").loadOrCreate(alloc, io, peer.path());
+                var guard = try checkpoint.open(alloc, io, peer.path(), peer_key.root_incarnation, binding, validation_request.target_expectation.?, .{});
+                defer guard.deinit();
+                {
+                    var file = try @import("antfly_runtime_fs").fs_paths.createFilePortable(io, guard.path, .{ .exclusive = true, .permissions = if (comptime @import("builtin").os.tag == .windows) .default_file else @fromBackingInt(0o600) });
+                    defer file.close(io);
+                    var buffer: [4096]u8 = undefined;
+                    var writer = file.writer(io, &buffer);
+                    try writer.interface.writeAll(raw);
+                    try writer.end();
+                    try file.sync(io);
+                }
+                try std.testing.expectError(error.InvalidRelationalIndexValidation, guard.load());
+            }
+        }
         try std.testing.expectEqual(@as(u64, 1), db.native_index_build_cache.compilations);
         try std.testing.expectEqual(@as(u32, 1), db.core.schema.?.version);
     }
