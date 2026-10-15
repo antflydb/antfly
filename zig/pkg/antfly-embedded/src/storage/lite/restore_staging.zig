@@ -212,9 +212,17 @@ fn stageAfliteRestoreBackupWithOptions(
 }
 
 fn temporaryPortablePath(allocator: Allocator, io: std.Io) ![]u8 {
+    return temporaryPreparationPath(allocator, io, "antfly-prepare-", ".afb");
+}
+
+fn temporaryPreparationPath(allocator: Allocator, io: std.Io, prefix: []const u8, suffix: []const u8) ![]u8 {
     var nonce: [16]u8 = undefined;
     try io.randomSecure(&nonce);
-    return std.fmt.allocPrint(allocator, "/tmp/antfly-prepare-{s}.afb", .{std.fmt.bytesToHex(nonce, .lower)});
+    const env = @import("antfly_platform").env;
+    const directory = env.getenv("TMPDIR") orelse env.getenv("TEMP") orelse "/tmp";
+    const name = try std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ prefix, std.fmt.bytesToHex(nonce, .lower), suffix });
+    defer allocator.free(name);
+    return std.fs.path.join(allocator, &.{ directory, name });
 }
 
 /// No archive-sized buffer, and the cap is checked before forwarding bytes.
@@ -276,6 +284,10 @@ fn stageAfbRestoreBackupWithOptions(
     else
         try std.Io.Dir.cwd().openFile(io, path, .{});
     defer source.close(io);
+    // Pin the source before reading any admission metadata. Native extraction
+    // rereads the manifest and must consume the inventory checked below.
+    if (!try source.tryLock(io, .shared)) return error.WriterLocked;
+    defer source.unlock(io);
     try checkInputLimit(io, source, options.max_input_bytes);
     const source_stat = try source.stat(io);
     var framing = backup_codec.FileReader.init(io, source, source_stat.size);
@@ -296,7 +308,7 @@ fn stageAfbRestoreBackupWithOptions(
             allocator,
             io,
             source,
-            source_stat.size,
+            source_stat,
             table_name,
             requested_backup_id,
             location_uri,
@@ -379,7 +391,7 @@ fn stageNativeAfbRestoreBackup(
     allocator: Allocator,
     io: std.Io,
     source: std.Io.File,
-    source_size: u64,
+    initial_stat: std.Io.File.Stat,
     target_table_name: []const u8,
     requested_backup_id: []const u8,
     location_uri: []const u8,
@@ -390,17 +402,13 @@ fn stageNativeAfbRestoreBackup(
     if (requested_backup_id.len > 0 and !std.mem.eql(u8, requested_backup_id, root_manifest.backup_id))
         return error.BackupIdentityMismatch;
 
-    if (!try source.tryLock(io, .shared)) return error.WriterLocked;
-    defer source.unlock(io);
-    const initial_stat = try source.stat(io);
-    if (initial_stat.size != source_size) return error.SourceFileChanged;
-    var nonce: [16]u8 = undefined;
-    try io.randomSecure(&nonce);
-    const nonce_hex = std.fmt.bytesToHex(nonce, .lower);
-    const staging_root = try std.fmt.allocPrint(allocator, "/tmp/antfly-afb2-{s}", .{&nonce_hex});
+    // The caller holds the shared lock and supplies the stat from before its
+    // header/manifest reads. Also reject writers that ignore advisory locks.
+    if (!backups_api.localArtifactStatsEqual(try source.stat(io), initial_stat)) return error.SourceFileChanged;
+    const staging_root = try temporaryPreparationPath(allocator, io, "antfly-afb2-", "");
     defer allocator.free(staging_root);
     defer std.Io.Dir.cwd().deleteTree(io, staging_root) catch {};
-    try backup_bundle_io.extractNativeFileToStagingDirectory(allocator, io, source, source_size, staging_root);
+    try backup_bundle_io.extractNativeFileToStagingDirectory(allocator, io, source, initial_stat.size, staging_root);
 
     var source_manifest = try backups_api.readManifest(allocator, staging_root, root_manifest.backup_id);
     defer source_manifest.deinit(allocator);
@@ -1939,6 +1947,113 @@ test "lite restore staging checks large u64 input sizes without allocating them"
     var counter: InspectionCounter = .{};
     try std.testing.expectError(error.InvalidMagic, portable_backup.inspectPortableFileBlocks(a, io, file, .{}, &counter, InspectionCounter.visit));
     try std.testing.expectEqual(@as(usize, 0), counter.blocks);
+}
+
+test "lite restore staging locks archives before parsing their header" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+    const input = try std.fs.path.join(alloc, &.{ root, "busy.afb" });
+    defer alloc.free(input);
+    const location = try std.fmt.allocPrint(alloc, "file://{s}/never-created", .{root});
+    defer alloc.free(location);
+    var writer = try tmp.dir.createFile(io, "busy.afb", .{ .read = true, .lock = .exclusive });
+    defer writer.close(io);
+    const fixture = @embedFile("../testdata/cross_backend_v1.afb");
+    try writer.writePositionalAll(io, fixture, 0);
+    // Model a writer halfway through replacing the header. No header parsing
+    // or budget admission may happen while that writer owns the archive.
+    try writer.writePositionalAll(io, &.{fixture[16] ^ 1}, 16);
+    try std.testing.expectError(error.WriterLocked, stageInputRestoreBackup(alloc, input, "docs", "test", location));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "never-created", .{}));
+}
+
+test "lite restore staging rejects same-size native source changes since admission" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var source = try tmp.dir.createFile(io, "changed.afb2", .{ .read = true });
+    defer source.close(io);
+    try source.writePositionalAll(io, "old archive", 0);
+    // Make the generation change deterministic on coarse-timestamp filesystems.
+    try source.setTimestamps(io, .{ .modify_timestamp = .{ .new = .fromNanoseconds(0) } });
+    if (!try source.tryLock(io, .shared)) return error.WriterLocked;
+    defer source.unlock(io);
+    const admitted_stat = try source.stat(io);
+    // Advisory locks cannot stop a noncooperating writer. Preserve the size
+    // while replacing the generation the caller used for its admission.
+    try source.writePositionalAll(io, "new archive", 0);
+    const changed_stat = try source.stat(io);
+    try std.testing.expectEqual(admitted_stat.size, changed_stat.size);
+    try std.testing.expect(!backups_api.localArtifactStatsEqual(admitted_stat, changed_stat));
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+    const location = try std.fmt.allocPrint(alloc, "file://{s}/never-created", .{root});
+    defer alloc.free(location);
+    // Stale admission must be rejected before any payload decoding or output.
+    try std.testing.expectError(error.SourceFileChanged, stageNativeAfbRestoreBackup(
+        alloc,
+        io,
+        source,
+        admitted_stat,
+        "docs",
+        "test",
+        location,
+        .{ .representation = .native, .backup_id = "test", .table_name = "docs" },
+    ));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "never-created", .{}));
+}
+
+test "lite restore staging scratch honors TMPDIR and TEMP" {
+    if (comptime !builtin.link_libc or builtin.os.tag == .windows) return error.SkipZigTest;
+    const Environment = struct {
+        extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern fn unsetenv(name: [*:0]const u8) c_int;
+    };
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const env = @import("antfly_platform").env;
+    const saved_tmpdir = if (env.getenv("TMPDIR")) |value| try alloc.dupeSentinel(u8, value, 0) else null;
+    defer if (saved_tmpdir) |value| alloc.free(value);
+    const saved_temp = if (env.getenv("TEMP")) |value| try alloc.dupeSentinel(u8, value, 0) else null;
+    defer if (saved_temp) |value| alloc.free(value);
+    defer {
+        if (saved_tmpdir) |value| {
+            _ = Environment.setenv("TMPDIR", value, 1);
+        } else {
+            _ = Environment.unsetenv("TMPDIR");
+        }
+        if (saved_temp) |value| {
+            _ = Environment.setenv("TEMP", value, 1);
+        } else {
+            _ = Environment.unsetenv("TEMP");
+        }
+    }
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(directory);
+    const directory_z = try alloc.dupeSentinel(u8, directory, 0);
+    defer alloc.free(directory_z);
+    try std.testing.expectEqual(@as(c_int, 0), Environment.setenv("TMPDIR", directory_z, 1));
+    try std.testing.expectEqual(@as(c_int, 0), Environment.setenv("TEMP", "/nonexistent-antfly-temp", 1));
+    const portable = try temporaryPortablePath(alloc, io);
+    defer alloc.free(portable);
+    try std.testing.expectEqualStrings(directory, std.fs.path.dirname(portable).?);
+    var file = try fs_paths.createFilePortable(io, portable, .{ .exclusive = true, .permissions = .fromMode(0o600) });
+    file.close(io);
+    try std.Io.Dir.cwd().deleteFile(io, portable);
+    try std.testing.expectEqual(@as(c_int, 0), Environment.unsetenv("TMPDIR"));
+    try std.testing.expectEqual(@as(c_int, 0), Environment.setenv("TEMP", directory_z, 1));
+    const native = try temporaryPreparationPath(alloc, io, "antfly-afb2-", "");
+    defer alloc.free(native);
+    try std.testing.expectEqualStrings(directory, std.fs.path.dirname(native).?);
+    try fs_paths.createDirPathPortable(io, native);
+    try std.Io.Dir.cwd().deleteTree(io, native);
 }
 
 test "lite restore staging inspector refuses an active archive writer" {

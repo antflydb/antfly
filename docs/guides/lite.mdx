@@ -221,6 +221,8 @@ that a destination has enough capacity. Allow disk space for the input,
 temporary copies, and native extraction. Format validation does not check
 whether the destination can access media or run the configured models; the
 shared location and named connection are still required.
+Preparation places scratch files and native extraction directories under
+`TMPDIR`, then `TEMP`, falling back to `/tmp` when neither is set.
 
 **A normal instance into Lite.** Back up the table with `--format portable` (Lite cannot read a native bundle), then restore or import it:
 
