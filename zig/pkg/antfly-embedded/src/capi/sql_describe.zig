@@ -33,7 +33,6 @@ fn describePrepared(handle: *h.Handle, request_json: []const u8, alloc: std.mem.
     defer request.deinit();
     var compiled = try sql.compiler.compile(alloc, request.value.statement, .{});
     defer compiled.deinit();
-    try @import("tables.zig").loadAvailable(handle);
     try @import("sql_commit.zig").recover(handle);
     try @import("sql_ddl.zig").recover(handle);
     var adapter = sql.Adapter(h.antfly){ .handle = handle, .db = &handle.db, .table_name = "default", .read_only = !h.liteOpenModeCanWrite(handle.open_mode) };

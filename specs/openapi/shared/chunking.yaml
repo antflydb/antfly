@@ -165,7 +165,7 @@ components:
       properties:
         model:
           type: string
-          description: "The chunking model to use. Either 'fixed' for simple token-based chunking, or a model name from models/chunkers/{name}/."
+          description: "The chunking model to use. Antfly inference implements only 'fixed' (token-count text chunking and fixed audio windows); other model names are rejected."
           default: "fixed"
           example: "fixed"
         max_chunks:
@@ -183,7 +183,7 @@ components:
           format: float
           minimum: 0
           maximum: 1
-          description: "Confidence threshold for model-based chunking (0.0-1.0). Used by ONNX text models and VAD audio models."
+          description: "Confidence threshold for model-based chunking (0.0-1.0). Validated but not used by the built-in fixed chunker."
         text:
           $ref: "#/components/schemas/TextChunkOptions"
         audio:

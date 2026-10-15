@@ -4,23 +4,83 @@ unlisted: true
 description: Key terms and concepts used in Antfly and the broader AI/search ecosystem
 ---
 
+## Antfly Concepts
+
+### Antfly Inference
+
+The model runtime built into Antfly. It runs embedding, chunking, reranking, extraction, transcription, and generation models from GGUF, safetensors, and [ONNX](#onnx-open-neural-network-exchange) artifacts on native CPU, Metal, and CUDA backends, plus experimental PJRT/XLA and WASM/WebGPU backends. Standalone serves it in-process under `/ai/v1`; `antfly inference run` runs it as a separate process that a database reaches through `inference.api_url`.
+
+See: [Antfly Inference](/docs/guides/inference) | [Local Model Compatibility](/docs/guides/supported-models)
+
+### CDC & Foreign Sources
+
+Two ways to work with an external PostgreSQL table. **CDC** (`replication_sources` on a table) uses logical replication to stream inserts, updates, and deletes into canonical Antfly storage. **Foreign sources** (`foreign_sources` on a query) read or join the external table at request time without ingesting it, and support only filters, field selection, and paging.
+
+See: [Mirror a PostgreSQL Table](/docs/guides/cdc-replication) | [CDC design](https://github.com/antflydb/antfly/blob/main/zig/CDC.md)
+
+### Document Extraction
+
+The `document_extraction` asset producer downloads a document URL during enrichment and persists derived units such as PDF pages and chunks. PDF pages with no native text use OCR by default with the local `antflydb/Florence-2-base` model. Set `ocr_fallback` to `false` or `ocr.enabled` to `false` to opt out. This durable ingestion path is distinct from [template](#templates) helpers such as `remoteMedia`, which prepare media for inference without persisting page artifacts.
+
+### Enrichments, Artifacts & Asset Producers
+
+An **enrichment** is a named producer that generates and maintains **artifacts**, durable outputs attached to a document and exposed under `_artifacts`. Enrichment kinds are `chunk`, `asset`, and `embedding`. Summaries, extraction, OCR, transcription, and decisions are all `asset` artifacts made by an **asset producer** (`copy`, `generator`, `extractor`, `decision`, `reader`, `transcriber`, or [`document_extraction`](#document-extraction)), and indexes can consume artifact streams as sources.
+
+See: [Artifact Indexes](/docs/guides/artifact-indexes) | [Artifacts design](https://github.com/antflydb/antfly/blob/main/zig/ARTIFACTS.md) | [Enrichments design](https://github.com/antflydb/antfly/blob/main/zig/ENRICHMENTS.md)
+
+### Lake Tables
+
+*In progress.* Lake query mode serves Parquet datasets and Iceberg tables that stay in your object storage through the same relational row plans, pushing predicates and projections down into file reads instead of copying every row into Antfly. It ships with the SQL work tracked in [#145](https://github.com/antflydb/antfly/pull/145).
+
+See: [Lake design](https://github.com/antflydb/antfly/blob/main/zig/LAKES.md) | [Remote table serving](https://github.com/antflydb/antfly/blob/main/zig/REMOTE_TABLE_SERVING.md)
+
+### Relational Tables
+
+A second table profile on the same engine. The schema is required and closed, and every declared scalar property becomes a typed column, so predicates, sorts, and aggregations run columnar. The `relational` index type adds composite ordered keys on these tables.
+
+See: [Relational mode design](https://github.com/antflydb/antfly/blob/main/zig/RELATIONAL.md)
+
+### remotePDF (deprecated)
+
+`remotePDF` is a deprecated Handlebars helper retained for compatibility. Use `remoteMedia` for template-time multimodal inference, or `document_extraction` when PDF pages and chunks should be durable and reprocessable.
+
+### SQL & pgwire
+
+*In progress.* SQL is lowered to Antfly's native typed plans, and an optional PostgreSQL wire-protocol (pgwire) listener lets `psql`-compatible clients connect. Tracked in [#145](https://github.com/antflydb/antfly/pull/145).
+
+See: [SQL design](https://github.com/antflydb/antfly/blob/main/docs/design/sql/extraction.md) | [pgwire transport](https://github.com/antflydb/antfly/blob/main/zig/pkg/antfly/src/pgwire/README.md)
+
+### sync_level
+
+How long a batch write waits before returning: `propose` (Raft proposal accepted, the default), `write` (durably applied to the local store), `full_text` (full-text index WAL written), `enrichments` (enrichments precomputed before commit; a synchronous producer failure rejects the write), or `full_index` (all index writes complete).
+
+### Templates
+
+Handlebars templates turn a document into the text or media that a model sees, for embedders, rerankers, and enrichments. Built-in helpers include `scrubHtml`, `eq`, `media`, `remoteMedia` (download a URL into a media part, such as an image), and `remoteText` (fetch a URL's text), with downloads guarded by host allowlists, private-IP blocking, and size limits.
+
+See: [Multimodal Embeddings](/docs/guides/multimodal) | [Handlebars](https://handlebarsjs.com/guide/)
+
+### Transforms
+
+In-place document updates with MongoDB-style operators (`$set`, `$setOnInsert`, `$unset`, `$inc`, `$push`, `$pull`, `$addToSet`, `$min`, `$max`), sent in the `transforms` array of a batch. They apply atomically at the storage layer, which avoids read-modify-write races, but results are not validated against the table schema.
+
 ## AI & Machine Learning
 
 ### Agent
 
-An autonomous AI system that can plan, reason, and take actions to accomplish goals. In Antfly, native agents include the Retrieval Agent for retrieval, tool selection, and generation, plus the Query Builder Agent for turning natural language into executable Antfly queries. Agents may use [tools](#tool-use), make decisions, and operate over multiple bounded steps to complete complex tasks.
+An autonomous AI system that can plan, reason, and take actions to accomplish goals. Antfly has three native agents: the Retrieval Agent (`POST /agents/retrieval`) for retrieval, tool selection, and generation; the Query Builder Agent (`POST /agents/query-builder`) for turning natural language into executable Antfly queries; and the Research Agent (`POST /agents/research`, with durable runs under `/agents/research/jobs`) for cited long-form reports. Agents may use [tools](#tool-use) and operate over multiple bounded steps, and [A2A](#a2a-agent2agent) exposes them to other agents.
 
-See: [ReAct: Synergizing Reasoning and Acting in Language Models](https://arxiv.org/abs/2210.03629)
+See: [Write a Cited Research Report](/docs/guides/deep-research) | [ReAct: Synergizing Reasoning and Acting in Language Models](https://arxiv.org/abs/2210.03629)
 
 ### Chunking
 
-The process of splitting large documents into smaller, semantically meaningful pieces for indexing and retrieval. Effective chunking preserves context while creating appropriately sized segments for [embedding](#embeddings). Antfly Inference provides semantic chunking with multi-tier caching.
+The process of splitting large documents into smaller pieces for indexing and retrieval, so each piece fits an [embedding](#embeddings) model's input. In Antfly a chunker is configured on an index or enrichment, not at query time. The default `fixed` model splits by token count (and by fixed windows for audio and images), and a source shared by several indexes is chunked at most once per write.
 
 See: [Chunking Strategies for LLM Applications](https://www.pinecone.io/learn/chunking-strategies/)
 
 ### Embeddings
 
-Dense vector representations of text, images, or other data that capture semantic meaning. Similar concepts have similar embeddings (close in vector space). Managed index creation supports Antfly Inference, Ollama, OpenAI, OpenRouter, Cohere, Gemini, Vertex AI, and AWS Bedrock. Used by [AKNN](#aknn-approximate-k-nearest-neighbors) indexes for similarity search.
+Dense vector representations of text, images, or other data that capture semantic meaning. Similar concepts have similar embeddings (close in vector space). Managed index creation supports Antfly Inference, Ollama, OpenAI, OpenRouter, Cohere, Gemini, Vertex AI, and AWS Bedrock. Used by [AKNN](#aknn-approximate-k-nearest-neighbors) indexes for similarity search. See also [Sparse Vectors & SPLADE](#sparse-vectors--splade).
 
 See: [Word2Vec](https://arxiv.org/abs/1301.3781) | [Sentence-BERT](https://arxiv.org/abs/1908.10084) | [MTEB Leaderboard](https://huggingface.co/spaces/mteb/leaderboard)
 
@@ -32,17 +92,17 @@ See: [RAGAS: Evaluation framework for RAG](https://docs.ragas.io/) | [OpenAI Eva
 
 ### Generators
 
-Models that produce text, images, or other content. In [RAG](#rag-retrieval-augmented-generation) pipelines, generators (typically LLMs) take retrieved context and user queries to produce final answers. Antfly's RAG endpoint streams generated responses via Server-Sent Events.
+Models that produce text, images, or other content. In [RAG](#rag-retrieval-augmented-generation) pipelines, generators (typically LLMs) take retrieved context and user queries to produce final answers. Antfly's Retrieval Agent (`POST /agents/retrieval`) streams generated answers via Server-Sent Events.
 
 ### Genkit
 
-A framework from Google for building AI-powered applications. Genkit provides abstractions for working with LLMs, [embeddings](#embeddings), vector stores, and retrieval pipelines. It supports multiple AI providers and includes tools for testing, debugging, and deploying AI features.
+An open-source framework for building AI-powered applications, with abstractions for LLMs, [embeddings](#embeddings), and retrieval. Antfly ships a Genkit (Go) plugin, `github.com/antflydb/antfly/go/pkg/genkit/antfly`, that exposes an Antfly table and index as a Genkit retriever.
 
-See: [Genkit Go Documentation](https://firebase.google.com/docs/genkit-go/get-started-go)
+See: [Antfly Genkit plugin](https://github.com/antflydb/antfly/tree/main/go/pkg/genkit/antfly) | [Genkit](https://github.com/firebase/genkit)
 
 ### Model (ML/AI)
 
-A trained machine learning system that performs specific tasks. In Antfly's context, this includes embedding models (convert data to vectors), [reranker](#rerankers) models (re-score search results), vision models (process images), and [generator](#generators) models (produce text). Models can be local via [ONNX](#onnx-open-neural-network-exchange) or remote (API-based).
+A trained machine learning system that performs specific tasks. In Antfly's context, this includes embedding models (convert data to vectors), [reranker](#rerankers) models (re-score search results), vision models (process images), and [generator](#generators) models (produce text). Models run locally on [Antfly Inference](#antfly-inference) from [GGUF, safetensors](#gguf--safetensors), or [ONNX](#onnx-open-neural-network-exchange) artifacts on its native backends, or remotely through an API provider.
 
 See: [Hugging Face Model Hub](https://huggingface.co/models)
 
@@ -64,19 +124,19 @@ See: [spaCy NER](https://spacy.io/usage/linguistic-features#named-entities) | [S
 
 ### Pruners
 
-Components that filter or reduce search results before final ranking. Pruners remove low-quality or irrelevant results early in the pipeline, improving both performance and result quality. In Antfly, pruners are query processors that filter results after retrieval. See also [Rerankers](#rerankers).
+A query processor that drops low-quality results by score. In Antfly the pruner runs once on the merged results, after fusion and any reranking and before offset/limit paging. Its options are `min_score_ratio`, `max_score_gap_percent`, `min_absolute_score`, `std_dev_threshold`, and `require_multi_index`. See also [Rerankers](#rerankers).
 
 ### RAG (Retrieval-Augmented Generation)
 
-A technique that combines search/retrieval with generative AI. Instead of relying solely on an LLM's training data, RAG retrieves relevant documents and provides them as context for generation. This produces more accurate, grounded, and up-to-date responses. Antfly provides native RAG with streaming responses via the [Answerbar](#answerbar).
+A technique that combines search/retrieval with generative AI. Instead of relying solely on an LLM's training data, RAG retrieves relevant documents and provides them as context for generation. This produces more accurate, grounded, and up-to-date responses. In Antfly, RAG is the Retrieval Agent at `POST /agents/retrieval`, which streams its answer over Server-Sent Events.
 
-See: [Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks](https://arxiv.org/abs/2005.11401)
+See: [Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks](https://arxiv.org/abs/2005.11401) | [RAG in the Quickstart](/docs/guides/quickstart#rag-retrieval-augmented-generation)
 
 ### Rerankers
 
-Models that re-score and reorder search results for improved relevance. Unlike initial retrieval (which must be fast), rerankers can use more sophisticated cross-attention between query and document. Antfly supports rerankers as query processors that refine results from [hybrid search](#hybrid-search).
+Models that re-score and reorder search results for improved relevance. Unlike initial retrieval (which must be fast), rerankers can use more sophisticated cross-attention between query and document. Antfly supports rerankers as query processors that refine results from [hybrid search](#hybrid-search), with `antfly`, `cohere`, and `vertex` providers. See also [Late Interaction](#late-interaction-colbert--maxsim).
 
-See: [ColBERT: Efficient and Effective Passage Search](https://arxiv.org/abs/2004.12832) | [Cross-Encoders](https://www.sbert.net/examples/applications/cross-encoder/README.html)
+See: [Cross-Encoders](https://www.sbert.net/examples/applications/cross-encoder/README.html)
 
 ### Tokenizers
 
@@ -92,37 +152,33 @@ See: [Toolformer](https://arxiv.org/abs/2302.04761) | [Anthropic Tool Use](https
 
 ## Search & Indexing
 
-### Indexing
-
-The process of analyzing documents and building data structures for efficient search. Indexes trade storage space and write-time processing for fast query performance. Antfly supports multiple index types: [full-text](#full-text-search-bm25) (BM25), [vector](#aknn-approximate-k-nearest-neighbors) (dense AKNN, sparse, and late interaction), graph, algebraic, and relational.
-
 ### Agentic Search
 
 Search that goes beyond simple query-response patterns. An agentic search system can reformulate queries, explore multiple search paths, synthesize information from different sources, and iteratively refine results to better answer user intent. See also [Semantic Search](#semantic-search).
 
 ### AKNN (Approximate K-Nearest Neighbors)
 
-Algorithms that find the K most similar vectors to a query vector, trading perfect accuracy for dramatic speed improvements. Antfly's `embeddings` index type uses AKNN for fast, memory-efficient vector search on [embeddings](#embeddings).
+Algorithms that find the K most similar vectors to a query vector, trading perfect accuracy for dramatic speed improvements. Antfly's dense `embeddings` index uses AKNN for fast, memory-efficient vector search on [embeddings](#embeddings).
 
 **Key techniques used in Antfly's AKNN implementation:**
 
-- **HBC (Hierarchical Balanced Clustering)**: A clustering algorithm that organizes vectors into a tree structure for efficient search. HBC creates balanced clusters at multiple levels, enabling logarithmic search time. Antfly's dense index routes vectors through an HBC centroid tree to posting lists; large indexes switch routing to a flat centroid directory.
-- **RaBitQ (Randomized Bit Quantization)**: A vector quantization technique that compresses high-dimensional vectors into compact binary representations while preserving distance relationships. RaBitQ enables memory-efficient vector search with minimal accuracy loss.
-- **SPFresh**: A technique for maintaining fresh vector indexes in the presence of updates. Traditional ANNS indexes degrade with updates; SPFresh provides mechanisms for efficient incremental updates while maintaining search quality.
+- **HBC (Hierarchical Balanced Clustering)**: Vectors are organized into a tree of balanced clusters whose leaves are posting lists. A query runs a beam search down the centroid tree, scans the selected leaves, then exact-scores only the candidates whose quantization error bounds overlap the result cutoff. Large indexes route through a flat exact-centroid directory instead of the tree. The only public tuning knob is `search_effort` (0 to 1, default 0.5).
+- **RaBitQ**: A quantization method with a theoretical error bound. Antfly stores each vector as a 1-bit-per-dimension code of its residual from the leaf centroid and keeps full-precision vectors for the final rerank.
+- **SPFresh**: Antfly applies SPFresh-style maintenance policies to HBC, such as lazy centroid refresh and local posting split and merge, so routine inserts and deletes stay local and never trigger a full rebuild. It is not a separate index type.
 
-Hardware acceleration via [SIMD/SME](#simd-sme) provides significant performance improvements for distance calculations.
+Hardware acceleration via [SIMD](#simd) speeds up distance calculations.
 
-See: [Annoy](https://github.com/spotify/annoy) | [FAISS](https://github.com/facebookresearch/faiss) | [ANN Benchmarks](http://ann-benchmarks.com/) | [SPANN Paper](https://arxiv.org/abs/2111.08566) | [RaBitQ Paper](https://arxiv.org/abs/2405.12497) | [SPFresh Paper](https://arxiv.org/abs/2410.14452)
+See: [FAISS](https://github.com/facebookresearch/faiss) | [ANN Benchmarks](http://ann-benchmarks.com/) | [SPANN Paper](https://arxiv.org/abs/2111.08566) | [RaBitQ Paper](https://arxiv.org/abs/2405.12497) | [SPFresh Paper](https://arxiv.org/abs/2410.14452)
 
-### Answerbar & Searchbar
+### Algebraic Index
 
-**Answerbar** is a search interface that provides direct answers to questions rather than just links. It uses [RAG](#rag-retrieval-augmented-generation) to synthesize responses from retrieved content, providing immediate answers with supporting sources.
+An index type that derives typed fields from the table schema and maintains declared exact aggregate recipes (`aggregates`) as materializations. Eligible queries reuse a complete materialization instead of scanning. The design treats aggregation as a fold over algebraic structures such as monoids, groups, and semirings.
 
-**Searchbar** is a traditional search interface where users enter queries and receive ranked results. Unlike answerbar, searchbar returns document results rather than synthesized answers, letting users explore and select relevant content themselves.
+See: [Algebraic design](https://github.com/antflydb/antfly/blob/main/zig/ALGEBRAIC.md)
 
 ### Facetting
 
-Organizing search results into categories (facets) based on document attributes. Facets let users filter results by category, date range, author, or other fields. Antfly's native full-text index supports faceted search. See [Full-Text Search](#full-text-search-bm25).
+Organizing search results into categories (facets) based on document attributes. Facets let users filter results by category, date range, author, or other fields. In Antfly, facets come from a query's `aggregations` (terms, range, histogram, date histogram, and geo) over the full-text index. See [Full-Text Search](#full-text-search--bm25).
 
 See: [Faceted Search (Wikipedia)](https://en.wikipedia.org/wiki/Faceted_search)
 
@@ -136,21 +192,45 @@ Antfly's full-text index (`zig/pkg/antfly-embedded/src/search`) is implemented n
 
 See: [Introduction to Information Retrieval](https://nlp.stanford.edu/IR-book/) | [Okapi BM25 (Wikipedia)](https://en.wikipedia.org/wiki/Okapi_BM25) | [BM25 Paper](https://www.staff.city.ac.uk/~sbrp622/papers/foundations_bm25_review.pdf)
 
+### Graph Index
+
+An index type that stores typed, directed edges between documents, from document fields or from relation [artifacts](#enrichments-artifacts--asset-producers) extracted by enrichments. Queries can traverse, list neighbors, find shortest paths, and match patterns; optional node summaries enable tree navigation in the Retrieval Agent.
+
+See: [Graph Navigation](/docs/guides/graph-navigation) | [Graph design](https://github.com/antflydb/antfly/blob/main/zig/GRAPH.md)
+
 ### Hybrid Search
 
-Combining multiple search approaches - typically [BM25](#full-text-search-bm25) (keyword) and [vector](#aknn-approximate-k-nearest-neighbors) (semantic) search - to get the benefits of both. Keyword search excels at exact matches; vector search handles [semantic similarity](#semantic-search). Antfly merges results using [RRF](#rrf-reciprocal-rank-fusion) or [RSF](#rsf-relative-score-fusion) fusion.
+Combining multiple search approaches - typically [BM25](#full-text-search--bm25) (keyword) and [vector](#aknn-approximate-k-nearest-neighbors) (semantic) search - to get the benefits of both. Keyword search excels at exact matches; vector search handles [semantic similarity](#semantic-search). Antfly merges results using [RRF](#rrf-reciprocal-rank-fusion) or [RSF](#rsf-relative-score-fusion) fusion.
 
-See: [Hybrid Search Explained](https://weaviate.io/blog/hybrid-search-explained)
+See: [Hybrid Search](/docs/guides/hybrid-search) | [Hybrid Search Explained](https://weaviate.io/blog/hybrid-search-explained)
+
+### Indexing
+
+The process of analyzing documents and building data structures for efficient search. Indexes trade storage space and write-time processing for fast query performance. Antfly's index types are [`full_text`](#full-text-search--bm25) (BM25), [`embeddings`](#aknn-approximate-k-nearest-neighbors) (dense or [sparse](#sparse-vectors--splade) vectors), [`graph`](#graph-index), [`algebraic`](#algebraic-index), and [`relational`](#relational-tables).
+
+See: [Document Engine](/docs/guides/document-engine)
+
+### Late Interaction (ColBERT & MaxSim)
+
+A scoring method that keeps one vector per token for both query and document and sums, over query tokens, each token's best match in the document (MaxSim). In Antfly, late interaction is a [reranking](#rerankers) method: ColBERT-style models served by Antfly Inference rerank candidates. It is not an index type.
+
+See: [ColBERT: Efficient and Effective Passage Search](https://arxiv.org/abs/2004.12832)
+
+### React Components
+
+`@antfly/components` is a React library for search interfaces on Antfly: `QueryBox` and autosuggest, facet filters, results and pagination, `AnswerResults` for streamed Retrieval Agent answers, and `ChatBar` for multiturn chat.
+
+See: [React Antfly](/docs/ui/react-antfly)
 
 ### RRF (Reciprocal Rank Fusion)
 
-A score fusion method that combines ranked lists from different retrieval systems. RRF uses the formula `1/(k + rank)` where k is a constant (typically 60). It's robust, parameter-free, and effective for [hybrid search](#hybrid-search). Antfly uses RRF by default for combining BM25 and vector results.
+A fusion method that combines ranked lists from different retrieval systems by scoring each result `1/(k + rank)`. RRF is Antfly's default merge strategy for [hybrid search](#hybrid-search). The constant `k` is `rank_constant` (default 60), and per-index `weights` scale each list's contribution.
 
-See: [Reciprocal Rank Fusion outperforms Condorcet and individual Rank Learning Methods](https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf)
+See: [Reciprocal Rank Fusion outperforms Condorcet and individual Rank Learning Methods](https://cormack.uwaterloo.ca/cormacksigir09-rrf.pdf)
 
 ### RSF (Relative Score Fusion)
 
-A score fusion method that normalizes and combines actual scores (not just ranks) from different retrieval systems. RSF can better preserve score magnitude information compared to [RRF](#rrf-reciprocal-rank-fusion) but requires careful score normalization across different scoring functions.
+A score fusion method that normalizes and combines actual scores (not just ranks) from different retrieval systems. RSF can better preserve score magnitude information compared to [RRF](#rrf-reciprocal-rank-fusion) but requires careful score normalization across different scoring functions. Antfly's RSF min/max-normalizes scores within `window_size` and applies the same per-index `weights` as RRF.
 
 ### Semantic Search
 
@@ -158,27 +238,39 @@ Search based on meaning rather than exact keyword matching. Semantic search uses
 
 See: [Semantic Search with Sentence-BERT](https://www.sbert.net/examples/applications/semantic-search/README.html)
 
+### Sparse Vectors & SPLADE
+
+Vectors in which most dimensions are zero, each nonzero dimension a weighted vocabulary term. SPLADE models produce them from text, which gives learned keyword matching. An `embeddings` index with `sparse: true` stores them in an inverted index instead of the dense HBC index.
+
+See: [SPLADE Paper](https://arxiv.org/abs/2107.05720)
+
 ## Distributed Systems
 
 ### 2PC (Two-Phase Commit)
 
-A distributed transaction protocol that ensures all participants in a transaction either commit or abort together. In phase one, a coordinator asks all participants to prepare; in phase two, it tells them to commit (if all prepared) or abort (if any failed). Antfly uses coordinator-based 2PC with intent-based locking for atomic cross-shard writes.
+A distributed transaction protocol that ensures all participants in a transaction either commit or abort together. Antfly runs coordinator-driven 2PC over write intents with optimistic concurrency control (OCC): read versions are validated at commit, and a conflict returns 409. Clients use stateless `POST /transactions/commit` or server-managed sessions (`/transactions/begin`) with savepoints, and the protocol is model-checked in [TLA+](#tla).
 
-See: [CockroachDB Distributed Transactions](https://www.cockroachlabs.com/docs/stable/architecture/transaction-layer) | [Two-Phase Commit (Wikipedia)](https://en.wikipedia.org/wiki/Two-phase_commit_protocol)
+See: [Transaction TLA+ spec](https://github.com/antflydb/antfly/blob/main/zig/specs/tla/AntflyTransaction.tla) | [Two-Phase Commit (Wikipedia)](https://en.wikipedia.org/wiki/Two-phase_commit_protocol)
 
 ### Autoscaling
 
-Automatically adjusting system resources (nodes, CPU, memory) based on load. Antfly's Kubernetes operator supports autoscaling, adding or removing storage nodes as query volume changes. Compare with [Autosharding](#autosharding) which handles data growth.
+Automatically adjusting system resources based on load. When enabled (it is opt-in), Antfly's Kubernetes operator scales data nodes on CPU and memory utilization within configured minimum and maximum replica bounds, and inference pools scale through a Kubernetes HPA. Compare with [Autosharding](#autosharding), which handles data growth.
 
 See: [Kubernetes HPA](https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/)
 
 ### Autosharding
 
-Automatically splitting data partitions ([shards](#sharding)) when they grow too large. Unlike [autoscaling](#autoscaling) which handles traffic spikes by adjusting replicas, autosharding handles data growth by subdividing partitions. Antfly supports automatic shard splitting when shards exceed size thresholds, redistributing data across the cluster without downtime.
+Automatically splitting data partitions ([shards](#sharding)) when they grow too large and merging them when they shrink. Antfly splits and merges shards by size (`max_shard_size_bytes`, default 64 MiB) once you opt in by setting the node config key `disable_shard_alloc: false`; it defaults to `true`.
+
+### Hot Standby
+
+A Postgres-style high-availability mode: a single primary streams its WAL to read-only standbys (`antfly standby`), with replication slots for WAL retention and explicit promotion with fencing. It is an alternative to Raft quorums for read replicas, disaster recovery, and online upgrades. Point-in-time recovery is not supported; backups restore a selected backup snapshot.
+
+See: [Hot standby design](https://github.com/antflydb/antfly/blob/main/zig/HOT_STANDBY.md)
 
 ### Raft & Multiraft
 
-**Raft** is a consensus algorithm that ensures multiple nodes agree on a sequence of operations, providing strong consistency in distributed systems. Raft uses leader election and log replication. Antfly implements its own Raft consensus natively in Zig (`zig/lib/raft`, `zig/pkg/antfly/src/raft`), architecturally inspired by `etcd/raft`'s deterministic core and Dragonboat-style multi-group hosting.
+**Raft** is a consensus algorithm that ensures multiple nodes agree on a sequence of operations, providing strong consistency in distributed systems. Raft uses leader election and log replication. Antfly implements its own Raft consensus natively in Zig (`zig/lib/raft`, `zig/pkg/antfly/src/raft`), architecturally inspired by `etcd/raft`'s deterministic core and Dragonboat-style multi-group hosting. Node-to-node Raft traffic uses HTTP.
 
 **Multiraft** extends this by using multiple independent Raft consensus groups. Unlike single-Raft systems where one group handles all data, Multiraft assigns separate Raft groups to different data partitions ([shards](#sharding)). This enables parallel operations, fault isolation, and independent scaling. Antfly uses Multiraft with separate groups for metadata and each storage shard.
 
@@ -186,19 +278,29 @@ See: [In Search of an Understandable Consensus Algorithm](https://raft.github.io
 
 ### Sharding
 
-Horizontally partitioning data across multiple nodes or storage units. Each shard contains a subset of the data, typically determined by key ranges or hash values. Sharding enables horizontal scaling beyond single-node limits. Antfly automatically partitions data across shards with configurable replication. See also [Autosharding](#autosharding).
+Horizontally partitioning data across multiple nodes or storage units. Antfly partitions each table into shards by key range; `num_shards` sets the initial count, and `replication_factor` (default 3, maximum 5) sets how many replicas each shard keeps. See also [Autosharding](#autosharding).
 
 See: [Shard (Wikipedia)](https://en.wikipedia.org/wiki/Shard_(database_architecture))
 
-## Data Storage
+### Tables, Shards & Raft Groups
 
-### Document Extraction
+A **table** is a named collection of documents with a schema and indexes, split into key-range **shards**. In a distributed deployment each shard is replicated by its own data **Raft group**, while a separate **metadata group** holds cluster topology, schemas, and table definitions. Lite storage has no Raft, and `object` tables allocate no data Raft groups.
 
-The `document_extraction` asset producer downloads a document URL during enrichment and persists derived units such as PDF pages and chunks. PDF pages with no native text use OCR by default with the local `antflydb/Florence-2-base` model. Set `ocr_fallback` to `false` or `ocr.enabled` to `false` to opt out. This durable ingestion path is distinct from template helpers such as `remoteMedia`, which prepare media for inference without persisting page artifacts.
+See: [Architecture](/docs/architecture)
 
-### remotePDF (deprecated)
+## Deployment & Storage
 
-`remotePDF` is a deprecated Handlebars helper retained for compatibility. Use `remoteMedia` for template-time multimodal inference, or `document_extraction` when PDF pages and chunks should be durable and reprocessable.
+### Antfly Lite (.aflite)
+
+Antfly's single-file storage engine: one portable `.aflite` file with one writable owner, opened directly by an embedded application or served by a standalone server, and managed with the `antfly lite` CLI. It uses its own page engine rather than the [LSM tree](#lsm-tree).
+
+See: [Antfly Lite](/docs/guides/lite) | [Lite design](https://github.com/antflydb/antfly/blob/main/zig/LITE.md)
+
+### Deployment Modes
+
+Which processes run, chosen independently of the [storage engine](#storage-engines). `embedded` opens Antfly inside an application with no server; `standalone` runs one process that owns metadata, data, APIs, and inference; `distributed` splits metadata and data nodes for horizontal scale; and `serverless` (in progress) decouples compute from object storage.
+
+See: [Deployment and storage design](https://github.com/antflydb/antfly/blob/main/zig/STORAGE.md)
 
 ### Document Storage
 
@@ -208,21 +310,37 @@ Storing data as self-contained JSON documents rather than rows in tables. Docume
 
 A stateless way to sync sorted records from an external source. Antfly's linear merge (`POST /db/v1/tables/{table}/merge`) takes a sorted page of source records and performs a three-way sync over that key range: it inserts new keys, updates changed ones, and deletes Antfly keys missing from the page.
 
-### LSM & SSTables
+### LSM Tree
 
-Antfly's native storage engine (`zig/pkg/antfly-embedded/src/storage/lsm`) is a Zig LSM-tree implementation. Each [shard](#sharding) has its own storage instance.
-
-**SSTables (Sorted String Tables)** are the immutable, sorted files that form the LSM engine's on-disk storage format. SSTables enable efficient range scans and merging. The LSM-tree architecture writes data to memory first, then flushes to SSTables, and periodically compacts them for efficiency.
+The log-structured merge tree behind the `local` [storage engine](#storage-engines) (`zig/pkg/antfly-embedded/src/storage/lsm_backend`). Writes land in a WAL-backed memtable, then flush to immutable sorted runs (`runs/<id>.tbl`, often called SSTables) tracked by a manifest and compacted in the background. Each [shard](#sharding) has its own storage instance; [Antfly Lite](#antfly-lite-aflite) uses its own engine instead.
 
 See: [LSM-Tree (Wikipedia)](https://en.wikipedia.org/wiki/Log-structured_merge-tree)
 
+### Storage Engines
+
+Where durable state lives, chosen independently of the [deployment mode](#deployment-modes). `lite` is a single `.aflite` file, `local` is a directory of [LSM](#lsm-tree) shard and metadata storage, and `object` keeps durable data in object storage.
+
+See: [Deployment and storage design](https://github.com/antflydb/antfly/blob/main/zig/STORAGE.md)
+
 ### WAL (Write-Ahead Log)
 
-A durability mechanism where operations are written to a sequential log before being applied. If the system crashes, the WAL enables recovery by replaying logged operations. Antfly uses WAL for both [Raft](#raft--multiraft) consensus logs and the [LSM engine's](#lsm--sstables) storage durability.
+A durability mechanism where operations are written to a sequential log before being applied. If the system crashes, the WAL enables recovery by replaying logged operations. Antfly keeps a [Raft](#raft--multiraft) log WAL and an [LSM](#lsm-tree) WAL for mutable state, and [hot standby](#hot-standby) replicates by streaming the WAL to standbys.
 
 See: [Write-Ahead Logging (Wikipedia)](https://en.wikipedia.org/wiki/Write-ahead_logging)
 
 ## Technologies & Frameworks
+
+### A2A (Agent2Agent)
+
+An open protocol for agents to discover and call each other. Antfly serves A2A at `POST /a2a` with an agent card at `/.well-known/agent-card.json`, advertising its native [agents](#agent) as skills.
+
+See: [A2A design](https://github.com/antflydb/antfly/blob/main/zig/A2A.md) | [A2A Protocol](https://a2a-protocol.org/)
+
+### GGUF & safetensors
+
+Model weight file formats. GGUF is the single-file format from the llama.cpp/ggml ecosystem, often quantized; safetensors is Hugging Face's safe tensor serialization format. [Antfly Inference](#antfly-inference) runs both natively, alongside [ONNX](#onnx-open-neural-network-exchange).
+
+See: [Model Downloads](/docs/guides/model-downloads) | [GGUF](https://github.com/ggml-org/ggml/blob/master/docs/gguf.md) | [safetensors](https://github.com/huggingface/safetensors)
 
 ### JSON Schema
 
@@ -230,35 +348,55 @@ A vocabulary for annotating and validating JSON documents. JSON Schema defines t
 
 See: [JSON Schema](https://json-schema.org/) | [Understanding JSON Schema](https://json-schema.org/understanding-json-schema/)
 
+### MCP (Model Context Protocol)
+
+An open protocol that lets AI clients call tools exposed by a server. Antfly's MCP surface, over streamable HTTP, exposes exact table, index, document, and query operations; natural-language planning stays in the native [agents](#agent).
+
+See: [n8n AI Agent over MCP](/docs/guides/n8n) | [MCP design](https://github.com/antflydb/antfly/blob/main/zig/MCP.md) | [Model Context Protocol](https://modelcontextprotocol.io/)
+
 ### ONNX (Open Neural Network Exchange)
 
-A standard format for representing machine learning [models](#model-mlai). ONNX enables models trained in different frameworks (PyTorch, TensorFlow) to run in a common runtime. Antfly Inference runs local models on its own native backends (CPU, Metal, CUDA) for GGUF, safetensors, and ONNX artifacts. It parses `.onnx` graphs itself and executes them on the same kernels, with no external ONNX runtime, providing [embedding](#embeddings), [chunking](#chunking), [reranking](#rerankers), and generation without external API calls.
+A standard format for representing machine learning [models](#model-mlai). ONNX enables models trained in different frameworks (PyTorch, TensorFlow) to run in a common runtime. Antfly Inference parses `.onnx` graphs itself and executes them on its native kernels, with no external ONNX runtime, providing [embedding](#embeddings), [chunking](#chunking), [reranking](#rerankers), and generation without external API calls. Its experimental WASM/WebGPU browser backend also uses the native importer rather than ONNX Runtime Web.
 
 See: [ONNX](https://onnx.ai/)
 
 ### OpenAPI Specification
 
-A standard for describing REST APIs in a machine-readable format. OpenAPI specs enable automatic generation of documentation, client SDKs, and server stubs. Antfly's APIs are defined via OpenAPI, with auto-generated Go, TypeScript, Python, and Rust clients.
+A standard for describing REST APIs in a machine-readable format. Antfly's APIs are defined in OpenAPI under `specs/openapi/`. The Go, TypeScript, and Python SDKs are hand-written clients over generated code, and the Rust SDK is generated end to end.
 
-See: [OpenAPI Specification](https://spec.openapis.org/oas/latest.html) | [Swagger](https://swagger.io/specification/)
+See: [SDKs](/docs/sdks) | [OpenAPI Specification](https://spec.openapis.org/oas/latest.html)
 
-### QUIC (HTTP/3)
+### SIMD
 
-A transport protocol that runs over UDP, providing faster connection establishment, better performance over lossy networks, and multiplexed streams without head-of-line blocking. Antfly's HTTP stack (`zig/lib/httpx`) includes a native QUIC/HTTP-3 implementation; [Raft](#raft--multiraft) node-to-node traffic currently uses HTTP.
+**SIMD (Single Instruction, Multiple Data)** is a CPU feature that processes multiple data elements in parallel with one instruction. Antfly uses Zig's portable `@Vector` SIMD, AVX2/AVX-512 kernels on x86, and NEON on ARM for fast vector distance calculations in [AKNN](#aknn-approximate-k-nearest-neighbors) search and for inference kernels.
 
-See: [RFC 9000: QUIC](https://www.rfc-editor.org/rfc/rfc9000.html) | [HTTP/3 Explained](https://http3-explained.haxx.se/)
+See: [Intel Intrinsics Guide](https://www.intel.com/content/www/us/en/docs/intrinsics-guide/index.html) | [ARM NEON](https://developer.arm.com/Architectures/Neon)
 
-### SIMD/SME
+### TOON (Token-Oriented Object Notation)
 
-**SIMD (Single Instruction, Multiple Data)** is a CPU feature that processes multiple data elements in parallel with one instruction. Common implementations include AVX2/AVX-512 on x86 and NEON on ARM. **SME (Scalable Matrix Extension)** is ARM's extension for matrix operations, ideal for ML workloads. Antfly uses SIMD optimizations for fast vector distance calculations in [AKNN](#aknn-approximate-k-nearest-neighbors) similarity search.
+A compact encoding of JSON for LLM prompts that declares the fields of uniform arrays once and lists one row per line. The Retrieval Agent renders retrieved documents into its generation prompt as TOON by default, so more documents fit in the same context.
 
-See: [Intel Intrinsics Guide](https://www.intel.com/content/www/us/en/docs/intrinsics-guide/index.html) | [ARM NEON](https://developer.arm.com/Architectures/Neon) | [ARM SME](https://developer.arm.com/documentation/109246/latest/)
+See: [TOON format reference](https://github.com/antflydb/antfly/blob/main/docs/reference/toon-format.md)
 
 ### XLA (Accelerated Linear Algebra)
 
-A domain-specific compiler for linear algebra that optimizes TensorFlow computations. XLA can target CPUs, GPUs, and TPUs. Antfly Inference runs GGUF, safetensors, and [ONNX](#onnx-open-neural-network-exchange) models on its native CPU, Metal, and CUDA backends, with an optional PJRT/XLA backend; XLA represents the broader ecosystem of ML acceleration technologies.
+An open-source ML compiler, now developed under the OpenXLA project, that targets CPUs, GPUs, and TPUs through the PJRT runtime interface. Antfly Inference has an experimental PJRT/XLA backend.
 
-See: [XLA Overview](https://www.tensorflow.org/xla) | [OpenXLA](https://openxla.org/)
+See: [OpenXLA](https://openxla.org/)
+
+## Testing & Verification
+
+### TLA+
+
+A formal specification language for modeling concurrent and distributed systems and model-checking their invariants. Antfly's TLA+ specs cover the Raft, 2PC transaction, shard split, snapshot transfer, and LSM lifecycle protocols.
+
+See: [Antfly TLA+ specs](https://github.com/antflydb/antfly/blob/main/zig/specs/tla/README.md) | [TLA+](https://lamport.azurewebsites.net/tla/tla.html)
+
+### VOPR
+
+Antfly's deterministic simulation testing platform. It runs unmodified production code on a virtual, fully controlled I/O layer, injects faults, and replays any failing history exactly from its seed. Scenarios cover metadata, transactions, Raft, storage, standby, backups, and a full cluster.
+
+See: [VOPR design](https://github.com/antflydb/antfly/blob/main/zig/VOPR.md)
 
 ## Other Concepts
 

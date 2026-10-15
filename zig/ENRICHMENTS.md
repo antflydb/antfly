@@ -19,7 +19,7 @@ The shared direction is:
 
 This repo has two artifact identity layers:
 
-- Internal storage keys: binary LMDB/DocStore keys. These are private
+- Internal storage keys: binary DocStore keys. These are private
   implementation details.
 - Public artifact identity: `ArtifactRef` plus an opaque `artifact_id` token.
 

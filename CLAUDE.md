@@ -50,7 +50,7 @@ cd go/pkg/sdk && GOEXPERIMENT=simd go test -race -v ./... > /tmp/test.log 2>&1
 
 Client SDKs in `go/pkg/sdk/`, `ts/packages/sdk/`, `py/packages/sdk/`, and `rs/crates/sdk/` wrap generated API clients; edit the hand-written wrappers, never generated files (`*generated*`, `oapi/`, `public-api.d.ts`). The Go SDK's oapi-codegen settings live in `go/pkg/sdk/**/cfg.yaml` (optional fields use `omitzero`, not pointers).
 
-Custom `x-antfly-*` OpenAPI annotations drive indexing and SQL typing; see `specs/openapi/antfly/metadata.yaml`.
+Custom `x-antfly-*` OpenAPI annotations drive indexing and SQL typing; see `specs/openapi/antfly/schema.yaml`.
 
 ## Rules
 

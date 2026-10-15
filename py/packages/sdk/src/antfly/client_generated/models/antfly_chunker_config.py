@@ -21,11 +21,12 @@ class AntflyChunkerConfig:
     r"""Configuration for the Antfly inference chunking provider.
 
     Antfly inference is Antfly's built-in ML service for local chunking.
-    The model name maps to ONNX model directory names (similar to how Ollama works).
 
     **Chunking Models:**
-    - fixed: Simple fixed-size chunking by token count (built-in, no ONNX required)
-    - Any other name will attempt to load from models/chunkers/{name}/ directory
+    - fixed: Fixed-size chunking by token count, with fixed time windows for audio
+      (aliases `fixed_bert`, `fixed_bpe`, and `fixed-bert-tokenizer`). This is the
+      only chunking model Antfly inference implements; other model names are
+      rejected as unsupported.
 
     **Deduplication:**
     - Within a single document write, chunk results are deduplicated when multiple

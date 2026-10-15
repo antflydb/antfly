@@ -76,13 +76,12 @@ def sync_detailed(
 
     ## Embedders
 
-    - ONNX models from `models_dir/embedders/`
+    - Embedding models from `models_dir`
     - Quantized variants have `-i8` suffix
 
     ## Chunkers
 
-    - Always includes \"fixed\" (built-in)
-    - Plus any ONNX models from `models_dir/chunkers/`
+    - Always \"fixed\" (built-in); chunking does not load models from `models_dir`
 
     ## Rerankers
 
@@ -146,13 +145,12 @@ def sync(
 
     ## Embedders
 
-    - ONNX models from `models_dir/embedders/`
+    - Embedding models from `models_dir`
     - Quantized variants have `-i8` suffix
 
     ## Chunkers
 
-    - Always includes \"fixed\" (built-in)
-    - Plus any ONNX models from `models_dir/chunkers/`
+    - Always \"fixed\" (built-in); chunking does not load models from `models_dir`
 
     ## Rerankers
 
@@ -212,13 +210,12 @@ async def asyncio_detailed(
 
     ## Embedders
 
-    - ONNX models from `models_dir/embedders/`
+    - Embedding models from `models_dir`
     - Quantized variants have `-i8` suffix
 
     ## Chunkers
 
-    - Always includes \"fixed\" (built-in)
-    - Plus any ONNX models from `models_dir/chunkers/`
+    - Always \"fixed\" (built-in); chunking does not load models from `models_dir`
 
     ## Rerankers
 
@@ -280,13 +277,12 @@ async def asyncio(
 
     ## Embedders
 
-    - ONNX models from `models_dir/embedders/`
+    - Embedding models from `models_dir`
     - Quantized variants have `-i8` suffix
 
     ## Chunkers
 
-    - Always includes \"fixed\" (built-in)
-    - Plus any ONNX models from `models_dir/chunkers/`
+    - Always \"fixed\" (built-in); chunking does not load models from `models_dir`
 
     ## Rerankers
 

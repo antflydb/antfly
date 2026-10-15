@@ -56,6 +56,14 @@ fn catalogStamp(database: *h.db_mod.DB) ![32]u8 {
         }
     }.less);
     hash.update(try std.json.Stringify.valueAlloc(a, indexes, .{}));
+    const resolvers = try database.core.listResolvers(a);
+    std.mem.sort(@TypeOf(resolvers[0]), resolvers, {}, struct {
+        fn less(_: void, lhs: @TypeOf(resolvers[0]), rhs: @TypeOf(resolvers[0])) bool {
+            return std.mem.lessThan(u8, lhs.name, rhs.name);
+        }
+    }.less);
+    hash.update("resolvers\x00");
+    hash.update(try std.json.Stringify.valueAlloc(a, resolvers, .{}));
     var digest: [32]u8 = undefined;
     hash.final(&digest);
     return digest;
@@ -71,6 +79,7 @@ pub const PreparedPublication = struct {
     catalog: [32]u8,
     index_prefix: []const u8,
     snapshot_root: *h.Handle,
+    snapshot_database: *h.db_mod.DB,
     source_read: ?*SourceRead,
     relational_rows: bool,
     index_inputs_changed: bool = false,
@@ -92,6 +101,12 @@ pub const PreparedPublication = struct {
         self.owner.gate.mutex.lockUncancelable(io);
         defer self.owner.gate.mutex.unlock(io);
         if (self.owner.stopping.load(.acquire)) return error.Canceled;
+        self.owner.publication_stats.attempts +|= 1;
+        self.owner.publication_stats.generated_attempts +|= 1;
+        errdefer {
+            self.owner.publication_stats.refused +|= 1;
+            self.owner.publication_stats.generated_refused +|= 1;
+        }
         var lease = try native.lockWriterPathWithIo(alloc, io, self.owner.path);
         defer lease.close();
         const database = try self.current();
@@ -110,30 +125,12 @@ pub const PreparedPublication = struct {
         publication: *PreparedPublication,
         path_lease: native.PathWriterLock,
         database: *h.db_mod.DB,
+        refusal_recorded: bool = false,
 
         fn release(ptr: *anyopaque) void {
             const held: *@This() = @ptrCast(@alignCast(ptr));
             const p = held.publication;
-            const snapshot = p.snapshot_root.owned_lite_backend.?.native_docstore.?;
-            // Opening the live coordinator can add immutable-reader leases.
-            // Rebind primary reads after publication, but remember any changed
-            // LSM inputs: adopting a header must never erase that evidence.
-            var latest = native.NativeFile.openWithIo(alloc, h.handleLockIo(), p.owner.path, .{ .read_only = true, .internal_reader = true }) catch null;
-            if (latest) |*file| {
-                defer file.close();
-                const live_stat = file.file.stat(file.runtime()) catch null;
-                const captured_stat = snapshot.file.file.stat(snapshot.file.runtime()) catch null;
-                const same_inode = live_stat != null and captured_stat != null and live_stat.?.inode == captured_stat.?.inode;
-                if (same_inode) {
-                    if (snapshot.file.activeCheckpoint().index_catalog_root_page != file.activeCheckpoint().index_catalog_root_page) {
-                        const unchanged = snapshot.file.indexCatalogPrefixUnchanged(file, p.index_prefix) catch false;
-                        if (!unchanged) p.index_inputs_changed = true;
-                    }
-                    snapshot.refreshIndexPublicationCheckpoint(file.header) catch {
-                        p.index_inputs_changed = true;
-                    };
-                } else p.index_inputs_changed = true;
-            } else p.index_inputs_changed = true;
+            p.refreshSnapshotCheckpoint();
             held.path_lease.close();
             p.owner.gate.mutex.unlock(h.handleLockIo());
             alloc.destroy(held);
@@ -141,33 +138,134 @@ pub const PreparedPublication = struct {
 
         fn guardKey(ptr: *anyopaque, key: []const u8) !void {
             const held: *@This() = @ptrCast(@alignCast(ptr));
-            const p = held.publication;
-            const doc_key = (try keys.decodeDocumentComponentAlloc(alloc, key)) orelse return;
-            defer alloc.free(doc_key);
-            const captured_read = p.source_read orelse return error.EnrichmentWaitCanceled;
-            var expected = try captured_read.openReadScope(alloc);
-            defer expected.close();
-            const row_key = if (p.relational_rows) try @import("../storage/db/relational_store.zig").keyAlloc(alloc, doc_key) else try keys.documentKeyAlloc(alloc, doc_key);
-            defer alloc.free(row_key);
-            const ordinal_key = try keys.identityDocToOrdinalKeyAlloc(alloc, doc_key);
-            defer alloc.free(ordinal_key);
-            var actual = try held.database.enrichment_runtime.?.store.beginRead();
-            defer actual.abort();
-            for ([_][]const u8{ row_key, ordinal_key }) |source_key| {
-                const before = expected.get(source_key) catch |err| if (err == error.NotFound) null else return err;
-                const after = actual.get(source_key) catch |err| if (err == error.NotFound) null else return err;
-                if ((before == null) != (after == null)) return error.EnrichmentWaitCanceled;
-                if (before) |bytes| if (!std.mem.eql(u8, bytes, after.?)) return error.EnrichmentWaitCanceled;
+            errdefer {
+                if (!held.refusal_recorded) {
+                    held.refusal_recorded = true;
+                    held.publication.owner.publication_stats.refused +|= 1;
+                    held.publication.owner.publication_stats.generated_refused +|= 1;
+                }
             }
-            if (expected.get(ordinal_key)) |ordinal| {
-                if (ordinal.len != 4) return error.EnrichmentWaitCanceled;
-                const state_key = keys.identityOrdinalStateKey(std.mem.readInt(u32, ordinal[0..4], .big));
-                const before = try expected.get(&state_key);
-                const after = try actual.get(&state_key);
-                if (!std.mem.eql(u8, before, after)) return error.EnrichmentWaitCanceled;
-            } else |err| if (err != error.NotFound) return err;
+            try held.publication.guardKey(held.database, key);
         }
     };
+
+    fn refreshSnapshotCheckpoint(self: *@This()) void {
+        const snapshot = self.snapshot_root.owned_lite_backend.?.native_docstore.?;
+        // Opening the live coordinator can add immutable-reader leases.
+        // Rebind primary reads after publication, but remember any changed
+        // LSM inputs: adopting a header must never erase that evidence.
+        var latest = native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.owner.path, .{ .read_only = true, .internal_reader = true }) catch null;
+        if (latest) |*file| {
+            defer file.close();
+            const live_stat = file.file.stat(file.runtime()) catch null;
+            const captured_stat = snapshot.file.file.stat(snapshot.file.runtime()) catch null;
+            const same_inode = live_stat != null and captured_stat != null and live_stat.?.inode == captured_stat.?.inode;
+            if (same_inode) {
+                if (snapshot.file.activeCheckpoint().index_catalog_root_page != file.activeCheckpoint().index_catalog_root_page) {
+                    const unchanged = snapshot.file.indexCatalogPrefixUnchanged(file, self.index_prefix) catch false;
+                    if (!unchanged) self.index_inputs_changed = true;
+                }
+                snapshot.refreshIndexPublicationCheckpoint(file.header) catch {
+                    self.index_inputs_changed = true;
+                };
+            } else self.index_inputs_changed = true;
+        } else self.index_inputs_changed = true;
+    }
+
+    fn guardDocument(self: *@This(), database: *h.db_mod.DB, doc_key: []const u8) !void {
+        const captured_read = self.source_read orelse return error.EnrichmentWaitCanceled;
+        var expected = try captured_read.openReadScope(alloc);
+        defer expected.close();
+        var actual = try database.core.store.runtime_store.beginRead();
+        defer actual.abort();
+        const row_key = if (self.relational_rows) try @import("../storage/db/relational_store.zig").keyAlloc(alloc, doc_key) else try keys.documentKeyAlloc(alloc, doc_key);
+        defer alloc.free(row_key);
+        const ordinal_key = try keys.identityDocToOrdinalKeyAlloc(alloc, doc_key);
+        defer alloc.free(ordinal_key);
+        for ([_][]const u8{ row_key, ordinal_key }) |key| try sameValue(&expected, &actual, key);
+        if (expected.get(ordinal_key)) |ordinal| {
+            if (ordinal.len != 4) return error.EnrichmentWaitCanceled;
+            const state_key = keys.identityOrdinalStateKey(std.mem.readInt(u32, ordinal[0..4], .big));
+            try sameValue(&expected, &actual, &state_key);
+        } else |err| if (err != error.NotFound) return err;
+    }
+
+    fn sameValue(expected: anytype, actual: anytype, key: []const u8) !void {
+        const before = expected.get(key) catch |err| if (err == error.NotFound) null else return err;
+        const after = actual.get(key) catch |err| if (err == error.NotFound) null else return err;
+        if ((before == null) != (after == null)) return error.EnrichmentWaitCanceled;
+        if (before) |bytes| if (!std.mem.eql(u8, bytes, after.?)) return error.EnrichmentWaitCanceled;
+    }
+
+    fn guardKey(self: *@This(), database: *h.db_mod.DB, key: []const u8) !void {
+        const doc_key = (try keys.decodeDocumentComponentAlloc(alloc, key)) orelse return;
+        defer alloc.free(doc_key);
+        try self.guardDocument(database, doc_key);
+    }
+
+    fn guardReplayKey(self: *@This(), database: *h.db_mod.DB, key: []const u8, inputs: ?@import("../storage/db/replay_read_set.zig").View) !void {
+        try self.guardKey(database, key);
+        // Computed resolver outputs were read through the captured logical
+        // store and validated above. A prior publication in this turn may
+        // have changed them legitimately; comparing them again to the turn's
+        // original physical snapshot would reject our own committed output.
+        if (inputs) |read_set| if (read_set.hasPoint(key)) return;
+        const captured_read = self.source_read orelse return error.EnrichmentWaitCanceled;
+        var expected = try captured_read.openReadScope(alloc);
+        defer expected.close();
+        var actual = try database.core.store.runtime_store.beginRead();
+        defer actual.abort();
+        try sameValue(&expected, &actual, key);
+    }
+
+    fn publishReplay(ptr: *anyopaque, batch: h.db_mod.derived_types.DerivedBatch, artifact_keys: []const []const u8, inputs: ?@import("../storage/db/replay_read_set.zig").View, request: *anyopaque, apply: *const fn (*anyopaque, *anyopaque) anyerror!u64) !u64 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const io = h.handleLockIo();
+        self.owner.gate.mutex.lockUncancelable(io);
+        defer self.owner.gate.mutex.unlock(io);
+        if (self.owner.stopping.load(.acquire)) return error.Canceled;
+        self.owner.publication_stats.attempts +|= 1;
+        self.owner.publication_stats.replay_attempts +|= 1;
+        errdefer {
+            self.owner.publication_stats.refused +|= 1;
+            self.owner.publication_stats.replay_refused +|= 1;
+        }
+        var lease = try native.lockWriterPathWithIo(alloc, io, self.owner.path);
+        defer lease.close();
+        const database = try self.current();
+        // Computed resolver effects must explicitly carry their read set.
+        // Enqueue-only replay has no computed artifact writes to fence.
+        if (artifact_keys.len > 0 and inputs == null) return error.EnrichmentWaitCanceled;
+        if (inputs) |read_set| {
+            var live_inputs = try database.core.store.beginReadTxn();
+            defer live_inputs.abort();
+            try read_set.validate(&live_inputs);
+        }
+        // Release read pins before writing. The gate and path lease still
+        // fence every input until the commit below has completed.
+        const journal = @import("../storage/db/derived/change_journal.zig");
+        var record = try journal.recordFromDerivedBatch(alloc, batch, 0);
+        defer journal.deinitRecord(alloc, &record);
+        // Projection-only documents and direct vectors need their source
+        // guards too, even when the journal omits them from changed_doc_keys.
+        for (batch.documents) |document| if (document.action != .upsert) try self.guardDocument(database, document.key);
+        for (batch.dense_embeddings) |embedding| try self.guardDocument(database, embedding.parent_doc_key orelse embedding.doc_key);
+        for (batch.sparse_embeddings) |embedding| try self.guardDocument(database, embedding.doc_key);
+        for (record.changed_doc_keys) |key| try self.guardDocument(database, key);
+        for (record.deleted_doc_keys) |key| try self.guardDocument(database, key);
+        for (record.overwritten_doc_keys) |key| try self.guardDocument(database, key);
+        for (record.changed_artifact_keys) |key| try self.guardReplayKey(database, key, inputs);
+        for (artifact_keys) |key| try self.guardReplayKey(database, key, inputs);
+        const sequence = try apply(request, database);
+        // The physical header alone does not update the detached DocStore's
+        // committed/reserved sequence caches. Only mirror successful commits.
+        self.refreshSnapshotCheckpoint();
+        self.snapshot_database.core.store.observeExternalReplayCommit(sequence);
+        self.owner.notifyMutation();
+        // A changed index input cancels subsequent detached index work, not
+        // this already committed primary record. Report its durable success.
+        return sequence;
+    }
 
     fn acquireStore(ptr: *anyopaque, fence: ?WriteFence, now_ms: u64) !StoreLease {
         const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -175,6 +273,12 @@ pub const PreparedPublication = struct {
         self.owner.gate.mutex.lockUncancelable(io);
         errdefer self.owner.gate.mutex.unlock(io);
         if (self.owner.stopping.load(.acquire)) return error.Canceled;
+        self.owner.publication_stats.attempts +|= 1;
+        self.owner.publication_stats.generated_attempts +|= 1;
+        errdefer {
+            self.owner.publication_stats.refused +|= 1;
+            self.owner.publication_stats.generated_refused +|= 1;
+        }
         var lease = try native.lockWriterPathWithIo(alloc, io, self.owner.path);
         errdefer lease.close();
         const database = try self.current();
@@ -349,6 +453,17 @@ pub const Owner = struct {
     maintenance_table_cursor: usize = 0,
     maintenance_round_pending: bool = false,
     maintenance_capture_misses: u8 = 0,
+    // Connection-owner lifetime totals, protected by the path gate. They survive
+    // foreground runtime refreshes and distinguish conflicts from a moving tip.
+    publication_stats: struct {
+        attempts: u64 = 0,
+        refused: u64 = 0,
+        rebased: u64 = 0,
+        generated_attempts: u64 = 0,
+        generated_refused: u64 = 0,
+        replay_attempts: u64 = 0,
+        replay_refused: u64 = 0,
+    } = .{},
     test_runtime_snapshot_opens: if (h.builtin.is_test) u64 else void = if (h.builtin.is_test) 0 else {},
     embedding_memo: ?memo_mod.QueryEmbeddingCache = null,
     embedding_memo_budget: cache_budget.CacheBudget = .init(embedding_memo_bytes),
@@ -461,9 +576,9 @@ pub const Owner = struct {
         self.embedding_memo.?.remember(&self.embedding_memo_budget, key, vector);
     }
 
-    // Index publications queue behind foreground operations. Their DB/index
-    // locks belong to the detached runtime; foreground refresh opens a separate
-    // runtime. Primary/reclamation admission yields on contention.
+    // Primary transactions and index publications join the fair writer queue.
+    // Their DB/index locks belong to the detached runtime; foreground refresh
+    // opens a separate runtime. Reclamation admission yields on contention.
     fn enterMaintenanceWriter(ptr: *anyopaque, scope: PublicationScope) !void {
         const root: *h.Handle = @ptrCast(@alignCast(ptr));
         const self = root.maintenance_owner.?;
@@ -474,9 +589,12 @@ pub const Owner = struct {
             return;
         }
         if (self.stopping.load(.acquire)) return error.Canceled;
-        if (scope == .index) self.gate.mutex.lockUncancelable(h.handleLockIo()) else if (!self.gate.mutex.tryLock()) return error.EnrichmentWaitCanceled;
+        if (scope != .reclamation) self.gate.mutex.lockUncancelable(h.handleLockIo()) else if (!self.gate.mutex.tryLock()) return error.EnrichmentWaitCanceled;
         errdefer self.gate.mutex.unlock(h.handleLockIo());
-        if (scope == .index) if (root.maintenance_publication) |p| if (p.index_inputs_changed) return error.EnrichmentWaitCanceled;
+        if (self.stopping.load(.acquire)) return error.Canceled;
+        self.publication_stats.attempts +|= 1;
+        errdefer self.publication_stats.refused +|= 1;
+        if (scope != .reclamation) if (root.maintenance_publication) |p| if (p.index_inputs_changed) return error.EnrichmentWaitCanceled;
         if (self.current) |current| if (needsOutcomeReconciliation(current)) return error.EnrichmentWaitCanceled;
         var lease = native.lockWriterPathWithIo(alloc, h.handleLockIo(), self.path) catch |err| switch (err) {
             error.FileBusy, error.WouldBlock => return error.EnrichmentWaitCanceled,
@@ -488,11 +606,15 @@ pub const Owner = struct {
         const file = &root.owned_lite_backend.?.native_docstore.?.file;
         if ((try probe.file.stat(probe.runtime())).inode != (try file.file.stat(file.runtime())).inode) return error.EnrichmentWaitCanceled;
         if (!std.meta.eql(probe.header, file.header)) {
-            if (scope != .index) return error.EnrichmentWaitCanceled;
+            if (scope == .reclamation) return error.EnrichmentWaitCanceled;
             const publication = root.maintenance_publication orelse return error.EnrichmentWaitCanceled;
             _ = try publication.current();
-            // Foreground refresh may create reader leases. Those are outside
-            // the index's physical path and cannot invalidate its LSM inputs.
+            // Rebase before opening a primary transaction as well as before
+            // publishing immutable index bytes. Lease acquisition and replay
+            // checkpoints must not require a quiet interval between capture
+            // and publication. Unchanged physical index inputs and catalog
+            // identity keep detached computations valid; transactions opened
+            // after this admission read the current primary checkpoint.
             var latest = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), self.path, .{ .read_only = true, .internal_reader = true });
             defer latest.close();
             if ((try latest.file.stat(latest.runtime())).inode != (try file.file.stat(file.runtime())).inode) return error.EnrichmentWaitCanceled;
@@ -500,6 +622,7 @@ pub const Owner = struct {
                 if (!try file.indexCatalogPrefixUnchanged(&latest, publication.index_prefix)) return error.EnrichmentWaitCanceled;
             }
             try root.owned_lite_backend.?.native_docstore.?.refreshIndexPublicationCheckpoint(latest.header);
+            self.publication_stats.rebased +|= 1;
         }
         root.maintenance_writer_lease = lease;
         root.maintenance_writer_references = 1;
@@ -653,9 +776,9 @@ pub const Owner = struct {
         defer alloc.free(publication_name);
         const index_prefix = try std.fmt.allocPrint(alloc, "{s}/", .{database.core.index_manager.base_path});
         defer alloc.free(index_prefix);
-        var source_read = if (run_database) (if (database.enrichment_runtime) |runtime| try runtime.store.beginRead() else null) else null;
+        var source_read = if (run_database) try database.core.store.runtime_store.beginRead() else null;
         defer if (source_read) |*read| read.abort();
-        var publication: PreparedPublication = .{ .owner = self, .name = publication_name, .identity = database.core.identity_namespace, .incarnation = database.root_incarnation, .catalog = if (run_database) try catalogStamp(database) else @splat(0), .index_prefix = index_prefix, .snapshot_root = root, .source_read = if (source_read) |*read| read else null, .relational_rows = if (database.enrichment_runtime) |runtime| runtime.config.relational_base_rows else false };
+        var publication: PreparedPublication = .{ .owner = self, .name = publication_name, .identity = database.core.identity_namespace, .incarnation = database.root_incarnation, .catalog = if (run_database) try catalogStamp(database) else @splat(0), .index_prefix = index_prefix, .snapshot_root = root, .snapshot_database = database, .source_read = if (source_read) |*read| read else null, .relational_rows = if (database.enrichment_runtime) |runtime| runtime.config.relational_base_rows else false };
         root.maintenance_references += 1;
         root.maintenance_owner = self;
         root.maintenance_publication = &publication;
@@ -665,6 +788,7 @@ pub const Owner = struct {
             runtime.dense_result_cache = .{ .ptr = self, .lookup = lookupEmbedding, .remember = rememberEmbedding };
             runtime.generated_publication = .{ .ptr = &publication, .commit = PreparedPublication.commit, .heartbeat = PreparedPublication.heartbeat, .acquire_store = PreparedPublication.acquireStore };
         };
+        if (run_database) database.async_context.replay_publication = .{ .ptr = &publication, .publish = PreparedPublication.publishReplay };
         store.writer_admission = .{ .ptr = root, .enter = enterMaintenanceWriter, .leave = leaveMaintenanceWriter };
         lease.close();
         lease_held = false;
@@ -678,6 +802,7 @@ pub const Owner = struct {
             runtime.dense_result_cache = null;
             runtime.generated_publication = null;
         };
+        if (run_database) database.async_context.replay_publication = null;
         root.maintenance_publication = null;
         if (source_read) |*read| read.abort();
         source_read = null;

@@ -22,14 +22,14 @@ class InferenceChunkConfig:
     Combines shared text options with inference-specific audio/VAD options.
 
         Attributes:
-            model (str | Unset): The chunking model to use. Either 'fixed' for simple token-based chunking, or a model name
-                from models/chunkers/{name}/. Default: 'fixed'. Example: fixed.
+            model (str | Unset): The chunking model to use. Antfly inference implements only 'fixed' (token-count text
+                chunking and fixed audio windows); other model names are rejected. Default: 'fixed'. Example: fixed.
             max_chunks (int | Unset): Maximum number of chunks to generate per document. Zero (the default when omitted)
                 means unlimited: the document is chunked in full. Set an explicit value up to 4096 to cap output; any chunks
                 beyond the cap are silently omitted, so treat a result whose chunk count equals `max_chunks` as potentially
                 truncated.
-            threshold (float | Unset): Confidence threshold for model-based chunking (0.0-1.0). Used by ONNX text models and
-                VAD audio models.
+            threshold (float | Unset): Confidence threshold for model-based chunking (0.0-1.0). Validated but not used by
+                the built-in fixed chunker.
             text (TextChunkOptions | Unset): Options specific to text chunking.
             audio (InferenceAudioChunkConfig | Unset): Audio chunking configuration for inference, including VAD options.
     """

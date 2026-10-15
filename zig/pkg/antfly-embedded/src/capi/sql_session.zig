@@ -118,7 +118,7 @@ pub const Session = struct {
         defer arena.deinit();
         const a = arena.allocator();
         var adapter = sql.Adapter(h.antfly){ .handle = self.handle, .db = try @import("tables.zig").get(self.handle, target.physical_name), .table_name = target.physical_name };
-        if (!adapter.localRequiresCoordination()) return;
+        if (!try adapter.localRequiresCoordination()) return;
         const metadata = try adapter.localCatalog(a, target.schema_version);
         const requests = try self.commitRequests(a);
         const previous = try requestsForEntries(a, self.entries.items[0..statement_start]);
