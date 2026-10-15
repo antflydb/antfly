@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const runtime_callback_abi = @import("../../runtime_callback_abi.zig");
 const TestDirectory = @import("../../common/test_directory.zig").TestDirectory;
 const Crc32 = @import("antfly_hash").Crc32;
 const platform_sync = @import("antfly_platform").sync;
@@ -87,6 +88,7 @@ fn configuredNativeFdAdmissionCapacity() usize {
 pub const AtomicWriteSink = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
 
     pub const VTable = struct {
         len: *const fn (*anyopaque) usize,
@@ -102,13 +104,14 @@ pub const AtomicWriteSink = struct {
         finish_mapped: ?*const fn (*anyopaque) anyerror!@import("../../segment_source.zig").MappedArtifact = null,
         abort: *const fn (*anyopaque) void,
     };
+    const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
     pub fn len(self: *const AtomicWriteSink) usize {
         return self.vtable.len(self.ptr);
     }
 
     pub fn appendSlice(self: *AtomicWriteSink, bytes: []const u8) !void {
-        try self.vtable.append_slice(self.ptr, bytes);
+        try BoundaryAbi.call("append_slice", self.boundary_dispatch, self.vtable.append_slice, .{ self.ptr, bytes });
     }
 
     pub fn appendByte(self: *AtomicWriteSink, byte: u8) !void {
@@ -117,15 +120,15 @@ pub const AtomicWriteSink = struct {
     }
 
     pub fn writeAt(self: *AtomicWriteSink, offset: usize, bytes: []const u8) !void {
-        try self.vtable.write_at(self.ptr, offset, bytes);
+        try BoundaryAbi.call("write_at", self.boundary_dispatch, self.vtable.write_at, .{ self.ptr, offset, bytes });
     }
 
     pub fn crc32Prefix(self: *AtomicWriteSink, len_prefix: usize) !u32 {
-        return try self.vtable.crc32_prefix(self.ptr, len_prefix);
+        return try BoundaryAbi.call("crc32_prefix", self.boundary_dispatch, self.vtable.crc32_prefix, .{ self.ptr, len_prefix });
     }
 
     pub fn crc32Range(self: *AtomicWriteSink, offset: usize, range_len: usize) !u32 {
-        return try self.vtable.crc32_range(self.ptr, offset, range_len);
+        return try BoundaryAbi.call("crc32_range", self.boundary_dispatch, self.vtable.crc32_range, .{ self.ptr, offset, range_len });
     }
 
     /// Marks a maintenance output as a one-pass sequential stream. Native
@@ -139,13 +142,18 @@ pub const AtomicWriteSink = struct {
     /// Consumes the sink whether publishing succeeds or fails.
     /// Unsupported capability does not consume the writer. A supported
     /// implementation consumes it even when publication or mapping fails.
+    pub fn finishSource(self: *AtomicWriteSink) !@import("../../segment_source.zig").Source {
+        const finish_source = self.vtable.finish_source orelse return error.ImmutableReadSourceUnsupported;
+        return BoundaryAbi.call("finish_source", self.boundary_dispatch, finish_source, .{self.ptr});
+    }
+
     pub fn finishMapped(self: *AtomicWriteSink) !@import("../../segment_source.zig").MappedArtifact {
         const finish_mapped = self.vtable.finish_mapped orelse return error.MappedArtifactUnsupported;
-        return finish_mapped(self.ptr);
+        return BoundaryAbi.call("finish_mapped", self.boundary_dispatch, finish_mapped, .{self.ptr});
     }
 
     pub fn finish(self: *AtomicWriteSink) !void {
-        try self.vtable.finish(self.ptr);
+        try BoundaryAbi.call("finish", self.boundary_dispatch, self.vtable.finish, .{self.ptr});
     }
 
     /// Discard all bytes and remove any temporary object.
@@ -204,6 +212,7 @@ pub const ColdReadStats = struct {
 pub const ColdSequentialReader = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
 
     pub const VTable = struct {
         read_range_alloc: *const fn (*anyopaque, Allocator, u64, usize) anyerror![]u8,
@@ -212,20 +221,21 @@ pub const ColdSequentialReader = struct {
         release_scratch: *const fn (*anyopaque) void,
         deinit: *const fn (*anyopaque) void,
     };
+    const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
     pub fn readRangeAlloc(self: *ColdSequentialReader, allocator: Allocator, offset: u64, len: usize) ![]u8 {
-        return try self.vtable.read_range_alloc(self.ptr, allocator, offset, len);
+        return try BoundaryAbi.call("read_range_alloc", self.boundary_dispatch, self.vtable.read_range_alloc, .{ self.ptr, allocator, offset, len });
     }
 
     pub fn readRangeInto(self: *ColdSequentialReader, offset: u64, out: []u8) !void {
-        return try self.vtable.read_range_into(self.ptr, offset, out);
+        return try BoundaryAbi.call("read_range_into", self.boundary_dispatch, self.vtable.read_range_into, .{ self.ptr, offset, out });
     }
 
     /// Reads ranges ordered by ascending file offset. Implementations may
     /// coalesce neighboring requests, but every destination remains independently
     /// owned by the caller for the duration of this synchronous operation.
     pub fn readRangesInto(self: *ColdSequentialReader, ranges: []const ColdReadRange) !ColdReadStats {
-        return try self.vtable.read_ranges_into(self.ptr, ranges);
+        return try BoundaryAbi.call("read_ranges_into", self.boundary_dispatch, self.vtable.read_ranges_into, .{ self.ptr, ranges });
     }
 
     /// Releases implementation-private bounce buffers after a large batch.
@@ -243,16 +253,18 @@ pub const ColdSequentialReader = struct {
 pub const RangeReadFuture = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
 
     pub const VTable = struct {
         wait: *const fn (*anyopaque) anyerror![]u8,
         cancel: *const fn (*anyopaque) void,
     };
+    const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
     /// Complete this one-shot read and transfer the returned bytes to the
     /// caller. After wait or cancel, the future must not be used again.
     pub fn wait(self: *RangeReadFuture) ![]u8 {
-        return try self.vtable.wait(self.ptr);
+        return try BoundaryAbi.call("wait", self.boundary_dispatch, self.vtable.wait, .{self.ptr});
     }
 
     /// Best-effort cancellation. Synchronous/completed futures just release
@@ -568,6 +580,7 @@ pub const Storage = struct {
 
     ptr: *anyopaque,
     vtable: *const VTable,
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
 
     pub const VTable = struct {
         /// Physical directory for private build files; null disables filesystem staging.
@@ -626,6 +639,7 @@ pub const Storage = struct {
         supports_host_path_generation_publication: bool = false,
         supports_native_path_locks: bool = false,
     };
+    const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
     pub fn privateScratchDirectory(self: Storage, fallback: []const u8) ?[]const u8 {
         if (self.vtable.private_scratch_directory) |directory| return directory(self.ptr);
@@ -634,45 +648,45 @@ pub const Storage = struct {
 
     pub fn nativeCheckpointReferenceAlloc(self: Storage, a: Allocator) !?[]u8 {
         const reference = self.vtable.native_checkpoint_reference_alloc orelse return null;
-        return reference(self.ptr, a);
+        return BoundaryAbi.call("native_checkpoint_reference_alloc", self.boundary_dispatch, reference, .{ self.ptr, a });
     }
 
     pub fn createDirPath(self: Storage, path: []const u8) !void {
-        return self.vtable.create_dir_path(self.ptr, path);
+        return BoundaryAbi.call("create_dir_path", self.boundary_dispatch, self.vtable.create_dir_path, .{ self.ptr, path });
     }
 
     /// Providers must explicitly support ownership. A borrowed fallback would
     /// turn delayed maintenance into a use-after-free during index shutdown.
     pub fn acquireLease(self: Storage) !Lease {
         const acquire = self.vtable.acquire_lease orelse return error.UnsupportedStorageLease;
-        return acquire(self.ptr);
+        return BoundaryAbi.call("acquire_lease", self.boundary_dispatch, acquire, .{self.ptr});
     }
 
     pub fn readFileAlloc(self: Storage, allocator: Allocator, path: []const u8, max_bytes: usize) ![]u8 {
-        return self.vtable.read_file_alloc(self.ptr, allocator, path, max_bytes);
+        return BoundaryAbi.call("read_file_alloc", self.boundary_dispatch, self.vtable.read_file_alloc, .{ self.ptr, allocator, path, max_bytes });
     }
 
     pub fn readFileRangeAlloc(self: Storage, allocator: Allocator, path: []const u8, offset: u64, len: usize) ![]u8 {
-        return self.vtable.read_file_range_alloc(self.ptr, allocator, path, offset, len);
+        return BoundaryAbi.call("read_file_range_alloc", self.boundary_dispatch, self.vtable.read_file_range_alloc, .{ self.ptr, allocator, path, offset, len });
     }
 
     pub fn beginReadFileRangeAlloc(self: Storage, allocator: Allocator, path: []const u8, offset: u64, len: usize) !RangeReadFuture {
         if (self.vtable.begin_read_file_range_alloc) |begin_read_file_range_alloc| {
-            return try begin_read_file_range_alloc(self.ptr, allocator, path, offset, len);
+            return try BoundaryAbi.call("begin_read_file_range_alloc", self.boundary_dispatch, begin_read_file_range_alloc, .{ self.ptr, allocator, path, offset, len });
         }
         return try CompletedRangeReadFuture.create(self, allocator, path, offset, len);
     }
 
     pub fn beginReadFileRangeAllocWithRuntime(self: Storage, read_runtime: ?ReadRuntime, allocator: Allocator, path: []const u8, offset: u64, len: usize) !RangeReadFuture {
         if (self.vtable.begin_read_file_range_alloc_with_runtime) |begin_read_file_range_alloc_with_runtime| {
-            return try begin_read_file_range_alloc_with_runtime(self.ptr, read_runtime, allocator, path, offset, len);
+            return try BoundaryAbi.call("begin_read_file_range_alloc_with_runtime", self.boundary_dispatch, begin_read_file_range_alloc_with_runtime, .{ self.ptr, read_runtime, allocator, path, offset, len });
         }
         return try self.beginReadFileRangeAlloc(allocator, path, offset, len);
     }
 
     pub fn readFileRangeInto(self: Storage, allocator: Allocator, path: []const u8, offset: u64, out: []u8) !void {
         if (self.vtable.read_file_range_into) |read_file_range_into| {
-            return read_file_range_into(self.ptr, path, offset, out);
+            return BoundaryAbi.call("read_file_range_into", self.boundary_dispatch, read_file_range_into, .{ self.ptr, path, offset, out });
         }
         const loaded = try self.readFileRangeAlloc(allocator, path, offset, out.len);
         defer allocator.free(loaded);
@@ -682,7 +696,7 @@ pub const Storage = struct {
 
     pub fn readFileRangeAtMostInto(self: Storage, allocator: Allocator, path: []const u8, offset: u64, out: []u8) !usize {
         if (self.vtable.read_file_range_at_most_into) |read_file_range_at_most_into| {
-            return try read_file_range_at_most_into(self.ptr, path, offset, out);
+            return try BoundaryAbi.call("read_file_range_at_most_into", self.boundary_dispatch, read_file_range_at_most_into, .{ self.ptr, path, offset, out });
         }
         const size = self.fileSize(path) catch |err| switch (err) {
             error.FileNotFound => return 0,
@@ -701,26 +715,26 @@ pub const Storage = struct {
     /// forbidden after opening, including during vacuum and replacement.
     pub fn mapImmutableArtifact(self: Storage, allocator: Allocator, path: []const u8) !@import("../../segment_source.zig").MappedArtifact {
         const map = self.vtable.map_immutable_artifact orelse return error.MappedArtifactUnsupported;
-        return map(self.ptr, allocator, path);
+        return BoundaryAbi.call("map_immutable_artifact", self.boundary_dispatch, map, .{ self.ptr, allocator, path });
     }
 
     pub fn openLeasedImmutableSource(self: Storage, allocator: Allocator, path: []const u8) !@import("../../segment_source.zig").Source {
         const open = self.vtable.open_leased_immutable_source orelse return error.ImmutableReadSourceUnsupported;
-        return open(self.ptr, allocator, path);
+        return BoundaryAbi.call("open_leased_immutable_source", self.boundary_dispatch, open, .{ self.ptr, allocator, path });
     }
 
     pub fn openImmutableSource(self: Storage, allocator: Allocator, path: []const u8) !@import("../../segment_source.zig").Source {
         const open = self.vtable.open_immutable_source orelse return error.ImmutableReadSourceUnsupported;
-        return open(self.ptr, allocator, path);
+        return BoundaryAbi.call("open_immutable_source", self.boundary_dispatch, open, .{ self.ptr, allocator, path });
     }
 
     pub fn fileSize(self: Storage, path: []const u8) !u64 {
-        return self.vtable.file_size(self.ptr, path);
+        return BoundaryAbi.call("file_size", self.boundary_dispatch, self.vtable.file_size, .{ self.ptr, path });
     }
 
     pub fn readFileTrailerAlloc(self: Storage, allocator: Allocator, path: []const u8, len: usize) !FileTrailer {
         if (self.vtable.read_file_trailer_alloc) |read_file_trailer_alloc| {
-            var trailer = try read_file_trailer_alloc(self.ptr, allocator, path, len);
+            var trailer = try BoundaryAbi.call("read_file_trailer_alloc", self.boundary_dispatch, read_file_trailer_alloc, .{ self.ptr, allocator, path, len });
             errdefer trailer.deinit(allocator);
             if (trailer.bytes.len != len or trailer.file_size < len)
                 return error.EndOfStream;
@@ -736,12 +750,12 @@ pub const Storage = struct {
     }
 
     pub fn writeFileAbsolute(self: Storage, path: []const u8, contents: []const u8) !void {
-        return self.vtable.write_file_absolute(self.ptr, path, contents);
+        return BoundaryAbi.call("write_file_absolute", self.boundary_dispatch, self.vtable.write_file_absolute, .{ self.ptr, path, contents });
     }
 
     pub fn appendFileAbsolute(self: Storage, allocator: Allocator, path: []const u8, contents: []const u8, sync: bool) !void {
         if (self.vtable.append_file_absolute) |append_file_absolute| {
-            return append_file_absolute(self.ptr, path, contents, sync);
+            return BoundaryAbi.call("append_file_absolute", self.boundary_dispatch, append_file_absolute, .{ self.ptr, path, contents, sync });
         }
 
         const existing = self.readFileAlloc(allocator, path, std.math.maxInt(usize)) catch |err| switch (err) {
@@ -764,7 +778,7 @@ pub const Storage = struct {
 
     pub fn beginAtomicWrite(self: Storage, allocator: Allocator, path: []const u8) !AtomicWriteSink {
         if (self.vtable.begin_atomic_write) |begin_atomic_write| {
-            return try begin_atomic_write(self.ptr, allocator, path);
+            return try BoundaryAbi.call("begin_atomic_write", self.boundary_dispatch, begin_atomic_write, .{ self.ptr, allocator, path });
         }
         if (self.vtable.sync_contents_absolute == null or
             self.vtable.sync_parent_absolute == null or
@@ -777,7 +791,7 @@ pub const Storage = struct {
 
     pub fn beginColdSequentialRead(self: Storage, allocator: Allocator, path: []const u8) !ColdSequentialReader {
         if (self.vtable.begin_cold_sequential_read) |begin_cold_sequential_read| {
-            return try begin_cold_sequential_read(self.ptr, allocator, path);
+            return try BoundaryAbi.call("begin_cold_sequential_read", self.boundary_dispatch, begin_cold_sequential_read, .{ self.ptr, allocator, path });
         }
         return try GenericColdSequentialReader.create(allocator, self, path);
     }
@@ -787,7 +801,7 @@ pub const Storage = struct {
     /// cache policy into the foreground descriptor cache.
     pub fn beginColdRandomRead(self: Storage, allocator: Allocator, path: []const u8) !ColdSequentialReader {
         if (self.vtable.begin_cold_random_read) |begin_cold_random_read| {
-            return try begin_cold_random_read(self.ptr, allocator, path);
+            return try BoundaryAbi.call("begin_cold_random_read", self.boundary_dispatch, begin_cold_random_read, .{ self.ptr, allocator, path });
         }
         return try GenericColdSequentialReader.create(allocator, self, path);
     }
@@ -798,7 +812,7 @@ pub const Storage = struct {
     /// Null means use the existing generation's positional read path.
     pub fn tryBeginColdRandomReads(self: Storage, allocator: Allocator, paths: []const []const u8) !?[]ColdSequentialReader {
         const begin = self.vtable.try_begin_cold_random_reads orelse return null;
-        return try begin(self.ptr, allocator, paths);
+        return try BoundaryAbi.call("try_begin_cold_random_reads", self.boundary_dispatch, begin, .{ self.ptr, allocator, paths });
     }
 
     /// Acquires a descriptor/handle bound to the currently opened file, not a
@@ -808,7 +822,7 @@ pub const Storage = struct {
     pub fn beginStableSequentialRead(self: Storage, allocator: Allocator, path: []const u8) !ColdSequentialReader {
         const begin = self.vtable.begin_cold_sequential_read orelse
             return error.StableFileLeaseUnsupported;
-        return try begin(self.ptr, allocator, path);
+        return try BoundaryAbi.call("begin_cold_sequential_read", self.boundary_dispatch, begin, .{ self.ptr, allocator, path });
     }
 
     pub fn beginSequentialRead(self: Storage, allocator: Allocator, path: []const u8) !ColdSequentialReader {
@@ -833,7 +847,7 @@ pub const Storage = struct {
 
     pub fn syncFileContentsAbsolute(self: Storage, path: []const u8) !void {
         if (self.vtable.sync_contents_absolute) |sync_contents_absolute| {
-            return try sync_contents_absolute(self.ptr, path);
+            return try BoundaryAbi.call("sync_contents_absolute", self.boundary_dispatch, sync_contents_absolute, .{ self.ptr, path });
         }
         return error.DurableFileSyncUnsupported;
     }
@@ -841,21 +855,21 @@ pub const Storage = struct {
     /// Persists creation or removal of `path` without resyncing its contents.
     pub fn syncParentAbsolute(self: Storage, path: []const u8) !void {
         if (self.vtable.sync_parent_absolute) |sync_parent_absolute| {
-            return try sync_parent_absolute(self.ptr, path);
+            return try BoundaryAbi.call("sync_parent_absolute", self.boundary_dispatch, sync_parent_absolute, .{ self.ptr, path });
         }
         return error.DurableDirectorySyncUnsupported;
     }
 
     pub fn renameAbsolute(self: Storage, old_path: []const u8, new_path: []const u8) !void {
-        return self.vtable.rename_absolute(self.ptr, old_path, new_path);
+        return BoundaryAbi.call("rename_absolute", self.boundary_dispatch, self.vtable.rename_absolute, .{ self.ptr, old_path, new_path });
     }
 
     pub fn deleteFileAbsolute(self: Storage, path: []const u8) !void {
-        return self.vtable.delete_file_absolute(self.ptr, path);
+        return BoundaryAbi.call("delete_file_absolute", self.boundary_dispatch, self.vtable.delete_file_absolute, .{ self.ptr, path });
     }
 
     pub fn deleteTree(self: Storage, path: []const u8) !void {
-        return self.vtable.delete_tree(self.ptr, path);
+        return BoundaryAbi.call("delete_tree", self.boundary_dispatch, self.vtable.delete_tree, .{ self.ptr, path });
     }
 
     /// Returns owned basenames for regular files immediately below `path`.
@@ -863,7 +877,7 @@ pub const Storage = struct {
     /// their authoritative CURRENT record after crashes and failed unlinks.
     pub fn listFileNamesAlloc(self: Storage, allocator: Allocator, path: []const u8) ![][]u8 {
         const list = self.vtable.list_file_names_alloc orelse return error.DirectoryListingUnsupported;
-        return try list(self.ptr, allocator, path);
+        return try BoundaryAbi.call("list_file_names_alloc", self.boundary_dispatch, list, .{ self.ptr, allocator, path });
     }
 
     pub fn freeFileNames(allocator: Allocator, names: [][]u8) void {
@@ -882,7 +896,7 @@ pub const Storage = struct {
 
     pub fn rootIdentityAlloc(self: Storage, allocator: Allocator, root_dir: []const u8) ![]u8 {
         if (self.vtable.root_identity_alloc) |root_identity_alloc| {
-            return try root_identity_alloc(self.ptr, allocator, root_dir);
+            return try BoundaryAbi.call("root_identity_alloc", self.boundary_dispatch, root_identity_alloc, .{ self.ptr, allocator, root_dir });
         }
         return try std.fmt.allocPrint(allocator, "storage:{x}:{x}:{s}", .{
             @intFromPtr(self.ptr),
@@ -5586,4 +5600,64 @@ test "memory storage rename preserves both paths on allocation failure" {
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "storage file errors and returned writers use their owning dispatcher" {
+    const Foreign = struct {
+        var calls: usize = 0;
+        fn dispatch(contract: *const @import("antfly_runtime_abi").native_abi.CallContract, callback: *const anyopaque, args: *const anyopaque, output: ?*anyopaque) callconv(.c) @import("antfly_runtime_abi").error_abi.Status {
+            calls += 1;
+            return Storage.BoundaryAbi.local_dispatch(contract, callback, args, output);
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+    const file = try std.fs.path.join(std.testing.allocator, &.{ path, "data" });
+    defer std.testing.allocator.free(file);
+    var backing = IoStorage.init(std.testing.io);
+    var storage = backing.storage();
+    storage.boundary_dispatch = Foreign.dispatch;
+    Foreign.calls = 0;
+    try std.testing.expectError(error.FileNotFound, storage.fileSize(file));
+    try std.testing.expectError(error.FileNotFound, storage.readFileAlloc(std.testing.allocator, file, 64));
+    try storage.writeFileAbsolute(file, "hello");
+    try std.testing.expectEqual(@as(u64, 5), try storage.fileSize(file));
+    try std.testing.expectEqual(@as(usize, 4), Foreign.calls);
+    const SinkForeign = struct {
+        var calls: usize = 0;
+        fn dispatch(contract: *const @import("antfly_runtime_abi").native_abi.CallContract, callback: *const anyopaque, args: *const anyopaque, output: ?*anyopaque) callconv(.c) @import("antfly_runtime_abi").error_abi.Status {
+            calls += 1;
+            return AtomicWriteSink.BoundaryAbi.local_dispatch(contract, callback, args, output);
+        }
+    };
+    var sink = try storage.beginAtomicWrite(std.testing.allocator, file);
+    var unfinished = true;
+    defer if (unfinished) sink.abort();
+    SinkForeign.calls = 0;
+    sink.boundary_dispatch = SinkForeign.dispatch;
+    try sink.appendSlice("hello");
+    try sink.writeAt(0, "h");
+    try std.testing.expectEqual(Crc32.hash("hello"), try sink.crc32Prefix(5));
+    try std.testing.expectEqual(Crc32.hash("ello"), try sink.crc32Range(1, 4));
+    unfinished = false;
+    try sink.finish();
+    try std.testing.expectEqual(@as(usize, 5), SinkForeign.calls);
+    var reader = try storage.beginColdSequentialRead(std.testing.allocator, file);
+    defer reader.deinit();
+    const ReaderForeign = struct {
+        var calls: usize = 0;
+        fn dispatch(contract: *const @import("antfly_runtime_abi").native_abi.CallContract, callback: *const anyopaque, args: *const anyopaque, output: ?*anyopaque) callconv(.c) @import("antfly_runtime_abi").error_abi.Status {
+            calls += 1;
+            return ColdSequentialReader.BoundaryAbi.local_dispatch(contract, callback, args, output);
+        }
+    };
+    reader.boundary_dispatch = ReaderForeign.dispatch;
+    ReaderForeign.calls = 0;
+    var bytes: [5]u8 = undefined;
+    try reader.readRangeInto(0, &bytes);
+    try std.testing.expectEqualStrings("hello", &bytes);
+    try std.testing.expectError(error.EndOfStream, reader.readRangeInto(5, &bytes));
+    try std.testing.expectEqual(@as(usize, 2), ReaderForeign.calls);
 }

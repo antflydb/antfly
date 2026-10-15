@@ -2535,7 +2535,7 @@ test "lite atomic publication returns owned immutable source without requiring m
     source_only_writer.finish_mapped = null;
     writer.vtable = &source_only_writer;
     active = false;
-    var source = try writer.vtable.finish_source.?(writer.ptr);
+    var source = try writer.finishSource();
     defer source.close();
     try storage.writeFileAbsolute("/published", "replacement");
     docs.close();
