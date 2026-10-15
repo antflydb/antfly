@@ -10351,7 +10351,9 @@ static NSString *termite_metal_shader_source(void) {
            "}\n"
            // termite_training_adamw_f32 with weight and moments written to new
            // buffers, so the inputs stay intact until the caller publishes.
-           "kernel void termite_training_adamw_into_f32(device const float *weight [[buffer(0)]], device float *grad [[buffer(1)]], device const float *m [[buffer(2)]], device const float *v [[buffer(3)]], device float *weight_out [[buffer(4)]], device float *m_out [[buffer(5)]], device float *v_out [[buffer(6)]], constant termite_metal_training_adamw_params &p [[buffer(7)]], uint gid [[thread_position_in_grid]]) {\n"
+           // flag[0] becomes 1 if any new weight or moment is not finite; every
+           // writer stores the same value, so the race is benign.
+           "kernel void termite_training_adamw_into_f32(device const float *weight [[buffer(0)]], device float *grad [[buffer(1)]], device const float *m [[buffer(2)]], device const float *v [[buffer(3)]], device float *weight_out [[buffer(4)]], device float *m_out [[buffer(5)]], device float *v_out [[buffer(6)]], constant termite_metal_training_adamw_params &p [[buffer(7)]], device float *flag [[buffer(8)]], uint gid [[thread_position_in_grid]]) {\n"
            "    if (gid >= p.elem_count) return;\n"
            "    float g = grad[gid] * p.grad_scale;\n"
            "    float mv = p.beta1 * m[gid] + (1.0f - p.beta1) * g;\n"
@@ -10362,8 +10364,10 @@ static NSString *termite_metal_shader_source(void) {
            "    float vh = vv / p.bias_correction2;\n"
            "    float w = weight[gid];\n"
            "    float update = mh / (sqrt(vh) + p.eps) + p.weight_decay * w;\n"
-           "    weight_out[gid] = w - p.lr * update;\n"
+           "    float w_new = w - p.lr * update;\n"
+           "    weight_out[gid] = w_new;\n"
            "    grad[gid] = 0.0f;\n"
+           "    if (!isfinite(w_new) || !isfinite(mv) || !isfinite(vv)) flag[0] = 1.0f;\n"
            "}\n"
            "kernel void termite_training_sumsq_f32(device const float *input [[buffer(0)]], device float *output [[buffer(1)]], constant termite_metal_training_sumsq_params &p [[buffer(2)]], uint gid [[thread_position_in_grid]]) {\n"
            "    if (gid != 0u) return;\n"
@@ -51766,6 +51770,7 @@ int termite_metal_decode_runtime_training_adamw_into_many_f32(
     const termite_metal_training_ref *weight_out,
     const termite_metal_training_ref *m_out,
     const termite_metal_training_ref *v_out,
+    termite_metal_training_ref flag,
     const size_t *elem_counts,
     const float *bias_correction1s,
     const float *bias_correction2s,
@@ -51781,6 +51786,7 @@ int termite_metal_decode_runtime_training_adamw_into_many_f32(
         m_out == NULL || v_out == NULL || elem_counts == NULL || bias_correction1s == NULL || bias_correction2s == NULL)
         return -1;
     if (runtime->training_adamw_into_pipeline == nil) return -2;
+    if (!termite_metal_training_ref_fits(flag, sizeof(float))) return -1;
     if (input_count == 0 || input_count > UINT32_MAX) return -3;
     @autoreleasepool {
         bool frame_owned = true;
@@ -51821,6 +51827,7 @@ int termite_metal_decode_runtime_training_adamw_into_many_f32(
                 [encoder setBuffer:(__bridge id<MTLBuffer>)refs[r].handle offset:refs[r].offset atIndex:r];
             }
             [encoder setBytes:&params length:sizeof(params) atIndex:7];
+            [encoder setBuffer:(__bridge id<MTLBuffer>)flag.handle offset:flag.offset atIndex:8];
             [encoder dispatchThreads:MTLSizeMake(elem_count, 1, 1)
                threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->training_adamw_into_pipeline, elem_count), 1, 1)];
         }

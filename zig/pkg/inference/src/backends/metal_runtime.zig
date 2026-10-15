@@ -10012,8 +10012,9 @@ pub const TrainingAdamWInto = struct {
     bias_correction2: f32,
 };
 
-/// AdamW reading weight/m/v and writing new buffers; grad is cleared.
-pub fn decoderRuntimeTrainingAdamWIntoManyF32(self: anytype, batch: []const TrainingAdamWInto, opts: TrainingAdamWBatchOptions) !bool {
+/// AdamW reading weight/m/v and writing new buffers; grad is cleared, and
+/// `flag[0]` is set to 1 if any new value is not finite.
+pub fn decoderRuntimeTrainingAdamWIntoManyF32(self: anytype, batch: []const TrainingAdamWInto, flag: MetalTensor, opts: TrainingAdamWBatchOptions) !bool {
     const runtime = self.raw_decode_runtime orelse return false;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
     if (batch.len == 0) return true;
@@ -10041,6 +10042,7 @@ pub fn decoderRuntimeTrainingAdamWIntoManyF32(self: anytype, batch: []const Trai
         refs[4 * n ..].ptr,
         refs[5 * n ..].ptr,
         refs[6 * n ..].ptr,
+        try trainingRef(flag, 1),
         counts.ptr,
         corrections.ptr,
         corrections[n..].ptr,
@@ -22651,6 +22653,7 @@ pub extern fn termite_metal_decode_runtime_training_adamw_into_many_f32(
     weight_out: [*]const TrainingRef,
     m_out: [*]const TrainingRef,
     v_out: [*]const TrainingRef,
+    flag: TrainingRef,
     elem_counts: [*]const usize,
     bias_correction1s: [*]const f32,
     bias_correction2s: [*]const f32,

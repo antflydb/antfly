@@ -2642,8 +2642,9 @@ pub const ComputeBackend = struct {
         /// Allocates one fresh output per input. On error no output is returned.
         trainingAccumulateIntoManyF32: ?*const fn (ctx: *anyopaque, inputs: []const TrainingAccumulateIntoInput, divisor: f32, renormalize: f32, outputs: []CT) anyerror!void = null,
         /// AdamW that only reads weight/m/v, writing fresh outputs (grad is
-        /// still cleared). On error no output is returned.
-        trainingAdamWIntoManyF32: ?*const fn (ctx: *anyopaque, inputs: []const TrainingAdamWBatchInput, shapes: []const []const i32, opts: TrainingAdamWBatchOptions, outputs: []TrainingAdamWOutputs) anyerror!void = null,
+        /// still cleared) and setting `flag` (an f32 scalar the caller zeroed)
+        /// to 1 if any output is not finite. On error no output is returned.
+        trainingAdamWIntoManyF32: ?*const fn (ctx: *anyopaque, inputs: []const TrainingAdamWBatchInput, shapes: []const []const i32, opts: TrainingAdamWBatchOptions, outputs: []TrainingAdamWOutputs, flag: CT) anyerror!void = null,
         trainingSumSquaresManyF32: ?*const fn (ctx: *anyopaque, inputs: []const TrainingSumSquaresInput) anyerror!f32 = null,
         trainingSynchronize: ?*const fn (ctx: *anyopaque) anyerror!void = null,
 
@@ -4695,11 +4696,11 @@ pub const ComputeBackend = struct {
         return op(self.ptr, inputs, divisor, renormalize, outputs);
     }
 
-    pub fn trainingAdamWIntoManyF32(self: *const ComputeBackend, inputs: []const TrainingAdamWBatchInput, shapes: []const []const i32, opts: TrainingAdamWBatchOptions, outputs: []TrainingAdamWOutputs) !void {
+    pub fn trainingAdamWIntoManyF32(self: *const ComputeBackend, inputs: []const TrainingAdamWBatchInput, shapes: []const []const i32, opts: TrainingAdamWBatchOptions, outputs: []TrainingAdamWOutputs, flag: CT) !void {
         const op = self.vtable.trainingAdamWIntoManyF32 orelse return error.DeviceTrainingUnavailable;
         if (outputs.len != inputs.len or shapes.len != inputs.len) return error.InvalidTrainingGradient;
         try self.checkExecutionControl();
-        return op(self.ptr, inputs, shapes, opts, outputs);
+        return op(self.ptr, inputs, shapes, opts, outputs, flag);
     }
 
     pub fn trainingAdamWManyF32(self: *const ComputeBackend, inputs: []const TrainingAdamWBatchInput, opts: TrainingAdamWBatchOptions) !void {

@@ -5252,7 +5252,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return error.UnsupportedResidentTrainingPrimitive;
     }
 
-    fn trainingAdamWIntoManyF32Op(ctx: *anyopaque, inputs: []const ops.TrainingAdamWBatchInput, shapes: []const []const i32, opts: ops.TrainingAdamWBatchOptions, outputs: []ops.TrainingAdamWOutputs) anyerror!void {
+    fn trainingAdamWIntoManyF32Op(ctx: *anyopaque, inputs: []const ops.TrainingAdamWBatchInput, shapes: []const []const i32, opts: ops.TrainingAdamWBatchOptions, outputs: []ops.TrainingAdamWOutputs, flag: CT) anyerror!void {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (opts.pytorch_fused != null) return error.DeviceTrainingUnavailable;
         if (self.residentExternalFrame()) return error.ResidentTrainingExternalFrame;
@@ -5287,7 +5287,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .bias_correction2 = input.bias_correction2,
             };
         }
-        if (!try metal_runtime.decoderRuntimeTrainingAdamWIntoManyF32(self.provider_impl, batch, .{
+        const flag_tensor = try self.residentTrainingTensor(flag, .f32, .{});
+        if (!try metal_runtime.decoderRuntimeTrainingAdamWIntoManyF32(self.provider_impl, batch, flag_tensor, .{
             .lr = opts.lr,
             .beta1 = opts.beta1,
             .beta2 = opts.beta2,

@@ -676,6 +676,10 @@ pub fn prepare(a: Allocator, cb: *const ops.ComputeBackend, state: State, reques
     defer scratch.free(norms);
     const adam = try scratch.alloc(ops.TrainingAdamWBatchInput, batch_capacity);
     defer scratch.free(adam);
+    // Set by the out-of-place AdamW kernel if any new weight or moment is not
+    // finite; read once after the batch instead of validating every tensor.
+    var adam_flag: ?CT = null;
+    defer if (adam_flag) |flag| pending.backend.free(flag);
     // Out-of-place accumulation and AdamW write the replacements directly,
     // with no snapshot copies; the PyTorch parity profiles keep the general
     // path. The norm of the new accumulators also proves every incoming
@@ -821,6 +825,7 @@ pub fn prepare(a: Allocator, cb: *const ops.ComputeBackend, state: State, reques
                 @floatCast(state.max_grad_norm / (pending.receipt.grad_norm + 1e-6))
             else
                 1;
+            if (fused) adam_flag = try scalar(pending, 0, limits);
             if (fused) for (state.groups, 0..) |group, group_id| {
                 // Clipping is AdamW's gradient scale: the same single multiply
                 // as the separate clip pass, without its buffer.
@@ -853,7 +858,7 @@ pub fn prepare(a: Allocator, cb: *const ops.ComputeBackend, state: State, reques
                     .eps = group.optimizer.eps,
                     .weight_decay = group.optimizer.weight_decay,
                     .grad_scale = clip,
-                }, outputs);
+                }, outputs, adam_flag.?);
                 for (outputs, owners) |output, index| {
                     pending.replacements[index].weight = output.weight;
                     pending.replacements[index].m = output.m;
@@ -890,28 +895,35 @@ pub fn prepare(a: Allocator, cb: *const ops.ComputeBackend, state: State, reques
                 }
                 try adamBatch(pending, adam[0..used], group, state.identity.optimizer_step);
             };
-            norm_used = 0;
-            for (pending.replacements) |replacement| {
-                const count = try elements(state.slots[replacement.slot], limits);
-                for ([_]CT{ replacement.weight.?, replacement.m.?, replacement.v.? }) |tensor|
-                    try appendValidation(pending, norms, &norm_used, tensor, count, limits);
-            }
-            _ = try validateValues(pending, norms[0..norm_used], limits);
-            // AdamW's ABI clears its private gradient buffer. Prove this
-            // invariant before exposing it as the next accumulation buffer.
-            norm_used = 0;
-            for (pending.replacements) |replacement| {
-                norms[norm_used] = .{ .tensor = replacement.grad_accum.?, .elem_count = try elements(state.slots[replacement.slot], limits) };
-                norm_used += 1;
-                if (norm_used == norms.len) {
-                    if (!try validateValues(pending, norms, limits)) return error.InvalidDeviceOptimizerResult;
-                    norm_used = 0;
+            // The fused kernel flags non-finite results itself and clears the
+            // accumulator it consumes, so only the general path re-reads them.
+            if (!fused) {
+                norm_used = 0;
+                for (pending.replacements) |replacement| {
+                    const count = try elements(state.slots[replacement.slot], limits);
+                    for ([_]CT{ replacement.weight.?, replacement.m.?, replacement.v.? }) |tensor|
+                        try appendValidation(pending, norms, &norm_used, tensor, count, limits);
                 }
+                _ = try validateValues(pending, norms[0..norm_used], limits);
+                // AdamW's ABI clears its private gradient buffer. Prove this
+                // invariant before exposing it as the next accumulation buffer.
+                norm_used = 0;
+                for (pending.replacements) |replacement| {
+                    norms[norm_used] = .{ .tensor = replacement.grad_accum.?, .elem_count = try elements(state.slots[replacement.slot], limits) };
+                    norm_used += 1;
+                    if (norm_used == norms.len) {
+                        if (!try validateValues(pending, norms, limits)) return error.InvalidDeviceOptimizerResult;
+                        norm_used = 0;
+                    }
+                }
+                if (!try validateValues(pending, norms[0..norm_used], limits)) return error.InvalidDeviceOptimizerResult;
             }
-            if (!try validateValues(pending, norms[0..norm_used], limits)) return error.InvalidDeviceOptimizerResult;
         }
     }
     if (batched) try pending.backend.residentTrainingEndBatch(true);
+    // Read through the resident norm, the transaction's one scalar readback
+    // path: the flag's square is 0 unless AdamW set it.
+    if (adam_flag) |flag| if (try norm(pending, &.{.{ .tensor = flag, .elem_count = 1 }}, limits) != 0) return error.NonFiniteTrainingUpdate;
     if (pending.receipt.scalar_upload_bytes + pending.receipt.scalar_download_bytes > admission.scalar_transfer_upper_bound_bytes)
         return error.InvalidDeviceOptimizerResult;
     try pending.backend.checkExecutionControl();
