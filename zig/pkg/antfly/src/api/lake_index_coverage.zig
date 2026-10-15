@@ -78,6 +78,7 @@ pub fn pinWithFileMap(source: *Source, context: Context, previous: ?local.server
 // delete-object evidence remains fresh for every selection.
 pub const DataProof = Hash;
 pub fn pinData(source: *Source, context: Context, previous: ?local.serverless_external_source_types.Inventory, verified_files: ?*const FileMap) !DataProof {
+    try source.ensureInventory(context);
     try source.ownInventory();
     const a = source.alloc;
     if (source.immutable_objects) if (previous) |inventory| {

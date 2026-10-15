@@ -4521,3 +4521,40 @@ fallbacks. Compiler-local native error generation, Zig/Python formatting and
 lint, whitespace, all 100 changed source license headers, and the Apache product
 boundary passed (2,053 source files). Live-provider retention qualification and
 archive-scale latency/RSS benchmarks remain deferred.
+
+
+### Lazy snapshot catalogs and bounded composed setup
+
+Legacy compacted text roots now detect supported versions from authenticated
+bodies in both serving and resumable GC. Composed workers borrow immutable
+parent version maps, own private overrides, and retry serially if workspace
+admission fails during setup. These address the two findings from the review.
+
+Iceberg snapshot discovery keeps a persistent file-ID tree over leased manifest
+chunks. Unchanged snapshots share the root; changed snapshots path-copy only
+changed entries. Selective row hydration performs direct lookups and owns just
+the selected file view. Full inventory and canonical ordering are deferred to
+scans, with the latter shared after its first construction. Cache pressure
+retains the materialized fallback. Fresh metadata, credential scope, schemas,
+delete plans and reader authority remain required. Initial manifest-list work
+and full-scan ordering remain proportional to their inputs.
+
+Selective Boolean trees now keep finite bounds for constant-score match-all and
+bitmap clauses. Regressions cover root compatibility/GC, source views larger
+than a worker quota, persistent-catalog allocation failures and snapshot refresh,
+and real Parquet mixed-Boolean score/tie/offset comparisons. Live-provider
+retention qualification and archive-scale latency/RSS benchmarks remain deferred.
+
+
+Final qualification with origin/main `89df7aff46`: Debug CLI built; all 479 lake
+integration tests passed (176 shared-engine and 303 server), all 75 focused
+tests passed (15 and 60), and all 46 real Parquet/Iceberg E2Es passed in 374.08
+seconds. The E2Es used an isolated 3 GiB HFS test volume to retain production
+disk-admission checks despite low host-volume headroom. The temporary volume
+was removed after qualification. Snapshot refresh coverage changes the metadata
+URI and verifies unchanged file-node reuse and fresh version strings. Legacy
+non-snapshot planning leases remain compatible. Native error metadata, Zig and
+Python formatting/lint, whitespace, all 102 changed source license headers, and
+the Apache product boundary passed (2,054 source files). Provider qualification
+and archive-scale latency/RSS benchmarks remain deferred; this is functional
+and ownership qualification, not an archive-scale performance measurement.

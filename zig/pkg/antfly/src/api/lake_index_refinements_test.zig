@@ -593,3 +593,38 @@ test "external lake global frontier compact coverage survives absent inventory a
     try std.testing.expectEqual(@as(usize, 2), (try stream.next()).?.rowCount());
     try std.testing.expectEqual(null, try stream.next());
 }
+
+test "external lake global frontier retained compacted roots detect v10 and v11 before serving and GC" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("legacy-compact-version");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@import("lake_index_publication.zig").uploadDomainWithNamespace(1, @splat(1), null), 1, std.testing.io);
+    const text = @import("lake_index_native_text.zig");
+    for ([_]u16{ 10, 11 }) |version| {
+        var child: text.Root = .{ .version = version, .domain = store.upload_scope.?.domain, .binding = .{ .sidecar_kind = .text, .source_kind = .external_parquet, .row_ref_kind = .external, .source_id = "source", .snapshot_id = "snapshot", .schema_fingerprint = "schema", .index_config_hash = "recipe", .column_bindings = &.{"body"} }, .config_json = "{}", .collection = .{ .documents = 0, .fields = &.{} } };
+        var upload = try store.putWithCancellation(try std.json.Stringify.valueAlloc(ca, child, .{}), .none);
+        defer upload.deinit(a);
+        const chunk: @import("lake_index_aggregate_artifact.zig").ChunkRef = .{ .artifact_id = upload.artifact_id, .checksum = upload.checksum, .byte_len = upload.byte_len };
+        const decoded = try text.loadRootDirectoryAuto(ca, store, chunk, .none, null);
+        try std.testing.expectEqual(version, decoded.metadata_version);
+        child.version = text.metadata_version;
+        child.compacted = chunk;
+        _ = try text.servingRoot(ca, store, child, .none, null);
+        var parent = try store.putWithCancellation(try std.json.Stringify.valueAlloc(ca, child, .{}), .none);
+        defer parent.deinit(a);
+        var collector: @import("lake_index_gc.zig").Collector = .{ .a = a, .table = 1, .authority = undefined, .store = store, .identity = @splat(1), .context = .{}, .audit_only = true, .token = @splat(1), .remaining_reads = 16 * 1024 * 1024 };
+        defer {
+            var keys = collector.marked.keyIterator();
+            while (keys.next()) |key| a.free(key.*);
+            collector.marked.deinit(a);
+        }
+        try collector.markArtifact(ca, .{ .kind = .text_segment, .metadata_version = text.metadata_version, .artifact_id = parent.artifact_id, .checksum = parent.checksum, .byte_len = parent.byte_len });
+        try std.testing.expect(collector.marked.contains(upload.artifact_id));
+    }
+}

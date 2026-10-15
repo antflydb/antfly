@@ -360,12 +360,15 @@ pub const ServingSource = struct {
     delete_lease: ?@import("lake_decoded_cache.zig").Lease = null,
     local_plan: ?PreparedPlan = null,
     inventory_owned: bool = true,
+    catalog_files: bool = false,
+    selected_catalog_view: bool = false,
     attachment_uri: ?[]u8 = null,
     // Exact immutable metadata used to construct this inventory, independent
     // of the attachment URI and subsequent catalog pointer changes.
     catalog_metadata: ?@import("../external_source/lake_catalog/types.zig").Table = null,
     // Version evidence is query-local; shared manifest bytes are never mutated.
     versions: std.AutoHashMapUnmanaged(usize, external_source_api.FileEntry) = .empty,
+    version_parent: ?*const ServingSource = null,
     lazy_versions: bool = false,
     immutable_objects: bool = false,
     pinned_files: []bool = &.{},
@@ -384,21 +387,14 @@ pub const ServingSource = struct {
         var view = self.*;
         view.alloc = a;
         view.inventory_owned = false;
+        view.catalog_files = false;
         view.pinned_files_owned = false;
         view.attachment_uri = null;
         view.versions = .empty;
         view.delete_lease = if (self.delete_lease) |lease| lease.retain() else null;
         view.scanner.shared_reader = null;
         errdefer view.closeParallelView(self);
-        var entries = self.versions.iterator();
-        while (entries.next()) |entry| {
-            var file = entry.value_ptr.*;
-            file.etag = try a.dupe(u8, file.etag);
-            errdefer a.free(file.etag);
-            file.version_id = try a.dupe(u8, file.version_id);
-            errdefer a.free(file.version_id);
-            try view.versions.put(a, entry.key_ptr.*, file);
-        }
+        view.version_parent = self;
         if (self.scanner.shared_reader) |reader| {
             const owned = try a.create(@import("lake_serving_cache.zig").Reader);
             owned.* = .{ .base = reader.base, .cache = reader.cache, .scope = reader.scope, .context = reader.context };
@@ -413,6 +409,7 @@ pub const ServingSource = struct {
         }
         if (self.delete_lease) |lease| lease.release() else if (self.prepared_deletes != parent.prepared_deletes) if (self.prepared_deletes) |prepared| prepared.destroy(self.alloc);
         self.clearVersions();
+        self.freeCatalogFiles();
         if (self.inventory_owned) self.inventory.deinit(self.alloc);
         if (self.pinned_files_owned) self.alloc.free(self.pinned_files);
     }
@@ -425,6 +422,12 @@ pub const ServingSource = struct {
         return openCached(alloc, schema, options, context, null);
     }
     pub fn openCached(alloc: std.mem.Allocator, schema: storage_schema.TableSchema, options: host_store.OpenOptions, context: @import("lake_read_context.zig").Context, cache: ?*@import("lake_serving_cache.zig").Cache) !ServingSource {
+        return openCachedMode(alloc, schema, options, context, cache, false);
+    }
+    pub fn openLazyCached(alloc: std.mem.Allocator, schema: storage_schema.TableSchema, options: host_store.OpenOptions, context: @import("lake_read_context.zig").Context, cache: ?*@import("lake_serving_cache.zig").Cache) !ServingSource {
+        return openCachedMode(alloc, schema, options, context, cache, true);
+    }
+    fn openCachedMode(alloc: std.mem.Allocator, schema: storage_schema.TableSchema, options: host_store.OpenOptions, context: @import("lake_read_context.zig").Context, cache: ?*@import("lake_serving_cache.zig").Cache, lazy: bool) !ServingSource {
         try context.ensureActive();
         const binding = (schema.external_base_source orelse return error.InvalidExternalTableBinding).binding;
         var store = try options.open(alloc, binding);
@@ -490,7 +493,7 @@ pub const ServingSource = struct {
                     @import("lake_prepared_deletes.zig").Prepared.hashObjectVersion(&hash, uri, metadata_bytes, binding.snapshot_mode.pinnedSnapshotId() orelse "");
                     const key = hash.finalResult();
                     plan_identity = key;
-                    var loader: SnapshotPlanLoader = .{ .client = client, .source = binding.table_id, .uri = uri, .snapshot = binding.snapshot_mode.pinnedSnapshotId(), .metadata = metadata_bytes, .manifests = if (binding.object_mutability == .immutable) &shared.manifests else null, .chunks = if (binding.object_mutability == .immutable) &shared.inventory_chunks else null, .scope = scope, .context = context };
+                    var loader: SnapshotPlanLoader = .{ .client = client, .source = binding.table_id, .uri = uri, .snapshot = binding.snapshot_mode.pinnedSnapshotId(), .metadata = metadata_bytes, .manifests = if (binding.object_mutability == .immutable) &shared.manifests else null, .chunks = if (binding.object_mutability == .immutable) &shared.inventory_chunks else null, .catalogs = if (binding.object_mutability == .immutable) &shared.inventory_catalogs else null, .scope = scope, .context = context };
                     // Coalesce cold manifest discovery as well as warm residency.
                     // Waiters retain their own authority, cancellation and lease;
                     // the cache owns only the immutable inventory/delete plan.
@@ -534,7 +537,7 @@ pub const ServingSource = struct {
                 {
                     iceberg_schema = try @import("lake_schema.zig").icebergSchema(alloc, metadata_bytes, binding.snapshot_mode.pinnedSnapshotId());
                     if (!std.mem.eql(u8, iceberg_schema.?.fingerprint, snapshot.inventory.schema_fingerprint)) return error.ExternalLakeSnapshotMismatch;
-                    if (snapshot.inventory.files.len != 0) partition_rules = try @import("lake_partition_pruning.zig").parseAlloc(alloc, uri, metadata_bytes, snapshot.inventory.snapshot_id, binding.snapshot_mode.pinnedSnapshotId(), snapshot.inventory.schema_fingerprint);
+                    if ((if (snapshot.catalog) |index| index.count() else snapshot.inventory.files.len) != 0) partition_rules = try @import("lake_partition_pruning.zig").parseAlloc(alloc, uri, metadata_bytes, snapshot.inventory.snapshot_id, binding.snapshot_mode.pinnedSnapshotId(), snapshot.inventory.schema_fingerprint);
                 }
                 if (cache == null) try serverless_query.pinLakeIcebergInventoryDataFileObjectVersionsAlloc(alloc, client, &snapshot.inventory);
                 break :blk snapshot.inventory;
@@ -556,7 +559,13 @@ pub const ServingSource = struct {
         errdefer if (snapshot_pin) |pin| pin.deinit(pin.ptr);
         if (snapshot_pin) |pin| context_store.extra_checkpoint = .{ .ptr = pin.ptr, .check = pin.check };
         const local_plan = if (plan_lease == null) try PreparedPlan.init(alloc, inventory) else null;
-        return .{ .alloc = alloc, .snapshot_pin = snapshot_pin, .store = store, .inventory = inventory, .scanner = scanner, .context_store = context_store, .partition_rules = partition_rules, .iceberg_schema = iceberg_schema, .plan_identity = plan_identity, .plan_lease = plan_lease, .local_plan = local_plan, .inventory_owned = plan_lease == null, .attachment_uri = attachment_uri, .catalog_metadata = retained_metadata, .lazy_versions = lazy_versions, .immutable_objects = binding.object_mutability == .immutable, .pinned_files = pinned_files };
+        var result: ServingSource = .{ .alloc = alloc, .snapshot_pin = snapshot_pin, .store = store, .inventory = inventory, .scanner = scanner, .context_store = context_store, .partition_rules = partition_rules, .iceberg_schema = iceberg_schema, .plan_identity = plan_identity, .plan_lease = plan_lease, .local_plan = local_plan, .inventory_owned = plan_lease == null, .attachment_uri = attachment_uri, .catalog_metadata = retained_metadata, .lazy_versions = lazy_versions, .immutable_objects = binding.object_mutability == .immutable, .pinned_files = pinned_files };
+        errdefer result.freeCatalogFiles();
+        if (!lazy) {
+            try result.ensureInventory(context);
+            try result.ensureCanonicalPlan(context);
+        }
+        return result;
     }
 
     const SnapshotPlanLoader = struct {
@@ -567,27 +576,104 @@ pub const ServingSource = struct {
         metadata: []const u8,
         manifests: ?*@import("lake_decoded_cache.zig").Cache = null,
         chunks: ?*@import("lake_decoded_cache.zig").Cache = null,
+        catalogs: ?*@import("lake_inventory_catalog.zig").Cache = null,
         scope: [32]u8 = @splat(0),
         context: @import("lake_read_context.zig").Context = .{},
         fn load(raw: *anyopaque, item: *@import("lake_decoded_cache.zig").Item) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            item.payload = .{ .snapshot = try @import("lake_iceberg_snapshot.zig").planSnapshotInventoryAndDeletePlanFromMetadataAlloc(item.budget.allocator(), .{ .client = self.client, .source_id = self.source, .metadata_uri = self.uri, .requested_snapshot_id = self.snapshot, .manifests = self.manifests, .inventory_chunks = self.chunks, .manifest_scope = self.scope, .context = self.context }, self.metadata) };
+            item.payload = .{ .snapshot = try @import("lake_iceberg_snapshot.zig").planSnapshotInventoryAndDeletePlanFromMetadataAlloc(item.budget.allocator(), .{ .client = self.client, .source_id = self.source, .metadata_uri = self.uri, .requested_snapshot_id = self.snapshot, .manifests = self.manifests, .inventory_chunks = self.chunks, .catalogs = self.catalogs, .manifest_scope = self.scope, .context = self.context }, self.metadata) };
+            if (item.payload.snapshot.catalog) |index| item.foreign_bytes +|= index.footprint();
             for (item.payload.snapshot.file_leases) |lease| item.foreign_bytes +|= lease.item.budget.live;
             try prepareCachedPlan(item);
         }
     };
 
     pub fn validateBinding(self: *const ServingSource, binding: @import("../external_source/catalog_binding.zig").Binding) !void {
-        if (self.canonicalOrder() != null)
+        if (self.catalog() != null or self.canonicalOrder() != null)
             try @import("lake_scan_plan.zig").validateBindingInventoryIdentity(binding, self.inventory)
         else
             try serverless_query.validateLakeBindingInventory(binding, self.inventory);
     }
+    pub fn catalog(self: *const ServingSource) ?*@import("lake_inventory_catalog.zig").Index {
+        if (self.selected_catalog_view) return null;
+        return if (self.plan_lease) |lease| switch (lease.item.payload) {
+            .snapshot => |snapshot| snapshot.catalog,
+            else => null,
+        } else null;
+    }
+    pub fn fileCount(self: *const ServingSource) usize {
+        return if (self.catalog()) |index| index.count() else self.inventory.files.len;
+    }
+    pub fn hasLazyInventory(self: *const ServingSource) bool {
+        return self.catalog() != null and !self.catalog_files and self.inventory.files.len == 0;
+    }
+    fn freeCatalogFiles(self: *ServingSource) void {
+        if (!self.catalog_files) return;
+        for (self.inventory.files) |file| self.alloc.free(file.version_id);
+        self.alloc.free(self.inventory.files);
+        self.inventory.files = &.{};
+        self.catalog_files = false;
+    }
+    pub fn ensureInventory(self: *ServingSource, context: @import("lake_read_context.zig").Context) !void {
+        if (!self.hasLazyInventory()) return;
+        self.inventory.files = try self.catalog().?.materialize(self.alloc, self.inventory.snapshot_id, context);
+        self.catalog_files = true;
+        self.scanner.inventory = self.inventory;
+    }
+    pub fn ensureCanonicalPlan(self: *ServingSource, context: @import("lake_read_context.zig").Context) !void {
+        if (self.catalog()) |index| _ = index.ensureOrdering(self.inventory.source_id, self.inventory.snapshot_id, context) catch |err| switch (err) {
+            error.OutOfMemory => return, // ordinary scan-local ordering remains valid
+            else => return err,
+        };
+    }
+    /// A bounded selection owns just its flat view/version strings. The parent
+    /// pins immutable chunk pages, provider selectors and reader authority.
+    pub fn selectedView(self: *ServingSource, a: std.mem.Allocator, refs: []const @import("../../storage/rowsource/types.zig").RowRef, context: @import("lake_read_context.zig").Context) !ServingSource {
+        const index = self.catalog() orelse return error.InvalidExternalSourceInventory;
+        var view = try self.parallelView(a);
+        errdefer view.closeParallelView(self);
+        view.version_parent = null;
+        view.pinned_files = &.{};
+        view.local_plan = null;
+        view.selected_catalog_view = true;
+        view.plan_identity = null; // delete plans bind this exact bounded file view
+        var selected: std.StringHashMapUnmanaged(void) = .empty;
+        defer selected.deinit(a);
+        for (refs) |ref| {
+            try context.ensureActive();
+            if (ref != .external or !std.mem.eql(u8, ref.external.source_id, self.inventory.source_id) or !std.mem.eql(u8, ref.external.snapshot_id, self.inventory.snapshot_id)) return error.ExternalLakeSnapshotMismatch;
+            try selected.put(a, ref.external.file_id, {});
+        }
+        const files = try a.alloc(external_source_api.FileEntry, selected.count());
+        var initialized: usize = 0;
+        errdefer {
+            for (files[0..initialized]) |file| a.free(file.version_id);
+            a.free(files);
+        }
+        var ids = selected.keyIterator();
+        for (files) |*file| {
+            const input = index.find(ids.next().?.*) orelse return error.ExternalLakeSnapshotMismatch;
+            file.* = try @import("lake_inventory_catalog.zig").Index.qualify(a, input.*, self.inventory.snapshot_id);
+            initialized += 1;
+        }
+        std.mem.sort(external_source_api.FileEntry, files, {}, struct {
+            fn less(_: void, l: external_source_api.FileEntry, r: external_source_api.FileEntry) bool {
+                return std.mem.lessThan(u8, l.file_id, r.file_id);
+            }
+        }.less);
+        view.inventory.files = files;
+        view.scanner.inventory = view.inventory;
+        view.catalog_files = true;
+        return view;
+    }
     pub fn isFilePinned(self: *const ServingSource, index: usize) bool {
-        return self.versions.contains(index) or (self.pinned_files.len != 0 and self.pinned_files[index]);
+        return self.pinnedVersion(index) != null or (self.pinned_files.len != 0 and self.pinned_files[index]);
+    }
+    pub fn pinnedVersion(self: *const ServingSource, index: usize) ?external_source_api.FileEntry {
+        return self.versions.get(index) orelse if (self.version_parent) |parent| parent.pinnedVersion(index) else null;
     }
     pub fn fileAt(self: *const ServingSource, index: usize) external_source_api.FileEntry {
-        return self.versions.get(index) orelse self.inventory.files[index];
+        return self.pinnedVersion(index) orelse self.inventory.files[index];
     }
     pub fn clearVersions(self: *ServingSource) void {
         var it = self.versions.valueIterator();
@@ -597,11 +683,13 @@ pub const ServingSource = struct {
         }
         self.versions.deinit(self.alloc);
         self.versions = .empty;
+        self.version_parent = null;
     }
     // Full source proofs and builds explicitly materialize mutable evidence.
     // Warm selective readers retain only the files they actually touch.
     pub fn ownInventory(self: *ServingSource) !void {
         if (self.inventory_owned) return;
+        try self.ensureInventory(self.protectContext(.{}));
         const bytes = try @import("../external_source/codec.zig").encodeAlloc(self.alloc, self.inventory);
         defer self.alloc.free(bytes);
         var inventory = try @import("../external_source/codec.zig").decodeAlloc(self.alloc, bytes);
@@ -609,19 +697,18 @@ pub const ServingSource = struct {
         const pinned = try self.alloc.alloc(bool, inventory.files.len);
         errdefer self.alloc.free(pinned);
         @memset(pinned, false);
-        var it = self.versions.iterator();
-        while (it.next()) |entry| {
-            const file = &inventory.files[entry.key_ptr.*];
-            const etag = try self.alloc.dupe(u8, entry.value_ptr.etag);
+        for (inventory.files, 0..) |*file, index| if (self.pinnedVersion(index)) |evidence| {
+            const etag = try self.alloc.dupe(u8, evidence.etag);
             errdefer self.alloc.free(etag);
-            const version = try self.alloc.dupe(u8, entry.value_ptr.version_id);
+            const version = try self.alloc.dupe(u8, evidence.version_id);
             self.alloc.free(file.etag);
             self.alloc.free(file.version_id);
             file.etag = etag;
             file.version_id = version;
-            pinned[entry.key_ptr.*] = true;
-        }
+            pinned[index] = true;
+        };
         self.clearVersions();
+        self.freeCatalogFiles();
         if (self.pinned_files_owned) self.alloc.free(self.pinned_files);
         self.pinned_files = pinned;
         self.pinned_files_owned = true;
@@ -660,22 +747,30 @@ pub const ServingSource = struct {
         }
     };
     pub fn canonicalOrder(self: *const ServingSource) ?[]usize {
+        if (self.selected_catalog_view) return null;
+        if (self.catalog()) |index| if (index.ordering.load(.acquire)) |order| return order.order;
         if (self.plan_lease) |lease| if (lease.item.file_order) |order| return order;
         return if (self.local_plan) |plan| plan.file_order else null;
     }
     pub fn fileRanks(self: *const ServingSource) ?[]usize {
+        if (self.selected_catalog_view) return null;
+        if (self.catalog()) |index| if (index.ordering.load(.acquire)) |order| return order.ranks;
         if (self.plan_lease) |lease| if (lease.item.file_rank) |rank| return rank;
         return if (self.local_plan) |plan| plan.file_rank else null;
     }
     pub fn fileMap(self: *const ServingSource) ?*const std.StringHashMapUnmanaged(usize) {
+        if (self.selected_catalog_view) return null;
+        if (self.catalog()) |index| if (index.ordering.load(.acquire)) |order| return &order.by_id;
         if (self.plan_lease) |lease| if (lease.item.file_rank != null) return &lease.item.file_by_id;
         return if (self.local_plan) |*plan| &plan.file_by_id else null;
     }
     pub fn estimates(self: *const ServingSource) ?struct { rows: u64, bytes: u64 } {
+        if (self.catalog()) |index| return .{ .rows = index.rows(), .bytes = index.bytes() };
         if (self.plan_lease) |lease| if (lease.item.file_order != null) return .{ .rows = lease.item.estimated_rows, .bytes = lease.item.estimated_bytes };
         return if (self.local_plan) |plan| .{ .rows = plan.estimated_rows, .bytes = plan.estimated_bytes } else null;
     }
     pub fn prepareCachedPlan(item: *@import("lake_decoded_cache.zig").Item) !void {
+        if (item.payload.snapshot.catalog != null) return;
         const plan = try PreparedPlan.init(item.budget.allocator(), item.payload.snapshot.inventory);
         item.file_order = plan.file_order;
         item.file_rank = plan.file_rank;
@@ -765,6 +860,7 @@ pub const ServingSource = struct {
         self.clearVersions();
         if (self.local_plan) |*plan| plan.deinit(self.alloc);
         if (self.pinned_files_owned) self.alloc.free(self.pinned_files);
+        self.freeCatalogFiles();
         if (self.inventory_owned) self.inventory.deinit(self.alloc);
         if (self.attachment_uri) |uri| self.alloc.free(uri);
         if (self.catalog_metadata) |*table| table.deinit(self.alloc);
@@ -930,6 +1026,10 @@ test "external lake metadata navigation parallel source views own version mutati
     try parent.versions.put(a, 0, file);
     var view = try parent.parallelView(a);
     defer view.closeParallelView(&parent);
+    var selected_file = view.pinnedVersion(0).?;
+    selected_file.etag = try a.dupe(u8, selected_file.etag);
+    selected_file.version_id = try a.dupe(u8, selected_file.version_id);
+    try view.versions.put(a, 0, selected_file);
     const selected = view.versions.getPtr(0).?;
     a.free(selected.etag);
     selected.etag = try a.dupe(u8, "changed");

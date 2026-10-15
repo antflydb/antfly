@@ -48,6 +48,7 @@ pub const Job = union(enum) {
     contribution_page: Ref,
     chunk: artifacts.ChunkRef,
     text_directory: artifacts.ChunkRef,
+    text_root: artifacts.ChunkRef,
     text_manifest: struct { ref: artifacts.ChunkRef, seekable: bool, maintenance_only: bool = false },
     page: struct { ref: tree.Ref, ordered_rows: bool, contributions: bool = false, text_files: ?struct { seekable: bool, maintenance_only: bool } = null },
 };
@@ -111,6 +112,7 @@ pub const Progress = struct {
             },
             .artifact => |artifact| try collector.markArtifact(a, artifact),
             .text_directory => |ref| try collector.markTextDirectory(a, ref),
+            .text_root => |ref| try collector.markTextRootAuto(a, ref),
             .text_manifest => |manifest| try collector.markTextManifestMode(a, manifest.ref, manifest.seekable, manifest.maintenance_only),
             .contribution_page => |page| {
                 if (!try self.expand(.{ .artifact_id = page.artifact_id, .checksum = page.checksum, .byte_len = page.byte_len }, "contributions")) return;

@@ -1,0 +1,401 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Immutable snapshot file catalogs. Path-copying ordered trees reuse unchanged
+//! manifest chunks; selected readers never flatten the archive or sort its IDs.
+const std = @import("std");
+const external = @import("../external_source/types.zig");
+const decoded = @import("lake_decoded_cache.zig");
+const Context = @import("lake_read_context.zig").Context;
+const A = std.mem.Allocator;
+pub const Chunk = struct { key: [32]u8, lease: decoded.Lease };
+const Node = struct {
+    refs: std.atomic.Value(usize) = .init(1),
+    a: A,
+    file: *const external.FileEntry,
+    left: ?*Node,
+    right: ?*Node,
+    priority: u64,
+    count: usize,
+    rows: u64,
+    bytes: u64,
+    fn retain(node: ?*Node) ?*Node {
+        if (node) |value| _ = value.refs.fetchAdd(1, .monotonic);
+        return node;
+    }
+    fn release(node: ?*Node) void {
+        const value = node orelse return;
+        if (value.refs.fetchSub(1, .acq_rel) != 1) return;
+        release(value.left);
+        release(value.right);
+        value.a.destroy(value);
+    }
+    fn create(a: A, file: *const external.FileEntry, left: ?*Node, right: ?*Node) !*Node {
+        const node = try a.create(Node);
+        var hash: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(file.file_id, &hash, .{});
+        node.* = .{ .a = a, .file = file, .left = retain(left), .right = retain(right), .priority = std.mem.readInt(u64, hash[0..8], .little), .count = 1 + (if (left) |v| v.count else 0) + (if (right) |v| v.count else 0), .rows = file.row_count +| (if (left) |v| v.rows else 0) +| (if (right) |v| v.rows else 0), .bytes = file.byte_len +| (if (left) |v| v.bytes else 0) +| (if (right) |v| v.bytes else 0) };
+        return node;
+    }
+    fn precedes(priority: u64, id: []const u8, other: *const Node) bool {
+        return priority < other.priority or (priority == other.priority and std.mem.lessThan(u8, id, other.file.file_id));
+    }
+    const Split = struct { left: ?*Node, right: ?*Node };
+    fn split(a: A, root: ?*Node, id: []const u8, depth: usize) !Split {
+        if (depth == 256) return error.InvalidExternalSourceInventory;
+        const node = root orelse return .{ .left = null, .right = null };
+        if (std.mem.lessThan(u8, node.file.file_id, id)) {
+            const parts = try split(a, node.right, id, depth + 1);
+            defer release(parts.left);
+            errdefer release(parts.right);
+            return .{ .left = try create(a, node.file, node.left, parts.left), .right = parts.right };
+        }
+        const parts = try split(a, node.left, id, depth + 1);
+        defer release(parts.right);
+        errdefer release(parts.left);
+        return .{ .left = parts.left, .right = try create(a, node.file, parts.right, node.right) };
+    }
+    fn insert(a: A, root: ?*Node, file: *const external.FileEntry, depth: usize) !*Node {
+        if (depth == 256) return error.InvalidExternalSourceInventory;
+        const node = root orelse return create(a, file, null, null);
+        const order = std.mem.order(u8, file.file_id, node.file.file_id);
+        if (order == .eq) return error.InvalidExternalSourceInventory;
+        var hash: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(file.file_id, &hash, .{});
+        if (precedes(std.mem.readInt(u64, hash[0..8], .little), file.file_id, node)) {
+            const parts = try split(a, root, file.file_id, depth + 1);
+            defer release(parts.left);
+            defer release(parts.right);
+            return create(a, file, parts.left, parts.right);
+        }
+        const branch = try insert(a, if (order == .lt) node.left else node.right, file, depth + 1);
+        defer release(branch);
+        return create(a, node.file, if (order == .lt) branch else node.left, if (order == .gt) branch else node.right);
+    }
+    fn merge(a: A, left: ?*Node, right: ?*Node, depth: usize) !?*Node {
+        if (depth == 256) return error.InvalidExternalSourceInventory;
+        const l = left orelse return retain(right);
+        const r = right orelse return retain(left);
+        if (precedes(l.priority, l.file.file_id, r)) {
+            const branch = try merge(a, l.right, right, depth + 1);
+            defer release(branch);
+            return try create(a, l.file, l.left, branch);
+        }
+        const branch = try merge(a, left, r.left, depth + 1);
+        defer release(branch);
+        return try create(a, r.file, branch, r.right);
+    }
+    fn remove(a: A, root: ?*Node, id: []const u8, depth: usize) !?*Node {
+        if (depth == 256) return error.InvalidExternalSourceInventory;
+        const node = root orelse return error.InvalidExternalSourceInventory;
+        const order = std.mem.order(u8, id, node.file.file_id);
+        if (order == .eq) return merge(a, node.left, node.right, depth + 1);
+        const branch = try remove(a, if (order == .lt) node.left else node.right, id, depth + 1);
+        defer release(branch);
+        return try create(a, node.file, if (order == .lt) branch else node.left, if (order == .gt) branch else node.right);
+    }
+};
+pub const Iterator = struct {
+    stack: [256]*Node = undefined,
+    len: usize = 0,
+    pending: ?*Node,
+    pub fn next(self: *Iterator) !?*const external.FileEntry {
+        while (self.pending) |node| {
+            if (self.len == self.stack.len) return error.InvalidExternalSourceInventory;
+            self.stack[self.len] = node;
+            self.len += 1;
+            self.pending = node.left;
+        }
+        if (self.len == 0) return null;
+        self.len -= 1;
+        const node = self.stack[self.len];
+        self.pending = node.right;
+        return node.file;
+    }
+};
+pub const Ordering = struct {
+    a: A,
+    identity: [32]u8,
+    order: []usize,
+    ranks: []usize,
+    by_id: std.StringHashMapUnmanaged(usize) = .empty,
+    fn destroy(self: *Ordering) void {
+        const a = self.a;
+        a.free(self.order);
+        a.free(self.ranks);
+        self.by_id.deinit(a);
+        a.destroy(self);
+    }
+};
+pub const Index = struct {
+    a: A,
+    refs: std.atomic.Value(usize) = .init(1),
+    root: ?*Node = null,
+    chunks: []Chunk = &.{},
+    by_key: std.AutoHashMapUnmanaged([32]u8, usize) = .empty,
+    initialized_chunks: usize = 0,
+    new_files: usize = 0,
+    ordering: std.atomic.Value(?*Ordering) = .init(null),
+    ordering_mu: std.atomic.Mutex = .unlocked,
+    pub fn retain(self: *Index) *Index {
+        _ = self.refs.fetchAdd(1, .monotonic);
+        return self;
+    }
+    pub fn release(self: *Index) void {
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+        const a = self.a;
+        if (self.ordering.load(.acquire)) |order| order.destroy();
+        Node.release(self.root);
+        for (self.chunks[0..self.initialized_chunks]) |chunk| chunk.lease.release();
+        a.free(self.chunks);
+        self.by_key.deinit(a);
+        a.destroy(self);
+    }
+    pub fn count(self: *const Index) usize {
+        return if (self.root) |root| root.count else 0;
+    }
+    pub fn rows(self: *const Index) u64 {
+        return if (self.root) |root| root.rows else 0;
+    }
+    pub fn bytes(self: *const Index) u64 {
+        return if (self.root) |root| root.bytes else 0;
+    }
+    pub fn footprint(self: *const Index) usize {
+        var total = self.count() * @sizeOf(Node) + self.chunks.len * @sizeOf(Chunk);
+        for (self.chunks) |chunk| total +|= chunk.lease.item.budget.live;
+        return total;
+    }
+    pub fn acquireChunk(self: *const Index, key: [32]u8) ?decoded.Lease {
+        const position = self.by_key.get(key) orelse return null;
+        return self.chunks[position].lease.retain();
+    }
+    pub fn find(self: *const Index, id: []const u8) ?*const external.FileEntry {
+        var current = self.root;
+        while (current) |node| switch (std.mem.order(u8, id, node.file.file_id)) {
+            .eq => return node.file,
+            .lt => current = node.left,
+            .gt => current = node.right,
+        };
+        return null;
+    }
+    pub fn iterator(self: *const Index) Iterator {
+        return .{ .pending = self.root };
+    }
+    /// Header/version strings remain snapshot-local; every other field borrows
+    /// the immutable catalog pinned by the source's snapshot lease.
+    pub fn qualify(a: A, file: external.FileEntry, snapshot: []const u8) !external.FileEntry {
+        const marker = "iceberg:v1:snapshot=manifest-chunk";
+        if (!std.mem.startsWith(u8, file.version_id, marker)) return error.InvalidIcebergInventory;
+        var out = file;
+        out.version_id = try std.fmt.allocPrint(a, "iceberg:v1:snapshot={s}{s}", .{ snapshot, file.version_id[marker.len..] });
+        return out;
+    }
+    pub fn materialize(self: *const Index, a: A, snapshot: []const u8, context: Context) ![]external.FileEntry {
+        const files = try a.alloc(external.FileEntry, self.count());
+        var initialized: usize = 0;
+        errdefer {
+            for (files[0..initialized]) |file| a.free(file.version_id);
+            a.free(files);
+        }
+        var it = self.iterator();
+        for (files) |*file| {
+            try context.ensureActive();
+            file.* = try qualify(a, (try it.next()).?.*, snapshot);
+            initialized += 1;
+        }
+        return files;
+    }
+    pub fn ensureOrdering(self: *Index, source: []const u8, snapshot: []const u8, context: Context) !*const Ordering {
+        const identity = @import("../../storage/rowsource/identity.zig").fileDigest(source, snapshot, "");
+        if (self.ordering.load(.acquire)) |order| {
+            if (!std.mem.eql(u8, &identity, &order.identity)) return error.ExternalLakeSnapshotMismatch;
+            return order;
+        }
+        while (!self.ordering_mu.tryLock()) {
+            try context.ensureActive();
+            if (context.io) |io| try io.sleep(.fromMilliseconds(1), .awake) else std.atomic.spinLoopHint();
+        }
+        defer self.ordering_mu.unlock();
+        if (self.ordering.load(.acquire)) |order| {
+            if (!std.mem.eql(u8, &identity, &order.identity)) return error.ExternalLakeSnapshotMismatch;
+            return order;
+        }
+        const a = self.a;
+        const order = try a.create(Ordering);
+        errdefer a.destroy(order);
+        order.* = .{ .a = a, .identity = identity, .order = try a.alloc(usize, self.count()), .ranks = &.{} };
+        errdefer a.free(order.order);
+        order.ranks = try a.alloc(usize, self.count());
+        errdefer a.free(order.ranks);
+        errdefer order.by_id.deinit(a);
+        const hashes = try a.alloc([32]u8, self.count());
+        defer a.free(hashes);
+        try order.by_id.ensureTotalCapacity(a, @intCast(self.count()));
+        var it = self.iterator();
+        for (hashes, order.order, 0..) |*hash, *position, i| {
+            try context.ensureActive();
+            const file = (try it.next()).?;
+            hash.* = @import("../../storage/rowsource/identity.zig").fileDigest(source, snapshot, file.file_id);
+            position.* = i;
+            order.by_id.putAssumeCapacity(file.file_id, i);
+        }
+        std.mem.sort(usize, order.order, hashes, struct {
+            fn less(keys: [][32]u8, l: usize, r: usize) bool {
+                return std.mem.lessThan(u8, &keys[l], &keys[r]);
+            }
+        }.less);
+        try context.ensureActive();
+        for (order.order, 0..) |file, i| order.ranks[file] = i;
+        self.ordering.store(order, .release);
+        return order;
+    }
+    pub fn build(a: A, prior: ?*const Index, chunks: []const Chunk, context: Context) !*Index {
+        const index = try a.create(Index);
+        index.* = .{ .a = a };
+        errdefer index.release();
+        const owned = try a.alloc(Chunk, chunks.len);
+        index.chunks = owned;
+        for (chunks, owned, 0..) |input, *out, i| {
+            const slot = try index.by_key.getOrPut(a, input.key);
+            if (slot.found_existing) return error.DuplicateIcebergManifest;
+            slot.value_ptr.* = i;
+            out.* = .{ .key = input.key, .lease = if (prior) |old| old.acquireChunk(input.key) orelse input.lease.retain() else input.lease.retain() };
+            index.initialized_chunks = i + 1;
+        }
+        index.root = Node.retain(if (prior) |old| old.root else null);
+        if (prior) |old| for (old.chunks) |part| if (!index.by_key.contains(part.key)) {
+            for (part.lease.item.payload.iceberg_chunk.files) |file| {
+                try context.ensureActive();
+                const next = try Node.remove(a, index.root, file.file_id, 0);
+                Node.release(index.root);
+                index.root = next;
+            }
+        };
+        for (index.chunks) |part| if (prior == null or !prior.?.by_key.contains(part.key)) {
+            for (part.lease.item.payload.iceberg_chunk.files) |*file| {
+                try context.ensureActive();
+                if (index.find(file.file_id) != null) return error.InvalidExternalSourceInventory;
+                const next = try Node.insert(a, index.root, file, 0);
+                Node.release(index.root);
+                index.root = next;
+                index.new_files += 1;
+            }
+        };
+        return index;
+    }
+};
+/// A bounded, data-only predecessor cache. The owner outlives every decoded
+/// snapshot and every structurally shared catalog node.
+pub const Cache = struct {
+    budget: @import("../../sql/memory_budget.zig") = .{ .backing = std.heap.page_allocator, .limit = 128 * 1024 * 1024 },
+    mutex: std.atomic.Mutex = .unlocked,
+    entries: [4]?struct { key: [32]u8, index: *Index, used: u64 } = @splat(null),
+    tick: u64 = 0,
+    fn lock(self: *Cache) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+    pub fn get(self: *Cache, key: [32]u8) ?*Index {
+        self.lock();
+        defer self.mutex.unlock();
+        self.tick +|= 1;
+        for (&self.entries) |*entry| if (entry.*) |*value| if (std.mem.eql(u8, &value.key, &key)) {
+            value.used = self.tick;
+            return value.index.retain();
+        };
+        return null;
+    }
+    pub fn put(self: *Cache, key: [32]u8, index: *Index) void {
+        self.lock();
+        self.tick +|= 1;
+        var target: usize = 0;
+        for (self.entries, 0..) |entry, i| {
+            if (entry) |value| {
+                if (std.mem.eql(u8, &value.key, &key)) {
+                    target = i;
+                    break;
+                }
+                if (self.entries[target] != null and value.used < self.entries[target].?.used) target = i;
+            } else target = i;
+        }
+        const old = self.entries[target];
+        self.entries[target] = .{ .key = key, .index = index.retain(), .used = self.tick };
+        self.mutex.unlock();
+        if (old) |entry| entry.index.release();
+    }
+    pub fn deinit(self: *Cache) void {
+        for (self.entries) |entry| if (entry) |value| value.index.release();
+        self.entries = @splat(null);
+        std.debug.assert(self.budget.live == 0);
+    }
+};
+
+test "external lake metadata navigation persistent catalogs reuse chunks and defer canonical ordering" {
+    const a = std.testing.allocator;
+    var memory: decoded.Cache = .{ .a = a };
+    defer memory.deinit();
+    const Fixture = struct {
+        fn chunk(cache: *decoded.Cache, first: usize, count_: usize) !decoded.Lease {
+            const lease = try cache.create(1024 * 1024);
+            errdefer lease.release();
+            const ca = lease.item.budget.allocator();
+            const inventory: external.Inventory = .{ .format = .iceberg, .source_id = try ca.dupe(u8, "source"), .source_uri = try ca.dupe(u8, "uri"), .snapshot_id = try ca.dupe(u8, "manifest-chunk"), .schema_fingerprint = try ca.dupe(u8, "schema"), .files = try ca.alloc(external.FileEntry, count_) };
+            for (inventory.files, first..) |*file, i| file.* = .{ .file_id = try std.fmt.allocPrint(ca, "file-{d:0>4}", .{i}), .object_uri = try ca.dupe(u8, "file://data"), .byte_len = 100, .row_count = 3, .row_groups = &.{}, .etag = &.{}, .version_id = try ca.dupe(u8, "iceberg:v1:snapshot=manifest-chunk:sequence=1") };
+            lease.item.payload = .{ .iceberg_chunk = inventory };
+            return lease;
+        }
+    };
+    const one = try Fixture.chunk(&memory, 0, 100);
+    defer one.release();
+    const two = try Fixture.chunk(&memory, 100, 100);
+    defer two.release();
+    const append = try Fixture.chunk(&memory, 200, 1);
+    defer append.release();
+    const old = try Index.build(a, null, &.{ .{ .key = @splat(1), .lease = one }, .{ .key = @splat(2), .lease = two } }, .{});
+    defer old.release();
+    const next = try Index.build(a, old, &.{ .{ .key = @splat(1), .lease = one }, .{ .key = @splat(2), .lease = two }, .{ .key = @splat(3), .lease = append } }, .{});
+    defer next.release();
+    try std.testing.expectEqual(@as(usize, 1), next.new_files);
+    try std.testing.expect(old.find("file-0001") == next.find("file-0001"));
+    try std.testing.expectEqual(@as(usize, 201), next.count());
+    try std.testing.expect(next.ordering.load(.acquire) == null);
+    const unchanged = try Index.build(a, next, next.chunks, .{});
+    defer unchanged.release();
+    try std.testing.expectEqual(@as(usize, 0), unchanged.new_files);
+    try std.testing.expect(unchanged.root == next.root);
+    const removed = try Index.build(a, next, &.{.{ .key = @splat(1), .lease = one }}, .{});
+    defer removed.release();
+    try std.testing.expectEqual(@as(usize, 100), removed.count());
+    try std.testing.expect(removed.find("file-0100") == null and old.find("file-0100") != null);
+    const files = try next.materialize(a, "fresh", .{});
+    defer {
+        for (files) |file| a.free(file.version_id);
+        a.free(files);
+    }
+    const inventory: external.Inventory = .{ .format = .iceberg, .source_id = @constCast("source"), .source_uri = @constCast("uri"), .snapshot_id = @constCast("fresh"), .schema_fingerprint = @constCast("schema"), .files = files };
+    const reference = try @import("lake_serving.zig").ServingSource.canonicalFileOrder(a, inventory);
+    defer a.free(reference);
+    const ordered = try next.ensureOrdering("source", "fresh", .{});
+    try std.testing.expectEqualSlices(usize, reference, ordered.order);
+    try std.testing.expect(ordered == try next.ensureOrdering("source", "fresh", .{}));
+    try std.testing.expectError(error.ExternalLakeSnapshotMismatch, next.ensureOrdering("source", "other", .{}));
+    const Harness = struct {
+        fn run(failing: A, prior: *Index, chunks: []const Chunk) !void {
+            const candidate = try Index.build(failing, prior, chunks, .{});
+            defer candidate.release();
+            _ = try candidate.ensureOrdering("source", "fresh", .{});
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Harness.run, .{ old, next.chunks });
+}

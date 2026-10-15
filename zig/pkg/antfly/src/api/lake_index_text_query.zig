@@ -173,7 +173,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     var source = blk: {
         const source_started = @import("antfly_platform").time.monotonicNs();
         defer server.lake_query_metrics.record(.source, source_started);
-        break :blk try local.serverless_query_lake_serving.ServingSource.openCached(a, .{ .storage_mode = .relational, .external_base_source = source_schema }, options.lakeOptions(), context, &server.lake_read_cache);
+        break :blk try local.serverless_query_lake_serving.ServingSource.openLazyCached(a, .{ .storage_mode = .relational, .external_base_source = source_schema }, options.lakeOptions(), context, &server.lake_read_cache);
     };
     defer source.deinit();
     try source.attachCache(&server.lake_read_cache, schema.binding, context);
@@ -229,7 +229,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
         navigation_pin = try @import("lake_index_decoded_metadata.zig").acquire(navigation_api.Root, cached, store.artifactStore(), ref, retained_cancellation, navigation_api.load);
         const root = navigation_pin.?.value.*;
         if (!std.mem.eql(u8, &root.domain, &owner.domain) or !std.mem.eql(u8, root.source, source.inventory.source_id) or
-            !std.mem.eql(u8, root.schema, source.inventory.schema_fingerprint) or !std.mem.eql(u8, root.snapshot, source.inventory.snapshot_id) or root.count != source.inventory.files.len) return error.ExternalLakeSnapshotMismatch;
+            !std.mem.eql(u8, root.schema, source.inventory.schema_fingerprint) or !std.mem.eql(u8, root.snapshot, source.inventory.snapshot_id) or root.count != source.fileCount()) return error.ExternalLakeSnapshotMismatch;
         navigation = .{ .root = root, .store = store.artifactStore(), .cached = cached, .token = retained_cancellation };
         owner.navigation = &navigation.?;
     } else {
@@ -1930,14 +1930,18 @@ const Execution = struct {
             result: ?types.SearchResult = null,
             task: ?scheduler.Task(anyerror!void) = null,
             failure: ?anyerror = null,
+            serial_only: bool = false,
             done: std.Io.Event = .unset,
             fn create(base: *Execution, component: local.storage_db_query_search_exec.ComposedComponent, backing: A, limit: usize) !*@This() {
                 const owner = try std.heap.page_allocator.create(@This());
-                owner.* = .{ .budget = .{ .backing = backing, .limit = limit }, .parent = base.source, .component = component };
+                owner.* = .{ .budget = .{ .backing = backing, .limit = limit }, .serial_only = limit == std.math.maxInt(usize), .parent = base.source, .component = component };
                 errdefer std.heap.page_allocator.destroy(owner);
                 owner.arena = .init(owner.budget.allocator());
                 errdefer owner.arena.deinit();
-                owner.source = try base.source.parallelView(owner.budget.allocator());
+                owner.source = base.source.parallelView(owner.budget.allocator()) catch |err| {
+                    if (err == error.OutOfMemory and owner.budget.isExhausted()) return error.SqlMemoryLimitExceeded;
+                    return err;
+                };
                 owner.execution = base.childExecution(&owner.source, owner.arena.allocator(), owner.budget.allocator());
                 owner.execution.scheduled_component = true;
                 return owner;
@@ -1979,9 +1983,14 @@ const Execution = struct {
             };
             const count = @min(3, components.len - first);
             for (components[first..][0..count], 0..) |component, i| {
-                const worker = try Worker.create(self, component, @import("antfly_platform").allocator.processAllocator(std.heap.page_allocator), 16 * 1024 * 1024);
+                const worker = Worker.create(self, component, @import("antfly_platform").allocator.processAllocator(std.heap.page_allocator), 16 * 1024 * 1024) catch |err| switch (err) {
+                    error.SqlMemoryLimitExceeded => try Worker.create(self, component, a, std.math.maxInt(usize)),
+                    else => return err,
+                };
                 workers[i] = worker;
-                if (self.context.io) |io| worker.task = scheduler.global().submitIo(io, 16 * 1024 * 1024, Worker.run, .{worker});
+                if (!worker.serial_only) if (self.context.io) |io| {
+                    worker.task = scheduler.global().submitIo(io, 16 * 1024 * 1024, Worker.run, .{worker});
+                };
                 if (worker.task == null) Worker.run(worker) catch |err| {
                     if (err != error.OutOfMemory or !worker.budget.isExhausted()) return err;
                     worker.failure = err;
@@ -2038,11 +2047,13 @@ const Execution = struct {
             result: ?types.SearchResult = null,
             task: ?scheduler.Task(anyerror!void) = null,
             failure: ?anyerror = null,
+            serial_only: bool = false,
             done: std.Io.Event = .unset,
             fn create(base: *Execution, selected_run: ?@import("lake_recent_vectors.zig").Run, limit: usize, backing: A) !*@This() {
                 const owner = try std.heap.page_allocator.create(@This());
                 owner.* = .{ .arena = undefined, .execution = undefined };
                 owner.budget.limit = limit;
+                owner.serial_only = limit == std.math.maxInt(usize);
                 owner.budget.backing = backing;
                 owner.arena = .init(owner.budget.allocator());
                 errdefer {
@@ -2050,7 +2061,10 @@ const Execution = struct {
                     std.heap.page_allocator.destroy(owner);
                 }
                 owner.parent_source = base.source;
-                if (include_archive) owner.source_view = try base.source.parallelView(owner.budget.allocator());
+                if (include_archive) owner.source_view = base.source.parallelView(owner.budget.allocator()) catch |err| {
+                    if (err == error.OutOfMemory and owner.budget.isExhausted()) return error.SqlMemoryLimitExceeded;
+                    return err;
+                };
                 owner.execution = base.childExecution(if (include_archive) &owner.source_view.? else base.source, owner.arena.allocator(), owner.budget.allocator());
                 owner.execution.active_recent = selected_run != null;
                 owner.execution.recent_run = selected_run;
@@ -2115,9 +2129,15 @@ const Execution = struct {
             }
             const count = @min(workers.len, runs.len + archive_count - first);
             for (workers[0..count], 0..) |*slot, i| {
-                const worker = try Worker.create(self, if (include_archive and first + i == 0) null else runs[first + i - archive_count], workspace, @import("antfly_platform").allocator.processAllocator(std.heap.page_allocator));
+                const selected_run = if (include_archive and first + i == 0) null else runs[first + i - archive_count];
+                const worker = Worker.create(self, selected_run, workspace, @import("antfly_platform").allocator.processAllocator(std.heap.page_allocator)) catch |err| switch (err) {
+                    error.SqlMemoryLimitExceeded => try Worker.create(self, selected_run, std.math.maxInt(usize), a),
+                    else => return err,
+                };
                 slot.* = worker;
-                if (self.context.io) |io| worker.task = scheduling.submitIo(io, workspace, Worker.run, .{ worker, req, query });
+                if (!worker.serial_only) if (self.context.io) |io| {
+                    worker.task = scheduling.submitIo(io, workspace, Worker.run, .{ worker, req, query });
+                };
                 if (worker.task == null) Worker.run(worker, req, query) catch |err| {
                     // Cancellation must unwind immediately: swallowing it
                     // would consume the caller cancellation point before joins.
@@ -3921,4 +3941,30 @@ test "external lake bounded WAL vector lanes join cancel saturate and retry over
         try std.testing.expectEqual(@as(usize, 0), scheduling.bytes);
         try std.testing.expectEqual(@as(usize, 0), scheduling.io_workers);
     }
+}
+
+test "external lake global frontier large source version views avoid lane setup copies" {
+    const a = std.testing.allocator;
+    var source: local.serverless_query_lake_serving.ServingSource = .{ .alloc = a, .store = undefined, .inventory = undefined, .scanner = undefined };
+    source.scanner.shared_reader = null;
+    defer source.clearVersions();
+    const value: [512]u8 = @splat('v');
+    for (0..32768) |i| try source.versions.put(a, i, .{ .file_id = @constCast("file"), .object_uri = @constCast("file://file"), .byte_len = 1, .row_count = 1, .row_groups = &.{}, .etag = try a.dupe(u8, "etag"), .version_id = try a.dupe(u8, &value) });
+    var tiny: local.sql_memory_budget = .{ .backing = a, .limit = 1024 };
+    var view = try source.parallelView(tiny.allocator());
+    defer view.closeParallelView(&source);
+    try std.testing.expectEqual(@as(usize, 0), view.versions.count());
+    try std.testing.expectEqualStrings(&value, view.pinnedVersion(32767).?.version_id);
+    const runs = [_]@import("lake_recent_vectors.zig").Run{.{ .prefix = 1, .digest = @splat(0), .declarations = &.{}, .cloud_generations = null }};
+    var execution: Execution = .{ .server = undefined, .table = undefined, .source = &source, .store = undefined, .domain = @splat(0), .declarations = &.{}, .context = .{ .io = std.testing.io }, .request = .{}, .schema_json = "{}", .arena = a, .result_allocator = a, .recent_runs = &runs };
+    defer execution.deinit();
+    const Part = struct {
+        fn run(_: ?*anyopaque, alloc: A, _: types.SearchRequest, _: bool) !types.SearchResult {
+            return .{ .alloc = alloc, .hits = &.{}, .total_hits = 0 };
+        }
+    };
+    var combined: types.SearchResult = .{ .alloc = a, .hits = &.{}, .total_hits = 0 };
+    defer combined.deinit();
+    var scheduler: local.sql_parallel_scheduler.Scheduler = .{};
+    try execution.searchVectorParts(a, .{ .limit = 1 }, false, Part.run, &combined, &scheduler, true);
 }

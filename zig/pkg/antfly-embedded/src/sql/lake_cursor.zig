@@ -77,6 +77,26 @@ fn numericPruning(a: std.mem.Allocator, column: []const u8, op: catalog.Conditio
 }
 
 pub fn openPinned(alloc: Allocator, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *serving.ServingSource) !catalog.Cursor {
+    const normalized = try context.platformDeadline();
+    var inherited: @import("../serverless/query/lake_read_context.zig").Context = if (source.context_store) |store| store.context else .{};
+    if (normalized.deadline_ns) |deadline| inherited.deadline_ns = if (inherited.deadline_ns) |prior| @min(prior, deadline) else deadline;
+    inherited.cancellation = @import("../storage/object_storage.zig").CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn);
+    const read_context = source.protectContext(inherited);
+    if (source.hasLazyInventory() and request.row_refs != null) {
+        const view = try alloc.create(serving.ServingSource);
+        errdefer alloc.destroy(view);
+        view.* = try source.selectedView(alloc, request.row_refs.?, read_context);
+        errdefer view.closeParallelView(source);
+        const cursor = try openPinnedMaterialized(alloc, table, request, context, view);
+        const owner: *Owner = @ptrCast(@alignCast(cursor.ptr));
+        owner.source = view;
+        owner.source_parent = source;
+        return cursor;
+    }
+    try source.ensureInventory(read_context);
+    return openPinnedMaterialized(alloc, table, request, context, source);
+}
+fn openPinnedMaterialized(alloc: Allocator, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *serving.ServingSource) !catalog.Cursor {
     if (request.include_primary_digest or request.include_document or request.index_equality != null) return error.UnsupportedSqlExecution;
     try context.ensureActive();
     const binding = table.external_base_source orelse return error.InvalidSqlBackend;
@@ -253,6 +273,7 @@ const Owner = struct {
     conditions: []const catalog.Condition,
     context: operation.RequestContext,
     source: ?*serving.ServingSource = null,
+    source_parent: ?*serving.ServingSource = null,
     partition_source: ?*serving.ServingSource = null,
     partition_versions_owned: bool = false,
     borrowed_prepared: ?*@import("../serverless/query/lake_prepared_deletes.zig").Prepared = null,
@@ -585,7 +606,7 @@ const Owner = struct {
             self.alloc.destroy(source);
         }
         if (self.source) |source| {
-            source.deinit();
+            if (self.source_parent) |parent| source.closeParallelView(parent) else source.deinit();
             self.alloc.destroy(source);
         }
         self.arena.deinit();

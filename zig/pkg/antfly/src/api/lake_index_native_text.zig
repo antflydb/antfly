@@ -375,6 +375,19 @@ pub fn loadRootDirectory(a: A, store: stores.ArtifactStore, ref: Ref, cancellati
     if (ref.kind != .text_segment or !supportsBuildMetadata(ref.metadata_version) or ref.byte_len > max_root_bytes) return error.InvalidNativeLakeTextCorpus;
     const bytes = try artifacts.readArtifact(a, store, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, cancellation, cache);
     defer a.free(bytes);
+    return decodeRootDirectory(a, ref, bytes);
+}
+/// Legacy compacted pointers did not carry a version. Authenticate their body
+/// before selecting a supported decoder; advertised root versions stay strict.
+pub fn loadRootDirectoryAuto(a: A, store: stores.ArtifactStore, ref: artifacts.ChunkRef, cancellation: Cancellation, cache: ?artifacts.CachedRead) !struct { root: Root, metadata_version: u16 } {
+    if (ref.byte_len == 0 or ref.byte_len > max_root_bytes) return error.InvalidNativeLakeTextCorpus;
+    const bytes = try artifacts.readArtifact(a, store, ref, cancellation, cache);
+    defer a.free(bytes);
+    const header = try std.json.parseFromSliceLeaky(struct { version: u16 }, a, bytes, .{ .ignore_unknown_fields = true });
+    if (!supportsBuildMetadata(header.version)) return error.InvalidNativeLakeTextCorpus;
+    return .{ .root = try decodeRootDirectory(a, .{ .kind = .text_segment, .metadata_version = header.version, .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, bytes), .metadata_version = header.version };
+}
+fn decodeRootDirectory(a: A, ref: Ref, bytes: []const u8) !Root {
     var root = try std.json.parseFromSliceLeaky(Root, a, bytes, .{ .allocate = .alloc_always });
     if (root.version != ref.metadata_version) return error.InvalidNativeLakeTextCorpus;
     // V11 file records are single-page GC units; authenticate their population
@@ -400,7 +413,7 @@ pub fn loadDirectory(a: A, store: stores.ArtifactStore, ref: Ref, cancellation: 
 }
 pub fn servingRoot(a: A, store: stores.ArtifactStore, outer: Root, token: Cancellation, cache: ?artifacts.CachedRead) !Root {
     const ref = outer.serving orelse outer.compacted orelse return outer;
-    const root = try loadRootDirectory(a, store, .{ .kind = .text_segment, .metadata_version = if (outer.serving != null) metadata_version else 10, .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, cache);
+    const root = if (outer.serving != null) try loadRootDirectory(a, store, .{ .kind = .text_segment, .metadata_version = metadata_version, .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, cache) else (try loadRootDirectoryAuto(a, store, ref, token, cache)).root;
     if (root.serving != null or root.compacted != null or !rebuild.bindingsEqual(root.binding, outer.binding) or !std.mem.eql(u8, &root.recipe, &outer.recipe) or !std.mem.eql(u8, &root.domain, &outer.domain) or root.collection == null or outer.collection == null or root.collection.?.documents != outer.collection.?.documents or root.collection.?.fields.len != outer.collection.?.fields.len or root.stored_projection != outer.stored_projection or !std.mem.eql(u8, root.config_json, outer.config_json)) return error.InvalidNativeLakeTextCorpus;
     return root;
 }

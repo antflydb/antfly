@@ -296,6 +296,76 @@ pub const Collector = struct {
             } else _ = try self.mark(segment);
         }
     }
+    pub fn markTextRootAuto(self: *Collector, a: A, ref: artifacts.ChunkRef) anyerror!void {
+        const fresh = if (self.progress) |progress| try progress.expand(ref, "text_segment") else try self.mark(ref);
+        if (!fresh) return;
+        try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
+        const decoded = try @import("lake_index_native_text.zig").loadRootDirectoryAuto(a, self.store, ref, self.cancellation(), null);
+        try self.markTextRoot(a, decoded.root, decoded.metadata_version);
+    }
+    fn markTextRoot(self: *Collector, a: A, root: @import("lake_index_native_text.zig").Root, metadata_version: u16) anyerror!void {
+        if (root.checkpoint_base) |base| {
+            const child: local.serverless_manifest_artifact_ref.ArtifactRef = .{ .kind = .text_segment, .metadata_version = @import("lake_index_native_text.zig").metadata_version, .artifact_id = base.artifact_id, .checksum = base.checksum, .byte_len = base.byte_len };
+            if (self.progress) |progress| try progress.enqueue(.{ .artifact = child }) else try self.markArtifact(a, child);
+        }
+        if (root.serving orelse root.compacted) |serving| {
+            if (root.serving != null) {
+                const child: local.serverless_manifest_artifact_ref.ArtifactRef = .{ .kind = .text_segment, .metadata_version = @import("lake_index_native_text.zig").metadata_version, .artifact_id = serving.artifact_id, .checksum = serving.checksum, .byte_len = serving.byte_len };
+                if (self.progress) |progress| try progress.enqueue(.{ .artifact = child }) else try self.markArtifact(a, child);
+            } else if (self.progress) |progress| try progress.enqueue(.{ .text_root = serving }) else try self.markTextRootAuto(a, serving);
+        }
+        try self.markPages(a, root.domain, root.checkpoint_removed_files, false);
+        if (root.checkpoint_files) |files| {
+            if (self.progress) |progress| {
+                try progress.enqueue(.{ .page = .{ .ref = files, .ordered_rows = false, .text_files = .{ .seekable = root.seekable, .maintenance_only = false } } });
+            } else {
+                try self.markPages(a, root.domain, files, false);
+                var directory = root;
+                directory.directories = .{ .files = files };
+                directory.file_count = root.checkpoint_file_count;
+                const records = try @import("lake_index_text_directory.zig").fileRecordsBudget(a, directory, self.store, null, self.cancellation(), &self.remaining_reads);
+                for (records) |record| try self.markTextManifestMode(a, record.manifest, root.seekable, false);
+            }
+        }
+        try self.markPages(a, root.domain, root.serving_inventory, false);
+        try self.markPages(a, root.domain, root.serving_routes, false);
+        try self.markPages(a, root.domain, root.segment_files, false);
+        const paged_text_files = self.progress != null and root.inventory_version == 3 and metadata_version >= 11;
+        if (paged_text_files) {
+            if (root.directories.files) |files| try self.progress.?.enqueue(.{ .page = .{ .ref = files, .ordered_rows = false, .text_files = .{ .seekable = root.seekable, .maintenance_only = root.serving != null } } });
+        } else try self.markPages(a, root.domain, root.directories.files, false);
+        try self.markPages(a, root.domain, root.directories.segments, false);
+        try self.markPages(a, root.domain, root.directories.routing, false);
+        try self.markPages(a, root.domain, root.pack_ownership, false);
+        try self.markPages(a, root.domain, root.source_routes, false);
+        try self.markPages(a, root.domain, root.tie_bounds, false);
+        try self.markPages(a, root.domain, root.term_statistics, false);
+        for (root.statistics_deltas) |delta_run| try self.markPages(a, root.domain, delta_run.page, false);
+        try self.markPages(a, root.domain, root.term_directory.branches, false);
+        try self.markPages(a, root.domain, root.term_directory.leaves, false);
+        for (root.file_groups) |group| {
+            for (group.opening_packs) |pack| _ = try self.mark(pack.artifact);
+            for (group.summaries) |summary| try self.markPages(a, root.domain, summary, false);
+        }
+
+        const manifests = if (paged_text_files) &.{} else if (root.inventory_version == 3) blk: {
+            const records = try @import("lake_index_text_directory.zig").fileRecordsBudget(a, root, self.store, null, self.cancellation(), &self.remaining_reads);
+            const refs = try a.alloc(artifacts.ChunkRef, records.len);
+            for (refs, records) |*manifest, record| manifest.* = record.manifest;
+            break :blk refs;
+        } else root.manifests;
+        for (manifests) |manifest| {
+            if (self.progress) |progress| try progress.enqueue(.{ .text_manifest = .{ .ref = manifest, .seekable = root.seekable, .maintenance_only = root.serving != null } }) else try self.markTextManifestMode(a, manifest, root.seekable, root.serving != null);
+        }
+        for (root.file_groups) |group| for (group.rows) |block| {
+            if (block.bitmap) |bitmap| _ = try self.mark(bitmap);
+        };
+        for (root.segments) |segment| {
+            if (root.seekable) {
+                if (self.progress) |progress| try progress.enqueue(.{ .text_directory = segment }) else try self.markTextDirectory(a, segment);
+            } else _ = try self.mark(segment);
+        }
+    }
     pub fn markArtifact(self: *Collector, a: A, ref: local.serverless_manifest_artifact_ref.ArtifactRef) !void {
         const root_chunk: artifacts.ChunkRef = .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len };
         const fresh = if (self.progress) |progress| try progress.expand(root_chunk, @tagName(ref.kind)) else try self.mark(root_chunk);
@@ -338,65 +408,7 @@ pub const Collector = struct {
                 if (ref.metadata_version >= 1 and ref.metadata_version <= @import("lake_index_native_text.zig").metadata_version) {
                     try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
                     const root = try self.retainedNativeRoot(a, @import("lake_index_native_text.zig"), ref);
-                    if (root.checkpoint_base) |base| {
-                        const child: local.serverless_manifest_artifact_ref.ArtifactRef = .{ .kind = .text_segment, .metadata_version = @import("lake_index_native_text.zig").metadata_version, .artifact_id = base.artifact_id, .checksum = base.checksum, .byte_len = base.byte_len };
-                        if (self.progress) |progress| try progress.enqueue(.{ .artifact = child }) else try self.markArtifact(a, child);
-                    }
-                    if (root.serving orelse root.compacted) |serving| {
-                        const child: local.serverless_manifest_artifact_ref.ArtifactRef = .{ .kind = .text_segment, .metadata_version = if (root.serving != null) @import("lake_index_native_text.zig").metadata_version else 10, .artifact_id = serving.artifact_id, .checksum = serving.checksum, .byte_len = serving.byte_len };
-                        if (self.progress) |progress| try progress.enqueue(.{ .artifact = child }) else try self.markArtifact(a, child);
-                    }
-                    try self.markPages(a, root.domain, root.checkpoint_removed_files, false);
-                    if (root.checkpoint_files) |files| {
-                        if (self.progress) |progress| {
-                            try progress.enqueue(.{ .page = .{ .ref = files, .ordered_rows = false, .text_files = .{ .seekable = root.seekable, .maintenance_only = false } } });
-                        } else {
-                            try self.markPages(a, root.domain, files, false);
-                            var directory = root;
-                            directory.directories = .{ .files = files };
-                            directory.file_count = root.checkpoint_file_count;
-                            const records = try @import("lake_index_text_directory.zig").fileRecordsBudget(a, directory, self.store, null, self.cancellation(), &self.remaining_reads);
-                            for (records) |record| try self.markTextManifestMode(a, record.manifest, root.seekable, false);
-                        }
-                    }
-                    try self.markPages(a, root.domain, root.serving_inventory, false);
-                    try self.markPages(a, root.domain, root.serving_routes, false);
-                    try self.markPages(a, root.domain, root.segment_files, false);
-                    const paged_text_files = self.progress != null and root.inventory_version == 3 and ref.metadata_version >= 11;
-                    if (paged_text_files) {
-                        if (root.directories.files) |files| try self.progress.?.enqueue(.{ .page = .{ .ref = files, .ordered_rows = false, .text_files = .{ .seekable = root.seekable, .maintenance_only = root.serving != null } } });
-                    } else try self.markPages(a, root.domain, root.directories.files, false);
-                    try self.markPages(a, root.domain, root.directories.segments, false);
-                    try self.markPages(a, root.domain, root.directories.routing, false);
-                    try self.markPages(a, root.domain, root.pack_ownership, false);
-                    try self.markPages(a, root.domain, root.source_routes, false);
-                    try self.markPages(a, root.domain, root.tie_bounds, false);
-                    try self.markPages(a, root.domain, root.term_statistics, false);
-                    for (root.statistics_deltas) |delta_run| try self.markPages(a, root.domain, delta_run.page, false);
-                    try self.markPages(a, root.domain, root.term_directory.branches, false);
-                    try self.markPages(a, root.domain, root.term_directory.leaves, false);
-                    for (root.file_groups) |group| {
-                        for (group.opening_packs) |pack| _ = try self.mark(pack.artifact);
-                        for (group.summaries) |summary| try self.markPages(a, root.domain, summary, false);
-                    }
-
-                    const manifests = if (paged_text_files) &.{} else if (root.inventory_version == 3) blk: {
-                        const records = try @import("lake_index_text_directory.zig").fileRecordsBudget(a, root, self.store, null, self.cancellation(), &self.remaining_reads);
-                        const refs = try a.alloc(artifacts.ChunkRef, records.len);
-                        for (refs, records) |*manifest, record| manifest.* = record.manifest;
-                        break :blk refs;
-                    } else root.manifests;
-                    for (manifests) |manifest| {
-                        if (self.progress) |progress| try progress.enqueue(.{ .text_manifest = .{ .ref = manifest, .seekable = root.seekable, .maintenance_only = root.serving != null } }) else try self.markTextManifestMode(a, manifest, root.seekable, root.serving != null);
-                    }
-                    for (root.file_groups) |group| for (group.rows) |block| {
-                        if (block.bitmap) |bitmap| _ = try self.mark(bitmap);
-                    };
-                    for (root.segments) |segment| {
-                        if (root.seekable) {
-                            if (self.progress) |progress| try progress.enqueue(.{ .text_directory = segment }) else try self.markTextDirectory(a, segment);
-                        } else _ = try self.mark(segment);
-                    }
+                    try self.markTextRoot(a, root, ref.metadata_version);
                 } else if (ref.metadata_version != 0) return error.InvalidNativeLakeGcReference;
             },
             .sparse_segment => {

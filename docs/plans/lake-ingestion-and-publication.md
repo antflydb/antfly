@@ -988,3 +988,30 @@ reduction. Long lower keys use conservative prefixes; long upper keys use
 prefix successors. A saturated upper prefix or legacy child emits a nonempty
 unknown reduction, preserving publication compatibility and retaining candidate
 packs. Exact row membership remains authoritative after this lossy pruning.
+
+
+Legacy compacted text-root pointers carry no version. Serving and resumable GC
+authenticate the root body before choosing the supported decoder; roots with an
+advertised metadata version continue to require an exact match. GC persists a
+version-discovery job so resumed traversal follows the same contract.
+
+Composed execution lanes borrow their quiescent parent's immutable version map
+and keep only private overrides. The parent remains pinned until every lane
+joins. Workspace exhaustion during lane setup uses the same serial fallback as
+execution exhaustion; cancellation and real allocation failures still propagate.
+
+Immutable Iceberg snapshot catalogs use refcounted, path-copying file-ID trees
+that pin immutable manifest chunks. A bounded predecessor cache scopes reuse to
+credentials, source, table location and manifest inheritance. A new snapshot
+reuses unchanged nodes and derives only changed manifest entries. Headers, schema
+and delete applicability remain fresh. Point hydration creates a bounded view
+of the selected files; flat inventory and canonical row ordering are materialized
+only when a full scan needs them. Canonical ordering is published once per
+snapshot with cancellation-aware waiting. Cache admission failure preserves the
+ordinary materialized plan. Initial discovery still reads the manifest list;
+this does not promise constant-time discovery of a new snapshot.
+
+Constant-score match-all and bitmap leaves expose finite nonnegative score
+bounds within selective Boolean trees. Invalid or signed boosts retain
+conservative bounds. Independent full-admission ranked pages remain the oracle
+for score, tie and offset behavior.

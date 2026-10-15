@@ -94,7 +94,7 @@ fn selectVerified(a: A, table: sql.Table, source: *local.serverless_query_lake_s
             break :loaded root_pin.?.value.*;
         } else try navigation.load(root_arena.allocator(), artifacts, ref, normalized, null);
         const expected_domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(table.id, store.identity, published.namespace);
-        if (!std.mem.eql(u8, &root.domain, &expected_domain) or root.count != source.inventory.files.len or
+        if (!std.mem.eql(u8, &root.domain, &expected_domain) or root.count != source.fileCount() or
             !std.mem.eql(u8, root.source, source.inventory.source_id) or !std.mem.eql(u8, root.schema, source.inventory.schema_fingerprint) or
             !std.mem.eql(u8, root.snapshot, source.inventory.snapshot_id)) return error.InvalidExternalLakeIndexCoverage;
         try local.serverless_query_lake_scan_plan.validateBindingInventoryIdentity(binding, source.inventory);
@@ -109,6 +109,7 @@ fn selectVerified(a: A, table: sql.Table, source: *local.serverless_query_lake_s
         pinned_delete_objects = pinned.delete_objects;
         if (immutable_proof) try @import("lake_verified_file_selector.zig").install(source, store, published, root, cached.?, reader.?);
     } else {
+        try source.ensureInventory(context);
         if (cached) |shared| inventory_lease = try @import("lake_index_decoded_metadata.zig").acquire(InventoryMetadata, shared, artifacts, published.inventory, normalized, InventoryMetadata.load) else owned_inventory = try InventoryMetadata.load(a, artifacts, published.inventory, normalized, null);
         const metadata = if (inventory_lease) |owned| owned.value else &owned_inventory.?;
         const inventory = metadata.inventory;

@@ -3485,7 +3485,7 @@ pub const TextNavigationPlan = struct {
         var exact = true;
         switch (node.kind) {
             .none => possible = false,
-            .all, .bitmap => return .{ .upper = std.math.inf(f32), .possible = true },
+            .all, .bitmap => return .{ .upper = if (node.boost >= 0 and std.math.isFinite(node.boost)) node.boost else std.math.inf(f32), .possible = true, .exact = node.boost >= 0 and std.math.isFinite(node.boost) },
             .filter => {
                 const terms = node.pattern_terms orelse {
                     if (source.pattern) |pattern| return pattern(source.ptr, node.pattern_query.?);
@@ -10764,6 +10764,9 @@ test "external lake metadata navigation shares scorer lowering and conservative 
     const missing: SearchQuery = .{ .term = .{ .field = "title", .term = "missing" } };
     const custom: analysis_mod.Analyzer = .{ .tokenizer = .unicode_words, .filters = &.{.lowercase} };
     const queries = [_]SearchQuery{
+        .{ .bool_query = .{ .must = &.{ common, .match_all } } },
+        .{ .bool_query = .{ .must = &.{common}, .should = &.{.match_all} } },
+
         .{ .match = .{ .field = "title", .text = "COMMON rare common", .analyzer = &custom } },
         common,
         .{ .bool_query = .{ .must = &.{ common, missing } } },
@@ -10782,10 +10785,11 @@ test "external lake metadata navigation shares scorer lowering and conservative 
         .{ .bool_query = .{ .must = &.{rare}, .should = &.{.{ .prefix = .{ .field = "title", .prefix = "" } }} } },
         .{ .bool_query = .{ .should = &.{ common, .{ .prefix = .{ .field = "title", .prefix = "ra" } } }, .min_should = 2 } },
     };
-    for (queries) |query| {
+    for (queries, 0..) |query, query_index| {
         const plan = (try TextNavigationPlan.create(a, query, .{ .ptr = &source, .count = source.snapshot.scoringDocCount(), .average = Source.average, .frequencies = Source.frequencies }, .{})).?;
         defer plan.deinit();
         const upper = try plan.bound(.{ .ptr = &source, .read = Source.summary });
+        if (query_index < 2) try std.testing.expect(std.math.isFinite(upper));
         const Cancel = struct {
             fn yes(_: *const anyopaque) bool {
                 return true;

@@ -4828,6 +4828,24 @@ def test_broad_native_text_windows_preserve_scores_ties_counts_and_hydration(
             assert profiled["profile"]["sort"]["selection_reason"] == (
                 "bounded_global_text_frontier"
             ), profiled
+            # Constant-score clauses keep finite bounds in selective Boolean trees.
+            for clause in ("must", "should"):
+                boolean = {"must": [direct["full_text_search"]]}
+                boolean.setdefault(clause, []).append({"match_all": {}})
+                mixed = dict(direct, full_text_search={"bool": boolean})
+                found = call("POST", "/tables/profile_text/query", mixed)
+                complete = full_admission(
+                    dict(request, full_text_search=mixed["full_text_search"])
+                )
+                assert [
+                    (h["_score"], h["_source"]["amount"]) for h in found["hits"]["hits"]
+                ] == [
+                    (h["_score"], h["_source"]["amount"])
+                    for h in complete["hits"]["hits"][61:80]
+                ]
+                assert found["profile"]["sort"]["selection_reason"] == (
+                    "bounded_global_text_frontier"
+                ), found
             # Pattern admission uses the global vocabulary and routing summaries,
             # with equivalent Boolean lowering for score and result comparisons.
             for pattern in (

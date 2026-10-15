@@ -350,6 +350,8 @@ pub const Stream = struct {
     pub fn init(alloc: Allocator, source: *serving.ServingSource, columns: []const []const u8, predicates: []const Predicate, parent: Context, limits: Limits) !Stream {
         const context = source.protectContext(parent);
         try context.ensureActive();
+        try source.ensureInventory(context);
+        try source.ensureCanonicalPlan(context);
         const cached_order = source.canonicalOrder();
         if (cached_order == null) try source.inventory.validate();
         const files = cached_order orelse try serving.ServingSource.canonicalFileOrder(alloc, source.inventory);
@@ -513,7 +515,7 @@ pub const Stream = struct {
             source.delete_lease = null;
             source.versions = .empty;
             defer source.clearVersions();
-            if (parent.source.versions.get(job.index)) |pinned| {
+            if (parent.source.pinnedVersion(job.index)) |pinned| {
                 var owned = pinned;
                 owned.etag = try job.alloc.dupe(u8, pinned.etag);
                 errdefer job.alloc.free(owned.etag);
