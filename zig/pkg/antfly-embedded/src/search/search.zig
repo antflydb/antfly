@@ -2765,7 +2765,7 @@ const StreamingBoolNode = struct {
     requires_positions: bool = false,
 
     fn check(self: *@This()) !void {
-        if (self.steps % 256 == 0) if (self.segment.query_source) |source| if (source == .ranges) if (source.ranges.check_read_context) |check_context| try check_context(source.ranges.ptr);
+        if (self.steps % 256 == 0) if (self.segment.query_source) |source| try source.checkReadContext();
         self.steps +%= 1;
     }
 
@@ -3948,7 +3948,7 @@ const StreamingBoolPreparedCache = struct {
     /// for this cache; warm bounds still check this facade's current authority.
     fn checkBoundContext(self: *@This(), plan: index_mod.IndexSnapshot.TextSegmentPlan) !void {
         try self.snap.checkScoringReadContext();
-        if (self.snap.segments[plan.segment_idx].query_source) |source| if (source == .ranges) if (source.ranges.check_read_context) |check_context| try check_context(source.ranges.ptr);
+        if (self.snap.segments[plan.segment_idx].query_source) |source| try source.checkReadContext();
     }
     fn buildExactBound(self: *@This(), plan: index_mod.IndexSnapshot.TextSegmentPlan, a: Allocator) !f32 {
         const upper = try exactStreamingBoolBound(self.snap, self.bq, self.request, self.stats, self.producers, plan, a);
@@ -4010,7 +4010,7 @@ const StreamingBoolPreparedCache = struct {
         var selected_segment = try self.snap.leaseSegment(plan.segment_idx);
         defer selected_segment.deinit();
         const segment = selected_segment.entry;
-        if (segment.query_source) |source| if (source == .ranges) if (source.ranges.check_read_context) |check_context| try check_context(source.ranges.ptr);
+        if (segment.query_source) |source| try source.checkReadContext();
         try self.mutex.lock(self.io);
         while (true) {
             var found: ?*Slot = null;

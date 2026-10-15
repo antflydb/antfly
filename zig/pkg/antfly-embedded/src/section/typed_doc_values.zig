@@ -2770,7 +2770,10 @@ test "typed compressed copy borrows provider spans and propagates visitor failur
             self.copied_bytes += out.len;
             @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
         }
-        fn visit(raw: *anyopaque, offset: u64, length: u64, context: *anyopaque, consume: *const fn (*anyopaque, u64, []const u8) anyerror!void) !void {
+        fn visit(raw: *anyopaque, offset: u64, length: u64, visitor_port: @import("../segment_source.zig").SourceVisitor) !void {
+            var receiving_visitor = visitor_port;
+            const context: *anyopaque = &receiving_visitor;
+            const consume = @import("../segment_source.zig").SourceVisitor.consume;
             const self: *@This() = @ptrCast(@alignCast(raw));
             if (self.fail) return error.TestIoFailure;
             self.visits += 1;

@@ -796,3 +796,4 @@ pub const storage_lsm_backend_recycling_workspace = @import("storage/lsm_backend
 pub const sql_read_requirements = @import("sql/read_requirements.zig");
 
 pub const storage_db_cypher_write_observation = @import("storage/db/cypher_write_observation.zig");
+pub const storage_db_native_query_reuse = @import("storage/db/native_query_reuse.zig");

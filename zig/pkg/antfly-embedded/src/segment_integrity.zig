@@ -162,10 +162,10 @@ pub const PagedSource = struct {
         // Only an explicit fused capability guarantees authentication and
         // delivery share the provider's cache/traversal. A checksum callback
         // alone may bypass that cache and duplicate cold and warm reads.
-        if (self.original.ranges.read_authenticated) |read_authenticated| {
+        if (self.original.ranges.read_authenticated != null) {
             var expected: [4]u8 = undefined;
             try self.original.readInto(self.directory.offset + @as(u64, index) * 4, &expected);
-            read_authenticated(self.original.ranges.ptr, offset, length, within, out, std.mem.readInt(u32, &expected, .big)) catch |err| {
+            self.original.readAuthenticated(offset, length, within, out, std.mem.readInt(u32, &expected, .big)) catch |err| {
                 if (err == error.CrcMismatch) state.store(2, .release);
                 return err;
             };
@@ -205,8 +205,8 @@ pub const PagedSource = struct {
         @memcpy(out, self.buffer[within..][0..out.len]);
     }
     fn readVerified(self: *PagedSource, offset: u64, length: usize, within: usize, out: []u8) !void {
-        if (self.original == .ranges) if (self.original.ranges.read_authenticated) |read_authenticated| {
-            return read_authenticated(self.original.ranges.ptr, offset, length, within, out, null);
+        if (self.original == .ranges) if (self.original.ranges.read_authenticated != null) {
+            return self.original.readAuthenticated(offset, length, within, out, null);
         };
         return self.original.readInto(offset + within, out);
     }
@@ -223,7 +223,10 @@ pub const PagedSource = struct {
         state.store(1, .release);
         try self.original.readInto(offset + within, out);
     }
-    fn visit(ptr: *anyopaque, offset: u64, length: u64, context: *anyopaque, consume: *const fn (*anyopaque, u64, []const u8) anyerror!void) !void {
+    fn visit(ptr: *anyopaque, offset: u64, length: u64, visitor_port: @import("segment_source.zig").SourceVisitor) !void {
+        var receiving_visitor = visitor_port;
+        const context: *anyopaque = &receiving_visitor;
+        const consume = @import("segment_source.zig").SourceVisitor.consume;
         const self: *PagedSource = @ptrCast(@alignCast(ptr));
         const Forward = struct {
             context: *anyopaque,
@@ -463,7 +466,10 @@ test "segment borrowed spans authenticate cold pages and borrow verified ranges"
             self.reads += 1;
             @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
         }
-        fn visit(raw: *anyopaque, offset: u64, length: u64, context: *anyopaque, consume: *const fn (*anyopaque, u64, []const u8) anyerror!void) !void {
+        fn visit(raw: *anyopaque, offset: u64, length: u64, visitor_port: @import("segment_source.zig").SourceVisitor) !void {
+            var receiving_visitor = visitor_port;
+            const context: *anyopaque = &receiving_visitor;
+            const consume = @import("segment_source.zig").SourceVisitor.consume;
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.visits += 1;
             try consume(context, 0, self.bytes[@intCast(offset)..][0..@intCast(length)]);
@@ -519,7 +525,10 @@ test "segment cold streaming handles fragmented pages, tails, reentrancy and fai
             if (self.fail_directory and offset >= payload_len) return error.TestIoFailure;
             @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
         }
-        fn visit(raw: *anyopaque, offset: u64, length: u64, context: *anyopaque, consume: *const fn (*anyopaque, u64, []const u8) anyerror!void) !void {
+        fn visit(raw: *anyopaque, offset: u64, length: u64, visitor_port: @import("segment_source.zig").SourceVisitor) !void {
+            var receiving_visitor = visitor_port;
+            const context: *anyopaque = &receiving_visitor;
+            const consume = @import("segment_source.zig").SourceVisitor.consume;
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.visits += 1;
             var position: usize = 0;
@@ -596,7 +605,10 @@ test "segment.mixed authentication borrows verified suffix after a cold prefix" 
             const self: *@This() = @ptrCast(@alignCast(raw));
             @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
         }
-        fn visit(raw: *anyopaque, offset: u64, size: u64, context: *anyopaque, consume: *const fn (*anyopaque, u64, []const u8) anyerror!void) !void {
+        fn visit(raw: *anyopaque, offset: u64, size: u64, visitor_port: @import("segment_source.zig").SourceVisitor) !void {
+            var receiving_visitor = visitor_port;
+            const context: *anyopaque = &receiving_visitor;
+            const consume = @import("segment_source.zig").SourceVisitor.consume;
             const self: *@This() = @ptrCast(@alignCast(raw));
             try consume(context, 0, self.bytes[@intCast(offset)..][0..@intCast(size)]);
         }

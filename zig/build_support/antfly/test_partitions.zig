@@ -42,8 +42,7 @@ fn collect(step: *std.Build.Step, runs: *std.ArrayList(*std.Build.Step.Run), vis
 
 fn cloneModule(b: *std.Build, original: *std.Build.Module, copies: *std.AutoHashMap(*std.Build.Module, *std.Build.Module)) *std.Build.Module {
     if (copies.get(original)) |existing| return existing;
-    const copy = b.allocator.create(std.Build.Module) catch @panic("OOM");
-    copy.init(original.owner, .{ .existing = original });
+    const copy = source_owner.cloneModule(b, original);
     copy.import_table = .empty;
     copy.cached_graph = .{ .modules = &.{}, .names = &.{} };
     copies.put(original, copy) catch @panic("OOM");

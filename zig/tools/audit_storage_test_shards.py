@@ -188,6 +188,13 @@ def main() -> int:
         default=[],
         help="test-bearing source owned by a separately linked focused suite",
     )
+    parser.add_argument(
+        "--local-dedicated",
+        type=Path,
+        action="append",
+        default=[],
+        help="local test source owned by a separately configured module suite",
+    )
     parser.add_argument("--runtime-partition-source", type=Path)
     parser.add_argument("--runtime-partition-filter", action="append", default=[])
     args = parser.parse_args()
@@ -200,13 +207,19 @@ def main() -> int:
 
     if bool(args.local_root) != bool(args.local_catalog):
         parser.error("--local-root and --local-catalog must be used together")
+    if args.local_dedicated and not args.local_root:
+        parser.error("--local-dedicated requires --local-root and --local-catalog")
     failures = audit_manifest(
         args.root, args.manifest, args.filter, args.dedicated, args.local_catalog
     )
     if args.local_root:
         failures.extend(
             audit_manifest(
-                args.local_root, args.manifest, args.filter, catalog=args.local_catalog
+                args.local_root,
+                args.manifest,
+                args.filter,
+                args.local_dedicated,
+                catalog=args.local_catalog,
             )
         )
     if args.runtime_partition_source:

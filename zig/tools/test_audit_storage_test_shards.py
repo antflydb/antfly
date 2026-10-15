@@ -16,6 +16,7 @@
 
 import importlib.util
 import sys
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -81,6 +82,40 @@ class StorageTestShardAuditTest(unittest.TestCase):
                 self.root / "local/storage", manifest, ["storage.db."], catalog=catalog
             ),
         )
+
+    def test_cli_routes_dedicated_local_module_tests_to_their_physical_owner(self):
+        self.write("server/storage/test_manifest.zig", "")
+        self.write("local/source_catalog.zig", "")
+        self.write("local/storage/ordinals/root.zig", 'test "ordinal" {}\n')
+        command = [
+            sys.executable,
+            str(SCRIPT),
+            "--root",
+            str(self.root / "server/storage"),
+            "--manifest",
+            str(self.root / "server/storage/test_manifest.zig"),
+            "--local-root",
+            str(self.root / "local/storage"),
+            "--local-catalog",
+            str(self.root / "local/source_catalog.zig"),
+            "--filter",
+            "storage.",
+            "--local-dedicated",
+        ]
+        result = subprocess.run(
+            [*command, str(self.root / "local/storage/ordinals/root.zig")],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        # A dedicated declaration still cannot escape its own physical root.
+        result = subprocess.run(
+            [*command, str(self.root / "server/storage/test_manifest.zig")],
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("dedicated test source escapes storage root", result.stdout)
 
     def test_rejects_unimported_test_under_an_owned_directory(self):
         self.write("db/query/scan.zig", 'test "scan" {}\n')
